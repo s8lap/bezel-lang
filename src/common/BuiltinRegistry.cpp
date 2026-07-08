@@ -61,7 +61,7 @@ constexpr std::array<std::string_view, 2> kLinkedListNames = {
 // LlvmBackend_Layout.cpp (see header).  This is the intersection of the two
 // pre-refactor hand-lists: OwningBuffer (astNode-only) and the FFI class names
 // (imported-only) are NOT here — they stay as explicit deltas at the sites.
-constexpr std::array<std::string_view, 61> kHeapPointerReferenceBuiltins = {
+constexpr std::array<std::string_view, 63> kHeapPointerReferenceBuiltins = {
     // §4 collections (SortedSet: stdlib §4.18/#1426 — bz_dict_t* rep, both paths)
     "Array", "OwningArray", "Dictionary", "OwningDictionary",
     "SortedDictionary", "SortedSet", "Stack", "OwningStack", "Queue", "OwningQueue",
@@ -79,8 +79,10 @@ constexpr std::array<std::string_view, 61> kHeapPointerReferenceBuiltins = {
     "Subscription", "CancellationToken", "CancellationTokenSource", "TaskScope",
     // §28.13 / §2.16 Shared/Weak; §30.14/§30.15 channels; §5 groupings
     "Shared", "Weak", "Channel", "ChannelSender", "IGrouping",
-    // §24.3 event sources
-    "IEvent", "IAsyncEvent",
+    // §24.3 event sources; §6.5 / fix #1536: EventSource<T>/AsyncEventSource<T>
+    // (the producer-side face, §24.3) are heap-allocated like the IEvent<T>/
+    // IAsyncEvent<T> interfaces above — same ptr rep, no user TypeDecl.
+    "IEvent", "IAsyncEvent", "EventSource", "AsyncEventSource",
     // §6.2/§6.3 sync primitives
     "Mutex", "Lock", "Semaphore", "SemaphoreToken",
     // §6.6 task-completion sources; §6.4 atomics; #545 Buffer

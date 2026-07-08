@@ -110,7 +110,7 @@ BEZEL_TEST(builtin_registry_snapshot, linked_list_set) {
 // (imported-only) are deliberately NOT in the shared set — they are the small
 // site-local deltas the two call sites still test explicitly.
 BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
-    static constexpr std::array<std::string_view, 61> kSnapshot = {
+    static constexpr std::array<std::string_view, 63> kSnapshot = {
         "Array", "OwningArray", "Dictionary", "OwningDictionary",
         // INTENTIONAL addition (stdlib §4.18, #1426): SortedSet — bz_dict_t*
         // rep on both the astNode and imported paths.
@@ -125,7 +125,10 @@ BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
         "Subscription", "CancellationToken", "CancellationTokenSource",
         "TaskScope",
         "Shared", "Weak", "Channel", "ChannelSender", "IGrouping",
-        "IEvent", "IAsyncEvent",
+        // INTENTIONAL addition (stdlib §6.5, fix #1536): EventSource<T> /
+        // AsyncEventSource<T> — the producer-side event face (§24.3), same
+        // ptr rep as IEvent<T>/IAsyncEvent<T>.
+        "IEvent", "IAsyncEvent", "EventSource", "AsyncEventSource",
         "Mutex", "Lock", "Semaphore", "SemaphoreToken",
         "TaskCompletionSource", "OwningTaskCompletionSource",
         "Atomic", "AtomicInteger", "Buffer",

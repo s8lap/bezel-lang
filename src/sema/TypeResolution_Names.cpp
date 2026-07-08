@@ -136,6 +136,19 @@ int Resolver::builtinTypeArity(std::string_view n) {
         n == "ICollection" || n == "IList" ||
         n == "IOwningCollection" || n == "IOwningList" ||
         n == "IEvent" || n == "IAsyncEvent" ||
+        // stdlib §6.5 / spec §2.3 (fix #1536): EventSource<T> / AsyncEventSource<T>
+        // — the producer-side (in-declaring-class) face of an event member
+        // (§24.3). Per §2.3, `IEvent<T>`/`IAsyncEvent<T>` are auto-imported (they
+        // are the public type of every event member) but `EventSource<T>` /
+        // `AsyncEventSource<T>` require `import System.Threading`, like
+        // `CancellationTokenSource` / `Mutex` and the rest of that module.
+        // Before this fix neither name was registered at all, so a helper
+        // method whose parameter type names the in-class face (spec-legal per
+        // §24.3) could not be written. Same import-gating stance as
+        // CancellationTokenSource/TaskScope above: not yet enforced. Arity 1
+        // (single payload-type parameter); declaration stays null (no user
+        // TypeDecl) — same representation as Channel<T> below.
+        n == "EventSource" || n == "AsyncEventSource" ||
         // §2.8 / §2.9: auto-imported generic interfaces (stdlib §2.8–§2.9).
         // Registered here so they resolve as base types and field/param types
         // (fix #576: "unresolved type name 'IComparable'").
