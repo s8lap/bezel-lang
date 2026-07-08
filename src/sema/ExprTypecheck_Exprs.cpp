@@ -2192,10 +2192,43 @@ void ExprTC::visitExpr(const ast::Expr& e) {
 // ops `and` / `or` produce bool; `??` produces the non-nullable
 // result type of the LHS; range ops produce a Range value (slice 3c
 // leaves Range as Error).
+// §25.2 / §12.2 (v0.181, #1562): every `operator <token>` overload of the
+// given arity visible on `ts` — its own declarations plus those inherited from
+// its base classes. §25.2's resolution rule reaches inherited operators ("a
+// derived-typed operand reaches its base's operators, as in C#"); no user-facing
+// upcast exists that could otherwise expose them. §12.2's per-token no-hiding
+// rule guarantees a single inheritance chain contributes at most one declaring
+// type per token, so this walk yields no intra-chain duplicates for a
+// well-formed program. `baseTypes` mixes the base class and interfaces; both are
+// walked, but an interface's static-abstract operator (recurrence-parameter
+// typed) never matches a concrete operand at the call site (operandMatchesParam
+// discriminates by declaration), so including them is harmless.
+std::vector<MethodSymbol*>
+ExprTC::collectInheritedOperators(TypeSymbol* ts, std::string_view token,
+                                  std::size_t arity) {
+    std::vector<MethodSymbol*> out;
+    if (!ts) return out;
+    std::vector<TypeSymbol*> work{ts};
+    std::unordered_set<TypeSymbol*> seen;
+    while (!work.empty()) {
+        TypeSymbol* cur = work.back();
+        work.pop_back();
+        if (!cur || !seen.insert(cur).second) continue;
+        for (Symbol* m : cur->members) {
+            auto* ms = dynamic_cast<MethodSymbol*>(m);
+            if (ms && ms->isOperator && ms->operatorToken == token &&
+                ms->params.size() == arity)
+                out.push_back(ms);
+        }
+        for (TypeSymbol* b : cur->baseTypes) work.push_back(b);
+    }
+    return out;
+}
+
 // §25: the user-defined `static operator <op>` method that applies to a
-// binary expression, if either operand's type (class or record)
-// declares one. `=`/`<>` on classes are excluded (they invoke Equals,
-// §25.2).
+// binary expression, if either operand's type (class or record) — OR a base
+// class of that type (§25.2, v0.181, #1562) — declares one. `=`/`<>` on
+// classes are excluded (they invoke Equals, §25.2).
 MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
     // §22.6 / §25 (#1131): collect ALL binary-operator overloads of `be.op`
     // declared on the operand's type. A type may declare several overloads of the
@@ -2205,20 +2238,15 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
     // caller (`tryOperand`) picks the candidate whose parameters match the
     // operands in order.
     auto candidatesOn = [&](const ast::Expr* operand) -> std::vector<MethodSymbol*> {
-        std::vector<MethodSymbol*> out;
-        if (!operand) return out;
+        if (!operand) return {};
         TypeSymbol* ts = memberTargetType(operand);
-        if (!ts) return out;
-        // §25: user-defined `operator =` and `<>` on class types take
-        // precedence over built-in reference equality — only skip when
-        // no user-defined operator exists (handled by falling through).
-        for (Symbol* m : ts->members) {
-            auto* ms = dynamic_cast<MethodSymbol*>(m);
-            if (ms && ms->isOperator && ms->operatorToken == be.op &&
-                ms->params.size() == 2)
-                out.push_back(ms);
-        }
-        return out;
+        if (!ts) return {};
+        // §25.2 (v0.181, #1562): the candidate set is the operator overloads
+        // declared on the operand's type AND those inherited from its base
+        // classes. §25: user-defined `operator =` and `<>` on class types take
+        // precedence over built-in reference equality — only skip when no
+        // user-defined operator exists (handled by falling through).
+        return collectInheritedOperators(ts, be.op, 2);
     };
     // §25 (#1096): the operator's operands must match its declared parameters
     // IN ORDER (left → param 0, right → param 1). Bezel does not auto-commute
@@ -2252,11 +2280,25 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
         // protocol (lowerNullSafeRecordEquality), which unwraps the `{i8, T}`
         // payload to bare `T` before invoking the user operator. All other
         // operators remain gated (§7.11: lifting over `T?` is deferred).
-        if (pt->kind == TypeRef::Kind::Named)
-            return at->kind == TypeRef::Kind::Named &&
-                   pt->declaration == at->declaration &&
+        if (pt->kind == TypeRef::Kind::Named) {
+            if (at->kind != TypeRef::Kind::Named) return false;
+            // §25.2 (v0.181, #1562): "a derived-typed operand satisfies a
+            // base-typed parameter by the ordinary argument rules." Accept an
+            // exact declaration match OR a derived operand whose declaration
+            // derives from the parameter's declaration — this is what makes an
+            // operator inherited from a base class applicable to a derived-typed
+            // operand (the params are declared with the *base* type). The
+            // covariant direction is preserved (operand is-a parameter), so no
+            // spurious commutation is introduced. Note: isSubtype compares
+            // declarations only; generic-instantiation consistency for a generic
+            // declaring type stays with genericArgsConsistent below.
+            bool declOk = pt->declaration == at->declaration ||
+                          (pt->declaration && at->declaration &&
+                           isSubtype(at->declaration, pt->declaration));
+            return declOk &&
                    (pt->nullable || !at->nullable ||
                     be.op == "=" || be.op == "<>");
+        }
         // A primitive parameter accepts a primitive operand (numeric widening /
         // coercion is handled downstream); the kinds must still agree.
         if (pt->kind == TypeRef::Kind::Primitive)
@@ -3126,12 +3168,13 @@ MethodSymbol* ExprTC::findUnaryOperator(const ast::UnaryExpr& ue) {
     TypeSymbol* ts = ue.operand ? memberTargetType(ue.operand.get())
                                 : nullptr;
     if (!ts) return nullptr;
-    for (Symbol* m : ts->members) {
-        auto* ms = dynamic_cast<MethodSymbol*>(m);
-        if (ms && ms->isOperator && ms->operatorToken == ue.op &&
-            ms->params.size() == 1)
-            return ms;
-    }
+    // §25.2 (v0.181, #1562): "A unary operator consults the operand's type and
+    // its base classes, likewise." Walk the inheritance chain so an operator
+    // inherited from a base class is found for a derived-typed operand. §12.2's
+    // per-token no-hiding rule keeps the chain duplicate-free; take the first
+    // (nearest-declared) match.
+    for (MethodSymbol* ms : collectInheritedOperators(ts, ue.op, 1))
+        return ms;
     return nullptr;
 }
 

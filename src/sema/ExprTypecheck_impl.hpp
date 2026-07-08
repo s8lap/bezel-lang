@@ -914,6 +914,16 @@ private:
     // §25.2).
     MethodSymbol* findBinaryOperator(const ast::BinaryExpr& be);
 
+    // §25.2 / §12.2 (v0.181, #1562): collect every `operator <token>` overload
+    // of the given arity declared on `ts` OR inherited from any of its base
+    // classes. A derived-typed operand reaches its base's operators (there is
+    // no user-facing upcast that could otherwise reach them); §12.2's per-token
+    // no-hiding rule keeps a single inheritance chain duplicate-free. Walks the
+    // `baseTypes` chain transitively with a seen-set (cycle-safe).
+    std::vector<MethodSymbol*> collectInheritedOperators(TypeSymbol* ts,
+                                                         std::string_view token,
+                                                         std::size_t arity);
+
     void typeBinary(const ast::BinaryExpr& be);
 
     // §17.1 result-type table for unary operators (slice 3c).

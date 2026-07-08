@@ -1765,6 +1765,19 @@ void Resolver::checkHidingAndOverride() {
         // of them (most-derived first) and pick the matching overload below.
         std::unordered_map<std::string_view, std::vector<MemberSymbol*>>
             baseMembers;
+        // §12.2 (v0.181, #1562): operator declarations are covered by the
+        // no-hiding rule PER OPERATOR TOKEN — a derived class may not declare an
+        // `operator <op>` overload when any base class declares an overload of
+        // the same token, whatever the parameter types. An operator symbol's
+        // `name` is its token (SymbolCollection sets `name = opToken`), so a
+        // derived operator hiding a base one is *already* caught by the generic
+        // name-keyed path below — but with an operator-inappropriate message
+        // ("choose a different name"). Collect base operators separately, keyed
+        // by token, so the derived side can emit a per-token §12.2 diagnostic
+        // instead, and so the rule is enforced explicitly rather than by the
+        // incidental name==token coincidence. This is what keeps §25.2's
+        // inherited-operator candidate set duplicate-free within one chain.
+        std::unordered_map<std::string_view, MethodSymbol*> baseOperators;
         std::vector<TypeSymbol*> frontier;
         for (TypeSymbol* b : t->baseTypes) {
             if (b && b->kind == ast::TypeDeclKind::Class) {
@@ -1794,6 +1807,16 @@ void Resolver::checkHidingAndOverride() {
                     if (fs->posParam && cur->kind == ast::TypeDeclKind::Class)
                         continue;
                 }
+                // §12.2 (v0.181, #1562): route base operators to the per-token
+                // map and out of the name-keyed collection, so the derived side
+                // handles them with the operator-specific diagnostic (below)
+                // rather than the generic name-hiding message. emplace keeps the
+                // first-seen (nearest, most-derived-first) declaration.
+                if (auto* bop = dynamic_cast<MethodSymbol*>(m);
+                    bop && bop->isOperator) {
+                    baseOperators.emplace(bop->operatorToken, bop);
+                    continue;
+                }
                 if (auto* ms = dynamic_cast<MemberSymbol*>(m)) {
                     // Collect every same-name base member (most-derived first);
                     // an overloaded method contributes one entry per overload.
@@ -1806,7 +1829,7 @@ void Resolver::checkHidingAndOverride() {
                 }
             }
         }
-        if (baseMembers.empty()) continue;
+        if (baseMembers.empty() && baseOperators.empty()) continue;
         for (Symbol* m : t->members) {
             if (dynamic_cast<ConstructorSymbol*>(m) ||
                 dynamic_cast<DestructorSymbol*>(m)) {
@@ -1818,6 +1841,32 @@ void Resolver::checkHidingAndOverride() {
             if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
                 if (fs->posParam && t->kind == ast::TypeDeclKind::Class)
                     continue;
+            }
+            // §12.2 (v0.181, #1562): a derived operator redeclaring a token any
+            // base class already declares is a compile error — operators are
+            // static (§12.1: static members cannot be virtual), so no `override`
+            // escape exists, and the redeclaration would inject a base-vs-derived
+            // intra-chain ambiguity into §25.2's candidate set that the spec
+            // declares undeclarable. The prohibition is per token, whatever the
+            // parameter types.
+            if (auto* dop = dynamic_cast<MethodSymbol*>(m);
+                dop && dop->isOperator) {
+                auto it = baseOperators.find(dop->operatorToken);
+                if (it != baseOperators.end()) {
+                    std::string baseCls =
+                        (it->second->parent && !it->second->parent->name.empty())
+                            ? std::string(it->second->parent->name)
+                            : "a base class";
+                    ctx_.diagnostics().report(
+                        Severity::Error, dop->declLoc,
+                        std::string("operator `") +
+                        std::string(dop->operatorToken) +
+                        "` is already declared in `" + baseCls +
+                        "`; hiding is forbidden — an operator token declared in "
+                        "a base class may not be redeclared in a derived class "
+                        "(operators are static and cannot be overridden) (§12.2)");
+                }
+                continue;  // operators handled here; not name-keyed below
             }
             auto* ms = dynamic_cast<MemberSymbol*>(m);
             if (!ms || ms->name.empty()) continue;
