@@ -397,6 +397,92 @@ BEZEL_TEST(task_combinators_6_7, when_any_delay_race_winner_index) {
 }
 
 // ============================================================
+// #1501 / stdlib §6.7 (line 2884) §30.10 / §30.15: Task.WhenAny over an
+// INLINE Array<Task> literal of Channel<T>.Receive() tasks — the natural
+// "select" idiom. Before the fix, `Task.WhenAny([ta, tb])` (an inline
+// CollectionLiteralExpr argument, as opposed to every pre-existing test
+// above which binds the array to a named `using var tasks` local first)
+// silently lowered to null: WhenAny is a compiler intrinsic with no
+// MethodDecl param, so sema never gave the literal a materialization
+// target, and a bare lowerExpr returns null for a CollectionLiteralExpr
+// per §15.4 (it is not a general expression value). The whole
+// `using var w := Task.WhenAny([…])` store then never executed, leaving
+// `w` holding whatever garbage was already on the native stack; the
+// subsequent `await w` called bz_task_is_done on that garbage pointer and
+// SIGSEGV'd/aborted before any output — 100% reproducible (issue #1501).
+// ============================================================
+
+// #1501: `Task.WhenAny([ta, tb])` where ta is an already-done Receive (a
+// value pre-sent on channel `a`) and tb is a genuinely pending Receive on
+// an otherwise-idle channel `b` — the exact repro shape from the issue.
+// Must not crash; the already-done ta wins (index 0); `await ta` then
+// yields the sent value. `tb` is left pending and disposed (still pending)
+// at Main's scope end — the §30.15 v0.179 D14 abandonment case (tracked
+// separately at #1524; this test only asserts #1501's crash is gone, not
+// that abandonment redelivers the message). Looped: the crash this guards
+// was a race — WhenAny's continuation on the already-done `ta` is enqueued
+// (not run inline), so `await w` almost always genuinely suspends the async
+// state machine before the temp array (and `tb`) get disposed, which is
+// exactly the interleaving that exposed the bug (garbage stack reads across
+// the suspend/resume boundary, and — in an earlier, reverted fix attempt
+// that deferred the temp array's free to scope-end instead of freeing it
+// synchronously — a flaky heap-corrupting double free).
+BEZEL_TEST(task_combinators_1501, when_any_inline_literal_over_channel_receive) {
+    const std::string src =
+        "module M; import System.Threading; class C "
+        "  public static async method Main(): Task<int> "
+        "    using var a := new Channel<int>(); "
+        "    using var b := new Channel<int>(); "
+        "    using var tx := a.NewSender(); "
+        "    tx.Send(42); "
+        "    using var ta := a.Receive(); "
+        "    using var tb := b.Receive(); "
+        "    using var w := Task.WhenAny([ta, tb]); "
+        "    var idx := await w; "
+        "    if idx = 0 then "
+        "      var v := await ta; "
+        "      return v; "
+        "    end; "
+        "    return -1; "
+        "  end Main; end C;";
+    for (int i = 0; i < 20; ++i)
+        BEZEL_EXPECT_EQ(compileAndRun(src), 42);
+}
+
+// #1501: same idiom, LSan-checked once for leak/corruption cleanliness. The
+// literal's temp Array<Task> is freed synchronously right after
+// bz_task_when_any borrows it (not via scope-end disposal — seeing this stay
+// clean also guards against reintroducing a deferred-free that leaks or
+// double-frees the temp). Both channels are pre-sent (both Receives are
+// already-done) so NEITHER task is still pending at its channel's scope-end
+// dispose — a still-pending Receive left abandoned at dispose is the
+// separately-tracked §30.15 v0.179 D14 leak (#1524; confirmed present even
+// with no WhenAny involved at all), which would make this LSan-clean
+// assertion fail for a reason unrelated to #1501.
+BEZEL_TEST(task_combinators_1501, when_any_inline_literal_over_channel_receive_lsan) {
+    expectValueLeakFree(
+        "module M; import System.Threading; class C "
+        "  public static async method Main(): Task<int> "
+        "    using var a := new Channel<int>(); "
+        "    using var b := new Channel<int>(); "
+        "    using var tx := a.NewSender(); "
+        "    using var ty := b.NewSender(); "
+        "    tx.Send(42); "
+        "    ty.Send(99); "
+        "    using var ta := a.Receive(); "
+        "    using var tb := b.Receive(); "
+        "    using var w := Task.WhenAny([ta, tb]); "
+        "    var idx := await w; "
+        "    if idx = 0 then "
+        "      var v := await ta; "
+        "      return v; "
+        "    end; "
+        "    return -1; "
+        "  end Main; end C;",
+        42);
+}
+
+// ============================================================
 // stdlib §6.7 line 2885: Task.FireAndForget(owned task: Task)
 // ============================================================
 

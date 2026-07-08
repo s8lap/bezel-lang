@@ -11146,6 +11146,94 @@ const sema::TypeRef* Emitter::builtinByteArrayTypeRef() {
     return tr;
 }
 
+// #1501 / stdlib §6.7 (line 2884) / §30.10: build (once) a concrete
+// `Array<Task>` sema::TypeRef for the Task.WhenAny/WhenAll `tasks` argument.
+// `Task.WhenAny(tasks: Array<Task>)` and `Task.WhenAll(tasks: Array<Task>)`
+// are compiler intrinsics with no MethodDecl params, so — exactly like the
+// byte-array FFI factories (#999) — sema never assigns the literal argument
+// a target type, and a bare `lowerExpr` on a CollectionLiteralExpr returns
+// null (§15.4: a collection literal is not a general expression value). The
+// element type is a bare `Task` (Named, no declaration, no generic args) —
+// mirrors sema's `makeTaskTypeRef` (ExprTypecheck_Calls.cpp) — since a
+// borrowing `Array<Task>` element is an opaque task handle regardless of the
+// awaited T; `lowerTypeRef`/`collectionElemSize` resolve it to a bare `ptr`.
+const sema::TypeRef* Emitter::builtinTaskArrayTypeRef() {
+    static const ast::Type* kArrayAstNode = []() -> ast::Type* {
+        auto* qn = new ast::QualifiedName;
+        qn->parts.push_back("Array");
+        auto* t = new ast::Type;
+        t->kind = ast::TypeKind::Named;
+        t->name.reset(qn);
+        return t;
+    }();
+    static const ast::Type* kTaskAstNode = []() -> ast::Type* {
+        auto* qn = new ast::QualifiedName;
+        qn->parts.push_back("Task");
+        auto* t = new ast::Type;
+        t->kind = ast::TypeKind::Named;
+        t->name.reset(qn);
+        return t;
+    }();
+    auto* elem = ctx_.makeTypeRef();
+    elem->kind = sema::TypeRef::Kind::Named;
+    elem->declaration = nullptr;
+    elem->astNode = kTaskAstNode;
+    auto* tr = ctx_.makeTypeRef();
+    tr->kind = sema::TypeRef::Kind::Named;
+    tr->declaration = nullptr;
+    tr->astNode = kArrayAstNode;
+    tr->genericArgs.push_back(elem);
+    return tr;
+}
+
+// #1501 / stdlib §6.7 (line 2884) / §30.10: lower the `tasks` argument of
+// Task.WhenAny/WhenAll. When the argument is an inline collection literal
+// `[t1, t2, …]` (the natural "select" idiom pairing WhenAny with per-branch
+// Receive tasks), materialize it into an owned `Array<Task>` temporary via the
+// same construction machinery a `using var tasks: Array<Task> := […]` local
+// uses. Returns {value, isLiteralTemp}: the caller (WhenAny/WhenAll lowering)
+// must free a literal temp SYNCHRONOUSLY, immediately after the runtime call
+// that consumes it — NOT via scope-end disposeStack_ registration, and NOT
+// via a spilled `using var`-style local. Reason: bz_task_when_any/bz_task_
+// when_all read every element out of the array synchronously (bz_array_get in
+// their loop) before returning and never retain the array pointer, so the
+// temp has no use beyond that one call — but an intervening `await` (the
+// aggregate is essentially always awaited next) can genuinely suspend the
+// enclosing async state machine, and collectSuspendLocals (LlvmBackend_
+// Iterators.cpp) only scans AST-level `LocalDeclStmt`s to decide which
+// allocas get a frame field spilled/restored across a suspend/resume
+// boundary (LlvmBackend_Async.cpp emitAwaitSuspend). A synthetic temp with no
+// LocalDeclStmt is invisible to that pass, so a deferred (scope-end) free
+// read back an uninitialized/reused native stack slot from the FRESH stack
+// frame of the resumed continuation — bz_array_free on garbage, observed as a
+// flaky `free(): invalid pointer` abort. Freeing immediately, before any
+// suspend point can occur, sidesteps the hazard entirely. A non-literal
+// argument (an existing `Array<Task>` local or expression, unaffected by any
+// of this — its own `using var`/registerUnwindOwnedLocal disposal already
+// correctly spills/restores) is plain lowerExpr, isLiteralTemp=false.
+std::pair<llvm::Value*, bool> Emitter::lowerTaskArrayArg(
+        const ast::Expr& argExpr) {
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&argExpr)) {
+        llvm::Value* arr =
+            materializeCollectionLiteralForArg(cl, builtinTaskArrayTypeRef());
+        return {arr, arr != nullptr};
+    }
+    return {lowerExpr(argExpr), false};
+}
+
+// #1501: free a literal temp `Array<Task>` built by lowerTaskArrayArg,
+// synchronously, right after the runtime call that borrowed it — see
+// lowerTaskArrayArg's comment for why this must NOT be a deferred
+// (scope-end) disposal. The array holds borrowed (non-owning) Task element
+// pointers (bare `Task`'s ElementPolicy is Value/no-disposer — see
+// builtinTaskArrayTypeRef), so freeing it never touches the individual tasks.
+void Emitter::freeTaskArrayArgTemp(llvm::Value* arr) {
+    auto* freeFn = declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy()});
+    builder_.CreateCall(freeFn,
+        {arr, llvm::ConstantPointerNull::get(ptrTy())});
+}
+
 
 // #999 / stdlib §10 / §15.4: lower the single `Array<byte>` BORROW argument of a
 // byte-array FFI factory (RawBytes.From / CString.FromBytes). These intrinsic

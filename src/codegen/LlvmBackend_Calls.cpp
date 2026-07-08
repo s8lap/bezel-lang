@@ -7185,11 +7185,36 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // unconstructible under §30.5). sema types the result as Task<int>, so the
         // await-result is loaded as i32. The runtime bz_task_when_any completes
         // the aggregate with sizeof(int32_t) bytes holding the winner index.
+        //
+        // #1501 / §30.10 / §30.15: the natural "select" idiom pairs WhenAny with
+        // an INLINE array literal of per-branch Receive tasks —
+        // `Task.WhenAny([a.Receive(), b.Receive()])`. A bare lowerExpr on that
+        // CollectionLiteralExpr returned null (§15.4: not a general expression
+        // value — WhenAny is a compiler intrinsic with no MethodDecl param, so
+        // sema never gave the literal a materialization target), so `arr` was
+        // null and the whole WhenAny call silently dropped out of codegen —
+        // the `using var w := Task.WhenAny([…])` store never executed, leaving
+        // `w` (and the async frame's pending-task slot) holding whatever
+        // garbage was already on the stack. The subsequent `await w` then
+        // called bz_task_is_done on that garbage pointer, corrupting an
+        // unrelated stack slot's "mutex" and SIGSEGV/aborting. lowerTaskArrayArg
+        // materializes a literal into a proper owned Array<Task> temporary,
+        // exactly as the byte-array FFI factories do for the identical class of
+        // bug (#999); a pre-bound Array<Task> argument is unaffected (plain
+        // lowerExpr). Unlike #999's factories, the temp here is freed
+        // SYNCHRONOUSLY right after this call (freeTaskArrayArgTemp), not via
+        // scope-end disposal — see lowerTaskArrayArg's comment: a deferred free
+        // would need to survive the `await w` that (almost) always follows,
+        // which can genuinely suspend the async state machine, and the temp's
+        // alloca is invisible to collectSuspendLocals' frame-spill analysis.
         if (m == "WhenAny" && !call.args.empty() && call.args[0].value) {
-            llvm::Value* arr = lowerExpr(*call.args[0].value);
+            auto [arr, isLiteralTemp] = lowerTaskArrayArg(*call.args[0].value);
             if (!arr) return nullptr;
             auto* whenAnyFn = declareC("bz_task_when_any", ptrTy(), {ptrTy()});
-            return builder_.CreateCall(whenAnyFn, {arr}, "task.when_any");
+            llvm::Value* result =
+                builder_.CreateCall(whenAnyFn, {arr}, "task.when_any");
+            if (isLiteralTemp) freeTaskArrayArgTemp(arr);
+            return result;
         }
         // stdlib §6.7 (line 2942): Task.WhenAllOwned<T>(
         //   owned tasks: OwningArray<OwningTask<T>>): OwningTask<OwningArray<T>>

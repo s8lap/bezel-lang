@@ -5893,6 +5893,31 @@ private:
     // a method result, …) this is exactly lowerExpr.
     llvm::Value* lowerByteArrayFactoryArg(const ast::Expr& argExpr);
 
+    // #1501 / stdlib §6.7 (line 2884) / §30.10: a synthesized, concrete
+    // `Array<Task>` sema::TypeRef for the Task.WhenAny/WhenAll `tasks`
+    // argument. Mirrors builtinByteArrayTypeRef's rationale: these intrinsic
+    // call sites have no MethodDecl params, so a literal argument needs an
+    // explicit materialization target. genericArgs[0] is a bare `Task`
+    // (Named, no declaration, no generic args) — an opaque task handle.
+    const sema::TypeRef* builtinTaskArrayTypeRef();
+
+    // #1501 / stdlib §6.7 (line 2884) / §30.10: lower the `tasks` argument of
+    // Task.WhenAny/WhenAll. When the argument is an inline collection literal
+    // `[t1, t2, …]`, materialize it into an owned Array<Task> temporary and
+    // report it as such (second element = true) — the caller must free it
+    // SYNCHRONOUSLY via freeTaskArrayArgTemp immediately after the runtime
+    // call, NOT via scope-end disposal (see the .cpp comment: the temp's
+    // alloca is invisible to collectSuspendLocals, so a deferred free across
+    // a genuine await-suspend boundary reads back stack garbage). For any
+    // other argument expression (a named local, a method result, …) this is
+    // exactly lowerExpr, reported as not-a-temp (false) — the caller must NOT
+    // free it (its own declaration already owns disposal).
+    std::pair<llvm::Value*, bool> lowerTaskArrayArg(const ast::Expr& argExpr);
+
+    // #1501: free a literal temp Array<Task> built by lowerTaskArrayArg,
+    // synchronously, right after the runtime call that borrowed it.
+    void freeTaskArrayArgTemp(llvm::Value* arr);
+
     // #999 / §15.4 / §28.3: build the scope-end Disposal entry for an owned
     // temporary heap collection materialized for a BORROW call-argument (the temp
     // is an owned local; the callee borrows it for the call duration; it must be
