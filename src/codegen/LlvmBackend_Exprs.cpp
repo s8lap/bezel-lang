@@ -305,11 +305,11 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 } else if (rt && rt->kind == sema::TypeRef::Kind::Named &&
                            rt->declaration &&
                            rt->declaration->kind == ast::TypeDeclKind::Enum) {
-                    // §8.5: an enum interpolates as the type's qualified name
-                    // (the default ToString), not its underlying integer.
-                    pv = lowerStringLiteral(
-                        std::string("\"") +
-                        std::string(rt->declaration->name) + "\"", false);
+                    // per §10.5 (v0.183): an enum interpolates via its user
+                    // `ToString(): string` if declared, else the §8.5 default
+                    // (the type's qualified name) — not its underlying integer.
+                    // `ev` is the enum's underlying integer.
+                    pv = emitEnumToString(ev, rt->declaration);
                 } else if (!rt || rt->kind != sema::TypeRef::Kind::Primitive) {
                     // Type not set or not primitive — infer from LLVM type.
                     using P = sema::PrimitiveType;

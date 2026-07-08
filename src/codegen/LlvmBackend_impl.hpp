@@ -3493,6 +3493,24 @@ private:
     llvm::Constant* boxRecordEqualsThunk(const sema::TypeSymbol* ts);
     llvm::Constant* boxRecordHashThunk(const sema::TypeSymbol* ts);
 
+    // per §10.5 (v0.183): an enum may declare plain `ToString(): string`,
+    // `Equals(E): bool`, and `GetHashCode(): int` members that REPLACE the
+    // compiler-generated defaults for every consumer (interpolation §8.5, boxed
+    // dispatch §8.6, hash containers §4.8/§4.10). enumUserMember finds such a
+    // member (non-static, matching name + arity) or returns null. The three
+    // emit helpers dispatch to the user member when present (passing the enum's
+    // underlying integer as `this`, §10.3) and otherwise emit the §8.5/§8.3
+    // default (type name / integer compare / integer hash). Centralizing the
+    // user-or-default choice keeps the four consumer paths consistent.
+    sema::MethodSymbol* enumUserMember(const sema::TypeSymbol* ts,
+                                       std::string_view name, size_t nParams);
+    llvm::Value* emitEnumToString(llvm::Value* enumVal,
+                                  const sema::TypeSymbol* ts);
+    llvm::Value* emitEnumEquals(llvm::Value* a, llvm::Value* b,
+                                const sema::TypeSymbol* ts);
+    llvm::Value* emitEnumHashCode(llvm::Value* enumVal,
+                                  const sema::TypeSymbol* ts);
+
     // §9.1 / §9.6 (#961): per-primitive structural Equals and GetHashCode thunks
     // for boxed PRIMITIVES (int, bool, char, …). Equals guards `other` is a box
     // of the same primitive (matching vtable[0] descriptor), then loads both

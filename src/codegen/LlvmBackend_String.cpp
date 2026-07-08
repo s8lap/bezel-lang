@@ -2574,9 +2574,10 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
         if (ts->kind == ast::TypeDeclKind::Record && val->getType()->isStructTy())
             return emitRecordToString(val, ts);          // §9.1 recurse
         if (ts->kind == ast::TypeDeclKind::Enum)
-            // §8.5: enum default ToString is the type's qualified name.
-            return lowerStringLiteral(
-                std::string("\"") + std::string(ts->name) + "\"", false);
+            // per §10.5 (v0.183): a user `ToString(): string` replaces the §8.5
+            // default (the type's qualified name) inside interpolation; `val`
+            // is the enum's underlying integer.
+            return emitEnumToString(val, ts);
         if (ts->kind == ast::TypeDeclKind::Class && val->getType()->isPointerTy()) {
             // §8.5: a class field formats via its ToString override if any,
             // else the type name. Walk the class chain for a ToString method.

@@ -299,9 +299,14 @@ llvm::Function* Emitter::buildValueHashTrampoline(const sema::TypeRef* ty) {
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
     builder_.SetInsertPoint(entry);
     llvm::Value* v = builder_.CreateLoad(lt, fn->getArg(0), "key.val");
-    // emitValueHashCode hashes a string by content when fieldTy is the string
-    // primitive; a scalar by its bits.
-    llvm::Value* h = emitValueHashCode(v, ty);             // i32
+    // per §10.5 (v0.183): an enum key hashes via a user `GetHashCode(): int` if
+    // declared, else by its underlying integer (§8.3). Non-enum keys:
+    // emitValueHashCode hashes a string by content, a scalar by its bits.
+    llvm::Value* h =
+        (ty->kind == sema::TypeRef::Kind::Named && ty->declaration &&
+         ty->declaration->kind == ast::TypeDeclKind::Enum)
+            ? emitEnumHashCode(v, ty->declaration)
+            : emitValueHashCode(v, ty);                    // i32
     builder_.CreateRet(builder_.CreateZExt(h, i64()));
     builder_.restoreIP(savedIP);
     currentFn_ = savedFn;
@@ -367,8 +372,13 @@ llvm::Function* Emitter::buildValueEqTrampoline(const sema::TypeRef* ty) {
         // struct's fields (guid → two i64 compares) — consistent with the hash
         // trampoline's structural fold.
         eq = emitValueEquality(a, b, ty);
+    else if (ty->kind == K::Named && ty->declaration &&
+             ty->declaration->kind == ast::TypeDeclKind::Enum)
+        // per §10.5 (v0.183): an enum key compares via a user `Equals(E): bool`
+        // if declared, else by underlying-integer equality (§8.3).
+        eq = emitEnumEquals(a, b, ty->declaration);
     else
-        eq = builder_.CreateICmpEQ(a, b);                  // int/bool/char/enum/ptr
+        eq = builder_.CreateICmpEQ(a, b);                  // int/bool/char/ptr
     builder_.CreateRet(eq);
     builder_.restoreIP(savedIP);
     currentFn_ = savedFn;

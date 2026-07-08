@@ -12279,11 +12279,12 @@ llvm::Constant* Emitter::boxRecordEqualsThunk(const sema::TypeSymbol* ts) {
             llvm::Value* ov = builder_.CreateLoad(st, otherPayload, "beq.ov");
             eq = emitStructEquality(sv, ov, st, ts);
         } else {
-            // Enum: underlying integer comparison.
+            // per §10.5 (v0.183): a user `Equals(E)` replaces the §8.3 default
+            // (underlying-integer comparison) for boxed dispatch.
             llvm::Type* ety = enumLlvmType(ts);
             llvm::Value* sv = builder_.CreateLoad(ety, selfPayload,  "beq.sv");
             llvm::Value* ov = builder_.CreateLoad(ety, otherPayload, "beq.ov");
-            eq = builder_.CreateICmpEQ(sv, ov);
+            eq = emitEnumEquals(sv, ov, ts);
         }
         llvm::BasicBlock* checkEnd = builder_.GetInsertBlock();
         builder_.CreateBr(endBB);
@@ -12323,13 +12324,11 @@ llvm::Constant* Emitter::boxRecordHashThunk(const sema::TypeSymbol* ts) {
             llvm::Value* rv = builder_.CreateLoad(st, payload, "bhash.rv");
             h = emitRecordHashCode(rv, ts);
         } else {
-            // Enum: hash by underlying integer value.
+            // per §10.5 (v0.183): a user `GetHashCode(): int` replaces the §8.3
+            // default (hash of the underlying integer) for boxed dispatch.
             llvm::Type* ety = enumLlvmType(ts);
             llvm::Value* ev = builder_.CreateLoad(ety, payload, "bhash.ev");
-            sema::TypeRef enumRef;
-            enumRef.kind      = sema::TypeRef::Kind::Named;
-            enumRef.declaration = const_cast<sema::TypeSymbol*>(ts);
-            h = emitValueHashCode(ev, &enumRef);
+            h = emitEnumHashCode(ev, ts);
         }
         if (h->getType() != i32())
             h = builder_.CreateZExtOrTrunc(h, i32());
@@ -12438,12 +12437,112 @@ llvm::Constant* Emitter::primBoxHashThunk(sema::PrimitiveType prim,
 }
 
 
+// per §10.5 (v0.183): find a user-declared plain (non-static, non-override)
+// enum member `name` of the given arity — `ToString()`/`GetHashCode()` (0
+// params) or `Equals(E)` (1 param). Returns null when the enum declares no such
+// member (so the caller emits the §8.5/§8.3 default).
+sema::MethodSymbol* Emitter::enumUserMember(const sema::TypeSymbol* ts,
+                                            std::string_view name,
+                                            size_t nParams) {
+    if (!ts || ts->kind != ast::TypeDeclKind::Enum) return nullptr;
+    for (sema::Symbol* sym : ts->members) {
+        auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+        if (ms && !isStaticMethod(ms) && ms->name == name &&
+            ms->params.size() == nParams)
+            return ms;
+    }
+    return nullptr;
+}
+
+// per §10.5 (v0.183): `enumVal` (the enum's underlying integer, §10.3) → its
+// string form. A user `ToString(): string` replaces the §8.5 default (the
+// type's qualified name) for the interpolation and boxed-dispatch consumers,
+// matching the direct-call behavior.
+llvm::Value* Emitter::emitEnumToString(llvm::Value* enumVal,
+                                       const sema::TypeSymbol* ts) {
+    if (sema::MethodSymbol* user = enumUserMember(ts, "ToString", 0)) {
+        auto fit = methodFns_.find(user);
+        if (fit != methodFns_.end()) {
+            llvm::FunctionType* fty = fit->second->getFunctionType();
+            llvm::Type* thisTy = fty->getParamType(0);
+            if (enumVal->getType() != thisTy &&
+                enumVal->getType()->isIntegerTy() && thisTy->isIntegerTy())
+                enumVal = builder_.CreateZExtOrTrunc(enumVal, thisTy);
+            return builder_.CreateCall(fty, fit->second, {enumVal});
+        }
+    }
+    return lowerStringLiteral(
+        std::string("\"") + std::string(ts->name) + "\"", false);
+}
+
+// per §10.5 (v0.183): equality of two enum values (`a`, `b` are the underlying
+// integers). A user `Equals(E): bool` replaces the §8.3 default (integer
+// comparison) for the boxed-dispatch and hash-container consumers.
+llvm::Value* Emitter::emitEnumEquals(llvm::Value* a, llvm::Value* b,
+                                     const sema::TypeSymbol* ts) {
+    if (sema::MethodSymbol* user = enumUserMember(ts, "Equals", 1)) {
+        auto fit = methodFns_.find(user);
+        if (fit != methodFns_.end()) {
+            llvm::FunctionType* fty = fit->second->getFunctionType();
+            llvm::Type* selfTy  = fty->getParamType(0);
+            llvm::Type* otherTy = fty->getParamType(1);
+            // §10.5's sanctioned form is `Equals(E)`: both `this` and the
+            // parameter lower to the enum's underlying integer. Dispatch only
+            // when that holds (a non-integer parameter — e.g. an `Object?`
+            // signature — would need boxing; leave that to the default rather
+            // than emit a type-mismatched call).
+            if (selfTy->isIntegerTy() && otherTy->isIntegerTy()) {
+                if (a->getType() != selfTy && a->getType()->isIntegerTy())
+                    a = builder_.CreateZExtOrTrunc(a, selfTy);
+                if (b->getType() != otherTy && b->getType()->isIntegerTy())
+                    b = builder_.CreateZExtOrTrunc(b, otherTy);
+                return builder_.CreateCall(fty, fit->second, {a, b});
+            }
+        }
+    }
+    if (a->getType() != b->getType() && a->getType()->isIntegerTy() &&
+        b->getType()->isIntegerTy())
+        b = builder_.CreateZExtOrTrunc(b, a->getType());
+    return builder_.CreateICmpEQ(a, b);
+}
+
+// per §10.5 (v0.183): hash of an enum value (`enumVal` is the underlying
+// integer) → i32. A user `GetHashCode(): int` replaces the §8.3 default (a
+// hash of the integer value) for the boxed-dispatch and hash-container
+// consumers.
+llvm::Value* Emitter::emitEnumHashCode(llvm::Value* enumVal,
+                                       const sema::TypeSymbol* ts) {
+    if (sema::MethodSymbol* user = enumUserMember(ts, "GetHashCode", 0)) {
+        auto fit = methodFns_.find(user);
+        if (fit != methodFns_.end()) {
+            llvm::FunctionType* fty = fit->second->getFunctionType();
+            llvm::Type* thisTy = fty->getParamType(0);
+            if (enumVal->getType() != thisTy &&
+                enumVal->getType()->isIntegerTy() && thisTy->isIntegerTy())
+                enumVal = builder_.CreateZExtOrTrunc(enumVal, thisTy);
+            llvm::Value* h = builder_.CreateCall(fty, fit->second, {enumVal});
+            if (h->getType() != i32())
+                h = builder_.CreateZExtOrTrunc(h, i32());
+            return h;
+        }
+    }
+    // §8.3 default: hash by the underlying integer value (emitValueHashCode
+    // folds a wide underlying type the same way the record/box path did).
+    sema::TypeRef enumRef;
+    enumRef.kind        = sema::TypeRef::Kind::Named;
+    enumRef.declaration = const_cast<sema::TypeSymbol*>(ts);
+    llvm::Value* h = emitValueHashCode(enumVal, &enumRef);
+    if (h->getType() != i32())
+        h = builder_.CreateZExtOrTrunc(h, i32());
+    return h;
+}
+
 // §8.5 / §8.6 (#417): the uniform ToString thunk for a boxed RECORD or boxed
 // ENUM. The receiver is the BOX pointer { vtable*, i64 rc, payload }; the
 // payload starts two words in (offset 16, BZ_BOX layout). For a record the
 // thunk prefers a user `ToString()` override and otherwise emits the
 // synthesized §8.5/§9.1/§9.2 property-listing form. For an enum the thunk
-// returns the type name (§8.5).
+// dispatches to a user `ToString()` (per §10.5) else returns the type name.
 llvm::Constant* Emitter::boxToStringThunk(const sema::TypeSymbol* ts) {
     auto it = boxToStringFns_.find(ts);
     if (it != boxToStringFns_.end()) return it->second;
@@ -12458,9 +12557,16 @@ llvm::Constant* Emitter::boxToStringThunk(const sema::TypeSymbol* ts) {
         ThunkScope scope(currentFn_, builder_, thunk, entry);
         llvm::Value* result = nullptr;
         if (ts->kind == ast::TypeDeclKind::Enum) {
-            // §8.5: enum default ToString is the type's qualified name.
-            result = lowerStringLiteral(
-                std::string("\"") + std::string(ts->name) + "\"", false);
+            // per §10.5 (v0.183): a user `ToString(): string` replaces the §8.5
+            // default (the type's qualified name) for boxed dispatch too. Load
+            // the enum's underlying integer from the box payload (two words in)
+            // and route through the shared user-or-default helper.
+            llvm::Value* boxPtr = thunk->getArg(0);
+            llvm::Value* payload = builder_.CreateGEP(
+                ptrTy(), boxPtr, {builder_.getInt32(2)}, "box.valptr");
+            llvm::Value* enumVal = builder_.CreateLoad(
+                enumLlvmType(ts), payload, "box.enumval");
+            result = emitEnumToString(enumVal, ts);
         } else {
             // Record: payload is the bare record struct two words into the box.
             llvm::Value* boxPtr = thunk->getArg(0);
