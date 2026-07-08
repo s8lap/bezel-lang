@@ -2552,6 +2552,34 @@ bool Emitter::lowerIf(const ast::IfStmt& ifs) {
         // (return/throw) already emitted these via emitAllDisposals; the
         // null-guard in dynamicDispose makes the slot-null paths safe.
         emitDisposals(disposeStack_.back());
+        // fix #1602 / §28.10 / §28.11: emitDisposals above runs with the
+        // default isUnwind=false, so any `unwindOnly` entry registered while
+        // lowering the condition — the #1466 pre-declared out-owned recipient
+        // written by the condition's own call, or an inline `out owned var` /
+        // `out using var` recipient (§22.4) not yet discharged — was SKIPPED,
+        // not fired: it is a pure exception-edge backstop, not a normal-exit
+        // disposal. Popping the condition scope right after would silently
+        // drop that still-live entry from disposeStack_ entirely, so a LATER
+        // throw — anywhere in the enclosing block, after this if-statement,
+        // before the recipient's real discharge point — would never find it,
+        // and the recipient would leak (bounded leak, confirmed via valgrind
+        // in #1602; never a double-free, since the entry is null-guarded and
+        // an explicit discharge nulls the slot before any later dispose
+        // could run). Migrate any surviving `unwindOnly` entries into the
+        // enclosing scope instead of discarding them: per §22.4, the
+        // recipient's true lexical home is "the enclosing block, from the
+        // call onward" — it outlives this transient condition scope (#1387
+        // Item 1), so its unwind backstop must too. `dynamicDispose` entries
+        // need no such migration: they already fired, unconditionally, in
+        // the emitDisposals call above (#1387's if-end auto-drop timing is
+        // unaffected).
+        if (disposeStack_.size() >= 2) {
+            std::vector<Disposal>& condScope = disposeStack_.back();
+            std::vector<Disposal>& outerScope =
+                disposeStack_[disposeStack_.size() - 2];
+            for (const Disposal& d : condScope)
+                if (d.unwindOnly) outerScope.push_back(d);
+        }
         disposeStack_.pop_back();
         return false;
     }

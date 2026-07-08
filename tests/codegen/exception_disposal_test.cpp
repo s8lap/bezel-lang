@@ -1832,6 +1832,149 @@ BEZEL_TEST(codegen_excdisp_1466,
            stack_predeclared_out_recipient_dispose_reclaims_once) {
     expectExitAndLeakFree(kStack1466OutRecipientDispose, 1);
 }
+
+// --------------------------------------------------------------------------
+// [1602] §28.10 / §28.11 / §22.4 — an out-owned recipient's `unwindOnly`
+// exception-edge disposal (registered by ensureOutVarSlots — the #1466 pre-
+// declared recipient above, or the inline `out owned var` / `out using var`
+// forms of §22.4) was silently DISCARDED when the producing call is the
+// if/elif's own CONDITION.
+//
+// Root cause (`lowerIf`, LlvmBackend_Stmts.cpp): #1387 Item 1 pushes a
+// dedicated "condition scope" around the if/elif condition chain so an
+// out-inline local declared BY the condition is disposed at the if-
+// statement's own end rather than leaking into the enclosing block. But
+// ensureOutVarSlots registers EVERY out-owned recipient it sees while
+// lowering the condition — including a PRE-EXISTING recipient the condition
+// merely WRITES (#1466's bare `out item`) — into that same transient scope.
+// At the if-statement's normal-exit merge point, emitDisposals(isUnwind=false)
+// correctly SKIPS an `unwindOnly` entry (it is a pure exception-edge
+// backstop), but the condition scope is then popped and discarded outright —
+// taking the still-live, never-fired entry with it. A `throw` anywhere after
+// the if-statement, before the recipient's real discharge point, then finds
+// nothing to dispose: a bounded leak (confirmed via valgrind — 16 bytes, 1
+// block — never a double-free).
+//
+// Fix: at the mergeBB pop, migrate any still-`unwindOnly` entries from the
+// condition scope into the enclosing scope instead of discarding them —
+// per §22.4 the recipient's true lexical home is "the enclosing block, from
+// the call onward", which outlives the transient condition scope.
+// `dynamicDispose` entries (the auto-drop case) need no migration: they
+// already fired, unconditionally, in the emitDisposals call that precedes
+// the pop — #1387's if-end auto-drop timing is unaffected by this fix.
+// --------------------------------------------------------------------------
+
+// Direct repro from issue #1602: a pre-declared out-owned recipient
+// (`var item: R? := null;`) is written by a call that is literally the
+// if-statement's own condition, with NO discharge anywhere — the throw
+// right after the if must still find and dispose it via the migrated
+// unwindOnly backstop. Pre-fix: R.count == 0 (leaked). Post-fix: R.count == 1.
+const char* kArr1602PredeclaredOutRecipientThrowAfterIf =
+    "module M; class AppError end AppError; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C public static method Main(): int "
+    "  try "
+    "    do "
+    "      using var arr := new OwningArray<R>(); "
+    "      arr.Add(move (new R())); "
+    "      var item: R? := null; "
+    "      if arr.TryPopLast(out item) then end; "
+    "      throw new AppError(); "
+    "    end; "
+    "  catch AppError => return R.count; end; "
+    "  return -1; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_1602,
+           if_cond_predeclared_out_recipient_disposed_on_throw_after_if) {
+    expectExitAndLeakFree(kArr1602PredeclaredOutRecipientThrowAfterIf, 1);
+}
+
+// Same shape, but the out-owned call is an ELIF's condition (the if's own
+// condition chain shares the SAME condition scope across every if/elif test,
+// per #1387), covering the issue title's "if/elif's own CONDITION" verbatim.
+const char* kArr1602ElifCondPredeclaredOutRecipientThrowAfterIf =
+    "module M; class AppError end AppError; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C public static method Main(): int "
+    "  try "
+    "    do "
+    "      using var arr := new OwningArray<R>(); "
+    "      arr.Add(move (new R())); "
+    "      var item: R? := null; "
+    "      if false then return 99; "
+    "      elif arr.TryPopLast(out item) then end; "
+    "      throw new AppError(); "
+    "    end; "
+    "  catch AppError => return R.count; end; "
+    "  return -1; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_1602,
+           elif_cond_predeclared_out_recipient_disposed_on_throw_after_if) {
+    expectExitAndLeakFree(kArr1602ElifCondPredeclaredOutRecipientThrowAfterIf,
+                           1);
+}
+
+// Regression guard on the NORMAL (no-throw) path: the inline `out owned var`
+// form declared BY the if-condition, discharged AFTER the if-statement (its
+// §22.4 "enclosing block, from the call onward" scope) rather than inside
+// the if-body. The migrated backstop entry must be a safe no-op once the
+// explicit `top?.Dispose()` nulls the slot — no double-free.
+const char* kArr1602InlineOutOwnedVarDischargeAfterIfNormalPath =
+    "module M; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C public static method Main(): int "
+    "  using var s := new OwningStack<R>(); "
+    "  s.Push(move (new R())); "
+    "  if s.TryPop(out owned var top) then end; "
+    "  top?.Dispose(); "
+    "  return R.count; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_1602,
+           if_cond_inline_out_owned_var_discharged_after_if_normal_path) {
+    expectExitAndLeakFree(kArr1602InlineOutOwnedVarDischargeAfterIfNormalPath,
+                           1);
+}
+
+// The inline `out owned var` form's latent half of #1602 (noted in the issue's
+// "Scope" section): `top` is declared by the if-condition, and DISCHARGED
+// after the if — but on THIS run, a throw fires on a different branch BEFORE
+// the discharge is ever reached. The migrated unwindOnly backstop must
+// dispose it on that unwind; the discharge branch (shouldThrow=false, run
+// separately in the leak-free-normal-path test above) proves no double-free.
+const char* kArr1602InlineOutOwnedVarThrowBeforeLaterDischarge =
+    "module M; class AppError end AppError; "
+    "class R public static count: int := 0; "
+    "  destructor R.count := R.count + 1; end destructor; end R; "
+    "class C "
+    "  public static method Run(shouldThrow: bool): int "
+    "    using var s := new OwningStack<R>(); "
+    "    s.Push(move (new R())); "
+    "    if s.TryPop(out owned var top) then end; "
+    "    if shouldThrow then throw new AppError(); else top?.Dispose(); end; "
+    "    return R.count; "
+    "  end Run; "
+    "  public static method Main(): int "
+    "    try "
+    "      return Run(true); "
+    "    catch AppError => return R.count; end; "
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(codegen_excdisp_1602,
+           if_cond_inline_out_owned_var_disposed_on_throw_before_later_discharge) {
+    expectExitAndLeakFree(kArr1602InlineOutOwnedVarThrowBeforeLaterDischarge,
+                           1);
+}
+
 // #1468 §28.3 "Exception-path discharge" / §28.4 — a destructor that touches a
 // (different type's) PUBLIC static member was silently SKIPPED during exception
 // unwinding, leaking the object and its whole owned subtree.
