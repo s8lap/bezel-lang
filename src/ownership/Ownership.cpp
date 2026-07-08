@@ -3303,6 +3303,59 @@ bool methodIsStatic(const ast::MethodDecl& md) {
     return false;
 }
 
+// §28.3 "Factory methods and sourceless returns" (fix #1600, follow-up to
+// #1499): "When the compiler cannot identify a source for a non-`owned`
+// class-typed return from a static method, it treats the return as owned and
+// emits a warning recommending that the callee add `owned` to its return
+// type." #1499 shipped the CALLER-side half (the call is classified Owned via
+// common::staticFactoryReturnsFreshOwned, consulted from producerState). This
+// is the missing CALLEE-side half: a DECLARATION-level nudge, distinct from
+// the §28.3 auto-drop must-use warning that fires at undischarged call sites.
+// It fires once per method declaration — a lint on the API's shape,
+// independent of whether/how many times the factory is called — which is why
+// it lives here in checkMember (the per-declaration walker) rather than in
+// MethodOwnership's per-statement dataflow.
+//
+// Reuses staticFactoryReturnsFreshOwned so the nudge fires in EXACTLY the
+// cases where the caller-side rule it documents actually applies: static,
+// non-`owned`, resolves to a plain class/interface (not a value-builtin, not
+// an owning-collection/-wrapper name-head — those carry their own §28.6
+// documented-source rule), and every return path is a fresh owned producer
+// (`new T(...)` or an `owned`-returning call).
+//
+// **Iterator methods are exempt from this warning** (§28.3, same section):
+// "adding `owned` to every iterator return type would be redundant noise."
+// A genuine iterator body (`yield return`/`yield break`, §29.3) has no plain
+// `return EXPR;` at all — only YieldStmt, invisible to
+// staticFactoryReturnsFreshOwned's ReturnStmt walk — so the predicate above
+// already returns false for it (sawReturn stays false); the explicit
+// bodyContainsYield guard below is belt-and-suspenders, matching the spec's
+// own explicit carve-out rather than relying solely on that incidental
+// side effect. An expression-bodied method (`=> E`) cannot contain `yield`
+// (yield is a statement, not an expression), so it needs no such guard.
+void checkStaticFactoryNudgeWarning(const ast::MethodDecl& md,
+                                     sema::SemaContext& ctx) {
+    if (md.returnOwned) return;   // already annotated — no nudge needed
+    if (!md.returnType) return;   // void / no declared return type
+    if (!methodIsStatic(md)) return;  // instance methods have a receiver source
+    if (md.bodyKind == ast::MethodBodyKind::Block &&
+        bodyContainsYield(md.stmts))
+        return;  // §29.3 iterator exemption
+    const sema::TypeRef* resultTy = ctx.resolvedType(*md.returnType);
+    common::TypeParamResolver identity =
+        [](const sema::TypeRef* t) { return t; };
+    if (!common::staticFactoryReturnsFreshOwned(md, resultTy, ctx, identity))
+        return;
+    ctx.diagnostics().report(
+        Severity::Warning, md.span.begin,
+        std::string("static factory method `") + std::string(md.name) +
+        "` returns `" + std::string(resultTy->headName()) +
+        "` with no `owned` qualifier and no structural borrow source; the "
+        "caller treats the result as owned (§28.3 sourceless-return rule) — "
+        "declare the return type `owned " + std::string(resultTy->headName()) +
+        "` to make the ownership transfer explicit");
+}
+
 void checkMember(const ast::Member& m, sema::SemaContext& ctx) {
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
         if (md->bodyKind == ast::MethodBodyKind::Block) {
@@ -3329,6 +3382,10 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx) {
                 *md->exprBody, paramSymsOf(m, ctx),
                 md->returnType.get(), md->returnOwned, methodIsStatic(*md));
         }
+        // §28.3 (fix #1600): the declaration-level "add `owned`" nudge —
+        // independent of bodyKind (both Block and Expression bodies are
+        // checked by staticFactoryReturnsFreshOwned internally).
+        checkStaticFactoryNudgeWarning(*md, ctx);
     } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
         MethodOwnership mo(ctx);
         mo.run(cd->body, paramSymsOf(m, ctx));
