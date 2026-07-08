@@ -276,6 +276,136 @@ bool ExprTC::defaultIllFormed(const TypeRef* t) {
     }
 }
 
+// per §27.4 (v0.183, #1408) / A.7 LambdaDestructure. See declaration
+// (ExprTypecheck_impl.hpp) for the contract. Mirrors the §19.3 case-pattern
+// DestructuringPattern desugar (ExprTypecheck.cpp CaseStmt / ExprTypecheck_
+// Exprs.cpp CaseExpr) but (a) checks the head against an exact target type
+// instead of doing a runtime subtype test, and (b) binds straight into the
+// lambda's own scope rather than a fresh per-arm scope.
+TypeRef* ExprTC::bindLambdaDestructure(const ast::DestructuringPattern& dp,
+                                       TypeRef* targetType, Scope& scope) {
+    std::string_view lastName = dp.typeName && !dp.typeName->parts.empty()
+        ? dp.typeName->parts.back() : std::string_view{};
+    // Resolve the head to a record TypeSymbol. Prefer module-local types
+    // (matches the CaseStmt/CaseExpr lookup) and fall back to the full
+    // symbol table (imported/builtin records), same widening the nested
+    // case-pattern `fieldsOfRecord` helper uses.
+    TypeSymbol* recTy = nullptr;
+    bool foundClass = false;
+    if (ctx_.module()) {
+        for (Symbol* child : ctx_.module()->children) {
+            auto* ts = dynamic_cast<TypeSymbol*>(child);
+            if (!ts || ts->name != lastName) continue;
+            if (ts->kind == ast::TypeDeclKind::Record) { recTy = ts; break; }
+            if (ts->kind == ast::TypeDeclKind::Class) foundClass = true;
+        }
+    }
+    if (!recTy) {
+        for (const auto& sym : ctx_.symbols()) {
+            auto* ts = dynamic_cast<TypeSymbol*>(sym.get());
+            if (!ts || ts->name != lastName) continue;
+            if (ts->kind == ast::TypeDeclKind::Record) { recTy = ts; break; }
+            if (ts->kind == ast::TypeDeclKind::Class) foundClass = true;
+        }
+    }
+    if (!recTy) {
+        // §27.4: "The head must name a positional record type." Classes have
+        // no positional-destructuring surface (§19.3) — dedicated wording for
+        // that common mistake; a name that resolves to nothing at all gets
+        // the generic unknown-type wording.
+        if (foundClass) {
+            ctx_.diagnostics().report(
+                Severity::Error, dp.span.begin,
+                "destructuring lambda parameter `" + std::string(lastName) +
+                "(...)` is not valid on a class type \xe2\x80\x94 classes do "
+                "not have a positional-destructuring surface; the head of a "
+                "destructuring lambda parameter must name a positional "
+                "record type (\xc2\xa7""27.4)");
+        } else {
+            ctx_.diagnostics().report(
+                Severity::Error, dp.span.begin,
+                "`" + std::string(lastName) + "` in a destructuring lambda "
+                "parameter does not name a known positional record type "
+                "(\xc2\xa7""27.4)");
+        }
+        return nullptr;
+    }
+    // §27.4: "it must be exactly the parameter's type: when a target type
+    // supplies the parameter type, a head naming any other type is a compile
+    // error (no subtype test, nothing to fail at runtime)." Applies both at
+    // the top level (targetType = the lambda's expected positional param
+    // type) and recursively for a nested slot (targetType = the enclosing
+    // field's resolved type) — a nested head naming a mismatched type is
+    // exactly as wrong as a top-level one.
+    if (targetType &&
+        (targetType->kind != TypeRef::Kind::Named ||
+         targetType->declaration != recTy || targetType->nullable)) {
+        std::string targetDesc = targetType->nullable
+            ? "a nullable type"
+            : (targetType->kind == TypeRef::Kind::Named && targetType->declaration
+                   ? "`" + std::string(targetType->declaration->name) + "`"
+                   : "a non-record type");
+        ctx_.diagnostics().report(
+            Severity::Error, dp.span.begin,
+            "destructuring lambda parameter head `" + std::string(lastName) +
+            "` does not match the expected parameter type (" + targetDesc +
+            ") \xe2\x80\x94 the head must name exactly the parameter's type, "
+            "with no subtype test (\xc2\xa7""27.4)");
+        return nullptr;
+    }
+    // Collect the record's non-static positional fields, in declaration
+    // order (same filter the CaseStmt/CaseExpr handlers use).
+    std::vector<FieldSymbol*> fields;
+    for (Symbol* m : recTy->members) {
+        auto* fs = dynamic_cast<FieldSymbol*>(m);
+        if (!fs) continue;
+        bool isStatic = false;
+        for (auto& mod : fs->modifiers) if (mod == "static") { isStatic = true; break; }
+        if (!isStatic) fields.push_back(fs);
+    }
+    if (dp.subPatterns.size() != fields.size()) {
+        ctx_.diagnostics().report(
+            Severity::Error, dp.span.begin,
+            "destructuring lambda parameter `" + std::string(lastName) +
+            "(...)` binds " + std::to_string(dp.subPatterns.size()) +
+            " value(s) but record `" + std::string(lastName) + "` has " +
+            std::to_string(fields.size()) +
+            " positional field(s); the binding count must match "
+            "(\xc2\xa7""27.4)");
+        // Fall through and bind whatever slots line up with a real field —
+        // still gives the body a chance to type-check the fields that do
+        // exist rather than cascading "unresolved identifier" everywhere.
+    }
+    for (std::size_t i = 0; i < dp.subPatterns.size() && i < fields.size(); ++i) {
+        const auto& sp = dp.subPatterns[i];
+        TypeRef* fieldTy = nullptr;
+        if (fields[i]->posParam && fields[i]->posParam->type)
+            fieldTy = ctx_.resolvedType(*fields[i]->posParam->type);
+        if (!sp.nakedBinding.empty()) {
+            // per §27.4: "each binding is an ordinary read of the
+            // corresponding positional field at body entry" — a naked
+            // identifier slot (`Entry(k, v)`).
+            auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+            lsym->name = sp.nakedBinding;
+            lsym->decl = sp.nakedAnchor.get();  // #1271 real Node anchor
+            lsym->declType = fieldTy;
+            scope.names[sp.nakedBinding] = lsym;
+        } else if (dynamic_cast<const ast::DiscardPattern*>(sp.pattern.get())) {
+            // `_`: binds nothing (parser already validated only `_`, a
+            // naked binding, or a nested destructuring reach here).
+        } else if (auto* nested = dynamic_cast<const ast::DestructuringPattern*>(
+                       sp.pattern.get())) {
+            // Nested LambdaDestructure — recurse, checked against this
+            // slot's own field type.
+            bindLambdaDestructure(*nested, fieldTy, scope);
+        }
+    }
+    auto* rt = ctx_.makeTypeRef();
+    rt->kind = TypeRef::Kind::Named;
+    rt->declaration = recTy;
+    return rt;
+}
+
 void ExprTC::visitExpr(const ast::Expr& e) {
     // Slice 3b: IdentifierExpr name lookup. `this` / `base` are
     // implicit-meaning identifiers — leave them unresolved
@@ -4147,6 +4277,36 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         std::vector<sema::Symbol*> lamParamSyms;
         for (size_t pi = 0; pi < lam->params.size(); ++pi) {
             const auto& p = lam->params[pi];
+            if (p.destructure) {
+                // §27.4 (v0.183, #1408): destructuring lambda parameter.
+                // Resolve the head against the target type known from
+                // context (if any) and bind each slot into lamScope; the
+                // parameter itself keeps a synthetic, unnamed
+                // ParameterSymbol of the resolved record type so the
+                // funcParams/codegen positional plumbing below sees an
+                // ordinary parameter slot (§27.4: "the lambda's function
+                // type is unchanged by the spelling").
+                TypeRef* target = pi < inferredParamTypes.size()
+                    ? inferredParamTypes[pi] : nullptr;
+                // §24.3 / stdlib §5 (D7): the spec's own §27.4 headline example
+                // — `entries.Select((Entry(k, v)) => ...)` — is a single-param
+                // LINQ/event-handler lambda, whose target type flows through
+                // the SINGULAR eventParamType (set from linqLambdaElementType /
+                // eventHandlerPayloadType above), not the plural
+                // inferredParamTypes vector used by typed-local / multi-param
+                // call-argument inference. Fall back to it exactly as the
+                // ordinary (non-destructuring) branch below does, so that
+                // example type-checks (and a wrong head is still caught).
+                if (!target && eventParamType && lam->params.size() == 1)
+                    target = eventParamType;
+                TypeRef* recTyRef =
+                    bindLambdaDestructure(*p.destructure, target, lamScope);
+                auto* ps = ctx_.makeSymbol<ParameterSymbol>();
+                ps->resolvedDeclType = recTyRef;
+                ps->destructure = p.destructure.get();
+                lamParamSyms.push_back(ps);
+                continue;
+            }
             auto* ps = ctx_.makeSymbol<ParameterSymbol>();
             ps->name = p.name;
             ps->modifier = p.modifier;
@@ -4227,9 +4387,24 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         {
             auto* lamTy = ctx_.makeTypeRef();
             lamTy->kind = TypeRef::Kind::Function;
+            const auto* lamParamSymsOut = ctx_.lambdaParams(lam);
             for (size_t pi = 0; pi < lam->params.size(); ++pi) {
                 const auto& p = lam->params[pi];
                 TypeRef::FuncParam fp;
+                if (p.destructure) {
+                    // §27.4: "the lambda's function type is unchanged by the
+                    // spelling (`(Entry) -> R`)" — the positional slot's type
+                    // is the exact record type resolved in the param-binding
+                    // loop above (no name: destructuring has no single
+                    // parameter identifier).
+                    if (lamParamSymsOut && pi < lamParamSymsOut->size()) {
+                        if (auto* ps = dynamic_cast<ParameterSymbol*>(
+                                (*lamParamSymsOut)[pi]))
+                            fp.type = ps->resolvedDeclType;
+                    }
+                    lamTy->funcParams.push_back(std::move(fp));
+                    continue;
+                }
                 fp.modifier = p.modifier;
                 fp.name = p.name;
                 if (p.type) fp.type = ctx_.resolvedType(*p.type);

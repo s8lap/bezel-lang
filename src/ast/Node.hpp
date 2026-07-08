@@ -79,6 +79,9 @@ struct TopDecl : Node {};
 
 struct Type; // defined after TypeDecl; used by TypeDecl::baseTypes.
 struct Expr; // defined further below; used by FieldDecl::initializer.
+// defined further below (with the rest of the Pattern hierarchy); used by
+// Param::destructure (§27.4, v0.183: lambda-parameter record destructuring).
+struct DestructuringPattern;
 
 // §11.1 / #873: forward-declared here so TypeDecl::primaryBaseCtorArgs can use
 // it. The full definition appears below (after Expr is defined in full).
@@ -355,6 +358,14 @@ struct Param {
     // A.4 PositionalField's SerializedClause. Only populated for record
     // positional fields — other Param uses leave this null.
     std::unique_ptr<SerializedClause> serialized;
+    // §27.4 (v0.183, #1408) / A.7 `LambdaDestructure`: non-null when this
+    // LambdaParam was written as a record-destructuring pattern
+    // (`(Entry(k, v)) => ...`) instead of a plain identifier. When set,
+    // `name`/`type`/`modifier` are unused (the destructuring head supplies
+    // the parameter's type, and the form admits no separate annotation or
+    // modifier). Only ever populated for LambdaExpr params — method/ctor/
+    // operator/indexer param lists never populate this field.
+    std::unique_ptr<DestructuringPattern> destructure;
 };
 
 // A.3 GenericConstraints. One `where T: c1, c2` clause; multiple clauses

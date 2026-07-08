@@ -273,6 +273,14 @@ struct ParameterSymbol : Symbol {
     // end on BOTH the normal and unwind edges (dynamicDispose), the same as a
     // dropped owned local. A param discharged on some path is not flagged.
     bool autoDropAtScopeEnd = false;
+    // §27.4 (v0.183, #1408): non-null when this lambda parameter was written
+    // as a record-destructuring pattern (`(Entry(k, v)) => ...`). The
+    // parameter itself binds no name (`name` stays empty); `resolvedDeclType`
+    // carries the exact record type. Codegen's lambda-param prologue reads
+    // this to bind each destructured slot's LocalSymbol from the incoming
+    // record argument's fields, instead of storing the whole argument into a
+    // single named parameter slot.
+    const ast::DestructuringPattern* destructure = nullptr;
 };
 
 // A.3 ExtensionDecl — collected at module level. Its target type is

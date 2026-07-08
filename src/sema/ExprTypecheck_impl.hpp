@@ -326,6 +326,20 @@ private:
     // types, and free names are all permitted.
     void checkNotInstanceMember(const ast::IdentifierExpr& id, Symbol* sym);
 
+    // §27.4 (v0.183, #1408) / A.7 LambdaDestructure: resolve a destructuring
+    // lambda parameter's head to its exact positional-record TypeSymbol
+    // (checked against `targetType` when the lambda's expected function type
+    // supplies one — §27.4 "no subtype test"; when `targetType` is null the
+    // head itself supplies the parameter's type), then bind every (possibly
+    // nested) slot as a LocalSymbol into `scope`, typed as the corresponding
+    // positional field, mirroring the §19.3 case-pattern destructuring desugar
+    // (ExprTypecheck.cpp's CaseStmt/CaseExpr DestructuringPattern handling).
+    // Returns a Named TypeRef for the resolved record type, or null when a
+    // diagnostic was already reported (unresolved head / class head / target
+    // mismatch / arity mismatch).
+    TypeRef* bindLambdaDestructure(const ast::DestructuringPattern& dp,
+                                   TypeRef* targetType, Scope& scope);
+
     // §17.11 (#951): does `default(T)` have NO well-defined zero value? True for
     // a non-nullable reference type (string/class/interface/function) and,
     // recursively, a record any of whose positional fields — or an inline array

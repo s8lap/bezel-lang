@@ -1314,6 +1314,16 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 refParams_[psym] = {&*it, elemTy};
                 continue;
             }
+            // §27.4 (v0.183, #1408): a destructuring lambda parameter has no
+            // single name to bind — instead of storing the whole incoming
+            // record argument into one paramSlots_ entry, extract each
+            // destructured slot's field directly (mirrors the case-pattern
+            // DestructuringPattern prologue, patternMatches() above, but
+            // unconditional — sema already fixed the parameter's exact type).
+            if (par && par->destructure) {
+                bindLambdaDestructureParam(*par->destructure, &*it);
+                continue;
+            }
             auto* slot = entryAlloca(it->getType());
             builder_.CreateStore(&*it, slot);
             paramSlots_[psym] = slot;
@@ -6209,6 +6219,51 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
     return nullptr;  // positional — deferred
 }
 
+// per §27.4 (v0.183, #1408) — see declaration (LlvmBackend_impl.hpp) for the
+// contract. Resolves the record TypeSymbol the same way patternMatches'
+// DestructuringPattern branch does (by name over ctx_.symbols(), just above);
+// there is no sema-attached back-pointer on the AST node to reuse.
+void Emitter::bindLambdaDestructureParam(const ast::DestructuringPattern& dp,
+                                         llvm::Value* structVal) {
+    if (!dp.typeName || !structVal) return;
+    std::string_view lastName = dp.typeName->parts.empty()
+        ? std::string_view{} : dp.typeName->parts.back();
+    const sema::TypeSymbol* recTy = nullptr;
+    for (const auto& sym : ctx_.symbols()) {
+        if (auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get())) {
+            if (ts->name == lastName && ts->kind == ast::TypeDeclKind::Record) {
+                recTy = ts; break;
+            }
+        }
+    }
+    if (!recTy) return;
+    recordStruct(recTy);  // ensure fieldIndex_ is populated for this record
+    std::vector<const sema::FieldSymbol*> fields;
+    for (const sema::Symbol* m : recTy->members) {
+        if (auto* fs = dynamic_cast<const sema::FieldSymbol*>(m)) {
+            if (!isStaticField(fs)) fields.push_back(fs);
+        }
+    }
+    for (std::size_t i = 0; i < dp.subPatterns.size() && i < fields.size(); ++i) {
+        const auto& sp = dp.subPatterns[i];
+        auto idxIt = fieldIndex_.find(fields[i]);
+        if (idxIt == fieldIndex_.end()) continue;
+        llvm::Value* fieldVal =
+            builder_.CreateExtractValue(structVal, {idxIt->second});
+        if (!sp.nakedBinding.empty()) {
+            // per §27.4: "each binding is an ordinary read of the
+            // corresponding positional field at body entry."
+            llvm::AllocaInst* slot = entryAlloca(fieldVal->getType());
+            builder_.CreateStore(fieldVal, slot);
+            locals_[sp.nakedAnchor.get()] = slot;  // #1271 real Node anchor
+        } else if (auto* nested = dynamic_cast<const ast::DestructuringPattern*>(
+                       sp.pattern.get())) {
+            // Nested LambdaDestructure — recurse on the extracted field.
+            bindLambdaDestructureParam(*nested, fieldVal);
+        }
+        // `_` (DiscardPattern) binds nothing — nothing to do.
+    }
+}
 
 llvm::Value* Emitter::emitEquals(llvm::Value* a, llvm::Value* b,
                         bool isStr) {

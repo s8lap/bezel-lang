@@ -418,6 +418,14 @@ inline std::string exprToString(const ast::Expr& e) {
         for (std::size_t i = 0; i < lam->params.size(); ++i) {
             if (i > 0) out += ", ";
             const auto& p = lam->params[i];
+            // §27.4 (v0.183, #1408): LambdaDestructure — render like the
+            // §19.3 case-pattern DestructuringPattern (patternToString),
+            // since this IS one (Param::destructure), just reused in
+            // parameter position.
+            if (p.destructure) {
+                out += patternToString(*p.destructure);
+                continue;
+            }
             if (!p.modifier.empty()) {
                 out += std::string(p.modifier);
                 out += ' ';

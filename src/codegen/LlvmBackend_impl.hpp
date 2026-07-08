@@ -2893,6 +2893,20 @@ private:
         }
     }
 
+    // §27.4 (v0.183, #1408): lambda-parameter record destructuring prologue.
+    // `structVal` is an already-lowered record struct VALUE (the lambda's
+    // incoming argument, or a field extracted from an enclosing level for a
+    // nested LambdaDestructure slot); binds each slot's LocalSymbol to a
+    // fresh alloca holding the corresponding positional field, recursing into
+    // nested DestructuringPattern slots. Mirrors patternMatches' unconditional
+    // field-extraction for a plain (non-boxed) record scrutinee (§19/§9.4,
+    // LlvmBackend_Exprs2.cpp ~6151) but with no runtime match test — sema
+    // (ExprTC::bindLambdaDestructure) already enforced the head is exactly the
+    // parameter's (or field's) static type, so every slot unconditionally
+    // reads its field.
+    void bindLambdaDestructureParam(const ast::DestructuringPattern& dp,
+                                    llvm::Value* structVal);
+
     // §9.1 / §9.2: the resolved declared type of a record storage member —
     // a positional Param, a body FieldDecl, or an auto-property PropertyDecl.
     // Null if it cannot be determined.

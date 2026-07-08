@@ -857,20 +857,48 @@ bool Parser::tokensLookLikeReceiverTypeArgs() {
 }
 
 ast::Param Parser::parseLambdaParam() {
-    // A.7 `LambdaParam ::= FuncParamMods? Identifier (":" Type)?`. Type is
-    // optional (unlike A.4 method ParamList).
+    // A.7 `LambdaParam ::= FuncParamMods? Identifier (":" Type)? |
+    // LambdaDestructure`. Type is optional on the Identifier form (unlike
+    // A.4 method ParamList).
     ast::Param p;
+    std::string_view mod;
+    bool hasMod = false;
+    SourceLocation modLoc = current_.location;
     if (consumeKeyword("ref")) {
-        p.modifier = "ref";
+        mod = "ref";
+        hasMod = true;
     } else if (consumeKeyword("out")) {
+        hasMod = true;
         if (consumeKeyword("owned")) {
-            p.modifier = "out owned";
+            mod = "out owned";
         } else {
-            p.modifier = "out";
+            mod = "out";
         }
     } else if (consumeKeyword("owned")) {
-        p.modifier = "owned";
+        mod = "owned";
+        hasMod = true;
     }
+    // per §27.4 (v0.183)/A.7: the LambdaDestructure alternative is
+    // `QualifiedName "(" ...`, discriminated from the Identifier alternative
+    // by a `(` immediately following the (possibly dotted) name.
+    if (tokensLookLikeLambdaDestructure()) {
+        if (hasMod) {
+            // §27.4: "The destructuring parameter admits no modifiers (`ref`,
+            // `scoped`) and no separate type annotation — the head carries
+            // the type." A dedicated diagnostic, not the generic "expected
+            // lambda parameter name" a modifier consumed here would produce.
+            diagnostics_.report(
+                Severity::Error, modLoc,
+                "a destructuring lambda parameter admits no modifier "
+                "(`" + std::string(mod) +
+                "`) \xe2\x80\x94 the destructuring head names the exact "
+                "parameter type and carries no separate annotation "
+                "(\xc2\xa7""27.4)");
+        }
+        p.destructure = parseLambdaDestructure();
+        return p;
+    }
+    p.modifier = mod;
     if (current_.kind != TokenKind::Identifier) {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected lambda parameter name");
@@ -882,6 +910,82 @@ ast::Param Parser::parseLambdaParam() {
         p.type = parseType();
     }
     return p;
+}
+
+bool Parser::tokensLookLikeLambdaDestructure() {
+    // `QualifiedName "("`: an Identifier, optionally dotted, immediately
+    // followed by `(`. peekAt(0) is current_.
+    if (current_.kind != TokenKind::Identifier) return false;
+    std::size_t k = 1;
+    for (;;) {
+        const Token& dot = peekAt(k);
+        if (!(dot.kind == TokenKind::Punctuator && dot.text == ".")) break;
+        const Token& id = peekAt(k + 1);
+        if (id.kind != TokenKind::Identifier) return false;
+        k += 2;
+    }
+    const Token& open = peekAt(k);
+    return open.kind == TokenKind::Punctuator && open.text == "(";
+}
+
+std::unique_ptr<ast::DestructuringPattern> Parser::parseLambdaDestructure() {
+    // per §27.4 (v0.183, #1408) / A.7: `LambdaDestructure ::= QualifiedName
+    // "(" LambdaSlot ("," LambdaSlot)* ")"`. Reuses the §19.3 case-pattern
+    // destructuring parse (parseQualifiedName + parsePositionalPattern) —
+    // same spelling, parameter-position restrictions enforced afterward by
+    // validateLambdaDestructureSlots.
+    SourceLocation start = current_.location;
+    auto dp = std::make_unique<ast::DestructuringPattern>();
+    dp->typeName = parseQualifiedName();
+    consumePunctuator("("); // confirmed by tokensLookLikeLambdaDestructure
+    if (!isPunctuator(")")) {
+        dp->subPatterns.push_back(parsePositionalPattern());
+        while (consumePunctuator(",")) {
+            dp->subPatterns.push_back(parsePositionalPattern());
+        }
+    }
+    if (!consumePunctuator(")")) {
+        diagnostics_.report(
+            Severity::Error, current_.location,
+            "expected ')' to close destructuring lambda parameter");
+    }
+    dp->span.begin = start;
+    dp->span.end = current_.location;
+    validateLambdaDestructureSlots(*dp);
+    return dp;
+}
+
+void Parser::validateLambdaDestructureSlots(const ast::DestructuringPattern& dp) {
+    // per §27.4 (v0.183, #1408): "A destructuring parameter is a binding
+    // form, not a test, so only irrefutable elements are admitted. Each slot
+    // is a naked identifier binding, a discard `_`, or a nested destructuring
+    // meeting the same rules... Constants, ranges, relationals, type tests,
+    // `var`-form bindings, and alternatives are compile errors in parameter
+    // position." parsePositionalPattern (shared with §19.3 case patterns)
+    // parses the full pattern grammar, so any of those disallowed shapes may
+    // come back here; reject them with a dedicated diagnostic rather than
+    // letting them silently through to sema as if this were a `case` arm.
+    for (const auto& sp : dp.subPatterns) {
+        if (!sp.nakedBinding.empty()) continue; // naked identifier: OK
+        if (dynamic_cast<const ast::DiscardPattern*>(sp.pattern.get())) {
+            continue; // `_`: OK
+        }
+        if (auto* nested =
+                dynamic_cast<const ast::DestructuringPattern*>(sp.pattern.get())) {
+            validateLambdaDestructureSlots(*nested); // nested LambdaDestructure
+            continue;
+        }
+        SourceLocation loc =
+            sp.pattern ? sp.pattern->span.begin : dp.span.begin;
+        diagnostics_.report(
+            Severity::Error, loc,
+            "a destructuring lambda-parameter element must be a binding "
+            "identifier, `_`, or a nested destructuring \xe2\x80\x94 "
+            "constants, ranges, relationals, type tests, `var`-form "
+            "bindings, and alternatives are refutable and not admitted in "
+            "parameter position (a parameter list is not a `case`, "
+            "\xc2\xa7""27.4)");
+    }
 }
 
 // ===== Slice 38: patterns and case expressions (§A.7) =====================

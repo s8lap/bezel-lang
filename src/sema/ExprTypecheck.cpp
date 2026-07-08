@@ -3279,6 +3279,21 @@ struct MutablyCapturedScan {
             if (s == n) return true;
         return false;
     }
+    // §27.4 (v0.183, #1408): a destructuring lambda parameter has no single
+    // `p.name` — its slots are the shadowing names instead (`(Entry(k, v)) =>
+    // ...` shadows an outer `k`/`v` for the lambda body exactly as a plain
+    // named parameter would). Recurse into nested LambdaDestructure slots.
+    void collectDestructureNames(const ast::DestructuringPattern* dp) {
+        if (!dp) return;
+        for (const auto& sp : dp->subPatterns) {
+            if (!sp.nakedBinding.empty()) {
+                shadowed.push_back(sp.nakedBinding);
+            } else if (auto* nested = dynamic_cast<
+                           const ast::DestructuringPattern*>(sp.pattern.get())) {
+                collectDestructureNames(nested);
+            }
+        }
+    }
     // Record a bare-identifier mutation target when inside a lambda and the name
     // is not one of the enclosing lambdas' parameters.
     void recordTarget(const ast::Expr* target) {
@@ -3312,8 +3327,10 @@ void MutablyCapturedScan::expr(const ast::Expr* e) {
     if (!e) return;
     if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
         std::size_t mark = shadowed.size();
-        for (const auto& p : lam->params)
+        for (const auto& p : lam->params) {
             if (!p.name.empty()) shadowed.push_back(p.name);
+            else if (p.destructure) collectDestructureNames(p.destructure.get());
+        }
         ++lambdaDepth;
         if (lam->exprBody) expr(lam->exprBody.get());
         body(lam->stmts);

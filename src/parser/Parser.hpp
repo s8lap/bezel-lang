@@ -113,6 +113,22 @@ private:
     // Slice 36: a single LambdaParam (A.7). Differs from method ParamList
     // in that the `: Type` ascription is optional.
     ast::Param parseLambdaParam();
+    // §27.4 (v0.183, #1408) / A.7 `LambdaDestructure ::= QualifiedName "("
+    // LambdaSlot ("," LambdaSlot)* ")"`. Caller (parseLambdaParam) has
+    // confirmed via tokensLookLikeLambdaDestructure() that the parser is
+    // positioned at the QualifiedName head. Reuses parsePositionalPattern
+    // for slot parsing (same spelling as §19.3 case-pattern destructuring),
+    // then validates every slot — recursively, through nested destructuring —
+    // is one of the three irrefutable forms A.7 admits (naked binding, `_`,
+    // nested LambdaDestructure), reporting a dedicated diagnostic for any
+    // other pattern shape (constant/range/relational/type-test/`var`-form/
+    // alternative — all refutable, and a parameter list is not a `case`).
+    std::unique_ptr<ast::DestructuringPattern> parseLambdaDestructure();
+    void validateLambdaDestructureSlots(const ast::DestructuringPattern& dp);
+    // Lookahead: does the token stream starting at current_ look like a
+    // LambdaDestructure head — `QualifiedName "("`? Used to discriminate the
+    // two LambdaParam alternatives before committing to either parse path.
+    bool tokensLookLikeLambdaDestructure();
     // Slice 37: peek-style helper — is the parser positioned at the start
     // of a `get`/`set` accessor (with optional Visibility prefix)?
     bool isPropertyAccessorStart();
