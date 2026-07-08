@@ -3929,13 +3929,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // OwningArray<T>.Drain(), OwningLinkedList<T>.Drain(),
                     // OwningStack<T>.Drain(), OwningQueue<T>.Drain() all
                     // return IOwningEnumerable<T>.
+                    // fix #1475 / stdlib §4.10: OwningSet<T>.Drain() shares this
+                    // exact contract — its element `T` is always a class (`where
+                    // T: class`) and its runtime representation is the same
+                    // array-backed collection as OwningArray (see #1474: a
+                    // class-element Set/OwningSet is never dict-eligible, so it
+                    // is always array-backed). Without this arm, `s.Drain()` for
+                    // `s: OwningSet<T>` left `ce`'s expr type unset — the
+                    // `isArrLike` block above (which DOES include Set/OwningSet)
+                    // has no `m == "Drain"` case of its own — so the for-loop
+                    // sema/codegen never recognized the iterable as
+                    // IOwningEnumerable<T> and codegen rejected it with
+                    // "not yet implemented: codegen for this for statement".
                     // T is the first (and only) generic argument of the receiver.
-                    // codegen's lowerOwnedSeqDrainFor handles all four;
+                    // codegen's lowerOwnedSeqDrainFor handles all five;
                     // it detects the collection kind from the receiver type name.
                     if ((colName == "OwningArray" ||
                          colName == "OwningLinkedList" ||
                          colName == "OwningStack" ||
-                         colName == "OwningQueue") &&
+                         colName == "OwningQueue" ||
+                         colName == "OwningSet") &&
                         m == "Drain" && ce.args.empty() &&
                         recvTy &&
                         !recvTy->genericArgs.empty() &&

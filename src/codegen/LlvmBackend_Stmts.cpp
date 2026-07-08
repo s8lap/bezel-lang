@@ -4208,7 +4208,21 @@ bool Emitter::lowerOwnedSeqDrainFor(const ast::ForStmt& fs) {
         elemTy->importedName == "DrainedEntry")
         return false;  // let lowerDictDrainFor handle it
 
-    // The iterable must be a Drain() call on one of the four collection types.
+    // The iterable must be a Drain() call on one of the five collection types.
+    // fix #1475 / stdlib §4.10: OwningSet<T> is included alongside OwningArray/
+    // OwningLinkedList/OwningStack/OwningQueue. OwningSet<T> requires
+    // `where T: class` (stdlib §4.10), so its element is never eligible for the
+    // generic-key dict backing (genericBackingType returns null for every class
+    // type, per #1474) — every valid OwningSet<T> is therefore ARRAY-backed,
+    // constructed via the same bz_array_alloc allocation and manipulated by the
+    // same bz_array_* entry points as OwningArray (see the Add/TryAdd/Remove/
+    // Contains/Count/Clear handlers in LlvmBackend_Calls.cpp, which already
+    // operate on an OwningSet receiver through bz_array_len/bz_array_ptr_at/
+    // bz_array_add directly). Draining it is thus mechanically identical to
+    // draining an OwningArray: bz_array_drain_next pops index 0 each iteration,
+    // transferring ownership of the popped element to the loop body — order is
+    // unspecified by §4.10 (a set has no ordering contract), so front-to-back
+    // is a legitimate, simple choice.
     const ast::Expr* collExpr = nullptr;
     std::string_view collName;
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(fs.iterable.get())) {
@@ -4229,7 +4243,8 @@ bool Emitter::lowerOwnedSeqDrainFor(const ast::ForStmt& fs) {
     }
     if (!collExpr) return false;
     if (collName != "OwningArray" && collName != "OwningLinkedList" &&
-        collName != "OwningStack" && collName != "OwningQueue")
+        collName != "OwningStack" && collName != "OwningQueue" &&
+        collName != "OwningSet")
         return false;
 
     // Evaluate the collection object.
@@ -4273,7 +4288,9 @@ bool Emitter::lowerOwnedSeqDrainFor(const ast::ForStmt& fs) {
     } else if (collName == "OwningStack") {
         drainFnName = "bz_array_drain_next_lifo"; // pops tail → LIFO
     } else {
-        // OwningArray and OwningQueue: both drain front-to-back.
+        // OwningArray and OwningQueue: both drain front-to-back. OwningSet
+        // (fix #1475) shares the same array backing and has no ordering
+        // contract to honour, so it drains front-to-back too.
         drainFnName = "bz_array_drain_next";      // pops index 0 → FIFO/front-to-back
     }
     // bz_array_drain_next / bz_array_drain_next_lifo / bz_llist_drain_next
