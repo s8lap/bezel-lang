@@ -702,22 +702,31 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             auto* okBB = llvm::BasicBlock::Create(llvm_, "main.ok", fn);
             builder_.CreateCondBr(mainErr, errBB, okBB);
             builder_.SetInsertPoint(errBB);
-            // #1366 / §33.3: a faulted awaited-Main task. Unlike the synchronous
-            // no-handler boundary, the fault exception object is NOT live here —
-            // the async resume/await machinery has already disposed+freed it by
-            // the time Main's outer frame observes the fault (a use-after-free if
-            // read). Pass null so the runtime prints the bare "Unhandled
-            // exception" header and exits 70 (the pre-v0.163 async behavior). A
-            // richer async report would require the await path to preserve the
-            // fault object's message/CauseChain to a sendable record first
-            // (tracked as a follow-up).
+            // §33.3 / §30.9 (fix #1609, superseding #1366): report the REAL fault
+            // exception at the async-Main no-handler boundary, matching the
+            // synchronous path (LlvmBackend_Disposal.cpp propagateBB). The outer
+            // task carries the fault exception OBJECT in its error_obj slot — the
+            // async.fault boundary stored it there via bz_task_complete_error_obj
+            // (from the body's in-flight bz$exc, itself an awaited task's re-raised
+            // error_obj or a synchronous throw). It is STILL LIVE here: bz_task_free
+            // frees only result/error_msg, never error_obj (§30.9 fault ownership),
+            // and an UNCAUGHT async fault has no catch arm to run the deferred
+            // dispose — so the object survives, un-disposed, to this process-exit
+            // boundary exactly as the synchronous in-flight exception does. Passing
+            // it (with the built-in exception vtable table, so §31.4 field reads are
+            // gated to that layout) makes the runtime print the §33.3 type / message
+            // / CauseChain instead of the previous bare "Unhandled exception" header.
+            // #1366's earlier "not live here" note was overcautious — no fault path
+            // between async.fault and this boundary disposes error_obj.
+            auto* errObjFn = declareC("bz_task_error_obj", ptrTy(), {ptrTy()});
+            llvm::Value* faultObj =
+                builder_.CreateCall(errObjFn, {outerTask}, "main.fault.exc");
             auto* unhandledFn = declareC("bz_unhandled_exception",
                                          llvm::Type::getVoidTy(llvm_),
                                          {ptrTy(), ptrTy()});
             unhandledFn->setDoesNotReturn();
             builder_.CreateCall(unhandledFn,
-                {llvm::ConstantPointerNull::get(ptrTy()),
-                 llvm::ConstantPointerNull::get(ptrTy())});
+                {faultObj, builtinExcVtableTablePtr()});
             builder_.CreateUnreachable();
             builder_.SetInsertPoint(okBB);
             llvm::Value* res = nullptr;

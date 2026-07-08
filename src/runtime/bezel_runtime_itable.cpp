@@ -125,7 +125,12 @@ extern "C" void bz_unhandled_exception(void* exc, void** excVtableTable) {
     FILE* f = stderr;
     if (!exc) {  // defensive: no in-flight object (should not happen)
         fputs("Unhandled exception\n", f);
-        exit(70);
+        // fix #1609 / §33.3: use _exit, not exit — see the note at the §33.3
+        // exit site below (an uncaught fault leaves the scheduler pool's worker
+        // threads running; exit()'s atexit/static-dtor phase can deadlock or
+        // race against them, so terminate without running them).
+        fflush(f);
+        _exit(70);
     }
     // Virtual ToString (vtable slot 3) is safe for any class instance — the type
     // name (§8.5 default for a built-in exception). The Message@8 / CauseChain@24
@@ -175,7 +180,21 @@ extern "C" void bz_unhandled_exception(void* exc, void** excVtableTable) {
             }
         }
     }
-    exit(70);
+    // fix #1609 / §33.3: terminate with _exit, NOT exit. This is the process's
+    // abnormal-termination boundary for an uncaught exception. Reaching it from
+    // an async Main (or any program that spawned domains) leaves the scheduler
+    // pool's worker threads — and possibly the timer thread — still running: the
+    // fault path completes the outer task and unwinds to `main`, but never calls
+    // bz_scheduler_shutdown (that runs only on normal completion). exit() would
+    // then run atexit handlers and C++ static destructors on THIS thread while
+    // those worker threads are live and may hold a libc lock (malloc arena,
+    // stdio) or be blocked in a system call — a deadlock (observed as a
+    // multi-minute hang under load) or data race. _exit terminates immediately
+    // without that teardown; stdio is flushed explicitly first so the §33.3
+    // report above is not lost. Matches C++ std::terminate's abort-style exit
+    // discipline for an already-failing process.
+    fflush(f);
+    _exit(70);
 }
 
 // fix #492 / §31.1 / §2.6: the per-thread in-flight exception pointer.
