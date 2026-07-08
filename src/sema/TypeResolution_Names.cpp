@@ -673,6 +673,20 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
             // an ill-formed `default(R)` param default slips through silently.
             if (p.defaultValue) resolveTypesInExpr(*p.defaultValue, &methodScope);
         }
+        // per §28.14 (v0.180, #1606): `scoped` on a static method's parameter
+        // requires an `owned` return — otherwise no call site can ever resolve
+        // a bounding object for the stored value. AST-only check (isStatic /
+        // returnOwned are both parsed flags), so it runs before type
+        // resolution needs anything further.
+        {
+            bool isStatic = false;
+            for (std::string_view mod : md->modifiers) {
+                if (mod == "static") { isStatic = true; break; }
+            }
+            checkScopedStaticNeedsOwnedReturn(md->params, isStatic,
+                                              md->returnOwned, md->name,
+                                              md->span.begin);
+        }
         if (md->returnType) resolveType(*md->returnType, &methodScope);
         // §22.4 (v0.183, #1585): validate any out-nullability postcondition
         // against the resolved return/parameter types.
@@ -887,6 +901,33 @@ void Resolver::checkScopedIsFunctionTyped(const ast::Type* declaredType,
         std::string("`scoped` is valid only on a function-typed ") +
         std::string(what) + " (§22.3, §28.14 v0.175); `" + std::string(name) +
         "` does not have a function type");
+}
+
+// §28.14 (v0.180, #1606): a `scoped` parameter on a STATIC method is admitted
+// only when the method's return is `owned`, so that a call site can resolve
+// bounding form 2 (a `using var` initializer) or form 3 (an `owned` field of
+// `this`) for the stored value. A static method with no `owned` return has no
+// receiver, no constructed object, and no instance to hold the stored value —
+// nothing could ever bound the storage — so declaring `scoped` there is a
+// compile error. Non-static methods are unaffected (form 5 resolves the
+// receiver as the bounding object). AST-level check: `isStatic` and
+// `returnOwned` are both parsed flags, so this needs no type resolution.
+void Resolver::checkScopedStaticNeedsOwnedReturn(
+    const std::vector<ast::Param>& params, bool isStatic, bool returnOwned,
+    std::string_view methodName, SourceLocation loc) {
+    if (!isStatic || returnOwned) return;
+    for (const auto& p : params) {
+        if (p.modifier != "scoped") continue;
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            std::string("`scoped` on parameter `") + std::string(p.name) +
+            "` of static method `" + std::string(methodName) +
+            "` requires the method to have an `owned` return (§28.14 "
+            "v0.180); a static method with no `owned` return has no "
+            "receiver, constructed object, or instance to bound the stored "
+            "value");
+        return;  // one diagnostic per method is enough.
+    }
 }
 
 // §22.4 (v0.183, #1585): validate the placement of a `when true`/`when false`

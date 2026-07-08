@@ -87,11 +87,17 @@ BEZEL_TEST(scoped_type_identity_2712, func_type_non_function_position_rejected) 
 // §27.2 (v0.175): a method with a `scoped` parameter has the scoped position
 // in its FUNCTION-TYPE identity; the method reference does not convert to the
 // plain-signature function type.
+//
+// `Take` returns `owned C` (§28.14 v0.180, #1606: a `scoped` parameter on a
+// static method requires an `owned` return so a call site can resolve a
+// bounding object) — the identity mismatch under test is on the PARAMETER's
+// `scoped` modifier, independent of the return type.
 BEZEL_TEST(scoped_type_identity_2712, scoped_to_plain_conversion_rejected_27_2) {
     auto r = parseAndCheckOwnership(
         "module M; class C "
-        "  public static method Take(scoped f: () -> ()) "
+        "  public static method Take(scoped f: () -> ()): owned C "
         "    f(); "
+        "    return new C(); "
         "  end Take; "
         "  public static method Main(): int "
         "    var h: (() -> ()) -> () := C.Take; "
@@ -121,11 +127,15 @@ BEZEL_TEST(scoped_type_identity_2712, plain_to_scoped_conversion_rejected_27_2) 
 
 // §27.2 control: the MATCHING scoped-position assignment is accepted — the
 // identity rule forbids conversion, not the type itself.
+//
+// `Take` returns `owned C` for the same §28.14 v0.180 (#1606) reason as
+// above.
 BEZEL_TEST(scoped_type_identity_2712, matching_scoped_signature_accepted_27_2) {
     auto r = parseAndCheckOwnership(
         "module M; class C "
-        "  public static method Take(scoped f: () -> ()) "
+        "  public static method Take(scoped f: () -> ()): owned C "
         "    f(); "
+        "    return new C(); "
         "  end Take; "
         "  public static method Main(): int "
         "    var g: (scoped () -> ()) -> () := C.Take; "

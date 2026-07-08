@@ -434,6 +434,18 @@ private:
                                     std::string_view what,
                                     SourceLocation loc);
 
+    // §28.14 (v0.180): a `scoped` parameter on a STATIC method is admitted
+    // only when the method's return is `owned` — otherwise no call site can
+    // ever resolve a bounding object (form 2 "using var" or form 3 "owned
+    // field of this") for the stored callback/borrow: there is no receiver,
+    // no constructed object, and no instance to hold the stored value.
+    // Applies uniformly to function-typed and class/interface-typed `scoped`
+    // parameters — both share the same bounding-object mechanism.
+    void checkScopedStaticNeedsOwnedReturn(const std::vector<ast::Param>& params,
+                                           bool isStatic, bool returnOwned,
+                                           std::string_view methodName,
+                                           SourceLocation loc);
+
     // §22.4 (v0.183, #1585): a `when true`/`when false` out-nullability
     // postcondition is admitted ONLY on an `out`/`out owned` parameter of
     // nullable type in a bool-returning method. `returnType` is the enclosing
