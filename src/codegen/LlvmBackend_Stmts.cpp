@@ -1690,8 +1690,31 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // unless the element is a nullable value type).
                     v = coerceReturnToNullableValue(v, iterElemSemaTy_);
                     if (v->getType() != iterElemTy_ &&
-                        v->getType()->isIntegerTy() && iterElemTy_->isIntegerTy())
-                        v = builder_.CreateTrunc(v, iterElemTy_);
+                        v->getType()->isIntegerTy() && iterElemTy_->isIntegerTy()) {
+                        // #1596 / §5.1: a narrower integer (e.g. a `byte` span
+                        // element) yielded into a wider element type (e.g.
+                        // `IEnumerable<int>`) is a WIDENING conversion, not a
+                        // truncation — CreateTrunc requires DestTy narrower
+                        // than SrcTy, and the verifier rejects the reverse
+                        // ("DestTy too big for Trunc"). Widen with zero-extend
+                        // for unsigned source primitives (byte, ushort, uint,
+                        // ulong, char) and sign-extend otherwise, matching the
+                        // value-preserving widening of §5.1; only truncate
+                        // when the source is genuinely the wider type.
+                        unsigned srcBits = v->getType()->getIntegerBitWidth();
+                        unsigned dstBits = iterElemTy_->getIntegerBitWidth();
+                        if (srcBits > dstBits) {
+                            v = builder_.CreateTrunc(v, iterElemTy_);
+                        } else if (srcBits < dstBits) {
+                            const sema::TypeRef* srcSemaTy =
+                                ctx_.exprType(*ys->value);
+                            bool srcUnsigned = srcSemaTy &&
+                                isUnsignedPrim(srcSemaTy->primitive);
+                            v = srcUnsigned
+                                ? builder_.CreateZExt(v, iterElemTy_)
+                                : builder_.CreateSExt(v, iterElemTy_);
+                        }
+                    }
                     if (v->getType() == iterElemTy_) {
                         llvm::Value* cvField = builder_.CreateStructGEP(
                             smStateStruct_, smSelf_, iterCurrentValField_);
