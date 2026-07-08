@@ -118,6 +118,15 @@ bool isBuiltinOwnedTransferCall(const ast::CallExpr& call,
     if (nm == "TakeCurrent" &&
         (rcn == "IOwningEnumerator" || rcn == "IOwningAsyncEnumerator"))
         return true;
+    // fix #1476 / stdlib §4.10: OwningSet<T>.Take(query: T) removes the
+    // element equal to `query` and transfers its ownership to the caller —
+    // the same owned-transfer shape as PopLast/PopFirst/PopAt/PopValue above.
+    // Gated to the OwningSet receiver: TryTake's analogous transfer flows
+    // through its `out owned removed: T?` PARAMETER, not this call's own
+    // return value (bool) — that path is tracked separately by
+    // isOutOwnedArgPosition, already wired for OwningSet.TryTake.
+    if (nm == "Take" && rcn == "OwningSet")
+        return true;
     return false;
 }
 

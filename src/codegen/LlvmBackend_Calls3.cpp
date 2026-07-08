@@ -1238,6 +1238,22 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
 
     // Only intercept on a collection, lazy-enumerable, or LinkedList receiver.
     auto* recvTy = ctx_.exprType(*ma->target);
+
+    // fix #1476 / stdlib §4.10: OwningSet<T>.Take(query: T): owned T (and its
+    // TryTake analogue) share a method name with — but are NOT — the LINQ
+    // Take(count: int) operator every array-backed collection exposes below.
+    // Both take exactly one positional arg, so without this guard
+    // isCollectionTypeName(OwningSet) + the unconditional `m == "Take"` match
+    // in `isOp` further down intercepted the call, materialized `s` into a
+    // lazy enumerator, and treated the class-typed query pointer as an int
+    // count — `builder_.CreateSExt(nV, i64(), "tk.n")` on a pointer produced
+    // malformed IR ("SExt only operates on integer", #1476). Bail out here so
+    // both methods fall through to tryLowerCollectionInstanceCall's dedicated
+    // OwningSet Take/TryTake handler (LlvmBackend_Calls.cpp).
+    if ((m == "Take" || m == "TryTake") &&
+        builtinTypeName(recvTy) == "OwningSet")
+        return nullptr;
+
     bool collRecv = isCollectionTypeName(recvTy);
     bool lazyRecv = isLazyEnumerableType(recvTy);
     // fix #454 / §5 / §4.6: LinkedList<T> implements IEnumerable<T> but is

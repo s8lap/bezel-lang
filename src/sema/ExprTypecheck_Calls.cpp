@@ -2335,7 +2335,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // downstream member access). Returns true if `m` was a LINQ
                 // operator (typed) — caller falls through otherwise.
                 auto typeLinqOperator = [&](TypeRef* srcElem) -> bool {
-                    if (m == "Where" || m == "Skip" || m == "Take" ||
+                    // fix #1476 / stdlib §4.10: OwningSet<T>.Take(query: T) is
+                    // typed explicitly (owned T, above in the isArrLike chain)
+                    // and must NOT be re-typed here as the LINQ Take(count:
+                    // int) operator. This lambda is invoked again from an
+                    // UNCONDITIONAL fallback further below that runs as part
+                    // of a SEPARATE if/else-if chain (broken from the one
+                    // above by the intervening standalone Sort / OwningArray
+                    // Reversed-Sorted `if` statements) — that second chain
+                    // runs regardless of what the first chain already decided,
+                    // so without this guard it clobbered the OwningSet.Take
+                    // typing right back to a lazy IEnumerable<T>, leaving
+                    // codegen's now-excluded LINQ dispatcher's absence moot:
+                    // the CALL's own sema type was still wrong, so `using var
+                    // taken := s.Take(q); taken.Tag` failed to resolve
+                    // (lowerExpr-null ICE, #1386) and the transferred element
+                    // was never disposed (a leak — its Dispose() never ran
+                    // because sema thought `taken` was an IEnumerable<T>, not
+                    // an R).
+                    if (m == "Where" || m == "Skip" ||
+                        (m == "Take" && colName != "OwningSet") ||
                         m == "Distinct") {
                         ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
                         return true;
@@ -3059,11 +3078,32 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // Queue.TryDequeue/TryPeek (out item: T): bool.
                         // §4.5/§4.7 (#831/#1354): OwningArray/OwningLinkedList
                         // TryPopFirst/TryPopLast (out owned item: T): bool.
+                        // fix #1476 / stdlib §4.10: OwningSet<T>.TryTake(query: T,
+                        // out owned removed: T?): bool — the no-throw analogue
+                        // of Take (below).
                         else if (m == "Contains" || m == "TryAdd" ||
                                  m == "TryPop" || m == "TryDequeue" ||
                                  m == "TryPeek" ||
-                                 m == "TryPopFirst" || m == "TryPopLast")
+                                 m == "TryPopFirst" || m == "TryPopLast" ||
+                                 m == "TryTake")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        // fix #1476 / stdlib §4.10: OwningSet<T>.Take(query: T):
+                        // owned T. Gated to colName == "OwningSet" — every other
+                        // isArrLike collection's "Take" is the LINQ Take(count:
+                        // int) operator (typed by the typeLinqOperator fallback
+                        // below as a lazy IEnumerable<T>). Both forms take
+                        // exactly one positional arg, so without this guard
+                        // `s.Take(query)` on an OwningSet fell into that same
+                        // fallback, mistyping the call and leaving codegen's
+                        // upstream LINQ Take(count) dispatcher to treat the
+                        // class-pointer query as an int count — `sext ptr ...
+                        // to i64`, malformed IR LLVM rejects (#1476).
+                        else if (m == "Take" && colName == "OwningSet" &&
+                                 ce.args.size() == 1) {
+                            if (recvTy && !recvTy->genericArgs.empty() &&
+                                recvTy->genericArgs[0])
+                                ctx_.setExprType(&ce, recvTy->genericArgs[0]);
+                        }
                         else if (m == "IndexOf")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                         // per §5 LINQ: Any/All → bool, Count(pred) → int

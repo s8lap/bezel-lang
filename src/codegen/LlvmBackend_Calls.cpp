@@ -3657,6 +3657,145 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             phi->addIncoming(builder_.getTrue(), newBB);
             return phi;
         }
+        // fix #1476 / stdlib §4.10: OwningSet<T>.Take(query: T): owned T —
+        // finds the element EQUAL to `query` (§8.3 equality: a user Equals
+        // override is honoured, else reference identity — same contract
+        // emitRemoveElementEquality dispatches for TryAdd/Remove above),
+        // removes it, and transfers its ownership to the caller. Raises
+        // InvalidOperationException when no equal element is present (mirrors
+        // OwningDictionary.PopValue's "raises if not present" contract,
+        // stdlib §4.9 / LlvmBackend_Calls.cpp's PopValue handler below);
+        // TryTake (next) is the no-throw variant. `query` is a PURE BORROW —
+        // never consumed or disposed (stdlib §4.10 "borrow-taking query").
+        //
+        // Before this handler, "Take" on an OwningSet was intercepted upstream
+        // by the generic LINQ Take(count: int) operator (now gated off for an
+        // OwningSet receiver in LlvmBackend_Calls3.cpp's tryLowerLazyLinqCall),
+        // which treated the class-pointer query as an int count and emitted
+        // `sext ptr ... to i64` — malformed IR LLVM rejects.
+        if (m == "Take" && call.args.size() == 1 && call.args[0].value &&
+            isOwnedSetRecv && arrElemIsClass && arrIsOwning) {
+            llvm::Value* query = lowerExpr(*call.args[0].value);
+            if (!query) return nullptr;
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv}, "tk.len");
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                   {ptrTy(), i64(), i64()});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB  = llvm::BasicBlock::Create(llvm_, "tk.c", currentFn_);
+            auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "tk.b", currentFn_);
+            auto* foundBB = llvm::BasicBlock::Create(llvm_, "tk.f", currentFn_);
+            auto* nextBB  = llvm::BasicBlock::Create(llvm_, "tk.n", currentFn_);
+            auto* endBB   = llvm::BasicBlock::Create(llvm_, "tk.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot, "tk.i");
+            builder_.CreateCondBr(
+                builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* ep = builder_.CreateCall(
+                ptrFn, {recv, idx, builder_.getInt64(esz)}, "tk.ep");
+            llvm::Value* existing = builder_.CreateLoad(ptrTy(), ep, "tk.ex");
+            llvm::Value* eq = emitRemoveElementEquality(
+                existing, query, recvTy->genericArgs[0], /*elemIsClass=*/true);
+            if (!eq) return nullptr;
+            builder_.CreateCondBr(eq, foundBB, nextBB);
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(
+                builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(foundBB);
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            auto* foundPhi = builder_.CreatePHI(i1(), 2, "tk.found");
+            foundPhi->addIncoming(builder_.getTrue(), foundBB);
+            foundPhi->addIncoming(builder_.getFalse(), condBB);
+            auto* idxPhi = builder_.CreatePHI(i64(), 2, "tk.idxphi");
+            idxPhi->addIncoming(idx, foundBB);
+            idxPhi->addIncoming(builder_.getInt64(0), condBB);
+            auto* valPhi = builder_.CreatePHI(ptrTy(), 2, "tk.val");
+            valPhi->addIncoming(existing, foundBB);
+            valPhi->addIncoming(llvm::ConstantPointerNull::get(ptrTy()), condBB);
+            llvm::Value* notFound = builder_.CreateNot(foundPhi, "tk.notfound");
+            emitGuardThrow(notFound, "InvalidOperationException");
+            // Remove the matched slot WITHOUT disposing — ownership transfers
+            // to the caller (unlike Remove(item), which disposes; #1476 /
+            // stdlib §4.10). Mirrors Pop/Dequeue's get-then-remove shape
+            // below.
+            auto* rmFn = declareC("bz_array_remove_at",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), i64()});
+            builder_.CreateCall(rmFn, {recv, idxPhi, builder_.getInt64(esz)});
+            return valPhi;
+        }
+        // fix #1476 / stdlib §4.10: OwningSet<T>.TryTake(query: T, out owned
+        // removed: T?): bool — the no-throw analogue of Take above: finds the
+        // element equal to `query`, removes it (WITHOUT disposing — ownership
+        // transfers through the out param) and returns true; on no match,
+        // writes null through the out param (mirrors TryPopValue/TryGetValue's
+        // "pre-null on the false path" convention, #891) and returns false.
+        // `query` is a pure borrow, never disposed. Discovered broken (silent
+        // no-op / always-false, `r` left null) alongside Take while fixing
+        // #1476 — same missing-handler root cause (no codegen dispatch existed
+        // for either method on a class-typed OwningSet receiver).
+        if (m == "TryTake" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value &&
+            isOwnedSetRecv && arrElemIsClass && arrIsOwning) {
+            llvm::Value* query = lowerExpr(*call.args[0].value);
+            if (!query) return nullptr;
+            llvm::Type* outTy = nullptr;
+            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, outTy);
+            if (!outAddr) return nullptr;
+            // False-path null now (§22.3 / #891 pre-null convention); the
+            // found path below overwrites it. T is always class (`where T:
+            // class`, stdlib §4.10), so this is always a plain nullable
+            // pointer slot (never the tagged {i8,T} nullable-value struct).
+            storeTryOutNull(outAddr, outTy);
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv}, "tt.len");
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                   {ptrTy(), i64(), i64()});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB  = llvm::BasicBlock::Create(llvm_, "tt.c",    currentFn_);
+            auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "tt.b",    currentFn_);
+            auto* foundBB = llvm::BasicBlock::Create(llvm_, "tt.f",    currentFn_);
+            auto* nextBB  = llvm::BasicBlock::Create(llvm_, "tt.next", currentFn_);
+            auto* endBB   = llvm::BasicBlock::Create(llvm_, "tt.end",  currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot, "tt.i");
+            builder_.CreateCondBr(
+                builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* ep = builder_.CreateCall(
+                ptrFn, {recv, idx, builder_.getInt64(esz)}, "tt.ep");
+            llvm::Value* existing = builder_.CreateLoad(ptrTy(), ep, "tt.ex");
+            llvm::Value* eq = emitRemoveElementEquality(
+                existing, query, recvTy->genericArgs[0], /*elemIsClass=*/true);
+            if (!eq) return nullptr;
+            builder_.CreateCondBr(eq, foundBB, nextBB);
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(
+                builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            // found: remove WITHOUT disposing (ownership transfers through the
+            // out param), overwrite the pre-stored null with the owned ptr.
+            builder_.SetInsertPoint(foundBB);
+            {
+                auto* rmFn = declareC("bz_array_remove_at",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), i64()});
+                builder_.CreateCall(rmFn, {recv, idx, builder_.getInt64(esz)});
+                storeTryOutValue(outAddr, outTy, existing, /*isValTy=*/false);
+            }
+            llvm::BasicBlock* foundEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            auto* phi2 = builder_.CreatePHI(i1(), 2, "tt.r");
+            phi2->addIncoming(builder_.getTrue(), foundEnd);
+            phi2->addIncoming(builder_.getFalse(), condBB);
+            return phi2;
+        }
         // per §4.5: .Insert(index, item) — insert at index, shifting up. For an
         // OwningArray<T> the item is `owned` (already moved in by the caller);
         // there is no element to dispose (a fresh slot is created, not a
