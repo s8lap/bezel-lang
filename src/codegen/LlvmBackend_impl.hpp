@@ -3459,6 +3459,20 @@ private:
     // continue. Splits the current block.
     void emitGuardThrow(llvm::Value* cond, const char* name);
 
+    // §16.3 (v0.183, #1586): compute the value `step` successor-applications
+    // away from `cur` for a `Range<char>` iterator, skipping the UTF-16
+    // surrogate gap U+D800-U+DFFF (the successor of U+D7FF is U+E000, the
+    // predecessor of U+E000 is U+D7FF). `cur` and `step` are i32; `step` may
+    // be negative (descending ranges apply the predecessor). Used at every
+    // codegen site that advances a char-typed range's working value — both
+    // the counted-loop `for` optimization (lowerRangeFor) and the runtime
+    // lazy-enumerator path share this formula via a bijection with a dense,
+    // gap-free index space: d(cp) = cp below the gap, cp - 0x800 above it;
+    // stepping is plain addition in that space, then the inverse mapping
+    // restores the code point. See bz_lazy_movenext's BZ_LAZY_RANGE case
+    // (bezel_runtime_collections.cpp) for the runtime-side mirror.
+    llvm::Value* emitCharRangeStep(llvm::Value* cur, llvm::Value* step);
+
     // CG22: a checked add/sub/mul via the with-overflow intrinsic; raises
     // OverflowException when the operation overflows (§6.1).
     llvm::Value* emitCheckedArith(llvm::Intrinsic::ID id, llvm::Value* l,
@@ -6719,10 +6733,14 @@ private:
     // Calls the closure `(env, elem) -> ptr` (the inner collection) and wraps the
     // returned collection as a lazy enumerator (bz_lazy_from_array) the runtime
     // drains. `elemTy` is the upstream element type; `innerEsz` the inner U size.
+    // `rangeInnerIsChar` (§16.3, v0.183, #1586): true when `rangeInner` and the
+    // selector's Range<T> result has T = char — the emitted bz_lazy_from_range
+    // call flags the enumerator to step across the UTF-16 surrogate gap.
     llvm::Function* buildSelectManyTrampoline(llvm::Type* elemTy,
                                               int64_t innerEsz,
                                               bool innerIsLazy = false,
-                                              bool rangeInner = false);
+                                              bool rangeInner = false,
+                                              bool rangeInnerIsChar = false);
 
     // stdlib §5 Zip: a combine trampoline `void(closure, a, b, out)`. Loads the
     // left element (`aTy`) and right element (`bTy`), calls the closure

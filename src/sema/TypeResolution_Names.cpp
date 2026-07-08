@@ -72,7 +72,10 @@ int Resolver::builtinTypeArity(std::string_view n) {
     // Slice S25 (§31.4): language-built-in exception types, all
     // nullary, available without import.
     if (n == "Exception" || n == "ArgumentException" ||
-        n == "ArgumentNullException" || n == "ArithmeticException" ||
+        n == "ArgumentNullException" ||
+        // stdlib §2.5/§4.4 (v0.183, #1396).
+        n == "ArgumentOutOfRangeException" ||
+        n == "ArithmeticException" ||
         n == "OverflowException" || n == "DivideByZeroException" ||
         n == "InvalidOperationException" ||
         // §31.4 / issue #601: DisposedAccessException — raised by checked

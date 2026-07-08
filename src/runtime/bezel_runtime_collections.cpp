@@ -2355,6 +2355,18 @@ static void bz_lazy_orderby_materialize(bz_lazy_t* e) {
     e->materialized = 1;
 }
 
+// §16.3 (v0.183, #1586): the runtime-side mirror of codegen's
+// emitCharRangeStep (LlvmBackend_Stmts.cpp) — used by BZ_LAZY_RANGE below
+// when the enumerator was flagged char-stepping (phase bit3, set by
+// lowerToLazyEnumerator / buildSelectManyTrampoline's rangeInner path). See
+// emitCharRangeStep's comment for the dense-index-bijection derivation;
+// `cur` is assumed already a valid (non-surrogate) char code point.
+static int64_t bz_char_range_step(int64_t cur, int64_t step) {
+    int64_t d = (cur >= 0xD800) ? (cur - 0x800) : cur;
+    int64_t d2 = d + step;
+    return (d2 >= 0xD800) ? (d2 + 0x800) : d2;
+}
+
 static int32_t bz_lazy_movenext(bz_lazy_t* e) {
     switch (e->kind) {
     case BZ_LAZY_ARRAY: {
@@ -2376,7 +2388,10 @@ static int32_t bz_lazy_movenext(bz_lazy_t* e) {
                                   : (incl ? cur <= end : cur < end);
         if (!inRange) return 0;
         memcpy(e->cur, &cur, (size_t)e->esz);  // low esz bytes = truncation to T
-        e->idx = cur + step;
+        // §16.3 (v0.183, #1586): phase bit3 flags a Range<char> — step across
+        // the UTF-16 surrogate gap instead of plain arithmetic.
+        bool isChar = (e->phase & 0x8) != 0;
+        e->idx = isChar ? bz_char_range_step(cur, step) : cur + step;
         return 1;
     }
     case BZ_LAZY_WHERE: {

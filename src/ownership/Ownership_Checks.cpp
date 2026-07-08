@@ -2043,6 +2043,8 @@ static bool ownershipIsBuiltinExceptionName(std::string_view n) {
     return n == "Exception"              ||
            n == "ArgumentException"      ||
            n == "ArgumentNullException"  ||
+           // stdlib §2.5/§4.4 (v0.183, #1396).
+           n == "ArgumentOutOfRangeException" ||
            n == "ArithmeticException"    ||
            n == "OverflowException"      ||
            n == "DivideByZeroException"  ||

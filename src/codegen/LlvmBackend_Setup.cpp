@@ -2031,6 +2031,12 @@ Emitter::builtinExceptionHierarchy() {
         {"Exception", ""},
         {"ArgumentException", "Exception"},
         {"ArgumentNullException", "ArgumentException"},
+        // stdlib §2.5/§4.4 (v0.183, #1396): ArgumentOutOfRangeException — raised
+        // by DateTime's component validation and by the negative-magnitude
+        // constructor guards (capacity/size/length). Derives from
+        // ArgumentException so a broad `catch var e: ArgumentException` still
+        // covers it (stdlib doc, declared alongside DateTime in §2.5).
+        {"ArgumentOutOfRangeException", "ArgumentException"},
         {"ArithmeticException", "Exception"},
         {"OverflowException", "ArithmeticException"},
         {"DivideByZeroException", "ArithmeticException"},

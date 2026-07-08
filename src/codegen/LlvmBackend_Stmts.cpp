@@ -2682,6 +2682,30 @@ bool Emitter::lowerForBody(const ast::ForStmt& fs) {
 }
 
 
+// §16.3 (v0.183, #1586): see declaration (LlvmBackend_impl.hpp) for the
+// dense-index bijection this implements. `cur` is assumed to already be a
+// valid (non-surrogate) char code point, as every value this is applied to
+// either came from a char literal endpoint (surrogate literals are compile
+// errors, §18.3/§18.8) or was itself produced by a prior call to this
+// function.
+llvm::Value* Emitter::emitCharRangeStep(llvm::Value* cur, llvm::Value* step) {
+    llvm::Value* gapLo = builder_.getInt32(0xD800);
+    llvm::Value* gapSize = builder_.getInt32(0x800);
+    // Forward map: d = cur < 0xD800 ? cur : cur - 0x800.
+    llvm::Value* curAboveGap = builder_.CreateICmpSGE(cur, gapLo, "crs.above");
+    llvm::Value* curShifted =
+        builder_.CreateSub(cur, gapSize, "crs.shifted");
+    llvm::Value* d = builder_.CreateSelect(curAboveGap, curShifted, cur, "crs.d");
+    // Step in the dense (gap-free) space — plain addition, ascending or
+    // descending per step's sign.
+    llvm::Value* d2 = builder_.CreateAdd(d, step, "crs.d2");
+    // Inverse map: cp = d2 < 0xD800 ? d2 : d2 + 0x800.
+    llvm::Value* d2AboveGap = builder_.CreateICmpSGE(d2, gapLo, "crs.d2above");
+    llvm::Value* d2Shifted = builder_.CreateAdd(d2, gapSize, "crs.d2shifted");
+    return builder_.CreateSelect(d2AboveGap, d2Shifted, d2, "crs.next");
+}
+
+
 bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
     auto* range = dynamic_cast<const ast::RangeExpr*>(fs.iterable.get());
 
@@ -2692,6 +2716,13 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
     if (!range && fs.iterable) {
         auto* iterTy = ctx_.exprType(*fs.iterable);
         if (!isRangeType(iterTy)) return false;  // not a Range — try other for-handlers
+        // §16.3 (v0.183, #1586): a Range<char> steps across the UTF-16
+        // surrogate gap instead of the plain arithmetic every other Range<T>
+        // uses (see emitCharRangeStep).
+        bool isCharRange = iterTy && !iterTy->genericArgs.empty() &&
+            iterTy->genericArgs[0] &&
+            iterTy->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
+            iterTy->genericArgs[0]->primitive == sema::PrimitiveType::Char;
 
         llvm::Value* rv = lowerExpr(*fs.iterable);
         if (!rv) return false;
@@ -2765,7 +2796,9 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
 
         builder_.SetInsertPoint(incBB);
         llvm::Value* v = builder_.CreateLoad(i32(), rfvCounter);
-        builder_.CreateStore(builder_.CreateAdd(v, step), rfvCounter);
+        llvm::Value* nextV = isCharRange ? emitCharRangeStep(v, step)
+                                          : builder_.CreateAdd(v, step);
+        builder_.CreateStore(nextV, rfvCounter);
         builder_.CreateBr(condBB);
 
         builder_.SetInsertPoint(endBB);
@@ -2776,6 +2809,15 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
     llvm::Value* lo = lowerExpr(*range->lo);
     llvm::Value* hi = lowerExpr(*range->hi);
     if (!lo || !hi) return false;
+
+    // §16.3 (v0.183, #1586): the literal-range counted loop below must match
+    // emitCharRangeStep's surrogate-gap-skipping increment for Range<char>,
+    // same as the Range-variable path above.
+    auto* litIterTy = ctx_.exprType(*fs.iterable);
+    bool isCharRange = litIterTy && !litIterTy->genericArgs.empty() &&
+        litIterTy->genericArgs[0] &&
+        litIterTy->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
+        litIterTy->genericArgs[0]->primitive == sema::PrimitiveType::Char;
 
     // §16.4: resolve the step (default = 1; negative steps descend).
     llvm::Value* stepVal = llvm::ConstantInt::get(lo->getType(), 1);
@@ -2826,7 +2868,9 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
             if (!term) builder_.CreateBr(incBB);
             builder_.SetInsertPoint(incBB);
             llvm::Value* v = builder_.CreateLoad(lo->getType(), rfCounter);
-            builder_.CreateStore(builder_.CreateAdd(v, s), rfCounter);
+            llvm::Value* nextV =
+                isCharRange ? emitCharRangeStep(v, s) : builder_.CreateAdd(v, s);
+            builder_.CreateStore(nextV, rfCounter);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
             return true;
@@ -2881,7 +2925,8 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         if (!term) builder_.CreateBr(incBB);
         builder_.SetInsertPoint(incBB);
         llvm::Value* v = builder_.CreateLoad(slot->getAllocatedType(), slot);
-        llvm::Value* next = builder_.CreateAdd(v, stepVal);
+        llvm::Value* next = isCharRange ? emitCharRangeStep(v, stepVal)
+                                         : builder_.CreateAdd(v, stepVal);
         builder_.CreateStore(next, slot);
         builder_.CreateBr(condBB);
         builder_.SetInsertPoint(endBB);
@@ -2932,9 +2977,12 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
     if (!term) builder_.CreateBr(incBB);
 
     // inc: counter := counter + step (body mutations to varSlot are ignored).
+    // §16.3 (v0.183, #1586): for a Range<char>, step across the surrogate gap
+    // instead of plain addition (emitCharRangeStep).
     builder_.SetInsertPoint(incBB);
     llvm::Value* v = builder_.CreateLoad(slot->getAllocatedType(), slot);
-    llvm::Value* next = builder_.CreateAdd(v, stepVal);
+    llvm::Value* next = isCharRange ? emitCharRangeStep(v, stepVal)
+                                     : builder_.CreateAdd(v, stepVal);
     builder_.CreateStore(next, slot);
     builder_.CreateBr(condBB);
 

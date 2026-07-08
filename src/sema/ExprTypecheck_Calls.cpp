@@ -8223,6 +8223,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         return n == "Exception"                 ||
                                n == "ArgumentException"         ||
                                n == "ArgumentNullException"     ||
+                               // stdlib §2.5/§4.4 (v0.183, #1396).
+                               n == "ArgumentOutOfRangeException" ||
                                n == "ArithmeticException"       ||
                                n == "OverflowException"         ||
                                n == "DivideByZeroException"     ||
@@ -8299,7 +8301,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             }
             if (ma.member == "ParamName") {
                 std::string_view n = excBuiltinName(rtt);
-                if (n == "ArgumentException" || n == "ArgumentNullException") {
+                // stdlib §2.5/§4.4 (v0.183, #1396): ArgumentOutOfRangeException
+                // derives from ArgumentException and inherits ParamName.
+                if (n == "ArgumentException" || n == "ArgumentNullException" ||
+                    n == "ArgumentOutOfRangeException") {
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(
                                               PrimitiveType::String,
                                               /*nullable=*/true));
@@ -9857,6 +9862,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 return n == "Exception"             ||
                        n == "ArgumentException"     ||
                        n == "ArgumentNullException" ||
+                       // stdlib §2.5/§4.4 (v0.183, #1396).
+                       n == "ArgumentOutOfRangeException" ||
                        n == "ArithmeticException"   ||
                        n == "OverflowException"     ||
                        n == "DivideByZeroException" ||

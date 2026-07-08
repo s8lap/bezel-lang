@@ -34,6 +34,14 @@ BEZEL_TEST(sema_exc, argument_null_exception_resolves) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// #1586 / stdlib §2.5/§4.4 (v0.183, #1396): ArgumentOutOfRangeException is a
+// new builtin exception type, declared alongside DateTime's component
+// validation and used by the negative-magnitude constructor guards.
+BEZEL_TEST(sema_exc, argument_out_of_range_exception_resolves) {
+    auto r = parseSemaAll(field("ArgumentOutOfRangeException"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 BEZEL_TEST(sema_exc, invalid_operation_exception_resolves) {
     auto r = parseSemaAll(field("InvalidOperationException"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

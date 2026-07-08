@@ -2457,6 +2457,28 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                  // branch lowerNew returned nullptr, leaving the slot uninitialized
                  // — same root cause as #1406 for SortedDictionary.
                  colName == "SortedSet")) {
+                // stdlib §1/§4.4 (v0.183, #1396): `Set<T>(capacity: int)` /
+                // `OwningSet<T>(capacity: int)` fault on a negative capacity
+                // rather than silently ignoring it. The first arg is the
+                // capacity form only when it is a non-nullable int (the sibling
+                // `constructor(comparer: IEqualityComparer<T>)` overload's arg
+                // is not, and is left untouched here).
+                if (!ne.args.empty() && ne.args[0].value) {
+                    const sema::TypeRef* a0ty = ctx_.exprType(*ne.args[0].value);
+                    if (a0ty && a0ty->kind == sema::TypeRef::Kind::Primitive &&
+                        a0ty->primitive == sema::PrimitiveType::Int &&
+                        !a0ty->nullable) {
+                        llvm::Value* capArg = lowerExpr(*ne.args[0].value);
+                        if (capArg) {
+                            if (!capArg->getType()->isIntegerTy(64))
+                                capArg = builder_.CreateSExt(capArg, i64());
+                            emitGuardThrow(
+                                builder_.CreateICmpSLT(capArg,
+                                                       builder_.getInt64(0)),
+                                "ArgumentOutOfRangeException");
+                        }
+                    }
+                }
                 uint64_t ksz = 0;
                 if (const sema::TypeRef* elemTy =
                         genericBackingType(rt, 0, /*isSet=*/true, &ksz)) {
@@ -2491,6 +2513,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     if (!nArg) return nullptr;
                     if (!nArg->getType()->isIntegerTy(64))
                         nArg = builder_.CreateSExt(nArg, i64());
+                    // stdlib §1/§4.4 (v0.183, #1396): OwningBuffer<T>(length) and
+                    // its (length, init) overload both fault on negative length
+                    // rather than silently allocating an empty buffer.
+                    emitGuardThrow(
+                        builder_.CreateICmpSLT(nArg, builder_.getInt64(0)),
+                        "ArgumentOutOfRangeException");
                     // bz_array_alloc_count_n: alloc with capacity n and set count=n.
                     // (All slots are zero-initialized by calloc inside the runtime.)
                     auto* fn = declareC("bz_array_alloc_count_n", ptrTy(),
@@ -2597,6 +2625,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     if (!sizeArg) return nullptr;
                     if (!sizeArg->getType()->isIntegerTy(64))
                         sizeArg = builder_.CreateSExt(sizeArg, i64());
+                    // stdlib §1/§4.4 (v0.183, #1396): Array<T>(size, fill) faults
+                    // on a negative size rather than silently building an
+                    // empty array.
+                    emitGuardThrow(
+                        builder_.CreateICmpSLT(sizeArg, builder_.getInt64(0)),
+                        "ArgumentOutOfRangeException");
                     // bz_array_alloc_count_n: alloc with capacity=n, count=n,
                     // all slots zero-initialised (calloc inside the runtime).
                     auto* fn = declareC("bz_array_alloc_count_n", ptrTy(),
@@ -2655,7 +2689,15 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     if (capArg) {
                         if (!capArg->getType()->isIntegerTy(64))
                             capArg = builder_.CreateSExt(capArg, i64());
-                        // max(capArg, 1) so a 0/negative request still yields a
+                        // stdlib §1/§4.4 (v0.183, #1396): Array<T>(capacity) /
+                        // OwningArray<T>(capacity) (and the Set<T>/OwningSet<T>
+                        // capacity forms that fall through to this shared
+                        // backing) fault on a negative capacity — zero remains
+                        // valid and is handled by the max(capArg, 1) below.
+                        emitGuardThrow(
+                            builder_.CreateICmpSLT(capArg, builder_.getInt64(0)),
+                            "ArgumentOutOfRangeException");
+                        // max(capArg, 1) so a 0 request still yields a
                         // usable buffer; matches the OwningArray reference impl
                         // (`if capacity > 0 then capacity else 1`, stdlib §4.5).
                         llvm::Value* one = builder_.getInt64(1);
@@ -2675,6 +2717,29 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // leaving the variable slot uninitialized — bz_dict_* calls then
                 // received a zero/i32 receiver and produced malformed IR.
                 colName == "SortedDictionary") {
+                // stdlib §1/§4.8 (v0.183, #1396): `Dictionary<K,V>(capacity: int)`
+                // / `OwningDictionary<K,V>(capacity: int)` (bare or paired with a
+                // comparer) fault on a negative capacity. The first arg is the
+                // capacity form only when it is a non-nullable int (the sibling
+                // `constructor(comparer: IEqualityComparer<K>)` overload's arg
+                // is not, and is left untouched here). Capacity is not otherwise
+                // used to size the backing table below — only the fault matters.
+                if (!ne.args.empty() && ne.args[0].value) {
+                    const sema::TypeRef* a0ty = ctx_.exprType(*ne.args[0].value);
+                    if (a0ty && a0ty->kind == sema::TypeRef::Kind::Primitive &&
+                        a0ty->primitive == sema::PrimitiveType::Int &&
+                        !a0ty->nullable) {
+                        llvm::Value* capArg = lowerExpr(*ne.args[0].value);
+                        if (capArg) {
+                            if (!capArg->getType()->isIntegerTy(64))
+                                capArg = builder_.CreateSExt(capArg, i64());
+                            emitGuardThrow(
+                                builder_.CreateICmpSLT(capArg,
+                                                       builder_.getInt64(0)),
+                                "ArgumentOutOfRangeException");
+                        }
+                    }
+                }
                 // issues #343 / D3 / §4.8: a non-string key uses the generic-key
                 // runtime variant, parameterized by the key's hash/eq via
                 // trampolines (§8.3). This covers records (#343) AND primitive/
@@ -2725,6 +2790,23 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                                                    {ptrTy(), ptrTy(), i64()});
                             builder_.CreateCall(addFn,
                                 {sb, slot, builder_.getInt64(SB_ESZ)});
+                        }
+                    } else if (argTy &&
+                               argTy->kind == sema::TypeRef::Kind::Primitive &&
+                               argTy->primitive == sema::PrimitiveType::Int &&
+                               !argTy->nullable) {
+                        // stdlib §1/§3.1 (v0.183, #1396): StringBuilder(capacity)
+                        // faults on a negative capacity. The capacity value is
+                        // not otherwise used to size the backing buffer above
+                        // (a fixed 64-slot reservation) — only the fault matters.
+                        llvm::Value* capArg = lowerExpr(*ne.args[0].value);
+                        if (capArg) {
+                            if (!capArg->getType()->isIntegerTy(64))
+                                capArg = builder_.CreateSExt(capArg, i64());
+                            emitGuardThrow(
+                                builder_.CreateICmpSLT(capArg,
+                                                       builder_.getInt64(0)),
+                                "ArgumentOutOfRangeException");
                         }
                     }
                 }

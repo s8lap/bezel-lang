@@ -529,7 +529,8 @@ llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
 llvm::Function* Emitter::buildSelectManyTrampoline(llvm::Type* elemTy,
                                                    int64_t innerEsz,
                                                    bool innerIsLazy,
-                                                   bool rangeInner) {
+                                                   bool rangeInner,
+                                                   bool rangeInnerIsChar) {
     auto* fty = llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false);
     auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
                                       "bz$linq$flatsel", module_.get());
@@ -560,6 +561,10 @@ llvm::Function* Emitter::buildSelectManyTrampoline(llvm::Type* elemTy,
         llvm::Value* end   = builder_.CreateExtractValue(rv, {1u}, "fs.re");
         llvm::Value* step  = builder_.CreateExtractValue(rv, {2u}, "fs.rp");
         llvm::Value* flags = builder_.CreateExtractValue(rv, {3u}, "fs.rf");
+        // §16.3 (v0.183, #1586): see the mirrored isRangeRecv branch in
+        // lowerToLazyEnumerator for the bit3 char-flag convention.
+        if (rangeInnerIsChar)
+            flags = builder_.CreateOr(flags, builder_.getInt8(0x8), "fs.rf.char");
         auto* frFn = declareC("bz_lazy_from_range", ptrTy(),
             {i64(), i64(), i64(), llvm::Type::getInt8Ty(llvm_), i64()});
         inner = builder_.CreateCall(frFn,
@@ -1145,6 +1150,17 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
         llvm::Value* end   = builder_.CreateExtractValue(recv, {1u}, "rng.end");
         llvm::Value* step  = builder_.CreateExtractValue(recv, {2u}, "rng.step");
         llvm::Value* flags = builder_.CreateExtractValue(recv, {3u}, "rng.flags");
+        // §16.3 (v0.183, #1586): flag the enumerator as char-stepping via a
+        // spare bit (bit3 — bits 0-2 are IsEndInclusive/startOpen/endOpen,
+        // §16.3) so bz_lazy_movenext's BZ_LAZY_RANGE case skips the UTF-16
+        // surrogate gap instead of stepping by plain arithmetic. This is the
+        // GetEnumerator()/LINQ-receiver path; lowerRangeFor's counted-loop
+        // `for` optimization mirrors it via emitCharRangeStep.
+        bool isCharRange = elemRef &&
+            elemRef->kind == sema::TypeRef::Kind::Primitive &&
+            elemRef->primitive == sema::PrimitiveType::Char;
+        if (isCharRange)
+            flags = builder_.CreateOr(flags, builder_.getInt8(0x8), "rng.flg.char");
         llvm::Value* isOpen = builder_.CreateICmpNE(
             builder_.CreateAnd(flags, builder_.getInt8(6)),
             builder_.getInt8(0), "rng.open");
@@ -1613,8 +1629,13 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                           retSemaType->kind == sema::TypeRef::Kind::Named &&
                           retSemaType->declaration &&
                           retSemaType->declaration->name == "Range";
-        llvm::Function* tramp =
-            buildSelectManyTrampoline(elemTy, innerEsz, innerIsLazy, rangeInner);
+        // §16.3 (v0.183, #1586): T = char for the selector's Range<T> result.
+        bool rangeInnerIsChar = rangeInner && !retSemaType->genericArgs.empty() &&
+            retSemaType->genericArgs[0] &&
+            retSemaType->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
+            retSemaType->genericArgs[0]->primitive == sema::PrimitiveType::Char;
+        llvm::Function* tramp = buildSelectManyTrampoline(
+            elemTy, innerEsz, innerIsLazy, rangeInner, rangeInnerIsChar);
         auto* smFn = declareC("bz_lazy_selectmany", ptrTy(),
                               {ptrTy(), i64(), ptrTy(), ptrTy()});
         llvm::Value* e = builder_.CreateCall(smFn,
