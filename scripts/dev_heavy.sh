@@ -18,7 +18,17 @@
 # /var/tmp/bezel-scratch (DISK-backed), never /tmp — Fedora's /tmp is tmpfs
 # (RAM): a scratch build tree parked there permanently eats gigabytes of RAM.
 set -u
-kind="${1:?usage: dev_heavy.sh {build|suite|probe} cmd...}"; shift
+# NB: do NOT fold the usage string into `${1:?...}` — a literal `}` in the message
+# (e.g. `{build|suite|probe}`) prematurely closes the `${...}` expansion, so `kind`
+# silently captured `$1` plus trailing message text ("build cmd...}") and NEVER
+# matched the case below → every call fell through to the `*)` default (lock=0,
+# mem=4G). That single quoting bug is why builds never serialized (OOM vector) and
+# why caged test-binary runs were killed at 4G. Keep the guard as a plain check.
+if [ "$#" -lt 1 ]; then
+  echo "usage: dev_heavy.sh {build|suite|probe} cmd..." >&2
+  exit 2
+fi
+kind="$1"; shift
 case "$kind" in
   build) mem=12G; lock=1 ;;
   suite) mem=8G;  lock=1 ;;
@@ -28,8 +38,26 @@ run=(systemd-run --user --scope -q
      -p "MemoryMax=$mem" -p MemorySwapMax=0
      -p CPUWeight=40 -p IOWeight=40
      -- "$@")
+# Serialize heavy ops across all worktrees/agents (32 GiB box; concurrent -j16
+# builds OOM). Hold the lock on a dedicated FD (9) owned by THIS script process,
+# then run the command. The FD stays locked until the script exits, so the lock
+# spans the whole build/suite.
+#
+# Why not `flock <file> <cmd>`? Empirically (2026-07-08) the `flock`-wraps-command
+# form releases the lock mid-build here: `flock` exec-chains into
+# `systemd-run --scope`, which registers the scope and hands the command off, and
+# the lock holder goes away ~1s in — so two `dev_heavy build` ran CONCURRENTLY
+# (the real OOM vector this whole session). `systemd-run --scope` DOES block the
+# caller for the command's duration, so holding the lock on a script-owned FD and
+# then blocking on `--scope` keeps it held the entire time. (Service mode
+# `--wait --pipe` would also block but runs in $HOME and drops env vars like
+# BEZEL_SHARD_*/TMPDIR/ASAN_OPTIONS — unusable for the suite; `--scope` keeps CWD
+# and the full environment.) Verified: two `dev_heavy build sleep 5` take ~10s
+# (serial) with this form vs ~5s (concurrent) with `flock <file> <cmd>`.
 if [ "$lock" = 1 ]; then
-  exec flock /var/tmp/bezel-heavy.lock "${run[@]}"
+  exec 9>/var/tmp/bezel-heavy.lock
+  flock -x 9
+  "${run[@]}"
 else
-  exec "${run[@]}"
+  "${run[@]}"
 fi
