@@ -4403,6 +4403,636 @@ bool MethodOwnership::typeRefIsCancellationToken(const sema::TypeRef* rt) const 
     return builtinTypeRefNameHead(rt) == "CancellationToken";
 }
 
+// ===========================================================================
+// §30.1 / §29.4 (v0.179, #1438 / #1448) — async-borrow soundness rejections.
+//
+//  #1438: a borrow-bearing record (a span, or any record carrying a non-
+//         runtime-managed borrow) is forbidden as an `async` method's
+//         parameter, result, or async-iterator element type.
+//  #1448: a borrow-bearing-record LOCAL held live across a suspension point
+//         (`await` / `await using` / `await for`, or `yield return` in an
+//         iterator, §29.4) is rejected unless every borrow it carries has a
+//         frame-resident source (an owned local, a `using var`, or an `owned`
+//         parameter of the same body).
+// `CancellationToken` (§30.8) is the single stdlib-certified exception; it is
+// a value builtin with no Record decl, so the borrow-bearing predicate below
+// does not flag it. // per §30.1, §29.4
+// ===========================================================================
+
+namespace {
+// Adapt a body's owning statement vector to the raw-pointer form the
+// across-suspension walk consumes, so a nested block, a `do…end` body, or a
+// single catch-arm body all funnel through one walker.
+std::vector<const ast::Stmt*> stmtPtrs(
+    const std::vector<std::unique_ptr<ast::Stmt>>& v) {
+    std::vector<const ast::Stmt*> out;
+    out.reserve(v.size());
+    for (const auto& p : v) out.push_back(p.get());
+    return out;
+}
+}  // namespace
+
+bool MethodOwnership::isBorrowBearingRecordOrSpan(const sema::TypeRef* rt) const {
+    if (!rt) return false;
+    // Builtin span *views* carry a borrow of their backing Array / OwningBuffer
+    // (a reference type) but have no user Record TypeDecl, so isBorrowBearing
+    // Record misses them. The string-backed spans (ReadOnlyStringSpan /
+    // ReadOnlyAsciiByteSpan) view a runtime-managed `string` and are NOT
+    // borrow-bearing (§9.7); CancellationToken (§30.8) is a value builtin and
+    // is likewise not in this list — its exemption is the single enumerated
+    // stdlib carve-out. // per §30.1, §4.14, §4.15
+    const std::string_view n = builtinTypeRefNameHead(rt);
+    if (n == "Span" || n == "ReadOnlySpan" ||
+        n == "ArraySpan" || n == "ReadOnlyArraySpan")
+        return true;
+    return isBorrowBearingRecord(rt);
+}
+
+void MethodOwnership::checkAsyncSignatureBorrowBearing(
+    const std::vector<sema::Symbol*>* paramSyms,
+    const ast::Type* returnType) {
+    // Parameters (§30.1): a borrow captured into the heap state-machine frame
+    // has no stack frame whose unwinding bounds it, and §28.3's frame-local
+    // borrow-lifetime rules cannot establish that the source outlives the frame.
+    if (paramSyms) {
+        for (sema::Symbol* sym : *paramSyms) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+            if (!ps) continue;
+            const sema::TypeRef* rt =
+                ps->declType ? ctx_.resolvedType(*ps->declType)
+                             : ps->resolvedDeclType;
+            if (!isBorrowBearingRecordOrSpan(rt)) continue;
+            report(
+                Severity::Error, ps->declLoc,
+                std::string("`async` parameter `") + std::string(ps->name) +
+                "` has a borrow-bearing type — a span, or a record carrying a "
+                "non-runtime-managed borrow, may not be a parameter of an "
+                "`async` method, `async` lambda, or async iterator: it is "
+                "captured into the heap state-machine frame that outlives the "
+                "synchronous call and lives until the task settles, so the "
+                "borrow's source is bounded by no stack frame (§30.1). Pass a "
+                "heap-owned window instead — an `Array<T>` with explicit "
+                "offset/count, or an owned result type. `CancellationToken` is "
+                "the single stdlib-certified exception (§30.8)");
+        }
+    }
+    // Result / element type (§30.1): the single generic argument of the async
+    // return type — `T` of `Task<T>` / `OwningTask<T>`, or the element type of
+    // an async-iterator interface (`IAsyncEnumerable<T>` …). `Task` (unit) has
+    // no generic argument and is unaffected.
+    if (returnType && !returnType->genericArgs.empty()) {
+        const ast::Type* resultNode = returnType->genericArgs.front().get();
+        if (resultNode) {
+            const sema::TypeRef* resRt = ctx_.resolvedType(*resultNode);
+            if (isBorrowBearingRecordOrSpan(resRt))
+                report(
+                    Severity::Error, resultNode->span.begin,
+                    "an `async` method may not have a borrow-bearing result or "
+                    "element type — a span, or a record carrying a non-runtime-"
+                    "managed borrow, would escape the state-machine frame with "
+                    "no bounded source (§30.1). Return a heap-owned window (an "
+                    "`Array<T>` with explicit offset/count) or an owned result "
+                    "type instead");
+        }
+    }
+}
+
+bool MethodOwnership::exprContainsAwait(const ast::Expr* e) const {
+    if (!e) return false;
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
+        if (ue->op == "await") return true;
+        return exprContainsAwait(ue->operand.get());
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e))
+        return exprContainsAwait(be->left.get()) ||
+               exprContainsAwait(be->right.get());
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e))
+        return exprContainsAwait(ma->target.get());
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e))
+        return exprContainsAwait(nm->target.get());
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
+        if (exprContainsAwait(ce->callee.get())) return true;
+        for (const auto& a : ce->args)
+            if (exprContainsAwait(a.value.get())) return true;
+        return false;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        if (exprContainsAwait(nc->callee.get())) return true;
+        for (const auto& a : nc->args)
+            if (exprContainsAwait(a.value.get())) return true;
+        return false;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+        if (exprContainsAwait(ix->target.get())) return true;
+        for (const auto& a : ix->indices)
+            if (exprContainsAwait(a.value.get())) return true;
+        return false;
+    }
+    if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(e))
+        return exprContainsAwait(bg->operand.get());
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+        for (const auto& a : ne->args)
+            if (exprContainsAwait(a.value.get())) return true;
+        return false;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e))
+        return exprContainsAwait(cd->condition.get()) ||
+               exprContainsAwait(cd->thenValue.get()) ||
+               exprContainsAwait(cd->elseValue.get());
+    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(e))
+        return exprContainsAwait(te->operand.get());
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e))
+        return exprContainsAwait(th->operand.get());
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
+        if (exprContainsAwait(we->source.get())) return true;
+        for (const auto& ia : we->assigns)
+            if (exprContainsAwait(ia.value.get())) return true;
+        return false;
+    }
+    if (auto* re = dynamic_cast<const ast::RangeExpr*>(e))
+        return exprContainsAwait(re->lo.get()) ||
+               exprContainsAwait(re->hi.get()) ||
+               exprContainsAwait(re->step.get());
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        for (const auto& k : cl->keys)
+            if (exprContainsAwait(k.get())) return true;
+        for (const auto& v : cl->elements)
+            if (exprContainsAwait(v.get())) return true;
+        return false;
+    }
+    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+        for (const auto& p : is->parts)
+            if (exprContainsAwait(p.expr.get())) return true;
+        return false;
+    }
+    // LambdaExpr: a separate async scope — not descended (§30.6).
+    return false;
+}
+
+void MethodOwnership::collectReadIdentifiers(
+    const ast::Expr* e, std::vector<const ast::IdentifierExpr*>& out) const {
+    if (!e) return;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+        out.push_back(id);
+        return;
+    }
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
+        collectReadIdentifiers(ue->operand.get(), out);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
+        collectReadIdentifiers(be->left.get(), out);
+        collectReadIdentifiers(be->right.get(), out);
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+        collectReadIdentifiers(ma->target.get(), out);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+        collectReadIdentifiers(nm->target.get(), out);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
+        collectReadIdentifiers(ce->callee.get(), out);
+        for (const auto& a : ce->args) collectReadIdentifiers(a.value.get(), out);
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        collectReadIdentifiers(nc->callee.get(), out);
+        for (const auto& a : nc->args) collectReadIdentifiers(a.value.get(), out);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+        collectReadIdentifiers(ix->target.get(), out);
+        for (const auto& a : ix->indices)
+            collectReadIdentifiers(a.value.get(), out);
+        return;
+    }
+    if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+        collectReadIdentifiers(bg->operand.get(), out);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+        for (const auto& a : ne->args) collectReadIdentifiers(a.value.get(), out);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+        collectReadIdentifiers(cd->condition.get(), out);
+        collectReadIdentifiers(cd->thenValue.get(), out);
+        collectReadIdentifiers(cd->elseValue.get(), out);
+        return;
+    }
+    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+        collectReadIdentifiers(te->operand.get(), out);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+        collectReadIdentifiers(th->operand.get(), out);
+        return;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
+        collectReadIdentifiers(we->source.get(), out);
+        for (const auto& ia : we->assigns)
+            collectReadIdentifiers(ia.value.get(), out);
+        return;
+    }
+    if (auto* re = dynamic_cast<const ast::RangeExpr*>(e)) {
+        collectReadIdentifiers(re->lo.get(), out);
+        collectReadIdentifiers(re->hi.get(), out);
+        collectReadIdentifiers(re->step.get(), out);
+        return;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        for (const auto& k : cl->keys) collectReadIdentifiers(k.get(), out);
+        for (const auto& v : cl->elements) collectReadIdentifiers(v.get(), out);
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+        for (const auto& p : is->parts)
+            collectReadIdentifiers(p.expr.get(), out);
+        return;
+    }
+    // LambdaExpr: a captured borrow-bearing record that escapes an async
+    // closure is governed by the §9.7 escaping-closure rule, not this one; not
+    // descended here.
+}
+
+bool MethodOwnership::blockContainsSuspension(
+    const std::vector<std::unique_ptr<ast::Stmt>>& stmts) const {
+    for (const auto& sp : stmts) {
+        const ast::Stmt* s = sp.get();
+        if (!s) continue;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            if (ld->isAwaitUsing) return true;
+            if (exprContainsAwait(ld->initializer.get())) return true;
+            continue;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            if (exprContainsAwait(as->value.get()) ||
+                exprContainsAwait(as->target.get()))
+                return true;
+            continue;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            if (exprContainsAwait(es->expr.get())) return true;
+            continue;
+        }
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            if (exprContainsAwait(rs->value.get())) return true;
+            continue;
+        }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            if (exprContainsAwait(ts->value.get())) return true;
+            continue;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            if (exprContainsAwait(ds->value.get())) return true;
+            continue;
+        }
+        if (auto* incs = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            if (exprContainsAwait(incs->target.get())) return true;
+            continue;
+        }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            if (exprContainsAwait(lc->value.get())) return true;
+            continue;
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            if (!ys->isBreak) return true;  // yield return suspends the frame
+            continue;
+        }
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s)) {
+            if (exprContainsAwait(ifs->ifBranch.condition.get())) return true;
+            if (blockContainsSuspension(ifs->ifBranch.body)) return true;
+            for (const auto& eb : ifs->elifBranches) {
+                if (exprContainsAwait(eb.condition.get())) return true;
+                if (blockContainsSuspension(eb.body)) return true;
+            }
+            if (ifs->hasElse && blockContainsSuspension(ifs->elseBody)) return true;
+            continue;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            if (exprContainsAwait(ws->condition.get())) return true;
+            if (blockContainsSuspension(ws->body)) return true;
+            continue;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            if (fs->isAwait) return true;
+            if (exprContainsAwait(fs->iterable.get())) return true;
+            if (fs->withExpr && exprContainsAwait(fs->withExpr.get())) return true;
+            if (blockContainsSuspension(fs->body)) return true;
+            continue;
+        }
+        if (auto* de = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            if (blockContainsSuspension(de->body)) return true;
+            continue;
+        }
+        if (auto* tr = dynamic_cast<const ast::TryStmt*>(s)) {
+            if (blockContainsSuspension(tr->body)) return true;
+            for (const auto& arm : tr->catches) {
+                if (exprContainsAwait(arm.guard.get())) return true;
+                if (arm.body) {
+                    // A catch-arm body is a single statement (ExpressionStmt,
+                    // DoEndBlock, or another statement form).
+                    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(arm.body.get())) {
+                        if (blockContainsSuspension(db->body)) return true;
+                    } else if (auto* ay = dynamic_cast<const ast::YieldStmt*>(arm.body.get())) {
+                        if (!ay->isBreak) return true;
+                    } else if (auto* aes = dynamic_cast<const ast::ExpressionStmt*>(arm.body.get())) {
+                        if (exprContainsAwait(aes->expr.get())) return true;
+                    }
+                }
+            }
+            if (tr->hasFinally && blockContainsSuspension(tr->finallyBody))
+                return true;
+            continue;
+        }
+    }
+    return false;
+}
+
+bool MethodOwnership::suspSourceIsFrameResident(const ast::Expr& init) {
+    // A record constructor `new Rec(src, …)` carries the borrow of its borrow-
+    // carrying argument(s); the record is frame-resident iff a carried source
+    // is. (One frame-resident carried source suffices for that source; the
+    // per-source rule is applied to the local as a whole.) // per §30.1
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&init)) {
+        for (const ast::CallArgument& a : ne->args)
+            if (a.value && suspSourceIsFrameResident(*a.value)) return true;
+        return false;
+    }
+    // Otherwise the source is the identifier at the root of the initializer
+    // chain (`arr.AsSpan()`, `s.Slice(…)`, or a bare alias `arr`).
+    const ast::IdentifierExpr* root = identifierRoot(init);
+    if (!root) return false;  // temporary / no named root → caller-side
+    sema::Symbol* sym = ctx_.exprSymbol(*root);
+    if (!sym) return false;
+    // An `owned` / `out owned` parameter transfers into the frame at call time
+    // (§30.1 "`owned` parameters transfer into the frame"), so it survives
+    // every suspension.
+    if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym))
+        return ps->modifier == "owned" || ps->modifier == "out owned";
+    if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+        // Transitive: a span derived from another frame-resident span local
+        // (`var t := s.Slice(…)`) inherits its residence.
+        auto ci = suspCands_.find(ls);
+        if (ci != suspCands_.end()) return ci->second.frameResident;
+        // A `using var` / `await using var` is an owned location the frame owns.
+        if (ls->isUsing) return true;
+        // A plain `var x := <owned producer>` (e.g. `new OwningBuffer<T>()`) is
+        // an owned local the frame owns; consult its declaration initializer.
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl))
+            if (ld->initializer &&
+                producerState(*ld->initializer) == OwnershipState::Owned)
+                return true;
+        return false;
+    }
+    // `this`, a field reached through `this`, or a module/global — caller-side.
+    return false;
+}
+
+void MethodOwnership::reportSuspCross(const sema::Symbol* sym,
+                                      const ast::Node* suspNode) {
+    if (!suspReported_.insert(sym).second) return;  // one diagnostic per local
+    auto ci = suspCands_.find(sym);
+    std::string name = ci != suspCands_.end()
+                           ? std::string(ci->second.name)
+                           : std::string(sym->name);
+    SourceLocation loc = suspNode ? suspNode->span.begin : sym->declLoc;
+    report(
+        Severity::Error, loc,
+        std::string("borrow-bearing local `") + name +
+        "` is held live across a suspension point, but its borrow's source is "
+        "not frame-resident. A borrow-bearing record (a span, or a record "
+        "carrying a non-runtime-managed borrow) may cross an `await` / `await "
+        "using` / `await for` / `yield return` only when every borrow it "
+        "carries comes from a location the state-machine frame owns — an owned "
+        "local, a `using var`, or an `owned` parameter of this body. A caller-"
+        "side source (a plain parameter, `this`, a field, or an enclosing "
+        "capture) may be disposed while the frame is suspended (§30.1 / §29.4). "
+        "Re-derive the record after the suspension, or copy the borrowed data "
+        "into frame-owned storage before it");
+}
+
+void MethodOwnership::checkBorrowBearingLocalsAcrossSuspension(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    suspCands_.clear();
+    suspInScope_.clear();
+    suspReported_.clear();
+    std::unordered_map<const sema::Symbol*, const ast::Node*> crossed;
+    walkSuspStmts(stmtPtrs(body), crossed);
+}
+
+void MethodOwnership::walkSuspStmts(
+    const std::vector<const ast::Stmt*>& stmts,
+    std::unordered_map<const sema::Symbol*, const ast::Node*>& crossed) {
+    // Report any read (in `e`) of a candidate that a suspension has already
+    // crossed and whose source is caller-side.
+    auto checkReads = [&](const ast::Expr* e) {
+        if (!e) return;
+        std::vector<const ast::IdentifierExpr*> ids;
+        collectReadIdentifiers(e, ids);
+        for (const ast::IdentifierExpr* id : ids) {
+            sema::Symbol* sym = ctx_.exprSymbol(*id);
+            if (!sym) continue;
+            auto ci = suspCands_.find(sym);
+            if (ci == suspCands_.end() || ci->second.frameResident) continue;
+            auto xi = crossed.find(sym);
+            if (xi != crossed.end()) reportSuspCross(sym, xi->second);
+        }
+    };
+    // A suspension crosses every candidate currently in scope on this path.
+    auto markCrossed = [&](const ast::Node* n) {
+        for (const sema::Symbol* sym : suspInScope_)
+            if (suspCands_.count(sym) && !crossed.count(sym)) crossed[sym] = n;
+    };
+    // Merge a branch's resulting crossings back (union — a candidate crossed on
+    // any path is crossed after the merge).
+    auto mergeInto =
+        [&](std::unordered_map<const sema::Symbol*, const ast::Node*>& dst,
+            const std::unordered_map<const sema::Symbol*, const ast::Node*>& src) {
+            for (const auto& [k, v] : src)
+                if (!dst.count(k)) dst[k] = v;
+        };
+    std::vector<const sema::Symbol*> declaredHere;
+
+    for (const ast::Stmt* s : stmts) {
+        if (!s) continue;
+
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            checkReads(ld->initializer.get());
+            // An `await` in the initializer, or an `await using`, suspends
+            // before the new binding is made — it crosses pre-existing locals.
+            if ((ld->initializer && exprContainsAwait(ld->initializer.get())) ||
+                ld->isAwaitUsing)
+                markCrossed(s);
+            // Introduce the binding; a `using var` cannot be a record (§9.7
+            // forbids record IDisposable), so only a plain `var` can be a
+            // borrow-bearing-record candidate.
+            if (sema::LocalSymbol* ls = findLocalSymbol(*ld)) {
+                const sema::TypeRef* lt =
+                    ls->declType
+                        ? ls->declType
+                        : (ld->initializer ? ctx_.exprType(*ld->initializer)
+                                           : nullptr);
+                if (!ld->isUsing && isBorrowBearingRecordOrSpan(lt)) {
+                    SuspCandidate c;
+                    c.name = ld->name;
+                    c.frameResident =
+                        ld->initializer &&
+                        suspSourceIsFrameResident(*ld->initializer);
+                    suspCands_[ls] = c;
+                    suspInScope_.insert(ls);
+                    declaredHere.push_back(ls);
+                    crossed.erase(ls);  // a fresh binding has not yet crossed
+                }
+            }
+            continue;
+        }
+
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            checkReads(as->value.get());
+            const auto* tgtId =
+                dynamic_cast<const ast::IdentifierExpr*>(as->target.get());
+            if (!tgtId) checkReads(as->target.get());  // member/index base read
+            if (exprContainsAwait(as->value.get())) markCrossed(s);
+            if (tgtId) {
+                if (sema::Symbol* tsym = ctx_.exprSymbol(*tgtId)) {
+                    auto ci = suspCands_.find(tsym);
+                    if (ci != suspCands_.end()) {
+                        crossed.erase(tsym);  // the live range restarts here
+                        ci->second.frameResident =
+                            as->op == ":=" && as->value &&
+                            suspSourceIsFrameResident(*as->value);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            checkReads(es->expr.get());
+            if (exprContainsAwait(es->expr.get())) markCrossed(s);
+            continue;
+        }
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            checkReads(rs->value.get());
+            if (exprContainsAwait(rs->value.get())) markCrossed(s);
+            continue;
+        }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            checkReads(ts->value.get());
+            if (exprContainsAwait(ts->value.get())) markCrossed(s);
+            continue;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            checkReads(ds->value.get());
+            if (exprContainsAwait(ds->value.get())) markCrossed(s);
+            continue;
+        }
+        if (auto* incs = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            checkReads(incs->target.get());
+            if (exprContainsAwait(incs->target.get())) markCrossed(s);
+            continue;
+        }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            checkReads(lc->value.get());
+            if (exprContainsAwait(lc->value.get())) markCrossed(s);
+            continue;
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            checkReads(ys->value.get());
+            if (ys->value && exprContainsAwait(ys->value.get())) markCrossed(s);
+            if (!ys->isBreak) markCrossed(s);  // yield return suspends the frame
+            continue;
+        }
+
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s)) {
+            // Conditions run before any branch body; check their reads and
+            // treat a condition `await` as a pre-branch suspension.
+            checkReads(ifs->ifBranch.condition.get());
+            bool condAwait = exprContainsAwait(ifs->ifBranch.condition.get());
+            for (const auto& eb : ifs->elifBranches) {
+                checkReads(eb.condition.get());
+                condAwait = condAwait || exprContainsAwait(eb.condition.get());
+            }
+            if (condAwait) markCrossed(s);
+            auto merged = crossed;
+            auto runBranch =
+                [&](const std::vector<std::unique_ptr<ast::Stmt>>& b) {
+                    auto c = crossed;
+                    walkSuspStmts(stmtPtrs(b), c);
+                    mergeInto(merged, c);
+                };
+            runBranch(ifs->ifBranch.body);
+            for (const auto& eb : ifs->elifBranches) runBranch(eb.body);
+            if (ifs->hasElse) runBranch(ifs->elseBody);
+            crossed = std::move(merged);
+            continue;
+        }
+
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            checkReads(ws->condition.get());
+            // A suspension anywhere in the loop crosses a use elsewhere in it
+            // (the back edge): mark in-scope candidates crossed before the body.
+            if (exprContainsAwait(ws->condition.get()) ||
+                blockContainsSuspension(ws->body))
+                markCrossed(s);
+            auto c = crossed;
+            walkSuspStmts(stmtPtrs(ws->body), c);
+            mergeInto(crossed, c);
+            continue;
+        }
+
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            checkReads(fs->iterable.get());
+            checkReads(fs->withExpr.get());
+            if (fs->isAwait || exprContainsAwait(fs->iterable.get()) ||
+                (fs->withExpr && exprContainsAwait(fs->withExpr.get())) ||
+                blockContainsSuspension(fs->body))
+                markCrossed(s);
+            auto c = crossed;
+            walkSuspStmts(stmtPtrs(fs->body), c);
+            mergeInto(crossed, c);
+            continue;
+        }
+
+        if (auto* de = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            walkSuspStmts(stmtPtrs(de->body), crossed);
+            continue;
+        }
+
+        if (auto* tr = dynamic_cast<const ast::TryStmt*>(s)) {
+            auto merged = crossed;
+            {
+                auto c = crossed;
+                walkSuspStmts(stmtPtrs(tr->body), c);
+                mergeInto(merged, c);
+            }
+            for (const auto& arm : tr->catches) {
+                checkReads(arm.guard.get());
+                if (arm.body) {
+                    auto c = crossed;
+                    std::vector<const ast::Stmt*> one{arm.body.get()};
+                    walkSuspStmts(one, c);
+                    mergeInto(merged, c);
+                }
+            }
+            if (tr->hasFinally) {
+                auto c = merged;  // the finally runs after a possible try suspend
+                walkSuspStmts(stmtPtrs(tr->finallyBody), c);
+                mergeInto(merged, c);
+            }
+            crossed = std::move(merged);
+            continue;
+        }
+        // Break / Continue and other terminators carry no candidate reads.
+    }
+    // Pop this block's candidates as they leave scope.
+    for (const sema::Symbol* sym : declaredHere) suspInScope_.erase(sym);
+}
+
 bool MethodOwnership::builtinScopedCallbackFormal(const ast::Expr* callee,
                                                   std::size_t argPos) {
     // #1420: builtin subscribe-and-store callees whose handler formal the

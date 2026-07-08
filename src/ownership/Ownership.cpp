@@ -115,6 +115,21 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // comment on moveOnlyArrayLeakScan for why it runs outside the CFG
     // dataflow. // per §15.3
     moveOnlyArrayLeakScan(body);
+    // §30.1 (v0.179, #1438): a borrow-bearing record (a span, or any record
+    // carrying a non-runtime-managed borrow) is forbidden as an `async`
+    // method's parameter, result, or (for an async iterator) element type. A
+    // signature-level check that runs once here, before the dataflow; gated on
+    // `isAsync_` so a synchronous body is untouched. // per §30.1
+    if (isAsync_)
+        checkAsyncSignatureBorrowBearing(paramSyms, returnType);
+    // §30.1 / §29.4 (v0.179, #1448): a borrow-bearing record LOCAL whose live
+    // range crosses a suspension point (`await` / `await using` / `await for`,
+    // or `yield return` in an iterator) is rejected unless every borrow it
+    // carries has a frame-resident source. Applies to async bodies and to
+    // iterators (sync or async — a sync iterator's `yield return` suspends its
+    // heap frame the same way, §29.4). // per §30.1, §29.4
+    if (isAsync_ || sawYield_)
+        checkBorrowBearingLocalsAcrossSuspension(body);
     // Seed the dataflow entry state with `owned` / `out owned` parameters
     // (slice O10): each enters the method in the Owned state and must
     // reach a discharge point on every normal-exit path (§28.8).

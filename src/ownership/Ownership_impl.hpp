@@ -713,6 +713,77 @@ private:
     // value-typed fields do not make a record borrow-bearing.
     bool isBorrowBearingRecord(const sema::TypeRef* rt) const;
 
+    // §30.1 / §9.7 (v0.179, #1438/#1448): true when `rt` is borrow-bearing for
+    // the async-signature and across-suspension rules — a user borrow-bearing
+    // record (isBorrowBearingRecord, above) OR a builtin span *view* over an
+    // Array / OwningBuffer (`ArraySpan` / `ReadOnlyArraySpan`, stdlib §4.15;
+    // `Span` / `ReadOnlySpan`, stdlib §4.14 — each carries a borrow of its
+    // backing reference-typed store, but has no user Record TypeDecl so the
+    // predicate above misses it). The stdlib-certified `CancellationToken`
+    // (§30.8, the single enumerated exception) is a value builtin with no
+    // Record decl and is not in the span list, so it is correctly NOT flagged;
+    // likewise the string-backed spans `ReadOnlyStringSpan` /
+    // `ReadOnlyAsciiByteSpan` (string is runtime-managed, §9.7). // per §30.1
+    bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt) const;
+
+    // §30.1 (v0.179, #1438): an `async` method / async iterator may not declare
+    // a parameter, result, or (for an async iterator) element type that is a
+    // borrow-bearing record (isBorrowBearingRecordOrSpan). An async method
+    // captures its parameters into a heap state-machine frame that outlives the
+    // synchronous call and lives until the task settles, so a captured borrow
+    // has no stack frame whose unwinding bounds it. Runs once per body at the
+    // top of run(), gated on `isAsync_`. `CancellationToken` is exempt (handled
+    // by the predicate). // per §30.1
+    void checkAsyncSignatureBorrowBearing(
+        const std::vector<sema::Symbol*>* paramSyms,
+        const ast::Type* returnType);
+
+    // §30.1 / §29.4 (v0.179, #1448): a local of borrow-bearing-record type
+    // whose live range crosses a suspension point (`await`, `await using`,
+    // `await for`, or `yield return` in an iterator) is rejected unless every
+    // borrow it carries has a frame-resident source — an owned local, a
+    // `using var`/`await using var`, or an `owned` parameter of the same body
+    // (locations the state-machine frame itself owns, which therefore survive
+    // every suspension). A caller-side source (a plain parameter, `this`, a
+    // field through `this`, or an enclosing capture) does not qualify: its
+    // owner may dispose it while the frame is suspended. Runs a source-order
+    // walk over the body; gated on `isAsync_ || sawYield_`. // per §30.1, §29.4
+    void checkBorrowBearingLocalsAcrossSuspension(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+
+    // Info recorded at a borrow-bearing-record local's declaration for the
+    // across-suspension check. `frameResident` is computed once from the
+    // initializer's borrow source (an owned/using/owned-param source survives
+    // suspension). // per §30.1
+    struct SuspCandidate {
+        std::string_view name;
+        bool frameResident = false;
+    };
+    // Helpers for checkBorrowBearingLocalsAcrossSuspension. `walkSuspStmts`
+    // takes raw statement pointers so a nested body, a `do…end` block, or a
+    // single catch-arm body can all be walked through the one function.
+    void walkSuspStmts(
+        const std::vector<const ast::Stmt*>& stmts,
+        std::unordered_map<const sema::Symbol*, const ast::Node*>& crossed);
+    void reportSuspCross(const sema::Symbol* sym, const ast::Node* suspNode);
+    // True when `init`'s borrow source is a frame-resident owner (per §30.1).
+    bool suspSourceIsFrameResident(const ast::Expr& init);
+    // Collect the identifiers read anywhere in `e` (no descent into lambdas).
+    void collectReadIdentifiers(
+        const ast::Expr* e,
+        std::vector<const ast::IdentifierExpr*>& out) const;
+    // True when `e` (recursively, no lambda descent) contains an `await`.
+    bool exprContainsAwait(const ast::Expr* e) const;
+    // True when any statement in `stmts` (recursively, incl. nested blocks) is
+    // a suspension point: an `await` expr, an `await using` decl, an `await
+    // for` loop, or a `yield return`. // per §30.1, §29.4
+    bool blockContainsSuspension(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts) const;
+    // The per-body candidate map + de-dup set for the across-suspension walk.
+    std::unordered_map<const sema::Symbol*, SuspCandidate> suspCands_;
+    std::unordered_set<const sema::Symbol*> suspInScope_;
+    std::unordered_set<const sema::Symbol*> suspReported_;
+
     // Find the identifier at the root of a chain like `x.f.g[i].M(...)`.
     // Returns null if the root isn't a bare identifier.
     const ast::IdentifierExpr* identifierRoot(const ast::Expr& e);
