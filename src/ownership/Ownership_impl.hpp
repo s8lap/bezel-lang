@@ -636,6 +636,23 @@ private:
     // avoid a duplicate diagnostic for the same store. // per §28.3
     bool checkBorrowStoreEscape(const ast::AssignmentStmt& as);
 
+    // §28.11 "Storing a borrow" (v0.180, #1539) — the borrowing-collection
+    // store rule. Storing a class-typed borrow into a BORROWING collection
+    // (`Array<T>`, `Dictionary<K, V>`, `SortedDictionary<K, V>`, `Set<T>`,
+    // `Stack<T>`, `Queue<T>`, `LinkedList<T>`) "follows the same shape as
+    // §28.3's borrowed-field rule": parameter-, receiver-, and field-SOURCED
+    // borrows are admitted; a borrow of a scope-bound LOCAL stored into a
+    // collection that provably outlives that scope — the collection is a
+    // field, is reachable from one, escapes the method (the receiver or a
+    // parameter), or is a local of strictly wider scope — is rejected at the
+    // store site. Owning collections (`OwningArray<T>`, …) take an `owned`
+    // argument and are governed by the ownership-transfer rules (§28.8)
+    // elsewhere, not this rule, so they are excluded. Called from
+    // handleDischarge for every CallExpr; scans a builtin storing method
+    // (Add/Insert/TryAdd/AddFirst/AddLast/AddBefore/AddAfter/Push/Enqueue)
+    // whose receiver is a borrowing collection. // per §28.11
+    void checkCollectionBorrowStoreEscape(const ast::CallExpr& call);
+
     // §28.3 / §28.5 / §28.8 (issue #402): true when `target` resolves to an
     // `owned` field — an owned storage location. Reuses the owned-field
     // recognizer `exprIsOwnedFieldRead` (a real FieldSymbol carrying the

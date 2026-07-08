@@ -363,6 +363,12 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             if (auto* fma = dynamic_cast<const ast::MemberAccessExpr*>(
                     call->callee.get()))
                 checkBorrowedOwningCollectionCapability(*fma);
+        // §28.11 "Storing a borrow" (v0.180, #1539): a borrow of a
+        // scope-bound owned local stored (via Add/Insert/…) into a
+        // BORROWING collection that provably outlives that scope is
+        // rejected at the store site. See the declaration comment for the
+        // full rule; independent of the §28.6 capability check above.
+        checkCollectionBorrowStoreEscape(*call);
         // §28.4 / §28.5 (#1230): explicit `.Dispose()` of an owned field of
         // THIS object inside a destructor body double-frees: the compiler-
         // generated Dispose() runs the destructor body first and then
@@ -2303,17 +2309,26 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
     sema::Symbol* src = ownedLocalBorrowSource(*as.value);
     if (!src) return false;
 
-    // §28.3 / §28.9 (#861): resolve a plain-local target into an OuterLocal
-    // escape. Require (a) the RHS to be a closure (a LambdaExpr — a closure
-    // BORROWS its captures, so this is a borrow store, never a move; gating on a
-    // lambda avoids any move-vs-borrow ambiguity of a bare local read), and
-    // (b) the target local's declaring block to strictly ENCLOSE the source's
-    // (a smaller nesting depth). Both `targetLocal` and `src` are in lexical
-    // scope at the assignment, so their blocks lie on a single nesting path and
-    // the depths are comparable; the smaller depth is the longer-lived block. A
-    // target at the same or a deeper block dies no later than the source, so it
-    // is not an escape. If either depth is unknown (e.g. a for-loop variable —
-    // not a LocalDecl statement), we conservatively do NOT flag it.
+    // §28.3 (#861, generalized under v0.180 / #1539): resolve a plain-local
+    // target into an OuterLocal escape whenever the target local's declaring
+    // block strictly ENCLOSES the source's (a smaller nesting depth). Both
+    // `targetLocal` and `src` are in lexical scope at the assignment, so their
+    // blocks lie on a single nesting path and the depths are comparable; the
+    // smaller depth is the longer-lived block. A target at the same or a
+    // deeper block dies no later than the source, so it is not an escape. If
+    // either depth is unknown (e.g. a for-loop variable — not a LocalDecl
+    // statement), we conservatively do NOT flag it.
+    //
+    // Two shapes reach this branch: (1) the #861 closure-capture case — the
+    // RHS is a lambda that captures `src`, so escaping the closure's holder
+    // outlives the capture; (2) the general §28.3 "Borrow lifetime rules"
+    // bullet (v0.180) — a PLAIN borrow read of `src` assigned straight into
+    // the outer local, including the named loop-carried back-edge case
+    // (`prev := cur;` where `cur` is declared inside the loop body: the
+    // target `prev` sits at the loop's enclosing depth, `cur` at the body's,
+    // so td < sd here too). `outerLocalIsClosureCapture` records which shape
+    // matched, purely to pick the right diagnostic wording below.
+    bool outerLocalIsClosureCapture = false;
     if (dest == Dest::None && targetLocal) {
         std::function<bool(const ast::Expr&)> hasLambda =
             [&](const ast::Expr& e) -> bool {
@@ -2329,10 +2344,12 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
         };
         int td = targetLocal->decl ? depthOf(targetLocal->decl) : -1;
         int sd = src->decl ? depthOf(src->decl) : -1;
-        if (hasLambda(*as.value) && td >= 0 && sd >= 0 && td < sd)
+        if (td >= 0 && sd >= 0 && td < sd) {
             dest = Dest::OuterLocal;
-        else
+            outerLocalIsClosureCapture = hasLambda(*as.value);
+        } else {
             return false;
+        }
     }
 
     // §31.1 (issue #392): the borrow source is a catch-bound exception
@@ -2381,18 +2398,41 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
     }
 
     if (dest == Dest::OuterLocal) {
-        report(
-            Severity::Error, as.span.begin,
-            std::string("closure capturing `") + std::string(src->name) +
-            "` is assigned to `" + std::string(targetLocal->name) +
-            "`, which outlives it — `" + std::string(src->name) +
-            "` is an owned scope-bound local disposed at the end of its block, "
-            "but `" + std::string(targetLocal->name) +
-            "` lives in an enclosing block, so calling the closure after the "
-            "inner block exits reads a disposed value (§28.3 / §28.9; move an "
-            "owned value into the closure, or keep `" + std::string(src->name) +
-            "` in a block that outlives `" + std::string(targetLocal->name) +
-            "`)");
+        if (outerLocalIsClosureCapture) {
+            report(
+                Severity::Error, as.span.begin,
+                std::string("closure capturing `") + std::string(src->name) +
+                "` is assigned to `" + std::string(targetLocal->name) +
+                "`, which outlives it — `" + std::string(src->name) +
+                "` is an owned scope-bound local disposed at the end of its block, "
+                "but `" + std::string(targetLocal->name) +
+                "` lives in an enclosing block, so calling the closure after the "
+                "inner block exits reads a disposed value (§28.3 / §28.9; move an "
+                "owned value into the closure, or keep `" + std::string(src->name) +
+                "` in a block that outlives `" + std::string(targetLocal->name) +
+                "`)");
+        } else {
+            // §28.3 "Borrow lifetime rules" (v0.180, #1539): "A borrow may not
+            // be assigned to a local whose scope strictly encloses the
+            // borrow's source's scope — including flowing into a loop-carried
+            // binding along a back edge when the source is declared inside
+            // the loop body." Lead with the spec's own recommended diagnostic
+            // text ("Borrow held by `x` would outlive its source `y`.").
+            report(
+                Severity::Error, as.span.begin,
+                std::string("borrow held by `") + std::string(targetLocal->name) +
+                "` would outlive its source `" + std::string(src->name) +
+                "` — `" + std::string(src->name) +
+                "` is an owned scope-bound local disposed at the end of its "
+                "block (each loop iteration, if declared inside a loop body), "
+                "but `" + std::string(targetLocal->name) +
+                "` lives in an enclosing scope, so a later read — including "
+                "around a loop back edge — would see a disposed value (§28.3 "
+                "borrow-lifetime rule; keep `" + std::string(src->name) +
+                "` alive in a scope at least as wide as `" +
+                std::string(targetLocal->name) +
+                "`, or transfer an owned value instead)");
+        }
     } else if (dest == Dest::Field) {
         report(
             Severity::Error, as.span.begin,
@@ -2416,6 +2456,114 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
             "source in a longer-lived scope)");
     }
     return true;
+}
+
+// §28.11 "Storing a borrow" (v0.180, #1539). See the declaration comment
+// (Ownership_impl.hpp) for the rule; this implementation mirrors
+// checkBorrowStoreEscape's Dest classification but for the collection
+// RECEIVER of a builtin storing-method call rather than an assignment
+// target: `Escapes` covers every receiver root that provably outlives this
+// method (`this`/`base`, a field, a chain reachable through one, or a
+// parameter — caller-supplied storage); `Local` defers to the same
+// declaring-block depth comparison used for the outer-local case above. An
+// unrooted or structurally-complex receiver (e.g. the result of a call) is
+// conservatively left unclassified — no diagnostic — matching the "residual
+// is trust" posture the spec documents for the cases this structural check
+// cannot decide. // per §28.11
+void MethodOwnership::checkCollectionBorrowStoreEscape(
+    const ast::CallExpr& call) {
+    if (!call.callee) return;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return;
+    const std::string_view m = ma->member;
+    const bool storing = m == "Add" || m == "Insert" || m == "TryAdd" ||
+                          m == "AddFirst" || m == "AddLast" ||
+                          m == "AddBefore" || m == "AddAfter" ||
+                          m == "Push" || m == "Enqueue";
+    if (!storing) return;
+
+    // Built-in collections resolve to a Named TypeRef with a NULL declaration
+    // carrying the class name on the AST node / import metadata (cf.
+    // builtinCollectionStoreCallee). A user type's own method never matches —
+    // its formals carry their own §28.14 call-boundedness obligations, not
+    // this collection-specific rule. Owning collections (OwningArray, …) are
+    // excluded: their `Add` takes an OWNED argument (§28.8 transfer), not a
+    // borrow, so this borrow-store rule does not apply to them.
+    const sema::TypeRef* tt = ctx_.exprType(*ma->target);
+    if (!tt || tt->kind != sema::TypeRef::Kind::Named || tt->declaration)
+        return;
+    const std::string_view cn = tt->headName();
+    const bool borrowingFamily =
+        cn == "Array" || cn == "Dictionary" || cn == "SortedDictionary" ||
+        cn == "Set" || cn == "Stack" || cn == "Queue" || cn == "LinkedList";
+    if (!borrowingFamily) return;
+
+    enum class RecvKind { Unknown, Escapes, Local };
+    RecvKind kind = RecvKind::Unknown;
+    sema::LocalSymbol* recvLocal = nullptr;
+    const ast::IdentifierExpr* recvRoot = identifierRoot(*ma->target);
+    if (const auto* rid =
+            dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+        if (rid->name == "this" || rid->name == "base") {
+            kind = RecvKind::Escapes;
+        } else if (sema::Symbol* sym = ctx_.exprSymbol(*rid)) {
+            if (dynamic_cast<sema::FieldSymbol*>(sym) ||
+                dynamic_cast<sema::ParameterSymbol*>(sym)) {
+                kind = RecvKind::Escapes;
+            } else if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                kind = RecvKind::Local;
+                recvLocal = ls;
+            }
+        }
+    } else if (dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get()) ||
+               dynamic_cast<const ast::NullCondMemberExpr*>(
+                   ma->target.get())) {
+        // `obj.pool.Add(x)` / `this._pool.Add(x)` — reachable from a field.
+        kind = RecvKind::Escapes;
+    }
+    if (kind == RecvKind::Unknown) return;
+
+    auto depthOf = [&](const ast::Node* declNode) -> int {
+        auto it = localDepth_.find(declNode);
+        return it == localDepth_.end() ? -1 : it->second;
+    };
+
+    for (const ast::CallArgument& a : call.args) {
+        if (!a.value) continue;
+        // ownedLocalBorrowSource restricts to a scope-bound owned LOCAL
+        // source, excluding parameters — a plain borrow read of `src` here
+        // (not a `move`d/owned transfer, which recordMovesIn has already
+        // resolved to MovedFrom before this pass runs).
+        sema::Symbol* src = ownedLocalBorrowSource(*a.value);
+        if (!src) continue;
+        bool reject = false;
+        if (kind == RecvKind::Escapes) {
+            reject = true;
+        } else if (recvLocal) {
+            int cd = recvLocal->decl ? depthOf(recvLocal->decl) : -1;
+            int sd = src->decl ? depthOf(src->decl) : -1;
+            reject = (cd >= 0 && sd >= 0 && cd < sd);
+        }
+        if (!reject) continue;
+        const std::string recvName =
+            recvRoot ? std::string(recvRoot->name) : std::string("it");
+        report(
+            Severity::Error, a.value->span.begin,
+            std::string("borrow of `") + std::string(src->name) +
+            "` passed to `." + std::string(m) + "(...)` on `" + recvName +
+            "` would outlive its source — `" + std::string(src->name) +
+            "` is an owned scope-bound local disposed at the end of its "
+            "block, and `" + recvName +
+            (kind == RecvKind::Escapes
+                 ? "` is reachable beyond this method's scope (the "
+                   "receiver, a field, or a parameter)"
+                 : "` lives in an enclosing scope") +
+            ", which outlives it (§28.11 borrowing-collection store rule; "
+            "keep `" + std::string(src->name) + "` alive at least as long "
+            "as `" + recvName + "`, or store into an owning-family "
+            "collection and transfer ownership with `Add(owned item)` "
+            "instead)");
+    }
 }
 
 const ast::IdentifierExpr* MethodOwnership::identifierRoot(const ast::Expr& e) {
