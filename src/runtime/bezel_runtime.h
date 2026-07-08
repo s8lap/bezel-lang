@@ -957,6 +957,20 @@ void* bz_event_handler_at(void* src, int64_t i);
 // handler subscribed via the same closure value — see §24 report note.)
 void bz_event_remove_closure(void* src, void* closure);
 
+// §27.7.1 (v0.180): general function-VALUE equality for the `=`/`<>` binary
+// operator on two function-typed operands. Two closures are the SAME handler
+// by the spec's {method, receiver} rule, not by closure-WRAPPER pointer
+// identity — reuses the exact match already used by `-=` (bz_event_remove_
+// closure's internal bz_closure_same), so a static method reference equals
+// every other reference to the same method, and a repeated `obj.Method`
+// reference on the same class-typed `obj` is guaranteed equal, even though
+// each reference formation mints a fresh closure cell (#1170). A lambda has
+// no method/receiver pair to match on distinct cells, so it still only
+// equals itself (the identical-wrapper fast path). Returns 0/1, not C `bool`
+// — matching this header's other codegen-called predicates and avoiding any
+// i1-vs-i8 ABI ambiguity at the LLVM declareC boundary.
+int32_t bz_closure_value_equals(void* a, void* b);
+
 // Remove the handler with the given token. Idempotent (second call is a
 // no-op). Used by Subscription.Dispose.
 void bz_event_remove_token(void* src, int64_t token);

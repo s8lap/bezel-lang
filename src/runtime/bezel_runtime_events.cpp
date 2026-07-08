@@ -145,6 +145,14 @@ static bool bz_closure_same(void* a, void* b) {
     return a_recv == b_recv;
 }
 
+// §27.7.1 (v0.180) / declared in bezel_runtime.h: the general `=`/`<>`
+// function-value equality operator delegates to the same {fn, receiver}
+// match `-=` already uses (bz_closure_same above) instead of a raw closure-
+// wrapper pointer compare — see the header comment for the rationale.
+extern "C" int32_t bz_closure_value_equals(void* a, void* b) {
+    return bz_closure_same(a, b) ? 1 : 0;
+}
+
 extern "C" void bz_event_remove_closure(void* srcp, void* closure) {
     auto* s = (bz_event_source_t*)srcp;
     if (!s) return;

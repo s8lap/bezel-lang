@@ -6486,6 +6486,34 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 return op == "=" ? eq : builder_.CreateNot(eq);
         }
     }
+    // §27.7.1 (v0.180): `=`/`<>` on FUNCTION-typed operands — a lambda equals
+    // only itself, but a method/property reference equals another reference
+    // to the same method (same receiver, for an instance reference) even
+    // though each reference formation mints a FRESH closure cell (#1170,
+    // makeMethodThunk/buildMethodClosureCell). A raw ICmp pointer compare
+    // (the fallback below) is therefore wrong for two separately-formed
+    // references to the same method — it always says "unequal". Route
+    // through bz_closure_value_equals, the SAME {fn, receiver} match `-=`
+    // already uses (bz_event_remove_closure / bz_closure_same), so the
+    // general operator and the `-=` desugaring agree. Excludes a null-
+    // literal operand (handled by the plain pointer compare below) and
+    // fires only when BOTH operands are function-typed.
+    if ((op == "=" || op == "<>") &&
+        l->getType()->isPointerTy() && r->getType()->isPointerTy()) {
+        auto isFunctionExpr = [&](const ast::Expr* e) -> bool {
+            if (!e || dynamic_cast<const ast::NullLiteralExpr*>(e)) return false;
+            const sema::TypeRef* t = ctx_.exprType(*e);
+            return t && t->kind == sema::TypeRef::Kind::Function;
+        };
+        if (isFunctionExpr(bin.left.get()) && isFunctionExpr(bin.right.get())) {
+            auto* eqFn = declareC("bz_closure_value_equals",
+                                  llvm::Type::getInt32Ty(llvm_), {ptrTy(), ptrTy()});
+            llvm::Value* raw = builder_.CreateCall(eqFn, {l, r}, "fn.eqraw");
+            llvm::Value* eq = builder_.CreateICmpNE(
+                raw, builder_.getInt32(0), "fn.eq");
+            return op == "=" ? eq : builder_.CreateNot(eq);
+        }
+    }
     // CG4: integer comparisons → i1.
     if (op == "=") return builder_.CreateICmpEQ(l, r);
     if (op == "<>") return builder_.CreateICmpNE(l, r);

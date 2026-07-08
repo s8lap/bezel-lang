@@ -457,6 +457,16 @@ private:
     // so a single thunk per method is correct; the per-conversion receiver
     // lives in the freshly-allocated env, never in the shared thunk.
     std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodThunks_;
+    // §27.7.1 (v0.180, #1544): cached property-getter-reference thunk per
+    // property symbol — the SAME #1170 stability reasoning as methodThunks_
+    // above, applied to a property used as a function value (§27.6, `var f:
+    // () -> T := b.P`). Without this, each makePropertyThunk call emitted a
+    // fresh pthunk$N, so two references to the SAME property on the SAME
+    // receiver had different `fn` pointers and never compared equal under
+    // the general `=`/`<>` operator (bz_closure_value_equals) even though
+    // "property references follow the method-reference rule" (§27.7.1
+    // fourth bullet).
+    std::unordered_map<sema::PropertySymbol*, llvm::Function*> propertyThunks_;
     // CG10: emitted LLVM function for each (non-static) constructor symbol.
     std::unordered_map<sema::ConstructorSymbol*, llvm::Function*> ctorFns_;
     // CG47 / fix #582 / §22.13: one entry per static-initialisation unit that
@@ -6285,6 +6295,13 @@ private:
     llvm::Value* makePropertyThunk(sema::PropertySymbol* ps,
                                    llvm::Value* receiverVal,
                                    const ast::MemberAccessExpr* ma);
+
+    // §27.7.1 (v0.180, #1544): build a fresh closure cell { thunk, env, rc,
+    // envdtor } wrapping a (possibly cached, propertyThunks_) property-getter
+    // thunk and the current receiver. Shared by the cache-hit and cache-miss
+    // paths of makePropertyThunk — mirrors buildMethodClosureCell above.
+    llvm::Value* buildPropertyClosureCell(llvm::Function* thunk,
+                                          llvm::Value* receiverVal);
 
     // CG9: address of an implicitly-`this`-qualified instance field
     // referenced bare inside an instance method (`_x` rather than

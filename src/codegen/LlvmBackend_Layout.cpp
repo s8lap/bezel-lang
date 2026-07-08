@@ -2337,6 +2337,18 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
                                         llvm::Value* receiverVal,
                                         const ast::MemberAccessExpr* ma) {
     if (!ps) return nullptr;
+    // §27.7.1 (v0.180, #1544): reuse a cached thunk for this property so a
+    // named property reference resolves to a STABLE fn pointer (the cell's fn
+    // at offset 0) — the same #1170 reasoning makeMethodThunk applies below,
+    // needed so two references to the SAME property on the SAME receiver
+    // compare EQUAL under the general `=`/`<>` operator (bz_closure_value_
+    // equals / §27.7.1 fourth bullet: "property references follow the
+    // method-reference rule"). On a cache hit skip re-emitting the body (the
+    // property's return type / generic substitution were already baked into
+    // the compiled thunk on first emission) and go straight to building a
+    // fresh closure cell with the current receiver.
+    if (auto cit = propertyThunks_.find(ps); cit != propertyThunks_.end())
+        return buildPropertyClosureCell(cit->second, receiverVal);
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     // Result type = the property's value type.
     llvm::Type* retTy = nullptr;
@@ -2480,9 +2492,22 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     genericSubstSemaTy_ = std::move(savedSemaTy);
     if (savedBB) builder_.SetInsertPoint(savedBB);
 
+    // §27.7.1 (v0.180, #1544): cache the thunk so subsequent references to
+    // this property (e.g. a repeated `b.Count` read as a function value)
+    // reuse the SAME fn pointer — mirrors makeMethodThunk's methodThunks_.
+    propertyThunks_[ps] = thunk;
+    return buildPropertyClosureCell(thunk, receiverVal);
+}
+
+llvm::Value* Emitter::buildPropertyClosureCell(llvm::Function* thunk,
+                                               llvm::Value* receiverVal) {
     // Build the closure cell { thunk_ptr, env_ptr, rc, envdtor } at the call
     // site. The env holds the receiver as a BORROW (§28.3); bz_closure_release
-    // frees the cell + env, never the receiver.
+    // frees the cell + env, never the receiver. #1544: a FRESH cell+env is
+    // built per reference (the thunk fn is shared via propertyThunks_), so
+    // each reference still has its own rc/lifetime; equality is by the
+    // cell's { fn, receiver-in-env } value (bz_closure_value_equals),
+    // mirroring buildMethodClosureCell.
     uint64_t cellSz =
         module_->getDataLayout().getTypeAllocSize(closureCellType());
     llvm::Value* closureObj = builder_.CreateCall(

@@ -1020,6 +1020,81 @@ bool ExprTC::isSubtype(TypeSymbol* from, TypeSymbol* to) {
     return false;
 }
 
+// §27.1.1 (v0.180): exact structural equality of two TypeRefs — the
+// INVARIANT fallback for a function-value slot that is not a bare, non-
+// generic class/interface reference (a value-typed, record-typed, primitive,
+// nested-function-typed, generic, or inline-array slot). An already-
+// constructed function value has no adapter object to perform a numeric-
+// widening, boxing, or other representation-changing conversion (§27.1.1
+// third bullet), so those slots require an EXACT match rather than the usual
+// §5.1 widening. Mirrors Resolver::typeRefEqual (TypeResolution_Checks.cpp)
+// but is duplicated locally — ExprTC has no handle on a Resolver instance —
+// rather than threading one through for this single use.
+static bool functionSlotTypeRefEqual(const TypeRef* a, const TypeRef* b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    if (a->kind != b->kind) return false;
+    if (a->nullable != b->nullable) return false;
+    switch (a->kind) {
+        case TypeRef::Kind::Error:
+            return false;
+        case TypeRef::Kind::Unit:
+            return true;
+        case TypeRef::Kind::Primitive:
+            return a->primitive == b->primitive;
+        case TypeRef::Kind::Named:
+            if (a->declaration != b->declaration) return false;
+            if (a->genericArgs.size() != b->genericArgs.size()) return false;
+            for (std::size_t i = 0; i < a->genericArgs.size(); ++i) {
+                if (!functionSlotTypeRefEqual(a->genericArgs[i], b->genericArgs[i]))
+                    return false;
+            }
+            return true;
+        case TypeRef::Kind::InlineArray:
+            return a->arrayOwned == b->arrayOwned &&
+                   functionSlotTypeRefEqual(a->arrayElement, b->arrayElement);
+        case TypeRef::Kind::Function:
+            if (a->funcParams.size() != b->funcParams.size()) return false;
+            for (std::size_t i = 0; i < a->funcParams.size(); ++i) {
+                if (a->funcParams[i].modifier != b->funcParams[i].modifier)
+                    return false;
+                if (!functionSlotTypeRefEqual(a->funcParams[i].type,
+                                              b->funcParams[i].type))
+                    return false;
+            }
+            return a->funcReturnOwned == b->funcReturnOwned &&
+                   functionSlotTypeRefEqual(a->funcReturn, b->funcReturn);
+    }
+    return false;
+}
+
+// §27.1.1 (v0.180): does a value of slot-type `from` convert to slot-type
+// `to` under the function-VALUE assignability rule? A non-generic class or
+// interface slot uses the standard §5.1 reference conversion (declaration
+// identity/subtype plus nullable-widening, mirroring the Named-Named branch
+// of checkAssignable below); every other slot shape — value-typed, record-
+// typed, primitive, generic, nested-function, or array — is INVARIANT (exact
+// structural match, functionSlotTypeRefEqual above). Callers apply this with
+// the operands swapped for a CONTRAVARIANT parameter slot and in-order for a
+// COVARIANT return slot (§27.1.1 first/second bullets).
+static bool functionSlotConvertible(
+        const TypeRef* from, const TypeRef* to,
+        bool (*isSubtypeFn)(TypeSymbol*, TypeSymbol*)) {
+    if (!from || !to) return from == to;  // both absent: both `()`-shaped
+    if (from->kind == TypeRef::Kind::Named && to->kind == TypeRef::Kind::Named &&
+        from->declaration && to->declaration &&
+        from->genericArgs.empty() && to->genericArgs.empty() &&
+        (from->declaration->kind == ast::TypeDeclKind::Class ||
+         from->declaration->kind == ast::TypeDeclKind::Interface) &&
+        (to->declaration->kind == ast::TypeDeclKind::Class ||
+         to->declaration->kind == ast::TypeDeclKind::Interface)) {
+        if (from->nullable && !to->nullable) return false;
+        return from->declaration == to->declaration ||
+               isSubtypeFn(from->declaration, to->declaration);
+    }
+    return functionSlotTypeRefEqual(from, to);
+}
+
 // Slices T1/T4: assignability check (§5.1, §7, §12 subtyping).
 // Handles two cases and conservatively skips everything else
 // (mixed primitive/named, generics, null, Object target) so it
@@ -1261,33 +1336,105 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
         reportNotConvertible();
         return;
     }
-    // §27.2 / §28.14 (v0.175): `scoped` participates in function-signature
-    // IDENTITY like ref/out — `(scoped () -> Task) -> ()` and
-    // `(() -> Task) -> ()` are distinct types with no conversion either way.
-    // Deliberately NARROW: general function-to-function signature matching is
-    // still the deferred slice above, so this fires ONLY when the two sides
-    // disagree on a `scoped` position (same arity), leaving every previously-
-    // accepted function assignment unchanged.
+    // §27.1.1 (v0.180): function-VALUE assignability. §27.6 draws a line
+    // between forming a fresh method/property reference at THIS use site
+    // (which may bridge any §5.1 implicit conversion by synthesizing an
+    // adapter at the formation site) and rebinding an ALREADY-FORMED
+    // function value to a new function type (the narrower rule enforced
+    // below). Detect the formation case the same way codegen's
+    // isPlusOneClosureProducer does: a bare IdentifierExpr or
+    // MemberAccessExpr whose resolved symbol is a MethodSymbol/
+    // PropertySymbol, evaluated directly as this assignment's source —
+    // NOT a value already sitting in a variable/field/parameter. A bare
+    // LambdaExpr is the same story for a different reason: its param/return
+    // shape is target-typed (§27.4) — inferred FROM `to`, not independently —
+    // so there is no prior, independently-typed value to compare; its body is
+    // separately checked against the target elsewhere (pendingLambdaReturnType_
+    // / pendingLambdaParamTypes_ above). Formation sites keep their prior
+    // (unchanged) permissive behavior for the param/return SHAPES; every
+    // function-typed assignment still requires exact arity and exact
+    // modifier slots (§27.1, §27.6's own "modifier slots ... must match
+    // exactly" — that part is not part of the bridge).
     if (from->kind == TypeRef::Kind::Function &&
-        to->kind == TypeRef::Kind::Function &&
-        from->funcParams.size() == to->funcParams.size()) {
+        to->kind == TypeRef::Kind::Function) {
+        bool freshReferenceFormation = fromExpr &&
+            ((dynamic_cast<const ast::IdentifierExpr*>(fromExpr) ||
+              dynamic_cast<const ast::MemberAccessExpr*>(fromExpr)) &&
+             (dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*fromExpr)) ||
+              dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(*fromExpr))));
+        bool freshLambda = fromExpr &&
+            dynamic_cast<const ast::LambdaExpr*>(fromExpr);
+        bool skipShapeCheck = freshReferenceFormation || freshLambda;
+
+        // Arity mismatch is never assignable (§27.1.1), formation or not.
+        if (from->funcParams.size() != to->funcParams.size()) {
+            reportNotConvertible();
+            return;
+        }
+        // The FUNCTION TYPE ITSELF may be nullable (`((int) -> int)?`); a
+        // nullable value into a non-nullable target is the ordinary §7 rule
+        // (unchanged from before this block existed — restored here because
+        // this block now returns unconditionally on the accepted paths below,
+        // where it used to fall through to the general nullable check).
+        if (from->nullable && !to->nullable) { reportNullable(); return; }
+        // Modifier slots (owned/ref/out/out owned/scoped) must match
+        // EXACTLY, always — §27.1's identity rule; §27.1.1's fourth bullet
+        // restates it for value-assignability, and §27.6 confirms it is not
+        // part of what a formation-site adapter may bridge.
         for (std::size_t i = 0; i < from->funcParams.size(); ++i) {
-            const bool fromScoped = from->funcParams[i].modifier == "scoped";
-            const bool toScoped = to->funcParams[i].modifier == "scoped";
-            if (fromScoped != toScoped) {
+            if (from->funcParams[i].modifier != to->funcParams[i].modifier) {
+                const bool fromScoped = from->funcParams[i].modifier == "scoped";
+                const bool toScoped = to->funcParams[i].modifier == "scoped";
+                std::string detail;
+                if (fromScoped != toScoped) {
+                    // Preserve the more specific §27.2/§28.14 `scoped` wording
+                    // when that is the mismatched modifier.
+                    detail = fromScoped ? " is `scoped` but the target's is not"
+                                        : " is not `scoped` but the target's is";
+                } else {
+                    auto modName = [](std::string_view m) {
+                        return m.empty() ? std::string("(none)")
+                                         : "`" + std::string(m) + "`";
+                    };
+                    detail = std::string(" is ") +
+                             modName(from->funcParams[i].modifier) +
+                             " but the target's is " +
+                             modName(to->funcParams[i].modifier);
+                }
                 ctx_.diagnostics().report(
                     Severity::Error, loc,
                     std::string("the ") + what +
                     " has a function type whose parameter " +
-                    std::to_string(i + 1) +
-                    (fromScoped ? " is `scoped` but the target's is not"
-                                : " is not `scoped` but the target's is") +
-                    " — `scoped` is part of a function signature's identity; "
-                    "there is no conversion between the two (§27.2, §28.14 "
-                    "v0.175)");
+                    std::to_string(i + 1) + detail +
+                    " — modifier slots are part of a function signature's "
+                    "identity; there is no conversion between them (§27.1, "
+                    "§27.1.1 v0.180, §27.2/§28.14 v0.175)");
                 return;
             }
         }
+        if (!skipShapeCheck) {
+            // Parameter slots are CONTRAVARIANT (§27.1.1 first bullet): the
+            // TARGET's declared param type must convert to the VALUE's — a
+            // (Animal) -> () value is usable where (Dog) -> () is expected,
+            // so the check is applied with the operands swapped.
+            for (std::size_t i = 0; i < from->funcParams.size(); ++i) {
+                if (!functionSlotConvertible(to->funcParams[i].type,
+                                             from->funcParams[i].type,
+                                             isSubtype)) {
+                    reportNotConvertible();
+                    return;
+                }
+            }
+            // The return slot is COVARIANT (§27.1.1 second bullet): the
+            // VALUE's return type must convert to the TARGET's — a
+            // () -> Dog value is usable as () -> Animal.
+            if (!functionSlotConvertible(from->funcReturn, to->funcReturn,
+                                         isSubtype)) {
+                reportNotConvertible();
+                return;
+            }
+        }
+        return;
     }
     // A nullable source assigned to a non-nullable target whose shapes did not
     // match either branch above — notably the `null` literal (typed `Object?`, a
