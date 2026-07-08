@@ -176,6 +176,100 @@ BEZEL_TEST(sema_serialization_550, positional_record_non_serializable_record_fie
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
+// ─── Ineligible: reference-typed field even when the target IS serializable
+//     (§9.8 v0.182 / issue #1573) ─────────────────────────────────────────────
+
+// §9.8 v0.182: "A record cannot hold a class-typed component in its serialized
+// set at all ... a record's reference-typed fields are always borrows, and a
+// borrow has no position in an owning spanning tree — there is no owner for an
+// inline write to reconstruct against, and the synthesized `Deserialize` could
+// not construct the record without binding a freshly-produced component to a
+// borrowing field, which §9.7's no-temporary-source rule rejects." This must
+// hold even when the class field's OWN type is itself fully
+// serialization-eligible (declares `ISerializable`/`IDeserializable` with only
+// primitive components) — the record-vs-class distinction, not the target
+// class's own eligibility, is what disqualifies it.
+BEZEL_TEST(sema_serialization_550,
+           positional_record_serializable_class_field_ineligible_spec_9_8_v0_182) {
+    auto r = parseSema(
+        "module M; "
+        "class C: ISerializable "
+        "  public property V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "end C; "
+        "record R(X: int, Obj: C): ISerializable;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// Same rule, body-record form (auto-property component instead of a
+// positional field) — §9.8's body-record membership rule shares the same
+// component-eligibility check as the positional-record rule above.
+BEZEL_TEST(sema_serialization_550,
+           body_record_serializable_class_field_ineligible_spec_9_8_v0_182) {
+    auto r = parseSema(
+        "module M; "
+        "class C: ISerializable "
+        "  public property V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "end C; "
+        "record R: ISerializable "
+        "  public property Obj: C; "
+        "  public constructor(obj: C) Obj := obj; end constructor; "
+        "end R;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §9.8 v0.182: "The same holds for `Shared<T>` ... a record declares no
+// owning spanning tree against which an identity participant ... could
+// resolve." A record field of type `Shared<C>` (C itself serialization-
+// eligible) is not serialization-eligible.
+BEZEL_TEST(sema_serialization_550,
+           positional_record_shared_field_ineligible_spec_9_8_v0_182) {
+    auto r = parseSema(
+        "module M; "
+        "class C: ISerializable "
+        "  public property V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "end C; "
+        "record R(X: int, Obj: Shared<C>): ISerializable;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §9.8 v0.182: "The same holds for ... `Weak<T>` ... components: a record
+// declares no owning spanning tree against which ... a back-edge could
+// resolve." A record field of type `Weak<C>` is not serialization-eligible.
+BEZEL_TEST(sema_serialization_550,
+           positional_record_weak_field_ineligible_spec_9_8_v0_182) {
+    auto r = parseSema(
+        "module M; "
+        "class C: ISerializable "
+        "  public property V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "end C; "
+        "record R(X: int, Obj: Weak<C>): ISerializable;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// Regression guard: the record-only restriction above must NOT affect a
+// CLASS holding a nested serializable-class component — §9.8's class
+// synthesis explicitly admits "another conforming class" as an owning edge
+// ("recursively admitting other conforming classes ..."). Only records are
+// restricted (§9.8 v0.182).
+BEZEL_TEST(sema_serialization_550,
+           class_with_nested_serializable_class_field_eligible_spec_9_8) {
+    auto r = parseSema(
+        "module M; "
+        "class Inner: ISerializable "
+        "  public property V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "end Inner; "
+        "class Outer: ISerializable "
+        "  public owned Obj: Inner; "
+        "  public constructor(owned obj: Inner) Obj := move obj; end constructor; "
+        "end Outer;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // ─── serialized skip removes ineligible field from consideration (§9.8) ───────
 
 // §9.8: "`serialized skip` interacts with the eligibility rule by *removing*

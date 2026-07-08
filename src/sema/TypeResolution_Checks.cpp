@@ -3473,9 +3473,21 @@ void Resolver::checkVarianceMarkerScope() {
 
 // Check whether a TypeRef is a serialization-eligible COMPONENT type (§9.8).
 // `visited` prevents infinite recursion on mutually-referencing eligible records.
+// `forRecordComponent` is true when this component is being checked as a field
+// of a RECORD (positional field or body-record auto-property) rather than a
+// class. §9.8 v0.182: "A record cannot hold a class-typed component in its
+// serialized set at all ... a record's reference-typed fields are always
+// borrows, and a borrow has no position in an owning spanning tree ... The
+// same holds for `Shared<T>`, `Weak<T>`, and interface-typed components: a
+// record declares no owning spanning tree against which an identity
+// participant or a back-edge could resolve." Class-typed and `Shared<T>`/
+// `Weak<T>`-typed components are therefore eligible only when the containing
+// type is a class, never a record (interface-typed components are already
+// unconditionally ineligible below, satisfying the same rule for records).
 static bool isSerializationEligibleType(
         const TypeRef* tr,
-        std::unordered_set<const TypeSymbol*>& visited) {
+        std::unordered_set<const TypeSymbol*>& visited,
+        bool forRecordComponent = false) {
     if (!tr) return false;
     using K = TypeRef::Kind;
     // Nullable T?: eligible when T is eligible (§9.8).
@@ -3483,7 +3495,7 @@ static bool isSerializationEligibleType(
         // Peel the nullable wrapper and check the inner type.
         TypeRef inner = *tr;
         inner.nullable = false;
-        return isSerializationEligibleType(&inner, visited);
+        return isSerializationEligibleType(&inner, visited, forRecordComponent);
     }
     if (tr->kind == K::Primitive) {
         // All primitives except Object are eligible.
@@ -3522,7 +3534,12 @@ static bool isSerializationEligibleType(
         }
         if ((bname == "Shared" || bname == "Weak") &&
             !tr->genericArgs.empty() && tr->genericArgs[0]) {
-            return isSerializationEligibleType(tr->genericArgs[0], visited);
+            // §9.8 v0.182: a record declares no owning spanning tree, so it
+            // cannot hold a `Shared<T>` identity participant or a `Weak<T>`
+            // back-edge — only a class can.
+            if (forRecordComponent) return false;
+            return isSerializationEligibleType(tr->genericArgs[0], visited,
+                                                forRecordComponent);
         }
     }
 
@@ -3559,10 +3576,16 @@ static bool isSerializationEligibleType(
         return true;
     }
 
-    // Class: NOT eligible in tier 1 unless it has a serialized-class clause.
-    // A class without such a clause is not a "serialization-eligible synthesized
-    // class" per §9.8. (Tier 1 scope: tree shape is supported; graph/cyclic not.)
+    // Class: never eligible as a RECORD component (§9.8 v0.182 — a record
+    // declares no owning spanning tree for a class-typed owning edge or
+    // back-edge to resolve against; the synthesized `Deserialize` could not
+    // construct the record without binding a freshly-produced component to a
+    // borrowing field, which §9.7's no-temporary-source rule for
+    // borrow-bearing records rejects). As a CLASS component it is eligible
+    // when it has a serialized-class clause ("serialization-eligible
+    // synthesized class" per §9.8).
     if (ts->kind == ast::TypeDeclKind::Class) {
+        if (forRecordComponent) return false;
         auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
         if (td && td->serializedClass) return true;  // has serialized-class clause
         return false;
@@ -4226,7 +4249,11 @@ void Resolver::checkSerializationEligibility() {
                 if (!pf.type) continue;
                 const TypeRef* tr = ctx_.resolvedType(*pf.type);
                 if (!tr) continue;
-                if (!isSerializationEligibleType(tr, visited)) {
+                // §9.8 v0.182: checked as a RECORD component — class-,
+                // interface-, `Shared<T>`-, and `Weak<T>`-typed fields are
+                // never eligible here, only within a class.
+                if (!isSerializationEligibleType(tr, visited,
+                                                  /*forRecordComponent=*/true)) {
                     reportIneligible(pf.name,
                         "has a type that is not serialization-eligible");
                     foundError = true;
@@ -4260,7 +4287,10 @@ void Resolver::checkSerializationEligibility() {
                 if (!pd->type) continue;
                 const TypeRef* tr = ctx_.resolvedType(*pd->type);
                 if (!tr) continue;
-                if (!isSerializationEligibleType(tr, visited)) {
+                // §9.8 v0.182: checked as a RECORD component (see the
+                // positional-field case above).
+                if (!isSerializationEligibleType(tr, visited,
+                                                  /*forRecordComponent=*/true)) {
                     reportIneligible(m->name,
                         "has a type that is not serialization-eligible");
                     foundError = true;
