@@ -148,9 +148,13 @@ BEZEL_TEST(channel_sender_borrow_return_1493, move_field_return_rejected) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// The legal transfer form remains available: `move _tx` through `: owned
-// ChannelSender<int>` is a clean ownership transfer.
-BEZEL_TEST(channel_sender_borrow_return_1493, move_field_owned_return_clean) {
+// `move _tx` out of a NON-nullable owned field and returning it leaves the
+// field in a moved-from state at method exit with no way to restore it (a
+// non-nullable field cannot be nulled) — §28.8.1 rejects this. The #1493 fix
+// (which is about bare-read *borrow*-returns) does not, and should not, make
+// this clean. (A genuine take-the-field pattern uses a nullable owned field
+// `owned _tx: ChannelSender<int>?` with `_tx := null` after the move.)
+BEZEL_TEST(channel_sender_borrow_return_1493, move_nonnullable_field_return_rejected) {
     auto r = parseAndCheckOwnership(
         "module M; "
         "class Holder "
@@ -161,7 +165,7 @@ BEZEL_TEST(channel_sender_borrow_return_1493, move_field_owned_return_clean) {
         "    return move _tx; "
         "  end TakeTx; "
         "end Holder;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());  // §28.8.1 moved-from field at exit
 }
 
 // A fresh owned producer (a builtin owned-returning call, `Channel<T>.
