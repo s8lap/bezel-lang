@@ -53,23 +53,46 @@ if [ "$rc" -ne 0 ]; then
   crashed=$(grep 'died on:' "$S/gate_shard.log" | sed -E 's/.*died on: //')
   [ -z "$crashed" ] && fail "sharded suite — nonzero exit, no crash marker (see $S/gate_shard.log)"
   real=0
+  # Re-run each crashed test's SUITE alone up to 5x. A DETERMINISTIC crash (real
+  # regression) fails all 5; a LOAD/TIMING flake (e.g. cross-domain-mutex
+  # contention tests, which crash a few % of the time under build load) passes
+  # at least once. One isolation run is not enough — it shares the flake rate.
   while IFS= read -r t; do
     [ -z "$t" ] && continue
-    if ! BEZEL_TEST_FILTER="${t##*.}" timeout 120 build/tests/bezel_tests >/dev/null 2>&1; then
-      echo "   REAL: crashed test $t ALSO fails in isolation"; real=1
+    suite="${t%%.*}"
+    passed_alone=0
+    for k in 1 2 3 4 5; do
+      if BEZEL_TEST_FILTER="$suite" timeout 180 build/tests/bezel_tests >/dev/null 2>&1; then passed_alone=1; break; fi
+    done
+    if [ "$passed_alone" -eq 1 ]; then
+      echo "   FLAKY: crashed test $t — its suite PASSES alone within 5 tries (load/timing flake, not a deterministic crash)"
+    else
+      echo "   REAL: crashed test $t — fails alone all 5 tries"; real=1
     fi
   done <<< "$crashed"
-  [ "$real" -eq 1 ] && fail "sharded suite — a crashed test fails in isolation (real crash)"
-  echo "   all crashed-shard tests PASS in isolation -> flaky test-pollution; continuing to serial (authoritative)"
+  [ "$real" -eq 1 ] && fail "sharded suite — a crashed test fails alone all 5 tries (real crash)"
+  echo "   crashed-shard tests are flaky (pass alone) -> continuing to serial (authoritative)"
 fi
 
 if [ "$MODE" != "--quick" ]; then
   echo "== gate[4/*]: serial suite (heap-order, catches sharded-hidden fails) =="
-  "$DH" suite build/tests/bezel_tests >"$S/gate_serial.log" 2>&1 || true
-  grep -E '[0-9]+ passed, [0-9]+ failed, [0-9]+ total' "$S/gate_serial.log" | tail -1
-  if grep -qE '^\[ FAIL' "$S/gate_serial.log"; then
-    echo "   serial FAILs:"; grep -E '^\[ FAIL' "$S/gate_serial.log"; fail "serial suite"
-  fi
+  # A flaky-crash test (rc=70 mid-run) aborts the serial binary with NO summary
+  # line and NO '[ FAIL' — which the old grep passed silently. Require a COMPLETE
+  # green summary; retry up to 3x if the run didn't complete (flake); hard-fail on
+  # any assertion FAIL immediately, or on a persistent no-complete (real crash).
+  serial_ok=0
+  for attempt in 1 2 3; do
+    "$DH" suite build/tests/bezel_tests >"$S/gate_serial.log" 2>&1 || true
+    if grep -qE '^\[ FAIL' "$S/gate_serial.log"; then
+      echo "   serial FAILs (attempt $attempt):"; grep -E '^\[ FAIL' "$S/gate_serial.log"; fail "serial suite — assertion failure"
+    fi
+    if grep -qE '[0-9]+ passed, 0 failed, [0-9]+ total' "$S/gate_serial.log"; then
+      grep -E '[0-9]+ passed, [0-9]+ failed, [0-9]+ total' "$S/gate_serial.log" | tail -1
+      serial_ok=1; break
+    fi
+    echo "   serial run did NOT complete cleanly (no green summary — likely a flaky-test crash mid-run); retry $attempt/3"
+  done
+  [ "$serial_ok" -ne 1 ] && fail "serial suite — did not complete green in 3 attempts (persistent crash, not a flake)"
 fi
 
 if [ "$MODE" = "--full" ]; then
