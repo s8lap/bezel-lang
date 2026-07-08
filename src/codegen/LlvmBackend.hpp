@@ -35,6 +35,23 @@ struct CodegenOptions {
     // remains readable so the flag check after disposal is well-defined).
     // Default false = unchecked (release) mode: zero extra cost.
     bool checkedDisposal = false;
+
+    // per §33.1/§2.4/§33.6: is this compilation unit the executable's **main
+    // module** — the module named as the build's executable target? Only the
+    // main module's qualifying `Main` (§33.2) is the process entry point: it
+    // alone is lowered to the native `main` symbol (§33.2 signature, i32
+    // return, argc/argv ABI, the propagateBB uncaught-exception boundary,
+    // §22.7 static-ctor bootstrapping). Everywhere else — a library artifact
+    // (§33.6: "a library module has no entry point") and, by construction, any
+    // dependency module (compiled as its own library artifact, §2.5) — a
+    // method named `Main` is an ordinary method and must NOT claim the native
+    // `main` symbol; doing so previously caused a link-time "multiple
+    // definition of `main`" when a dependency happened to also declare a
+    // qualifying `Main` (#1563). Default true: matches every single-module
+    // caller (the executable driver path and the JIT test harnesses, which
+    // always JIT-execute their snippet as if it were the main module). The
+    // driver's library (`-c`) path explicitly sets this false.
+    bool isMainModule = true;
 };
 
 // Build an LLVM module for `src` (already checked, using `ctx`'s side tables),

@@ -230,7 +230,8 @@ public:
         : ctx_(ctx), llvm_(llvmCtx),
           module_(std::make_unique<llvm::Module>("bezel", llvmCtx)),
           builder_(llvmCtx),
-          checkedDisposal_(opts.checkedDisposal) {}
+          checkedDisposal_(opts.checkedDisposal),
+          isMainModule_(opts.isMainModule) {}
 
     std::unique_ptr<llvm::Module> run() {
         // CG8: build every class's instance layout first (so field
@@ -357,6 +358,11 @@ private:
     // disposed-flag test on every instance-member entry; emitDisposeAndReclaim
     // suppresses the heap-free (quarantine) so the flag remains readable.
     bool checkedDisposal_ = false;
+    // per §33.1/§2.4/§33.6 (#1563): true when this compilation unit is the
+    // executable's main module, so a qualifying `Main` (§33.2) is lowered as
+    // the native process entry point. False for a library (`-c`) build — see
+    // CodegenOptions::isMainModule.
+    bool isMainModule_ = true;
     llvm::Function* currentFn_ = nullptr;
     // §9.8 v0.141 / #703: the set of class types whose synthesized Serialize /
     // Deserialize body is currently being INLINE-emitted. Serialization codegen
@@ -1470,8 +1476,15 @@ private:
         return false;
     }
 
-    static bool isMain(sema::MethodSymbol* ms) {
-        return ms->name == "Main" && isStaticMethod(ms);
+    // per §33.1/§2.4 (#1563): a static `Main` is the native process entry
+    // point only when this compilation unit IS the executable's main module
+    // (isMainModule_). In a library build (§33.6: "a library module has no
+    // entry point") — which is also how a dependency module is compiled,
+    // §2.5 — a same-shaped `Main` is an ordinary method: no native `main`
+    // symbol, no argc/argv ABI, no process-boundary unwind handling. Not
+    // `static` (was, pre-#1563) since it now reads instance state.
+    bool isMain(sema::MethodSymbol* ms) const {
+        return isMainModule_ && ms->name == "Main" && isStaticMethod(ms);
     }
 
     static bool isStaticField(const sema::FieldSymbol* fs) {

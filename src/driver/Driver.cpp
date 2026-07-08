@@ -249,7 +249,18 @@ CompileResult Driver::compileObject(const std::string& path,
         // intentionally NOT run here (that is the executable path's concern).
         if (!diagnostics.hasErrors()) {
             llvm::LLVMContext llvmCtx;
-            auto module = codegen::emitModule(*unit, semaCtx, llvmCtx);
+            // per §33.1/§2.4/§33.6 (#1563): this artifact is a library, never
+            // the executable's main module (it is either compiled standalone
+            // as a library or loaded elsewhere as a dependency, §2.5) — a
+            // qualifying `Main` here is an ordinary method, not the native
+            // process entry point. Without this, a class's qualifying `Main`
+            // was unconditionally lowered to the native `main` symbol even in
+            // a library build, so importing this artifact into an executable
+            // that has its own `Main` failed to link with a duplicate
+            // definition of `main`.
+            codegen::CodegenOptions libOpts;
+            libOpts.isMainModule = false;
+            auto module = codegen::emitModule(*unit, semaCtx, llvmCtx, libOpts);
             // §2.6 step 4: embed the public-interface metadata so an importer's
             // loader can read this object's interface (issue #328 inc 1/2/3).
             // §14 / #662c: pass `source` for ctor/dtor body export.
