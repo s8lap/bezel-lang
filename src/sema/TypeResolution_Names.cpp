@@ -633,6 +633,10 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
             if (p.defaultValue) resolveTypesInExpr(*p.defaultValue, &methodScope);
         }
         if (md->returnType) resolveType(*md->returnType, &methodScope);
+        // §22.4 (v0.183, #1585): validate any out-nullability postcondition
+        // against the resolved return/parameter types.
+        checkOutNullPostcond(md->params, md->returnType.get(), &methodScope,
+                             md->span.begin);
         for (const auto& gc : md->genericConstraints) {
             for (const auto& item : gc.items) {
                 if (item.typeArg) resolveType(*item.typeArg, &methodScope);
@@ -664,6 +668,9 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
             if (p.defaultValue) resolveTypesInExpr(*p.defaultValue, &methodScope);
         }
         if (od->returnType) resolveType(*od->returnType, &methodScope);
+        // §22.4 (v0.183, #1585): the postcondition is a method-only feature —
+        // an operator declaration never admits it (returnType passed as null).
+        checkOutNullPostcond(od->params, nullptr, &methodScope, od->span.begin);
         if (od->bodyKind == ast::MethodBodyKind::Block) {
             resolveTypesInBody(od->stmts, &methodScope);
         } else if (od->bodyKind == ast::MethodBodyKind::Expression &&
@@ -683,6 +690,9 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
             // per §17.11 (#1166): resolve a parameter default's inner types.
             if (p.defaultValue) resolveTypesInExpr(*p.defaultValue, &ctorScope);
         }
+        // §22.4 (v0.183, #1585): a constructor is not a bool-returning method,
+        // so any postcondition on its parameters is rejected (null returnType).
+        checkOutNullPostcond(cd->params, nullptr, &ctorScope, cd->span.begin);
         resolveTypesInBody(cd->body, &ctorScope);
     } else if (auto* dd =
                    dynamic_cast<const ast::DestructorDecl*>(&m)) {
@@ -695,6 +705,9 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
             // per §17.11 (#1166): resolve an indexer parameter default's types.
             if (p.defaultValue) resolveTypesInExpr(*p.defaultValue, parent);
         }
+        // §22.4 (v0.183, #1585): an indexer is not a bool-returning method; a
+        // postcondition on an indexer parameter is rejected (null returnType).
+        checkOutNullPostcond(pd->indexerParams, nullptr, parent, pd->span.begin);
         // §23.2/§23.3 (FINDING [4]): resolve types embedded in accessor
         // bodies — `new T()`, LocalDecl `: Type`, etc. — exactly as method
         // bodies are resolved above (line 283). Without this a getter/setter
@@ -833,6 +846,62 @@ void Resolver::checkScopedIsFunctionTyped(const ast::Type* declaredType,
         std::string("`scoped` is valid only on a function-typed ") +
         std::string(what) + " (§22.3, §28.14 v0.175); `" + std::string(name) +
         "` does not have a function type");
+}
+
+// §22.4 (v0.183, #1585): validate the placement of a `when true`/`when false`
+// out-nullability postcondition. It is admitted only on an `out`/`out owned`
+// parameter of nullable type in a bool-returning method; anywhere else is a
+// compile error (A.5 OutNullPostcond / §22.4).
+void Resolver::checkOutNullPostcond(const std::vector<ast::Param>& params,
+                                    const ast::Type* returnType, Scope* scope,
+                                    SourceLocation loc) {
+    // The enclosing method must return `bool`. `returnType` is null in a
+    // non-method context or a void method — in either case the clause is
+    // rejected. Resolve leniently: an already-Error return type stays silent.
+    TypeRef* rt = nullptr;
+    if (returnType) {
+        rt = ctx_.resolvedType(*returnType);
+        if (!rt) rt = resolveType(*returnType, scope);
+    }
+    const bool returnsBool = rt && rt->kind == TypeRef::Kind::Primitive &&
+                             rt->primitive == PrimitiveType::Bool;
+    for (const auto& p : params) {
+        if (p.outNullPostcond == ast::OutNullWhen::None) continue;
+        const std::string clause =
+            p.outNullPostcond == ast::OutNullWhen::WhenTrue ? "when true"
+                                                            : "when false";
+        // Must be `out` or `out owned`.
+        if (p.modifier != "out" && p.modifier != "out owned") {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "a `" + clause +
+                    "` nullability postcondition is admitted only on an `out` "
+                    "or `out owned` parameter (§22.4); `" +
+                    std::string(p.name) + "` is not an out parameter");
+            continue;
+        }
+        // The enclosing method must return `bool`.
+        if (!returnsBool) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "a `" + clause +
+                    "` nullability postcondition is admitted only in a "
+                    "`bool`-returning method (§22.4)");
+        }
+        // The parameter type must be nullable (the false-return path assigns
+        // `null`; the clause narrows away that nullability on the stated
+        // return). Skip an unresolved/Error type to avoid cascading.
+        TypeRef* pt = p.type ? ctx_.resolvedType(*p.type) : nullptr;
+        if (!pt && p.type) pt = resolveType(*p.type, scope);
+        if (pt && pt->kind != TypeRef::Kind::Error && !pt->nullable) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "a `" + clause +
+                    "` nullability postcondition requires a nullable parameter "
+                    "type (§22.4); `" +
+                    std::string(p.name) + "` is non-nullable");
+        }
+    }
 }
 
 std::optional<long long> Resolver::foldIntConstExpr(const ast::Expr& e,

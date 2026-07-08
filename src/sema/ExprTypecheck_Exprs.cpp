@@ -4420,6 +4420,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // nested lambdas.
         bool saveInLambda = inLambda_;
         inLambda_ = true;
+        // §22.4 (v0.183, #1585): a lambda is its own callable — a `return`
+        // inside it never discharges the enclosing method's out-nullability
+        // postcondition. Clear the set for the lambda body and restore after.
+        auto saveOutPostconds = std::move(currentOutPostconds_);
+        currentOutPostconds_.clear();
         currentScope_ = &lamScope;
         returnCtx_ = ReturnCtx::None;
         currentReturnType_ = nullptr;
@@ -4448,6 +4453,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         currentScope_ = saveScope;
         returnCtx_ = saveRet;
         currentReturnType_ = saveRetTy;
+        currentOutPostconds_ = std::move(saveOutPostconds);  // §22.4 (#1585)
         inAsyncContext_ = saveAsync;
         inIteratorMethod_ = saveIter;
         inLambda_ = saveInLambda;

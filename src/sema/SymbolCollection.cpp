@@ -76,6 +76,9 @@ std::vector<Symbol*> collectParams(const std::vector<ast::Param>& params,
         sym->modifier = p.modifier;
         sym->scope = scope;
         sym->declType = p.type.get();
+        // §22.4 (v0.183, #1585): carry the out-nullability postcondition onto
+        // the symbol so narrowing and override-match can consult it.
+        sym->outNullPostcond = p.outNullPostcond;
         out.push_back(sym);
     }
     return out;

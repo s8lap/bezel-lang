@@ -3067,6 +3067,78 @@ bool ExprTC::narrowFromNullTest(const ast::Expr* cond, bool forTrueBranch) {
     return true;
 }
 
+// §22.4 (v0.183, #1585): caller-side narrowing for an out-nullability
+// postcondition. When the condition is a call to a method that declares
+// `when true` / `when false` on an `out`/`out owned` parameter, the out
+// recipient is known non-null in the branch where the call's `bool` result
+// equals the stated constant. Out arguments are positional (§22.5) and an out
+// parameter can never follow an optional parameter (§22.5), so arg[j] maps to
+// param[j] for every out parameter. The call has already been visited, so
+// `ce->callee` resolves to the chosen overload and each out argument's `value`
+// expression carries its recipient symbol.
+bool ExprTC::narrowFromOutPostcond(const ast::Expr* cond, bool forTrueBranch) {
+    auto* ce = dynamic_cast<const ast::CallExpr*>(cond);
+    if (!ce || !ce->callee) return false;
+    auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*ce->callee));
+    if (!ms) return false;
+    bool any = false;
+    for (std::size_t j = 0;
+         j < ms->params.size() && j < ce->args.size(); ++j) {
+        auto* ps = dynamic_cast<ParameterSymbol*>(ms->params[j]);
+        if (!ps || ps->outNullPostcond == ast::OutNullWhen::None) continue;
+        const bool whenTrue =
+            ps->outNullPostcond == ast::OutNullWhen::WhenTrue;
+        if (whenTrue != forTrueBranch) continue;
+        const auto& a = ce->args[j];
+        // Only an out-form argument produces a narrowable recipient. (Guards
+        // against a positional misalignment in an already-erroring program.)
+        if (!(a.modifier == "out" || a.modifier == "out var" ||
+              a.modifier == "out using var" || a.modifier == "out owned var"))
+            continue;
+        if (!a.value) continue;
+        Symbol* recip = ctx_.exprSymbol(*a.value);
+        if (!recip) continue;
+        if (!dynamic_cast<LocalSymbol*>(recip) &&
+            !dynamic_cast<ParameterSymbol*>(recip))
+            continue;
+        nullNarrowed_.insert(recip);
+        any = true;
+    }
+    return any;
+}
+
+// §22.4 (v0.183, #1585): callee-side postcondition check at a return point.
+void ExprTC::checkOutPostcondAtReturn(const ast::Expr* returnValue,
+                                      SourceLocation loc) {
+    if (currentOutPostconds_.empty() || !returnValue) return;
+    // A literal `true`/`false` return value fixes which constant this path
+    // produces; any other expression may produce either.
+    const auto* lit = dynamic_cast<const ast::BoolLiteralExpr*>(returnValue);
+    for (const auto& [psym, whenTrue] : currentOutPostconds_) {
+        // A path that provably returns the OTHER constant carries no obligation
+        // (it typically assigns `null`).
+        if (lit && lit->value != whenTrue) continue;
+        // Apply the §7 facts that hold when the returned expression equals the
+        // stated constant, then require the parameter provably non-null. Save
+        // and restore the flow state so this probe does not leak.
+        auto savedNull = nullNarrowed_;
+        auto savedNarrow = narrowings_;
+        collectNarrowings(returnValue, /*forTrueBranch=*/whenTrue);
+        const bool ok = isKnownNonNull(psym);
+        nullNarrowed_ = std::move(savedNull);
+        narrowings_ = std::move(savedNarrow);
+        if (!ok) {
+            const std::string cst = whenTrue ? "true" : "false";
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "the `out` parameter `" + std::string(psym->name) +
+                    "` must be provably non-null on every path that returns `" +
+                    cst + "` — its `when " + cst +
+                    "` nullability postcondition is not satisfied here (§22.4)");
+        }
+    }
+}
+
 // §12.7: collect every flow-narrowing an `if`/`elif` condition establishes for
 // one branch into narrowings_. A single type test narrows per
 // narrowFromTypeTest; a single null test narrows per narrowFromNullTest (§7.4 /
@@ -3079,6 +3151,10 @@ void ExprTC::collectNarrowings(const ast::Expr* cond, bool forTrueBranch) {
     if (!cond) return;
     if (narrowFromTypeTest(cond, forTrueBranch)) return;
     if (narrowFromNullTest(cond, forTrueBranch)) return;
+    // §22.4 (v0.183, #1585): a `Try`-style call with an out-nullability
+    // postcondition narrows its out recipient on the branch matching the
+    // stated constant.
+    if (narrowFromOutPostcond(cond, forTrueBranch)) return;
     // `and`-joined tests: both sides narrow throughout the combined true
     // branch (§12.7). This does not extend to `or` (where neither side is
     // guaranteed) nor to the else branch of an `and` (De Morgan would make it
@@ -3559,6 +3635,31 @@ void ExprTC::runMethodBody(
     // by a lambda anywhere in THIS body, so a control-transfer operation inside a
     // controlled block can invalidate their narrowing (invalidateCapturedNarrowings).
     computeMutablyCaptured(stmts, exprBody);
+    // §22.4 (v0.183, #1585): collect the body's out-nullability postcondition
+    // params so each `return E;` (and an expression body) can be checked. Only
+    // a bool-returning method carries these (the admittance check in
+    // TypeResolution rejects the clause elsewhere). Saved/restored so a nested
+    // callable body does not inherit this body's obligations.
+    auto savedPostconds = std::move(currentOutPostconds_);
+    currentOutPostconds_.clear();
+    const bool retIsBool =
+        currentReturnType_ &&
+        currentReturnType_->kind == TypeRef::Kind::Primitive &&
+        currentReturnType_->primitive == PrimitiveType::Bool;
+    if (retIsBool && paramSyms) {
+        for (std::size_t i = 0;
+             i < params.size() && i < paramSyms->size(); ++i) {
+            if (params[i].outNullPostcond == ast::OutNullWhen::None) continue;
+            // Only a genuine out parameter carries the obligation; a stray
+            // clause on a non-out parameter is already an admittance error
+            // (TypeResolution), so skip it here rather than cascade.
+            if (params[i].modifier != "out" && params[i].modifier != "out owned")
+                continue;
+            if (auto* ps = dynamic_cast<ParameterSymbol*>((*paramSyms)[i]))
+                currentOutPostconds_.emplace_back(
+                    ps, params[i].outNullPostcond == ast::OutNullWhen::WhenTrue);
+        }
+    }
     // §22.5 (issue #1160): a default-value expression may read parameters
     // appearing EARLIER in the same parameter list; a reference to the
     // parameter itself or to a LATER one is a forward reference that would read
@@ -3589,13 +3690,22 @@ void ExprTC::runMethodBody(
         }
     }
     forbiddenForwardParams_.clear();
-    if (exprBody) visitExpr(*exprBody);
+    if (exprBody) {
+        visitExpr(*exprBody);
+        // §22.4 (v0.183, #1585): the expression body is the returned value; it
+        // must satisfy any out-nullability postcondition. (Realistically an
+        // out-param method has a statement body — an expression body cannot
+        // assign the out param — so this is a conservative belt-and-braces.)
+        checkOutPostcondAtReturn(exprBody, exprBody->span.begin);
+    }
     if (stmts) {
         for (const auto& s : *stmts) {
             if (s) visitStmt(*s);
         }
     }
     currentScope_ = save;
+    // §22.4 (v0.183, #1585): restore the enclosing body's postcondition set.
+    currentOutPostconds_ = std::move(savedPostconds);
 }
 
 void ExprTC::visitMember(const ast::Member& m) {
@@ -4321,6 +4431,9 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         }
         if (rs->value) visitExpr(*rs->value);
         currentLiteralWideningHint_ = savedRetHint;
+        // §22.4 (v0.183, #1585): a `return E;` that may produce a postcondition's
+        // stated constant must leave the out parameter provably non-null.
+        checkOutPostcondAtReturn(rs->value.get(), rs->span.begin);
         // per §31.2: `return` inside a `finally` block is a compile error.
         // Appendix A: "`return` does not appear in `finally` blocks."
         if (finallyDepth_ > 0) {

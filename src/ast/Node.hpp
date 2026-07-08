@@ -350,11 +350,21 @@ struct SerializedClause {
                                     // surrounding quotes).
 };
 
+// §22.4 (v0.183, #1585) A.5 OutNullPostcond ::= "when" ("true" | "false").
+// A nullability postcondition on an `out`/`out owned` parameter of nullable
+// type in a bool-returning method: `when true` states the parameter is
+// non-null whenever the method returns `true` (and `when false`, whenever it
+// returns `false`). Checked in the callee body; consumed by caller narrowing.
+enum class OutNullWhen { None, WhenTrue, WhenFalse };
+
 struct Param {
     std::string_view modifier; // "ref", "out", "out owned", "owned", or empty
     std::string_view name;
     std::unique_ptr<Type> type;
     std::unique_ptr<Expr> defaultValue; // null when no `:= Expr`
+    // §22.4 (v0.183, #1585): the `when true`/`when false` out-nullability
+    // postcondition (A.5 OutNullPostcond), or None when absent.
+    OutNullWhen outNullPostcond = OutNullWhen::None;
     // A.4 PositionalField's SerializedClause. Only populated for record
     // positional fields — other Param uses leave this null.
     std::unique_ptr<SerializedClause> serialized;

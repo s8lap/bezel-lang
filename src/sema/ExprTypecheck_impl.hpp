@@ -588,6 +588,16 @@ private:
     // applied. (issue #418)
     bool narrowFromNullTest(const ast::Expr* cond, bool forTrueBranch);
 
+    // §22.4 (v0.183, #1585) caller-side narrowing: if `cond` is a call to a
+    // method that declares a `when true`/`when false` out-nullability
+    // postcondition, and the requested branch is the one where the result
+    // equals the stated constant, record the out recipient in `nullNarrowed_`
+    // (known non-null). Returns true iff any narrowing was applied. The call
+    // was already visited (so `cond`'s callee resolved and out-recipient
+    // symbols are bound), and the #1188 out-argument invalidation already
+    // cleared the recipient — this re-establishes it on the matching branch.
+    bool narrowFromOutPostcond(const ast::Expr* cond, bool forTrueBranch);
+
     // The resolved declared TypeRef of a local or parameter symbol, or null for
     // any other symbol kind (or when the type is unresolved). Used by
     // null-narrowing to compute the non-nullable form.
@@ -616,6 +626,23 @@ private:
         const std::vector<std::unique_ptr<ast::Stmt>>* stmts,
         const ast::Expr* exprBody,
         const std::vector<Symbol*>* paramSyms);
+
+    // §22.4 (v0.183, #1585) callee-side check: at a point where the body
+    // returns the value `returnValue` (a `return E;` or the expression body of
+    // an expression-bodied method), verify that every out-nullability
+    // postcondition param whose stated constant this path may produce is
+    // provably non-null. Uses §7 narrowing (`collectNarrowings` of the returned
+    // expression) so `return conn <> null;` discharges a `when true` clause and
+    // a path returning the other constant carries no obligation. A no-op unless
+    // the enclosing bool method declares postcondition params.
+    void checkOutPostcondAtReturn(const ast::Expr* returnValue,
+                                  SourceLocation loc);
+    // §22.4 (v0.183, #1585): the out-nullability postcondition params of the
+    // method body currently being walked — (param symbol, whenTrue) pairs.
+    // Populated in `runMethodBody` only for a bool-returning method; cleared
+    // across a nested lambda body so a lambda `return` never discharges the
+    // enclosing method's clause. Saved/restored by `runMethodBody`.
+    std::vector<std::pair<ParameterSymbol*, bool>> currentOutPostconds_;
 
     // §7.4 (v0.182, #1566): recompute `mutablyCapturedNames_` from a method body
     // (its statements and/or expression body). Syntactic full-body scan: records

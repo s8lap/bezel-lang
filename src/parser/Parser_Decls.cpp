@@ -1988,6 +1988,24 @@ std::vector<ast::Param> Parser::parseParamList() {
         if (consumePunctuator(":=")) {
             p.defaultValue = parseExpression();
         }
+        // §22.4 (v0.183, #1585) A.5 `OutNullPostcond ::= "when" ("true" |
+        // "false")`. An out-nullability postcondition directly follows the
+        // parameter's Type. No parse ambiguity: `out` parameters never carry
+        // defaults (§22.5), so at this point the next token is `,`, `)`, or the
+        // `when` clause. Semantic admissibility (out/out-owned nullable param in
+        // a bool-returning method) is checked in TypeResolution.
+        if (consumeKeyword("when")) {
+            if (consumeKeyword("true")) {
+                p.outNullPostcond = ast::OutNullWhen::WhenTrue;
+            } else if (consumeKeyword("false")) {
+                p.outNullPostcond = ast::OutNullWhen::WhenFalse;
+            } else {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected `true` or `false` after `when` in an "
+                    "out-nullability postcondition (§22.4)");
+            }
+        }
         return p;
     };
 

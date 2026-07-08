@@ -246,6 +246,10 @@ struct LocalSymbol : Symbol {
 // they're part of the type's surface.
 struct ParameterSymbol : Symbol {
     std::string_view modifier; // "", "ref", "out", "out owned", "owned"
+    // §22.4 (v0.183, #1585): the `when true`/`when false` out-nullability
+    // postcondition copied from the ast::Param. Consulted by the caller-side
+    // narrowing (collectNarrowings) and the override modifier-match check.
+    ast::OutNullWhen outNullPostcond = ast::OutNullWhen::None;
     // Pointer back to the ast::Type for this parameter (the ast::Param
     // itself isn't a Node, so we hold its `type` pointer directly).
     // Null if the parameter has no declared type (lambda params with

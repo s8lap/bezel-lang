@@ -414,6 +414,16 @@ private:
                                     std::string_view what,
                                     SourceLocation loc);
 
+    // §22.4 (v0.183, #1585): a `when true`/`when false` out-nullability
+    // postcondition is admitted ONLY on an `out`/`out owned` parameter of
+    // nullable type in a bool-returning method. `returnType` is the enclosing
+    // method's declared return type (null for a void method or a non-method
+    // context such as a constructor/operator/indexer, in which the clause is
+    // never admitted). Reports a compile error for every ill-placed clause.
+    void checkOutNullPostcond(const std::vector<ast::Param>& params,
+                              const ast::Type* returnType, Scope* scope,
+                              SourceLocation loc);
+
     // §15.1 (issue #734): fold an inline-array size `N` to a compile-time
     // integer. N must be a compile-time integer expression: integer literals,
     // `const` declarations whose value is itself an int-const expression, and

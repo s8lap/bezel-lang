@@ -1751,6 +1751,13 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
             err("parameter modifiers");
             return;
         }
+        // §22.4 (v0.183, #1585): the out-nullability postcondition is part of
+        // the method's contract like the other parameter modifiers — an
+        // override must repeat it (the §12 modifier-match rule).
+        if (dp->outNullPostcond != bp->outNullPostcond) {
+            err("`when` nullability postcondition");
+            return;
+        }
         TypeRef* dt = dp->declType ? ctx_.resolvedType(*dp->declType)
                                    : nullptr;
         TypeRef* bt = bp->declType ? ctx_.resolvedType(*bp->declType)
