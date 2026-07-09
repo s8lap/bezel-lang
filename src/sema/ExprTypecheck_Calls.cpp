@@ -403,6 +403,27 @@ std::string methodSignatureString(std::string_view name,
     s += ')';
     return s;
 }
+
+// §22.4 / #1303: true when `t` still references one of the method's own type
+// parameters — a bare `T` (or `T?`) or a `T` nested inside a constructed
+// generic's arguments (`Pair<T, U>`) — i.e. the generic out-parameter's
+// declared type was NOT fully substituted at the call site. Used to guard the
+// inline `out var x` re-type so a partially-substituted out param (a type
+// parameter left unbound by inference) is left untouched rather than
+// installing a half-resolved type. Mirrors substituteReturnType's bare-method-
+// type-parameter detection (astNode / importedName single-part head).
+bool containsMethodTypeParam(
+    const TypeRef* t,
+    const std::unordered_set<std::string_view>& gpNames) {
+    if (!t) return false;
+    if (t->kind == TypeRef::Kind::Named && !t->declaration && !gpNames.empty()) {
+        std::string_view head = t->headName();
+        if (!head.empty() && gpNames.count(head)) return true;
+    }
+    for (auto* ga : t->genericArgs)
+        if (containsMethodTypeParam(ga, gpNames)) return true;
+    return false;
+}
 }  // namespace
 
 // §22.6/§12.1 (#1090): collect same-name overloads across the class hierarchy.
@@ -1212,22 +1233,34 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }
             }
         }
-        // §14.2 / §7.10 (#1469): re-type an inline `out var x` that is bound to
-        // a GENERIC method's `out T?` parameter where T is a value type. The
-        // out-var symbol was registered (visitChildren, ExprTypecheck_Exprs.cpp)
-        // from the callee's formal parameter type `T?` with the nullable flag
-        // stripped and the method type parameter LEFT UNRESOLVED (`T`). Stripping
-        // is representationally harmless for a reference type (`C?` and `C` share
-        // the ptr lowering), but for a value type it is wrong: `int?` is a tagged
-        // {i8 hasValue; i32} struct distinct from bare `int`, and codegen sizes
-        // the out slot from the SUBSTITUTED `int?` (a struct), so a local typed
-        // as the unresolved non-nullable `T` desyncs from the slot — the `b = 88`
-        // comparison then lowers as ICmp(struct, i32) and aborts (LLVM "both
-        // operands to ICmp not same type"). Substitute the method type parameter
-        // with the call's type argument and canonicalize the local to the value
-        // type's nullable companion (`int?`) — the exact representation a
-        // directly-declared `int?` carries — so the comparison / interpolation
-        // lowering takes the nullable-value path. Runs regardless of return type
+        // §22.4 / §14.1 (#1469, #1303): re-type an inline `out var x` that is
+        // bound to a GENERIC method's `out` parameter so the local carries the
+        // parameter's SUBSTITUTED type rather than the callee's still-unbound
+        // formal. The out-var symbol was registered (visitChildren,
+        // ExprTypecheck_Exprs.cpp) from the callee's formal parameter type
+        // resolved in the CALLER's scope, where the method's type parameter is
+        // unbound, so the local is left as an unresolved `T` (rendered `?`).
+        // Per §22.4 the inline out-var's type is INFERRED FROM the matched `out`
+        // parameter — at a concrete instantiation that is the substituted type
+        // (`T`→`int`, `T?`→`int?`), with the parameter's declared nullability
+        // preserved. substituteReturnType already carries `T?`'s nullability
+        // through to the substituted type's nullable form, so assigning
+        // `concrete` is correct for every shape:
+        //   - `out T?` value type (`int?`): the tagged {i8 hasValue; i32} struct
+        //     distinct from bare `int`; codegen sizes the slot from the
+        //     substituted `int?`, so a local typed as the unresolved `T`
+        //     desynced from the slot and the `b = 88` comparison lowered as
+        //     ICmp(struct, i32), aborting (LLVM "both operands to ICmp not same
+        //     type") — the original #1469 crash.
+        //   - `out T` non-nullable (`int` / `string`), and `out T?` reference
+        //     type: previously left as `?` because the #1469 re-type only fired
+        //     for nullable VALUE types, so arithmetic / member access on the
+        //     out-var was spuriously rejected (#1303). The runtime value was
+        //     always correct (codegen sizes the slot from the formal parameter
+        //     independent of this sema TypeRef); only the static type was `?`.
+        // A partially-substituted constructed-generic out param (a type param
+        // left unbound by inference) is left untouched via containsMethodTypeParam
+        // so no half-resolved type is installed. Runs regardless of return type
         // (SetIt<T> above has none). The static-interface `T.TryParse` shape
         // (#807) has an empty md->genericParams and is handled separately in
         // ExprTypecheck_Exprs.cpp, so it is untouched here.
@@ -1283,27 +1316,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     }
                 }
                 if (!outSubst.empty()) {
-                    // A value type carries the tagged {i8,T} nullable
-                    // representation (§14.2 / §3): every primitive except the
-                    // reference primitives `string`/`Object`, plus records and
-                    // enums. Reference types keep the harmless stripped form.
-                    auto isNullableValueTy = [](const TypeRef* t) -> bool {
-                        if (!t || !t->nullable) return false;
-                        switch (t->kind) {
-                            case TypeRef::Kind::Primitive:
-                                return t->primitive != PrimitiveType::String &&
-                                       t->primitive != PrimitiveType::Object &&
-                                       t->primitive != PrimitiveType::None;
-                            case TypeRef::Kind::Named:
-                                return t->declaration &&
-                                       (t->declaration->kind ==
-                                            ast::TypeDeclKind::Record ||
-                                        t->declaration->kind ==
-                                            ast::TypeDeclKind::Enum);
-                            default:
-                                return false;
-                        }
-                    };
+                    // The method's own type-parameter names — a fully-resolved
+                    // substituted out type references none of them.
+                    std::unordered_set<std::string_view> gpNames;
+                    for (const auto& gp : md->genericParams)
+                        gpNames.insert(gp.name);
                     std::size_t pos = 0;
                     for (const auto& a : ce.args) {
                         if (a.modifier == "out var" && a.value &&
@@ -1314,8 +1331,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         *md->params[pos].type)) {
                                     TypeRef* concrete =
                                         substituteReturnType(resolved, outSubst);
+                                    // §22.4: assign the substituted type whenever
+                                    // the formal type parameter was actually
+                                    // resolved (concrete != resolved, a pointer
+                                    // inequality — substituteReturnType returns
+                                    // the same pointer when no parameter matched)
+                                    // AND the result no longer references any
+                                    // method type parameter (no half-resolved
+                                    // constructed generic). The parameter's
+                                    // declared nullability is preserved by
+                                    // substituteReturnType, so this neither
+                                    // over-narrows (`T?`→`int?`) nor over-widens
+                                    // (`T`→`int`).
                                     if (concrete && concrete != resolved &&
-                                        isNullableValueTy(concrete))
+                                        !containsMethodTypeParam(concrete, gpNames))
                                         loc->declType = concrete;
                                 }
                             }

@@ -1429,10 +1429,29 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
             // slot from the sema-resolved concrete local type instead.
             slotTy = lowerTypeRef(loc->declType);
         } else if (ms) {
-            auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-            if (md && pos < md->params.size() && md->params[pos].type) {
-                sema::TypeRef* pt = ctx_.resolvedType(*md->params[pos].type);
-                if (pt) slotTy = lowerTypeRef(pt);
+            // §22.4 / #1303: prefer the sema-resolved concrete local type
+            // (loc->declType). For a GENERIC method's `out r: T`, sema
+            // (typeCall, ExprTypecheck_Calls.cpp) resolved the local to the
+            // substituted concrete type (int/string/long/…) via the call's
+            // type argument; the formal parameter type `T` lowers HERE with
+            // the i32 placeholder (genericSubst_ is not active during slot
+            // creation) — correct only for the int instantiation, and WRONG
+            // for a reference type (string → ptr), a wider value type
+            // (long → i64), or a record/enum, sizing the slot undersized so
+            // the specialized callee's write corrupts it (a malformed-IR GEP
+            // on the read-back). For a non-generic method loc->declType is
+            // the parameter's own concrete type, so this is a no-op there.
+            // Fall back to the formal parameter only when sema left the
+            // local untyped (loc == null / declType unset).
+            if (loc && loc->declType) {
+                slotTy = lowerTypeRef(loc->declType);
+            } else {
+                auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+                if (md && pos < md->params.size() && md->params[pos].type) {
+                    sema::TypeRef* pt =
+                        ctx_.resolvedType(*md->params[pos].type);
+                    if (pt) slotTy = lowerTypeRef(pt);
+                }
             }
         } else if (callPrimTy != sema::PrimitiveType::None) {
             using P = sema::PrimitiveType;
