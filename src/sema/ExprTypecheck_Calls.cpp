@@ -7536,9 +7536,23 @@ void ExprTC::resolveExtensionMember(const ast::MemberAccessExpr& ma,
         // the MethodSymbol's decl directly for `x.M(...)`, so this Function
         // type only affects the bare-reference case. No receiver substitution:
         // an extension member is not generic over the receiver in this slice.
+        // §27.6 (#1306): for an EXTENSION method the reference is UNBOUND —
+        // "the resulting function has the receiver as its first parameter" —
+        // so `Vec.Scaled` is `(Vec) -> int`, not `() -> int`. The receiver
+        // (`this`) is implicit (absent from ms->params), so prepend the
+        // extension's target type as the leading function parameter.
         auto* ft = ctx_.makeTypeRef();
         ft->kind = TypeRef::Kind::Function;
         auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        if (ms->extensionDecl && ms->extensionDecl->targetType) {
+            if (auto* recvTy =
+                    ctx_.resolvedType(*ms->extensionDecl->targetType)) {
+                TypeRef::FuncParam recv;
+                recv.type = recvTy;  // by-value for records/primitives; the
+                                     // reference itself for a class receiver
+                ft->funcParams.push_back(recv);
+            }
+        }
         for (auto* psym : ms->params) {
             auto* par = dynamic_cast<ParameterSymbol*>(psym);
             if (!par) continue;

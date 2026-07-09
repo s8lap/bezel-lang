@@ -4384,7 +4384,13 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(e))) {
             llvm::Value* recv = nullptr;
-            if (!isStaticMethod(ms) && ma->target)
+            // §27.6 (#1306): an EXTENSION-method reference is UNBOUND —
+            // `Vec.Scaled` is `(Vec) -> int`, the receiver being the
+            // function's first parameter (supplied by the caller at the
+            // call site, not captured here). ma->target is the extended
+            // TYPE NAME, not an instance, so it must NOT be lowered as a
+            // receiver value (it yields null/garbage → SIGSEGV at the call).
+            if (!isStaticMethod(ms) && !isExtensionMethod(ms) && ma->target)
                 recv = lowerExpr(*ma->target);
             return makeMethodThunk(ms, recv);
         }

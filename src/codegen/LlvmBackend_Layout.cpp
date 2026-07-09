@@ -2136,6 +2136,15 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // statically-resolved origFn). An INTERFACE method has no concrete body /
     // methodFns_ entry, so derive its LLVM signature from methodFnType.
     bool instMethod = !isStaticMethod(ms);
+    // §27.6 (#1306): an EXTENSION-method reference (`Vec.Scaled`) is UNBOUND —
+    // the receiver is the function value's FIRST PARAMETER (supplied by the
+    // caller at the call site), never captured in the env. A class instance
+    // method ref captures `this` from the env; an extension method ref instead
+    // forwards the caller's argument, shaping it to origFn's `this` ABI. So for
+    // env/capture purposes (buildMethodClosureCell, the skipped-`this` arg loop)
+    // it behaves like a static ref — no env, no captured receiver.
+    bool extRef = isExtensionMethod(ms);
+    if (extRef) instMethod = false;
     auto ifaceIt = ifaceMethodIndex_.find(ms);
     auto vtSlotIt = vtableSlot_.find(ms);
     bool dynamicDispatch = instMethod &&
@@ -2159,11 +2168,29 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // Build the thunk's parameter types: (ptr env, user_params...).
     std::vector<llvm::Type*> thunkParamTys;
     thunkParamTys.push_back(ptrTy());  // env_ptr
-    // Skip the leading `this` arg for instance methods
-    // (it comes from env instead).
-    for (std::size_t i = (instMethod ? 1 : 0);
-         i < methTy->getNumParams(); ++i)
-        thunkParamTys.push_back(methTy->getParamType(i));
+    if (extRef) {
+        // §27.6 (#1306): the receiver is the thunk's first USER parameter.
+        // Use the receiver's VALUE representation (lowerType of the extension's
+        // target type) so it matches what the caller passes — for a record that
+        // is the first-class struct value, for a class the object pointer, for a
+        // primitive/enum the value. origFn expects a (possibly differently)
+        // shaped `this` (record → spilled pointer); that shaping happens in the
+        // body below. Then append origFn's explicit params (skip its `this`
+        // arg 0), which already match what the caller passes.
+        if (const ast::Type* tt = ms->extensionDecl
+                ? ms->extensionDecl->targetType.get() : nullptr)
+            thunkParamTys.push_back(lowerType(tt));
+        else
+            thunkParamTys.push_back(ptrTy());
+        for (std::size_t i = 1; i < methTy->getNumParams(); ++i)
+            thunkParamTys.push_back(methTy->getParamType(i));
+    } else {
+        // Skip the leading `this` arg for instance methods
+        // (it comes from env instead).
+        for (std::size_t i = (instMethod ? 1 : 0);
+             i < methTy->getNumParams(); ++i)
+            thunkParamTys.push_back(methTy->getParamType(i));
+    }
     llvm::Type* retTy = methTy->getReturnType();
     auto* thunkFnTy = llvm::FunctionType::get(retTy, thunkParamTys, false);
 
@@ -2201,7 +2228,23 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     std::vector<llvm::Value*> callArgs;
     auto argIt = thunk->args().begin();
     llvm::Value* envPtrArg = &*argIt++;  // env_ptr (arg 0)
-    if (instMethod) {
+    if (extRef) {
+        // §27.6 (#1306): the receiver is the thunk's first user param. Shape it
+        // to origFn's `this` ABI: a RECORD receiver is passed to origFn as a
+        // pointer to a spilled copy (so the body's `this.field` reuses record
+        // field access — §26.1 / #433); the thunk receives the value, so spill
+        // it. Class receivers are already ptr; primitive/enum receivers are by
+        // value and need no shaping. origFn's `this` type is methTy param 0.
+        llvm::Value* recvArg = &*argIt++;
+        llvm::Type* origThisTy = methTy->getParamType(0);
+        if (origThisTy->isPointerTy() && !recvArg->getType()->isPointerTy()) {
+            llvm::AllocaInst* tmp = entryAlloca(recvArg->getType());
+            builder_.CreateStore(recvArg, tmp);
+            callArgs.push_back(tmp);
+        } else {
+            callArgs.push_back(recvArg);
+        }
+    } else if (instMethod) {
         // §26.1 / #457: Load receiver from env with the CORRECT `this` type.
         // For a class/interface/record extension method `this` is a ptr (the
         // env block holds a ptr and we load ptr). For a PRIMITIVE or ENUM
