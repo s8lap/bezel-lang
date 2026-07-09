@@ -2124,43 +2124,32 @@ void bz_ser_exc_vtable_init(void* vtable) {
 // The legacy `ser_exn_vtable` parameter is kept for ABI compatibility but
 // ignored — the global is always used so runtime-internal JSON throws work.
 void bz_ser_throw(const char* msg, void* /*ser_exn_vtable*/) {
-    // fix #688 / §2.15: allocate exception object, bz_string_struct, and message
-    // buffer as a SINGLE contiguous block so that free(exc_obj) — called by the
-    // no-op-Dispose + reclaim path in emitDisposeAndReclaim — frees everything
-    // without a separate per-field free.  Layout (all tightly packed):
-    //   [0]  void*           : vtable pointer
-    //   [8]  void*           : pointer to bz_string_struct (at offset 16)
-    //   [16] bz_string_struct: {data*, len, width, rc} = BZ_STRING_SIZEOF bytes
-    //   [16+BZ_STRING_SIZEOF] char[]: message text (null-terminated)
-    // e.Message codegen GEPs at byte 8 → reads the bz_string* which points
-    // right back into this same block, so Contains/etc work normally.
-    size_t msg_len = msg ? strlen(msg) : 0;
-    // Header: 2 pointers (vtable + str*).
-    static constexpr size_t kHdr   = 2 * sizeof(void*);   // 16 bytes
-    static constexpr size_t kSStr  = sizeof(bz_string_struct);
-    size_t total = kHdr + kSStr + msg_len + 1;
-
-    char* block = static_cast<char*>(malloc(total));
-    memset(block, 0, kHdr + kSStr);  // zero vtable+strptr+string-struct fields
-
-    // Pointer slots.
-    void** exc_obj = reinterpret_cast<void**>(block);
-    exc_obj[0] = bz_ser_exc_vtable;  // vtable
-    exc_obj[1] = block + kHdr;       // → bz_string_struct at [16]
-
-    // bz_string_struct lives at block+kHdr.
-    auto* str = reinterpret_cast<bz_string_struct*>(block + kHdr);
-    // Message text follows the struct.
-    char* buf = block + kHdr + kSStr;
-    if (msg_len > 0) memcpy(buf, msg, msg_len);
-    buf[msg_len] = '\0';
-    str->data  = buf;
-    str->len   = (int64_t)msg_len;
-    str->width = 1;
-    // str->rc is already 0 from memset; bz_str_contains does not touch rc.
+    // §2.15 / #1033: build a SerializationException object (§31.4 layout) with a
+    // PROPERLY REFCOUNTED message. The built-in exception disposer (bz$exDisposeMsg,
+    // vtable slot 2) releases the owned Message@8 via bz_string_release on disposal
+    // (#1033 / §31.1 / §28.9), so the message MUST be a normal refcounted bz_string
+    // (rc = 1, independently-allocated data + header) — exactly like bz_scope_make_ioe
+    // and lowerNew's +1 producer — NOT an rc=0 string packed into the same block.
+    //
+    // The earlier single-contiguous-block design (rc=0 embedded at offset 16) was
+    // crafted for the former NO-OP disposer, where free(exc_obj) reclaimed the whole
+    // block at once. Under the string-releasing disposer that embedded layout
+    // CORRUPTS THE HEAP: bz_string_release sees rc=0 (not the sentinel), decrements
+    // it to -1, and free()s the data pointer AND the header — both interior pointers
+    // into the same block — then emitDisposeAndReclaim free()s the block. That
+    // double-free crashed every deserialization "raises" path (malformed JSON, type
+    // mismatch, unknown field, NaN/Infinity, depth limit, …). The exception object is
+    // now calloc'd (BZ_EXC_OBJ_SIZE, message slot null); the disposer frees the
+    // message, then free(obj) reclaims the exception block — balanced, no leak.
+    void* obj = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
+    memcpy(obj, &bz_ser_exc_vtable, sizeof(void*));  // slot 0 = vtable
+    if (msg) {
+        void* s = bz_make_string(msg, (int64_t)strlen(msg));  // rc = 1 (+1 transfer)
+        memcpy((uint8_t*)obj + 8, &s, sizeof(void*));         // slot 1 = Message@8
+    }
 
     extern thread_local void* bz_exc;
-    bz_exc = block;
+    bz_exc = obj;
 }
 
 // OwningBuffer<byte> helpers --------------------------------------------------
