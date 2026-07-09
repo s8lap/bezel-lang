@@ -107,13 +107,26 @@ if [ "$MODE" = "--full" ]; then
   echo "== gate[5/*]: asan_sweep (disposal/codegen/runtime) =="
   # via dev_heavy suite: the lock is re-entrant, so asan_sweep's inner dev_heavy
   # build does not deadlock; do NOT run asan_sweep bare + a build concurrently.
-  "$DH" suite scripts/asan_sweep.sh >"$S/gate_asan.log" 2>&1 || true
+  "$DH" suite scripts/asan_sweep.sh >"$S/gate_asan.log" 2>&1; asan_rc=$?
+  # asan_sweep exits 2 on configure/build failure. Previously `|| true` masked
+  # that: a failed ASan build leaves no "ERROR: AddressSanitizer" markers, so the
+  # error count below was 0 and the gate FALSE-PASSED having validated nothing.
+  if [ "$asan_rc" -eq 2 ]; then
+    echo "   asan_sweep: build/configure FAILED (exit 2):"; tail -20 "$S/gate_asan.log"; fail "asan_sweep — ASan build failed (validated nothing)"
+  fi
   # Count REAL sanitizer errors — the per-shard summary line is "shard N: X ASan
   # errors", so grepping the substring 'ASan error' false-counts the zero lines.
   # Sum the per-shard counts, and also catch the sanitizer's own error markers.
   errs=$(awk 'match($0,/ASan errors/){for(i=1;i<=NF;i++)if($i=="ASan"){s+=$(i-1)}} END{print s+0}' "$S/gate_asan.log")
   errs=$(( errs + $(grep -cE '(ERROR|SUMMARY): (Address|Leak)Sanitizer|runtime error:|detected memory leaks' "$S/gate_asan.log") ))
-  echo "   ASan shards reported: $(grep -c 'ASan errors' "$S/gate_asan.log")/8, real errors: $errs"
+  shards_reported=$(grep -c 'ASan errors' "$S/gate_asan.log")
+  echo "   ASan shards reported: $shards_reported/8, real errors: $errs"
+  # Enforce that all 8 shards actually ran — fewer means some silently skipped
+  # (partial build failure / crash before reporting), which previously let the
+  # gate pass having validated fewer than the full suite under ASan.
+  if [ "$shards_reported" -ne 8 ]; then
+    echo "   asan_sweep: only $shards_reported/8 shards reported (incomplete sweep):"; tail -20 "$S/gate_asan.log"; fail "asan_sweep — incomplete ($shards_reported/8 shards)"
+  fi
   [ "$errs" -ne 0 ] && { grep -iE 'ERROR: AddressSanitizer|runtime error:|shard [0-9]+: [1-9]' "$S/gate_asan.log" | head; fail "asan_sweep"; }
 fi
 
