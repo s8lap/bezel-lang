@@ -269,6 +269,7 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
             isPunctuator("(")) {
             advance();
             decl->hasPositionalFields = true;
+            const SourceLocation primaryCtorParamListLoc = current_.location;
             if (!isPunctuator(")")) {
                 // Records: PositionalField list (SerializedClause-bearing,
                 // no modifiers, no default). Classes: PrimaryCtorParam list
@@ -277,6 +278,42 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                     (decl->kind == ast::TypeDeclKind::Record)
                         ? parsePositionalFieldList()
                         : parseParamList();
+            }
+            // §22.10 (v0.160 `ref`/`out`; v0.180 `scoped`) / #1594: a primary-
+            // constructor parameter list admits plain and `owned` parameters
+            // only — `ref`/`out` are rejected because a constructor parameter
+            // initializes object state and a by-reference alias or caller-out
+            // slot has no meaning in that role; `scoped` is rejected because
+            // its storage contract (§28.14) needs an explicitly declared
+            // field. The shared Param production over-admits all of these
+            // syntactically (Appendix A.4's over-admit-and-reject-
+            // semantically pattern, used identically by the extern-
+            // declaration `scoped` check above); reject them here. Records
+            // parse through parsePositionalFieldList (no modifiers at all),
+            // so this loop is a no-op for records.
+            if (decl->kind == ast::TypeDeclKind::Class) {
+                for (const auto& p : decl->positionalFields) {
+                    if (p.modifier == "ref" || p.modifier == "out" ||
+                        p.modifier == "out owned") {
+                        diagnostics_.report(
+                            Severity::Error, primaryCtorParamListLoc,
+                            std::string("`") + std::string(p.modifier) +
+                            "` is not permitted on a primary-constructor "
+                            "parameter (§22.10) — a constructor parameter "
+                            "initializes object state, and a by-reference "
+                            "alias or caller-out slot has no meaning in that "
+                            "role; parameter `" + std::string(p.name) + "`");
+                    } else if (p.modifier == "scoped") {
+                        diagnostics_.report(
+                            Severity::Error, primaryCtorParamListLoc,
+                            std::string("`scoped` is not permitted on a "
+                            "primary-constructor parameter (§22.10) — the "
+                            "scoped-storage contract (§28.14) needs an "
+                            "explicitly declared field; use a regular "
+                            "constructor instead; parameter `") +
+                            std::string(p.name) + "`");
+                    }
+                }
             }
             if (!consumePunctuator(")")) {
                 diagnostics_.report(

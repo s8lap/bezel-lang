@@ -3488,6 +3488,14 @@ private:
     // #662 foundation B: for IMPORTED fields (fs->decl == nullptr), the field's
     // type rides ctx_.importedMemberType(fs).
     bool isOwnedBuiltinExceptionField(const sema::FieldSymbol* fs) {
+        // §22.10 (v0.180) / #1594: a captured `owned` primary-ctor parameter
+        // typed as a BUILTIN exception (e.g. `owned e: Exception`, referenced
+        // in a body position). Mirrors isOwnedReferenceField's posParam
+        // branch (#1543); capturedOwnedPrimaryParamType is defined further
+        // below, alongside isCapturedOwnedPrimaryParam — forward-declared use
+        // here is fine since this is a member function of the same class.
+        if (fs->posParam)
+            return isBuiltinExceptionTypeRef(capturedOwnedPrimaryParamType(fs));
         if (!hasOwnedModifier(fs)) return false;
         // #662 foundation B: imported field — type from importedMemberType.
         if (!fs->decl)
@@ -4372,6 +4380,20 @@ private:
                fs->posParamBodyRef && !fs->posParamInitRef;
     }
 
+    // §22.10 (v0.180) / #1594: the resolved declared type of a captured `owned`
+    // primary-ctor parameter (isCapturedOwnedPrimaryParam(fs)), or null when
+    // `fs` isn't one. Its type rides `posParam->type` (fs->decl is the owning
+    // TypeDecl, not a FieldDecl — see isOwnedReferenceField below). Shared by
+    // the Shared<T>/Weak<T>, owning-collection, Subscription, and builtin-
+    // exception owned-field predicates below, mirroring the class/interface
+    // branch isOwnedReferenceField already has (#1543).
+    const sema::TypeRef* capturedOwnedPrimaryParamType(
+        const sema::FieldSymbol* fs) const {
+        if (!isCapturedOwnedPrimaryParam(fs) || !fs->posParam->type)
+            return nullptr;
+        return ctx_.resolvedType(*fs->posParam->type);
+    }
+
     bool isOwnedReferenceField(const sema::FieldSymbol* fs) {
         // §22.10 (v0.180): a captured `owned` primary-ctor parameter. Its type
         // rides `posParam->type` (fs->decl is the owning TypeDecl, not a
@@ -4436,6 +4458,24 @@ private:
     // user types — Shared<T>/Weak<T> are runtime builtins, §2.5/§28.13).
     bool isOwnedSharedWeakField(const sema::FieldSymbol* fs,
                                 bool* isWeak = nullptr) const {
+        // §22.10 (v0.180) / #1594: a captured `owned` primary-ctor parameter of
+        // Shared<T>/Weak<T> type. Mirrors isOwnedReferenceField's posParam
+        // branch (#1543) — Shared/Weak are compiler-known builtins with no
+        // user TypeDecl, so `declaration` is null and the name comes from
+        // astNode (a local field's posParam type is always locally resolved,
+        // never an imported side-table lookup).
+        if (fs->posParam) {
+            const sema::TypeRef* pt = capturedOwnedPrimaryParamType(fs);
+            if (!pt || pt->kind != sema::TypeRef::Kind::Named || pt->declaration)
+                return false;
+            if (!pt->astNode || !pt->astNode->name ||
+                pt->astNode->name->parts.empty())
+                return false;
+            std::string_view n = pt->astNode->name->parts[0];
+            if (n == "Shared") { if (isWeak) *isWeak = false; return true; }
+            if (n == "Weak")   { if (isWeak) *isWeak = true;  return true; }
+            return false;
+        }
         if (!hasOwnedModifier(fs)) return false;
         const sema::TypeRef* rt = nullptr;
         // #662 foundation B: imported field — type from importedMemberType.
@@ -4469,6 +4509,10 @@ private:
     // bz_subscription_dispose (which is null-safe: `if (!subp) return;`), not
     // through the vtable-Dispose path.  This mirrors isOwnedSharedWeakField.
     bool isOwnedSubscriptionField(const sema::FieldSymbol* fs) const {
+        // §22.10 (v0.180) / #1594: a captured `owned` primary-ctor parameter of
+        // Subscription type. Mirrors isOwnedReferenceField's posParam branch
+        // (#1543).
+        if (fs->posParam) return isSubscriptionType(capturedOwnedPrimaryParamType(fs));
         if (!hasOwnedModifier(fs)) return false;
         const sema::TypeRef* rt = nullptr;
         if (!fs->decl) {
@@ -4495,6 +4539,20 @@ private:
     // name-detection logic), so the same predicates work for imported fields once
     // the TypeRef is obtained from the correct source.
     const sema::TypeRef* ownedCollectionFieldType(const sema::FieldSymbol* fs) {
+        // §22.10 (v0.180) / #1594: a captured `owned` primary-ctor parameter
+        // of a concretely-typed owning-collection (e.g. `owned v: OwningArray
+        // <Cell>`). Mirrors isOwnedReferenceField's posParam branch (#1543).
+        // Unlike the FieldDecl path below, no type-PARAMETER substitution
+        // resolution is attempted here (a bare `owned v: T` captured param
+        // where T substitutes to a collection is the generic-param case,
+        // tracked separately — #1594 piece 1, not a double-free either way).
+        if (fs->posParam) {
+            const sema::TypeRef* rt = capturedOwnedPrimaryParamType(fs);
+            if (isCollectionTypeName(rt)) return rt;
+            if (isLinkedListTypeName(rt)) return rt;
+            if (isDictTypeName(rt)) return rt;
+            return nullptr;
+        }
         if (!hasOwnedModifier(fs)) return nullptr;
         const sema::TypeRef* rt = nullptr;
         // #662 foundation B: imported field — type from importedMemberType.

@@ -4820,11 +4820,55 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                            t->declaration->kind == ast::TypeDeclKind::Class &&
                            !t->declaration->isValueBuiltin) {
                     for (TypeSymbol* cur = t->declaration; cur && !reject;) {
-                        for (Symbol* m : cur->members)
+                        for (Symbol* m : cur->members) {
                             if (dynamic_cast<DestructorSymbol*>(m)) {
                                 reject = true;
                                 break;
                             }
+                            // §21.9 / §3.6 / #1594: non-trivial-dispose is not
+                            // just "has a user destructor" — a class carrying
+                            // ANY `owned` storage member is non-trivial-dispose
+                            // too (§28.9's derived-property computation), since
+                            // its generated Dispose() must run to release that
+                            // member. Without this, a class whose only
+                            // disposal obligation is an `owned` field (declared,
+                            // or a captured `owned` primary-ctor parameter,
+                            // §22.10 v0.180) was misclassified trivial-dispose:
+                            // the bare-statement codegen path
+                            // (LlvmBackend_Stmts.cpp ExpressionStmt) never calls
+                            // Dispose() for a bare-statement discard, so the
+                            // owned member genuinely leaked with zero
+                            // diagnostics. Mirrors codegen's
+                            // isCapturedOwnedPrimaryParam (LlvmBackend_impl.hpp)
+                            // for the posParam case; sema has no access to that
+                            // codegen predicate, so the equivalent check is
+                            // reproduced here directly on the FieldSymbol.
+                            auto* fs = dynamic_cast<FieldSymbol*>(m);
+                            if (!fs) continue;
+                            if (fs->posParam) {
+                                if (fs->parent &&
+                                    fs->parent->kind ==
+                                        ast::TypeDeclKind::Class &&
+                                    fs->posParam->modifier == "owned" &&
+                                    fs->posParamBodyRef &&
+                                    !fs->posParamInitRef) {
+                                    reject = true;
+                                    break;
+                                }
+                                continue;
+                            }
+                            // A `static owned` field (§22.12 rule 4) is
+                            // disposed at process-exit order (§22.13), not by
+                            // this instance's Dispose() — exclude it, or a
+                            // class whose only `owned` member is static would
+                            // be wrongly classified non-trivial-dispose here.
+                            bool isStatic = false, isOwned = false;
+                            for (auto mod : fs->modifiers) {
+                                if (mod == "static") isStatic = true;
+                                if (mod == "owned") isOwned = true;
+                            }
+                            if (isOwned && !isStatic) { reject = true; break; }
+                        }
                         TypeSymbol* nextBase = nullptr;
                         for (TypeSymbol* b : cur->baseTypes)
                             if (b && b->kind == ast::TypeDeclKind::Class) {
