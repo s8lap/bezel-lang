@@ -1004,6 +1004,11 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         asyncResultTy_ = nullptr;
         asyncResultSemaType_ = nullptr;
         asyncPatternAResultDisposer_ = nullptr;
+        // Clear the published owned-param frame ref so it does not dangle after
+        // emitAsyncMethod returns — asyncOwnedParamFrame_ must be null outside an
+        // emitting async method (the fault-boundary handler null-guards it; §30.1).
+        // #1521.
+        asyncOwnedParamFrame_ = nullptr;
     }
 }
 
