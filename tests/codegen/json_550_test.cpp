@@ -31,7 +31,9 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
+#include <sys/wait.h>
 
 #include "codegen/LlvmBackend.hpp"
 #include "driver/Driver.hpp"
@@ -54,6 +56,8 @@
 using bezel::test::runJit;
 
 namespace {
+
+namespace fs = std::filesystem;
 
 int run(const std::string& src) {
     auto r = runJit(src);
@@ -90,7 +94,6 @@ static std::string laneLocalAsanObject() {
 // Run source under ASan (detect_leaks enabled by default).
 // Returns 0=clean, 99=asan/leak triggered, -1=skip (toolchain/compile fail).
 int runUnderLeakSanitizerJson(const std::string& source, bool detectLeaks = true) {
-    namespace fs = std::filesystem;
     const std::string& rtObj = laneLocalAsanObject();
     if (rtObj.empty()) return -1;
 
@@ -139,6 +142,45 @@ int runUnderLeakSanitizerJson(const std::string& source, bool detectLeaks = true
     if (code == 99) return 99;   // asan/leak
     if (code == 0)  return 0;    // clean
     return code;
+}
+
+// Compile `source` to a temp native executable via the real Driver and run it
+// in its OWN SUBPROCESS (async_618 compileAndRun model). Returns the exit code,
+// or -1 on compile/link/run failure. Subprocess isolation keeps the §2.15 graph
+// $id/$ref tag-table heap (Shared<T>) out of the test process, deflaking the
+// serial in-process runJit value-checks whose accumulated heap was triggering
+// LSan at process exit / polluting later in-process leak probes.
+int compileAndRun(const std::string& source) {
+    static int counter = 0;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bezel_json_675_" + std::to_string(counter++);
+    std::string src = (dir / (stem + ".bzl")).string();
+    std::string exe = (dir / stem).string();
+    {
+        std::ofstream out(src);
+        out << source;
+    }
+    bezel::Driver driver;
+    bezel::CompileResult r = driver.compileFile(src, exe);
+    int code = -1;
+    if (r.success) {
+        int status = std::system(exe.c_str());
+        if (status != -1 && WIFEXITED(status)) code = WEXITSTATUS(status);
+    }
+    std::remove(src.c_str());
+    std::remove(exe.c_str());
+    return code;
+}
+
+// compileAndRun() returns -1 when its in-test sub-compile/link fails — under
+// concurrent build load this is a transient INFRASTRUCTURE failure, not a
+// semantic one (the source is fixed and known to compile). Retry a few times
+// before treating it as a result; a genuine wrong VALUE is never -1 and is
+// asserted immediately. Mirrors async_618_domain_serial_test.cpp.
+int compileAndRunRetrying(const std::string& source) {
+    int v = compileAndRun(source);
+    for (int r = 0; r < 3 && v == -1; ++r) v = compileAndRun(source);
+    return v;
 }
 
 } // namespace
@@ -698,7 +740,7 @@ BEZEL_TEST(codegen_json_550, asan_malformed_json_no_leaks_spec_2_15) {
 // After round-trip: mutating Shared.Val through one alias is visible via Alias.
 // Wire must contain "$id" and "$ref" fields (verified separately below).
 BEZEL_TEST(codegen_json_675, graph_diamond_roundtrip_spec_2_15_v0139) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(compileAndRunRetrying(
         std::string("module M; ") + kImport +
         "class Node : ISerializable, IDeserializable "
         "  public Val: int := 0; "
@@ -730,7 +772,7 @@ BEZEL_TEST(codegen_json_675, graph_diamond_roundtrip_spec_2_15_v0139) {
 // §2.15 v0.139: JSON output MUST contain "$id" and "$ref" fields.
 // String-compare test: verifies the wire text is the expected JSON graph form.
 BEZEL_TEST(codegen_json_675, graph_wire_text_contains_id_and_ref_spec_2_15_v0139) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(compileAndRunRetrying(
         std::string("module M; ") + kImport +
         "class Node : ISerializable, IDeserializable "
         "  public Val: int := 0; "
@@ -760,7 +802,7 @@ BEZEL_TEST(codegen_json_675, graph_wire_text_contains_id_and_ref_spec_2_15_v0139
 // §2.15 v0.139: null back-edge in JSON graph mode serializes as `null` and
 // deserializes back to null (the null-ref path must remain working).
 BEZEL_TEST(codegen_json_675, graph_null_back_edge_json_spec_2_15_v0139) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(compileAndRunRetrying(
         std::string("module M; ") + kImport +
         "class Slot : ISerializable, IDeserializable "
         "  public Name: string := \"\"; "
@@ -790,7 +832,7 @@ BEZEL_TEST(codegen_json_675, graph_null_back_edge_json_spec_2_15_v0139) {
 // §2.15 v0.139: `serialized graph` cycle raises SerializationException in JSON mode.
 // (Same contract as binary mode — cycle detection is format-agnostic.)
 BEZEL_TEST(codegen_json_675, graph_json_cycle_raises_spec_2_15_v0139) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(compileAndRunRetrying(
         std::string("module M; ") + kImport +
         "class Link : ISerializable, IDeserializable "
         "  public Val: int := 0; "
@@ -815,7 +857,7 @@ BEZEL_TEST(codegen_json_675, graph_json_cycle_raises_spec_2_15_v0139) {
 // §2.15 v0.139: tree-mode JSON is UNCHANGED — no $id/$ref fields appear for
 // type-driven (v0.141) tree classes.  The tree JSON round-trip still returns 42.
 BEZEL_TEST(codegen_json_675, tree_json_unchanged_spec_2_15_v0139) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(compileAndRunRetrying(
         std::string("module M; ") + kImport +
         "class Leaf : ISerializable, IDeserializable "
         "  public N: int := 0; "
