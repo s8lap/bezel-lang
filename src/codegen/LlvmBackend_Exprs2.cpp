@@ -2366,6 +2366,17 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 if (!ne.args.empty() && ne.args[0].value) {
                     llvm::Value* msgStr = lowerExpr(*ne.args[0].value);
                     if (msgStr) {
+                        // §31.1 / §28.9 (#1033): the exception OWNS its Message.
+                        // A +1 producer (interpolation / `+` / slice / ToString)
+                        // TRANSFERS its single reference into the slot (no
+                        // retain); a BORROW initializer (literal / local / field
+                        // / call) is RETAINED so the slot owns an independent
+                        // +1 — mirroring lowerStringFieldStore. The +1 is
+                        // released by the built-in exception disposer
+                        // (bz$exDisposeMsg) on disposal; before this the +1
+                        // from `new Exception($"...")` leaked (#1033).
+                        if (!isPlusOneStringProducer(ne.args[0].value.get()))
+                            emitStringRetain(msgStr);
                         llvm::Value* msgSlot = builder_.CreateGEP(
                             i8Ty2, obj, builder_.getInt64(kExcMsgOffset));
                         builder_.CreateStore(msgStr, msgSlot);
@@ -2383,6 +2394,11 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     if (argIsString) {
                         llvm::Value* pn = lowerExpr(*ne.args[1].value);
                         if (pn) {
+                            // §31.1 / §28.9 (#1033): ParamName is an owned
+                            // string slot, same retain/transfer model as the
+                            // Message above (released by bz$exDisposeMsg).
+                            if (!isPlusOneStringProducer(ne.args[1].value.get()))
+                                emitStringRetain(pn);
                             llvm::Value* pnSlot = builder_.CreateGEP(
                                 i8Ty2, obj, builder_.getInt64(kExcParamOffset));
                             builder_.CreateStore(pn, pnSlot);

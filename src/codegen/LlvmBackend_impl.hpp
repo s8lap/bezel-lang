@@ -1108,8 +1108,17 @@ private:
     // no user TypeSymbol). A shared no-op Dispose serves all of them.
     std::unordered_map<std::string, llvm::GlobalVariable*> builtinDesc_;
     std::unordered_map<std::string, llvm::GlobalVariable*> builtinVtable_;
-    // Shared no-op Dispose for built-in exceptions AND every value-type box.
+    // Shared no-op Dispose for every value-type box (record / primitive / span
+    // box, §8.6). Built-in exceptions used to share this; #1033 gave them their
+    // own string-releasing disposer (builtinExceptionDisposeFn_).
     llvm::Function* builtinDisposeFn_ = nullptr;
+    // #1033 / §31.1 / §28.9: Dispose for built-in exceptions ONLY — releases
+    // the owned Message@8 (and ParamName@32) string slots, then NULLs them so a
+    // repeated dispatch (explicit .Dispose() + scope-end, the §28.6 split) is a
+    // no-op. Value-type boxes keep the no-op builtinDisposeFn_ (they carry no
+    // string at offset 8); this disposer is wired only into the built-in
+    // exception vtables (slot 2).
+    llvm::Function* builtinExceptionDisposeFn_ = nullptr;
 
     // CG30: computed integer value of each enum constant (§10).
     std::unordered_map<const sema::Symbol*, std::int64_t> enumValue_;

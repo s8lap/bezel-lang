@@ -239,8 +239,8 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // It has no user TypeSymbol (so isOwnedReferenceField rejects it),
             // but it is an ordinary owned heap class instance and is disposed
             // through the same dynamic-dispatch path as a class field below
-            // (vtable slot 2 is the shared no-op bz$exDispose; the block is
-            // reclaimed, the runtime-managed message string is not freed).
+            // (vtable slot 2 = bz$exDisposeMsg, which #1033 made release the
+            // owned Message/ParamName strings before the block is reclaimed).
             owned.push_back({fs, nullptr});
         } else if (const sema::TypeRef* ct = ownedCollectionFieldType(fs)) {
             owned.push_back({fs, ct});

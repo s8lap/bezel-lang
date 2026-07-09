@@ -2324,23 +2324,74 @@ void Emitter::setupBuiltinExceptions() {
         dispTy, llvm::Function::InternalLinkage, "bz$exDispose",
         module_.get());
     {
-        // The SHARED no-op disposer for built-in exceptions AND every value-type
-        // box (record / primitive / span box, §8.6). It stays a pure no-op: a
-        // built-in exception owns nothing that its Dispose must free.
+        // The SHARED no-op disposer for every VALUE-TYPE box (record / primitive
+        // / span box, §8.6) — a box owns nothing its Dispose must free. Built-in
+        // EXCEPTIONS used to share this no-op too, but #1033 (§31.1 / §28.9)
+        // gave them their own disposer that releases the owned Message string
+        // (see builtinExceptionDisposeFn_ below); boxes still use this no-op
+        // because they carry no string at offset 8.
         //
         // §31.4/#811 note: the CauseChain snapshot a `(message, cause)` exception
-        // holds is NOT freed here. An exception object has several disposal /
-        // reclaim paths (catch-arm dispose, scope-end dispose, and the async
-        // fault-propagation free in bz$async$*$Resume), and they are not a single
-        // idempotent site — a Dispose that read/free'd CauseChain@24 double-freed
-        // it (and read freed memory) on the async path. So the CauseChain is left
-        // to be reclaimed by process exit, exactly like the runtime-owned
-        // TypeInitializationException.InnerException (§22.13, above). This is a
-        // small, bounded leak confined to a caught-and-disposed exception that was
-        // constructed WITH a cause; tracked as a follow-up.
+        // holds is NOT freed (in either disposer). An exception object has
+        // several disposal / reclaim paths (catch-arm dispose, scope-end dispose,
+        // and the async fault-propagation free in bz$async$*$Resume), and they
+        // are not a single idempotent site — a Dispose that read/free'd
+        // CauseChain@24 double-freed it (and read freed memory) on the async
+        // path. So the CauseChain is left to be reclaimed by process exit, like
+        // the runtime-owned TypeInitializationException.InnerException (§22.13).
+        // This is a small, bounded leak confined to a caught-and-disposed
+        // exception constructed WITH a cause; tracked as a follow-up. (The
+        // Message/ParamName strings DO get the slot-null idempotency guard
+        // below, so they are safe to release where CauseChain is not.)
         auto* bb = llvm::BasicBlock::Create(llvm_, "entry",
                                             builtinDisposeFn_);
         llvm::IRBuilder<> b(bb);
+        b.CreateRetVoid();
+    }
+
+    // #1033 / §31.1 / §28.9: the built-in exception's OWN disposer. A built-in
+    // exception OWNS its Message string (§31.4 `readonly property Message:
+    // string`), and ArgumentException owns its ParamName. Per §28.9 a class
+    // string field holds an INDEPENDENT +1 (retained/transferred at the store
+    // site in the construction path, LlvmBackend_Exprs2.cpp), released exactly
+    // once on disposal — mirroring the class string-field disposal loop
+    // (LlvmBackend_Disposal.cpp). Before this, `new Exception($"...")` stored
+    // the +1 interpolation result into the slot but nothing ever released it,
+    // so every `throw new Exception(<fresh string>)` leaked the message (#1033).
+    //
+    // The release is null-safe and a no-op on a sentinel/literal
+    // (bz_string_release), so a guard-thrown exception (calloc'd, null slots)
+    // and a literal-message exception (sentinel) dispose cleanly. After
+    // releasing, NULL the slot so a repeated dispatch (explicit .Dispose() +
+    // scope-end, the §28.6 split, or the DomainFaulted wrap that disposes the
+    // original then re-uses its retained message copy) finds null and skips —
+    // the same #396 slot-null precedent the class string-field loop uses.
+    builtinExceptionDisposeFn_ = llvm::Function::Create(
+        dispTy, llvm::Function::InternalLinkage, "bz$exDisposeMsg",
+        module_.get());
+    {
+        auto* bb = llvm::BasicBlock::Create(
+            llvm_, "entry", builtinExceptionDisposeFn_);
+        llvm::IRBuilder<> b(bb);
+        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+        llvm::Value* excObj = builtinExceptionDisposeFn_->arg_begin();
+        auto* relFn = declareC("bz_string_release",
+                               llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        // Release Message@kExcMsgOffset, then null the slot.
+        llvm::Value* msgSlot = b.CreateGEP(
+            i8Ty, excObj, b.getInt64(kExcMsgOffset), "ex.msg.slot");
+        llvm::Value* msg = b.CreateLoad(ptrTy(), msgSlot, "ex.msg");
+        b.CreateCall(relFn, {msg});
+        b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), msgSlot);
+        // Release ParamName@kExcParamOffset (ArgumentException; null for every
+        // other built-in → no-op), then null the slot.
+        llvm::Value* pnSlot = b.CreateGEP(
+            i8Ty, excObj, b.getInt64(kExcParamOffset), "ex.param.slot");
+        llvm::Value* pn = b.CreateLoad(ptrTy(), pnSlot, "ex.param");
+        b.CreateCall(relFn, {pn});
+        b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pnSlot);
+        // CauseChain@kExcCauseOffset is intentionally NOT touched — see the
+        // #811 note in the no-op disposer's comment above.
         b.CreateRetVoid();
     }
 
@@ -2412,7 +2463,7 @@ void Emitter::setupBuiltinExceptions() {
         std::vector<llvm::Constant*> v = {
             builtinDesc_[name],
             llvm::ConstantExpr::getPointerCast(emptyItmap, ptrTy()),
-            builtinDisposeFn_,
+            builtinExceptionDisposeFn_,
             tsThunk
         };
         auto* arrTy = llvm::ArrayType::get(ptrTy(), v.size());
