@@ -2953,6 +2953,16 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         auto* bodyBB = llvm::BasicBlock::Create(llvm_, "rfv.body", currentFn_);
         auto* incBB  = llvm::BasicBlock::Create(llvm_, "rfv.inc",  currentFn_);
         auto* endBB  = llvm::BasicBlock::Create(llvm_, "rfv.end",  currentFn_);
+        // §16.4 (v0.183, #1623): a computed step of zero raises ArgumentException
+        // at GetEnumerator time. The compiler-optimized counted loop bypasses the
+        // IEnumerable protocol (§16.5 "Compiler optimization") and must keep
+        // observable behavior identical, so replicate the check here — otherwise a
+        // step-0 Range variable enters a counted loop that never advances (the
+        // induction adds 0) and hangs. A stepless range stores step=1 (see the
+        // RangeExpr-in-value-position lowering), so this only fires for an explicit
+        // computed step-0.
+        emitGuardThrow(builder_.CreateICmpEQ(step, builder_.getInt32(0), "rfv.step0"),
+                       "ArgumentException");
         builder_.CreateBr(condBB);
 
         builder_.SetInsertPoint(condBB);
@@ -3020,6 +3030,15 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
             // above (previously this case bailed to the "not implemented" catch-all).
             if (s->getType() != lo->getType())
                 s = builder_.CreateSExtOrTrunc(s, lo->getType());
+            // §16.4 (v0.183, #1623): a computed step of zero raises ArgumentException
+            // at GetEnumerator time. The constant-step-0 case is handled above
+            // (cs && cs->isZero()); a RUNTIME step-0 reaches here and must raise
+            // instead of entering the counted loop, which would add 0 forever and
+            // hang. The optimized counted loop must keep GetEnumerator's observable
+            // behavior (§16.5 "Compiler optimization").
+            emitGuardThrow(builder_.CreateICmpEQ(
+                               s, llvm::ConstantInt::get(lo->getType(), 0), "rf.step0"),
+                           "ArgumentException");
             llvm::Value* stepNeg = builder_.CreateICmpSLT(
                 s, llvm::ConstantInt::get(lo->getType(), 0), "rf.desc");
             // #1243 §21.4: hidden counter + body-visible var (per rfv path above).
