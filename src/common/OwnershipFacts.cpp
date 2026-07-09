@@ -2,6 +2,7 @@
 #include "common/BuiltinRegistry.hpp"
 
 #include <string_view>
+#include <unordered_set>
 
 #include "ast/Node.hpp"
 #include "sema/SemaContext.hpp"
@@ -260,6 +261,121 @@ bool staticFactoryReturnsFreshOwned(const ast::MethodDecl& md,
                                      allFresh);
     }
     return sawReturn && allFresh;
+}
+
+namespace {
+
+// The three TypeRef name fallbacks shared by the builtin-type matchers
+// (mirrors MethodOwnership's own `builtinTypeRefNameHead`,
+// Ownership_Checks.cpp — that copy is a private `namespace {}`-local helper
+// with no free-function form to share, so this scoped duplicate exists only
+// so `isBorrowBearingRecordOrSpan` below can name a Named TypeRef's builtin
+// head without depending on the ownership pass, which is a layer ABOVE
+// common/): builtin TypeSymbol declaration name, annotation AST name,
+// imported name.
+std::string_view borrowSpanNameHead(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return {};
+    if (rt->declaration) return rt->declaration->name;
+    if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty())
+        return rt->headName();
+    return rt->importedName;
+}
+
+// Mirrors MethodOwnership::isBorrowableType (Ownership_Checks.cpp), used here
+// only for the InlineArray element-type leg of `isBorrowBearingRecordCommon`'s
+// local `fieldIsBorrowCarrying` field classification below — true when `rt`
+// is a class/interface reference (the only element kind an inline-array
+// field can hold that itself carries a borrow).
+bool isReferenceTypeForRecordField(const sema::TypeRef* rt) {
+    if (!rt) return true;  // unknown → conservative
+    switch (rt->kind) {
+        case sema::TypeRef::Kind::Primitive:
+        case sema::TypeRef::Kind::Function:
+            return false;
+        case sema::TypeRef::Kind::Named:
+            if (!rt->declaration) return false;  // generic param
+            if (rt->declaration->isValueBuiltin) return false;
+            return rt->declaration->kind == ast::TypeDeclKind::Class ||
+                   rt->declaration->kind == ast::TypeDeclKind::Interface;
+        case sema::TypeRef::Kind::Error:
+            return true;  // unresolved → conservative
+        default:
+            return false;  // Unit, InlineArray, enum, record
+    }
+}
+
+// §9.7: true when `rt` is itself a borrow-bearing record (recursion target of
+// the field walk below) — mirrors MethodOwnership::isBorrowBearingRecordImpl
+// (Ownership_Checks.cpp) exactly, so the declaration-site and instantiation-
+// site checks classify identically (#1595). `seen` is the #1611 cycle guard
+// for a self- or mutually-referential STATIC field.
+bool isBorrowBearingRecordCommon(const sema::TypeRef* rt,
+                                 const sema::SemaContext& ctx,
+                                 std::unordered_set<const ast::TypeDecl*>& seen) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return false;
+    const auto* decl =
+        dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
+    if (!decl || decl->kind != ast::TypeDeclKind::Record) return false;
+    if (!seen.insert(decl).second) return false;
+
+    auto fieldIsBorrowCarrying = [&](const sema::TypeRef* ft) -> bool {
+        if (!ft) return false;
+        switch (ft->kind) {
+            case sema::TypeRef::Kind::Named: {
+                if (!ft->declaration) return false;  // generic param
+                if (ft->declaration->isValueBuiltin) return false;
+                if (ft->declaration->kind == ast::TypeDeclKind::Class ||
+                    ft->declaration->kind == ast::TypeDeclKind::Interface)
+                    return true;
+                if (ft->declaration->kind == ast::TypeDeclKind::Record)
+                    return isBorrowBearingRecordCommon(ft, ctx, seen);
+                return false;  // enum
+            }
+            case sema::TypeRef::Kind::InlineArray:
+                return ft->arrayElement && !ft->arrayOwned &&
+                       isReferenceTypeForRecordField(ft->arrayElement);
+            default:
+                return false;  // Primitive, Unit, Function, Error
+        }
+    };
+
+    // Positional record fields (§9.1) — never static, so no exclusion needed.
+    for (const ast::Param& f : decl->positionalFields) {
+        if (!f.type) continue;
+        if (fieldIsBorrowCarrying(ctx.resolvedType(*f.type))) return true;
+    }
+    // Body-record reference fields (§9.2); static fields are per-TYPE storage
+    // and excluded (mirrors Resolver::recordValueContainsSelf's own exclusion).
+    for (const auto& m : decl->members) {
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get())) {
+            bool isStatic = false;
+            for (std::string_view mod : fd->modifiers)
+                if (mod == "static") { isStatic = true; break; }
+            if (isStatic) continue;
+            if (fd->type && fieldIsBorrowCarrying(ctx.resolvedType(*fd->type)))
+                return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt,
+                                 const sema::SemaContext& ctx) {
+    if (!rt) return false;
+    // Builtin span VIEWS carry a borrow of their backing Array/OwningBuffer
+    // but have no user Record TypeDecl, so the record walk below misses them.
+    // CancellationToken (§30.8) is a value builtin with no Record decl and is
+    // not in this list — correctly not flagged; likewise the string-backed
+    // spans (runtime-managed `string`, §9.7).
+    const std::string_view n = borrowSpanNameHead(rt);
+    if (n == "Span" || n == "ReadOnlySpan" ||
+        n == "ArraySpan" || n == "ReadOnlyArraySpan")
+        return true;
+    std::unordered_set<const ast::TypeDecl*> seen;
+    return isBorrowBearingRecordCommon(rt, ctx, seen);
 }
 
 }  // namespace bezel::common

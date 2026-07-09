@@ -116,4 +116,31 @@ bool staticFactoryReturnsFreshOwned(const ast::MethodDecl& md,
                                     const sema::SemaContext& ctx,
                                     const TypeParamResolver& resolveParam);
 
+// §30.1 / §9.7 (v0.179, #1438; re-applied post-substitution at a generic
+// method's INSTANTIATION site, #1595): true when `rt` is a borrow-bearing
+// record — a user record (§9.7) carrying at least one borrow-carrying field
+// (a class/interface reference field, an inline array of reference
+// elements, or, transitively, another borrow-bearing record) — OR a builtin
+// span VIEW over an `Array`/`OwningBuffer` (`Span`/`ReadOnlySpan`, stdlib
+// §4.14; `ArraySpan`/`ReadOnlyArraySpan`, stdlib §4.15), which carries a
+// borrow of its backing reference-typed store but has no user Record
+// TypeDecl. `CancellationToken` (§30.8, the single stdlib-certified
+// exception) and the string-backed spans (`ReadOnlyStringSpan` /
+// `ReadOnlyAsciiByteSpan`, over the runtime-managed `string`) are correctly
+// excluded.
+//
+// Two consumers need the IDENTICAL predicate: the async-signature
+// DECLARATION-site check (`MethodOwnership::checkAsyncSignatureBorrowBearing`,
+// ownership pass) sees only the unsubstituted method type parameter `T` and
+// cannot reject an instantiation that later binds `T` to a borrow-bearing
+// type; the INSTANTIATION-site re-check §30.1 requires ("for a generic
+// async method the check is re-applied after substitution, so an
+// instantiation whose type argument makes a parameter borrow-bearing is
+// rejected at the instantiation site") runs at each call site
+// (`ExprTypecheck_Calls.cpp`, #1595) against the SUBSTITUTED parameter/
+// result type. Living here (rather than duplicated in each pass) keeps the
+// two checks from drifting apart.
+bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt,
+                                 const sema::SemaContext& ctx);
+
 }  // namespace bezel::common

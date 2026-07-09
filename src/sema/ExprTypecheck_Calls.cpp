@@ -2,6 +2,7 @@
 
 #include <algorithm>  // std::find (isCaptureFreeEntry's static-modifier check)
 
+#include "common/OwnershipFacts.hpp"  // isBorrowBearingRecordOrSpan (§30.1, #1595)
 #include "sema/TypeResolution.hpp"  // typeRefEqual, overrideParamTypeMatches
 
 namespace bezel::sema {
@@ -1599,6 +1600,84 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                         }
                     };
+                // §30.1 (v0.179, #1438; re-applied at the instantiation site,
+                // #1595): "for a generic async method the check is re-applied
+                // after substitution, so an instantiation whose type argument
+                // makes a parameter borrow-bearing is rejected at the
+                // instantiation site." The DECLARATION-site check
+                // (MethodOwnership::checkAsyncSignatureBorrowBearing,
+                // ownership pass) runs once on the method's unsubstituted
+                // body and sees only the bare method type parameter `T` — it
+                // cannot know whether some future call binds `T` to a
+                // borrow-bearing record or span. This re-applies the SAME
+                // predicate (common::isBorrowBearingRecordOrSpan) to each
+                // parameter's and the result's type, substituted with THIS
+                // call's concrete type argument(s), so the instantiation that
+                // makes the shape unsound is rejected exactly where it is
+                // introduced. No-op for a non-`async` method or an empty
+                // `subst` (nothing to substitute against). // per §30.1
+                auto checkAsyncInstantiationBorrowBearing =
+                    [&](const std::unordered_map<std::string_view,
+                                                 TypeRef*>& subst) {
+                        if (subst.empty()) return;
+                        bool isAsync = false;
+                        for (std::string_view mod : md->modifiers)
+                            if (mod == "async") { isAsync = true; break; }
+                        if (!isAsync) return;
+                        for (const ast::Param& p : md->params) {
+                            if (!p.type) continue;
+                            TypeRef* declTy = ctx_.resolvedType(*p.type);
+                            if (!declTy) continue;
+                            TypeRef* subTy = substituteReturnType(declTy, subst);
+                            if (subTy == declTy) continue;  // T not bound here
+                            if (!common::isBorrowBearingRecordOrSpan(subTy, ctx_))
+                                continue;
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                "instantiating `async` method `" +
+                                std::string(md->name) + "` with this type "
+                                "argument makes parameter `" +
+                                std::string(p.name) + "` borrow-bearing — a "
+                                "span, or a record carrying a non-runtime-"
+                                "managed borrow, may not be a parameter of an "
+                                "`async` method: it is captured into the heap "
+                                "state-machine frame that outlives the "
+                                "synchronous call, so the borrow's source is "
+                                "bounded by no stack frame (§30.1, re-checked "
+                                "at the instantiation site)");
+                        }
+                        // Result/element type: the single generic argument of
+                        // the declared async return type (`T` of `Task<T>` /
+                        // `OwningTask<T>`, or an async-iterator's element
+                        // type). `Task` (unit) has none and is unaffected.
+                        if (md->returnType &&
+                            !md->returnType->genericArgs.empty()) {
+                            const ast::Type* resultNode =
+                                md->returnType->genericArgs.front().get();
+                            TypeRef* declResult =
+                                resultNode ? ctx_.resolvedType(*resultNode)
+                                          : nullptr;
+                            if (declResult) {
+                                TypeRef* subResult =
+                                    substituteReturnType(declResult, subst);
+                                if (subResult != declResult &&
+                                    common::isBorrowBearingRecordOrSpan(
+                                        subResult, ctx_))
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        "instantiating `async` method `" +
+                                        std::string(md->name) + "` with this "
+                                        "type argument makes its result "
+                                        "borrow-bearing — a span, or a record "
+                                        "carrying a non-runtime-managed "
+                                        "borrow, may not be an `async` "
+                                        "method's result: it would escape the "
+                                        "state-machine frame with no bounded "
+                                        "source (§30.1, re-checked at the "
+                                        "instantiation site)");
+                            }
+                        }
+                    };
                 bool hadExplicitTypeArgs = false;
                 if (!md->genericParams.empty()) {
                     // per §14.1 (issue #509/#561) + §7.5/§1278: explicit type
@@ -1647,6 +1726,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // argument-inferred check below is suppressed.
                         hadExplicitTypeArgs = true;
                         checkMethodGenericConstraints(explicitSubst);
+                        // §30.1 / #1595: re-check async borrow-bearing
+                        // signature rules against the EXPLICIT type args.
+                        checkAsyncInstantiationBorrowBearing(explicitSubst);
                         // Apply substitution: substituteReturnType handles
                         // both bare-param returns (e.g. `T` → concrete T)
                         // and compound returns (e.g. `Array<T>` → `Array<int>`).
@@ -1801,8 +1883,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // #729: enforce the method's where-constraints on the
                     // argument-inferred type args (only when no explicit type
                     // args were given — else the explicit check already ran).
-                    if (!hadExplicitTypeArgs)
+                    if (!hadExplicitTypeArgs) {
                         checkMethodGenericConstraints(argSubst);
+                        // §30.1 / #1595: re-check async borrow-bearing
+                        // signature rules against the ARGUMENT-INFERRED type
+                        // args (only when no explicit type args were given —
+                        // the explicit-args check above already ran).
+                        checkAsyncInstantiationBorrowBearing(argSubst);
+                    }
                     // Apply substitution to the (possibly compound) return type.
                     if (!argSubst.empty())
                         rt = substituteReturnType(rt, argSubst);
