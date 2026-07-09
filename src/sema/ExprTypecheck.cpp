@@ -1635,17 +1635,39 @@ TypeRef* ExprTC::catchArmNcb(
     // list (which captures built-in bases missing from the TypeSymbol chain).
     // Stops at built-in TypeRefs (declaration==nullptr), which have no AST
     // TypeDecl to walk further.
+    //
+    // §31.2.1 (NCB) — TERMINATION (#1624): the visited-set MUST gate the base
+    // WALK, not only the result set. The base-type graph can contain cycles
+    // that survive into sema via error recovery (an erroneous `class A: B;
+    // class B: A` is reported by the §12 cycle check but still reaches this
+    // walk during catch-arm binding); if a revisited node re-pushes its bases,
+    // the walk loops forever. A node is "visited" the first time its name
+    // (logical type identity) is seen; empty-name nodes (synthetic/built-in
+    // TypeRefs without a resolvable name) are deduped by TypeRef pointer. A
+    // hard iteration cap is kept as defense-in-depth so a malformed generic
+    // cycle can never make the NCB computation unbounded.
     auto collectAncestors =
         [&](TypeRef* ty) -> std::vector<std::pair<std::string_view, TypeRef*>> {
         std::vector<std::pair<std::string_view, TypeRef*>> result;
-        std::unordered_set<std::string_view> seen;
+        std::unordered_set<std::string_view> seenName;
+        std::unordered_set<const TypeRef*> seenPtr;  // empty-name nodes
         std::vector<TypeRef*> queue{ty};
+        const std::size_t kMaxWalk = 8192;  // defensive bound; ancestor sets are shallow
+        std::size_t walked = 0;
         while (!queue.empty()) {
+            if (++walked > kMaxWalk) break;  // §31.2.1 NCB must terminate
             TypeRef* cur = queue.back();
             queue.pop_back();
             if (!cur || cur->kind != TypeRef::Kind::Named) continue;
             std::string_view curName = namedRefName(cur);
-            if (!curName.empty() && seen.insert(curName).second)
+            // Cycle guard: a node is fresh only the first time it is seen, and
+            // the guard gates the base walk below — a revisit continues WITHOUT
+            // re-pushing bases, so a base-type cycle cannot loop forever.
+            bool fresh = !curName.empty()
+                ? seenName.insert(curName).second
+                : seenPtr.insert(cur).second;
+            if (!fresh) continue;
+            if (!curName.empty())
                 result.emplace_back(curName, cur);
             if (cur->declaration) {
                 // Visit TypeSymbol base-type refs (user-declared bases with
@@ -5707,6 +5729,24 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // is the nearest common base (NCB) of all listed types; for a
                 // single-type arm it is the type itself.
                 TypeRef* ncb = catchArmNcb(arm.types);
+                // per §31.2.1 (v0.182): when a multi-type BINDING arm's listed
+                // types share no common base more specific than the implicit
+                // root `Object` (catchArmNcb finds no shared ancestor — only
+                // possible for the multi-type case, since a single listed type
+                // always resolves via the size==1 shortcut), the binding form is
+                // a compile error: `Object` gives the bound name no usable
+                // surface and collides with §31.1's rejection of `Object`-typed
+                // throw operands. The non-binding form (`T1 | T2` with no `var`)
+                // needs no common type and is unrestricted — this caller is
+                // already guarded by `arm.hasBinding`.
+                if (!ncb && arm.types.size() > 1) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, arm.types[0]->span.begin,
+                        "a multi-type `catch` arm that binds a name must list "
+                        "types sharing a common base class more specific than "
+                        "`Object` (§31.2.1) — split into separate arms, or drop "
+                        "the binding");
+                }
                 bnd->declType = ncb ? ncb : ctx_.resolvedType(*arm.types[0]);
                 armScope.names[arm.varName] = bnd;
             }
