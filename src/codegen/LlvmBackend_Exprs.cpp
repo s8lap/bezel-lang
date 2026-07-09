@@ -4384,13 +4384,16 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(e))) {
             llvm::Value* recv = nullptr;
-            // §27.6 (#1306): an EXTENSION-method reference is UNBOUND —
-            // `Vec.Scaled` is `(Vec) -> int`, the receiver being the
-            // function's first parameter (supplied by the caller at the
-            // call site, not captured here). ma->target is the extended
-            // TYPE NAME, not an instance, so it must NOT be lowered as a
-            // receiver value (it yields null/garbage → SIGSEGV at the call).
-            if (!isStaticMethod(ms) && !isExtensionMethod(ms) && ma->target)
+            // §27.6 (#1306 rework): an extension-method reference is EITHER
+            // unbound (`Vec.Scaled`, type-name qualifier — the receiver is the
+            // function's first parameter, §27.6) or bound (`x.Double`, instance
+            // qualifier — the receiver is captured, #457). For a type-name
+            // qualifier, lowerExpr yields null (no value to lower); for an
+            // instance qualifier, it yields the receiver value. makeMethodThunk
+            // uses the null-vs-value distinction to route the two cases:
+            // extRef = isExtensionMethod && !receiverVal. So lower the target
+            // uniformly for every non-static method ref.
+            if (!isStaticMethod(ms) && ma->target)
                 recv = lowerExpr(*ma->target);
             return makeMethodThunk(ms, recv);
         }

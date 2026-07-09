@@ -2136,14 +2136,15 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // statically-resolved origFn). An INTERFACE method has no concrete body /
     // methodFns_ entry, so derive its LLVM signature from methodFnType.
     bool instMethod = !isStaticMethod(ms);
-    // §27.6 (#1306): an EXTENSION-method reference (`Vec.Scaled`) is UNBOUND —
-    // the receiver is the function value's FIRST PARAMETER (supplied by the
-    // caller at the call site), never captured in the env. A class instance
-    // method ref captures `this` from the env; an extension method ref instead
-    // forwards the caller's argument, shaping it to origFn's `this` ABI. So for
-    // env/capture purposes (buildMethodClosureCell, the skipped-`this` arg loop)
-    // it behaves like a static ref — no env, no captured receiver.
-    bool extRef = isExtensionMethod(ms);
+    // §27.6 (#1306): an UNBOUND extension-method reference (`Vec.Scaled`) has
+    // the receiver as the function value's FIRST PARAMETER (supplied by the
+    // caller at the call site), never captured in the env. A BOUND extension-
+    // method reference (`x.Double`) captures the instance like any instance-
+    // method ref (#457). The two are distinguished by whether the caller
+    // lowered a receiver: a type-name qualifier yields a null receiverVal
+    // (lowerExpr on a bare type name returns null), an instance qualifier
+    // yields the value. So extRef is true ONLY for the unbound case.
+    bool extRef = isExtensionMethod(ms) && !receiverVal;
     if (extRef) instMethod = false;
     auto ifaceIt = ifaceMethodIndex_.find(ms);
     auto vtSlotIt = vtableSlot_.find(ms);
@@ -2162,7 +2163,7 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // receiver-independent (it loads `this` from env), so one thunk per method
     // is correct. On a cache hit skip re-emitting the body and go straight to
     // building a fresh closure cell with the current receiver.
-    if (auto cit = methodThunks_.find(ms); cit != methodThunks_.end())
+    if (auto cit = methodThunks_.find({ms, extRef}); cit != methodThunks_.end())
         return buildMethodClosureCell(cit->second, instMethod, receiverVal);
 
     // Build the thunk's parameter types: (ptr env, user_params...).
@@ -2319,7 +2320,7 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
 
     // #1170 / §24.4: cache the thunk so subsequent references to this method
     // (e.g. the `-=` matching an earlier `+=`) reuse the SAME fn pointer.
-    methodThunks_[ms] = thunk;
+    methodThunks_[{ms, extRef}] = thunk;
 
     return buildMethodClosureCell(thunk, instMethod, receiverVal);
 }

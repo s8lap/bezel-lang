@@ -7536,15 +7536,26 @@ void ExprTC::resolveExtensionMember(const ast::MemberAccessExpr& ma,
         // the MethodSymbol's decl directly for `x.M(...)`, so this Function
         // type only affects the bare-reference case. No receiver substitution:
         // an extension member is not generic over the receiver in this slice.
-        // §27.6 (#1306): for an EXTENSION method the reference is UNBOUND —
-        // "the resulting function has the receiver as its first parameter" —
-        // so `Vec.Scaled` is `(Vec) -> int`, not `() -> int`. The receiver
-        // (`this`) is implicit (absent from ms->params), so prepend the
-        // extension's target type as the leading function parameter.
+        // §27.6 (#1306): for an UNBOUND extension-method reference (type-name
+        // qualifier, e.g. `Vec.Scaled`), "the resulting function has the
+        // receiver as its first parameter" — so `Vec.Scaled` is `(Vec) -> int`.
+        // For a BOUND reference (instance qualifier, e.g. `x.Double`), the
+        // receiver is captured (#457), so the type is `() -> T` (no receiver
+        // parameter). Detect the type-name qualifier via its exprSymbol: a type
+        // name resolves to a TypeSymbol; an instance resolves to a value symbol
+        // (LocalSymbol/ParameterSymbol). The receiver (`this`) is implicit
+        // (absent from ms->params), so prepend the extension's target type as
+        // the leading function parameter ONLY for the unbound case.
         auto* ft = ctx_.makeTypeRef();
         ft->kind = TypeRef::Kind::Function;
         auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-        if (ms->extensionDecl && ms->extensionDecl->targetType) {
+        bool unboundExtRef = false;
+        if (ms->extensionDecl && ma.target) {
+            if (auto* tgtSym = ctx_.exprSymbol(*ma.target))
+                unboundExtRef = dynamic_cast<TypeSymbol*>(tgtSym) != nullptr;
+        }
+        if (unboundExtRef && ms->extensionDecl &&
+            ms->extensionDecl->targetType) {
             if (auto* recvTy =
                     ctx_.resolvedType(*ms->extensionDecl->targetType)) {
                 TypeRef::FuncParam recv;

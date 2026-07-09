@@ -456,7 +456,11 @@ private:
     // thunk body is receiver-independent (it loads `this` from the env block),
     // so a single thunk per method is correct; the per-conversion receiver
     // lives in the freshly-allocated env, never in the shared thunk.
-    std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodThunks_;
+    // §27.6 (#1306 rework): keyed by {method, isUnboundExtRef} so a BOUND
+    // (`x.M`, receiver captured) and an UNBOUND (`T.M`, receiver is the first
+    // parameter) reference to the same extension method cache DISTINCT thunks
+    // (they have different signatures).
+    std::map<std::pair<sema::MethodSymbol*, bool>, llvm::Function*> methodThunks_;
     // §27.7.1 (v0.180, #1544): cached property-getter-reference thunk per
     // property symbol — the SAME #1170 stability reasoning as methodThunks_
     // above, applied to a property used as a function value (§27.6, `var f:
