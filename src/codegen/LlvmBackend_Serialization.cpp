@@ -790,6 +790,34 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
         recSeenFlags.push_back({i, components[i].declName, sf});
     }
 
+    // §9.8 / #1635 leak-safety: the per-iteration field-name string returned by
+    // bz_binder_read_field_name must be released even when a nested
+    // emitDeserializeField throws (its emitThrowBuiltin calls emitUnwindDisposals
+    // which sweeps ALL disposeStack_ entries, including this one). This mirrors
+    // emitClassDeserialize's namePtrSlot (see below / the class path). Strategy:
+    // keep one `namePtrSlot` alloca (null-initialized) holding the current
+    // iteration's namePtr, registered as a stringRelease disposal so
+    // emitUnwindDisposals releases it on the throw path. On the normal match/skip
+    // path, after the explicit bz_string_release(namePtr), we null the slot to
+    // prevent the disposal from double-releasing. Per §9.8/§28. Without this the
+    // field name read just before a throwing value read (e.g. JSON type mismatch)
+    // leaks — the #1635 defect.
+    //
+    // fix #669: null-init MUST be in the entry block (emitRecordDeserialize can
+    // be called from inside a conditional branch). See emitClassDeserialize's
+    // namePtrSlot for the full rationale.
+    llvm::AllocaInst* namePtrSlot = entryAlloca(ptrTy());
+    {
+        llvm::BasicBlock& eb = currentFn_->getEntryBlock();
+        llvm::IRBuilder<> eb_b(&eb, std::next(namePtrSlot->getIterator()));
+        eb_b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), namePtrSlot);
+    }
+    if (!disposeStack_.empty()) {
+        Disposal nd{namePtrSlot, nullptr};
+        nd.stringRelease = true;
+        disposeStack_.back().push_back(nd);
+    }
+
     // BeginObject → read field count.
     auto* beginFn = declareC("bz_binder_begin_object", i32(), {ptrTy()});
     llvm::Value* fieldCount = builder_.CreateCall(beginFn, {derPtr}, "deser.count");
@@ -819,6 +847,10 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     llvm::Value* namePtr = builder_.CreateCall(readNameFn, {derPtr}, "deser.fname");
     // §2.15: bz_binder_read_field_name can throw (JSON: malformed input).
     emitPendingCheck();
+    // §9.8 / #1635: record the live namePtr so emitUnwindDisposals can release
+    // it if a nested emitDeserializeField throws before the normal match/skip
+    // release below. (null-safe: a null namePtr stored here is a no-op release.)
+    builder_.CreateStore(namePtr, namePtrSlot);
 
     // Dispatch: compare namePtr against each component's wire name.
     // Use bz_string_compare (runtime ordinal comparison) to test equality.
@@ -886,6 +918,9 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
         // Release namePtr (bz_string_release).
         auto* relFn = declareC("bz_string_release", voidTy, {ptrTy()});
         builder_.CreateCall(relFn, {namePtr});
+        // §9.8 / #1635: null the slot so the stringRelease disposal doesn't
+        // double-release on the normal path (or at scope-end disposal).
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), namePtrSlot);
         builder_.CreateBr(afterBB);
 
         builder_.SetInsertPoint(nextBB);
@@ -901,6 +936,9 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     // Release namePtr.
     auto* relFn2 = declareC("bz_string_release", voidTy, {ptrTy()});
     builder_.CreateCall(relFn2, {namePtr});
+    // §9.8 / #1635: null the slot so the stringRelease disposal doesn't
+    // double-release on the normal path (or at scope-end disposal).
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), namePtrSlot);
     builder_.CreateBr(afterBB);
 
     builder_.SetInsertPoint(afterBB);
