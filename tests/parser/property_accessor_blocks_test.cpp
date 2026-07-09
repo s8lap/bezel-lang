@@ -23,6 +23,22 @@
 using bezel::test::memberSummaries;
 using bezel::test::parseAll;
 
+namespace {
+
+// Return true when any error diagnostic reports the SetterParamSpec
+// ParamMod rejection (§A.4, v0.180).
+bool hasSetterModifierRejection(const bezel::test::ParseResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("not a valid setter parameter modifier") !=
+                std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+} // namespace
+
 BEZEL_TEST(parser_property_accessor, getter_only_expression_body) {
     auto r = parseAll(
         "module M; class C "
@@ -208,4 +224,67 @@ BEZEL_TEST(parser_property_accessor, expression_body_still_works) {
         BEZEL_EXPECT_EQ(
             ms[0], std::string("public property X: int => 0"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §A.4 ParamMod (v0.180): `ParamMod ::= "owned"` — the setter's value
+// parameter is always an input, so the `ref`/`out` spellings never had
+// semantics here and no longer parse. Design Rationale v0.180 migration
+// notes: "ref/out in a setter parameter spec become compile errors."
+BEZEL_TEST(parser_property_accessor, setter_ref_modifier_rejected) {
+    auto r = parseAll(
+        "module M; class C "
+        "public property X: Resource "
+        "  set(ref) => Take(value); "
+        "end X; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasSetterModifierRejection(r));
+}
+
+BEZEL_TEST(parser_property_accessor, setter_ref_modifier_with_name_rejected) {
+    auto r = parseAll(
+        "module M; class C "
+        "public property X: Resource "
+        "  set(ref newVal) => Take(newVal); "
+        "end X; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasSetterModifierRejection(r));
+}
+
+BEZEL_TEST(parser_property_accessor, setter_out_modifier_rejected) {
+    auto r = parseAll(
+        "module M; class C "
+        "public property X: Resource "
+        "  set(out) => Take(value); "
+        "end X; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasSetterModifierRejection(r));
+}
+
+BEZEL_TEST(parser_property_accessor, setter_out_owned_modifier_rejected) {
+    // The pre-v0.180 grammar additionally admitted a compound `out owned`
+    // spelling; both tokens of that compound are rejected the same way.
+    auto r = parseAll(
+        "module M; class C "
+        "public property X: Resource "
+        "  set(out owned) => Take(value); "
+        "end X; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasSetterModifierRejection(r));
+}
+
+BEZEL_TEST(parser_property_accessor, indexer_setter_ref_modifier_rejected) {
+    // Same rejection applies to indexer setters, which reuse PropertyBody.
+    auto r = parseAll(
+        "module M; class C "
+        "public property[i: int]: Resource "
+        "  get => Lookup(i); "
+        "  set(ref) => Store(i, value); "
+        "end; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasSetterModifierRejection(r));
 }

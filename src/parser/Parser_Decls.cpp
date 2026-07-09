@@ -1497,15 +1497,22 @@ ast::PropertyAccessor Parser::parsePropertyAccessor() {
     acc.isSet = (current_.text == "set");
     advance();
     if (acc.isSet && consumePunctuator("(")) {
-        // SetterParamSpec ::= "(" ParamMod? Identifier? ")".
+        // SetterParamSpec ::= "(" ParamMod? Identifier? ")"; ParamMod ::= "owned".
+        // The setter's value parameter is always an input, so the `ref`/`out`
+        // spellings never had semantics here and no longer parse (§A.4
+        // ParamMod, v0.180 — Design Rationale v0.180 migration notes: "ref/out
+        // in a setter parameter spec become compile errors").
         acc.hasSetterParamSpec = true;
-        if (consumeKeyword("ref")) {
-            acc.setterParamMod = "ref";
-        } else if (consumeKeyword("out")) {
+        if (isKeyword("ref") || isKeyword("out")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                std::string("'") + std::string(current_.text) +
+                "' is not a valid setter parameter modifier; only 'owned' "
+                "is permitted (the setter's value parameter is always an "
+                "input)");
+            advance();
             if (consumeKeyword("owned")) {
-                acc.setterParamMod = "out owned";
-            } else {
-                acc.setterParamMod = "out";
+                acc.setterParamMod = "owned";
             }
         } else if (consumeKeyword("owned")) {
             acc.setterParamMod = "owned";

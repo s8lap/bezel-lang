@@ -141,6 +141,29 @@ BEZEL_TEST(static_borrow_return_1547, static_field_read_stays_accepted) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// §28.3 producers table (v0.180), #1546 conformance batch: a static method
+// returning its own STATIC PROPERTY getter — not merely a static field, the
+// shape `static_field_read_stays_accepted` above covers — is the row this
+// file's #1547 fix was written to satisfy but did not separately exercise:
+// "Static property access `T.P` (class-typed result) | Borrowed (source:
+// the declaring type's static storage — process-lived, so every
+// intra-program liveness constraint is satisfied; static state is disposed
+// only at program exit, §22.13)." A property getter is ordinarily a
+// borrow-producing call sourced from ITS receiver (the "Property access
+// (instance getter)" row immediately above this one in the same table), but
+// for a STATIC property there is no receiver — the source is the declaring
+// type's process-lived static storage instead, exactly as for a static
+// field — so the static-method return must stay accepted.
+BEZEL_TEST(static_borrow_return_1547, static_property_read_stays_accepted) {
+    auto r = parseAndCheckOwnership(mod(
+        "class Holder "
+        "  private static readonly _shared: Res := new Res(); "
+        "  public static property Shared: Res => _shared; "
+        "  public static method Get(): Res => Holder.Shared; "
+        "end Holder;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // --- ACCEPT: instance-method receiver-sourced returns are a separate,
 //     still-legal form and must not regress. ---
 

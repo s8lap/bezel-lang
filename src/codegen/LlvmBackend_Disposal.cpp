@@ -145,9 +145,41 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
         builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
                              emitExcSlot());
         emittingDisposerBody_ = true;
-        terminated = lowerScopedBlock(dd->body);
+        // fix #1546 / §28.4 (v0.180 throwing-destructor defined behavior):
+        // "Before it propagates, the remaining steps of the generated
+        // Dispose() still run: the remaining owned-field disposals ...
+        // and the base-class chain complete, and physical reclamation
+        // still occurs." Without a local redirect, a `throw` (or a
+        // propagating call) directly inside the destructor body branches
+        // straight to this function's unwindBB()/propagateBB() — which,
+        // for a non-`main` function, is an immediate `ret void` — skipping
+        // every step below. Install a local unwind target for the body
+        // only: a throw inside it lands in dtorThrewBB (after
+        // emitThrowValue / emitPendingCheck has already stored the new
+        // exception into bz_exc and run any unwind disposals the body's
+        // OWN scopes need — e.g. a `using var` inside the destructor),
+        // which then falls into the SAME post-body cleanup used for
+        // normal completion, so the field cascade / base chain / reclaim
+        // run on the throwing path exactly as on the non-throwing one.
+        // (An early `return;` inside the body is a separate, pre-existing
+        // deferred corner — see the comment below — unaffected by this.)
+        llvm::BasicBlock* savedUnwindTarget = unwindTarget_;
+        auto* dtorThrewBB =
+            llvm::BasicBlock::Create(llvm_, "dtor.threw", fn);
+        unwindTarget_ = dtorThrewBB;
+        bool bodyFellThrough = !lowerScopedBlock(dd->body);
+        unwindTarget_ = savedUnwindTarget;
         emittingDisposerBody_ = false;
         disposerEntryExc_ = nullptr;
+        if (bodyFellThrough) {
+            // Normal completion (no throw reached dtorThrewBB on this
+            // path): join with any throwing path via the same cleanup
+            // block below instead of running the shared cleanup twice.
+            builder_.CreateBr(dtorThrewBB);
+        }
+        builder_.SetInsertPoint(dtorThrewBB);
+        terminated = false;  // fall through into the shared cleanup below,
+                              // on BOTH the thrown and the fell-through path
     }
     // §28.4: after the destructor body, dispose owned fields (reverse
     // declaration order), then chain to the base class's CORE disposer.
