@@ -6018,6 +6018,15 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // the outer's value must survive the nested specialization untouched.
     llvm::Function* savedAsyncPatternAResultDisposer =
         asyncPatternAResultDisposer_;
+    // §30.1 (#1521): same nested-emission hazard as asyncPatternAResultDisposer_
+    // above — emitAsyncMethod (called below for a specialized plain async method)
+    // both publishes and clears this field itself around its OWN emission, but a
+    // specialization built mid-emission of an OUTER async method's Resume body
+    // must not lose the outer's frame pointer across the nested call, nor must
+    // the nested emission see the OUTER frame while smStateStruct_/smSelf_ are
+    // reset to the specialization's own (different) frame — reset to null below
+    // alongside the other SM scalars.
+    const StateMachineFrame* savedAsyncOwnedParamFrame = asyncOwnedParamFrame_;
     auto savedSmStateBBs = std::move(smStateBBs_);
     auto savedSmLocalFields = std::move(smLocalFields_);
     auto savedSmForInSrcFields = std::move(smForInSrcFields_);
@@ -6056,6 +6065,7 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     asyncResultTy_ = nullptr;
     asyncResultSemaType_ = nullptr;
     asyncPatternAResultDisposer_ = nullptr;
+    asyncOwnedParamFrame_ = nullptr;  // §30.1 (#1521); emitAsyncMethod republishes it
 
     currentFn_ = specFn;
     // #1060 / #1061: a STATE-MACHINE method (async / iterator) must have its
@@ -6213,6 +6223,7 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     asyncResultTy_ = savedAsyncResultTy;
     asyncResultSemaType_ = savedAsyncResultSemaTy;
     asyncPatternAResultDisposer_ = savedAsyncPatternAResultDisposer;
+    asyncOwnedParamFrame_ = savedAsyncOwnedParamFrame;  // §30.1 (#1521)
     smStateBBs_ = std::move(savedSmStateBBs);
     smLocalFields_ = std::move(savedSmLocalFields);
     smForInSrcFields_ = std::move(savedSmForInSrcFields);

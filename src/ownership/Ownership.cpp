@@ -263,19 +263,29 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     continue;
                 }
             }
-            // §29.8 (#945, #973b): an iterator method's `owned` parameter that the
-            // body never moves out is disposed by the state machine at iterator-
-            // Dispose. Suppress the §28.3 normal-exit drop reject and flag the
-            // parameter for codegen disposal — emitIteratorMethod's Dispose for a
-            // SYNC iterator (#945), or emitAsyncIteratorMethod's Dispose for an
-            // ASYNC iterator (#973b: emitFreeAndReturn disposes it before freeing
-            // the frame, on every Dispose path, null-guarded + nulled). A param
+            // §29.8 (#945, #973b) / §30.1 (#1521): a state-machine method's `owned`
+            // parameter that the body never moves out is disposed by the frame at
+            // its terminal state. Suppress the §28.3 normal-exit drop reject and
+            // flag the parameter for codegen disposal — emitIteratorMethod's
+            // Dispose for a SYNC iterator (#945), emitAsyncIteratorMethod's Dispose
+            // for an ASYNC iterator (#973b: emitFreeAndReturn disposes it before
+            // freeing the frame, on every Dispose path, null-guarded + nulled), or
+            // — #1521 — emitAsyncMethod's completion edges for a plain (non-
+            // iterator) `async` method returning `Task`/`Task<T>`/`OwningTask<T>`:
+            // §30.1 "`owned` parameters transfer into the frame ... any `owned`
+            // parameter never moved out is disposed by the frame when the task
+            // reaches its terminal state — on every completion path (success,
+            // fault, and cancellation)". `isAsync_` covers that plain-async shape
+            // too (it is true whenever the enclosing method is `async`, yield or
+            // not); codegen routes every such method through one of the three
+            // frame-owning emitters, each of which now runs this same disposal
+            // loop over params flagged here, so a single gate suffices. A param
             // discharged on SOME path is in everDischarged_ → kept as a reject (the
             // state machine can't statically tell it was moved out, so auto-
             // disposing would risk a double-free; #973a covers that conditional
-            // case via a runtime moved-from flag). Owned LOCALS in an iterator keep
-            // the reject (their frame-disposal is a separate piece).
-            if (sawYield_) {
+            // case via a runtime moved-from flag). Owned LOCALS in a state-machine
+            // method keep the reject (their frame-disposal is a separate piece).
+            if (sawYield_ || isAsync_) {
                 if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
                     if (ps->modifier == "owned" &&
                         everDischarged_.count(sym) == 0) {
@@ -455,6 +465,35 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             "iteration (§29.2/§28.3 auto-drop); use `.Dispose()`, "
             "`move`, `using var`, or `return` to discharge it "
             "explicitly");
+    }
+    // §29.8/§30.1 (#1521 addendum): a state-machine method's (`sawYield_ ||
+    // isAsync_`) `owned` PARAMETER that reaches the function exit ONLY via an
+    // uncaught throw is dropped from `endState` by the dataflow's ordinary
+    // exception-path-discharge assumption stated near the top of this function
+    // ("a value that reaches exit only via a throw ... does not trip the
+    // undischarged check below") — an assumption that holds for a SYNCHRONOUS
+    // body, where codegen registers an owned local/param onto the ordinary
+    // scope-disposal stack so an unwind disposes it there, but NOT for a
+    // state-machine method's `owned` parameter: its ONLY disposal mechanism is
+    // the frame's terminal-state auto-dispose (the `sawYield_ || isAsync_`
+    // branch inside the endState loop above), which must run on the FAULT edge
+    // exactly as much as the normal-exit edge — §30.1 "on every completion path
+    // (success, fault, and cancellation)"; §29.8's iterator-Dispose is unwind-
+    // reachable the same way. The endState loop therefore MISSES a param whose
+    // only exit is a throw, mirroring the #1257 gap below for nested-scope owned
+    // LOCALS. Fix: scan every parameter directly instead of relying on endState
+    // membership — any `owned` param never discharged on any path
+    // (everDischarged_ == 0) is exactly-once-safe to flag regardless of which
+    // edges reach the merged exit state; skip one already flagged above (the
+    // ordinary case, endState-Owned) to avoid redundant work.
+    if ((sawYield_ || isAsync_) && paramSyms) {
+        for (sema::Symbol* sym : *paramSyms) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+            if (!ps || ps->modifier != "owned") continue;
+            if (ps->iteratorAutoDispose) continue;  // already flagged above
+            if (everDischarged_.count(sym) != 0) continue;  // discharged on some path
+            ps->iteratorAutoDispose = true;
+        }
     }
     // §28.3 (#1257): a plain-var owned local declared in a NESTED scope that exits
     // normally before the function reaches a throw-only exit never appears in

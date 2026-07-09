@@ -1388,6 +1388,19 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // nested-async-lambda-inside-an-enclosing-machine hazard.
         llvm::Function* savedAsyncPatternAResultDisposer =
             asyncPatternAResultDisposer_;
+        // §30.1 (#1521): save/restore + suppress the enclosing method's owned-
+        // param-auto-dispose frame across the nested lambda emission. emitAsyncLambda
+        // does not itself publish this field (a lambda's own `owned` params are not
+        // yet wired into this mechanism), so left alone it would still point at the
+        // OUTER method's StateMachineFrame while smStateStruct_/smSelf_ are swapped
+        // to the LAMBDA's own (differently laid out) frame — emitAsyncComplete calls
+        // inside the lambda's own Resume body would then GEP the outer frame's
+        // capture field indices into the lambda's struct type, a type/index
+        // mismatch. Null it for the duration of the nested call so the lambda's own
+        // completion sites see "no owned-param frame" (a correct no-op) and restore
+        // the outer pointer afterward for the enclosing method's own sites.
+        const StateMachineFrame* savedAsyncOwnedParamFrame = asyncOwnedParamFrame_;
+        asyncOwnedParamFrame_ = nullptr;
         // emitAsyncLambda recomputes closure-release AND capture-cell-free
         // eligibility for the LAMBDA's own body and keys them to the lambda resume
         // fn. The ENCLOSING function's eligibility (which governs whether THIS
@@ -1436,6 +1449,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         asyncResultTy_ = savedAsyncResultTy;
         asyncResultSemaType_ = savedAsyncResultSemaType;
         asyncPatternAResultDisposer_ = savedAsyncPatternAResultDisposer;
+        asyncOwnedParamFrame_ = savedAsyncOwnedParamFrame;  // §30.1 (#1521)
     } else
     // Emit body.
     if (lam.exprBody) {

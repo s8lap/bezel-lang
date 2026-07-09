@@ -626,6 +626,13 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     asyncOuterTaskField_ = OUTER_TASK_FIELD;
     asyncPendingTaskField_ = PENDING_TASK_FIELD;
     asyncSpillPtrField_ = SPILL_PTR_FIELD;
+    // §30.1 (#1521): publish this frame so emitAsyncComplete (every normal
+    // completion site) and the async.fault boundary below can dispose any
+    // `owned`/move-only-value parameter Ownership.cpp flagged
+    // iteratorAutoDispose (never discharged on any path) — the frame-transfer
+    // + terminal-state auto-dispose §30.1 requires. Cleared at the end of
+    // this function.
+    asyncOwnedParamFrame_ = &frame;
 
     bool isInstance = !isStaticMethod(ms);
     std::string prefix = std::string("bz$async$") + std::string(ms->name) + "$";
@@ -921,6 +928,11 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             // double-handled if this resume activation continues elsewhere.
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
                                  emitExcSlot());
+            // §30.1 (#1521): the fault/cancellation completion edge — dispose any
+            // never-discharged `owned` parameter before the frame is freed, exactly
+            // as the success edge (emitAsyncComplete) does. Runs BEFORE the frame
+            // free below so it can still read/GEP through `self`.
+            emitAsyncOwnedParamAutoDispose(self);
             // §30.5: the frame is dead on this terminal (fault) path — free it.
             // §30.13 (#439-followup): free the cross-suspend spill area first (if
             // any) — it is a side allocation pointed to from the frame.
@@ -2515,6 +2527,47 @@ void Emitter::emitAsyncStub(sema::MethodSymbol* ms, llvm::Function* fn,
 }
 
 
+// §30.1 (#1521): "`owned` parameters transfer into the frame ... any `owned`
+// parameter never moved out is disposed by the frame when the task reaches its
+// terminal state — on every completion path (success, fault, and
+// cancellation), after the body's `using var` cleanups and `finally` clauses,
+// in reverse declaration order (§28.4's ordering)." Mirrors the sync iterator's
+// disposeOwnedParams (LlvmBackend_Iterators.cpp) and the async iterator's
+// emitFreeAndReturn dispose loop (both keyed off the same ps->iteratorAutoDispose
+// flag Ownership.cpp sets — §28.3/§29.8) for the plain (non-iterator) async-
+// method frame published in *asyncOwnedParamFrame_. Called from BOTH terminal
+// edges: emitAsyncComplete (success — every `return`/fall-off) and the
+// async.fault boundary in emitAsyncMethod (fault; the runtime models
+// cancellation as an OperationCanceledException fault, so no third edge is
+// needed). `self` is the CURRENT frame pointer (smSelf_ at the call site);
+// reads/GEPs through the SAME smStateStruct_ that was live when
+// asyncOwnedParamFrame_ was published (never a mismatched nested frame — see
+// the save/restore-and-null wrappers around nested async-lambda and lazy
+// generic-specialization emission). No-op when no frame is published (an async
+// iterator's or lambda's own completion, or a synchronous method).
+void Emitter::emitAsyncOwnedParamAutoDispose(llvm::Value* self) {
+    if (!asyncOwnedParamFrame_ || !self || !smStateStruct_) return;
+    const StateMachineFrame& frame = *asyncOwnedParamFrame_;
+    for (std::size_t i = frame.captures.size(); i-- > 0;) {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(frame.captures[i].first);
+        if (!ps || !ps->iteratorAutoDispose) continue;
+        unsigned fieldIdx = frame.captureStart + (unsigned)i;
+        llvm::Value* fptr =
+            builder_.CreateStructGEP(smStateStruct_, self, fieldIdx);
+        llvm::Value* obj = builder_.CreateLoad(ptrTy(), fptr, "aop.obj");
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            obj, llvm::ConstantPointerNull::get(ptrTy()), "aop.isnull");
+        auto* dispBB = llvm::BasicBlock::Create(llvm_, "aop.dispose", currentFn_);
+        auto* contBB = llvm::BasicBlock::Create(llvm_, "aop.cont", currentFn_);
+        builder_.CreateCondBr(isNull, contBB, dispBB);
+        builder_.SetInsertPoint(dispBB);
+        emitDisposeAndReclaim(obj);
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), fptr);
+        builder_.CreateBr(contBB);
+        builder_.SetInsertPoint(contBB);
+    }
+}
+
 // §30.1 / §30.9: complete the outer task. `value` is the lowered return value
 // (null for a `Task` with no value, or a fall-off completion). The result is
 // copied by the runtime (bz_task_complete malloc+memcpy's `result_size` bytes),
@@ -2563,6 +2616,17 @@ void Emitter::emitAsyncComplete(llvm::Value* value) {
                             {outerTask, llvm::ConstantPointerNull::get(ptrTy()),
                              builder_.getInt64(0)});
     }
+    // §30.1 (#1521): the SUCCESS completion edge — dispose any never-discharged
+    // `owned` parameter of the current plain async method now, after the task
+    // is completed (so a param the return VALUE itself derives from — already
+    // read into `value`/the result buffer above — is unaffected either way; a
+    // param the body actually returned is already discharged and not flagged
+    // here) and before the frame is freed below. No-op outside emitAsyncMethod
+    // (asyncOwnedParamFrame_ is null for a fall-off/return inside an async
+    // ITERATOR's own emission, which owns a separate dispose path, and for a
+    // nested async-lambda emission, suppressed across the call per the
+    // save/restore in LlvmBackend_Exprs2.cpp).
+    emitAsyncOwnedParamAutoDispose(self);
     // §30.5 (minimal): the frame is dead once the task is completed on a terminal
     // path. In the synchronous / already-done cut the resume runs inline to
     // completion with no pending suspension, so freeing the frame here is safe and

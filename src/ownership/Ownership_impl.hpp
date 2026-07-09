@@ -199,7 +199,10 @@ private:
     // §29.3 / §29.8 (#945): true when this method's body uses `yield` (it is an
     // iterator method). A SYNC iterator (sawYield_ && !isAsync_) whose `owned`
     // parameter is never moved out gets §29.8 state-machine auto-dispose instead
-    // of the §28.3 normal-exit drop reject. Set at the start of run().
+    // of the §28.3 normal-exit drop reject; per #1521, the SAME auto-dispose
+    // applies whenever `isAsync_` alone is true (a plain, non-iterator `async`
+    // method — §30.1's frame-transfer + terminal-state dispose) — see the
+    // `sawYield_ || isAsync_` gate in run(). Set at the start of run().
     bool sawYield_ = false;
     // §29.8 (#945): symbols (params or locals) discharged — moved-from or
     // disposed — on AT LEAST ONE path during the dataflow. Recorded by

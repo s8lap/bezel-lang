@@ -5103,6 +5103,36 @@ private:
     // free the source task immediately (it will be chained to the outer task).
     // Reset to false after lowerExpr returns in lowerStmt.
     bool asyncChainedReturn_ = false;
+    // §30.1 (#1521): the current plain (non-iterator) async method's frame,
+    // published by emitAsyncMethod right after buildStateMachineFrame so
+    // emitAsyncOwnedParamAutoDispose can walk frame.captures from EVERY
+    // terminal-completion site — emitAsyncComplete (every `return`/fall-off,
+    // §30.1 success path) and the async.fault boundary (§30.9, covering both
+    // an ordinary uncaught throw and an uncaught OperationCanceledException,
+    // i.e. the §30.1 "fault, and cancellation" edges — the runtime models
+    // cancellation as an OperationCanceledException fault, so no separate
+    // edge is needed). Not the same mechanism as the async-ITERATOR path
+    // (emitAsyncIteratorMethod has its own captures-driven dispose loop
+    // inline in its Dispose body, gated on frame.captures directly since that
+    // function does not share emitAsyncComplete). Null outside emitAsyncMethod
+    // (emitAsyncComplete/emitAsyncOwnedParamAutoDispose no-op when null) —
+    // an async lambda does not publish this (out of #1521's scope; a lambda's
+    // own `owned` params are a separate, not-yet-flagged case).
+    const StateMachineFrame* asyncOwnedParamFrame_ = nullptr;
+
+    // §30.1 (#1521): dispose every `owned`/move-only-value capture of
+    // *asyncOwnedParamFrame_ that sema flagged iteratorAutoDispose (never
+    // discharged on any path — the same flag §29.8's iterator machinery
+    // uses), in REVERSE declaration order (§28.4), reading/nulling each
+    // through frame pointer `self`. Null-guarded per capture so a parameter
+    // already moved out (chained via `return await <param>`, or explicitly
+    // disposed) — whose field was nulled at the move/dispose site — is safely
+    // skipped; a param flagged here is, by construction, never discharged on
+    // any path, so this runs at most once per parameter per task lifetime
+    // regardless of which terminal edge calls it (success xor fault, never
+    // both, since bz_task_complete / the fault boundary are mutually
+    // exclusive terminal states). No-op when asyncOwnedParamFrame_ is null.
+    void emitAsyncOwnedParamAutoDispose(llvm::Value* self);
 
     // Pass 2: emit a function's body.
     void emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn);
