@@ -4819,7 +4819,26 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                            t->kind == TypeRef::Kind::Named && t->declaration &&
                            t->declaration->kind == ast::TypeDeclKind::Class &&
                            !t->declaration->isValueBuiltin) {
+                    // §21.9 / §31.2.1 (#1624 precedent) — TERMINATION: the
+                    // base-type graph can contain cycles that survive into
+                    // sema via error recovery (an erroneous `class A: B;
+                    // class B: A` is reported by the §12 cycle check but its
+                    // TypeSymbol baseTypes still link A↔B, so this walk reaches
+                    // it during the §21.9 bare-discard non-trivial-dispose
+                    // classification). Without a guard, a cyclic base chain
+                    // whose members set no `reject` (no destructor / no owned
+                    // field in the cycle — a trivial-dispose cycle reached via
+                    // `ownedProduced`) loops forever, hanging/crashing the
+                    // compiler on valid input. Mirror catchArmNcb's #1624 fix:
+                    // a visited-set (by TypeSymbol pointer) gates the walk, and
+                    // a hard iteration cap is defense-in-depth so a malformed
+                    // deep/diamond graph can never make this unbounded.
+                    std::unordered_set<const TypeSymbol*> visitedBase;
+                    const std::size_t kMaxWalk = 4096;  // defensive; base chains are shallow
+                    std::size_t walked = 0;
                     for (TypeSymbol* cur = t->declaration; cur && !reject;) {
+                        if (++walked > kMaxWalk) break;              // §21.9 walk must terminate
+                        if (!visitedBase.insert(cur).second) break;  // cycle guard (#1624)
                         for (Symbol* m : cur->members) {
                             if (dynamic_cast<DestructorSymbol*>(m)) {
                                 reject = true;

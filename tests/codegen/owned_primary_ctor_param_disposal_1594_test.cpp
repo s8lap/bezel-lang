@@ -34,8 +34,13 @@
 // consuming-initializer compile error (needs precise consume-vs-read
 // detection in the ownership/flow layer).
 
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <string>
+#include <sys/wait.h>
 
+#include "driver/Driver.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
@@ -47,6 +52,32 @@ namespace {
 int run(const std::string& program) {
     auto r = runJit(program);
     return r.ran ? r.exitCode : -999;
+}
+
+// §17.13 explicit-discard (`_ := expr`) disposal is driven by the OWNERSHIP
+// pass's disposeOwnedValue classification (src/ownership/Ownership.cpp), which
+// runJit does NOT run (it is a surface-marker audit only — see
+// codegen_support.hpp::runJitInProcess). So a `_ :=` discard's disposal can
+// only be observed through the real Driver pipeline, mirroring
+// move_result_owned_724_test.cpp's compileAndRun helper.
+namespace fs = std::filesystem;
+int compileAndRun(const std::string& program) {
+    static int counter = 0;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bezel_1594_" + std::to_string(counter++);
+    std::string src = (dir / (stem + ".bz")).string();
+    std::string exe = (dir / stem).string();
+    { std::ofstream out(src); out << program; }
+    bezel::Driver driver;
+    bezel::CompileResult r = driver.compileFile(src, exe);
+    int code = -1;
+    if (r.success) {
+        int status = std::system(exe.c_str());
+        if (status != -1 && WIFEXITED(status)) code = WEXITSTATUS(status);
+    }
+    std::remove(src.c_str());
+    std::remove(exe.c_str());
+    return code;
 }
 
 bool diagContains(const JitResult& r, const std::string& needle) {
@@ -286,13 +317,18 @@ BEZEL_TEST(codegen_owned_primary_ctor_param_1594, bare_discard_of_declared_owned
 }
 
 // §17.13 (v0.150, #1009) (#1594): the explicit discard form `_ := new
-// Holder(...);` was ALREADY correctly disposing (it is unconditional on the
-// value being an owned-producing class/interface, not gated by the
-// misclassified non-trivial-dispose check) — verifies the piece-3 fix didn't
-// regress the always-permitted explicit-discard path (counter → 1).
+// Holder(...);` is an unbound owned temporary whose end-of-statement disposal
+// is classified by the ownership pass (DiscardStmt::disposeOwnedValue,
+// src/ownership/Ownership.cpp). That classification runs in the real Driver
+// pipeline, NOT in runJit (runJit runs only collect/resolve/typecheck — see
+// codegen_support.hpp::runJitInProcess), so this case is driven through
+// compileAndRun (the same Driver path move_result_owned_724_test.cpp uses for
+// §17.13 `_ :=` disposal). Verifies the piece-3 fix didn't regress the always-
+// permitted explicit-discard path: the captured owned Res is disposed exactly
+// once (counter → 1).
 BEZEL_TEST(codegen_owned_primary_ctor_param_1594, explicit_discard_of_captured_owned_param_still_disposes_17_13) {
     // per §17.13 (v0.150) / §21.9
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(compileAndRun(
         std::string("module M; ") + kRes +
         "class Holder(owned r: Res) "
         "  public method Use(): int => r.Id(); "
