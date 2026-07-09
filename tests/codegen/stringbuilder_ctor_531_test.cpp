@@ -17,17 +17,66 @@
 //
 // StringBuilder is an owned type — programs bind it with `using var` (§28.3).
 
-#include "support/codegen_support.hpp"
-#include "test_harness.hpp"
+// Deflake #531: these value tests previously ran via the in-process LLVM ORC JIT
+// (runJit in support/codegen_support.hpp), sharing the process heap and
+// accumulated LLVM module state across serial tests. That made results
+// heap-order-dependent and a crash elsewhere could drop a test's count under
+// sharding. Each test now compiles + runs the bezel program in its OWN process
+// via the real Driver, isolating heap state. All assertions and expected values
+// are unchanged — only the execution harness moved out of process.
 
-using bezel::test::runJit;
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <sys/wait.h>
+
+#include "driver/Driver.hpp"
+#include "test_harness.hpp"
 
 namespace {
 
-int run(const std::string& src) {
-    auto r = runJit(src);
-    return r.ran ? r.exitCode : -999;
+namespace fs = std::filesystem;
+
+// Compile `source` to a temp native executable via the real Driver and run it;
+// returns the exit code, or -1 on compile/link/run failure. Same shape as
+// async_618_domain_serial_test.cpp::compileAndRun.
+int compileAndRun(const std::string& source) {
+    static int counter = 0;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bezel_sb531_" + std::to_string(counter++);
+    std::string src = (dir / (stem + ".bzl")).string();
+    std::string exe = (dir / stem).string();
+    {
+        std::ofstream out(src);
+        out << source;
+    }
+    bezel::Driver driver;
+    bezel::CompileResult r = driver.compileFile(src, exe);
+    int code = -1;
+    if (r.success) {
+        int status = std::system(exe.c_str());
+        if (status != -1 && WIFEXITED(status)) code = WEXITSTATUS(status);
+    }
+    std::remove(src.c_str());
+    std::remove(exe.c_str());
+    return code;
 }
+
+// compileAndRun() returns -1 when its in-test clang++ sub-compile/link fails —
+// under concurrent build load inside the gate's memory scope this is a transient
+// INFRASTRUCTURE failure, not a semantic one (the source here is fixed and known
+// to compile). Retry a few times before treating it as a result; a genuine wrong
+// VALUE is never -1 and is asserted immediately. Mirrors
+// async_618_domain_serial_test.cpp:155-169 (compileAndRunRetrying).
+int compileAndRunRetrying(const std::string& source) {
+    int v = compileAndRun(source);
+    for (int r = 0; r < 3 && v == -1; ++r) v = compileAndRun(source);
+    return v;
+}
+
+int run(const std::string& src) { return compileAndRunRetrying(src); }
 
 // -------------------------------------------------------------------------
 // §3.1: new StringBuilder(initial := "hello") — Length equals the code-point
