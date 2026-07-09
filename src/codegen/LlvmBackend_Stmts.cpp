@@ -2082,12 +2082,34 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         // break/continue of a loop opened INSIDE the try body must not route
         // through this finally (see the break/continue handlers).
         frame.loopDepthAtEntry = loopStack_.size();
-        // fix #1567 / §29.7/§28.10 (v0.182): the dispose-stack depth at this
-        // try's entry. disposeStack_ is not touched between here and the
-        // `unwindScopeDepth_ = disposeStack_.size()` below, so this equals the
-        // `thisTryDepth` the unwind path uses. A return/break/continue routing
-        // through this finally disposes scopes >= this depth (the try body)
-        // before the finally and the enclosing scopes < this depth after it.
+        // fix #1263 / §28.3: for a try-WITH-finally, push the try body's own
+        // disposal scope NOW — before capturing disposeDepthAtEntry and before
+        // the `unwindScopeDepth_ = disposeStack_.size()` below — so the body
+        // scope sits at an index BELOW thisTryDepth. §28.3: "the explicit finally
+        // runs first (with the local still in scope), then the implicit
+        // auto-dispose runs as the scope unwinds further." Three consequences:
+        //  (a) a throw from the body does NOT auto-dispose the body's owned
+        //      locals at the throw site: unwindScopeDepth_ (= disposeStack_.size()
+        //      after this push) sits ABOVE the body scope, so emitUnwindDisposals
+        //      skips it. The pre-fix ordering disposed the body locals FIRST and
+        //      ran the finally AFTER — letting a finally observe an already-
+        //      disposed local (a UAF); the repro in #1263 saw seq 214 instead of
+        //      the spec-mandated 421.
+        //  (b) the body scope's index (< thisTryDepth) means the finally
+        //      dispatch's existing emitUnwindDisposalsInRange(savedDepth,
+        //      thisTryDepth) and the mode dispatches' emitDisposalsInRange(...,
+        //      thisTryDepth) naturally INCLUDE it — disposing it AFTER the
+        //      finally body, as the scope unwinds further outward.
+        //  (c) frame.disposeDepthAtEntry (= disposeStack_.size() after the push)
+        //      sits ABOVE the body scope, so a return/break/continue routing
+        //      through this finally disposes only NESTED try-body scopes at the
+        //      exit site, NOT the body scope itself — the body scope rides the
+        //      finally's post-body dispatch. The body is lowered with lowerBody
+        //      (no fall-through auto-dispose) and the scope is popped at the end
+        //      of lowerTry, after every dispatch block that disposes it is
+        //      emitted. A try WITHOUT a finally is unaffected: lowerScopedBlock
+        //      owns the body scope and disposes it on both edges as before.
+        disposeStack_.emplace_back();   // §28.3 body scope (kept on the stack)
         frame.disposeDepthAtEntry = disposeStack_.size();
         finallyStack_.push_back(frame);
         // §29.7 (#623): track the AST finally-body alongside the frame so
@@ -2115,7 +2137,14 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
     // intervening scopes (e.g. an outer `using var`) are still live and must be
     // disposed when re-propagating to outerUnwind — see finUnwindBB below.
     std::size_t thisTryDepth = unwindScopeDepth_;
-    bool bodyTerm = lowerScopedBlock(trys.body);
+    // fix #1263 / §28.3 (see the body-scope push in the frame setup above): for
+    // a try-WITH-finally the body scope is already on the stack; lower the body
+    // with lowerBody so it is NOT auto-disposed on normal fall-through (the
+    // finally's mode-0 dispatch disposes it AFTER the finally body). For a try
+    // WITHOUT a finally, lowerScopedBlock owns and disposes the body scope on
+    // both edges as before.
+    bool bodyTerm = hasFin ? lowerBody(trys.body)
+                           : lowerScopedBlock(trys.body);
     unwindTarget_ = savedUnwind;
     unwindScopeDepth_ = savedDepth;
     if (!bodyTerm) builder_.CreateBr(normalExit);
@@ -2339,8 +2368,19 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         // Build the dispatch block after finally.
         builder_.SetInsertPoint(resumeBB);
         llvm::Value* mode = builder_.CreateLoad(i32(), exitModSlot);
-        // Default (mode=0): fall through to afterBB.
-        auto* sw = builder_.CreateSwitch(mode, afterBB, 3);
+        // fix #1263 / §28.3: mode=0 (normal fall-through) disposes the try BODY
+        // scope (index thisTryDepth-1) AFTER the finally body — the body was
+        // lowered with lowerBody (no fall-through auto-dispose) precisely so the
+        // finally runs first while the body's owned locals are still alive. The
+        // enclosing scopes (< thisTryDepth-1) outlive the try and are NOT
+        // disposed here. Pre-fix, lowerScopedBlock disposed the body scope BEFORE
+        // the finally — a finally observing an already-disposed local.
+        auto* fallDispBB = llvm::BasicBlock::Create(
+            llvm_, "finally.falldisp", currentFn_);
+        auto* sw = builder_.CreateSwitch(mode, fallDispBB, 3);
+        builder_.SetInsertPoint(fallDispBB);
+        emitDisposalsInRange(thisTryDepth - 1, thisTryDepth);
+        builder_.CreateBr(afterBB);
 
         // mode=1: return — propagate through outer finally or emit ret.
         auto* retDispBB = llvm::BasicBlock::Create(llvm_,"finally.ret",currentFn_);
@@ -2624,6 +2664,12 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 builder_.CreateBr(outerUnwind);
             }
         }
+        // fix #1263 / §28.3: drop the try body scope pushed in the frame setup.
+        // Every block that disposes it (mode 0's fallDispBB, modes 1-5,
+        // finUnwindBB, and a throw from the finally body) has been emitted, so
+        // the scope's Disposals have been baked into the IR; safe to drop the
+        // C++-side entry now.
+        disposeStack_.pop_back();
     }
 
     builder_.SetInsertPoint(afterBB);
