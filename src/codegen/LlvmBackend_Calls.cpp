@@ -5293,6 +5293,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(fn, {recv, oldV, newV});
             return recv;
         }
+        // §3.1 AppendFormat(format: string, args: Array<Object>): StringBuilder.
+        // Substitutes {N} placeholders with args[N].ToString() and appends the
+        // result (bz_sb_append_format runtime helper). fix #1179: previously
+        // this had no dispatch case and the call fell through as a silent no-op.
+        if (m == "AppendFormat" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* fmtV  = lowerExpr(*call.args[0].value);
+            llvm::Value* argsV = lowerExpr(*call.args[1].value);
+            if (!fmtV || !argsV) return nullptr;
+            auto* fn = declareC("bz_sb_append_format", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {recv, fmtV, argsV});
+            return recv;  // allow chaining
+        }
         if (m == "Length" || m == "Count") {
             // Sum of lengths of all string parts
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});

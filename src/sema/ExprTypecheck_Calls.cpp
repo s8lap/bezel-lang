@@ -4200,7 +4200,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                         else if (m == "Append" || m == "AppendLine" ||
                                  m == "Clear" || m == "Insert" ||
-                                 m == "Remove" || m == "Replace")
+                                 m == "Remove" || m == "Replace" ||
+                                 m == "AppendFormat")
                             ctx_.setExprType(&ce, recvTy);  // returns same StringBuilder (chaining, §3.1)
                     }
                     // Random instance methods

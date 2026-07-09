@@ -674,6 +674,121 @@ void bz_sb_replace(void* parts_arr, const void* old_value, const void* new_value
     bz_sb_reset_to(arr, buf, total);
 }
 
+// stdlib §3.1 AppendFormat(format, args): substitute the .NET-style composite
+// placeholders {N} in `format` with the string form of args[N] (resolved via
+// virtual ToString, vtable slot 3 — the uniform per-type thunk a boxed Object
+// carries), then append the result to the builder's parts list (exactly like
+// Append, which adds a fresh +1 part). A literal brace is escaped as {{ }}.
+// Alignment (`,W`) and a sub-format specifier (`:F`) after the index are skipped
+// to reach the index, which is what the bare {N} form requires; a no-placeholder
+// format contributes its literal text. This is the #1179 fix: AppendFormat
+// previously had no codegen/runtime case and emitted nothing. `format` is a
+// bz.string*; `args` is a bz_array_t* of object pointers (Array<Object>).
+void bz_sb_append_format(void* parts_arr, const void* format_ptr,
+                         const void* args_arr) {
+    auto* arr = (bz_array_t*)parts_arr;
+    if (!arr || !format_ptr) return;
+    auto* fmt = (bz_string_struct*)format_ptr;
+    auto* args = (bz_array_t*)args_arr;
+
+    // StringBuilder operates in width-1 (byte) mode; format strings are width-1
+    // (the ASCII placeholder chars {, }, digits are read as raw bytes).
+    const char* fb = (const char*)fmt->data;
+    int64_t nb = fmt->len * (fmt->width ? fmt->width : 1);
+    int64_t nargs = args ? args->count : 0;
+    void** argSlots = args ? (void**)args->data : nullptr;
+
+    // Resolve every arg's string form ONCE (virtual ToString, vtable slot 3) so
+    // the two passes below share one cached {data,len} per arg — ToString is not
+    // re-invoked (it allocates; calling it twice would double the tolerated leak
+    // and could observe side effects twice). A null/undispatchable arg yields "".
+    struct ArgStr { const char* data; int64_t len; };
+    ArgStr* astr = (ArgStr*)malloc((size_t)(nargs > 0 ? nargs : 1) * sizeof(ArgStr));
+    for (int64_t k = 0; k < nargs; k++) {
+        astr[k].data = "";
+        astr[k].len = 0;
+        void* obj = argSlots ? argSlots[k] : nullptr;
+        if (!obj) continue;
+        void* vtable; memcpy(&vtable, obj, sizeof(void*));
+        if (!vtable) continue;
+        void* toStrFnP; memcpy(&toStrFnP,
+            (uint8_t*)vtable + 3 * sizeof(void*), sizeof(void*));
+        if (!toStrFnP) continue;
+        typedef void* (*bz_tostr_fn)(void*);
+        void* strObj = ((bz_tostr_fn)toStrFnP)(obj);
+        if (!strObj) continue;
+        auto* s = (bz_string_struct*)strObj;
+        astr[k].data = (const char*)s->data;
+        astr[k].len = s->len * (s->width ? s->width : 1);
+    }
+
+    // Parse one placeholder beginning at fb[i]=='{'. On success sets idx/close
+    // (index of '}') and returns true; a malformed/empty index returns false.
+    auto parsePlaceholder = [&](int64_t i, int64_t& idx, int64_t& close)
+        -> bool {
+        int64_t j = i + 1;
+        if (j >= nb || fb[j] < '0' || fb[j] > '9') return false;  // need a digit
+        int64_t v = 0;
+        while (j < nb && fb[j] >= '0' && fb[j] <= '9') { v = v * 10 + (fb[j] - '0'); j++; }
+        // Skip optional ,alignment and :formatString up to the closing brace.
+        while (j < nb && fb[j] != '}') j++;
+        if (j >= nb || fb[j] != '}') return false;               // no closing brace
+        idx = v;
+        close = j;
+        return true;
+    };
+
+    // First pass: total output byte length.
+    int64_t total = 0;
+    for (int64_t i = 0; i < nb;) {
+        char c = fb[i];
+        if (c == '{') {
+            if (i + 1 < nb && fb[i + 1] == '{') { total++; i += 2; continue; }
+            int64_t idx = -1, close = -1;
+            if (parsePlaceholder(i, idx, close)) {
+                if (idx >= 0 && idx < nargs) total += astr[idx].len;
+                i = close + 1;
+            } else { total++; i++; }                              // literal '{'
+        } else if (c == '}') {
+            if (i + 1 < nb && fb[i + 1] == '}') { total++; i += 2; continue; }
+            total++; i++;
+        } else { total++; i++; }
+    }
+
+    // Second pass: fill the buffer.
+    char* buf = (char*)malloc((size_t)(total + 1));
+    int64_t off = 0;
+    for (int64_t i = 0; i < nb;) {
+        char c = fb[i];
+        if (c == '{') {
+            if (i + 1 < nb && fb[i + 1] == '{') { buf[off++] = '{'; i += 2; continue; }
+            int64_t idx = -1, close = -1;
+            if (parsePlaceholder(i, idx, close)) {
+                if (idx >= 0 && idx < nargs && astr[idx].len > 0) {
+                    memcpy(buf + off, astr[idx].data, (size_t)astr[idx].len);
+                    off += astr[idx].len;
+                }
+                i = close + 1;
+            } else { buf[off++] = fb[i++]; }
+        } else if (c == '}') {
+            if (i + 1 < nb && fb[i + 1] == '}') { buf[off++] = '}'; i += 2; continue; }
+            buf[off++] = fb[i++];
+        } else { buf[off++] = fb[i++]; }
+    }
+    buf[off] = '\0';
+    free(astr);
+
+    // Wrap the formatted bytes as a fresh +1 width-1 part and append it (like
+    // Append — the builder does not own/retain its parts, so the allocation is
+    // the existing tolerated leak; no part is freed here).
+    uint8_t* strObj = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+    memcpy(strObj, &buf, sizeof(void*));                 // data
+    memcpy(strObj + 8, &off, sizeof(int64_t));           // len
+    strObj[16] = 1;                                      // width = 1 (byte mode)
+    bz_string_init_rc(strObj);                           // producer's reference, rc := 1
+    bz_array_add(arr, &strObj, 8);
+}
+
 // per §32.5/§32.6: re-encode a bz_string's code points to a fresh,
 // null-terminated UTF-8 buffer for the CString FFI boundary.
 //

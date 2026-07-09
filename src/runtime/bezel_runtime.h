@@ -1171,6 +1171,14 @@ void bz_strbuilder_to_string(void* parts_arr,  // bz_array_t* of bz.string ptrs
 void bz_sb_insert(void* parts_arr, int64_t index, const void* value);
 void bz_sb_remove(void* parts_arr, int64_t start_index, int64_t length);
 void bz_sb_replace(void* parts_arr, const void* old_value, const void* new_value);
+// §3.1 AppendFormat(format, args): substitute {N} placeholders in `format`
+// (a bz.string*) with args[N]'s string form (virtual ToString, vtable slot 3)
+// and append the result as one new part, like Append. `args` is a bz_array_t*
+// of object pointers (Array<Object>); args beyond Count or a null arg → "".
+// Alignment/sub-format specifiers after the index are skipped; {{ }} are literal
+// braces. fix #1179 (was a silent no-op: no codegen/runtime case existed).
+void bz_sb_append_format(void* parts_arr, const void* format_ptr,
+                         const void* args_arr);
 
 // ---------------------------------------------------------------------------
 // per §32.5/§32.6: re-encode a bz_string (layout {ptr data, i64 len, i8 width})
