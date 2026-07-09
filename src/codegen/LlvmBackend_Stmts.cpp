@@ -45,6 +45,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             if (it != locals_.end()) {
                 Disposal d{it->second, nullptr};
                 d.task = true;
+                // §30.15 (v0.179, #1524): a plain `var t := channel.Receive();`
+                // never awaited is abandoned exactly like a `using var` one —
+                // route through the give-back protocol, not ordinary task
+                // disposal (see LlvmBackend_Setup.cpp's using-var registration
+                // for the full rationale).
+                d.channelReceiveTask = isChannelReceiveInitializer(ld);
                 disposeStack_.back().push_back(d);
             }
             // Still register the unwind-owned path for any non-task cleanup

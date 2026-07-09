@@ -6577,6 +6577,13 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     if (const sema::TypeRef* tt = taskTypeOfLocal(ld)) {
         Disposal d{it->second, nullptr};
         d.task = true;
+        // §30.15 (v0.179, #1524): a Receive() task overrides the ordinary
+        // disposal below with the channel abandonment give-back protocol — see
+        // the field's doc comment (LlvmBackend_impl.hpp) and
+        // bz_channel_receive_abandon. `taskOwnedResultDisposer` is deliberately
+        // left unset in this branch: the abandon path never disposes a
+        // produced item, so no per-T disposer thunk is needed.
+        d.channelReceiveTask = isChannelReceiveInitializer(ld);
         // §30.5 / #1258: an OwningTask<T:class> owns its produced result. If the
         // task is dropped at scope end without an intervening await taking the
         // result (bz_task_take_result zeros it on consume), the produced owned
@@ -6592,7 +6599,8 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             }
             return {};
         };
-        if (taskName(tt) == "OwningTask" && !tt->genericArgs.empty() &&
+        if (!d.channelReceiveTask &&
+            taskName(tt) == "OwningTask" && !tt->genericArgs.empty() &&
             isClassOrInterfaceRef(tt->genericArgs[0])) {
             d.taskOwnedResultDisposer =
                 elementPolicyFor(tt->genericArgs[0], /*owningFamily=*/true)
@@ -12037,6 +12045,24 @@ const sema::TypeRef* Emitter::taskTypeOfLocal(const ast::LocalDecl* ld) {
             if (isTaskTypeName(rt)) return rt;
     }
     return nullptr;
+}
+
+// §30.15 (v0.179, #1524): recognise `ld`'s initializer as a no-arg `Receive()`
+// call on a `Channel<T>` receiver — the exact same syntactic shape
+// tryLowerChannelAndDomainCall matches when lowering the call
+// (LlvmBackend_Calls3.cpp: `mname == "Receive" && call.args.empty()` on a
+// receiver whose builtinTypeName is "Channel"). Re-checked here (rather than
+// threaded through as codegen state) because disposal registration runs in a
+// separate pass over the LocalDecl, with only the AST/type info available.
+bool Emitter::isChannelReceiveInitializer(const ast::LocalDecl* ld) {
+    if (!ld->initializer) return false;
+    auto* call = dynamic_cast<const ast::CallExpr*>(ld->initializer.get());
+    if (!call || !call->callee || !call->args.empty()) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma || !ma->target || ma->member != "Receive") return false;
+    auto* recvTy = ctx_.exprType(*ma->target);
+    return recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+           builtinTypeName(recvTy) == "Channel";
 }
 
 

@@ -77,6 +77,13 @@ struct bz_task_t;
 static void domain_enqueue(bz_domain_t* dom,
                            void (*fn)(void*, void*), void* task, void* state);
 
+// Forward declaration for the §30.15 Channel<T> core (fully defined much
+// further down in this file, after bz_task_free). bz_task_free needs to
+// release a channel-receive task's core ref (see bz_task_t::recv_channel,
+// #1524) without requiring bz_channel_t's complete type at this point.
+struct bz_channel_t;
+static void channel_core_release(bz_channel_t* ch);
+
 // ---------------------------------------------------------------------------
 // bz_domain_t — serial execution unit (§30.13 / #618)
 // ---------------------------------------------------------------------------
@@ -963,8 +970,17 @@ void bz_task_free(void* tp) {
     // transitively — the source owns the result that the outer task borrowed.
     void* chainedSrc = task->chained_source;
     bz_domain_t* dom = task->domain;
+    // §30.15 (v0.179, #1524): release the core ref bz_channel_receive acquired
+    // for this task's whole lifetime (mirrors fix #634's Channel/ChannelSender
+    // handle refcounting). Keeps the channel core alive for as long as ANY
+    // receive task from it could still dereference it — including a deferred
+    // bz_channel_receive_abandon give-back continuation (scheduled via
+    // bz_task_then) that has not yet run at the point the channel's own
+    // `using var` disposes it. Null for every task not from bz_channel_receive.
+    void* recvChannel = task->recv_channel;
     delete task;
     if (dom) domain_release(dom);  // per fix #632: release task's domain ref
+    if (recvChannel) channel_core_release((bz_channel_t*)recvChannel);
     if (chainedSrc) bz_task_free(chainedSrc);
 }
 
@@ -2432,6 +2448,17 @@ void* bz_channel_receive(void* chp, void* cce_vtable) {
     // fix #713: route to the caller's domain.
     { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
       task->domain = d; domain_ref(d); }  // per fix #632: task holds a ref on its domain
+    // §30.15 (v0.179, #1524): stamp the owning channel so an abandoned (never
+    // consumed) Receive() task can deregister from / give an item back to it —
+    // see bz_channel_receive_abandon. Acquire a core ref for the task's whole
+    // lifetime (fix #634's refcounting protocol, extended here): without it, a
+    // channel disposed by its own `using var` while this task's abandonment is
+    // still deferred (bz_task_then routes even an already-settled outcome
+    // through the domain queue, never inline — see bz_channel_receive_abandon)
+    // could free the core out from under that later give-back. Released in
+    // bz_task_free, symmetrically, whenever this task is finally reclaimed.
+    task->recv_channel = ch;
+    channel_core_ref(ch);
 
     void* item = nullptr;
     bool  have_item = false;
@@ -2480,6 +2507,133 @@ void* bz_channel_receive(void* chp, void* cce_vtable) {
     }
     // else: task is parked; bz_channel_send or sender_release will complete it.
     return task;
+}
+
+// channel_giveback_item: §30.15 v0.179 -- return an item to the channel's
+// head after an abandoned Receive() task is found to already own one (the
+// "internal give-back" the spec text describes; items remain exactly-once).
+// If another receiver is already parked (FIFO -- it necessarily queued AFTER
+// the one being abandoned, since that one had already been popped off
+// `pending` to receive this very item), hand the item to it directly rather
+// than leaving it buffered -- mirrors bz_channel_send's immediate-delivery
+// path and preserves per-sender FIFO order. Otherwise requeue at the FRONT of
+// `items` (the channel's head), so it is redelivered before anything sent
+// after it.
+//
+// Bounded-channel note: an item delivered straight from a sender to a parked
+// receiver (bz_channel_send's `recv.task` path, and this function's own
+// direct-redelivery path) never occupies a buffer slot, so give-back can
+// transiently leave `items.size()` one above `capacity` when no receiver is
+// waiting to take it immediately. This does not lose or duplicate the item
+// (the exactly-once invariant §30.15 requires) and self-heals on the next
+// Receive/TryReceive; it is an accepted bounded cost of the give-back
+// protocol, the same kind of documented edge as the displaced-admitted-
+// mutable-static cost in §22.12 v0.181, rather than a capacity violation a
+// caller can observe as a lost or corrupted item.
+// Also guards against a narrow cross-domain race: the channel's OWN `using
+// var` may dispose it (bz_channel_dispose) concurrently with this give-back —
+// the core-ref bz_channel_receive/bz_task_free hold (per #1524, mirroring fix
+// #634) keeps `ch` itself alive, but a Channel object already disposed has no
+// Bezel-visible reference left that could ever Receive() the buffered item
+// again. Disposing it here instead of queueing it into `ch->items` avoids an
+// item stranded in a deque nothing will ever drain (§28.2 exactly-once).
+static void channel_giveback_item(bz_channel_t* ch, void* item) {
+    bz_pending_receiver_t recv{nullptr, nullptr};
+    bool disposeInstead = false;
+    {   std::lock_guard<std::mutex> lk(ch->mtx);
+        if (ch->disposed) {
+            disposeInstead = true;
+        } else if (!ch->pending.empty()) {
+            recv = ch->pending.front();
+            ch->pending.pop_front();
+        } else {
+            ch->items.push_front(item);
+        }
+    }
+    if (recv.task)
+        bz_task_complete(recv.task, &item, sizeof(void*));
+    else if (disposeInstead && item && ch->dispose_elem)
+        ch->dispose_elem(item);
+}
+
+// bz_channel_receive_abandon: §30.15 v0.179 (#1524) -- the scope-end drop of
+// a Channel<T>.Receive() task whose result was never consumed (awaited or
+// `.Result`-read). Spec: "Abandoning a pending receive deregisters, never
+// consumes... no message is consumed or lost... An item being handed to the
+// waiter at the instant of disposal is returned to the channel's head." This
+// REPLACES the general §30.5 "Disposing an unconsumed OwningTask<T>"
+// dispose-continuation semantics (which would eventually DISPOSE a produced
+// item, or silently drop one not yet produced) for this one task shape.
+//
+// Two cases, both resolved race-safely against a concurrent Send/close:
+//
+//   (a) The task is still parked in ch->pending: remove it from the FIFO
+//       under ch->mtx and free it directly -- no item was ever dequeued into
+//       it, so there is nothing to give back or dispose.
+//
+//   (b) The task is NOT found in ch->pending. Either it already settled (an
+//       item was delivered to it earlier, or the channel closed and faulted
+//       it), or a concurrent bz_channel_send/close just popped it from
+//       `pending` under ch->mtx and is about to call bz_task_complete*
+//       outside that lock (the narrow window bz_channel_send documents
+//       between the pop and the completion call). bz_task_then resolves this
+//       race exactly the way bz_task_fire_and_forget's already-done check
+//       does: it inspects task->done under the task's OWN mutex and either
+//       runs the continuation immediately (already settled) or registers it
+//       to run the moment the racing completion call finishes -- so the
+//       outcome is always "handled after settlement," never a lost update.
+//       A successful outcome gives the item back (channel_giveback_item)
+//       instead of disposing it; a faulted outcome (ChannelClosedException)
+//       has no item to give back and is freed like any other task (its
+//       error_obj, if the fault is still in flight when genuinely abandoned
+//       this way, is the same documented #1021 unobserved-fault residual as
+//       every other abandoned task -- not a regression introduced here).
+//
+// Either case frees the task struct exactly once via bz_task_free, which is
+// itself a no-op on the ITEM here regardless of task->result's contents:
+// result_disposer is never set for a channel-receive task (see
+// LlvmBackend_Setup.cpp's using-var registration), so bz_task_free's
+// disposer branch never fires for one. Case (b)'s continuation therefore
+// leaves task->result untouched after reading it -- bz_task_free's own
+// free(task->result) still reclaims that (8-byte, pointer-sized) buffer
+// normally; only the ITEM IT POINTED TO was redirected via
+// channel_giveback_item, not the buffer itself.
+extern "C"
+void bz_channel_receive_abandon(void* tp) {
+    if (!tp) return;
+    auto* task = (bz_task_t*)tp;
+    auto* ch = (bz_channel_t*)task->recv_channel;
+    if (!ch) { bz_task_free(tp); return; }  // defensive: should not happen
+
+    bool removed = false;
+    {   std::lock_guard<std::mutex> lk(ch->mtx);
+        for (auto pit = ch->pending.begin(); pit != ch->pending.end(); ++pit) {
+            if (pit->task == task) { ch->pending.erase(pit); removed = true; break; }
+        }
+    }
+    if (removed) {
+        // Case (a): deregistered before anything was ever dequeued into it.
+        bz_task_free(tp);
+        return;
+    }
+
+    // Case (b): settled already, or settling concurrently -- resolve via the
+    // task's own completion machinery (race-safe, see doc comment above).
+    bz_task_then(tp, [](void* completedTask, void* /*state*/) {
+        auto* t = (bz_task_t*)completedTask;
+        if (!t->is_error && t->result && t->result_size >= (int64_t)sizeof(void*)) {
+            void* item = *(void**)t->result;
+            channel_giveback_item((bz_channel_t*)t->recv_channel, item);
+            // Deliberately NOT nulling t->result: result_disposer is always
+            // null for a channel-receive task (see the doc comment above), so
+            // bz_task_free's disposer branch never touches the item below --
+            // leaving t->result as-is just lets bz_task_free's own
+            // free(task->result) reclaim the (pointer-sized) result BUFFER
+            // normally, exactly like any other task. Nulling it here would
+            // leak that buffer (an earlier version of this function did).
+        }
+        bz_task_free(t);
+    }, nullptr);
 }
 
 // bz_channel_try_receive: non-blocking receive. If an item is available,

@@ -2167,6 +2167,29 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // reclaims the task, matching §30.5's "the Dispose() call
             // attaches a continuation that disposes the produced result
             // whenever it appears" for a not-yet-settled task.
+            // §30.15 (v0.179, #1524): a Channel<T>.Receive() task overrides the
+            // ordinary "attach a disposer, then fire-and-forget" sequence below.
+            // The synchronous already-faulted-at-scope-end exception disposal
+            // above (the `if (err) {...}` block) still applies unchanged — it is
+            // about the fault OBJECT, orthogonal to the channel ITEM the give-
+            // back protocol is about. What must NOT happen for a Receive() task
+            // is (a) attaching a result_disposer that would eventually DESTROY a
+            // produced item (bz_task_free's default for an unconsumed owned
+            // result), or (b) plain fire-and-forget's continuation silently
+            // dropping a not-yet-produced item once it arrives. Both are exactly
+            // what spec §30.15 calls "the one place §30.5's dispose-continuation
+            // semantics do not apply to a pending result": instead
+            // bz_channel_receive_abandon deregisters a still-parked waiter, or
+            // gives a produced item back to the channel's head, so "no message
+            // is consumed or lost."
+            if (it->channelReceiveTask) {
+                auto* fn = declareC("bz_channel_receive_abandon",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(fn, {t});
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+                continue;
+            }
             if (it->taskOwnedResultDisposer) {
                 auto* setDispFn = declareC("bz_task_set_result_disposer",
                                            llvm::Type::getVoidTy(llvm_),

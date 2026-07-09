@@ -705,6 +705,19 @@ private:
         // result at scope end (passed to bz_task_dispose_owned_result before the
         // task is freed). Null for a Task<T> / value-result / no-value task.
         llvm::Value* taskOwnedResultDisposer = nullptr;
+        // §30.15 (v0.179, #1524): true when this task local's initializer is
+        // (syntactically) a `Channel<T>.Receive()` call. Overrides the ordinary
+        // `task` disposal below at scope end: instead of
+        // `bz_task_fire_and_forget[_checked]` (which — per §30.5's default
+        // dispose-continuation semantics — would eventually dispose a produced-
+        // but-unconsumed item, or silently drop a not-yet-produced one), the
+        // scope-end drop calls `bz_channel_receive_abandon`, which deregisters a
+        // still-parked waiter or gives a produced item back to the channel's
+        // head — "no message is consumed or lost" (§30.15). `taskOwnedResultDisposer`
+        // is intentionally left null alongside this flag (see
+        // isChannelReceiveInitializer's call sites): the abandon path never
+        // disposes the item, so no per-T disposer is needed.
+        bool channelReceiveTask = false;
         // §28.12 / §30 (`await using var`): the resource implements
         // IAsyncDisposable. On the NORMAL exit path (not unwind) we call
         // DisposeAsync() and await the returned Task (a proper suspend point),
@@ -6704,6 +6717,12 @@ private:
     // stdlib §6.7 / §30.5: return a local's resolved Task / Task<T> TypeRef if
     // it is Task-typed; null otherwise. Used by the using-var registration path.
     const sema::TypeRef* taskTypeOfLocal(const ast::LocalDecl* ld);
+    // §30.15 (v0.179, #1524): true when `ld`'s initializer is (syntactically)
+    // a no-arg `Receive()` call on a `Channel<T>` receiver — the same shape
+    // tryLowerChannelAndDomainCall recognises when lowering the call itself.
+    // Used to route the task-local's scope-end drop through the abandonment
+    // give-back protocol instead of the ordinary task disposal.
+    bool isChannelReceiveInitializer(const ast::LocalDecl* ld);
 
     // issue #401 / stdlib §4.1 / §4.2: is `rt` one of the int-indexed list
     // INTERFACES (IReadOnlyList<T>, IList<T>, IOwningList<T>)? These are the only

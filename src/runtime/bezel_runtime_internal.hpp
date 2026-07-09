@@ -216,6 +216,15 @@ struct bz_task_t {
     // §30.13 (#618): owning execution domain (set at allocation; always
     // g_main_domain for current single-domain programs).
     bz_domain_t* domain = nullptr;
+    // §30.15 (v0.179, #1524): set (to a bz_channel_t*) only for the task
+    // returned by bz_channel_receive — read exclusively by
+    // bz_channel_receive_abandon (the scope-end drop of an unconsumed
+    // Receive() task) to find the channel a still-parked or racily-completing
+    // waiter must deregister from / give an item back to. Opaque void* to
+    // avoid a forward-declaration cycle (bz_channel_t is defined further down
+    // in bezel_runtime_concurrency.cpp, after this struct). Null for every
+    // other task.
+    void* recv_channel = nullptr;
     // Continuation chain (registered by bz_task_then before the task completes)
     struct Cont { void (*fn)(void*, void*); void* state; };
     std::vector<Cont> continuations;
