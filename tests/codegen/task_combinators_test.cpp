@@ -594,6 +594,38 @@ BEZEL_TEST(task_combinators_30_5, using_var_when_all_not_awaited_no_leak) {
         12);
 }
 
+// §30.10 / §30.5 / #1617: bz_task_then vs bz_task_fire_and_forget inline-free
+// UAF/hang. WhenAll registers a per-input continuation via bz_task_then on each
+// already-settled input. The inputs are OWNED (`using var`) and disposed at the
+// block's scope end WITHOUT awaiting the aggregate — the abandonment idiom
+// (§30.5). bz_task_fire_and_forget's already-done fast path frees each task
+// inline. Before the fix, bz_task_then DEFERRED the continuation through the
+// domain queue with a raw task pointer, so the inline free could precede (or
+// race) the deferred continuation: the continuation then dereffed freed memory
+// (heap corruption / crash) or the aggregate never settled (hang at scheduler
+// shutdown). The fix runs the already-settled continuation synchronously, while
+// the caller still holds the task alive. Looped to stress the race window.
+BEZEL_TEST(task_combinators_1617, when_all_settled_inputs_then_faf_no_uaf) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    var i := 0; "
+        "    while i < 200 do "
+        "      i := i + 1; "
+        "      using var t1 := Task.FromResult(1); "
+        "      using var t2 := Task.FromResult(2); "
+        "      using var t3 := Task.FromResult(3); "
+        "      using var tasks := new Array<Task>(); "
+        "      tasks.Add(t1); "
+        "      tasks.Add(t2); "
+        "      tasks.Add(t3); "
+        "      using var wa := Task.WhenAll(tasks); "
+        "    end; "
+        "    return 42; "
+        "  end Main; end C;"),
+        42);
+}
+
 // ===========================================================================
 // §30.9 / #443 (WhenAll fault propagation): bz_task_when_all must propagate
 // faults from any input task to the aggregate. Before the fix the completion

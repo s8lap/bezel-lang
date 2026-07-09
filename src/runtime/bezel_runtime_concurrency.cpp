@@ -30,17 +30,38 @@
 //   bz_task_t.domain — pointer to the owning domain (always g_main_domain
 //     for now; Domain.Spawn will supply a fresh domain).
 //
-// Inline fast-path in bz_task_then (already-done):
-//   The caller of bz_task_then is itself a continuation running inside the
-//   domain's active runner.  Firing the next continuation *inline* (on the
-//   same C call stack) would be correct for the memory-safety contract, but
-//   it would (a) recursively deepen the C stack for every already-done await
-//   chain and (b) skip the domain-queue round-trip that lets other
-//   continuations that arrived concurrently interleave at the right points.
-//   Routing through domain_enqueue is the correct run-to-completion
-//   implementation: the current continuation returns to the domain drain loop,
-//   which finds the newly-enqueued item and runs it next — a domain-level tail
-//   call without stack growth.
+// Already-done fast path in bz_task_then (§30.10 / #1617):
+//   When the task is already settled at bz_task_then time, the continuation is
+//   run SYNCHRONOUSLY (inline) rather than deferred through the domain queue.
+//   Deferral was the previous design, but it left a use-after-free window: the
+//   deferred continuation carried a raw task pointer, while
+//   bz_task_fire_and_forget's already-done fast path freed the task struct
+//   inline — so a `using var` task disposed without being awaited could be
+//   freed while a still-queued WhenAll/WhenAny continuation was pending against
+//   it (#1617). Running inline closes the window: the continuation executes
+//   while the caller still holds the task alive, before any disposal can race.
+//
+//   The codegen await path never reaches this branch — emitAwaitSuspend
+//   pre-tests bz_task_is_done and takes its own inline fast path, calling
+//   bz_task_then only on the suspend (not-done) branch — so the only callers
+//   that hit the already-done branch are the runtime's own combinator helpers
+//   (WhenAll/WhenAny/WhenAllOwned, TaskScope.Spawn, the async-event raise
+//   chain). Those continuations synchronize their own shared state (atomics /
+//   per-context mutexes) and do not depend on domain-queue serialization, so
+//   running them off the queue is sound. g_current_domain is saved/restored
+//   around the inline call (mirroring domain_drain) so nested async allocation
+//   routes to the task's own domain.
+//
+//   The one recursive caller is the async-event raise chain
+//   (bz_raise_invoke_next → bz_task_then → bz_raise_chain_step → repeat), which
+//   could deepen the C stack once per synchronous handler. g_task_then_depth
+//   bounds that recursion: once it reaches the cap, the continuation falls back
+//   to domain_enqueue (the old deferred path). That fallback is safe for the
+//   only chain that reaches the cap, because the raise-chain context owns each
+//   handler task and frees it in the chain step itself — there is no concurrent
+//   fire-and-forget to race the deferred continuation. The combinator helpers
+//   never recurse through bz_task_then, so they always take the inline path
+//   regardless of input count.
 //
 // bz_task_await_sync (blocking sync-wait for async Main):
 //   The main OS thread calls this to block until the top-level Task completes.
@@ -95,6 +116,13 @@ bz_domain_t* g_main_domain = nullptr;
 // the nullptr fallback at each allocation site means main-thread callers still
 // get g_main_domain — zero behavior change for the common path.
 thread_local bz_domain_t* g_current_domain = nullptr;
+
+// #1617 / §30.10: per-thread inline-recursion depth for bz_task_then's
+// already-done fast path. Bounds C-stack growth for the only recursive caller
+// (the async-event raise chain over synchronous handlers); see the fast-path
+// comment above. Combinator helpers (WhenAll et al.) never recurse through
+// bz_task_then, so they always take the inline path regardless of this depth.
+thread_local int g_task_then_depth = 0;
 
 // #1553 / §22.13 (v0.181): a stable, non-zero per-OS-thread identifier used by
 // the static-initialization re-entrancy backstop (emitEnsureInitFns) to
@@ -862,17 +890,23 @@ const char* bz_task_error(void* tp) {
     return ((bz_task_t*)tp)->error_msg;
 }
 
-// §30.13 (#618): bz_task_then routes the continuation through the task's domain
-// queue regardless of the already-done fast path.
+// §30.10 / §30.13 / #1617: register a continuation on `task`. If the task is
+// NOT yet settled, the continuation is appended to the task's continuation list
+// and fired by bz_task_complete (which routes it through the domain queue). If
+// the task IS already settled, the continuation is run SYNCHRONOUSLY (inline)
+// rather than deferred — see the fast-path comment at the top of this file for
+// the full rationale and the UAF window this closes vs bz_task_fire_and_forget.
 //
-// When already_done is true the caller is executing as the domain's active
-// runner (it is itself a continuation that just ran and is chaining the next
-// step via bz_task_then).  Routing through domain_enqueue means: the current
-// continuation returns to the domain drain loop, which finds the newly-enqueued
-// item and runs it next — a domain-level tail call without stack growth.  This
-// is the correct run-to-completion implementation: other continuations that
-// arrived concurrently (e.g. from a parallel timer completion on a sub-task)
-// can be interleaved at the right points between the already-done items.
+// The inline call is made with g_current_domain set to the task's domain (the
+// same save/restore domain_drain performs) so any nested async allocation
+// routes correctly, and with task->mtx already released so the continuation may
+// itself complete tasks / enqueue domain work without deadlock. A per-thread
+// depth cap bounds the only recursive shape (the async-event raise chain over
+// synchronous handlers); past the cap the continuation falls back to the
+// deferred domain_enqueue path, which is safe there because the raise-chain
+// context owns the handler task and frees it in the step itself — no external
+// fire-and-forget can race it. Combinator helpers never recurse, so they always
+// run inline regardless of input count.
 void bz_task_then(void* tp, void (*cont)(void* task, void* state), void* state) {
     auto* task = (bz_task_t*)tp;
     bool already_done;
@@ -883,8 +917,21 @@ void bz_task_then(void* tp, void (*cont)(void* task, void* state), void* state) 
         dom = task->domain;
         if (!already_done) task->continuations.push_back({cont, state});
     }
-    if (already_done)
+    if (!already_done) return;
+    // #1617: run the continuation inline so it cannot race a concurrent inline
+    // free of this task (bz_task_fire_and_forget's already-done fast path). The
+    // depth cap bounds recursion for the async-event raise chain; the deferred
+    // fallback is safe for that chain (see the function comment above).
+    if (g_task_then_depth < 64) {
+        ++g_task_then_depth;
+        bz_domain_t* prev_cd = g_current_domain;
+        g_current_domain = dom;
+        cont(task, state);
+        g_current_domain = prev_cd;
+        --g_task_then_depth;
+    } else {
         domain_enqueue(dom, cont, task, state);
+    }
 }
 
 void bz_task_free(void* tp) {
