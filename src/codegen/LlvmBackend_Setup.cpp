@@ -7065,6 +7065,46 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
             }
         }
     }
+    // §28.7 / §28.3 (#1625): a null-INITIALIZED plain local (`var x: T? := null;`)
+    // that BECOMES owned via reassignment is an owned class/interface local for
+    // disposal purposes, even though its initializer (`null`) is not itself an
+    // owned producer. The ownership pass sets becomesOwnedViaReassign ONLY for a
+    // null-initialized local (handleAssignment) on its first Owned reassignment.
+    // The restriction is load-bearing: a BORROW-initialized local must NOT be
+    // classified as owned here — disposeDisplacedOwnedClassLocal would otherwise
+    // dispose the displaced BORROW on the first owned assignment (a double-free;
+    // the exclusion that helper documents) — and a no-initializer local returns
+    // null at the top of this function (the `!ld->initializer` gate). A null-
+    // initialized slot starts null, so treating it as owned for drop-on-overwrite
+    // (§28.7) and scope-end/unwind disposal (§28.3) is sound: the disposal is
+    // dynamic (vtable) and null-guarded, so a slot still null or moved-from at
+    // the dispose site disposes nothing. The state-match rule (§28.3) guarantees
+    // such a local is never reassigned a borrow. Recover the class from the
+    // declared type (a nullable `T?` resolves to T with nullable=true).
+    // Collections/wrappers/tasks/subscriptions were excluded above.
+    if (ld->becomesOwnedViaReassign) {
+        const sema::TypeSymbol* cls = classOfLocal(ld);
+        if (cls && cls->kind == ast::TypeDeclKind::Class &&
+            disposerFns_.find(cls) != disposerFns_.end())
+            return cls;
+        // An INTERFACE-typed nullable local (`var x: IThing? := null;
+        // x := new C();`): classOfLocal returns the interface symbol (no
+        // disposerFns_ entry), but the concrete object behind it has a vtable,
+        // so dispose dynamically. Mirrors the interface handling in the `new`
+        // branch above and usingVarOwnsClassObjectDynamically (a).
+        if (cls && cls->kind == ast::TypeDeclKind::Interface)
+            return reinterpret_cast<const sema::TypeSymbol*>(1);
+        // A declared class/interface type whose declaration did not resolve
+        // (a generic type parameter under the active substitution): resolve
+        // through genericSubstSemaTy_, else dispose dynamically when the
+        // declared type is recognisably a class/interface.
+        if (ld->type) {
+            const sema::TypeRef* rt = ctx_.resolvedType(*ld->type);
+            const sema::TypeRef* rrt = resolveTypeParamRef(rt);
+            if (isClassOrInterfaceRef(rt) || isClassOrInterfaceRef(rrt))
+                return reinterpret_cast<const sema::TypeSymbol*>(1);
+        }
+    }
     return nullptr;
 }
 

@@ -2225,7 +2225,39 @@ bool MethodOwnership::localDropOnOverwriteCovered(const sema::Symbol* sym) {
     auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym);
     if (!ls) return false;
     auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
-    if (!ld || !ld->initializer) return false;
+    if (!ld) return false;
+    // §28.7 / §28.3 (#1625): a null-INITIALIZED plain local (`var x: T? := null;`)
+    // that BECOMES owned via reassignment is covered by codegen's drop-on-overwrite
+    // once unwindOwnedLocalClass recognises the becomesOwnedViaReassign flag — so
+    // the FINAL value is exactly-once-safe to auto-drop at scope end, exactly like
+    // the owned-initializer locals the path below admits. The flag is set ONLY for
+    // a null-initialized local (handleAssignment), so this branch does NOT fire for
+    // a no-initializer local (`var x: Stream;`) that becomes owned on both branches
+    // of a join — that case CARRIES the §28.3 obligation and stays a hard error
+    // absent explicit discharge (own_join.owned_on_both_branches_carries_obligation)
+    // — nor for a borrow-initialized local (its overwrite must not auto-drop). The
+    // DECLARED type (not the `null` initializer's type) is the class/interface;
+    // exclude owning collections/wrappers/tasks (their overwrite does not dispose
+    // via class dispatch — codegen's unwindOwnedLocalClass excludes them too),
+    // mirroring the initializer-based checks below. Falls through when not a
+    // covered class/interface local.
+    if (ld->becomesOwnedViaReassign) {
+        const sema::TypeRef* dt =
+            ld->type ? ctx_.resolvedType(*ld->type) : nullptr;
+        if (isClassOrInterfaceResult(dt)) {
+            std::string_view head =
+                (dt->astNode && dt->astNode->name &&
+                 !dt->astNode->name->parts.empty())
+                    ? dt->headName()
+                    : std::string_view{};
+            if (!head.empty() &&
+                !isOwningCollectionNameHead(head) &&
+                !isOwningTypeNameHead(head) &&
+                head != "Task" && head != "OwningTask")
+                return true;
+        }
+    }
+    if (!ld->initializer) return false;
     if (producerState(*ld->initializer) != OwnershipState::Owned) return false;
     const sema::TypeRef* t = ctx_.exprType(*ld->initializer);
     if (!isClassOrInterfaceResult(t)) return false;
@@ -2553,6 +2585,44 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
                 checkConsumeFreeze(id->name, as.target->span.begin);
             st.state = producerState(*as.value);
             st.obligationOrigin = &as;
+            // §28.7 / §28.3 (#1625): flag a null-INITIALIZED plain local
+            // (`var x: T? := null;`, PolyNull) the first time it ADOPTS Owned
+            // state from a non-null RHS, so codegen treats it as an owned class
+            // local for drop-on-overwrite (§28.7) and scope-end disposal (§28.3).
+            // Its `null` initializer is not itself an owned producer, so without
+            // the flag codegen's unwindOwnedLocalClass (which keys on the
+            // initializer form) would never classify it as owned and every
+            // displaced value would leak. Idempotent (a sticky boolean); the
+            // type/class gating (class/interface, not collection/wrapper/task)
+            // lives in the two consumers. // per §28.7, §28.3
+            //
+            // RESTRICTED to the null-initialized local — the two other "becomes
+            // owned via reassign" shapes must NOT set the flag:
+            //   * a NO-initializer local (`var x: Stream;`) that becomes owned on
+            //     both branches of a join CARRIES the §28.3 disposal obligation:
+            //     absent an explicit discharge it stays a hard error, NOT an
+            //     auto-drop (own_join.owned_on_both_branches_carries_obligation).
+            //     Setting the flag would admit it to the §28.3 affine auto-drop
+            //     (localDropOnOverwriteCovered), wrongly converting the error
+            //     into a warning — the regression this guard prevents.
+            //   * a BORROW-initialized local (`var x := src.f; … x := new C();`)
+            //     must not be classified as owned for drop-on-overwrite: the
+            //     first owned assignment would dispose the displaced BORROW (a
+            //     double-free; disposeDisplacedOwnedClassLocal excludes borrow-
+            //     init locals, and so must this flag).
+            // The state-match rule (§28.3) guarantees a null-init local, once
+            // owned, is never reassigned a borrow, so the flag is sound once set.
+            if (st.state == OwnershipState::Owned) {
+                if (auto* lsym = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                    if (auto* ld2 =
+                            dynamic_cast<const ast::LocalDecl*>(lsym->decl))
+                        if (ld2->initializer &&
+                            dynamic_cast<const ast::NullLiteralExpr*>(
+                                ld2->initializer.get()))
+                            const_cast<ast::LocalDecl*>(ld2)
+                                ->becomesOwnedViaReassign = true;
+                }
+            }
             if (src && src != sym) {
                 BorrowSource bs;
                 bs.sym = src;

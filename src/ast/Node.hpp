@@ -148,6 +148,25 @@ struct LocalDecl : Stmt {
     // value its real owner also disposes (the borrow-LOCAL sibling of the
     // #1274 borrow-parameter exclusion, which codegen can detect on its own).
     bool usingVarSourceIsBorrow = false;
+    // §28.7 / §28.3 (#1625): set by the ownership pass ONLY on a null-
+    // INITIALIZED plain (non-`using`) local (`var x: T? := null;`, PolyNull)
+    // whose ownership state BECOMES Owned through reassignment — it later
+    // receives a fresh owned producer (`x := new T();`). Such a local's
+    // initializer (`null`) is not itself an owned producer, so codegen's
+    // unwindOwnedLocalClass — which otherwise keys on the initializer form —
+    // would never classify it as an owned class local, and §28.7 drop-on-overwrite
+    // (disposeDisplacedOwnedClassLocal) plus §28.3 scope-end disposal would both
+    // be skipped, leaking every displaced value. The state-match rule (§28.3)
+    // guarantees such a local, once owned, is never reassigned a borrow, so
+    // treating it as owned for disposal is sound. Deliberately NOT set for a
+    // no-initializer local (`var x: Stream;`) that becomes owned on both branches
+    // of a join — that case CARRIES the §28.3 obligation and stays a hard error
+    // absent explicit discharge (own_join.owned_on_both_branches_carries_obligation)
+    // — nor for a borrow-initialized local (its drop-on-overwrite would dispose
+    // the borrow: a double-free). Codegen reads this flag as a fallback in
+    // unwindOwnedLocalClass; the ownership-side mirror localDropOnOverwriteCovered
+    // reads it to admit the local to affine auto-drop.
+    bool becomesOwnedViaReassign = false;
     std::string_view name;
     std::unique_ptr<Type> type;        // null when no `: Type`
     std::unique_ptr<Expr> initializer; // null only when plain `var x;`
