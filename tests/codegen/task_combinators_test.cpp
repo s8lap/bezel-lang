@@ -298,21 +298,35 @@ BEZEL_TEST(task_combinators_6_7, when_all_empty_array) {
         3);
 }
 
-// §6.7: Task.WhenAll with Task.Delay tasks — genuinely cross-thread.
-// WhenAll completes after ALL delays elapse. Run 3x for stability.
-// NOTE: individual Task.Delay tasks in the Array<Task> are borrowed by the
-// array and cannot be freed by it (Array<Task> is a borrowing collection).
-// Their lifetime is managed by the scheduler infrastructure (the delay workers
-// run to completion). This test validates cross-thread correctness only.
+// §6.7: Task.WhenAll over genuinely cross-thread inputs. The flake cause in the
+// original was that the ONLY cross-thread synchronization was a fixed Task.Delay
+// (5) wall-clock timer — a no-barrier race mitigated solely by the 3x loop.
+// Replaced with a DETERMINISTIC completion primitive using only stdlib types
+// (§6.9 Channel<T>, §30.14 Domain.Spawn): two Channel<int>.Receive() tasks are
+// the inputs (both pending), and a spawned producer domain Sends two items on
+// the channel. Each Send completes its receive via the RECEIVER's domain queue
+// (§30.15 — genuinely cross-thread, the same character as a timer firing on a
+// pool thread) but, unlike a wall-clock timer, is guaranteed to fire by program
+// logic, so WhenAll deterministically completes once both items are sent. No
+// timing dependence remains. The 3x loop is now defense-in-depth, not race
+// compensation. Correctness-only (the borrowing Array<Task> does not own the
+// receive tasks; their lifetime is managed by the scheduler, as the delay
+// workers it replaces were).
 BEZEL_TEST(task_combinators_6_7, when_all_with_delays_cross_thread) {
     const std::string src =
-        "module M; class C "
+        "module M; import System.Threading; class C "
+        "  public static method Signal2(owned tx: ChannelSender<int>) "
+        "    using var s := tx; s.Send(1); s.Send(2); "
+        "  end Signal2; "
         "  public static async method Main(): Task<int> "
+        "    using var ch := new Channel<int>(); "
         "    using var tasks := new Array<Task>(); "
-        "    tasks.Add(Task.Delay(5)); "
-        "    tasks.Add(Task.Delay(5)); "
+        "    tasks.Add(ch.Receive()); "
+        "    tasks.Add(ch.Receive()); "
+        "    using var prod := Domain.Spawn(C.Signal2, ch.NewSender()); "
         "    using var wa := Task.WhenAll(tasks); "
         "    await wa; "
+        "    await prod; "
         "    return 4; "
         "  end Main; end C;";
     for (int i = 0; i < 3; ++i)
@@ -362,35 +376,68 @@ BEZEL_TEST(task_combinators_6_7, when_any_yields_winner_index) {
         0);
 }
 
-// §6.7 / #1332: Task.WhenAny with Task.Delay — genuinely cross-thread (first delay to
-// fire wins). Run 3x for nondeterminism stability. Correctness-only test.
+// §6.7 / #1332: Task.WhenAny over genuinely cross-thread inputs. The original
+// used two Task.Delay timers (5ms vs 20ms) — a wall-clock race whose ONLY sync
+// was the fixed timers, mitigated solely by the 3x loop. Replaced with a
+// DETERMINISTIC completion primitive (§6.9 Channel<T>, §30.14 Domain.Spawn):
+// two Channel<int>.Receive() tasks are the inputs, and a spawned producer domain
+// Sends on both channels. Each Send completes its receive cross-thread via the
+// receiver's domain queue (§30.15); WhenAny completes with whichever fires
+// first. The asserted value (6) is independent of the winner, so the result is
+// now fully deterministic regardless of completion order. The 3x loop is
+// defense-in-depth. Correctness-only.
 BEZEL_TEST(task_combinators_6_7, when_any_with_delay_cross_thread) {
     const std::string src =
-        "module M; class C "
+        "module M; import System.Threading; class C "
+        "  public static method Signal2("
+        "      owned tx1: ChannelSender<int>, owned tx2: ChannelSender<int>) "
+        "    using var s1 := tx1; using var s2 := tx2; s1.Send(1); s2.Send(2); "
+        "  end Signal2; "
         "  public static async method Main(): Task<int> "
+        "    using var ch1 := new Channel<int>(); "
+        "    using var ch2 := new Channel<int>(); "
         "    using var tasks := new Array<Task>(); "
-        "    tasks.Add(Task.Delay(5)); "
-        "    tasks.Add(Task.Delay(20)); "
+        "    tasks.Add(ch1.Receive()); "
+        "    tasks.Add(ch2.Receive()); "
+        "    using var prod := Domain.Spawn(C.Signal2, ch1.NewSender(), ch2.NewSender()); "
         "    using var wa := Task.WhenAny(tasks); "
         "    await wa; "
+        "    await prod; "
         "    return 6; "
         "  end Main; end C;";
     for (int i = 0; i < 3; ++i)
         BEZEL_EXPECT_EQ(compileAndRun(src), 6);
 }
 
-// §6.7 / #1332: WhenAny Delay-race index — shorter delay wins index 0 (5ms vs 500ms).
-// The first-done task is index 0; winner index is 0. Run 3x for stability.
+// §6.7 / #1332: WhenAny winner-index — the input that completes first wins.
+// The original was a 5ms-vs-500ms Task.Delay race asserting index 0; the 100x
+// timer margin made the right answer likely but still timing-dependent (the
+// ONLY sync was the fixed wall-clock timers). Replaced with a DETERMINISTIC
+// completion primitive (§6.9 Channel<T>, §30.14 Domain.Spawn): the producer
+// domain Sends on channel 0 only (completing index 0's receive cross-thread,
+// §30.15); channel 1's receive is left genuinely pending. With exactly one
+// input ever completing, WhenAny deterministically returns index 0 — no race,
+// no timer margin to rely on. (The pending channel-1 receive is abandoned at
+// scope end, the §30.15/#1524 disposal case, identical to the #1501 test's
+// pending `tb`; this test is value-only and does not LSan-check, like #1501.)
+// The 3x loop is defense-in-depth.
 BEZEL_TEST(task_combinators_6_7, when_any_delay_race_winner_index) {
     const std::string src =
-        "module M; class C "
+        "module M; import System.Threading; class C "
+        "  public static method Signal1(owned tx: ChannelSender<int>) "
+        "    using var s := tx; s.Send(1); "
+        "  end Signal1; "
         "  public static async method Main(): Task<int> "
+        "    using var ch0 := new Channel<int>(); "
+        "    using var ch1 := new Channel<int>(); "
         "    using var tasks := new Array<Task>(); "
-        "    tasks.Add(Task.Delay(5)); "
-        "    tasks.Add(Task.Delay(500)); "
+        "    tasks.Add(ch0.Receive()); "
+        "    tasks.Add(ch1.Receive()); "
+        "    using var prod := Domain.Spawn(C.Signal1, ch0.NewSender()); "
         "    using var wa := Task.WhenAny(tasks); "
         "    var idx := await wa; "
-        "    return idx; "  // 0 — the 5ms delay always wins over 500ms
+        "    await prod; "
+        "    return idx; "  // 0 — only ch0 is ever signalled
         "  end Main; end C;";
     for (int i = 0; i < 3; ++i)
         BEZEL_EXPECT_EQ(compileAndRun(src), 0);
@@ -613,20 +660,34 @@ BEZEL_TEST(task_combinators_443, when_all_all_success_unaffected) {
         5);
 }
 
-// §30.9 / #443: WhenAll with a genuinely-async (Task.Delay) faulted input, run
-// cross-thread. The fault propagates to the aggregate and the process exits 70.
-// Run 3x for nondeterminism stability.
+// §30.9 / #443: WhenAll re-raises a fault from a genuinely-async faulted input.
+// The original made the fault async by awaiting Task.Delay(5) before throwing —
+// wall-clock sync whose ONLY barrier was the fixed timer, mitigated by the 3x
+// loop. Replaced with a DETERMINISTIC completion primitive (§6.9 Channel<T>,
+// §30.14 Domain.Spawn): a pending Channel<int>.Receive() is the faulting input,
+// and a spawned producer domain disposes its sender — the channel's ONLY sender
+// — which CLOSES the channel (§30.15), faulting the pending receive with
+// ChannelClosedException cross-thread. WhenAll re-raises it (§30.9 / #443 fault
+// propagation) and, with no handler, the process exits 70 — the GENERIC
+// unhandled-exception boundary (§33.3, bz_unhandled_exception → _exit(70)),
+// independent of exception type, so ChannelClosedException yields the same 70
+// the original's InvalidOperationException did. The fault is now triggered by
+// program logic, not a wall-clock timer, so it propagates deterministically.
+// (Robust to producer scheduling either way: if the channel closes before the
+// receive is parked, a closed-channel Receive faults immediately per §30.15 —
+// still 70.) The 3x loop is defense-in-depth.
 BEZEL_TEST(task_combinators_443, when_all_delay_then_fault_cross_thread) {
     const std::string src =
-        "module M; class C "
-        "  public static async method BoomAfterDelay(): Task "
-        "    await Task.Delay(5); "
-        "    throw new InvalidOperationException(); "
-        "  end BoomAfterDelay; "
+        "module M; import System.Threading; class C "
+        "  public static method CloseChan(owned tx: ChannelSender<int>) "
+        "    using var s := tx; "
+        "  end CloseChan; "
         "  public static async method Main(): Task<int> "
+        "    using var ch := new Channel<int>(); "
         "    using var tasks := new Array<Task>(); "
         "    tasks.Add(Task.FromResult(1)); "
-        "    tasks.Add(BoomAfterDelay()); "
+        "    tasks.Add(ch.Receive()); "
+        "    using var prod := Domain.Spawn(C.CloseChan, ch.NewSender()); "
         "    using var wa := Task.WhenAll(tasks); "
         "    await wa; "
         "    return 5; "
