@@ -97,7 +97,19 @@ CompileResult Driver::compileFile(const std::string& path,
     Parser parser(lexer, diagnostics);
     auto unit = parser.parseCompilationUnit();
 
-    if (unit) {
+    // §2.6 (build phases): parse must complete cleanly before the later
+    // phases (type resolution, type-check, ownership) run. The parser returns
+    // an error-recovery AST even after queueing parse diagnostics, and the
+    // front-end passes unconditionally deref AST children that the grammar
+    // guarantees non-null but a partial recovery leaves null (e.g. a `const`
+    // whose initializer is the malformed `1 + ;` leaves a `BinaryExpr` with a
+    // null right operand). Running those passes on such a tree crashed the
+    // compiler — a `unique_ptr::operator*()` abort — before the already-queued
+    // parse diagnostic was ever printed (#1622; #1615 was one such deref).
+    // Gate the whole front-end on a clean parse, exactly as the entry-point
+    // check and codegen below already gate on a clean front-end. Valid programs
+    // (no parse errors) are unaffected: the block runs precisely as before.
+    if (unit && !diagnostics.hasErrors()) {
         // Sema milestone — runs in pass order: symbol collection,
         // type resolution, expression typecheck. Each pass annotates
         // the AST via side-tables on SemaContext.
@@ -222,7 +234,10 @@ CompileResult Driver::compileObject(const std::string& path,
     Parser parser(lexer, diagnostics);
     auto unit = parser.parseCompilationUnit();
 
-    if (unit) {
+    // §2.6 (build phases) / #1622: do not run the front-end on an error-
+    // recovery AST. See compileFile for the full rationale — the same parse-
+    // gates-the-front-end rule applies to this library/object path.
+    if (unit && !diagnostics.hasErrors()) {
         sema::SemaContext semaCtx(diagnostics);
         sema::collectSymbols(*unit, semaCtx);
         // §2.5: a library may itself import dependencies (acyclic).
