@@ -27,6 +27,14 @@
 // before the corrected Step 2 walk runs. That case is tracked by #1621 and is
 // NOT covered here.
 
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <sys/wait.h>
+#include <thread>
+#include <unistd.h>
+
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
@@ -168,4 +176,129 @@ BEZEL_TEST(catch_multitype_no_common_base_v182, single_type_binding_unaffected_s
         "  return 0; "
         "end Main; end C;"),
         7);
+}
+
+// #1624 / §31.2.1 (NCB TERMINATION) — the load-bearing regression for the hang
+// fix. The tests above all walk a NON-CYCLIC base graph (a 2-level diamond or a
+// shallow shared base): no node is ever revisited, so dropping the cycle guard
+// would NOT fail them. This case reproduces the actual compile-time hang that
+// #1624 fixed: a CYCLIC base-type graph reaching `catchArmNcb`'s
+// `collectAncestors` walk, where the pre-fix visited-set gated only the RESULT
+// set, not the base WALK — a revisited node re-pushed its bases, so the walk
+// looped forever.
+//
+// Spec grounding:
+//  - §12.10: "An inheritance cycle is a compile error ... `class A: B`,
+//    `class B: A` ... The compiler detects the cycle and reports an error
+//    naming the participating types." So the cyclic pair below is REJECTED, but
+//    — as the fix commit notes — it reaches the catch-arm binding via error
+//    recovery: the §12.10 diagnostic is recorded, yet `typecheckExpressions`
+//    still runs and reaches `catchArmNcb` on the (now cyclic) base graph.
+//  - §31.2.1: a multi-type BINDING arm's static type is the nearest common base
+//    of the listed types, computed by `catchArmNcb`. For `A | C` (A in the
+//    A<->B cycle, C unrelated) `commonTypeOf(A, C)` is null — neither converts
+//    into the other (isSubtype's cycle guard makes it return false for the
+//    cyclic chain) — so the Step-2 `collectAncestors(A)` walk runs and, pre-fix,
+//    never terminates on the A->B->A->B cycle.
+//
+// REPRODUCING THE BUG is only useful if a regression FAILS THE TEST rather than
+// hanging CI. The front-end (`runJit`) therefore runs in a forked child under a
+// hard wall-clock deadline; the parent `waitpid`s and kills the child if it does
+// not exit. Pre-fix, `collectAncestors` loops forever in the child and the
+// parent kills it -> the test reports "did not terminate". Post-fix the child
+// returns promptly, and the parent additionally asserts the §12.10 "circular
+// inheritance" diagnostic was recorded — confirming the cycle was reached and
+// reported (distinguishing a real termination from an early parse/scope abort),
+// not bypassed. `runJit` does not run the ownership pass (off unless
+// BEZEL_CHECK_OWNERSHIP=1) and skips codegen when sema has errors, so this path
+// isolates the §31.2.1 sema NCB hang (#1624) from the separate cyclic-hierarchy
+// codegen/ownership hangs tracked elsewhere.
+//
+// VERIFIED to fail-without / pass-with the fix: pre-fix bezelc on this input
+// hangs in ExprTC::catchArmNcb's collectAncestors (push_back loop); post-fix it
+// terminates reporting both the §12.10 cycle error and the §31.2.1
+// no-common-base error.
+BEZEL_TEST(catch_multitype_no_common_base_v182,
+           cyclic_base_graph_ncb_terminates_spec_31_2_1_1624) {
+    // Cyclic base graph (§12.10) + an unrelated class C. `throw new C()`
+    // instantiates the UNRELATED C (not a cyclic type), so the only unbounded
+    // walk this input reaches — pre-fix — is `catchArmNcb`'s `collectAncestors`
+    // on A's cyclic ancestor chain (the #1624 hang).
+    const std::string src =
+        "module M; "
+        "class A: B end A; "          // cycle: A -> B -> A (§12.10)
+        "class B: A end B; "
+        "class C end C; "             // unrelated to A/B -> commonTypeOf(A,C) is
+                                      // null, forcing catchArmNcb Step 2 onto
+                                      // collectAncestors(A)'s cyclic walk
+        "class Runner public static method Main(): int "
+        "  try throw new C(); "
+        "  catch var e: A | C => return 1; "  // §31.2.1 multi-type BINDING arm
+        "  end; "
+        "  return 0; "
+        "end Main; end Runner;";
+
+    namespace fs = std::filesystem;
+    static int counter = 0;
+    const std::string diagPath =
+        (fs::temp_directory_path() /
+         ("bezel_1624_" + std::to_string(counter++) + ".diag")).string();
+
+    pid_t pid = ::fork();
+    BEZEL_EXPECT_TRUE(pid >= 0);
+    if (pid < 0) { std::remove(diagPath.c_str()); return; }
+
+    if (pid == 0) {
+        // Child: run the front-end on the cyclic graph. With the #1624 fix this
+        // returns (sema records the §12.10 cycle + §31.2.1 no-common-base
+        // errors, so runJit returns before codegen); without the fix
+        // collectAncestors loops forever here and the parent kills this child.
+        // Write the recorded errors to a file the parent inspects, then _Exit
+        // (NOT exit): skip atexit/static destructors in the forked copy.
+        auto r = runJit(src);
+        std::ofstream out(diagPath);
+        for (const auto& d : r.diagnostics.diagnostics()) {
+            if (d.severity == bezel::Severity::Error)
+                out << d.message << "\n";
+        }
+        out.flush();
+        out.close();
+        std::_Exit(0);
+    }
+
+    // Parent: bounded wait. A normal sema of this fragment is sub-second, so a
+    // generous deadline still catches the pre-fix infinite walk quickly.
+    constexpr int kDeadlineSec = 20;
+    int status = 0;
+    bool terminated = false;
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::seconds(kDeadlineSec);
+    while (std::chrono::steady_clock::now() < deadline) {
+        pid_t w = ::waitpid(pid, &status, WNOHANG);
+        if (w == pid) { terminated = true; break; }
+        if (w == -1) break;  // error other than EINTR; treat as not-terminated
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (!terminated) {
+        ::kill(pid, SIGKILL);
+        ::waitpid(pid, &status, 0);  // reap the killed child
+    }
+
+    // Assertion 1 (#1624): the §31.2.1 NCB walk TERMINATED on a cyclic base
+    // graph. This is the load-bearing assertion — it fails (killed child) iff
+    // the visited-set cycle guard is dropped.
+    BEZEL_EXPECT_TRUE(terminated);
+
+    // Assertion 2: the §12.10 cycle was reached and reported, confirming sema
+    // ran (vs. an early parse/scope abort that would also "terminate").
+    std::string diags;
+    {
+        std::ifstream in(diagPath);
+        diags.assign(std::istreambuf_iterator<char>(in),
+                     std::istreambuf_iterator<char>());
+    }
+    std::remove(diagPath.c_str());
+    if (!terminated) return;  // avoid a misleading second failure
+    BEZEL_EXPECT_TRUE(diags.find("circular inheritance detected") !=
+                      std::string::npos);
 }
