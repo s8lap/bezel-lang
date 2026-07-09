@@ -3917,7 +3917,22 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                     lsym->name = id->name;
                     lsym->decl = id;
+                    // per §22.4 / §28.8 (#1304): infer the type from the
+                    // callee's `out owned T` formal parameter for a USER-DEFINED
+                    // method (the common case), so a later member access on the
+                    // recipient (`res!.v`) resolves. The builtin derivation
+                    // below handles the owning-collection / Weak Try* methods,
+                    // which have no MethodDecl. Mirrors the `out owned var`
+                    // handler just above; without this the recipient's declType
+                    // stayed null and every member read on it lowered to a
+                    // default value (the #1304 wrong-value bug).
+                    if (calleeMd2 && pos2 < calleeMd2->params.size() &&
+                        calleeMd2->params[pos2].type) {
+                        lsym->declType = ctx_.resolvedType(
+                            *calleeMd2->params[pos2].type);
+                    }
                     // Derive the type from the builtin receiver.
+                    if (!lsym->declType) {
                     if (auto* maCallee =
                             dynamic_cast<const ast::MemberAccessExpr*>(
                                 ce->callee.get())) {
@@ -4018,6 +4033,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             }
                         }
                     }
+                    }  // close `if (!lsym->declType)` (#1304)
                     currentScope_->names[id->name] = lsym;
                 }
             }
