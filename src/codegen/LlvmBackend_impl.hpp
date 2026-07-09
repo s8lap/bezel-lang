@@ -7211,6 +7211,8 @@ private:
     // (a Named TypeRef with a null user declaration whose first name part is
     // "IEvent"/"IAsyncEvent")? Mirrors isSubscriptionType.
     static bool isIEventTypeName(const sema::TypeRef* rt);
+    // §6.5 / §24.3 (#1610): producer-side "EventSource"/"AsyncEventSource".
+    static bool isEventSourceTypeName(const sema::TypeRef* rt);
 
     // per §24.4: `<event> += h` / `<event> -= h` inside the declaring class —
     // a fixed desugaring to Add/Remove. Returns true when handled.

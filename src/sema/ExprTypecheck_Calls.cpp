@@ -5384,6 +5384,71 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         // Dispose(): unit; no return type set.
                     }
+                    // §6.5 / §24.3 (#1610): EventSource<T> / AsyncEventSource<T>
+                    // instance methods on a value held in a local, parameter, or
+                    // field — i.e. NOT a direct `<event>.Method()` access (whose
+                    // receiver carries no exprType and is handled by the
+                    // EventSymbol-keyed path in resolveMemberAccess + codegen's
+                    // eventSymbolOf). These builtin generics have declaration ==
+                    // nullptr, so ordinary member lookup never resolves their
+                    // methods; without this block any call — valid or bogus —
+                    // silently compiles and no-ops at runtime (#1610). Mirror the
+                    // Channel<T> pattern: type each known method (stdlib §6.5)
+                    // and reject any unrecognized name. The §24.3 visibility
+                    // fence is NOT re-applied here: once a value is typed
+                    // EventSource<T>, all producer methods are available per the
+                    // type-fence design (stdlib §6.5 — the reference is
+                    // obtainable only inside the declaring class; smuggling one
+                    // out is a deliberate breach the language does not defend
+                    // against).
+                    if ((rcn == "EventSource" || rcn == "AsyncEventSource") &&
+                        recvTy) {
+                        bool isAsyncES = (rcn == "AsyncEventSource");
+                        if (m == "Subscribe") {
+                            // Subscribe(handler): owned Subscription.
+                            static const ast::Type* kEvSubNode = []() -> ast::Type* {
+                                auto* qn = new ast::QualifiedName;
+                                qn->parts.push_back("Subscription");
+                                auto* t = new ast::Type;
+                                t->kind = ast::TypeKind::Named;
+                                t->name.reset(qn);
+                                return t;
+                            }();
+                            auto* subTy = ctx_.makeTypeRef();
+                            subTy->kind = TypeRef::Kind::Named;
+                            subTy->declaration = nullptr;
+                            subTy->astNode = kEvSubNode;
+                            ctx_.setExprType(&ce, subTy);
+                        } else if (m == "RaiseAsync" && isAsyncES) {
+                            // RaiseAsync(payload: T): Task.
+                            auto* tt = ctx_.makeTypeRef();
+                            tt->kind = TypeRef::Kind::Named;
+                            tt->nullable = false;
+                            auto* ann = new ast::Type();
+                            ann->kind = ast::TypeKind::Named;
+                            auto* nm = new ast::QualifiedName();
+                            nm->parts.push_back("Task");
+                            ann->name.reset(nm);
+                            tt->astNode = ann;
+                            ctx_.setExprType(&ce, tt);
+                        } else if (m == "Raise" && !isAsyncES) {
+                            // Raise(payload: T) -> unit (no return type set).
+                        } else if (m == "Add" || m == "Remove") {
+                            // Add(handler) / Remove(handler) -> unit.
+                        } else if (m != "Dispose") {
+                            // Dispose is compiler-generated and passes silently;
+                            // any other name is not on the producer surface.
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `") + std::string(m) +
+                                "` on `" + std::string(rcn) +
+                                "<T>`; documented surface: Subscribe(handler)" +
+                                std::string(isAsyncES
+                                    ? ", RaiseAsync(payload), Add(handler), Remove(handler)"
+                                    : ", Raise(payload), Add(handler), Remove(handler)") +
+                                " (stdlib \xC2\xA7""6.5 / \xC2\xA7""24.3)");
+                        }
+                    }
                     // §6.2 / issue #647: Mutex instance methods.
                     // Mutex TypeRef: Named, no declaration, astNode name "Mutex".
                     if (rcn == "Mutex" && recvTy) {
@@ -6814,10 +6879,26 @@ TypeRef* ExprTC::eventHandlerPayloadType(const ast::Expr* callee) {
         ma->member != "Remove")
         return nullptr;
     auto* es = dynamic_cast<EventSymbol*>(ctx_.exprSymbol(*ma->target));
-    if (!es) return nullptr;
-    auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
-    if (!ed || !ed->type) return nullptr;  // no-payload event → unit (no param)
-    return ctx_.resolvedType(*ed->type);
+    if (es) {
+        auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
+        if (!ed || !ed->type) return nullptr;  // no-payload → unit (no param)
+        return ctx_.resolvedType(*ed->type);
+    }
+    // §6.5 / §24.3 (#1610): a Subscribe/Add/Remove on a value held in a local,
+    // parameter, or field of static type EventSource<T>/AsyncEventSource<T>
+    // (the target is not an EventSymbol). The payload type is the receiver's
+    // genericArgs[0], so an untyped handler lambda's `(e)` param is typed as T
+    // and its body resolves `e.Field` — the same seeding the direct-event path
+    // provides above.
+    const TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
+        !recvTy->declaration && recvTy->astNode &&
+        recvTy->astNode->name && !recvTy->astNode->name->parts.empty() &&
+        (recvTy->headName() == "EventSource" ||
+         recvTy->headName() == "AsyncEventSource") &&
+        !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+        return recvTy->genericArgs[0];
+    return nullptr;
 }
 
 // §21.9 / §17.13 / §2.11 (#949): is `e` an `<event>.Subscribe(...)` call whose

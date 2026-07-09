@@ -2032,6 +2032,20 @@ bool Emitter::isIEventTypeName(const sema::TypeRef* rt) {
     return n == "IEvent" || n == "IAsyncEvent";
 }
 
+// §6.5 / §24.3 (#1610): the producer-side event-source classes. Like
+// isIEventTypeName, a NULL-declaration Named TypeRef whose astNode first name
+// part is "EventSource" / "AsyncEventSource". A value of this static type held
+// in a local/parameter/field is the same bz_event_source_t* a direct event
+// access yields, so member calls dispatch against it identically.
+bool Emitter::isEventSourceTypeName(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+        return false;
+    const auto& n = rt->headName();
+    return n == "EventSource" || n == "AsyncEventSource";
+}
+
 llvm::Value* Emitter::lowerEventHandlerClosure(const ast::Expr* handlerExpr,
                                                const sema::TypeRef* payload) {
     if (!handlerExpr) return nullptr;
@@ -2059,103 +2073,145 @@ llvm::Value* Emitter::lowerEventHandlerClosure(const ast::Expr* handlerExpr,
 std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call) {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
     if (!ma || !ma->target) return std::nullopt;
-    // The target of `.Subscribe`/`.Raise`/`.Add`/`.Remove` must itself be an
-    // event access.
-    const sema::EventSymbol* es = eventSymbolOf(*ma->target);
-    if (!es) {
-        // §24.3 (#747): `.Subscribe` on a STORED IEvent<T>/IAsyncEvent<T> value
-        // (`var ev := s.Happened; ev.Subscribe(h)`), not a direct event access.
-        // IEvent<T> has no itable, but its runtime value IS the
-        // bz_event_source_t* (via the event-as-value read), so dispatch directly
-        // to bz_event_subscribe. The payload is the receiver type's genericArgs[0]
-        // (the upcast type, variance-safe per §12.9). Add/Remove/Raise are NOT on
-        // the IEvent<T> interface (§24.3) and are deferred to ordinary dispatch.
-        if (ma->member == "Subscribe" && call.args.size() == 1 &&
-            call.args[0].value) {
-            const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
-            if (isIEventTypeName(recvTy)) {
-                llvm::Value* src = lowerExpr(*ma->target);
-                if (!src) return std::optional<llvm::Value*>(nullptr);
-                const sema::TypeRef* payload =
-                    (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
-                                                   : nullptr;
-                llvm::Value* closure =
-                    lowerEventHandlerClosure(call.args[0].value.get(), payload);
-                if (!closure) return std::optional<llvm::Value*>(nullptr);
+
+    // §24.3 / §24.5: dispatch a recognized event method (Subscribe/Add/Remove/
+    // Raise/RaiseAsync) against a bz_event_source_t* (`src`) whose payload type
+    // is `payload`. Shared by the direct-event-access path (src from
+    // eventSourcePtr, payload from eventPayloadType) and the
+    // EventSource<T>/AsyncEventSource<T>-typed local/param/field path (#1610:
+    // src from lowerExpr — the value is the same bz_event_source_t* via the
+    // event-as-value read, payload from genericArgs[0]). Returns nullopt when
+    // `ma->member` is not one of the event methods (so non-event members fall
+    // through to ordinary dispatch).
+    auto dispatchEventMethods = [&](llvm::Value* src,
+                                    const sema::TypeRef* payload)
+        -> std::optional<llvm::Value*> {
+        const auto& method = ma->member;
+        const bool isSubscribe  = method == "Subscribe"  && call.args.size() == 1;
+        const bool isAdd        = method == "Add"        && call.args.size() == 1;
+        const bool isRemove     = method == "Remove"     && call.args.size() == 1;
+        const bool isRaise      = method == "Raise";
+        const bool isRaiseAsync = method == "RaiseAsync";
+        if (!isSubscribe && !isAdd && !isRemove && !isRaise && !isRaiseAsync)
+            return std::nullopt;  // not an event method — ordinary dispatch
+        if (isSubscribe || isAdd || isRemove) {
+            // per §24.3 / stdlib §6.5: the handler argument is a function value
+            // (lambda or method reference) lowered to a closure { fn, env } with
+            // the synthesized `(payload) -> ()` expected type (shared helper).
+            llvm::Value* closure =
+                lowerEventHandlerClosure(call.args[0].value.get(), payload);
+            if (!closure) return std::optional<llvm::Value*>(nullptr);
+            if (isSubscribe) {
                 auto* subFn =
                     declareC("bz_event_subscribe", ptrTy(), {ptrTy(), ptrTy()});
                 return std::optional<llvm::Value*>(
                     builder_.CreateCall(subFn, {src, closure}, "subscription"));
             }
+            if (isAdd) {
+                auto* addFn = declareC("bz_event_add", i64(), {ptrTy(), ptrTy()});
+                builder_.CreateCall(addFn, {src, closure});
+                return std::optional<llvm::Value*>(nullptr);  // Add returns unit
+            }
+            // isRemove
+            auto* remFn = declareC("bz_event_remove_closure",
+                                   llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+            builder_.CreateCall(remFn, {src, closure});
+            return std::optional<llvm::Value*>(nullptr);  // Remove returns unit
         }
-        return std::nullopt;
+
+        // isRaise / isRaiseAsync — per §24.5: invoke each subscribed handler
+        // with the payload.
+        // #737: gate payload lowering on the event's payload TYPE, not on the
+        // call args being non-empty. For a no-payload event the explicit
+        // `Raise(())` form passes the unit literal `()` as an arg — non-empty,
+        // but lowerExpr has no case for a UnitExpr and returns null, so the old
+        // `!call.args.empty` check then bailed BEFORE emitEventRaise and
+        // silently dropped the entire dispatch (the Subscribe side already
+        // builds a `void(env)` handler for unit events). §24.5: `Raise()` and
+        // `Raise(())` are equivalent and must dispatch identically.
+        const bool hasPayload =
+            payload && payload->kind != sema::TypeRef::Kind::Unit;
+        llvm::Value* payloadLL = nullptr;
+        llvm::Type* payloadTy = nullptr;
+        if (hasPayload && !call.args.empty() && call.args[0].value) {
+            payloadLL = lowerExpr(*call.args[0].value);
+            if (!payloadLL) return std::optional<llvm::Value*>(nullptr);
+            payloadTy = payloadLL->getType();
+        }
+        if (isRaiseAsync) {
+            // §24.5 / §30: RaiseAsync returns a Task* (awaited by the caller).
+            // emitAsyncEventRaise calls each handler (which returns Task*),
+            // awaits each synchronously via bz_task_await_sync in order, and
+            // returns an already-done Task carrying either success or the first
+            // fault.
+            llvm::Value* task = emitAsyncEventRaise(src, payloadLL, payloadTy);
+            return std::optional<llvm::Value*>(task);
+        }
+        emitEventRaise(src, payloadLL, payloadTy);
+        return std::optional<llvm::Value*>(nullptr);  // Raise returns unit
+    };
+
+    // The target of `.Subscribe`/`.Raise`/`.Add`/`.Remove` may itself be a
+    // direct event access (EventSymbol on the target expr).
+    const sema::EventSymbol* es = eventSymbolOf(*ma->target);
+    if (es) {
+        // Gate BEFORE lowering the source: a non-event member on a direct-event
+        // access (semantically bogus, e.g. `Clicked.GetInvocationList()`) must
+        // fall through to ordinary dispatch WITHOUT first lowering the event
+        // source — eventSourcePtr evaluates the target (lowerExpr) and emits
+        // GEPs/loads (and an itable lookup for interface events), which would
+        // otherwise be dead IR plus a double evaluation once ordinary dispatch
+        // re-lowers the target. Cheap name compares; dispatchEventMethods
+        // re-checks (idempotently) after the source is loaded.
+        const auto& method = ma->member;
+        const bool isEventMethod =
+            (method == "Subscribe" && call.args.size() == 1) ||
+            (method == "Add" && call.args.size() == 1) ||
+            (method == "Remove" && call.args.size() == 1) ||
+            method == "Raise" || method == "RaiseAsync";
+        if (!isEventMethod) return std::nullopt;
+        llvm::Value* src = eventSourcePtr(*ma->target);
+        if (!src) return std::nullopt;
+        return dispatchEventMethods(src, eventPayloadType(es));
     }
-    const auto& method = ma->member;
-    const bool isSubscribe  = method == "Subscribe"  && call.args.size() == 1;
-    const bool isAdd        = method == "Add"        && call.args.size() == 1;
-    const bool isRemove     = method == "Remove"     && call.args.size() == 1;
-    const bool isRaise      = method == "Raise";
-    const bool isRaiseAsync = method == "RaiseAsync";
-    if (!isSubscribe && !isAdd && !isRemove && !isRaise && !isRaiseAsync)
-        return std::nullopt;
-
-    llvm::Value* src = eventSourcePtr(*ma->target);
-    if (!src) return std::nullopt;
-
-    if (isSubscribe || isAdd || isRemove) {
-        // per §24.3 / stdlib §6.5: the handler argument is a function value
-        // (lambda or method reference) lowered to a closure { fn, env } with the
-        // synthesized `(payload) -> ()` expected type (shared helper).
-        llvm::Value* closure = lowerEventHandlerClosure(
-            call.args[0].value.get(), eventPayloadType(es));
+    // es == null: the target is not a direct event access. Its static type
+    // determines the dispatch.
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    // §24.3 (#747): `.Subscribe` on a STORED IEvent<T>/IAsyncEvent<T> value
+    // (`var ev := s.Happened; ev.Subscribe(h)`). IEvent<T> has no itable, but
+    // its runtime value IS the bz_event_source_t* (via the event-as-value
+    // read), so dispatch directly to bz_event_subscribe. The payload is the
+    // receiver type's genericArgs[0] (the upcast type, variance-safe per §12.9).
+    // Add/Remove/Raise are NOT on the IEvent<T> interface (§24.3) and stay
+    // rejected (no IEvent member-dispatch block admits them).
+    if (ma->member == "Subscribe" && call.args.size() == 1 &&
+        call.args[0].value && isIEventTypeName(recvTy)) {
+        llvm::Value* src = lowerExpr(*ma->target);
+        if (!src) return std::optional<llvm::Value*>(nullptr);
+        const sema::TypeRef* payload =
+            (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+        llvm::Value* closure =
+            lowerEventHandlerClosure(call.args[0].value.get(), payload);
         if (!closure) return std::optional<llvm::Value*>(nullptr);
-        if (isSubscribe) {
-            auto* subFn =
-                declareC("bz_event_subscribe", ptrTy(), {ptrTy(), ptrTy()});
-            return std::optional<llvm::Value*>(
-                builder_.CreateCall(subFn, {src, closure}, "subscription"));
-        }
-        if (isAdd) {
-            auto* addFn = declareC("bz_event_add", i64(), {ptrTy(), ptrTy()});
-            builder_.CreateCall(addFn, {src, closure});
-            return std::optional<llvm::Value*>(nullptr);  // Add returns unit
-        }
-        // isRemove
-        auto* remFn = declareC("bz_event_remove_closure",
-                               llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-        builder_.CreateCall(remFn, {src, closure});
-        return std::optional<llvm::Value*>(nullptr);  // Remove returns unit
+        auto* subFn =
+            declareC("bz_event_subscribe", ptrTy(), {ptrTy(), ptrTy()});
+        return std::optional<llvm::Value*>(
+            builder_.CreateCall(subFn, {src, closure}, "subscription"));
     }
-
-    // isRaise / isRaiseAsync — per §24.5: invoke each subscribed handler with
-    // the payload.
-    // #737: gate payload lowering on the event's payload TYPE, not on the call
-    // args being non-empty. For a no-payload event the explicit `Raise(())`
-    // form passes the unit literal `()` as an arg — non-empty, but lowerExpr
-    // has no case for a UnitExpr and returns null, so the old `!call.args.empty`
-    // check then bailed BEFORE emitEventRaise and silently dropped the entire
-    // dispatch (the Subscribe side already builds a `void(env)` handler for unit
-    // events). §24.5: `Raise()` and `Raise(())` are equivalent and must dispatch
-    // identically.
-    const sema::TypeRef* evPt = eventPayloadType(es);
-    const bool hasPayload = evPt && evPt->kind != sema::TypeRef::Kind::Unit;
-    llvm::Value* payloadLL = nullptr;
-    llvm::Type* payloadTy = nullptr;
-    if (hasPayload && !call.args.empty() && call.args[0].value) {
-        payloadLL = lowerExpr(*call.args[0].value);
-        if (!payloadLL) return std::optional<llvm::Value*>(nullptr);
-        payloadTy = payloadLL->getType();
+    // §6.5 / §24.3 (#1610): a value held in a local/param/field of static type
+    // EventSource<T>/AsyncEventSource<T>. Its runtime value is the same
+    // bz_event_source_t* a direct event access yields (via the event-as-value
+    // read), so Raise/Add/Remove/Subscribe/RaiseAsync dispatch identically.
+    // (Sema's EventSource/AsyncEventSource rcn block already rejected any
+    // non-method name before codegen, so only valid methods reach here.)
+    if (isEventSourceTypeName(recvTy)) {
+        llvm::Value* src = lowerExpr(*ma->target);
+        if (!src) return std::optional<llvm::Value*>(nullptr);
+        const sema::TypeRef* payload =
+            (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+        return dispatchEventMethods(src, payload);
     }
-    if (isRaiseAsync) {
-        // §24.5 / §30: RaiseAsync returns a Task* (awaited by the caller).
-        // emitAsyncEventRaise calls each handler (which returns Task*), awaits
-        // each synchronously via bz_task_await_sync in order, and returns an
-        // already-done Task carrying either success or the first fault.
-        llvm::Value* task = emitAsyncEventRaise(src, payloadLL, payloadTy);
-        return std::optional<llvm::Value*>(task);
-    }
-    emitEventRaise(src, payloadLL, payloadTy);
-    return std::optional<llvm::Value*>(nullptr);  // Raise returns unit
+    return std::nullopt;
 }
 
 
