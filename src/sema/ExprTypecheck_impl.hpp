@@ -418,6 +418,18 @@ private:
     // interface)? BFS, cycle-guarded.
     static bool isSubtype(TypeSymbol* from, TypeSymbol* to);
 
+    // §8.6 / §5.1 (#1311): does a primitive value type box into a builtin
+    // generic interface it implements — IComparable<T>/IEquatable<T> where T
+    // is the primitive's own keyword alias (stdlib §9.1–§9.5: every numeric
+    // and char primitive implements both; Boolean implements IEquatable<bool>
+    // only, NOT IComparable — §9.4)? Recognised by: `to` is a single-arg
+    // IComparable/IEquatable whose argument is the SAME primitive as `fromPrim`
+    // (no widening — Byte implements IComparable<byte>, not IComparable<int>).
+    // Used by checkAssignable (storage boxing) and implicitlyConvertible
+    // (argument-to-parameter boxing) so the two paths agree.
+    static bool primitiveBoxesIntoBuiltinIface(PrimitiveType fromPrim,
+                                               const TypeRef* to);
+
     // Slices T1/T4: assignability check (§5.1, §7, §12 subtyping).
     // Handles two cases and conservatively skips everything else
     // (mixed primitive/named, generics, null, Object target) so it

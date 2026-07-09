@@ -12700,19 +12700,32 @@ void Emitter::setupBoxDescriptors() {
         llvm::Constant* hashThunk = (p == P::String)
             ? boxDefaultHashCodeThunk()
             : primBoxHashThunk(p, nm);
+        // §8.6 / §5.1 (#1311): a boxable VALUE primitive (not string — string
+        // is a class reaching Object/interface through the class itable path)
+        // implements IComparable<T>/IEquatable<T> (stdlib §9.1–§9.5). Build an
+        // itable/itmap so dispatch on a builtin generic interface variable
+        // holding the boxed primitive reaches a real CompareTo/Equals; null
+        // itmap (the previous behaviour) crashed itable lookup (bz_itable_lookup
+        // dereferenced the null vtable[1]). Mirrors ensureSpanBoxVtable.
+        llvm::Constant* itmapSlot = llvm::ConstantPointerNull::get(ptrTy());
+        if (p != P::String) {
+            if (llvm::GlobalVariable* itmap = buildPrimBoxItmap(p, nm))
+                itmapSlot = llvm::ConstantExpr::getPointerCast(itmap, ptrTy());
+        }
+        std::vector<llvm::Constant*> vtElems(kVirtualMethodsBase,
+            llvm::ConstantPointerNull::get(ptrTy()));
+        vtElems[0] = desc;
+        vtElems[1] = itmapSlot;  // itmap (interfaces the primitive implements)
+        if (builtinDisposeFn_)
+            vtElems[2] = llvm::cast<llvm::Constant>(builtinDisposeFn_);  // Dispose
+        vtElems[3] = tostr;          // ToString
+        vtElems[4] = eqThunk;        // Equals
+        vtElems[5] = hashThunk;      // GetHashCode
         auto* vtTy = llvm::ArrayType::get(ptrTy(), kVirtualMethodsBase);
         primBoxVtable_[nm] = new llvm::GlobalVariable(
             *module_, vtTy, /*isConstant=*/true,
             llvm::GlobalValue::InternalLinkage,
-            llvm::ConstantArray::get(
-                vtTy, {desc,
-                       llvm::ConstantPointerNull::get(ptrTy()),  // itmap
-                       builtinDisposeFn_
-                           ? llvm::cast<llvm::Constant>(builtinDisposeFn_)
-                           : llvm::ConstantPointerNull::get(ptrTy()),  // Dispose
-                       tostr,
-                       eqThunk,    // [4]=Equals
-                       hashThunk}),  // [5]=GetHashCode
+            llvm::ConstantArray::get(vtTy, vtElems),
             std::string("pvt$") + nm);
         allVtables_.push_back(primBoxVtable_[nm]);  // §8.6 #417
     }
@@ -13182,6 +13195,139 @@ llvm::Constant* Emitter::primBoxHashThunk(sema::PrimitiveType prim,
         builder_.CreateRet(h);
     }
     return thunk;
+}
+
+
+// §8.6 / §5.1 (#1311): build the interface itable/itmap for a boxed PRIMITIVE
+// so dispatch through a builtin generic interface it implements
+// (IComparable<T>/IEquatable<T>, stdlib §9.1–§9.5) reaches a real
+// CompareTo/Equals. Each boxable primitive (other than Boolean, which
+// implements IEquatable<bool> only — §9.4) implements IComparable<T> AND
+// IEquatable<T> where T is the primitive's own alias. The itable slots hold
+// freshly-built thunks whose signature is `int/bool(ptr this, T other)`: they
+// load the scalar payload from the box (offset 16, the same slot
+// primBoxEqualsThunk reads) and run the same signed/unsigned/ordered-FP
+// comparison the DIRECT primitive CompareTo/Equals lowering uses
+// (LlvmBackend_Exprs.cpp, fix #586 / #863). At dispatch time the itable
+// call's needsConcrete reconciliation builds the matching fnTy from the real
+// arg types, so the i32-erased interface signature never mis-types the call.
+// Mirrors ensureSpanBoxVtable's itable/itmap assembly. Returns nullptr when
+// the builtin interface descriptors are unavailable (so the box vtable keeps
+// its null itmap and dispatch on the interface bails rather than crashes).
+llvm::GlobalVariable* Emitter::buildPrimBoxItmap(sema::PrimitiveType prim,
+                                                 const char* nm) {
+    using P = sema::PrimitiveType;
+    // Boolean implements IEquatable<bool> only (§9.4 — no IComparable<bool>).
+    bool hasCmp = prim != P::Bool;
+
+    // Locate the builtin interface TypeSymbols and their descriptors.
+    auto* cmpSym = ctx_.builtinInterfaceSym("IComparable");
+    auto* eqSym  = ctx_.builtinInterfaceSym("IEquatable");
+    auto cmpDescIt = hasCmp && cmpSym ? descArray_.find(cmpSym) : descArray_.end();
+    auto eqDescIt  = eqSym ? descArray_.find(eqSym) : descArray_.end();
+    bool haveCmp = hasCmp && cmpDescIt != descArray_.end();
+    bool haveEq  = eqDescIt != descArray_.end();
+    if (!haveCmp && !haveEq) return nullptr;
+
+    llvm::Type* valTy = lowerPrimitive(prim);
+    if (!valTy) return nullptr;
+
+    // Comparison class — mirrors the direct primitive CompareTo/Equals lowering.
+    bool isSignedInt   = prim == P::Int   || prim == P::Long  ||
+                         prim == P::Short || prim == P::SByte ||
+                         prim == P::Char;
+    bool isUnsignedInt = prim == P::UInt  || prim == P::ULong ||
+                         prim == P::UShort|| prim == P::Byte;
+    bool isFP          = prim == P::Double || prim == P::Float;
+
+    // Helper: load the scalar payload from the box (offset 16 = GEP index 2 on
+    // a byte-strided ptr, the same slot primBoxEqualsThunk/primBoxHashThunk
+    // read). `tb` is a standalone builder positioned at the thunk's entry.
+    auto loadPayload = [&](llvm::IRBuilder<>& tb,
+                           llvm::Value* box) -> llvm::Value* {
+        llvm::Value* pay = tb.CreateGEP(
+            ptrTy(), box, {llvm::ConstantInt::get(i32(), 2)}, "pbcmp.pay");
+        return tb.CreateLoad(valTy, pay, "pbcmp.val");
+    };
+
+    // --- CompareTo thunk: i32(ptr this, T other) — (a>b) - (a<b) → -1/0/1 ---
+    llvm::Function* cmpFn = nullptr;
+    if (haveCmp) {
+        auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy(), valTy}, false);
+        cmpFn = llvm::Function::Create(
+            fnTy, llvm::Function::InternalLinkage,
+            std::string("bz$primcmp$") + nm, module_.get());
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", cmpFn);
+        llvm::IRBuilder<> tb(entry);
+        llvm::Value* self  = cmpFn->getArg(0);
+        llvm::Value* other = cmpFn->getArg(1);
+        llvm::Value* a = loadPayload(tb, self);
+        llvm::Value* b = other;
+        llvm::Value* gt, *lt;
+        if (isFP) {
+            gt = tb.CreateFCmpOGT(a, b, "pbcmp.gt");
+            lt = tb.CreateFCmpOLT(a, b, "pbcmp.lt");
+        } else if (isUnsignedInt) {
+            gt = tb.CreateICmpUGT(a, b, "pbcmp.gt");
+            lt = tb.CreateICmpULT(a, b, "pbcmp.lt");
+        } else {
+            gt = tb.CreateICmpSGT(a, b, "pbcmp.gt");
+            lt = tb.CreateICmpSLT(a, b, "pbcmp.lt");
+        }
+        llvm::Value* gtI = tb.CreateZExt(gt, i32(), "pbcmp.gti");
+        llvm::Value* ltI = tb.CreateZExt(lt, i32(), "pbcmp.lti");
+        tb.CreateRet(tb.CreateSub(gtI, ltI, "pbcmp.res"));
+    }
+
+    // --- Equals thunk: i1(ptr this, T other) — payload == other ---
+    llvm::Function* eqFn = nullptr;
+    if (haveEq) {
+        auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), valTy}, false);
+        eqFn = llvm::Function::Create(
+            fnTy, llvm::Function::InternalLinkage,
+            std::string("bz$primeqT$") + nm, module_.get());
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", eqFn);
+        llvm::IRBuilder<> tb(entry);
+        llvm::Value* self  = eqFn->getArg(0);
+        llvm::Value* other = eqFn->getArg(1);
+        llvm::Value* a = loadPayload(tb, self);
+        llvm::Value* r = isFP ? tb.CreateFCmpOEQ(a, other, "pbcmp.eq")
+                             : tb.CreateICmpEQ(a, other, "pbcmp.eq");
+        tb.CreateRet(r);
+    }
+
+    // --- Assemble itables + itmap (mirrors ensureSpanBoxVtable) ---
+    auto buildItable = [&](llvm::Function* fn,
+                           const char* iname) -> llvm::GlobalVariable* {
+        auto* arrTy = llvm::ArrayType::get(ptrTy(), 1);
+        return new llvm::GlobalVariable(
+            *module_, arrTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(
+                arrTy, {llvm::cast<llvm::Constant>(fn)}),
+            std::string("itab$prim$") + nm + "$" + iname);
+    };
+
+    std::vector<llvm::Constant*> pairs;  // [td$I, itab, …]
+    if (haveCmp) {
+        auto* itab = buildItable(cmpFn, "IComparable");
+        pairs.push_back(llvm::cast<llvm::Constant>(cmpDescIt->second));
+        pairs.push_back(llvm::ConstantExpr::getPointerCast(itab, ptrTy()));
+    }
+    if (haveEq) {
+        auto* itab = buildItable(eqFn, "IEquatable");
+        pairs.push_back(llvm::cast<llvm::Constant>(eqDescIt->second));
+        pairs.push_back(llvm::ConstantExpr::getPointerCast(itab, ptrTy()));
+    }
+    pairs.push_back(llvm::ConstantPointerNull::get(ptrTy()));  // null terminator
+
+    auto* itmapArrTy = llvm::ArrayType::get(ptrTy(), pairs.size());
+    auto* itmapGV = new llvm::GlobalVariable(
+        *module_, itmapArrTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(itmapArrTy, pairs),
+        std::string("itmap$prim$") + nm);
+    return itmapGV;
 }
 
 

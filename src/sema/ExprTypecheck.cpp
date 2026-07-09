@@ -1020,6 +1020,27 @@ bool ExprTC::isSubtype(TypeSymbol* from, TypeSymbol* to) {
     return false;
 }
 
+// §8.6 / §5.1 (#1311): see header doc. A primitive value type boxes into a
+// builtin generic interface it implements (IComparable<T>/IEquatable<T>,
+// stdlib §9.1–§9.5). T must be exactly the primitive's own alias — no widening
+// (Byte implements IComparable<byte>, not IComparable<int>). Boolean
+// implements IEquatable<bool> only (§9.4 — no IComparable<bool>).
+bool ExprTC::primitiveBoxesIntoBuiltinIface(PrimitiveType fromPrim,
+                                            const TypeRef* to) {
+    if (!to || to->kind != TypeRef::Kind::Named || !to->declaration ||
+        to->declaration->kind != ast::TypeDeclKind::Interface ||
+        to->genericArgs.size() != 1 || !to->genericArgs[0])
+        return false;
+    bool isCmp = to->declaration->name == "IComparable";
+    bool isEq  = to->declaration->name == "IEquatable";
+    if (!isCmp && !isEq) return false;
+    // Boolean implements IEquatable<bool> but NOT IComparable<bool> (§9.4).
+    if (isCmp && fromPrim == PrimitiveType::Bool) return false;
+    const TypeRef* targ = to->genericArgs[0];
+    if (targ->kind != TypeRef::Kind::Primitive) return false;
+    return targ->primitive == fromPrim;
+}
+
 // §27.1.1 (v0.180): exact structural equality of two TypeRefs — the
 // INVARIANT fallback for a function-value slot that is not a bare, non-
 // generic class/interface reference (a value-typed, record-typed, primitive,
@@ -1204,6 +1225,19 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
             reportNotConvertible();
             return;
         }
+    }
+    // §8.6 / §5.1 (#1311): a primitive value type boxes into a builtin generic
+    // interface it implements (IComparable<T>/IEquatable<T>, stdlib §9.1–§9.5)
+    // — `var c: IComparable<int> := 5` boxes the int. The interface's type
+    // argument must be the primitive's own alias (no widening); an invalid
+    // boxing (`IComparable<long> := 5`, `IComparable<int> := false`) stays
+    // rejected by primitiveBoxesIntoBuiltinIface. A nullable source into a
+    // non-nullable interface reference is still a §7 drop and is reported.
+    if (from->kind == TypeRef::Kind::Primitive &&
+        to->kind == TypeRef::Kind::Named &&
+        primitiveBoxesIntoBuiltinIface(from->primitive, to)) {
+        if (from->nullable && !to->nullable) { reportNullable(); return; }
+        return;  // accepted — codegen boxes the primitive at the store site
     }
     if (from->kind == TypeRef::Kind::Primitive &&
         to->kind == TypeRef::Kind::Primitive) {

@@ -3716,6 +3716,16 @@ private:
     llvm::Constant* primBoxEqualsThunk(sema::PrimitiveType prim, const char* nm);
     llvm::Constant* primBoxHashThunk(sema::PrimitiveType prim, const char* nm);
 
+    // §8.6 / §5.1 (#1311): build the interface itable/itmap for a boxed
+    // PRIMITIVE so virtual dispatch through a builtin generic interface it
+    // implements (IComparable<T>/IEquatable<T>, stdlib §9.1–§9.5) reaches a
+    // real CompareTo/Equals. Returns the itmap global (a null-terminated
+    // [td$I, itab, …] pair list) to install at vtable slot 1, or nullptr when
+    // the primitive implements no such interface or the interface descriptors
+    // are unavailable. Mirrors ensureSpanBoxVtable's itable/itmap assembly.
+    llvm::GlobalVariable* buildPrimBoxItmap(sema::PrimitiveType prim,
+                                            const char* nm);
+
     // §9.6 (#946/#947/#948): lower `o.Equals(x)` / `o.GetHashCode()` where `o`
     // is Object/interface (no resolved MethodSymbol). Mirrors lowerObjectToString:
     // a string operand (no vtable) uses the string content intrinsic; a null

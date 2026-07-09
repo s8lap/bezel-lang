@@ -74,6 +74,17 @@ bool ExprTC::implicitlyConvertible(const TypeRef* from, const TypeRef* to) {
             return true;
         }
     }
+    // §8.6 / §5.1 (#1311): a primitive value type boxes into a builtin generic
+    // interface it implements (IComparable<T>/IEquatable<T>, stdlib §9.1–§9.5)
+    // when passed as an argument — mirrors checkAssignable's storage-boxing
+    // branch so a candidate with an IComparable<int> parameter is not made
+    // spuriously inapplicable for an int argument.
+    if (from->kind == TypeRef::Kind::Primitive &&
+        to->kind == TypeRef::Kind::Named &&
+        primitiveBoxesIntoBuiltinIface(from->primitive, to)) {
+        if (from->nullable && !to->nullable) return false;
+        return true;
+    }
     return false;
 }
 
