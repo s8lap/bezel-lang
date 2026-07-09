@@ -339,6 +339,15 @@ private:
     void checkOverrideSignatureMatch(MemberSymbol* derivedSym,
                                      MemberSymbol* baseSym);
 
+    // #1614 (§12.1): a property/indexer `override` must match the base
+    // member's signature — the property (return) type exactly, the accessor
+    // set/get presence, and (for indexers) the index-parameter signature
+    // (count, modifiers, types with the §12.1 T→T? widening). Mirrors the
+    // method-override check (checkOverrideSignatureMatch) for the
+    // property/indexer member kinds, which previously had NO check at all.
+    void checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
+                                             PropertySymbol* base);
+
     // §14.2 (v0.182, #1579): are two `where <T>: ...` clauses on a type
     // parameter the SAME constraint set — compared order-insensitively and
     // after type-alias resolution? A null pointer denotes the type parameter

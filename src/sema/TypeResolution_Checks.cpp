@@ -1804,7 +1804,18 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
                                            MemberSymbol* baseSym) {
     auto* derived = dynamic_cast<MethodSymbol*>(derivedSym);
     auto* base = dynamic_cast<MethodSymbol*>(baseSym);
-    if (!derived || !base) return;  // not a method pair — skip.
+    if (!derived || !base) {
+        // #1614 (§12.1): a property/indexer override must also match the
+        // base member's signature. Previously this returned immediately for
+        // any non-method pair, so a property/indexer override with a
+        // mismatched property type, accessor presence, or indexer index-
+        // parameter signature was silently accepted. Delegate to the
+        // property/indexer check when BOTH members are PropertySymbols.
+        auto* dp = dynamic_cast<PropertySymbol*>(derivedSym);
+        auto* bp = dynamic_cast<PropertySymbol*>(baseSym);
+        if (dp && bp) checkPropertyOverrideSignatureMatch(dp, bp);
+        return;  // not a method pair — nothing else to check here.
+    }
     auto err = [&](const std::string& what) {
         ctx_.diagnostics().report(
             Severity::Error, derived->declLoc,
@@ -1908,6 +1919,151 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
                     ": ...` clause that differs from the inherited "
                     "constraint set — omit the clause to inherit it exactly, "
                     "or restate the identical set (§14.2)");
+                return;
+            }
+        }
+    }
+}
+
+// #1614 / §12.1: does a property/indexer declaration have a setter? Mirrors
+// codegen's Emitter::propertyHasSetter (LlvmBackend_impl.hpp) for the
+// concrete case, with one semantic refinement for the override-match: an
+// abstract Auto-shorthand property (`abstract property Name: T;`) declares a
+// single abstract getter (get-only) — the conventional reading of the §12.5
+// shorthand. (Codegen's predicate reports a spurious setter for such a
+// declaration because the Auto body has no `readonly`; that allocates an
+// empty setter vtable slot, which is harmless — an abstract class is never
+// instantiated and an abstract get-only property is never assigned. The
+// override check must use the semantic accessor shape, not the spurious slot,
+// or it would reject the common `abstract property P: T;` / `override
+// property P: T => e;` idiom.) An expression-bodied property is get-only; a
+// concrete auto-property is read-write unless `readonly`; a block-body
+// property has a setter iff it declares a `set` arm.
+static bool propertyDeclHasSetter(const ast::PropertyDecl* pd) {
+    if (!pd) return false;
+    if (pd->bodyKind == ast::PropertyBodyKind::Expression) return false;
+    if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+        for (const auto& a : pd->accessors)
+            if (a.isSet) return true;
+        return false;
+    }
+    // Auto body.
+    bool isAbstract = false;
+    for (auto mod : pd->modifiers)
+        if (mod == "abstract") { isAbstract = true; break; }
+    if (isAbstract) return false;  // §12.5 shorthand = get-only abstract getter
+    for (auto mod : pd->modifiers)
+        if (mod == "readonly") return false;
+    return true;
+}
+
+void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
+                                                   PropertySymbol* base) {
+    auto err = [&](const std::string& what) {
+        ctx_.diagnostics().report(
+            Severity::Error, derived->declLoc,
+            std::string("override of `") +
+            (derived->isIndexer ? std::string("indexer")
+                                : std::string(derived->name)) +
+            "` does not match the base member's " + what + " (§12.1)");
+    };
+
+    // Build the enclosing-class generic substitution map (base class T →
+    // concrete arg the derived class binds it to), the property analog of
+    // the method check's buildBaseGenericSubst. A property/indexer carries
+    // no own generic parameters, so only the enclosing-class substitution
+    // applies.
+    std::unordered_map<std::string_view, TypeRef*> genericSubst;
+    if (derived->parent && base->parent) {
+        for (std::size_t bi = 0; bi < derived->parent->baseTypes.size();
+             ++bi) {
+            if (derived->parent->baseTypes[bi] != base->parent) continue;
+            TypeRef* baseRef =
+                (bi < derived->parent->baseTypeRefs.size())
+                    ? derived->parent->baseTypeRefs[bi]
+                    : nullptr;
+            if (!baseRef) break;
+            for (std::size_t gi = 0;
+                 gi < base->parent->genericParams.size() &&
+                 gi < baseRef->genericArgs.size();
+                 ++gi) {
+                if (auto* gp = dynamic_cast<GenericParamSymbol*>(
+                        base->parent->genericParams[gi])) {
+                    genericSubst[gp->name] = baseRef->genericArgs[gi];
+                }
+            }
+            break;
+        }
+    }
+
+    // Visibility must match exactly (per §12.1, same as methods).
+    if (derived->visibility != base->visibility) {
+        err("visibility");
+    }
+
+    auto* dDecl = dynamic_cast<const ast::PropertyDecl*>(derived->decl);
+    auto* bDecl = dynamic_cast<const ast::PropertyDecl*>(base->decl);
+    if (dDecl && bDecl) {
+        // The property type is the getter's return type (and the setter's
+        // implicit `value` parameter type). Per §12.1, return types must
+        // match exactly — no covariance in this version — so no T→T?
+        // widening here (unlike a method parameter or an indexer index
+        // parameter, which are inputs).
+        TypeRef* dTy =
+            dDecl->type ? ctx_.resolvedType(*dDecl->type) : nullptr;
+        TypeRef* bTy =
+            bDecl->type ? ctx_.resolvedType(*bDecl->type) : nullptr;
+        TypeRef* bTySubst = applyGenericSubst(bTy, genericSubst);
+        if (!typeRefEqual(dTy, bTySubst)) {
+            err("property type");
+        }
+
+        // Accessor presence must match (§12.1): a property that adds or
+        // removes a setter relative to the base member changes the vtable
+        // slot shape — codegen installs a separate `$set` slot only when a
+        // property has a setter (LlvmBackend_Setup.cpp), so a mismatched
+        // override leaves a slot unfilled or orphaned. propertyDeclHasSetter
+        // is the same predicate codegen uses to decide slot allocation.
+        if (propertyDeclHasSetter(dDecl) != propertyDeclHasSetter(bDecl)) {
+            err("accessor set/get presence");
+        }
+    }
+
+    // Indexer index-parameter signature: count, modifiers, and types (with
+    // the §12.1 T→T? parameter widening a method override admits). The index
+    // parameters are bona fide parameters, so the widening applies to them
+    // just as it does to a method's.
+    if (derived->isIndexer && base->isIndexer) {
+        if (derived->indexerParams.size() != base->indexerParams.size()) {
+            err("index parameter count");
+            return;
+        }
+        for (std::size_t i = 0; i < derived->indexerParams.size(); ++i) {
+            auto* dp =
+                dynamic_cast<ParameterSymbol*>(derived->indexerParams[i]);
+            auto* bp =
+                dynamic_cast<ParameterSymbol*>(base->indexerParams[i]);
+            if (!dp || !bp) continue;
+            if (dp->modifier != bp->modifier) {
+                err("index parameter modifiers");
+                return;
+            }
+            // §22.4 (v0.183, #1585): the out-nullability postcondition is
+            // part of the contract like the other parameter modifiers — an
+            // override must repeat it.
+            if (dp->outNullPostcond != bp->outNullPostcond) {
+                err("`when` nullability postcondition");
+                return;
+            }
+            TypeRef* dt =
+                dp->declType ? ctx_.resolvedType(*dp->declType) : nullptr;
+            TypeRef* bt =
+                bp->declType ? ctx_.resolvedType(*bp->declType) : nullptr;
+            TypeRef* btSubst = applyGenericSubst(bt, genericSubst);
+            if (dt && btSubst &&
+                !overrideParamTypeMatches(dt, btSubst,
+                                          isByRefParamModifier(dp->modifier))) {
+                err("index parameter types");
                 return;
             }
         }
