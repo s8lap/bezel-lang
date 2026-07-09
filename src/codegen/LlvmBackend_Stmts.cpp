@@ -1612,7 +1612,6 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     // CG21c (§31.2): if inside a try-with-finally, route through finally.
     if (dynamic_cast<const ast::BreakStmt*>(&s)) {
         if (!loopStack_.empty()) {
-            emitLoopDisposals(loopStack_.back().scopeDepth);
             // #1083 / §31.2: route through the finally ONLY when the break EXITS
             // the try — i.e. the target loop was already open at try-entry (the
             // try is nested inside the loop). A loop opened INSIDE the try body
@@ -1622,10 +1621,24 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // try body and, with the mode slot still set, re-ran the finally.
             if (!finallyStack_.empty() &&
                 loopStack_.size() <= finallyStack_.back().loopDepthAtEntry) {
+                // fix #1598 / §29.7/§28.10 (v0.182): a break that crosses a
+                // finally disposes only the try-BODY scopes (>= this finally's
+                // entry depth) here; the enclosing scopes down to the loop's own
+                // scope depth — which may include a `using var` established
+                // before the try but inside the loop — are disposed by the
+                // finally's mode-2 dispatch AFTER the finally body runs
+                // (reverse establishment, mirroring the #1567 return fix). The
+                // pre-v0.182 code called emitLoopDisposals(loopScopeDepth) HERE,
+                // disposing that enclosing `using var` BEFORE the finally ran —
+                // a use-after-dispose if the finally touched it.
                 auto& fr = finallyStack_.back();
+                emitDisposalsInRange(fr.disposeDepthAtEntry, disposeStack_.size());
                 builder_.CreateStore(builder_.getInt32(2), fr.exitModSlot);
                 builder_.CreateBr(fr.finNormalBB);
             } else {
+                // No finally in the way: dispose eagerly down to the loop scope,
+                // as before.
+                emitLoopDisposals(loopStack_.back().scopeDepth);
                 builder_.CreateBr(loopStack_.back().breakTarget);
             }
             return true;
@@ -1634,15 +1647,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     }
     if (dynamic_cast<const ast::ContinueStmt*>(&s)) {
         if (!loopStack_.empty()) {
-            emitLoopDisposals(loopStack_.back().scopeDepth);
             // #1083: as above — a continue of a loop opened inside the try is
             // intra-try; only a continue that exits the try routes via finally.
             if (!finallyStack_.empty() &&
                 loopStack_.size() <= finallyStack_.back().loopDepthAtEntry) {
+                // fix #1598 / §29.7/§28.10 (v0.182): mirrors the break fix above
+                // — dispose only the try-body scopes here; the finally's mode-3
+                // dispatch disposes the enclosing range (down to the loop scope)
+                // AFTER the finally body runs.
                 auto& fr = finallyStack_.back();
+                emitDisposalsInRange(fr.disposeDepthAtEntry, disposeStack_.size());
                 builder_.CreateStore(builder_.getInt32(3), fr.exitModSlot);
                 builder_.CreateBr(fr.finNormalBB);
             } else {
+                emitLoopDisposals(loopStack_.back().scopeDepth);
                 builder_.CreateBr(loopStack_.back().continueTarget);
             }
             return true;
@@ -1706,7 +1724,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // the terminal state=-1 + ret. Without this the finally is
                 // silently skipped on the yield-break edge.
                 if (!finallyStack_.empty()) {
+                    // fix #1598 / §29.7/§28.10 (v0.182): dispose only the
+                    // try-body scopes (>= this finally's entry depth) before
+                    // routing to the finally — the yield-break twin of the
+                    // return/break/continue fixes. The enclosing scopes (an
+                    // outer `using var` established before the try) are
+                    // disposed by the finally's mode-4 dispatch AFTER the
+                    // finally body runs, mirroring mode 1's reverse-
+                    // establishment order. Pre-fix this site disposed nothing
+                    // at all before jumping to the finally.
                     auto& fr = finallyStack_.back();
+                    emitDisposalsInRange(fr.disposeDepthAtEntry, disposeStack_.size());
                     builder_.CreateStore(builder_.getInt32(4), fr.exitModSlot);
                     builder_.CreateBr(fr.finNormalBB);
                     return true;
@@ -2020,6 +2048,15 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         ? nullptr : loopStack_.back().breakTarget;
     llvm::BasicBlock* loopContBB  = loopStack_.empty()
         ? nullptr : loopStack_.back().continueTarget;
+    // fix #1598 / §29.7/§28.10 (v0.182): the disposeStack_ depth at the
+    // innermost loop's own entry (captured alongside loopBreakBB/loopContBB,
+    // same loopStack_.back()). A break/continue that exits straight to this
+    // loop (no further outer finally) disposes the enclosing range
+    // [loopScopeDepth, thisTryDepth) — scopes established before this try but
+    // still inside the loop, e.g. an enclosing `using var` — AFTER the finally
+    // body runs, mirroring mode 1/5's [0, thisTryDepth)/outer-depth ranges.
+    std::size_t loopScopeDepth =
+        loopStack_.empty() ? 0 : loopStack_.back().scopeDepth;
     // #721 C1: in an async method, `return v` completes the OUTER task with the
     // unwrapped result (asyncResultTy_), not a function `ret`. Allocate a slot of
     // that type so an async return inside this try can stash its value across the
@@ -2337,9 +2374,22 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             sw->addCase(builder_.getInt32(2), brkDispBB);
             builder_.SetInsertPoint(brkDispBB);
             if (outerFr) {
+                // fix #1598 / §29.7/§28.10 (v0.182): dispose the scopes
+                // established between this finally and the next-outer finally
+                // (reverse establishment) before routing onward — the mode-2
+                // twin of mode 1/5.
+                emitDisposalsInRange(outerFr->disposeDepthAtEntry, thisTryDepth);
                 builder_.CreateStore(builder_.getInt32(2), outerFr->exitModSlot);
                 builder_.CreateBr(outerFr->finNormalBB);
             } else {
+                // fix #1598 / §29.7/§28.10 (v0.182): no further outer finally —
+                // dispose every remaining scope down to the loop's own scope
+                // depth (an enclosing `using var` established before this try
+                // but inside the loop) AFTER the finally body, then jump to the
+                // break target. The pre-v0.182 code disposed nothing here,
+                // leaving that range disposed too early (at the break site,
+                // before the finally) instead — a use-after-dispose.
+                emitDisposalsInRange(loopScopeDepth, thisTryDepth);
                 builder_.CreateBr(loopBreakBB);
             }
         }
@@ -2350,9 +2400,13 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             sw->addCase(builder_.getInt32(3), cntDispBB);
             builder_.SetInsertPoint(cntDispBB);
             if (outerFr) {
+                // fix #1598 / §29.7/§28.10 (v0.182): mode-3 twin of mode-2 above.
+                emitDisposalsInRange(outerFr->disposeDepthAtEntry, thisTryDepth);
                 builder_.CreateStore(builder_.getInt32(3), outerFr->exitModSlot);
                 builder_.CreateBr(outerFr->finNormalBB);
             } else {
+                // fix #1598 / §29.7/§28.10 (v0.182): mode-3 twin of mode-2 above.
+                emitDisposalsInRange(loopScopeDepth, thisTryDepth);
                 builder_.CreateBr(loopContBB);
             }
         }
@@ -2371,9 +2425,22 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             sw->addCase(builder_.getInt32(4), ybDispBB);
             builder_.SetInsertPoint(ybDispBB);
             if (outerFr) {
+                // fix #1598 / §29.7/§28.10 (v0.182): dispose the scopes
+                // established between this finally and the next-outer finally
+                // (reverse establishment) before routing onward — the mode-4
+                // twin of mode 1/5.
+                emitDisposalsInRange(outerFr->disposeDepthAtEntry, thisTryDepth);
                 builder_.CreateStore(builder_.getInt32(4), outerFr->exitModSlot);
                 builder_.CreateBr(outerFr->finNormalBB);
             } else {
+                // fix #1598 / §29.7/§28.10 (v0.182): a `yield break` is a
+                // terminal exit from the whole MoveNext/Resume function (like
+                // `return`), so — mirroring mode 1's emitDisposalsInRange(0,
+                // thisTryDepth) — dispose every remaining scope established
+                // before this try, AFTER the finally body, then perform the
+                // terminal iterator exit. Pre-v0.182 this range was never
+                // disposed on the yield-break edge at all.
+                emitDisposalsInRange(0, thisTryDepth);
                 builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
                 if (smKind_ == SuspendKind::AsyncYield) {
                     emitAsyncIterComplete(/*hasValue=*/false);
