@@ -5203,26 +5203,59 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     if (isStrBld) {
         constexpr int64_t SB_ESZ = 8;  // pointer-sized elements (string ptrs)
 
-        // Helper: coerce value to string
-        auto toStr = [&](llvm::Value* v, const ast::Expr* expr) -> llvm::Value* {
+        // Helper: coerce value to string. Returns the string pointer AND, via
+        // the out-param, whether it was freshly RENDERED (a +1 producer: a
+        // primitive formatted via emitPrimitiveToString, or an Object/class
+        // rendered via lowerObjectToString) — the Append path uses that to decide
+        // retain-vs-transfer (#1185).
+        auto toStr = [&](llvm::Value* v, const ast::Expr* expr,
+                         bool* rendered) -> llvm::Value* {
             if (!v) return nullptr;
             auto* rt = expr ? ctx_.exprType(*expr) : nullptr;
             if (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
-                rt->primitive != sema::PrimitiveType::String)
+                rt->primitive != sema::PrimitiveType::String) {
+                if (rendered) *rendered = true;
                 return emitPrimitiveToString(v, rt->primitive);
+            }
+            // #1185 / stdlib §3.1: "Append(value: Object) = Append(value.
+            // ToString())". An Object/class arg is converted via lowerObjectToString
+            // (a fresh +1 string). This both matches the stdlib AND guarantees
+            // every part is a real bz_string so the builder's part disposal
+            // (bz_string_release) is never handed a raw object pointer (which
+            // would misread a vtable as a refcount / data buffer).
+            if (rt && rt->kind != sema::TypeRef::Kind::Primitive) {
+                if (llvm::Value* r = lowerObjectToString(v)) {
+                    if (rendered) *rendered = true;
+                    return r;
+                }
+            }
             if (v->getType()->isPointerTy()) return v;
             // Fallback: format as integer
+            if (rendered) *rendered = true;
             llvm::Value* iv = v->getType()->isIntegerTy(64)
                 ? v : builder_.CreateSExt(v, i64());
             return emitPrimitiveToString(iv, sema::PrimitiveType::Long);
         };
 
         if ((m == "Append" || m == "AppendLine") && !call.args.empty()) {
+            const ast::Expr* sExpr = call.args[0].value.get();
             llvm::Value* s = nullptr;
-            if (call.args[0].value) {
-                s = toStr(lowerExpr(*call.args[0].value), call.args[0].value.get());
+            // #1185 / stdlib §3.1 / §4.6: the builder must own an independent +1
+            // for each appended part so the part stays live for the builder's
+            // lifetime and is released on its disposal. A freshly RENDERED string
+            // (a primitive/Object formatted via toStr) or a STRING arg that is
+            // itself a +1 PRODUCER (`+`/interpolation/`string.Join`/ToString()/
+            // string-returning call) hands a single +1 — TRANSFER (no retain).
+            // Any other string arg (a literal / local / field borrow) is RETAINED.
+            // Mirrors lowerStringFieldStore.
+            bool freshPlusOne = false;
+            if (sExpr) {
+                bool rendered = false;
+                s = toStr(lowerExpr(*sExpr), sExpr, &rendered);
+                freshPlusOne = rendered || isPlusOneStringProducer(sExpr);
             }
             if (s) {
+                if (!freshPlusOne) emitStringRetain(s);  // borrow → builder's own +1
                 llvm::AllocaInst* slot = entryAlloca(ptrTy());
                 builder_.CreateStore(s, slot);
                 auto* fn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
@@ -5249,8 +5282,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return recv;
         }
         if (m == "Clear" && call.args.empty()) {
-            auto* fn = declareC("bz_array_clear", llvm::Type::getVoidTy(llvm_), {ptrTy()});
-            builder_.CreateCall(fn, {recv});
+            // #1185: the builder owns a +1 per part (Append retains), so Clear
+            // must release each part before emptying — bz_array_clear_disposing
+            // with bz_string_release (null-/sentinel-safe) does exactly that.
+            auto* relFn = declareC("bz_string_release",
+                                   llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            auto* fn = declareC("bz_array_clear_disposing",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {recv, relFn});
             return recv;
         }
         // §3.1: Insert(index: int, value: string): StringBuilder — flatten,

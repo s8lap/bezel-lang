@@ -2821,8 +2821,14 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         argTy->kind == sema::TypeRef::Kind::Primitive &&
                         argTy->primitive == sema::PrimitiveType::String;
                     if (isStrArg) {
+                        const ast::Expr* sExpr = ne.args[0].value.get();
                         llvm::Value* s = lowerExpr(*ne.args[0].value);
                         if (s) {
+                            // #1185 / stdlib §3.1: the builder owns a +1 for the
+                            // initial part — retain a borrow, TRANSFER a +1
+                            // producer (mirrors Append in LlvmBackend_Calls.cpp).
+                            if (!isPlusOneStringProducer(sExpr))
+                                emitStringRetain(s);
                             llvm::AllocaInst* slot = entryAlloca(ptrTy());
                             builder_.CreateStore(s, slot);
                             auto* addFn = declareC("bz_array_add",

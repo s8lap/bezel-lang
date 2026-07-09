@@ -582,9 +582,11 @@ void bz_strbuilder_to_string(void* parts_arr, char** out_data, int64_t* out_len)
 // ---------------------------------------------------------------------------
 // StringBuilder mutators (§3.1). Strategy: flatten the parts to one byte buffer,
 // apply the operation, and reset the parts array to a single fresh +1 part. The
-// builder does not own its parts (Append/Clear never release them), so resetting
-// the count and overwriting slot 0 cannot double-free; old part headers are left
-// as the existing tolerated leak. Width-1 (byte) mode, matching Append/ToString.
+// builder OWNS each of its parts (Append retains / transfers a +1 per part,
+// #1185), so before dropping the old parts each one is bz_string_release'd —
+// otherwise the retained +1 would leak. bz_string_release is null-safe and a
+// no-op on a sentinel/literal, so a null/never-stored slot is safe to pass.
+// Width-1 (byte) mode, matching Append/ToString.
 
 // Replace the entire parts list with one freshly-allocated +1 string holding
 // `data[0..len)` (which `bz_sb_set_*` then owns by transferring it in). Resets
@@ -595,7 +597,15 @@ static void bz_sb_reset_to(bz_array_t* arr, char* data, int64_t len) {
     memcpy(strObj + 8, &len, sizeof(int64_t));
     strObj[16] = 1;                                  // width = 1 (byte mode)
     bz_string_init_rc(strObj);                       // #422: producer ref, rc := 1
-    arr->count = 0;                                  // drop old parts (not freed)
+    // #1185: release each old owned part before dropping it (the builder owns a
+    // +1 per part from Append/ctor). bz_string_release is null-/sentinel-safe.
+    if (arr->data) {
+        for (int64_t i = 0; i < arr->count; ++i) {
+            void* part = ((void**)arr->data)[i];
+            if (part) bz_string_release(part);
+        }
+    }
+    arr->count = 0;                                  // drop old parts
     bz_array_add(arr, &strObj, 8);
 }
 

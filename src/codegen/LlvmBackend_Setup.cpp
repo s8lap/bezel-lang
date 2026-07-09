@@ -6824,6 +6824,40 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return;
         }
     }
+    // #1185 / stdlib §3.1: a `using var` bound to a StringBuilder. The builder is
+    // a bz_array_t* of string parts and OWNS a +1 per part (Append/ctor retain or
+    // transfer it). Its value is the array pointer itself (a heap-pointer builtin
+    // with no user TypeSymbol, so classOfLocal returns null below and every other
+    // special case misses it — without this it leaked the whole parts array).
+    // Disposal reuses the borrowing-Array<string> path: bz_array_free with the
+    // string-element release thunk, which bz_string_release's each part (null-/
+    // sentinel-safe) and frees the backing array. Mutators that flatten-and-reset
+    // (Insert/Remove/Replace) release the old parts themselves (bz_sb_reset_to).
+    {
+        auto isSbName = [](const sema::TypeRef* rt) {
+            return rt && rt->kind == sema::TypeRef::Kind::Named &&
+                   !rt->declaration && rt->astNode && rt->astNode->name &&
+                   !rt->astNode->name->parts.empty() &&
+                   rt->headName() == "StringBuilder";
+        };
+        bool isSB = false;
+        if (ld->type) isSB = isSbName(ctx_.resolvedType(*ld->type));
+        if (!isSB && ld->initializer) {
+            if (auto* ne = dynamic_cast<const ast::NewExpr*>(
+                    ld->initializer.get()))
+                isSB = ne->type && ne->type->name &&
+                       !ne->type->name->parts.empty() &&
+                       ne->type->name->parts[0] == "StringBuilder";
+            if (!isSB) isSB = isSbName(ctx_.exprType(*ld->initializer));
+        }
+        if (isSB) {
+            Disposal d{it->second, nullptr};
+            d.collection = true;
+            d.collectionElemDisposer = stringElementReleaseThunk();
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
 
     const sema::TypeSymbol* cls = classOfLocal(ld);
     if (cls && disposerFns_.find(cls) != disposerFns_.end()) {
@@ -8236,6 +8270,29 @@ struct StringEscapeWalker {
                static_cast<const void*>(loc->decl) == target;
     }
 
+    // #1185 / stdlib §3.1: StringBuilder.Append/AppendLine(string) is a RETAINING
+    // builtin consumer — Append retains (or, for a +1 producer, transfers) the
+    // string into its owned parts list, so the builder holds an INDEPENDENT +1
+    // that keeps the value alive for the builder's lifetime. The builder is
+    // disposed at scope end, so passing a string LOCAL to Append does NOT make
+    // the local escape: a scope-end release of the caller's +1 is safe (the
+    // builder's own retain outlives the call; no UAF). This mirrors the #1430
+    // plain-method relaxation, extended to this retaining builtin (which has no
+    // resolved MethodSymbol — it is matched structurally in
+    // tryLowerCollectionInstanceCall). Only the STRING arg position (index 0) of
+    // Append/AppendLine qualifies; other overloads/positions stay escaped.
+    bool isStringBuilderRetainingStringArg(const ast::Expr* callee, size_t i) {
+        if (i != 0) return false;
+        auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+        if (!ma || !ma->target) return false;
+        if (ma->member != "Append" && ma->member != "AppendLine") return false;
+        const sema::TypeRef* rt = ctx.exprType(*ma->target);
+        return rt && rt->kind == sema::TypeRef::Kind::Named &&
+               !rt->declaration && rt->astNode && rt->astNode->name &&
+               !rt->astNode->name->parts.empty() &&
+               rt->headName() == "StringBuilder";
+    }
+
     // Call arguments (#1430): a bare read of the target passed in a PLAIN
     // (no-modifier) parameter position of a resolved user/imported method is a
     // CALL-BOUNDED read, not an escape (§28.3 borrow-for-the-call / §28.9).
@@ -8270,6 +8327,12 @@ struct StringEscapeWalker {
                     dynamic_cast<sema::ParameterSymbol*>(ms->params[i]);
                 if (ps && ps->modifier.empty()) safeArg = true;
             }
+            // #1185: a string local passed to StringBuilder.Append/AppendLine's
+            // string slot is non-escaping (the retaining builder owns a +1).
+            if (!safeArg && a.modifier.empty() && a.name.empty() &&
+                isStringBuilderRetainingStringArg(callee, i) &&
+                isTargetIdent(a.value.get()))
+                safeArg = true;
             expr(a.value.get(), safeArg);
         }
     }
