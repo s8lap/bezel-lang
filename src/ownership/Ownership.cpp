@@ -2308,6 +2308,33 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
                         it->second.state == OwnershipState::Borrowed)
                         const_cast<ast::LocalDecl&>(ld)
                             .usingVarSourceIsBorrow = true;
+                    // §28.10 / §29.2 (#1287): a `using var u := item` whose
+                    // source is the loop variable of a BORROWING for-loop holds
+                    // no disposal obligation. Default iteration over an owning
+                    // collection (`for var item in arr` where arr: OwningArray<T>)
+                    // yields borrows (§28.11 / §29.2: default iteration is
+                    // borrowing — the collection still owns its elements), as do
+                    // all other non-owning iterables (Array<T>, IEnumerable<T>,
+                    // string, range, span). The using var is therefore a
+                    // borrow-pin (§28.10), not an adoption; disposing it would
+                    // double-free the element the source collection still owns.
+                    // A borrowing loop var is never seeded into states_
+                    // (seedOwnedIterVar only seeds IOwningEnumerable /
+                    // IOwningAsyncEnumerable loops, whose iteration transfers
+                    // ownership), so the states_.find above misses it; detect
+                    // it by the loop var's decl being a ForStmt that is NOT an
+                    // owning-enumerable loop. The owning path (Drain) IS seeded
+                    // as Owned, so this else-branch never fires for it.
+                    else if (it == states_.end()) {
+                        if (auto* loc = dynamic_cast<sema::LocalSymbol*>(srcSym)) {
+                            if (auto* fs = dynamic_cast<const ast::ForStmt*>(
+                                    loc->decl)) {
+                                if (!iterableIsOwningEnumerable(*fs))
+                                    const_cast<ast::LocalDecl&>(ld)
+                                        .usingVarSourceIsBorrow = true;
+                            }
+                        }
+                    }
                 }
             }
         }
