@@ -2058,9 +2058,10 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
     // innermost loop's own entry (captured alongside loopBreakBB/loopContBB,
     // same loopStack_.back()). A break/continue that exits straight to this
     // loop (no further outer finally) disposes the enclosing range
-    // [loopScopeDepth, thisTryDepth) — scopes established before this try but
-    // still inside the loop, e.g. an enclosing `using var` — AFTER the finally
-    // body runs, mirroring mode 1/5's [0, thisTryDepth)/outer-depth ranges.
+    // [loopScopeDepth, bodyScopeIdx) — scopes established before this try's body
+    // scope but still inside the loop, e.g. an enclosing `using var` — AFTER the
+    // finally body runs, mirroring mode 1/5's enclosing-range dispatch (the body
+    // scope itself is disposed at the exit site; see the frame-setup comment).
     std::size_t loopScopeDepth =
         loopStack_.empty() ? 0 : loopStack_.back().scopeDepth;
     // #721 C1: in an async method, `return v` completes the OUTER task with the
@@ -2082,35 +2083,42 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         // break/continue of a loop opened INSIDE the try body must not route
         // through this finally (see the break/continue handlers).
         frame.loopDepthAtEntry = loopStack_.size();
-        // fix #1263 / §28.3: for a try-WITH-finally, push the try body's own
-        // disposal scope NOW — before capturing disposeDepthAtEntry and before
-        // the `unwindScopeDepth_ = disposeStack_.size()` below — so the body
-        // scope sits at an index BELOW thisTryDepth. §28.3: "the explicit finally
-        // runs first (with the local still in scope), then the implicit
-        // auto-dispose runs as the scope unwinds further." Three consequences:
-        //  (a) a throw from the body does NOT auto-dispose the body's owned
-        //      locals at the throw site: unwindScopeDepth_ (= disposeStack_.size()
-        //      after this push) sits ABOVE the body scope, so emitUnwindDisposals
-        //      skips it. The pre-fix ordering disposed the body locals FIRST and
-        //      ran the finally AFTER — letting a finally observe an already-
-        //      disposed local (a UAF); the repro in #1263 saw seq 214 instead of
-        //      the spec-mandated 421.
-        //  (b) the body scope's index (< thisTryDepth) means the finally
-        //      dispatch's existing emitUnwindDisposalsInRange(savedDepth,
-        //      thisTryDepth) and the mode dispatches' emitDisposalsInRange(...,
-        //      thisTryDepth) naturally INCLUDE it — disposing it AFTER the
-        //      finally body, as the scope unwinds further outward.
-        //  (c) frame.disposeDepthAtEntry (= disposeStack_.size() after the push)
-        //      sits ABOVE the body scope, so a return/break/continue routing
-        //      through this finally disposes only NESTED try-body scopes at the
-        //      exit site, NOT the body scope itself — the body scope rides the
-        //      finally's post-body dispatch. The body is lowered with lowerBody
-        //      (no fall-through auto-dispose) and the scope is popped at the end
-        //      of lowerTry, after every dispatch block that disposes it is
-        //      emitted. A try WITHOUT a finally is unaffected: lowerScopedBlock
-        //      owns the body scope and disposes it on both edges as before.
+        // fix #1263 / §28.3 (reworked to compose with #1567/#1598): for a
+        // try-WITH-finally, push the try body's own disposal scope NOW so it
+        // sits at an index BELOW thisTryDepth, but capture disposeDepthAtEntry
+        // BEFORE the push (= that body-scope index) so the early-exit edges keep
+        // the #1567/#1598 reverse-establishment ordering. §28.3: "the explicit
+        // finally runs first (with the local still in scope), then the implicit
+        // auto-dispose runs as the scope unwinds further." The body scope's
+        // disposal point is EDGE-DEPENDENT:
+        //  • EXCEPTION edge (finUnwindBB) and NORMAL edge (fallDispBB): the body
+        //    scope is disposed AFTER the finally body — §28.3's finally-first
+        //    ordering, the only edges #1263 pins. The throw site's
+        //    unwindScopeDepth_ (= disposeStack_.size() AFTER this push) sits
+        //    ABOVE the body scope, so emitUnwindDisposals skips it; finUnwindBB's
+        //    emitUnwindDisposalsInRange(savedDepth, thisTryDepth) and fallDispBB's
+        //    emitDisposalsInRange(bodyScopeIdx, thisTryDepth) dispose it after the
+        //    finally. Pre-fix, both edges disposed the body scope BEFORE the
+        //    finally — a UAF if the finally touched a body local (#1263 saw 214
+        //    instead of the spec-mandated 421).
+        //  • BREAK/CONTINUE/RETURN/YIELD-BREAK edges: the body scope is disposed
+        //    at the EXIT SITE (the site's emitDisposalsInRange(disposeDepthAtEntry,
+        //    top) includes it, since disposeDepthAtEntry == bodyScopeIdx), and the
+        //    mode dispatches (modes 1-5) use bodyScopeIdx as their upper bound,
+        //    disposing only the ENCLOSING scopes — the #1567/#1598 reverse-
+        //    establishment chain. Capturing disposeDepthAtEntry AFTER the push (the
+        //    original #1263) shifted this index past the body scope, so the inner
+        //    finally's mode dispatch no longer reached an OUTER try's body scope:
+        //    that scope slipped to the outer finally's dispatch and was disposed
+        //    too late — the #1598 nested-finally-chain break-edge regression
+        //    (419 became 491). Capturing it before the push restores the index
+        //    #1598's dispatch ranges depend on.
+        // The body is lowered with lowerBody (no fall-through auto-dispose); the
+        // scope is popped at the end of lowerTry, after every dispatch block that
+        // disposes it is emitted. A try WITHOUT a finally is unaffected
+        // (lowerScopedBlock owns the body scope on both edges as before).
+        frame.disposeDepthAtEntry = disposeStack_.size();   // = bodyScopeIdx
         disposeStack_.emplace_back();   // §28.3 body scope (kept on the stack)
-        frame.disposeDepthAtEntry = disposeStack_.size();
         finallyStack_.push_back(frame);
         // §29.7 (#623): track the AST finally-body alongside the frame so
         // a yield inside this try can snapshot the chain for Dispose.
@@ -2137,6 +2145,13 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
     // intervening scopes (e.g. an outer `using var`) are still live and must be
     // disposed when re-propagating to outerUnwind — see finUnwindBB below.
     std::size_t thisTryDepth = unwindScopeDepth_;
+    // fix #1263-rework: the try body's disposal scope sits at thisTryDepth-1
+    // (bodyScopeIdx). The mode dispatches (modes 1-5) dispose only the ENCLOSING
+    // scopes [.., bodyScopeIdx), leaving the body scope to the EXIT SITE — the
+    // #1567/#1598 reverse-establishment chain. finUnwindBB and fallDispBB use
+    // thisTryDepth (inclusive of the body scope) — those are the §28.3 finally-
+    // first edges (exception + normal). See the frame-setup comment above.
+    const std::size_t bodyScopeIdx = thisTryDepth - 1;
     // fix #1263 / §28.3 (see the body-scope push in the frame setup above): for
     // a try-WITH-finally the body scope is already on the stack; lower the body
     // with lowerBody so it is NOT auto-disposed on normal fall-through (the
@@ -2393,7 +2408,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             // onward, then let the outer finally run and dispose its own outer
             // range. This is the normal-exit twin of the exception path's
             // emitUnwindDisposalsInRange(savedDepth, thisTryDepth) below.
-            emitDisposalsInRange(outerFr->disposeDepthAtEntry, thisTryDepth);
+            emitDisposalsInRange(outerFr->disposeDepthAtEntry, bodyScopeIdx);
             // Route through outer finally (nested try-with-finally).
             builder_.CreateStore(builder_.getInt32(1), outerFr->exitModSlot);
             if (retValSlot && outerFr->retValSlot) {
@@ -2403,12 +2418,13 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             builder_.CreateBr(outerFr->finNormalBB);
         } else {
             // fix #1567 / §29.7/§28.10 (v0.182): no enclosing finally — dispose
-            // every remaining scope established before this try (indices
-            // [0, thisTryDepth)), AFTER the finally body, then ret. Together with
-            // the return site's disposal of the try-body scopes (>= thisTryDepth)
-            // this disposes all live scopes in reverse establishment order with
-            // the finally interleaved at its establishment point.
-            emitDisposalsInRange(0, thisTryDepth);
+            // every remaining scope established before this try's body scope
+            // (indices [0, bodyScopeIdx)), AFTER the finally body, then ret.
+            // Together with the return site's disposal of the try-body scopes
+            // (>= bodyScopeIdx) this disposes all live scopes in reverse
+            // establishment order with the finally interleaved at its
+            // establishment point.
+            emitDisposalsInRange(0, bodyScopeIdx);
             llvm::Value* rv = (retValSlot && retTy && !retTy->isVoidTy())
                 ? builder_.CreateLoad(retTy, retValSlot) : nullptr;
             emitReturn(currentFn_, rv);
@@ -2424,7 +2440,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 // established between this finally and the next-outer finally
                 // (reverse establishment) before routing onward — the mode-2
                 // twin of mode 1/5.
-                emitDisposalsInRange(outerFr->disposeDepthAtEntry, thisTryDepth);
+                emitDisposalsInRange(outerFr->disposeDepthAtEntry, bodyScopeIdx);
                 builder_.CreateStore(builder_.getInt32(2), outerFr->exitModSlot);
                 builder_.CreateBr(outerFr->finNormalBB);
             } else {
@@ -2435,7 +2451,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 // break target. The pre-v0.182 code disposed nothing here,
                 // leaving that range disposed too early (at the break site,
                 // before the finally) instead — a use-after-dispose.
-                emitDisposalsInRange(loopScopeDepth, thisTryDepth);
+                emitDisposalsInRange(loopScopeDepth, bodyScopeIdx);
                 builder_.CreateBr(loopBreakBB);
             }
         }
@@ -2447,12 +2463,12 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             builder_.SetInsertPoint(cntDispBB);
             if (outerFr) {
                 // fix #1598 / §29.7/§28.10 (v0.182): mode-3 twin of mode-2 above.
-                emitDisposalsInRange(outerFr->disposeDepthAtEntry, thisTryDepth);
+                emitDisposalsInRange(outerFr->disposeDepthAtEntry, bodyScopeIdx);
                 builder_.CreateStore(builder_.getInt32(3), outerFr->exitModSlot);
                 builder_.CreateBr(outerFr->finNormalBB);
             } else {
                 // fix #1598 / §29.7/§28.10 (v0.182): mode-3 twin of mode-2 above.
-                emitDisposalsInRange(loopScopeDepth, thisTryDepth);
+                emitDisposalsInRange(loopScopeDepth, bodyScopeIdx);
                 builder_.CreateBr(loopContBB);
             }
         }
@@ -2475,18 +2491,18 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 // established between this finally and the next-outer finally
                 // (reverse establishment) before routing onward — the mode-4
                 // twin of mode 1/5.
-                emitDisposalsInRange(outerFr->disposeDepthAtEntry, thisTryDepth);
+                emitDisposalsInRange(outerFr->disposeDepthAtEntry, bodyScopeIdx);
                 builder_.CreateStore(builder_.getInt32(4), outerFr->exitModSlot);
                 builder_.CreateBr(outerFr->finNormalBB);
             } else {
                 // fix #1598 / §29.7/§28.10 (v0.182): a `yield break` is a
                 // terminal exit from the whole MoveNext/Resume function (like
                 // `return`), so — mirroring mode 1's emitDisposalsInRange(0,
-                // thisTryDepth) — dispose every remaining scope established
-                // before this try, AFTER the finally body, then perform the
-                // terminal iterator exit. Pre-v0.182 this range was never
-                // disposed on the yield-break edge at all.
-                emitDisposalsInRange(0, thisTryDepth);
+                // bodyScopeIdx) — dispose every remaining scope established
+                // before this try's body scope, AFTER the finally body, then
+                // perform the terminal iterator exit. Pre-v0.182 this range was
+                // never disposed on the yield-break edge at all.
+                emitDisposalsInRange(0, bodyScopeIdx);
                 builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
                 if (smKind_ == SuspendKind::AsyncYield) {
                     emitAsyncIterComplete(/*hasValue=*/false);
@@ -2511,7 +2527,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 // this finally and the next-outer finally (reverse establishment)
                 // after this finally body, before routing the async return onward
                 // — the mode-5 twin of mode 1.
-                emitDisposalsInRange(outerFr->disposeDepthAtEntry, thisTryDepth);
+                emitDisposalsInRange(outerFr->disposeDepthAtEntry, bodyScopeIdx);
                 builder_.CreateStore(builder_.getInt32(5), outerFr->exitModSlot);
                 if (asyncRetSlot && outerFr->asyncRetSlot && asyncResultTy_) {
                     llvm::Value* rv =
@@ -2523,7 +2539,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 // fix #1567 / §29.7/§28.10 (v0.182): no enclosing finally —
                 // dispose every remaining scope established before this try
                 // AFTER the finally body, then complete the outer task.
-                emitDisposalsInRange(0, thisTryDepth);
+                emitDisposalsInRange(0, bodyScopeIdx);
                 llvm::Value* rv = (asyncRetSlot && asyncResultTy_)
                     ? builder_.CreateLoad(asyncResultTy_, asyncRetSlot)
                     : nullptr;
