@@ -86,6 +86,52 @@ struct LocalOwnership {
     // An activation-local (live range does NOT cross an await) leaves this
     // false and behaves exactly as a synchronous owned local. // per §30.5
     bool suspendLocal = false;
+
+    // §28.3 (v0.180, #1626): maybe-consumed — the maybe-consumed lattice
+    // state, realized as a flag ORTHOGONAL to the Owned state. Set at a
+    // control-flow join where one incoming edge holds the local Owned and the
+    // other has MOVED FROM it (MovedFrom via a move / `owned`-transfer / owned
+    // argument) — ownership left the local on that branch, the object may be
+    // freed by its new owner, and any post-join use is a use-after-free.
+    //
+    //   "A join of owned with moved-from ... yields maybe-consumed (v0.180):
+    //    the variable may not be read, borrowed from, or consumed after the
+    //    join, and may not flow around a loop back edge into any use;
+    //    scope-end auto-drop applies per-path (disposal runs only on the
+    //    still-owned path)."
+    //
+    // Rework (#1626 v2, reconciling §28.3 with §28.2 / #601): the marker is
+    // NOT set for the Owned ⊓ DISPOSED split, even though §28.3's literal
+    // "(or explicitly disposed)" clause groups it with moved-from. An explicit
+    // Dispose() is idempotent — §28.2: "a further Dispose() call remains a
+    // no-op, not an error, in both modes" — and the local still OWNS the
+    // reference on both branches (Disposed is a logical state, not a transfer;
+    // the object is freed only at the per-path scope-end auto-drop). So the
+    // Owned ⊓ Disposed join resolves to plain Owned with no marker: the
+    // post-join Dispose is the proper discharge on the owned path and an
+    // idempotent no-op on the disposed path (#601's one-branch discharge
+    // pattern), and reads fall to the runtime disposed-flag backstop (§28.2
+    // checked mode) just as for any non-dominating use-after-dispose. Setting
+    // the marker there would over-reject that valid program. The marker is the
+    // move/transfer use-after-free danger ONLY.
+    //
+    // The state stays Owned (NOT a new enum lattice value) so that all the
+    // discharge machinery — the end-of-scope leak check / affine auto-drop
+    // (§28.3), the exception-path discharge, and #338's per-path obligation
+    // retention — behave EXACTLY as for a plain Owned local: the still-owned
+    // branch's value must still be disposed at scope end on that path, which
+    // the runtime disposed-flag/null check makes a no-op on the moved-from
+    // path. A fresh enum value would have required touching every
+    // `state == Owned` discharge site (each a potential soundness gap or
+    // over-rejection if mis-classified); the flag leaves that machinery
+    // untouched by construction. It is consulted only at the use sites —
+    // checkRead (read/borrow), markMovedByName (consume/move), and
+    // markDisposedByName (explicit Dispose) — each of which rejects a
+    // maybe-consumed local with a diagnostic pointing at the offending use
+    // (the spec's "diagnostics should point at the offending use, not the
+    // declaration"). Reassignment to a fresh owned value clears the flag
+    // (the local is then definitely owned again). // per §28.3, §28.2
+    bool maybeConsumed = false;
 };
 
 // Spelled state for diagnostics + tests.

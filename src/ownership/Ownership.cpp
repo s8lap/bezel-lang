@@ -2585,6 +2585,12 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
                 checkConsumeFreeze(id->name, as.target->span.begin);
             st.state = producerState(*as.value);
             st.obligationOrigin = &as;
+            // §28.3 (#1626): a reassignment writes a fresh value, so any
+            // maybe-consumed marker from a prior Owned⊓{MovedFrom,Disposed}
+            // join is no longer accurate — the local now holds a definite
+            // value (owned or borrowed per the RHS producer). Clear it so a
+            // later use of the reassigned local is not spuriously rejected.
+            st.maybeConsumed = false;
             // §28.7 / §28.3 (#1625): flag a null-INITIALIZED plain local
             // (`var x: T? := null;`, PolyNull) the first time it ADOPTS Owned
             // state from a non-null RHS, so codegen treats it as an owned class

@@ -468,11 +468,19 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                             cma->target.get())) {
                         // Only skip read-check if the local is already Disposed
-                        // (the double-dispose case that markDisposedByName handles).
+                        // (the double-dispose case that markDisposedByName
+                        // handles), OR maybe-consumed (§28.3 #1626: disposing
+                        // a maybe-consumed local — owned on one branch,
+                        // moved-from on the other — is the use-after-free /
+                        // double-dispose the lattice state exists to reject;
+                        // markDisposedByName emits the precise message, so
+                        // suppress the generic read diagnostic here to avoid a
+                        // double report).
                         for (auto& [s, lo] : states_) {
                             if (s->name == tid->name) {
                                 skipCalleeReadForDispose =
-                                    (lo.state == OwnershipState::Disposed);
+                                    (lo.state == OwnershipState::Disposed) ||
+                                    lo.maybeConsumed;
                                 break;
                             }
                         }
@@ -882,6 +890,31 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
             if (s->name == id->name) { sym = s; st = &lo; break; }
         }
         if (!st) return;
+        // §28.3 (#1626, v0.180): a maybe-consumed local — owned on one
+        // branch, moved-from on the other at the last join (the marker is the
+        // move/transfer use-after-free danger only; see joinInto) — "may not
+        // be read, borrowed from, or consumed after the join." A read here (a
+        // plain `_ := x`, a borrow argument, a member/index access on it,
+        // etc.) is exactly that forbidden use: on the consuming branch the
+        // value is already gone (transferred out and possibly freed by its
+        // new owner), so the read may observe freed memory. Reject at the
+        // offending use (the spec's "diagnostics should point at the
+        // offending use, not the declaration"). The `.Dispose()` form is
+        // diverted to markDisposedByName for a precise double-dispose message
+        // via skipCalleeReadForDispose below. Poison to suppress cascades
+        // (and the redundant scope-end leak diagnostic).
+        if (st->maybeConsumed &&
+            st->state == OwnershipState::Owned) {
+            report(
+                Severity::Error, id->span.begin,
+                std::string("local `") + std::string(id->name) +
+                "` may have already been consumed on another branch and may "
+                "not be read here (maybe-consumed join, §28.3) — equalize the "
+                "branches before the merge, or confine every use of `" +
+                std::string(id->name) + "` to a single branch");
+            st->state = OwnershipState::Poisoned;
+            return;
+        }
         if (st->state == OwnershipState::MovedFrom) {
             report(
                 Severity::Error, id->span.begin,
@@ -2728,7 +2761,23 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
         auto it = other.find(sym);
         if (it == other.end()) continue;
         const LocalOwnership& o = it->second;
-        if (st.state == o.state) continue;
+        if (st.state == o.state) {
+            // §28.3 (#1626): preserve the maybe-consumed marker across a
+            // same-state Owned ⊓ Owned merge (OR it). The marker is only ever
+            // set on the Owned state (the ownedDischargedSplit rule below, for
+            // the Owned ⊓ MovedFrom split only — see the rework note there), so
+            // this branch is the only same-state case where it is live. OR-ing
+            // — rather than keeping `st`'s flag — is what makes the marker
+            // survive a loop back-edge: a loop-carried Owned local that became
+            // maybe-consumed (moved on one path in the body) inside the body
+            // must stay maybe-consumed at the header so a use in a later
+            // iteration (flowing around the back edge, which the spec forbids)
+            // is rejected. Keeping only `st`'s flag would let the freshly-owned
+            // incoming path wash the marker out and re-admit the use. // per §28.3
+            if (st.state == OwnershipState::Owned)
+                st.maybeConsumed = st.maybeConsumed || o.maybeConsumed;
+            continue;
+        }
         // PolyNull absorbs: PolyNull ⊓ X = X.
         if (st.state == OwnershipState::PolyNull) {
             st = o;
@@ -2797,19 +2846,80 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
         // never reaches here. Exception edges are unaffected: the unwound
         // owned local is *removed* from the incoming state before the meet
         // (dischargeOnExceptionEdge), so it is never the Disposed/Owned
-        // operand of this rule. // per §28.3, §28.6
+        // operand of this rule.
+        //
+        // #1626 (§28.3 v0.180): retaining plain Owned here was itself unsound
+        // for the MOVED-FROM split — it left the joined local indistinguishable
+        // from a freshly-owned one, so a subsequent read/borrow/consume/Dispose
+        // compiled clean and DOUBLE-DISPOSED (or worse, use-after-freed) at
+        // runtime on the branch that had already transferred ownership out. The
+        // spec therefore names this join result a distinct state — maybe-
+        // consumed — whose only remaining privilege is the per-path scope-end
+        // auto-drop; every explicit use is rejected. We model that state with
+        // the `maybeConsumed` flag (see OwnershipState.hpp): the Owned record
+        // is still kept (so #338's leak diagnostic on the undischarged path and
+        // the exception/auto-drop machinery are unchanged — the still-owned
+        // branch's value is still disposed at scope end on that path), but the
+        // flag marks it as maybe-consumed for checkRead / markMovedByName /
+        // markDisposedByName to reject. // per §28.3, §28.6
+        //
+        // The maybe-consumed marker applies ONLY to the MOVED-FROM split, NOT
+        // to the DISPOSED split (#1626 rework, reconciling §28.3 with §28.2 /
+        // #601). The two halves of this join are not equally dangerous:
+        //
+        //   * Owned ⊓ MovedFrom — ownership LEFT the local on one branch (a
+        //     `move`, an `owned`-argument transfer, an `owned`-binding RHS):
+        //     the object is now owned by the receiver and may be physically
+        //     FREED by it, so the local is a dangling reference. ANY post-join
+        //     use — read, borrow, consume, or Dispose — is a use-after-free.
+        //     This is the genuine #1626 soundness hole; the marker is set.
+        //
+        //   * Owned ⊓ Disposed — the local STILL owns the reference on both
+        //     branches (Disposed is a *logical* state of an owned local, not a
+        //     transfer; the object is not freed until the per-path scope-end
+        //     auto-drop). A post-join `.Dispose()` is the IDEMPOTENT discharge
+        //     §28.2 guarantees — "a further Dispose() call remains a no-op, not
+        //     an error, in both modes" — and is the canonical one-branch
+        //     discharge pattern (#601 spec_28_2_one_branch_no_warn: dispose on
+        //     one branch, the final Dispose is the proper discharge on the
+        //     other). A read/borrow of the joined local is admitted with the
+        //     runtime disposed-flag backstop (§28.2 checked disposal) exactly
+        //     as for any non-dominating use-after-dispose — §28.2's compile-
+        //     time warning fires only when Dispose DOMINATES the use on every
+        //     path, which a one-branch dispose never does. Setting the marker
+        //     here would over-reject that valid program. So this half resolves
+        //     to plain Owned (the pre-#1626 behavior, carrying the #338 per-
+        //     path obligation) with NO marker.
+        //
+        // (Recorded tension: §28.3 v0.180's literal "owned with moved-from (or
+        //  explicitly disposed) yields maybe-consumed" groups both halves; the
+        //  "(or explicitly disposed)" parenthetical collides with §28.2's
+        //  idempotent-Dispose guarantee for the post-join discharge. This code
+        //  implements the §28.2-faithful reading — the marker is the move/
+        //  transfer danger only — which is what makes #601 and #1626 coexist.)
+        const bool stOwned = (st.state == OwnershipState::Owned);
+        const bool oOwned = (o.state == OwnershipState::Owned);
         const bool ownedDischargedSplit =
-            (st.state == OwnershipState::Owned &&
+            (stOwned &&
              (o.state == OwnershipState::Disposed ||
               o.state == OwnershipState::MovedFrom)) ||
             ((st.state == OwnershipState::Disposed ||
               st.state == OwnershipState::MovedFrom) &&
-             o.state == OwnershipState::Owned);
+             oOwned);
         if (ownedDischargedSplit) {
             // Keep the Owned record so obligationOrigin / implicitDischarge
             // are the ones that drive the end-of-scope diagnostic. If the
             // Owned side is `other`, copy its record over `into`'s.
+            // The discharged (non-Owned) side is the one whose state is the
+            // danger signal — capture it BEFORE the reassignment below.
+            const OwnershipState dischargedState = stOwned ? o.state : st.state;
             if (st.state != OwnershipState::Owned) st = o;
+            // §28.3 (#1626, reworked): mark maybe-consumed ONLY for the MOVED-
+            // FROM split — the ownership-transfer-out use-after-free danger.
+            // The DISPOSED split resolves to plain Owned with no marker (the
+            // idempotent §28.2 discharge / #601 one-branch pattern).
+            if (dischargedState == OwnershipState::MovedFrom)
+                st.maybeConsumed = true;
             continue;
         }
         // Other mismatches (e.g. Uninitialized on one side at a non-loop
@@ -2877,6 +2987,28 @@ void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation l
             Severity::Error, loc,
             std::string("cannot dispose `") + std::string(name) +
             "`: it was already moved out (§28.3)");
+        st->state = OwnershipState::Poisoned;
+        return;
+    }
+    // §28.3 (#1626, v0.180): disposing a maybe-consumed local — owned on one
+    // branch, moved-from on the other (ownership transferred out) — is the
+    // double-dispose / use-after-free the maybe-consumed lattice state exists
+    // to catch. On the consuming branch the value is already gone (its new
+    // owner may have freed it); this `.Dispose()` would operate on freed
+    // memory. The marker is the move/transfer danger only (see joinInto), so
+    // this never fires for the Owned ⊓ Disposed join — whose post-join
+    // Dispose is the idempotent §28.2 discharge (#601's one-branch pattern),
+    // not an error. The scope-end per-path auto-drop is the ONLY disposal a
+    // maybe-consumed local still permits (and that runs only on the still-
+    // owned branch). Poison to suppress the redundant scope-end leak diagnostic.
+    if (st->maybeConsumed) {
+        report(
+            Severity::Error, loc,
+            std::string("cannot dispose `") + std::string(name) +
+            "`: it may have already been consumed on another branch "
+            "(maybe-consumed join, §28.3) — disposing it here would "
+            "double-dispose on the consuming branch; confine the disposal "
+            "to a single branch or equalize the branches before the merge");
         st->state = OwnershipState::Poisoned;
         return;
     }
@@ -3182,6 +3314,22 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
         st->state = OwnershipState::Poisoned;
         return;
     }
+    // §28.3 (#1626, v0.180): a maybe-consumed local — owned on one branch,
+    // already consumed on the other — may not be consumed after the join
+    // either: on the consuming branch the value is already gone, so this
+    // `move`/`owned`-transfer/`using var` adoption would transfer a stale
+    // reference (a use-after-free / double-consume). The spec lists consume
+    // alongside read and borrow as the uses a maybe-consumed join forbids.
+    if (st->maybeConsumed) {
+        report(
+            Severity::Error, loc,
+            std::string("cannot consume `") + std::string(name) +
+            "`: it may have already been consumed on another branch "
+            "(maybe-consumed join, §28.3) — confine the consume to a single "
+            "branch or equalize the branches before the merge");
+        st->state = OwnershipState::Poisoned;
+        return;
+    }
     // §28.3 (v0.180) consume-site freeze: this is the central consume of an owned
     // LOCAL binding — a `move x`, an `owned`-argument transfer (`M(owned x)`,
     // including `Domain.Spawn(owned c)` and channel `Send`, §30.14/§30.15), or a
@@ -3288,6 +3436,9 @@ void MethodOwnership::markOwnedByName(std::string_view name, SourceLocation loc,
     st->state = OwnershipState::Owned;
     st->obligationOrigin = origin;
     st->source.reset();
+    // §28.3 (#1626): an `out owned` write deposits a fresh owned value, so
+    // clear any maybe-consumed marker from a prior mixed join.
+    st->maybeConsumed = false;
     (void)loc;
 }
 
@@ -5318,6 +5469,17 @@ void MethodOwnership::recordAwaitOperandConsume(
             "` was already awaited (consumed) — an `OwningTask<T>` is "
             "single-consumer; awaiting it again moves out an already-moved "
             "result (§30.5 / §30.4)");
+        st->state = OwnershipState::Poisoned;
+        return;
+    }
+    // §28.3 (#1626): awaiting a maybe-consumed task local is a consume of a
+    // value that may already have been consumed on another branch — reject.
+    if (st->maybeConsumed) {
+        report(
+            Severity::Error, loc,
+            std::string("cannot await `") + std::string(id->name) +
+            "`: it may have already been consumed on another branch "
+            "(maybe-consumed join, §28.3)");
         st->state = OwnershipState::Poisoned;
         return;
     }
