@@ -74,12 +74,74 @@
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+#include "codegen/LlvmBackend.hpp"
+#include "lexer/Lexer.hpp"
+#include "ownership/Ownership.hpp"
+#include "parser/Parser.hpp"
+#include "sema/ExprTypecheck.hpp"
+#include "sema/SemaContext.hpp"
+#include "sema/SymbolCollection.hpp"
+#include "sema/TypeResolution.hpp"
+#include "support/Diagnostic.hpp"
+
+#include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
+#include "llvm/ExecutionEngine/Orc/LLJIT.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
 
 namespace {
+// #1521 lives ENTIRELY in the ownership pass (the §28.3 reject + the §30.1
+// iteratorAutoDispose flag) and the async completion-edge codegen
+// (emitAsyncOwnedParamAutoDispose) that reads that flag. The shared `runJit`
+// helper (tests/support/codegen_support.hpp) runs sema but NOT
+// `ownership::checkOwnership` — by design it is "surface-only ... emitted
+// objects are byte-identical" — so it can exercise NEITHER half of this fix:
+//   - the iteratorAutoDispose flag stays unset → emitAsyncOwnedParamAutoDispose
+//     is a no-op → the `owned` param LEAKS (Cell.n stays 1) on every completion
+//     edge; and
+//   - the §28.3 reject never fires → a conditionally-discharged param "runs"
+//     instead of being rejected.
+// This full-pipeline runner adds the ownership pass before codegen, mirroring
+// the real driver (src/driver/Driver.cpp) and the established #945 precedent
+// (iterator_owned_param_945_test.cpp's run(), which exists for the identical
+// reason — that test's header documents the same runJit-skips-ownership gap).
+// Without it these tests mis-report (7 leak, 1 false-accept); with it every
+// case below gives the spec-stated result, matching the bezelc AOT behaviour.
 int run(const std::string& prog) {
-    auto r = runJit(prog);
-    return r.ran ? r.exitCode : -999;
+    bezel::DiagnosticEngine diags;
+    bezel::Lexer lexer(prog, diags);
+    bezel::Parser parser(lexer, diags);
+    auto unit = parser.parseCompilationUnit();
+    if (!unit) return -999;
+    bezel::sema::SemaContext ctx(diags);
+    bezel::sema::collectSymbols(*unit, ctx);
+    bezel::sema::resolveTypes(*unit, ctx);
+    bezel::sema::typecheckExpressions(*unit, ctx);
+    bezel::ownership::checkOwnership(*unit, ctx);   // the pass #1521 lives in
+    if (diags.hasErrors()) return -999;
+    bezel::test::ensureNativeTargetInitialized();
+    auto llvmCtx = std::make_unique<llvm::LLVMContext>();
+    auto module = bezel::codegen::emitModule(*unit, ctx, *llvmCtx,
+                                             bezel::codegen::CodegenOptions{});
+    if (!module) return -999;
+    auto jitOrErr = llvm::orc::LLJITBuilder().create();
+    if (!jitOrErr) { llvm::consumeError(jitOrErr.takeError()); return -999; }
+    auto jit = std::move(*jitOrErr);
+    if (auto gen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+            jit->getDataLayout().getGlobalPrefix())) {
+        jit->getMainJITDylib().addGenerator(std::move(*gen));
+    } else {
+        llvm::consumeError(gen.takeError());
+    }
+    llvm::orc::ThreadSafeModule tsm(std::move(module), std::move(llvmCtx));
+    if (auto err = jit->addIRModule(std::move(tsm))) {
+        llvm::consumeError(std::move(err));
+        return -999;
+    }
+    auto sym = jit->lookup("main");
+    if (!sym) { llvm::consumeError(sym.takeError()); return -999; }
+    auto fn = sym->toPtr<int (*)()>();
+    return fn();
 }
 
 // Cell: a class with a static counter (ctor ++, dtor --) for leak/double-free
