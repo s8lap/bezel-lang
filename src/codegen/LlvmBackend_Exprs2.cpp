@@ -476,7 +476,9 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                 // Guard the null-store on !emittingDisposerBody_, mirroring the
                 // qualified-form fix, so inside a destructor the field is left
                 // non-null and the auto-dispose pass disposes it exactly once.
-                if (isOwnedReferenceField(fs) && !emittingDisposerBody_) {
+                if ((isOwnedReferenceField(fs) ||
+                     isOwnedIteratorInterfaceField(fs)) &&
+                    !emittingDisposerBody_) {
                     llvm::Type* fty = nullptr;
                     if (llvm::Value* addr = implicitFieldAddr(*id, fty)) {
                         if (fty && fty->isPointerTy())
@@ -523,7 +525,8 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                 if (auto* fs = dynamic_cast<sema::FieldSymbol*>(
                         ctx_.exprSymbol(*ma))) {
                     auto idxIt = fieldIndex_.find(fs);
-                    if (isOwnedReferenceField(fs) && fs->parent &&
+                    if ((isOwnedReferenceField(fs) ||
+                         isOwnedIteratorInterfaceField(fs)) && fs->parent &&
                         idxIt != fieldIndex_.end()) {
                         llvm::StructType* st = classStruct(fs->parent);
                         if (st && st->getElementType(idxIt->second)

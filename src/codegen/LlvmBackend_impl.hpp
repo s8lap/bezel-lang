@@ -3540,6 +3540,39 @@ private:
         return isBuiltinExceptionTypeRef(ctx_.resolvedType(*fd->type));
     }
 
+    // #1643 / §28 / §29.7: an `owned` field whose type is a builtin ITERATOR
+    // interface (IEnumerable<T> / IOwningEnumerable<T>) — a declaration-less
+    // Named type whose runtime value is the iterator-vtable object
+    // ([0]=td,[1]=Dispose,[2]=MoveNext,[3]=Current — §29.7), NOT a user class.
+    // isOwnedReferenceField (which requires a class/interface `declaration`) and
+    // the other builtin-field predicates do not match it (it has no declaration
+    // and is not an exception/collection/Shared/Subscription), so without this
+    // the field is skipped by emitOwnedFieldDisposals and the iterator FRAME
+    // (bz$C$Gen, incl. its owned captures) leaks at class disposal. Disposed via
+    // the iterator-vtable slot-1 Dispose (which runs pending finally blocks and
+    // frees the frame itself, §29.7), NOT the class-vtable slot-2 dynamicDispose
+    // (which would call MoveNext and never free) — see emitOwnedFieldDisposals.
+    //
+    // #662 foundation B: for IMPORTED fields (fs->decl == nullptr), the field's
+    // type rides ctx_.importedMemberType(fs). Mirrors isOwnedBuiltinException
+    // Field's structure (posParam branch from #1543/#1594 included).
+    bool isOwnedIteratorInterfaceField(const sema::FieldSymbol* fs) {
+        // §22.10 (v0.180) / #1594: a captured `owned` primary-ctor parameter
+        // typed as IEnumerable<T>/IOwningEnumerable<T>. Mirrors isOwnedReference
+        // Field's posParam branch (#1543); capturedOwnedPrimaryParamType is
+        // defined further below (forward-declared use is fine — same class).
+        if (fs->posParam)
+            return isVtableBackedIEnumerableType(
+                capturedOwnedPrimaryParamType(fs));
+        if (!hasOwnedModifier(fs)) return false;
+        // #662 foundation B: imported field — type from importedMemberType.
+        if (!fs->decl)
+            return isVtableBackedIEnumerableType(ctx_.importedMemberType(fs));
+        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+        if (!fd || !fd->type) return false;
+        return isVtableBackedIEnumerableType(ctx_.resolvedType(*fd->type));
+    }
+
     // #595 / §12 / §31: detect whether a user-defined class or any of its user-
     // class ancestors has a built-in exception type as a direct AST-declared base
     // (e.g. `class ErrA: Exception`, or `class ErrB: ErrA` where ErrA: Exception).

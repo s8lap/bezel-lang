@@ -226,6 +226,11 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         // §28.5/§24.4 (#879): true for Subscription (or Subscription?) owned
         // field (bz_subscription_dispose — null-safe, so no guard needed).
         bool subscriptionField = false;
+        // #1643 / §29.7: true for an owned IEnumerable<T>/IOwningEnumerable<T>
+        // field — an iterator-vtable object whose Dispose is at slot 1 (which
+        // frees the frame itself), dispatched below via the iterEnumDispose
+        // path, NOT the class-vtable slot-2 dynamicDispose.
+        bool iterField = false;
     };
     std::vector<OwnedField> owned;
     for (const sema::Symbol* m : ts->members) {
@@ -251,6 +256,14 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // (null-safe: `if (!subp) return;` — so Subscription? is safe too).
             OwnedField of{fs, nullptr};
             of.subscriptionField = true;
+            owned.push_back(of);
+        } else if (isOwnedIteratorInterfaceField(fs)) {
+            // #1643 / §29.7: an `owned` IEnumerable<T>/IOwningEnumerable<T>
+            // field. Its runtime value is an iterator-vtable object (Dispose at
+            // slot 1, which frees the frame itself); disposed below via the
+            // slot-1 path, NOT the class-vtable slot-2 emitDisposeAndReclaim.
+            OwnedField of{fs, nullptr};
+            of.iterField = true;
             owned.push_back(of);
         } else {
             // §28.13 / stdlib §2.16 (#620): an `owned` field of Shared<T> or
@@ -353,6 +366,40 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                                    {ptrTy()});
             builder_.CreateCall(relFn, {val});
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+            continue;
+        }
+        // #1643 / §29.7: an owned IEnumerable<T>/IOwningEnumerable<T> field
+        // holds an iterator-vtable object. Dispatch Dispose via vtable slot 1
+        // (the iterator format [0]=td,[1]=Dispose,[2]=MoveNext,[3]=Current),
+        // which runs the state machine's pending finally blocks and FREES THE
+        // FRAME ITSELF (§29.7) — so NO separate free/reclaim here (unlike the
+        // class-vtable slot-2 path below, where Dispose only runs the destructor
+        // and emitDisposeAndReclaim must also free). Calling slot 2 here would
+        // invoke MoveNext, not Dispose, and leak the frame. Null-guard (a never-
+        // assigned or moved-from slot holds null) + null-after (the #396 slot-
+        // null precedent) so a re-entrant / second pass is a no-op. Mirrors the
+        // scope-end iterEnumDispose path (emitDisposals) and the iterator
+        // Dispose-body EnumFrame cleanup (emitIteratorMethod).
+        if (it->iterField) {
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                val, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* iterDispBB = llvm::BasicBlock::Create(
+                llvm_, "owned.iter.dispose", currentFn_);
+            auto* iterContBB = llvm::BasicBlock::Create(
+                llvm_, "owned.iter.cont", currentFn_);
+            builder_.CreateCondBr(isNull, iterContBB, iterDispBB);
+            builder_.SetInsertPoint(iterDispBB);
+            // Dispatch vtable slot 1 (Dispose) — frees the frame.
+            llvm::Value* vt = builder_.CreateLoad(ptrTy(), val);
+            llvm::Value* dispSlot =
+                builder_.CreateGEP(ptrTy(), vt, {builder_.getInt32(1)});
+            llvm::Value* dispFnPtr = builder_.CreateLoad(ptrTy(), dispSlot);
+            auto* dispTy = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
+            builder_.CreateCall(dispTy, dispFnPtr, {val});
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+            builder_.CreateBr(iterContBB);
+            builder_.SetInsertPoint(iterContBB);
             continue;
         }
         llvm::Value* isNull = builder_.CreateICmpEQ(

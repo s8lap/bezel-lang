@@ -4292,7 +4292,11 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
                    isOwnedSharedWeakField(fs) ||
                    // §28.5/§24.4 (#879): owned Subscription field also needs
                    // cleanup if the constructor body throws.
-                   isOwnedSubscriptionField(fs))) {
+                   isOwnedSubscriptionField(fs) ||
+                   // #1643 / §29.7: owned IEnumerable<T>/IOwningEnumerable<T>
+                   // field's iterator frame needs cleanup (slot-1 dispose) if
+                   // the constructor body throws after it was assigned.
+                   isOwnedIteratorInterfaceField(fs))) {
             hasOwnedToClean = true;
             break;
         }
