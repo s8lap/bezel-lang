@@ -551,3 +551,72 @@ BEZEL_TEST(ienumerable_vtable_linq_995,
         "    return n * 10 + Dog._n; "
         "  end Main; end C;"), 2);
 }
+
+// §12.9 / §29.2 / stdlib §4.4 / #1316: a METHOD-LEVEL-GENERIC method returning
+// `Array<T>` coerced to its `IEnumerable<T>` view must wrap the array into the
+// vtable-backed enumerator — the generic sibling of the #1310 return-coercion.
+// Root cause: a method-level generic (`AsSeq<T>`) is specialized via
+// emitInlineGenericMethod, whose EXPRESSION-body path inlined `=> a` RAW (it
+// never reaches buildSpecializedMethodFn — only block bodies do), so the raw
+// bz_array_t* pointer was returned; the caller's for-in then dispatched through
+// the array's first word as a vtable (null-fn-pointer call) and SIGSEGV'd. Fix
+// in LlvmBackend_Calls2.cpp: emitInlineGenericMethod's expression-body path now
+// applies the same boxForTarget + wrapAsIEnumerableForTarget return-coercion as
+// buildSpecializedMethodFn. Array<T> implements IEnumerable<T> via IList<T>
+// (stdlib §4.4); the for desugaring (§29.2) drives the wrapper's vtable
+// protocol; T is substituted under the active genericSubst_ (§12.9) so the
+// enumerator's element type/stride matches the instantiation.
+BEZEL_TEST(ienumerable_vtable_linq_995,
+           generic_method_array_as_ienumerable_iterated_1316) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Util "
+        "  public static method AsSeq<T>(a: Array<T>): IEnumerable<T> => a; "
+        "end Util; "
+        "class C "
+        "  public static method Main(): int "
+        "    var xs: Array<int> := [1, 2, 4]; "
+        "    var s := 0; "
+        "    for var x in Util.AsSeq<int>(xs) do s := s + x; end; "
+        "    return s; "
+        "  end Main; end C;"), 7);
+}
+
+// §29.11 / §29.2 / #1316: re-enumerating the generic-returned IEnumerable<T>
+// replays from the start (GetEnumerator slot 4 clones the cursor to idx=-1),
+// so two for-in loops over the same view each see all three elements
+// (7*10+7 = 77). Pins that the wrapper (not the raw array) is what reaches the
+// caller: a raw bz_array_t* has no GetEnumerator slot and would SIGSEGV on the
+// second enumeration just as on the first.
+BEZEL_TEST(ienumerable_vtable_linq_995,
+           generic_method_array_as_ienumerable_reenumerates_1316) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Util "
+        "  public static method AsSeq<T>(a: Array<T>): IEnumerable<T> => a; "
+        "end Util; "
+        "class C "
+        "  public static method Main(): int "
+        "    var xs: Array<int> := [1, 2, 4]; "
+        "    var e := Util.AsSeq<int>(xs); "
+        "    var s1 := 0; for var x in e do s1 := s1 + x; end; "
+        "    var s2 := 0; for var y in e do s2 := s2 + y; end; "
+        "    return s1 * 10 + s2; "
+        "  end Main; end C;"), 77);
+}
+
+// §12.9 / §29.2 / #1316: a reference element type (string = ptr, stride 8)
+// substituted for T exercises the genericSubst_-driven element-type/stride
+// selection in wrapArrayAsIEnumerable. Sum of "ab"(2)+"cde"(3)+"f"(1) = 6.
+BEZEL_TEST(ienumerable_vtable_linq_995,
+           generic_method_string_array_as_ienumerable_1316) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Util "
+        "  public static method AsSeq<T>(a: Array<T>): IEnumerable<T> => a; "
+        "end Util; "
+        "class C "
+        "  public static method Main(): int "
+        "    var xs: Array<string> := [\"ab\", \"cde\", \"f\"]; "
+        "    var n := 0; "
+        "    for var x in Util.AsSeq<string>(xs) do n := n + x.Length; end; "
+        "    return n; "
+        "  end Main; end C;"), 6);
+}

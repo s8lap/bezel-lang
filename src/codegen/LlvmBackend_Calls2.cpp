@@ -6570,6 +6570,27 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
     llvm::Value* result = nullptr;
     if (ci.bodyKind == ast::MethodBodyKind::Expression && ci.exprBody) {
         result = lowerExpr(*ci.exprBody);
+        // §8.6 / §29.2 / §4.3 (#1316): apply the SAME return-coercion the
+        // non-generic return sites and buildSpecializedMethodFn use — a generic
+        // expression-body method like `AsSeq<T>(a: Array<T>): IEnumerable<T>
+        // => a` would otherwise inline the raw bz_array_t* pointer; the caller's
+        // for-in then dispatches through the array's first word as a vtable
+        // (SIGSEGV). This inline path is reached for method-level generics
+        // (emitMethodCall forces specialization when md->genericParams is bound
+        // in genericSubst_), but expression bodies are inlined HERE — they never
+        // reach buildSpecializedMethodFn (only block bodies do), so the wrap that
+        // #1310 added there was missed. boxForTarget boxes a value-typed result
+        // returned through an Object/interface return (no-op for a reference
+        // source like Array); wrapAsIEnumerableForTarget wraps an Array<T> /
+        // user-class into the vtable-backed enumerator. resolvedType under the
+        // active genericSubst_ substitutes T so the enumerator's element type
+        // matches the instantiation.
+        if (result && ci.returnType && !diverged_) {
+            result = boxForTarget(result,
+                ctx_.resolvedType(*ci.returnType), ci.exprBody);
+            result = wrapAsIEnumerableForTarget(
+                result, ctx_.resolvedType(*ci.returnType), ci.exprBody);
+        }
     } else if (ci.bodyKind == ast::MethodBodyKind::Block) {
         // Block body: compile a specialized function and call it.
         // Inlining block bodies is problematic because `return` generates
