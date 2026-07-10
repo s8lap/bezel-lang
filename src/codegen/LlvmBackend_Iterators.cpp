@@ -971,6 +971,30 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         smStateStruct_ = stateStructTy;
         asyncSpillPtrField_ = SPILL_PTR_FIELD;
 
+        // §28.2 / §29.7 (#1107): idempotent disposal — if the iterator is
+        // already done (state == -1), this is a redundant Dispose call; return
+        // immediately without re-running disposal logic (which would double-
+        // free the spill area and frame). In unchecked mode the call-site null
+        // guard (LlvmBackend_Calls2.cpp) already prevents the second call from
+        // reaching here on the same slot; this guard covers checked mode (frame
+        // quarantined, slot not nulled) and any alias / future call path.
+        {
+            llvm::Value* stateGEP = builder_.CreateStructGEP(
+                stateStructTy, self, STATE_FIELD);
+            llvm::Value* curState =
+                builder_.CreateLoad(i32(), stateGEP, "dsp.curstate");
+            llvm::Value* isDone = builder_.CreateICmpEQ(
+                curState, builder_.getInt32(-1), "dsp.isdone");
+            auto* earlyRet =
+                llvm::BasicBlock::Create(llvm_, "dsp.idem", targetFn);
+            auto* proceed =
+                llvm::BasicBlock::Create(llvm_, "dsp.proceed", targetFn);
+            builder_.CreateCondBr(isDone, earlyRet, proceed);
+            builder_.SetInsertPoint(earlyRet);
+            builder_.CreateRetVoid();
+            builder_.SetInsertPoint(proceed);
+        }
+
         // Restore captures so finally bodies can access `this` / params.
         emitFrameCaptureRestores(frame, self);
 

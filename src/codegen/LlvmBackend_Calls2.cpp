@@ -4030,7 +4030,29 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     if (ebn == "IEnumerator" || ebn == "IOwningEnumerator") {
                         llvm::Value* obj = lowerExpr(*ma->target);
                         if (obj && obj->getType()->isPointerTy()) {
-                            llvm::Value* vt = builder_.CreateLoad(ptrTy(), obj);
+                            // §28.2 / §29.7: idempotent disposal — a *repeated*
+                            // explicit `e.Dispose()` on the same enumerator local
+                            // must be a no-op. The first call freed the frame and
+                            // nulled the slot (below), so on the second call `obj`
+                            // (reloaded from that slot) is null — dispatching a
+                            // vtable Dispose through it would be a null-deref
+                            // SIGSEGV (#1107). Guard the whole dispatch + slot-
+                            // nulling on a non-null receiver so the second
+                            // `e.Dispose()` cleanly skips. (Checked mode does not
+                            // null the slot — the object is quarantined — so
+                            // `obj` stays non-null there and the re-dispatch is a
+                            // no-op via the run-once guard in the Dispose body.)
+                            auto* nn = llvm::BasicBlock::Create(
+                                llvm_, "enumdisp.nn", currentFn_);
+                            auto* cont = llvm::BasicBlock::Create(
+                                llvm_, "enumdisp.cont", currentFn_);
+                            builder_.CreateCondBr(
+                                builder_.CreateICmpNE(
+                                    obj, llvm::ConstantPointerNull::get(ptrTy())),
+                                nn, cont);
+                            builder_.SetInsertPoint(nn);
+                            llvm::Value* vt =
+                                builder_.CreateLoad(ptrTy(), obj);
                             llvm::Value* dSlot = builder_.CreateGEP(
                                 ptrTy(), vt, {builder_.getInt32(1)});
                             llvm::Value* dFn =
@@ -4046,6 +4068,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                                         llvm::ConstantPointerNull::get(ptrTy()),
                                         slot);
                             }
+                            builder_.CreateBr(cont);
+                            builder_.SetInsertPoint(cont);
                         }
                         return nullptr;
                     }
