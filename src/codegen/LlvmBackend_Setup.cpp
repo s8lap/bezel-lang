@@ -13,6 +13,47 @@ namespace bezel::codegen {
 // unwind-disposal eligibility helpers above its definition.
 static bool isClassOrInterfaceRef(const sema::TypeRef* rt);
 
+// #1309 / §22.13: the constant-literal initializer shapes that constInitForExpr
+// can fold into an LLVM Constant for a static field's backing global. Factored
+// out of the (previously triplicated) inline dynamic_cast checklist so the
+// mutable-vs-readonly bake decision stays consistent across every call site
+// (declareStatics, needsRuntimeFieldInit, the sfinit field loop, and
+// isSfinitStoredStaticField).
+static bool isConstantLiteralStaticInit(const ast::Expr* e) {
+    if (!e) return false;
+    return dynamic_cast<const ast::IntLiteralExpr*>(e) ||
+           dynamic_cast<const ast::BoolLiteralExpr*>(e) ||
+           dynamic_cast<const ast::FloatLiteralExpr*>(e) ||
+           dynamic_cast<const ast::StringLiteralExpr*>(e) ||
+           dynamic_cast<const ast::VerbatimStringExpr*>(e);
+}
+
+// #1309 / §22.13: a static field is MUTABLE unless its modifiers include
+// `readonly` (a `const` member is a different symbol kind — ConstMemberSymbol —
+// and never reaches this path). Only a `readonly` static may have its literal
+// initializer baked into the global at compile time: a forward reference from an
+// earlier `static readonly` initializer is a compile error (§22.13), so baking
+// is sound there. A MUTABLE static must initialize at runtime in textual
+// declaration order — otherwise an earlier initializer that reads it would
+// silently observe the baked value instead of the not-yet-initialized state the
+// partial-state guard exists to protect (§22.13: "Partially-initialized statics
+// are never observable").
+static bool isReadonlyStaticField(const sema::FieldSymbol* fs) {
+    if (!fs) return false;
+    for (auto mod : fs->modifiers)
+        if (mod == "readonly") return true;
+    return false;
+}
+
+// #1309 / §22.13: true iff a static field's initializer is baked at compile time
+// into its backing global (constInitForExpr) and so needs NO runtime store in the
+// textual-order sfinit. Baked iff the initializer is a constant literal AND the
+// field is readonly; a mutable static is always runtime-initialized.
+static bool isBakedStaticFieldInit(const sema::FieldSymbol* fs,
+                                   const ast::Expr* e) {
+    return isConstantLiteralStaticInit(e) && isReadonlyStaticField(fs);
+}
+
 std::string Emitter::functionName(sema::MethodSymbol* ms) {
     if (isMain(ms)) return "main";
     // §26 (#433): an extension method has no parent type — name it after its
@@ -352,10 +393,20 @@ void Emitter::declareStatics() {
         // EXTERNAL linkage so the symbol is global (not module-local `d`), so a
         // cross-module read binds to THIS definition at link time. The
         // definition (with its initializer) lives in the exporting module only.
+        // #1309 / §22.13: a MUTABLE static is NOT compile-time-baked — it is
+        // initialized at runtime in textual declaration order (its initializer is
+        // stored by the synthesized sfinit), so a forward reference to it from an
+        // earlier initializer observes the not-yet-stored state and the
+        // partial-state guard fires rather than silently reading a baked value.
+        // Only a `readonly` static keeps its literal baked in the global (forward
+        // refs among readonly are a compile error per §22.13, so baking is sound).
+        llvm::Constant* fieldInitC = isReadonlyStaticField(fs)
+            ? constInitFor(fd, ty)
+            : llvm::Constant::getNullValue(ty);
         auto* gv = new llvm::GlobalVariable(
             *module_, ty, /*isConstant=*/false,
             llvm::GlobalValue::ExternalLinkage,
-            constInitFor(fd, ty),
+            fieldInitC,
             "bz$" + cls + "$" + std::string(fs->name));
         staticGlobals_[fs] = gv;
     }
@@ -944,13 +995,10 @@ void Emitter::declareFunctions() {
             auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
             if (!fd || !fd->initializer) continue;
             const ast::Expr* e = fd->initializer.get();
-            // Mirrors constInitFor: only these expressions yield a
-            // compile-time LLVM Constant; everything else needs runtime eval.
-            if (dynamic_cast<const ast::IntLiteralExpr*>(e))     continue;
-            if (dynamic_cast<const ast::BoolLiteralExpr*>(e))    continue;
-            if (dynamic_cast<const ast::FloatLiteralExpr*>(e))   continue;
-            if (dynamic_cast<const ast::StringLiteralExpr*>(e))  continue;
-            if (dynamic_cast<const ast::VerbatimStringExpr*>(e)) continue;
+            // #1309 / §22.13: only a readonly static's literal initializer is
+            // baked (constInitFor); a mutable static's literal initializer needs
+            // a runtime store in textual order, so it does NOT skip here.
+            if (isBakedStaticFieldInit(fs, e)) continue;
             return true;  // non-constant initializer found
         }
         return false;
@@ -3560,13 +3608,14 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
             auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
             if (!fd || !fd->initializer) continue;
             const ast::Expr* initExpr = fd->initializer.get();
-            // Skip initializers that constInitFor already handles as a
-            // compile-time constant — no runtime store needed for those.
-            if (dynamic_cast<const ast::IntLiteralExpr*>(initExpr))     continue;
-            if (dynamic_cast<const ast::BoolLiteralExpr*>(initExpr))    continue;
-            if (dynamic_cast<const ast::FloatLiteralExpr*>(initExpr))   continue;
-            if (dynamic_cast<const ast::StringLiteralExpr*>(initExpr))  continue;
-            if (dynamic_cast<const ast::VerbatimStringExpr*>(initExpr)) continue;
+            // #1309 / §22.13: skip only the BAKED initializers (readonly
+            // literal) — constInitFor already encoded those as the global's LLVM
+            // initializer, so they need no runtime store. A MUTABLE static's
+            // literal initializer is NOT baked; it is stored here in textual
+            // order so a forward reference to it from an earlier initializer hits
+            // the partial-state guard instead of silently reading a compile-time
+            // value.
+            if (isBakedStaticFieldInit(fs, initExpr)) continue;
             // Non-constant initializer: evaluate it and store into the global.
             auto gvIt = staticGlobals_.find(fs);
             if (gvIt == staticGlobals_.end()) continue;  // no backing global
@@ -4013,11 +4062,15 @@ void Emitter::emitEnsureStaticInit(const sema::TypeSymbol* owner) {
 }
 
 
-// #1553 / §22.13 (v0.181): true iff sfinit stores `f` at RUNTIME in textual
-// order — a non-constant static-field initializer with a backing global. A
-// compile-time-constant literal is already in the global (constInitFor), so it
-// is always assigned and contributes no init-progress step (mirrors the skip
-// list in emitStaticConstructorBody's field loop).
+// #1553 / §22.13 (v0.181); #1309: true iff sfinit stores `f` at RUNTIME in
+// textual order — a static-field initializer with a backing global that is NOT
+// compile-time-baked. A readonly static's constant-literal initializer is
+// already in the global (constInitFor), so it is always assigned and contributes
+// no init-progress step. A MUTABLE static's literal initializer is NOT baked
+// (#1309): it is runtime-stored in textual order, so it DOES contribute an
+// init-progress step — and the partial-state read guard then fires on a forward
+// reference to it from an earlier initializer (§22.13: "Partially-initialized
+// statics are never observable"), instead of silently observing a baked value.
 static bool isSfinitStoredStaticField(const sema::FieldSymbol* f,
     const std::unordered_map<const sema::Symbol*, llvm::GlobalVariable*>& globals) {
     if (!f) return false;
@@ -4027,11 +4080,7 @@ static bool isSfinitStoredStaticField(const sema::FieldSymbol* f,
     auto* fd = dynamic_cast<const ast::FieldDecl*>(f->decl);
     if (!fd || !fd->initializer) return false;
     const ast::Expr* e = fd->initializer.get();
-    if (dynamic_cast<const ast::IntLiteralExpr*>(e))     return false;
-    if (dynamic_cast<const ast::BoolLiteralExpr*>(e))    return false;
-    if (dynamic_cast<const ast::FloatLiteralExpr*>(e))   return false;
-    if (dynamic_cast<const ast::StringLiteralExpr*>(e))  return false;
-    if (dynamic_cast<const ast::VerbatimStringExpr*>(e)) return false;
+    if (isBakedStaticFieldInit(f, e)) return false;  // readonly literal: baked
     return globals.count(f) != 0;
 }
 
