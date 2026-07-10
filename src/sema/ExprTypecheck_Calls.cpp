@@ -7227,7 +7227,18 @@ TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
     // `int` (so `Box<A>` with A=int worked by luck) but is wrong for any
     // other param — `Box<B>` with B=string laid out as `Box<int>` (zero-init)
     // and `Pair<B,A>` laid out as `Pair<int,int>` (malformed IR on return).
-    if (declared->kind != TypeRef::Kind::Named) return declared;
+    // #1261 (§14.1 / §27.5 / §A.7): a Function return type (`() -> T`) and an
+    // InlineArray (`[N]T`) ALSO embed a parent type parameter — in funcReturn/
+    // funcParams / arrayElement rather than genericArgs. The early-out below
+    // must not skip them, or a generic-class method returning `() -> T` is left
+    // with an unresolved inner `T` at a concrete instantiation, so the call's
+    // result is typed as the bare parameter and member access on it fails
+    // (substituteReturnType handles the recursion once we reach it). Only kinds
+    // that carry NO nested type references (Primitive/Unit/Error) bail here.
+    if (declared->kind != TypeRef::Kind::Named &&
+        declared->kind != TypeRef::Kind::Function &&
+        declared->kind != TypeRef::Kind::InlineArray)
+        return declared;
     // Find the receiver's resolved TypeRef (carries the concrete generic args).
     // Prefer the target's exprType; fall back to a local/parameter's declared
     // type when the target itself was not given an exprType.
@@ -7513,6 +7524,47 @@ TypeRef* ExprTC::substituteReturnType(
         if (!changed) return declared;
         TypeRef* result = ctx_.makeTypeRef(*declared);
         result->genericArgs = std::move(newArgs);
+        return result;
+    }
+    // #1261 (§14.1 / §27.5 / §A.7): a FUNCTION return type (`() -> T`,
+    // `(T)->T`, `owned (x: T) -> T?`) embeds parent/method type parameters in
+    // its funcParams and funcReturn. Substitute each recursively so a
+    // generic-class method returning `() -> T`, called on a concrete
+    // instantiation, is typed `() -> <concrete>` instead of leaving the inner
+    // `T` unresolved — otherwise the call result is the bare parameter and
+    // member access on it (e.g. `result._v` where `result := f()`) fails to
+    // resolve. Mirrors the genericArgs recursion above.
+    if (declared->kind == TypeRef::Kind::Function) {
+        bool changed = false;
+        std::vector<TypeRef::FuncParam> newParams;
+        newParams.reserve(declared->funcParams.size());
+        for (const auto& fp : declared->funcParams) {
+            TypeRef* sub = fp.type ? substituteReturnType(fp.type, solved)
+                                   : fp.type;
+            if (sub != fp.type) changed = true;
+            TypeRef::FuncParam np = fp;  // preserve modifier/name
+            np.type = sub;
+            newParams.push_back(np);
+        }
+        TypeRef* newRet = declared->funcReturn
+                              ? substituteReturnType(declared->funcReturn, solved)
+                              : declared->funcReturn;
+        if (newRet != declared->funcReturn) changed = true;
+        if (!changed) return declared;
+        TypeRef* result = ctx_.makeTypeRef(*declared);
+        result->funcParams = std::move(newParams);
+        result->funcReturn = newRet;
+        return result;
+    }
+    // #1261 (§14.1): an inline-array return (`[N]T`) embeds a type parameter in
+    // arrayElement; substitute it so `[N]T` on a concrete instantiation resolves
+    // the element type.
+    if (declared->kind == TypeRef::Kind::InlineArray &&
+        declared->arrayElement) {
+        TypeRef* sub = substituteReturnType(declared->arrayElement, solved);
+        if (sub == declared->arrayElement) return declared;
+        TypeRef* result = ctx_.makeTypeRef(*declared);
+        result->arrayElement = sub;
         return result;
     }
     return declared;
