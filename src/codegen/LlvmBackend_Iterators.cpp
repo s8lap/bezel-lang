@@ -839,8 +839,13 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             // `using var` resources active at the end must be disposed before the
             // iterator reports done. (The abandonment path — Dispose while still
             // suspended at a yield — is handled by smIterDisposalsAtState_ in the
-            // Dispose function below.) State is set to -1, so the consumer's
-            // subsequent Dispose() is a no-op → each resource is disposed once.
+            // Dispose function below.) State is set to -1 (iteration logically
+            // complete; the frame is STILL ALLOCATED and still owes disposal).
+            // The consumer's subsequent Dispose() proceeds (the Dispose-entry guard
+            // tests the disposed sentinel -2, NOT this -1), frees the frame, and
+            // disposes owned params — but its state switch hits the default (-1)
+            // and skips re-running these using-var disposals, so each is disposed
+            // exactly once.
             emitDisposals(disposeStack_.back());
             // §29 (#1120): on exhaustion, dispose the last outstanding yielded
             // owned value if (and only if) the enumerator owns it (it was produced
@@ -944,7 +949,10 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // Emitted after MoveNext so smIterFinallyAtState_ is populated.
     // If the iterator was suspended inside a try/finally, run the finally
     // chains (innermost first) before freeing the frame.  A second Dispose
-    // (state == -1) is a no-op per §29.7.
+    // is a no-op per §28.2/§29.7: the entry guard tests the DISPOSED sentinel
+    // (state == -2, set only by Dispose itself) — distinct from MoveNext's
+    // exhaustion value (state == -1), which must still let the first Dispose
+    // proceed to free the frame and dispose owned params (§29.8).
     //
     // §29.11 (#943): emitted TWICE — once as `disposeFn` (the SOURCE/IEnumerable
     // Dispose, which runs §29.8 owned-parameter auto-dispose) and once as
@@ -971,25 +979,37 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         smStateStruct_ = stateStructTy;
         asyncSpillPtrField_ = SPILL_PTR_FIELD;
 
-        // §28.2 / §29.7 (#1107): idempotent disposal — if the iterator is
-        // already done (state == -1), this is a redundant Dispose call; return
-        // immediately without re-running disposal logic (which would double-
-        // free the spill area and frame). In unchecked mode the call-site null
-        // guard (LlvmBackend_Calls2.cpp) already prevents the second call from
-        // reaching here on the same slot; this guard covers checked mode (frame
-        // quarantined, slot not nulled) and any alias / future call path.
+        // §28.2 / §29.7 (#1107, rework): idempotent disposal. §28.2 models
+        // idempotency as a "per-instance disposed flag"; we encode that flag as
+        // a distinct STATE SENTINEL — `-2` — that ONLY Dispose ever sets (at the
+        // mark-done stores below, before running cleanup + free). MoveNext never
+        // produces `-2`: it writes the positive yield states 1..N and, on natural
+        // exhaustion, writes `-1` (meaning "iteration logically complete; the
+        // frame is still allocated and STILL OWES DISPOSAL" — §29.7).
+        //
+        // The guard must therefore test the DISPOSED sentinel (`-2`), NOT the
+        // MoveNext exhaustion value (`-1`). Testing `-1` (the original #1107
+        // guard) was wrongly predicated: on the dominant exhaust-then-Dispose
+        // pattern MoveNext has already set `state = -1`, so the FIRST (legitimate)
+        // Dispose would no-op BEFORE free(self) / disposeOwnedParams() /
+        // emitFreeSpillArea — regressing the pre-fix behavior into a frame + owned-
+        // param LEAK (§29.7/§29.8). Re-predicating on `-2` lets the first Dispose
+        // (whether after exhaustion `-1`, a suspended yield `N`, or never-iterated
+        // `0`) proceed and free the frame, while a SECOND Dispose (after the first
+        // set `-2`) no-ops. This covers checked mode (frame quarantined, slot not
+        // nulled, so the call-site null guard does not fire) and any alias path.
         {
             llvm::Value* stateGEP = builder_.CreateStructGEP(
                 stateStructTy, self, STATE_FIELD);
             llvm::Value* curState =
                 builder_.CreateLoad(i32(), stateGEP, "dsp.curstate");
-            llvm::Value* isDone = builder_.CreateICmpEQ(
-                curState, builder_.getInt32(-1), "dsp.isdone");
+            llvm::Value* isDisposed = builder_.CreateICmpEQ(
+                curState, builder_.getInt32(-2), "dsp.isdisposed");
             auto* earlyRet =
                 llvm::BasicBlock::Create(llvm_, "dsp.idem", targetFn);
             auto* proceed =
                 llvm::BasicBlock::Create(llvm_, "dsp.proceed", targetFn);
-            builder_.CreateCondBr(isDone, earlyRet, proceed);
+            builder_.CreateCondBr(isDisposed, earlyRet, proceed);
             builder_.SetInsertPoint(earlyRet);
             builder_.CreateRetVoid();
             builder_.SetInsertPoint(proceed);
@@ -1121,26 +1141,30 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // establishment-ordered stack (smIterCleanupAtState_) is the superset of
         // all three; empty iff there is nothing to run.
         if (smIterCleanupAtState_.empty()) {
-            // Mark done so a second Dispose is a no-op (not strictly necessary
-            // when there are no finally chains, but keeps the contract clean).
+            // Set the DISPOSED sentinel (-2, §28.2 per-instance flag) BEFORE any
+            // cleanup so a re-entrant / second Dispose no-ops at the entry guard.
             llvm::Value* stateGEP2 =
                 builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
-            builder_.CreateStore(builder_.getInt32(-1), stateGEP2);
+            builder_.CreateStore(builder_.getInt32(-2), stateGEP2);
             disposeYieldedVal();       // §29 (#1120): dispose outstanding yield val
             disposeOwnedParams();      // §29.8 (#945)
             emitFreeSpillArea(self);   // #747: free any spilled for-loop frame
             builder_.CreateCall(freeFn, {self});
             builder_.CreateRetVoid();
         } else {
-            // Build a switch on the current state.  State == -1 or 0: already
-            // done or never suspended inside a try — just free.  State N: run
-            // the finally chain recorded for that state, then free.
+            // Build a switch on the current state.  State == -1 (MoveNext
+            // exhaustion) or 0 (never iterated): nothing suspended inside a
+            // try — just free.  State N: run the finally chain recorded for
+            // that state, then free.
             auto* doneBB = llvm::BasicBlock::Create(llvm_, "dsp.done", targetFn);
             llvm::Value* stateGEP2 =
                 builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
             llvm::Value* curState = builder_.CreateLoad(i32(), stateGEP2);
-            // Mark done immediately so re-entrant Dispose is a no-op.
-            builder_.CreateStore(builder_.getInt32(-1), stateGEP2);
+            // Set the DISPOSED sentinel (-2, §28.2 per-instance flag) immediately
+            // — BEFORE the finally chains run — so a re-entrant / second Dispose
+            // no-ops at the entry guard. (Switch below dispatches on the already-
+            // loaded `curState`, so overwriting the field here is safe.)
+            builder_.CreateStore(builder_.getInt32(-2), stateGEP2);
             // fix #1567 / §29.7/§28.10 (v0.182): the states that have any pending
             // cleanup — one unified establishment-ordered stack per state (a
             // finally chain, active using-var disposals #821, and/or live for-in
