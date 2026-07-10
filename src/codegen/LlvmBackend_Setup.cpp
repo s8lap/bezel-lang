@@ -3941,14 +3941,27 @@ void Emitter::emitEnsureInitFns() {
         builder_.SetInsertPoint(initB);
         builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1), stateGV);
         builder_.CreateStore(builder_.CreateCall(tidFn, {}, "owntid"), ownerTidGV);
+        // #792 / §22.13: snapshot any PRE-EXISTING in-flight exception before
+        // running sfinit/cctor. The lazy init can be triggered while an exception
+        // is already propagating — most notably an async-iterator `finally`
+        // disposing its frame during a body-throw unwind touches a static member,
+        // which lazily runs the owner's sfinit with bz_exc already set. Without
+        // this snapshot the post-sfinit "did it throw?" check (`bz_exc != null`)
+        // misreads the pre-existing exception as "sfinit threw", spuriously
+        // marking the type failed and raising a TypeInitializationException.
+        // Compare the FRESH load against the snapshot: sfinit/cctor "threw" iff
+        // bz_exc CHANGED (its propagate-block wraps the original in a fresh TIE,
+        // so the pointer differs). When no exception was in flight the snapshot
+        // is null and this reduces exactly to the old `e != null` test.
+        llvm::Value* initPreExc =
+            builder_.CreateLoad(ptrTy(), emitExcSlot(), "init.preexc");
         auto sfIt = sfinitFnOf_.find(t);
         auto ccIt = cctorFnOf_.find(t);
         auto* afterSf = llvm::BasicBlock::Create(llvm_, "after_sf", fn);
         if (sfIt != sfinitFnOf_.end()) {
             builder_.CreateCall(sfIt->second, {});
             llvm::Value* e = builder_.CreateLoad(ptrTy(), emitExcSlot());
-            llvm::Value* thrown = builder_.CreateICmpNE(
-                e, llvm::ConstantPointerNull::get(ptrTy()));
+            llvm::Value* thrown = builder_.CreateICmpNE(e, initPreExc);
             builder_.CreateCondBr(thrown, failB, afterSf);
         } else {
             builder_.CreateBr(afterSf);
@@ -3957,8 +3970,7 @@ void Emitter::emitEnsureInitFns() {
         if (ccIt != cctorFnOf_.end()) {
             builder_.CreateCall(ccIt->second, {});
             llvm::Value* e = builder_.CreateLoad(ptrTy(), emitExcSlot());
-            llvm::Value* thrown = builder_.CreateICmpNE(
-                e, llvm::ConstantPointerNull::get(ptrTy()));
+            llvm::Value* thrown = builder_.CreateICmpNE(e, initPreExc);
             builder_.CreateCondBr(thrown, failB, doneB);
         } else {
             builder_.CreateBr(doneB);
@@ -4035,8 +4047,25 @@ void Emitter::emitEnsureStaticInit(const sema::TypeSymbol* owner) {
     if (!owner) return;
     auto it = ensureInitFns_.find(owner);
     if (it != ensureInitFns_.end()) {
+        // #792 / §22.13: snapshot bz_exc around the ensureinit call and route
+        // ONLY an exception the init RAISED (sfinit/cctor failed → TIE), not a
+        // PRE-EXISTING in-flight exception. The static-init guard can fire while
+        // an exception is already propagating — e.g. an async-iterator `finally`
+        // disposing its frame during a body-throw unwind touches a static member,
+        // running the owner's lazy init with bz_exc already set. Unconditionally
+        // re-checking bz_exc here would route the pre-existing exception at the
+        // access site, skipping the field access (e.g. the `flag := true` store
+        // that records frame disposal). The ensureinit itself is guarded against
+        // misattributing the pre-existing exception (doinit block, above), so if
+        // bz_exc is UNCHANGED the init succeeded and the access should proceed;
+        // the pre-existing exception stays in bz_exc and routes at the next
+        // natural pending check. Mirrors the #1468 disposer-body "is-new" gate.
+        llvm::Value* preExc =
+            builder_.CreateLoad(ptrTy(), emitExcSlot(), "si.preexc");
         builder_.CreateCall(it->second, {});
-        emitPendingCheck();
+        llvm::Value* postExc =
+            builder_.CreateLoad(ptrTy(), emitExcSlot(), "si.postexc");
+        emitPendingCheckIf(builder_.CreateICmpNE(preExc, postExc, "si.raised"));
         return;
     }
     // #798 / §2.5 / §22.13: an IMPORTED type's static init runs in its DEFINING
@@ -4056,8 +4085,14 @@ void Emitter::emitEnsureStaticInit(const sema::TypeSymbol* owner) {
                 voidFnTy, llvm::GlobalValue::ExternalLinkage, name,
                 module_.get());
         }
+        // #792: same pre/post snapshot as the local ensureinit above — route
+        // only an exception the cross-module init raised, not a pre-existing one.
+        llvm::Value* preExc =
+            builder_.CreateLoad(ptrTy(), emitExcSlot(), "si.preexc");
         builder_.CreateCall(fn, {});
-        emitPendingCheck();
+        llvm::Value* postExc =
+            builder_.CreateLoad(ptrTy(), emitExcSlot(), "si.postexc");
+        emitPendingCheckIf(builder_.CreateICmpNE(preExc, postExc, "si.raised"));
     }
 }
 

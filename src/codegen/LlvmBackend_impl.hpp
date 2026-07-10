@@ -3972,6 +3972,18 @@ private:
     // first), else continue.
     void emitPendingCheck();
 
+    // CG20 + #792 / §22.13: route the pending exception ONLY when `cond` is
+    // true. emitPendingCheck computes its own condition (bz_exc != null, ANDed
+    // with the #1468 disposer-body "is-new" gate) and delegates here. Callers
+    // that have ALREADY snapshotted bz_exc around an operation that could raise
+    // (notably the §22.13 static-init guard in emitEnsureStaticInit) pass a
+    // "the operation raised a NEW exception" condition so a PRE-EXISTING
+    // in-flight exception (we were called during an exception unwind) is NOT
+    // misrouted here — it stays in bz_exc and routes at the next natural
+    // pending check. The unwind block (scope disposal + #1216 supersede) is
+    // shared verbatim with emitPendingCheck.
+    void emitPendingCheckIf(llvm::Value* cond);
+
     // §22.9 / §28.3 (FINDING [4]): the new-expression variant of emitPendingCheck.
     // When the constructor of an in-flight `new T(...)` throws, the freshly-
     // calloc'd instance `obj` is never bound to a `using var`/scope, so the

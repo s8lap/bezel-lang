@@ -847,10 +847,21 @@ void Emitter::emitPendingCheck() {
         llvm::Value* isNew = builder_.CreateICmpNE(exc, disposerEntryExc_);
         pending = builder_.CreateAnd(pending, isNew);
     }
+    emitPendingCheckIf(pending);
+}
+
+// #792 / §22.13: the shared route block for a conditional pending check. Branch
+// to the unwind target (disposing unwound using-vars first, with the #1216
+// supersede of a captured in-flight exception) iff `cond` is true, else
+// continue. emitPendingCheck computes its condition (bz_exc != null, ANDed with
+// the #1468 disposer "is-new" gate) and delegates here; emitEnsureStaticInit
+// passes a "the static-init guard RAISED a new exception" condition so a
+// pre-existing in-flight exception is not misrouted at the static-access site.
+void Emitter::emitPendingCheckIf(llvm::Value* cond) {
     auto* unwind =
         llvm::BasicBlock::Create(llvm_, "call.unwind", currentFn_);
     auto* cont = llvm::BasicBlock::Create(llvm_, "call.cont", currentFn_);
-    builder_.CreateCondBr(pending, unwind, cont);
+    builder_.CreateCondBr(cond, unwind, cont);
     builder_.SetInsertPoint(unwind);
     // #1216 (sibling of #1149 / §31.2): if a call inside a finally body (or
     // catch arm) propagates an exception E2 via this pending-check, and there
