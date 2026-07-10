@@ -988,18 +988,23 @@ void* bz_event_handler_at(void* src, int64_t i);
 // handler subscribed via the same closure value — see §24 report note.)
 void bz_event_remove_closure(void* src, void* closure);
 
-// §27.7.1 (v0.180): general function-VALUE equality for the `=`/`<>` binary
-// operator on two function-typed operands. Two closures are the SAME handler
-// by the spec's {method, receiver} rule, not by closure-WRAPPER pointer
-// identity — reuses the exact match already used by `-=` (bz_event_remove_
-// closure's internal bz_closure_same), so a static method reference equals
-// every other reference to the same method, and a repeated `obj.Method`
-// reference on the same class-typed `obj` is guaranteed equal, even though
-// each reference formation mints a fresh closure cell (#1170). A lambda has
-// no method/receiver pair to match on distinct cells, so it still only
-// equals itself (the identical-wrapper fast path). Returns 0/1, not C `bool`
-// — matching this header's other codegen-called predicates and avoiding any
-// i1-vs-i8 ABI ambiguity at the LLVM declareC boundary.
+// §27.7.1 (v0.180, #1544): general function-VALUE equality for the `=`/`<>`
+// binary operator on two function-typed operands. Each closure cell carries a
+// KIND tag (off 32 — see bezel_runtime_internal.hpp's BZ_FVK_* constants) that
+// records which §27.7.1 rule the value obeys, so the operator and the `-=`
+// desugaring (bz_event_remove_closure) agree and dispatch on kind:
+//   - a lambda or value-shaped-receiver (record) reference equals ONLY itself
+//     (reference identity on the cell) — two separately-constructed lambdas / two
+//     separate record-receiver evaluations are NOT equal;
+//   - a class-receiver method/property reference equals another with the same
+//     fn (thunk) AND the same receiver pointer (repeated `obj.Method` on the
+//     same class-typed `obj` is guaranteed equal);
+//   - a static method/property reference equals every other reference to the
+//     same method (same fn);
+//   - a lambda never equals a method/property reference (distinct kinds).
+// Returns 0/1, not C `bool` — matching this header's other codegen-called
+// predicates and avoiding any i1-vs-i8 ABI ambiguity at the LLVM declareC
+// boundary.
 int32_t bz_closure_value_equals(void* a, void* b);
 
 // Remove the handler with the given token. Idempotent (second call is a
@@ -1048,8 +1053,11 @@ int32_t bz_obj_is_string(void* obj, void** vtable_table);
 // references) are runtime-managed (§28.9): the heap-allocated closure object
 // backing the value is reclaimed automatically.  The cell is laid out
 //   { void* fn (off 0), void* env (off 8), int64 rc (off 16),
-//     void* envdtor (off 24) }  total 32 bytes.
+//     void* envdtor (off 24), int64 kind (off 32) }  total 40 bytes.
 // fn (off 0) and env (off 8) keep their offsets.  rc at off 16 is unchanged.
+// kind (off 32, §27.7.1 / #1544): a tag recording the function-value equality
+// rule (see bezel_runtime_internal.hpp's BZ_FVK_* constants); consulted only by
+// bz_closure_same / bz_closure_value_equals, never by retain/release.
 // envdtor (off 24, #672 foundation): a per-lambda typed env-disposal function
 // emitted by codegen beside the trampoline.  When non-null, bz_closure_release
 // calls it as envdtor(env) at the last drop BEFORE freeing the env block; this

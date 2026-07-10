@@ -2156,6 +2156,12 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // A non-virtual, non-interface method ref must have a concrete origFn.
     if (!origFn && !dynamicDispatch) return nullptr;
 
+    // §27.7.1 (#1544): classify the function-value equality kind from the
+    // method symbol + whether a receiver is captured. Computed once here and
+    // threaded into buildMethodClosureCell on both the cache-hit and cache-miss
+    // paths so the kind tag is consistent across every reference to this method.
+    FnValKind kind = closureKindForMethod(ms, extRef);
+
     // #1170 / §24.4: reuse a cached thunk for this method so a named method
     // reference resolves to a STABLE fn pointer (the cell's fn at offset 0).
     // This lets `event -= OnTick` match the `event += OnTick` handler by value
@@ -2164,7 +2170,7 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // is correct. On a cache hit skip re-emitting the body and go straight to
     // building a fresh closure cell with the current receiver.
     if (auto cit = methodThunks_.find({ms, extRef}); cit != methodThunks_.end())
-        return buildMethodClosureCell(cit->second, instMethod, receiverVal);
+        return buildMethodClosureCell(cit->second, instMethod, receiverVal, kind);
 
     // Build the thunk's parameter types: (ptr env, user_params...).
     std::vector<llvm::Type*> thunkParamTys;
@@ -2322,20 +2328,60 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // (e.g. the `-=` matching an earlier `+=`) reuse the SAME fn pointer.
     methodThunks_[{ms, extRef}] = thunk;
 
-    return buildMethodClosureCell(thunk, instMethod, receiverVal);
+    return buildMethodClosureCell(thunk, instMethod, receiverVal, kind);
+}
+
+// §27.7.1 (#1544): classify the equality kind of a method-reference function
+// value. The runtime cannot tell a class receiver (which must match by fn +
+// receiver across separate evaluations) from a record receiver (which must NOT,
+// having no identity), so the kind is tagged at the cell and dispatched on by
+// bz_closure_value_equals / bz_closure_same.
+Emitter::FnValKind Emitter::closureKindForMethod(sema::MethodSymbol* ms,
+                                                 bool extRef) {
+    // Static, or an UNBOUND extension reference (receiver is the function's
+    // first parameter, never captured in env): no receiver to match — same fn.
+    if (isStaticMethod(ms) || extRef) return FVK_FN_ONLY;
+    // Bound extension reference: classify by the extension's TARGET type kind.
+    if (isExtensionMethod(ms)) {
+        if (ms->extensionDecl && ms->extensionDecl->targetType) {
+            const sema::TypeRef* rt =
+                ctx_.resolvedType(*ms->extensionDecl->targetType);
+            if (rt && rt->kind == sema::TypeRef::Kind::Named &&
+                rt->declaration) {
+                auto k = rt->declaration->kind;
+                if (k == ast::TypeDeclKind::Class ||
+                    k == ast::TypeDeclKind::Interface)
+                    return FVK_FN_PLUS_RECV;
+            }
+        }
+        // record / enum / primitive extension receiver — value-shaped: no
+        // identity; two separate evaluations hold distinct copies.
+        return FVK_REF_IDENTITY;
+    }
+    // Regular instance method: classify by the declaring type's kind.
+    if (ms->parent) {
+        auto k = ms->parent->kind;
+        if (k == ast::TypeDeclKind::Class ||
+            k == ast::TypeDeclKind::Interface)
+            return FVK_FN_PLUS_RECV;
+    }
+    // record / enum instance receiver — value-shaped: equals only itself.
+    return FVK_REF_IDENTITY;
 }
 
 llvm::Value* Emitter::buildMethodClosureCell(llvm::Function* thunk,
                                              bool instMethod,
-                                             llvm::Value* receiverVal) {
-    // Build closure cell { thunk_ptr, env_ptr, rc, envdtor }.
-    // #422 / #672 / §27.6 / §28.9: a method reference is a runtime-managed
-    // function value backed by the same closure cell as a lambda (now 32 bytes:
-    // rc at off 16, envdtor at off 24 — #672 foundation). The env is null for a
-    // static method, or an 8-byte block holding the receiver (a BORROW of the
-    // receiver, §28.3 — the cell does not own it). bz_closure_release frees the
-    // cell + env block, never the receiver. envdtor is null (foundation: the env
-    // for a method thunk holds a borrow and needs no typed disposal).
+                                             llvm::Value* receiverVal,
+                                             FnValKind kind) {
+    // Build closure cell { thunk_ptr, env_ptr, rc, envdtor, kind }.
+    // #422 / #672 / §27.6 / §28.9 / §27.7.1 (#1544): a method reference is a
+    // runtime-managed function value backed by the same closure cell as a lambda
+    // (40 bytes: rc at off 16, envdtor at off 24, kind at off 32). The env is
+    // null for a static method, or an 8-byte block holding the receiver (a
+    // BORROW of the receiver, §28.3 — the cell does not own it). bz_closure_
+    // release frees the cell + env block, never the receiver. envdtor is null
+    // (foundation: the env for a method thunk holds a borrow and needs no typed
+    // disposal). kind tags the §27.7.1 equality rule (set below).
     // For a primitive/enum extension receiver the env block stores the raw value
     // bytes (≤ 8 bytes for all supported primitives).
     // #1170: a FRESH cell+env is built per reference (the thunk fn is shared via
@@ -2366,6 +2412,7 @@ llvm::Value* Emitter::buildMethodClosureCell(llvm::Function* thunk,
         builder_.CreateGEP(ptrTy(), closureObj, {builder_.getInt32(1)}));
     initClosureRc(closureObj);      // #422: producer's reference, rc := 1
     initClosureEnvdtor(closureObj); // #672: foundation null envdtor
+    initClosureKind(closureObj, kind); // §27.7.1 (#1544): equality-rule tag
     return closureObj;
 }
 
@@ -2391,8 +2438,11 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     // property's return type / generic substitution were already baked into
     // the compiled thunk on first emission) and go straight to building a
     // fresh closure cell with the current receiver.
+    // §27.7.1 (#1544): classify the equality kind once and thread it into
+    // buildPropertyClosureCell on both paths (mirrors makeMethodThunk).
+    FnValKind pkind = closureKindForProperty(ps, receiverVal);
     if (auto cit = propertyThunks_.find(ps); cit != propertyThunks_.end())
-        return buildPropertyClosureCell(cit->second, receiverVal);
+        return buildPropertyClosureCell(cit->second, receiverVal, pkind);
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     // Result type = the property's value type.
     llvm::Type* retTy = nullptr;
@@ -2540,18 +2590,38 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     // this property (e.g. a repeated `b.Count` read as a function value)
     // reuse the SAME fn pointer — mirrors makeMethodThunk's methodThunks_.
     propertyThunks_[ps] = thunk;
-    return buildPropertyClosureCell(thunk, receiverVal);
+    return buildPropertyClosureCell(thunk, receiverVal, pkind);
+}
+
+// §27.7.1 (#1544): classify the equality kind of a property-reference function
+// value. A static property (no receiver captured) is FVK_FN_ONLY; a class /
+// interface receiver is FVK_FN_PLUS_RECV; a record receiver is FVK_REF_IDENTITY
+// (no identity — equals only itself). Mirrors closureKindForMethod.
+Emitter::FnValKind Emitter::closureKindForProperty(sema::PropertySymbol* ps,
+                                                   llvm::Value* receiverVal) {
+    // A static property reference has no receiver (receiverVal is null and the
+    // thunk's env is null) — §27.6: "() -> PropertyType for static properties".
+    if (!receiverVal) return FVK_FN_ONLY;
+    if (ps->parent) {
+        auto k = ps->parent->kind;
+        if (k == ast::TypeDeclKind::Class ||
+            k == ast::TypeDeclKind::Interface)
+            return FVK_FN_PLUS_RECV;
+    }
+    // record receiver — value-shaped: equals only itself (§27.7.1 third bullet).
+    return FVK_REF_IDENTITY;
 }
 
 llvm::Value* Emitter::buildPropertyClosureCell(llvm::Function* thunk,
-                                               llvm::Value* receiverVal) {
-    // Build the closure cell { thunk_ptr, env_ptr, rc, envdtor } at the call
-    // site. The env holds the receiver as a BORROW (§28.3); bz_closure_release
-    // frees the cell + env, never the receiver. #1544: a FRESH cell+env is
-    // built per reference (the thunk fn is shared via propertyThunks_), so
-    // each reference still has its own rc/lifetime; equality is by the
-    // cell's { fn, receiver-in-env } value (bz_closure_value_equals),
-    // mirroring buildMethodClosureCell.
+                                               llvm::Value* receiverVal,
+                                               FnValKind kind) {
+    // Build the closure cell { thunk_ptr, env_ptr, rc, envdtor, kind } at the
+    // call site. The env holds the receiver as a BORROW (§28.3); bz_closure_
+    // release frees the cell + env, never the receiver. #1544: a FRESH cell+env
+    // is built per reference (the thunk fn is shared via propertyThunks_), so
+    // each reference still has its own rc/lifetime; equality is by the cell's
+    // { fn, receiver-in-env, kind } value (bz_closure_value_equals), mirroring
+    // buildMethodClosureCell.
     uint64_t cellSz =
         module_->getDataLayout().getTypeAllocSize(closureCellType());
     llvm::Value* closureObj = builder_.CreateCall(
@@ -2568,6 +2638,7 @@ llvm::Value* Emitter::buildPropertyClosureCell(llvm::Function* thunk,
         builder_.CreateGEP(ptrTy(), closureObj, {builder_.getInt32(1)}));
     initClosureRc(closureObj);
     initClosureEnvdtor(closureObj);
+    initClosureKind(closureObj, kind); // §27.7.1 (#1544): equality-rule tag
     return closureObj;
 }
 

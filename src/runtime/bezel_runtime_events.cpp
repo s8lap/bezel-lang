@@ -110,35 +110,58 @@ extern "C" void* bz_event_handler_at(void* srcp, int64_t idx) {
     return nullptr;
 }
 
-// Two closure cells denote the SAME handler when their { fn, receiver } pair is
-// equal — NOT when the wrapper pointers themselves are identical. Each named
-// method reference (`event += OnTick`; `event -= OnTick`) materializes a FRESH
-// closure cell: the fn (offset 0) is the method's thunk — STABLE per method,
-// because codegen memoizes one thunk per method symbol (#1170) — and the env
-// (offset 8) is a freshly-allocated block holding the receiver. So the cell
-// handed to `-=` is a different allocation than the one stored by `+=`, with a
-// different env-block POINTER but the SAME thunk fn and the SAME receiver value
-// inside env. Comparing the fn and the receiver *value* (the env's first word)
-// makes `-=` find the handler. The identical-wrapper fast path also handles a
-// stored lambda/field variable removed via the same variable (per §24.4: the
-// same method reference compares equal; separately-built lambdas need not).
+// §27.7.1 (v0.180, #1544): two function values are the SAME under the spec's
+// equality rule, which is KIND-DISPATCHED because the runtime cannot otherwise
+// distinguish a lambda from a method/property reference, nor a class-receiver
+// reference from a record-receiver reference (all are {fn, env, rc, envdtor,
+// kind} cells). Codegen tags each cell with a FnValKind (off
+// BZ_CLOSURE_KIND_OFFSET = 32; see bezel_runtime_internal.hpp):
 //
-// Layout per bz_closure_release: fn at offset 0, env at offset 8. A non-null
-// env block is always >= 8 bytes (method-thunk env is sized to >= 8; a lambda
-// env stores pointer-sized capture words), so reading its first word is in
-// bounds. The env read is reached only when the fn pointers already match.
+//   * BZ_FVK_REF_IDENTITY (0, default): a lambda or a value-shaped-receiver
+//     (record/enum/primitive) method/property reference. Such a value equals
+//     ONLY itself — §27.7.1 first bullet (lambdas) and third bullet (record
+//     receivers have no identity; two separate evaluations are distinct copies).
+//     So after the identical-wrapper fast path (a == b), two DISTINCT cells of
+//     this kind are NEVER equal.
+//   * BZ_FVK_FN_PLUS_RECV (1): a class/interface-receiver method/property
+//     reference. Equal iff same fn (thunk) AND same receiver pointer — §27.7.1
+//     second bullet ("repeated evaluations of obj.Method on the same class-typed
+//     obj are guaranteed equal"). Each reference formation mints a FRESH env
+//     block, so the env pointers differ; the receiver is the env's first word.
+//   * BZ_FVK_FN_ONLY (2): a static (or unbound-extension) method/property
+//     reference. Equal iff same fn — §27.7.1 second bullet ("a static ...
+//     reference to M equals every other reference to M"). The env is null.
+//
+// Distinct kinds are never equal (§27.7.1 fourth bullet: "a lambda never
+// equals a method reference"). The identical-wrapper fast path (a == b) serves
+// the store-once pattern for ALL kinds (a stored value compared/removed via the
+// same binding) — load-bearing for §24.4 `-=` matching of a stored lambda or a
+// record-receiver named method (which, lacking identity, can only match itself).
+//
+// Layout per bz_closure_release: fn at off 0, env at off 8. The env for a
+// method/property thunk holds the receiver as its first word and is always
+// >= 8 bytes, so reading it is in bounds; the read is reached only when both
+// the kinds and the fn pointers already match.
 static bool bz_closure_same(void* a, void* b) {
     if (a == b) return true;        // identical wrapper (or both null)
     if (!a || !b) return false;
+    int64_t a_kind, b_kind;
+    memcpy(&a_kind, (uint8_t*)a + BZ_CLOSURE_KIND_OFFSET, sizeof(int64_t));
+    memcpy(&b_kind, (uint8_t*)b + BZ_CLOSURE_KIND_OFFSET, sizeof(int64_t));
+    if (a_kind != b_kind) return false;   // §27.7.1: lambda never equals a ref
     void* a_fn; void* b_fn;
     memcpy(&a_fn, a, sizeof(void*));
     memcpy(&b_fn, b, sizeof(void*));
-    if (a_fn != b_fn) return false;
+    if (a_fn != b_fn) return false;       // different method/thunk → never equal
+    // Same kind + same fn. Apply the per-kind receiver rule.
+    if (a_kind == BZ_FVK_FN_ONLY) return true;        // static: fn match suffices
+    if (a_kind == BZ_FVK_REF_IDENTITY) return false;   // lambda/value-receiver: only a==b (already false)
+    // BZ_FVK_FN_PLUS_RECV: class/interface receiver — compare receiver ptrs.
     void* a_env; void* b_env;
     memcpy(&a_env, (uint8_t*)a + 8, sizeof(void*));  // env ptr at offset 8
     memcpy(&b_env, (uint8_t*)b + 8, sizeof(void*));
-    if (a_env == b_env) return true;        // same env (or both null): match
-    if (!a_env || !b_env) return false;     // one captures a receiver, one not
+    if (a_env == b_env) return true;        // same env block: match
+    if (!a_env || !b_env) return false;     // one has a receiver, one not
     void* a_recv; void* b_recv;
     memcpy(&a_recv, a_env, sizeof(void*));   // receiver = first word of env
     memcpy(&b_recv, b_env, sizeof(void*));

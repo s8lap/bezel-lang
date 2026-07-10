@@ -150,12 +150,15 @@ extern "C" int32_t bz_obj_is_string(void* obj, void** vtable_table) {
 //   { void* fn      (off  0),
 //     void* env     (off  8),
 //     int64_t rc    (off 16),
-//     void* envdtor (off 24) }  = 32 bytes.
+//     void* envdtor (off 24),
+//     int64_t kind  (off 32) }  = 40 bytes.
 // `fn` is the function/thunk pointer; `env` is null (non-capturing / static
 // method reference) or points at a separately-allocated env block holding the
 // capture pointers. The rc was appended AFTER env so fn (off 0) and env (off 8)
 // keep their offsets: every codegen call site loads fn at offset 0 and env at
-// GEP index 1, both unmoved.
+// GEP index 1, both unmoved. `kind` (off 32, §27.7.1 / #1544) tags the
+// function-value equality rule (see bezel_runtime_internal.hpp's BZ_FVK_*
+// constants); retain/release never read it.
 //
 // #672 TYPED ENV-DISPOSER (foundation). `envdtor` (off 24) is a per-lambda
 // typed disposal function emitted by codegen beside the trampoline. When

@@ -47,6 +47,31 @@
 static const int64_t BZ_EXC_OBJ_SIZE = 40;
 static const int64_t BZ_CLOSURE_ENV_OFFSET = 8;
 
+// §27.7.1 (v0.180, #1544): byte offset of the function-value KIND tag inside
+// the closure cell (after fn/env/rc/envdtor). The kind records which §27.7.1
+// equality rule the value obeys, since the runtime cannot otherwise tell a
+// lambda from a method/property reference (both are {fn, env, rc, envdtor}
+// cells) — and, critically, cannot tell a class-receiver reference (which must
+// match by fn + receiver across separate evaluations) from a record-receiver
+// reference (which must NOT match across separate evaluations, §27.7.1 third
+// bullet). Codegen's closureCellType() places this as field index 4.
+static const int64_t BZ_CLOSURE_KIND_OFFSET = 32;
+// Kind values (must agree with codegen's FnValKind lowering):
+//  0 (default, calloc zero): a lambda OR a value-shaped-receiver (record/enum/
+//    primitive) method/property reference. Equality is REFERENCE IDENTITY on
+//    the closure cell — the value equals only itself (§27.7.1 first & third
+//    bullets). Two separately-constructed lambdas / two separate record-receiver
+//    evaluations are therefore NOT equal.
+//  1: a class/interface-receiver method/property reference. Equality is
+//    same-fn + same-receiver-pointer, so repeated `obj.Method` on the same
+//    class-typed `obj` are GUARANTEED equal (§27.7.1 second bullet).
+//  2: a static (or unbound-extension) method/property reference. Equality is
+//    same-fn: every reference to the same static method is equal (§27.7.1
+//    second bullet).
+static const int64_t BZ_FVK_REF_IDENTITY = 0;
+static const int64_t BZ_FVK_FN_PLUS_RECV  = 1;
+static const int64_t BZ_FVK_FN_ONLY       = 2;
+
 // ---- shared string-header layout constants + rc initializer ----
 static const int64_t BZ_STRING_SIZEOF = 32;
 // Byte offset of the rc field inside the header (after data/len/width + pad).

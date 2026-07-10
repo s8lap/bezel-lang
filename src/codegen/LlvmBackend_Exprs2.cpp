@@ -1578,11 +1578,11 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     diverged_ = savedDiverged;
     if (savedBB) builder_.SetInsertPoint(savedBB);
 
-    // --- Build the closure struct { fn_ptr, env_ptr, rc, envdtor } ---
-    // #422 / #672 / §27.5 / §28.9: allocate a heap closure cell { ptr fn,
-    // ptr env, i64 rc, ptr envdtor } (32 bytes). fn (off 0) and env (off 8)
-    // keep their offsets; getTypeAllocSize is the single source of truth for
-    // the size so the rc/envdtor stores never overflow.
+    // --- Build the closure struct { fn_ptr, env_ptr, rc, envdtor, kind } ---
+    // #422 / #672 / §27.5 / §28.9 / §27.7.1 (#1544): allocate a heap closure cell
+    // { ptr fn, ptr env, i64 rc, ptr envdtor, i64 kind } (40 bytes). fn (off 0)
+    // and env (off 8) keep their offsets; getTypeAllocSize is the single source
+    // of truth for the size so the rc/envdtor/kind stores never overflow.
     uint64_t cellSz =
         module_->getDataLayout().getTypeAllocSize(closureCellType());
     llvm::Value* closureObj = builder_.CreateCall(
@@ -1632,6 +1632,9 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         ptrTy(), closureObj, {builder_.getInt32(1)});
     builder_.CreateStore(envAlloc, envSlot);
     initClosureRc(closureObj);     // #422: producer's reference, rc := 1
+    // §27.7.1 (#1544): a lambda equals only itself — tag the cell REF_IDENTITY
+    // (the calloc default; set explicitly to document intent and pin the value).
+    initClosureKind(closureObj, FVK_REF_IDENTITY);
 
     // #429 / #672 / §27.5 / §28.9: emit per-lambda envdtor if any non-`this`
     // capture exists.  The envdtor runs at last-drop (from bz_closure_release)

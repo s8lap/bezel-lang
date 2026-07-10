@@ -1977,22 +1977,33 @@ private:
         builder_.CreateCall(fn, {s});
     }
 
-    // #422 / #672 / §27.5 / §28.9: the closure-cell heap layout —
-    //   { ptr fn (off 0), ptr env (off 8), i64 rc (off 16), ptr envdtor (off 24) }
-    //   = 32 bytes.
+    // #422 / #672 / §27.5 / §28.9 / §27.7.1 (#1544): the closure-cell heap layout —
+    //   { ptr fn (off 0), ptr env (off 8), i64 rc (off 16), ptr envdtor (off 24),
+    //     i64 kind (off 32) }
+    //   = 40 bytes.
     // fn (off 0) and env (off 8) keep the offsets the existing closure-call sites
     // use (fn at offset 0, env at GEP index 1); rc (field index 2, off 16) is
-    // unchanged; envdtor (field index 3, off 24) is NEW (#672 foundation): a
-    // per-lambda typed disposal function emitted beside the trampoline that, when
-    // non-null, is called by bz_closure_release at last-drop BEFORE the env block
-    // is freed.  null = old behaviour (back-compat for makeMethodThunk and any
-    // non-capturing lambda whose env has nothing to dispose).
-    // Every closure-cell producer (lowerLambda, makeMethodThunk) calloc's this
-    // size and stores rc := 1 and envdtor := null (foundation).
+    // unchanged; envdtor (field index 3, off 24) is the #672 typed env-disposer;
+    // kind (field index 4, off 32) is NEW (#1544): a FnValKind tag recording which
+    // §27.7.1 equality rule the value obeys, consulted only by
+    // bz_closure_value_equals / bz_closure_same (never by retain/release). The
+    // values MUST agree with bezel_runtime_internal.hpp's BZ_FVK_* constants.
+    // Every closure-cell producer calloc's this size and stores rc := 1,
+    // envdtor := null, and kind := the producer-appropriate FnValKind.
+    enum FnValKind : int64_t {
+        // Lambda or value-shaped-receiver (record/enum/primitive) ref: equals
+        // only itself (reference identity on the cell). §27.7.1 first & third.
+        FVK_REF_IDENTITY = 0,
+        // Class/interface-receiver method/property ref: same fn + same receiver.
+        // §27.7.1 second ("guaranteed equal" across re-evaluations).
+        FVK_FN_PLUS_RECV = 1,
+        // Static / unbound-extension method/property ref: same fn. §27.7.1 second.
+        FVK_FN_ONLY = 2,
+    };
     llvm::StructType* closureCellType() {
         if (!closureCellTy_)
             closureCellTy_ = llvm::StructType::create(
-                llvm_, {ptrTy(), ptrTy(), i64(), ptrTy()}, "bz.closure");
+                llvm_, {ptrTy(), ptrTy(), i64(), ptrTy(), i64()}, "bz.closure");
         return closureCellTy_;
     }
 
@@ -2014,6 +2025,17 @@ private:
         builder_.CreateStore(
             llvm::ConstantPointerNull::get(ptrTy()),
             builder_.CreateStructGEP(closureCellType(), cellObj, 3));
+    }
+
+    // §27.7.1 (#1544): store the function-value KIND tag into a freshly calloc'd
+    // closure cell (field index 4, off 32). Records which equality rule the value
+    // obeys so bz_closure_value_equals / bz_closure_same can dispatch on it. The
+    // default (calloc zero) is FVK_REF_IDENTITY; this explicit store documents the
+    // producer's intent and pins the value independently of the allocator.
+    void initClosureKind(llvm::Value* cellObj, FnValKind kind) {
+        builder_.CreateStore(
+            llvm::ConstantInt::get(i64(), static_cast<int64_t>(kind)),
+            builder_.CreateStructGEP(closureCellType(), cellObj, 4));
     }
 
     // #422: emit a call to bz_closure_retain(c) — increments rc (no-op on null).
@@ -6466,11 +6488,20 @@ private:
     llvm::Value* makeMethodThunk(sema::MethodSymbol* ms,
                                  llvm::Value* receiverVal);
 
-    // #1170: build a fresh closure cell { thunk, env, rc, envdtor } wrapping a
-    // (possibly cached) method thunk and the current receiver. Shared by the
-    // cache-hit and cache-miss paths of makeMethodThunk.
+    // #1170: build a fresh closure cell { thunk, env, rc, envdtor, kind }
+    // wrapping a (possibly cached) method thunk and the current receiver. Shared
+    // by the cache-hit and cache-miss paths of makeMethodThunk. `kind` tags the
+    // §27.7.1 equality rule the cell obeys (set via initClosureKind).
     llvm::Value* buildMethodClosureCell(llvm::Function* thunk, bool instMethod,
-                                        llvm::Value* receiverVal);
+                                        llvm::Value* receiverVal,
+                                        FnValKind kind);
+
+    // §27.7.1 (#1544): classify a method-reference cell's equality kind from the
+    // method symbol and whether the receiver is captured. A static / unbound-
+    // extension reference (no captured receiver) is FVK_FN_ONLY; a class /
+    // interface receiver is FVK_FN_PLUS_RECV; a value-shaped receiver (record /
+    // enum / primitive) is FVK_REF_IDENTITY (no identity — equals only itself).
+    FnValKind closureKindForMethod(sema::MethodSymbol* ms, bool extRef);
 
     // §27.6 (#756): a property reference in function-value position →
     // a closure whose thunk computes the getter on the captured receiver.
@@ -6478,12 +6509,19 @@ private:
                                    llvm::Value* receiverVal,
                                    const ast::MemberAccessExpr* ma);
 
+    // §27.7.1 (#1544): classify a property-reference cell's equality kind: a
+    // static property (no receiver) is FVK_FN_ONLY; a class/interface receiver
+    // is FVK_FN_PLUS_RECV; a value-shaped receiver (record) is FVK_REF_IDENTITY.
+    FnValKind closureKindForProperty(sema::PropertySymbol* ps,
+                                     llvm::Value* receiverVal);
+
     // §27.7.1 (v0.180, #1544): build a fresh closure cell { thunk, env, rc,
-    // envdtor } wrapping a (possibly cached, propertyThunks_) property-getter
-    // thunk and the current receiver. Shared by the cache-hit and cache-miss
-    // paths of makePropertyThunk — mirrors buildMethodClosureCell above.
+    // envdtor, kind } wrapping a (possibly cached, propertyThunks_) property-
+    // getter thunk and the current receiver. Shared by the cache-hit and
+    // cache-miss paths of makePropertyThunk — mirrors buildMethodClosureCell.
     llvm::Value* buildPropertyClosureCell(llvm::Function* thunk,
-                                          llvm::Value* receiverVal);
+                                          llvm::Value* receiverVal,
+                                          FnValKind kind);
 
     // CG9: address of an implicitly-`this`-qualified instance field
     // referenced bare inside an instance method (`_x` rather than
