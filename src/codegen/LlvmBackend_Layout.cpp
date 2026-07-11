@@ -2252,20 +2252,52 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
             callArgs.push_back(recvArg);
         }
     } else if (instMethod) {
-        // §26.1 / #457: Load receiver from env with the CORRECT `this` type.
-        // For a class/interface/record extension method `this` is a ptr (the
-        // env block holds a ptr and we load ptr). For a PRIMITIVE or ENUM
-        // extension method `this` is passed BY VALUE (e.g. i32 for `int`);
-        // the env block holds the raw value bytes and we must load that type.
-        // Always loading ptr (the old code) produces a type mismatch that the
-        // IR verifier catches and that SIGSEGVs at call time.
+        // §26.1 / #457 / #1636: Load receiver from env with the CORRECT `this`
+        // representation. For a CLASS/INTERFACE extension (or a regular
+        // instance method) `this` is a ptr and the env block already holds
+        // that same ptr directly (buildMethodClosureCell stores receiverVal
+        // verbatim) — load ptr. For a PRIMITIVE or ENUM extension method
+        // `this` is passed BY VALUE (e.g. i32 for `int`); the env block holds
+        // the raw value bytes and we must load that type. For a RECORD
+        // extension method `this` is a POINTER TO A SPILLED COPY (§26.1 /
+        // #433 — so the body's `this.field` reuses record field access), but
+        // the env block holds the record's VALUE itself (receiverVal is the
+        // struct value the lowered receiver expression produced, sized by
+        // buildMethodClosureCell via getTypeStoreSize) — never a pointer.
+        // Loading `ptr` there (the pre-#1636 code) reads the struct's leading
+        // bytes as a garbage pointer and SIGSEGVs when origFn dereferences it.
+        // Load the record's actual struct type from env, then spill it to a
+        // fresh alloca and pass that address — mirroring the record-receiver
+        // shaping applied at direct (non-thunk) extension-method call sites
+        // (LlvmBackend_Calls2.cpp's `isExtensionMethod(ms)` receiver-shaping
+        // block).
         llvm::Type* thisLoadTy = ptrTy();  // default: pointer (class/record)
+        bool recordEnv = false;
         if (isExtensionMethod(ms)) {
             // The actual `this` type is origFn->getArg(0)->getType().
             llvm::Type* extThisTy = origFn->getArg(0)->getType();
-            if (!extThisTy->isPointerTy()) thisLoadTy = extThisTy;
+            if (!extThisTy->isPointerTy()) {
+                thisLoadTy = extThisTy;
+            } else if (const ast::Type* tt =
+                           ms->extensionDecl ? ms->extensionDecl->targetType.get()
+                                              : nullptr) {
+                const sema::TypeRef* rt = ctx_.resolvedType(*tt);
+                if (rt && rt->kind == sema::TypeRef::Kind::Named &&
+                    rt->declaration &&
+                    rt->declaration->kind == ast::TypeDeclKind::Record) {
+                    thisLoadTy = recordStruct(rt->declaration);
+                    recordEnv = true;
+                }
+            }
         }
-        callArgs.push_back(builder_.CreateLoad(thisLoadTy, envPtrArg));
+        llvm::Value* loadedThis = builder_.CreateLoad(thisLoadTy, envPtrArg);
+        if (recordEnv) {
+            llvm::AllocaInst* tmp = entryAlloca(thisLoadTy);
+            builder_.CreateStore(loadedThis, tmp);
+            callArgs.push_back(tmp);
+        } else {
+            callArgs.push_back(loadedThis);
+        }
     }
     for (; argIt != thunk->args().end(); ++argIt)
         callArgs.push_back(&*argIt);
