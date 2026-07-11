@@ -64,6 +64,13 @@ std::optional<long long> foldIntConst(
     // Unary `+ - ~`. (Source parentheses are not their own AST node — the tree
     // shape already encodes grouping.)
     if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        // per §17.14: only a unary op applied to a constant OPERAND is itself
+        // a constant expression. A parser error-recovery AST can leave
+        // `operand` null (e.g. `const K: int := -;` recovers to
+        // `UnaryExpr{op:"-", operand:null}`, #1631) — mirror
+        // Resolver::resolveTypesInExpr's `if (ue->operand)` guard so the
+        // absent operand declines to fold instead of dereferencing null.
+        if (!u->operand) return std::nullopt;
         auto v = foldIntConst(*u->operand, resolveIdent, depth + 1);
         if (!v) return std::nullopt;
         if (u->op == "-") return -*v;
@@ -74,6 +81,17 @@ std::optional<long long> foldIntConst(
 
     // Binary arithmetic / bitwise (`[BufferSize * 2]byte`, §15.1).
     if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        // per §17.14: both operands must themselves be constant expressions.
+        // A parser error-recovery AST can leave `left` or `right` null (e.g.
+        // `const K: int := 1 + ;` recovers to a `BinaryExpr` with a null
+        // `right`; `const K: int := * 1;` — `*` is not a valid expression
+        // start, so the unary parse returns null without consuming it and
+        // the binary loop then reads that unconsumed `*` as the operator,
+        // leaving a null `left` — #1631). Mirror
+        // Resolver::resolveTypesInExpr's `if (be->left)` / `if (be->right)`
+        // guards so a null operand declines to fold instead of dereferencing
+        // null.
+        if (!b->left || !b->right) return std::nullopt;
         auto l = foldIntConst(*b->left, resolveIdent, depth + 1);
         auto r = foldIntConst(*b->right, resolveIdent, depth + 1);
         if (!l || !r) return std::nullopt;
