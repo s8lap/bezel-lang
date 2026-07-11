@@ -175,6 +175,21 @@ The simple rule — function-typed values are runtime-managed — makes them as 
 
 C#'s opt-in nullable reference types proved that most reference fields are non-null in practice. Bezel goes one step further: non-nullability is the default, nullable types are opt-in via `?`. The cost is `?` on a small minority of types; the benefit is that `null` is noteworthy, not the default value of every reference.
 
+<a id="sec-allocation-failure-fatal"></a>
+### 4.4 Allocation failure is fatal
+
+v0.184 states what every no-GC systems language eventually states: an
+allocation the runtime cannot satisfy terminates the process. No
+OutOfMemoryException exists because the alternative prices every `new`,
+every collection growth, and every closure/iterator/async frame as a throw
+site — a permanent tax on the exception-CFG and the ownership checker's
+discharge analysis — for a fault whose "handlers" almost universally allocate
+on their way to failing. StackOverflowException set the precedent (resource
+exhaustion, uncatchable, terminates); allocation failure joins §22.13's
+abnormal-termination list, where disposal-at-exit is already excused. The
+declined named-type variant (an uncatchable OutOfMemoryException, for report
+symmetry with SOE) is cosmetic and revisitable without breaking anything.
+
 <a id="sec-ownership"></a>
 ## 5. Ownership
 
@@ -190,6 +205,8 @@ Trade-off: programmers can write aliasing bugs that Rust would reject. They can 
 *(v0.180 narrowing — the consume-site freeze, recorded.)* Spec §28.3 (v0.180) makes it a compile error to **consume** an owned binding — move it into an `owned` argument (including a domain spawn or channel send), transfer it with the binding/assignment marker, store it into an owned slot, return it owned, or reassign it — while a live local borrow of that binding exists. This is a deliberate, scoped narrowing of this section's decline of compile-time borrow-liveness checking, **not** a borrow checker, and the recorded boundary is load-bearing: **explicit `Dispose()` while borrowed remains runtime-checked**, exactly as this section decided — disposal sets the per-instance flag, so checked mode deterministically catches every later aliased use, and the `Dispose()` call is itself the source-visible announcement. What forced the static rule for the *silent* kills is the case with **no runtime backstop of any kind**: an object moved to another domain stays alive, no flag is ever set, and a surviving pre-transfer borrow is a live data race (probe-confirmed, 2026-07 review) — §30.14's isolation claim was false without the freeze. The freeze was applied uniformly at every consume site rather than at a compiler-known-transfer subset because transfer positions are not closed under composition (any `owned` argument may be forwarded to a spawn), and because the rule composes with §28.7's drop-on-overwrite — unborrowed reassignment stays legal (the reference compiler's current blanket rejection of owned-local reassignment, #1465, narrows to exactly the borrowed case). Cost accepted: the borrow-then-transfer-then-keep-using-the-borrow idiom is rejected (mechanical rewrite: re-borrow from the new owner). Alternatives declined: (a) freezing explicit `Dispose()` too — converts this section's recorded trade-off into a de-facto borrow checker for no soundness gain (the backstop is real); one deliberate exception is recorded: sources captured under §28.14's storage-bounded admission *are* frozen against disposal as well, because a stored callback's later invocation is invisible at the dispose site and the admission promises a fully static bound; (b) scoping the freeze to domain-crossing sites only — leaky (not compositionally closed), unpredictable at call sites, and it would leave the borrowed-reassignment silent kill entirely outside the rule.*
 
 *(Supersession notes, v0.157.* Two of this section's original claims have been overtaken by later decisions and are preserved above only where still true. **Data races:** as first written, this section accepted that programmers could write data races; since v0.131–v0.133 the domain model closed that hole — continuations are serial per domain and no mutable state is reachable from two domains ([§12.5](#sec-execution-domains), [§12.6](#sec-sendability-spawning-channels)), so data races are no longer expressible in safe code and the remaining trade-off is aliasing/use-after-dispose, caught at runtime. **Discharge errors:** the original hard "must discharge every owned value" compile error became the affine auto-drop-with-warning model in v0.150–v0.152 — see [§5.23](#sec-the-affine-model).)*
+
+*(v0.184 refinements, recorded.)* Three further boundary placements compose with the v0.180 narrowing. (1) **The join rule**: a read of an owned local after a *conditional* explicit `Dispose()` (or discard) is a compile error — owned ⊓ explicitly-disposed = maybe-consumed (spec §28.3). This is a deliberate step past this section's runtime-checked posture for announced kills: the per-path consumption tracking exists regardless (per-path scope-end disposal requires it), so the rejection is free precision, not a borrow checker; the posture continues to govern straight-line use after an announced kill, which stays a (now mandatory) warning plus the checked-mode backstop. (2) **The dispose-capability rule** (spec §28.6): `Dispose()` requires an owned receiver; disposing through a tracked borrow is a compile error — this is not borrow-liveness checking (it reads only the receiver's own ownership classification, already computed at every site) and it leaves this section's recorded trade-off intact: disposing an *owned* binding while borrows of it live remains legal and runtime-checked. The recorded exception is the borrowing-collection **transit regime** — element borrows whose true owner is structurally unknowable, keyed on the source's static type — where per-element disposal is the manual form of §5.3's `DisposeElements()` escape hatch, caller-vouched. (3) **Captured owned bindings** are borrow-state inside closures (no consume, no reassign, no dispose through the capture): the alternative admitted a silent drop-on-overwrite kill that the consume-site freeze — decidable precisely because it is local to one body — could never see.
 
 <a id="sec-dispose-is-not-on-object"></a>
 ### 5.2 `Dispose` is not on `Object`
@@ -212,6 +229,8 @@ Option 1 fails for collections of borrowed references, common when a class has a
 `DisposeElements()` is on `ICollection<T>`. Asymmetric ownership (own the values, not the keys) is rare enough to be worth doing by hand.
 
 v0.97's resolution: option 2 remains for the borrowing types (`Array<T>`, `Dictionary<K, V>`, etc.), and option 1 is provided as separately-named owning types (`OwningArray<T>`, `OwningDictionary<K, V>`, etc.). Users pick the form that matches their ownership intent at the declaration site. The earlier v0.88-v0.96 attempt at option 3 (an `<owned T>` generic-argument modifier with merged class declarations) was abandoned in v0.97 because the substitution machinery accumulated more complexity each revision; separate named types capture the semantic distinction directly without the substitution rules. The non-owning baseline retains its original justification — it is the right default for collections of borrows, and `DisposeElements()` remains the right escape hatch when the holding class wants to dispose elements explicitly without committing the collection's type to ownership.
+
+*(v0.184: the per-element manual form — disposing element borrows obtained from a borrowing collection, e.g. the asymmetric `entry.Value.Dispose()` loop — is recorded as the same escape hatch as `DisposeElements()`, and is the one exception to spec §28.6's dispose-requires-an-owned-receiver rule; it is keyed on the source expression's static type (borrowing-family collection types only), and tracked borrows everywhere else may not be disposed.)*
 
 <a id="sec-no-shared-ownership"></a>
 ### 5.4 No shared ownership
@@ -358,6 +377,8 @@ v0.89 splits the owned-class-typed-yield rule into two cases, distinguished by t
 The split is determined at compile time by the iterator method's return type. The same physical implementation (a state machine that pops elements from the source one at a time) compiles to different consumer-side semantics depending on which signature it presents.
 
 The split rule's complexity is justified because the two cases address distinct use patterns. A filter iterator that yields owned values (perhaps because it constructs them on the fly) and wants the consumer to borrow each one briefly is one valid pattern; a drain iterator that yields owned values and wants the consumer to take responsibility is another. Forcing both into one rule would require either making every consumer-borrow scenario also accept the discharge obligation (adding ceremony to filtering use cases) or making every consumer-owned scenario accept the borrow restriction (preventing drain use cases entirely). The split lets each pattern be expressed naturally.
+
+*(v0.184.)* The v0.180 marker discipline reached yield position: an owning iterator's yield of a named owned binding is an announced consume (the declared return type is the announcement, the owned-return parallel) that joins the consume-site freeze — a yield transfer hands the value alive, so it has no disposed-flag backstop and cannot ride the throw/dispose/discard exemption — while a borrowing iterator's unmarked named-binding yield is a borrow (nothing announces a kill; the enumerator-owns model is scoped to fresh producers and `move` results, and the adopt-then-yield spelling is the warning-free named form). A yield-position transfer marker was declined as grammar without need and stays on the recorded liftable-marker list with the arm positions. The same pass recorded Pattern B await as the announced-kill family's fourth member (keyword + single-consumer type + disposal-sets-flag) and Pattern A's chained `return await` as unfrozen for the structural reason that the outer task cannot dispose the chained source before the body completes.
 
 The error-message-side complexity is small: an iterator's static signature is known at the call site, and the compiler can produce a clear "this is `IEnumerable<owned T>` — the iteration variable is owned" message when the consumer fails to discharge.
 
@@ -761,6 +782,8 @@ What was deliberately *kept* strict: `Task`/`Task<T>` discard stays an error (ab
 
 The trade recorded honestly: the compile-time "you forgot to discharge" error is gone, replaced by a warning. Programs that leak by *intent-mismatch* (the author believed something consumed the value) now compile with a diagnostic instead of failing. Implementation experience since v0.150 supports the choice — the warning has proven sufficient signal in practice, and an entire class of false-positive discharge errors (branch-dependent consumption) disappeared with it.
 
+*(v0.184.)* The three-pattern doctrine this section grounds is now stated once, normatively, in spec §28.3 "Choosing a disposal form": `using var` = declared intent + scope pin; plain `var` = movable, warned on the implicit drop; explicit `Dispose()` = an early/conditional release point (exception-safe by this section's own mechanism — the C# dispose-at-end anti-pattern deliberately does not transfer). The announced-kill family gained its third member — the discard of a named owned binding, `_ := x;` — under the same no-marker logic as `throw x` and `owned` returns; and the must-use warning was confirmed uniform across body kinds (frame-disposed `owned` parameters of iterators and async methods warn at the declaration, the adoption idiom being the warning-free spelling).
+
 <a id="sec-nullability"></a>
 ## 6. Nullability
 
@@ -784,6 +807,11 @@ Some languages (Kotlin) try to narrow fields and produce subtle TOCTOU bugs. Bez
 `name!.Length` reads left-to-right; prefix `!name.Length` would have to be parenthesized. There is also a semantic argument: `!` asserts something about the value to its left, and putting the assertion to the left of the asserted value reads backwards.
 
 There is no prefix `!` for boolean negation either; `not` is the boolean operator.
+
+<a id="sec-interpolating-a-nullable-renders-null"></a>
+### 6.3 Interpolating a nullable renders `null` (v0.184)
+
+`$"{x}"` over a `T?` is the most common diagnostic line in the language; requiring narrowing or `??` there (the §4.6 strict-ordering template) would tax every log statement for zero safety — rendering is total and loses nothing. Between C#'s empty string and a visible token, the visible token wins: an empty hole *hides* the null that a log line exists to reveal. The format spec is skipped on null rather than dispatched (there is no value to format) but stays compile-checked against `T`, so a bad specifier target is caught regardless of the value's presence.
 
 <a id="sec-equality-and-hashing"></a>
 ## 7. Equality and hashing
@@ -821,6 +849,8 @@ The asymmetry is intentional. Equality is what hash tables, sets, and `case` pat
 C# allows a derived member with the same name as a base member to *shadow* (not override) it, with dispatch depending on the static type of the receiver. Almost no one understands the semantics correctly, and the rare cases where it's the right tool are better solved by renaming.
 
 Bezel rejects same-name members in derived classes outright. To override a virtual base member, write `override`. To add something new, choose a different name.
+
+(v0.184) The blocked set is **visible** inherited members (§12.2): the recorded motivation above — shadowing and dispatch confusion — requires a member the derived author could see. A base class's `private` (and cross-module `internal`) names stay out of its compatibility surface; the residual cross-module collision creates two distinct members resolved by visibility and static type, recorded as the deliberate scope of the guarantee.
 
 <a id="sec-class-hierarchy-exhaustiveness-in-case"></a>
 ### 8.2 Class-hierarchy exhaustiveness in `case`
@@ -875,6 +905,8 @@ Two extreme implementations exist. Erasure (Java) is fast to compile but produce
 Bezel's intended implementation specializes for value-type substitutions (where boxing would hurt) and shares for reference-type substitutions (where uniform layout is achievable). This gives most of the codegen benefit of monomorphization where it matters, and most of the binary-size benefit of erasure where it doesn't.
 
 `typeof(T)` and `value.GetType()` work because the runtime carries enough type information to resolve them, regardless of whether a particular generic was specialized or shared.
+
+(v0.184) Type-argument inference (§14.5) follows the same temperament as the dispatch strategy above — the predictable subset, stated fully. Bindings must agree exactly: the compiler computes no common supertype (`Pick(1, 2L)` is an error, not `long`), the §27.3/§20 no-LUB posture applied to inference, so a call's meaning never shifts because a distant hierarchy edit changed a join. The call's target type participates only as a *completion* for parameters the arguments cannot see (`var a: Array<int> := Util.Empty();`) — unification against one declared type, no suprema, error when absent — a deliberate divergence from C# (which refuses return-target inference) in favor of the factory idiom the reference implementation has always supported. Explicit lists are all-or-nothing, constraints are checked after inference rather than feeding it (liftable), and an otherwise-tied non-generic overload beats a generic one — ranked *after* the defaulted-arity tie-break, so adding an optional-parameter overload still never re-routes an existing call (v0.181's guarantee, kept where C#'s internal order would break it). Each declined power — bound-set fixpoints, best-common-type, constraint-driven inference, partial lists — is liftable later without rejecting a program this rule set accepts.
 
 <a id="sec-pattern-matching"></a>
 ## 11. Pattern matching
@@ -1159,6 +1191,42 @@ v0.133 delivers the parallelism half of the domain model: `Domain.Spawn` creates
 
 **`CancellationToken` does not cross domains.** Not by a new rule — it falls out: the token is a borrow-bearing record, hence not sendable. The cross-domain cancellation pattern (a dedicated channel carrying a cancel message) is documented rather than mechanized; a sendable cancellation primitive can be added later without disturbing anything in this revision.
 
+<a id="sec-memory-model-edges"></a>
+### 12.7 The memory model is five edges plus atomics
+
+v0.184 wrote down the happens-before edges the runtime was always going to
+need: mutex/semaphore release→next-acquire, channel accept→deliver,
+spawn→entry and settlement→join, task settlement→awaiter (or blocking wait
+at the process edge), and static publication — the store into an admitted
+mutable static, and static-init completion, publishing the referent's memory
+to observing domains. That fifth edge is the one §22.12's untorn-pointer
+wording silently presumed, and the one that makes §22.13's cross-domain task
+cache — and §30.5's borrowed-source chain through it — sound on weakly
+ordered hardware rather than by x86 accident. Two object-specific guarantees
+were already stated in place and are cross-referenced rather than restated:
+CancellationToken's cross-thread flag visibility (§30.8) and Shared<T>'s
+drop→last-drop-destruction ordering (§28.13). The striking property is how
+little there is to say, and that is by construction, not omission: the
+sendable discipline means no mutable state is ever reachable from two
+domains, so a Bezel program cannot *write* the racy access whose semantics
+memory models spend most of their pages on. The only deliberate hole is
+memory shared with foreign threads outside the §30.12 primitives, which
+belongs to the platform. Sequential consistency for atomics (v0.140) was
+reconfirmed — no acquire/release variants until profiles demand them.
+
+The same revision fixed the fate of a faulted channel send (the item is
+disposed; a channel never retains what it did not accept — the TrySend
+give-back RFC remains the path to a lossless failure mode), made the
+TCS/OwningTCS source the owner of its task (every §30.11 example already
+assumed it; the v0.75 changelog records the alternative's typecheck failure;
+disposal accounting splits by source kind so plain-TCS multi-await fan-out
+survives untouched), and closed the one silent hole in structured
+concurrency's quiescence guarantee: a TaskScope live across a yield in an
+abandonable async iterator would have been physically reclaimed with
+children running — now a compile error keyed on the same class-level fact as
+§28.12's no-destructor warning, with the degraded-destructor fallback
+recorded but not taken.
+
 <a id="sec-events"></a>
 ## 13. Events
 
@@ -1284,6 +1352,11 @@ Implicit conversions make overload resolution unpredictable, hide allocation cos
 **Overload resolution tie-breaking (v0.128).** v0.127's §22.6 said overloads are distinguishable by number, type, and `ref`/`out` modifiers, but was silent on how to choose when two applicable overloads are each reachable through a different built-in implicit conversion (§5.1). §5.1 catalogs the implicit conversions; it did not say how they rank during overload resolution. v0.128 closes the gap conservatively: an exact match is preferred over any implicit conversion, but built-in implicit conversions are not ranked against one another, so a call that reaches two overloads only through (equally-ranked) conversions is ambiguous and is a compile error citing the candidates. The programmer disambiguates with an explicit cast.
 
 We considered importing C#'s finer "better conversion target" ordering (narrower target preferred, so `int→long` would beat `int→float`). We declined it: §5.1 deliberately admits an implicit conversion only when no programmer-visible information is lost (or, for wide-integer-to-float, when an explicit cast would be unjustified noise), and it places every numeric widening in one undifferentiated row — including the precision-losing `int→float`. Ranking those conversions would be net-new semantics layered on top of §5.1, not a clarification of it. The conservative rule keeps faith with Bezel's "explicit over implicit" stance (the same principle that omits user-defined conversion operators, §25.4) and with the existing treatment of overloaded method references (§27.6), which already makes the absence of a unique winner a compile error citing the candidates. The cost is that a few calls that a C#-style rule would silently resolve are instead flagged for an explicit cast; that is the intended trade.
+
+<a id="sec-compound-assignment-narrows-back-checked"></a>
+### 14.6 Compound assignment narrows back, checked (v0.184)
+
+`b += 10` on a `byte` is the one place every C-family language needs an exception to its no-implicit-narrowing rule, because §6.2-style promotion makes the natural desugaring `b := b + 10` ill-typed. C#'s answer is a hidden cast that silently truncates in unchecked contexts, guarded by an RHS-convertibility test to bound the damage. Bezel's answer (§6.6) is the same hidden cast made *checked*: the write-back raises `OverflowException` out of range, so the only loss is range and range loss is loud — which is why Bezel does not need C#'s guard and admits a runtime `int` RHS (`acc += n`), the same posture as §6.1's checked `a + b`. The line is drawn at the integer family (plus `char`): a binary-float or `decimal` result against a narrower LHS is rejected outright, because §5.2's float narrowings round or truncate *silently* — `b += 1.5` adding-then-flooring is exactly the invisible loss §5.1 exists to exclude, and the explicit `b := byte(b + 1.5)` spelling is the visible version. The carve-out is scoped to the compound form; plain assignment keeps the strict rule everywhere.
 
 <a id="sec-strings"></a>
 ## 15. Strings
@@ -7757,6 +7830,262 @@ v0.183 is the **small-rulings batch** — many independent, individually small r
 #### Migration
 
 Compile-time, additive (no existing meaning changes): enum operator declarations, lambda destructuring, range/relational alternatives, the `when true` clause and its narrowing (`!` remains legal where it was), the §34 tags. Compile-time, newly rejected: an import alias colliding with an unambiguously imported bare name (previously legal-but-dead — qualify or rename); `static` members in extension blocks (previously accepted without specification — move to a module-level method or static class); `extension Array<T?>`-style nullable-marked heads (previously an unclear error — now a defined one). Runtime-visible: `Range<char>` iteration now crosses the surrogate gap — code that relied on termination at U+D7FF must bound its range at `'퟿'` explicitly (the two-loop pattern keeps working); negative constructor magnitudes now raise `ArgumentOutOfRangeException` (previously empty-container fallback in the reference implementation); an enum's user-declared `ToString`/`GetHashCode`/`Equals` now reach interpolation, hash containers, and boxed dispatch (previously only direct calls — a correctness fix for the §25.2 divergence).
+
+---
+
+### v0.184 changelog (v0.183 → v0.184)
+
+v0.184 is the **ownership-coherence settlement** — the centerpiece of the 2026-07-11 spec-quality run, answering the owner's named pain point: three surface ways to dispose a local (`using var`; plain `var` + auto-drop; explicit `Dispose()`), with manual dispose-at-end exception-safe unlike in C#. The finding is that the triad is one mechanism with two specializations, already principled and recorded (§5.23) — so the revision consolidates rather than restructures: one normative "Choosing a disposal form" recap (§28.3), repair of the stale pre-affine sentences in §28's own text (five of them, including the unbound-temporaries "three-form contract" sentence and §21.9's remedy list), and rulings closing the seams the v0.179/v0.180 trains left open. Every rule below was selected between recorded live alternatives, with the road not taken noted.
+
+- **Choosing a disposal form (§28.3 recap; §28 preamble/table, §21.9 conformed).** The three-pattern doctrine is now stated once, normatively: `using var` = intent declared + scope pin; plain `var` = movable, auto-dropped with the must-use warning; explicit `Dispose()` = an early/conditional release point — never exception-safety plumbing, because the unwinding edge always discharges owned locals (the recorded §5.23 posture; the C# habit inverts here by design). The pre-affine "reaches an owned location, `using var`, or explicit dispose" contract sentence, the summary table's three-mechanism class row, the "must reach a discharge point" residue, the unbound-temporaries three-form sentence, §21.9's hard-error remedy list, and the category-ordered `finally` sentence are conformed to the five-form affine contract and the v0.182 establishment-order stack (implicit drops are established at declaration; owned-parameter drops at entry; temporaries at production).
+- **The discard of a named owned binding is an announced consume (§17.13, §28.3, §21.9, C.3).** `_ := x;` disposes at end of the discard statement, leaves `x` explicitly-disposed, needs no marker (the sink is the announcement — the §31.1 `throw x` logic verbatim), and joins no freeze list (disposed-flag backstop); the freeze's boundary paragraph now names all three announced kills. A discard of a borrow-state operand disposes nothing (stated normatively). The `Task`/`Task<T>` discard rejection is unchanged. *Declined:* a marked `_ := owned x;` form (churns every documented remedy spelling for a sink that is already unmistakable); the borrow reading (falsifies §28.3's and §29.2's remedy lists).
+- **The join boundary is recorded; the sibling lints harmonized (§28.2, §28.3, §5.1).** Uses after a *conditional* explicit dispose stay compile errors (owned ⊓ explicitly-disposed = maybe-consumed): a recorded, deliberate step past §5.1's runtime-checked posture — per-path tracking exists anyway, the precision is free. §28.2's dominated use-after-dispose warning is promoted from should to must (covering reads, borrows, and consuming uses), so the statically-certain straight-line case is never the silent one. *Declined:* softening the disposed join arm to a warning (surrenders computed precision; splits the join rule's arms).
+- **Who may call `Dispose()` (§28.6, §28.2, C.3).** Explicit disposal requires an owned receiver; `Dispose()` through a borrow is a compile error — borrowed locals/parameters (including `this`: no self-dispose), non-owned field reads, call results, catch bindings, pattern bindings, captured owned bindings, owning-collection element borrows. The owned-field admission is by declaring type (class-level privacy symmetry, §13.1). One recorded exception: element borrows from **borrowing-family** collections (the §28.11 transit regime, **keyed on the source expression's static type** — an `IEnumerable<T>`/enumerator/query-typed source produces tracked borrows and stays rejected) may be disposed — the manual form of `DisposeElements()`, §5.3's recorded escape hatch, caller-vouched with the checked-mode backstop; this preserves §28.11's normative asymmetric-ownership idiom (`entry.Value.Dispose()`), which a uniform prohibition would have deleted. §28.6's "double-free" justification is rewritten in owner-liveness terms (under §28.2 idempotence the second dispose is a no-op — the harm is destroying value the owner relies on), and §28.11's setter paragraph drops its "double-dispose" claim for the same reason (an explicit dispose before an owned-field assignment is §28.7's blessed, redundant legacy shape). *Declined:* dispose-through-borrow legal for plain classes (reads §28.6's first bullet out of the spec; leaves `M(s: Stream) s.Dispose()` compiling); a uniform prohibition without the transit exception (breaks the recorded idiom).
+- **Closures cannot consume captured owned bindings (§28.3, §27.5, §28.9).** A captured owned binding is borrow-state inside the lambda: assignment, marked transfer, disposal, and every owned-consuming use through the capture are compile errors — generalizing §28.9's recorded move-only posture and keeping the consume-site freeze body-local and decidable (the admitted alternative was a silent drop-on-overwrite kill invisible to the freeze). *Declined:* cross-body freeze analysis (the whole-method closure-invocation analysis the freeze's recorded design deliberately avoids).
+- **Trivial-dispose is defined; borrowing collections are trivial-dispose (§28.9, §28 table, §28.11, §17.13, stdlib §4.4).** "Provably a no-op" = runs no user code and frees nothing beyond what the implicit reclaim mechanism frees with the instance; the intrinsic borrowing collections' backing storage is reclaimed with the instance (their `Dispose()` does nothing — the §28 table's "Dispose releases backing storage" row and stdlib §4.4's sentence are conformed), matching §5.9's recorded plain-memory intent and the no-warning behavior every example relies on. `OwningBuffer<T>` stays non-trivial for both element kinds with its real reason stated: a declared destructor over a manually-managed allocation — the user-expressible storage primitive. *Declined:* making backing-storage release a real obligation (reverses §28.9, §17.13, §5.9; ceremony on every dropped `ToArray()` result).
+- **Seam rulings, one each:** the **must-use warning covers frame-disposed `owned` parameters** of iterators/async methods, attached at the declaration, suppressed by the `using var r := owned reader;` adoption idiom (§29.8's Echo annotated; uniformity over a body-kind-conditional lint); a method may **return a deferred-activation frame** whose carried borrows are parameter-/receiver-sourced (§28.3 — the caller-side v0.179 classification re-establishes the constraints; iterator methods are the canonical instance; frames over scope-bound locals rejected at the return site; the §28.6 owned-escape rules are explicitly unaffected); **fresh producers of non-trivial-dispose class type are rejected as borrowing-family literal elements** (§15.4 — statically-certain dangle, §9.7's bind-it-first remedy; trivial-dispose elements stay admissible, which keeps §15.4's own nested-literal examples well-formed; `Add`/`Insert` stay under the §28.11 residual-trust regime, asymmetry recorded); **if-expression and expression-position `case`/`when` arm ownership** follows `??`'s recorded v0.180 meet rule, named-owned-binding-arm demotion and no-arm-marker record included (§28.3 producers row + local-read-row conformance; §20/§19.2 cross-refs; §28.10 admission — Guide 01's Pattern B gains its normative backing, the example carrying its `CloneBuffer(): owned Buffer` signature); **`set(owned)` property/indexer assignment is an announced consume** (no RHS marker; §28.11's setter example fixed to declare `set(owned)`; freeze list and producers row conformed); **implicit discharge is synchronous** (§28.12 — an implicit disposal point never awaits; only `await using` runs `DisposeAsync`); **drop-on-overwrite stores are throwable** for §28.8.1's restoration analysis (moved-from/null-targeted stores stay non-throwable, so the build-before-take idioms stand); **operator parameters admit no modifiers** (§25.2/C.10/A.4 — operand positions never consume named owned bindings; the §22.10 over-admit pattern); **move-only scrutinee pattern bindings are borrows** (§19.3, §15.3 — the §28.9 closure reasoning; `move` through the binding rejected); **unbound owned temporaries are unwind-disposed** when their full expression is exited by an exception (§28.3/§28.4/§28.7/C.3 — reverse production order on the establishment stack; the rule §15.4.1 and §28.7 already cited now exists); **§27.7.1's store-once passage rewritten** (the field spelling was rejected by §28.14 bound 3 and ill-formed under §22.8; named-method references and `Subscribe`+`Subscription` are the reliable forms, respelled `this.Clicked +=` in declaring-class framing per §24.4; record-receiver deterministic `-=` recorded as **not expressible in v1**, bound 3 liftable — this supersedes the v0.180 entry's "store-once required there" for record receivers); **§26.1/§26.4/§25.4 extension and conversion examples conformed** to §28.6/§28.3 (`Words()`, `Sort()`, `Map()` declare `owned` returns; `User` pinned as a record).
+
+**Async, iterators, and exceptions (TRAIN-ASYNC).**
+
+- **Yield ownership under the v0.180 discipline (spec §29.2/§28.3/C.3).** The
+  yield-operand read of a named owned binding is classified by the declared
+  return type: owning iterators consume (announced by the return type, no
+  marker — the owned-return parallel) and the consume joins the consume-site
+  freeze (the transfer hands the value alive; no disposed-flag backstop
+  exists, unlike throw/dispose/discard); borrowing iterators borrow (nothing
+  announces a kill; the re-borrow's source is the frame-resident binding —
+  disposed on abandonment by §29.7's pass — and the adopt-then-yield spelling
+  `using var l := owned line; yield return l;` is the warning-free form).
+  §29.2's owned-expression bullets are re-scoped to fresh producers and
+  `move` results. Declined: a `yield return owned x;` marker form (grammar
+  for a case the ruling covers without syntax; the operand-position marker
+  absence stays recorded as liftable) and §29.2's old letter (silent
+  consumption of named bindings — the pattern v0.180 abolished). Impl
+  divergence was already on file as #1267.
+- **Pattern B await joins the announced-kill family (spec §30.5/§28.3/C.6).**
+  The await of a named owned OwningTask<T> binding is enumerated as an
+  owned-consuming position, exempt from the freeze with the recorded
+  throw-precedent reasoning: the keyword+type announce the kill and the
+  await's implicit task disposal sets the disposed flag. Pattern A chaining
+  `return await <owned source>` (owned parameter or plain owned local; a
+  `using var` source is not consumed, only disposal-deferred) is likewise
+  unfrozen for a *structural* reason: the outer task cannot dispose the
+  chained task before the body (including `finally`) completes.
+- **Pattern A borrowed-source chain (spec §30.5/§22.13/C.6; resolves #1533).**
+  `return await <borrowed source>` gets the third result-slot kind: a borrow
+  through the source, teardown disposes nothing on the link; source-outlives
+  is a caller-side residual with the checked-mode backstop, trivially
+  discharged for process-lived statics — §22.13(b)'s own `return await _cfg!;`
+  idiom now composes with §30.5 instead of contradicting it. Plain owned
+  locals and admitted static Task fields join the admitted operand list
+  (#1533 answered yes; the freeze already protects the plain-local case; the
+  chained result stays under §22.12 rule 4's confine-or-synchronize
+  obligation).
+- **No ref/out on async or iterator declarations (spec §30.1/§29.3/§30.6,
+  C.5/C.6).** State-machine frames outlive the synchronous call; a caller
+  stack slot reference cannot be captured into one, and §22.3's out-contract
+  has no coherent exit for a first-suspension return. Rejected semantically
+  through the shared Param production (the §22.10 pattern); async-lambda
+  target types with ref/out slots rejected at the conversion. Declined:
+  assign-before-first-suspension (coherent for out only, unsound for ref,
+  fragile, no use case; C# rejects both).
+- **Memory-model clause (spec §30.13; stdlib §6.2).** Five normative
+  happens-before edges — mutex/semaphore release→acquire (incl. FFI threads
+  and Shared<Mutex>), channel accept→deliver, spawn→entry +
+  settlement→join, task settlement→awaiter/blocking-wait, and static
+  publication (admitted-mutable-static store→observing read; static-init
+  completion→cross-domain use — the fence that makes §22.13(b)'s cache and
+  the borrowed-source chain through it sound on weak hardware) — plus the
+  object-specific guarantees cross-referenced in place (CancellationToken
+  flag visibility, §30.8; Shared<T> drop→last-drop destruction, §28.13) and
+  seq-cst atomics (v0.140). Small by construction: no mutable state is
+  reachable from two domains, so no residual racy-access category exists to
+  specify.
+- **Channel send fault fate (spec §30.15; stdlib §6.9).** A faulting
+  Send/SendAsync disposes the item before the exception surfaces; a channel
+  never retains an item it did not accept. States the discharge composition
+  explicitly because the data loss is on a retryable condition; give-back
+  stays deferred with the TrySend RFC.
+- **TCS source-owns-task (spec §30.11; stdlib §6.7).** The Task property is a
+  borrow of a source-owned task; the task never outlives the source. Disposal
+  accounting is by source kind: OwningTCS awaits-through-borrow dispose (the
+  source's later disposal is the idempotent no-op); plain-TCS awaits neither
+  consume nor dispose (multi-await fan-out stands, §30.4) and the source's
+  disposal is the task's single disposal; a never-awaited task is disposed by
+  the source — for OwningTCS disposing the still-held result with it (the
+  "disposing the source has no effect on the result" paragraph is rewritten
+  to say exactly when that is true). Fault-disposal deferral extends across
+  awaiters registered at the fault. The §6.7 immediately-faulted example —
+  which returned src.Task out of the source's scope, the exact shape the
+  v0.75 changelog records as never having typechecked cleanly, and passed an
+  exception of unstated provenance to SetException — is rewritten to the
+  async-wrapper idiom (throw in an async OwningTask<T> body, §30.9).
+  Declined: first-read transfer (a property read that moves) and an
+  independently-owned/refcounted task (imports shared ownership).
+- **TaskScope not live across yield (spec §30.7; stdlib §6.10).** An `await
+  using var` of an IAsyncDisposable-without-destructor class (TaskScope; and
+  conservatively, bindings of interface static type — recorded liftable) may
+  not be live across a `yield return` in an async iterator: consumer
+  abandonment would take §28.12's synchronous fallback, which for a
+  no-destructor type skips cancel/join entirely and silently voids §6.10's
+  normative quiescence. Declined (recorded as fallback): a degraded
+  synchronous destructor (cancel + detached drain, the #1422 shape); an
+  async unwind driver stays future work and would lift the restriction
+  wholesale.
+- **Allocation failure is fatal (spec §31.4/§17.7/§22.13).** Uncatchable
+  termination covering new, growth, strings, boxing, and frames; joins
+  §22.13's abnormal-termination list; no OutOfMemoryException. Declined:
+  catchable OOM (an exception edge on every allocation, unhandleable in
+  practice); a named uncatchable OOM type (report label only) — the latter
+  flagged as a cosmetic owner choice.
+- **Thrown-borrow cross-reference (spec §31.1; Guide 02).** A borrowing field
+  inside a thrown instance is §28.3's field-held residual with the
+  checked-mode backstop operative through the unwind's disposals; stated as a
+  cross-reference, with the base Exception type's CauseChain snapshot named
+  as the design precedent. The finding's reject options are recorded as
+  declined (constructor-local admission; no interprocedural field-flow;
+  same-frame handlers are sound).
+
+Migration: nil expected for the yield rules (no doc example yields a named
+owned binding in a borrowing iterator; owning-iterator named-binding yields
+were BAD_REJECTed by the impl, so no user code relies on them), nil for
+ref/out (never compiled meaningfully), nil for allocation failure and the
+memory model (strengthenings of unstated behavior), one-shape break for
+TaskScope-across-yield (restructure to a non-yielding helper), and the §6.7
+TCS example was never expressible (see the v0.75 record).
+
+**Statics, construction, and parameter passing (same revision, third train — after own and async).**
+The statics/constructor half of the 2026-07-11 settlement: the three-way
+incoherences in §22.13 and §22.7/§7.9 are resolved with the same
+approximation-plus-recorded-bound pattern v0.181 established, and the
+parameter-passing cells the spec never filled (out-assignment scope, transfer
+model, ref/out operand categories, defaults × ownership) are filled with the
+recorded C#-divergences that ownership forces.
+
+- **Observing `this` during construction (§22.7 new subsection; §7.9, §24.4,
+  §12.5, C.5).** §7.9's "no non-nullable field is ever observed unset" was
+  falsified by a three-line base-ctor-virtual program the compiler accepts and
+  segfaults on. Now: a constructor-local definite-assignment gate on synchronous
+  `this`-observation (extending §28.8.1's in-ctor precedent; observations in
+  base/this-argument position always rejected); virtual-family calls on `this`
+  in ctor bodies rejected outside sealed non-abstract classes (the
+  template-method footgun, rejected loudly); `this`-capture carved out
+  (observation is at invocation — keeps §28.14 form 3 / §24.4's TickObserver
+  verbatim); and the derived-mid-construction residual (helper-routed dispatch,
+  escapes, construction-time closure invocation) recorded with a defined bound —
+  null watermark at allocation, checked-mode `NullReferenceException`, unchecked
+  UB — the §28.2 split applied to construction. *Declined:* C#-style defined
+  null-observation (defines the footgun; puts null behind a non-nullable type
+  as sanctioned behavior); C++ dispatch-as-static-type (silent
+  different-method surprise; vtable machinery; recorded as the liftable path);
+  the retired v0.123 self-contained-construction discipline as a
+  general-language floor (designed for the keyword-model serialization
+  eligibility and retired with it in v0.141; cited as historical precedent
+  only — v0.183's §9.8 has no such rule).
+- **A type's own static initialization is ordinary execution (§22.13, C.11).**
+  The v0.181 backstop read literally made every initializer-to-own-helper call
+  raise, while the within-type forward-reference rule checked only literal
+  initializer expressions — three sentences, three answers for `Name :=
+  PickName()`. Now: the backstop keys on innermost-initialization attribution
+  (self-touches ordinary; T→U→T raises); the cross-type graph is distinct-types
+  only (T ≠ U — without which the static-ctor freedom sentence was a self-cycle
+  error); the within-type forward check follows the cross-type graph's own
+  statically-resolvable-call walk (deviation from the verdict's same-type-only
+  walk, recorded: same machinery, catches the one-hop foreign-helper route);
+  and the function-value/virtual/cross-module residual is recorded with the
+  same watermark bound. "Partially-initialized statics are never observable"
+  is requalified to the backstop's scope — true again.
+- **`out` is copy-out-on-normal-return; obligations bind on return paths
+  (§22.3, §22.4, §22.6, stdlib §1, C.3).** §22.3's "every exit path" (which the
+  spec's own vocabulary includes throw edges in) made virtually every Try body
+  ill-formed; §22.6 said return paths; no transfer model was stated anywhere.
+  Now: return-path obligation (throw edges carry none); the callee's out
+  parameter is a callee-local slot, copied out exactly on normal return —
+  exception edges never expose a partial write, an inline out recipient stays
+  unassigned, and an assigned-but-unreturned `out owned` value is discharged
+  callee-side by the ordinary exception-path discharge: one owner at every
+  instant. Composes with §22.4's v0.181 per-path attachment and the v0.183
+  `when true` postcondition (both return-path-keyed). *Declined:* write-through
+  (C#'s model, chosen there because a GC owes nothing on the exception edge;
+  here it would park an owned value in the caller's slot mid-call with no
+  attached obligation). Gives #1634 its normative answer.
+- **`ref`/`out` operand categories defined (§22.3 new subsection, §17.6,
+  A.4 commentary).** The admissible argument category was never stated; the
+  implementation already admitted indexer slots (#1302 is a write-back bug in
+  the unspecified corner). Now: §17.6's assignable-lvalue categories, reused by
+  cross-reference; locals/fields alias, accessor targets are copy-in/copy-out
+  with evaluate-once bracketing and write-back on normal return in argument
+  textual order (deviation from "unspecified or rejected", recorded: §22.5
+  v0.181 made observable order normative-textual, and write-back order should
+  not reintroduce the nondeterminism one token to the right); owned-state
+  locations and rule-2 mutable statics excluded as recorded v1 bounds
+  (liftable — the freeze-at-ref-site design is the lift path).
+- **§22.13 pattern (a) rewritten onto the admitted task cache (§22.13, §30.5,
+  C.6).** The sanctioned `Config.Current := await LoadConfigAsync();` wrote a
+  mutable class-typed static rule 2 rejects (and its RHS had no legal Pattern A
+  reading). Pattern (a) is now eager assignment of pattern (b)'s `Task<T>?`
+  cache before any spawn — exactly-once with zero new machinery. Two
+  composition gaps this surfaced are closed by TRAIN-ASYNC's borrowed-source
+  formulation in this same revision (E-A3a–e, to which this train defers): an
+  admitted static task field is a named Pattern-A borrow source (process-lived;
+  overwrite-never-disposes is what makes the mutable cache's borrow race-proof
+  — the v0.181 accepted cost now pays for itself), and chaining from a
+  borrowed source transfers nothing (statics are not movable; pattern (b)'s
+  own `return await _cfg!` finally has a defined reading). *Recorded loss:* no synchronous-access async-initialized
+  class-typed static exists; restoring it is a real design (a third rule-2
+  form with store semantics and an enforcement story), declined here because
+  rule 2's admission must stay decidable at the declaration.
+- **`when true` × #1535(B): deliberate coexistence, recorded on #1535.** The
+  v0.183 clause serves every user-authored Try API and is not deletable by any
+  stdlib reshaping; fork (B) (nullable-return conversions) stays open per-API
+  on stdlib §1(b)'s criterion. Nullable return where the payload carries the
+  signal; Try + `when true` where it cannot (§14.4/§7.10 nullable-underlying
+  instantiations) or where the bool shape is the idiom.
+- **Statics seams, one each:** §24.6's blanket "not synchronized" scoped to
+  instance events, the static exception stated (conforming to rule 5, which
+  governed since v0.163); the compiler-generated static-event backing field
+  admitted under rule 5 and exempt from rules 2/4, with §30.14's
+  `EventSource<T>` entry qualified (both superseded by 0035 if it lands);
+  rule 4's domain-reachability warning and §22.13's no-`owned` disposal warning
+  stated independent and co-firing, `owned` clearing only the latter;
+  §28.13's `Shared`-payload synchronized set given a normative four-type
+  list, pinned (as of v0.184) as rule 2 form-(i) minus `ChannelSender<T>` with
+  the exclusion's reason (senders are minted per producer) and a
+  no-silent-growth clause (a later form-(i) joiner needs a separate ruling),
+  replacing two same-named different-membership enumerations, with the two
+  predicate-restating sites conformed (spec §30.14, stdlib §2.16) and the two
+  stdlib "every exit path" restatements conformed (`TryRead*`,
+  `Mutex.TryAcquire`; historical changelog entries deliberately untouched);
+  §22.9's construction-unwind enumeration extended to step-0 owned capture
+  fields on every edge including step-1 throws (whose "no derived state" claim
+  was false), with "reverse construction order" corrected to reverse
+  declaration order and the parameter-to-capture move stated (no double
+  discharge); §22.7's scenario-table row-2 remnant ("or the throwing field
+  initializer is preceded by a successful one") deleted; §22.5's owned-default
+  cell filled (owned-producing non-trivial-dispose defaults on `owned`
+  parameters only, compile error on plain — trivial-dispose defaults free) and
+  the evaluation-site freedom pinned as semantically unobservable.
+- **Rule 5 honestly narrowed (§22.12, C.11 — interim; #1647).** The v0.180
+  capture-free compile-error promise is unenforceable through an
+  `IEvent<T>`-typed alias (bypassable member-site reading vs. undecidable
+  all-sites reading). Interim, recorded downgrade: the compile error is scoped
+  to member-syntax subscription sites; the alias route is a recorded programmer
+  obligation joining §30.14's indirect-alias family, surfaced by a should-level
+  advisory at the alias-creation site — a value-position use of the member;
+  subscribe- and raise-receiver positions never warn. The
+  enforceable statement is proposal 0035 §7 S1, owner-gated; nothing here
+  forecloses it. *Declined:* an alias restriction (a new member-kind carve-out
+  of exactly the genus 0035 proposes deleting, severing legitimate capture-free
+  composition with no bridge); minting a proto-S1 type ahead of the owner's Q4.
+
+**Types, generics, and inference (fourth train).** (1) §14.5 NEW — generic-method type-argument inference: exact-agreement structural unification (no common-supertype joins), two-phase lambda participation with the closed-slot admission rule (equal or implicitly converting; exact beats converting at ranking), method references via §27.6's exact-preferred ranking (now stated in §27.6 — its OrderBy(Math.Abs) example was previously underivable), target-typed completion (typed declaration/assignment/return/default/determined-argument contexts — codifies the implemented Empty()-factory idiom); explicit lists all-or-nothing; no constructor inference; per-candidate inference before §22.6 with failed candidates silently inapplicable; non-generic beats generic as the LAST comparison, after the v0.181 defaulted-arity tie-break (implemented behavior; C#'s internal order would let a new optional-parameter overload re-route existing calls). (2) §6.6 — compound assignment: desugaring with the target evaluated once (base, member hops, indexes, getter/setter each once; §17.6 becomes an instance) and the checked narrow-integer write-back (b += 10 ≡ b := byte(b + 10), OverflowException on range, runtime RHS admitted); cross-family results (f += 2.5, b += 1.5) are compile errors; ??= and event +=/-= carve-outs restated. (3) §18.5 — nullable holes render null (no dispatch, alignment applies, type-formattability check against non-nullable T); §8.5/§7.4 conformed. (4) §9.8 — records with heap-collection serialized components are ineligible (record-admissibility: value-shaped components only); the v0.182 open question closes as same-treatment (Deserialize is ownership-invalid per §9.7); positional/body records agree; C.8 conformed. (5) §12.2 — blocked-name set is visible-members-only (private never blocks except nested-in-base; internal blocks in-module; cross-module residual stated: distinct members, lookup selects by static type, selected member dispatches per its own virtual-ness); pure liberalization; C.1 conformed. (6) §11.2/§12.1 — scoped joins the exact-match parameter-modifier lists, both directions, with the caller-contract reasoning recorded; C.1 conformed. (7) §17.14 NEW — constant expressions: the closed sublanguage (literals sans interpolation, const/enum refs incl. wrapper constants, nameof, built-in operators over primitives/string, constant conditional, parentheses; default(T) declined-liftable) with compile-time evaluation under runtime semantics and evaluation faults as compile errors; A.8/A.5 grammar comments, §22.12, §17.9 (phantom 'attribute arguments' removed), §5.1, §10.2, §15.1, C.11 re-pointed. (8) §5.1 — reference conversions stated (identity, class→base, →Object with boxing, type→conformed interface, interface→extended, type-parameter→constraint bound, §12.9 variance), ownership carries through unchanged, co-equal ranking (M(Animal)/M(Object) on Dog stays ambiguous; C#'s better-target refinement declined per rationale §14.5); §20/§22.6 conformed. Migration: newly rejected — partial/excess explicit type-argument lists, generic-constructor inference, cross-family compound assignment (previously crashed codegen), scoped mismatches, fault-at-fold const initializers, record collection components (already rejected by impl), converting-only lambda overload sets (previously a silent pick); newly accepted — invisible-base-member name reuse, nullable holes (already implemented). Runtime-visible: none for correct programs.
+
+#### Migration
+
+Compile-time, newly **rejected**: `Dispose()` (or a discard) through a tracked borrow — a borrowed local/parameter (including `this`), a non-owned field read, a call result, a catch or pattern binding, an owning-collection element borrow, or an element read of an `IEnumerable<T>`/enumerator/query-typed source (previously unaddressed; each is a probable bug — restructure so the owner disposes, use the owning collection's removal forms, or iterate the collection itself for the transit regime); assignment to / transfer from / disposal of a captured owned binding inside a lambda (previously admitted by the compiler — restructure to an `owned`-parameter callback); a fresh-producer element of non-trivial-dispose class type in a borrowing-family collection literal (bind the source first, or use the owning family; trivial-dispose elements — nested collection literals — are unaffected); parameter modifiers on operator parameters (previously parseable, semantics undefined); a returned lazy/enumerable/Task-typed frame carrying a scope-bound local's borrow (materialize instead). Newly **warned**: undischarged `owned` parameters of iterators/async methods (adopt with `using var … := owned …` to silence); straight-line use after a dominating dispose/discard is now a mandatory warning. Newly **accepted / defined**, no action needed: `_ := x;` on a named owned binding now has one meaning (announced consume at end of statement); if-expressions and expression-position `case`/`when` over owned arms are defined owned producers (Guide 01's Pattern B shape); returning parameter-sourced lazy pipelines (`Evens(xs) => xs.Where(IsEven)`) is confirmed legal; `cache.Current := c;` through a `set(owned)` setter consumes without a marker; mid-expression producers are defined to be unwind-disposed (no leak on the exception edge — codifies the only sound reading). Runtime-visible: none for correct programs — borrowing-collection `Dispose()` was already specified trivial in §28.9 (the contrary table row promised work no conforming program could observe); the unwind disposal of expression temporaries codifies the behavior three sections already assumed.
+
+*From the statics train:*
+Newly **rejected** (compile-time): `this`-observation in a ctor body before the declaring class's §7.9-strict fields are assigned, and in `base(...)`/`this(...)` argument position always; virtual/override/abstract calls on `this` in ctor bodies of non-sealed (or abstract) classes; a within-type forward static-readonly read routed through statically-resolvable calls; `ref`/`out` arguments over owned-state locations or admitted mutable statics; owned-producing non-trivial-dispose default values on plain parameters; capture-bearing member-syntax static-event subscriptions (already implemented, #1542 — now the stated scope). Newly **defined**, no action for correct programs: `out` copy-out semantics (programs observing a partial `out` write in `catch` were relying on unspecified behavior); accessor-target `ref`/`out` bracketing with textual-order write-back; callee-side discharge of assigned-but-unreturned `out owned` values; the construction/static null-watermark + checked-mode `NullReferenceException` residual bounds; self-static-init as ordinary execution (programs that today survive only because the backstop is unimplemented become sanctioned; the `Boot` forward-read shape becomes a compile error). Newly **warned** (should-level): a `static event` member used as a value (alias creation); receiver positions — subscribe family and raise family alike — never warn. **Doc-only:** pattern (a) rewrite; §24.6/§22.9/§22.7-row-2/§28.13-set/warning-independence edits; the B6/B7 conforming restatements (spec §30.14; stdlib §1, §2.16, `TryRead*`, `Mutex.TryAcquire`).
 
 ## 20. Closing
 
