@@ -1903,6 +1903,42 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
     }
 }
 
+// §6.6 / A.6 (v0.184, #1690): grammar A.6 restricts an `LValue`'s base to
+// `Identifier | "this"`, extended only by `.field` and `[index]` hops —
+// "A.6's lvalue shape applies unchanged: a method-call result cannot base
+// the chain — extract it to a local first" (§6.6). `target` is walked from
+// the outside in, peeling off `.member` (MemberAccessExpr), `[index]`
+// (IndexExpr), and the null-forgiving `!` (PostfixBangExpr) — each of these
+// denotes the SAME underlying storage location as its operand (a read-
+// through, not a fresh value; #206's `a!.V := 7` is a real lvalue and must
+// stay accepted) — looking for the chain's actual base. A CallExpr or
+// NullCondCallExpr found there means the base is a method-call (or
+// null-conditional-invocation) RESULT, which grammar A.6 does not admit.
+void ExprTC::checkLValueChainNotCallBased(const ast::Expr& target) {
+    const ast::Expr* e = &target;
+    for (;;) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            e = ma->target.get();
+        } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            e = ix->target.get();
+        } else if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            e = pb->operand.get();
+        } else {
+            break;
+        }
+        if (!e) return;
+    }
+    if (dynamic_cast<const ast::CallExpr*>(e) ||
+        dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        ctx_.diagnostics().report(
+            Severity::Error, target.span.begin,
+            "a method-call result cannot be the base of an assignment "
+            "target — grammar A.6's lvalue base must be an identifier or "
+            "`this`; extract the call result into a local first "
+            "(`var c := getCache(); c.items[0] := v;`) (§6.6)");
+    }
+}
+
 // Slice S5: member lookup that walks the base-type chain.
 // BFS over the inheritance graph (no cycle detection — the spec
 // forbids cycles; sema's class-graph validation slice will catch
@@ -5004,6 +5040,11 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         plainSetAssignTargetNode_ = (as->op == ":=") ? as->target.get() : nullptr;
         if (as->target) visitExpr(*as->target);
         plainSetAssignTargetNode_ = savedPlainSet;
+        // §6.6 / A.6 (v0.184, #1690): the lvalue chain's base must be an
+        // identifier or `this` — a method-call result (`h.Self().Total`)
+        // cannot serve as the chain's base. Checked before the shape-
+        // specific rules below, which assume a resolvable storage location.
+        if (as->target) checkLValueChainNotCallBased(*as->target);
         // §23.5: "Assigning to a member of a value-typed indexer result is a
         // compile error: `g[0].X := 5` would modify a discarded copy." A
         // value-typed indexer get returns a COPY (records/enums are value
@@ -6061,6 +6102,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if (ys->value) visitExpr(*ys->value);
     } else if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
         if (is->target) visitExpr(*is->target);
+        // §6.6 / A.6 (v0.184, #1690): `IncrementStmt ::= LValue ("++"|"--")`
+        // consumes the same A.6 `LValue` production as AssignmentStmt — a
+        // method-call result cannot serve as the chain's base here either.
+        if (is->target) checkLValueChainNotCallBased(*is->target);
         // fix #913 / §28.10 / §17.6: `c++` / `c--` desugars to
         // `c := T.operator++(c)` — a reassignment. A `using var` local is
         // implicitly non-reassignable, so an increment/decrement on it is a

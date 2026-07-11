@@ -496,6 +496,15 @@ private:
     // tracking that we don't have yet (and rarely matters in practice).
     void checkReadonlyAssignment(const ast::AssignmentStmt& as);
 
+    // §6.6 / A.6 (v0.184, #1690): reject an assignment/increment `target`
+    // whose lvalue chain bases on a method-call result — grammar A.6
+    // restricts an LValue's base to `Identifier | "this"`, and §6.6 states
+    // "A.6's lvalue shape applies unchanged: a method-call result cannot
+    // base the chain — extract it to a local first." Shared by
+    // AssignmentStmt and IncrementStmt, which both consume grammar A.6's
+    // `LValue` production.
+    void checkLValueChainNotCallBased(const ast::Expr& target);
+
     // Slice S5: member lookup that walks the base-type chain.
     // BFS over the inheritance graph (no cycle detection — the spec
     // forbids cycles; sema's class-graph validation slice will catch
