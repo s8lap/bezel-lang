@@ -292,6 +292,23 @@ private:
     // collectBorrowUses (innermost last); accumulates each loop's identifier
     // extent. Populated and drained during the pre-pass only.
     std::vector<std::pair<std::uint32_t, std::uint32_t>> loopScanStack_;
+    // §28.3 (v0.186, #1726) consume-site freeze: for each local of borrow-
+    // bearing-record type (a span, canonically — isBorrowBearingRecordOrSpan),
+    // the source binding(s) whose borrow the record carries, computed at the
+    // local's declaration as the identifier root(s) of its initializer chain
+    // (`buf.AsSpan()` / `s.Slice(r)` → `buf`/`s`; a `new Rec(a, b)` record →
+    // the borrow-carrying arg roots). The spec (v0.186): "A live local of
+    // borrow-bearing record type ... counts as a live local borrow of every
+    // carried borrow's source." These record locals carry NO
+    // LocalOwnership.source (they are value-typed records; setting one would
+    // perturb the §9.7 escape-on-return / field-store checks, which the spec
+    // assigns to §9.7's own escape bullets, not to this freeze). So the freeze
+    // consults this map IN ADDITION to states_. A root may itself be another
+    // record local — the query resolves transitively. Populated by
+    // collectRecordBorrowSource in the same pre-pass as borrowUseOffsets_, so
+    // liveness reuses borrowHolderUsedAfter unchanged. // per §28.3, §4.19, §9.7
+    std::unordered_map<const sema::Symbol*, std::vector<const sema::Symbol*>>
+        recordBorrowLocalSource_;
     // §28.3 / §28.7 (v0.180, #1465): reassigned owned locals whose drop-on-
     // overwrite codegen implements (disposeDisplacedOwnedClassLocal — plain owned
     // class/interface locals; collections/wrappers/tasks excluded). For these the
@@ -740,6 +757,20 @@ private:
     // dataflow. Called once at the start of run(). // per §28.3
     void collectBorrowUses(const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void collectBorrowUsesStmt(const ast::Stmt& s);
+    // §28.3 (v0.186, #1726): if `ld` declares a local whose initializer produces
+    // a borrow-bearing record / builtin span view (isBorrowBearingRecordOrSpan),
+    // record the source binding(s) it carries into recordBorrowLocalSource_ (the
+    // identifier root of the initializer chain, or the borrow-carrying arg roots
+    // of a `new Rec(...)` construction). Called from the freeze pre-pass at each
+    // LocalDecl. // per §28.3
+    void collectRecordBorrowSource(const ast::LocalDecl& ld);
+    // §28.3 (v0.186, #1726): true when the borrow-bearing-record local `recLocal`
+    // transitively carries a borrow of `consumed` — a DFS over
+    // recordBorrowLocalSource_ following record-local roots to a binding root.
+    // Used by checkConsumeFreeze to reject a consume of `consumed` while a live
+    // span over it survives. // per §28.3
+    bool recordBorrowAliasesConsumed(const sema::Symbol* recLocal,
+                                     const sema::Symbol* consumed) const;
     // Record each identifier read inside `e` into borrowUseOffsets_ (and into any
     // enclosing loop's identifier extent). `attributeOffset` != 0 forces every
     // recorded use to that source offset instead of the identifier's own — used

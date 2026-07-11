@@ -3167,6 +3167,10 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
     }
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         if (ld->initializer) recordBorrowUseExpr(*ld->initializer);
+        // §28.3 (v0.186, #1726): record the carried source of a borrow-bearing-
+        // record / span local so the consume-site freeze can see it as a live
+        // local borrow of that source.
+        collectRecordBorrowSource(*ld);
         return;
     }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
@@ -3235,6 +3239,62 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
     }
 }
 
+void MethodOwnership::collectRecordBorrowSource(const ast::LocalDecl& ld) {
+    // §28.3 (v0.186, #1726): "A live local of borrow-bearing record type — a
+    // span is the canonical case — counts as a live local borrow of every
+    // carried borrow's source." Only borrow-bearing-record / builtin-span locals
+    // participate; a plain value/class local is handled by the ordinary
+    // states_-based source tracking.
+    if (!ld.initializer) return;
+    const sema::TypeRef* rt = ctx_.exprType(*ld.initializer);
+    if (!isBorrowBearingRecordOrSpan(rt)) return;
+    sema::LocalSymbol* lsym = findLocalSymbol(ld);
+    if (!lsym) return;
+    std::vector<const sema::Symbol*> srcs;
+    auto addRoot = [&](const ast::Expr& e) {
+        // The carried source is the identifier at the root of the chain:
+        // `buf.AsSpan()` / `s.Slice(r)` → `buf` / `s`, a bare alias `s` → `s`.
+        if (const ast::IdentifierExpr* r = identifierRoot(e)) {
+            if (sema::Symbol* sym = ctx_.exprSymbol(*r))
+                if (sym != lsym) srcs.push_back(sym);
+        }
+    };
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(ld.initializer.get())) {
+        // A `new Rec(a, b)` borrow-bearing record carries a borrow from each
+        // borrow-carrying constructor argument; record every arg root (the
+        // spec's "every carried borrow's source"). Over-recording a value-typed
+        // arg root is harmless — a value arg can never be an owned binding the
+        // freeze protects, so it never matches a consumed binding.
+        for (const ast::CallArgument& a : ne->args)
+            if (a.value) addRoot(*a.value);
+    } else {
+        addRoot(*ld.initializer);
+    }
+    if (!srcs.empty()) recordBorrowLocalSource_[lsym] = std::move(srcs);
+}
+
+bool MethodOwnership::recordBorrowAliasesConsumed(
+    const sema::Symbol* recLocal, const sema::Symbol* consumed) const {
+    // DFS over recordBorrowLocalSource_ following each record local's carried
+    // roots; a root that is itself a record local (a span derived from another
+    // span, `var t := s.Slice(r)`) is resolved transitively. `seen` guards the
+    // (structurally impossible but cheap-to-defend) cycle. // per §28.3
+    std::unordered_set<const sema::Symbol*> seen;
+    std::vector<const sema::Symbol*> work{recLocal};
+    while (!work.empty()) {
+        const sema::Symbol* cur = work.back();
+        work.pop_back();
+        if (!seen.insert(cur).second) continue;
+        auto it = recordBorrowLocalSource_.find(cur);
+        if (it == recordBorrowLocalSource_.end()) continue;
+        for (const sema::Symbol* src : it->second) {
+            if (src == consumed) return true;
+            work.push_back(src);
+        }
+    }
+    return false;
+}
+
 bool MethodOwnership::borrowHolderUsedAfter(const sema::Symbol* holder,
                                             std::uint32_t consumeOffset) const {
     auto it = borrowUseOffsets_.find(holder);
@@ -3277,6 +3337,28 @@ void MethodOwnership::checkConsumeFreeze(std::string_view consumedName,
         report(Severity::Error, consumeLoc,
                std::string("cannot consume `") + std::string(consumedName) +
                    "` here: the borrow held by `" + std::string(holder->name) +
+                   "` is still live — its later use would read freed memory "
+                   "(consume-site freeze, §28.3/§28.7/§30.14 v0.180)");
+        return;  // one freeze diagnostic per consume site
+    }
+    // §28.3 (v0.186, #1726): a live local of borrow-bearing-record type (a span,
+    // canonically) counts as a live local borrow of every carried borrow's
+    // source — the rule stdlib §4.19's FrozenArray<T>.From(owned buf)
+    // construction-time soundness is load-bearing on. These record locals carry
+    // no LocalOwnership.source (see recordBorrowLocalSource_), so they are
+    // checked here: a span whose carried source is the consumed binding, and
+    // which has a reachable later use, freezes the consume exactly as a plain
+    // alias does. Liveness reuses borrowHolderUsedAfter (the same backward query
+    // as plain borrows); a span whose only uses precede the consume is not live
+    // and does not freeze (the accept-after-last-use case). // per §28.3, §4.19
+    for (const auto& [recLocal, srcs] : recordBorrowLocalSource_) {
+        (void)srcs;
+        if (recLocal == consumed) continue;
+        if (!recordBorrowAliasesConsumed(recLocal, consumed)) continue;
+        if (!borrowHolderUsedAfter(recLocal, consumeLoc.offset)) continue;
+        report(Severity::Error, consumeLoc,
+               std::string("cannot consume `") + std::string(consumedName) +
+                   "` here: the borrow held by `" + std::string(recLocal->name) +
                    "` is still live — its later use would read freed memory "
                    "(consume-site freeze, §28.3/§28.7/§30.14 v0.180)");
         return;  // one freeze diagnostic per consume site
