@@ -53,6 +53,43 @@ static bool caseIntScrutineeRange(PrimitiveType t, long long& lo, long long& hi)
     }
 }
 
+// §30.1 / §29.3 (v0.184, #1670): `ref`/`out` parameters are forbidden on an
+// `async` method or an iterator method (synchronous or async, §29.3) — a
+// `ref`/`out` argument is a reference to a caller stack slot, bounded by the
+// synchronous call, but these bodies capture their parameters into a heap-
+// allocated state-machine frame that outlives the synchronous call, so the
+// captured slot reference dangles the moment the method returns its task or
+// enumerable at the first suspension. The shared Param production
+// over-admits the modifiers syntactically (Appendix A.4); the rejection is
+// semantic — the same over-admit-and-reject pattern as §22.10's primary
+// constructors and §23.4's indexer parameter lists. `owned` parameters are
+// unaffected (§29.8 / §30.1).
+static void checkNoRefOutOnAsyncOrIterator(
+    const std::vector<ast::Param>& params, bool isAsync, bool isIterator,
+    std::string_view methodName, SourceLocation methodLoc, SemaContext& ctx) {
+    if (!isAsync && !isIterator) return;
+    for (const auto& p : params) {
+        if (p.modifier != "ref" && p.modifier != "out" &&
+            p.modifier != "out owned")
+            continue;
+        const char* kind = isAsync ? "an `async` method" : "an iterator method";
+        // §22.10/#1664 precedent (TypeResolution_Checks.cpp): ParameterSymbol
+        // (and, here, the raw AST Param) carries no reliable per-parameter
+        // location — `ast::Type::span` is never stamped by the parser — so
+        // point at the enclosing method declaration, the same fallback the
+        // operator-parameter-modifier check uses.
+        ctx.diagnostics().report(
+            Severity::Error, methodLoc,
+            std::string("`") + std::string(p.modifier) + "` parameter `" +
+            std::string(p.name) + "` is not permitted on " + kind + " `" +
+            std::string(methodName) + "` — its arguments are captured into a "
+            "heap-allocated state-machine frame that outlives the "
+            "synchronous call, so a caller-stack-slot reference would dangle "
+            "the moment the method returns its task or enumerable at the "
+            "first suspension point (§30.1, §29.3, v0.184)");
+    }
+}
+
 // The ExprTC class is declared in ExprTypecheck_impl.hpp; its method
 // definitions live across this and the sibling ExprTypecheck_*.cpp
 // translation units. This file holds the public entry point, the worker's
@@ -4181,6 +4218,14 @@ void ExprTC::visitMember(const ast::Member& m) {
         // flag BEFORE visiting the body so checkReturnForm can reject a plain
         // `return;` (the async iterator case slips past §21.7). Restore after.
         bool isIteratorMethod = stmts && stmtsContainYield(*stmts);
+        // §30.1 / §29.3 (v0.184, #1670): reject `ref`/`out` params on an
+        // `async` method or an iterator method (sync or async) — declaration-
+        // level, independent of body kind (a block-bodied method is the only
+        // shape that can be an iterator; `inAsyncContext_` already reflects
+        // the `async` modifier for both block and expression bodies here).
+        checkNoRefOutOnAsyncOrIterator(md->params, inAsyncContext_,
+                                        isIteratorMethod, md->name,
+                                        md->span.begin, ctx_);
         bool saveIter = inIteratorMethod_;
         inIteratorMethod_ = isIteratorMethod;
         runMethodBody(md->params, stmts, expr, paramSymbolsOf(m));

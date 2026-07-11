@@ -4632,6 +4632,30 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             auto* ps = ctx_.makeSymbol<ParameterSymbol>();
             ps->name = p.name;
             ps->modifier = p.modifier;
+            // §30.6 / §30.1 (v0.184, #1670): an async lambda's parameter
+            // slots are plain, `owned`, or `scoped` only — `ref`/`out` are
+            // rejected for the same reason as an async method's (§30.1):
+            // the lambda's parameters are captured into a heap-allocated
+            // state-machine frame that outlives the synchronous call, so a
+            // caller-stack-slot reference would dangle the moment the
+            // lambda returns its task at the first suspension point.
+            if (lam->isAsync &&
+                (p.modifier == "ref" || p.modifier == "out" ||
+                 p.modifier == "out owned")) {
+                // `ast::Type::span` is never stamped by the parser (see the
+                // method-level #1664 precedent), so point at the lambda
+                // expression's own (reliably-stamped) span instead.
+                ctx_.diagnostics().report(
+                    Severity::Error, lam->span.begin,
+                    std::string("`") + std::string(p.modifier) +
+                    "` parameter `" + std::string(p.name) + "` is not "
+                    "permitted on an `async` lambda — its parameters are "
+                    "captured into a heap-allocated state-machine frame "
+                    "that outlives the synchronous call, so a caller-"
+                    "stack-slot reference would dangle the moment the "
+                    "lambda returns its task at the first suspension "
+                    "point (§30.6, v0.184)");
+            }
             if (p.type) ps->declType = p.type.get();
             else if (eventParamType && lam->params.size() == 1)
                 ps->resolvedDeclType = eventParamType;  // §24.3 handler param
