@@ -7812,6 +7812,34 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             if (ma.member == "Raise" || ma.member == "RaiseAsync" ||
                 ma.member == "Add" || ma.member == "Remove")
                 checkEventVisibilityFence(es, ma.member, ma.span.begin);
+            // per stdlib §6.5 / §24.3 (#1639): a DIRECT `<event>.Method()`
+            // access whose member name is not on the event's documented
+            // surface previously fell straight through to the ordinary
+            // member-lookup path below, which never resolves an event name
+            // (the event has no user TypeSymbol) — so a bogus method
+            // silently compiled and no-op'd (codegen's tryLowerEventCall
+            // likewise falls through to "not an event method" with nothing
+            // else recognizing it). This mirrors #1610's rejection for an
+            // EventSource<T>/AsyncEventSource<T>-TYPED value (the
+            // `rcn == "EventSource"` block above): reject any member name
+            // outside {Subscribe, Raise, RaiseAsync, Add, Remove, Dispose}.
+            // `Dispose` is compiler-generated for every owned/disposable
+            // type and passes silently, matching #1610's precedent; the
+            // Raise-vs-RaiseAsync sync/async pairing is not policed here —
+            // out of #1639's scope, since codegen's direct-access dispatch
+            // does not distinguish the two by the event's declared
+            // async-ness either, unlike the typed-value path.
+            if (ma.member != "Subscribe" && ma.member != "Raise" &&
+                ma.member != "RaiseAsync" && ma.member != "Add" &&
+                ma.member != "Remove" && ma.member != "Dispose") {
+                ctx_.diagnostics().report(
+                    Severity::Error, ma.span.begin,
+                    std::string("no member `") + std::string(ma.member) +
+                    "` on event `" + std::string(es->name) +
+                    "`; documented surface: Subscribe(handler), "
+                    "Raise(payload)/RaiseAsync(payload), Add(handler), "
+                    "Remove(handler) (stdlib \xC2\xA7""6.5 / \xC2\xA7""24.3)");
+            }
         }
     }
     // §7.4 (issues #418, #862): member access (and method calls) on a NULLABLE
