@@ -2063,6 +2063,54 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
     }
 }
 
+// §12.2 (v0.184): is `inner` nested (directly or transitively) inside
+// `outer`? Mirrors ExprTypecheck_Calls.cpp's isNestedWithin, which backs the
+// same §11.6 mutual-access rule for ordinary member access — kept as a
+// separate file-local (internal-linkage) copy here since the two checkers
+// live in different translation units with no shared utility header for a
+// helper this narrow.
+static bool isNestedWithin(const TypeSymbol* inner, const TypeSymbol* outer) {
+    if (!inner || !outer) return false;
+    for (const Symbol* m : outer->members) {
+        if (auto* nts = dynamic_cast<const NestedTypeSymbol*>(m)) {
+            if (nts->type == inner) return true;
+            if (nts->type && isNestedWithin(inner, nts->type)) return true;
+        }
+    }
+    return false;
+}
+
+// §12.2 (v0.184 — "The blocked-name set"): does `baseMember`, declared on
+// `declaringBase`, block `derived` from reusing its name? `public` and
+// `protected` base members always block (a subclass reached `declaringBase`
+// by inheriting from it, so a `protected` member of `declaringBase` is
+// always visible to `derived`). An `internal` base member blocks exactly
+// when it is visible at the derived declaration site — same module, i.e.
+// not an imported symbol (§13.4, mirroring ExprTypecheck_Calls.cpp's
+// checkMemberVisibility internal case). A `private` base member never
+// blocks, EXCEPT that a derived class nested inside the base class (§11.6)
+// sees the base's private members and IS blocked by them. When a base
+// member does not block, it is invisible at the derived declaration site
+// and the derived declaration is a distinct member: no override
+// relationship and no shared overload family exist between the two, so
+// such a member must not be collected as a hiding/override candidate at
+// all (not just suppressed at diagnostic time).
+static bool memberBlocksHiding(SemaContext& ctx, TypeSymbol* derived,
+                                TypeSymbol* declaringBase,
+                                MemberSymbol* baseMember) {
+    switch (baseMember->visibility) {
+        case ast::Visibility::Public:
+        case ast::Visibility::None:
+        case ast::Visibility::Protected:
+            return true;
+        case ast::Visibility::Internal:
+            return !ctx.isImported(baseMember);
+        case ast::Visibility::Private:
+            return isNestedWithin(derived, declaringBase);
+    }
+    return true;
+}
+
 void Resolver::checkHidingAndOverride() {
     if (!ctx_.module()) return;
     for (Symbol* child : ctx_.module()->children) {
@@ -2126,6 +2174,13 @@ void Resolver::checkHidingAndOverride() {
                     continue;
                 }
                 if (auto* ms = dynamic_cast<MemberSymbol*>(m)) {
+                    // §12.2 (v0.184): only a base member VISIBLE at `t`'s
+                    // declaration site can block its name — an invisible
+                    // member (typically `private`, not reachable via
+                    // nesting) is not collected at all, so it neither
+                    // diagnoses a hiding conflict nor stands in as an
+                    // override target.
+                    if (!memberBlocksHiding(ctx_, t, cur, ms)) continue;
                     // Collect every same-name base member (most-derived first);
                     // an overloaded method contributes one entry per overload.
                     baseMembers[ms->name].push_back(ms);
