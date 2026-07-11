@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | **accepted (owner, 2026-07-12)** — graduation in progress this run. *(prior: draft (RFC))* |
+| **Status** | **superseded — graduated in v0.188 (`ebfa7e0`)**: Appendix D.2 standalone Extended row (Move-only value types) + D.3 dependency bullet; conformance-staging only, no semantics change; #1385 stays open. Open questions resolved as delegated rulings (recorded in the v0.188 changelog). *(prior: accepted (owner, 2026-07-12); draft (RFC))* |
 | **Tracking issue** | [#1551](https://github.com/s8lap/bezel-lang/issues/1551) |
 | **Target module(s)** | None (spec-only). Appendix [D.2](../Bezel_Language_Spec.md#sec-extended-features) (one new feature row + the closing "Everything not listed is Core" paragraph), [D.3](../Bezel_Language_Spec.md#sec-feature-dependencies) (one dependency bullet). No stdlib surface. No semantics change anywhere. |
 | **Written against** | spec/stdlib **v0.179**. One touched clause (§28.9's move-only capture rule) sits in text the v0.180 capture train (landing) revises; its location must be re-verified when that train lands (§8, Q4). |

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | **accepted (owner, 2026-07-12)** — graduation in progress this run. *(prior: draft)* |
+| **Status** | **superseded — graduated in v0.188 (`ebfa7e0`)**: new spec §2.8 (+ §2.x/§13.4/§27.8/§33.1 cross-refs, Appendix C.12/C.13); entry-point widening (OQ5) recorded in §33.1. Open questions resolved as delegated rulings (recorded in the v0.188 changelog). *(prior: accepted (owner, 2026-07-12); draft (RFC))* |
 | **Tracking issue** | [#1517](https://github.com/s8lap/bezel-lang/issues/1517) |
 | **Target module(s)** | None (spec-only). Spec §2 (new §2.8; small edits to [§2.1](../Bezel_Language_Spec.md#sec-module-declarations)/[§2.4](../Bezel_Language_Spec.md#sec-compilation-unit)/[§2.5](../Bezel_Language_Spec.md#sec-dependency-resolution)/[§2.6](../Bezel_Language_Spec.md#sec-build-phases)), [§13.4](../Bezel_Language_Spec.md#sec-modules-and-internal), and cross-references from [§33.1](../Bezel_Language_Spec.md#sec-the-main-method)/[§33.5](../Bezel_Language_Spec.md#sec-program-entry-point-resolution)/[§33.6](../Bezel_Language_Spec.md#sec-example). No stdlib surface. |
 | **Written against** | spec/stdlib **v0.178** |
