@@ -1540,6 +1540,39 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         "(n)` from its underlying integer, not with `new` "
                         "(§5.4/§10)");
                 }
+                // §14.5 Scope (v0.184, #1687): "Class-, record-, and
+                // interface-level type arguments are never inferred from
+                // constructor arguments: `new Pair(1, "x")` against `record
+                // Pair<TF, TS>(...)` is a compile error directing to explicit
+                // arguments (`new Pair<int, string>(1, "x")`) or, where a
+                // target type exists, the `new()` shorthand." This is the
+                // explicit-name form (`ne->type` is present — the `new()`
+                // shorthand takes the type name from the DECLARED TARGET TYPE
+                // via a separate code path, `ne->type == nullptr`, and is
+                // unaffected). A NON-empty but mismatched explicit list
+                // (`new Pair<int>(...)`) is already rejected generically by
+                // the type resolver's generic-arity check; this catches the
+                // case that check does not — an EMPTY list on a generic
+                // user type, which previously left the constructor's field
+                // types as unresolved type parameters and either silently
+                // miscompiled or crashed the backend (issue #1687 q19).
+                if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
+                    rt->genericArgs.empty() &&
+                    !rt->declaration->genericParams.empty()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ne->span.begin,
+                        "`new " + std::string(rt->declaration->name) +
+                        "(...)` supplies no type arguments, but `" +
+                        std::string(rt->declaration->name) + "` declares " +
+                        std::to_string(rt->declaration->genericParams.size()) +
+                        " type parameter(s) — class-, record-, and "
+                        "interface-level type arguments are never inferred "
+                        "from constructor arguments; supply the full "
+                        "explicit list (`new " +
+                        std::string(rt->declaration->name) +
+                        "<...>(...)`) or, where a target type exists, use "
+                        "the `new()` shorthand (§14.5, §17.7)");
+                }
                 // §14.1 (#992): `new T()` where T is a generic type parameter
                 // requires `where T: new()` on the enclosing generic declaration.
                 // Without that constraint the body type-checks under the weakest

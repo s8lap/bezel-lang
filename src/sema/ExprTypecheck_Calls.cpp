@@ -1204,6 +1204,45 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     }
     if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym)) {
         auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        // §14.5 (v0.184, #1687): "Explicit lists are all-or-nothing." An
+        // explicit type-argument list binds the method's declared type
+        // parameters in declaration order and must supply EXACTLY as many
+        // arguments as the method declares — a shorter or longer list is a
+        // compile error; there are no partial lists. This must be checked
+        // before ANY of the several call-typing branches below (out-var
+        // re-typing, return-type substitution, constraint checking) consume
+        // `callTypeArgs`, since each of those independently clips the loop to
+        // `min(genericParams.size(), callTypeArgs.size())` and silently
+        // ignores the mismatch otherwise (a partial list left later
+        // parameters unbound and inference never ran to fill them; an excess
+        // list silently dropped the extra arguments) — issue #1687.
+        if (md && !md->genericParams.empty()) {
+            const std::vector<std::unique_ptr<ast::Type>>* callTypeArgs =
+                nullptr;
+            if (auto* cma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+                callTypeArgs = &cma->typeArgs;
+            else if (auto* cncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                         ce.callee.get()))
+                callTypeArgs = &cncm->typeArgs;
+            else if (auto* cid =
+                         dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get()))
+                callTypeArgs = &cid->typeArgs;
+            if (callTypeArgs && !callTypeArgs->empty() &&
+                callTypeArgs->size() != md->genericParams.size()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ce.span.begin,
+                    "call to `" + std::string(ms->name) +
+                    "` supplies " + std::to_string(callTypeArgs->size()) +
+                    " explicit type argument(s), but `" +
+                    std::string(ms->name) + "` declares " +
+                    std::to_string(md->genericParams.size()) +
+                    " type parameter(s) — an explicit type-argument list "
+                    "must supply exactly as many arguments as the method "
+                    "declares type parameters; there are no partial lists "
+                    "(§14.5)");
+            }
+        }
         // §12.3/§12.5, #874: `base.M()` where M is abstract has no
         // implementation to call — the vtable slot is unfilled.  Diagnose this
         // as a compile error so the caller never reaches garbage at runtime.
