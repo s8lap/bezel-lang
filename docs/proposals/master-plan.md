@@ -2,19 +2,34 @@
 
 *Capstone deliverable of the 2026-07-11 spec-quality run. Dependency-first view over **all 39** numbered proposals (0001–0039). Complements — does not replace — [`implementation-roadmap-2026-07.md`](implementation-roadmap-2026-07.md), which sequences the same work as R0→R8 run-shapes. This document adds the explicit **proposal-to-proposal DAG** the roadmap does not carry.*
 
-*Sources: `docs/proposals/README.md` (status ground truth, per spec-change-process §8), `phase8-interactions.json` (the 37-item verified interaction map — primary dependency data), `phase8-scoreboard.json` (issue state), and the headers of the ten most-entangled proposals. Written against docs **v0.185**; compiler implements ~v0.177 + partial. Do not treat any proposal as implemented: **none have graduated** (none are `superseded`); all 39 are still design documents.*
+*Sources: `docs/proposals/README.md` (status ground truth, per spec-change-process §8), `phase8-interactions.json` (the 37-item verified interaction map — primary dependency data), `phase8-scoreboard.json` (issue state), and the headers of the ten most-entangled proposals. Written against docs **v0.185**; **refreshed 2026-07-12** for the graduation run (docs now **v0.188**, main `ebfa7e0`). **Nine proposals have now graduated into the normative docs** (`superseded`): 0003/0032/0033 (v0.186), 0035 (v0.187), 0034/0036/0037/0038/0039 (v0.188) — see §1's graduated ledger. The graduation is docs-only; no *implementation* has landed yet, so the R1–R8 build tracks are unchanged in size — but the nine graduated proposals are now spec-complete and their remaining work is pure compiler catch-up (impl trackers #1705–#1737).*
 
 ---
 
 ## 1. Status ledger
 
-Implementation state is **`none` for all 39** — verified: not one proposal file carries `Status: superseded`, and the roadmap's R1–R8 are all still "to build." What *has* partially landed is the **R0 substrate** (spec rulings v0.179–v0.185 that some proposals name as prerequisites — e.g. 0006's scoped-construction landed v0.180, 0031's throw-operand rule landed v0.182); those are compiler-catch-up items, not proposal implementations. The "Prereq landed" column below flags proposals whose *blocking spec ruling* is already in the docs, so implementation can begin the moment the proposal is picked up.
+**Nine proposals have graduated (`Status: superseded`) — spec-complete, compiler catch-up outstanding.** No proposal is *implemented* yet (the R1–R8 build tracks are all still "to build"), but the graduation run landed the spec/stdlib side of nine designs into v0.186–v0.188. Beyond that, the **R0 substrate** partially landed (spec rulings v0.179–v0.185 that some proposals name as prerequisites — e.g. 0006's scoped-construction landed v0.180, 0031's throw-operand rule landed v0.182); those are compiler-catch-up items too. The "Prereq landed" column below flags draft proposals whose *blocking spec ruling* is already in the docs, so implementation can begin the moment the proposal is picked up.
 
-### 1a. Accepted (delegated) — owner-blessed, schedulable now (15)
+### 1·0. Graduated (superseded) — spec landed, compiler catch-up tracked (9)
+
+| # | Title | Graduated | Impl trackers (compiler catch-up) |
+|---|---|---|---|
+| 0003 | `Locked<T>` / `RwLocked<T>` | v0.186 (`3d08ec2`) | #1721 |
+| 0032 | Parallel extensions | v0.186 (`3d08ec2`) | #1722 / #1723 / #1724; Stage-2 gate #1725; consume-site #1726 |
+| 0033 | FFI v2 (+ `env` instance-callback extension) | v0.186 (`3d08ec2`) | #1705–#1720 |
+| 0035 | Retire the `event` member kind | v0.187 (`7024955`) | #1727 / #1728 (needs #1646 first); #1704 liftable; #1647 closed |
+| 0034 | Module identity + program assembly | v0.188 (`ebfa7e0`) | #1729–#1734 (+ #1398 build driver) |
+| 0036 | Demote owning inline arrays to Extended | v0.188 (`ebfa7e0`) | #1737 (conformance staging); #1385 stays open |
+| 0037 | Remove object-initializer blocks | v0.188 (`ebfa7e0`) | #1735 |
+| 0038 | Retire `ReadOnlyAsciiByteSpan` | v0.188 (`ebfa7e0`) | #1736 |
+| 0039 | One specificity rule for extensions | v0.188 (`ebfa7e0`) | #1307 (re-scoped) |
+
+### 1a. Accepted (delegated) — owner-blessed, schedulable now (14)
+
+*(0003 graduated — see §1·0.)*
 
 | # | Title | Status | Tracking | Impl | Prereq landed? |
 |---|---|---|---|---|---|
-| 0003 | `Locked<T>` / `RwLocked<T>` | accepted (delegated) | #1404 | none | statics v0.164; #1391 static-init sync open |
 | 0006 | Concrete stream family | accepted (delegated) | #1433 | none | **yes** (v0.180 scoped-construction) |
 | 0007 | System.Net substrate | accepted (delegated) | #1436 | none | runtime event loop + OpenSSL owner ruling pending |
 | 0008 | Integer toolkit | accepted (delegated) | #1437 | none | **yes** (no deps) |
@@ -30,7 +45,9 @@ Implementation state is **`none` for all 39** — verified: not one proposal fil
 | 0028 | Random extensions | accepted (delegated) | #1459 | none | **yes** (no deps) |
 | 0030 | Unicode normalization | accepted (delegated) | #1455 | none | **yes** (no deps) |
 
-### 1b. Draft — needs a routine owner accept before graduation (16)
+### 1b. Draft — needs a routine owner accept before graduation (13)
+
+*(0032, 0033, 0034 graduated — see §1·0.)*
 
 | # | Title | Status | Tracking | Impl | Note |
 |---|---|---|---|---|---|
@@ -49,21 +66,12 @@ Implementation state is **`none` for all 39** — verified: not one proposal fil
 | 0026 | LINQ additions | draft | #1457 | none | no deps |
 | 0029 | Checksums | draft | #1454 | none | hard dep 0008 |
 | 0031 | Verify / Unreachable / Debug | draft | #1456 | none | v0.182 throw-operand landed |
-| 0033 | FFI v2 | draft | #1516 | none | §32 amendment train + layout owner ruling |
-| 0034 | Module identity | draft | #1517 | none | spec-only; §2.8 owner rulings + #1398 |
-| 0032 | Parallel extensions | draft | #1510 | none | dep 0003; Stage 1.5/2 owner rulings |
 
 *(0004 lives in 1d; count above is the draft build-track set.)*
 
-### 1c. RFC — owner-gated design changes; cannot be scheduled until the owner decides the fork (5)
+### 1c. RFC — owner-gated design changes (0 — all graduated)
 
-| # | Title | Status | Tracking | The fork the owner must decide |
-|---|---|---|---|---|
-| 0035 | Demote the `event` member kind | draft (RFC) | #1550 | delete §24 vs. keep-as-expansion; static fork engages #1647 rule-5 alias gap |
-| 0036 | Demote owning inline arrays to Extended | draft (RFC) | #1551 | conformance re-partition; pairs with #1385 either way |
-| 0037 | Remove object-initializer blocks | draft (RFC) | #1648 | retire `new T(args) with…end` on classes (this run) |
-| 0038 | Retire `ReadOnlyAsciiByteSpan` | draft (RFC) | #1649 | delete the 6th span type (this run) |
-| 0039 | One specificity rule for extensions | draft (RFC) | #1650 | delete §26.5.1 rules 2–3 (this run) |
+All five simplification/demotion RFCs graduated in this run (owner-accepted 2026-07-12) and moved to §1·0: **0035** → v0.187; **0036**, **0037**, **0038**, **0039** → v0.188. This bucket is now empty; the owner-decision gate that §4a projected onto the graph is discharged.
 
 ### 1d. Not scheduled (owner-declared out of the near-term plan) (3)
 
@@ -101,7 +109,7 @@ Landed-spec-ruling prerequisites (v0.179–v0.185), runtime substrate work, and 
 | 0025 bitarray | 0008 (soft/severable — PopCount) | 0024 (numbering) | — |
 | 0029 checksums | **0008** | 0006(stream forms), 0008(accumulator) | — |
 | 0032 parallel | **0003**-as-amended | 0006(naming), TaskScope | — |
-| 0033 ffi v2 | §32 amendment train *(unlanded)* | 0007/0011/0014(§9), 0034(symbol seam) | 0007/0011/0014 runtime routings |
+| 0033 ffi v2 | §32 amendment train *(landed v0.186)* | 0007/0011/0014(§9), 0034(symbol seam) | 0007/0011/0014 runtime routings |
 | 0034 module identity | evidence bugs + #1398 | 0033 (linking/symbol seam), #1365 | 0033(shared seam) |
 | 0003 locked | — *(#1391 static-init)* | 0032, 0002, 0021 | **0032** |
 | 0014 signal hooks | — *(runtime drain)* | 0011, 0002, 0021, 0033 | 0002/0021(soft) |
@@ -191,15 +199,15 @@ The critical path length, not total work, is what bounds calendar time; keep 000
 
 Per spec-change-process §8, the README `Status` column **is** the owner-review queue. Projected onto scheduling, three tiers:
 
-### 4a. Hard gates — cannot be scheduled at all until the owner accepts (the 5 RFCs)
+### 4a. Hard gates — DISCHARGED (the 5 RFCs graduated 2026-07-12)
 
-These are **design changes** (§2 of the process): they need a proposal→accept→graduation, not a routine landing. All are deletion/demotion-shaped (mostly doc-only, small conformance-corpus deltas):
+These were **design changes** (§2 of the process) needing a proposal→accept→graduation. The owner accepted all five on 2026-07-12 and they graduated into the normative docs; the gate is closed. What remains is compiler catch-up (§1·0), not a decision:
 
-- **0035** event-member demotion (#1550) — decide delete-§24 vs. keep-as-expansion; the static fork proposes a new `SharedEventSource<T>` and engages the **live #1647 rule-5 alias gap** head-on. Precondition #1536 closed.
-- **0036** owning-inline-array demotion (#1551) — decide the Core/Extended re-partition; resolve **#1385** (whole-value reassignment) either way.
-- **0037** remove object-initializer blocks (#1648) — decide retiring `new T(args) with…end` on classes; ~23/27 test sites are class-source (conformance-corpus checklist owed).
-- **0038** retire `ReadOnlyAsciiByteSpan` (#1649) — decide deleting the 6th span type; no migration (compiler never implemented it, #971).
-- **0039** one specificity rule for extensions (#1650) — decide deleting §26.5.1 rules 2–3; zero stdlib sites resolve through them.
+- **0035** event-member demotion → **graduated v0.187** (`7024955`); #1550 closed, #1647 closed by construction, impl #1727/#1728 (after #1646).
+- **0036** owning-inline-array demotion → **graduated v0.188** (`ebfa7e0`); #1551 closed, conformance staging #1737; **#1385** (whole-value reassignment) stays open, orthogonal.
+- **0037** remove object-initializer blocks → **graduated v0.188**; #1648 closed, impl #1735.
+- **0038** retire `ReadOnlyAsciiByteSpan` → **graduated v0.188**; #1649 closed, impl #1736; #971 item 3 retired.
+- **0039** one specificity rule for extensions → **graduated v0.188**; #1650 closed, impl re-scoped onto #1307.
 
 ### 4b. Embedded sub-question gates — schedulable, but one owner decision gates *part* of the work
 
@@ -210,9 +218,9 @@ The proposal is accepted/draftable and most of it can proceed, but a load-bearin
 - **0012** — **instant-order equality overriding §9.6 structural** (first stdlib record to do so) + the full-offset wire form.
 - **0020** — **engine family (RE2) + `Match` shape** (RFC): the whole proposal is gated on these two.
 - **0022** — **discovery fork** (the `test` modifier, RFC): the `Assert` library + `using var` fixtures ship under any fork; only the discovery endpoint waits.
-- **0032** — **Stage 1.5** needs the §28.13 definitional-widening ratification (q4); **Stage 2** needs owner rulings q5–q9. Stage 0/1 need none. Also: **the 0003 amendments 0032 relies on are not yet landed in 0003's file** — a prerequisite sub-task.
-- **0033** — **Stage B layout-promise ratification** (q4, the language's first normative layout promise) + the six §32 amendments must land as spec first.
-- **0034** — the four **§2.8 rulings** (identity/closure, artifact interface, transitive deps, program assembly) are a spec-only design change needing owner sign-off; plus the v0.181 entry-point ruling needs rebase (PX-03).
+- **0032** — DISCHARGED: graduated v0.186. The §28.13 widening (q4) and 0003 amendments landed; Stage-2 design (q5–q9) is recorded design-now/ship-later (#1725). Implementation only now (#1722–#1726).
+- **0033** — DISCHARGED: graduated v0.186. Layout promise (q4) and the six §32 amendments landed as spec; the `env` instance-callback extension landed too. Implementation only now (#1705–#1720).
+- **0034** — DISCHARGED: graduated v0.188. The four §2.8 rulings landed as normative spec; the entry-point widening (OQ5) was ruled and recorded in §33.1. Implementation only now (#1729–#1734 + #1398).
 - **0010** — mechanism choice (Option A, compiler-provided conformances, recommended) awaits owner accept as part of graduating this draft.
 
 ### 4c. Routine-accept gates — the plain drafts
