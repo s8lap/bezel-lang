@@ -1153,6 +1153,34 @@ void Resolver::checkOperatorGroups() {
                     "infix syntax with no call-site spelling for a restricted "
                     "member (§25)");
             }
+            // §25.2 (#1664, v0.184): "Operator parameters admit no parameter
+            // modifiers." `ref`/`out`/`owned`/`scoped` on an operator's
+            // parameter list are rejected semantically — Appendix A.4's
+            // OperatorDecl over-admits them through the shared `Param`
+            // production (the same over-admit-and-reject pattern as §22.10's
+            // primary constructors), and the return slot's optional `owned`
+            // (grammar A.4) is the sole ownership annotation on operators.
+            // Operands are received as plain borrows (or value copies) under
+            // their type kinds. Was silently accepted (`owned`/`out`) or fell
+            // through to a codegen IR-verification failure (`ref`, whose
+            // by-reference ABI never matches the by-value operator signature).
+            for (Symbol* ps : ms->params) {
+                auto* param = dynamic_cast<ParameterSymbol*>(ps);
+                if (!param || param->modifier.empty()) continue;
+                // ParameterSymbol carries no declLoc of its own (#1664
+                // survey: no other diagnostic in this file keys off
+                // param->declLoc either) — point at the operator's own
+                // declaration, as the declaring-type-parameter check below
+                // (`m->declLoc`) already does.
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    "operator parameter `" + std::string(param->name) +
+                    "` may not carry the `" + std::string(param->modifier) +
+                    "` modifier — operator parameters admit no parameter "
+                    "modifiers; operands are received as plain borrows or "
+                    "value copies, and `owned` may appear only on an "
+                    "operator's return type (§25.2)");
+            }
             // §25.2 (#1347, v0.160): at least one parameter of an operator
             // overload must be the declaring type. An operator whose parameters
             // never mention the declaring type would be unreachable by the

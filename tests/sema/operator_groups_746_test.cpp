@@ -51,6 +51,15 @@ bool hasClassEqError(const bezel::test::SemaResult& r) {
     return false;
 }
 
+// §25.2 (#1664, v0.184): a parameter-modifier-on-operator-parameter diagnostic.
+bool hasParamModifierError(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("may not carry the") != std::string::npos &&
+            d.message.find("25.2") != std::string::npos)
+            return true;
+    return false;
+}
+
 // §8.3 (#1193): a type overrides `Equals` but not `GetHashCode` diagnostic.
 bool hasEqHashPairingError(const bezel::test::SemaResult& r) {
     for (const auto& d : r.diagnostics.diagnostics())
@@ -118,6 +127,88 @@ BEZEL_TEST(operator_groups_746, additive_operator_alone_ok) {
         "end V; class F public static method Main(): int return 0; end Main; "
         "end F;");
     BEZEL_EXPECT_FALSE(hasGroupError(r));
+}
+
+// ---------------------------------------------------------------------------
+// §25.2 (#1664, v0.184): "Operator parameters admit no parameter modifiers.
+// `ref`, `out`, `owned`, and `scoped` on an operator's parameter list are
+// rejected semantically — the grammar admits them through the shared `Param`
+// production, the same over-admit-and-reject pattern as §22.10's primary
+// constructors. Operands are received as plain borrows (or value copies)
+// under their type kinds; the return slot's optional `owned` (grammar A.4)
+// is the sole ownership annotation on operators." Verified pre-fix: `ref`
+// fell through to a codegen IR-verification crash (by-ref ABI vs. by-value
+// operator signature); `owned`/`out` were silently accepted with undefined
+// semantics.
+// ---------------------------------------------------------------------------
+
+// §25.2: `ref` on an operator parameter is rejected.
+BEZEL_TEST(operator_groups_746, ref_modifier_on_operator_param_rejected_1664) {
+    auto r = parseSemaAll(
+        std::string(kRec) +
+        "  public static method operator +(ref a: V, b: V): V => "
+        "new V(a.n + b.n); "
+        "end V; class F public static method Main(): int return 0; end Main; "
+        "end F;");
+    BEZEL_EXPECT_TRUE(hasParamModifierError(r));
+}
+
+// §25.2: `out` on an operator parameter is rejected.
+BEZEL_TEST(operator_groups_746, out_modifier_on_operator_param_rejected_1664) {
+    auto r = parseSemaAll(
+        std::string(kRec) +
+        "  public static method operator +(out a: V, b: V): V => "
+        "new V(a.n + b.n); "
+        "end V; class F public static method Main(): int return 0; end Main; "
+        "end F;");
+    BEZEL_EXPECT_TRUE(hasParamModifierError(r));
+}
+
+// §25.2: `owned` on an operator parameter is rejected — `owned` is admitted
+// only on an operator's return type, not its parameters.
+BEZEL_TEST(operator_groups_746, owned_modifier_on_operator_param_rejected_1664) {
+    auto r = parseSemaAll(
+        std::string(kRec) +
+        "  public static method operator +(owned a: V, b: V): V => "
+        "new V(a.n + b.n); "
+        "end V; class F public static method Main(): int return 0; end Main; "
+        "end F;");
+    BEZEL_EXPECT_TRUE(hasParamModifierError(r));
+}
+
+// §25.2: `scoped` on an operator parameter is rejected.
+BEZEL_TEST(operator_groups_746, scoped_modifier_on_operator_param_rejected_1664) {
+    auto r = parseSemaAll(
+        std::string(kRec) +
+        "  public static method operator +(scoped a: V, b: V): V => "
+        "new V(a.n + b.n); "
+        "end V; class F public static method Main(): int return 0; end Main; "
+        "end F;");
+    BEZEL_EXPECT_TRUE(hasParamModifierError(r));
+}
+
+// §25.2: a modifier-free operator parameter list is accepted — no false
+// positive from the new check.
+BEZEL_TEST(operator_groups_746, unmodified_operator_params_accepted_1664) {
+    auto r = parseSemaAll(
+        std::string(kRec) +
+        "  public static method operator +(a: V, b: V): V => "
+        "new V(a.n + b.n); "
+        "end V; class F public static method Main(): int return 0; end Main; "
+        "end F;");
+    BEZEL_EXPECT_FALSE(hasParamModifierError(r));
+}
+
+// §25.2: `owned` on an operator's RETURN type (not a parameter) is unaffected
+// — the return slot is the sole permitted ownership annotation on operators.
+BEZEL_TEST(operator_groups_746, owned_return_type_unaffected_1664) {
+    auto r = parseSemaAll(
+        std::string(kRec) +
+        "  public static method operator +(a: V, b: V): owned V => "
+        "new V(a.n + b.n); "
+        "end V; class F public static method Main(): int return 0; end Main; "
+        "end F;");
+    BEZEL_EXPECT_FALSE(hasParamModifierError(r));
 }
 
 // §25.1: `operator not` may not be overloaded — rejected.
