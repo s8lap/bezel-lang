@@ -5396,6 +5396,29 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         if (re->lo) visitExpr(*re->lo);
         if (re->hi) visitExpr(*re->hi);
         if (re->step) visitExpr(*re->step);
+        // §16.4 (#1628): "A literal step of zero is a compile error; a
+        // computed step of zero is admitted at construction and raises
+        // ArgumentException at GetEnumerator()." The literal/computed
+        // boundary is the same compile-time-constant fold already used a few
+        // lines up this section for the direction/sign-mismatch warning
+        // ("both endpoints and step are constants or constant after
+        // folding") — foldIntConstExprTC resolves an integer literal, unary
+        // +/-/~, const-arithmetic, and a `const` identifier reference, which
+        // is exactly the set of forms LLVM also collapses to a ConstantInt
+        // during lowering (the `cs->isZero()` check in
+        // Emitter::lowerRangeFor, LlvmBackend_Stmts.cpp). A non-constant
+        // (runtime-computed) step folds to nullopt and is left alone here —
+        // that case is guarded at runtime by #1623's emitGuardThrow.
+        if (re->step) {
+            if (auto stepV = foldIntConstExprTC(*re->step); stepV && *stepV == 0)
+                ctx_.diagnostics().report(
+                    Severity::Error, re->step->span.begin,
+                    "a range step of zero is a compile error (§16.4) when "
+                    "the step is a compile-time constant — a step whose "
+                    "value is only known at runtime is still permitted, and "
+                    "raises `ArgumentException` at `GetEnumerator()` if it "
+                    "evaluates to zero");
+        }
         // fix #499 / §9.8: give the RangeExpr itself a Range-named type so
         // that `var r := a..b` infers lsym->declType = Range (not null).
         // The element type is inferred from lo (or hi if lo is absent); it is
