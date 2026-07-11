@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.184 — July 2026**
+**Version 0.185 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -767,7 +767,8 @@ Narrowing also applies after early return, after `is not null`, inside the contr
 - a null test — `x <> null` (narrowing the true branch), `x = null` (narrowing the *false* branch), `x is not null`, or a successful `is`/typed-pattern test ([§12.7](#sec-type-tests-is-is-not-as), [§19.3](#sec-patterns)) — in an `if`/`elif` condition, a `while` condition, or a `when` guard;
 - boolean composition of tests: in `A and B`, `B` (and the true branch) is checked under `A`'s true-facts; in `A or B`, `B` (and the false branch) sees `A`'s false-facts; `not` swaps the fact sets — the standard three-outcome flow analysis, so `x <> null and x.Length > 0` is well-typed;
 - an early exit: after `if x = null then return; end;` (or `throw`, `break`, `continue` in that branch), the surviving path is narrowed;
-- assignment: after `x := expr;` where `expr`'s static type is non-nullable — or `expr` is itself narrowed non-null at that point — `x` is narrowed until invalidated.
+- assignment: after `x := expr;` where `expr`'s static type is non-nullable — or `expr` is itself narrowed non-null at that point — `x` is narrowed until invalidated;
+- a call to a method declaring a `when true`/`when false` nullability postcondition on an `out` recipient ([§22.4](#sec-out-nullability-postcondition), v0.183): in any region where the call's `bool` result is statically known to equal the stated constant, the recipient is narrowed non-null, composing through boolean operators and early exits like any other fact.
 
 **How narrowing is invalidated (v0.182 — the previous rule omitted `out` arguments and closure-capture mutation, the latter a probe-confirmed soundness hole).** The narrowing of a variable is invalidated when, within the controlled block:
 
@@ -1431,7 +1432,7 @@ Inside a `case` whose scrutinee is an enum, the enum prefix may be omitted:
 ```bezel
 case p of
   Low => Console.WriteLine("low"),
-  Medium, High => Console.WriteLine("medium or high")
+  Medium | High => Console.WriteLine("medium or high")
 end;
 ```
 
@@ -1691,7 +1692,7 @@ end Sum;
 
 **Static-member interfaces as ordinary types (v0.181).** Declaring static members does not remove an interface from the ordinary type grammar: it remains usable as a variable, field, parameter, or return type, as a boxing target, and as an `is`/`is not`/`as` operand ([§12.7](#sec-type-tests-is-is-not-as)) — the tests behave as for any interface, since a runtime type conforms only by declaring the full member set, statics included, so there is no partial-conformance state to probe. Two consequences are normative. (1) Static interface members contribute **nothing to the instance surface**: through an interface-typed *value* only instance members are reachable, and calling a static member on the interface *name* (`INumber<int>.Zero()`) is a compile error — the interface declares no bodies to run. `T.Member(...)` dispatch requires a generic type **parameter** constrained by the interface: a value's static type names no single conforming type, so "static dispatch through a value" would be hidden dynamic dispatch, which Bezel declines. (2) An interface that declares static members may not mark its type parameters variant (`in`/`out`, [§12.9](#sec-variance)) — a compile error at the declaration: variance is defined by instance-reference assignability, the position rules have no recorded reading for static signatures, and invariance keeps the question closed until a use case arrives (recorded v1 bound, liftable).
 
-**Primitive conformances (compiler-provided).** The primitive numeric tower (`byte`…`ulong`, `float`, `double`, `decimal`) and `char` conform to the standard-library `INumber<T>`/`ISteppable<T>`/`IParsable<T>` interfaces (stdlib §2.19) **without declaring them**: primitive operators are compiler intrinsics (§3.5), so the compiler bridges the intrinsic/declared split by treating each primitive as conforming with its intrinsic operations as the member bodies. User code observes no difference from a declared conformance.
+**Primitive conformances (compiler-provided).** The primitive numeric tower (`byte`…`ulong`, `float`, `double`, `decimal`) and `char` conform to the standard-library `INumber<T>`/`ISteppable<T>`/`IParsable<T>` interfaces (stdlib §2.19) **without declaring them**: primitive operators are compiler intrinsics (§3.5), so the compiler bridges the intrinsic/declared split by treating each primitive as conforming with its intrinsic operations as the member bodies. User code observes no difference from a declared conformance. The bridge covers not only the intrinsic/declared operator split but also the `IParsable<T>.TryParse` **out-nullability** shape: the per-type witnesses declare `out result: T` (a concrete value type), while the interface declares `out value: T?` — required for user class conformers, for which `default(T)` is a compile error ([§17.11](#sec-the-default-operator)). A call through the constraint observes `T?`; a direct call observes `T`.
 
 **What this unblocks (recorded follow-ups, not part of v0.176):** promoting the name-recognized `FromCollectionLiteral` (§15.4.1) to a real `ICollectionLiteralTarget<T>` and `IDeserializable`'s `Deserialize` (§2.14) to a true static interface method — both signatures were chosen for zero-source-change promotion; and replacing §16's compiler-intrinsic `Range<T>` element restriction with an `ISteppable<T>` constraint.
 
@@ -1705,7 +1706,7 @@ end Sum;
 
 A method, property, or indexer is non-virtual unless marked `virtual`. To override a virtual member in a derived class, mark the matching member `override`. Visibility, return type, parameter types, and parameter modifiers must match the base member exactly, with one allowance (v0.181): an override may declare a parameter as `T?` where the overridden member declares `T` — the same contravariant nullability widening [§11.2](#sec-interface-declaration) grants interface implementations, admitted here for the same recorded reason (the override accepts more inputs than the virtual slot promises to pass; the reasoning applies verbatim, and the old asymmetry between the two positions was never recorded as intentional). Widening is **monotone down the chain**: an override matches against the *nearest* overridden declaration, so once a parameter is `T?` a further override must keep it `T?` — narrowing back would let a `null` admitted through an intermediate static type reach a non-nullable parameter. The reverse direction (overridden `T?`, override `T`) is rejected, as in §11.2. Return types must still match exactly (no covariance in this version).
 
-Parameter modifiers that must match: `ref`, `out`, `owned`, `scoped` (v0.184 — a `scoped`/unscoped mismatch changes the caller's capture/freeze contract in both directions, [§11.2](#sec-interface-declaration)). Return modifiers that must match: `owned`. A mismatch — for example, a base method declaring `Foo(owned x: T)` and the override declaring `Foo(x: T)` — is a compile error. The compiler does not infer or relax these modifiers across the override boundary, because they affect the method's contract rather than its implementation.
+Parameter modifiers that must match: `ref`, `out`, `owned`, `scoped` (v0.184 — a `scoped`/unscoped mismatch changes the caller's capture/freeze contract in both directions, [§11.2](#sec-interface-declaration)). The `when true`/`when false` postcondition clause on an `out` parameter ([§22.4](#sec-out-nullability-postcondition)) must match exactly as well — an override may neither add nor drop it. Return modifiers that must match: `owned`. A mismatch — for example, a base method declaring `Foo(owned x: T)` and the override declaring `Foo(x: T)` — is a compile error. The compiler does not infer or relax these modifiers across the override boundary, because they affect the method's contract rather than its implementation.
 
 Fields, constructors, destructors, and static members may not be virtual.
 
@@ -1773,8 +1774,7 @@ end DataSource;
 
 public class FileSource: DataSource
   public async override method LoadAsync(): Task<string>
-    using var fs := new FileStream(_path);
-    return await fs.ReadAllAsync();
+    return await File.ReadAllTextAsync(_path);
   end LoadAsync;
 
   public async override method SaveAsync(data: string): Task
@@ -2974,7 +2974,7 @@ The operand must be an assignable lvalue (a local variable, a writable field, an
 
 For reference-type operands, `++` and `--` apply only when the reference type overloads the operator; the overload returns a new instance, and the statement reassigns the local or field to the new instance. Overloading `++`/`--` on a class is permitted but uncommon; the `Counter` example in [§25.3](#sec-examples) demonstrates the typical record use.
 
-When `++` or `--` is applied to an `owned` field of class type T whose `operator ++` / `operator --` returns a new instance, the previous value of the field is overwritten and the [§28.7](#sec-reassigning-owned-fields) reassignment rule applies: the previous owned value must be disposed before the field is overwritten, and the operator's body must produce an owned value to be stored back. The compiler warns on `++` and `--` against owned class-typed fields for the same reason it warns on direct reassignment without prior disposal — the leak risk is identical. Authors of class-typed types that overload `++` or `--` should document the intended use; in practice these overloads are far easier to reason about on records, where ownership is not at issue.
+When `++` or `--` is applied to an `owned` field of class type T whose `operator ++` / `operator --` returns a new instance, the [§28.7](#sec-reassigning-owned-fields) drop-on-overwrite rule applies: the operator result (an owned value) is produced first, then the displaced previous value is disposed implicitly, then the new value is stored — no explicit prior disposal and no warning is involved. Authors of class-typed types that overload `++` or `--` should document the intended use; in practice these overloads are far easier to reason about on records, where ownership is not at issue.
 
 <a id="sec-increment-decrement-on-indexer-slots"></a>
 #### Increment/decrement on indexer slots
@@ -3868,7 +3868,7 @@ public method ProcessLargeFile(filename: string)
   var result := 0;
 
   do
-    using var fs := new FileStream(filename);
+    using var fs := new FileStream(filename, FileMode.Open);
     var data := fs.ReadAll();
     result := ProcessData(data);
   end;
@@ -5240,7 +5240,7 @@ What cannot be extended:
 - No fields, auto-properties, constructors, destructors, or `owned` fields.
 - No operator overloads.
 - No indexers.
-- No `static` members (v0.183): a `static` modifier inside an extension block is a compile error. An extension block adds receiver-directed members only; statics resolve against the extended type's own declarations ([§22.12](#sec-static-members)), and admitting extension statics would need its own resolution, merging, and ambiguity story for no recorded need. Write a module-level method or a static class instead.
+- No `static` members (v0.183): a `static` modifier inside an extension block is a compile error. An extension block adds receiver-directed members only; statics resolve against the extended type's own declarations ([§22.12](#sec-static-members)), and admitting extension statics would need its own resolution, merging, and ambiguity story for no recorded need. Write a static method on a static class instead.
 - No `virtual`, `override`, `abstract`, or `sealed` — extensions are statically dispatched.
 - Extension members must be declared `public` or `internal` (v0.160); `protected` and `private` are compile errors — an extension block has no declaring class and no inheritance, so [§13.1](#sec-levels)'s definitions for those levels do not apply. The member's effective visibility is the more restrictive of the block's reach and the member's own declaration (mirroring [§11.6](#sec-nested-types)'s nested-type rule).
 - Extension members see only the extended type's public API. From the same module, `internal` members are also visible.
@@ -5284,7 +5284,7 @@ When the compiler encounters `x.Foo(args)`:
 1. **Instance members win — by name (v0.183).** If `x`'s declared type (or any base type) *declares* any instance member named `Foo` — of any arity, applicability, or accessibility — instance resolution is committed and extension blocks are **never consulted** for that name on that receiver. If the committed instance lookup then fails (no applicable overload, [§22.5](#sec-optional-parameters-and-named-arguments)/[§22.6](#sec-overloading), or the member is inaccessible, [§13.1](#sec-levels)), the call is a compile error citing the instance member(s); it does not fall back to an extension (the diagnostic should note a same-named extension where one exists). Blocking by *name* rather than by applicability or accessibility keeps resolution predictable: whether a call reaches an instance member or an extension never depends on argument types or the caller's access level, so changing an overload's signature or a member's visibility cannot silently re-route a call across the instance/extension boundary.
 2. **Extension members.** If the receiver's type declares no instance member of that name, the compiler searches the current module and all imported modules for extension blocks on `x`'s type, base types, or implemented interfaces, considering only extension members visible at the call site ([§26.3](#sec-extension-blocks-restrictions)'s effective-visibility rule). When an extension block is declared on a generic type (e.g. `extension IEnumerable<T>`), the block-level type parameter is inferred from the receiver's type: if `x` has type `Array<int>` and `Array<int>` implements `IEnumerable<int>`, then `T` is inferred as `int`. The receiver-driven inference is the unification of [§14.5](#sec-type-argument-inference) applied to the extension head: the receiver's static type is unified against the declared head, exactly and structurally, binding the block-level parameters (v0.184 — §14.5 is the rule set this sentence has always referred to; it was previously unstated).
 3. **Most specific type wins.** Extensions on the most specific type are preferred per the ordering below.
-4. **Ambiguity.** If two equally-specific extensions match, the call is a compile error. The remedies are the mechanisms that exist: remove or narrow a conflicting import, or hoist the intended behavior into a module-level helper (a plain method taking the receiver as a parameter) and call that — no call-site syntax qualifies an extension's defining type, because extension blocks are nameless and extensions have no static-invocation form. A first-class extension-disambiguation spelling is deferred, not designed here (rationale [§18](Bezel_Design_Rationale.md#sec-things-deferred), v0.183).
+4. **Ambiguity.** If two equally-specific extensions match, the call is a compile error. The remedies are the mechanisms that exist: remove or narrow a conflicting import, or hoist the intended behavior into a helper static method (taking the receiver as a parameter) on a static class and call that — no call-site syntax qualifies an extension's defining type, because extension blocks are nameless and extensions have no static-invocation form. A first-class extension-disambiguation spelling is deferred, not designed here (rationale [§18](Bezel_Design_Rationale.md#sec-things-deferred), v0.183).
 
 Adding a real method to a type silently takes priority over an extension with the same name — by design.
 
@@ -5825,7 +5825,7 @@ The ownership state of an expression is determined by the expression form:
 | Function call producing an ordinary value type, `string`, or runtime-managed type | Not applicable ([§28.9](#sec-runtime-managed-types)) |
 | Function call producing a move-only value type (an owning inline array `[N owned]T?` or `[N owned]T`) | Owned. The result is a move-only value ([§15.3](#sec-move-only-value-types)); the caller takes ownership and must discharge by binding into a local (auto-disposed at scope end via the move-only-local rule), into an owning-inline-array slot, or into a class field of move-only type. |
 | `x as T` | Borrowed (source: same as `x`'s source if `x` is borrowed; `x` itself if `x` is owned). The cast does not move from `x`; `x` retains its ownership state. The result is nullable. See [§17.4](#sec-the-is-is-not-and-as-operators) for the rationale. |
-| `a ?? b` (null-coalescing, [§7.7](#sec-null-coalescing-and-=)) | The **meet** of the ownership states of `a` and `b` — the same two-branch merge as the control-flow join above. `owned ⊓ owned = ` **owned**: the result carries the disposal obligation — when `a` is non-null its value is consumed into the result, when `a` is null the result takes `b`'s owned value; exactly one of the two owned values is produced at runtime and is discharged once, so there is no leak and no double-free. (v0.180: an **owned arm** here is a fresh producer, a `move`, or another owned-producing expression. A **named owned binding** written as an arm is an *unmarked read* and therefore a **borrow** arm, per the local-variable-read row above — `a ?? b` over two named owned locals is a borrowed ⊓ borrowed merge and consumes neither binding. There is no arm-position transfer marker in this revision (recorded; liftable): to coalesce two named owned bindings into one owned result, equalize explicitly — `if a <> null then r := owned a; else r := owned b; end;` — which keeps the no-silent-consume rule of *Move semantics* uniform.) `borrowed ⊓ borrowed = ` **borrowed** (carrying the union of both arms' source-liveness constraints, exactly as the control-flow join above, v0.180). An **owned** arm together with a **borrowed** arm disagree and the expression is **rejected**, exactly as an `if`/`else` whose branches leave a variable owned on one path and borrowed on the other is rejected — equalize the arms first ([§28.3](#sec-local-variables-ownership-and-borrows) two-branch patterns). A `null`-literal arm absorbs to the other arm's state. The compound form `a ??= b` assigns into `a` and follows the same meet rule for the assigned-into location. |
+| `a ?? b` (null-coalescing, [§7.7](#sec-null-coalescing-and-=)) | The **meet** of the ownership states of `a` and `b` — the same two-branch merge as the control-flow join above. `owned ⊓ owned = ` **owned**: the result carries the disposal obligation — when `a` is non-null its value is consumed into the result, when `a` is null the result takes `b`'s owned value; exactly one of the two owned values is produced at runtime and is discharged once, so there is no leak and no double-free. (v0.180: an **owned arm** here is a fresh producer, a `move`, or another owned-producing expression. A **named owned binding** written as an arm is an *unmarked read* and therefore a **borrow** arm, per the local-variable-read row above — `a ?? b` over two named owned locals is a borrowed ⊓ borrowed merge and consumes neither binding. There is no arm-position transfer marker in this revision (recorded; liftable): to coalesce two named owned bindings into one owned result, equalize explicitly — `if a <> null then r := owned a; else r := owned b; end;` — which keeps the no-silent-consume rule of *Move semantics* uniform.) `borrowed ⊓ borrowed = ` **borrowed** (carrying the union of both arms' source-liveness constraints, exactly as the control-flow join above, v0.180). An **owned** arm together with a **borrowed** arm disagree and the expression is **rejected**, exactly as an `if`/`else` whose branches leave a variable owned on one path and borrowed on the other is rejected — equalize the arms first ([§28.3](#sec-local-variables-ownership-and-borrows) two-branch patterns). A `null`-literal arm absorbs to the other arm's state; a bottom-typed (`throw`) arm likewise imposes no ownership state and absorbs to the other arm's state, legitimizing the `x ?? throw …` shape ([§17.12](#sec-the-throw-expression)). The compound form `a ??= b` assigns into `a` and follows the same meet rule for the assigned-into location. |
 | `v1 if c else v2` ([§20](#sec-the-if-expression)); the result of an expression-position `case`/`when` ([§19.1](#sec-forms), [§19.2](#sec-arms)) | The **meet** of the arms' ownership states, identically to the `a ?? b` row above (v0.184, extending the rule v0.180 recorded for `??` to the sibling arm forms): owned ⊓ owned = **owned** — exactly one arm's value is produced at runtime and is discharged once, so there is no leak and no double-free; borrowed ⊓ borrowed = **borrowed**, carrying the union of the arms' source-liveness constraints; a mixed owned/borrowed arm set is **rejected** — equalize the arms. A **named owned binding** written as an arm is an unmarked read and therefore a **borrow** arm (there is no arm-position transfer marker — the same recorded, liftable bound as `??`); a `throw` arm is bottom-typed and imposes no ownership constraint ([§17.12](#sec-the-throw-expression)); a `null`-literal arm absorbs to the other arms' state. For `case`/`when` the meet ranges over every arm's result expression. |
 | Captured borrow inside a closure | Borrowed (source: same as the captured local's source). The closure value itself is runtime-managed; the captured borrow's lifetime is tracked separately. |
 | Captured owned local inside a closure | Borrowed (source: the local's enclosing scope). Capturing does not transfer ownership; the closure cannot outlive the local's scope. See [§28.9](#sec-runtime-managed-types). |
@@ -5846,7 +5846,7 @@ The compiler determines the borrow source as follows: for an instance method, th
 <a id="sec-move-semantics-for-owned-locals"></a>
 #### Move semantics for owned locals
 
-Reading an owned local `x` in a position that requires an owned value (assigning to an owned slot, returning under an `owned` return, passing as an `owned` argument) **transfers ownership out of `x`**. After the transfer, `x` is in the **moved-from** state: it may not be read again until reassigned, and it has no disposal obligation. Reading an owned local in a position that accepts a borrow leaves `x` unchanged. The transfer is spelled where it is not already announced by the target (v0.169; extended in v0.180): in the owned-argument case at the call site — `M(owned x)` ([§22.3](#sec-parameter-modifiers)) — and in **local binding and assignment positions** with the same marker — `var y := owned x;`, `y := owned x;`, `using var y := owned x;` ([§28.10](#sec-using-var) adoption). Stores into an **`owned` field or owning-collection slot** and `return` under an `owned` return type need no marker — the declared `owned` slot or return type is itself the announcement — as does assignment through a user-declared `set(owned)` property or indexer ([§23.3](#sec-block-form-properties), v0.184): the declared owned-taking setter is the announcement, so a named owned binding on the right-hand side is consumed without a call-site marker (`cache.Current := c;`), exactly as at the stdlib owning-collection indexer-set, whose setters are themselves declared `set(owned)` — and a fresh producer needs none anywhere (no live binding is invalidated). An **unmarked** read of a named owned binding in a local binding/assignment position is a **borrow** (the aliasing idiom `var b := a;` never silently consumes `a`). Writing the marker on a **borrow or fresh-producer right-hand side** is an error, as is a marked reassignment into a **borrowed-state** LHS (the state-match rule above) — mirroring the call-site marker's rules; a fresh declaration (`var y := owned x;`, `using var y := owned x;`) or a **polymorphic-null** LHS (`var best: Res? := null; … best := owned cur;` — the null-literal producers row) adopts owned state from the marked transfer, exactly as it would from a fresh producer.
+Reading an owned local `x` in a position that requires an owned value (assigning to an owned slot, returning under an `owned` return, passing as an `owned` argument, supplying the operand of `throw` ([§31.1](#sec-the-throw-operand))) **transfers ownership out of `x`**. After the transfer, `x` is in the **moved-from** state: it may not be read again until reassigned, and it has no disposal obligation. Reading an owned local in a position that accepts a borrow leaves `x` unchanged. The transfer is spelled where it is not already announced by the target (v0.169; extended in v0.180): in the owned-argument case at the call site — `M(owned x)` ([§22.3](#sec-parameter-modifiers)) — and in **local binding and assignment positions** with the same marker — `var y := owned x;`, `y := owned x;`, `using var y := owned x;` ([§28.10](#sec-using-var) adoption). Stores into an **`owned` field or owning-collection slot** and `return` under an `owned` return type need no marker — the declared `owned` slot or return type is itself the announcement — as does assignment through a user-declared `set(owned)` property or indexer ([§23.3](#sec-block-form-properties), v0.184): the declared owned-taking setter is the announcement, so a named owned binding on the right-hand side is consumed without a call-site marker (`cache.Current := c;`), exactly as at the stdlib owning-collection indexer-set, whose setters are themselves declared `set(owned)` — and a fresh producer needs none anywhere (no live binding is invalidated). An **unmarked** read of a named owned binding in a local binding/assignment position is a **borrow** (the aliasing idiom `var b := a;` never silently consumes `a`). Writing the marker on a **borrow or fresh-producer right-hand side** is an error, as is a marked reassignment into a **borrowed-state** LHS (the state-match rule above) — mirroring the call-site marker's rules; a fresh declaration (`var y := owned x;`, `using var y := owned x;`) or a **polymorphic-null** LHS (`var best: Res? := null; … best := owned cur;` — the null-literal producers row) adopts owned state from the marked transfer, exactly as it would from a fresh producer.
 
 The marked assignment form is what makes the loop-accumulator pattern expressible — keep the best, dispose the rest:
 
@@ -5922,6 +5922,7 @@ An owned local is disposed exactly once on every control-flow path. The program 
 - Transfer into another owned local or a `using var` under the explicit marker — `var y := owned x;`, `y := owned x;`, `using var y := owned x;` (v0.180): the target takes over the obligation and `x` is left moved-from. An **unmarked** binding `var y := x;` is a borrow of `x` and discharges nothing.
 - An explicit `.Dispose()` call (including the `x?.Dispose()` / `x!.Dispose()` spellings).
 - A discard statement `_ := x;` ([§17.13](#sec-the-discard-_), v0.184): an announced consume — the value is disposed at the end of the discard statement and `x` is left explicitly-disposed.
+- The operand of `throw` ([§31.1](#sec-the-throw-operand)): the exception machinery takes the obligation and `x` is left moved-from — no marker, the keyword is the announcement.
 
 **Auto-drop (affine).** When an owned local — or an `owned` parameter — reaches a *normal-exit* scope end without having reached one of the above, and is not in moved-from state, it is **disposed implicitly at that scope end** (for an `owned` parameter, at the end of the method) — the same implicit disposal that the *Exception-path discharge* below performs on the unwinding edge, now applied to the normal-exit edge as well. Bezel is therefore **affine**: every owned value is disposed exactly once on every path — explicitly where the program discharges it, implicitly at scope end otherwise — and the move analysis ([§28.8.1](#sec-the-move-expression)) leaves a transferred value in moved-from state so the scope-end disposal skips it; nothing is disposed twice. This makes a plain `var` owned local (and an undischarged `owned` parameter) behave, on a path that never moves it out, like a `using var`: the value is reclaimed when its scope ends. (Since v0.152 this covers `owned` parameters of ordinary methods; earlier revisions auto-dropped only locals on the normal edge, though the exception edge has always disposed owned parameters too.)
 
@@ -6488,7 +6489,7 @@ When the addition is necessary (the class genuinely now owns a resource), the st
 
 ```bezel
 public method ProcessFile(filename: string)
-  using var fs := new FileStream(filename);
+  using var fs := new FileStream(filename, FileMode.Open);
   using var buffer := new Array<byte>(4096);
   var data := fs.ReadAll();
   // fs and buffer disposed here in reverse order
@@ -6511,7 +6512,7 @@ To dispose before the enclosing method returns, nest in a `do ... end`:
 public method Process()
   var result := 0;
   do
-    using var fs := new FileStream("data.txt");
+    using var fs := new FileStream("data.txt", FileMode.Open);
     result := fs.ReadCount();
   end;     // fs disposed here
   Console.WriteLine($"count = {result}");
@@ -8056,7 +8057,7 @@ If the `try` has only a `finally` (no `catch`), the catch block is omitted entir
 
 ```bezel
 try
-  using var fs := new FileStream(path);
+  using var fs := new FileStream(path, FileMode.Open);
   ProcessFile(fs);
 finally
   Log("file processing finished");
@@ -9694,6 +9695,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - A synchronous observation of `this` in a constructor body (instance call, argument, store, type test) occurs only after every [§7.9](#sec-definite-assignment-for-non-nullable-fields)-strict field of the declaring class is definitely assigned; in the `base(...)`/`this(...)` argument position it is always rejected ([§22.7](#sec-observing-this-during-construction), v0.184).
 - A `virtual`/`override`/`abstract` member is not called on `this` from a constructor body unless the class is `sealed` and not `abstract`; `base.M()` is exempt ([§22.7](#sec-observing-this-during-construction), v0.184).
 - Reference-typed fields are null-initialized before construction begins; a checked-mode read of a non-nullable reference field still at the watermark raises `NullReferenceException` ([§22.7](#sec-observing-this-during-construction), v0.184).
+- A `bool`-returning method's `when true`/`when false` nullability postcondition is admitted only on an `out`/`out owned` parameter of nullable type; every path of the declaring body that returns the stated constant must leave the parameter provably non-null, and an override must repeat the clause exactly ([§22.4](#sec-out-nullability-postcondition), v0.183).
 
 <a id="sec-async"></a>
 ### C.6 Async
@@ -9723,6 +9725,8 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - `step` is not used in patterns; it is a range modifier only.
 - A record-destructuring pattern's positional-binding count matches the record's positional-field count.
 - Static exhaustiveness counts only **unguarded** arms; a `when`-guarded arm contributes nothing to the proof ([§19.6](#sec-exhaustiveness)).
+- A multi-type catch alternative in **binding** form requires the listed types' nearest common base to be more specific than `Object`; if it is `Object`, the binding form is a compile error (the non-binding form `Type1 | Type2` is unrestricted). The binding's static type is that nearest common base ([§31.2.1](#sec-arm-patterns), v0.182).
+- A generic type parameter used as a catch-arm type must carry a **class-type bound** (`where TEx: C` for a class `C`); an unconstrained, value-constrained, or `where TEx: class`-only parameter is a compile error, checked at the generic declaration ([§31.2.1](#sec-arm-patterns), v0.182).
 
 <a id="sec-appendix-c-serialization"></a>
 <a id="sec-appendix-c-serialization-synthesis"></a>
@@ -9750,7 +9754,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - `=` and `<>` are not overloaded on classes.
 - An operator overload is `public static` and at least one parameter is the declaring type ([§25.2](#sec-operator-overloading-restrictions), v0.160).
 - Operator parameters carry no parameter modifiers (`ref`/`out`/`owned`/`scoped` are rejected semantically); `owned` may appear only on an operator's return type ([§25.2](#sec-operator-overloading-restrictions), v0.184).
-- A record/enum overloading homogeneous `=`/`<>` also declares `Equals(T)` and `override GetHashCode` (the [§25.2](#sec-operator-overloading-restrictions) co-declaration rule, v0.158).
+- A record/enum overloading homogeneous `=`/`<>` also declares `Equals(T)` and `GetHashCode` — on a record, `override GetHashCode`; on an enum, a plain `GetHashCode(): int`, since enum members never carry `override` (the [§25.2](#sec-operator-overloading-restrictions) co-declaration rule, v0.158; enum spelling v0.183).
 - Comparison operators are overloaded as a complete group (`<`, `>`, `<=`, `>=` together; `=` and `<>` together).
 - The bitwise complement operator is `~`; the boolean negation operator is `not`. They are not interchangeable. `~` is user-overloadable; `not` is not.
 - `mod` has no compound-assignment form; `mod=` is not valid syntax.

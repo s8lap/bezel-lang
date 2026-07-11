@@ -1,6 +1,6 @@
 # Bezel Guide 2: Errors and Nullability
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.157.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.185.*
 
 If you know C#, Kotlin, or Swift, most of this chapter is familiar: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. Skim those parts. The three places where the ownership model changes how you write this code — and where a habit from those languages produces a *compile error* — are headed **How Bezel does it**. Read those.
 
@@ -42,6 +42,8 @@ if local <> null then
 end;
 ```
 
+One local *also* loses its narrowing: a local that is **mutably captured** — assigned, or passed by `ref`/`out`, inside any lambda in the method — is re-widened at the next call, function-value invocation, or `await` in the controlled block, because a closure could run and rewrite it in between (spec §7.4). Copy such a value into a plain, uncaptured local and test *that* — the same remedy as for a field.
+
 ---
 
 ## 2. Exceptions: the familiar shape
@@ -65,6 +67,8 @@ end;
 The built-in exception hierarchy is what you would expect — `ArgumentException` (with `ArgumentNullException` under it), `InvalidOperationException`, `OverflowException`, `IndexOutOfRangeException`, `FormatException`, and so on. These are available without `import`. Arm patterns match subclasses: a `catch` arm for `ArithmeticException` also catches `OverflowException` and `DivideByZeroException`. Order arms most-specific first.
 
 A handful of common exception types live in the standard library rather than the built-in set and need an explicit `import` — `IOException` and `FileNotFoundException` (with the file APIs), `KeyNotFoundException` (with `Dictionary<K, V>`), and others. They are otherwise ordinary exceptions, caught the same way.
+
+Two resource-exhaustion faults are deliberately unrecoverable — no `catch` will ever handle them, and both terminate the process. A **stack overflow** raises a `StackOverflowException`: the type exists in the hierarchy, but it **cannot be caught** — no `catch` arm ever matches it. An out-of-memory **allocation failure** is not an exception at all: there is no `OutOfMemoryException`, nothing unwinds, the process simply aborts. Neither is something a `catch` could meaningfully handle — the "handler" would itself need the stack or heap that just ran out — so Bezel does not pretend otherwise.
 
 Throwing:
 
@@ -121,11 +125,13 @@ end RecordError;
 
 The reasoning: an exception often carries no disposable resources, but the rule is uniform so the language never has to ask "does this exception own something?" at a `catch` boundary. Copy what you need; let the instance go.
 
+The same borrow discipline reaches *inside* an exception you throw: don't stash a borrow of a local in an exception's field. The unwind disposes that local before the handler runs — in checked mode the handler's access to it faults deterministically as `DisposedAccessException`. Give exception classes owned or copied state instead; that is exactly why the built-in cause-chaining constructor (`new Exception(msg, cause)`) *snapshots* the cause rather than pointing at it.
+
 ---
 
 ## 4. How Bezel does it: exceptions and cleanup — there is no leak, automatically
 
-In C# you reach for `try`/`finally` (or `using`) to avoid leaking on the exception path. In Bezel you usually write neither: an owned value live when an exception propagates is disposed automatically during unwinding (every owned local and `owned` parameter behaves as if wrapped in an implicit `try`/`finally`).
+In C# you reach for `try`/`finally` (or `using`) to avoid leaking on the exception path. In Bezel you usually write neither *for leak prevention*: an owned value live when an exception propagates is disposed automatically during unwinding (every owned local and `owned` parameter behaves as if wrapped in an implicit `try`/`finally`). `using var` stays the default — it declares *intent*, not exception-safety — and what you stop writing is the `try`/`finally` *cleanup plumbing*.
 
 ```bezel
 method Import(path: string)
@@ -146,7 +152,9 @@ finally
 end;
 ```
 
-Even a half-constructed object is safe: if a constructor throws after some `owned` fields are set, those fields are disposed before the exception propagates. You do not write code for this.
+Even a half-constructed object is safe: if a constructor throws after some `owned` fields are set, those fields are disposed before the exception propagates. The same holds for a half-built *expression*: if one argument throws while an earlier argument has already produced an owned temporary, that temporary is disposed during the unwind (v0.184) — an exception never leaks a half-built argument list. You do not write code for any of this.
+
+One diagnostic worth recognizing in this area: disposing a value and then using it. A *straight-line* dispose-then-use is a warning (and a deterministic fault in checked mode); a use after a *conditional* dispose — disposed on one branch, still live on another — is a compile error at the merge (the value is "maybe-disposed"). Both are the compiler catching a use-after-free before it can happen.
 
 ---
 
@@ -171,30 +179,30 @@ end;
 
 Or collapse it with the operators from §1: `directory.Find("alice")?.Name ?? "stranger"`.
 
-**The `Try` pattern** when the failure path and success path differ, and especially when the value is *owned*. A `bool` return plus an `out owned` parameter:
+**The `Try` pattern** when the failure path and success path differ, and especially when the value is *owned*. A `bool` return plus an `out owned` parameter, with a `when true` postcondition that lets the caller skip the `!`:
 
 ```bezel
 private owned _cache: OwningDictionary<string, Connection>;
 
-method TryGetCached(name: string, out owned conn: Connection?): bool
+method TryTakeCached(name: string, out owned conn: Connection? when true): bool
   if not _cache.ContainsKey(name) then
-    conn := null;                  // every out path must assign
+    conn := null;                  // every out path must assign (throw paths exempt)
     return false;
   end;
   conn := _cache.PopValue(name);   // takes ownership out of the cache
   return true;
-end TryGetCached;
+end TryTakeCached;
 ```
 
-The parameter is `out owned` because a successful call hands the caller ownership of the `Connection`. It is typed `Connection?` (nullable) because the false path must assign *something* and `default(Connection)` is illegal for a non-nullable reference type. The caller consumes with `out using var` and trusts the bool guard:
+The method is named `TryTakeCached`, not `TryGetCached`, on purpose: the stdlib gives the borrowing accessor and the ownership-transferring one distinct names — `Get`/`Peek` borrow; `Pop`/`Drain`/`Take` transfer — so the name alone tells you whether you now owe a disposal (spec §22.6). This one transfers: it hands the caller ownership through `out owned`. The parameter is typed `Connection?` (nullable) because the false path must assign *something* and `default(Connection)` is illegal for a non-nullable reference type. The `when true` clause states the contract in the signature — "a `true` return implies `conn` is non-null" — and the caller's flow analysis picks it up:
 
 ```bezel
-if pool.TryGetCached("primary", out using var c) then
-  UseConnection(c!);               // bool guarantee makes ! safe; c is owned here
-end;                               // c disposed at end of this block
+if pool.TryTakeCached("primary", out using var c) then
+  UseConnection(c);                // owned, and narrowed non-null by `when true`
+end;                               // c disposed at the end of the enclosing block
 ```
 
-`out using var c` binds the out value as an owned, scope-disposed local — so a successful `TryGetCached` that handed you ownership of a `Connection` cannot leak. (`out owned` in the signature and `out using var` at the call site must match: you cannot write `out using var` for a plain `out` parameter, nor plain `out var` for an `out owned` one — the compiler rejects the mismatch, because the ownership would have nowhere to go.) This is the ownership-aware version of C#'s `TryGet`: the contract is "on `true`, you now own it," and `out using var` discharges that obligation for you.
+`out using var c` binds the out value as an owned, scope-disposed local — so a successful call that handed you a `Connection` cannot leak. Its scope is the *enclosing* block, from the call onward (not just the `if`), so the connection is disposed when that block ends. Without the `when true` clause you would still write `UseConnection(c!)` — the bool guard alone does not narrow the nullable; only the postcondition does. (`out owned` in the signature and `out using var` at the call site must match: you cannot write `out using var` for a plain `out` parameter, nor plain `out var` for an `out owned` one — the compiler rejects the mismatch, because the ownership would have nowhere to go.) This is the ownership-aware version of C#'s `TryGet`: the contract is "on `true`, you now own it," and `out using var` discharges that obligation for you.
 
 ---
 
@@ -203,7 +211,7 @@ end;                               // c disposed at end of this block
 | Situation | Use |
 |---|---|
 | Value may legitimately be absent | nullable return `T?`, handle with `?.` / `??` / narrowing |
-| Absent *and* the value would be owned | `Try` pattern: `bool` + `out owned T?`, caller uses `out using var` |
+| Absent *and* the value would be owned | `Try` pattern: `bool` + `out owned T? when true`, caller uses `out using var` (and drops the `!`) |
 | Caller passed something invalid | `throw new ArgumentException(...)` |
 | Operation invalid in current state | `throw new InvalidOperationException(...)` |
 | Must run cleanup that is not a disposal | `try … finally` |

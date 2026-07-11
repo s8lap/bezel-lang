@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.184 — July 2026**
+**Companion to the Bezel Language Specification, v0.185 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -35,7 +35,7 @@ Throughout this document:
 - Implementations may add internal helper methods and private members. Anything documented here is part of the public contract.
 - Methods returning freshly-allocated class instances annotate the return type with `owned` to communicate the caller's disposal obligation (see [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows) and [§28.8](Bezel_Language_Spec.md#sec-ownership-transfer) of the language spec). Methods returning `string` or other runtime-managed types ([§28.9](Bezel_Language_Spec.md#sec-runtime-managed-types)) do not use `owned`, since those types are exempt from manual disposal.
 - Generic constraints are noted where relevant; absence of a constraint clause means "any T."
-- **The Try convention (v0.171, #1336).** Exactly two Try shapes are sanctioned. **(a) `bool` + nullable out** — `TryX(..., out item: T?): bool` (with `owned` on the out where the payload transfers) — for keyed/positional extraction: the bool distinguishes the outcome from a legitimately-null payload, and the out parameter is *nullable in every form* because §22.3 requires every out assigned on every return path (v0.184 wording; throw paths carry no obligation) and the false path has no value to assign (it assigns `null`; for value-typed instantiations the call site therefore reads a `T?`). **(b) nullable return** — `TryX(...): owned T?` — when null alone is the signal (e.g. `Mutex.TryAcquire`, the v0.77 ruling: simpler call sites). The pre-v0.171 non-nullable `out owned item: T` shape was unimplementable under §22.3 (the rationale's v0.89 entry states the rule; the v0.96 collection rewrite reintroduced the illegal shape without a decision) and is removed everywhere. **Every shape-(a) signature in this document carries the `when true` nullability postcondition** on its out parameter (language spec §22.4, v0.183) — `TryX(..., out item: T? when true): bool` — so in a region where the call is known `true`, the recipient is narrowed non-null and no `!` is needed. The clause is elided from the per-type listings below for brevity but is normative for all of them (`TryGetValue`, `TryPop`/`TryPeek`/`TryDequeue`, `TryPopFirst`/`TryPopLast`, `Channel<T>.TryReceive`, and the §11.8 `TryParse` companions).
+- **The Try convention (v0.171, #1336; shape (c) codified v0.184).** Exactly three Try shapes are sanctioned. **(a) `bool` + nullable out** — `TryX(..., out item: T?): bool` (with `owned` on the out where the payload transfers) — for keyed/positional extraction: the bool distinguishes the outcome from a legitimately-null payload, and, for a **generic or class-typed** payload, the out parameter is *nullable in every form*, because a class payload has no `default` to assign on the false path (spec §17.11) and a generic payload may be instantiated by a class; §22.3 requires every out assigned on every return path (v0.184 wording; throw paths carry no obligation), and the false path assigns `null`. **(b) nullable return** — `TryX(...): owned T?` — when null alone is the signal (e.g. `Mutex.TryAcquire`, the v0.77 ruling: simpler call sites). **(c) `bool` + non-nullable value-typed out** — `TryX(..., out result: T): bool` with `default(T)` assigned on the false path (spec §22.3) — for APIs whose payload type is a **concrete value type**: the §9 primitive `TryParse` family, `Convert.TryTo*` (§2.3), the `DateTime`/`DateOnly`/`TimeOnly`/`Guid` `TryParse` members (§2.5/§2.6), and the §4.14/§4.15 `TryRead*` accessors. The `when true` postcondition does not apply — the out is never null, so `default(T)` (a real value distinguished only by the `bool`) is what the false path assigns. The pre-v0.171 non-nullable `out owned item: T` shape was unimplementable under §22.3 (the rationale's v0.89 entry states the rule; the v0.96 collection rewrite reintroduced the illegal shape without a decision) and is removed everywhere. **Every shape-(a) signature in this document carries the `when true` nullability postcondition** on its out parameter (language spec §22.4, v0.183) — `TryX(..., out item: T? when true): bool` — so in a region where the call is known `true`, the recipient is narrowed non-null and no `!` is needed. The clause is elided from the per-type listings below for brevity but is normative for all of them (`TryGetValue`, `TryPop`/`TryPeek`/`TryDequeue`, `TryPopFirst`/`TryPopLast`, `Channel<T>.TryReceive`).
 - **Negative magnitudes fault (v0.183, #1396).** Every constructor parameter that states a magnitude — `capacity`, `size`, `length` — raises `ArgumentOutOfRangeException` when passed a negative value: `StringBuilder(capacity)`, `Array<T>(capacity)`, `Array<T>(size, fill)`, `OwningArray<T>(capacity)`, the `Dictionary`/`OwningDictionary`/`Set`/`OwningSet` capacity forms, and `OwningBuffer<T>(length)` with its `init` overloads. Zero is valid (an empty container or zero-length buffer). A negative magnitude is a programming error, not a request — the defined-fault stance of `DateTime`'s component validation (§2.5), chosen over a silent empty fallback. (`Channel<T>(capacity)` is stricter under its own v0.174 contract — `capacity >= 1`, `ArgumentException` otherwise — and is unchanged.)
 - Compiler-intrinsic types (primitive wrappers, `Range<T>`) may declare `const` members whose values are provided by the compiler rather than by a source-level initializer expression. In the declarations below, a `const` field shown without `:= value` (e.g. `public static const MaxValue: double;`) is such a compiler-provided constant. User-defined code may not omit `const` initializers (see language spec [§22.12](Bezel_Language_Spec.md#sec-static-members)).
 - **Elided interface-required members.** When a class declares it implements an interface, the members required by that interface are part of the class's public contract whether or not the declaration shows them explicitly. Some declarations show every interface-required member; others elide the redundant ones with a marker comment such as `// plus standard ICollection<T> operations` or `// ICollection<T> operations plus:`. Both forms are equivalent — the elided members are still part of the public contract, with signatures determined by the interface declaration plus the implementation's type substitution (per the [§11.2](Bezel_Language_Spec.md#sec-interface-declaration) exact-match rule). For interfaces whose substitution produces a member with the same name but a different parameter type than another method on the class — `Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>` is the leading example, where ICollection's `Add(item: T)` substitutes to `Add(item: DictionaryEntry<K, V>)` while Dictionary also offers `Add(key: K, value: V)` — both forms are public members of the class and both are reachable.
@@ -685,23 +685,27 @@ The clause has a closed effect vocabulary — `serialized "<name>"` (rename), `s
 A **class** can also be synthesized: it declares `: ISerializable`/`: IDeserializable` and the compiler reads its serialized shape from its field types — no header clause. A class whose fields are all `owned` (or value-typed) serializes as a tree:
 
 ```bezel
-public class Order(id: int): ISerializable, IDeserializable
-  public owned Customer: Customer;        // owned: an owning edge, serialized inline
-  public owned Lines: OwningArray<LineItem>;
+public class Order(id: int, owned customer: Customer,
+                   owned lines: OwningArray<LineItem>): ISerializable, IDeserializable
+  public owned Customer: Customer := customer;        // owned: an owning edge, serialized inline
+  public owned Lines: OwningArray<LineItem> := lines;
   public readonly property Id: int => id;
-  // compiler synthesizes Serialize / Deserialize; each owned child
-  // recurses through its own synthesized members
+  // compiler synthesizes Serialize / Deserialize; each owned child recurses
+  // through its own synthesized members. The primary constructor binds every
+  // serialized component (id, customer, lines), matched case-insensitively to
+  // the fields — spec §9.8 constructor selection.
 end Order;
 ```
 
 A class whose serialized graph *aliases* — the same object reachable by more than one serialized path — expresses the shared edge through its field types: a plain borrowing field is a back-edge into the owning tree, and a `Shared<T>` field is a co-owned identity participant. No header clause:
 
 ```bezel
-public class Invoice(number: string): ISerializable, IDeserializable
-  public owned Seller: Company;           // owned: in the owning spanning tree
-  public owned Buyer: Company;            // owned
-  public AccountManager: Employee;        // borrow: a back-edge, e.g. an
-                                          //   Employee owned by Seller
+public class Invoice(number: string, owned seller: Company, owned buyer: Company,
+                     accountManager: Employee): ISerializable, IDeserializable
+  public owned Seller: Company := seller;             // owned: in the owning spanning tree
+  public owned Buyer: Company := buyer;               // owned
+  public AccountManager: Employee := accountManager;  // borrow: a back-edge, e.g. an
+                                                      //   Employee owned by Seller
   public readonly property Number: string => number;
 end Invoice;
 ```
@@ -726,8 +730,9 @@ A class whose serialized graph may contain **cycles** uses `Shared<T>` for the s
 
 ```bezel
 public class Node(label: string): ISerializable, IDeserializable
-  public owned Next: Node?;          // owned forward edge (nullable to terminate)
-  public back: Weak<Node>?;          // back-edge: a weak reference that may close a cycle
+  public owned Next: Shared<Node>?;  // owned handle to the shared spine (identity
+                                     //   participant); nullable to terminate the chain
+  public owned Back: Weak<Node>?;    // back-edge: a weak observer that may close a cycle
   public readonly property Label: string => label;
 end Node;
 ```
@@ -924,7 +929,7 @@ public interface IParsable<T> where T: IParsable<T>
 end IParsable;
 ```
 
-Conformances: `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `float`, `double`, `decimal` conform to all three; `char` to `ISteppable<char>` and `IParsable<char>`. `string` conforms to none (concatenation is not addition; parsing a string to a string is meaningless). The existing per-type `Parse`/`TryParse` members are the conformance witnesses — no signatures changed (`TryParse` follows the v0.171 nullable-out shape).
+Conformances: `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `float`, `double`, `decimal` conform to all three; `char` to `ISteppable<char>` and `IParsable<char>`. `string` conforms to none (concatenation is not addition; parsing a string to a string is meaningless). `Parse` is witnessed by the existing per-type members unchanged. For `TryParse`, the per-type members keep their non-nullable value-typed outs (the shape-(c) convention, [§1](#sec-conventions)); the **compiler-provided conformance bridges the out-nullability difference**, so `T.TryParse(s, out v)` **through the constraint** has the declared `out value: T?` shape while a **direct** call keeps `out result: T` (language spec [§11.8](Bezel_Language_Spec.md#sec-static-interface-members)).
 
 ## 3. `System.Text` (auto-imported)
 
@@ -1294,6 +1299,8 @@ A collection literal `[1, 2, 3]` constructs an `Array<T>` when the target type i
 
 `Reverse`/`Sort` versus `Reversed`/`Sorted` follow a uniform naming convention: the imperative-verb form (`Reverse`, `Sort`) mutates the receiver in place and returns nothing; the past-participle form (`Reversed`, `Sorted`) leaves the receiver unchanged and returns a fresh `owned Array<T>` with the elements in the new order. The result's ownership mirrors `ToArray(): owned Array<T>` — it is a borrowing array (a fresh backing buffer holding the same element borrows), so the caller is responsible for disposing the array itself, not its elements. `Sorted` comes in two forms, mirroring `Sort`: the comparer-taking method on `Array<T>`, and the parameterless `Sorted()` in the `where T: IComparable<T>` extension that sorts by the natural order. `OwningArray<T>` deliberately has **no** value copy-forms — neither `Reversed`/`Sorted` nor `ToArray` — because its elements are uniquely owned: a copy would either double-own each element (two arrays claiming the same owned instances) or drain the source (leaving it empty). To reorder an `OwningArray<T>`, use the in-place `Reverse()`/`Sort()`; to move its elements into a new owning array, drain it (`Drain()`), which transfers ownership and empties the original.
 
+**Sorting contract.** (1) **Stability.** `Array<T>`/`OwningArray<T>` `Sort`/`Sorted` (both the comparer and comparerless forms) are **not guaranteed stable** — equal elements may be reordered. `OrderBy`, `OrderByDescending`, `ThenBy`, and `ThenByDescending` ([§5](#sec-system-collections-linq)) **are stable** — equal keys retain source order (`ThenBy`'s compositional semantics require it). (2) **Comparer contract.** A comparer (or `CompareTo`) must induce a **total order**; under an inconsistent comparer the result is an **unspecified permutation of the original elements** — memory-safe, no element lost or duplicated. (3) **A comparer that throws mid-sort** propagates the exception and leaves the collection holding **exactly the original elements in unspecified order** (none lost, none duplicated). For `OwningArray<T>` this is the Appendix C disposed-exactly-once guarantee: every owned slot remains present and singly-held on the throw edge. (4) **Re-entrancy.** Structurally mutating a collection from inside its own sort comparer raises `InvalidOperationException` (the loud-failure discipline of language spec [§29.12](Bezel_Language_Spec.md#sec-concurrent-modification), extended from enumerator invalidation to sort callbacks).
+
 `AsSpan()` and its overloads return an `ArraySpan<T>` (writable view) over a contiguous range of the array; `AsReadOnlySpan()` returns a `ReadOnlyArraySpan<T>`. These views are non-allocating record constructions and admit `Slice`, search, equality, and bulk-mutation methods. See [§4.15](#sec-arrayspant-readonlyarrayspant) for the full description; note that the mutation surface differs from `Span<T>`'s — it is uniform `Fill`/`CopyFrom`/`Reverse` for all T, without the class/value split that `Span<T>` requires, because `Array<T>` slots store borrows rather than owned values. `AsSpan` returns the writable form by default (matching `Array<T>`'s mutable nature); callers wanting read-only access either call `AsReadOnlySpan` directly or call `.AsReadOnly()` on the writable form. The four overload signatures of each form accept range parameters in the same style as v0.104's `string.AsSpan()`: no-arg (full used range, `0..<Count`), `(start)` (from offset to end), `(start, length)`, or `(r: Range<int>)`. Bounds-check semantics follow the standard Bezel convention: `IndexOutOfRangeException` if `start` or `length` is out of range against the array's `Count`.
 
 <a id="sec-ownedarrayt"></a>
@@ -1379,7 +1386,10 @@ public class OwningArray<T>: IOwningList<T> where T: class
   end constructor;
 
   public constructor(capacity: int)
-    _storage := new OwningBuffer<T>(if capacity > 0 then capacity else 1);
+    if capacity < 0 then
+      throw new ArgumentOutOfRangeException("capacity");
+    end;
+    _storage := new OwningBuffer<T>(capacity if capacity > 0 else 1);
   end constructor;
 
   public readonly property Count: int => _count;
@@ -1552,6 +1562,8 @@ The `move` operator does not extend to linked-list nodes in this version — rem
 ### 4.8 `Dictionary<K, V>`
 
 Borrowing hash-based map. `K` must be **equality-bearing** (spec §3.6/§8.3) — enforced at the instantiation site per §3.6 rule 2: a `Dictionary<K, V>` (or `OwningDictionary<K, V>`) whose `K` is a record that is neither auto-equality-bearing nor declares user equality is rejected with a diagnostic naming the property. (Added in v0.158, replacing the previous unenforceable prose requirement.)
+
+**Stability while stored.** While a value is stored as a **key** of a `Dictionary`/`OwningDictionary` or a `SortedDictionary`, or an **element** of a `Set`/`OwningSet` or `SortedSet`, the program must not mutate any state consulted by its `Equals`/`GetHashCode` / the collection's `IEqualityComparer` (hash forms) or `CompareTo` (ordered forms). Violation leaves the collection's observable behavior **unspecified** — entries may become unfindable by lookup/`Remove` while still visible to iteration and `Count` — but **memory-safe**: no slot is lost or double-held, and an owning collection still disposes every owned element exactly once at collection disposal/`Clear` (the Appendix C guarantee is unconditional). A class-typed key/element is held by **borrow** (the [§28.11](Bezel_Language_Spec.md#sec-borrowing-collections) borrowing column), so its owner may still mutate it while it is stored — this rule is the caller's obligation, not a compile-time guarantee.
 
 ```bezel
 public class Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>
@@ -1745,12 +1757,12 @@ public class OwningDictionary<K, V>: IDisposable where V: class
     var foundDup := false;
     while chain <> null do
       var rest := move chain.Next;
-      chain.Next := rebuilt;          // restore (with the rebuilt-chain head)
-      rebuilt := chain;                // ownership transfers in
       if not foundDup and _comparer.Equals(chain.Key, key) then
-        foundDup := true;
+        foundDup := true;              // test the key BEFORE the node is transferred
       end;
-      chain := rest;
+      chain.Next := rebuilt;           // restore (with the rebuilt-chain head)
+      rebuilt := owned chain;          // ownership transfers in (v0.180 marker)
+      chain := owned rest;             // (v0.180 marker)
     end;
     if foundDup then
       _buckets[idx] := rebuilt;       // restore bucket with unchanged chain
@@ -1780,9 +1792,9 @@ public class OwningDictionary<K, V>: IDisposable where V: class
                                           //   destructor's auto-dispose passes are no-ops
       else
         chain.Next := rebuilt;            // restore (with rebuilt-chain head)
-        rebuilt := chain;
+        rebuilt := owned chain;          // (v0.180 marker)
       end;
-      chain := rest;
+      chain := owned rest;               // (v0.180 marker)
     end;
     _buckets[idx] := rebuilt;             // restore bucket
     if taken = null then
@@ -1817,6 +1829,8 @@ The structural insight: **every bucket mutation is expressed as taking the chain
 ### 4.10 `Set<T>` and `OwningSet<T>`
 
 Borrowing and owning hash-based sets. `T` must be **equality-bearing** (spec §3.6/§8.3), enforced at the instantiation site per §3.6 rule 2 — same rule as `Dictionary<K, V>` keys (§4.8). (Added in v0.158.)
+
+**Iteration order.** Iteration over a `Set<T>` yields elements in **insertion order** — removing and re-adding an element places it at the end — the same guarantee as `Dictionary<K, V>` ([§4.8](#sec-dictionaryk-v)). `OwningSet<T>` makes **no** iteration-order guarantee, for [§4.9](#sec-owneddictionaryk-v)'s drain-and-rebuild reason; programs needing ordered iteration use `SortedSet<T>` or an `Array`.
 
 ```bezel
 public class Set<T>: ICollection<T>
@@ -1864,7 +1878,7 @@ end OwningSet;
 
 ```bezel
 if not pool.Contains(candidate) then
-  pool.Add(candidate);     // ownership transfers
+  pool.Add(owned candidate);   // ownership transfers (v0.169 call-site marker)
 end;
 // On the duplicate path, candidate retains ownership.
 ```
@@ -2713,6 +2727,8 @@ LINQ-style extension methods on `IEnumerable<T>`. All are lazy unless documented
 
 A bound lazy query is single-consumption with the normative consumption-point list of spec §29.11 (enumeration/terminal, composing a further operator, passing as `IEnumerable<T>`); inside a callee a plain `IEnumerable<T>` parameter is statically untracked and guarded at runtime.
 
+**Callback retention (the callback-taking lazy operators store their callbacks).** A predicate/selector/key/combiner passed to a **lazy** operator that takes one — `Where`, `Select`, `SelectMany`, `TakeWhile`, `SkipWhile`, `OrderBy`, `OrderByDescending`, `ThenBy`, `ThenByDescending`, `GroupBy`, `Zip` — is **retained by the returned query value until enumeration**, not just for the duration of the call. These are **stdlib-certified storing signatures** (language spec [§28.14](Bezel_Language_Spec.md#sec-scoped-callback-parameters), [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows)): capture admission for a capturing lambda is checked against the **query value** as the deferred-activation frame, and the retention ends at the query's [§29.11](Bezel_Language_Spec.md#sec-multiple-enumeration) single-consumption point. The callback-free lazy operators (`Take`, `Skip`, `Reverse`, `Distinct`, `OfType`, `Concat`, `Union`, `Intersect`, `Except`) hold no callback and carry no such obligation. The **eager** operators (`First(pred)`, `Last(pred)`, `Single(pred)`, `Count(pred)`, `Any(pred)`, `All(pred)`, `Sum`, `Min`, `Max`, `Average`, `Aggregate`, `ToArray`, `ToDictionary`, `ToSet`) are **call-bounded** as their unmarked signatures state — they invoke the callback during the call and retain nothing.
+
 ```bezel
 public extension IEnumerable<T>
   // Filtering
@@ -2895,7 +2911,14 @@ public class CancellationTokenSource
 end CancellationTokenSource;
 ```
 
-**Linked sources (v0.173, #810).** `CreateLinked`/`CreateLinkedAll` complete the composition story: *"cancel if the caller cancels OR my local timeout fires"* is `using var cts := CancellationTokenSource.CreateLinked(callerToken, CancellationTokenSource.WithCancelAfter(timeout).Token);` — no hand-wired `Register` plumbing. Semantics: the linked source enters the cancelled state when **any** parent token cancels or its own `Cancel()`/`CancelAfter()` fires, whichever happens first; a parent already cancelled at creation cancels the linked source before `CreateLinked` returns (the same race-free synchronous policy as `Register` on a cancelled token, below). Disposing the linked source **unregisters from its parents first** — no callback can fire into a disposed source. Lifetime follows the existing source-outlives-token rule ([§28.13](Bezel_Language_Spec.md#sec-shared-ownership) posture, spec §30.8): the parent *sources* must outlive the linked source, exactly as they must outlive any other holder of their tokens. Linking is **intra-domain** — cross-domain cancellation remains a message on a channel (rationale §12.6).
+**Linked sources (v0.173, #810).** `CreateLinked`/`CreateLinkedAll` complete the composition story: *"cancel if the caller cancels OR my local timeout fires"* binds **both** sources so the timeout source outlives the linked source:
+
+```bezel
+using var timeoutSrc := CancellationTokenSource.WithCancelAfter(timeout);
+using var cts := CancellationTokenSource.CreateLinked(callerToken, timeoutSrc.Token);
+```
+
+— no hand-wired `Register` plumbing. A `WithCancelAfter` result **must be bound**: left as an unbound temporary, its disposal at the end of the statement cancels the source (cancel-on-dispose, below) and severs the just-created link, so `cts` would be born cancelled. Reverse-order disposal (`cts` before `timeoutSrc`) satisfies the source-outlives-token rule. Semantics: the linked source enters the cancelled state when **any** parent token cancels or its own `Cancel()`/`CancelAfter()` fires, whichever happens first; a parent already cancelled at creation cancels the linked source before `CreateLinked` returns (the same race-free synchronous policy as `Register` on a cancelled token, below). Disposing the linked source **unregisters from its parents first** — no callback can fire into a disposed source. Lifetime follows the existing source-outlives-token rule ([§28.13](Bezel_Language_Spec.md#sec-shared-ownership) posture, spec §30.8): the parent *sources* must outlive the linked source, exactly as they must outlive any other holder of their tokens. Linking is **intra-domain** — cross-domain cancellation remains a message on a channel (rationale §12.6).
 
 **Timeout-as-a-scope needs no new type.** The RFC's `CancellationScope` sketch is already expressible: the source's destructor *cancels on dispose*, so `using var cts := CancellationTokenSource.WithCancelAfter(delay);` **is** a cancellation scope — auto-cancelled at scope exit or on timeout, whichever first. Recorded as the idiom rather than a wrapper type (see the v0.173 rationale entry).
 
@@ -2998,6 +3021,8 @@ end SemaphoreToken;
 
 `Acquire()` and `TryAcquire(timeout)` follow the same blocking discipline as `Mutex`'s (v0.179; spec §30.12): compile error inside `async` bodies, runtime `InvalidOperationException` where a domain continuation would park in them, legal outside domains.
 
+**Sendability (language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)).** `Semaphore` is **sendable** and internally synchronized — like `Mutex` ([§6.2](#sec-mutex-and-lock)) it may be reached by multiple domains simultaneously; that is its purpose (`Shared<Semaphore>` is the cross-domain sharing idiom, language spec §28.13). `SemaphoreToken` is **not** sendable: a held permit is bound to the acquiring domain and released there, like `Lock` ([§6.2](#sec-mutex-and-lock)) — moving a held permit between domains would decouple acquisition from release.
+
 `AcquireAsync` returns `OwningTask<SemaphoreToken>`; awaiters consume the task under Pattern B (language spec [§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal)) — the await must appear in an owned-consuming context. The natural call site:
 
 ```bezel
@@ -3031,7 +3056,7 @@ public class Atomic<T> where T: value
 end Atomic;
 ```
 
-`Value`'s read and write are atomic with respect to other `Value` reads, `Value` writes, and the `Exchange`/`CompareExchange` methods on the same instance. All §6.4 atomic operations are **sequentially consistent** (specified in v0.140): they participate in a single global order; no weaker ordering is offered. (Relaxed/acquire-release variants were considered and declined — see the rationale changelog; the surface stays minimal until profiles demand otherwise.) `Atomic<T>` and `AtomicInteger<T>` are internally synchronized and participate in the `Shared<T>` cross-domain rule of language-spec §28.13 (v0.140). The accessors are compiler-intrinsic; they are not auto-property storage.
+`Value`'s read and write are atomic with respect to other `Value` reads, `Value` writes, and the `Exchange`/`CompareExchange` methods on the same instance. All §6.4 atomic operations are **sequentially consistent** (specified in v0.140): they participate in a single global order; no weaker ordering is offered. (Relaxed/acquire-release variants were considered and declined — see the rationale changelog; the surface stays minimal until profiles demand otherwise.) `Atomic<T>` and `AtomicInteger<T>` are **sendable** (language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)) and internally synchronized, and participate in the `Shared<T>` cross-domain rule of language-spec §28.13 (v0.140). The accessors are compiler-intrinsic; they are not auto-property storage.
 
 `Exchange(value)` atomically replaces `Value` with `value` and returns the previous value. `CompareExchange(expected, replacement)` atomically replaces `Value` with `replacement` if and only if the current value equals `expected`, and returns the value observed (the original value, equal to `expected` on success, or the value that prevented the swap on failure).
 
@@ -3086,6 +3111,7 @@ public class EventSource<T>: IEvent<T>
 
   public method Add(scoped handler: (T) -> ());         // scoped (v0.180): Add stores — spec §28.14
   public method Remove(handler: (T) -> ());              // call-bounded: Remove only compares
+  destructor;    // severs the subscriber list before reclamation (spec §28.14 quiescence)
 end EventSource;
 
 public class AsyncEventSource<T>: IAsyncEvent<T>
@@ -3095,6 +3121,7 @@ public class AsyncEventSource<T>: IAsyncEvent<T>
 
   public method Add(scoped handler: (T) -> Task);        // scoped (v0.180): Add stores — spec §28.14
   public method Remove(handler: (T) -> Task);             // call-bounded: Remove only compares
+  destructor;    // severs the subscriber list before reclamation (spec §28.14 quiescence)
 end AsyncEventSource;
 ```
 
@@ -3131,6 +3158,8 @@ public class TaskCompletionSource<T>
   public method TrySetResult(result: T): bool;
   public method TrySetException(owned exception: Exception): bool;
   public method TrySetCancelled(): bool;
+  destructor;    // disposes the produced task, faulting it first if the source
+                 //   is disposed before completion (spec §30.11, v0.184)
 end TaskCompletionSource;
 
 // For class T. Result is transferred via `owned` parameter; produced task is Pattern B.
@@ -3145,6 +3174,8 @@ public class OwningTaskCompletionSource<T> where T: class
   public method TrySetResult(owned result: T): bool;
   public method TrySetException(owned exception: Exception): bool;
   public method TrySetCancelled(): bool;
+  destructor;    // disposes the produced task, faulting it first if the source
+                 //   is disposed before completion (spec §30.11, v0.184)
 end OwningTaskCompletionSource;
 
 // Non-generic form for void-completion tasks
@@ -3157,6 +3188,8 @@ public class TaskCompletionSource
   public method TrySetResult(): bool;
   public method TrySetException(owned exception: Exception): bool;
   public method TrySetCancelled(): bool;
+  destructor;    // disposes the produced task, faulting it first if the source
+                 //   is disposed before completion (spec §30.11, v0.184)
 end TaskCompletionSource;
 ```
 
@@ -3373,7 +3406,7 @@ There is no built-in cross-domain cancellation: `CancellationToken` is a borrow-
 <a id="sec-channel"></a>
 ### 6.9 `Channel<T>` and `ChannelSender<T>`
 
-Multiple-producer, single-consumer channel carrying sendable values between domains with ownership transfer at both ends (language spec [§30.15](Bezel_Language_Spec.md#sec-channels)). Both types are compiler-known and internally synchronized; together with `Mutex` ([§6.2](#sec-mutex-and-lock), v0.138) they are the only standard types two domains may reach simultaneously. T must be sendable; the instantiation is rejected otherwise (language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)). A **mutable static** `Channel<T>` field is rejected by language spec [§22.12](Bezel_Language_Spec.md#sec-static-members) rule 2 (v0.181), and a `static readonly Channel<T>` draws rule 4's warning: the channel object is the single-consumer *receiving* end and must stay confined to one consuming domain — when producers across many domains need a process-global send endpoint, publish a `ChannelSender<T>` static instead (rule 2's synchronized set).
+Multiple-producer, single-consumer channel carrying sendable values between domains with ownership transfer at both ends (language spec [§30.15](Bezel_Language_Spec.md#sec-channels)). Both types are compiler-known and internally synchronized; together with `Mutex`, `Semaphore`, and the atomics (`Atomic<T>`/`AtomicInteger<T>`) — stdlib [§6.2](#sec-mutex-and-lock)–[§6.4](#sec-atomict-and-atomicintegert) — they are the standard types two domains may reach simultaneously (the sendable, internally-synchronized set; language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)). T must be sendable; the instantiation is rejected otherwise (language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)). A **mutable static** `Channel<T>` field is rejected by language spec [§22.12](Bezel_Language_Spec.md#sec-static-members) rule 2 (v0.181), and a `static readonly Channel<T>` draws rule 4's warning: the channel object is the single-consumer *receiving* end and must stay confined to one consuming domain — when producers across many domains need a process-global send endpoint, publish a `ChannelSender<T>` static instead (rule 2's synchronized set).
 
 The signature surface dispatches on T's category, as with `OwningBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)). For class-typed (sendable) T:
 
@@ -3390,6 +3423,8 @@ public class Channel<T>: IDisposable                       // the receiving end;
 
   public method Receive(): OwningTask<T>;                   // await transfers ownership of one item
   public method TryReceive(out owned item: T?): bool;      // non-blocking; false when none available
+  destructor;    // closes the channel; disposes every undelivered class-typed
+                 //   item in reverse insertion order (language spec §30.15)
 end Channel;
 
 public class ChannelSender<T>: IDisposable                 // class T form
@@ -3401,6 +3436,7 @@ public class ChannelSender<T>: IDisposable                 // class T form
                                                            //   bounded channel (immediate when space
                                                            //   or unbounded); ChannelClosedException
                                                            //   if the channel closes while waiting
+  destructor;    // disposing the last sender closes the channel (language spec §30.15)
 end ChannelSender;
 ```
 
@@ -3480,19 +3516,24 @@ public abstract class Stream
   public abstract readonly property Length: long;
   public abstract property Position: long;
 
-  public async method ReadAsync(buffer: Array<byte>, offset: int, count: int,
-                                 token: CancellationToken := CancellationToken.None): Task<int>;
-  public async method WriteAsync(buffer: Array<byte>, offset: int, count: int,
-                                  token: CancellationToken := CancellationToken.None): Task;
+  public async virtual method ReadAsync(buffer: Array<byte>, offset: int, count: int,
+                                         token: CancellationToken := CancellationToken.None): Task<int>;
+  public async virtual method WriteAsync(buffer: Array<byte>, offset: int, count: int,
+                                          token: CancellationToken := CancellationToken.None): Task;
 
   // Convenience methods
   public method ReadAll(): owned Array<byte>;            // reads from current position to end
   public async method ReadAllAsync(token: CancellationToken := CancellationToken.None): OwningTask<Array<byte>>;
 end Stream;
-
+```
 
 **Windowed-form contract (v0.165, #1375):** in `Read`/`Write(buffer, offset, count)` the window `[offset, offset+count)` ranges over the buffer's **`Count`** (like every other bounds rule in this library); out-of-range raises `IndexOutOfRangeException`. `Read` writes into *existing* elements and never grows the array — the canonical read loop allocates its buffer with the sized constructor (`new Array<byte>(64 * 1024, 0)`, §4.4) and passes `count := buffer.Count`. The **synchronous** span overloads carry their range in the value and are the preferred forms for synchronous I/O; the asynchronous path uses the `Array<byte>` windowed form exclusively (the async span overloads were removed — see the changelog below, #1438).
 
+**Override points (v0.184).** `Read`/`Write(buffer, offset, count)`, `Flush`, `Seek`, `Length`, `Position`, and the `CanRead`/`CanWrite`/`CanSeek` properties are `abstract` — every concrete stream supplies them. `ReadAsync`/`WriteAsync` are **`virtual`** with a **base default that delegates to the synchronous `Read`/`Write`**; the default **blocks the calling domain for the I/O's duration** — legal only where blocking is legal, and a [§30.12](Bezel_Language_Spec.md#sec-thread-synchronization) pool-starvation hazard (a blocked continuation pins one pool worker) with **no compiler/runtime backstop for I/O**. A stream performing real I/O (`FileStream`, [§7.2](#sec-filestream)) **overrides** them with genuinely asynchronous implementations; a memory-backed stream whose synchronous ops never block correctly inherits the default. The span overloads `Read(Span<byte>)`/`Write(ReadOnlySpan<byte>)` and the `ReadAll`/`ReadAllAsync` conveniences are **fixed base implementations** over the windowed/async forms — not override points; a subclass that overrides the windowed/async forms gets the correct behavior through them.
+
+`Stream` is abstract and declares no `Dispose` behavior of its own; each concrete subclass defines its disposal (e.g. `FileStream` flushes and closes, [§7.2](#sec-filestream)). The `destructor;`-absence convention of [§1](#sec-conventions) does **not** imply that a `Stream` subclass's disposal is a no-op.
+
+```bezel
 public enum SeekOrigin: byte
   Begin, Current, End;
 end SeekOrigin;
@@ -3509,6 +3550,7 @@ public class FileStream: Stream
   public constructor(path: string, mode: FileMode, access: FileAccess);
   // Stream operations plus file-specific:
   public readonly property Path: string;
+  destructor;    // flushes buffered writes and closes the OS file handle
 end FileStream;
 
 public enum FileMode: byte
@@ -3519,6 +3561,8 @@ public enum FileAccess: byte
   Read, Write, ReadWrite;
 end FileAccess;
 ```
+
+**Disposal (flush-on-dispose).** Disposing a `FileStream` — at `using var` scope exit or an explicit `Dispose()` — flushes any buffered writes and releases the OS file handle. A `FileStream` opened for writing must be disposed (or explicitly `Flush()`ed) for buffered data to reach the file; the `using var` idiom guarantees this on every exit edge, including exceptions. `FileStream` overrides `ReadAsync`/`WriteAsync` ([§7.1](#sec-stream)) with genuinely asynchronous OS I/O — not the blocking base default.
 
 <a id="sec-file"></a>
 ### 7.3 `File`
