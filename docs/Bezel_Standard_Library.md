@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.186 — July 2026**
+**Companion to the Bezel Language Specification, v0.187 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -3186,11 +3186,29 @@ end AtomicInteger;
 `Increment`, `Decrement`, and `Add` perform the operation atomically and return the post-operation value. Overflow follows the standard integer-arithmetic rule ([§6.1](Bezel_Language_Spec.md#sec-integer-arithmetic) of the language spec): an operation whose mathematical result is not representable in `T` raises `OverflowException`.
 
 <a id="sec-events-ievent-eventsource"></a>
-### 6.5 Events: `IEvent`, `EventSource`
+### 6.5 Events: `IEvent`, `EventSource`, `ISharedEvent`, `SharedEventSource`
 
-The types underlying `event` declarations (language spec [§24](Bezel_Language_Spec.md#sec-events)). The generic parameter `T` is the event's **payload type** — the type of value passed to handlers when the event fires.
+An **event** is a named publication point on a class: the class controls when the event fires; external code subscribes but cannot fire the event or inspect the subscriber list. As of v0.187 events are not a member kind (the former `event` declaration is retired — language spec [§24](Bezel_Language_Spec.md#sec-events), rationale §13.6); an event is the following **pattern** over the types of this section, and this section is the normative home of event semantics. The generic parameter `T` is the event's **payload type** — the type of value passed to handlers when the event fires. The payload type may be any type. For a synchronous event the handler type is `(T) -> ()`; for an asynchronous event, `(T) -> Task`.
 
-For a synchronous event `event E: T`, the handler type is `(T) -> ()`. For an asynchronous event `async event E: T`, the handler type is `(T) -> Task`.
+**The event pattern.** One `owned readonly` field holding the source, and — for a public event — one expression-bodied property exposing the subscribe-only interface face:
+
+```bezel
+public record ClickedEvent(Sender: Button, X: int, Y: int);
+
+public class Button
+  private owned readonly _clicked: EventSource<ClickedEvent> := new();
+  public property Clicked: IEvent<ClickedEvent> => _clicked;
+
+  private method OnPress(x: int, y: int)
+    _clicked.Raise(new ClickedEvent(this, x, y));
+  end OnPress;
+end Button;
+
+// Subscription sites:
+using var sub := button.Clicked.Subscribe((e) => UpdateStatus(e.X, e.Y));
+```
+
+Every piece is an existing mechanism: the field is an ordinary `owned` field (initialized during construction, disposed with the object — spec §28.5), `readonly` per spec §22.8, initialized with the spec §17.7 `new()` shorthand; the property is a spec §23.2 expression-bodied read-only property whose body is a receiver-sourced borrow (spec §28.6). A **`private` event needs no property** — the field alone is the event (one line). A **`protected` event** declares the field `protected`; derived classes raise through it. **Async events** use `AsyncEventSource<T>` / `IAsyncEvent<T>` identically. **No-payload events** use `EventSource<()>`; both `EventSource<()>` and `SharedEventSource<()>` provide a convenience `Raise()` overload that takes no arguments, equivalent to `Raise(())`. `readonly` on the field is the pattern's safety feature, not decoration: an accidental reassignment would otherwise silently dispose the source and sever every live subscription (spec §28.7 drop-on-overwrite); the producer-side `_clicked += h` spelling remains available on the `readonly` field because the subscription forms neither read nor assign the operand (spec §17.2). An observable **interface contract** is a get-only interface property of the interface face — `readonly property PropertyChanged: IEvent<PropertyChangedEvent>;` — which the pattern's property satisfies directly.
 
 ```bezel
 public interface IEvent<out T>
@@ -3202,7 +3220,7 @@ public interface IAsyncEvent<out T>
 end IAsyncEvent;
 
 public class EventSource<T>: IEvent<T>
-  // No public constructor; obtained via event declaration.
+  public constructor();
   public method Subscribe(scoped handler: (T) -> ()): owned Subscription;
   public method Raise(payload: T);
 
@@ -3212,7 +3230,7 @@ public class EventSource<T>: IEvent<T>
 end EventSource;
 
 public class AsyncEventSource<T>: IAsyncEvent<T>
-  // No public constructor; obtained via event declaration.
+  public constructor();
   public method Subscribe(scoped handler: (T) -> Task): owned Subscription;
   public async method RaiseAsync(payload: T): Task;
 
@@ -3222,19 +3240,103 @@ public class AsyncEventSource<T>: IAsyncEvent<T>
 end AsyncEventSource;
 ```
 
-Outside the declaring class, the static type of an event member is `IEvent<T>` (sync) or `IAsyncEvent<T>` (async); `Raise`, `RaiseAsync`, `Add`, and `Remove` are not on the interface, leaving `Subscribe` as the only entry point. Inside the declaring class, the static type is `EventSource<T>` (or `AsyncEventSource<T>`), where `Add`, `Remove`, `Raise`, and `Subscribe` are all available. The compiler-recognized syntactic forms `event += handler` and `event -= handler` rewrite to `event.Add(handler)` and `event.Remove(handler)` respectively. See language spec [§24.3](Bezel_Language_Spec.md#sec-the-type-of-an-event-member) / [§24.4](Bezel_Language_Spec.md#sec-subscribing).
+The constructors are public as of v0.187 (previously "no public constructor; obtained via event declaration"): the pattern constructs its own sources, and standalone construction threatens nothing — a third party constructing a *fresh* `EventSource<T>` gains capability over its own event only.
 
-`Add` is `scoped` (v0.180): it stores its handler in the subscriber list, whose lifetime is the event source's — which the compiler-generated `owned` backing field ties to the publisher. The caller-side capture admission is spec [§28.14](Bezel_Language_Spec.md#sec-scoped-callback-parameters)'s (bounding object: the publisher instance, form 4 via the `+=` desugaring); the publisher's disposal severs the subscriber list before reclamation (quiescence, normative). `Remove` and `Subscribe`-returned `Subscription` disposal only compare/deregister and stay unmarked/call-bounded respectively; `Subscribe` was already `scoped` (v0.175).
+**Payload records.** Event payloads should be records; there is no required base class. The sender, if any, is a field of the payload record, typed precisely — the pattern example's `ClickedEvent` above follows the same convention:
 
-The `Add`, `Remove`, and `Raise` methods are declared `public` rather than `internal` because the visibility restriction is enforced by the **type fence**: an `EventSource<T>` reference is obtainable only inside the declaring class (the field type from outside is the interface, not the class). User code that smuggles an `EventSource<T>` reference out of the declaring class — for example, by exposing it through a public method or by reflection — gains the ability to call `Raise` directly, but doing so is a deliberate breach of the event-pattern contract that the language does not attempt to defend against. The conventional design is to never expose the `EventSource<T>` itself; the public surface is always the interface.
+```bezel
+record ValueChangedEvent(Sender: Slider, OldValue: decimal, NewValue: decimal);
+record DataReceivedEvent(Sender: Connection, Payload: Array<byte>, Timestamp: DateTime);
+record ProcessResult(Success: bool, Message: string);
+```
 
-`IEvent<T>` and `IAsyncEvent<T>` are covariant in T (`out T`): `IEvent<Dog>` is a subtype of `IEvent<Animal>`, the same direction as `IEnumerable<out T>`. An event source that fires `Dog` payloads can be exposed as an `IEvent<Animal>` to consumers; subscribers register `(Animal) -> ()` handlers, which accept any `Animal` (including `Dog`), and each fired `Dog` is passed in as an `Animal`. The variance check is sound because T appears once in `Subscribe(scoped handler: (T) -> ())`, in the parameter position of `(T) -> ()` (contravariant) which is itself a method parameter (contravariant) — composing to a covariant position overall.
+A record provides named fields, destructuring in handlers, and a single point of documentation for the event's data contract. (A record can hold the *payload* but not the *source*: an `EventSource<T>` field is an `owned` field, which records cannot carry — spec §9.7.)
 
-`EventSource<T>` and `AsyncEventSource<T>` (the producer-side classes) remain invariant because their `Raise(payload: T)` method places T in input position, which is incompatible with `out`. Since `EventSource<T>` is visible only inside the declaring class, the user-facing variance comes from `IEvent<out T>` exclusively.
+**Subscribing.** `Subscribe` — on the interface, so available everywhere — registers a handler and returns an owned `Subscription` ([§2.11](#sec-subscription)); disposing the subscription removes the handler. The producer-side forms `source += handler` / `source -= handler` (a fixed, language-defined desugaring to `Add`/`Remove` — normative statement in spec §17.2) are available wherever the source itself is in scope, i.e. to the declaring class; `-=` removes the first handler matching by function-value equality (spec §27.7.1) and is a no-op when no handler matches. `Add` is a `scoped` (storing) position: the caller-side capture admission is spec §28.14's (for the pattern's `_clicked += OnClicked`, bounding object `this` via form 4 — the receiver chain roots at `this` through an `owned` field). Storing a `Subscription` in an **`owned` field of `this`** resolves spec §28.14's bounding object to `this` (form 3), so a handler capturing `this` (or state reached through it) is admitted *regardless of how the publisher was reached* — a parameter, a field, an interface face. Disposing `this` disposes the field, severing the registration before `this` is reclaimed (spec §28.12); the recorded residual is that the subscription must not be moved out past `this` (spec §28.14, the registration-lifetime residual). This is the standard observer pattern:
 
-For no-payload events (declared without a type, e.g. `public static event ApplicationExiting;`), the payload is `()`. `EventSource<()>` provides a convenience `Raise()` overload that takes no arguments, equivalent to `Raise(())`.
+```bezel
+public class TickObserver
+  private owned _sub: Subscription;
+  private _count: int := 0;
 
-`Subscription` (the return type of `Subscribe`) is declared in [§2.11](#sec-subscription) and lives in the auto-imported `System` module. v0.76 moved it from `System.Threading` so that all register-and-unregister APIs returning a `Subscription` work without requiring an explicit threading-module import.
+  public constructor(ticks: IEvent<TickEvent>)
+    _sub := ticks.Subscribe((e) => do OnTick(e); end);   // captures `this` — admitted:
+  end constructor;                                        //   bounding object is `this` (§28.14 form 3)
+
+  private method OnTick(e: TickEvent)
+    _count := _count + 1;
+  end OnTick;
+end TickObserver;
+```
+
+Captured constructor parameters other than `this` are not admitted — a constructor parameter is a borrow of a caller local and does not provably outlive the constructed object. A raise cannot reach the handler before the constructor completes unless the constructor itself — directly or transitively — raises the subscribed event: instance sources are domain-serial (below) and no other continuation runs during construction. A constructor that does so observes `this` partially initialized — the construction-time-observation residual of spec §22.7 (v0.184), with the runtime bound recorded there. For handlers that must not capture `this`, `using var sub := …` remains the scope-bound alternative (spec §28.14 form 2).
+
+**Raising.** `Raise` and `RaiseAsync` invoke handlers in subscription order, over a **snapshot of the subscriber list taken when the raise begins** (v0.163): a handler that subscribes or unsubscribes during the raise affects the *next* raise, never the in-flight pass — snapshot rather than fault, because self-unsubscribing one-shot listeners are a legitimate idiom (spec §29.12's loud-mutation discipline is the contrasting response to mutation mid-traversal; the correction of the former spec §24.5 "same posture" comparison is recorded in rationale §13.6). With zero subscribers, both methods are no-ops — no null check, no `?.`, no `Invoke` indirection. Handlers execute **on the raising domain's thread** (v0.180 — normative): for an instance source this is invisible (all access is domain-serial); for a shared source (below) a handler subscribed from one domain runs on whichever domain raises — which is why shared-source handlers must be capture-free. The synchronous `Raise` returns `()` and runs each handler to completion before invoking the next. `RaiseAsync` returns a `Task` that completes when every handler's task completes; **each handler's task is awaited before the next is invoked.**
+
+**Handler exceptions — first error wins (rationale §13.5).** If a synchronous handler throws, subsequent handlers are not invoked and the exception propagates out of `Raise` to the raiser. If an asynchronous handler's task faults, subsequent handlers are not invoked and the exception propagates from the awaited `RaiseAsync`. If an asynchronous handler's task is **cancelled**, the behavior is the same as a fault: subsequent handlers are not invoked and `OperationCanceledException` propagates from the awaited `RaiseAsync`. To run all handlers regardless of failures and aggregate exceptions, the raiser must implement that policy explicitly — `Raise`/`RaiseAsync` do not aggregate. Handlers that must run independently catch their own exceptions (fragment context: `_dataReceived` is the connection's own source field, so the async lambda's bare `ProcessPayloadAsync`/`Log` calls capture `this` and are admitted by spec §28.14's subscription admission):
+
+```bezel
+_dataReceived += async (e) => do
+  try
+    await ProcessPayloadAsync(e.Payload);
+  catch
+    var ex: Exception => Log($"Handler failed: {ex.Message}")
+  end;
+end;
+```
+
+**Thread safety, per type.** An `EventSource<T>`/`AsyncEventSource<T>` subscriber list is **not synchronized**, and within a single execution domain (spec §30.13) it does not need to be: continuations never run concurrently, so subscribe, unsubscribe, and raise — from sync or async code — are serialized by construction (v0.163 reasoning, recorded). When handlers are async, the subscriber list may still change between a raise's suspension points; that is interleaving, not a data race. External synchronization (`Mutex`, [§6.2](#sec-mutex-and-lock)) is required only where event operations are reachable from foreign threads through the FFI (spec §32). A `SharedEventSource<T>` (below) is the internally-synchronized exception. Quiescence is normative for every source type of this section: the source's destructor severs the subscriber list before reclamation (spec §28.14), so a publisher's disposal is a deterministic unsubscribe-all.
+
+**The type fence.** `Add`, `Remove`, and `Raise` are `public` rather than `internal` because the producer-side restriction is carried by **types**: the producer surface of a given event is fenced by the **field's** visibility. An `EventSource<T>` reference for someone else's event is reachable only if their class exposes it — or if a holder of the interface face downcasts it (`face as EventSource<T>`), which is the recorded, not-defended-against breach: a type-driven fence is exactly as strong as the type system's static view, and downcast is that view's built-in escape. Code that smuggles a source out of its class — through a public member or through the FFI — gains `Raise`, as a deliberate breach of the pattern's contract that the language does not attempt to defend against. The conventional design is to never expose the `EventSource<T>` itself; the public surface is always the interface face. Third-party construction of a *fresh* source (the public constructor) grants no capability over anyone else's events.
+
+**Variance.** `IEvent<T>` and `IAsyncEvent<T>` are covariant in T (`out T`): `IEvent<Dog>` is a subtype of `IEvent<Animal>`, the same direction as `IEnumerable<out T>` — sound because T appears once, in the parameter position of `(T) -> ()` (contravariant), itself a method parameter (contravariant), composing to covariant overall (spec §12.9). The source classes are invariant — `Raise(payload: T)` places T in input position. The conventional public surface is the interface, so user-facing variance is expected through `IEvent<out T>`/`IAsyncEvent<out T>` (and `ISharedEvent<out T>`); an exposed source is simply invariant, as its signature dictates. Covariant exposure is directly declarable by the pattern: an `EventSource<Dog>` field behind a `property Sightings: IEvent<Animal>` face.
+
+**Shared events (cross-domain publication points).** Static state is process-global, and a publication point reachable from every domain cannot be an unsynchronized `EventSource<T>` (spec §22.12). The shared pair carries the guarantees in its declared positions:
+
+```bezel
+public interface ISharedEvent<out T>
+  method Subscribe(handler: (T) -> ()): owned Subscription;
+      // capture-free admission: the handler must be a non-capturing lambda or a
+      // static method reference — a stdlib-stated position in spec §28.14's
+      // capture-free register (the same register Domain.Spawn's entries live in),
+      // NOT a `scoped` storage-bounded position.
+end ISharedEvent;
+
+public sealed class SharedEventSource<T>: ISharedEvent<T>
+  public constructor();
+  public method Subscribe(handler: (T) -> ()): owned Subscription;   // capture-free (as above)
+  public method Raise(payload: T);       // synchronized snapshot-raise; handlers run on the raising domain
+  public method Add(handler: (T) -> ());                             // capture-free (as above)
+  public method Remove(handler: (T) -> ());                          // call-bounded: compares only
+  destructor;                            // synchronized quiescence: severs the subscriber list under the
+                                         // same lock discipline as subscribe/raise
+end SharedEventSource;
+```
+
+- **Synchronization.** The subscriber list is internally synchronized: subscribe, raise, and `Subscription.Dispose` may arrive from any domain. A raise takes the v0.163 snapshot; handlers execute on the raising domain; first-error-wins applies unchanged. The destructor severs the list under the same lock as subscribe/raise — a concurrent subscribe either lands before the severance and is severed, or observes the disposed source; program-exit disposal of the recommended `static owned readonly` field runs per spec §22.13 on the shutdown path with no other Bezel code running, which makes exit-time severance race-free.
+- **Capture-freedom at every subscribe position.** Every subscribe position of the pair (`Subscribe` on the interface and the class, `Add`, and the `+=` desugaring, spec §17.2) admits only **capture-free** handlers — a non-capturing lambda or a static method reference — as a stdlib-stated entry in spec §28.14's capture-free register (`Domain.Spawn`'s admission), keyed on the **resolved callee**: the check applies wherever a call resolves to a subscribe position declared on the pair, a constrained generic receiver included. Two companion rules make the admission alias-proof: `SharedEventSource<T>` deliberately does **not** implement `IEvent<T>` (an upcast would launder the requirement through `IEvent<T>.Subscribe`'s capture-admitting `scoped` signature), and forming a method reference over a capture-free-register position is a compile error (spec §28.14, v0.187 — the formed plain function type would erase the admission). The requirement is therefore enforced on every route through which a subscription can be written. A payload never needs to be sendable: under capture-freedom plus raising-domain execution, each payload is constructed and consumed within one domain.
+- **The severed `IEvent<T>` composition, and its bridge.** A shared source does not compose with `IEvent<T>`-consuming APIs (the `TickObserver` shape above). The bridge for that use case is a domain-local relay: subscribe a capture-free forwarder that routes payloads through a process-global `ChannelSender<T>` static (spec §22.12 rule 2 form (i)); the consuming domain owns the `Channel<T>`, receives, and re-raises on a local instance `EventSource<T>`, whose `IEvent<T>` face composes with anything. Payloads crossing the bridge must be sendable (spec §30.14) — inherent to any cross-domain delivery.
+- **User implementations of `ISharedEvent<T>`** are admissible but gain no retention right: a user-authored `Subscribe` body is verified under spec §28.14's ordinary call-bounded regime, so it can neither store its handler parameter nor forward it into a register position. **User classes cannot be cross-domain publication points in v1** (recorded; the lift path is §28.14's deferred unbounded tier, #1427). `SharedEventSource<T>` is `sealed`, so no derived class inherits the trusted position.
+- **Statics.** `SharedEventSource<T>` is in spec §22.12 rule 2's form-(i) synchronized set: the recommended shape `private static owned readonly _exiting: SharedEventSource<()> := new();` is admitted warning-free, with program-exit disposal (spec §22.13). The recommended public face is a static expression-bodied property of the interface face, as in the idiom below — a bare read of a `static` `owned` field returned as a borrow of process-lived static storage (spec §28.3/§28.6, v0.187). A *mutable* static of the type is admissible under rule 2's store semantics; note that overwrite-never-disposes means a displaced source leaks with its subscriber list intact until process exit — prefer `readonly`. The type is **not sendable** (spec §30.14): static reachability, not transfer, is its distribution mechanism — and it is deliberately not in spec §28.13's `Shared`-payload set (`Shared<SharedEventSource<T>>` would add a second distribution mechanism).
+- **The shared async twin is deferred.** `ISharedAsyncEvent<T>`/`SharedAsyncEventSource<T>` (a synchronized `RaiseAsync` awaiting each handler's task on the raising domain) ships when demand appears; until then a cross-domain async publication point is not spellable, and the channel bridge above is the alternative.
+
+The static idiom, complete:
+
+```bezel
+public static class App
+  private static owned readonly _exiting: SharedEventSource<()> := new();
+  public static property Exiting: ISharedEvent<()> => _exiting;
+
+  public static method NotifyExiting()
+    _exiting.Raise();
+  end NotifyExiting;
+end App;
+
+// consumer, any domain — handler must be capture-free (static method ref / non-capturing lambda):
+using var sub := App.Exiting.Subscribe(OnExit);
+```
+
+All six event types live in `System.Threading` and are always available without import (language spec [§2.3](Bezel_Language_Spec.md#sec-always-available-names), v0.187 — the `CancellationToken` precedent). `Subscription` (the return type of `Subscribe`) is declared in [§2.11](#sec-subscription) and lives in the auto-imported `System` module. v0.76 moved it from `System.Threading` so that all register-and-unregister APIs returning a `Subscription` work without requiring an explicit threading-module import.
 
 <a id="sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet"></a>
 ### 6.6 `TaskCompletionSource<T>` and `OwningTaskCompletionSource<T>`

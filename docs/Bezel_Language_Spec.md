@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.186 — July 2026**
+**Version 0.187 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -36,7 +36,7 @@ If this is your first encounter with Bezel, the rationale's opening section is a
 21. [Statements](#21-statements)
 22. [Methods and Constructors](#22-methods-and-constructors)
 23. [Properties and Indexers](#23-properties-and-indexers)
-24. [Events](#24-events)
+24. [Events (retired member kind)](#24-events-retired-member-kind)
 25. [Operator Overloading](#25-operator-overloading)
 26. [Extension Blocks](#26-extension-blocks)
 27. [Lambdas and Function Types](#27-lambdas-and-function-types)
@@ -140,9 +140,9 @@ import System.Collections.Generic;
 
 The following names are visible in every source file without import.
 
-**Language primitives.** `bool`, `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `float`, `double`, `decimal`, `char`, `string`. The unit type `()`. `Object`, `Array<T>`, `OwningArray<T>`. Inline arrays `[N]T` (with size N as part of the type). `Type`. `IDisposable`, `IAsyncDisposable`. `IEnumerable<out T>`, `IEnumerator<out T>`, `IAsyncEnumerable<out T>`, `IAsyncEnumerator<out T>`. `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, `IOwningAsyncEnumerable<T>`, `IOwningAsyncEnumerator<T>`. `IReadOnlyCollection<out T>`, `IReadOnlyList<out T>`, `ICollection<T>`, `IList<T>`, `IOwningCollection<T>`, `IOwningList<T>`. `Task`, `Task<T>`, `OwningTask<T>`. `Subscription`. `CancellationToken`. `IEvent<out T>`, `IAsyncEvent<out T>`. The exception types listed in [§31.4](#sec-standard-exception-types).
+**Language primitives.** `bool`, `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `float`, `double`, `decimal`, `char`, `string`. The unit type `()`. `Object`, `Array<T>`, `OwningArray<T>`. Inline arrays `[N]T` (with size N as part of the type). `Type`. `IDisposable`, `IAsyncDisposable`. `IEnumerable<out T>`, `IEnumerator<out T>`, `IAsyncEnumerable<out T>`, `IAsyncEnumerator<out T>`. `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, `IOwningAsyncEnumerable<T>`, `IOwningAsyncEnumerator<T>`. `IReadOnlyCollection<out T>`, `IReadOnlyList<out T>`, `ICollection<T>`, `IList<T>`, `IOwningCollection<T>`, `IOwningList<T>`. `Task`, `Task<T>`, `OwningTask<T>`. `Subscription`. `CancellationToken`. `IEvent<out T>`, `IAsyncEvent<out T>`, `EventSource<T>`, `AsyncEventSource<T>`, `ISharedEvent<out T>`, `SharedEventSource<T>`. The exception types listed in [§31.4](#sec-standard-exception-types).
 
-`Subscription` is declared in `System` (standard library [§2.11](Bezel_Standard_Library.md#sec-subscription)) and is auto-imported. It is the return type of event `.Subscribe()` methods and `CancellationToken.Register()` — operations that pervade idiomatic Bezel code. `CancellationToken` is also auto-imported (despite living in `System.Threading`) because it appears in the `await for ... with` desugaring ([§30.7](#sec-asynchronous-programming-async-iterators)), in default parameter values on standard async methods, and in `IAsyncEnumerable<T>.GetAsyncEnumerator` — making it a de-facto language-level type. `IEvent<T>` and `IAsyncEvent<T>` are auto-imported because they are the public types of every event member viewed from outside the declaring class ([§24.3](#sec-the-type-of-an-event-member)); requiring an explicit `import System.Threading` to subscribe to any event would defeat the design. Importing `System.Threading` is not required to use `Subscription`, `CancellationToken`, `IEvent<T>`, or `IAsyncEvent<T>`; it is required for `CancellationTokenSource`, `Mutex`, `EventSource<T>`, `AsyncEventSource<T>`, and the other threading types.
+`Subscription` is declared in `System` (standard library [§2.11](Bezel_Standard_Library.md#sec-subscription)) and is auto-imported. It is the return type of event `.Subscribe()` methods and `CancellationToken.Register()` — operations that pervade idiomatic Bezel code. `CancellationToken` is also auto-imported (despite living in `System.Threading`) because it appears in the `await for ... with` desugaring ([§30.7](#sec-asynchronous-programming-async-iterators)), in default parameter values on standard async methods, and in `IAsyncEnumerable<T>.GetAsyncEnumerator` — making it a de-facto language-level type. The six event types of stdlib [§6.5](Bezel_Standard_Library.md#sec-events-ievent-eventsource) are auto-imported (v0.187): `IEvent<T>`/`IAsyncEvent<T>`/`ISharedEvent<T>` because they are the public property types of the standard event pattern — requiring an import to subscribe to any event would defeat the design — and the source types `EventSource<T>`/`AsyncEventSource<T>`/`SharedEventSource<T>` because they appear in the declaration of every event in the program (the same reasoning that auto-imports `CancellationToken` despite its `System.Threading` home). Importing `System.Threading` is not required to use `Subscription`, `CancellationToken`, or any of the six event types; it is required for `CancellationTokenSource`, `Mutex`, and the other threading types.
 
 The iteration-interface family — `IEnumerable<T>`, `IEnumerator<T>`, `IAsyncEnumerable<T>`, `IAsyncEnumerator<T>`, `IReadOnlyCollection<T>`, `IReadOnlyList<T>`, `ICollection<T>`, `IList<T>`, plus the owning variants `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, `IOwningAsyncEnumerable<T>`, `IOwningAsyncEnumerator<T>`, `IOwningCollection<T>`, `IOwningList<T>` — is auto-imported because these interfaces participate in core language constructs: `IEnumerable<T>` and the async variant in the `for` and `await for` desugarings ([§29.2](#sec-desugaring-of-for)); the read-only and mutating interfaces in standard-library types' inheritance clauses (`Array<T>: IList<T>`, `OwningArray<T>: IOwningList<T>`, etc.) and in pattern-frequent variable type ascriptions. The stdlib documents their full declarations in [§4](Bezel_Standard_Library.md#sec-system-collections-generic); the language treats them as primitives for visibility purposes, in the same way it treats `Array<T>` and `Object` (also documented in stdlib but always visible).
 
@@ -684,9 +684,9 @@ current value is null, with the typing and ownership rules of
 the getter once; `e` is evaluated — and the setter invoked — only when the
 assignment actually occurs.
 
-**Events.** `+=`/`-=` whose left operand's static type is `EventSource<T>` or
-`AsyncEventSource<T>` are the fixed subscription desugaring of
-[§24.3](#sec-the-type-of-an-event-member), selected by that operand type
+**Events.** `+=`/`-=` whose left operand's static type is `EventSource<T>`,
+`AsyncEventSource<T>`, or `SharedEventSource<T>` are the fixed subscription
+desugaring of [§17.2](#sec-notes-on-operators), selected by that operand type
 before this section applies; they are not compound assignments
 ([§25.1](#sec-overloadable-operators)).
 
@@ -1517,7 +1517,7 @@ interface IBankAccount
   method Withdraw(amount: decimal);
   property Balance: decimal;
   readonly property AccountNumber: string;
-  event BalanceChanged: BalanceChangedEvent;
+  readonly property BalanceChanged: IEvent<BalanceChangedEvent>;
 end IBankAccount;
 ```
 
@@ -1567,7 +1567,7 @@ rule with no compensating capability. (This governs the **top-level**
 parameter modifier; `scoped` *inside* a function-typed parameter's type was
 always caught by the exact-type-equality clause above.)
 
-Interfaces may declare events. An interface event member has type `IEvent<T>` (synchronous) or `IAsyncEvent<T>` (asynchronous, declared with `async event`). The implementing class provides the matching event declaration; the compiler-generated `EventSource<T>` or `AsyncEventSource<T>` backing satisfies the interface's `IEvent<T>` / `IAsyncEvent<T>` contract because `EventSource<T>` implements `IEvent<T>` (and `AsyncEventSource<T>` implements `IAsyncEvent<T>`). Outside the implementing class, the event is accessed through the interface, which exposes only `Subscribe`. See [§24.7](#sec-events-on-interfaces).
+An observable contract on an interface is an ordinary get-only property of type `IEvent<T>` (or `IAsyncEvent<T>`) — the interface face of the stdlib [§6.5](Bezel_Standard_Library.md#sec-events-ievent-eventsource) event pattern, as `BalanceChanged` above (v0.187; interface `event` members are retired with the member kind, [§24](#sec-events)). The implementing class satisfies it with the pattern's borrowing property; consumers reach only `Subscribe`.
 
 An interface may extend other interfaces:
 
@@ -1582,11 +1582,11 @@ Multiple-interface inheritance is permitted. Diamond resolution: a single implem
 <a id="sec-member-body"></a>
 ### 11.3 Member body
 
-A class body may contain fields, methods, properties, indexers, events, constructors, a destructor, operator overloads, nested types, and class-level constants.
+A class body may contain fields, methods, properties, indexers, constructors, a destructor, operator overloads, nested types, and class-level constants.
 
 Every class member must declare its visibility explicitly ([§13](#sec-visibility)). Interface members do not declare visibility (they are always public).
 
-A type may not declare two members that are not distinguishable from each other. Two members **clash** when they have the same name and the type system cannot tell them apart: two fields, properties, events, or nested types with the same name; or two methods, constructors, or operator overloads with the same name that are not distinguishable as overloads ([§22.6](#sec-overloading)) — that is, that do not differ in number of parameters, parameter types, or the `ref`/`out` modifiers in a participating position (`owned` — ordinary or on `out` — and `scoped` never distinguish overloads, [§22.6](#sec-overloading), v0.181). A non-overloadable member — a field, property, event, or nested type — additionally clashes with **any** other member of the type that shares its name, regardless of kind: within a type a given name belongs either to exactly one non-overloadable member or to a single overload family of methods, constructors, or operators. A clash is a compile error at the second declaration, reported at the type, and names the conflicting members. Legal overloads — members of the same name that *are* distinguishable per [§22.6](#sec-overloading) — are unaffected; this rule rejects only the duplicates that overloading does not admit. The same rule applies to interface members within an interface declaration.
+A type may not declare two members that are not distinguishable from each other. Two members **clash** when they have the same name and the type system cannot tell them apart: two fields, properties, or nested types with the same name; or two methods, constructors, or operator overloads with the same name that are not distinguishable as overloads ([§22.6](#sec-overloading)) — that is, that do not differ in number of parameters, parameter types, or the `ref`/`out` modifiers in a participating position (`owned` — ordinary or on `out` — and `scoped` never distinguish overloads, [§22.6](#sec-overloading), v0.181). A non-overloadable member — a field, property, or nested type — additionally clashes with **any** other member of the type that shares its name, regardless of kind: within a type a given name belongs either to exactly one non-overloadable member or to a single overload family of methods, constructors, or operators. A clash is a compile error at the second declaration, reported at the type, and names the conflicting members. Legal overloads — members of the same name that *are* distinguishable per [§22.6](#sec-overloading) — are unaffected; this rule rejects only the duplicates that overloading does not admit. The same rule applies to interface members within an interface declaration.
 
 <a id="sec-block-endings"></a>
 ### 11.4 Block endings
@@ -1606,7 +1606,7 @@ visibility static async (abstract | virtual | override | sealed override) owned 
 
 `owned` ([§28.5](#sec-owned-fields)) appears between the virtual-modifier slot and `readonly`. It applies only to fields; methods, properties, and other members do not carry `owned`. The combination `static owned readonly` is the canonical form for a static field that owns a long-lived resource ([§22.13](#sec-static-initialization-order)).
 
-For events, only `visibility`, `static`, and `async` are applicable. The compiler rejects out-of-order modifiers.
+The compiler rejects out-of-order modifiers.
 
 <a id="sec-nested-types"></a>
 ### 11.6 Nested types
@@ -1855,7 +1855,7 @@ end IComparer;
 
 `out` requires T to appear only in output positions (return types, read-only property types, `out` parameters). `in` requires T to appear only in input positions. The compiler enforces position constraints.
 
-Position is composed across nested type constructors. A type parameter inside another generic type inherits position from that wrapper's variance: T inside `IEnumerator<T>` (where `IEnumerator` is `out T'`) has the same position the wrapper itself sits in. Function types are themselves variant (covariant in return, contravariant in parameter, see below), and the same composition rule applies. The practical consequence — relevant for event interfaces — is that T appearing inside the *parameter* of a function type that is itself the *parameter* of a method ends up in covariant position, because contravariant-of-contravariant is covariant. A concrete worked example: in `IEvent<out T>`, the method `Subscribe(scoped handler: (T) -> ())` places T inside `(T) -> ()` (contravariant in T) which is itself a parameter of `Subscribe` (an input, contravariant), giving T a covariant position overall — `out T` is sound.
+Position is composed across nested type constructors. A type parameter inside another generic type inherits position from that wrapper's variance: T inside `IEnumerator<T>` (where `IEnumerator` is `out T'`) has the same position the wrapper itself sits in. Function types are themselves variant (covariant in return, contravariant in parameter, see below), and the same composition rule applies. The practical consequence — relevant for event interfaces — is that T appearing inside the *parameter* of a function type that is itself the *parameter* of a method ends up in covariant position, because contravariant-of-contravariant is covariant. A concrete worked example: in `IEvent<out T>` (stdlib [§6.5](Bezel_Standard_Library.md#sec-events-ievent-eventsource)), the method `Subscribe(scoped handler: (T) -> ())` places T inside `(T) -> ()` (contravariant in T) which is itself a parameter of `Subscribe` (an input, contravariant), giving T a covariant position overall — `out T` is sound.
 
 Type parameters without `out` or `in` are invariant. Classes, records, and concrete generic types are always invariant — and the variance markers are **interface-only syntax**: `in`/`out` on a generic parameter of a class, record, method, or type alias ([§27.8](#sec-type-aliases)) is a **compile error** (v0.181 makes the rejection explicit; the shared `GenericParam` grammar admits the marker everywhere and outside interface declarations it is rejected semantically, Appendix A.4). A marker the language cannot honor must not parse as decoration — `class Box<out T>` silently accepted-and-ignored would promise an assignability the type does not have. Additionally, an interface declaring **static members** may not mark its parameters variant ([§11.8](#sec-static-interface-members), v0.181).
 
@@ -1978,7 +1978,7 @@ The auto-property shorthand `public property Name: string private set;` is equiv
 ### 13.7 Visibility and inheritance
 
 - An override must declare the same visibility as the base member.
-- **Every type appearing in a member's signature must be at least as visible as the member.** The rule covers: field types, parameter types, return types, property types, indexer parameter and result types, event payload types, and types named in `where` clauses on a public/protected member. The rule applies at every visibility level — a `public` member's signature types must be `public` (or more permissive); an `internal` member's signature types must be `internal` (or more); a `protected` member's must be at least `protected`; a `private` member is unconstrained (since `private` is the most restrictive level).
+- **Every type appearing in a member's signature must be at least as visible as the member.** The rule covers: field types, parameter types, return types, property types, indexer parameter and result types, and types named in `where` clauses on a public/protected member. The rule applies at every visibility level — a `public` member's signature types must be `public` (or more permissive); an `internal` member's signature types must be `internal` (or more); a `protected` member's must be at least `protected`; a `private` member is unconstrained (since `private` is the most restrictive level).
 - A class's base class and implemented interfaces must be at least as visible as the class.
 
 The signature-type-visibility rule applies to a member's *declared* signature. Generic-method type parameters whose substitution at the call site could narrow visibility are not constrained — the caller's substitution is the caller's choice, not the declarer's.
@@ -2875,6 +2875,7 @@ Operators are evaluated according to the following table, from highest to lowest
 - `?.`, `?(...)`, and `!` (postfix) are primary-level. They bind as tightly as `.` and `[ ]`.
 - `case … end` and `when … end` do not appear in the table (v0.182 — through v0.181 `case` was listed at level 15 nominally): they are self-delimited and parse as **primary atoms** (grammar A.7 `PrimaryAtom`), composable in any operand position without parentheses; the level-15 listing misstated the real grammar. `throw expr` genuinely belongs at level 15: its operand is a full `Expression`, so it extends maximally to the right — note that the conditional's *true* branch parses at a higher level and derives no bare `throw` ([§20](#sec-the-if-expression)).
 - Assignments and compound assignments are statements, not expressions; they produce no value.
+- **Event-subscription forms `+=`/`-=` (v0.187; formerly §24.3/§24.4).** When the static type of the left operand of `+=` or `-=` is `EventSource<T>`, `AsyncEventSource<T>`, or `SharedEventSource<T>` (stdlib [§6.5](Bezel_Standard_Library.md#sec-events-ievent-eventsource)), the statement is a fixed, language-defined desugaring: `lhs += h` rewrites to `lhs.Add(h)` and `lhs -= h` to `lhs.Remove(h)`, selected by that operand type before the compound-assignment rules of [§6.6](#sec-compound-assignments) apply. Grammatically the form is an `AssignmentStmt` (A.6) reinterpreted by the LHS's static type; the forms are not compound assignments, not user-overloadable ([§25.1](#sec-overloadable-operators)), and `lhs += h` **does not read `lhs` and does not assign to it**. The desugaring is recognized **before** `readonly`-assignability checking, so the forms are available on a `readonly` field — the recommended declaration of stdlib §6.5's event pattern (`private owned readonly _clicked: EventSource<T> := new();` … `_clicked += OnClicked;`). `Add` is a `scoped` (storing) position: [§28.14](#sec-scoped-callback-parameters)'s storage-bounded admission applies to the desugared call (for the pattern's spelling the receiver chain roots at `this` through an `owned` field — form 4); on `SharedEventSource<T>` the handler position admits only **capture-free** handlers ([§28.14](#sec-scoped-callback-parameters)'s stdlib-stated capture-free register). `Remove` is call-bounded — it only compares its argument, by function-value equality ([§27.7.1](#sec-equality-of-function-values)); when no handler matches, `-=` is a no-op.
 - `++` and `--` are statement-only ([§17.6](#sec-the-increment-and-decrement-operators)) and do not appear in the precedence table. They are not expression operators; they cannot be combined with other operators.
 - `mod` has no compound-assignment form; `mod=` is not valid syntax. The rare uses where it would apply (`x := x mod c`) are written explicitly by design — `mod` is uncommon in compound forms.
 - Range operators `..` and `..<` bind looser than arithmetic and shift, but tighter than the bitwise, relational, equality, logical, and conditional operators. Worked examples:
@@ -4369,7 +4370,7 @@ end Utils;
 
 A static constructor body may use `try`/`catch`. An exception caught inside the body does not transition the type to the failed state — the constructor completes normally and static initialization is considered successful. The failed state is entered only when an exception escapes the static initializer entirely. If the static initializer (the static field initializers, the static constructor body, or both) throws an *uncaught* exception, the type is left in a permanently failed state:
 
-- Every subsequent access to a static member of the type — field read, field write, method call, property read or write, indexer, event subscription — raises `TypeInitializationException` whose `InnerException` is the original exception (for the [§22.13](#sec-static-initialization-order) cycle backstop, the cached instance is the runtime-synthesized one and `InnerException` is `null`).
+- Every subsequent access to a static member of the type — field read, field write, method call, property read or write, indexer — raises `TypeInitializationException` whose `InnerException` is the original exception (for the [§22.13](#sec-static-initialization-order) cycle backstop, the cached instance is the runtime-synthesized one and `InnerException` is `null`).
 - The state is not recoverable: re-running static initialization is not attempted.
 - Static fields whose initializers had not yet run remain at their default values, but those defaults are not observable: every access raises. For non-nullable reference fields, where no default value exists ([§7.9](#sec-definite-assignment-for-non-nullable-fields)), this rule is satisfied vacuously — every access to the type raises before any field read could occur, so the absence of a value is never observed. The compiler's definite-assignment analysis is not violated, because the failed-state machinery intercepts every access before any read of the field.
 - Static fields whose initializers completed successfully before the failing initializer have their values; if any such field is `owned`, its value will be disposed at program exit per [§22.13](#sec-static-initialization-order). The runtime makes no guarantee about ordering of disposal across types when one of the types is in a failed state.
@@ -4424,11 +4425,12 @@ guarantee true while `this` is under construction:
 3. **Closures observe at invocation, not at capture.** Capturing `this` in a
    lambda or method reference is not a synchronous observation and is not gated
    by rule 1 — whether the capture is legal is [§28.14](#sec-scoped-callback-parameters)'s
-   question, unchanged (form 3's owned-field subscription in [§24.4](#sec-subscribing)
-   stays the standard observer pattern). An admitted `this`-capturing closure
+   question, unchanged (form 3's owned-field subscription — stdlib
+   [§6.5](Bezel_Standard_Library.md#sec-events-ievent-eventsource) — stays the
+   standard observer pattern). An admitted `this`-capturing closure
    that is nevertheless *invoked before construction completes* — possible only
    if the constructor itself, directly or transitively, causes the invocation
-   ([§24.6](#sec-thread-safety)'s domain-serial argument) — is a construction-time
+   (instance event sources are domain-serial, stdlib §6.5) — is a construction-time
    observation under the residual below.
 
 **The recorded residual.** These checks reject every unsafe observation they
@@ -4601,12 +4603,12 @@ The semantics of object initialization (mutation through setters) does not apply
 **Statics and domains (v0.163; specified here — compiler/runtime enforcement tracked at #1363, #1391–#1393).** Static state is **process-global** — one instance across all domains — which makes unrestricted static mutability a side door through [§30.14](#sec-sendable-types)'s no-shared-mutable-state discipline. The rules:
 
 1. **Lazy static initialization is runtime-synchronized**: a type's static initializer runs exactly once process-wide; a domain touching a type mid-initialization by another domain blocks until initialization completes (or observes the failed state, [§22.7](#sec-constructors)). Exit disposal order ([§22.13](#sec-static-initialization-order)) is therefore well-defined: the runtime records the single global initialization order.
-2. A **mutable** (non-`readonly`, non-`const`) static field or auto-property is admitted in exactly **two forms** (v0.181, reconciling this rule with [§22.13](#sec-static-initialization-order)'s pattern (b)); any other mutable static is a **compile error** naming this rule — unsynchronized cross-domain mutation is exactly the race §30.14 exists to exclude. **(i) Internally-synchronized handle:** the field's type is compiler-known internally-synchronized *and safe to reach from every domain* — `Mutex`, `Semaphore`, `Atomic<T>`, `AtomicInteger<T>`, `ChannelSender<T>` (stdlib §6). `Channel<T>` is **excluded** (v0.181): the channel object is the *receiving* end ([§30.15](#sec-channels)), single-consumer by ownership, and a process-global receiving end would readmit the multi-consumer receive that stdlib §6.9 explicitly defers — keep the `Channel<T>` domain-confined and publish a `ChannelSender<T>` static instead. **(ii) Lazy task cache:** a static whose declared type is `Task?` or `Task<T>?` — the admission is keyed to the declared type alone, so the check stays decidable at the declaration; the intended shape is [§22.13](#sec-static-initialization-order) pattern (b)'s `null`-initialized once-set cache of an asynchronous computation (Pattern A multi-await, [§30.5](#sec-result-lifetime-and-task-disposal)). `OwningTask<T>?` is *not* admitted here: it is single-await ([§30.5](#sec-result-lifetime-and-task-disposal)), useless as a shared cache, and a displaced owned task would strand its result. Three store semantics apply to every admitted mutable static (v0.181). **Atomicity:** stores are single pointer-word writes the runtime performs atomically (no torn reference is ever observed), but a check-then-store sequence is **not** atomic across domains: racing first uses of a task cache may each start the work and store, last store winning — every stored task remains independently awaitable, so the race duplicates work without unsoundness; when exactly-once matters, use eager startup assignment ([§22.13](#sec-static-initialization-order) pattern (a)) or a `Mutex`. **Ownership:** assigning a fresh owned value into an admitted mutable static discharges the producer — [§22.13](#sec-static-initialization-order)'s ownership-discharge exemption for non-`owned` statics extends to these fields; the referent becomes process-lived. **Overwrite:** overwriting an admitted mutable static never disposes the displaced referent — deliberately *not* [§28.7](#sec-reassigning-owned-fields)'s drop-on-overwrite, since a racing first use may still hold and await the displaced task; the displaced referent remains alive until process exit, an accepted bounded cost of the same kind as the [§22.13](#sec-static-initialization-order) exemption (displacement can occur only during first-use races). *(Compiler status: the current check under-enforces this rule — mutable statics of primitive/`string`/record and compiler-known stdlib class types are still admitted — tracked at #1393, pending the owner ruling recorded there.)*
+2. A **mutable** (non-`readonly`, non-`const`) static field or auto-property is admitted in exactly **two forms** (v0.181, reconciling this rule with [§22.13](#sec-static-initialization-order)'s pattern (b)); any other mutable static is a **compile error** naming this rule — unsynchronized cross-domain mutation is exactly the race §30.14 exists to exclude. **(i) Internally-synchronized handle:** the field's type is compiler-known internally-synchronized *and safe to reach from every domain* — `Mutex`, `Semaphore`, `Atomic<T>`, `AtomicInteger<T>`, `ChannelSender<T>` (stdlib §6), and — v0.187 — `SharedEventSource<T>` (stdlib §6.5): the set's one non-sendable member, safe to reach from every domain by static reachability rather than [§30.14](#sec-sendable-types) transfer. `Channel<T>` is **excluded** (v0.181): the channel object is the *receiving* end ([§30.15](#sec-channels)), single-consumer by ownership, and a process-global receiving end would readmit the multi-consumer receive that stdlib §6.9 explicitly defers — keep the `Channel<T>` domain-confined and publish a `ChannelSender<T>` static instead. **(ii) Lazy task cache:** a static whose declared type is `Task?` or `Task<T>?` — the admission is keyed to the declared type alone, so the check stays decidable at the declaration; the intended shape is [§22.13](#sec-static-initialization-order) pattern (b)'s `null`-initialized once-set cache of an asynchronous computation (Pattern A multi-await, [§30.5](#sec-result-lifetime-and-task-disposal)). `OwningTask<T>?` is *not* admitted here: it is single-await ([§30.5](#sec-result-lifetime-and-task-disposal)), useless as a shared cache, and a displaced owned task would strand its result. Three store semantics apply to every admitted mutable static (v0.181). **Atomicity:** stores are single pointer-word writes the runtime performs atomically (no torn reference is ever observed), but a check-then-store sequence is **not** atomic across domains: racing first uses of a task cache may each start the work and store, last store winning — every stored task remains independently awaitable, so the race duplicates work without unsoundness; when exactly-once matters, use eager startup assignment ([§22.13](#sec-static-initialization-order) pattern (a)) or a `Mutex`. **Ownership:** assigning a fresh owned value into an admitted mutable static discharges the producer — [§22.13](#sec-static-initialization-order)'s ownership-discharge exemption for non-`owned` statics extends to these fields; the referent becomes process-lived. **Overwrite:** overwriting an admitted mutable static never disposes the displaced referent — deliberately *not* [§28.7](#sec-reassigning-owned-fields)'s drop-on-overwrite, since a racing first use may still hold and await the displaced task; the displaced referent remains alive until process exit, an accepted bounded cost of the same kind as the [§22.13](#sec-static-initialization-order) exemption (displacement can occur only during first-use races). *(Compiler status: the current check under-enforces this rule — mutable statics of primitive/`string`/record and compiler-known stdlib class types are still admitted — tracked at #1393, pending the owner ruling recorded there.)*
 3. `static readonly` and `const` of **immutable content** — value types of sendable-value category, `string`, enums — are unrestricted (shared-immutable).
 4. A `static readonly` (including `owned`) field of **class type** is admitted with a **declaration-site warning** unless the class is in rule 2's form-(i) synchronized set or in this rule's v0.186 suppression list below: the referenced instance is reachable from every domain, and confining its use to one domain — or ensuring its own internal synchronization — is the programmer's obligation (the checked-disposal backstop of [§28.2](#sec-the-idisposable-contract) applies; this is the singleton-with-resources pattern the warning text names). The warning is suppressed by the form-(i) set, and (v0.186 — the **suppression list**, grown only by recorded ruling) by the data-owning locks `Locked<T>`/`RwLocked<T>` (stdlib [§6.11](Bezel_Standard_Library.md#sec-locked-and-rwlocked); [§30.12](#sec-data-owning-locks) — internally synchronized and safe to reach from every domain by construction, `static owned readonly` being the canonical process-global registry idiom) and by `FrozenArray<T>` (stdlib [§4.19](Bezel_Standard_Library.md#sec-frozen-array) — deeply immutable, hence safe to reach from every domain with no machinery). The three suppression-list types are deliberately *not* form-(i) — no mutable statics of them: rule 2's overwrite-never-disposes store semantics would leak a displaced value of unbounded payload (a whole frozen array; a lock plus its entire interior) until process exit, a payload-scaled cost the `Task?` cache's acceptance does not cover, and no use case demands static *reassignment* of them (a data-owning lock's mutability lives behind its guards; a frozen array has none). A `static readonly Channel<T>` deliberately still warns — the warning is the reminder that the channel is the single-consumer *receiving* end and must stay confined to one consuming domain ([§30.15](#sec-channels)). This warning is independent of [§22.13](#sec-static-class-typed-fields-without-owned)'s non-trivial-`Dispose`-without-`owned` warning and the two may co-fire on one declaration (v0.184): adding `owned` clears only the disposal warning — rule 4 applies to `owned` fields too — while this warning is silenced only by the type being in the form-(i) set or the v0.186 suppression list; confining the instance to one domain discharges the obligation the warning names, but confinement is not compiler-observable and does not silence the warning. An implementation may present the co-firing pair as one combined diagnostic (Appendix [D](#appendix-d-conformance-levels)'s identity latitude).
-5. **Static events are runtime-synchronized and capture-free** (v0.163; strengthened v0.180): the compiler-generated subscriber list of a `static event` uses synchronized operations, since subscribe/raise may arrive from any domain. Additionally (v0.180), a handler subscribed to a `static event` — through `+=`/`Add` or `Subscribe` — must be **capture-free**: a non-capturing lambda or a static method reference, the same admission as `Domain.Spawn` entries ([§30.14](#sec-spawning-domains)) and FFI callbacks. The process-global subscriber list transports the handler to whichever domain raises ([§24.5](#sec-raising-events): handlers execute on the raising domain), and a capture-bearing closure carries borrows of its origin domain's scopes — exactly what [§30.14](#sec-sendable-types)'s "function-typed values are never sendable" rule exists to exclude; a capture-bearing subscription written **against the static event member itself** — `E += h` / `E.Add(h)` in the declaring class, or `TypeName.E.Subscribe(h)` anywhere — is a compile error naming this rule (v0.184: the check is scoped to member-syntax subscription sites, where the member kind is visible; this is a recorded narrowing of the v0.180 statement, which promised the error at sites where no compiler can deliver it). **Recorded residual (#1647):** outside the declaring class the member's face is plain `IEvent<T>` ([§24.3](#sec-the-type-of-an-event-member)), and a subscription reached through an `IEvent<T>`-typed **alias** — a parameter, binding, or field holding the static event's face — is admitted by [§28.14](#sec-scoped-callback-parameters)'s ordinary forms, which cannot know the source is static. Keeping alias-routed handlers capture-free is the **programmer's obligation**, of the same recorded kind as [§30.14](#sec-sendable-types)'s indirect-alias trust obligations, and a violation is not caught by checked disposal mode (the handler runs, on the raising domain, over borrows of its origin domain). An implementation **should** warn when a `static event` member is used as a **value** — as an argument, the right-hand side of a binding or assignment, a field initializer, or a return value: the alias-creation sites, where the member kind is visible (receiver positions — of `Subscribe`/`+=`/`-=`/`Add`/`Remove`, and equally of `Raise`/`RaiseAsync` in the declaring class, [§24.5](#sec-raising-events) — are not value uses and draw no warning); the warning names this residual and the safe alternatives (subscribe member-syntax, or keep the alias's handlers capture-free). The enforceable, type-level statement of this guarantee is proposal 0035 §7 (S1, #1550), owner-gated. No payload-sendability check is imposed: under capture-freedom plus raising-domain execution the payload is constructed and consumed in one domain and never crosses a boundary. (Instance events remain unsynchronized and capture-admitting — domain-serial per [§24.6](#sec-thread-safety), captures per [§28.14](#sec-scoped-callback-parameters).) Rules 2 and 4 govern **user-declared** statics; the compiler-generated static-event backing field ([§24.1](#sec-declaration) — a `static owned` field of type `EventSource<T>`/`AsyncEventSource<T>` with program-exit disposal, [§22.13](#sec-static-initialization-order)) is admitted and governed by **this rule** — runtime-synchronized, capture-free-subscribed, program-exit-disposed — and draws neither rule 2's error nor rule 4's warning (v0.184).
+5. **Shared publication points are typed, not member-kinded** (v0.187; supersedes the `static event` rule of v0.163/v0.180 and its v0.184 scoping — the member kind is retired, [§24](#sec-events)). A process-global publication point is an ordinary static field of type `SharedEventSource<T>` (stdlib [§6.5](Bezel_Standard_Library.md#sec-events-ievent-eventsource)) — a form-(i) member, admitted warning-free in the recommended shape `private static owned readonly _e: SharedEventSource<T> := new();` with program-exit disposal ([§22.13](#sec-static-initialization-order)). The former rule's guarantees are carried by the type and therefore hold at **every** subscription site, aliases included: the subscriber list is internally synchronized (subscribe, raise, and `Subscription.Dispose` may arrive from any domain), and every call resolving to a subscribe position **declared on** `ISharedEvent<T>`/`SharedEventSource<T>` — whatever the receiver's static spelling, a constrained generic parameter included — admits only **capture-free** handlers: a non-capturing lambda or a static method reference, the same admission as `Domain.Spawn` entries, as a stdlib-stated entry in [§28.14](#sec-scoped-callback-parameters)'s capture-free register; and method-reference formation over a register position is itself rejected ([§28.14](#sec-scoped-callback-parameters), v0.187), so no plain function-typed alias of `Subscribe`/`Add` can launder the admission. There is no static type through which a capture-admitting subscription to a shared source can be written (this is the enforceable statement of the guarantee whose member-kinded form was unenforceable through an `IEvent<T>` alias — #1647, resolved by construction). No payload-sendability check is imposed: under capture-freedom plus raising-domain execution (stdlib §6.5), each payload is constructed and consumed within one domain. Instance sources (`EventSource<T>`/`AsyncEventSource<T>`) remain unsynchronized and capture-admitting — domain-serial per stdlib §6.5, captures per [§28.14](#sec-scoped-callback-parameters); a `static owned readonly` field of an instance-source type is admissible but draws rule 4's warning like any other unsynchronized class-typed static singleton, and confining it to one domain is the programmer's obligation the warning names.
 
-Static methods, properties, fields, events, and constructors are declared with `static`. A class-level `const` is implicitly static; writing `static const` is redundant but permitted for clarity — both forms declare the same constant.
+Static methods, properties, fields, and constructors are declared with `static`. A class-level `const` is implicitly static; writing `static const` is redundant but permitted for clarity — both forms declare the same constant.
 
 `const` declarations (with or without `static`) require a compile-time-constant expression ([§17.14](#sec-constant-expressions), v0.184 — the referenced definition) and a primitive value type or `string`; the same requirement covers local `const` declarations (grammar A.6). `static readonly` accepts any value but is read at runtime.
 
@@ -4833,250 +4835,19 @@ Records may declare read-only indexers. Body-form records with mutable propertie
 ---
 
 <a id="sec-events"></a>
-## 24. Events
-
-An event is a named publication point on a class. The class controls when the event fires; external code subscribes but cannot fire the event or inspect the subscriber list.
-
 <a id="sec-declaration"></a>
-### 24.1 Declaration
-
-An event declaration names a **payload type** — the type of value passed to handlers when the event fires:
-
-```bezel
-public event Clicked: ClickedEvent;
-public event ValueChanged: ValueChangedEvent;
-public static event ApplicationExiting;              // no payload; implicit ()
-```
-
-The payload type may be any type. Records are strongly recommended ([§24.2](#sec-payload-records)). When no payload type is specified, the payload is the unit type `()`.
-
-Static events use `static`.
-
-Asynchronous events require the `async` modifier. Async events invoke handlers that return `Task`; see [§24.5](#sec-raising-events).
-
-```bezel
-public async event DataReceived: DataReceivedEvent;
-public async event ProcessCompleted: ProcessResult;
-```
-
-Modifier order: `visibility static async event`. Events do not support `virtual`, `override`, `abstract`, `sealed`, or `readonly`.
-
-Events may be declared on **classes and interfaces only** (v0.180): the compiler-generated `owned EventSource<T>` backing field (below) requires an owning, disposable container, which records and enums cannot be ([§9.7](#sec-records-and-disposal), Appendix C.3) — an `event` member in a record or enum body is a compile error naming this rule (the shared `Member` grammar production admits the parse; the rejection is semantic, Appendix A.4). Events may be declared on interfaces; see [§24.7](#sec-events-on-interfaces). The interface form omits the body and ends with `;`, like other interface members.
-
-The compiler generates a private `owned` backing field of type `EventSource<T>` (or `AsyncEventSource<T>`) for each event declaration. The backing field is initialized during construction and disposed when the containing object is disposed, following the standard owned-field rules ([§28.5](#sec-owned-fields)). For static events, the backing field is a static owned field with program-exit disposal ([§22.13](#sec-static-initialization-order)).
-
 <a id="sec-payload-records"></a>
-### 24.2 Payload records
-
-Event payloads should be records. There is no required base class. The sender, if any, is a field of the payload record, typed precisely:
-
-```bezel
-record ClickedEvent(Sender: Button, X: int, Y: int, Button: MouseButton);
-record ValueChangedEvent(Sender: Slider, OldValue: decimal, NewValue: decimal);
-record DataReceivedEvent(Sender: Connection, Payload: Array<byte>, Timestamp: DateTime);
-record ProcessResult(Success: bool, Message: string);
-```
-
-Using a record provides named fields, destructuring in handlers, and a single point of documentation for the event's data contract.
-
 <a id="sec-the-type-of-an-event-member"></a>
-### 24.3 The type of an event member
-
-An event member has two faces, distinguished by whether the access is from inside the declaring class or from outside.
-
-For a synchronous event `event E: T`, the handler type is `(T) -> ()`. For an asynchronous event `async event E: T`, the handler type is `(T) -> Task`. These handler types are derived from the payload type and are not written in the event declaration.
-
-**Outside the declaring class**, an event member has type `IEvent<T>` (synchronous events) or `IAsyncEvent<T>` (async events). These interfaces expose only the subscribe-side operations and are covariant in the payload type ([§12.9](#sec-variance)):
-
-```bezel
-public interface IEvent<out T>
-  method Subscribe(scoped handler: (T) -> ()): owned Subscription;
-end IEvent;
-
-public interface IAsyncEvent<out T>
-  method Subscribe(scoped handler: (T) -> Task): owned Subscription;
-end IAsyncEvent;
-```
-
-`T` is the event's payload type. `out T` is sound because T appears once, in the parameter position of `(T) -> ()` (contravariant), which is itself a method parameter (contravariant) — composing to a covariant position overall. `EventSource<T>` and `AsyncEventSource<T>` (the producer-side classes) remain invariant because their `Raise(payload: T)` method places T in input position.
-
-**Inside the declaring class** (and inside derived classes for `protected` events), the same member has type `EventSource<T>` (or `AsyncEventSource<T>`), which extends the interface above with `Raise` (or `RaiseAsync`) and provides the `+=`/`-=` operators ([§24.4](#sec-subscribing)):
-
-```bezel
-public class EventSource<T>: IEvent<T>
-  // No public constructor; obtained via event declaration.
-  public method Subscribe(scoped handler: (T) -> ()): owned Subscription;
-  public method Raise(payload: T);
-  public method Add(scoped handler: (T) -> ());        // scoped (v0.180): Add stores — §28.14
-  public method Remove(handler: (T) -> ());             // call-bounded: Remove only compares
-end EventSource;
-
-public class AsyncEventSource<T>: IAsyncEvent<T>
-  public method Subscribe(scoped handler: (T) -> Task): owned Subscription;
-  public async method RaiseAsync(payload: T): Task;
-  public method Add(scoped handler: (T) -> Task);       // scoped (v0.180): Add stores — §28.14
-  public method Remove(handler: (T) -> Task);            // call-bounded: Remove only compares
-end AsyncEventSource;
-```
-
-Inside the declaring class, the syntactic forms `event += handler` and `event -= handler` are recognized by the compiler and rewritten to `event.Add(handler)` and `event.Remove(handler)` respectively. `Add` is a `scoped` (storing) position (v0.180), so the [§28.14](#sec-scoped-callback-parameters) storage-bounded admission applies to the desugared call: the bounding object is the event's **containing instance** (form 4 — the receiver is the compiler-generated backing member on the publisher). `this.Clicked += OnButtonClicked` therefore admits the `this`-capturing method reference (self-capture of the bounding object), a `using var` publisher admits handlers whose captures satisfy the declared-before test, and a handler capturing a shorter-lived local than its publisher is rejected at the subscription site. `Remove` is call-bounded — it only compares its argument during the call. They are **not** user-overloadable operators — `operator +=` and `operator -=` cannot be declared on any type ([§25.1](#sec-overloadable-operators)) — and they do not interact with the compound-assignment statement form. The `+=` and `-=` syntax on events is a fixed, language-defined desugaring, available only when the static type of the left operand is `EventSource<T>` or `AsyncEventSource<T>`.
-
-The compiler enforces visibility: outside the declaring class, the member's static type is the interface (`IEvent<T>` or `IAsyncEvent<T>`), so neither `Add`/`Remove` nor `Raise`/`RaiseAsync` are in scope. External code subscribes through `Subscribe` (which is on the interface) and unsubscribes by disposing the returned `Subscription`. The split is type-driven, not a special access-control rule.
-
-For no-payload events (declared without a type), the payload is `()`. `EventSource<()>` has a convenience `Raise()` overload that takes no arguments, equivalent to `Raise(())`.
-
 <a id="sec-subscribing"></a>
-### 24.4 Subscribing
-
-The `+=` and `-=` syntax and the `.Subscribe()` method serve different contexts. The `+=`/`-=` forms are available only inside the declaring class (and inside derived classes for `protected` events), where the event's static type is `EventSource<T>` or `AsyncEventSource<T>`. Outside the declaring class, the event's static type is `IEvent<T>` (or `IAsyncEvent<T>`), which exposes only `.Subscribe()`. External code subscribes through `.Subscribe()` and unsubscribes by disposing the returned `Subscription`.
-
 <a id="sec-with-named-methods-inside-the-declaring-class"></a>
-#### With named methods (inside the declaring class)
-
-```bezel
-button.Clicked += OnButtonClicked;
-button.Clicked -= OnButtonClicked;
-```
-
-Where the handler has signature `(ClickedEvent) -> ()`:
-
-```bezel
-public method OnButtonClicked(e: ClickedEvent)
-  UpdateStatus(e.X, e.Y);
-end OnButtonClicked;
-```
-
-`+=` adds a handler; `-=` removes the first matching handler, matching by **function-value equality** ([§27.7.1](#sec-equality-of-function-values), v0.180) — for a named method reference that is same-method + same-receiver, so the `+=`/`-=` pair above deterministically unsubscribes. If no match is found, `-=` is a no-op. These syntactic forms desugar to `event.Add(handler)` and `event.Remove(handler)` respectively ([§24.3](#sec-the-type-of-an-event-member)); they are not user-overloadable operators and not the compound-assignment statements of [§17](#sec-expressions-and-operators) — `event += handler` does not read `event` and does not assign to it.
-
 <a id="sec-with-subscribe"></a>
-#### With `.Subscribe()`
-
-For lambdas, or any subscription whose lifetime should be tied to a scope:
-
-```bezel
-using var sub := button.Clicked.Subscribe((e) => UpdateStatus(e.X, e.Y));
-```
-
-`.Subscribe()` returns an owned `Subscription` that implements `IDisposable`. Disposing the subscription removes the handler. Storing the subscription in an `owned` field ties its lifetime to the containing object — and (v0.180) that store is precisely what admits a capture-bearing handler here: assigning the owned `Subscription` to an **`owned` field of `this`** resolves [§28.14](#sec-scoped-callback-parameters)'s bounding object to `this` (form 3), so a handler capturing `this` (or state reached through it) is admitted *regardless of how the publisher was reached* — a parameter, a field, an interface. Disposing `this` disposes the field, severing the registration before `this` is reclaimed ([§28.12](#sec-asynchronous-disposal)); the recorded residual is that the subscription must not be moved out past `this` ([§28.14](#sec-scoped-callback-parameters), the registration-lifetime residual). Captured **constructor parameters other than `this` are not admitted** — a constructor parameter is a borrow of a caller local and does not provably outlive the constructed object. This is the standard observer pattern:
-
-```bezel
-public class TickObserver
-  private owned _sub: Subscription;
-  private _count: int := 0;
-
-  public constructor(ticks: IEvent<TickEvent>)
-    _sub := ticks.Subscribe((e) => do OnTick(e); end);   // captures `this` — admitted:
-  end constructor;                                        //   bounding object is `this` (§28.14 form 3)
-
-  private method OnTick(e: TickEvent)
-    _count := _count + 1;
-  end OnTick;
-end TickObserver;
-```
-
-A raise cannot reach the handler before the constructor completes unless the constructor itself — directly or transitively — raises the subscribed event: instance events are domain-serial ([§24.6](#sec-thread-safety)) and no other continuation runs during construction. A constructor that does so observes `this` partially initialized — the construction-time-observation residual of [§22.7](#sec-observing-this-during-construction) (v0.184), with the runtime bound recorded there.
-
-For handlers that must not capture `this`, the `using var sub := …` form above remains the scope-bound alternative (form 2), with captures admitted under the declared-before rule.
-
-`.Subscribe()` is available everywhere — inside or outside the declaring class — because it is on the public interface.
-
 <a id="sec-raising-events"></a>
-### 24.5 Raising events
-
-Inside the declaring class:
-
-```bezel
-Clicked.Raise(new ClickedEvent(this, x, y, button));                    // synchronous
-await DataReceived.RaiseAsync(new DataReceivedEvent(this, payload, t)); // asynchronous
-ApplicationExiting.Raise();                                              // no-payload
-```
-
-`Raise` and `RaiseAsync` invoke handlers in subscription order, over a **snapshot of the subscriber list taken when the raise begins** (v0.163): a handler that subscribes or unsubscribes during the raise affects the *next* raise, never the in-flight pass — the same posture as [§24.6](#sec-thread-safety)'s interleaving note and [§29.12](#sec-mutation-during-iteration)'s loud-mutation discipline, chosen here as snapshot-rather-than-fault because self-unsubscribing handlers (one-shot listeners) are a legitimate idiom. With zero subscribers, both methods are no-ops — there is no null check at the call site, no `?.`, no `Invoke` indirection. Handlers execute **on the raising domain's thread** (v0.180 — normative; for `RaiseAsync`, each handler's task is started and awaited in the raising domain): for an instance event this is invisible (all access is domain-serial, [§24.6](#sec-thread-safety)), but a handler subscribed to a **static** event from one domain runs on whichever domain raises — which is why static-event handlers must be capture-free ([§22.12](#sec-static-members) rule 5).
-
-The synchronous form `Raise` returns `()` and runs each handler to completion before invoking the next. The asynchronous form `RaiseAsync` returns a `Task` that completes when every handler's task completes; each handler's task is awaited before the next is invoked.
-
 <a id="sec-handler-exceptions"></a>
-#### Handler exceptions
-
-If a synchronous handler throws, subsequent handlers are not invoked and the exception propagates out of `Raise` to the raiser. If an asynchronous handler's task faults, subsequent handlers are not invoked and the exception propagates from the awaited `RaiseAsync`. If an asynchronous handler's task is cancelled, the behavior is the same as a fault: subsequent handlers are not invoked and `OperationCanceledException` propagates from the awaited `RaiseAsync`.
-
-Handlers that must run independently of one another should catch their own exceptions (fragment context: `connection` is a `using var` local or an owned field of `this`, so the handler below — whose bare `ProcessPayloadAsync`/`Log` calls capture `this` — is admitted by [§28.14](#sec-scoped-callback-parameters)'s subscription admission, v0.180):
-
-```bezel
-connection.DataReceived += async (e) => do
-  try
-    await ProcessPayloadAsync(e.Payload);
-  catch
-    var ex: Exception => Log($"Handler failed: {ex.Message}")
-  end;
-end;
-```
-
-To run all handlers regardless of failures and aggregate exceptions, the raiser must implement that policy explicitly — `Raise`/`RaiseAsync` do not aggregate.
-
-Calling `Raise` or `RaiseAsync` outside the declaring class is a compile error: the static type of the event member outside the declaring class is the interface, which has no `Raise` method. Derived classes may raise `protected` events declared on their base class because the protected access exposes the `EventSource` form.
-
 <a id="sec-thread-safety"></a>
-### 24.6 Thread safety
-
-An **instance** event's subscriber list is not synchronized. Within a single execution domain ([§30.13](#sec-runtime-model)) it does not need to be: continuations never run concurrently, so subscribe, unsubscribe, and raise operations — whether reached from sync or async code — are serialized by construction, and no external synchronization is required. (When handlers are async, the subscriber list may still change between a raise's suspension points; that is interleaving, not a data race.) External synchronization (`Mutex`, [§30.12](#sec-thread-synchronization)) is required only where event operations are reachable from foreign threads through the FFI ([§32](#sec-foreign-function-interface)).
-
-A **static** event's subscriber list is the exception (v0.184, conforming this section to [§22.12](#sec-static-members) rule 5, which has governed since v0.163): it is runtime-synchronized, and its handlers must be capture-free at member-syntax subscription sites — subscribe and raise may arrive from any domain, so the serialized-by-construction argument above does not apply to it. Handlers still execute on the raising domain ([§24.5](#sec-raising-events)).
-
 <a id="sec-events-on-interfaces"></a>
-### 24.7 Events on interfaces
+## 24. Events (retired member kind)
 
-An interface may declare event members. The interface form omits the body and ends with `;`, like other interface members:
-
-```bezel
-public record PropertyChangedEvent(Sender: Object, PropertyName: string);
-
-public interface INotifyPropertyChanged
-  event PropertyChanged: PropertyChangedEvent;
-end INotifyPropertyChanged;
-```
-
-For asynchronous events, `async event` is used:
-
-```bezel
-public interface IDataSource
-  async event DataReceived: DataReceivedEvent;
-end IDataSource;
-```
-
-An implementing class declares the event normally; the compiler-generated `EventSource<T>` (or `AsyncEventSource<T>`) backing field satisfies the interface contract because `EventSource<T>` implements `IEvent<T>` and `AsyncEventSource<T>` implements `IAsyncEvent<T>`:
-
-```bezel
-public class Person: INotifyPropertyChanged
-  public event PropertyChanged: PropertyChangedEvent;
-
-  private _name: string := "";
-
-  public property Name: string
-    get => _name;
-    set => do
-      if _name <> value then
-        _name := value;
-        PropertyChanged.Raise(new PropertyChangedEvent(this, nameof(Name)));
-      end;
-    end;
-  end Name;
-end Person;
-```
-
-Outside the implementing class, the event is accessed through the interface, where its type is `IEvent<T>`. Only `Subscribe` is in scope:
-
-```bezel
-var p: INotifyPropertyChanged := new Person();
-using var sub := p.PropertyChanged.Subscribe((e) =>
-  Console.WriteLine($"Changed: {e.PropertyName}"));
-```
-
-The interface contract guarantees subscription works; raising remains restricted to code that holds the implementing class's static type, just as for class-declared events.
-
-Interface events follow the same modifier rules as class events: only `async` is meaningful in the interface declaration. `static` events on interfaces are not provided — the static interface members shipped in [§11.8](#sec-static-interface-members) are methods and operators only; `virtual`, `override`, `abstract`, and `sealed` do not apply (interfaces have no implementations to be virtual or overridden).
-
-An interface event declaration cannot specify a payload type that is itself unimplementable (e.g. a private nested type). The payload type's visibility must be at least as accessible as the interface itself.
+Through v0.185 this section defined an `event` member kind — a one-line declaration expanding to a hidden `owned EventSource<T>` backing field with access-site-dependent member typing (`IEvent<T>` outside the declaring class, `EventSource<T>` inside). The member kind is retired as of v0.187 (proposal 0035; rationale §13.6): an event is the two-declaration library pattern documented normatively in stdlib [§6.5](Bezel_Standard_Library.md#sec-events-ievent-eventsource) — a `private owned readonly` source field and a public borrowing property of the interface face — with identical subscriber-side call sites and semantics. The `+=`/`-=` subscription desugaring remains language-defined at [§17.2](#sec-notes-on-operators); shared (cross-domain) publication points use the `ISharedEvent<T>`/`SharedEventSource<T>` pair under [§22.12](#sec-static-members) rule 5. The word `event` remains reserved (Appendix B.3): an `event` declaration from pre-v0.187 code is a reserved-word error; the migration spelling is stdlib §6.5's pattern. (The anchors above are retained for citations in the rationale's historical changelog.)
 
 ---
 
@@ -5100,7 +4871,7 @@ The following operators are also not overloadable, for various reasons:
 - Range operators `..` and `..<` — these construct values of the language-built-in `Range<T>` type ([§16](#sec-range-expressions)); user types do not customize them.
 - The `in` operator — customization is via the structural `Contains` lookup ([§17.5](#sec-the-in-operator)).
 - Assignment and compound-assignment operators (`:=`, `+=`, `-=`, `*=`, `/=`, `&=`, `|=`, `^=`, `<<=`, `>>=`, `??=`) — Bezel has no compound-operator overload mechanism; the compound forms desugar mechanically to read-modify-write using the underlying binary operator's overload, with the evaluation counts and result typing of [§6.6](#sec-compound-assignments) (v0.184).
-- The `+=` and `-=` syntactic forms used with events ([§24.4](#sec-subscribing)) — these are a fixed, language-defined desugaring available only on `EventSource<T>` and `AsyncEventSource<T>`; they are not operator overloads and are not part of the user-overloadable surface.
+- The `+=` and `-=` event-subscription forms ([§17.2](#sec-notes-on-operators)) — a fixed, language-defined desugaring available only on `EventSource<T>`, `AsyncEventSource<T>`, and `SharedEventSource<T>`; they are not operator overloads and are not part of the user-overloadable surface.
 - The short-circuit boolean operators `and` and `or` — like `not`, they are fixed on `bool`; their short-circuit evaluation cannot be expressed by a user method's eager parameters, so they are not overloadable. Element access `[ ]` is customized through indexers ([§23.4](#sec-indexers)), not through operator overloads.
 
 <a id="sec-operator-overloading-restrictions"></a>
@@ -5563,32 +5334,32 @@ Function-typed values compare with `=` and `<>` by the following rule (normative
 
 - A **lambda** (closure) value equals only itself — reference equality on the closure instance. Two separately-constructed lambdas with identical source text are *not* equal, even if they capture the same variables.
 - A **method reference** equals another method reference **iff** both denote the **same method** and, for instance references, are bound to the **same receiver** — receiver sameness being reference identity for class-typed receivers. A static (or extension-method) reference to `M` equals every other reference to `M`. Repeated evaluations of `obj.Method` on the same class-typed `obj` are therefore **guaranteed equal**: equality is defined on the (method, receiver) pair, so whether the implementation caches or re-allocates the underlying function object is unobservable.
-- A method reference whose receiver is **value-shaped** (a record — [§27.6](#sec-method-references) captures the instance by copy) has no receiver identity: two separate evaluations compare **unequal** (each holds a distinct copy); only the same function object equals itself — and since every store-once spelling (a function-typed local or field passed to `+=`) is rejected at the scoped `Add` position by [§28.14](#sec-scoped-callback-parameters)'s admission bound 3, deterministic `-=` unsubscription for record receivers is not expressible in v1 (recorded below); use `Subscribe` and the owned `Subscription` ([§24.4](#sec-subscribing)). *(Alternative declined: defining receiver sameness by the record's own `Equals` would drag user equality dispatch into function-value comparison and make `-=` matching sensitive to value mutation between subscribe and unsubscribe; recorded in the v0.180 rationale changelog.)*
+- A method reference whose receiver is **value-shaped** (a record — [§27.6](#sec-method-references) captures the instance by copy) has no receiver identity: two separate evaluations compare **unequal** (each holds a distinct copy); only the same function object equals itself — and since every store-once spelling (a function-typed local or field passed to `+=`) is rejected at the scoped `Add` position by [§28.14](#sec-scoped-callback-parameters)'s admission bound 3, deterministic `-=` unsubscription for record receivers is not expressible in v1 (recorded below); use `Subscribe` and the owned `Subscription` (stdlib [§6.5](Bezel_Standard_Library.md#sec-events-ievent-eventsource)). *(Alternative declined: defining receiver sameness by the record's own `Equals` would drag user equality dispatch into function-value comparison and make `-=` matching sensitive to value mutation between subscribe and unsubscribe; recorded in the v0.180 rationale changelog.)*
 - A lambda never equals a method reference, and property references follow the method-reference rule (the getter is the method).
 
-The practical consequence: function values should still not be used as dictionary keys or set elements, but event unsubscription is deterministic for named methods (v0.180): `EventSource<T>.Remove` — and the `-=` desugaring ([§24.4](#sec-subscribing)) — matches handlers by the function-value equality above, so `+=`/`-=` with a named method reference on a class-typed receiver reliably unsubscribes (same method, same receiver). `+=`/`-=` with separately-constructed lambdas does not match (each lambda is a fresh closure object).
+The practical consequence: function values should still not be used as dictionary keys or set elements, but event unsubscription is deterministic for named methods (v0.180): `EventSource<T>.Remove` — and the `-=` desugaring ([§17.2](#sec-notes-on-operators)) — matches handlers by the function-value equality above, so `+=`/`-=` with a named method reference on a class-typed receiver reliably unsubscribes (same method, same receiver). `+=`/`-=` with separately-constructed lambdas does not match (each lambda is a fresh closure object).
 
-The reliable pattern for `+=` followed by later `-=` is a **named method reference**: same method + same class-typed receiver compare equal (the rule above), so re-evaluated references match — and a method reference is one of the verified argument forms that [§28.14](#sec-scoped-callback-parameters)'s v1 admission bound 3 admits at the scoped `Add` position. (The `+=`/`-=` forms exist only inside the event's declaring class, [§24.4](#sec-subscribing); the examples below are publisher-side code, where `this.Clicked += OnButtonClicked` is [§24.3](#sec-the-type-of-an-event-member)'s form-4 self-capture admission. A method reference passed at *another* publisher instance's `+=` additionally faces the form-4 declared-before test.)
+The reliable pattern for `+=` followed by later `-=` is a **named method reference**: same method + same class-typed receiver compare equal (the rule above), so re-evaluated references match — and a method reference is one of the verified argument forms that [§28.14](#sec-scoped-callback-parameters)'s v1 admission bound 3 admits at the scoped `Add` position. (The `+=`/`-=` forms require a source-typed operand ([§17.2](#sec-notes-on-operators)), which under the stdlib §6.5 event pattern is the publisher's private field; the examples below are publisher-side code, where `_clicked += OnButtonClicked` is [§28.14](#sec-scoped-callback-parameters)'s form-4 self-capture admission (chain root `this`). A method reference passed at *another* publisher instance's `+=` additionally faces the form-4 declared-before test.)
 
 ```bezel
-this.Clicked += OnButtonClicked;
+_clicked += OnButtonClicked;
 // later:
-this.Clicked -= OnButtonClicked;   // same method, same receiver: matches and unsubscribes
+_clicked -= OnButtonClicked;   // same method, same receiver: matches and unsubscribes
 ```
 
-For a **lambda** handler, deterministic unsubscription goes through `Subscribe` and the owned `Subscription` ([§24.4](#sec-subscribing)). A lambda equals only itself, and the store-once spelling that would preserve the single closure instance — a function-typed field or local passed to `+=` — is **not admissible** at the subscription site: `Add` is a `scoped` (storing) position, and [§28.14](#sec-scoped-callback-parameters)'s admission bound 3 rejects function-typed locals and field reads as unverifiable argument forms (the verified forms are lambda literals and method references). The anti-pattern below therefore also silently fails to unsubscribe — each lambda is a fresh closure object:
+For a **lambda** handler, deterministic unsubscription goes through `Subscribe` and the owned `Subscription` (stdlib [§6.5](Bezel_Standard_Library.md#sec-events-ievent-eventsource)). A lambda equals only itself, and the store-once spelling that would preserve the single closure instance — a function-typed field or local passed to `+=` — is **not admissible** at the subscription site: `Add` is a `scoped` (storing) position, and [§28.14](#sec-scoped-callback-parameters)'s admission bound 3 rejects function-typed locals and field reads as unverifiable argument forms (the verified forms are lambda literals and method references). The anti-pattern below therefore also silently fails to unsubscribe — each lambda is a fresh closure object:
 
 ```bezel
-this.Clicked += (e) => UpdateStatus(e.X, e.Y);
+_clicked += (e) => UpdateStatus(e.X, e.Y);
 // later:
-this.Clicked -= (e) => UpdateStatus(e.X, e.Y);   // a different lambda, no match
+_clicked -= (e) => UpdateStatus(e.X, e.Y);   // a different lambda, no match
 ```
 
 ```bezel
 // The lambda form with deterministic teardown — and the form that also works
-// outside the declaring class, since Subscribe is on IEvent<T>:
+// anywhere, since Subscribe is on the IEvent<T> face:
 using var sub := button.Clicked.Subscribe((e) => UpdateStatus(e.X, e.Y));
-// disposing sub severs the registration (§24.4)
+// disposing sub severs the registration (stdlib §6.5)
 ```
 
 For named methods bound to **record** (value-shaped) receivers, deterministic `-=` unsubscription is **not expressible in v1** (recorded): the equality rule requires the very same function object, and every store-once spelling — a function-typed local or field — is rejected at the `Add` site by [§28.14](#sec-scoped-callback-parameters) bound 3. The remedy is `Subscribe` plus the owned `Subscription`, which needs no equality match at all. (Bound 3 is marked *liftable*; a future revision admitting provably-single-assignment private fields at scoped call sites would make the store-once form expressible again.)
@@ -5889,7 +5660,7 @@ A `using var` is owned but is additionally bound to its scope: it cannot be move
 A borrowed value's lifetime is the lifetime of its *source*. The compiler enforces:
 
 - A borrowed local may not be returned from a method whose return type is `owned`.
-- A borrowed local may not be returned from a method at all unless the return is a borrow with a clearly-defined source that outlives the call — in this version: a **receiver-sourced** borrow from an instance method (a bare owned-field read, `this`, or a borrow reached through the receiver's fields and indexers, [§28.6](#sec-leak-prevention)), or the receiver-parameter borrow of an extension method ([§26.7](#sec-ownership-in-extensions)). A borrowed *local or parameter* with **no** source that outlives the call — e.g. a static method returning one of its parameters, `static method Pick(a: Res, b: Res): Res return a;` — may **not** be returned; this callee-side prohibition is what makes the caller-side sourceless-return owned-assumption (*Factory methods* above) sound. (Value-typed and runtime-managed returns are not borrows and are outside this rule. A return whose declared type is a deferred-activation kind — an iterable/enumerator interface, a lazy query, a `Task`-family type — is exempted for parameter-/receiver-sourced frames: *Returning a deferred-activation frame*, [§28.3](#sec-returning-a-deferred-activation-frame), v0.184.)
+- A borrowed local may not be returned from a method at all unless the return is a borrow with a clearly-defined source that outlives the call — in this version: a **receiver-sourced** borrow from an instance method (a bare owned-field read, `this`, or a borrow reached through the receiver's fields and indexers, [§28.6](#sec-leak-prevention)), or the receiver-parameter borrow of an extension method ([§26.7](#sec-ownership-in-extensions)), or — v0.187 — a **static-storage-sourced** borrow: a bare read of a `static` `owned` field, from a static method or a static property getter, returned through a non-`owned` return type — its source is the declaring type's static storage, process-lived and disposed only at program exit ([§22.13](#sec-static-initialization-order)), the callee-side form of the *Static property access `T.P`* producers row above (the stdlib §6.5 event pattern's static idiom is the motivating case). A borrowed *local or parameter* with **no** source that outlives the call — e.g. a static method returning one of its parameters, `static method Pick(a: Res, b: Res): Res return a;` — may **not** be returned; this callee-side prohibition is what makes the caller-side sourceless-return owned-assumption (*Factory methods* above) sound. (Value-typed and runtime-managed returns are not borrows and are outside this rule. A return whose declared type is a deferred-activation kind — an iterable/enumerator interface, a lazy query, a `Task`-family type — is exempted for parameter-/receiver-sourced frames: *Returning a deferred-activation frame*, [§28.3](#sec-returning-a-deferred-activation-frame), v0.184.)
 - A method's return type that names an **owning-collection or owning-wrapper type** (`OwningArray<T>`, `OwningDictionary<K, V>`, `OwningSet<T>`, `OwningStack<T>`, `OwningQueue<T>`, `OwningLinkedList<T>`, `OwningTask<T>`, `Shared<T>`, `Weak<T>`, and the other owning types) follows the *same* owned-vs-borrow rule as any other reference return (the *Producers* table above): declared `owned`, the caller takes ownership; declared **without** `owned`, the result is a **borrow** with a documented source (the `Owning*` type name denotes *element* ownership, orthogonal to the container ownership the `owned` qualifier governs — [§5.11](Bezel_Design_Rationale.md#sec-owning-collections)). The borrow-return restrictions then apply unchanged: a bare owning-collection *field* read may be returned (its source is the receiver, [§28.6](#sec-leak-prevention)); a borrowed *local* or *parameter* with no source that outlives the call may **not** be returned; a `move`d field or a freshly-produced owning value must be returned through an `owned` return type. A borrow returned this way carries the capability restriction of [§28.6](#sec-borrowed-owning-collections) — the caller may not `Dispose` it (the owner does); it may otherwise be read and mutated like any borrowed collection.
 - A borrow may be stored in a field of an object only if the borrow's source provably outlives that object. A borrowed scope-bound *local* never satisfies this — it is disposed at the end of its scope, which a field of the object outlives — so a borrowed local may not be assigned to any field. A borrow whose source *does* outlive the object **is** admissible: the idiomatic form binds it through a constructor parameter into a non-owned class-typed field (the `_owner: Customer` back-reference of [§28.5](#sec-owned-fields)), where the caller-side source outlives the constructed object. Such a **borrowing class-typed field** — a non-owning class-typed field whose target is owned elsewhere — is the back-edge that serialization synthesis treats specially ([§9.8](#sec-serialization-synthesis)). The field stores a plain reference. **The assignment-site check is structural and decidable** — parameter-sourced and receiver-sourced borrows are admissible; scope-bound locals and temporaries are rejected. **The residual is trust:** whether the caller-side source actually outlives the object is the programmer's obligation, not a compile-time guarantee; a violation is caught as `DisposedAccessException` in checked disposal mode ([§28.2](#sec-the-idisposable-contract)) and is undefined behavior in unchecked mode. The caller-side obligation includes **not transferring the source's object to another domain** (v0.180) — and, its v0.186 extension, **not consuming it into a construction that makes it reachable from other domains**: `FrozenArray<T>.From(owned …)` (stdlib §4.19), a `Shared<T>`/`Locked<T>`/`RwLocked<T>` constructor whose result is then shared across domains ([§28.13](#sec-shared-ownership), [§30.12](#sec-data-owning-locks)), or a store into an admitted static ([§22.12](#sec-static-members)); such a consume is not itself a domain transfer, but it creates or publishes an object other domains may reach while the pre-consume borrow still aliases its storage, and every statement below about the transfer case applies to it verbatim. A field-stored borrow of an object later moved across a domain boundary — directly, or through a different binding such as `move box.f` into a spawn argument or channel send — is *not* rejected by the consume-site freeze below (the freeze sees only local borrows of the consumed binding) and is **not** caught by checked disposal mode (the object stays alive in the receiving domain, so no disposed flag is ever set); it is a data race. The same domain clause attaches to **every** residual-trust borrow admission: collection-held borrows ([§28.11](#sec-borrowing-collections)'s store rule) and borrows held by a **pending async frame** ([§30.1](#sec-async-methods), v0.179 — an unsettled task's receiver and plain reference-typed arguments live in the state machine, in no local borrow binding the freeze can see; §30.1's settlement obligation carries the clause explicitly, v0.180). These residuals are the honest limit of the static rule ([§30.14](#sec-multiple-domains)). A class- or interface-typed `scoped` parameter ([§28.14](#sec-scoped-callback-parameters), v0.180, #1439) upgrades this residual-trust admission to a fully static bound at participating call sites.
 - A borrow may not be assigned to a local whose scope strictly encloses the borrow's source's scope (v0.180) — including flowing into a loop-carried binding along a back edge when the source is declared inside the loop body (`prev := cur;` where `cur` is per-iteration). The scope comparison is structural and decidable; the diagnostic is the standard *"Borrow held by `x` would outlive its source `y`."* (This was the one borrow sink the surrounding bullets did not name; the producers table's null-polymorphic row reaches it too.)
@@ -6072,7 +5843,7 @@ A class with only owned-bearing fields (`owned` class/interface fields and/or ow
 
 The compiler enforces:
 
-- A *bare read* of an owned field may be returned through a **non-`owned`** return type as a **borrow** of the field — its source is the receiver, exactly as for `return this` (*Methods returning `this`* below). The caller receives a borrow it may not dispose (the receiver rule below, [Who may call `Dispose()`](#sec-who-may-dispose)), may not store in an `owned` location, and may not use past the receiver's lifetime; the field's owner (the receiver's destructor) still disposes it. This is leak-free and double-free-free, and applies uniformly to a class-typed owned field and to an owning-collection field (`owned _items: OwningArray<T>`).
+- A *bare read* of an owned field may be returned through a **non-`owned`** return type as a **borrow** of the field — its source is the receiver, exactly as for `return this` (*Methods returning `this`* below); for a **static** `owned` field read returned from a static method or static property getter, the source is the declaring type's static storage — process-lived, [§22.13](#sec-static-initialization-order) (v0.187, the callee-side form of [§28.3](#sec-local-variables-ownership-and-borrows)'s static-property producers row). The caller receives a borrow it may not dispose (the receiver rule below, [Who may call `Dispose()`](#sec-who-may-dispose)), may not store in an `owned` location, and may not use past the receiver's lifetime; the field's owner (the receiver's destructor) still disposes it. This is leak-free and double-free-free, and applies uniformly to a class-typed owned field and to an owning-collection field (`owned _items: OwningArray<T>`).
 - **Transferring** an owned field's value out — `move`-ing it ([§28.8.1](#sec-the-move-expression)), or returning it through an `owned` return type — is the only way to hand the caller ownership, and a `move`d owned field returned through a non-`owned` return is an **error** (the moved value would escape with no owner). A freshly-produced owning value (`return new OwningArray<T>(...)`) returned through a non-`owned` return is likewise an error unless the return type is `owned`.
 - An owned field's value may not be assigned to a non-owned field of any other class.
 - A **freshly-produced owned value** — a `new` expression, a call returning `owned T`, a `move` expression, or an owned operator result — stored into a non-`owned` (borrow) field is an **error**: the field does not own its referent, so the fresh value would be left with no owner and leak. Declare the field `owned` (the containing object then disposes it, [§28.5](#sec-owned-fields)), or hand the value to a method that takes it `owned`. This is the storing-side counterpart of the non-`owned`-return rule above: a fresh owned value may not escape into any non-owning location.
@@ -6793,7 +6564,7 @@ The semantics, stated against the existing model:
 - **Cycles leak.** A value that (transitively, through owned fields) holds a `Shared<T>` handle participating in its own ownership keeps its count above zero forever — the standard reference-counting hazard. The compiler does not detect ownership cycles through `Shared<T>`. Break cycles with `Weak<T>`.
 - **`Weak<T>`** (stdlib [§2.16](Bezel_Standard_Library.md#sec-shared-and-weak)) is a non-owning observer minted from a handle (`shared.Downgrade(): owned Weak<T>`). A weak handle does not keep the underlying value alive; **`TryUpgrade(out owned s: Shared<T>?): bool`** atomically produces a new strong handle if the value is still alive (Try pattern, `out using var` at the call site — [§22.3](#sec-parameter-modifiers)'s `out owned` rules). Weak handles are themselves ordinary owned class instances and are disposed like any other.
 - **Aliasing.** Multiple handles give multiple borrows of one mutable value within a domain. This is serial-execution-safe ([§30.13](#sec-runtime-model)) and carries the same *logical* aliasing hazards as any other long-lived borrow; nothing about `Shared<T>` relaxes use-after-dispose ([§28.2](#sec-checked-disposal)) for borrows taken from a handle that is then disposed.
-- **Sendability (amended in v0.140; membership grown by ruling in v0.186).** `Shared<T>` is sendable **iff `T` is in the `Shared`-payload synchronized set**: `Mutex`, `Atomic<T>`, `AtomicInteger<T>`, `Semaphore` (stdlib §6.2–§6.4), and — each admitted by its own recorded v0.186 ruling, per this bullet's no-silent-growth clause — the data-owning locks `Locked<T>` and `RwLocked<T>` (stdlib §6.11; real synchronization machinery, interior sendable by instantiation, [§30.12](#sec-data-owning-locks)) and `FrozenArray<T>` (stdlib §4.19; the set's first member admitted by **deep immutability** rather than machinery — no writer can exist after construction under stdlib §4.19's recorded construction obligations, and the reclamation synchronization that sharing needs is carried by `Shared<T>`'s own synchronized handle count together with the string-precedent storage tolerance, [§30.14](#sec-sendable-types)). This seven-type enumeration is **normative**. Its relation to [§22.12](#sec-static-members) rule 2's form-(i) set, restated: this set is form-(i) **minus `ChannelSender<T>`** (excluded below) **plus the three v0.186 members**, which are deliberately *not* form-(i) — no mutable statics of them; their `static readonly` forms are covered by [§22.12](#sec-static-members) rule 4's v0.186 suppression list instead. A type later joining the form-(i) set still does **not** join this set without a separate ruling, and vice versa. `ChannelSender<T>`, though itself internally synchronized and sendable, is deliberately excluded — senders are minted per producer from the channel ([§30.15](#sec-channels)), so `Shared<ChannelSender<T>>` would add a second distribution mechanism for a type that already has one. For such `T`, a cloned handle may move to another domain (as a spawn argument or through a channel), and the handle count is maintained with synchronized operations; the underlying value is still disposed exactly once, by whichever domain drops the last handle. For every other `T`, `Shared<T>` remains domain-local and not sendable — the count synchronization alone would not make an unsynchronized `T` safe to reach from two domains. This realizes §6.2's "reached by multiple domains simultaneously" for mutexes: `Shared<Mutex>` is the cross-domain sharing idiom (clone, move the clone, both domains `Get().AcquireAsync()` — the blocking `Acquire()` is barred inside domain continuations, [§30.12](#sec-thread-synchronization), v0.179).
+- **Sendability (amended in v0.140; membership grown by ruling in v0.186).** `Shared<T>` is sendable **iff `T` is in the `Shared`-payload synchronized set**: `Mutex`, `Atomic<T>`, `AtomicInteger<T>`, `Semaphore` (stdlib §6.2–§6.4), and — each admitted by its own recorded v0.186 ruling, per this bullet's no-silent-growth clause — the data-owning locks `Locked<T>` and `RwLocked<T>` (stdlib §6.11; real synchronization machinery, interior sendable by instantiation, [§30.12](#sec-data-owning-locks)) and `FrozenArray<T>` (stdlib §4.19; the set's first member admitted by **deep immutability** rather than machinery — no writer can exist after construction under stdlib §4.19's recorded construction obligations, and the reclamation synchronization that sharing needs is carried by `Shared<T>`'s own synchronized handle count together with the string-precedent storage tolerance, [§30.14](#sec-sendable-types)). This seven-type enumeration is **normative**. Its relation to [§22.12](#sec-static-members) rule 2's form-(i) set, restated: this set is form-(i) **minus `ChannelSender<T>`** (excluded below) and — v0.187 — **minus `SharedEventSource<T>`** (`SharedEventSource<T>` joins form-(i) at v0.187 but stays out of this set: static reachability is already its distribution mechanism, and `Shared<SharedEventSource<T>>` would add a second; stdlib §6.5) **plus the three v0.186 members**, which are deliberately *not* form-(i) — no mutable statics of them; their `static readonly` forms are covered by [§22.12](#sec-static-members) rule 4's v0.186 suppression list instead. A type later joining the form-(i) set still does **not** join this set without a separate ruling, and vice versa. `ChannelSender<T>`, though itself internally synchronized and sendable, is deliberately excluded — senders are minted per producer from the channel ([§30.15](#sec-channels)), so `Shared<ChannelSender<T>>` would add a second distribution mechanism for a type that already has one. For such `T`, a cloned handle may move to another domain (as a spawn argument or through a channel), and the handle count is maintained with synchronized operations; the underlying value is still disposed exactly once, by whichever domain drops the last handle. For every other `T`, `Shared<T>` remains domain-local and not sendable — the count synchronization alone would not make an unsynchronized `T` safe to reach from two domains. This realizes §6.2's "reached by multiple domains simultaneously" for mutexes: `Shared<Mutex>` is the cross-domain sharing idiom (clone, move the clone, both domains `Get().AcquireAsync()` — the blocking `Acquire()` is barred inside domain continuations, [§30.12](#sec-thread-synchronization), v0.179).
 
 ---
 
@@ -6809,10 +6580,10 @@ The closure-capture rules ([§28.3](#sec-local-variables-ownership-and-borrows))
   1. a constructor call → the constructed object;
   2. a call whose return is `owned` **and** is the initializer of a `using var`/`await using var` local → the returned object;
   3. (v0.180) a call whose return is `owned` **and** is directly assigned to (or initializes) an **`owned` field of `this`** → `this`;
-  4. (v0.180) a call whose receiver is a **member chain** rooted at `this` or a local binding in which every hop is an **`owned` field or a compiler-generated event backing member** ([§24.3](#sec-the-type-of-an-event-member)) — → the **chain head**: `this` for `this.Clicked.Add(h)` (and the bare `Clicked += h` spelling), the local `pub` for `pub.Clicked.Add(h)`. A chain containing a non-owned (borrow) field hop, an indexer, a getter, or an intervening call resolves **no** bounding object (capture-free callbacks only): across a borrow hop the storing object is externally owned and may outlive the chain head, so the head's teardown would not sever the registration;
+  4. (v0.180) a call whose receiver is a **member chain** rooted at `this` or a local binding in which every hop is an **`owned` field** — → the **chain head**: `this` for `this._clicked.Add(h)` (and the bare `_clicked += h` spelling — the stdlib §6.5 event pattern), the local `pub` for `pub._clicked.Add(h)` (cross-instance `private` access is class-keyed, [§13.1](#sec-levels)). A chain containing a non-owned (borrow) field hop, an indexer, a getter, or an intervening call resolves **no** bounding object (capture-free callbacks only): across a borrow hop the storing object is externally owned and may outlive the chain head, so the head's teardown would not sever the registration (*liftable*: a future revision may admit *transparent getters* — an expression-bodied getter whose body is a bare read of an `owned` field of its receiver, exactly the stdlib §6.5 event pattern's property — restoring chain-hop resolution through such properties; recorded, not shipped — #1704);
   5. otherwise → the receiver.
 
-  The forms are tested **in order; the first that resolves determines the bounding object** — `using var sub := pub.Clicked.Subscribe(h)` bounds by `sub` (form 2, the tightest bound), not by `pub` (form 4).
+  The forms are tested **in order; the first that resolves determines the bounding object** — `using var sub := pub.Clicked.Subscribe(h)` bounds by `sub` (form 2, the tightest bound; `Clicked` being the stdlib §6.5 pattern's getter-faced property, no later form would resolve a bound at all — an off-idiom discharge of the `Subscription` admits capture-free handlers only, with the `using var`/owned-field discharges of forms 2/3 as the admitted capture-bearing spellings).
 
   A closure argument capturing locals or parameters is admitted **iff** the bounding object resolves to one of:
   - a `using var`/`await using var` local `L` (directly, through the initializer resolution of forms 1/2, or as the chain head / receiver of forms 4/5), where every captured **local** source is declared **before** `L` in the same or an enclosing scope (`this` and the enclosing method's parameters count as declared before every local), **or is `L` itself, or is a value whose borrow provably originates from `L`** (v0.180 — self-capture: `scope.Spawn(() => Work(scope.Token))` and the bound intermediate `var tok := scope.Token;` are both admitted; `L` outlives every invocation of what it stores, and the quiescence rule below plus [§28.12](#sec-asynchronous-disposal)'s logical-before-physical ordering guarantee no stored callback observes a reclaimed `L`); or
@@ -6820,11 +6591,11 @@ The closure-capture rules ([§28.3](#sec-local-variables-ownership-and-borrows))
 
   Until `L`'s scope exits, the captured local sources are **frozen**: they may not be moved from, reassigned, or disposed — the consume-site freeze ([§28.3](#sec-consume-site-freeze)) **plus explicit disposal**. The storage freeze is deliberately *stronger* than the consume-site rule it extends: a stored callback's later invocation is invisible at a `Dispose()` site (no source-visible announcement reaches it), and this admission promises a fully static bound, so §28.3's announced-kill carve-out does not apply to admitted captures. A bounding object that is none of the admitted resolutions — a plain expression, a parameter, a returned value that reaches no admitted slot — admits **no** capture-bearing arguments (capture-free callbacks are always admitted).
 
-  **The registration-lifetime residual (v0.180, recorded).** Forms 3 and 4 bound invocations by an object whose teardown must sever the storage: for form 4 the storing member is reached through the bounding instance's **owned** fields and event backing members (the chain-hop restriction above) and is therefore disposed with it; for form 3 the returned handle (e.g. a `Subscription`, [§24.4](#sec-subscribing)) held in the `owned` field severs the registration when `this` is disposed — logical disposal precedes physical reclamation ([§28.12](#sec-asynchronous-disposal)), so severance completes before any capture dangles. The admission therefore carries one obligation the checker does not close: **the registration must not be extended past the bounding object** — `move`-ing the handle-holding `owned` field (or a storing owned child) out into longer-lived storage re-opens the invocation window. This is deliberately the same residual-trust shape as the quiescence rule below — structural checks decidable, the temporal guarantee the programmer's, `DisposedAccessException` in checked disposal mode the deterministic backstop — and it deliberately re-opens a corner of the owned-field-extraction closure recorded at v0.175: the alternative (freezing such fields against `move`) would require flow-marking fields by what initialized them, a per-value property a field declaration does not carry. Recorded, not silent.
+  **The registration-lifetime residual (v0.180, recorded).** Forms 3 and 4 bound invocations by an object whose teardown must sever the storage: for form 4 the storing member is reached through the bounding instance's **owned** fields (the chain-hop restriction above) and is therefore disposed with it; for form 3 the returned handle (e.g. a `Subscription`, stdlib [§6.5](Bezel_Standard_Library.md#sec-events-ievent-eventsource)) held in the `owned` field severs the registration when `this` is disposed — logical disposal precedes physical reclamation ([§28.12](#sec-asynchronous-disposal)), so severance completes before any capture dangles. The admission therefore carries one obligation the checker does not close: **the registration must not be extended past the bounding object** — `move`-ing the handle-holding `owned` field (or a storing owned child) out into longer-lived storage re-opens the invocation window. This is deliberately the same residual-trust shape as the quiescence rule below — structural checks decidable, the temporal guarantee the programmer's, `DisposedAccessException` in checked disposal mode the deterministic backstop — and it deliberately re-opens a corner of the owned-field-extraction closure recorded at v0.175: the alternative (freezing such fields against `move`) would require flow-marking fields by what initialized them, a per-value property a field declaration does not carry. Recorded, not silent.
 
-**Quiescence.** Disposal of the bounding object must guarantee that no stored callback is invoked after disposal completes (by draining in-flight work or severing registrations before teardown). For compiler-known types the guarantee is stated normatively in the standard library (`TaskScope`, the event types, the task-completion sources). For user-authored types the obligation is the same **residual-trust shape** as this chapter's borrowed-field rule: the storage-site checks are structural and decidable; the temporal guarantee is the author's, and **checked disposal mode** ([§28.2](#sec-the-idisposable-contract)) converts a violation into a deterministic `DisposedAccessException` rather than undefined behavior. A callback that runs *during* the drain may touch the bounding object soundly: logical disposal precedes physical reclamation ([§28.12](#sec-asynchronous-disposal)).
+**Quiescence.** Disposal of the bounding object must guarantee that no stored callback is invoked after disposal completes (by draining in-flight work or severing registrations before teardown). For compiler-known types the guarantee is stated normatively in the standard library (`TaskScope`, the stdlib §6.5 event types, the task-completion sources). For user-authored types the obligation is the same **residual-trust shape** as this chapter's borrowed-field rule: the storage-site checks are structural and decidable; the temporal guarantee is the author's, and **checked disposal mode** ([§28.2](#sec-the-idisposable-contract)) converts a violation into a deterministic `DisposedAccessException` rather than undefined behavior. A callback that runs *during* the drain may touch the bounding object soundly: logical disposal precedes physical reclamation ([§28.12](#sec-asynchronous-disposal)).
 
-**The call-bounded default (v0.177, #1419).** A function-typed parameter declared *without* `scoped` is **call-bounded**: the callee receives the callback for the duration of the call only. Within the callee the callback may be invoked, bound to locals, and passed on as an argument to another call-bounded parameter; it may **not** be stored in a field of any object, stored into any collection that is itself reachable beyond the call (a parameter, a borrow, or a field — a purely local collection is a local binding), returned, captured by a closure that itself escapes the callee (judged by these same rules, applied transitively), or forwarded into a `scoped` parameter position. The last restriction is load-bearing: the callee cannot see its argument's capture set, so it cannot vouch for the [§28.14 admission](#sec-scoped-callback-parameters); a callee that needs to register a callback it received must itself declare the parameter `scoped` (the forwarding rule above then requires the same bounding object). These obligations are compiler-verified for user-authored callees — structural and decidable, the same sink checks [§28.3](#sec-local-variables-ownership-and-borrows) applies to frame-bounded borrows. Standard-library callees state their retention in their signatures: `scoped` where they store ([§24.3](#sec-the-type-of-an-event-member) — including `EventSource<T>.Add`/`AsyncEventSource<T>.Add` as of v0.180 — and stdlib §6.5/§6.10), the [§30.11](#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet) task-completion-source admission as the legacy statement until those signatures migrate, the lazy query operators as stdlib-certified storing signatures on the same path, and the asynchronous spawn positions of [§30.14](#sec-multiple-domains) (`Domain.Spawn`'s capture-free entries and — v0.186 — the `Parallel` combinator bodies, [§30.14](#sec-data-parallel-combinators)/stdlib §6.12) under §30's capture and sendability rules rather than this section.
+**The call-bounded default (v0.177, #1419).** A function-typed parameter declared *without* `scoped` is **call-bounded**: the callee receives the callback for the duration of the call only. Within the callee the callback may be invoked, bound to locals, and passed on as an argument to another call-bounded parameter; it may **not** be stored in a field of any object, stored into any collection that is itself reachable beyond the call (a parameter, a borrow, or a field — a purely local collection is a local binding), returned, captured by a closure that itself escapes the callee (judged by these same rules, applied transitively), or forwarded into a `scoped` parameter position. The last restriction is load-bearing: the callee cannot see its argument's capture set, so it cannot vouch for the [§28.14 admission](#sec-scoped-callback-parameters); a callee that needs to register a callback it received must itself declare the parameter `scoped` (the forwarding rule above then requires the same bounding object). These obligations are compiler-verified for user-authored callees — structural and decidable, the same sink checks [§28.3](#sec-local-variables-ownership-and-borrows) applies to frame-bounded borrows. Standard-library callees state their retention in their signatures: `scoped` where they store (stdlib §6.5's `Subscribe`/`Add` positions — including `EventSource<T>.Add`/`AsyncEventSource<T>.Add` as of v0.180 — and stdlib §6.10), the [§30.11](#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet) task-completion-source admission as the legacy statement until those signatures migrate, the lazy query operators as stdlib-certified storing signatures on the same path, and the asynchronous spawn positions of [§30.14](#sec-multiple-domains) (`Domain.Spawn`'s capture-free entries and — v0.186 — the `Parallel` combinator bodies, [§30.14](#sec-data-parallel-combinators)/stdlib §6.12) under §30's capture and sendability rules rather than this section. The register's first **interface-declared** positions (v0.187) are the shared-event handler positions of stdlib §6.5: any call that resolves to a subscribe position **declared on** `ISharedEvent<T>` or `SharedEventSource<T>` (`Subscribe`/`Add` — whether the receiver's static type is the pair itself or a generic parameter constrained to it) admits only **capture-free** handler arguments, a non-capturing lambda or a static method reference; user implementations of `ISharedEvent<T>` gain no retention right and are verified under this paragraph's ordinary call-bounded regime. Register positions are stated at the callee, not marked in the parameter's function type, so — to keep the admission alias-proof — **forming a method reference over a capture-free-register position is a compile error** (v0.187, covering every register entry: `Domain.Spawn`'s and the shared-event positions): the formed value's plain function type would erase the admission, and a call through it would reach the trusted storing implementation under this paragraph's caller side, which admits any closure. (`scoped`-marked positions need no such bar: `scoped` is part of function-type identity, [§27.1](#sec-function-types), and survives formation.)
 
 The caller side is correspondingly unrestricted: **any** closure — capture-bearing or not — may be passed to a call-bounded parameter, since every captured source trivially outlives the call. (Before v0.177 ordinary call arguments were absent from §28.3's admitted-escape list entirely, and no check fired on them; the default completes the lattice this section began: plain = call-bounded, `scoped` = storage-bounded.)
 
@@ -7949,7 +7720,7 @@ A type is **sendable** — a derived type property ([§3.6](#sec-derived-type-pr
   3. The class has no function-typed fields, no `Object`-typed or interface-typed fields (boxed contents and runtime types behind interfaces cannot be statically verified), and no non-`owned` class-typed fields (a back-reference aliases an object owned in the origin domain).
   Mutually-recursive `owned` references among sendable classes are admitted; the property is evaluated coinductively (assume the types under test sendable, then check the rules). A sendable class instance crosses as an **owned transfer** — the entire ownership tree under it moves with it, and rule 2 guarantees that tree contains everything the instance can reach.
 - **Interface types** are never sendable (rule 3's reasoning, applied at the root).
-- **Compiler-known standard-library types** state their sendability in their stdlib sections, justified by their internal structure: owning collections and `OwningBuffer<T>` are sendable iff their element type is a sendable class type (their state is wholly owned); borrowing collections are sendable iff their element category ([§28.11](#sec-element-slot-policy)) is sendable-value or `string` (copy and shared-immutable slots; a borrowing collection of class elements carries borrows and is not sendable); `Task`, `Task<T>`, `OwningTask<T>`, enumerators, `EventSource<T>` — for a **static** event's backing instance, process-reachable and runtime-synchronized per [§22.12](#sec-static-members) rule 5, yet still not sendable: static reachability, not transfer, is its distribution mechanism (v0.184) — `CancellationTokenSource`, and `Weak<T>` are domain-local and not sendable; **`Shared<T>` is sendable iff `T` is in the `Shared`-payload synchronized set of [§28.13](#sec-shared-ownership)** (v0.184 wording for the v0.140 rule — `Shared<Mutex>` is the cross-domain sharing idiom; for every other `T` it remains domain-local — this list previously predated that amendment, v0.163/#1364); of the [§30.12](#sec-thread-synchronization) types, `Mutex`, `Semaphore`, and the atomics are **sendable** (internally synchronized — stdlib §6.2–§6.4; that is their purpose) while `Lock` guards are domain-bound and not sendable; the data-owning locks `Locked<T>`/`RwLocked<T>` (v0.186) are **sendable** (internally synchronized; their interior is a sendable class by instantiation, [§30.12](#sec-data-owning-locks)) while their guards (`LockGuard<T>`, `ReadGuard<T>`, `WriteGuard<T>`) are domain-bound and not sendable, the `Lock` reasoning verbatim; `FrozenArray<T>` (stdlib §4.19, v0.186) is **sendable** — a wholly-owned, deeply immutable tree that crosses as an owned transfer, readable from many domains at once behind `Shared<FrozenArray<T>>` handles ([§28.13](#sec-shared-ownership)) or as a `static readonly` singleton ([§22.12](#sec-static-members) rule 4); `Channel<T>` and `ChannelSender<T>` are sendable ([§30.15](#sec-channels)). `CancellationToken` is a borrow-bearing record and therefore not sendable by the value-type rule — cancellation does not cross domains in this revision; the cross-domain cancellation pattern is a message on a channel.
+- **Compiler-known standard-library types** state their sendability in their stdlib sections, justified by their internal structure: owning collections and `OwningBuffer<T>` are sendable iff their element type is a sendable class type (their state is wholly owned); borrowing collections are sendable iff their element category ([§28.11](#sec-element-slot-policy)) is sendable-value or `string` (copy and shared-immutable slots; a borrowing collection of class elements carries borrows and is not sendable); `Task`, `Task<T>`, `OwningTask<T>`, enumerators, `EventSource<T>`/`AsyncEventSource<T>`, `CancellationTokenSource`, and `Weak<T>` are domain-local and not sendable; `SharedEventSource<T>` is likewise **not sendable** even though it is internally synchronized and process-reachable as a static ([§22.12](#sec-static-members) rule 5): static reachability, not transfer, is its distribution mechanism (v0.187); **`Shared<T>` is sendable iff `T` is in the `Shared`-payload synchronized set of [§28.13](#sec-shared-ownership)** (v0.184 wording for the v0.140 rule — `Shared<Mutex>` is the cross-domain sharing idiom; for every other `T` it remains domain-local — this list previously predated that amendment, v0.163/#1364); of the [§30.12](#sec-thread-synchronization) types, `Mutex`, `Semaphore`, and the atomics are **sendable** (internally synchronized — stdlib §6.2–§6.4; that is their purpose) while `Lock` guards are domain-bound and not sendable; the data-owning locks `Locked<T>`/`RwLocked<T>` (v0.186) are **sendable** (internally synchronized; their interior is a sendable class by instantiation, [§30.12](#sec-data-owning-locks)) while their guards (`LockGuard<T>`, `ReadGuard<T>`, `WriteGuard<T>`) are domain-bound and not sendable, the `Lock` reasoning verbatim; `FrozenArray<T>` (stdlib §4.19, v0.186) is **sendable** — a wholly-owned, deeply immutable tree that crosses as an owned transfer, readable from many domains at once behind `Shared<FrozenArray<T>>` handles ([§28.13](#sec-shared-ownership)) or as a `static readonly` singleton ([§22.12](#sec-static-members) rule 4); `Channel<T>` and `ChannelSender<T>` are sendable ([§30.15](#sec-channels)). `CancellationToken` is a borrow-bearing record and therefore not sendable by the value-type rule — cancellation does not cross domains in this revision; the cross-domain cancellation pattern is a message on a channel.
 
 Sendability of a generic instantiation is checked at the instantiation or call site under the rules of [§3.6](#sec-derived-type-properties); diagnostics name the property ("not sendable"), the offending type, and the failing rule.
 
@@ -9286,7 +9057,7 @@ VariadicClause  ::= "variadic" "(" IntLiteral ")"
 
 ```
 Member          ::= FieldDecl | MethodDecl | PropertyDecl | IndexerDecl
-                  | EventDecl | ConstructorDecl | DestructorDecl
+                  | ConstructorDecl | DestructorDecl
                   | OperatorDecl | NestedTypeDecl | ConstDecl
                   | PolymorphicMember
 ExtensionMember ::= MethodDecl | ExpressionPropertyDecl
@@ -9294,14 +9065,14 @@ ExtensionMember ::= MethodDecl | ExpressionPropertyDecl
                                  (§26.3, v0.183); MethodDecl's "static"?
                                  alternative does not apply here. */
 
-InterfaceMember ::= IfaceMethod | IfaceProperty | IfaceIndexer | IfaceEvent
+InterfaceMember ::= IfaceMethod | IfaceProperty | IfaceIndexer
                   | IfaceStaticMethod | IfaceStaticOperator
 IfaceStaticMethod   ::= "static" "method" Identifier GenericParams?
                         "(" ParamList? ")" (":" "owned"? Type)? ";"
 IfaceStaticOperator ::= "static" "operator" OpToken
                         "(" ParamList? ")" (":" "owned"? Type)? ";"
                               /* §11.8 (v0.176): abstract-only — a body is an
-                                 error; static properties/consts/events are
+                                 error; static properties/consts are
                                  deferred. Conformance and dispatch rules in
                                  §11.8. */
 IfaceMethod     ::= "method" Identifier GenericParams?
@@ -9320,8 +9091,6 @@ IfaceIndexer    ::= "readonly"? "property" "[" ParamList "]" ":" Type
                                  property or indexer; in interface context each
                                  Accessor uses the `;`-terminated AccessorBody (no
                                  implementation), enforced semantically. See §23.3. */
-IfaceEvent      ::= "async"? "event" Identifier (":" Type)? ";"
-
 FieldDecl       ::= Visibility "static"? ("owned" | "scoped")? "readonly"?
                     Identifier ":" Type (":=" Expression)? ";"
                               /* "scoped" fields (§28.14, v0.175) hold storage-
@@ -9407,14 +9176,6 @@ IndexerDecl     ::= Visibility "static"? VirtualKind?
                                  indexers have no name, so the only valid
                                  form for an indexer's block-form `end` is
                                  plain `end;`. Enforced semantically. */
-
-EventDecl       ::= Visibility "static"? "async"? "event" Identifier (":" Type)? ";"
-                              /* Events are class/interface members only
-                                 (§24.1, v0.180): the shared Member production
-                                 admits an EventDecl inside RecordBody
-                                 syntactically; a record or enum event is
-                                 rejected semantically — records cannot carry
-                                 the generated owned backing field (§9.7, C.3). */
 
 ConstructorDecl ::= Visibility "constructor" "(" ParamList? ")"
                     CtorChain? Statement* "end" "constructor"? ";"
@@ -10014,7 +9775,7 @@ The following identifiers are keywords. Most are reserved unconditionally and ma
 
 **Unconditionally reserved:**
 
-`abstract`, `and`, `as`, `async`, `await`, `base`, `bool`, `break`, `byte`, `case`, `catch`, `char`, `class`, `const`, `constructor`, `continue`, `decimal`, `default`, `destructor`, `do`, `double`, `elif`, `else`, `end`, `enum`, `event`, `extension`, `extern`, `false`, `finally`, `float`, `for`, `if`, `import`, `in`, `int`, `interface`, `internal`, `is`, `long`, `method`, `mod`, `module`, `move`, `nameof`, `new`, `not`, `null`, `or`, `out`, `owned`, `override`, `private`, `property`, `protected`, `public`, `readonly`, `record`, `ref`, `return`, `sbyte`, `scoped`, `sealed`, `short`, `static`, `string`, `then`, `this`, `throw`, `true`, `try`, `type`, `typeof`, `uint`, `ulong`, `ushort`, `using`, `var`, `virtual`, `when`, `where`, `while`, `with`, `yield`.
+`abstract`, `and`, `as`, `async`, `await`, `base`, `bool`, `break`, `byte`, `case`, `catch`, `char`, `class`, `const`, `constructor`, `continue`, `decimal`, `default`, `destructor`, `do`, `double`, `elif`, `else`, `end`, `enum`, `extension`, `extern`, `false`, `finally`, `float`, `for`, `if`, `import`, `in`, `int`, `interface`, `internal`, `is`, `long`, `method`, `mod`, `module`, `move`, `nameof`, `new`, `not`, `null`, `or`, `out`, `owned`, `override`, `private`, `property`, `protected`, `public`, `readonly`, `record`, `ref`, `return`, `sbyte`, `scoped`, `sealed`, `short`, `static`, `string`, `then`, `this`, `throw`, `true`, `try`, `type`, `typeof`, `uint`, `ulong`, `ushort`, `using`, `var`, `virtual`, `when`, `where`, `while`, `with`, `yield`.
 
 **Contextual (see [§B.2](#sec-contextual-keywords)):**
 
@@ -10057,7 +9818,7 @@ The two-token sequence `is not` ([§17.4](#sec-the-is-is-not-and-as-operators), 
 <a id="sec-future-reservations"></a>
 ### B.3 Future reservations
 
-This version of the language does not reserve any identifiers for future use. New keywords introduced in future revisions will be drawn from new compound forms or from words not currently used as identifiers in the standard library.
+This version of the language reserves exactly one identifier for future use: **`event`**. Through v0.185 it was the keyword of the retired event member kind ([§24](#sec-events), v0.187); it is held out of the identifier namespace so that pre-retirement declarations fail with a reserved-word diagnostic rather than parsing `event` as an identifier, and so that a one-line declaration form remains re-introducible without a breaking change. Any other new keywords in future revisions will be drawn from new compound forms or from words not currently used as identifiers in the standard library.
 
 ---
 
@@ -10084,7 +9845,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - Member hiding is forbidden: a derived class cannot reuse the name of an inherited member **visible at its declaration site** unless overriding a virtual member ([§12.2](#sec-hiding-is-not-allowed), v0.184 — an invisible base member (`private`, or cross-module `internal`) does not block the name; the two are then distinct members with no override or overload relationship).
 - An override must match the base member's visibility, return type, parameter types, **and parameter modifiers (`ref`, `out`, `owned`, `scoped` — v0.184)** exactly, except that a parameter may widen `T` to `T?` ([§12.1](#sec-members-are-non-virtual-by-default), v0.181 — the same contravariant allowance as interface implementations); the widening is monotone down the override chain.
 - An inheritance cycle is rejected: no type may, directly or transitively, list itself among its base classes or extended interfaces ([§12.10](#sec-inheritance-cycles)).
-- A type may not declare two members that are indistinguishable: two fields, properties, events, or nested types of the same name, or two methods, constructors, or operator overloads of the same name that are not distinguishable as overloads ([§22.6](#sec-overloading)), are a compile error; likewise a non-overloadable member (field, property, event, nested type) may not share its name with any other member regardless of kind. Legal overloads are unaffected ([§11.3](#sec-member-body)).
+- A type may not declare two members that are indistinguishable: two fields, properties, or nested types of the same name, or two methods, constructors, or operator overloads of the same name that are not distinguishable as overloads ([§22.6](#sec-overloading)), are a compile error; likewise a non-overloadable member (field, property, nested type) may not share its name with any other member regardless of kind. Legal overloads are unaffected ([§11.3](#sec-member-body)).
 - Neither `owned` (on an ordinary or `out` parameter) nor `scoped` distinguishes overloads: two members differing only in these modifiers clash ([§22.6](#sec-overloading), v0.181 — the v0.77 `out`/`out owned` carve-out is withdrawn).
 - Variant generic parameters (`in`, `out`) appear only in the appropriate position.
 - A variant assignment whose source has a value-type type argument is rejected; the type itself (e.g. `IEnumerable<int>`) is fully usable, only the variant conversion is forbidden ([§12.9](#sec-variance)).
@@ -10102,7 +9863,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 ### C.2 Visibility
 
 - Every class member declares its visibility explicitly, except `static constructor`, `destructor`, and the `polymorphic` registry (which carry no visibility keyword).
-- Every type appearing in a member's signature — field type, parameter type, return type, property type, indexer parameter and result type, event payload type, types named in `where` constraints — is at least as visible as the member. The rule applies at every visibility level except `private`, which is unconstrained.
+- Every type appearing in a member's signature — field type, parameter type, return type, property type, indexer parameter and result type, types named in `where` constraints — is at least as visible as the member. The rule applies at every visibility level except `private`, which is unconstrained.
 - A class's base class and implemented interfaces are at least as visible as the class.
 - Top-level types are `public` or `internal` only.
 - An explicit accessor visibility is no less restrictive than the property's overall visibility.
@@ -10252,16 +10013,16 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - Comparison operators are overloaded as a complete group (`<`, `>`, `<=`, `>=` together; `=` and `<>` together).
 - The bitwise complement operator is `~`; the boolean negation operator is `not`. They are not interchangeable. `~` is user-overloadable; `not` is not.
 - `mod` has no compound-assignment form; `mod=` is not valid syntax.
-- Assignment and compound-assignment operators (`:=`, `+=`, `-=`, `*=`, `/=`, `&=`, `|=`, `^=`, `<<=`, `>>=`, `??=`) are not user-overloadable. The `+=` and `-=` syntactic forms on `EventSource<T>` and `AsyncEventSource<T>` are a fixed compiler desugaring, not operator overloads.
+- Assignment and compound-assignment operators (`:=`, `+=`, `-=`, `*=`, `/=`, `&=`, `|=`, `^=`, `<<=`, `>>=`, `??=`) are not user-overloadable. The `+=` and `-=` event-subscription forms on `EventSource<T>`, `AsyncEventSource<T>`, and `SharedEventSource<T>` are a fixed compiler desugaring ([§17.2](#sec-notes-on-operators)), not operator overloads.
 
 <a id="sec-static-initialization"></a>
 ### C.11 Static initialization
 
 - Cyclic static initialization across **distinct** types is rejected at compile time when visible to the [§22.13](#sec-static-initialization-order) dependency approximation (static-member references between distinct types, followed transitively through statically-resolvable calls within the compilation unit); a cycle the approximation misses raises a runtime-synthesized `TypeInitializationException` (`InnerException` null) at the same-thread **re-entrant** touch — one arriving from outside the touched type's own initialization — and partially-initialized statics are never observed through a re-entrant touch. Within-type forward reads of later `static readonly` fields are rejected transitively through the same call set; the routes both approximations miss are recorded residuals with the checked-mode watermark bound ([§22.13](#sec-static-initialization-order), v0.184).
 - A type's static initializer runs exactly once process-wide; a cross-domain touch of a type mid-initialization blocks until initialization completes or observes the failed state ([§22.12](#sec-static-members) rule 1).
-- A mutable (non-`readonly`, non-`const`) static field or auto-property has one of [§22.12](#sec-static-members) rule 2's two admitted forms: an internally-synchronized handle type (`Mutex`, `Semaphore`, `Atomic<T>`, `AtomicInteger<T>`, `ChannelSender<T>` — `Channel<T>` excluded) or a `Task?`/`Task<T>?` lazy cache; anything else is rejected.
-- `static readonly` and `const` of immutable content are unrestricted; a `static readonly` field of class or interface type outside the form-(i) synchronized set (and, v0.186, outside rule 4's suppression list — `Locked<T>`, `RwLocked<T>`, `FrozenArray<T>`) draws the [§22.12](#sec-static-members) rule 4 declaration-site warning. Rules 2/4 govern user-declared statics; the compiler-generated static-event backing field is admitted under rule 5 and draws neither diagnostic ([§22.12](#sec-static-members), v0.184).
-- A handler subscribed to a `static event` **at a member-syntax subscription site** is compiler-checked capture-free (v0.184 scoping; the `IEvent<T>`-alias route is a recorded programmer obligation, #1647); static-event subscriber lists are runtime-synchronized ([§22.12](#sec-static-members) rule 5).
+- A mutable (non-`readonly`, non-`const`) static field or auto-property has one of [§22.12](#sec-static-members) rule 2's two admitted forms: an internally-synchronized handle type (`Mutex`, `Semaphore`, `Atomic<T>`, `AtomicInteger<T>`, `ChannelSender<T>`, `SharedEventSource<T>` (v0.187) — `Channel<T>` excluded) or a `Task?`/`Task<T>?` lazy cache; anything else is rejected.
+- `static readonly` and `const` of immutable content are unrestricted; a `static readonly` field of class or interface type outside the form-(i) synchronized set (which includes `SharedEventSource<T>` as of v0.187 — [§22.12](#sec-static-members) rule 2; and, v0.186, outside rule 4's suppression list — `Locked<T>`, `RwLocked<T>`, `FrozenArray<T>`) draws the [§22.12](#sec-static-members) rule 4 declaration-site warning.
+- A handler argument at any call resolving to a subscribe position declared on `ISharedEvent<T>` or `SharedEventSource<T>` is compiler-checked **capture-free** — a non-capturing lambda or a static method reference ([§28.14](#sec-scoped-callback-parameters)'s stdlib-stated capture-free register; [§22.12](#sec-static-members) rule 5, v0.187) — and method-reference formation over a capture-free-register position is rejected ([§28.14](#sec-scoped-callback-parameters)), making the admission hold at every site, aliases included; shared-event subscriber lists are internally synchronized (stdlib §6.5).
 - The access that triggers a failing static initialization, and every subsequent access, observe the same cached `TypeInitializationException`; the original exception is observable only as its `InnerException` ([§22.7](#sec-constructors)).
 - A `const` declaration's initializer is a constant expression ([§17.14](#sec-constant-expressions)); an initializer whose compile-time evaluation faults (overflow, division by zero) is rejected at the declaration, never deferred to runtime (v0.184).
 
@@ -10295,7 +10056,7 @@ An implementation may also conform at "Core plus named features" (e.g., *Core + 
 
 | Feature | Specification sections | Standard-library sections |
 |---|---|---|
-| **Events** | [§24](#sec-events) | `EventSource<T>`, `IEvent<T>`, `AsyncEventSource<T>`, `IAsyncEvent<T>`, `Subscription` (stdlib [§2.11](Bezel_Standard_Library.md#sec-subscription)) |
+| **Events** | the event-subscription desugaring of [§17.2](#sec-notes-on-operators) | stdlib [§6.5](Bezel_Standard_Library.md#sec-events-ievent-eventsource) entire — `EventSource<T>`, `IEvent<T>`, `AsyncEventSource<T>`, `IAsyncEvent<T>`, `ISharedEvent<T>`, `SharedEventSource<T>` — plus `Subscription` (stdlib [§2.11](Bezel_Standard_Library.md#sec-subscription)) |
 | **Asynchronous programming** | [§30](#sec-asynchronous-programming) entire — including domains, spawning, and channels ([§30.13](#sec-runtime-model)–[§30.15](#sec-channels)); [§28.12](#sec-asynchronous-disposal) (`await using`, `IAsyncDisposable`); the async-iterator forms of [§29](#sec-iteration-2) (`IAsyncEnumerable<T>`, `IAsyncEnumerator<T>`, `IOwningAsyncEnumerable<T>`, `IOwningAsyncEnumerator<T>`) | `Task`, `Task<T>`, `OwningTask<T>`, completion sources, `CancellationToken`/`CancellationTokenSource`, `Mutex`/`Semaphore`/`Atomic<T>`, `Domain`, `Channel<T>`/`ChannelSender<T>`, the async forms of IO and sequence operations |
 | **Serialization synthesis** | [§9.8](#sec-serialization-synthesis) | stdlib §2.14–2.15 |
 | **Foreign Function Interface** | [§32](#sec-foreign-function-interface); the FFI clauses of [§15.1.3](#sec-inline-array-ffi); the C-compatible row and reservation-clause exception of [§3.6](#sec-derived-type-properties) | `Ptr<T>`, `Interop` (stdlib §10.5–§10.6); `RawBytes.FromForeign`, `CString`/`WString.Pointer` (stdlib §10.1–§10.3); `OwningBuffer<T>.DangerousPointer` (stdlib §4.14) |
@@ -10309,7 +10070,7 @@ Everything not listed is **Core**: lexical structure through generics, records, 
 ### D.3 Dependencies and closure
 
 - Extended features depend on Core; Core depends on no Extended feature. The Core sections' references *into* Extended sections (e.g., [§28.3](#sec-local-variables-ownership-and-borrows)'s notes on async lambdas, [§9.7](#sec-records-and-disposal)'s span examples) are normative only for implementations of the referenced feature.
-- The async-iterator forms belong to **Asynchronous programming** and additionally require synchronous iteration (Core). **Buffers and spans**, **Sequence operations**, and **Shared ownership** depend only on Core. **Events**' async event source requires **Asynchronous programming**; the synchronous `EventSource<T>` does not.
+- The async-iterator forms belong to **Asynchronous programming** and additionally require synchronous iteration (Core). **Buffers and spans**, **Sequence operations**, and **Shared ownership** depend only on Core. **Events**' async event source requires **Asynchronous programming**; the synchronous `EventSource<T>` does not, and neither do `ISharedEvent<T>`/`SharedEventSource<T>` (v0.187): their capture-free admission is ordinary [§28.14](#sec-scoped-callback-parameters) typing, and in a single-domain build the synchronization guarantee is satisfied vacuously; the deferred shared-async twin, if ever shipped, requires Asynchronous programming like `AsyncEventSource<T>`.
 - A Core implementation's standard library omits the types of unimplemented Extended features entirely (they are absent, not stubbed); programs referencing them fail name resolution with the feature-naming diagnostic of D.1.
 
 <a id="sec-conformance-and-the-runtime-model"></a>
