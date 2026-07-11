@@ -2350,6 +2350,17 @@ void Resolver::checkAbstractImplementations() {
             abstractArities;
         std::unordered_map<std::string_view, std::unordered_set<std::size_t>>
             concreteArities;
+        // #1685 / §11.2 (v0.184): the actual interface-declared MethodSymbols
+        // per name, kept (unlike the arity-only sets above) so the `scoped`
+        // match below can compare each interface member's parameters against
+        // its concrete implementation position-by-position. Populated only
+        // from INTERFACE declarations (curIsIface below) — an abstract CLASS
+        // member's concrete override already goes through the `override`
+        // keyword and is checked exactly (`scoped` included) by
+        // checkOverrideSignatureMatch (dp->modifier != bp->modifier, §12.1);
+        // adding it here too would just re-report the same violation twice.
+        std::unordered_map<std::string_view, std::vector<MethodSymbol*>>
+            ifaceMethodsByName;
         // §11.2 / §23: interface property names that require a property
         // implementation (a field does NOT satisfy a property contract — per
         // §23, a property is declared with the `property` keyword and
@@ -2387,6 +2398,13 @@ void Resolver::checkAbstractImplementations() {
                     if (methodIsAbstract(ms)) {
                         abstractNames.insert(ms->name);
                         abstractArities[ms->name].insert(ms->params.size());
+                        // #1685: record the interface's own MethodSymbol so
+                        // the `scoped` match below can inspect its per-
+                        // parameter modifiers directly (curIsIface implies
+                        // every non-static member here is interface-declared,
+                        // since methodIsAbstract is true for ALL interface
+                        // members — see methodIsAbstract above).
+                        if (curIsIface) ifaceMethodsByName[ms->name].push_back(ms);
                     } else {
                         concreteNames.insert(ms->name);
                         concreteArities[ms->name].insert(ms->params.size());
@@ -2447,6 +2465,73 @@ void Resolver::checkAbstractImplementations() {
                         std::to_string(arity) + "-parameter signature — the "
                         "implementing method's parameter count must match the "
                         "abstract/interface member exactly (§11.2 / §12.1)");
+                }
+            }
+        }
+        // #1685 / §11.2 (v0.184): "The same exact-match rule covers the
+        // `scoped` modifier, in both directions ... An implementation adding
+        // `scoped` to a parameter the interface declares plain would retain a
+        // callback ... that callers through the interface admitted under a
+        // call-bounded, non-retaining contract — a use-after-free shape. An
+        // implementation *dropping* the interface's `scoped` ... is rejected
+        // all the same: `scoped` is part of a function type's identity ...
+        // and never distinguishes overloads." Compared against the SAME
+        // concrete candidate codegen's `findInterfaceImpl`
+        // (LlvmBackend_impl.hpp) wires into the itable slot: most-derived
+        // class first, first same-arity overload in declaration order.
+        for (auto& [name, ifaceMethods] : ifaceMethodsByName) {
+            for (MethodSymbol* im : ifaceMethods) {
+                MethodSymbol* impl = nullptr;
+                MethodSymbol* nameOnly = nullptr;
+                TypeSymbol* c = t;
+                while (c && !impl) {
+                    for (Symbol* m : c->members) {
+                        auto* ms = dynamic_cast<MethodSymbol*>(m);
+                        if (!ms || ms->isOperator || hasMod(ms, "static") ||
+                            ms->name != im->name || methodIsAbstract(ms))
+                            continue;
+                        if (ms->params.size() == im->params.size()) {
+                            impl = ms;
+                            break;
+                        }
+                        if (!nameOnly) nameOnly = ms;
+                    }
+                    if (impl) break;
+                    TypeSymbol* nextClass = nullptr;
+                    for (TypeSymbol* b : c->baseTypes) {
+                        if (b && b->kind == ast::TypeDeclKind::Class) {
+                            nextClass = b;
+                            break;
+                        }
+                    }
+                    c = nextClass;
+                }
+                if (!impl) impl = nameOnly;
+                if (!impl || impl->params.size() != im->params.size())
+                    continue;  // missing/arity mismatch already reported above
+                for (std::size_t pi = 0; pi < im->params.size(); ++pi) {
+                    auto* ip = dynamic_cast<ParameterSymbol*>(im->params[pi]);
+                    auto* cp = dynamic_cast<ParameterSymbol*>(impl->params[pi]);
+                    if (!ip || !cp) continue;
+                    bool ifaceScoped = ip->modifier == "scoped";
+                    bool implScoped = cp->modifier == "scoped";
+                    if (ifaceScoped == implScoped) continue;
+                    ctx_.diagnostics().report(
+                        Severity::Error, impl->declLoc,
+                        std::string("method `") + std::string(name) +
+                        "` does not match interface member `" +
+                        std::string(name) + "`'s `scoped` modifier on "
+                        "parameter " + std::to_string(pi + 1) + " — " +
+                        (ifaceScoped
+                             ? std::string("the interface declares it "
+                                           "`scoped`; the implementation "
+                                           "must declare it `scoped` too")
+                             : std::string("the interface declares it "
+                                           "without `scoped`; the "
+                                           "implementation may not add "
+                                           "`scoped`")) +
+                        " (§11.2)");
+                    break;  // one diagnostic per member is enough
                 }
             }
         }
