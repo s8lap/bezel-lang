@@ -3314,6 +3314,37 @@ ExprTC::moveThroughBorrowingSpanSlotName(const ast::Expr& operand) const {
     return {};
 }
 
+// §19.3 / §15.3 (v0.184, #1665): a `case`/`when` pattern binding over a
+// MOVE-ONLY value-type scrutinee (an owning inline array, `[N owned]T` /
+// `[N owned]T?`) is a BORROW of the scrutinee's value — "the case construct
+// itself never moves from the scrutinee, so the borrow form is the only
+// consistent option ... Slot reads through the binding are admitted; `move
+// s[i]` through the binding is rejected (the binding does not own the
+// array)" (§19.3). Detect `operand` = `s[i]` where `s` resolves to a
+// LocalSymbol whose declaration node is a pattern `BindingPattern` (the
+// naked `var s` arm form, or a nested `var x` inside a destructuring
+// sub-pattern — both are registered with `lsym->decl` pointing at the
+// BindingPattern node, which is what distinguishes them from a plain
+// `var`-declared local, whose `lsym->decl` is the LocalDecl node instead —
+// see the CaseStmt/CaseExpr arm-binding handlers) and whose type is a
+// move-only owning inline array. Returns the bound name when this shape is
+// matched, else the empty string.
+std::string ExprTC::moveThroughBorrowedMoveOnlyArrayBindingName(
+        const ast::Expr& operand) const {
+    const auto* ix = dynamic_cast<const ast::IndexExpr*>(&operand);
+    if (!ix || !ix->target) return {};
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(ix->target.get());
+    if (!id) return {};
+    Symbol* sym = ctx_.exprSymbol(*id);
+    auto* loc = dynamic_cast<LocalSymbol*>(sym);
+    if (!loc || !loc->decl) return {};
+    if (!dynamic_cast<const ast::BindingPattern*>(loc->decl)) return {};
+    const TypeRef* tt = ctx_.exprType(*ix->target);
+    if (!tt || tt->kind != TypeRef::Kind::InlineArray || !tt->arrayOwned)
+        return {};
+    return std::string(id->name);
+}
+
 void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
     const auto& op = ue.op;
     // §25: a user-defined unary operator overload.
@@ -3407,6 +3438,23 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                 "or read-only buffer), so its slots hold borrows with no "
                 "ownership to transfer (§28.11 / §4.15 — `move arrSpan[i]` is "
                 "rejected; use the plain indexer-get to read the borrow)");
+        }
+        // §19.3 / §15.3 (v0.184, #1665): `move s[i]` is rejected when `s` is a
+        // `case`/`when` pattern binding over a move-only owning-inline-array
+        // scrutinee — the binding is a borrow of the scrutinee's value and
+        // does not own the array, so there is no slot to take ownership of.
+        std::string patBinding = moveThroughBorrowedMoveOnlyArrayBindingName(*ue.operand);
+        if (!patBinding.empty()) {
+            ctx_.diagnostics().report(
+                Severity::Error, ue.span.begin,
+                std::string("`move` is not admitted through a `case`/`when` "
+                            "pattern binding of move-only value type: `") +
+                patBinding +
+                "` is a borrow of the scrutinee — the case construct never "
+                "moves from the scrutinee, so the binding does not own the "
+                "array and there is no slot to take ownership of (§19.3 / "
+                "§15.3 — read the slot with the plain indexer, or move from "
+                "the original scrutinee after the match instead)");
         }
         // §4.14 (#779): `move sp[i]` on a VALUE-typed owning `Span<T>` is not
         // admitted — value elements are read with the plain indexer and copied

@@ -1000,6 +1000,16 @@ private:
     // OWNING `Span<T>` (over an `OwningBuffer`) is NOT matched here.
     std::string moveThroughBorrowingSpanSlotName(const ast::Expr& operand) const;
 
+    // §19.3 / §15.3 (v0.184, #1665): if `operand` is `s[i]` where `s` is a
+    // `case`/`when` pattern binding (a LocalSymbol whose `decl` is a pattern
+    // `BindingPattern`, not a plain `var`-declared LocalDecl) over a MOVE-ONLY
+    // owning-inline-array scrutinee, return the bound name; otherwise the
+    // empty string. The binding is a borrow of the scrutinee's value — it
+    // does not own the array — so `move s[i]` is rejected at compile time by
+    // `typeUnary`'s `move` branch.
+    std::string moveThroughBorrowedMoveOnlyArrayBindingName(
+        const ast::Expr& operand) const;
+
     // §30.14 / §3.6 (#600): sendability derived-type property.
     // Returns true iff `rt` satisfies the §30.14 sendable table for a
     // Channel<T> element or Domain.Spawn argument/result.
