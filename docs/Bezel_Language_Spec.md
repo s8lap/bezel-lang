@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.187 — July 2026**
+**Version 0.188 — July 2026**
 
 Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -118,7 +118,7 @@ module BankingApp.Transactions;
 
 A module name is a single identifier or a sequence of identifiers separated by dots. The dotted form is a single name; it does not establish nesting. `BankingApp` and `BankingApp.Transactions` are unrelated modules.
 
-Multiple files with identical `module` declarations belong to the same module. Files in the same module share `internal` access ([§13](#sec-visibility)).
+Multiple files with identical `module` declarations **presented to the module's one compilation ([§2.8.1](#sec-module-identity-and-closure))** belong to the same module. Files in the same module share `internal` access ([§13](#sec-visibility)).
 
 <a id="sec-imports"></a>
 ### 2.2 Imports
@@ -155,22 +155,22 @@ Only the primitive value-type keywords and their reserved PascalCase aliases (an
 <a id="sec-compilation-unit"></a>
 ### 2.4 Compilation unit
 
-The module is the unit of compilation. The compiler takes all source files belonging to a module, plus its dependencies, and produces a single native artifact:
+The compilation unit — a module, or an import-cycle SCC of modules ([§2.5](#sec-dependency-resolution)) — is the unit of compilation. The compiler takes all source files belonging to the compilation unit and, reading its dependencies' artifacts ([§2.5](#sec-dependency-resolution), [§2.8.3](#sec-transitive-closure-and-type-identity)), produces one native artifact per member module:
 
-- An **executable** is a standalone native binary. Its **main module** — the module named as the executable target ([§33.1](#sec-the-main-method)) — must contain exactly one qualifying `Main` method as defined in [§33](#sec-program-entry-point), unless [§33.5](#sec-program-entry-point-resolution)'s `--main-class` disambiguation selects among several.
-- A **library** is a shared native library (`.so`, `.dylib`, or `.dll`). It exposes its `public` types and methods.
+- An **executable** is a native binary requiring no language-runtime installation; whether its dependency artifacts are embedded in it or accompany it is the [§2.8.4](#sec-program-assembly) link-mode choice. An executable build requires exactly one qualifying `Main` method as defined in [§33](#sec-program-entry-point) in the root compilation, selected per [§2.8.4](#sec-program-assembly) and [§33.5](#sec-program-entry-point-resolution).
+- A **library** is a non-executable artifact; whether it takes the form of a shared native library (`.so`, `.dylib`, `.dll`), an object embedded statically by its consumers, or both, is the [§2.8.4](#sec-program-assembly) link-mode choice. It exposes its `public` types and methods.
 
 <a id="sec-dependency-resolution"></a>
 ### 2.5 Dependency resolution
 
-Dependencies are declared through `import` statements. In the acyclic case the compiler resolves each dependency by reading the imported module's compiled artifact, which embeds public-interface metadata (type signatures, method signatures, generic constraints).
+Dependencies are declared through `import` statements. In the acyclic case the compiler resolves each dependency by reading the imported module's compiled artifact, which embeds the module's interface ([§2.8.2](#sec-artifact-interface)).
 
 **Circular imports compile as one unit (v0.164 — previously this section permitted circularity while also requiring artifact-based resolution, which are jointly impossible: neither of two mutually-importing modules could be compiled first).** Modules whose imports form a cycle constitute a **strongly-connected component**, and an SCC is the unit of compilation: the build supplies the sources of all SCC members to one compiler invocation, which resolves their types against each other directly (no artifacts consumed within the SCC) and still emits one artifact per member module. A build that presents only part of an SCC is an error naming the missing members. Between SCCs, resolution is artifact-based as above; the module dependency graph condensed by SCCs is processed in topological order. Circular *static-initialization* dependencies are checked per [§22.13](#sec-static-initialization-order)'s two-part rule regardless of compilation grouping: the compile-time approximation rejects the cycles it can see, and the runtime re-entrancy backstop converts the rest into `TypeInitializationException` — never silent observation of partially-initialized statics (v0.181; this sentence previously asserted unconditional rejection).
 
 <a id="sec-build-phases"></a>
 ### 2.6 Build phases
 
-1. Parse all source files of the module.
+1. Parse all source files of the compilation unit (module or SCC, [§2.5](#sec-dependency-resolution)).
 2. Resolve all type declarations across the module and its dependencies.
 3. Type-check method bodies, field initializers, and expressions.
 4. Generate native code; emit the artifact with embedded interface metadata.
@@ -186,6 +186,155 @@ A dotted name `A.B` (and longer chains) can in principle read as a module-qualif
 2. **Otherwise, match the longest dotted prefix of the chain against an imported module's full name** (or the current module's). The remainder then resolves against that module's public declarations, continuing as in rule 1. A prefix matching *no* import is an error at `A` (naming the unresolved segment, and — when a non-imported module of that name is known to the build — suggesting the missing `import`).
 
 Consequences worth stating: a type named `A` in scope **shadows** a module-name prefix `A.…` for chain purposes (the compiler warns when both readings exist — qualify via an alias to reach the module); two module prefixes cannot be ambiguous (module names are exact); and because resolution never backtracks, the meaning of a chain is determined by its shortest resolvable head — adding an unrelated import can make a previously-erroring chain resolve, but can never silently *change* a chain that already resolved (rule 1 outranks rule 2, and rule-1 resolutions are collision-checked).
+
+<a id="sec-module-identity"></a>
+### 2.8 Module identity, artifact interface, and program assembly (v0.188)
+
+Sections [§2.1](#sec-module-declarations)–[§2.7](#sec-name-resolution-order) define a single compilation's view of modules: declarations, imports, name resolution, and the unit of compilation. This section defines everything downstream of one compilation: what makes a module *one* module across separately-compiled artifacts, what a compiled artifact must carry, who supplies the artifacts of transitive dependencies, and how a program is assembled. Terminology, consistent with [§2.4](#sec-compilation-unit)/[§2.5](#sec-dependency-resolution):
+
+- A **compilation** (**unit**) is one compiler invocation over the sources of one module, or of one import-cycle SCC ([§2.5](#sec-dependency-resolution)); it emits one artifact per member module.
+- The **root compilation** is the compilation a build is currently performing: the sources presented directly, as opposed to the dependency artifacts supplied alongside them.
+- A **build** (**program assembly**) presents a root compilation plus a set of dependency artifacts to produce a final artifact.
+- A **program** is an executable together with the dependency artifacts assembled into its process.
+
+<a id="sec-module-identity-and-closure"></a>
+#### 2.8.1 Module identity and closure
+
+1. **One module, one compilation, one artifact.** Every module in a program is the product of exactly one compilation. A module's membership is fixed by the source files presented to that compilation; no other source file becomes part of the module by declaring its name. An SCC compilation ([§2.5](#sec-dependency-resolution)) is one compilation producing one artifact per member module; each member module is still produced exactly once.
+
+2. **`internal` is closed by compilation, not by name.** `internal` ([§13.1](#sec-levels)) grants access only among the source files compiled together as the declaring module ([§13.4](#sec-modules-and-internal)). Co-compilation does not widen it: within an SCC unit, each member module's internals remain invisible to the other members — the SCC is a compilation-order grouping, not an access grant.
+
+3. **Duplicate module names are a build error.** A build whose artifact set — the root compilation plus the dependency closure ([§2.8.3](#sec-transitive-closure-and-type-identity)) — contains two **distinct** artifacts declaring the same module name, or a dependency artifact declaring a module name that the root compilation also declares, is ill-formed; the diagnostic names both origins. The intended diagnostic point is artifact-set load (metadata time); an implementation that discovers the duplication only at native linking conforms, but the metadata-time diagnostic naming both artifacts is the standard. Presenting the *same* artifact more than once (the same file, or bit-identical content — as when a build tool concatenates per-dependency closures that share a diamond base, [§2.8.3](#sec-transitive-closure-and-type-identity)) is idempotent: duplicates are deduplicated, not diagnosed. Within one process there is exactly one artifact per module name (runtime dynamic loading is out of scope, [§32](#sec-reserved-for-future-revisions)).
+
+4. **Self-import is a compile error.** An `import` naming the enclosing file's own module is rejected ("a module cannot import itself"). Import *cycles between distinct modules* remain legal and compile as an SCC ([§2.5](#sec-dependency-resolution)); the self-loop is not a cycle, it is a mistake.
+
+5. **Implementation-provided modules.** The standard-library modules — the [§2.3](#sec-always-available-names) always-available set and the other explicitly-imported modules the standard-library document defines — are provided by the implementation, not by any presented artifact. They are implicit members of every build's artifact set: exempt from the presentation requirement of [§2.8.3](#sec-transitive-closure-and-type-identity) rule 1, resolvable by `import` with no artifact supplied. They **do** participate in duplicate-name detection: a root compilation or dependency artifact declaring a module name the implementation provides (`module System;`, `module System.Threading;`, …) is the rule-3 build error.
+
+<a id="sec-artifact-interface"></a>
+#### 2.8.2 The artifact interface is a semantic requirement
+
+A compiled artifact embeds its module's **interface** ([§2.5](#sec-dependency-resolution)). The interface's required capability is semantic; its format is implementation-defined (source text, serialized AST, IR, or any mix). It must be sufficient for a consumer, given only the artifact (and the artifacts of its dependencies, [§2.8.3](#sec-transitive-closure-and-type-identity)), to:
+
+1. **Type-check** every well-formed use of the module's public surface: public (and, for cross-module derivation, `protected`) types and members, with full signatures — ownership modifiers (`owned` returns and parameters, `ref`/`out`, `scoped`), default argument values, generic parameters with variance and constraints, base types and implemented interfaces, enum constants, `const` values, and serialization conformances — and the **derived type properties** ([§3.6](#sec-derived-type-properties)): carried as computed verdicts for non-generic public types, and as the structural facts needed for per-instantiation evaluation ([§3.6](#sec-derived-type-properties) rule 2) for public generics. (These properties are computed from structure the public surface does not show — private fields, destructor presence — yet [§3.6](#sec-derived-type-properties) rule 3 makes them part of the public contract, and rules dispatch on them at the consumer: sendability at domain boundaries ([§30.14](#sec-sendable-types)), trivial-dispose ([§28.9](#sec-runtime-managed-types)), element category ([§28.11](#sec-collection-element-ownership)). An interface that omitted them would force the consumer to either reject imported types at those rules or guess.)
+
+2. **Instantiate** every public generic type and generic method at arbitrary module-external type arguments satisfying the declared constraints. An external instantiation behaves identically to a same-module instantiation of the same generic at the same arguments.
+
+3. **Identify and describe dependencies**: the interface of every dependency type referenced from the module's public surface *or from any declaration body carried in the interface* (the definition-site clause below), keyed by program-wide type identity ([§2.8.3](#sec-transitive-closure-and-type-identity)), sufficient for the consumer to use such types without holding their declaring module's artifact *at type-check time* (the artifact itself is still required in the build's closure).
+
+**Definition-site visibility.** Visibility inside a generic body is judged at the *definition site*: a public generic's body may reference its own module's `internal` declarations, and an external instantiation binds to them. The interface must therefore carry whatever internal machinery its exported generic bodies reach; internal declarations so carried do not become visible to the consumer's *source* (visibility is unchanged — only the instantiation may bind to them). Carried bodies may equally reach *other modules'* declarations that appear nowhere on the exporting module's public signatures; clause 3's "or from any declaration body carried in the interface" makes those modules describable and puts them in the build's closure ([§2.8.3](#sec-transitive-closure-and-type-identity) rule 1).
+
+An honest cost, stated plainly: definition-site visibility makes a module's `internal` declarations reached by exported generic bodies part of its **binary** interface even though they are absent from its *source* interface — changing one invalidates dependents exactly as a signature change does (a [§2.8.3](#sec-transitive-closure-and-type-identity) rule 3 staleness error until they recompile). Under the recompile-the-world model ([§2.8.5](#sec-module-system-non-goals)'s ABI non-goal) that is a build-time inconvenience, not a compatibility trap; it is the price of monomorphizing generics across artifact boundaries.
+
+**No restrictions beyond visibility.** Cross-module use of a public generic is not restricted relative to same-module use. An implementation unable to carry some body shape in its interface format must reject the export, or the import, with a diagnostic naming the shape; it must not alter the instantiation's semantics.
+
+<a id="sec-transitive-closure-and-type-identity"></a>
+#### 2.8.3 Transitive dependencies and cross-artifact type identity
+
+1. **The build supplies the transitive closure.** A build must present the artifacts of the root compilation's direct imports *and, transitively, of every module those artifacts' interfaces reference* — where an interface's references include those made by the declaration bodies it carries ([§2.8.2](#sec-artifact-interface), definition-site clause), not only its public signatures. A missing member of the closure is a build error naming the missing module and the artifact(s) that reference it; diagnosis quality is implementation-defined — a conforming implementation may discover the omission as late as native linking, but a metadata-time diagnostic naming the module is the intended standard. Implementation-provided modules ([§2.8.1](#sec-module-identity-and-closure) rule 5) are implicit members of every closure and are never required to be presented.
+
+2. **Use without import; naming requires import.** A file that imports module `A` may freely **use** values of any public type reachable through `A`'s public surface — receive them (including into `var`/`using var` bindings with inferred types), call their public members, pass them as arguments, return them, and dispose them — without importing the type's declaring module. **Naming** the type in source — in a type ascription, parameter or return type, `new` expression, cast, `is`/pattern type test, `catch` clause, explicit (source-spelled) generic type argument, or extension declaration — requires importing its declaring module (which then also puts the name under [§2.2](#sec-imports)'s collision discipline). An instantiation the compiler *infers* at a transitive type (a call `Util.Process(pay)` inferring `Process<Money>`; a call returning `Box<Money>` bound with `var`) spells no name and remains **use**.
+
+3. **Program-wide type identity.** A type is identified program-wide by its **declaring module name, its qualified type name (including any enclosing-type path, [§11.6](#sec-nested-types)), and its generic arity**; a constructed generic type is identified by its generic's identity plus the identities of its arguments. Two modules each declaring a public type of the same name declare two unrelated types (distinguished in diagnostics by module qualification). All descriptions of one type — the declaring artifact's own and every copy embedded in dependents' interfaces ([§2.8.2](#sec-artifact-interface) clause 3) — denote the same type and **must agree**; a build whose closure contains disagreeing descriptions (a stale artifact) is ill-formed, with a diagnostic naming the artifacts and recommending recompilation of the dependents.
+
+4. **Identity is one type at runtime, too.** A type — in particular a constructed generic type, whose monomorphized code may be emitted by several consumers' compilations — is one type *in the running process*: exactly **one copy of its static state** and **one recorded initialization** ([§22.12](#sec-static-members) rule 1: a type's static initializer runs exactly once process-wide; [§22.13](#sec-static-initialization-order)), and **one runtime type identity** — `is` tests, `catch` clauses, and [§19](#sec-the-case-construct) patterns over values of the instantiation match identically regardless of which artifact produced the value or performs the test. Duplicate *code* copies of a monomorphization are permitted only where observationally indistinguishable from one copy.
+
+**The diamond, worked.** `App` imports `Lib1` and `Lib2`; both import `Base`; `App` never imports `Base`.
+
+```bezel
+// base.bz
+module Base;
+
+public class Money
+  private _cents: long;
+
+  public constructor(cents: long)
+    _cents := cents;
+  end constructor;
+
+  public property Cents: long => _cents;
+
+  public method Format(): string
+    return $"{_cents} cents";
+  end Format;
+end Money;
+```
+
+```bezel
+// lib1.bz
+module Lib1;
+import Base;
+
+public class Payroll
+  public static method Net(hours: int, centsPerHour: int): owned Money
+    return new Money(hours * centsPerHour);   // fresh owned Base.Money, crossing Lib1's surface
+  end Net;
+end Payroll;
+```
+
+```bezel
+// lib2.bz
+module Lib2;
+import Base;
+
+public class Invoices
+  public static method Total(m: Money): long   // borrows a Base.Money
+    return m.Cents;
+  end Total;
+end Invoices;
+```
+
+```bezel
+// app.bz
+module App;
+import Lib1;
+import Lib2;
+// no `import Base;` — and none is needed for anything below
+
+class Program
+  public static method Main()
+    using var pay := Payroll.Net(40, 2500);      // USE: inferred binding of a transitive type (rule 2)
+    Console.WriteLine(Invoices.Total(pay));      // USE: passing the value across module surfaces
+    Console.WriteLine(pay.Format());             // USE: member access
+  end Main;                                      // USE: `using var` disposal of a transitive type
+end Program;
+
+// Each of the following would be NAMING, and each requires `import Base;` first:
+//   var m: Money := Payroll.Net(1, 1);           — type ascription
+//   using var m2 := new Money(500);              — `new`
+//   if pay is Money then … end;                  — type test
+//   var box := new OwningArray<Money>();         — generic type argument
+```
+
+The build compiles `Base` first, then `Lib1` and `Lib2` against `Base`'s artifact, and finally compiles `App` presenting the artifacts of `Lib1`, `Lib2`, **and `Base`** — the closure of rule 1 — even though `app.bz` never writes `import Base;`; omitting `Base`'s artifact is the rule-1 build error naming `Base` and the artifacts that reference it. `Money` arrives in `App`'s compilation three ways — embedded in `Lib1`'s interface, embedded in `Lib2`'s, and directly from `Base`'s artifact — and all three descriptions are `(Base, Money, arity 0)`: **one type** (rule 3); `pay` flows from `Lib1`'s surface into `Lib2`'s parameter with no conversion. Had `Lib1` been compiled against an older, different `Base.Money`, the descriptions would disagree and the build fails naming the stale artifact — and supplying both an old and a new artifact for `Base` is two distinct artifacts declaring one module name, the [§2.8.1](#sec-module-identity-and-closure) rule 3 error. (`Money` is trivial-dispose — no destructor, no owned fields ([§28.9](#sec-runtime-managed-types)) — so the disposal the `using var` inserts is a no-op here; the legality of the binding is the point. A `Base` type with an owned field behaves identically under rule 2 — disposal of the transitive value is still use, not naming.)
+
+When the root compilation is an SCC of several modules, the rules of this section and [§2.8.1](#sec-module-identity-and-closure) interact as follows: each member module is still produced by exactly one compilation — the same one (rule 1); co-compilation grants no `internal` access between members (rule 2); imports between members along the cycle are legal while self-import stays an error (rule 4); and a consumer importing any one member must still present every member's artifact in its closure — [§2.5](#sec-dependency-resolution) already requires an SCC's artifacts to have been produced together.
+
+<a id="sec-program-assembly"></a>
+#### 2.8.4 Program assembly: artifact kind, entry point, one copy per process
+
+1. **Artifact kind is chosen by the build request.** Whether a compilation produces an executable or a library ([§2.4](#sec-compilation-unit)) is a property of the *build request*, not of the source text; how the request is spelled is part of [§2.6](#sec-build-phases)'s implementation-defined build-tool surface. An **executable** build requires exactly one qualifying `Main` ([§33.2](#sec-accepted-signatures)) in the root compilation, or a `--main-class` selection among several ([§33.5](#sec-program-entry-point-resolution)); zero qualifying `Main`s is an error citing [§33.1](#sec-the-main-method)/[§33.2](#sec-accepted-signatures). A **library** build has no entry point; a qualifying `Main` in a library compilation is an ordinary method. (An implementation may additionally *offer* kind inference from `Main`-presence as a tooling convenience; the normative rules above are stated for explicit kinds — chosen over inference because deleting the last `Main` from an application must be the zero-`Main` error above, never a silent flip of artifact kind.)
+
+2. **The main module, defined.** The **main module** is the module containing the selected entry point ([§33.1](#sec-the-main-method)).
+
+3. **Entry-point search scope is the root compilation only.** Only classes of the root compilation are searched for qualifying `Main`s; a qualifying `Main` in a dependency artifact is **inert** — it is never selected, never conflicts under [§33.5](#sec-program-entry-point-resolution), and must not perturb the consumer's build. Consequence: adding a dependency can never break, change, or steal a program's entry point. `--main-class` disambiguates *within the root compilation*; it cannot reach into a dependency.
+
+4. **Dependency artifacts are library-kind.** Presenting an executable artifact as a dependency is a build error naming the artifact and its kind. (An executable carries a native entry symbol; admitting it as a dependency re-opens rule 3's perturbation hole from the other side, for no use case a library-kind artifact doesn't serve.)
+
+5. **One copy per process.** How a dependency artifact joins a consuming program — statically embedded in the executable or dynamically loaded alongside it — is implementation-defined, under one normative guarantee: **a process contains exactly one copy of each module's code and, for each type — including each generic instantiation ([§2.8.3](#sec-transitive-closure-and-type-identity) rule 4) — exactly one static state and one runtime identity**, regardless of link mode and regardless of how many compilations emitted code for the type.
+
+6. **Static initialization across artifacts: same rules, one new obligation.** Initialization order is a property of the running program, not of the artifact graph: statics initialize lazily on first use with the runtime recording the single process-wide order ([§22.13](#sec-static-initialization-order); [§22.12](#sec-static-members) rule 1), and exit disposal runs in reverse of that recorded order. What the artifact dimension adds is the obligation rule 5 states: the one-copy guarantee is *not* free where monomorphized instantiations are emitted by several compilations, and [§22.12](#sec-static-members)/[§22.13](#sec-static-initialization-order) are well-defined across artifacts only once it holds. The *compile-time* rejection of cross-type initialization cycles ([§22.13](#sec-static-initialization-order); [§2.5](#sec-dependency-resolution): "regardless of compilation grouping") additionally requires cross-unit dependency edges the artifact interface does not yet carry; pinning that dependency relation and its interface metadata is deferred (tracked at #804), and [§2.8.2](#sec-artifact-interface)'s interface requirement gains the corresponding clause when it lands.
+
+<a id="sec-module-system-non-goals"></a>
+#### 2.8.5 Non-goals of this section
+
+The following are deliberately absent from this revision's module system; each absence is decided, not forgotten. Revisiting one requires new evidence — real programs hitting real walls — against the stated reason.
+
+- **Package management, versioning, registries.** This chapter identifies modules within one build; *which* artifact provides a module is the build tool's input ([§2.6](#sec-build-phases): implementation-defined), and version arbitration is a package-manager design question for a later stage of the language's life.
+- **ABI stability across recompilation.** The model is recompile-the-world: an artifact's interface is a compile-time contract for *this* build ([§2.8.3](#sec-transitive-closure-and-type-identity) rule 3 makes staleness an error, not a compatibility negotiation); a stable binary ABI is a separate commitment nothing yet motivates.
+- **Conditional compilation (`#if`, feature flags).** One source text, one meaning: a file that means different things under different flag sets defeats spec-derived testing; platform variance belongs in the build tool selecting *which files* compile, not in files that change meaning.
+- **Selective imports (`import M.{X}`).** `import` is file-scoped and [§2.2](#sec-imports)'s collision rule already keeps bare-name pollution diagnosed and fixable (qualify or alias); a selective form adds a second place where a file's name set is edited, for no capability qualification doesn't already give.
+- **Re-exports (`public import`).** A module's public surface is what it declares; forwarding another module's names would break [§2.8.3](#sec-transitive-closure-and-type-identity)'s naming rule (naming requires importing the *declaring* module) for zero expressiveness — consumers can always import the declaring module.
+- **Wildcard imports.** Nothing to add: `import M;` already makes all of `M`'s public names visible; there is no narrower form for a wildcard to generalize.
 
 ---
 
@@ -401,7 +550,7 @@ Operations:
 
 The user-visible model is "a sequence of code points indexed in O(1)." The internal representation is implementation-defined: an implementation is expected to choose a per-string storage width — typically 1, 2, or 4 bytes per code point, selected at construction based on the largest code point in the value — to keep the common case (predominantly-ASCII text) compact while preserving O(1) indexing for every string. The choice of width is invisible at the language level; programs observe only the `char` sequence and its length.
 
-A pure-ASCII string (every code point in U+0000–U+007F) is identical in memory layout to a UTF-8 byte sequence. Implementations expose this through the runtime predicate `s.IsAscii: bool` (standard library [§9.6](Bezel_Standard_Library.md#sec-string)). A zero-copy byte view is provided as `ReadOnlyAsciiByteSpan` via `s.AsAsciiByteSpan()` and `s.TryAsAsciiByteSpan(out value): bool` (standard library [§3.4](Bezel_Standard_Library.md#sec-readonlyasciibytespan)); the former throws on non-ASCII input, the latter returns `false`. For FFI and IO callers needing UTF-8 bytes from an ASCII string this is the allocation-free path. When the string is not ASCII, or when a fresh owning byte array is required regardless, `Encoding.UTF8.GetBytes(s)` is `O(n)` and always correct.
+A pure-ASCII string (every code point in U+0000–U+007F) is identical in memory layout to a UTF-8 byte sequence. Implementations expose this through the runtime predicate `s.IsAscii: bool` (standard library [§9.6](Bezel_Standard_Library.md#sec-string)). Byte access to a string's contents goes through `Encoding.UTF8.GetBytes` (standard library [§3.2](Bezel_Standard_Library.md#sec-encoding)) in one of two forms: `GetBytes(s)` produces a fresh owned `Array<byte>` — `O(n)` and always correct — and the span-destination form `GetBytes(s, destination: Span<byte>)`, paired with `GetByteCount(s)` (v0.165), encodes into a caller-reused buffer — the allocation-conscious path for repeated encoding: zero per-call allocation, for every string, not only ASCII ones. (The zero-copy ASCII byte view of earlier revisions, `ReadOnlyAsciiByteSpan`, is retired — v0.188.)
 
 `string` is **runtime-managed**: its memory is reclaimed automatically. `Dispose()` on a string is a no-op. String fields cannot be marked `owned`. See [§28.9](#sec-runtime-managed-types).
 
@@ -1134,15 +1283,13 @@ var p2 := p1 with Y := 99 end;          // Point(1, 99)
 var p3 := p2 with X := 0, Y := 0 end;   // Point(0, 0)
 ```
 
-Syntax: `recordExpr with Name := value, ... end`. A trailing comma after the last assignment is permitted. The same `with ... end` shape applies to class instances after `new` (object initializer blocks, [§22.11](#sec-object-initializer-blocks)); the difference is semantic, not syntactic. For a record source, `with` produces a copy with the named fields replaced — the original record value is unchanged. For a class source (always a freshly-constructed instance), `with` assigns through the named properties' setters, mutating the new instance.
+Syntax: `recordExpr with Name := value, ... end`. A trailing comma after the last assignment is permitted. The source expression must be **record-typed**; `with` produces a copy with the named fields replaced — the original record value is unchanged. A `with` expression whose source is class-typed is a **compile error naming this rule** (v0.188 — the retired object-initializer reading, [§22.11](#sec-object-initializer-blocks)); the diagnostic names both remedies: named/optional constructor arguments ([§22.5](#sec-optional-parameters-and-named-arguments)), which run the constructor and respect its invariants, or binding the instance to a named local and assigning its members as statements. The discriminator is the source expression's **type kind**, never the presence of `new`: `new Point(1, 2) with Y := 9 end` has a record-typed source and is an ordinary record `with` applied to the freshly-constructed value; the same spelling on a class-typed `new` expression is rejected.
 
 The named fields must be auto-generated positional-field properties (regardless of their read-only status), auto-properties declared in the record body, or public fields. A `with` target must be **accessible at the use site under the member's own declared accessibility** ([§13](#sec-visibility), v0.180): a `private` auto-property is a valid target only inside the declaring record. Because `with` copies storage directly and never invokes setters (below), **accessor-level** visibility is irrelevant — a `private set` does not restrict `with`, by the same logic that lets read-only positional-field properties, which have no setter at all, be targets. For body-only records, `with` targets any auto-property that has backing storage; expression-bodied (computed) properties are not valid targets. All other fields keep their values from the source record. The result has the same static type as the source. The `with` operation constructs the copy directly from the source's storage; it does not invoke setters, so read-only positional-field properties are valid targets even though they have no setter.
 
 `with` copies field values directly; it does not invoke the record's constructor. A constructor that validates cross-field invariants (e.g. `Width > 0 and Height > 0`) is not re-run during `with`. If a record enforces invariants that may be violated by independent field replacement, the record should provide a named method for constrained updates rather than relying on `with`.
 
-`with` does not apply to existing class instances for non-destructive update; classes use property assignment. The `with ... end` syntax on a `new` class expression is an object initializer block ([§22.11](#sec-object-initializer-blocks)), which mutates the freshly-constructed instance rather than copying it.
-
-The `with` keyword has three uses across the language: record non-destructive update (this section), object initializer blocks on `new` expressions ([§22.11](#sec-object-initializer-blocks)), and cancellation in `await for ... with token` ([§30.7](#sec-asynchronous-programming-async-iterators)). The three are syntactically distinguished by context: record `with` follows a record-typed expression; object initializer `with` follows a `new` class expression; `await for`'s `with` follows the iteration source and precedes `do`.
+The `with` keyword has two uses across the language: record non-destructive update (this section) and cancellation in `await for ... with token` ([§30.7](#sec-asynchronous-programming-async-iterators)). The two are syntactically distinguished by grammar position: record `with` is a primary suffix following the source expression; `await for`'s `with` follows the iteration source and precedes `do`.
 
 <a id="sec-records-and-inheritance"></a>
 ### 9.6 Records and inheritance
@@ -1949,7 +2096,7 @@ Interface members do not declare visibility; they are implicitly public.
 <a id="sec-modules-and-internal"></a>
 ### 13.4 Modules and `internal`
 
-A module is the set of all source files declaring the same `module Name.Path;`. The dotted form is a single name; files in `Foo` get no special access to files in `Foo.Bar`.
+A module is the set of all source files declaring the same `module Name.Path;` **presented to the module's one compilation ([§2.8.1](#sec-module-identity-and-closure))**; `internal` access is closed by that compilation — no later source file joins a module by declaring its name, and within an SCC unit each member module's internals remain invisible to the other members. The dotted form is a single name; files in `Foo` get no special access to files in `Foo.Bar`.
 
 A file declares exactly one module.
 
@@ -4489,7 +4636,7 @@ When construction throws, the compiler unwinds the partially-constructed instanc
 - An exception during the **base or chained constructor call** (step 1) leaves no derived state to clean up **beyond step 0's owned primary-constructor capture fields ([§22.8](#sec-field-initializers), [§22.10](#sec-capture-rule-and-layout-stability)), which are already populated and are disposed in reverse declaration order before the exception propagates (v0.184)** — the base ctor's own exception-safety logic disposes whatever it had constructed of the base subobject. The exception propagates to the derived ctor's caller; the derived instance is never observable.
 - An exception during a **field initializer** (step 2) triggers disposal of any earlier derived owned fields whose initializers completed, in reverse declaration order, followed by the base subobject's `Dispose()` (which the runtime invokes because the base ctor completed successfully). The exception then propagates.
 - An exception in the **constructor body** (step 3) triggers disposal of every owned field assigned during initialization (step 2) and the base subobject. Owned fields assigned imperatively in the body are also disposed if assigned successfully before the throwing statement.
-- An exception in a **`this(...)`-chaining constructor** follows the same shape one level up (v0.181, completing the [§22.8](#sec-field-initializers) once-only rule). A throw during the chained call itself is the first case above, with one precision for the `this(...)` reading: the chained-to constructor's unwinding has by then disposed everything its steps initialized — *including derived fields*, since field initializers ran as its step 2 — so there is nothing further to dispose. If the chaining constructor's **body** throws, the chained-to construction completed and the instance is at that point fully initialized: the runtime disposes it through the normal generated-`Dispose()` path ([§28.4](#sec-the-destructor)) before the exception propagates — the same rule [§22.11](#sec-object-initializer-blocks) applies when an object-initializer setter throws.
+- An exception in a **`this(...)`-chaining constructor** follows the same shape one level up (v0.181, completing the [§22.8](#sec-field-initializers) once-only rule). A throw during the chained call itself is the first case above, with one precision for the `this(...)` reading: the chained-to constructor's unwinding has by then disposed everything its steps initialized — *including derived fields*, since field initializers ran as its step 2 — so there is nothing further to dispose. If the chaining constructor's **body** throws, the chained-to construction completed and the instance is at that point fully initialized: the runtime disposes it through the normal generated-`Dispose()` path ([§28.4](#sec-the-destructor)) before the exception propagates.
 
 Owned primary-constructor **capture fields**, populated at step 0, participate in every case above as owned fields whose initialization completed first: they are disposed in the same reverse-declaration-order pass (captures before declared fields, [§22.10](#sec-capture-rule-and-layout-stability)), and the capture **moves** the parameter, so no [§28.3](#sec-local-variables-ownership-and-borrows) parameter-level discharge ever also claims the value (v0.184). An `owned` primary parameter that was *not* captured (referenced only in initializer positions) still holds its value on any construction throw before its consuming initializer ran — a step-1 throw, or a step-2 throw from an earlier initializer — and is discharged as an ordinary `owned` parameter by the exception-path discharge; once its consuming initializer has run, the owning field's disposal covers it. One owner at every instant, on every edge (Appendix [C.3](#sec-appendix-c)).
 
@@ -4574,28 +4721,9 @@ This replaces an explicit `base(...)` call.
 A class with a primary constructor may declare additional convenience constructors. Each must chain to another constructor via `this(...)`; only the primary may chain to `base(...)`. The single-base-call rule keeps the base initialization logic and any captured-parameter side effects in one place: every instance of the class passes through the primary, regardless of which convenience entry point was used. Convenience constructors that need a different base call must be expressed as a different design — typically a derived class with its own primary, or a static factory method that constructs and post-configures.
 
 <a id="sec-object-initializer-blocks"></a>
-### 22.11 Object initializer blocks
+### 22.11 Object initializer blocks (retired v0.188)
 
-`new T(args) with ... end` constructs an instance and assigns to public settable properties or public fields:
-
-```bezel
-var t := new WaferTest(zUp := true) with
-  SaveResults := true,
-  NotifyUi := false
-end;
-```
-
-Equivalent to:
-
-```bezel
-var t := new WaferTest(zUp := true);
-t.SaveResults := true;
-t.NotifyUi := false;
-```
-
-Only `Name := value` pairs are permitted; no statements, control flow, or method calls. Targets must be public settable properties or public fields. Assignments execute in textual order, after the constructor returns. If an assignment throws, preceding assignments are not rolled back, but the partially-initialized instance itself **is** disposed: the object initializer block participates in the [§28.3](#sec-local-variables-ownership-and-borrows) exception-path discharge rule the same way any owned `new` result does. The instance produced by `new T(...)` is an owned value (sourceless return); during the object initializer block's setter sequence, the instance is in an unattached-owned state, and if any setter throws, the instance is disposed by the implicit `try`/`finally` cleanup before the exception propagates. The end effect: an object initializer block that fails midway leaks neither memory nor partially-attached resources, just like a plain `new T(...)` whose result is dropped on an exception path.
-
-The semantics of object initialization (mutation through setters) does not apply to records. The `with ... end` syntax following a `new RecordType(...)` expression is parsed by the same grammar production but resolved by the type-checker as the record's `with` operation ([§9.5](#sec-non-destructive-update-with)) — a copy with the named fields replaced — rather than as setter mutation. The resolution is purely a function of the constructed type's kind, invisible at the call site beyond the choice of class vs. record.
+Retired. Earlier revisions defined an **object-initializer block** here: `new T(args) with ... end` on a **class** type, sugar for binding the fresh instance to a local and assigning public settable properties or public fields in textual order. The class-source meaning of `with ... end` is retired (v0.188): a `with` expression requires a record-typed source, and a class-typed source is a compile error ([§9.5](#sec-non-destructive-update-with)). In its place: named/optional constructor arguments ([§22.5](#sec-optional-parameters-and-named-arguments)) — which run the constructor and respect its invariants — or binding the instance to a local and assigning its members as ordinary statements, whose exception-path disposal is [§28.3](#sec-local-variables-ownership-and-borrows)'s general discharge of an owned local (no construct-specific rule remains). Record `with` on a freshly-constructed record (`new Point(1, 2) with Y := 9 end`) is unaffected ([§9.5](#sec-non-destructive-update-with)). The section number is retained so §22.12+ citations stay stable; the decision record is the design rationale's v0.188 changelog entry.
 
 <a id="sec-static-members"></a>
 ### 22.12 Static members
@@ -5055,8 +5183,8 @@ When the compiler encounters `x.Foo(args)`:
 
 1. **Instance members win — by name (v0.183).** If `x`'s declared type (or any base type) *declares* any instance member named `Foo` — of any arity, applicability, or accessibility — instance resolution is committed and extension blocks are **never consulted** for that name on that receiver. If the committed instance lookup then fails (no applicable overload, [§22.5](#sec-optional-parameters-and-named-arguments)/[§22.6](#sec-overloading), or the member is inaccessible, [§13.1](#sec-levels)), the call is a compile error citing the instance member(s); it does not fall back to an extension (the diagnostic should note a same-named extension where one exists). Blocking by *name* rather than by applicability or accessibility keeps resolution predictable: whether a call reaches an instance member or an extension never depends on argument types or the caller's access level, so changing an overload's signature or a member's visibility cannot silently re-route a call across the instance/extension boundary.
 2. **Extension members.** If the receiver's type declares no instance member of that name, the compiler searches the current module and all imported modules for extension blocks on `x`'s type, base types, or implemented interfaces, considering only extension members visible at the call site ([§26.3](#sec-extension-blocks-restrictions)'s effective-visibility rule). When an extension block is declared on a generic type (e.g. `extension IEnumerable<T>`), the block-level type parameter is inferred from the receiver's type: if `x` has type `Array<int>` and `Array<int>` implements `IEnumerable<int>`, then `T` is inferred as `int`. The receiver-driven inference is the unification of [§14.5](#sec-type-argument-inference) applied to the extension head: the receiver's static type is unified against the declared head, exactly and structurally, binding the block-level parameters (v0.184 — §14.5 is the rule set this sentence has always referred to; it was previously unstated).
-3. **Most specific type wins.** Extensions on the most specific type are preferred per the ordering below.
-4. **Ambiguity.** If two equally-specific extensions match, the call is a compile error. The remedies are the mechanisms that exist: remove or narrow a conflicting import, or hoist the intended behavior into a helper static method (taking the receiver as a parameter) on a static class and call that — no call-site syntax qualifies an extension's defining type, because extension blocks are nameless and extensions have no static-invocation form. A first-class extension-disambiguation spelling is deferred, not designed here (rationale [§18](Bezel_Design_Rationale.md#sec-things-deferred), v0.183).
+3. **Most specific type wins.** Extensions on the most specific type are preferred per the subtype ordering below.
+4. **Ambiguity.** If two equally-specific extensions match, the call is a compile error. Because extension blocks are nameless, the diagnostic must identify each candidate by what it *has*: its **defining module**, its **declared head including any `where` clause**, and its **declaration site**. The remedies are the mechanisms that exist: remove or narrow a conflicting import; hoist the intended behavior into a helper static method (taking the receiver as a parameter) on a static class and call that; or, when the colliding blocks are under the author's control, give the members **distinct names** — the posture [§22.6](#sec-overloading) records for same-name declarations that cannot be soundly auto-ranked (the specialized member takes a distinct name, or the blocks merge into one member that dispatches internally). No call-site syntax qualifies an extension's defining type, because extension blocks are nameless and extensions have no static-invocation form; a first-class extension-disambiguation spelling is deferred, not designed here (rationale [§18](Bezel_Design_Rationale.md#sec-things-deferred), v0.183).
 
 Adding a real method to a type silently takes priority over an extension with the same name — by design.
 
@@ -5065,15 +5193,33 @@ Extensions are resolved on the **compile-time** type of the receiver, not the ru
 <a id="sec-specificity-ordering"></a>
 #### 26.5.1 Specificity ordering
 
-For receiver type R, an extension on type E1 is **more specific** than an extension on E2 when one of the following holds (in order):
+For receiver type R, specificity ranks the **applicable** candidates: extension members of the called name that match the call's arity and argument types, from blocks whose head matches R (step 2 of [§26.5](#sec-resolution)), with block-level `where` clauses satisfied by the arguments inferred from the receiver. A `where` clause is an *applicability* filter, never a ranking signal.
 
-1. E1 is a subtype of E2 and E2 is not a subtype of E1. (Derived class beats base class; class beats interface implemented by that class; derived interface beats extended interface.)
-2. E1 and E2 are both generic instantiations of the same generic type, and E1's type arguments are *more concrete* than E2's. A type argument is more concrete than another when it is a non-parameter type and the other is a generic type parameter, or when both are non-parameter and the rule applies recursively to their type arguments.
-3. E1 has more constraints in its `where` clause than E2, and every constraint of E2 is implied by E1's constraints.
+An extension on E1 is **more specific** than one on E2 when E1 is a subtype of E2 and E2 is not a subtype of E1. The subtype test is evaluated on the **receiver-substituted heads**: each candidate's declared extension head has its block-level type parameters replaced by the arguments inferred from the receiver (step 2 of [§26.5](#sec-resolution)) before the test runs. Derived class beats base class; class beats interface implemented by that class; derived interface beats extended interface. So for a receiver of type `Array<int>`: `extension Array<T>` (substituted head `Array<int>`) is more specific than `extension IEnumerable<T>` (substituted head `IEnumerable<int>`), because `Array<int>` is a subtype of `IEnumerable<int>`.
 
-If none of the above relations holds in either direction, the extensions are equally specific and rule 4 above produces an ambiguity error.
+If neither candidate's substituted head is a proper subtype of the other's, the candidates are equally specific and rule 4 of [§26.5](#sec-resolution) produces an ambiguity error. In particular, candidates with **identical substituted heads** never auto-rank: neither a more-concrete-looking declared head (`extension IEnumerable<int>` and `extension IEnumerable<T>` are indistinguishable after substitution for an `Array<int>` receiver) nor a stronger `where` clause on the same head makes one candidate more specific than the other. Auto-ranked specialization is declined, with a recorded re-addition condition (rationale [§17.10](Bezel_Design_Rationale.md#sec-auto-ranked-extension-specificity)).
 
-**What each relation compares (v0.183).** Rule 1's subtype test is evaluated on the **receiver-substituted heads**: each candidate's declared extension head has its block-level type parameters replaced by the arguments inferred from the receiver (step 2 of [§26.5](#sec-resolution)) before the subtype test runs. Rule 2's more-concrete comparison is evaluated on the **declared, pre-substitution heads** — it exists precisely to order `extension IEnumerable<int>` above `extension IEnumerable<T>`, which are indistinguishable after substitution. So for a receiver of type `Array<int>`: `extension Array<T>` (substituted head `Array<int>`) is more specific than `extension IEnumerable<int>` by rule 1, because `Array<int>` is a subtype of `IEnumerable<int>` — even though the latter's declared head is the more concrete-looking spelling; and `extension IEnumerable<int>` is more specific than `extension IEnumerable<T>` by rule 2, as in the example below.
+```bezel
+extension IEnumerable<T>
+  public method First(): T
+    for var item in this do return item; end;
+    throw new InvalidOperationException("empty sequence");
+  end First;
+end;
+
+extension Array<T>
+  public method First(): T
+    if this.Count = 0 then throw new InvalidOperationException("empty array"); end;
+    return this[0];
+  end First;
+end;
+
+var xs: Array<int> := [1, 2, 3];
+var f := xs.First();     // selects the Array<T> member — substituted head Array<int>
+                         // is a subtype of substituted head IEnumerable<int>
+```
+
+By contrast, two candidates whose substituted heads are identical are equally specific. If both of the following blocks are visible at the call site, the call is a compile error:
 
 ```bezel
 extension IEnumerable<T>
@@ -5085,16 +5231,17 @@ end;
 
 extension IEnumerable<int>
   public method First(): int
-    // optimized for int (an implementation may, for example,
-    // short-circuit on the `Array<int>` storage layout).
+    // a hand-specialized int form
     for var item in this do return item; end;
     throw new InvalidOperationException("empty sequence");
   end First;
 end;
 
 var xs: Array<int> := [1, 2, 3];
-var s := xs.First();                          // selects the IEnumerable<int> overload
+var f := xs.First();     // ERROR: ambiguous — both substituted heads are IEnumerable<int>
 ```
+
+The diagnostic names both candidates (rule 4 of [§26.5](#sec-resolution)); the remedies are rule 4's: narrow an import, hoist into a static-class helper, or — when both blocks are under the author's control — give the members distinct names.
 
 <a id="sec-multiple-blocks-for-the-same-type"></a>
 ### 26.6 Multiple blocks for the same type
@@ -5388,7 +5535,7 @@ record UserId(Value: int);
 record OrderId(Value: int);
 ```
 
-Type aliases may be declared at module level. A module-level alias is always **module-internal** (v0.183): `TypeAliasDecl` admits no visibility keyword (Appendix [A.2](#sec-source-file)), the alias is never among the public names an `import` makes visible ([§2.2](#sec-imports)), and it is not recorded in the artifact's public-interface metadata — an importing module that wants the same shorthand declares its own alias (aliases are free; they create no type). Exportable aliases are deferred (rationale [§18](Bezel_Design_Rationale.md#sec-things-deferred)).
+Type aliases may be declared at module level. A module-level alias is always **module-internal** (v0.183): `TypeAliasDecl` admits no visibility keyword (Appendix [A.2](#sec-source-file)), the alias is never among the public names an `import` makes visible ([§2.2](#sec-imports)), and it is not part of the public surface the module's interface describes ([§2.8.2](#sec-artifact-interface)) — an importing module that wants the same shorthand declares its own alias (aliases are free; they create no type). Exportable aliases are deferred (rationale [§18](Bezel_Design_Rationale.md#sec-things-deferred)).
 
 <a id="sec-generic-type-aliases"></a>
 #### Generic type aliases
@@ -5588,7 +5735,7 @@ The ownership state of an expression is determined by the expression form:
 | Range slice `arr[r]` on `Array<T>` ([§15.6](#sec-slicing)) | Owned — a fresh `Array<T>`, the compiler-recognized `Slice(r: Range<int>): owned Array<T>` form (stdlib §4.4); **not** the indexer row above (v0.182). The container is owned by the caller and discharged under the standard rules; class-typed elements are borrows copied as borrows, their sources unchanged. |
 | Property access `obj.P` (instance getter) | Borrowed (source: `obj`). Getters are borrow-producing positions — a getter may not return a fresh owned value ([§28.6](#sec-leak-prevention)). |
 | Static property access `T.P` (class-typed result) | Borrowed (source: the declaring type's static storage — process-lived, so every intra-program liveness constraint is satisfied; static state is disposed only at program exit, [§22.13](#sec-static-initialization-order)). (v0.180) |
-| `move coll[i]` where `coll` is an owning collection that admits slot-move (heap: `OwningArray<T>`, `OwningDictionary<K, V>`, `OwningBuffer<T>` for class-typed T, or a `Span<T>` view into a class-typed `OwningBuffer<T>`; inline: `[N owned]T?`, `[N owned]T`) | Owned. Slot is left in moved-from state and must be reassigned before the surrounding method exits ([§28.8.1](#sec-the-move-expression), [§28.11](#sec-collections-do-not-own-elements)). For `OwningBuffer<T>` / `Span<T>` with value-typed T, `move coll[i]` is not admitted (values have no ownership to transfer). `ReadOnlySpan<T>`, `ArraySpan<T>`, `ReadOnlyArraySpan<T>`, `ReadOnlyStringSpan`, and `ReadOnlyAsciiByteSpan` do not admit `move` for any T (`ReadOnlySpan<T>` and the string-backed forms have no writable indexer; the `Array<T>`-backed spans have borrowed slots with no ownership to transfer). |
+| `move coll[i]` where `coll` is an owning collection that admits slot-move (heap: `OwningArray<T>`, `OwningDictionary<K, V>`, `OwningBuffer<T>` for class-typed T, or a `Span<T>` view into a class-typed `OwningBuffer<T>`; inline: `[N owned]T?`, `[N owned]T`) | Owned. Slot is left in moved-from state and must be reassigned before the surrounding method exits ([§28.8.1](#sec-the-move-expression), [§28.11](#sec-collections-do-not-own-elements)). For `OwningBuffer<T>` / `Span<T>` with value-typed T, `move coll[i]` is not admitted (values have no ownership to transfer). `ReadOnlySpan<T>`, `ArraySpan<T>`, `ReadOnlyArraySpan<T>`, and `ReadOnlyStringSpan` do not admit `move` for any T (`ReadOnlySpan<T>` and the string-backed `ReadOnlyStringSpan` have no writable indexer; the `Array<T>`-backed spans have borrowed slots with no ownership to transfer). |
 | Local-variable read `x` where `x` is owned (a class-typed owned local, or a local of move-only value type per [§15.3](#sec-move-only-value-types)) | When the read appears in an owned-consuming position (assignment to an owned *field or collection slot* — including through a `set(owned)` property or indexer, [§23.3](#sec-block-form-properties), v0.184 — return under an `owned` return type, the operand of a Pattern B await and the owned **parameter or plain-local** source of a Pattern A chaining `return await` (a `using var` source is not consumed — its disposal is deferred to the outer task's teardown; [§30.5](#sec-result-lifetime-and-task-disposal), v0.184), the operand of a `yield return` in an owning iterator ([§29.2](#sec-iterator-yield-ownership), v0.184), an `owned` argument under the [§22.3](#sec-parameter-modifiers) call-site marker, or — v0.180 — a local binding/assignment RHS under the explicit transfer marker `owned x`; for move-only locals, any assignment to an owning location), the read transfers ownership out of `x` and `x` becomes moved-from (see *Move semantics*). When the read appears in a borrow-consuming position (a non-`owned` argument, an indexer or property access, an arm of a null-coalescing expression (`a ?? b` — the `??` row below then sees a borrow arm) or of an `if` expression or expression-position `case`/`when` (the arm-meet row below likewise sees a borrow arm, v0.184), the operand of a `yield return` in a borrowing iterator (a re-borrow, source the binding itself — [§29.2](#sec-iterator-yield-ownership), v0.184), an **unmarked** local binding or assignment RHS — `var y := x;`, `y := x;`: a plain alias binding is a borrow of `x`, source `x` itself (v0.180) — or, for move-only locals, a borrow of the value through indexing or equality comparison), `x` retains ownership and the value is borrowed for the consuming operation. |
 | Local-variable read `x` where `x` is borrowed | Borrowed (source: same as `x`'s source) |
 | Parameter `p` declared `owned p: T` | Owned |
@@ -6441,7 +6588,7 @@ The `move coll[i]` form is admitted on:
 - `Span<T>` for class-typed T (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)), which delegates to the underlying `OwningBuffer<T>`. `move span[i]` is equivalent to `move span.Buffer[span.Start + i]` — it takes ownership of the slot's value and leaves the slot in moved-from state in the *underlying buffer*, not in the span (the span is a stateless view; it carries no slot state of its own). As of v0.105, `move span[i]` bounds-checks against `span.Length` before delegating; if `i < 0` or `i >= span.Length`, `IndexOutOfRangeException` is thrown and no slot is moved-from. This matches the bounds-check behavior of the span's plain indexer-get and indexer-set. The field-restoration rule applies to the buffer slot in the usual way; the natural restoration is `span[i] := null`. `Span<T>` for value-typed T does not admit `move` (mirroring the underlying buffer). `ReadOnlySpan<T>` does not admit `move` for any T (it exposes no writable indexer and no take operation).
 - Owning inline arrays — both `[N owned]T?` and `[N owned]T` (see [§15.1.1](#sec-owning-inline-arrays)).
 
-`Array<T>`, `Dictionary<K, V>`, and the other borrowing collections do not admit `move coll[i]` — their slots hold borrows, not owned values; there is no ownership to transfer. The same applies to `ArraySpan<T>` and `ReadOnlyArraySpan<T>` (stdlib [§4.15](Bezel_Standard_Library.md#sec-arrayspant-readonlyarrayspant)), which view into a borrowing `Array<T>` source: `move arrSpan[i]` is rejected at compile time. The string-backed read-only span types `ReadOnlyStringSpan` (stdlib [§3.3](Bezel_Standard_Library.md#sec-readonlystringspan)) and `ReadOnlyAsciiByteSpan` (stdlib [§3.4](Bezel_Standard_Library.md#sec-readonlyasciibytespan)) also do not admit `move` — strings are immutable and their character data is reference-shared; no ownership transfer applies. The plain indexer-get is the only read form for all these types.
+`Array<T>`, `Dictionary<K, V>`, and the other borrowing collections do not admit `move coll[i]` — their slots hold borrows, not owned values; there is no ownership to transfer. The same applies to `ArraySpan<T>` and `ReadOnlyArraySpan<T>` (stdlib [§4.15](Bezel_Standard_Library.md#sec-arrayspant-readonlyarrayspant)), which view into a borrowing `Array<T>` source: `move arrSpan[i]` is rejected at compile time. The string-backed read-only span type `ReadOnlyStringSpan` (stdlib [§3.3](Bezel_Standard_Library.md#sec-readonlystringspan)) also does not admit `move` — strings are immutable and their character data is reference-shared; no ownership transfer applies. The plain indexer-get is the only read form for all these types.
 
 `OwningStack<T>`, `OwningQueue<T>`, `OwningLinkedList<T>`, and `OwningSet<T>` do not have indexers (`stack[i]`, `linkedList[i]`, etc. do not parse), so `move` cannot syntactically apply to their slots. These structured-or-unordered collection types provide their own ownership-out methods (`Pop`, `Dequeue`, `Take`, etc.) that perform the equivalent take-and-discharge in a single call.
 
@@ -6728,8 +6875,6 @@ When `source` has type `Span<T>` or `ReadOnlySpan<T>` (stdlib [§4.14](Bezel_Sta
 When `source` has type `OwningBuffer<T>` for value-typed T (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)), the desugaring is a direct indexed loop, parallel to the span case. The iteration variable's type is T and the loop body sees a borrow of each slot's value. (For class-typed `OwningBuffer<T>`, the type implements `IEnumerable<T?>` and the standard enumerator path applies, with the optimization-elision rule above; the observable result is the same as a direct-indexed loop.)
 
 When `source` has type `ReadOnlyStringSpan` (stdlib [§3.3](Bezel_Standard_Library.md#sec-readonlystringspan)), the desugaring is a direct indexed loop, parallel to the `ReadOnlySpan<T>` case. `ReadOnlyStringSpan` does not implement `IEnumerable<char>` — the enumerator returned by `IEnumerable<T>.GetEnumerator()` is an ordinary class instance that would need to hold the span (or its borrow of the source string) across its own lifetime, and the borrow tracker cannot bound that lifetime through the enumerator interface. The iteration variable's type is `char` and the loop body sees a copy of each code point (chars are value-typed primitives). The borrow's source is the underlying `string`, reached through the span's `Source` field.
-
-When `source` has type `ReadOnlyAsciiByteSpan` (stdlib [§3.4](Bezel_Standard_Library.md#sec-readonlyasciibytespan)), the desugaring is a direct indexed loop, parallel to the `ReadOnlyStringSpan` case above. The iteration variable's type is `byte` and the loop body sees a copy of each byte (the byte produced by the cast `byte(Source[Start + i])`, safe per the ASCII invariant established at span construction). The borrow's source is the underlying `string`, reached through the span's `Source` field.
 
 When `source` has type `ArraySpan<T>` or `ReadOnlyArraySpan<T>` (stdlib [§4.15](Bezel_Standard_Library.md#sec-arrayspant-readonlyarrayspant)), the desugaring is a direct indexed loop, parallel to the `Span<T>` / `ReadOnlySpan<T>` case. Neither type implements `IEnumerable<T>` — the same enumerator-escape reasoning given for `ReadOnlyStringSpan` above applies. The iteration variable's type is T and the loop body sees a borrow of each slot (the borrow's source is the underlying `Array<T>`, reached through the span's `Source` field). The iteration-variable type follows the array's element type directly — `T` is whatever the array was instantiated with (no `T?` wrapping, unlike the OwningBuffer-backed span case for class T, because `Array<T>` slots store borrows rather than owned nullable references). `move arrSpan[i]` is not admitted in the loop body for any T, since `Array<T>` slots are borrows with no ownership to transfer.
 
@@ -8746,7 +8891,7 @@ end;
 <a id="sec-the-main-method"></a>
 ### 33.1 The `Main` method
 
-Every Bezel executable has exactly one entry point: a `public static method Main` declared on a class in the program's **main module** — with several qualifying candidates permitted only under [§33.5](#sec-program-entry-point-resolution)'s explicit disambiguation. The **main module** is the module named as the build's executable target ([§2.4](#sec-compilation-unit)): the module for which the build requests an executable artifact (v0.181 — previously undefined). Only classes declared in the main module are searched for entry points: a qualifying signature in a dependency module — including a co-member of the main module's import SCC ([§2.5](#sec-dependency-resolution)), which is compiled *with* the main module but is not it — is an ordinary method, never an entry-point candidate. The runtime locates the entry point and invokes it to start the program.
+Every Bezel executable has exactly one entry point: a `public static method Main` declared on a class in the **root compilation** ([§2.8.4](#sec-program-assembly)) — with several qualifying candidates permitted only under [§33.5](#sec-program-entry-point-resolution)'s explicit disambiguation. The **main module** is the module containing the selected entry point (v0.188 — superseding v0.181's definition by build-target: when the root compilation is an import SCC of several modules ([§2.5](#sec-dependency-resolution)), every member module's classes are searched, a deliberate widening of the v0.181 rule, which excluded SCC co-members; several candidates across members are the ordinary [§33.5](#sec-program-entry-point-resolution) conflict). A qualifying signature in a dependency artifact is **inert** ([§2.8.4](#sec-program-assembly) rule 3): never selected, never a conflict, an ordinary method. The runtime locates the entry point and invokes it to start the program.
 
 <a id="sec-accepted-signatures"></a>
 ### 33.2 Accepted signatures
@@ -8791,7 +8936,7 @@ Programs that want to forward args to a method expecting `IEnumerable<string>` o
 <a id="sec-program-entry-point-resolution"></a>
 ### 33.5 Resolution
 
-A program is ill-formed if more than one method qualifies as the entry point. This applies both across classes (multiple classes each declaring a qualifying `Main`) and within a single class (one class declaring more than one of the eight signature shapes from [§33.2](#sec-accepted-signatures)).
+A program is ill-formed if more than one method qualifies as the entry point. This applies both across classes (multiple classes each declaring a qualifying `Main`) and within a single class (one class declaring more than one of the eight signature shapes from [§33.2](#sec-accepted-signatures)). The search space is the root compilation only ([§2.8.4](#sec-program-assembly)): a qualifying `Main` in a dependency artifact is inert and never conflicts.
 
 For the cross-class case, the build tool must accept a `--main-class FullyQualifiedName` flag (or its equivalent in tool-specific configuration); the named class is selected as the entry point and a successful build ensues. Without disambiguation, the compiler produces an error listing every qualifying `Main` it found.
 
@@ -8816,7 +8961,7 @@ class Program
 end Program;
 ```
 
-A library module has no entry point; the compiler produces a shared library artifact.
+A library build has no entry point ([§2.8.4](#sec-program-assembly)); a qualifying `Main` in a library compilation is an ordinary method.
 
 ---
 
@@ -9550,13 +9695,12 @@ PrimarySuffix   ::= "." Identifier GenericArgs?
                   | "?(" ArgList? ")"
                   | "!"
                   | "with" InitAssign ("," InitAssign)* ","? "end"
-                              /* The `with` suffix produces either a copy-with-
-                                 overrides (when the source is a record) or
-                                 setter-mutation on a freshly-constructed class
-                                 (when the source is `new C(...)` — object
-                                 initializer, §22.11). The form is syntactically
-                                 unified; the type checker resolves the semantic
-                                 difference from the source expression's type.
+                              /* The `with` suffix is the record copy-with-
+                                 overrides expression (§9.5). It requires a
+                                 record-typed source; a class-typed source is
+                                 rejected semantically (§9.5, v0.188) — the
+                                 grammar over-admits and the type checker
+                                 rejects, the same pattern A.4 uses throughout.
                                  Placing `with` at suffix level eliminates the
                                  left-recursive ambiguity that an earlier
                                  grammar had with a standalone WithExpr at
@@ -9615,10 +9759,13 @@ MoveExpr        ::= "move" PrimaryExpr
 
 NewExpr         ::= "new" Type "(" ArgList? ")"
                   | "new" "(" ArgList? ")"              /* shorthand */
-                              /* The object-initializer form `new T() with X := 5 end`
-                                 is parsed as `NewExpr` followed by a `with`
-                                 PrimarySuffix; there is no separate ObjectInit
-                                 production. */
+                              /* `new T(...) with X := 5 end` is parsed as
+                                 `NewExpr` followed by a `with` PrimarySuffix;
+                                 there is no separate ObjectInit production.
+                                 The suffix is the record `with` of §9.5:
+                                 legal when the constructed type is a record,
+                                 rejected semantically when it is a class
+                                 (v0.188). */
 InitAssign      ::= Identifier ":=" Expression
 
 LambdaExpr      ::= "async"? "(" LambdaParams? ")" "=>" LambdaBody
@@ -10029,10 +10176,20 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 <a id="sec-entry-point"></a>
 ### C.12 Entry point
 
-- A program's main module ([§33.1](#sec-the-main-method)) defines exactly one qualifying `Main` method, or `--main-class` ([§33.5](#sec-program-entry-point-resolution)) selects one when several classes qualify; a qualifying `Main` in a dependency module is an ordinary method.
+- An executable build's root compilation ([§2.8.4](#sec-program-assembly)) defines exactly one qualifying `Main` method, or `--main-class` ([§33.5](#sec-program-entry-point-resolution)) selects one when several classes qualify; a qualifying `Main` in a dependency artifact is inert — an ordinary method, never a candidate, never a conflict ([§33.1](#sec-the-main-method)).
 - A class declares at most one qualifying `Main`; multiple qualifying overloads in the same class are rejected at compile time without flag-based override.
 - `Main` is `public static`. If `async`, its return type is `Task`, `Task<int>`, or one of the parameterized forms; otherwise it returns `()` or `int`.
 
+<a id="sec-appendix-c-modules"></a>
+### C.13 Module identity and program assembly
+
+- Every module in a program is the product of exactly one compilation; no source file joins a module by declaring its name, and `internal` access is closed by the declaring module's compilation — including between co-members of an SCC unit ([§2.8.1](#sec-module-identity-and-closure)).
+- A build whose artifact set contains two distinct artifacts declaring the same module name — or an artifact declaring a module name the implementation provides — is rejected, naming both origins; bit-identical duplicate presentations are deduplicated, not diagnosed ([§2.8.1](#sec-module-identity-and-closure) rules 3/5).
+- An `import` naming the enclosing file's own module is a compile error ([§2.8.1](#sec-module-identity-and-closure) rule 4).
+- A build missing a member of the dependency closure — including modules referenced only from declaration bodies carried in an interface — is an error naming the missing module ([§2.8.3](#sec-transitive-closure-and-type-identity) rule 1).
+- Naming a transitively-reachable type in source requires importing its declaring module; using its values does not ([§2.8.3](#sec-transitive-closure-and-type-identity) rule 2).
+- Disagreeing descriptions of one type in a build's closure (a stale artifact) are a build error naming the artifacts ([§2.8.3](#sec-transitive-closure-and-type-identity) rule 3).
+- Presenting an executable artifact as a dependency is a build error naming the artifact and its kind ([§2.8.4](#sec-program-assembly) rule 4).
 
 ---
 
@@ -10060,17 +10217,19 @@ An implementation may also conform at "Core plus named features" (e.g., *Core + 
 | **Asynchronous programming** | [§30](#sec-asynchronous-programming) entire — including domains, spawning, and channels ([§30.13](#sec-runtime-model)–[§30.15](#sec-channels)); [§28.12](#sec-asynchronous-disposal) (`await using`, `IAsyncDisposable`); the async-iterator forms of [§29](#sec-iteration-2) (`IAsyncEnumerable<T>`, `IAsyncEnumerator<T>`, `IOwningAsyncEnumerable<T>`, `IOwningAsyncEnumerator<T>`) | `Task`, `Task<T>`, `OwningTask<T>`, completion sources, `CancellationToken`/`CancellationTokenSource`, `Mutex`/`Semaphore`/`Atomic<T>`, `Domain`, `Channel<T>`/`ChannelSender<T>`, the async forms of IO and sequence operations |
 | **Serialization synthesis** | [§9.8](#sec-serialization-synthesis) | stdlib §2.14–2.15 |
 | **Foreign Function Interface** | [§32](#sec-foreign-function-interface); the FFI clauses of [§15.1.3](#sec-inline-array-ffi); the C-compatible row and reservation-clause exception of [§3.6](#sec-derived-type-properties) | `Ptr<T>`, `Interop` (stdlib §10.5–§10.6); `RawBytes.FromForeign`, `CString`/`WString.Pointer` (stdlib §10.1–§10.3); `OwningBuffer<T>.DangerousPointer` (stdlib §4.14) |
-| **Buffers and spans** | the buffer/span clauses of [§28.11](#sec-collection-element-ownership) (`move` on `OwningBuffer`/`Span` slots) | stdlib §3.3–3.4, §4.14–4.16 |
+| **Buffers and spans** | the buffer/span clauses of [§28.11](#sec-collection-element-ownership) (`move` on `OwningBuffer`/`Span` slots) | stdlib §3.3, §4.14–4.16 |
 | **Sequence operations (LINQ-style)** | — | stdlib §5 entire |
 | **Shared ownership** | [§28.13](#sec-shared-ownership) | `Shared<T>`, `Weak<T>` (stdlib §2.16) |
+| **Move-only value types (owning inline arrays)** | [§15.1.1](#sec-owning-inline-arrays) and the `owned` slot marker of Appendix A.5's `InlineArrayType`; [§15.3](#sec-move-only-value-types); the move-only discard clause of [§17.13](#sec-the-discard-_); the owning-inline-array field clauses of [§28.5](#sec-owned-fields) (including the double-marking rejection) and [§22.13](#sec-static-initialization-order); the move-only clause of [§28.7](#sec-reassigning-owned-fields); the move-only row of [§28.11](#sec-element-slot-policy)'s element-category table; the owned-slot clauses of [§29.2](#sec-desugaring-of-for)'s inline-array desugaring and the move-only paragraph of [§29.8](#sec-iterators-with-owned-parameters); the move-only instantiation checks of [§7.10](#sec-generics-and-nullability) and [§14.2](#sec-constraints) (`where T: value`) | — |
 
-Everything not listed is **Core**: lexical structure through generics, records, enums, classes, interfaces, inheritance, nullability, patterns and `case`, expressions and statements, operators and overloading, properties and indexers, the entire ownership system of [§28](#sec-resource-management) (except §28.12 and §28.13), synchronous iteration ([§29](#sec-iteration-2)'s non-async forms, including iterator methods and `IOwningEnumerable<T>`), exceptions ([§31](#sec-exception-handling)), the entry point, and the corresponding standard-library sections.
+Everything not listed is **Core**: lexical structure through generics, records, enums, classes, interfaces, inheritance, nullability, patterns and `case`, expressions and statements, operators and overloading, properties and indexers, the entire ownership system of [§28](#sec-resource-management) (except §28.12, §28.13, and the move-only value-type clauses of §28.5, §28.7, and §28.11 carved to the **Move-only value types** row above), synchronous iteration ([§29](#sec-iteration-2)'s non-async forms, including iterator methods and `IOwningEnumerable<T>`), exceptions ([§31](#sec-exception-handling)), the entry point, and the corresponding standard-library sections.
 
 <a id="sec-feature-dependencies"></a>
 ### D.3 Dependencies and closure
 
 - Extended features depend on Core; Core depends on no Extended feature. The Core sections' references *into* Extended sections (e.g., [§28.3](#sec-local-variables-ownership-and-borrows)'s notes on async lambdas, [§9.7](#sec-records-and-disposal)'s span examples) are normative only for implementations of the referenced feature.
 - The async-iterator forms belong to **Asynchronous programming** and additionally require synchronous iteration (Core). **Buffers and spans**, **Sequence operations**, and **Shared ownership** depend only on Core. **Events**' async event source requires **Asynchronous programming**; the synchronous `EventSource<T>` does not, and neither do `ISharedEvent<T>`/`SharedEventSource<T>` (v0.187): their capture-free admission is ordinary [§28.14](#sec-scoped-callback-parameters) typing, and in a single-domain build the synchronization guarantee is satisfied vacuously; the deferred shared-async twin, if ever shipped, requires Asynchronous programming like `AsyncEventSource<T>`.
+- **Move-only value types** depend only on Core, and no other Extended feature depends on them: **Buffers and spans** does not (`OwningBuffer<T>`, `Span<T>`, and `ReadOnlySpan<T>` reject move-only element types, [§14.4](#sec-owned-as-a-generic-argument)); **Asynchronous programming** *references* them — [§30.14](#sec-sendable-types)'s transfer-closure rule 2 admits an owning-inline-array field, and [§30.1](#sec-async-methods)'s frame rule covers move-only parameters — but does not depend on them: an Extended section's references into another Extended feature's clauses are normative only for implementations of both features, the first bullet's rule for Core-section references into Extended sections generalized to Extended-to-Extended references.
 - A Core implementation's standard library omits the types of unimplemented Extended features entirely (they are absent, not stubbed); programs referencing them fail name resolution with the feature-naming diagnostic of D.1.
 
 <a id="sec-conformance-and-the-runtime-model"></a>

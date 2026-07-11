@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.187 — July 2026**
+**Companion to the Bezel Language Specification, v0.188 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -46,7 +46,7 @@ This document is normative for the names, signatures, and observable behavior li
 
 <a id="sec-system-auto-imported"></a>
 
-**Naming conventions for acronyms and widths (recorded v0.165, #1359, generalizing the v0.148 ruling).** Acronyms in Bezel-coined names are PascalCase (`IeeeEquals`, `AsAsciiByteSpan`); names inherited verbatim from .NET keep the .NET spelling (`IEEERemainder`, `Encoding.UTF8`, `ToInt64`) — so `Math.IEEERemainder` and `Double.IeeeEquals` are both *correct* under one rule, not an inconsistency. Where a bit-width is the point of the name, the width-bearing .NET type words are used (`Int32`, `Int64` — e.g. `Random.NextInt64`, `BitConverter`'s family). The owning enumeration interfaces carry the `I-` prefix since the v0.168 family rename (#1372).
+**Naming conventions for acronyms and widths (recorded v0.165, #1359, generalizing the v0.148 ruling).** Acronyms in Bezel-coined names are PascalCase (`IeeeEquals`); names inherited verbatim from .NET keep the .NET spelling (`IEEERemainder`, `Encoding.UTF8`, `ToInt64`) — so `Math.IEEERemainder` and `Double.IeeeEquals` are both *correct* under one rule, not an inconsistency. Where a bit-width is the point of the name, the width-bearing .NET type words are used (`Int32`, `Int64` — e.g. `Random.NextInt64`, `BitConverter`'s family). The owning enumeration interfaces carry the `I-` prefix since the v0.168 family rename (#1372).
 
 ## 2. `System` (auto-imported)
 
@@ -1081,64 +1081,9 @@ For convenience when comparing against string literals, `IndexOf(value: string)`
 **Construction.** Callers construct `ReadOnlyStringSpan` via the `AsSpan()` family on `string` ([§9.6](#sec-string)) rather than via the constructor directly. The direct constructor is admitted but is rarely needed — `s.AsSpan()` and its overloads cover the common cases.
 
 <a id="sec-readonlyasciibytespan"></a>
-### 3.4 `ReadOnlyAsciiByteSpan`
+### 3.4 `ReadOnlyAsciiByteSpan` (retired v0.188)
 
-A read-only byte view over the contiguous code points of an ASCII string. The natural companion to `string.AsAsciiByteSpan()` for FFI and I/O paths that need UTF-8 bytes from an ASCII string without going through `Encoding.UTF8.GetBytes` (which allocates a fresh byte array). Applies only to ASCII strings — the construction APIs check `IsAscii` and reject non-ASCII inputs.
-
-```bezel
-public record ReadOnlyAsciiByteSpan(Source: string, Start: int, Length: int): IReadOnlySpan<byte>
-
-  public property [i: int]: byte
-    get => do
-      if i < 0 or i >= Length then
-        throw new IndexOutOfRangeException();
-      end;
-      return byte(Source[Start + i]);
-    end;
-  end;
-
-  public readonly property IsEmpty: bool => Length = 0;
-
-  // Range construction
-  public method Slice(start: int, length: int): ReadOnlyAsciiByteSpan =>
-    new ReadOnlyAsciiByteSpan(Source, this.Start + start, length);
-
-  // Search
-  public method IndexOf(value: byte): int;
-  public method Contains(value: byte): bool;
-
-  // Equality (own type and cross-source against ReadOnlySpan<byte>)
-  public method SequenceEqual(other: ReadOnlyAsciiByteSpan): bool;
-  public method SequenceEqual(other: ReadOnlySpan<byte>): bool;
-  public method SequenceEqual(other: IReadOnlySpan<byte>): bool; // v0.108 — interface form
-
-  // Bulk copy (v0.109)
-  public method CopyTo(destination: Span<byte>);    // copy bytes to destination;
-                                                     //   lengths must match
-end ReadOnlyAsciiByteSpan;
-```
-
-A `ReadOnlyAsciiByteSpan` is a borrow-bearing record ([§9.7](Bezel_Language_Spec.md#sec-records-and-disposal) of the language spec) viewing into a contiguous range of an ASCII `string`. The `Source` field carries a borrow of a string; per the borrow-bearing-record rule, the span's lifetime is bounded by the source's lifetime. Strings are reference-typed and runtime-managed ([§4.6](Bezel_Language_Spec.md#sec-string)), so the lifetime story simplifies (as with `ReadOnlyStringSpan` in [§3.3](#sec-readonlystringspan)): as long as anything reachable from the program holds the string, the span remains valid.
-
-The type is purely user-level Bezel — no compiler intrinsic. The record machinery, borrow lifetime tracking, and indexer dispatch are all standard language features.
-
-**Why a separate type from `ReadOnlySpan<byte>` and `ReadOnlyStringSpan`.** `ReadOnlySpan<byte>` views into an `OwningBuffer<byte>` and cannot be backed by a string without source polymorphism (the same design problem solved by introducing `ReadOnlyStringSpan` in v0.104). `ReadOnlyStringSpan` views chars, not bytes — it has the right source (a string) but the wrong element type (`char`, 32 bits per element). The new type combines a string source with byte element type, with construction validated to keep the byte cast safe.
-
-**ASCII invariant and the byte cast.** Construction APIs (`String.AsAsciiByteSpan` and `String.TryAsAsciiByteSpan` in [§9.6](#sec-string)) check that every code point in the source is in the range `0..127`. Once constructed, the indexer reads each char via the string's indexer and narrows to byte unconditionally — the ASCII check at construction guarantees no narrowing-overflow exception will fire at access time. The cast `byte(Source[Start + i])` is therefore safe for every index in the span's range.
-
-`Slice` produces a sub-span over the same source; the ASCII invariant is preserved automatically because the source has not changed. No re-check is performed.
-
-**Bounds-check semantics.** The indexer bounds-checks `i` against the span's `Length` (not just the source string's length); `IndexOutOfRangeException` is thrown if `i < 0` or `i >= Length`. This matches the v0.105 bounds-check rule for `Span<T>`/`ReadOnlySpan<T>` and the v0.104 rule for `ReadOnlyStringSpan`.
-
-**Per-access cost.** When the string is stored in 1-byte-per-code-point representation (the typical case for ASCII strings under the adaptive-storage model of language spec [§4.6](Bezel_Language_Spec.md#sec-string)), the byte cast is effectively a direct memory read; the "zero-copy" claim holds end-to-end. When the string is stored in wider representation, the indexer reads the wider value (2 or 4 bytes) and narrows to byte; the view is still allocation-free, but the per-access cost is a width-dispatched read plus a narrowing operation. Implementations are expected to use 1-byte storage for ASCII strings whenever practical, but the language does not require it; programs requiring guaranteed contiguous-byte access for FFI can still use `Encoding.UTF8.GetBytes(s)` ([§3.2](#sec-encoding)), which produces a fresh `Array<byte>` at the cost of one allocation.
-
-**Search and equality.** `IndexOf(value: byte)` walks the span's range, returning the first index whose byte matches `value`, or `-1` if none. `Contains(value: byte)` returns `IndexOf(value) >= 0`. `SequenceEqual(other: ReadOnlyAsciiByteSpan)` compares two ASCII byte spans pairwise. The cross-source overload `SequenceEqual(other: ReadOnlySpan<byte>)` compares against a buffer-backed byte span — useful for "does this ASCII header start with these known constant bytes" patterns. There is no corresponding overload on `ReadOnlySpan<byte>` (no extension of v0.99-v0.105 surface); for the symmetric direction, callers invoke the method on the `ReadOnlyAsciiByteSpan` receiver.
-
-**Iteration.** `for var b in span do ... end` is admitted. The desugaring is a direct indexed loop over the span's range, parallel to the buffer-backed span rule of language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for). The iteration variable's type is `byte` and the loop body sees a copy of each byte.
-
-**Construction.** Callers construct `ReadOnlyAsciiByteSpan` via the `AsAsciiByteSpan` / `TryAsAsciiByteSpan` methods on `string` ([§9.6](#sec-string)) rather than via the constructor directly. The direct constructor is admitted but does not perform an ASCII check itself — passing a non-ASCII string to the constructor would produce a span whose indexer might silently lose information on access (the byte cast would narrow a code point above 127 to its low 8 bits, an obvious bug). The `AsAsciiByteSpan` / `TryAsAsciiByteSpan` methods are the supported entry points; calling the constructor directly is allowed but is the caller's responsibility to invoke only on a verified ASCII source.
-
-**What this type is not.** `ReadOnlyAsciiByteSpan` is not a general byte view — it is specifically tied to ASCII strings. Binary parsing on byte buffers should use `ReadOnlySpan<byte>` ([§4.14](#sec-owned-buffers-and-spans)), which has the `ReadInt32LittleEndian` / `WriteUInt64BigEndian` / etc. accessors of v0.103. The two types have different motivating use cases (ASCII text vs binary data) and do not share API surface; the cross-source `SequenceEqual` overload is the only bridge.
+Retired. Earlier revisions defined `ReadOnlyAsciiByteSpan` here — a read-only byte view over the contiguous code points of an ASCII string, constructed via `string.AsAsciiByteSpan()` / `TryAsAsciiByteSpan(out)` ([§9.6](#sec-string)) — added in v0.106 as a zero-allocation alternative to `Encoding.UTF8.GetBytes` for FFI and I/O paths. The type and its construction surface are retired (v0.188, proposal 0038): the FFI half of its motivation never applied — records are not FFI-compatible (language spec [§32.5](Bezel_Language_Spec.md#sec-ffi-compatible-types)), and the boundary carriers for string bytes are `CString`/`RawBytes` ([§10](#sec-ffi-boundary-types)) — while the allocation-avoidance half is served for **all** strings, not only ASCII ones, by the v0.165 span-destination encoding: `Encoding.GetByteCount(s)` plus `GetBytes(s, destination: Span<byte>)` into a caller-reused `OwningBuffer<byte>` ([§3.2](#sec-encoding)), zero per-call allocation. For one-shot byte access, `Encoding.UTF8.GetBytes(s)` remains the always-correct allocating form; byte-span-consuming APIs are fed with the array's or buffer's own span (`bytes.AsReadOnlySpan()`, `buf.AsReadOnlySpan()`). The section number is retained so later-section citations stay stable; the decision record is the design rationale's v0.188 changelog entry.
 
 ---
 
@@ -2621,7 +2566,7 @@ The borrow-of-`Array<T>` lifetime story is the same as `ArraySpan<T>`'s.
 <a id="sec-ireadonlyspantelement"></a>
 ### 4.16 `IReadOnlySpan<TElement>`
 
-An interface unifying the read-only access surface of every span type in the standard library. Implemented by all six concrete span types — `Span<T>`, `ReadOnlySpan<T>`, `ArraySpan<T>`, `ReadOnlyArraySpan<T>`, `ReadOnlyStringSpan`, `ReadOnlyAsciiByteSpan` — with the element type parameterized to match each concrete type's natural indexer return type.
+An interface unifying the read-only access surface of every span type in the standard library. Implemented by all five concrete span types — `Span<T>`, `ReadOnlySpan<T>`, `ArraySpan<T>`, `ReadOnlyArraySpan<T>`, `ReadOnlyStringSpan` — with the element type parameterized to match each concrete type's natural indexer return type.
 
 ```bezel
 public interface IReadOnlySpan<TElement>
@@ -2648,7 +2593,6 @@ end IReadOnlySpan;
 | `ArraySpan<T>` | `IReadOnlySpan<T>` (Array slots are non-nullable T or nullable T?, whichever T was instantiated as) |
 | `ReadOnlyArraySpan<T>` | `IReadOnlySpan<T>` |
 | `ReadOnlyStringSpan` | `IReadOnlySpan<char>` |
-| `ReadOnlyAsciiByteSpan` | `IReadOnlySpan<byte>` |
 
 A method that wants to accept any read-only span of `MyClass` typically takes `IReadOnlySpan<MyClass?>` (which matches both OwningBuffer-backed nullable-slot spans and Array-backed `MyClass?` spans). Code holding a non-nullable Array span (`ArraySpan<MyClass>`) cannot pass it to that parameter directly — it implements `IReadOnlySpan<MyClass>`, not `IReadOnlySpan<MyClass?>` — because the interface's TElement parameter is invariant. Authors who want full breadth across nullability provide two overloads (one for `IReadOnlySpan<T>`, one for `IReadOnlySpan<T?>`); authors who want the nullable form should use it consistently and accept that callers may need an explicit conversion at the boundary.
 
@@ -2670,7 +2614,7 @@ Authors of performance-sensitive APIs typically provide the concrete-type signat
 
 **Slice and the interface.** The interface deliberately omits `Slice`. Each concrete span type has its own `Slice` returning the same concrete type — `ReadOnlySpan<T>.Slice` returns `ReadOnlySpan<T>`, `ReadOnlyArraySpan<T>.Slice` returns `ReadOnlyArraySpan<T>`, and so on. Putting `Slice` on the interface would require the return type to be `IReadOnlySpan<TElement>`, which would propagate the interface-typed handle (and its virtual-dispatch cost) through the slicing chain. Callers who hold an `IReadOnlySpan<TElement>` and want to slice can do so by reading the relevant elements through the interface in a loop, or by recovering the concrete type via a pattern match (`if s is ReadOnlySpan<T> then ... else if s is ReadOnlyArraySpan<T> then ...`) and slicing on the concrete handle. In practice, slicing through the interface is rare enough that the explicit pattern is acceptable.
 
-**SequenceEqual and the interface.** `SequenceEqual` *is* on the interface, with parameter type `IReadOnlySpan<TElement>`. This admits cross-source equality through the interface — `byteSpan.SequenceEqual(asciiSpan)` where one is a `ReadOnlySpan<byte>` and the other is a `ReadOnlyAsciiByteSpan` compiles when both are passed via `IReadOnlySpan<byte>`. The cost is two virtual-dispatched indexer reads per element; the convenience is real for comparison code that doesn't care which source type the operands came from.
+**SequenceEqual and the interface.** `SequenceEqual` *is* on the interface, with parameter type `IReadOnlySpan<TElement>`. This admits cross-source equality through the interface — `bufSpan.SequenceEqual(arrSpan)` where one is a `ReadOnlySpan<byte>` (buffer-backed) and the other is a `ReadOnlyArraySpan<byte>` (array-backed) compiles when both are passed via `IReadOnlySpan<byte>`. The cost is two virtual-dispatched indexer reads per element; the convenience is real for comparison code that doesn't care which source type the operands came from.
 
 **What about writable spans.** v0.108 does not introduce an `IMutableSpan` (or similar) writable interface. The writable side has substantive semantic differences across span families — `Span<T>`'s class-T setter takes `owned T?` and disposes previous slot contents; `ArraySpan<T>`'s setter takes a borrow with no disposal; value-T setters are plain copies. Unifying these under a single writable interface would either pick one model and exclude the others, or fork the contract by source kind, which defeats the unification. The read-only side is genuinely uniform: every span supports indexer-get returning the slot's element, and that's enough for one interface. The writable side may be revisited if a partial unification (e.g. covering only the non-owned-slot writable spans) proves valuable.
 
@@ -4288,12 +4232,6 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string> 
   public method AsSpan(start: int, length: int): ReadOnlyStringSpan;
   public method AsSpan(r: Range<int>): ReadOnlyStringSpan; // parallels [r: Range<int>]: string
 
-  // ASCII byte views (v0.106)
-  // Throws InvalidOperationException if `not IsAscii`.
-  public method AsAsciiByteSpan(): ReadOnlyAsciiByteSpan;
-  // Returns false (and out value default) if `not IsAscii`.
-  public method TryAsAsciiByteSpan(out value: ReadOnlyAsciiByteSpan): bool;
-
   // Modification (returns a new string; original unchanged)
   public method Trim(): string;
   public method Trim(chars: IEnumerable<char>): string;
@@ -4348,7 +4286,7 @@ end String;
 
 `Replace`, `Trim`, `ToUpper`, etc. return new `string` values; `string` is immutable. A `StringBuilder` ([§3.1](#sec-stringbuilder)) is appropriate for accumulation.
 
-`Length` and `s[i]` are O(1) for every string (language spec [§4.6](Bezel_Language_Spec.md#sec-string)). The internal representation may be 1, 2, or 4 bytes per code point, selected per-string at construction; the choice is invisible to programmers but enables `IsAscii` for the common ASCII-only case. For char-level non-allocating substring views, use `AsSpan()` to obtain a `ReadOnlyStringSpan` ([§3.3](#sec-readonlystringspan)) — added in v0.104. For ASCII byte views — useful in FFI and I/O paths that need UTF-8 bytes without a per-call allocation — use `AsAsciiByteSpan()` to obtain a `ReadOnlyAsciiByteSpan` ([§3.4](#sec-readonlyasciibytespan)) — added in v0.106. The byte view is throwing-on-non-ASCII; a `TryAsAsciiByteSpan(out value: ReadOnlyAsciiByteSpan): bool` form is provided for fallible cases. When the string requires non-ASCII byte access (full UTF-8, allocating), use `Encoding.UTF8.GetBytes(s)` in `System.Text` ([§3.2](#sec-encoding)).
+`Length` and `s[i]` are O(1) for every string (language spec [§4.6](Bezel_Language_Spec.md#sec-string)). The internal representation may be 1, 2, or 4 bytes per code point, selected per-string at construction; the choice is invisible to programmers but enables `IsAscii` for the common ASCII-only case. For char-level non-allocating substring views, use `AsSpan()` to obtain a `ReadOnlyStringSpan` ([§3.3](#sec-readonlystringspan)) — added in v0.104. For byte access to a string's contents, use `Encoding.UTF8.GetBytes` in `System.Text` ([§3.2](#sec-encoding)): the one-shot form `GetBytes(s)` returns a fresh owned `Array<byte>` and is always correct; the allocation-conscious form — repeated encoding in a loop, I/O paths reusing a buffer — is `GetByteCount(s)` with `GetBytes(s, destination: Span<byte>)` (v0.165), which encodes into a caller-reused `OwningBuffer<byte>` with zero per-call allocation, for every string, ASCII or not. (The ASCII-only zero-copy byte view of v0.106, `ReadOnlyAsciiByteSpan`, is retired — [§3.4](#sec-readonlyasciibytespan), v0.188.)
 
 The `+` operator is declared explicitly here, not as compiler magic; the compiler resolves `s + t` to this overload like any other operator.
 
