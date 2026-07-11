@@ -622,6 +622,15 @@ private:
     // (a literal/arithmetic/const may; a variable or call result may not).
     std::optional<long long> foldIntConstExprTC(const ast::Expr& e);
 
+    // §17.14 (v0.184, #1688): does `e` contain a `/` or `mod` node whose RHS
+    // folds to a compile-time zero, using the SAME identifier resolution as
+    // foldIntConstExprTC (lexical-scope `lookupName`, not a type's member-
+    // const list)? Called when foldIntConstExprTC(e) returns nullopt for a
+    // local `const` initializer, to give the specific div/mod-by-zero
+    // diagnostic instead of silently accepting the expression (which then
+    // compiled and deferred the fault to a runtime DivideByZeroException).
+    bool localConstDivByZeroTC(const ast::Expr& e);
+
     // §15.1 (issue #734): fold a LOCAL-`const` inline-array size onto its
     // resolved TypeRef. Member/module consts are folded earlier (type
     // resolution); a local const is only in scope during this pass, so when a

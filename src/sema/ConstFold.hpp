@@ -11,6 +11,7 @@
 #include <optional>
 
 #include "ast/Node.hpp"
+#include "sema/TypeRef.hpp"
 
 namespace bezel::sema {
 
@@ -23,6 +24,31 @@ namespace bezel::sema {
 // initializer, so the shared depth guard bounds cyclic const references.
 // Returns nullopt for any expression that is not a foldable integer constant.
 std::optional<long long> foldIntConst(
+    const ast::Expr& e,
+    const std::function<std::optional<long long>(std::string_view, int)>&
+        resolveIdent,
+    int depth = 0);
+
+// §17.14 (v0.184, #1688): does the compile-time-constant value `v` fit the
+// representable range of integer-family primitive type `p`? Shared by every
+// const evaluation-fault check (class-level and local `const` alike) so a
+// folded value that overflows its declared/inferred type — `const B :=
+// 2147483647 + 1;` folds to 2147483648 in `foldIntConst`'s unchecked 64-bit
+// arithmetic, which does not fit `int` — is reported the same way everywhere.
+// `p` must be one of the eight integer-family PrimitiveTypes; Long/ULong
+// admit any 64-bit pattern (the literal/fold path already bounds them to 64
+// bits), so they always fit.
+bool fitsConstIntRange(long long v, PrimitiveType p);
+
+// §17.14 (v0.184, #1688): does `e` contain a `/` or `mod` node whose RHS
+// folds (via `resolveIdent`) to a compile-time zero? Called when
+// `foldIntConst` on the whole expression returns nullopt, to distinguish
+// "division/modulo by zero" (a specific evaluation fault, §17.14 — a compile
+// error at the constant expression, never deferred to runtime) from "not
+// structurally a constant expression" (a different diagnostic, e.g.
+// unresolved names). `resolveIdent` should be the SAME resolver passed to
+// the sibling `foldIntConst` call so both walks see consistent const values.
+bool containsConstDivByZero(
     const ast::Expr& e,
     const std::function<std::optional<long long>(std::string_view, int)>&
         resolveIdent,

@@ -572,33 +572,6 @@ void Resolver::checkConstTypes() {
     }
 }
 
-// per §22.12 (#1211): return true when `e` contains a division or modulo
-// node whose RHS folds to zero, making the expression unfoldable due to a
-// compile-time division by zero rather than because the expression is
-// structurally non-constant.  Only called for integer-const initializers
-// that have already passed the shape-constant check (isConstInitExpr), so
-// the tree only contains literals, unary ops, binary ops, and const refs.
-static bool containsConstDivByZero(
-    const ast::Expr& e,
-    const std::function<std::optional<long long>(std::string_view, int)>&
-        resolve,
-    int depth = 0) {
-    if (depth > 64) return false;
-    if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&e)) {
-        if (!b->left || !b->right) return false;
-        if (b->op == "/" || b->op == "mod") {
-            auto r = foldIntConst(*b->right, resolve, depth + 1);
-            if (r && *r == 0) return true;
-        }
-        return containsConstDivByZero(*b->left, resolve, depth + 1) ||
-               containsConstDivByZero(*b->right, resolve, depth + 1);
-    }
-    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e))
-        return u->operand &&
-               containsConstDivByZero(*u->operand, resolve, depth + 1);
-    return false;
-}
-
 void Resolver::checkTypeConsts(TypeSymbol* t) {
     for (Symbol* m : t->members) {
         auto* cs = dynamic_cast<ConstMemberSymbol*>(m);
@@ -630,18 +603,10 @@ void Resolver::checkTypeConsts(TypeSymbol* t) {
             p == P::Byte || p == P::SByte || p == P::Short || p == P::UShort ||
             p == P::Int || p == P::UInt || p == P::Long || p == P::ULong;
         if (isIntConst && cd->value) {
-            auto fits = [](long long v, P pt) -> bool {
-                switch (pt) {
-                    case P::Byte:   return v >= 0 && v <= 255;
-                    case P::SByte:  return v >= -128 && v <= 127;
-                    case P::Short:  return v >= -32768 && v <= 32767;
-                    case P::UShort: return v >= 0 && v <= 65535;
-                    case P::Int:    return v >= -2147483648LL &&
-                                           v <= 2147483647LL;
-                    case P::UInt:   return v >= 0 && v <= 4294967295LL;
-                    default:        return true;  // long / ulong: 64-bit
-                }
-            };
+            // §17.14 (v0.184, #1688): fitsConstIntRange / containsConstDivByZero
+            // are shared with the local-`const` fault check (ExprTypecheck.cpp)
+            // so both const forms agree on exactly one "fits"/"div-by-zero"
+            // definition (ConstFold.hpp).
             std::function<std::optional<long long>(std::string_view, int)>
                 resolve = [&](std::string_view name,
                               int depth) -> std::optional<long long> {
@@ -657,7 +622,7 @@ void Resolver::checkTypeConsts(TypeSymbol* t) {
                 return std::nullopt;
             };
             if (auto folded = foldIntConst(*cd->value, resolve)) {
-                if (!fits(*folded, p)) {
+                if (!fitsConstIntRange(*folded, p)) {
                     ctx_.diagnostics().report(
                         Severity::Error, m->declLoc,
                         std::string("const `") + std::string(cs->name) +

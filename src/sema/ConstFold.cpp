@@ -140,4 +140,50 @@ std::optional<long long> foldIntConst(
     return std::nullopt;
 }
 
+// per §17.14 (v0.184, #1688): shared range table for every integer-family
+// PrimitiveType — moved here from TypeResolution_Checks.cpp's checkTypeConsts
+// (originally #958) so class-level AND local `const` overflow checks agree on
+// exactly one definition of "fits". Long/ULong admit any 64-bit pattern: the
+// literal/fold path already bounds a folded value to 64 bits, so there is no
+// narrower range to check.
+bool fitsConstIntRange(long long v, PrimitiveType p) {
+    using P = PrimitiveType;
+    switch (p) {
+        case P::Byte:   return v >= 0 && v <= 255;
+        case P::SByte:  return v >= -128 && v <= 127;
+        case P::Short:  return v >= -32768 && v <= 32767;
+        case P::UShort: return v >= 0 && v <= 65535;
+        case P::Int:    return v >= -2147483648LL && v <= 2147483647LL;
+        case P::UInt:   return v >= 0 && v <= 4294967295LL;
+        default:        return true;  // Long / ULong: any 64-bit pattern fits
+    }
+}
+
+// per §17.14 (v0.184, #1688): moved here from TypeResolution_Checks.cpp's
+// file-local containsConstDivByZero (originally #1211) so the same walk backs
+// both the class-level and the local `const` div/mod-by-zero diagnostic.
+// Only meaningful once the caller has confirmed `e` is structurally a
+// constant expression — this walk is purely a division/modulo-by-zero probe,
+// not a general "is this constant" check.
+bool containsConstDivByZero(
+    const ast::Expr& e,
+    const std::function<std::optional<long long>(std::string_view, int)>&
+        resolveIdent,
+    int depth) {
+    if (depth > 64) return false;  // cyclic / runaway const reference
+    if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (!b->left || !b->right) return false;
+        if (b->op == "/" || b->op == "mod") {
+            auto r = foldIntConst(*b->right, resolveIdent, depth + 1);
+            if (r && *r == 0) return true;
+        }
+        return containsConstDivByZero(*b->left, resolveIdent, depth + 1) ||
+               containsConstDivByZero(*b->right, resolveIdent, depth + 1);
+    }
+    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e))
+        return u->operand &&
+               containsConstDivByZero(*u->operand, resolveIdent, depth + 1);
+    return false;
+}
+
 }  // namespace bezel::sema

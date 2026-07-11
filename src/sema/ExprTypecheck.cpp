@@ -3240,6 +3240,27 @@ std::optional<long long> ExprTC::foldIntConstExprTC(const ast::Expr& e) {
     return foldIntConst(e, resolve, 0);
 }
 
+// §17.14 (v0.184, #1688): same identifier resolution as foldIntConstExprTC
+// above (kept as a separate resolver here rather than sharing one closure,
+// matching foldIntConstExprTC's own self-contained style) so a local const's
+// unfoldable initializer can be diagnosed specifically as a division/modulo
+// by zero rather than silently accepted as "not a foldable constant".
+bool ExprTC::localConstDivByZeroTC(const ast::Expr& e) {
+    std::function<std::optional<long long>(std::string_view, int)> resolve =
+        [&](std::string_view name, int d) -> std::optional<long long> {
+        Symbol* s = lookupName(name);
+        if (!s) return std::nullopt;
+        const ast::Expr* val = nullptr;
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s->decl))
+            val = lc->value.get();
+        else if (auto* cd = dynamic_cast<const ast::ConstDecl*>(s->decl))
+            val = cd->value.get();
+        if (!val) return std::nullopt;
+        return foldIntConst(*val, resolve, d + 1);
+    };
+    return containsConstDivByZero(e, resolve);
+}
+
 void ExprTC::foldLocalConstArraySize(TypeRef* declType) {
     if (!declType || declType->kind != TypeRef::Kind::InlineArray) return;
     if (declType->arraySizeValue >= 0) return;  // already folded (literal/member)
@@ -4745,8 +4766,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if (lc->value) visitExpr(*lc->value);
         // Slice S31 (§21.1 / §22.12): a local const's explicit type
         // must be a primitive value type or string.
+        TypeRef* lcExplicitTy = nullptr;
         if (lc->type) {
             if (auto* rt = ctx_.resolvedType(*lc->type)) {
+                lcExplicitTy = rt;
                 bool ok = rt->kind == TypeRef::Kind::Primitive &&
                           rt->primitive != PrimitiveType::Object;
                 if (!ok) {
@@ -4755,6 +4778,51 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         std::string("const `") + std::string(lc->name) +
                         "` must have a primitive value type or "
                         "`string` (§22.12)");
+                }
+            }
+        }
+        // §17.14 (v0.184, #1688): a local const initializer's compile-time
+        // evaluation fault (integer overflow, division/mod by zero) is a
+        // compile error at the constant expression, never deferred to
+        // runtime. checkTypeConsts (TypeResolution_Checks.cpp) already
+        // enforces this for a CLASS-level const member (#958/#1211); this
+        // mirrors that logic for a LOCAL const, which had no equivalent
+        // check — `const B := 2147483647 + 1;` / `const D := 5 / 0;` inside
+        // a method body compiled cleanly and raised OverflowException /
+        // DivideByZeroException at runtime instead of being rejected here.
+        // Target type: the explicit annotation when primitive, else the
+        // initializer's own inferred type (visitExpr above already set it).
+        if (lc->value) {
+            TypeRef* targetTy =
+                lcExplicitTy ? lcExplicitTy : ctx_.exprType(*lc->value);
+            if (targetTy && targetTy->kind == TypeRef::Kind::Primitive) {
+                using P = PrimitiveType;
+                const P p = targetTy->primitive;
+                const bool isIntConst =
+                    p == P::Byte || p == P::SByte || p == P::Short ||
+                    p == P::UShort || p == P::Int || p == P::UInt ||
+                    p == P::Long || p == P::ULong;
+                if (isIntConst) {
+                    if (auto folded = foldIntConstExprTC(*lc->value)) {
+                        if (!fitsConstIntRange(*folded, p)) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, lc->span.begin,
+                                std::string("const `") + std::string(lc->name) +
+                                "` initializer value " +
+                                std::to_string(*folded) +
+                                " does not fit its declared type — a const "
+                                "initializer must be a representable "
+                                "compile-time constant (§17.14)");
+                        }
+                    } else if (localConstDivByZeroTC(*lc->value)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, lc->span.begin,
+                            std::string("const `") + std::string(lc->name) +
+                            "` initializer contains a division or modulo by "
+                            "zero — a const initializer must fold to a "
+                            "representable compile-time-constant value "
+                            "(§17.14)");
+                    }
                 }
             }
         }
