@@ -62,4 +62,30 @@ bool isLinkedListName(std::string_view n);
 // per §4 / §6 / §29 / §30 / §2.14–2.15
 bool isHeapPointerReferenceBuiltin(std::string_view n);
 
+// §31.4 / #1621: given a built-in exception type's simple name, return the
+// name of its DIRECT parent in the built-in exception hierarchy (e.g.
+// "FileNotFoundException" -> "IOException"), or an empty string_view if
+// `name` is not a recognized built-in exception name or is the hierarchy's
+// root (`Exception`, which has no parent).
+//
+// This is sema's ONLY access to the built-in exception hierarchy — used by
+// `ExprTC`'s multi-type catch-arm nearest-common-base walk (§31.2.1,
+// src/sema/ExprTypecheck.cpp) to continue an ancestor walk past a built-in
+// Named TypeRef (which carries no TypeSymbol / AST base-type list of its
+// own), so a multi-type catch-arm binding whose listed types are two SIBLING
+// built-ins (e.g. `OverflowException | ArgumentException`) still finds their
+// shared ancestor `Exception` instead of spuriously reporting "no common
+// base" or silently mistyping the binding.
+//
+// Codegen keeps an INDEPENDENT copy of the same edges —
+// `Emitter::builtinExceptionHierarchy()` (src/codegen/LlvmBackend_Setup.cpp)
+// — used to build the built-in exception descriptor/vtable globals that back
+// runtime `isA` dispatch. The two tables are not merged into one because
+// codegen's is `const char*`-keyed and threaded through several
+// std::string-keyed maps at its call sites; merging would need a wider,
+// separately-verified refactor than this fix's scope. They are hand-kept in
+// sync — a table edit at either site must mirror the other (each definition
+// cross-references the other's file/function).
+std::string_view builtinExceptionParentOf(std::string_view name);
+
 }  // namespace bezel::common

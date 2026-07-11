@@ -490,6 +490,47 @@ private:
     TypeRef* catchArmNcb(
         const std::vector<std::unique_ptr<ast::Type>>& types);
 
+    // #1621 / §31.2.1 / §20: the simple name of a Named TypeRef — its
+    // TypeSymbol's name when declared, else the AST use-site's last
+    // qualified-name part (for a built-in with no TypeSymbol, e.g.
+    // `IOException`), else `importedName` (a synthetic built-in-ancestor
+    // TypeRef minted by `builtinAncestorTypeRef`, which has neither). Empty
+    // for a non-Named ref. Shared by `commonTypeOf`'s `convertsInto` and
+    // `catchArmNcb`'s ancestor walk so both name a type identically.
+    static std::string_view namedRefSimpleName(const TypeRef* ref);
+
+    // #1621 / §31.2.1: mint a headless Named TypeRef standing for a built-in
+    // exception ancestor name reached only through
+    // `common::builtinExceptionParentOf` (no AST node names it directly —
+    // e.g. `Exception` reached while walking up from `OverflowException`).
+    // `declaration` stays null (it IS a built-in) and `importedName` carries
+    // the name so `namedRefSimpleName` still reports it correctly.
+    TypeRef* builtinAncestorTypeRef(std::string_view name);
+
+    // #1621 / §31.2.1: the ancestor-name chain of `ty` (most-specific first,
+    // `ty` itself included), walking the TypeSymbol base-type chain, the AST
+    // TypeDecl's declared bases (built-in bases have no TypeSymbol and are
+    // only visible here), AND — once a walked node is itself a built-in
+    // Named type with no further AST bases — the built-in exception
+    // hierarchy table (`common::builtinExceptionParentOf`), so a purely
+    // built-in ancestor chain (e.g. `OverflowException` ->
+    // `ArithmeticException` -> `Exception`) is still discoverable. Bounded:
+    // a node is "visited" the first time its name (or, for an unnamed node,
+    // its pointer) is seen, and the guard gates the WALK itself, so a §12.10
+    // base-type cycle that reaches this walk during error recovery cannot
+    // loop forever (#1624 precedent); a hard iteration cap is defense in
+    // depth.
+    std::vector<std::pair<std::string_view, TypeRef*>> namedAncestorChain(
+        TypeRef* ty);
+
+    // #1621 / §31.2.1: does `ty` (or one of its ancestors, per
+    // `namedAncestorChain`) carry the simple name `ancestorName`? Used by
+    // both `convertsInto` (does `from` subtype/widen into `to`, by name, when
+    // one side is a built-in with no TypeSymbol to run `isSubtype` on) and
+    // `catchArmNcb`'s Step 2 (does every OTHER listed type also have this
+    // candidate ancestor?).
+    bool hasNamedAncestor(TypeRef* ty, std::string_view ancestorName);
+
     // Slice S7: diagnose assignment to a readonly field outside the
     // declaring class's constructor. Tracks only the `this.<field>`
     // target shape; `other.f := X` would need cross-object readonly

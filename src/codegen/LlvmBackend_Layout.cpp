@@ -586,12 +586,24 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             // a field / local / parameter / return (so an owned field/local of
             // built-in-exception type stored a clobbered half-pointer that the
             // §28.4 / §28.10 auto-dispose then freed at the wrong address).
-            if (!rt->declaration && rt->astNode && rt->astNode->name &&
-                !rt->astNode->name->parts.empty() &&
-                builtinVtable_.find(
-                    std::string(rt->astNode->name->parts.back())) !=
-                    builtinVtable_.end())
-                return ptrTy();
+            //
+            // #1621: the name comes from `headName()` (astNode's syntactic name
+            // when the type was written directly in source, falling back to
+            // `importedName`) rather than requiring `rt->astNode` — a multi-type
+            // catch-arm binding's nearest-common-base can be a SYNTHETIC
+            // built-in-ancestor TypeRef (`ExprTC::builtinAncestorTypeRef`, minted
+            // when the NCB is reached only via the built-in exception hierarchy
+            // table, e.g. the `Exception` common to sibling `OverflowException`
+            // and `ArgumentException`) which carries no astNode at all; without
+            // this fallback it fell through to the i32 default below — the exact
+            // pointer-truncation bug this check exists to prevent.
+            if (!rt->declaration) {
+                auto exName = rt->headName();
+                if (!exName.empty() &&
+                    builtinVtable_.find(std::string(exName)) !=
+                        builtinVtable_.end())
+                    return ptrTy();
+            }
             if (rt->declaration &&
                 (rt->declaration->kind == ast::TypeDeclKind::Class ||
                  rt->declaration->kind == ast::TypeDeclKind::Interface)) {

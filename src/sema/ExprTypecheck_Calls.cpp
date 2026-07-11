@@ -8693,15 +8693,24 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // `DomainFaultedException e` or `ChannelClosedException e`).  The user-
         // class branch further below handles `Message` on user classes that
         // INHERIT from a built-in exception, but that branch needs targetType!=null.
-        // Here targetType IS null (pure built-in), so we match by ast node name
-        // against the known built-in exception set and type the access as `string`.
+        // Here targetType IS null (pure built-in), so we match by name against
+        // the known built-in exception set and type the access as `string`.
         // Codegen reads the message-ptr at byte offset 8 (LlvmBackend_Exprs.cpp
         // CG22+ handler) — same slot for ALL built-in exception objects.
+        //
+        // #1621 / §31.2.1: the name comes from `headName()` (astNode's syntactic
+        // name when the type was written directly in source, falling back to
+        // `importedName`) rather than reading `tt->astNode` directly — a
+        // multi-type catch-arm binding's nearest-common-base can be a SYNTHETIC
+        // built-in-ancestor TypeRef (`ExprTC::builtinAncestorTypeRef`, minted
+        // when the NCB is reached only via the built-in exception hierarchy
+        // table, e.g. the `Exception` common to sibling `OverflowException` and
+        // `ArgumentException`) which carries no astNode at all.
         if (ma.target && ma.member == "Message") {
             if (auto* tt = ctx_.exprType(*ma.target)) {
+                std::string_view ttName = tt->headName();
                 if (tt->kind == TypeRef::Kind::Named && !tt->declaration &&
-                        tt->astNode && tt->astNode->name &&
-                        !tt->astNode->name->parts.empty()) {
+                        !ttName.empty()) {
                     auto beName = [](std::string_view n) -> bool {
                         return n == "Exception"                 ||
                                n == "ArgumentException"         ||
@@ -8740,7 +8749,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                n == "EndOfStreamException"      ||
                                n == "PathTooLongException";
                     };
-                    if (beName(tt->astNode->name->parts.back())) {
+                    if (beName(ttName)) {
                         ctx_.setExprType(
                             &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                         return;
@@ -8755,12 +8764,13 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // type them by name here, mirroring the Message handler above. A built-in
         // exception is a declaration-less Named type whose name ends in
         // "Exception"; ExceptionInfo is the declaration-less "ExceptionInfo".
+        // #1621: name via `headName()` — see the comment on the Message handler
+        // above for why (a catch-arm NCB may be a synthetic, astNode-less
+        // built-in-ancestor TypeRef).
         {
             auto excBuiltinName = [](const TypeRef* t) -> std::string_view {
-                if (t && t->kind == TypeRef::Kind::Named && !t->declaration &&
-                    t->astNode && t->astNode->name &&
-                    !t->astNode->name->parts.empty())
-                    return t->astNode->name->parts.back();
+                if (t && t->kind == TypeRef::Kind::Named && !t->declaration)
+                    return t->headName();
                 return {};
             };
             auto isExcType = [&](const TypeRef* t) {

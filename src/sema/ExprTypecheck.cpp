@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "ast/Node.hpp"
+#include "common/BuiltinRegistry.hpp"
 #include "sema/ConstFold.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
@@ -1570,6 +1571,120 @@ void ExprTC::checkConditionIsBool(const ast::Expr& cond, std::string_view ctx) {
 // universal common supertype. Conservative (mirrors checkAssignable /
 // convertsInto) so it never false-positives while the type lattice is
 // incomplete.
+// #1621 / §31.2.1 / §20: see ExprTypecheck_impl.hpp for the full rationale.
+// The simple name of a Named TypeRef: its TypeSymbol's name when declared,
+// else the AST use-site's name (a built-in named directly in source, e.g.
+// `IOException`), else `importedName` (a cross-module TypeRef, or a
+// synthetic built-in-ancestor TypeRef minted by `builtinAncestorTypeRef`,
+// neither of which has an astNode). Empty for a non-Named ref.
+std::string_view ExprTC::namedRefSimpleName(const TypeRef* ref) {
+    if (!ref || ref->kind != TypeRef::Kind::Named) return {};
+    if (ref->declaration) return ref->declaration->name;
+    if (!ref->importedName.empty()) return ref->importedName;
+    if (ref->astNode && ref->astNode->name &&
+            !ref->astNode->name->parts.empty())
+        return ref->astNode->name->parts.back();
+    return {};
+}
+
+// #1621 / §31.2.1: a headless Named TypeRef standing for a built-in
+// exception ancestor name reached only through the built-in exception
+// hierarchy table (no AST node names it directly — e.g. `Exception` reached
+// while walking up from `OverflowException`). `declaration` stays null (it
+// IS a built-in); `importedName` carries the name.
+TypeRef* ExprTC::builtinAncestorTypeRef(std::string_view name) {
+    TypeRef* ref = ctx_.makeTypeRef();
+    ref->kind = TypeRef::Kind::Named;
+    ref->declaration = nullptr;
+    ref->importedName = name;
+    return ref;
+}
+
+// #1621 / §31.2.1: the ancestor-name chain of `ty` (most-specific first, `ty`
+// itself included), walking the TypeSymbol base-type chain, the AST
+// TypeDecl's declared bases (built-in bases have no TypeSymbol and are only
+// visible here), AND — once the walk reaches a built-in Named type with no
+// further AST bases of its own — the built-in exception hierarchy table
+// (`common::builtinExceptionParentOf`), so a purely built-in ancestor chain
+// (e.g. `OverflowException` -> `ArithmeticException` -> `Exception`) is still
+// discoverable. Before this, a multi-type catch-arm binding of two SIBLING
+// built-ins (`OverflowException | ArgumentException`, both `Exception`-
+// derived but neither the AST-declared base of the other) could not find
+// their shared ancestor at all.
+//
+// §31.2.1 (NCB) — TERMINATION (#1624): the visited-set MUST gate the base
+// WALK, not only the result set. The base-type graph can contain cycles that
+// survive into sema via error recovery (an erroneous `class A: B; class B:
+// A` is reported by the §12 cycle check but still reaches this walk during
+// catch-arm binding); if a revisited node re-pushes its bases, the walk loops
+// forever. A node is "visited" the first time its name (logical type
+// identity) is seen; empty-name nodes (synthetic/built-in TypeRefs without a
+// resolvable name) are deduped by TypeRef pointer. A hard iteration cap is
+// kept as defense-in-depth so a malformed generic cycle can never make the
+// NCB computation unbounded.
+std::vector<std::pair<std::string_view, TypeRef*>>
+ExprTC::namedAncestorChain(TypeRef* ty) {
+    std::vector<std::pair<std::string_view, TypeRef*>> result;
+    std::unordered_set<std::string_view> seenName;
+    std::unordered_set<const TypeRef*> seenPtr;  // empty-name nodes
+    std::vector<TypeRef*> queue{ty};
+    const std::size_t kMaxWalk = 8192;  // defensive bound; ancestor sets are shallow
+    std::size_t walked = 0;
+    while (!queue.empty()) {
+        if (++walked > kMaxWalk) break;  // §31.2.1 NCB must terminate (#1624)
+        TypeRef* cur = queue.back();
+        queue.pop_back();
+        if (!cur || cur->kind != TypeRef::Kind::Named) continue;
+        std::string_view curName = namedRefSimpleName(cur);
+        // Cycle guard: a node is fresh only the first time it is seen, and
+        // the guard gates the base walk below — a revisit continues WITHOUT
+        // re-pushing bases, so a base-type cycle cannot loop forever.
+        bool fresh = !curName.empty()
+            ? seenName.insert(curName).second
+            : seenPtr.insert(cur).second;
+        if (!fresh) continue;
+        if (!curName.empty())
+            result.emplace_back(curName, cur);
+        if (cur->declaration) {
+            // Visit TypeSymbol base-type refs (user-declared bases with
+            // TypeSymbols — these are already resolved and transitively walk).
+            for (TypeRef* b : cur->declaration->baseTypeRefs)
+                queue.push_back(b);
+            // Visit AST-declared bases (includes built-in bases that have no
+            // TypeSymbol and thus are absent from baseTypeRefs).
+            const auto* astDecl =
+                dynamic_cast<const ast::TypeDecl*>(cur->declaration->decl);
+            if (astDecl) {
+                for (const auto& baseAst : astDecl->baseTypes) {
+                    if (baseAst) queue.push_back(ctx_.resolvedType(*baseAst));
+                }
+            }
+        } else if (!curName.empty()) {
+            // #1621: `cur` is itself a built-in (no TypeSymbol, so no AST base
+            // list to walk) — consult the built-in exception hierarchy to keep
+            // walking upward, so two sibling built-ins still meet at their
+            // shared built-in ancestor.
+            std::string_view parentName = common::builtinExceptionParentOf(curName);
+            if (!parentName.empty())
+                queue.push_back(builtinAncestorTypeRef(parentName));
+        }
+    }
+    return result;
+}
+
+// #1621 / §31.2.1: does `ty` (or an ancestor reached by `namedAncestorChain`)
+// carry the simple name `ancestorName`?
+bool ExprTC::hasNamedAncestor(TypeRef* ty, std::string_view ancestorName) {
+    if (ancestorName.empty()) return false;
+    // Direct name match (the type IS the ancestor).
+    if (namedRefSimpleName(ty) == ancestorName) return true;
+    for (const auto& [name, unused] : namedAncestorChain(ty)) {
+        (void)unused;
+        if (name == ancestorName) return true;
+    }
+    return false;
+}
+
 TypeRef* ExprTC::commonTypeOf(TypeRef* a, TypeRef* b) {
     if (!a) return b;
     if (!b) return a;
@@ -1598,13 +1713,28 @@ TypeRef* ExprTC::commonTypeOf(TypeRef* a, TypeRef* b) {
             if (from->primitive == to->primitive) return true;
             return primitiveWidens(from->primitive, to->primitive);
         }
-        if (from->kind == TypeRef::Kind::Named &&
-            from->declaration && to->declaration) {
-            // Defer generics to the variance slice (conservative skip).
-            if (!from->genericArgs.empty() || !to->genericArgs.empty())
-                return true;
-            if (from->declaration == to->declaration) return true;
-            return isSubtype(from->declaration, to->declaration);
+        if (from->kind == TypeRef::Kind::Named) {
+            if (from->declaration && to->declaration) {
+                // Defer generics to the variance slice (conservative skip).
+                if (!from->genericArgs.empty() || !to->genericArgs.empty())
+                    return true;
+                if (from->declaration == to->declaration) return true;
+                return isSubtype(from->declaration, to->declaration);
+            }
+            // #1621: at least one side is a built-in Named type (no
+            // TypeSymbol, so `isSubtype` above cannot run). Resolve by NAME
+            // through the same ancestor-name walk `catchArmNcb`'s Step 2 uses
+            // — identity, a user-declared subtype of a built-in base, or a
+            // built-in ancestor/descendant pair — instead of the old blanket
+            // "declaration-less Named types are compatible" fallback that
+            // used to live here. That fallback was meant for genuinely
+            // different-KIND pairs (InlineArray/Function/Unit, handled below)
+            // but fired for ANY two Named types where either side lacked a
+            // declaration, so it spuriously treated unrelated built-ins (or a
+            // built-in vs. an unrelated user class, e.g. `Dog` vs.
+            // `IOException`) as mutually convertible — the root cause of
+            // #1621's unreliable multi-type catch-arm NCB.
+            return hasNamedAncestor(from, namedRefSimpleName(to));
         }
         // Other kinds (InlineArray/Function/Unit): conservatively treat
         // same-kind as compatible to avoid false positives.
@@ -1623,19 +1753,19 @@ TypeRef* ExprTC::commonTypeOf(TypeRef* a, TypeRef* b) {
 //
 // Two-step approach, per §31.2.1:
 //
-// Step 1 — commonTypeOf fold: handles user-defined hierarchies where all
-//   listed types have TypeSymbol base chains. `commonTypeOf` walks the
-//   TypeSymbol base-types list (§12 inheritance) and returns the common type
-//   if one branch is a subtype of the other.
+// Step 1 — commonTypeOf fold: handles the case where one listed type is
+//   (transitively) a subtype of another — the fold collapses to that base.
+//   `commonTypeOf`'s `convertsInto` (#1621) walks both the TypeSymbol
+//   base-types list (§12 inheritance, for user hierarchies) and the built-in
+//   exception hierarchy by name (for built-ins), so this step is now correct
+//   whether or not a built-in exception type participates.
 //
-// Step 2 — AST base-type walk: handles the common case where the shared base
-//   is a built-in (e.g. `Exception`). Built-in exception types have no user
-//   TypeSymbol (their TypeRef carries `declaration == nullptr`), so they are
-//   absent from TypeSymbol::baseTypes even when declared as base types in the
-//   user source. We therefore also walk each type's AST TypeDecl::baseTypes
-//   list (which records ALL declared bases, including built-ins) and collect
-//   base-type names. The NCB is the first name (BFS from the first type's
-//   ancestor chain) that appears in ALL listed types' ancestor name-sets.
+// Step 2 — ancestor-name walk (`namedAncestorChain`): handles the general
+//   case a pairwise fold cannot — e.g. two SIBLING types (neither a subtype
+//   of the other) that nonetheless share a more distant common ancestor,
+//   built-in or user-declared. The NCB is the first ancestor of the first
+//   listed type (most-specific first) that is also an ancestor of every
+//   other listed type.
 TypeRef* ExprTC::catchArmNcb(
     const std::vector<std::unique_ptr<ast::Type>>& types) {
     if (types.empty() || !types[0]) return nullptr;
@@ -1650,101 +1780,16 @@ TypeRef* ExprTC::catchArmNcb(
     }
     if (running) return running;
 
-    // --- Step 2: AST base-type walk (handles built-in common bases) --------
-    //
-    // Helper: extract the simple name of a Named TypeRef, for comparing
-    // built-in exception TypeRefs that carry no TypeSymbol declaration.
-    auto namedRefName = [](const TypeRef* ref) -> std::string_view {
-        if (!ref || ref->kind != TypeRef::Kind::Named) return {};
-        if (ref->declaration) return ref->declaration->name;
-        if (!ref->importedName.empty()) return ref->importedName;
-        if (ref->astNode && ref->astNode->name &&
-                !ref->astNode->name->parts.empty())
-            return ref->astNode->name->parts.back();
-        return {};
-    };
-
-    // Helper: collect all ancestor TypeRefs of `ty` in BFS order, walking
-    // both the TypeSymbol base-type chain AND the AST TypeDecl's base-type
-    // list (which captures built-in bases missing from the TypeSymbol chain).
-    // Stops at built-in TypeRefs (declaration==nullptr), which have no AST
-    // TypeDecl to walk further.
-    //
-    // §31.2.1 (NCB) — TERMINATION (#1624): the visited-set MUST gate the base
-    // WALK, not only the result set. The base-type graph can contain cycles
-    // that survive into sema via error recovery (an erroneous `class A: B;
-    // class B: A` is reported by the §12 cycle check but still reaches this
-    // walk during catch-arm binding); if a revisited node re-pushes its bases,
-    // the walk loops forever. A node is "visited" the first time its name
-    // (logical type identity) is seen; empty-name nodes (synthetic/built-in
-    // TypeRefs without a resolvable name) are deduped by TypeRef pointer. A
-    // hard iteration cap is kept as defense-in-depth so a malformed generic
-    // cycle can never make the NCB computation unbounded.
-    auto collectAncestors =
-        [&](TypeRef* ty) -> std::vector<std::pair<std::string_view, TypeRef*>> {
-        std::vector<std::pair<std::string_view, TypeRef*>> result;
-        std::unordered_set<std::string_view> seenName;
-        std::unordered_set<const TypeRef*> seenPtr;  // empty-name nodes
-        std::vector<TypeRef*> queue{ty};
-        const std::size_t kMaxWalk = 8192;  // defensive bound; ancestor sets are shallow
-        std::size_t walked = 0;
-        while (!queue.empty()) {
-            if (++walked > kMaxWalk) break;  // §31.2.1 NCB must terminate
-            TypeRef* cur = queue.back();
-            queue.pop_back();
-            if (!cur || cur->kind != TypeRef::Kind::Named) continue;
-            std::string_view curName = namedRefName(cur);
-            // Cycle guard: a node is fresh only the first time it is seen, and
-            // the guard gates the base walk below — a revisit continues WITHOUT
-            // re-pushing bases, so a base-type cycle cannot loop forever.
-            bool fresh = !curName.empty()
-                ? seenName.insert(curName).second
-                : seenPtr.insert(cur).second;
-            if (!fresh) continue;
-            if (!curName.empty())
-                result.emplace_back(curName, cur);
-            if (cur->declaration) {
-                // Visit TypeSymbol base-type refs (user-declared bases with
-                // TypeSymbols — these are already resolved and transitively walk).
-                for (TypeRef* b : cur->declaration->baseTypeRefs)
-                    queue.push_back(b);
-                // Visit AST-declared bases (includes built-in bases that have no
-                // TypeSymbol and thus are absent from baseTypeRefs).
-                const auto* astDecl =
-                    dynamic_cast<const ast::TypeDecl*>(cur->declaration->decl);
-                if (astDecl) {
-                    for (const auto& baseAst : astDecl->baseTypes) {
-                        if (baseAst) queue.push_back(ctx_.resolvedType(*baseAst));
-                    }
-                }
-            }
-        }
-        return result;
-    };
-
-    // Helper: does `ty` have an ancestor with the given name?
-    auto hasAncestorNamed =
-        [&](TypeRef* ty, std::string_view ancestorName) -> bool {
-        // Direct name match (the type IS the ancestor).
-        if (namedRefName(ty) == ancestorName) return true;
-        // BFS ancestor search.
-        auto ancestors = collectAncestors(ty);
-        for (const auto& [name, _] : ancestors)
-            if (name == ancestorName) return true;
-        return false;
-    };
-
-    // Compute the ancestor list of the first type. For each ancestor (in
-    // BFS order = most-specific first), check whether ALL other listed types
-    // also have that ancestor. The first match is the NCB.
+    // --- Step 2: ancestor-name walk (handles sibling / built-in common
+    // bases — see namedAncestorChain, #1621) --------------------------------
     TypeRef* first = ctx_.resolvedType(*types[0]);
-    auto firstAncestors = collectAncestors(first);
+    auto firstAncestors = namedAncestorChain(first);
     for (const auto& [name, candidateRef] : firstAncestors) {
         if (name.empty()) continue;
         bool allMatch = true;
         for (std::size_t i = 1; i < types.size(); ++i) {
             TypeRef* ti = types[i] ? ctx_.resolvedType(*types[i]) : nullptr;
-            if (!hasAncestorNamed(ti, name)) { allMatch = false; break; }
+            if (!hasNamedAncestor(ti, name)) { allMatch = false; break; }
         }
         if (allMatch) return candidateRef;
     }

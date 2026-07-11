@@ -2296,6 +2296,14 @@ llvm::GlobalVariable* Emitter::vtableOf(const sema::TypeSymbol* t) {
 }
 
 
+// #1621: sema keeps an INDEPENDENT copy of this table —
+// `bezel::common::builtinExceptionParentOf` (src/common/BuiltinRegistry.cpp)
+// — consulted by `ExprTC::catchArmNcb`'s ancestor walk (§31.2.1,
+// src/sema/ExprTypecheck.cpp) so a multi-type catch-arm binding of two
+// SIBLING built-in exceptions (e.g. `OverflowException | ArgumentException`)
+// resolves to their shared ancestor. Keep both in sync by hand when editing
+// either (they aren't merged — see the cross-reference comment on
+// `builtinExceptionParentOf` in BuiltinRegistry.hpp for why).
 const std::vector<std::pair<const char*, const char*>>&
 Emitter::builtinExceptionHierarchy() {
     static const std::vector<std::pair<const char*, const char*>> h = {

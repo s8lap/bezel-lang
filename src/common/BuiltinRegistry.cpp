@@ -94,6 +94,47 @@ constexpr std::array<std::string_view, 63> kHeapPointerReferenceBuiltins = {
     "JsonDeserializer",
 };
 
+// §31.4 / #1621: the built-in exception hierarchy (child name -> parent
+// name); the root `Exception` maps to "" (no parent). MIRRORS
+// `Emitter::builtinExceptionHierarchy()` in src/codegen/LlvmBackend_Setup.cpp
+// — see the cross-reference comment on `builtinExceptionParentOf` in the
+// header. Any edit here (a new built-in exception type, or a re-parented
+// one) must be mirrored there, and vice versa.
+struct BuiltinExceptionEdge {
+    std::string_view name;
+    std::string_view parent;
+};
+constexpr std::array<BuiltinExceptionEdge, 28> kBuiltinExceptionHierarchy = {{
+    {"Exception", ""},
+    {"ArgumentException", "Exception"},
+    {"ArgumentNullException", "ArgumentException"},
+    {"ArgumentOutOfRangeException", "ArgumentException"},
+    {"ArithmeticException", "Exception"},
+    {"OverflowException", "ArithmeticException"},
+    {"DivideByZeroException", "ArithmeticException"},
+    {"InvalidOperationException", "Exception"},
+    {"DisposedAccessException", "InvalidOperationException"},
+    {"NotImplementedException", "Exception"},
+    {"NullReferenceException", "Exception"},
+    {"IndexOutOfRangeException", "Exception"},
+    {"KeyNotFoundException", "Exception"},
+    {"MatchFailureException", "Exception"},
+    {"OperationCanceledException", "Exception"},
+    {"TypeInitializationException", "Exception"},
+    {"FormatException", "Exception"},
+    {"StackOverflowException", "Exception"},
+    {"ChannelClosedException", "Exception"},
+    {"ChannelFullException", "Exception"},
+    {"DomainFaultedException", "Exception"},
+    {"SerializationException", "Exception"},
+    {"TimeoutException", "Exception"},
+    {"IOException", "Exception"},
+    {"FileNotFoundException", "IOException"},
+    {"DirectoryNotFoundException", "IOException"},
+    {"EndOfStreamException", "IOException"},
+    {"PathTooLongException", "IOException"},
+}};
+
 }  // namespace
 
 bool isOwningPrefixedName(std::string_view head) {
@@ -122,6 +163,12 @@ bool isLinkedListName(std::string_view n) {
 
 bool isHeapPointerReferenceBuiltin(std::string_view n) {
     return contains(kHeapPointerReferenceBuiltins, n);
+}
+
+std::string_view builtinExceptionParentOf(std::string_view name) {
+    for (const auto& edge : kBuiltinExceptionHierarchy)
+        if (edge.name == name) return edge.parent;
+    return {};
 }
 
 }  // namespace bezel::common
