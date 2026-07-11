@@ -175,12 +175,33 @@ BEZEL_TEST(with_expression_target_validation_875, auto_property_target_accepted)
 }
 
 // ===========================================================================
-// §9.5 (#933): `with` on an EXISTING class instance is the object-initializer
-// form (§22.11) and is valid only on a freshly-`new`-constructed instance.
-// Applied to an existing class variable it would silently mutate/alias it.
+// §9.5 (v0.188, #1735, proposal 0037 graduation): a `with` source MUST be
+// record-typed. A class- (or interface-)typed source is a compile error
+// naming this rule, REGARDLESS of whether the source is an existing
+// instance or a freshly-`new`-constructed one — the discriminator is the
+// source's type kind, never the presence of `new`. This retires the former
+// §22.11 "object initializer block" reading (§22.11 is now a tombstone),
+// which the pre-v0.188 tests below (#933) used to accept for a `new`
+// source; both are now REJECT cases. The diagnostic names both remedies in
+// the spec's order: named/optional constructor arguments (§22.5), or
+// binding the instance to a named local and assigning its members.
 // ===========================================================================
 
-// REJECT: `with` on an existing class variable.
+// Helper: does the diagnostic name §9.5's two-remedy fix-it (§22.5 named
+// constructor arguments, then bind-to-local-and-assign)?
+bool hasWithClassSourceFixIt(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("9.5") != std::string::npos &&
+            d.message.find("record-typed") != std::string::npos &&
+            d.message.find("22.5") != std::string::npos &&
+            d.message.find("named local") != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+// REJECT: `with` on an existing class variable (#933) — unaffected by
+// v0.188, still rejected, still under §9.5.
 BEZEL_TEST(with_expression_target_validation_875, with_on_existing_class_rejected_933) {
     auto r = parseSemaAll(
         "module M; "
@@ -195,10 +216,16 @@ BEZEL_TEST(with_expression_target_validation_875, with_on_existing_class_rejecte
         "  return b2.V; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasWithClassSourceFixIt(r));
 }
 
-// ACCEPT: the object-initializer form on a `new` class expression.
-BEZEL_TEST(with_expression_target_validation_875, with_on_new_class_accepted_933) {
+// REJECT (v0.188, was ACCEPT pre-v0.188 #933): the former object-initializer
+// form on a `new` class expression is now rejected too — the discriminator
+// is the source's TYPE KIND (class), never the presence of `new` (§9.5).
+// This is the exact spec §9.5 example: "new Point(1, 2) with Y := 9 end has
+// a record-typed source ... the same spelling on a class-typed new
+// expression is rejected."
+BEZEL_TEST(with_expression_target_validation_875, with_on_new_class_rejected_9_5_v0188) {
     auto r = parseSemaAll(
         "module M; "
         "class Box "
@@ -207,8 +234,59 @@ BEZEL_TEST(with_expression_target_validation_875, with_on_new_class_accepted_933
         "  destructor end destructor; "
         "end Box; "
         "class C public static method Main(): int "
-        "  using var b := new Box() with V := 42 end; "  // new source — accepted
+        "  using var b := new Box() with V := 42 end; "  // class-typed `new` — rejected
         "  return b.V; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasWithClassSourceFixIt(r));
+}
+
+// ACCEPT (§22.5 remedy): the diagnostic's first remedy — named/optional
+// constructor arguments — actually compiles in place of the rejected form.
+BEZEL_TEST(with_expression_target_validation_875, with_on_new_class_remedy_named_ctor_args_9_5) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Box "
+        "  public property V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "  destructor end destructor; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  using var b := new Box(v := 42); "  // §22.5 remedy — accepted
+        "  return b.V; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ACCEPT (second remedy): bind the instance to a local, assign members as
+// statements.
+BEZEL_TEST(with_expression_target_validation_875, with_on_new_class_remedy_bind_and_assign_9_5) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Box "
+        "  public property V: int; "
+        "  public constructor() V := 0; end constructor; "
+        "  destructor end destructor; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  using var b := new Box(); b.V := 42; "  // bind + assign — accepted
+        "  return b.V; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ACCEPT: `with` on a FRESHLY-`new`-constructed RECORD is still ordinary
+// record `with` — §9.5's own example: "new Point(1, 2) with Y := 9 end has
+// a record-typed source and is an ordinary record `with`". The
+// discriminator is the source's type kind (record), not the absence of a
+// prior binding.
+BEZEL_TEST(with_expression_target_validation_875, with_on_new_record_accepted_9_5) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Point(1, 2) with Y := 9 end; "  // fresh record — accepted
+        "  return p.X + p.Y; "  // 1 + 9 = 10
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -250,8 +328,15 @@ BEZEL_TEST(with_expression_target_validation_875, duplicate_field_in_record_with
     BEZEL_EXPECT_TRUE(found);
 }
 
-// REJECT: duplicate field name in a class object-initializer `with`.
-BEZEL_TEST(with_expression_target_validation_875, duplicate_field_in_class_with_rejected_935) {
+// REJECT (v0.188, #1735): a duplicate field name on a now-rejected
+// class-typed `with` source still gets its OWN "assigned more than once"
+// diagnostic — the dup-name check (this section) runs independently of the
+// §9.5 source-type validation above (see ExprTypecheck_Exprs.cpp): a
+// program with both defects sees both diagnostics, not just the source-type
+// one. This pins that accumulate-diagnostics behavior (was previously
+// exercised on the accepted §22.11 class object-initializer form, now
+// retired — the source-type rejection fires ADDITIONALLY here).
+BEZEL_TEST(with_expression_target_validation_875, duplicate_field_in_rejected_class_with_both_diagnose_935) {
     auto r = parseSemaAll(
         "module M; "
         "class Box "
@@ -260,13 +345,23 @@ BEZEL_TEST(with_expression_target_validation_875, duplicate_field_in_class_with_
         "  destructor end destructor; "
         "end Box; "
         "class C public static method Main(): int "
-        "  using var b := new Box() with V := 3, V := 4 end; "  // V twice
+        "  using var b := new Box() with V := 3, V := 4 end; "  // V twice, + class source
         "  return b.V; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool foundDup = false, foundClassSource = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("assigned more than once") != std::string::npos)
+            foundDup = true;
+        if (d.message.find("9.5") != std::string::npos &&
+            d.message.find("record-typed") != std::string::npos)
+            foundClassSource = true;
+    }
+    BEZEL_EXPECT_TRUE(foundDup);
+    BEZEL_EXPECT_TRUE(foundClassSource);
 }
 
-// ACCEPT: distinct field names (record copy + class object-initializer).
+// ACCEPT: distinct field names on a record copy.
 BEZEL_TEST(with_expression_target_validation_875, distinct_fields_in_with_accepted_935) {
     auto r = parseSemaAll(
         "module M; "

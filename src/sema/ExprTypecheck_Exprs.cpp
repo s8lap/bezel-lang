@@ -5174,27 +5174,36 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         checkCaseExhaustiveness(*ce, scrutTy);
     } else if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
         if (we->source) visitExpr(*we->source);
-        // §9.5 (#933): `with` on a CLASS (or interface) source is the
-        // object-initializer form (§22.11), valid ONLY on a freshly-`new`-
-        // constructed instance. Applied to an existing class instance, codegen
-        // mutates that instance in place and returns an alias of it (lowerWith)
-        // — silently violating non-destructive-update expectations. The spec is
-        // explicit: "`with` does not apply to existing class instances for
-        // non-destructive update; classes use property assignment." Records
-        // (value types) are a copy and accept any source, so this gate is
-        // class/interface-only and skips a `new` source.
+        // §9.5 (v0.188, #1735, proposal 0037 graduation): the source
+        // expression of a `with` MUST be record-typed; a class- (or
+        // interface-)typed source is a compile error naming this rule,
+        // regardless of whether the source is a freshly-`new`-constructed
+        // instance or an existing one — the discriminator is the source's
+        // TYPE KIND, never the presence of `new` (§9.5: "new Point(1, 2)
+        // with Y := 9 end has a record-typed source ... the same spelling
+        // on a class-typed new expression is rejected"). This retires the
+        // former §22.11 class-source "object-initializer block" reading
+        // (§22.11 is now a tombstone); the diagnostic names both remedies
+        // in the spec's order: named/optional constructor arguments
+        // (§22.5), which run the constructor and respect its invariants, or
+        // binding the instance to a named local and assigning its members
+        // as statements. Records are a copy and accept any record-typed
+        // source, so this gate is class/interface-only.
         if (we->source) {
             if (auto* st = ctx_.exprType(*we->source)) {
                 if (st->kind == TypeRef::Kind::Named && st->declaration &&
                     st->declaration->kind != ast::TypeDeclKind::Record &&
-                    st->declaration->kind != ast::TypeDeclKind::Enum &&
-                    !dynamic_cast<const ast::NewExpr*>(we->source.get())) {
+                    st->declaration->kind != ast::TypeDeclKind::Enum) {
                     ctx_.diagnostics().report(
                         Severity::Error, we->source->span.begin,
-                        "`with` does not apply to an existing class instance — "
-                        "the object-initializer `with` form is valid only on a "
-                        "`new` class expression; mutate an existing instance "
-                        "through property assignment instead (§9.5)");
+                        "`with` requires a record-typed source; this source "
+                        "is class-typed (§9.5, v0.188) — the object-"
+                        "initializer reading of `with` on a class type is "
+                        "retired (formerly §22.11, now a tombstone). Use "
+                        "named/optional constructor arguments instead "
+                        "(§22.5), which run the constructor and respect its "
+                        "invariants, or bind the instance to a named local "
+                        "and assign its members as statements");
                 }
             }
         }
@@ -5213,8 +5222,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // always statically detectable; the first assignment would be dead code.
         // This mirrors the collection-literal rule (§15.4): a duplicate
         // Dictionary key is a compile error when all duplicates are compile-time
-        // constants. Applies to record copies and class object-initializers
-        // alike (independent of the source-type validation below).
+        // constants. Runs independently of the source-type validation above —
+        // a rejected class-typed source still gets this diagnostic too, so a
+        // program with both defects sees both.
         std::unordered_set<std::string_view> seenWithNames;
         for (const auto& ia : we->assigns) {
             if (ia.value) visitExpr(*ia.value);

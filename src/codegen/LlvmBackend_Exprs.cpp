@@ -1453,7 +1453,8 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             arrTy, addr, {builder_.getInt64(0), idx});
         return builder_.CreateLoad(arrTy->getElementType(), elemAddr);
     }
-    // CG34: object initializer `new C() with f := v, …`.
+    // CG34 / §9.5: non-destructive record update `recordExpr with f := v, …`
+    // (v0.188, #1735: no longer a class object initializer — see lowerWith).
     if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
         return lowerWith(*we);
     }

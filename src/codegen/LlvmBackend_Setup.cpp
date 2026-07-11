@@ -12361,25 +12361,13 @@ const sema::TypeSymbol* Emitter::classOfLocal(const ast::LocalDecl* ld) {
             }
         }
     }
-    // §22.11 / §28: `using var h := new C() with f := v end` — the initializer
-    // is a WithExpr whose source is the NewExpr. classOfLocal must look through
-    // the WithExpr to find the class so that registerUsingDisposal pushes a
-    // disposal entry. Without this, the WithExpr fell through every disposal-
-    // registration path and the object leaked (destructor never ran).
-    if (auto* we =
-            dynamic_cast<const ast::WithExpr*>(ld->initializer.get())) {
-        if (we->source) {
-            if (auto* ne2 =
-                    dynamic_cast<const ast::NewExpr*>(we->source.get())) {
-                if (ne2->type) {
-                    if (auto* rt = ctx_.resolvedType(*ne2->type)) {
-                        if (rt->kind == sema::TypeRef::Kind::Named)
-                            return rt->declaration;
-                    }
-                }
-            }
-        }
-    }
+    // (Before v0.188 this function also looked through a WithExpr initializer
+    // — `using var h := new C() with f := v end` — to find the class for
+    // registerUsingDisposal, #747 R43. That was the CLASS object-initializer
+    // reading of `with` (former §22.11), which proposal 0037 retired: a
+    // class-typed `with` source is now a compile error (§9.5), so a `using`
+    // initializer of that shape can no longer reach codegen. Retired with it
+    // — #1735.)
     // #639 / §28.11: `using var u := item` where `item` is a drain-loop
     // variable of user class type (an IdentifierExpr with no explicit
     // type annotation). The ownership checker confirms the transfer; here

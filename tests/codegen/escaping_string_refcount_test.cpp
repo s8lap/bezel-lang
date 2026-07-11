@@ -274,22 +274,27 @@ const char* kLocalSelfAssign =
     "  return s.Length; "                    // "self" => 4
     "end Main; end C;";
 
-// §28.9 / §22.11: a class OBJECT INITIALIZER block `new Holder() with Name := …`
-// stores into a string field with retain/transfer, released on the (single)
-// object's disposal → the field string is reclaimed, LSan-clean. The field is
-// `string?` so the object-initializer form is well-formed (a non-nullable field
-// would need a ctor or default initializer, §7.9). bz_string_release is
-// null-safe. NOTE: kept to a SINGLE object — a `using var ... with ... end`
-// object-initializer inside a tight loop trips a PRE-EXISTING (base-main)
-// object-disposal leak unrelated to strings (the Holder object itself leaks even
-// with an int field), which is out of #429's lane; a single object disposes
-// correctly and exercises the string-field retain→release path cleanly.
+// §28.9: a string field set by ordinary assignment after construction stores
+// with retain/transfer, released on the (single) object's disposal → the
+// field string is reclaimed, LSan-clean. The field is `string?` so leaving
+// it at its implicit null default until the assignment is well-formed (a
+// non-nullable field would need a ctor or default initializer, §7.9).
+// bz_string_release is null-safe. NOTE: kept to a SINGLE object — a `using
+// var` object construction inside a tight loop trips a PRE-EXISTING
+// (base-main) object-disposal leak unrelated to strings (the Holder object
+// itself leaks even with an int field), which is out of #429's lane; a
+// single object disposes correctly and exercises the string-field
+// retain→release path cleanly.
+//
+// Migrated from a class-source `with`-expression store (former §22.11's
+// object-initializer sugar, `new Holder() with Name := … end`) — §9.5
+// (v0.188) retired that sugar for class sources; #1735.
 const char* kObjectInitializerStore =
     "module M; class Holder "
     "  public Name: string?; "
     "end Holder; "
     "class C public static method Main(): int "
-    "  using var h := new Holder() with Name := \"oi\" + \"block\" end; "
+    "  using var h := new Holder(); h.Name := \"oi\" + \"block\"; "
     "  return h.Name!.Length; "              // "oiblock" => 7
     "end Main; end C;";
 
@@ -1304,7 +1309,7 @@ BEZEL_TEST(codegen_escaping_string_429, local_self_assign_no_double_free_28_9) {
     expectValueAndNoCorruption(kLocalSelfAssign, 4);
 }
 
-BEZEL_TEST(codegen_escaping_string_429, object_initializer_store_reclaimed_22_11) {
+BEZEL_TEST(codegen_escaping_string_429, field_assign_after_construction_store_reclaimed) {
     expectValueAndLeakFree(kObjectInitializerStore, 7);
 }
 

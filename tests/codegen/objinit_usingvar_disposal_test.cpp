@@ -1,9 +1,20 @@
-// Codegen — disposal of `using var` bound to an object-initializer / with-
-// expression (§22.11 / §28): `using var h := new C() with f := v end` must
-// dispose the resulting object exactly once at scope end. Before this fix,
-// classOfLocal() only recognised a raw NewExpr initializer; a WithExpr
-// wrapping a NewExpr fell through every disposal-registration path and the
-// object leaked (destructor never ran, block never freed).
+// Codegen — disposal of `using var` bound to a class instance whose fields
+// are then set by ordinary assignment (§28): `using var h := new C(); h.f
+// := v;` must dispose the resulting object exactly once at scope end.
+//
+// Before v0.188 (proposal 0037 graduation, #1735) this was originally a
+// class-source `with`-expression test: `using var h := new C() with f := v
+// end` (former §22.11's object-initializer sugar for exactly the
+// two-statement form below). §9.5 (v0.188) retired that sugar — a
+// class-typed `with` source is now a compile error — so these tests are
+// migrated to the two-statement form the sugar desugared to. The disposal
+// fix this file originally pinned (classOfLocal() recognizing a WithExpr
+// initializer wrapping a NewExpr, or the object leaked) is retired along
+// with the construct that needed it: a bare `new C()` initializer was
+// always recognized, so the two-statement form was never at risk of that
+// leak. See with_init_test.cpp for the disposal-on-a-throwing-assignment
+// coverage (§28.3/§28.10) the retired construct's #747 R43 tests migrated
+// to.
 //
 // Two complementary check kinds (matching the pattern in undisposed_leak_test.cpp):
 //   * destructor-count JIT tests (always run): prove Dispose runs the right
@@ -124,8 +135,9 @@ void expectNoDoubleFree(const std::string& source, int expectedExitCode) {
 // class D: owns a destructor that increments static _n, has two int fields.
 // -----------------------------------------------------------------------
 
-// (a) `using var h := new C() with _f := i end` in a loop → destructor runs
-// each iteration, no leak.  §22.11 / §28.
+// (a) `using var h := new C(); h._f := i;` in a loop → destructor runs
+// each iteration, no leak. Migrated from the retired class-source `with`
+// form (§9.5, v0.188, #1735); §28.
 const char* kWithOneField_Loop =
     "module M; class C "
     "  public static _n: int := 0; "
@@ -134,14 +146,15 @@ const char* kWithOneField_Loop =
     "  public static method Main(): int "
     "    var i := 0; "
     "    while i < 5 do "
-    "      using var h := new C() with _f := i end; "
+    "      using var h := new C(); h._f := i; "
     "      i := i + 1; "
     "    end; "
     "    return _n; "
     "  end Main; "
     "end C;";
 
-// (b) Object-initializer with multiple fields → no leak.  §22.11 / §28.
+// (b) Multiple field assignments → no leak. Migrated from the retired
+// class-source `with` form (§9.5, v0.188, #1735); §28.
 // Uses a `do ... end` block so disposal runs before `return _n`.
 const char* kWithMultipleFields =
     "module M; class D "
@@ -149,13 +162,14 @@ const char* kWithMultipleFields =
     "  public _x: int := 0; public _y: int := 0; "
     "  destructor _n := _n + 1; end destructor; "
     "  public static method Main(): int "
-    "    do using var h := new D() with _x := 10, _y := 32 end; end; "
+    "    do using var h := new D(); h._x := 10; h._y := 32; end; "
     "    return _n; "
     "  end Main; "
     "end D;";
 
 // (c) No double-free (ASan): destructor count == iterations.  §28.
 // Each loop iteration disposes exactly one object (destructor +1 per iter).
+// Migrated from the retired class-source `with` form (§9.5, v0.188, #1735).
 const char* kWithLoop_CountExact =
     "module M; class C "
     "  public static _n: int := 0; "
@@ -164,7 +178,7 @@ const char* kWithLoop_CountExact =
     "  public static method Main(): int "
     "    var i := 0; "
     "    while i < 3 do "
-    "      using var h := new C() with _f := i end; "
+    "      using var h := new C(); h._f := i; "
     "      i := i + 1; "
     "    end; "
     "    return _n; "
@@ -202,39 +216,41 @@ const char* kRecordWith_Control =
 
 // ---- (a) using var with one field, loop: destructor runs each iteration ----
 
-// §22.11 / §28: `using var h := new C() with _f := i end` in a loop →
-// destructor runs each of the 5 iterations. Before the fix: _n was 0 (leak).
-BEZEL_TEST(codegen_objinit_usingvar_22_11_28, with_one_field_loop_disposes_22_11) {
+// §28 (migrated from the retired §22.11 class-source `with` form, v0.188,
+// #1735): `using var h := new C(); h._f := i;` in a loop → destructor runs
+// each of the 5 iterations.
+BEZEL_TEST(codegen_objinit_usingvar_migrated_9_5_28, with_one_field_loop_disposes) {
     expectDisposedAndLeakFree(kWithOneField_Loop, 5);
 }
 
 // ---- (b) multiple fields: destructor runs once at scope end ----------------
 
-// §22.11 / §28: object-initializer with two field assignments → disposed once.
-// Before the fix: _n was 0 (leak).
-BEZEL_TEST(codegen_objinit_usingvar_22_11_28, with_multiple_fields_disposes_once_22_11) {
+// §28 (migrated, #1735): two field assignments after construction →
+// disposed once.
+BEZEL_TEST(codegen_objinit_usingvar_migrated_9_5_28, with_multiple_fields_disposes_once) {
     expectDisposedAndLeakFree(kWithMultipleFields, 1);
 }
 
 // ---- (c) no double-free (ASan): destructor count == iterations -------------
 
-// §28: exactly 3 destructor calls for 3 loop iterations — no double-free,
-// no skip. ASan confirms no UAF/DF even when disposal runs inside a loop.
-BEZEL_TEST(codegen_objinit_usingvar_22_11_28, with_loop_exact_count_no_doublefree_28) {
+// §28 (migrated, #1735): exactly 3 destructor calls for 3 loop iterations —
+// no double-free, no skip. ASan confirms no UAF/DF even when disposal runs
+// inside a loop.
+BEZEL_TEST(codegen_objinit_usingvar_migrated_9_5_28, with_loop_exact_count_no_doublefree) {
     expectNoDoubleFree(kWithLoop_CountExact, 3);
 }
 
 // ---- (d) CONTROL: plain new still disposes once ----------------------------
 
 // §28: ensure the existing plain `using var h := new C()` path is unaffected.
-BEZEL_TEST(codegen_objinit_usingvar_22_11_28, plain_new_using_var_control_28) {
+BEZEL_TEST(codegen_objinit_usingvar_migrated_9_5_28, plain_new_using_var_control_28) {
     expectDisposedAndLeakFree(kPlainNew_Control, 1);
 }
 
 // ---- (e) CONTROL: record with-expression is unaffected ---------------------
 
-// §9.5 / §22.11: a record with-expression produces a value type — no class
-// disposal is triggered. The field update is correct and there is no crash.
-BEZEL_TEST(codegen_objinit_usingvar_22_11_28, record_with_unaffected_9_5) {
+// §9.5: a record with-expression produces a value type — no class disposal
+// is triggered. The field update is correct and there is no crash.
+BEZEL_TEST(codegen_objinit_usingvar_migrated_9_5_28, record_with_unaffected_9_5) {
     BEZEL_EXPECT_EQ(run(kRecordWith_Control), 92);
 }

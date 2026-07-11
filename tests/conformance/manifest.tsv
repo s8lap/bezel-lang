@@ -136,7 +136,7 @@ spec_0133	spec	2210-Primary-constructors	fragment	compiles
 spec_0134	spec	Capture-rule-and-layout-stability	fragment	compiles	
 spec_0135	spec	Capture-rule-and-layout-stability	fragment	compiles	
 spec_0136	spec	Capture-rule-and-layout-stability	fragment	compiles	chained:1
-spec_0137	spec	2211-Object-initializer-blocks	skip	n/a	skip:incomplete-fragment
+spec_0137	spec	95-Non-destructive-update-with	error	diagnose	was-2211-now-rejects-per-9.5-v0.188
 spec_0138	spec	2211-Object-initializer-blocks	skip	n/a	skip:incomplete-fragment
 spec_0139	spec	2214-No-params-no-ref-returns	skip	n/a	skip:elided
 spec_0140	spec	231-Auto-properties	fragment	compiles	

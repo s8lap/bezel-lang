@@ -1752,17 +1752,24 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
 
 
 llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
-    // `expr with name := v, ... end` has two spec forms, distinguished by
-    // the source type:
-    //  - Record (value type, §9.5): a *non-destructive copy* — the source
-    //    record is unchanged. The source is a first-class struct value, so
-    //    spill it to a fresh stack slot (the copy), overwrite the named
-    //    fields through that pointer, and reload the result by value. Using
-    //    the struct value directly as a GEP base is malformed (and hung the
-    //    compiler — #254).
-    //  - Class (object initializer block, §22.11): the source is a freshly
-    //    `new`-constructed instance (a pointer); the named members are
-    //    assigned in place and the same pointer is returned.
+    // `expr with name := v, ... end` — §9.5 (v0.188): a non-destructive
+    // RECORD copy — the source record is unchanged. The source is a
+    // first-class struct value, so spill it to a fresh stack slot (the
+    // copy), overwrite the named fields through that pointer, and reload
+    // the result by value. Using the struct value directly as a GEP base is
+    // malformed (and hung the compiler — #254).
+    //
+    // Before v0.188 this function also lowered the CLASS "object initializer
+    // block" reading of `with` (former §22.11, now a tombstone): the source
+    // was a freshly-`new`-constructed instance, mutated in place through its
+    // setters and returned by the same pointer. Proposal 0037 (spec v0.188)
+    // retired that reading — a class-typed `with` source is now a compile
+    // error (§9.5, rejected in ExprTypecheck_Exprs.cpp before codegen ever
+    // runs) — so the class-only machinery this function used to carry
+    // (custom-setter dispatch, the #747 R43 unattached-owned disposal
+    // landing pad for a setter that throws mid-sequence, the #429 string-
+    // field retain/release on a class-instance store) is unreachable and
+    // retired with it (#1735).
     if (!we.source) return nullptr;
     llvm::Value* src = lowerExpr(*we.source);
     if (!src) return nullptr;
@@ -1803,7 +1810,23 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
         }
         if (!t) return src;
     }
-    const bool isRecord = t->kind == ast::TypeDeclKind::Record;
+    if (t->kind != ast::TypeDeclKind::Record) {
+        // Unreachable for a class/interface source: §9.5 rejects it at sema
+        // before codegen runs (#1735). The only other non-record kind an
+        // exprType can carry here is Enum, which §9.5 also requires to be
+        // record-typed but which the current sema gate does not yet enforce
+        // (a separate, pre-existing gap — filed as a follow-up, not part of
+        // #1735: an enum has no instance fields or auto-properties to serve
+        // as a `with` target at all, §10.5, so this path was never able to
+        // do anything useful for one). Report an internal error rather than
+        // GEP through class-shaped storage a bare enum value doesn't have.
+        ctx_.diagnostics().report(
+            Severity::Error, we.source->span.begin,
+            "internal: `with` on a non-record source reached codegen "
+            "unexpectedly — should have been rejected at sema (§9.5) — "
+            "#1735");
+        return nullptr;
+    }
     // issue #462 / §9.5 / §14.1: a GENERIC record `with`-copy must use the
     // SPECIALIZED struct layout for the source's instantiation, not the i32
     // placeholder. With the placeholder the spilled copy (and each replacement
@@ -1816,8 +1839,8 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
     // (which use fieldIndex_ as registered by recordStruct) and the final reload.
     // A no-op for a non-generic record or a class source.
     RecordSubstGuard withSubst(this, rt);
-    // classStruct routes records to recordStruct (no vtable), so this is
-    // the right layout for both forms.
+    // classStruct routes a record to recordStruct (no vtable) — the right
+    // layout here, since `t` is now known to be a record.
     llvm::StructType* st = classStruct(t);
     // #1273 (§9.5 / §7.5): a `with` on a NULLABLE record source (`p: P?`). `src`
     // is the tagged `{i8, P}` nullable struct value, but the record-copy below
@@ -1828,141 +1851,33 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
     // `q!.A` hit nullablePrimHasValue on a wrongly-shaped value (LLVM ICmp
     // type-mismatch → SIGABRT).
     const bool srcNullableRecord =
-        isRecord && rt && rt->nullable &&
-        rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
-        rt->declaration->kind == ast::TypeDeclKind::Record &&
+        rt && rt->nullable && rt->kind == sema::TypeRef::Kind::Named &&
+        rt->declaration && rt->declaration->kind == ast::TypeDeclKind::Record &&
         !src->getType()->isPointerTy();
     llvm::Value* nullableTag = nullptr;
     if (srcNullableRecord) {
         nullableTag = builder_.CreateExtractValue(src, {0u}, "with.nul.tag");
         src = builder_.CreateExtractValue(src, {1u}, "with.nul.payload");
     }
-    // The GEP base: a spilled copy for a record, the instance pointer for
-    // a class.
-    llvm::Value* base = src;
-    if (isRecord) {
-        base = entryAlloca(st);
-        // #575 / §9.5 / §22.3: when `this with { … }` is used inside a record
-        // instance method, lowerExpr(this) returns currentThis_ which is a
-        // POINTER to the record (CG29 — record methods receive `this` as ptr,
-        // §9.4). A regular non-this record source is already a struct VALUE.
-        // Load the struct from the pointer before spilling to the copy alloca;
-        // storing a ptr into a struct-typed alloca would corrupt the copy and
-        // produce a "return type does not match" IR verification failure.
+    // The GEP base: a spilled copy of the source record.
+    llvm::Value* base = entryAlloca(st);
+    // #575 / §9.5 / §22.3: when `this with { … }` is used inside a record
+    // instance method, lowerExpr(this) returns currentThis_ which is a
+    // POINTER to the record (CG29 — record methods receive `this` as ptr,
+    // §9.4). A regular non-this record source is already a struct VALUE.
+    // Load the struct from the pointer before spilling to the copy alloca;
+    // storing a ptr into a struct-typed alloca would corrupt the copy and
+    // produce a "return type does not match" IR verification failure.
+    {
         llvm::Value* srcVal = src->getType()->isPointerTy()
                               ? builder_.CreateLoad(st, src, "this.val")
                               : src;
         builder_.CreateStore(srcVal, base);
     }
-    // fix #747 R43 / §22.11 / §28.3: during a CLASS object-initializer block's
-    // setter sequence, the freshly-`new`'d instance is an UNATTACHED OWNED
-    // value. If a setter (or a setter's value expression) throws, §22.11
-    // requires the partially-initialized instance to be disposed by the implicit
-    // try/finally before the exception propagates — exactly as a plain owned
-    // `new T(...)` dropped on an exception path (§28.3). Register an unwindOnly
-    // disposal (dynamic dispatch through the object's vtable) that is active
-    // ONLY across the setter loop: it fires if a setter unwinds, and is removed
-    // once the loop completes (the result is returned and ownership transfers to
-    // the binding/caller, whose own discharge takes over — keeping it would
-    // double-dispose on a LATER throw). Records are value types with no disposal
-    // obligation, so this is the class form only.
-    llvm::AllocaInst* initGuardSlot = nullptr;
-    std::size_t initGuardIdx = static_cast<std::size_t>(-1);
-    if (!isRecord && !disposeStack_.empty()) {
-        initGuardSlot = entryAlloca(ptrTy());
-        builder_.CreateStore(base, initGuardSlot);
-        Disposal g{initGuardSlot, nullptr};
-        g.unwindOnly = true;
-        initGuardIdx = disposeStack_.back().size();
-        disposeStack_.back().push_back(g);
-    }
-    // fix #747 R43 / §22.11: a class object initializer "assigns through the
-    // named properties' setters". An auto-property's setter is a plain field
-    // store (its backing field is in `storage` below), but a property with a
-    // CUSTOM (block) setter must RUN that setter's body — a direct field store
-    // would bypass its logic and any exception it throws. Custom-setter
-    // properties are not in `storage` (collectInstanceStorage only records
-    // fields + auto-properties), so the assignment was previously dropped
-    // silently. Resolve a custom-setter property by name on the class chain.
-    auto customSetterPd =
-        [&](std::string_view name) -> const ast::PropertyDecl* {
-        for (const sema::TypeSymbol* cur = t; cur;) {
-            for (const sema::Symbol* mm : cur->members) {
-                auto* ps = dynamic_cast<const sema::PropertySymbol*>(mm);
-                if (!ps || ps->name != name || ps->isIndexer ||
-                    isAutoProperty(ps))
-                    continue;
-                auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-                if (!pd || pd->bodyKind != ast::PropertyBodyKind::Block)
-                    return nullptr;
-                for (const auto& acc : pd->accessors)
-                    if (acc.isSet &&
-                        acc.bodyKind != ast::PropertyAccessorBodyKind::Abstract)
-                        return pd;
-                return nullptr;
-            }
-            const sema::TypeSymbol* nextBase = nullptr;
-            for (const sema::TypeSymbol* b : cur->baseTypes)
-                if (b && b->kind == ast::TypeDeclKind::Class) {
-                    nextBase = b;
-                    break;
-                }
-            cur = nextBase;
-        }
-        return nullptr;
-    };
     std::vector<const sema::Symbol*> storage;
     collectInstanceStorage(t, storage);
     for (const auto& a : we.assigns) {
         if (!a.value) continue;
-        // §22.11: a custom-setter property target runs its setter body (with
-        // `this` = the new instance and `value` = the supplied value) — mirrors
-        // lowerPropertySetValue's non-static inlining. If the setter throws, the
-        // unwindOnly guard registered above disposes the instance before the
-        // exception propagates.
-        if (!isRecord) {
-            if (const ast::PropertyDecl* pd = customSetterPd(a.name)) {
-                const ast::PropertyAccessor* setter = nullptr;
-                for (const auto& acc : pd->accessors)
-                    if (acc.isSet && acc.bodyKind !=
-                            ast::PropertyAccessorBodyKind::Abstract) {
-                        setter = &acc;
-                        break;
-                    }
-                llvm::Value* v = lowerExpr(*a.value);
-                if (!v) {
-                    // #1386: ICE — lowerExpr returned null for the value in
-                    // a with-expression custom-setter assignment.
-                    ctx_.diagnostics().report(
-                        Severity::Error, a.value->span.begin,
-                        "internal: lowerExpr returned null for with-expression "
-                        "custom-setter value — #1386");
-                    continue;
-                }
-                if (!setter) continue;
-                llvm::AllocaInst* vslot = entryAlloca(v->getType());
-                builder_.CreateStore(v, vslot);
-                locals_[pd] = vslot;  // `value` param anchored on the PropertyDecl
-                llvm::Value* savedThis = currentThis_;
-                currentThis_ = base;
-                llvm::BasicBlock* savedAccEnd = inlinedAccessorEnd_;
-                auto* accEndBB =
-                    llvm::BasicBlock::Create(llvm_, "with.setter.end", currentFn_);
-                inlinedAccessorEnd_ = accEndBB;
-                bool term = false;
-                if (setter->bodyKind ==
-                        ast::PropertyAccessorBodyKind::Expression &&
-                    setter->exprBody)
-                    lowerExpr(*setter->exprBody);
-                else
-                    term = lowerScopedBlock(setter->stmts);
-                inlinedAccessorEnd_ = savedAccEnd;
-                if (!term) builder_.CreateBr(accEndBB);
-                builder_.SetInsertPoint(accEndBB);
-                currentThis_ = savedThis;
-                continue;
-            }
-        }
         const sema::Symbol* m = nullptr;
         for (const sema::Symbol* s : storage)
             if (s->name == a.name) { m = s; break; }
@@ -2031,22 +1946,12 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
             continue;
         }
         llvm::Value* slot = builder_.CreateStructGEP(st, base, idxIt->second);
-        // #429 / §4.6 / §28.9 / §22.11: a CLASS object-initializer store into a
-        // string field/auto-property takes an independent +1 (released on the
-        // instance's disposal), exactly like a plain assignment — retain-new (or
-        // transfer a producer) / release-old. The freshly-`new`'d field already
-        // holds its default-initializer value (retained by emitInstanceInit) or
-        // null, so release the old after storing the new. A RECORD `with`-copy is
-        // a value type whose string fields are borrows (§9) and has no disposer —
-        // it stays a plain store (no retain).
-        if (!isRecord && v->getType()->isPointerTy() && isStringStorageMember(m)) {
-            llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), slot, "strf.old");
-            if (!isPlusOneStringProducer(a.value.get()))
-                emitStringRetain(v);
-            builder_.CreateStore(v, slot);
-            emitStringRelease(oldVal);
-            continue;
-        }
+        // A RECORD `with`-copy is a value type whose string fields are
+        // borrows (§9) and has no disposer — a plain store (no retain).
+        // (Before v0.188 a CLASS object-initializer store into a string
+        // field/auto-property took an independent +1 here, released on the
+        // instance's disposal, #429 / §4.6 / §28.9 — retired with the class
+        // form, #1735.)
         // R40 / §9.5: a `with`-replacement of a nullable VALUE-type field must
         // store the tagged {i8,T} struct, not the raw scalar/payload — otherwise
         // the bare value overwrites the hasValue byte and leaves the value half
@@ -2086,21 +1991,8 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
         }
         builder_.CreateStore(v, slot);
     }
-    // §22.11: the setter sequence completed without throwing — ownership of the
-    // instance transfers to the with-expression's result, so remove the implicit
-    // try/finally guard (the binding/caller now owns the discharge). Guarded so a
-    // value-expression that perturbed the dispose scope cannot erase the wrong
-    // entry: only remove it if our exact unwindOnly guard is still at its index.
-    if (initGuardIdx != static_cast<std::size_t>(-1) && !disposeStack_.empty() &&
-        initGuardIdx < disposeStack_.back().size() &&
-        disposeStack_.back()[initGuardIdx].slot == initGuardSlot &&
-        disposeStack_.back()[initGuardIdx].unwindOnly) {
-        disposeStack_.back().erase(disposeStack_.back().begin() +
-                                   static_cast<std::ptrdiff_t>(initGuardIdx));
-    }
-    // Record: return the modified copy by value. Class: return the mutated
-    // instance pointer.
-    llvm::Value* result = isRecord ? builder_.CreateLoad(st, base) : base;
+    // Return the modified copy by value.
+    llvm::Value* result = builder_.CreateLoad(st, base);
     // #1273: re-wrap the copied record into the tagged `{i8, P}` nullable struct,
     // carrying the source's tag so a null source stays null.
     if (srcNullableRecord && nullableTag) {
