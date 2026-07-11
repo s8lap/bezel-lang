@@ -601,10 +601,24 @@ BEZEL_TEST(undisposed_leak, discard_move_local_disposed_once_1009) {
     if (lsan >= 0) BEZEL_EXPECT_EQ(lsan, 0);
 }
 
-// §17.13 (#1009) SOUNDNESS: discarding a BORROW (`_ := x` where x is an owned
-// local) does NOT dispose at the discard — `x` is the sole owner and disposes
-// the value exactly once at its own scope end. No double-free. The ownership
-// pass classifies the alias read as Borrowed, so the discard is a no-op read.
+// §17.13 / §28.3 (#1009, UPDATED for v0.184 / #1651) SOUNDNESS: `_ := x` where
+// `x` is a `using var` — a named owned binding, per the v0.184 "Who may call
+// Dispose()" list (spec:6036, which names `using var` alongside a plain owned
+// local/parameter as an eligible discard/dispose receiver) — is now an
+// ANNOUNCED CONSUME: `x` is disposed at the discard statement, not at its own
+// `using var` scope end. Before v0.184 the discard of a `using var` alias was
+// a no-op borrow read (this test's original premise); #1651 fixed the
+// ownership pass to treat ANY tracked-Owned named binding — not only a plain
+// `out owned var` local — as an announced consume. No double-free either way:
+// the discard's explicit-dispose codegen path (explicitDisposeOwnedReceiver-
+// Slot) nulls `x`'s slot, so the `using var`'s own (null-guarded) scope-end
+// disposal then finds null and is a no-op — exactly the same null-guard
+// interplay an early explicit `x.Dispose()` on a `using var` already relied
+// on. This test's ASSERTION (no leak / no double-free / no UAF) is unaffected
+// by the timing change; only the disposal's TIMING moved earlier. R has no
+// instance-level refcounted field, so its disposer-path reclaim is exact. See
+// tests/{ownership,codegen}/discard_named_owned_binding_1651*_test.cpp for the
+// dedicated #1651 regression coverage.
 BEZEL_TEST(undisposed_leak, discard_owned_local_alias_not_double_freed_1009) {
     const char* src =
         "module M; "
@@ -612,11 +626,12 @@ BEZEL_TEST(undisposed_leak, discard_owned_local_alias_not_double_freed_1009) {
         "  destructor _n := _n + 1; end destructor; end R; "
         "class C public static method Main(): int "
         "  using var x := new R(); "
-        "  _ := x; "                 // borrow read+discard — NOT disposed here
+        "  _ := x; "                 // v0.184: announced consume — disposed HERE
         "  return 0; "
         "end Main; end C;";
-    // detectLeaks=true: x is disposed exactly once at scope end → no leak; the
-    // borrow discard adds no second disposal → no double-free.
+    // detectLeaks=true: x is disposed exactly once (at the discard, v0.184) —
+    // no leak; the `using var`'s own scope-end disposal is null-guarded and
+    // skipped — no double-free.
     int lsan = runUnderLeakSanitizer(src);
     if (lsan >= 0) BEZEL_EXPECT_EQ(lsan, 0);
 }

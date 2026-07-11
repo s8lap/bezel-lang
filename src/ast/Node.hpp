@@ -288,13 +288,16 @@ struct DiscardStmt : Stmt {
     // marks the source as transferred so its scope-end disposal is skipped
     // (no double-free).
     bool disposeInlineOwnedArray = false;
-    // §17.13 / §28.3 / #1387: set by the ownership pass when `value` is a plain
-    // IdentifierExpr referencing an `out owned var` inline local that is currently
-    // Owned — a legal §17.13 discard-discharge. The discard consumes the value:
+    // §17.13 / §28.3 v0.184 (#1387, generalized by #1651): set by the ownership
+    // pass when `value` is a plain IdentifierExpr referencing a NAMED OWNED
+    // BINDING — a plain owned local (any decl form: `var`/`using var`
+    // LocalDecl, the `out owned var` inline form, or an owning-enumerable
+    // for-loop variable) or an `owned` parameter — that is currently Owned.
+    // This is the "announced consume" of a named owned binding (v0.184):
     // codegen emits null-guarded dispose+reclaim of the local's slot at this
-    // statement and nulls the slot (so the exception-path unwindOnly disposal is a
-    // no-op). Distinct from disposeOwnedValue (fresh-producer path) which stores to
-    // a separate alloca and does not null the original slot.
+    // statement and nulls the slot (so the exception-path unwindOnly disposal
+    // is a no-op). Distinct from disposeOwnedValue (fresh-producer path) which
+    // stores to a separate alloca and does not null an original slot.
     bool discardOutOwnedVar = false;
 };
 

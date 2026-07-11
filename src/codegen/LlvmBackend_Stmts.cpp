@@ -1444,13 +1444,18 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
         if (ds->value) {
             if (ds->discardOutOwnedVar) {
-                // §17.13 / §28.3 / #1387 (Item 2a): `_ := top` where `top` is an
-                // `out owned var` inline local recognized as a §17.13 discharge by
-                // the ownership pass. Emit null-guarded dispose+reclaim of the
-                // local's slot and null it so the exception-path unwindOnly disposal
-                // (registered by ensureOutVarSlots) is a no-op after this point.
-                // Uses explicitDisposeOwnedReceiverSlot to find the slot address
-                // (the same path as `top?.Dispose()` / `top.Dispose()`).
+                // §17.13 / §28.3 v0.184 (#1387, generalized by #1651): `_ := x`
+                // where `x` is a named owned binding (a plain owned local of any
+                // decl form, including the `out owned var` inline local, or an
+                // `owned` parameter) recognized as an announced-consume §17.13
+                // discharge by the ownership pass. Emit null-guarded dispose+
+                // reclaim of the local's slot and null it so any other scope-end
+                // / exception-path disposal registered for the same slot
+                // (e.g. ensureOutVarSlots' unwindOnly disposal) is a no-op after
+                // this point. Uses explicitDisposeOwnedReceiverSlot to find the
+                // slot address — the same resolver `x?.Dispose()` / `x.Dispose()`
+                // uses, so it is already general across LocalSymbol (any decl
+                // kind) and `owned` ParameterSymbol receivers.
                 llvm::Type* slotTy = nullptr;
                 llvm::Value* slotAddr =
                     explicitDisposeOwnedReceiverSlot(*ds->value, slotTy);

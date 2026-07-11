@@ -1709,31 +1709,42 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
         if (ds->value) {
             handleDischarge(*ds->value);
-            // §17.13 / §28.3 / #1387: `_ := top` where `top` is an `out owned var`
-            // inline local (ls->decl is IdentifierExpr) that is currently Owned.
-            // Recognize this as an explicit §17.13 discharge: mark `top` as moved-
-            // from (so the affine auto-drop path does not fire and emit a warning)
-            // and flag the DiscardStmt so codegen emits null-guarded dispose+reclaim
-            // of the local's slot at this statement and nulls the slot.
-            // Restricted to IdentifierExpr-decl locals (the `out owned var` inline
-            // form) — regular LocalDecl locals go through the auto-drop path which
-            // is already correct. // per §17.13, §28.3, §28.11
+            // §17.13 / §28.3 v0.184 (#1651): `_ := x;` where `x` is a named
+            // owned binding — a plain owned LOCAL (a `var`/`using var`
+            // LocalDecl, the `out owned var` inline form, #1387, or an
+            // owning-enumerable for-loop variable), or an `owned` PARAMETER —
+            // is an ANNOUNCED CONSUME (spec "Discard of a named owned
+            // binding"): the value is disposed at the end of the discard
+            // statement and `x` is left explicitly-disposed, exactly as
+            // `x.Dispose()` would leave it. Use markDisposedByName — NOT
+            // markMovedByName (the pre-v0.184 handling this replaces, which
+            // was also restricted to the out-owned-var-only case) — for two
+            // reasons the spec is explicit about: (1) the target state is
+            // Disposed, so the scope-end auto-drop pass (gated on state ==
+            // Owned) skips `x`, and a later read falls under the §28.2
+            // use-after-dispose regime — a WARNING on a dominating straight-
+            // line path, an ERROR at a maybe-consumed join — not the harder
+            // MovedFrom-read error markMovedByName's target state would draw;
+            // and (2) markDisposedByName does not invoke the §28.3 consume-
+            // site freeze (checkConsumeFreeze) — this is an ANNOUNCED kill
+            // (the discard is itself the source-visible announcement, like
+            // `throw x` or a Pattern B owned-task `await`), so the freeze
+            // must not apply, unlike a silent move/transfer. A borrow-state
+            // operand (a borrowed local/param, `obj.Field`, a borrow-
+            // returning call result) is excluded by construction — its
+            // OwnershipState is never Owned — so the discard disposes
+            // nothing for it (purely cosmetic, the spec's borrow-state
+            // carve-out). The disposal codegen is the shared explicit-dispose
+            // reclaim path (discardOutOwnedVar → explicitDisposeOwnedReceiver-
+            // Slot) already used for `x.Dispose()` and the #1387 out-owned-var
+            // discard — general across LocalSymbol (any decl kind) and `owned`
+            // ParameterSymbol receivers. // per §17.13, §28.3, v0.184
             if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                     ds->value.get())) {
-                auto* dstate = lookupState(id->name);
-                if (dstate && dstate->state == OwnershipState::Owned) {
-                    // Find the symbol to confirm it is an `out owned var` inline
-                    // local (LocalSymbol with IdentifierExpr decl).
-                    sema::LocalSymbol* dls = nullptr;
-                    for (auto& [sym, st] : states_) {
-                        if (sym->name == id->name) {
-                            dls = dynamic_cast<sema::LocalSymbol*>(sym);
-                            break;
-                        }
-                    }
-                    if (dls && dynamic_cast<const ast::IdentifierExpr*>(
-                                   dls->decl)) {
-                        markMovedByName(id->name, id->span.begin);
+                if (id->name != "this" && id->name != "base") {
+                    auto* dstate = lookupState(id->name);
+                    if (dstate && dstate->state == OwnershipState::Owned) {
+                        markDisposedByName(id->name, id->span.begin);
                         const_cast<ast::DiscardStmt*>(ds)->discardOutOwnedVar =
                             true;
                     }
