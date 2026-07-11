@@ -142,6 +142,9 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
         std::size_t pos = 0;
         for (const auto& a : ne->args) {
             if (!a.value) { ++pos; continue; }
+            // §22.3 (v0.184, #1682): the owned-state half of the ref/out
+            // operand-category rule — see recordMovesInArgs' twin call.
+            checkRefOutOwnedOperand(a);
             // §28.8 / §28.13: is this argument position an owned sink? A ctor
             // `owned` (or `out owned`) formal, or the implicit owned parameter
             // of `new Shared<T>(value)` at position 0. The `owned`/`move`/borrow
@@ -222,6 +225,11 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
     std::size_t pos = 0;
     for (const auto& a : args) {
         if (!a.value) { ++pos; continue; }
+        // §22.3 (v0.184, #1682): the owned-state half of the ref/out
+        // operand-category rule (a no-op for every modifier except bare
+        // "ref"/"out" — never "owned", so this cannot interfere with the
+        // owned-sink classification below).
+        checkRefOutOwnedOperand(a);
         // §28.8: is this argument position an owned sink? A user-declared
         // `owned` formal, or a built-in owning-collection method whose owned
         // arg sits at this position (#395: built-in methods have no AST decl).
@@ -494,6 +502,13 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         std::size_t pos = 0;
         for (const auto& a : call->args) {
             if (!a.value) { ++pos; continue; }
+            // §22.3 (v0.184, #1682): the owned-state half of the ref/out
+            // operand-category rule (a no-op for every modifier except bare
+            // "ref"/"out"). This handleDischarge loop is the path a bare-
+            // statement call (`Swallow(ref b);`, no enclosing LocalDecl/
+            // AssignmentStmt) takes — recordMovesInArgs' twin call covers
+            // the LocalDecl-initializer / assignment-RHS forms instead.
+            checkRefOutOwnedOperand(a);
             bool consumed = false;
             // §22.3 (v0.169, #1348): call-site `owned` marker validation. This
             // is SURFACE-ONLY — it does not change which arguments are consumed
@@ -759,6 +774,9 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         std::size_t pos = 0;
         for (const auto& a : ne->args) {
             if (!a.value) { ++pos; continue; }
+            // §22.3 (v0.184, #1682): the owned-state half of the ref/out
+            // operand-category rule — see recordMovesInArgs' twin call.
+            checkRefOutOwnedOperand(a);
             bool consumed = false;
             // §22.3 (v0.169, #1348): call-site `owned` marker validation for a
             // constructor call, mirroring the CallExpr path above — surface-only,
@@ -3577,6 +3595,91 @@ bool MethodOwnership::indexerSetterTakesOwned(const ast::Expr& target) {
         }
     }
     return false;
+}
+
+// §22.3 "ref and out argument locations" (v0.184, #1682). See the header for
+// the full contract.
+void MethodOwnership::checkRefOutOwnedOperand(const ast::CallArgument& a) {
+    if (!a.value) return;
+    if (a.modifier != "ref" && a.modifier != "out") return;
+    const ast::Expr& target = *a.value;
+    const char* kind = (a.modifier == "ref") ? "ref" : "out";
+
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&target)) {
+        if (id->name == "this" || id->name == "base") return;
+        sema::Symbol* sym = ctx_.exprSymbol(target);
+        // Declared `owned`/`out owned` parameter — a static fact, not a
+        // dataflow one.
+        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+            if (ps->modifier == "owned" || ps->modifier == "out owned") {
+                report(
+                    Severity::Error, target.span.begin,
+                    std::string("a `") + kind + "` argument may not be "
+                    "`owned` parameter `" + std::string(id->name) + "` — a "
+                    "ref/out write is an assignment through an alias, "
+                    "invisible to the drop-on-overwrite / consume-site-"
+                    "freeze machinery owned state relies on (§22.3; pass a "
+                    "borrow, use `owned` parameters/returns, or `move`)");
+            }
+            return;
+        }
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+            // A `using var` local is Owned in this lattice too, but sema's
+            // checkRefOutOperandCategory already reports the more specific
+            // "using var" diagnostic for it — skip to avoid a duplicate.
+            if (ls->isUsing) return;
+            if (auto* st = lookupState(id->name)) {
+                if (st->state == OwnershipState::Owned) {
+                    report(
+                        Severity::Error, target.span.begin,
+                        std::string("a `") + kind + "` argument may not be "
+                        "owned local `" + std::string(id->name) + "` — a "
+                        "ref/out write is an assignment through an alias, "
+                        "invisible to the drop-on-overwrite / consume-site-"
+                        "freeze machinery owned state relies on (§22.3; "
+                        "pass a borrow, use `owned` parameters/returns, or "
+                        "`move`)");
+                }
+            }
+            return;
+        }
+        // A bare identifier resolving to a FieldSymbol — implicit `this.f`.
+        if (exprIsOwnedFieldRead(target)) {
+            report(
+                Severity::Error, target.span.begin,
+                std::string("a `") + kind + "` argument may not be owned "
+                "field `" + std::string(id->name) + "` — a ref/out write is "
+                "an assignment through an alias, invisible to the drop-on-"
+                "overwrite machinery owned fields rely on (§22.3 / §28.7; "
+                "pass a borrow, use `owned` parameters/returns, or `move`)");
+        }
+        return;
+    }
+    if (dynamic_cast<const ast::MemberAccessExpr*>(&target)) {
+        if (exprIsOwnedFieldRead(target)) {
+            report(
+                Severity::Error, target.span.begin,
+                std::string("a `") + kind + "` argument may not be an "
+                "`owned` field — a ref/out write is an assignment through "
+                "an alias, invisible to the drop-on-overwrite machinery "
+                "owned fields rely on (§22.3 / §28.7; pass a borrow, use "
+                "`owned` parameters/returns, or `move`)");
+        }
+        return;
+    }
+    if (dynamic_cast<const ast::IndexExpr*>(&target)) {
+        if (indexerSetterTakesOwned(target) ||
+            targetIsOwningInlineArraySlot(target)) {
+            report(
+                Severity::Error, target.span.begin,
+                std::string("a `") + kind + "` argument may not be an "
+                "owning-collection or owning-inline-array indexer slot — a "
+                "ref/out write is an assignment through an alias, invisible "
+                "to the collection's disposal machinery (§22.3; move the "
+                "element out, or use the indexer setter directly)");
+        }
+        return;
+    }
 }
 
 // §28.8 built-in owned-sink methods (issue #395). See the header for the

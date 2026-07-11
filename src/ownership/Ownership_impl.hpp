@@ -1226,6 +1226,34 @@ private:
     // owned by definition. // per §28.11
     bool indexerSetterTakesOwned(const ast::Expr& target);
 
+    // §22.3 "ref and out argument locations" (v0.184, #1682): the DATAFLOW
+    // half of the ref/out operand-category rule — no location of OWNED
+    // state may be passed by `ref`/`out`, because a ref/out write is an
+    // assignment through an alias, invisible to the drop-on-overwrite
+    // (§28.7) / consume-site-freeze (§28.3) machinery owned state relies
+    // on. Checked for a bare `ref`/`out` argument (a no-op for every other
+    // modifier) at the point it is encountered in the live ownership
+    // dataflow, so `lookupState` reflects this exact program point:
+    //   - an owned LOCAL — `lookupState(name)->state == Owned` (a `using
+    //     var` local is skipped here: sema's checkRefOutOperandCategory
+    //     already reports the more specific "using var" diagnostic for it,
+    //     and it is ALSO Owned in this lattice, so skipping avoids a
+    //     duplicate report for the same argument);
+    //   - an `owned`/`out owned` PARAMETER — the declared modifier
+    //     (ParameterSymbol::modifier), not dataflow, since a parameter's
+    //     ownedness is a declared fact, unlike a plain local's;
+    //   - an owned FIELD — exprIsOwnedFieldRead (existing helper, covers
+    //     both the bare-identifier implicit-`this.f` and explicit
+    //     `obj.f`/`this.f` shapes);
+    //   - an owning-collection or owning-inline-array indexer slot —
+    //     indexerSetterTakesOwned / targetIsOwningInlineArraySlot (existing
+    //     helpers).
+    // The declaration-based categories (structural shape, `using var`,
+    // readonly-outside-context, mutable-static rule 2, property-setter
+    // existence) are sema's job (ExprTC::checkRefOutOperandCategory) —
+    // this function does not repeat them.
+    void checkRefOutOwnedOperand(const ast::CallArgument& a);
+
     // §28.8 built-in owned-sink methods (issue #395): true when `callee` is a
     // member access `coll.M` whose receiver `coll` has a *built-in* owning-
     // collection type (which sema resolves to a Named TypeRef with a null

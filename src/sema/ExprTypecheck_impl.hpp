@@ -546,6 +546,37 @@ private:
     // `LValue` production.
     void checkLValueChainNotCallBased(const ast::Expr& target);
 
+    // §22.3 "ref and out argument locations" (v0.184, #1682): validates a
+    // bare `ref`/`out` call argument's operand against the section's
+    // assignable-storage-location categories — a mutable local variable, a
+    // writable field, an indexer slot, or a property with an accessible
+    // setter — and its declarative exclusions: no `using var` binding, no
+    // readonly field/property outside its assignable context (§22.8/§23.1),
+    // and no mutable static admitted only in the two forms of §22.12 rule 2.
+    // The section's remaining exclusion — no location of OWNED state (an
+    // owned local/parameter, an owned field, an owning-collection/owning-
+    // inline-array slot) — is dataflow-dependent (whether a plain local
+    // currently holds an owned value) and is checked separately by the
+    // ownership pass (MethodOwnership::checkRefOutOwnedOperand), which
+    // tracks live ownership state; this function only covers the
+    // declaration-based categories. A no-op for every call-argument
+    // modifier except the two BARE pre-declared forms "ref" and "out" —
+    // "out var"/"out using var"/"out owned var" always declare a FRESH
+    // local (no pre-existing-location question), and "owned"/"scoped" are
+    // unrelated call-site markers (§22.3 / §28.14).
+    void checkRefOutOperandCategory(const ast::CallArgument& a);
+    // Shared by the Identifier and MemberAccess cases of
+    // checkRefOutOperandCategory: readonly-outside-context (§22.8) and
+    // mutable-static-rule-2 (§22.12) for a field operand.
+    void checkRefOutFieldOperand(FieldSymbol& fs, const ast::Expr& target,
+                                 const char* kind);
+    // Shared by the MemberAccess and Index cases of
+    // checkRefOutOperandCategory: no-setter / readonly-auto-outside-context /
+    // setter-visibility for a property (incl. indexer) operand — mirrors the
+    // §23.1/§23.3/§13.6 assignment-target checks inline in visitStmt.
+    void checkRefOutPropertyOperand(PropertySymbol& ps, const ast::Expr& target,
+                                    const char* kind);
+
     // Slice S5: member lookup that walks the base-type chain.
     // BFS over the inheritance graph (no cycle detection — the spec
     // forbids cycles; sema's class-graph validation slice will catch

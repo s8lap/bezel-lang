@@ -4353,6 +4353,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     }
                 }
             }
+            // §22.3 (v0.184, #1682): validate the operand category of a
+            // bare `ref`/`out` argument (a no-op for every other modifier).
+            // Runs after the argument's own visitExpr above so exprSymbol is
+            // populated for it.
+            checkRefOutOperandCategory(a);
             ++pos2;
         }
     } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
@@ -4537,6 +4542,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             }
             if (a.value) visitExpr(*a.value);
             currentLiteralWideningHint_ = savedNewHint;
+            // §22.3 (v0.184, #1682): validate a bare `ref`/`out` constructor
+            // argument's operand category (a no-op for every other
+            // modifier) — grammar A.4 admits ParamModifiers on a
+            // constructor's ParamList same as a method's.
+            checkRefOutOperandCategory(a);
             ++posn;
         }
     } else if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {

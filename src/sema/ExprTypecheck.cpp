@@ -2021,6 +2021,226 @@ void ExprTC::checkLValueChainNotCallBased(const ast::Expr& target) {
     }
 }
 
+// §22.3 "ref and out argument locations" (v0.184, #1682). See the header for
+// the full contract; this covers the DECLARATION-based categories only (the
+// dataflow-based owned-state exclusion is MethodOwnership::
+// checkRefOutOwnedOperand in the ownership pass).
+void ExprTC::checkRefOutOperandCategory(const ast::CallArgument& a) {
+    if (!a.value) return;
+    if (a.modifier != "ref" && a.modifier != "out") return;
+    const ast::Expr& target = *a.value;
+    const char* kind = (a.modifier == "ref") ? "ref" : "out";
+
+    // Structural shape (§6.6 / A.6's lvalue shape, reused from
+    // checkLValueChainNotCallBased): strip `.field` / `[index]` / postfix
+    // `!` hops down to the chain's base, which must be an Identifier
+    // (including `this`) — anything else (a call result, a binary/unary
+    // expression, a literal, a `new` expression, …) is not a storage
+    // location at all, and is exactly the ICE-inducing shape #1682 found
+    // reaching codegen's lvalueAddr with nothing to return (internal
+    // "lowerExpr returned null" diagnostic, #1386).
+    const ast::Expr* base = &target;
+    for (;;) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(base)) {
+            base = ma->target.get();
+        } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(base)) {
+            base = ix->target.get();
+        } else if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(base)) {
+            base = pb->operand.get();
+        } else {
+            break;
+        }
+        if (!base) return;
+    }
+    if (!dynamic_cast<const ast::IdentifierExpr*>(base)) {
+        ctx_.diagnostics().report(
+            Severity::Error, target.span.begin,
+            std::string("a `") + kind + "` argument must be an assignable "
+            "storage location — a variable, field, or indexer/property "
+            "slot — not the result of an expression; extract it into a "
+            "local first (§22.3)");
+        return;
+    }
+
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&target)) {
+        if (id->name == "this" || id->name == "base") return;
+        Symbol* sym = ctx_.exprSymbol(target);
+        if (auto* ls = dynamic_cast<LocalSymbol*>(sym)) {
+            // §28.10's pin: a `using var` binding's disposal is scope-bound;
+            // a `ref`/`out` write through it is invisible to that machinery.
+            if (ls->isUsing) {
+                ctx_.diagnostics().report(
+                    Severity::Error, target.span.begin,
+                    std::string("a `") + kind + "` argument may not be a "
+                    "`using var` binding `" + std::string(id->name) +
+                    "` — its disposal is pinned to scope exit (§22.3 / "
+                    "§28.10)");
+            }
+            return;  // owned-LOCAL exclusion: ownership pass (dataflow)
+        }
+        if (dynamic_cast<ParameterSymbol*>(sym)) {
+            return;  // owned-PARAMETER exclusion: ownership pass (dataflow)
+        }
+        if (auto* fs = dynamic_cast<FieldSymbol*>(sym)) {
+            checkRefOutFieldOperand(*fs, target, kind);
+            return;
+        }
+        if (dynamic_cast<ConstMemberSymbol*>(sym)) {
+            ctx_.diagnostics().report(
+                Severity::Error, target.span.begin,
+                std::string("a `") + kind + "` argument may not be a "
+                "`const` member — a const is a compile-time constant, not "
+                "a storage location (§22.3)");
+        }
+        return;
+    }
+    if (dynamic_cast<const ast::MemberAccessExpr*>(&target)) {
+        Symbol* sym = ctx_.exprSymbol(target);
+        if (auto* fs = dynamic_cast<FieldSymbol*>(sym)) {
+            checkRefOutFieldOperand(*fs, target, kind);
+            return;
+        }
+        if (auto* ps = dynamic_cast<PropertySymbol*>(sym)) {
+            checkRefOutPropertyOperand(*ps, target, kind);
+            return;
+        }
+        if (dynamic_cast<ConstMemberSymbol*>(sym)) {
+            ctx_.diagnostics().report(
+                Severity::Error, target.span.begin,
+                std::string("a `") + kind + "` argument may not be a "
+                "`const` member — a const is a compile-time constant, not "
+                "a storage location (§22.3)");
+        }
+        return;
+    }
+    if (dynamic_cast<const ast::IndexExpr*>(&target)) {
+        // §17.6 admits an indexer slot; §22.3 further requires an
+        // ACCESSIBLE SETTER (mirrors the plain-property rule below) — a
+        // user-declared indexer with no `set` accessor is not a storage
+        // location. Built-in collection indexers (Array<T>, OwningArray<T>,
+        // …) carry no PropertySymbol here and are left unchecked by this
+        // sema-level pass; their owning-slot exclusion is handled by the
+        // ownership pass (indexerSetterTakesOwned /
+        // targetIsOwningInlineArraySlot).
+        Symbol* sym = ctx_.exprSymbol(target);
+        if (auto* ps = dynamic_cast<PropertySymbol*>(sym)) {
+            checkRefOutPropertyOperand(*ps, target, kind);
+        }
+        return;
+    }
+}
+
+// §22.3 / §22.8 / §22.12 rule 2. Shared field-operand checks for
+// checkRefOutOperandCategory: readonly-outside-context and mutable-static.
+// Does NOT check the `owned` modifier — that exclusion is dataflow-owned
+// (see checkRefOutOperandCategory's header comment) and is applied by the
+// ownership pass via exprIsOwnedFieldRead, which this function's caller
+// leaves to a separate pass.
+void ExprTC::checkRefOutFieldOperand(FieldSymbol& fs, const ast::Expr& target,
+                                     const char* kind) {
+    bool isReadonly = false, isStatic = false;
+    for (auto mod : fs.modifiers) {
+        if (mod == "readonly") isReadonly = true;
+        else if (mod == "static") isStatic = true;
+    }
+    // §22.8: a readonly field is assignable only in a field initializer or
+    // the declaring class's constructor — `inConstructor_` covers both
+    // (see checkReadonlyAssignment above, the `:=`-target sibling of this
+    // check).
+    if (isReadonly && !inConstructor_) {
+        ctx_.diagnostics().report(
+            Severity::Error, target.span.begin,
+            std::string("a `") + kind + "` argument may not be readonly "
+            "field `" + std::string(fs.name) + "` outside the declaring "
+            "class's constructor (§22.3 / §22.8)");
+        return;
+    }
+    // §22.12 rule 2: a mutable (non-readonly, non-`const` — `const` members
+    // are ConstMemberSymbol, never reach here) static field's store
+    // semantics are defined for direct assignment only; a ref/out alias
+    // write is outside that contract.
+    if (isStatic && !isReadonly) {
+        ctx_.diagnostics().report(
+            Severity::Error, target.span.begin,
+            std::string("a `") + kind + "` argument may not be the mutable "
+            "static field `" + std::string(fs.name) + "` — its store "
+            "semantics under §22.12 rule 2 are defined for direct "
+            "assignment only (§22.3)");
+    }
+}
+
+// §22.3 / §23.1 / §23.3 / §13.6. Shared property-operand check for
+// checkRefOutOperandCategory (both a plain property and an indexer resolve
+// to a PropertySymbol): no setter, a readonly auto-property's setter used
+// outside its assignable context, or a setter that is not accessible here —
+// mirrors the plain-`:=`-assignment-target checks inline in visitStmt
+// (§23.3/§23.1/§13.6) verbatim, applied to a ref/out operand instead of an
+// assignment target.
+void ExprTC::checkRefOutPropertyOperand(PropertySymbol& ps,
+                                        const ast::Expr& target,
+                                        const char* kind) {
+    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps.decl);
+    if (!pd) return;
+    bool hasSetter = true;
+    if (pd->bodyKind == ast::PropertyBodyKind::Expression) {
+        hasSetter = false;
+    } else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+        hasSetter = false;
+        for (const auto& acc : pd->accessors)
+            if (acc.isSet) { hasSetter = true; break; }
+    }
+    if (!hasSetter) {
+        ctx_.diagnostics().report(
+            Severity::Error, target.span.begin,
+            std::string("a `") + kind + "` argument must be a property "
+            "with an accessible setter — this property has no setter "
+            "(§22.3 / §23.3)");
+        return;
+    }
+    bool isReadonlyAuto = false;
+    if (pd->bodyKind == ast::PropertyBodyKind::Auto)
+        for (auto mod : pd->modifiers)
+            if (mod == "readonly") { isReadonlyAuto = true; break; }
+    if (isReadonlyAuto && !inConstructor_) {
+        ctx_.diagnostics().report(
+            Severity::Error, target.span.begin,
+            std::string("a `") + kind + "` argument must be a property "
+            "with an accessible setter — this readonly property's setter "
+            "may be used only in a field initializer or constructor (§22.3 "
+            "/ §23.1)");
+        return;
+    }
+    // §13.6: the setter accessor's own (possibly more restrictive)
+    // visibility gates access, mirroring the plain-`:=` assignment check.
+    ast::Visibility sv = pd->visibility;
+    if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+        for (const auto& acc : pd->accessors)
+            if (acc.isSet && acc.visibility != ast::Visibility::None) {
+                sv = acc.visibility;
+                break;
+            }
+    } else if (pd->bodyKind == ast::PropertyBodyKind::Auto &&
+               pd->hasAutoAccessorVis && pd->autoAccessorIsSet) {
+        sv = pd->autoAccessorVis;
+    }
+    TypeSymbol* declaring = ps.parent;
+    bool bad = false;
+    if (sv == ast::Visibility::Private)
+        bad = (currentType_ != declaring);
+    else if (sv == ast::Visibility::Protected)
+        bad = !(currentType_ == declaring ||
+                (currentType_ && isSubtype(currentType_, declaring)));
+    else if (sv == ast::Visibility::Internal)
+        bad = ctx_.isImported(&ps);
+    if (bad) {
+        ctx_.diagnostics().report(
+            Severity::Error, target.span.begin,
+            std::string("a `") + kind + "` argument must be a property "
+            "with an accessible setter — its setter is not accessible "
+            "here (§22.3 / §13.6)");
+    }
+}
+
 // Slice S5: member lookup that walks the base-type chain.
 // BFS over the inheritance graph (no cycle detection — the spec
 // forbids cycles; sema's class-graph validation slice will catch
