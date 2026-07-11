@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.185 — July 2026**
+**Companion to the Bezel Language Specification, v0.186 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -2083,6 +2083,11 @@ public class OwningBuffer<T>                              // no IEnumerable conf
 
   // move buf[i] NOT admitted (values have no ownership; use plain read)
 
+  // Foreign-memory access (v0.186; language spec §32.12) — admitted only for
+  //   FFI-pointee scalar and C-compatible-record T; see prose. The result type
+  //   lives in System.Interop (import required at the use site).
+  public method DangerousPointer(): Ptr<T>;
+
   // Span views (v0.109)
   public method AsSpan(): Span<T>;                          // full buffer, writable
   public method AsSpan(start: int): Span<T>;                // from offset to end
@@ -2105,6 +2110,8 @@ The two presentations are different specializations of the same generic class. T
 The "Owned" in the name refers to the buffer-class's ownership of *its allocated storage*, not to slot-level ownership. For class-typed T, the buffer also owns its slot contents (the ownership semantics that motivated the name). For value-typed T, the buffer owns only its allocation; the slot contents are just data. In both cases the buffer is `IDisposable`: its destructor releases the allocation. The name is retained for continuity with the v0.99 design and for the class-typed case where slot-ownership remains the dominant concern.
 
 **Span views (v0.109).** `AsSpan()` and its overloads return a `Span<T>` (writable view) over a contiguous range of the buffer; `AsReadOnlySpan()` returns a `ReadOnlySpan<T>`. These views are non-allocating record constructions and admit the standard span surface (`Slice`, indexer, search, equality, bulk mutation per T's category). The methods are pure ergonomics — `buf.AsSpan(0, 100)` reads more naturally than `new Span<T>(buf, 0, 100)` and matches the established pattern from v0.104's `string.AsSpan()` and v0.107's `Array<T>.AsSpan()`. `AsSpan` returns the writable form by default (matching the buffer's mutability); callers wanting read-only access either call `AsReadOnlySpan` directly or call `.AsReadOnly()` on the writable form. The four overload signatures of each form accept range parameters: no-arg (full buffer, `0..<Length`), `(start)` (from offset to end), `(start, length)`, or `(r: Range<int>)`. Bounds-check semantics follow the standard Bezel convention: `IndexOutOfRangeException` if `start` or `length` is out of range against the buffer's `Length`.
+
+**`DangerousPointer()` (v0.186).** Returns the address of slot 0 as a `Ptr<T>` (language spec [§32.12](Bezel_Language_Spec.md#sec-foreign-memory)), valid until the buffer is disposed. Declared on the value-typed presentation only, and admitted only where `T` is an FFI-pointee scalar — integer types, `float`, `double`, `bool`, `IntPtr`, `UIntPtr` — or a C-compatible record (language spec [§32.13](Bezel_Language_Spec.md#sec-c-compatible-records)); every other `T` — classes (the class-typed presentation never satisfies the gate, so the member does not appear there), `string`, and `Ptr<U>` elements (whose slot address would reconstruct the declined `Ptr<Ptr<U>>`) — is rejected at the call's instantiation with a diagnostic naming the set. Pointer arrays are `OwningBuffer<IntPtr>` — exactly the argv shape. The `Dangerous` prefix marks the one accessor family whose result aliases mutable Bezel-owned slots; native retention past the synchronous call is the language spec [§32.10](Bezel_Language_Spec.md#sec-boundary-contract) obligation, and the recorded mitigation is the wrapper class that owns buffer and registration together.
 
 **Iteration.** For class-typed T, `OwningBuffer<T>` implements `IEnumerable<T?>`; iteration yields borrows of `T?` (slot contents, possibly null). The `for var x in buf do ... end` form works both via the enumerator protocol and via the direct-indexed-loop optimization that [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) permits for concretely-typed sources. For value-typed T, `OwningBuffer<T>` does *not* implement `IEnumerable<T>` (the type-parameter-category dispatch would require conditional interface implementation, which Bezel does not currently provide as a general mechanism). `for var x in buf do ... end` over a value-typed OwningBuffer desugars to a direct indexed loop per the [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) extension; the iteration variable has type T and is a copy of the slot. Users who need IEnumerable<T> conformance on a value-typed buffer can wrap or convert.
 
@@ -2717,6 +2724,96 @@ end SortedSet;
 ```
 
 The same single-order rule, complexity guarantees (point ops O(log n), in-order iteration O(n)), iteration form, and value semantics as [§4.17](#sec-sorted-dictionary) apply. As with `Set<T>` ([§4.10](#sec-sett-and-ownedsett)), the element type supplies the identity; for `SortedSet<T>` that identity is `CompareTo`-equality, and an `Add` of an equal element returns `false` without modifying the set.
+
+<a id="sec-frozen-array"></a>
+### 4.19 `FrozenArray<T>` (v0.186)
+
+A **deeply immutable, fixed-size array** whose contents can never change after construction — the standard library's
+zero-copy shared-read primitive (language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types),
+[§28.13](Bezel_Language_Spec.md#sec-shared-ownership)). `FrozenArray<T>` is sendable, and it is a member of the
+[§28.13](Bezel_Language_Spec.md#sec-shared-ownership) `Shared`-payload synchronized set — the set's first member
+admitted by **deep immutability** rather than synchronization machinery (v0.186 ruling) — so
+`Shared<FrozenArray<T>>` is sendable: clone one handle per worker domain, move the clones, and N domains read one
+buffer with zero bytes copied. A `static owned readonly` `FrozenArray<T>` is a sound all-domains singleton and draws
+no [§22.12](Bezel_Language_Spec.md#sec-static-members) rule-4 warning (the v0.186 suppression list); mutable statics
+of it remain rejected (rule 2 — it is deliberately not in the form-(i) set).
+
+```bezel
+/// Compiler-intrinsic; T restricted to sendable value types and `string`.
+public class FrozenArray<T>: IEnumerable<T>
+  // Construction consumes or copies its source — after either, no writer can exist.
+  public static method From(owned buffer: OwningBuffer<T>): owned FrozenArray<T>;
+      // VALUE-TYPED T ONLY: O(1) — steals the storage; the buffer is consumed
+      //   (owned call-site marker; the proposal-0006 owned-vs-copy construction shape).
+      //   No string-element form can exist: OwningBuffer<T> does not admit string (§4.14).
+  public static method From(items: Array<T>): owned FrozenArray<T>;
+      // Copies; the only construction form for T = string.
+
+  public readonly property Length: int;
+
+  public property [i: int]: T
+    get;                       // bounds-checked; IndexOutOfRangeException outside 0..<Length
+  end;
+
+  public method ToArray(): owned Array<T>;   // fresh mutable copy back out
+
+  destructor;                  // releases the backing storage
+end FrozenArray;
+```
+
+`T` is restricted by the compiler to **sendable value types and `string`** (a compiler-intrinsic restriction in the
+`Atomic<T>` style, checked at instantiation per language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)):
+*"FrozenArray<T> requires a sendable value type or string; T is not eligible. For class elements, frozen ownership
+trees are a designed future extension."*
+
+**Why no writer can exist — checked rules plus one named obligation (v0.186).** `FrozenArray<T>` has no mutating
+member, and both `From` forms sever their source: the owned overload consumes the buffer, the borrowing overload
+copies. The severance is delivered by named rules, not by assumption: the consume-site freeze (language spec
+[§28.3](Bezel_Language_Spec.md#sec-consume-site-freeze)) rejects `From(owned buf)` while any local borrow of `buf`
+survives — **including a live span local over it**, which §28.3 states counts as such a borrow — and
+[§9.7](Bezel_Language_Spec.md#sec-records-and-disposal)'s escape bullets keep spans out of fields, statics, escaping
+closures, and async frames, so no span over the buffer outlives the freezing body invisibly. **The residual is the
+domain clause** (language spec [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows), extended in
+v0.186 to exactly this construction): a borrow of the source held in a *field, a collection slot, or a pending async
+frame* is invisible to the freeze, and not consuming a so-borrowed source into `From` is the same recorded caller
+obligation as not transferring it to another domain — a violation is a cross-domain data race no conformance mode
+detects. Programs that honor that recorded obligation have, after construction, no writer: there is nothing to freeze
+*later* and no window in which a mutable alias soundly survives — the `string` precedent (language spec
+[§30.14](Bezel_Language_Spec.md#sec-sendable-types)), generalized to bulk data under the same conditional form §30.14
+itself uses for its transfer guarantee.
+
+**Cost accounting, stated plainly.** The O(1) freeze is **value-typed-only**; string elements always pay one copy at
+construction (the sharing after construction is zero-copy for both). `From(items: Array<T>)` is O(n) for both
+categories.
+
+**Sharing idiom** (requires `Shared<T>`, [§2.16](#sec-shared-and-weak); the handle count is maintained with
+synchronized operations, and the last handle — from whichever domain — disposes the frozen storage):
+
+```bezel
+var raw := LoadSamples();                                        // owned OwningBuffer<double>
+using var input := new Shared<FrozenArray<double>>(
+    FrozenArray<double>.From(owned raw));                        // O(1) freeze
+using var t1 := Domain.Spawn(Program.ScanLow,  input.Clone());   // Shared<FrozenArray<double>>: sendable
+using var t2 := Domain.Spawn(Program.ScanHigh, input.Clone());
+var answer := await t1 + await t2;                               // zero bytes copied
+```
+
+**Iteration** yields element copies (value semantics; `string` elements as shared references). The
+[§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) direct-indexed-loop optimization applies (concretely-typed
+source). Because class-typed `T` is not admitted, the `IEnumerable<T>` conformance is unconditional — the
+category-conditional-conformance problem that keeps value-typed `OwningBuffer<T>` out of `IEnumerable` ([§4.14](#sec-owned-buffers-and-spans))
+does not arise.
+
+**Disposal.** Non-trivial dispose: the destructor releases the backing storage (the [§4.14](#sec-owned-buffers-and-spans)
+`OwningBuffer` reasoning). A standalone owned `FrozenArray<T>` is discharged like any owned class instance; under
+`Shared<FrozenArray<T>>`, the last handle disposes it. *(Implementation note: like `string`, the frozen storage's
+reclamation bookkeeping must tolerate cross-domain sharing — language spec §30.14's string clause, applied here.)*
+
+**Deferred, each recorded:** frozen **class trees** (freeze = seal a transfer-closed ownership tree; real work in the
+disposal story); **frozen span/view forms** (today's `ReadOnlySpan<T>` is a record over `OwningBuffer<T>`
+specifically; a frozen view family should be designed once, together with the fork-join extension's needs — rationale
+[§12.9](Bezel_Design_Rationale.md#sec-data-parallelism)); `FrozenDictionary`/`FrozenSet` (same pattern, evidence
+first).
 
 ---
 
@@ -3406,7 +3503,7 @@ There is no built-in cross-domain cancellation: `CancellationToken` is a borrow-
 <a id="sec-channel"></a>
 ### 6.9 `Channel<T>` and `ChannelSender<T>`
 
-Multiple-producer, single-consumer channel carrying sendable values between domains with ownership transfer at both ends (language spec [§30.15](Bezel_Language_Spec.md#sec-channels)). Both types are compiler-known and internally synchronized; together with `Mutex`, `Semaphore`, and the atomics (`Atomic<T>`/`AtomicInteger<T>`) — stdlib [§6.2](#sec-mutex-and-lock)–[§6.4](#sec-atomict-and-atomicintegert) — they are the standard types two domains may reach simultaneously (the sendable, internally-synchronized set; language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)). T must be sendable; the instantiation is rejected otherwise (language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)). A **mutable static** `Channel<T>` field is rejected by language spec [§22.12](Bezel_Language_Spec.md#sec-static-members) rule 2 (v0.181), and a `static readonly Channel<T>` draws rule 4's warning: the channel object is the single-consumer *receiving* end and must stay confined to one consuming domain — when producers across many domains need a process-global send endpoint, publish a `ChannelSender<T>` static instead (rule 2's synchronized set).
+Multiple-producer, single-consumer channel carrying sendable values between domains with ownership transfer at both ends (language spec [§30.15](Bezel_Language_Spec.md#sec-channels)). Both types are compiler-known and internally synchronized; together with `Mutex`, `Semaphore`, the atomics (`Atomic<T>`/`AtomicInteger<T>`), and the data-owning locks (`Locked<T>`/`RwLocked<T>`, v0.186) — stdlib [§6.2](#sec-mutex-and-lock)–[§6.4](#sec-atomict-and-atomicintegert), [§6.11](#sec-locked-and-rwlocked) — and, by deep immutability rather than machinery, `FrozenArray<T>` behind `Shared` handles or as a `static readonly` singleton ([§4.19](#sec-frozen-array), v0.186), they are the standard types two domains may reach simultaneously (the sendable, internally-synchronized set; language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)). T must be sendable; the instantiation is rejected otherwise (language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)). A **mutable static** `Channel<T>` field is rejected by language spec [§22.12](Bezel_Language_Spec.md#sec-static-members) rule 2 (v0.181), and a `static readonly Channel<T>` draws rule 4's warning: the channel object is the single-consumer *receiving* end and must stay confined to one consuming domain — when producers across many domains need a process-global send endpoint, publish a `ChannelSender<T>` static instead (rule 2's synchronized set).
 
 The signature surface dispatches on T's category, as with `OwningBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)). For class-typed (sendable) T:
 
@@ -3423,6 +3520,7 @@ public class Channel<T>: IDisposable                       // the receiving end;
 
   public method Receive(): OwningTask<T>;                   // await transfers ownership of one item
   public method TryReceive(out owned item: T?): bool;      // non-blocking; false when none available
+  public method ReceiveAll(): IOwningAsyncEnumerable<T>;  // v0.186: drain form — see below
   destructor;    // closes the channel; disposes every undelivered class-typed
                  //   item in reverse insertion order (language spec §30.15)
 end Channel;
@@ -3440,13 +3538,14 @@ public class ChannelSender<T>: IDisposable                 // class T form
 end ChannelSender;
 ```
 
-For sendable value-typed T and `string`, the ownership modifiers drop out: `Receive(): Task<T>`, `TryReceive(out item: T?): bool`, `Send(item: T)`, `SendAsync(item: T): Task`.
+For sendable value-typed T and `string`, the ownership modifiers drop out: `Receive(): Task<T>`, `TryReceive(out item: T?): bool`, `ReceiveAll(): IAsyncEnumerable<T>`, `Send(item: T)`, `SendAsync(item: T): Task`.
 
 Semantics (normative statement: language spec [§30.15](Bezel_Language_Spec.md#sec-channels)):
 
 - `Channel<T>` and `ChannelSender<T>` are themselves sendable: each endpoint is an independently owned object and may be moved to another domain (as a spawn argument or through another channel). Typical use keeps the channel in the receiving domain and moves senders out.
 - **Closing.** Disposing the last sender closes the channel; buffered items remain receivable, and after the drain `Receive` raises `ChannelClosedException`. Disposing the `Channel<T>` closes it immediately and disposes every undelivered class-typed item in reverse insertion order; subsequent `Send` raises `ChannelClosedException`. `TryReceive` returns `false` for both empty-open and drained-closed; consult `IsClosed` to distinguish.
 - **Ordering.** Per-sender FIFO; cross-sender interleaving is an unspecified consistent total order; each item is received exactly once.
+- **`ReceiveAll` (v0.186).** The non-exceptional drain form: `await for var item in inbox.ReceiveAll() do … end;` yields each item with `Receive`'s exact transfer semantics (ownership transfers for class T), suspends while empty-and-open, and completes the enumeration **normally** on drained-and-closed — `ChannelClosedException` stops being control flow for the *normal* exit. At most one consumption may be in progress: beginning a `ReceiveAll` while another is active or while a `Receive` task is pending, and calling `Receive`/`TryReceive` while one is active, raise `InvalidOperationException` (the channel is single-consumer; this names the obligation). The enumerator is affine like every single-pass source (language spec [§29.11](Bezel_Language_Spec.md#sec-multiple-enumeration)). Zero new checking rules — a restatement of `Receive` over the [§4.13](#sec-owning-enumeration-interfaces) async-iteration interfaces (normative statement: language spec [§30.15](Bezel_Language_Spec.md#sec-channels)).
 - **Receive abandonment (v0.179).** Disposing a pending `Receive` task deregisters the waiter **without consuming an item** (normative statement: language spec §30.15); an item being handed off at the instant of disposal is returned to the channel's head. Applies to both the `OwningTask<T>` and `Task<T>` forms of `Receive`.
 
 ```bezel
@@ -3491,6 +3590,201 @@ end TaskScope;
 - **Quiescence (normative, §28.14)**: `DisposeAsync` completes only after every child task has completed and been reclaimed; no `scoped` callback runs after it returns.
 - **Self-capture (v0.180)**: a child body may capture the scope itself and values borrow-derived from it — `scope.Token` inline, or the bound intermediate `var tok := scope.Token;` — admitted by §28.14's self-capture rule. This is how children observe cooperative cancellation and how re-registration (`scope.Spawn` from inside a child) is expressed.
 - Intra-domain: `TaskScope` is not sendable; cross-domain fan-out remains channels + `Domain.Spawn`.
+
+<a id="sec-locked-and-rwlocked"></a>
+### 6.11 `Locked<T>` and `RwLocked<T>` (v0.186)
+
+Data-owning locks (language spec [§30.12 "Data-owning locks"](Bezel_Language_Spec.md#sec-data-owning-locks) — the
+normative statement of the interior admission, guard borrow-sourcing, the guard-liveness checks, blocking discipline,
+the read-guard write-restriction, the lock-disposal posture, visibility, and set memberships; design rationale
+[§12.8](Bezel_Design_Rationale.md#sec-locked-rwlocked)). The lock **owns its
+interior**: construction consumes an owned `T`; access is only through a scoped guard whose `Value` is a borrow
+sourced from the guard, so the `using var` scope *is* the critical section and the borrow-escape rules enforce the
+lock discipline — including against announced kills (a guard binding cannot be explicitly `Dispose()`d or discarded
+while a borrow from its `Value` is live, and a body-local lock binding cannot be killed while one of its guards is
+live; language spec §30.12/§28.3); the destructor disposes the interior. `T` must be a **sendable class type**
+(checked at instantiation): owning collections of sendable elements (`OwningDictionary`, `OwningSet`, …) and classes
+with wholly-owned state qualify; borrowing collections of class elements do not.
+
+```bezel
+public class Locked<T> where T: class          // compiler-known; T must additionally be a
+                                               //   sendable class type (checked at instantiation)
+  public constructor(owned value: T);          // the lock owns the interior
+
+  public method Lock(): owned LockGuard<T>;                          // blocks; §30.12 discipline
+  public method TryLock(timeout: TimeSpan): owned LockGuard<T>?;     // null on timeout (Try shape (b))
+  public async method LockAsync(token: CancellationToken := CancellationToken.None): OwningTask<LockGuard<T>>;
+  public async method TryLockAsync(timeout: TimeSpan, token: CancellationToken := CancellationToken.None): OwningTask<LockGuard<T>?>;
+
+  destructor;                                  // disposes the interior
+end Locked;
+
+public class LockGuard<T>
+  // No public constructor; obtained from Locked<T>.
+  public readonly property Value: T;           // borrow of the interior; source: this guard
+  destructor;                                  // releases the lock
+end LockGuard;
+
+public class RwLocked<T> where T: class        // same interior admission as Locked<T>
+  public constructor(owned value: T);
+
+  public method Read(): owned ReadGuard<T>;                          // shared; blocks
+  public method TryRead(timeout: TimeSpan): owned ReadGuard<T>?;
+  public async method ReadAsync(token: CancellationToken := CancellationToken.None): OwningTask<ReadGuard<T>>;
+  public async method TryReadAsync(timeout: TimeSpan, token: CancellationToken := CancellationToken.None): OwningTask<ReadGuard<T>?>;
+
+  public method Write(): owned WriteGuard<T>;                        // exclusive; blocks
+  public method TryWrite(timeout: TimeSpan): owned WriteGuard<T>?;
+  public async method WriteAsync(token: CancellationToken := CancellationToken.None): OwningTask<WriteGuard<T>>;
+  public async method TryWriteAsync(timeout: TimeSpan, token: CancellationToken := CancellationToken.None): OwningTask<WriteGuard<T>?>;
+
+  destructor;                                  // disposes the interior
+end RwLocked;
+
+public class ReadGuard<T>
+  public readonly property Value: T;           // borrow; WRITE-RESTRICTED (language spec §30.12)
+  destructor;                                  // releases the shared hold
+end ReadGuard;
+
+public class WriteGuard<T>
+  public readonly property Value: T;           // borrow; full access
+  destructor;                                  // releases the exclusive hold
+end WriteGuard;
+```
+
+The canonical process-global registry — the `static owned readonly` idiom (rule-4 warning suppressed by
+[§22.12](Bezel_Language_Spec.md#sec-static-members) rule 4's v0.186 suppression list; `owned` enrolls program-exit
+disposal and clears [§22.13](Bezel_Language_Spec.md#sec-static-initialization-order)'s disposal warning; a **mutable**
+static of a lock type remains rejected — put the mutability behind the guard):
+
+```bezel
+public static class Sessions
+  private static owned readonly _map: Locked<OwningDictionary<string, Session>>
+      := new Locked<OwningDictionary<string, Session>>(new OwningDictionary<string, Session>());
+
+  public static async method Touch(id: string): Task
+    using var g := await _map.LockAsync();
+    g.Value[id] := Session.Renewed(g.Value[id]);   // owning indexer-set disposes the displaced session
+  end Touch;                                       // guard disposed ⇒ lock released
+end Sessions;
+```
+
+Semantics and obligations (normative statement: language spec §30.12):
+
+- **Acquisition mirrors `Mutex` ([§6.2](#sec-mutex-and-lock))**: blocking forms are rejected lexically inside `async`
+  bodies and hit the runtime `InvalidOperationException` guard where a domain continuation would actually park; the
+  `Async` forms are Pattern B (`using var g := await x.LockAsync();`). `TryLock(timeout)`/`TryRead`/`TryWrite` return
+  `null` on timeout (Try shape (b), [§1](#sec-conventions)). **Non-reentrant**: a holder re-acquiring waits on itself
+  — including `Write()` while holding any guard of the same `RwLocked<T>`; and a second `Read()` while already
+  holding a read guard may block behind a queued writer (fairness is unspecified) — never nest acquisitions of one
+  lock.
+- **Read guards are write-restricted.** Any number of `ReadGuard<T>`s may be live at once, across domains; a
+  `WriteGuard<T>` excludes all guards. In the body holding the guard, the compiler rejects all stores, `move`, and
+  `ref`/`out` passing through a `ReadGuard`-sourced borrow; **calling a mutating method through a read guard, or
+  passing the read borrow into any callee as a plain argument that then stores through it, is the recorded programmer
+  obligation** (language spec §30.12) — reader purity beyond the checked stores is yours; violations are cross-domain
+  data races no mode detects. When in doubt, take `Write()`.
+- **Disposing the lock disposes the interior.** Never dispose a lock — or drop a last `Shared` handle — while any
+  guard is outstanding: checked disposal mode detects a lock destroyed with live guards and faults deterministically;
+  unchecked it is undefined behavior (language spec §30.12). Nest `using var` guards inside the scope that owns the
+  lock.
+- **Cross-domain use**: `Shared<Locked<T>>`/`Shared<RwLocked<T>>` are sendable ([§28.13](Bezel_Language_Spec.md#sec-shared-ownership));
+  clone a handle per domain and `Get().LockAsync()` — the `Shared<Mutex>` idiom with the state attached. Both lock
+  types are themselves sendable; all three guard types are **not** (domain-bound, like `Lock`).
+- **Fairness and ordering** between waiting readers and writers are unspecified; no upgrade/downgrade between guard
+  kinds (deferred — evidence first). No lock-ordering machinery: deadlock between two locks is out of scope, as
+  everywhere; use the actor idiom when ordering gets complicated.
+- **Guard across `await`**: legal but discouraged; an implementation **should** warn (on by default) when a guard is
+  live across a suspension point — narrow the `using var` scope instead.
+- **Visibility**: guard release → next acquisition is a [§30.13](Bezel_Language_Spec.md#sec-cross-thread-visibility)
+  edge-1 happens-before edge (write release orders before subsequent read/write acquisitions; read releases order
+  before the next write acquisition).
+
+<a id="sec-parallel"></a>
+### 6.12 `Parallel` (v0.186)
+
+Compiler-known data-parallel combinators over a lazy, process-wide team of worker domains (normative checking and
+runtime semantics: language spec [§30.14 "Data-parallel combinators"](Bezel_Language_Spec.md#sec-data-parallel-combinators)).
+The `body`/`selector`/`combiner` parameters are **spawn positions**: capture-free (a non-capturing lambda or a static
+method reference), with element and result sendability compiler-checked at the call site — the same admission as
+`Domain.Spawn` entries ([§6.8](#sec-domain)). This surface is not writable in user Bezel (function values are never
+sendable); being compiler-known is what lets its call sites reuse the spawn classifier.
+
+```bezel
+public static class Parallel
+  // The team's width: the value of Environment.ProcessorCount (§2.4) at team
+  // creation, fixed per process. `degree := 0` on the methods below means this value;
+  // 1 <= degree caps the workers used by that call; degree < 0 raises ArgumentException.
+  public static readonly property DefaultDegree: int;
+
+  // ---- value elements (sendable value types and string): chunks cross as copies ----
+  public static method Map<A, R>(items: Array<A>, body: (A) -> R,
+      degree: int := 0): owned Task<Array<R>>
+      where A: notnull, R: notnull;              // Pattern A result: the task owns the
+                                                 //   array, awaiters borrow (the §6.7 WhenAll<T> shape)
+
+  public static method Reduce<A, R>(items: Array<A>, seed: R,
+      selector: (A) -> R,                        // spawn position
+      combiner: (R, R) -> R,                     // spawn position; MUST be associative
+      degree: int := 0): owned Task<R>
+      where A: notnull, R: notnull;
+
+  public static method ForEach<A>(items: Array<A>, body: (A) -> (),
+      degree: int := 0): owned Task
+      where A: notnull;
+
+  // ---- class elements: ownership partitions in, results partition back ----
+  public static method Map<A, R>(owned items: OwningArray<A>, body: (owned A) -> owned R,
+      degree: int := 0): owned OwningTask<OwningArray<R>>
+      where A: class, R: class;                  // A, R sendable (compiler-checked)
+
+  public static method ForEach<A>(owned items: OwningArray<A>, body: (owned A) -> (),
+      degree: int := 0): owned Task
+      where A: class;
+
+  // ---- frozen elements (§4.19): zero-copy — one Shared handle cloned per worker ----
+  public static method Map<A, R>(items: Shared<FrozenArray<A>>, body: (A) -> R,
+      degree: int := 0): owned Task<Array<R>>
+      where A: notnull, R: notnull;
+  public static method Reduce<A, R>(items: Shared<FrozenArray<A>>, seed: R,
+      selector: (A) -> R, combiner: (R, R) -> R,
+      degree: int := 0): owned Task<R>
+      where A: notnull, R: notnull;
+  public static method ForEach<A>(items: Shared<FrozenArray<A>>, body: (A) -> (),
+      degree: int := 0): owned Task
+      where A: notnull;
+end Parallel;
+```
+
+As with `Domain.Spawn`, the `where` clauses are the declared constraints and **sendability is the stronger
+compiler-checked requirement**, diagnosed at the call site naming the failing rule. (Return types follow the
+`Domain.Spawn` owned-task convention — deliberately, and noted against §6.7's unmarked `WhenAll` rows.)
+
+- **Snapshot-at-call** (normative, spec §30.14): borrowed `Array<A>` inputs are chunk-copied synchronously by the
+  call itself; owned inputs are consumed and partitioned; `Shared<FrozenArray<A>>` inputs clone one handle per
+  participating worker (the borrow of the caller's handle is call-scoped; the caller keeps its handle) and copy no
+  element.
+- **Results in input order**; first fault wins, surfaced at the `await` as `DomainFaultedException` (implementations
+  are encouraged to name the failing element index in `Message`); later faults swallowed; moved-in unprocessed items
+  disposed by the runtime.
+- **`Reduce` seed semantics (v0.186, stated plainly).** Each worker folds its chunk starting from `seed`; per-worker
+  partials combine in an unspecified tree. A `seed` that is not `combiner`'s identity is therefore incorporated once
+  per participating worker. The serial-fold correspondence holds exactly when the combiner is associative and the
+  seed is its identity; for floating-point, reassociation may change the last bits even then. `Reduce` over an empty
+  `items` returns `seed`. Associativity is a documented requirement, not a checked one.
+- **Empty inputs** complete immediately (`Map` with an empty array; `ForEach` likewise).
+
+**Deliberately not in v1** (recorded deferrals, not oversights): *async bodies* (`(A) -> Task<R>` — I/O fan-out has
+`TaskScope` intra-domain and channels cross-domain; mixing the models needs its own design); *class-element `Reduce`*
+(an owned-threading combiner protocol; use class-element `Map` plus a serial merge); *a `CancellationToken`
+parameter* (tokens are not sendable — cross-domain cancellation stays a channel message); *user-declared spawn
+positions* (would expose the classifier; evidence first). The in-place fork-join extension (`Parallel.Join`,
+disjoint span lending) is designed-and-recorded, not shipped — rationale
+[§12.9](Bezel_Design_Rationale.md#sec-data-parallelism).
+
+Channels remain the right tool for heterogeneous, streaming, rate-mismatched work ([§6.9](#sec-channel),
+[§30.15](Bezel_Language_Spec.md#sec-channels)); these combinators replace the *abuse* of channels for uniform
+data-parallel maps, not channels.
 
 <a id="sec-system-io"></a>
 ## 7. `System.IO`
@@ -4000,7 +4294,7 @@ The compiler may optimize `for var i in rangeExpr` into a direct counted loop th
 <a id="sec-ffi-boundary-types"></a>
 ## 10. FFI-boundary types
 
-`CString`, `WString`, `RawBytes`, `IntPtr`, and `UIntPtr` are FFI-boundary types. The first three are classes with `owned`-returning factory methods and idempotent `Dispose`. `IntPtr` and `UIntPtr` are compiler-intrinsic value types representing pointer-sized integers — they are documented here for completeness, but their members are detailed in language spec [§32.7](Bezel_Language_Spec.md#sec-pointers-and-intptr).
+`CString`, `WString`, `RawBytes`, `IntPtr`, and `UIntPtr` are FFI-boundary types. The first three are classes with `owned`-returning factory methods and idempotent `Dispose`. `IntPtr` and `UIntPtr` are compiler-intrinsic value types representing pointer-sized integers — they are documented here for completeness, but their members are detailed in language spec [§32.7](Bezel_Language_Spec.md#sec-pointers-and-intptr). The types of §10.0–§10.4 live in the `System` module and are auto-imported (language spec [§2.3](Bezel_Language_Spec.md#sec-always-available-names), stated as of v0.186). The typed foreign-memory surface of [§10.5](#sec-system-interop-ptr)–[§10.6](#sec-system-interop-interop) lives in **`System.Interop`**, which is *not* auto-imported — the `import System.Interop;` line is the audit marker that a file performs foreign-memory access.
 
 <a id="sec-intptr-and-uintptr"></a>
 ### 10.0 `IntPtr` and `UIntPtr`
@@ -4042,6 +4336,7 @@ public class CString
   public static method FromBytes(bytes: Array<byte>): owned CString;
 
   public readonly property Length: int;       // byte length, excluding the null terminator
+  public readonly property Pointer: IntPtr;   // v0.186; address of the buffer — see prose
   public method ToBytes(): owned Array<byte>;
 
   destructor;       // releases the underlying buffer when this CString
@@ -4057,6 +4352,8 @@ end CString;
 
 A `CString` returned from a native function is wrapped without copying; the Bezel side must understand the native API's ownership contract (see language spec [§32.6](Bezel_Language_Spec.md#sec-string-marshalling)). Disposing such a `CString` calls the native deallocator only when constructed via `CString.From` or `FromBytes`. For native-allocated strings, the FFI declaration's documentation must specify how the native allocation should be released; this is beyond the scope of `CString` itself.
 
+**`Pointer`** (v0.186) exposes the underlying buffer's address (the same contract as `RawBytes.Pointer`, [§10.3](#sec-rawbytes): valid until the `CString` is disposed) — the element source for `char*[]` argv-building over `OwningBuffer<IntPtr>` ([§4.14](#sec-owned-buffers-and-spans)). Native retention of the address past the synchronous call is the trusted-lifetime obligation of language spec [§32.10](Bezel_Language_Spec.md#sec-boundary-contract).
+
 <a id="sec-wstring"></a>
 ### 10.2 `WString`
 
@@ -4069,12 +4366,15 @@ public class WString
   public static method From(s: string): owned WString;
 
   public readonly property Length: int;       // length in UTF-16 code units, excluding the null terminator
+  public readonly property Pointer: IntPtr;   // v0.186; address of the buffer — see prose
 
   destructor;       // releases the underlying buffer
 end WString;
 ```
 
 `WString.From(s)` allocates a fresh, owned `WString` whose contents are the UTF-16 encoding of `s` followed by a single zero code unit (two zero bytes). Surrogate pairs are produced for code points above the BMP per UTF-16 rules.
+
+**`Pointer`** (v0.186) exposes the underlying buffer's address, valid until the `WString` is disposed — the same contract as `CString.Pointer` ([§10.1](#sec-cstring)) and `RawBytes.Pointer` ([§10.3](#sec-rawbytes)). Native retention past the synchronous call is the trusted-lifetime obligation of language spec [§32.10](Bezel_Language_Spec.md#sec-boundary-contract).
 
 <a id="sec-rawbytes"></a>
 ### 10.3 `RawBytes`
@@ -4086,6 +4386,8 @@ public class RawBytes
   // No public constructor; obtained via factory methods.
 
   public static method From(buffer: Array<byte>): owned RawBytes;
+  public static method FromForeign(p: IntPtr, length: int,
+      freeOnDispose: bool := false): owned RawBytes;    // v0.186 — see prose
 
   public readonly property Length: int;
   public readonly property Pointer: IntPtr;
@@ -4099,6 +4401,8 @@ end RawBytes;
 `RawBytes.From(buffer)` allocates a fresh, owned `RawBytes` containing a copy of the source bytes. Mutations to the source after construction do not affect the `RawBytes`; the buffer is independent.
 
 `Pointer` exposes the underlying memory address as an `IntPtr`, suitable for passing to native APIs that expect `void*`. The pointer is valid until the `RawBytes` is disposed.
+
+**`FromForeign`** (v0.186) wraps `[p, p + length)` **without copying**. With `freeOnDispose := false` (the default) the result is a *view*: `Length`, `Pointer`, and `CopyTo` operate over foreign memory and disposal releases nothing — the destructor's existing "if owned by this instance" contract already carries the vocabulary. With `freeOnDispose := true`, disposal passes `p` to the C runtime's `free(3)` — the "returns a malloc'd buffer the caller must free" contract (POSIX `getline`'s buffer, `realpath(path, NULL)`). Two trust obligations, stated plainly: (a) if the buffer was not allocated by the same C runtime's `malloc` family, disposal is undefined behavior; (b) a custom deallocator (a library's `libfoo_free`) is *not* expressible through this flag — that contract belongs to a wrapper class owning both handle and buffer (language spec [§32.13](Bezel_Language_Spec.md#sec-c-compatible-records)). Cross-domain note: `RawBytes` is a class and not sendable (language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)'s class rule — not `sealed`), so a `FromForeign` view never crosses a domain boundary; stated here so the invariant is explicit.
 
 <a id="sec-conversions-to-bezel-types"></a>
 ### 10.4 Conversions to Bezel types
@@ -4116,6 +4420,74 @@ Behavior at the boundaries:
 - For non-null pointers, the conversion reads bytes (`FromCStringPointer`) or 16-bit code units (`FromWStringPointer`) starting at the pointer until a null terminator is found. If the pointer does not refer to a properly null-terminated buffer, behavior is undefined — the read may continue past the intended end of the string, returning garbage or causing a segmentation fault. The Bezel side cannot validate; the FFI declaration is trusted to expose only properly-formed strings.
 
 Each FFI-boundary type has a corresponding `string.From` overload ([§9.6](#sec-string)) for `CString` and `WString`, returning a Bezel `string`. For `RawBytes`, callers convert through `Array<byte>` via `CopyTo` and pass the byte array to the appropriate decoder (e.g. `Encoding.UTF8.GetString`).
+
+<a id="sec-system-interop-ptr"></a>
+### 10.5 `System.Interop`: `Ptr<T>`
+
+```bezel
+// Compiler-intrinsic value record; module System.Interop (NOT auto-imported).
+// Representation identical to IntPtr. T is gated (per-instantiation, language
+// spec §3.6-style diagnostic) to the FFI-POINTEE SET: integer types, float,
+// double, bool, IntPtr, UIntPtr — and C-compatible records (language spec
+// §32.13). Nested Ptr<Ptr<T>> is NOT admitted (language spec §32.12).
+public record Ptr<T>
+  public static const Zero: Ptr<T>;                    // compiler-provided, like IntPtr.Zero
+
+  public static method FromIntPtr(p: IntPtr): Ptr<T>;  // the only untyped->typed entry: EXPLICIT
+  public method ToIntPtr(): IntPtr;
+
+  // Every member below is TRUSTED BUT UNVERIFIED (language spec §32's preamble
+  // posture, verbatim): the address's validity, alignment, and pointee type are
+  // the programmer's declaration; a wrong one is undefined behavior.
+  public method Load(): T;                             // read  *p
+  public method Store(value: T);                       // write *p
+  public method LoadAt(index: int): T;                 // read  p[index]  (index scaled by T's ABI stride)
+  public method StoreAt(index: int, value: T);         // write p[index]
+  public method Add(count: int): Ptr<T>;               // p + count elements; negative counts allowed
+
+  public method CopyToArray(count: int): owned Array<T>;   // count elements, copied Bezel-side
+  public method CopyFromArray(source: Array<T>);           // source.Count elements written at p
+
+  // Equality is declared explicitly, NOT left to record synthesis — the §10.0
+  // IntPtr precedent, for the same reason: Ptr<T> has no auto-properties, so the
+  // synthesized `=` would be the zero-property "every-pair-equal" form. The
+  // intrinsic compares the address representation.
+  public static method operator =(a: Ptr<T>, b: Ptr<T>): bool;
+  public static method operator <>(a: Ptr<T>, b: Ptr<T>): bool;
+end Ptr;
+```
+
+The pointee gate mirrors language spec [§32.12](Bezel_Language_Spec.md#sec-foreign-memory): `T` is drawn from the FFI-pointee set — integer types, `float`, `double`, `bool`, `IntPtr`, `UIntPtr`, and C-compatible records (language spec [§32.13](Bezel_Language_Spec.md#sec-c-compatible-records)); any other instantiation is rejected at the instantiation site with a diagnostic naming the set. `Ptr<Ptr<U>>` is not admitted; pointer-array walking is `Ptr<IntPtr>` plus explicit re-typing.
+
+`CopyToArray(count)` copies `count` elements from foreign memory into a fresh Bezel-owned `Array<T>`; `CopyFromArray(source)` writes `source.Count` elements at `p`. Both are explicit whole-copies — foreign data becomes Bezel data at exactly one visible point.
+
+Equality is declared explicitly rather than left to record synthesis for the same reason as `IntPtr`'s ([§10.0](#sec-intptr-and-uintptr)): `Ptr<T>` has no auto-properties, so the synthesized `=` would be the zero-property "every-pair-equal" form. `Zero` is the null pointer, a compiler-provided `const` per the [§1](#sec-conventions) convention for compiler-intrinsic types.
+
+`Ptr<T>` computes **sendable** under language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)'s value-type rule — ratified at v0.186 with the cross-domain trust bullet of language spec [§32.10](Bezel_Language_Spec.md#sec-boundary-contract): foreign memory reached through a crossed pointer is outside domain isolation, and unsynchronized cross-domain access to the same address is a data race and undefined behavior.
+
+<a id="sec-system-interop-interop"></a>
+### 10.6 `System.Interop`: `Interop`
+
+```bezel
+/// Static intrinsics for the FFI boundary. Module System.Interop (NOT auto-imported).
+public static class Interop
+  // The calling thread's C errno, read directly. Valid only when read BEFORE the
+  // next extern call or runtime operation on this thread — and NEVER across an
+  // await: a continuation may resume on a DIFFERENT OS thread (language spec
+  // §30.13), so a post-await read is another thread's errno. Read it first,
+  // synchronously, in the same continuation as the failing call.
+  public static method LastErrno(): int;               // v0.186
+
+  // The process-lifetime code address of a callback admissible under the STATIC
+  // rule of language spec §32.8; F gated per-instantiation to FFI-compatible
+  // function types. One-way by design: no address→function inverse exists.
+  public static method CodeAddress<F>(callback: F): IntPtr;   // v0.186
+end Interop;
+```
+
+`LastErrno()` reads the calling thread's C `errno` directly. The window discipline is real, not decorative: read it into a local **before** constructing an exception message — interpolation allocates, and allocation is a runtime operation that may clobber the thread-local — and **never across an `await`** (a continuation may resume on a different OS thread, language spec [§30.13](Bezel_Language_Spec.md#sec-runtime-model): a post-await read is another thread's errno). Language spec [§32.9](Bezel_Language_Spec.md#sec-error-handling) shows the canonical use.
+
+`CodeAddress<F>(callback)` returns the process-lifetime code address of a callback admissible under the **static** rule of language spec [§32.8](Bezel_Language_Spec.md#sec-callbacks) — a static method reference or a non-capturing lambda; a capture-bearing argument is rejected with §32.8's diagnostic, and the `env` clause does not apply (there is no bounding call). `F` is gated per-instantiation to FFI-compatible function types. One-way by design: no address→function inverse exists (language spec [§32.14](Bezel_Language_Spec.md#sec-deferred-ffi-surface)).
 
 ---
 
