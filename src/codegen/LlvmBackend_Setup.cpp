@@ -8106,6 +8106,38 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // §3.1 / §28.3 / §28.9 (#1637): StringBuilder.ToString() is a BUILTIN lowered
+    // in tryLowerCollectionInstanceCall (no resolved MethodSymbol, so
+    // isUserMethodStringReturnCall below never sees it). Its lowering concatenates
+    // the parts into a freshly malloc'd buffer (bz_strbuilder_to_string) wrapped in
+    // a heap `bz.string` whose rc := 1 (initStringRc) — exactly the +1 single-
+    // reference shape of `+`/interpolation/range-slice/primitive-ToString/
+    // string.Join. Before this recognition the result was treated as a borrow and
+    // never released: `sb.ToString().Length` (and comparison/concat) read the
+    // string without dropping its single reference, leaking the 32-byte header +
+    // data buffer. Recognize it structurally — a CallExpr with an empty arg list,
+    // member == "ToString", and a StringBuilder-typed receiver (headName()
+    // "StringBuilder", alias-transparent per #1462) — so the borrowing read
+    // releases it after the read, and `var s := sb.ToString()` transfers the +1
+    // into the local (released at scope end when non-escaping). No double-free: the
+    // release site drops the SINGLE minted reference exactly once; an escaping
+    // local is excluded from the scope-end release by the escape walk (its +1 then
+    // leaks — the safe direction). This is a distinct check from the primitive-
+    // ToString block above, which requires a Primitive receiver and returns false
+    // for a Named StringBuilder.
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (call->args.empty() && call->callee) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+                if (ma->member == "ToString" && ma->target) {
+                    auto* tt = ctx_.exprType(*ma->target);
+                    if (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                        tt->headName() == "StringBuilder")
+                        return true;  // bz_strbuilder_to_string → rc=1 heap string
+                }
+            }
+        }
+    }
     // §9.6 / §28.3 (#1184): `string.Join(separator, items)` lowers (in
     // LlvmBackend_Calls.cpp) to a freshly malloc'd buffer wrapped in a heap
     // `bz.string` whose rc := 1 (initStringRc) — exactly the +1 single-reference
