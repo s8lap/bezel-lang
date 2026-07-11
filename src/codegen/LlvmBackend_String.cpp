@@ -963,6 +963,32 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
 }
 
 
+// §18.5 (v0.184, #1691): apply ONLY the alignment portion of an encoded
+// InterpPart::formatSpec to an already-rendered bz_string. The null-hole
+// path renders "null" directly (no ToString/ToString(format) dispatch is
+// performed on a null value — §18.5 v0.184), but "[t]he alignment applies
+// to the rendered text `null` exactly as to any other rendered text (it
+// participates in field padding)". This mirrors the padding half of the
+// `spec[0] == ','` branch above (snprintf `%Ns` / `%-Ns`) without the
+// value-to-string conversion, since the text is already rendered.
+llvm::Value* Emitter::emitAlignOnly(llvm::Value* strVal, const std::string& spec) {
+    if (!strVal || spec.empty() || spec[0] != ',') return strVal;
+    size_t colonPos = spec.find(':', 1);
+    std::string widthPart = (colonPos == std::string::npos)
+        ? spec.substr(1) : spec.substr(1, colonPos - 1);
+    int alignWidth = std::atoi(widthPart.c_str());
+    bool leftAlign = alignWidth < 0;
+    int w = leftAlign ? -alignWidth : alignWidth;
+    if (w == 0) return strVal;
+    std::string snpFmt = leftAlign
+        ? ("%-" + std::to_string(w) + "s")
+        : ("%" + std::to_string(w) + "s");
+    llvm::Value* datPtr = builder_.CreateLoad(
+        ptrTy(), builder_.CreateStructGEP(stringType(), strVal, 0));
+    return emitSnprintfToString(snpFmt, datPtr);
+}
+
+
 // §18.5 (v0.172, #812/#1339): dispatch a hole's format spec to a user type's
 // IFormattable.ToString(format): string. Walks the class chain for a
 // `ToString` taking one parameter (the format string). Returns null if no such

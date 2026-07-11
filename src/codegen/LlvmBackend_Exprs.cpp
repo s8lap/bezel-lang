@@ -221,7 +221,17 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                         auto* valEnd = builder_.GetInsertBlock();
                         builder_.CreateBr(endBB);
                         builder_.SetInsertPoint(nullBB);
-                        llvm::Value* nStr = lowerStringLiteral("\"null\"", false);
+                        // §18.5 (v0.184, #1691): the rendered "null" text
+                        // participates in alignment exactly as any other
+                        // rendered text — it was previously emitted bare,
+                        // dropping the width/alignment for a null hole
+                        // (`$"[{x,8}]"` printed "[null]" instead of
+                        // "[    null]"). The FORMAT portion (if any) is still
+                        // never dispatched on null — emitAlignOnly applies
+                        // only the `,WIDTH` prefix.
+                        llvm::Value* nStr = emitAlignOnly(
+                            lowerStringLiteral("\"null\"", false),
+                            part.formatSpec);
                         auto* nullEnd = builder_.GetInsertBlock();
                         builder_.CreateBr(endBB);
                         builder_.SetInsertPoint(endBB);
@@ -229,6 +239,48 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                         phi->addIncoming(vStr, valEnd);
                         phi->addIncoming(nStr, nullEnd);
                         appendPart(phi, ev, part.expr.get());
+                        continue;
+                    }
+                    // §18.5 / §7 (v0.184, #1691): a nullable REFERENCE part
+                    // (`string?`, a nullable class/interface) WITH a format
+                    // spec — same null-participates-in-alignment rule as the
+                    // nullable-value case above, plus a correctness fix: the
+                    // fallthrough below fed `ev` (possibly a real null
+                    // pointer) straight into emitWithFormatSpec, which
+                    // dereferences it unconditionally in the alignment path
+                    // (`,WIDTH` on `string?`) — a null value there crashed
+                    // (SIGSEGV) instead of rendering "[    null]".
+                    if (frt && isNullableRefTy(frt) &&
+                        ev->getType()->isPointerTy()) {
+                        llvm::Value* isNull = builder_.CreateICmpEQ(
+                            ev, llvm::ConstantPointerNull::get(ptrTy()),
+                            "fs.rnull");
+                        auto* liveBB = llvm::BasicBlock::Create(
+                            llvm_, "fs.rlive", currentFn_);
+                        auto* nullBB2 = llvm::BasicBlock::Create(
+                            llvm_, "fs.rnullstr", currentFn_);
+                        auto* endBB2 = llvm::BasicBlock::Create(
+                            llvm_, "fs.rend", currentFn_);
+                        builder_.CreateCondBr(isNull, nullBB2, liveBB);
+                        builder_.SetInsertPoint(liveBB);
+                        sema::TypeRef liveTy = *frt;
+                        liveTy.nullable = false;
+                        llvm::Value* liveStr =
+                            emitWithFormatSpec(ev, part.formatSpec, &liveTy);
+                        if (!liveStr) liveStr = emitValueToString(ev, &liveTy);
+                        auto* liveEnd = builder_.GetInsertBlock();
+                        builder_.CreateBr(endBB2);
+                        builder_.SetInsertPoint(nullBB2);
+                        llvm::Value* nStr2 = emitAlignOnly(
+                            lowerStringLiteral("\"null\"", false),
+                            part.formatSpec);
+                        auto* nullEnd2 = builder_.GetInsertBlock();
+                        builder_.CreateBr(endBB2);
+                        builder_.SetInsertPoint(endBB2);
+                        auto* phi2 = builder_.CreatePHI(ptrTy(), 2);
+                        phi2->addIncoming(liveStr, liveEnd);
+                        phi2->addIncoming(nStr2, nullEnd2);
+                        appendPart(phi2, ev, part.expr.get());
                         continue;
                     }
                     pv = emitWithFormatSpec(ev, part.formatSpec, frt);

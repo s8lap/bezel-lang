@@ -2192,6 +2192,15 @@ private:
                                     const std::string& spec,
                                     const sema::TypeRef* rt);
 
+    // §18.5 (v0.184, #1691): apply ONLY the alignment portion of an encoded
+    // InterpPart::formatSpec (a `,WIDTH` prefix; any trailing `:FORMAT` is
+    // ignored) to an already-rendered bz_string. Used for the null-hole
+    // "null" text: per §18.5 v0.184 the rendered text `null` "participates
+    // in field padding" exactly as any other rendered text, but the FORMAT
+    // spec (if any) is never dispatched on a null value. Returns `strVal`
+    // unchanged when `spec` carries no alignment prefix or the width is 0.
+    llvm::Value* emitAlignOnly(llvm::Value* strVal, const std::string& spec);
+
     // §18.5 (v0.172, #812/#1339): dispatch a hole's format spec to a user type's
     // IFormattable.ToString(format): string. Returns null if `ts` has no such
     // method (caller falls back). Handles class (ptr) and record (value)
