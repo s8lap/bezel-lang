@@ -7724,8 +7724,22 @@ void ExprTC::resolveExtensionMember(const ast::MemberAccessExpr& ma,
         auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
         bool unboundExtRef = false;
         if (ms->extensionDecl && ma.target) {
-            if (auto* tgtSym = ctx_.exprSymbol(*ma.target))
+            if (auto* tgtSym = ctx_.exprSymbol(*ma.target)) {
                 unboundExtRef = dynamic_cast<TypeSymbol*>(tgtSym) != nullptr;
+            } else if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                           ma.target.get())) {
+                // fix #1633: a PRIMITIVE type-name qualifier (`int.Doubled`)
+                // has NO exprSymbol at all — §5.2/ExprTypecheck_Exprs.cpp
+                // types a bare primitive-keyword identifier without a value
+                // symbol ("it has no value symbol; the enclosing call
+                // resolves the conversion"), unlike a user TypeSymbol, so the
+                // exprSymbol check above never fires for it. Detect this
+                // qualifier shape directly: a primitive keyword name in
+                // qualifier position is always a TYPE reference (never a
+                // value — no local/parameter can be named `int`, a reserved
+                // word), so it is unbound exactly like a user-type qualifier.
+                unboundExtRef = primitiveFromName(tid->name) != PrimitiveType::None;
+            }
         }
         if (unboundExtRef && ms->extensionDecl &&
             ms->extensionDecl->targetType) {
@@ -8345,6 +8359,28 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // object — which the pointer compare yields naturally.)
                 if (pt == PrimitiveType::Object && mbr == "ReferenceEquals") {
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                    return;
+                }
+                // fix #1633 / §26.5 / §27.6: before reporting "no static
+                // method or property", try a user-defined extension method
+                // on this primitive TYPE — a type-qualified reference like
+                // `int.Doubled`, which §27.6 resolves to an UNBOUND
+                // `(int) -> int` function value ("the resulting function has
+                // the receiver as its first parameter"). The RECORD-receiver
+                // form of this same reference shape was fixed by #1306; this
+                // primitive form fell through to the catch-all diagnostic
+                // below instead, because this whole primitive-keyword-
+                // qualifier block — entered only when `!targetType`, i.e. no
+                // TypeSymbol names the qualifier, which is true for every
+                // primitive keyword — never consulted extension lookup before
+                // rejecting, unlike the ordinary Named-receiver path (below,
+                // "§26.5: a user extension on a PRIMITIVE/builtin receiver")
+                // and the instance-receiver `string` path (#702, "before
+                // reporting 'not yet supported', try a user-defined extension
+                // method"). Mirrors both.
+                if (Symbol* ext =
+                        lookupExtensionMember(ctx_.primitiveTypeRef(pt), mbr)) {
+                    resolveExtensionMember(ma, ext);
                     return;
                 }
                 // per §3.4: the primitive-static handler above recognises a
