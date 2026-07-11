@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
+| **Status** | **accepted (owner, 2026-07-12)** — graduation in progress this run. *(prior: accepted (2026-07-07, delegated ruling — owner review pending))* |
 | **Origin** | Owner conversation 2026-07-03 ("do we need more synchronized statics for real programs?") + gap-review items 6/7/15/16 context |
 | **Design influences** | Rust `Mutex<T>`/`RwLock<T>` (the mutex *owns* the data; access only through a scoped guard); **not** .NET/Java standalone monitors (lock-next-to-data by convention) |
 | **Depends on** | §22.12 statics rules (v0.164), the borrow-lifetime machinery (§28.3), #1391 (static-init sync) for the static use case to be airtight |

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft (RFC) — authored + critique-verified 2026-07-11; owner-gated (nothing lands this run)
+| **Status** | **accepted (owner, 2026-07-12)** — graduation in progress. (prior: draft (RFC) — authored + critique-verified 2026-07-11; owner-gated (nothing lands this run))
 | **Tracking issue** | [#1648](https://github.com/s8lap/bezel-lang/issues/1648)
 | **Target module(s)** | Spec [§22.11](../Bezel_Language_Spec.md#sec-object-initializer-blocks) (deleted), [§9.5](../Bezel_Language_Spec.md#sec-non-destructive-update-with) (class-source paragraphs deleted; three-uses note shrinks to two), [§22.9](../Bezel_Language_Spec.md#sec-owned-fields-and-exception-safety) (one cross-reference restated standalone), Appendix [A.7](../Bezel_Language_Spec.md#sec-expressions) (two comment blocks rewritten; **no production changes** — §6 explains why none are available). **No stdlib change. No grammar-production change. No conformance-level change** (the construct is Core today and its deletion leaves Core smaller, not repartitioned). |
 | **Written against** | spec/stdlib **v0.183**. *(Carried to v0.184: the cited sections are unchanged by the 2026-07-11 ownership-coherence revision; re-verify at landing.)* Every citation below was re-verified against the v0.183 text (section numbers *and* wording), and the whole document was adversarially re-verified a second time by an independent critique pass (2026-07-11) whose two blocking findings are incorporated here. |

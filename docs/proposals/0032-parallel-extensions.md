@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | **accepted (owner, 2026-07-12)** — graduation in progress this run. *(prior: draft)* |
 | **Tracking issue** | [#1510](https://github.com/s8lap/bezel-lang/issues/1510) |
 | **Target modules** | `System.Threading` (`Domain` overloads, `Parallel`), `System.Collections.Generic` (`FrozenArray<T>`, span `SplitAt`), spec [§30.14](Bezel_Language_Spec.md#sec-multiple-domains)/[§28.13](Bezel_Language_Spec.md#sec-shared-ownership)/[§28.14](Bezel_Language_Spec.md#sec-scoped-callback-parameters)/[§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)/[§22.12](Bezel_Language_Spec.md#sec-static-members) (Stage 1.5 set scoping) |
 | **Written against** | spec/stdlib **v0.177** |

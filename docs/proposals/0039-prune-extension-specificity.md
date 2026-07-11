@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft (RFC) — authored + critique-verified 2026-07-11; owner-gated (nothing lands this run)
+| **Status** | **accepted (owner, 2026-07-12)** — graduation in progress. (prior: draft (RFC) — authored + critique-verified 2026-07-11; owner-gated (nothing lands this run))
 | **Tracking issue** | [#1650](https://github.com/s8lap/bezel-lang/issues/1650)
 | **Target module(s)** | Spec [§26.5.1](../Bezel_Language_Spec.md#sec-specificity-ordering) (rules 2 and 3 deleted; the v0.183 "What each relation compares" paragraph reduced to its rule-1 half; the worked example replaced), [§26.5](../Bezel_Language_Spec.md#sec-resolution) (step 3's pointer text; step 4's remedies gain the distinct-name remedy), Appendix A (none — no grammar is involved), Appendix C (**none — verified**, §7). Rationale: one decision record (the decline of auto-ranked generic specialization). **No stdlib change** (§5 verifies none is needed). No conformance-level change. |
 | **Written against** | spec/stdlib **v0.183**. *(Carried to v0.184: the cited sections are unchanged by the 2026-07-11 ownership-coherence revision; re-verify at landing.)* All citations re-verified against the v0.183 text; the stdlib extension-block inventory in §5 was re-derived from the current document, not inherited from the finding — and independently re-derived a second time by the adversarial critique pass (2026-07-11), which confirmed it complete and ran the killer-counterexample hunt to exhaustion: **zero** stdlib call sites resolve through rules 2–3 today. |
