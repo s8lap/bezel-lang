@@ -233,7 +233,7 @@ BEZEL_TEST(serialization_typedriven_703,
         "class C public static method Main(): int "
         "  var node := new Node(42, null); "
         "  using var sh := new Shared<Node>(owned node); "
-        "  sh.Get().Back := sh.Downgrade(); "
+        "  var n := sh.Get(); n.Back := sh.Downgrade(); "
         "  using var holder := new Holder(sh.Clone()); "
         "  using var s := new BinarySerializer(); "
         "  holder.Serialize(s); "
@@ -538,7 +538,7 @@ BEZEL_TEST(serialization_typedriven_703,
         "  var nodeA := new Node(1, new Shared<Node>(owned nodeB), null); "  // §22.3 v0.169
         "  using var shA := new Shared<Node>(owned nodeA); "  // §22.3 v0.169
 
-        "  shA.Get().Peer!.Get().Back := shA.Downgrade(); "
+        "  var pn := shA.Get().Peer!.Get(); pn.Back := shA.Downgrade(); "
         "  return shA.Get().V; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(src), 1);
@@ -579,7 +579,7 @@ BEZEL_TEST(serialization_typedriven_703,
         "class C public static method Main(): int "
         "  var node := new Node(42, null); "
         "  using var sh := new Shared<Node>(owned node); "
-        "  sh.Get().Back := sh.Downgrade(); "
+        "  var n := sh.Get(); n.Back := sh.Downgrade(); "
         "  using var holder := new Holder(sh.Clone()); "
         "  using var s := new BinarySerializer(); "
         "  holder.Serialize(s); "

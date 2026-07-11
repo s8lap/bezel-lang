@@ -171,7 +171,7 @@ BEZEL_TEST(move_coll_slot_28_8_1, owned_array_moved_element_value_preserved) {
         "class C public static method Main(): int "
         "  using var a := new OwningArray<R>(); "
         "  a.Add(move (new R())); "
-        "  a.Get(0).V := 42; "               // mutate the stored element
+        "  var e := a.Get(0); e.V := 42; "   // mutate the stored element (via a borrow local; §6.6/A.6 forbids a method-call lvalue base)
         "  using var x := move a[0]; "
         "  return x.V; "                      // moved element carries V=42
         "end Main; end C;"), 42);
