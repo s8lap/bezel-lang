@@ -5166,6 +5166,149 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             currentLiteralWideningHint_ = savedAssignHint;
             pendingLambdaParamType_ = savedPending;
         }
+        // §6.6 (v0.184, #1689): a compound assignment `x op= e` desugars to
+        // `x := x op e`. Let T be the target's type and R the type of
+        // `x op e` under this chapter's rules — §6.2's mixed-type promotion
+        // for the arithmetic/bitwise forms, §6.5's "a shift's result already
+        // has the left operand's type" for `<<=`/`>>=`. When R is T, or R
+        // implicitly converts to T (§5.1), the store is direct; when T is an
+        // integer type or `char` and R is an integer type, the store is a
+        // checked narrowing (§5.2) at runtime, never a silent truncation.
+        // "In every other case the compound form is a compile error" — most
+        // often a binary-float/decimal R against a different-family integer
+        // T (`b += 1.5` on `b: byte`; `i += 2.5` on `i: int`; `d += 5.0`
+        // where `d: decimal` — double and decimal have no implicit
+        // conversion either way). Before this check the mismatch reached
+        // codegen unchecked: the checked-arith intrinsic (or the bitwise/
+        // shift op) was fed one integer and one floating-point LLVM operand,
+        // and LLVM IR verification crashed instead of the frontend rejecting
+        // the program. §6.5's bitwise/shift restriction (above) checked only
+        // the TARGET's kind against "not valid on bool/char/floating-point";
+        // the right-hand OPERAND was unchecked, so e.g. `x &= 1.5` on
+        // `x: int` hit the same IR-verification crash — checked here too,
+        // now that the right-hand side has a type.
+        if (!eventPayload && as->target && as->value &&
+            (as->op == "+=" || as->op == "-=" || as->op == "*=" ||
+             as->op == "/=" || as->op == "&=" || as->op == "|=" ||
+             as->op == "^=" || as->op == "<<=" || as->op == ">>=")) {
+            TypeRef* tTy = ctx_.exprType(*as->target);
+            TypeRef* rTy = ctx_.exprType(*as->value);
+            if (tTy && rTy && tTy->kind == TypeRef::Kind::Primitive &&
+                rTy->kind == TypeRef::Kind::Primitive &&
+                !tTy->nullable && !rTy->nullable) {
+                using P = PrimitiveType;
+                // Diagnostic-only spelling of a primitive type; mirrors
+                // primitiveSpelling (ExprTypecheck_Exprs.cpp, anonymous
+                // namespace, not visible here).
+                auto spell = [](P p) -> const char* {
+                    switch (p) {
+                        case P::Bool:    return "bool";
+                        case P::Char:    return "char";
+                        case P::String:  return "string";
+                        case P::Byte:    return "byte";
+                        case P::SByte:   return "sbyte";
+                        case P::Short:   return "short";
+                        case P::UShort:  return "ushort";
+                        case P::Int:     return "int";
+                        case P::UInt:    return "uint";
+                        case P::Long:    return "long";
+                        case P::ULong:   return "ulong";
+                        case P::Float:   return "float";
+                        case P::Double:  return "double";
+                        case P::Decimal: return "decimal";
+                        case P::Object:  return "Object";
+                        case P::None:    return "<none>";
+                    }
+                    return "<unknown>";
+                };
+                bool isShift = (as->op == "<<=" || as->op == ">>=");
+                bool isBitwise = (as->op == "&=" || as->op == "|=" ||
+                                  as->op == "^=");
+                if (isShift || isBitwise) {
+                    // §6.5: both operands of a bitwise/shift op must be
+                    // (true) integer types — never bool, char, string, or
+                    // floating-point. The target side is checked above;
+                    // this is the missing right-hand-operand half of the
+                    // same rule.
+                    const char* badKind =
+                        (rTy->primitive == P::Float ||
+                         rTy->primitive == P::Double ||
+                         rTy->primitive == P::Decimal)
+                            ? "floating-point types"
+                        : (rTy->primitive == P::Bool)
+                            ? "`bool` (boolean operations use "
+                              "`and`/`or`/`not`)"
+                        : (rTy->primitive == P::Char)   ? "`char`"
+                        : (rTy->primitive == P::String) ? "`string`"
+                                                         : nullptr;
+                    if (badKind)
+                        ctx_.diagnostics().report(
+                            Severity::Error, as->value->span.begin,
+                            std::string("operator `") + std::string(as->op) +
+                            "` is not valid on " + badKind + " — bitwise and "
+                            "shift operators require integer operands "
+                            "(§6.5)");
+                    // A shift's result is always the left operand's type
+                    // (§6.5) — once the operand-kind check above passes
+                    // there is no R-vs-T mismatch left to check.
+                } else if (tTy->primitive != P::String &&
+                           tTy->primitive != P::Bool) {
+                    // Arithmetic (`+= -= *= /=`) or a non-shift bitwise op
+                    // whose operands both passed the integer-kind check
+                    // above. Compute R = type of `target op value` per
+                    // §6.2's promotion table (mirrors typeBinary's non-shift
+                    // block, ExprTypecheck_Exprs.cpp): identical primitives
+                    // keep that type; otherwise the narrower operand
+                    // promotes to whichever of the two admits it.
+                    P rPrim = tTy->primitive;
+                    if (tTy->primitive != rTy->primitive) {
+                        if (primitiveWidens(tTy->primitive, rTy->primitive))
+                            rPrim = rTy->primitive;
+                        else if (primitiveWidens(rTy->primitive,
+                                                  tTy->primitive))
+                            rPrim = tTy->primitive;
+                        else
+                            rPrim = rTy->primitive;  // no conversion either way
+                    }
+                    bool rEqualsT = rPrim == tTy->primitive;
+                    bool rConvertsToT =
+                        !rEqualsT && primitiveWidens(rPrim, tTy->primitive);
+                    auto isTrueInt = [](P p) {
+                        switch (p) {
+                            case P::Byte: case P::SByte: case P::Short:
+                            case P::UShort: case P::Int: case P::UInt:
+                            case P::Long: case P::ULong:
+                                return true;
+                            default:
+                                return false;
+                        }
+                    };
+                    bool integerWriteBack =
+                        !rEqualsT && !rConvertsToT &&
+                        (isTrueInt(tTy->primitive) ||
+                         tTy->primitive == P::Char) &&
+                        isTrueInt(rPrim);
+                    if (!rEqualsT && !rConvertsToT && !integerWriteBack) {
+                        std::string binOp(as->op.substr(0, as->op.size() - 1));
+                        ctx_.diagnostics().report(
+                            Severity::Error, as->value->span.begin,
+                            std::string("compound assignment `") +
+                            std::string(as->op) + "` has no valid result: `" +
+                            spell(tTy->primitive) + " " + binOp + " " +
+                            spell(rTy->primitive) + "` computes `" +
+                            spell(rPrim) + "`, which is neither `" +
+                            spell(tTy->primitive) + "` nor implicitly "
+                            "convertible to it, and `" +
+                            spell(tTy->primitive) + "` is not an integer/"
+                            "char target receiving an integer result (the "
+                            "only case §6.6's write-back narrows) — convert "
+                            "the right-hand operand explicitly, or write "
+                            "`x := " + spell(tTy->primitive) + "(x " + binOp +
+                            " e);` if the loss is intended (§6.6)");
+                    }
+                }
+            }
+        }
         // per §24.4: an event += / -= is not a real compound assignment, so
         // the readonly / assignability checks below do not apply to it.
         if (!eventPayload) {
