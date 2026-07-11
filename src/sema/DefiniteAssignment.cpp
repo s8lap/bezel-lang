@@ -14,6 +14,88 @@ namespace bezel::sema {
 
 namespace {
 
+// ---------- §22.7 (v0.184) construction-time `this`-observation helpers ------
+//
+// The observation gate (§22.7 rule 1) is satisfied only where every field the
+// declaring class must explicitly initialize is definitely assigned. That set
+// is exactly §7.9's non-nullable *reference*-typed fields without an
+// initializer (fields with an initializer count as assigned at body entry;
+// value-typed fields have a defined default). Mirrors ownership's
+// isNonNullableReferenceField (the O9 field-DA check) — same classification,
+// so the observation gate and the field-DA obligation stay in lock-step.
+bool isSevenNineStrictField(const ast::FieldDecl& f, SemaContext& ctx) {
+    for (auto m : f.modifiers)
+        if (m == "static") return false;
+    if (f.initializer) return false;  // assigned at body entry
+    if (!f.type) return false;
+    auto* rt = ctx.resolvedType(*f.type);
+    if (!rt || rt->nullable) return false;
+    switch (rt->kind) {
+        case TypeRef::Kind::Primitive:
+            return rt->primitive == PrimitiveType::String ||
+                   rt->primitive == PrimitiveType::Object;
+        case TypeRef::Kind::Function:
+            return true;
+        case TypeRef::Kind::Named:
+            if (!rt->declaration) return false;  // built-in / generic — skip
+            return rt->declaration->kind == ast::TypeDeclKind::Class ||
+                   rt->declaration->kind == ast::TypeDeclKind::Interface;
+        default:
+            return false;  // Unit, InlineArray, Error → value/unknown
+    }
+}
+
+// §22.7 (v0.184): a non-nullable-reference *auto-property* without an
+// initializer is §7.9-strict backing storage too (§22.7: "auto-property
+// assignments and reads … each is the backing field's assignment or read"), so
+// it joins the observation gate's needing-set exactly like a field. Indexers,
+// static, and initialized auto-properties are excluded (the last is assigned at
+// entry). A computed (block/expression-bodied) property has no backing storage
+// and is not counted.
+bool isSevenNineStrictAutoProp(const ast::PropertyDecl& p, SemaContext& ctx) {
+    if (p.bodyKind != ast::PropertyBodyKind::Auto) return false;
+    if (p.isIndexer || p.autoInitializer) return false;
+    for (auto m : p.modifiers)
+        if (m == "static") return false;
+    if (!p.type) return false;
+    auto* rt = ctx.resolvedType(*p.type);
+    if (!rt || rt->nullable) return false;
+    switch (rt->kind) {
+        case TypeRef::Kind::Primitive:
+            return rt->primitive == PrimitiveType::String ||
+                   rt->primitive == PrimitiveType::Object;
+        case TypeRef::Kind::Function:
+            return true;
+        case TypeRef::Kind::Named:
+            if (!rt->declaration) return false;
+            return rt->declaration->kind == ast::TypeDeclKind::Class ||
+                   rt->declaration->kind == ast::TypeDeclKind::Interface;
+        default:
+            return false;
+    }
+}
+
+// True when `e` is the bare `this`/`base` keyword (stored as an IdentifierExpr
+// with the keyword lexeme, per Parser_Exprs §22.3).
+bool isNamedIdent(const ast::Expr& e, std::string_view n) {
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+    return id && id->name == n;
+}
+
+// §22.7 rule 2: a `virtual`/`override`/`abstract` member (dispatching family).
+bool methodIsVirtualFamily(const MethodSymbol& ms) {
+    for (auto m : ms.modifiers)
+        if (m == "virtual" || m == "override" || m == "abstract") return true;
+    if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms.decl))
+        return md->bodyKind == ast::MethodBodyKind::Abstract;
+    return false;
+}
+bool propIsVirtualFamily(const PropertySymbol& ps) {
+    for (auto m : ps.modifiers)
+        if (m == "virtual" || m == "override" || m == "abstract") return true;
+    return false;
+}
+
 // Per-method walker. The state is the set of locally-declared names
 // that have been definitely assigned at the current program point.
 // Names enter the set when:
@@ -70,6 +152,68 @@ public:
         // No out-params to check.
     }
 
+    // §22.7 (v0.184): walk a constructor body with construction-time
+    // `this`-observation checking layered onto the ordinary local
+    // definite-assignment walk. `klass` is the declaring class (for the
+    // §7.9-strict field set, the sealed/abstract status, and rule 2). The walk
+    // is the same flow-sensitive pass as `run`; the extra state is
+    // `ctorMode_`/`assignedFields_`/`fieldsNeedingInit_` (see visitStmt/
+    // visitExpr for where observations are gated).
+    void runConstructor(const ast::ConstructorDecl& cd,
+                        const ast::TypeDecl& klass) {
+        ctorMode_ = true;
+        bool sealed = false, abstract = false;
+        for (auto m : klass.modifiers) {
+            if (m == "sealed") sealed = true;
+            if (m == "abstract") abstract = true;
+        }
+        classSealedNonAbstract_ = sealed && !abstract;
+        for (const auto& m : klass.members) {
+            if (auto* f = dynamic_cast<const ast::FieldDecl*>(m.get())) {
+                if (isSevenNineStrictField(*f, ctx_))
+                    fieldsNeedingInit_.push_back(f->name);
+            } else if (auto* p =
+                           dynamic_cast<const ast::PropertyDecl*>(m.get())) {
+                if (isSevenNineStrictAutoProp(*p, ctx_))
+                    fieldsNeedingInit_.push_back(p->name);
+            }
+        }
+        // Seed out-params (constructors normally have none; kept for parity
+        // with run() so an out-carrying ctor, if ever admitted, is checked).
+        for (const auto& p : cd.params) {
+            if (!p.name.empty() && p.modifier.rfind("out", 0) == 0 &&
+                p.modifier.rfind("out var", 0) != 0) {
+                outParams_.insert(p.name);
+                declared_.insert(p.name);
+            }
+        }
+        // §22.7 rule 1, chaining position: the `base(...)`/`this(...)` call is
+        // the body's first statement (Node.hpp: CtorChain surfaces as an
+        // ExpressionStmt of a CallExpr on `this`/`base`). Its arguments run
+        // before any field of the declaring class is assigned, so any
+        // observation of `this` there is an error. After a `this(...)` chain the
+        // chained-to constructor has discharged every §7.9-strict field, so the
+        // gate is satisfied on body entry; after `base(...)` (or the implicit
+        // `base()`) the field initializers run but the needing-set is still
+        // unassigned (the body must assign it).
+        std::size_t startIdx = 0;
+        if (const ast::CallExpr* chain = getChainingCall(cd)) {
+            startIdx = 1;
+            inChainingPosition_ = true;
+            for (const auto& a : chain->args) visitCallArg(a);
+            inChainingPosition_ = false;
+            if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(
+                    chain->callee.get())) {
+                if (cid->name == "this")
+                    for (auto n : fieldsNeedingInit_) assignedFields_.insert(n);
+            }
+        }
+        for (std::size_t i = startIdx; i < cd.body.size(); ++i) {
+            if (cd.body[i]) visitStmt(*cd.body[i]);
+        }
+        if (!terminated_) checkOutParams(/*loc=*/nullptr);
+    }
+
 private:
     SemaContext& ctx_;
     // declared_ records every local introduced in this method (by name).
@@ -93,6 +237,26 @@ private:
     // branch termination; partial-branch termination leaves it false so
     // the fall-off check runs on the live path).
     bool terminated_ = false;
+
+    // §22.7 (v0.184) construction-time `this`-observation checking. Active only
+    // while walking a constructor body (runConstructor). The observation gate
+    // (rule 1) needs field-level definite assignment threaded flow-sensitively,
+    // exactly parallel to `assigned_` for locals: `assignedFields_` is the set
+    // of §7.9-strict fields definitely assigned on every path reaching the
+    // current point; `fieldsNeedingInit_` is the (declaration-ordered) list of
+    // §7.9-strict fields the class must explicitly initialize. A synchronous
+    // observation of `this` is admitted only where fieldsNeedingInit_ ⊆
+    // assignedFields_.
+    bool ctorMode_ = false;
+    // True while visiting the arguments of the `base(...)`/`this(...)` chaining
+    // call, where no field is assigned yet — any observation of `this` there is
+    // an error (§22.7 rule 1, chaining position).
+    bool inChainingPosition_ = false;
+    // The declaring class is `sealed` and not `abstract` — the sole exemption
+    // to §22.7 rule 2 (virtual dispatch from a constructor body).
+    bool classSealedNonAbstract_ = false;
+    std::vector<std::string_view> fieldsNeedingInit_;
+    std::unordered_set<std::string_view> assignedFields_;
 
     // §22.4 (v0.181): short-circuit-sensitive definite-assignment state for a
     // boolean sub-expression. `afterTrue` / `afterFalse` are the sets of
@@ -253,6 +417,18 @@ private:
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
             // RHS first — that's a read before the write.
             if (as->value) visitExpr(*as->value);
+            // §22.7 rule 1 (v0.184): a `:=` store to a field or auto-property of
+            // `this` marks that field definitely assigned toward the
+            // observation gate, and is itself NOT an observation (do not recurse
+            // into the `this` receiver). A computed-property `:=` target falls
+            // through to visitExpr below, where its setter invocation is gated.
+            if (ctorMode_ && as->op == ":=" && as->target) {
+                std::string_view fname;
+                if (isThisFieldOrAutoPropTarget(*as->target, fname)) {
+                    assignedFields_.insert(fname);
+                    return;
+                }
+            }
             // Target as IdentifierExpr → local gets assigned. Other
             // targets (member/index) read their root path first.
             if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
@@ -309,6 +485,13 @@ private:
                                ? evalCond(*ifs->ifBranch.condition)
                                : CondState{assigned_, assigned_};
             auto consumedLazyEntry = consumedLazy_;
+            // §22.7 (v0.184): field-assignment state is threaded in parallel to
+            // `assigned_`. A guard expression assigns no field (assignments are
+            // statements), so every branch body starts from the same entry
+            // field-state; the post-`if` state is the intersection of the branch
+            // field-outs (a field is assigned after the `if` only where assigned
+            // on every reaching path). `fieldEntry` is that per-branch start.
+            auto fieldEntry = assignedFields_;
             // `falseState` threads the assigned set on the path where every
             // guard checked so far was false.
             auto falseState = std::move(c0.afterFalse);
@@ -320,11 +503,14 @@ private:
             branchOuts.push_back(std::move(assigned_));
             std::vector<std::unordered_set<std::string_view>> consumedLazyOuts;
             consumedLazyOuts.push_back(std::move(consumedLazy_));
+            std::vector<std::unordered_set<std::string_view>> fieldOuts;
+            fieldOuts.push_back(std::move(assignedFields_));
             std::vector<bool> branchTerminated;
             branchTerminated.push_back(terminated_);
             for (const auto& el : ifs->elifBranches) {
                 assigned_ = falseState;
                 consumedLazy_ = consumedLazyEntry;
+                assignedFields_ = fieldEntry;
                 terminated_ = false;
                 CondState ci = el.condition
                                    ? evalCond(*el.condition)
@@ -336,21 +522,25 @@ private:
                 }
                 branchOuts.push_back(std::move(assigned_));
                 consumedLazyOuts.push_back(std::move(consumedLazy_));
+                fieldOuts.push_back(std::move(assignedFields_));
                 branchTerminated.push_back(terminated_);
             }
             if (ifs->hasElse) {
                 assigned_ = falseState;
                 consumedLazy_ = consumedLazyEntry;
+                assignedFields_ = fieldEntry;
                 terminated_ = false;
                 for (const auto& bs : ifs->elseBody) {
                     if (bs) visitStmt(*bs);
                 }
                 branchOuts.push_back(std::move(assigned_));
                 consumedLazyOuts.push_back(std::move(consumedLazy_));
+                fieldOuts.push_back(std::move(assignedFields_));
                 branchTerminated.push_back(terminated_);
             } else {
                 branchOuts.push_back(std::move(falseState)); // no-else: guard-false path
                 consumedLazyOuts.push_back(consumedLazyEntry); // no-else: no new consumption
+                fieldOuts.push_back(fieldEntry); // no-else: guard-false path assigns no field
                 branchTerminated.push_back(false);     // no-else = path live
             }
             // Intersect assigned sets.
@@ -363,6 +553,16 @@ private:
                 out = std::move(tmp);
             }
             assigned_ = std::move(out);
+            // Intersect field-assignment sets (§22.7).
+            auto fieldOut = fieldOuts.front();
+            for (std::size_t i = 1; i < fieldOuts.size(); ++i) {
+                std::unordered_set<std::string_view> tmp;
+                for (auto n : fieldOut) {
+                    if (fieldOuts[i].count(n)) tmp.insert(n);
+                }
+                fieldOut = std::move(tmp);
+            }
+            assignedFields_ = std::move(fieldOut);
             // Intersect consumedLazy_ sets (#1226).
             auto consumedOut = consumedLazyOuts.front();
             for (std::size_t i = 1; i < consumedLazyOuts.size(); ++i) {
@@ -397,11 +597,17 @@ private:
                                         : CondState{assigned_, assigned_};
             auto consumedLazyEntry = consumedLazy_;
             assigned_ = std::move(c.afterTrue);
+            // §22.7 (v0.184): a zero-trip loop assigns no field, so body field
+            // assignments do not survive past the loop (an observation after the
+            // loop cannot assume the body ran). Observations *inside* the body
+            // still see the body's growing field-state (a single iteration).
+            auto fieldEntry = assignedFields_;
             for (const auto& bs : ws->body) {
                 if (bs) visitStmt(*bs);
             }
             assigned_ = std::move(c.afterFalse);
             consumedLazy_ = std::move(consumedLazyEntry);
+            assignedFields_ = std::move(fieldEntry);
             terminated_ = entryTerminated; // loop may not execute
             return;
         }
@@ -428,6 +634,9 @@ private:
             // body-internal lazy consumptions are rolled back conservatively —
             // a body that runs 0 times does not consume any inner lazy vars).
             auto consumedLazyEntry = consumedLazy_;
+            // §22.7 (v0.184): like `while`, a zero-trip `for` body assigns no
+            // field, so body field assignments do not survive past the loop.
+            auto fieldEntry = assignedFields_;
             bool entryTerminated = terminated_;
             terminated_ = false;
             if (!fs->varName.empty()) {
@@ -439,6 +648,7 @@ private:
             }
             assigned_ = std::move(entry);
             consumedLazy_ = std::move(consumedLazyEntry); // body-marks removed
+            assignedFields_ = std::move(fieldEntry);
             terminated_ = entryTerminated; // loop may not execute
             return;
         }
@@ -453,6 +663,12 @@ private:
         if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
             auto entry = assigned_;
             auto consumedLazyEntry = consumedLazy_;
+            // §22.7 (v0.184): the try-body may abort at any point (before a
+            // field assignment completes), and each catch arm starts from the
+            // entry field-state; a field is assigned after the `try` only where
+            // assigned on every arm (the try-body-completed path and every
+            // catch path). `fieldEntry` is that per-arm start.
+            auto fieldEntry = assignedFields_;
             bool entryTerminated = terminated_;
             terminated_ = false;
             for (const auto& bs : ts->body) {
@@ -464,15 +680,19 @@ private:
             outs.push_back(std::move(assigned_));
             std::vector<std::unordered_set<std::string_view>> consumedLazyOuts;
             consumedLazyOuts.push_back(std::move(consumedLazy_));
+            std::vector<std::unordered_set<std::string_view>> fieldOuts;
+            fieldOuts.push_back(std::move(assignedFields_));
             std::vector<bool> armTerminated;
             armTerminated.push_back(terminated_);
             for (const auto& arm : ts->catches) {
                 assigned_ = entry;
                 consumedLazy_ = consumedLazyEntry;
+                assignedFields_ = fieldEntry;
                 terminated_ = false;
                 if (arm.body) visitStmt(*arm.body);
                 outs.push_back(std::move(assigned_));
                 consumedLazyOuts.push_back(std::move(consumedLazy_));
+                fieldOuts.push_back(std::move(assignedFields_));
                 armTerminated.push_back(terminated_);
             }
             auto post = outs.front();
@@ -484,6 +704,16 @@ private:
                 post = std::move(tmp);
             }
             assigned_ = std::move(post);
+            // Intersect field-assignment sets (§22.7).
+            auto fieldPost = fieldOuts.front();
+            for (std::size_t i = 1; i < fieldOuts.size(); ++i) {
+                std::unordered_set<std::string_view> tmp;
+                for (auto n : fieldPost) {
+                    if (fieldOuts[i].count(n)) tmp.insert(n);
+                }
+                fieldPost = std::move(tmp);
+            }
+            assignedFields_ = std::move(fieldPost);
             // Intersect consumedLazy_ sets (#1226).
             auto consumedPost = consumedLazyOuts.front();
             for (std::size_t i = 1; i < consumedLazyOuts.size(); ++i) {
@@ -527,6 +757,17 @@ private:
             return;
         }
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+            // §22.7 rule 1 (v0.184): a bare `this` reached here is `this` used
+            // as a value — an argument, a stored/returned reference, an
+            // `is`/`is not`/`as` operand — i.e. a synchronous observation.
+            // Receiver-`this` uses (`this.f`, `this.M(...)`) are intercepted by
+            // the parent MemberAccess/Call handlers and never recurse into this
+            // leaf. `base` alone is not a value (only `base.member`), so only
+            // `this` is gated. per §22.7
+            if (ctorMode_ && id->name == "this") {
+                gateObservation(id->span.begin, "reference to `this`");
+                return;
+            }
             checkRead(*id);
             return;
         }
@@ -542,6 +783,10 @@ private:
             return;
         }
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+            // §22.7 (v0.184): `this.member`/`base.member` — a computed-property
+            // read is an observation; a field/auto-property read is not.
+            // Handled (and the `this`/`base` receiver not recursed into) here.
+            if (visitCtorMemberAccess(*ma)) return;
             if (ma->target) visitExpr(*ma->target);
             return;
         }
@@ -550,6 +795,10 @@ private:
             return;
         }
         if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+            // §22.7 rule 1/2 (v0.184): a receiver-`this` call (`this.M(...)`,
+            // `base.M(...)`, or an implicit-`this` bare `M(...)`) is a
+            // construction-time observation; handle it (and its args) here.
+            if (visitCtorCall(*ce)) return;
             // §29.11 point 2 (#1353): applying a further deferred LINQ
             // operator to a bound lazy local consumes that local.  Detect
             // by: call result type is lazy-enumerable AND the callee is a
@@ -738,9 +987,202 @@ private:
                 "an assignment on every reaching path)");
         }
     }
+
+    // ---- §22.7 (v0.184) construction-time observation helpers (ctor mode) ----
+
+    // The `base(...)`/`this(...)` chaining call, if this constructor has one —
+    // the body's first ExpressionStmt of a CallExpr on `this`/`base`
+    // (Node.hpp). Null otherwise (implicit `base()`).
+    static const ast::CallExpr* getChainingCall(const ast::ConstructorDecl& cd) {
+        if (cd.body.empty() || !cd.body.front()) return nullptr;
+        auto* es =
+            dynamic_cast<const ast::ExpressionStmt*>(cd.body.front().get());
+        if (!es || !es->expr) return nullptr;
+        auto* call = dynamic_cast<const ast::CallExpr*>(es->expr.get());
+        if (!call || !call->callee) return nullptr;
+        auto* id =
+            dynamic_cast<const ast::IdentifierExpr*>(call->callee.get());
+        if (id && (id->name == "this" || id->name == "base")) return call;
+        return nullptr;
+    }
+
+    // §22.7 rule 1: report a synchronous `this`-observation that is not admitted
+    // at the current program point — in the chaining position (no field yet
+    // assigned) it is always an error; otherwise it is an error iff some
+    // §7.9-strict field is not definitely assigned on every reaching path.
+    // `what` names the observation form for the diagnostic. Returns nothing;
+    // one diagnostic per unadmitted observation.
+    void gateObservation(const SourceLocation& loc, const std::string& what) {
+        if (!ctorMode_) return;
+        if (inChainingPosition_) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "cannot observe `this` (" + what +
+                ") in the chaining position — `base(...)`/`this(...)` arguments "
+                "run before any field of the declaring class is assigned "
+                "(§22.7, v0.184)");
+            return;
+        }
+        for (auto n : fieldsNeedingInit_) {
+            if (!assignedFields_.count(n)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "cannot observe `this` (" + what +
+                    ") before non-nullable field `" + std::string(n) +
+                    "` is definitely assigned on every path — the observation "
+                    "could read an unset field, breaking §7.9's guarantee that "
+                    "a fully-constructed object has every non-nullable field "
+                    "set (§22.7, v0.184)");
+                return;
+            }
+        }
+    }
+
+    // §22.7 rule 2: a dispatching call on `this` to a `virtual`/`override`/
+    // `abstract` member from a non-sealed (or abstract) constructor body is a
+    // compile error — during construction the runtime type may be a derived
+    // class whose field initializers have not run. `base.M()` is non-dispatching
+    // and exempt (caller passes viaBase=true). Returns true iff it reported (so
+    // the caller skips the rule-1 gate for the same site).
+    bool checkVirtualDispatch(Symbol* calleeSym, bool viaBase,
+                              const SourceLocation& loc,
+                              std::string_view mname) {
+        if (viaBase || classSealedNonAbstract_) return false;
+        bool virt = false;
+        if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym))
+            virt = methodIsVirtualFamily(*ms);
+        else if (auto* ps = dynamic_cast<PropertySymbol*>(calleeSym))
+            virt = propIsVirtualFamily(*ps);
+        if (!virt) return false;
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "cannot call `virtual`/`override`/`abstract` member `" +
+            std::string(mname) +
+            "` on `this` from a constructor body of a non-sealed class — "
+            "dispatch could reach a derived override over not-yet-initialized "
+            "fields (§22.7, v0.184); make the class `sealed` (and not "
+            "`abstract`), or call through `base.`");
+        return true;
+    }
+
+    // True when `e` targets a field or auto-property of `this` (`this.f` or a
+    // bare `f`) — a direct store that is NOT an observation and that counts
+    // toward the §22.7 rule-1 gate (§22.7: direct field and auto-property
+    // assignments keep their definite-assignment rules and the assignment
+    // counts toward the gate). A computed (block/expression-bodied) property
+    // target is excluded here — its setter is user code, an observation gated
+    // elsewhere.
+    bool isThisFieldOrAutoPropTarget(const ast::Expr& e, std::string_view& out) {
+        Symbol* sym = nullptr;
+        std::string_view name;
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+            if (!ma->target || !isNamedIdent(*ma->target, "this")) return false;
+            sym = ctx_.exprSymbol(*ma);
+            name = ma->member;
+        } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+            sym = ctx_.exprSymbol(*id);
+            name = id->name;
+        } else {
+            return false;
+        }
+        if (dynamic_cast<FieldSymbol*>(sym)) {
+            out = name;
+            return true;
+        }
+        if (auto* ps = dynamic_cast<PropertySymbol*>(sym))
+            if (!ps->isIndexer && isAutoPropertySymbol(ps)) {
+                out = name;
+                return true;
+            }
+        return false;
+    }
+
+    // §22.7 rule 1: a `this`-receiver call in a constructor body is an
+    // observation. Detects the two receiver-`this` call shapes (`this.M(...)`/
+    // `base.M(...)` and the implicit-`this` bare `M(...)`), applies rule 2
+    // (virtual dispatch) then, unless rule 2 fired, the rule-1 gate, and visits
+    // the arguments for their own observations and local DA. Returns true iff
+    // the call was a receiver-`this` call it handled (so the caller returns).
+    bool visitCtorCall(const ast::CallExpr& ce) {
+        if (!ctorMode_ || !ce.callee) return false;
+        bool viaThis = false, viaBase = false;
+        std::string_view mname;
+        if (auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+            if (ma->target && isNamedIdent(*ma->target, "this")) {
+                viaThis = true;
+                mname = ma->member;
+            } else if (ma->target && isNamedIdent(*ma->target, "base")) {
+                viaBase = true;
+                mname = ma->member;
+            }
+        } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                       ce.callee.get())) {
+            // A bare call to a non-static instance method is an implicit-`this`
+            // call (an observation). `this(...)`/`base(...)` chaining calls are
+            // handled in runConstructor and never reach here as body statements.
+            if (id->name != "this" && id->name != "base") {
+                if (auto* ms =
+                        dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*id))) {
+                    bool isStatic = false;
+                    for (auto m : ms->modifiers)
+                        if (m == "static") isStatic = true;
+                    if (!isStatic) {
+                        viaThis = true;
+                        mname = id->name;
+                    }
+                }
+            }
+        }
+        if (!viaThis && !viaBase) return false;
+        Symbol* calleeSym = ctx_.exprSymbol(*ce.callee);
+        bool reported =
+            checkVirtualDispatch(calleeSym, viaBase, ce.span.begin, mname);
+        if (!reported)
+            gateObservation(ce.span.begin,
+                            "instance call `" + std::string(mname) + "`");
+        // Visit arguments for their own observations / DA / lazy tracking —
+        // but not the callee (its `this`/`base` receiver is this observation,
+        // already accounted for).
+        for (const auto& a : ce.args) visitCallArg(a);
+        return true;
+    }
+
+    // §22.7 rule 1: a read of a member of `this`/`base` in a constructor body.
+    // A field or auto-property read is backing storage — NOT an observation
+    // (its own §7.9/§28.8.1 DA rules apply). A computed (block/expression-
+    // bodied) property read is an accessor invocation — an observation (rule 1,
+    // and rule 2 if virtual). Returns true iff `e` was a `this`/`base` member
+    // access it handled (so the caller does not recurse into the receiver and
+    // wrongly flag it as a bare-`this` observation).
+    bool visitCtorMemberAccess(const ast::MemberAccessExpr& ma) {
+        if (!ctorMode_ || !ma.target) return false;
+        bool viaThis = isNamedIdent(*ma.target, "this");
+        bool viaBase = isNamedIdent(*ma.target, "base");
+        if (!viaThis && !viaBase) return false;
+        if (auto* ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(ma))) {
+            if (!ps->isIndexer && !isAutoPropertySymbol(ps)) {
+                bool reported = checkVirtualDispatch(ps, viaBase, ma.span.begin,
+                                                     ma.member);
+                if (!reported)
+                    gateObservation(ma.span.begin,
+                                    "property `" + std::string(ma.member) + "`");
+            }
+        }
+        // Field / auto-property / method-group / unresolved: not an
+        // observation; do not recurse into the `this`/`base` receiver.
+        return true;
+    }
 };
 
-void checkMember(const ast::Member& m, SemaContext& ctx) {
+// `enclosing` is the type whose members are being walked (null for extension
+// members and top-level free code). §22.7 construction-time `this`-observation
+// checking runs only for a CLASS's non-static constructors — the same scope as
+// the O9 field-DA obligation (Ownership.cpp): records/interfaces/enums have no
+// base-first-construction/virtual-dispatch footgun, so their constructors get
+// the ordinary local-DA walk unchanged.
+void checkMember(const ast::Member& m, SemaContext& ctx,
+                 const ast::TypeDecl* enclosing) {
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
         if (md->bodyKind == ast::MethodBodyKind::Block) {
             MethodDA da(ctx);
@@ -748,7 +1190,12 @@ void checkMember(const ast::Member& m, SemaContext& ctx) {
         }
     } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
         MethodDA da(ctx);
-        da.run(cd->params, cd->body);
+        if (!cd->isStatic && enclosing &&
+            enclosing->kind == ast::TypeDeclKind::Class) {
+            da.runConstructor(*cd, *enclosing);  // §22.7 observation checking
+        } else {
+            da.run(cd->params, cd->body);
+        }
     } else if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(&m)) {
         MethodDA da(ctx);
         da.run(dd->body);  // destructors have no params
@@ -760,7 +1207,7 @@ void checkMember(const ast::Member& m, SemaContext& ctx) {
     } else if (auto* nt = dynamic_cast<const ast::NestedTypeMember*>(&m)) {
         if (nt->decl) {
             for (const auto& innerM : nt->decl->members) {
-                if (innerM) checkMember(*innerM, ctx);
+                if (innerM) checkMember(*innerM, ctx, nt->decl.get());
             }
         }
     }
@@ -769,11 +1216,11 @@ void checkMember(const ast::Member& m, SemaContext& ctx) {
 void checkTopDecl(const ast::TopDecl& d, SemaContext& ctx) {
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(&d)) {
         for (const auto& m : td->members) {
-            if (m) checkMember(*m, ctx);
+            if (m) checkMember(*m, ctx, td);
         }
     } else if (auto* ext = dynamic_cast<const ast::ExtensionDecl*>(&d)) {
         for (const auto& m : ext->members) {
-            if (m) checkMember(*m, ctx);
+            if (m) checkMember(*m, ctx, /*enclosing=*/nullptr);
         }
     }
 }
