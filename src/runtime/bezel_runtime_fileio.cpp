@@ -6,13 +6,29 @@
 // File I/O
 // ---------------------------------------------------------------------------
 
+// Hardened per WS7 R1 (2026-07-12 clang-tidy static-analysis run, HIGH):
+// every path — success AND error — must leave *out/*len in a defined state,
+// because callers (bz_file_read_all_text, bz_file_read_all_lines,
+// bz_file_copy, bz_file_read_all_bytes_arr, and the LlvmBackend_Calls.cpp
+// File.ReadAllText/ReadAllBytes codegen) read *out/*len unconditionally on
+// some paths without checking the returned error code. Previously: on a
+// fopen() failure *out/*len were never written, so callers propagated
+// uninitialized stack garbage as a "buffer pointer" and "length" (a garbage
+// pointer later passed to free()/memcpy() — heap corruption, not just a
+// wrong value). Also hardened: unchecked ftell() (-1 on failure flowed into
+// `malloc((size_t)-1 + 1)` == `malloc(0)`, then `buf[n] = 0` wrote past the
+// 0-byte allocation) and unchecked malloc() (OOM null-deref via buf[n] = 0).
 int32_t bz_file_read_all_bytes(const char* path, uint8_t** out, int64_t* len) {
+    *out = nullptr;
+    if (len) *len = 0;
     FILE* f = fopen(path, "rb");
     if (!f) return -errno;
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) { int e = errno; fclose(f); return -e; }
     long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    if (sz < 0) { int e = errno; fclose(f); return -e; }
+    if (fseek(f, 0, SEEK_SET) != 0) { int e = errno; fclose(f); return -e; }
     uint8_t* buf = (uint8_t*)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return -ENOMEM; }
     size_t n = fread(buf, 1, (size_t)sz, f);
     buf[n] = 0;
     fclose(f);
@@ -22,7 +38,7 @@ int32_t bz_file_read_all_bytes(const char* path, uint8_t** out, int64_t* len) {
 }
 
 int32_t bz_file_read_all_text(const char* path, char** out, int64_t* byte_len) {
-    uint8_t* buf; int64_t len;
+    uint8_t* buf = nullptr; int64_t len = 0;
     int32_t r = bz_file_read_all_bytes(path, &buf, &len);
     *out = (char*)buf;
     if (byte_len) *byte_len = len;
