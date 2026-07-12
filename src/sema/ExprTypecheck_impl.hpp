@@ -887,6 +887,19 @@ private:
     void collectHierarchyOverloads(TypeSymbol* start, std::string_view name,
                                    std::vector<MethodSymbol*>& out);
 
+    // §14.5 (v0.184, #1686): a `ref`/`out` argument bound to a generic
+    // method's type parameter must unify EXACTLY with the parameter's
+    // substituted type — no conversion, and no join across conflicting
+    // occurrences, at either the binding or the later applicability check.
+    // Runs UNCONDITIONALLY (independent of whether the call's return type
+    // needs a substitution) for a call to a generic method that has at
+    // least one ref/out parameter whose declared type mentions a method
+    // type parameter. Returns true when a §14.5 diagnostic was emitted, in
+    // which case the caller must stop typing the call (no codegen for a
+    // rejected call).
+    bool checkGenericRefOutExactUnification(const ast::CallExpr& ce,
+                                            const ast::MethodDecl* md);
+
     // Slices T5/T6/T7: shared check of an all-positional argument list
     // against a parameter list — argument count within [required,
     // total] (optional params lower the minimum), then per-argument

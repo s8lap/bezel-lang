@@ -424,6 +424,53 @@ bool containsMethodTypeParam(
         if (containsMethodTypeParam(ga, gpNames)) return true;
     return false;
 }
+
+// A printable spelling for a resolved TypeRef, used by the §14.5 ref/out
+// exact-unification diagnostics (checkGenericRefOutExactUnification below).
+// Handles primitives and simple named types (declaration, or an unresolved
+// bare type-parameter's AST name as a fallback) — the shapes those
+// diagnostics actually see. Mirrors the local `spellTR` lambda the #896
+// conflicting-inference diagnostic uses elsewhere in this file.
+std::string spellTypeRefForDiag(const TypeRef* a) {
+    if (!a) return "?";
+    if (a->kind == TypeRef::Kind::Primitive) {
+        using P = PrimitiveType;
+        const char* n = "?";
+        switch (a->primitive) {
+            case P::Bool:    n = "bool";    break;
+            case P::Char:    n = "char";    break;
+            case P::String:  n = "string";  break;
+            case P::Byte:    n = "byte";    break;
+            case P::SByte:   n = "sbyte";   break;
+            case P::Short:   n = "short";   break;
+            case P::UShort:  n = "ushort";  break;
+            case P::Int:     n = "int";     break;
+            case P::UInt:    n = "uint";    break;
+            case P::Long:    n = "long";    break;
+            case P::ULong:   n = "ulong";   break;
+            case P::Float:   n = "float";   break;
+            case P::Double:  n = "double";  break;
+            case P::Decimal: n = "decimal"; break;
+            case P::Object:  n = "Object";  break;
+            default:         n = "?";       break;
+        }
+        std::string s(n);
+        if (a->nullable) s += '?';
+        return s;
+    }
+    if (a->kind == TypeRef::Kind::Named) {
+        std::string s;
+        if (a->declaration)
+            s = std::string(a->declaration->name);
+        else if (a->astNode && a->astNode->name && !a->astNode->name->parts.empty())
+            s = std::string(a->astNode->name->parts.back());
+        else
+            s = "?";
+        if (a->nullable) s += '?';
+        return s;
+    }
+    return "?";
+}
 }  // namespace
 
 // §22.6/§12.1 (#1090): collect same-name overloads across the class hierarchy.
@@ -731,6 +778,172 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             return arityFallback();
     }
     return arityFallback();
+}
+
+// §14.5 (v0.184, #1686). Authority — the phase-1 argument-driven-unification
+// bullet: "a `ref` or `out` parameter position unifies **exactly**: the
+// parameter aliases the caller's location, so no conversion is admitted at
+// the binding or later at the applicability check." And the Agreement
+// paragraph: "All bindings a type parameter receives ... must be the SAME
+// type. ... The compiler computes no common supertype and no widened join."
+//
+// unifyArgSubst's existing #896 mechanism already binds every self-determined
+// argument — ref/out included — without conversion, and flags a same-
+// parameter conflict when two occurrences disagree. But that machinery only
+// ran as a side effect of substituting the call's RETURN type
+// (`if (md->returnType) { ... }` further down in typeCall), so a
+// void-returning generic method with conflicting ref/out arguments — the
+// canonical `Swap<T>(ref a: T, ref b: T)` called with mismatched types,
+// §22.3's own worked example for `ref` aliasing — skipped inference
+// entirely and the conflict went undetected (#1686): each `ref` argument was
+// accepted independently and the call silently converted through an aliased
+// location.
+//
+// This check runs UNCONDITIONALLY, independent of the return type, for any
+// call to a generic method that has at least one ref/out parameter whose
+// declared type mentions a method type parameter — the precondition under
+// which §14.5's ref/out exactness rule has anything to say. It determines
+// the call's type-argument substitution (an explicit list, else phase-1
+// inference over every self-determined argument) and rejects when either:
+//   (a) inference disagrees across occurrences of a type parameter — the
+//       Agreement paragraph, applied uniformly to ref/out and by-value
+//       occurrences alike (the `Swap<T>` shape); or
+//   (b) a ref/out argument's OWN static type does not EXACTLY equal the
+//       (now fully-substituted) parameter type — the widening a by-value
+//       argument may still take at the ordinary §22.6 applicability check
+//       is not admitted for a ref/out position (the `StoreW<long>(v, ref
+//       intSlot)` shape: T is fixed at `long` by an explicit type argument,
+//       and only the ref argument's own type is wrong).
+// Returns true when a §14.5 diagnostic was emitted — the caller must stop
+// typing this call (no codegen for a rejected call).
+bool ExprTC::checkGenericRefOutExactUnification(const ast::CallExpr& ce,
+                                                const ast::MethodDecl* md) {
+    if (!md || md->genericParams.empty()) return false;
+    auto isRefOutMod = [](std::string_view m) {
+        return m == "ref" || m == "out" || m == "out var" ||
+               m == "out using var" || m == "out owned var" ||
+               m == "out owned";
+    };
+    // Fast bail: no ref/out parameter at all — §14.5's ref/out exactness
+    // rule has nothing to check for this call.
+    bool anyRefOut = false;
+    for (const auto& p : md->params)
+        if (isRefOutMod(p.modifier)) { anyRefOut = true; break; }
+    if (!anyRefOut) return false;
+
+    std::unordered_set<std::string_view> gpNames;
+    for (const auto& gp : md->genericParams) gpNames.insert(gp.name);
+
+    // Fast bail: no ref/out parameter's declared type mentions a method type
+    // parameter — those ref/out arguments are concretely typed and carry no
+    // generic-inference exactness obligation (a separate, non-generic §22.3
+    // concern outside this check's scope).
+    bool anyRefOutGeneric = false;
+    for (const auto& p : md->params) {
+        if (!isRefOutMod(p.modifier) || !p.type) continue;
+        if (TypeRef* pt = ctx_.resolvedType(*p.type))
+            if (containsMethodTypeParam(pt, gpNames)) {
+                anyRefOutGeneric = true;
+                break;
+            }
+    }
+    if (!anyRefOutGeneric) return false;
+
+    // Determine the call's type-argument substitution: an explicit list
+    // (all-or-nothing; a count mismatch was already reported by typeCall's
+    // §14.5 arity check above, so avoid a cascading diagnostic here) wins
+    // outright; otherwise infer it via phase-1 argument-driven unification
+    // over every self-determined argument, ref/out included — mirroring
+    // unifyArgSubst's existing #896 call site below, but running regardless
+    // of whether the call has a return type.
+    std::unordered_map<std::string_view, TypeRef*> subst;
+    const std::vector<std::unique_ptr<ast::Type>>* callTypeArgs = nullptr;
+    if (auto* cma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+        callTypeArgs = &cma->typeArgs;
+    else if (auto* cncm =
+                 dynamic_cast<const ast::NullCondMemberExpr*>(ce.callee.get()))
+        callTypeArgs = &cncm->typeArgs;
+    else if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get()))
+        callTypeArgs = &cid->typeArgs;
+    bool hasExplicit = callTypeArgs && !callTypeArgs->empty();
+    if (hasExplicit) {
+        if (callTypeArgs->size() != md->genericParams.size()) return false;
+        for (std::size_t gi = 0; gi < md->genericParams.size(); ++gi) {
+            if (!(*callTypeArgs)[gi]) continue;
+            if (TypeRef* concrete = ctx_.resolvedType(*(*callTypeArgs)[gi]))
+                subst[md->genericParams[gi].name] = concrete;
+        }
+    } else {
+        std::unordered_set<std::string_view> conflicts;
+        for (std::size_t pi = 0;
+             pi < md->params.size() && pi < ce.args.size(); ++pi) {
+            if (!md->params[pi].type || !ce.args[pi].value) continue;
+            std::string_view amod = ce.args[pi].modifier;
+            // §22.4 / #1164: an inline `out var`/`out using var`/
+            // `out owned var` argument has no type of its own — its type is
+            // INFERRED FROM the matched parameter, so it contributes no
+            // binding (mirrors the existing skip below).
+            if (amod == "out var" || amod == "out using var" ||
+                amod == "out owned var")
+                continue;
+            TypeRef* argTy = ctx_.exprType(*ce.args[pi].value);
+            // §14.1 / #885-886: an uncontexted `null` literal carries no
+            // concrete type — skip it (mirrors the existing skip below).
+            if (argTy && argTy->kind == TypeRef::Kind::Primitive &&
+                argTy->primitive == PrimitiveType::Object && argTy->nullable)
+                continue;
+            unifyArgSubst(md->params[pi].type.get(), argTy, gpNames, subst,
+                          ctx_, &conflicts);
+        }
+        if (!conflicts.empty()) {
+            for (std::string_view cnm : conflicts) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ce.span.begin,
+                    "type parameter `" + std::string(cnm) +
+                    "` cannot be bound to both `" +
+                    spellTypeRefForDiag(subst.count(cnm) ? subst.at(cnm)
+                                                          : nullptr) +
+                    "` and a different type — all arguments for a type "
+                    "parameter must agree, and a `ref`/`out` position "
+                    "unifies exactly, with no conversion admitted (§14.5)");
+            }
+            return true;
+        }
+    }
+
+    // Every ref/out argument whose parameter type mentions a method type
+    // parameter must, once substituted, equal the argument's OWN static
+    // type EXACTLY — no conversion, not even the ordinary widening a
+    // by-value argument may take at the ordinary §22.6 applicability check.
+    for (std::size_t pi = 0; pi < md->params.size() && pi < ce.args.size();
+         ++pi) {
+        const ast::Param& p = md->params[pi];
+        if (!isRefOutMod(p.modifier) || !p.type) continue;
+        std::string_view amod = ce.args[pi].modifier;
+        if (amod == "out var" || amod == "out using var" ||
+            amod == "out owned var")
+            continue;  // §22.4: type inferred FROM the parameter — exact by construction
+        if (!ce.args[pi].value) continue;
+        TypeRef* declTy = ctx_.resolvedType(*p.type);
+        if (!declTy || !containsMethodTypeParam(declTy, gpNames)) continue;
+        TypeRef* substituted = substituteReturnType(declTy, subst);
+        if (containsMethodTypeParam(substituted, gpNames))
+            continue;  // still unbound — reported elsewhere as "unbindable"
+        TypeRef* argTy = ctx_.exprType(*ce.args[pi].value);
+        if (!argTy) continue;
+        if (!typeRefEqual(substituted, argTy)) {
+            ctx_.diagnostics().report(
+                Severity::Error, ce.args[pi].value->span.begin,
+                "the `" + std::string(p.modifier) +
+                "` argument for parameter `" + std::string(p.name) +
+                "` does not unify exactly with the inferred type `" +
+                spellTypeRefForDiag(substituted) + "` — a `ref`/`out` "
+                "position aliases the caller's location, so no conversion "
+                "is admitted, unlike an ordinary by-value argument (§14.5)");
+            return true;
+        }
+    }
+    return false;
 }
 
 // Slice 3h: resolve a CallExpr's return type from the callee's
@@ -1243,6 +1456,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     "(§14.5)");
             }
         }
+        // §14.5 (v0.184, #1686): ref/out inference positions must unify
+        // EXACTLY. Runs unconditionally — independent of the return-type
+        // branching below, which is what left a void-returning generic
+        // method's ref/out arguments completely unchecked (the `Swap<T>`
+        // aliasing-corruption repro). A rejected call stops here, before any
+        // of the (return-type-gated) inference/constraint/codegen machinery
+        // below runs for it.
+        if (checkGenericRefOutExactUnification(ce, md)) return;
         // §12.3/§12.5, #874: `base.M()` where M is abstract has no
         // implementation to call — the vtable slot is unfilled.  Diagnose this
         // as a compile error so the caller never reaches garbage at runtime.
