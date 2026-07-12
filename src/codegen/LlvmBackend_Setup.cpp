@@ -1698,6 +1698,24 @@ llvm::Function* Emitter::ensureVtableWideningThunk(
         const sema::MethodSymbol* rootMs, const sema::MethodSymbol* leafMs,
         const std::vector<bool>& widened) {
     if (!rootMs || !leafMs) return nullptr;
+    // #1766 / §12.1 / §14: this thunk exists SOLELY to unbox widened
+    // nullable-value parameters (#1592) — its body forwards every argument,
+    // unboxing only the positions this slot's virtual family actually widened.
+    // If NO position is widened it has nothing to adapt, and the only way it
+    // could still be reached is an UNRELATED signature difference it cannot
+    // legitimately bridge: a generic base method returning the type parameter
+    // `T` lowers its vtable-slot return type to the erased `i32` placeholder
+    // (methodFnType over the un-instantiated `Base<T>`), while a
+    // reference-typed override (`T` = string, a class, ...) returns `ptr`.
+    // Emitting a pass-through thunk there produced malformed IR (`ret ptr`
+    // from an `i32`-typed function): the AOT verifier rejected it; the JIT,
+    // which skips the verifier, silently ran it. Bail so the vtable slot holds
+    // the override fn directly (the slot is an opaque `ptr`; the virtual call
+    // site substitutes `T` and types the call on its own).
+    bool anyWidened = false;
+    for (bool w : widened)
+        if (w) { anyWidened = true; break; }
+    if (!anyWidened) return nullptr;
     auto cacheIt = vtableWideningThunks_.find(leafMs);
     if (cacheIt != vtableWideningThunks_.end()) return cacheIt->second;
 
