@@ -17,14 +17,15 @@
 //
 // runJit returns the FULL int from Main() (not 8-bit wrapped); values ≤ 255.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -114,7 +115,7 @@ BEZEL_TEST(virtual_overload_inherited_1090, three_level_hierarchy) {
 // A call matching NO overload across the hierarchy is still rejected (the
 // arity check must not be silently skipped just because the name is overloaded).
 BEZEL_TEST(virtual_overload_inherited_1090, no_matching_overload_rejected) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class Base "
         "  public virtual method F(x: int): int => x; "
