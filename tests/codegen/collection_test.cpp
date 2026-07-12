@@ -1,14 +1,15 @@
 // Codegen slice §3 stdlib — Array<T>, Dictionary<K,V>, Stack<T>, Queue<T>,
 // LINQ basics (Any/All/Where/Count/ForEach/Sum/Min/Max/First/Select).
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace

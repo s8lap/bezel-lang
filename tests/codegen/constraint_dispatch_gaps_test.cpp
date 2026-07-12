@@ -33,14 +33,15 @@
 //   (f) CONTROL: virtual method via class constraint still works → 99
 //   (g) CONTROL: record METHOD via constraint (702dede) still works → 7
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace

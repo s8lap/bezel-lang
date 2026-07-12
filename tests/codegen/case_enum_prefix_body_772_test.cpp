@@ -10,18 +10,19 @@
 // and the statement-position CaseStmt), and types a bare enum constant as its
 // enum so the arm common type (§20) resolves.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int runFull(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 bool rejected(const std::string& program) {
-    return !runJit(program).ran;  // a compile error → never runs
+    return !runAot(program).ran;  // a compile error → never runs
 }
 }  // namespace
 
