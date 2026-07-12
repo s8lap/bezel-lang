@@ -9,14 +9,15 @@
 // IS the pattern type or is not). A BOXED record/enum (an `Object`/interface
 // scrutinee — a pointer) remains a genuine runtime is-a (the §19.5 unbox case).
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
