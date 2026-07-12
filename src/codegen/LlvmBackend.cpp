@@ -1,14 +1,19 @@
 #include "codegen/LlvmBackend.hpp"
 #include "codegen/LlvmBackend_impl.hpp"
 
+#include "llvm/IR/Function.h"
 #include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Host.h"
+#include "llvm/Transforms/Instrumentation/AddressSanitizer.h"
 
 namespace bezel::codegen {
 
@@ -30,7 +35,7 @@ std::unique_ptr<llvm::Module> emitModule(const ast::SourceFile& src,
 }
 
 bool emitObjectFile(llvm::Module& module, const std::string& objectPath,
-                    std::string& error) {
+                    std::string& error, bool sanitizeAddress) {
     // #506: verify the module before any file I/O or codegen pass runs. A
     // malformed module must not produce a (broken) object file; the driver
     // interprets a false return as a codegen error and stops the pipeline
@@ -65,6 +70,48 @@ bool emitObjectFile(llvm::Module& module, const std::string& objectPath,
 
     module.setTargetTriple(triple);
     module.setDataLayout(tm->createDataLayout());
+
+    // JIT→AOT test-harness migration §2 (memory net): when requested, run LLVM's
+    // AddressSanitizerPass over the generated module so the emitted machine code
+    // carries shadow checks on its loads/stores. This closes the WS2 gap: an
+    // ASan-instrumented *runtime* + AOT link already catches allocator events
+    // (leaks via LSan, double-frees via the free() interceptor), but a
+    // use-after-free / out-of-bounds *read* performed by a *generated* load
+    // slips because no shadow check is inserted at bezelc's own loads. Guarded so
+    // the default AOT path is byte-identical: with sanitizeAddress==false this
+    // whole block is skipped and emission proceeds exactly as before.
+    //
+    // The linked executable must be built with `-fsanitize=address` so the ASan
+    // runtime (defining `__asan_report_*` / `asan.module_ctor`) is present; the
+    // driver's executable path adds that flag when this option is set.
+    if (sanitizeAddress) {
+        // (1) The AddressSanitizerPass only instruments functions carrying the
+        // `sanitize_address` fn-attr (Clang sets it under -fsanitize=address);
+        // tag every defined function bezelc emitted.
+        for (llvm::Function& fn : module)
+            if (!fn.isDeclaration())
+                fn.addFnAttr(llvm::Attribute::SanitizeAddress);
+
+        // (2) Run the module-level AddressSanitizerPass via the new PassManager.
+        // In LLVM's new PM (14+) a single module pass, AddressSanitizerPass,
+        // subsumes the old split of ModuleAddressSanitizer + the per-function
+        // AddressSanitizer legacy passes: it inserts `asan.module_ctor`/globals
+        // instrumentation at module scope and the per-function load/store shadow
+        // checks in one run over the module.
+        llvm::LoopAnalysisManager lam;
+        llvm::FunctionAnalysisManager fam;
+        llvm::CGSCCAnalysisManager cgam;
+        llvm::ModuleAnalysisManager mam;
+        llvm::PassBuilder pb(tm.get());
+        pb.registerModuleAnalyses(mam);
+        pb.registerCGSCCAnalyses(cgam);
+        pb.registerFunctionAnalyses(fam);
+        pb.registerLoopAnalyses(lam);
+        pb.crossRegisterProxies(lam, fam, cgam, mam);
+        llvm::ModulePassManager mpm;
+        mpm.addPass(llvm::AddressSanitizerPass(llvm::AddressSanitizerOptions{}));
+        mpm.run(module, mam);
+    }
 
     std::error_code ec;
     llvm::raw_fd_ostream os(objectPath, ec, llvm::sys::fs::OF_None);

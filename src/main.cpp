@@ -17,7 +17,8 @@ constexpr const char* kVersion =
 
 void printUsage(std::ostream& out) {
     out << "usage: bezelc [--version] [--help] [-c] [-o <output>] "
-           "[--import <artifact>]... [--checked-disposal] <source-file>\n"
+           "[--import <artifact>]... [--checked-disposal] "
+           "[--sanitize=address] <source-file>\n"
            "  -c                 compile to a native object (a library, §2.4) "
            "with embedded\n"
            "                     interface metadata; do not link, no `Main` "
@@ -30,7 +31,16 @@ void printUsage(std::ostream& out) {
            "  --checked-disposal enable checked disposal mode (§28.2): "
            "member access on a\n"
            "                     disposed instance raises DisposedAccess"
-           "Exception (§31.4)\n";
+           "Exception (§31.4)\n"
+           "  --sanitize=address instrument the GENERATED code with LLVM "
+           "AddressSanitizer and\n"
+           "                     link the executable against the ASan runtime, "
+           "so a\n"
+           "                     use-after-free / out-of-bounds read in emitted "
+           "code is\n"
+           "                     caught at the access (JIT→AOT memory net); "
+           "executable\n"
+           "                     builds only (not -c)\n";
 }
 
 // Default executable name from the source path: drop the directory and the
@@ -94,6 +104,20 @@ int main(int argc, char** argv) {
             codegenOpts.checkedDisposal = true;
             continue;
         }
+        if (arg == "--sanitize=address") {
+            // JIT→AOT test-harness migration §2 (memory net): run LLVM's
+            // AddressSanitizerPass over the generated module and link the
+            // executable against the ASan runtime, so a use-after-free /
+            // out-of-bounds read in the emitted code is caught at the access.
+            codegenOpts.sanitizeAddress = true;
+            continue;
+        }
+        if (arg.rfind("--sanitize=", 0) == 0) {
+            std::cerr << "bezelc: error: unsupported sanitizer '"
+                      << arg.substr(std::string("--sanitize=").size())
+                      << "' (only 'address' is supported)\n";
+            return 2;
+        }
         if (arg == "--import") {
             if (i + 1 >= args.size()) {
                 std::cerr << "bezelc: error: --import requires an argument\n";
@@ -120,6 +144,16 @@ int main(int argc, char** argv) {
 
     if (inputPath.empty()) {
         printUsage(std::cerr);
+        return 2;
+    }
+    // --sanitize=address instruments the emitted code AND relies on the
+    // executable being linked with `-fsanitize=address` (the executable path
+    // does this). The `-c` library-object path performs no link, so the flag is
+    // not wired there; reject the combination rather than silently ignoring it.
+    if (compileObjectOnly && codegenOpts.sanitizeAddress) {
+        std::cerr << "bezelc: error: --sanitize=address applies to the "
+                     "executable build; it is not supported with -c "
+                     "(library object)\n";
         return 2;
     }
     if (outputPath.empty()) outputPath = defaultOutput(inputPath);

@@ -51,11 +51,20 @@ bool readFile(const std::string& path, std::string& out) {
 // importer's object references as externals (issue #328 inc 3).
 bool linkExecutable(const std::string& objectPath,
                     const std::string& exePath,
-                    const std::vector<std::string>& extraObjects = {}) {
+                    const std::vector<std::string>& extraObjects = {},
+                    bool sanitizeAddress = false) {
     // Link with libc, libm, libpthread, and the Bezel runtime library.
     std::string cmd = "clang " + objectPath;
     for (const std::string& obj : extraObjects) cmd += " " + obj;
     cmd += " -o " + exePath + " -lm -lpthread";
+    if (sanitizeAddress) {
+        // JIT→AOT test-harness migration §2 (memory net): link the ASan runtime
+        // (defines __asan_report_* / asan.module_ctor referenced by the
+        // AddressSanitizer-instrumented object) and keep debug info so reports
+        // symbolise to source locations. Only added when the object was emitted
+        // with --sanitize=address; the default link line is unchanged.
+        cmd += " -fsanitize=address -g";
+    }
 #ifdef BEZEL_RUNTIME_LIB_PATH
     // Static-link the Bezel runtime (path injected at compile time by CMake).
     cmd += " ";
@@ -180,7 +189,8 @@ CompileResult Driver::compileFile(const std::string& path,
             }
             std::string objectPath = outputPath + ".o";
             std::string err;
-            if (!module || !codegen::emitObjectFile(*module, objectPath, err)) {
+            if (!module || !codegen::emitObjectFile(*module, objectPath, err,
+                                                    opts.sanitizeAddress)) {
                 // Print any diagnostics recorded during codegen (e.g. "not yet
                 // implemented") before reporting the codegen failure (#628 pt 1).
                 for (const Diagnostic& diag : diagnostics.diagnostics()) {
@@ -200,7 +210,8 @@ CompileResult Driver::compileFile(const std::string& path,
             for (const Dependency& dep : deps)
                 if (!dep.objectPath.empty())
                     depObjects.push_back(dep.objectPath);
-            if (!linkExecutable(objectPath, outputPath, depObjects)) {
+            if (!linkExecutable(objectPath, outputPath, depObjects,
+                                opts.sanitizeAddress)) {
                 std::cerr << "bezelc: link error\n";
                 std::remove(objectPath.c_str());
                 return CompileResult{false, diagnostics.errorCount() + 1};

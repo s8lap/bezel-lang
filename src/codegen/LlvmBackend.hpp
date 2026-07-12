@@ -52,6 +52,19 @@ struct CodegenOptions {
     // always JIT-execute their snippet as if it were the main module). The
     // driver's library (`-c`) path explicitly sets this false.
     bool isMainModule = true;
+
+    // JIT→AOT test-harness migration §2 (memory net): when true, bezelc runs
+    // LLVM's AddressSanitizerPass over the generated module in emitObjectFile,
+    // so the *generated Bezel code* — not just the C++ runtime — is ASan-
+    // instrumented. This closes the WS2 gap where use-after-free / out-of-bounds
+    // *reads* performed by generated loads slip (allocator events — leaks,
+    // double-frees — are already caught by an ASan-instrumented runtime + the
+    // AOT link). Default false = byte-identical AOT path: no ASan pass, no
+    // instrumentation. The executable this option's build produces must be
+    // linked with `-fsanitize=address` (the driver's executable path does so
+    // when set) so the ASan runtime that defines `__asan_report_*` /
+    // `asan.module_ctor` is present.
+    bool sanitizeAddress = false;
 };
 
 // Build an LLVM module for `src` (already checked, using `ctx`'s side tables),
@@ -65,8 +78,14 @@ std::unique_ptr<llvm::Module> emitModule(const ast::SourceFile& src,
 // Emit `module` as a native object file at `objectPath` (host target).
 // Returns true on success; on failure returns false and sets `error`.
 // Initializes the native target on first use.
+//
+// When `sanitizeAddress` is true, LLVM's AddressSanitizerPass is run over the
+// module (and every defined function tagged `sanitize_address`) before object
+// emission, so the emitted machine code carries shadow checks on its
+// loads/stores (JIT→AOT migration §2 memory net). Default false leaves the AOT
+// path byte-identical — no pass, no instrumentation.
 bool emitObjectFile(llvm::Module& module, const std::string& objectPath,
-                    std::string& error);
+                    std::string& error, bool sanitizeAddress = false);
 
 }  // namespace bezel::codegen
 
