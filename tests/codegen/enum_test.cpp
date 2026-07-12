@@ -3,15 +3,16 @@
 // else previous + 1 from 0). Enum-typed locals are integers, and enum
 // equality is an integer comparison. Observable via the int exit code.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& enumDecl, const std::string& body) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; " + enumDecl +
         " class C public static method Main(): int " + body +
         " end Main; end C;");
@@ -76,7 +77,7 @@ BEZEL_TEST(codegen_cg30_iface, enum_via_interface_returns_value) {
     // Dispatch through ICode-typed parameter must yield the enum's i32 value.
     // This is the primary #435 repro: before the fix the IR verifier rejects
     // the module (GEP on i32 base) and the program exits with garbage / 0.
-    BEZEL_EXPECT_EQ(runJit(
+    BEZEL_EXPECT_EQ(runAot(
         "module M; "
         "interface ICode method Code(): int; end ICode; "
         "enum Color : ICode "
@@ -94,7 +95,7 @@ BEZEL_TEST(codegen_cg30_iface, enum_via_interface_returns_value) {
 BEZEL_TEST(codegen_cg30_iface, enum_via_interface_two_constants) {
     // §10 / §13 / #435: dispatch through the interface for two different
     // enum constants must return their respective underlying values.
-    BEZEL_EXPECT_EQ(runJit(
+    BEZEL_EXPECT_EQ(runAot(
         "module M; "
         "interface ICode method Code(): int; end ICode; "
         "enum Color : ICode "
@@ -113,7 +114,7 @@ BEZEL_TEST(codegen_cg30_iface, enum_via_interface_two_constants) {
 BEZEL_TEST(codegen_cg30_iface, enum_via_interface_with_extra_arg) {
     // §10 / §13 / #435: the thunk must forward extra arguments past `this`
     // unchanged.  Method takes an int `n` and returns int(this) + n.
-    BEZEL_EXPECT_EQ(runJit(
+    BEZEL_EXPECT_EQ(runAot(
         "module M; "
         "interface IAdder method Add(n: int): int; end IAdder; "
         "enum E : IAdder "
@@ -132,7 +133,7 @@ BEZEL_TEST(codegen_cg30_iface, record_interface_box_thunk_regression) {
     // §8.6 / §9.6 / §13: REGRESSION — record box thunk must be unaffected
     // by the enum fix.  Rect : IArea; dispatch via IArea must still reach
     // the record's method with the correct field values.
-    BEZEL_EXPECT_EQ(runJit(
+    BEZEL_EXPECT_EQ(runAot(
         "module M; "
         "interface IArea method Area(): int; end IArea; "
         "record Rect(w: int, h: int): IArea "
