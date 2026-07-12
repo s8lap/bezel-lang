@@ -3193,8 +3193,14 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         std::vector<llvm::Type*> argTys;
         for (auto* v : args) argTys.push_back(v->getType());
         auto* fnTy = llvm::FunctionType::get(retTy, argTys, false);
-        llvm::Value* result = builder_.CreateCall(fnTy, fnPtr, args,
-                                                  "iife.ret");
+        // §27.2 / #678 (IIFE void body): a void-returning call must NOT carry a
+        // result name — `%name = call void …` is malformed IR ("Instruction has
+        // a name, but provides a void value!"). The ORC JIT skips verifyModule
+        // and masked this; the AOT path (which verifies) rejected it. Name the
+        // result only when non-void (mirrors the unnamed CreateCall on the
+        // var-stored closure-call path above).
+        llvm::Value* result = builder_.CreateCall(
+            fnTy, fnPtr, args, retTy->isVoidTy() ? "" : "iife.ret");
         // #422 / §28.9: release the transient closure after the call.
         emitClosureRelease(closureObj);
         return retTy->isVoidTy() ? nullptr : result;

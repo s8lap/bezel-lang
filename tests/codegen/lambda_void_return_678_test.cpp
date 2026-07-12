@@ -18,16 +18,22 @@
 //
 // Spec references: §27.2 (lambda expression body), §10 (enum), §27.5 (closure).
 
+#include "support/aot_support.hpp"   // runAot — AOT verifies the module (the JIT skips verifyModule)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+// Migrated JIT->AOT: the IIFE void-body case (iife_void_body_spec_27_2) emitted
+// `%iife.ret = call void …` — malformed IR that the ORC JIT accepted but the AOT
+// verifyModule rejected (fix in LlvmBackend_Calls2.cpp: name the closure-call
+// result only when non-void). Running the whole file through runAot pins the
+// fix: without it the IIFE test's compile is Rejected (ran==false).
+using bezel::test::runAot;
 using bezel::test::JitResult;
 
 namespace {
 
 int runProg(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -38,7 +44,7 @@ int runProg(const std::string& src) {
 // After fix: compiles and prints "hello"; exit 0 confirmed by test infra
 // (Console output is side-effectful; we verify it compiles/runs, rc=0).
 BEZEL_TEST(codegen_678_lambda_void, explicit_typed_param_void_body_spec_27_2) {
-    JitResult r = runJit(
+    JitResult r = runAot(
         "module M; class C "
         "  public static method Main() "
         "    var log := (msg: string) => Console.WriteLine(msg); "
@@ -52,7 +58,7 @@ BEZEL_TEST(codegen_678_lambda_void, explicit_typed_param_void_body_spec_27_2) {
 // §27.2 / #678: lambda with no params, void body.
 // `var f := () => Console.WriteLine(\"x\");` — compiles and runs.
 BEZEL_TEST(codegen_678_lambda_void, no_param_void_body_spec_27_2) {
-    JitResult r = runJit(
+    JitResult r = runAot(
         "module M; class C "
         "  public static method Main() "
         "    var f := () => Console.WriteLine(\"x\"); "
@@ -66,7 +72,7 @@ BEZEL_TEST(codegen_678_lambda_void, no_param_void_body_spec_27_2) {
 // §27.2 / #678: immediately-invoked void lambda.
 // `(() => Console.WriteLine(\"y\"))();` — compiles and runs.
 BEZEL_TEST(codegen_678_lambda_void, iife_void_body_spec_27_2) {
-    JitResult r = runJit(
+    JitResult r = runAot(
         "module M; class C "
         "  public static method Main() "
         "    (() => Console.WriteLine(\"y\"))(); "
@@ -121,7 +127,7 @@ BEZEL_TEST(codegen_678_lambda_void, regression_string_returning_lambda_spec_27_2
 // here as a cross-check that the fix's `lam.exprBody` guard is exact (only
 // applies to the expression-body path, never the block-body path).
 BEZEL_TEST(codegen_678_lambda_void, regression_block_body_void_lambda_spec_27_2) {
-    JitResult r = runJit(
+    JitResult r = runAot(
         "module M; class C "
         "  public static method Main() "
         "    var f := () => do Console.WriteLine(\"ok\"); end; "
