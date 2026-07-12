@@ -48,6 +48,24 @@
 // `bezelc --sanitize=address`, closing the WS2 gap. (LLVM 21 pass + system
 // clang 21 ASan runtime => matching ABI; verified E6.)
 //
+// QUALITY ROUND 2 (qr2) — three hardening items layered on round 1:
+//   * RUN-TIMEOUT TUNING (S4). The compiled-PROGRAM deadline defaults to 30s,
+//     deliberately LOWER than runJit's 60s: an AOT test program is a tiny native
+//     executable that runs in well under a millisecond, so the only thing the
+//     deadline bounds is a genuine hang. A tighter bound lets the shared 300s
+//     shard budget (run_parallel.sh) absorb more hangs before the shard is lost.
+//     The COMPILE deadline stays SEPARATE at 120s (linking legitimately takes
+//     seconds). BEZEL_AOT_TIMEOUT_SEC overrides.
+//   * STALE-WORKDIR REAPER (N1). WorkDir RAII cleans the mkdtemp dir on every
+//     normal path — including the compile/run child-timeout paths, where the
+//     PARENT survives the child SIGKILL and its dtor still runs. The leak this
+//     closes is the WHOLE PROCESS being killed (the 300s shard cap SIGKILL, or an
+//     OOM kill): the dtor never runs and the dir leaks. The first makeWorkDir()
+//     per process reaps aot* dirs older than 30 min — an age gate that never
+//     races a concurrently-running sibling shard's in-flight dir.
+//   * A COMMITTED crash-isolation regression test pins M1 (tests/support/
+//     aot_crash_isolation_test.cpp) via the BEZEL_AOT_TEST_CRASH_HOOK affordance.
+//
 // RETURN TYPE: both return `JitResult` (the runJit struct), so every downstream
 // `.ran` / `.exitCode` / `.diagnostics` call site is untouched (migration plan
 // §2; WS6 §3). The added `JitResult::stdoutText` carries the captured program
@@ -83,6 +101,7 @@
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -99,15 +118,25 @@ namespace fs = std::filesystem;
 // is RAM; a scratch object tree there thrashes the box) — /var/tmp is disk.
 inline std::string scratchBase() { return "/var/tmp/bezel-scratch/aot-harness"; }
 
-// Per-test wall-clock deadline for the compiled PROGRAM run (seconds); mirrors
-// codegen_support::jitTimeoutSec so a hung program cannot wedge the run.
+// Per-test wall-clock deadline for the compiled PROGRAM run (seconds) — a hung
+// program cannot wedge the run. qr1 S4: the default is 30s, deliberately LOWER
+// than runJit's 60s. An AOT test program is a tiny native executable that runs
+// in well under a millisecond; the deadline exists ONLY to bound a genuine hang
+// (infinite loop / deadlock). The shard budget is a hard ~300s cap
+// (run_parallel.sh BEZEL_SHARD_TIMEOUT) shared by every test in the shard, and
+// AOT is heavier per test (real clang link + native exec), so a shard absorbs
+// far fewer hangs than the JIT suite — at 60s each, ~4 hung programs exhaust the
+// budget and lose the whole shard; at 30s the same budget tolerates twice as
+// many, while still leaving 30s of slack for any legitimately slow program
+// (there are none at this scale). The COMPILE deadline is SEPARATE
+// (aotCompileTimeoutSec, 120s) because linking legitimately takes seconds.
 // BEZEL_AOT_TIMEOUT_SEC overrides; 0 disables the deadline.
 inline int aotTimeoutSec() {
     static const int v = [] {
         const char* e = std::getenv("BEZEL_AOT_TIMEOUT_SEC");
-        if (!e || *e == '\0') return 60;
+        if (!e || *e == '\0') return 30;
         int n = std::atoi(e);
-        return n >= 0 ? n : 60;
+        return n >= 0 ? n : 30;
     }();
     return v;
 }
@@ -231,6 +260,12 @@ inline int spawnCaptured(const std::vector<std::string>& argv,
                                  O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (outFd >= 0) ::dup2(outFd, STDOUT_FILENO);
         if (errFd >= 0) ::dup2(errFd, STDERR_FILENO);
+        // qr2 audit: close the ORIGINAL descriptors — they survive as fd 1/2 via
+        // dup2, and leaving them open would leak stray fds onto out/err into the
+        // exec'd program (which could observe or write them). Guard the
+        // errFd==outFd alias (same fd when errPath==outPath).
+        if (errFd > STDERR_FILENO && errFd != outFd) ::close(errFd);
+        if (outFd > STDERR_FILENO) ::close(outFd);
         std::vector<char*> cargv;
         cargv.reserve(argv.size() + 1);
         for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
@@ -242,18 +277,73 @@ inline int spawnCaptured(const std::vector<std::string>& argv,
     return reapWithDeadline(pid, timeoutSec, timedOut);
 }
 
+inline bool keepArtifacts() { return std::getenv("BEZEL_AOT_KEEP") != nullptr; }
+
+// Minimum age (seconds) before a leftover work dir is eligible for the boot-time
+// reaper (qr1 N1). Default 1800s (30 min): comfortably above the lifetime of any
+// single runAot call (compile deadline 120s + run deadline 30s ≈ 150s worst
+// case — a >10x margin) so the reaper can NEVER race a dir that a concurrent
+// shard is still using. run_parallel.sh launches ~16 shards, each its own
+// process, all starting together; each shard's reaper runs ONCE at its first
+// makeWorkDir() (≈ process start), when the only aot* dirs older than this
+// threshold are genuine leaks from a PRIOR run. BEZEL_AOT_REAP_AGE_SEC overrides
+// (lower only in a SERIAL run — a small value is unsafe under concurrent
+// shards); 0 disables the reaper.
+inline int reapAgeSec() {
+    static const int v = [] {
+        const char* e = std::getenv("BEZEL_AOT_REAP_AGE_SEC");
+        if (!e || *e == '\0') return 1800;
+        int n = std::atoi(e);
+        return n >= 0 ? n : 1800;
+    }();
+    return v;
+}
+
+// qr1 N1: reap STALE leftover work dirs once per process. WorkDir RAII cleans a
+// work dir on every NORMAL path — including the compile/run child-timeout paths,
+// where the PARENT survives the child's SIGKILL and its dtor still runs. The
+// leak this closes is the WHOLE PROCESS being killed: the outer
+// BEZEL_SHARD_TIMEOUT (300s) SIGKILLs a wedged shard, or the dev_heavy memory
+// cage OOM-kills it — the dtor never runs and the mkdtemp dir leaks under
+// scratchBase(). Over a 7,500-test migration these accumulate in /var/tmp. On
+// the first makeWorkDir() of each process we sweep aot* dirs older than
+// reapAgeSec(); the AGE GATE (see reapAgeSec) means only prior-run leaks are
+// reaped, never a sibling shard's in-flight dir.
+inline void reapStaleWorkDirs() {
+    static const bool once = [] {
+        const int ageSec = reapAgeSec();
+        if (ageSec <= 0 || keepArtifacts()) return true;  // disabled / keep mode
+        std::error_code ec;
+        const auto now = fs::file_time_type::clock::now();
+        const auto maxAge = std::chrono::seconds(ageSec);
+        for (fs::directory_iterator it(scratchBase(), ec), end;
+             !ec && it != end; it.increment(ec)) {
+            std::error_code ecEntry;
+            const fs::path& p = it->path();
+            // Only our own mkdtemp dirs ("aotXXXXXX"): never touch a sibling
+            // tool's scratch that may share the base directory.
+            if (p.filename().string().rfind("aot", 0) != 0) continue;
+            if (!fs::is_directory(p, ecEntry) || ecEntry) continue;
+            const auto mt = fs::last_write_time(p, ecEntry);
+            if (ecEntry) continue;
+            if (now - mt > maxAge) fs::remove_all(p, ecEntry);  // best-effort
+        }
+        return true;
+    }();
+    (void)once;
+}
+
 // A per-call working directory under scratchBase(). Empty string on failure.
 inline std::string makeWorkDir() {
     std::error_code ec;
     fs::create_directories(scratchBase(), ec);
+    reapStaleWorkDirs();  // qr1 N1: sweep prior-run leaks once per process.
     std::string tmpl = scratchBase() + "/aotXXXXXX";
     std::vector<char> tbuf(tmpl.begin(), tmpl.end());
     tbuf.push_back('\0');
     const char* dirp = ::mkdtemp(tbuf.data());
     return dirp ? std::string(dirp) : std::string{};
 }
-
-inline bool keepArtifacts() { return std::getenv("BEZEL_AOT_KEEP") != nullptr; }
 
 // RAII cleanup of a work dir (kept when BEZEL_AOT_KEEP is set, for debugging).
 struct WorkDir {
@@ -355,10 +445,19 @@ inline CompileStatus forkedCompile(const std::string& srcPath,
             ::dup2(fd, STDERR_FILENO);
             if (fd > STDERR_FILENO) ::close(fd);
         }
-        // Test-only fault injection for the E2 crash-isolation self-test (qr1);
-        // never set in normal runs. Proves a compiler crash in the child is
-        // isolated to ran=false without killing the parent test binary.
-        if (std::getenv("BEZEL_AOT_TEST_CRASH_HOOK")) ::raise(SIGSEGV);
+        // Test-only fault injection for the crash-isolation regression test
+        // (qr1 M1 / qr2 item 1; aot_crash_isolation_test.cpp); NEVER set in
+        // normal runs. Proves a compiler crash in the child is isolated to
+        // ran=false without killing the parent test binary. PR_SET_DUMPABLE=0
+        // suppresses the (COW-copied, potentially large) core dump — robust vs
+        // Fedora's systemd-coredump pipe, which ignores RLIMIT_CORE=0 — since the
+        // crash is expected, not something to capture. Reset the handler to
+        // default so the raise is fatal even if LLVM installed a crash handler.
+        if (std::getenv("BEZEL_AOT_TEST_CRASH_HOOK")) {
+            ::prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+            ::signal(SIGSEGV, SIG_DFL);
+            ::raise(SIGSEGV);
+        }
 
         Driver driver;
         CompileResult cc = driver.compileFile(srcPath, exePath, /*deps=*/{}, opts);
