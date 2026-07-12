@@ -326,3 +326,109 @@ BEZEL_TEST(sema_ctor_obs_2207, tick_observer_subscription_not_gated) {
         "end TickObserver;");
     BEZEL_EXPECT_FALSE(daHasError(r, "22.7"));
 }
+
+// ===========================================================================
+// fix #1753 — terminated-branch exclusion for FIELD definite-assignment
+// (§22.7's observation gate). A branch that provably diverges (throw/return)
+// reaches no join, so it must NOT shrink the intersection of assigned fields:
+// after `if ok then this.f := … else throw end`, `f` IS assigned on every
+// REACHING path and an observation past the `if` must be admitted. Before the
+// fix the throwing branch (which assigned no field) was intersected in and the
+// observation was over-rejected — the field analog of #1753's local case, and
+// one of #1679's two known over-rejections. The exclusion must not
+// under-reject: a LIVE branch that assigns no field still shrinks the
+// intersection and the observation must still be gated.
+// ===========================================================================
+
+// ACCEPT — the else branch `throw`s, so `_name` is assigned on every reaching
+// path before `Describe()`. Over-rejected before the fix.
+BEZEL_TEST(sema_ctor_obs_2207, field_assigned_else_throws_observation_admitted_1753) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "sealed class W "
+        "  private _name: string; "
+        "  public constructor(b: bool) "
+        "    if b then _name := \"a\"; else throw new Exception(); end; "
+        "    Describe(); "
+        "  end constructor; "
+        "  public method Describe() end Describe; "
+        "end W;");
+    BEZEL_EXPECT_FALSE(daHasError(r, "before non-nullable field"));
+}
+
+// ACCEPT — the else branch `return`s (a constructor early-return is a normal
+// diverging exit); `_name` is assigned on every reaching path before Describe().
+BEZEL_TEST(sema_ctor_obs_2207, field_assigned_else_returns_observation_admitted_1753) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "sealed class W "
+        "  private _name: string; "
+        "  public constructor(b: bool) "
+        "    if b then _name := \"a\"; else return; end; "
+        "    Describe(); "
+        "  end constructor; "
+        "  public method Describe() end Describe; "
+        "end W;");
+    BEZEL_EXPECT_FALSE(daHasError(r, "before non-nullable field"));
+}
+
+// REJECT — under-reject guard: the else branch is LIVE (falls through) and
+// assigns no field, so `_name` is NOT assigned on every reaching path; the
+// observation must still be gated. The terminated-branch exclusion must not
+// swallow this.
+BEZEL_TEST(sema_ctor_obs_2207, field_else_live_without_assign_still_rejected_1753) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "sealed class W "
+        "  private _name: string; "
+        "  public constructor(b: bool) "
+        "    if b then _name := \"a\"; else _ := b; end; "
+        "    Describe(); "
+        "    _name := \"z\"; "
+        "  end constructor; "
+        "  public method Describe() end Describe; "
+        "end W;");
+    BEZEL_EXPECT_TRUE(daHasError(r, "before non-nullable field"));
+}
+
+// ACCEPT — the terminated-branch exclusion threaded through a statement-position
+// `case` (fix #1681 + #1753 together): the `1` arm `throw`s (excluded), the `_`
+// arm assigns `_name`, so on every reaching path `_name` is assigned before the
+// observation. Before the fix the case was an inert no-op AND the throwing arm
+// would have shrunk the field intersection.
+BEZEL_TEST(sema_ctor_obs_2207, field_assigned_case_throwing_arm_excluded_admitted_1753) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "sealed class W "
+        "  private _name: string; "
+        "  public constructor(n: int) "
+        "    case n of "
+        "      1 => do throw new Exception(); end, "
+        "      _ => do _name := \"a\"; end "
+        "    end; "
+        "    Describe(); "
+        "  end constructor; "
+        "  public method Describe() end Describe; "
+        "end W;");
+    BEZEL_EXPECT_FALSE(daHasError(r, "before non-nullable field"));
+}
+
+// REJECT — under-reject guard for the `case` field join: a LIVE arm assigns no
+// field, so the observation past the case must still be gated.
+BEZEL_TEST(sema_ctor_obs_2207, field_case_live_arm_without_assign_still_rejected_1753) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "sealed class W "
+        "  private _name: string; "
+        "  public constructor(n: int) "
+        "    case n of "
+        "      1 => do _ := n; end, "
+        "      _ => do _name := \"a\"; end "
+        "    end; "
+        "    Describe(); "
+        "    _name := \"z\"; "
+        "  end constructor; "
+        "  public method Describe() end Describe; "
+        "end W;");
+    BEZEL_EXPECT_TRUE(daHasError(r, "before non-nullable field"));
+}

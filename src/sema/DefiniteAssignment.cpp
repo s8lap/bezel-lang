@@ -96,6 +96,68 @@ bool propIsVirtualFamily(const PropertySymbol& ps) {
     return false;
 }
 
+// §19.3/§19.6: an unguarded `_` (DiscardPattern) or unconstrained `var x`
+// (BindingPattern with no type annotation, no `when` guard) matches any value —
+// a trivial catch-all arm. Duplicated here rather than reused because
+// ExprTypecheck.cpp's identically-named helper has internal (anonymous-
+// namespace) linkage in that translation unit. Deliberately narrow — it
+// recognizes only the two syntactic forms the spec calls out, not a full
+// enum/bool coverage proof — so the CaseStmt join below stays conservative: a
+// case lacking this explicit catch-all always carries a live no-match fall-
+// through path (§19.6), never accidentally exhaustive. fix #1681
+bool caseArmIsUnguardedCatchAll(const ast::CaseArm& arm) {
+    if (arm.guard) return false;
+    const ast::Pattern* p = arm.pattern.get();
+    if (dynamic_cast<const ast::DiscardPattern*>(p)) return true;
+    if (auto* bp = dynamic_cast<const ast::BindingPattern*>(p))
+        return bp->type == nullptr;
+    return false;
+}
+
+// fix #1753 / §17.x, §22.3, §22.7: join the per-branch definitely-assigned
+// sets of an if/try/case, intersecting *only* the branches that do NOT provably
+// diverge (throw/return). A branch flagged `terminated[i]` reaches no path to
+// the join point, so — per "definitely assigned on every REACHING path" — it
+// must contribute nothing to the join; including it wrongly shrinks the
+// intersection and over-rejects (`if c then x:=1 else return end; _:=x`, or the
+// field analog before a `this`-observation). A branch that falls through is
+// still intersected, so a genuinely-unassigned read on some live path is still
+// caught (no under-reject). If *every* branch diverges the join is unreachable;
+// fall back to the whole-branch intersection (prior behavior) so no dead-code
+// read that previously passed regresses — soundness is unaffected there because
+// no reachable path observes the result. `entry` is used only for the
+// degenerate no-branch case.
+std::unordered_set<std::string_view> joinLiveBranches(
+    const std::vector<std::unordered_set<std::string_view>>& outs,
+    const std::vector<bool>& terminated,
+    const std::unordered_set<std::string_view>& entry) {
+    std::unordered_set<std::string_view> result;
+    bool any = false;
+    for (std::size_t i = 0; i < outs.size(); ++i) {
+        if (i < terminated.size() && terminated[i]) continue;  // diverging arm
+        if (!any) {
+            result = outs[i];
+            any = true;
+        } else {
+            std::unordered_set<std::string_view> tmp;
+            for (auto n : result)
+                if (outs[i].count(n)) tmp.insert(n);
+            result = std::move(tmp);
+        }
+    }
+    if (any) return result;
+    if (outs.empty()) return entry;
+    // All branches diverge → unreachable join; preserve prior full intersection.
+    result = outs.front();
+    for (std::size_t i = 1; i < outs.size(); ++i) {
+        std::unordered_set<std::string_view> tmp;
+        for (auto n : result)
+            if (outs[i].count(n)) tmp.insert(n);
+        result = std::move(tmp);
+    }
+    return result;
+}
+
 // Per-method walker. The state is the set of locally-declared names
 // that have been definitely assigned at the current program point.
 // Names enter the set when:
@@ -481,6 +543,7 @@ private:
             // set — the path on which a short-circuited call never ran.
             bool entryTerminated = terminated_;
             terminated_ = false;
+            auto entryAssigned = assigned_;  // fix #1753 join fallback
             CondState c0 = ifs->ifBranch.condition
                                ? evalCond(*ifs->ifBranch.condition)
                                : CondState{assigned_, assigned_};
@@ -543,27 +606,17 @@ private:
                 fieldOuts.push_back(fieldEntry); // no-else: guard-false path assigns no field
                 branchTerminated.push_back(false);     // no-else = path live
             }
-            // Intersect assigned sets.
-            auto out = branchOuts.front();
-            for (std::size_t i = 1; i < branchOuts.size(); ++i) {
-                std::unordered_set<std::string_view> tmp;
-                for (auto n : out) {
-                    if (branchOuts[i].count(n)) tmp.insert(n);
-                }
-                out = std::move(tmp);
-            }
-            assigned_ = std::move(out);
-            // Intersect field-assignment sets (§22.7).
-            auto fieldOut = fieldOuts.front();
-            for (std::size_t i = 1; i < fieldOuts.size(); ++i) {
-                std::unordered_set<std::string_view> tmp;
-                for (auto n : fieldOut) {
-                    if (fieldOuts[i].count(n)) tmp.insert(n);
-                }
-                fieldOut = std::move(tmp);
-            }
-            assignedFields_ = std::move(fieldOut);
-            // Intersect consumedLazy_ sets (#1226).
+            // Intersect assigned / field sets over the LIVE branches only —
+            // a branch that provably diverges (throw/return) reaches no join
+            // and must not shrink the intersection (fix #1753, §17.x/§22.7).
+            assigned_ =
+                joinLiveBranches(branchOuts, branchTerminated, entryAssigned);
+            // Intersect field-assignment sets (§22.7), same live-branch join.
+            assignedFields_ =
+                joinLiveBranches(fieldOuts, branchTerminated, fieldEntry);
+            // Intersect consumedLazy_ sets (#1226). Kept as a whole-branch
+            // intersection: lazy single-consumption (#1226) is a distinct
+            // obligation from definite-assignment and out of this fix's scope.
             auto consumedOut = consumedLazyOuts.front();
             for (std::size_t i = 1; i < consumedLazyOuts.size(); ++i) {
                 std::unordered_set<std::string_view> tmp;
@@ -695,26 +748,17 @@ private:
                 fieldOuts.push_back(std::move(assignedFields_));
                 armTerminated.push_back(terminated_);
             }
-            auto post = outs.front();
-            for (std::size_t i = 1; i < outs.size(); ++i) {
-                std::unordered_set<std::string_view> tmp;
-                for (auto n : post) {
-                    if (outs[i].count(n)) tmp.insert(n);
-                }
-                post = std::move(tmp);
-            }
-            assigned_ = std::move(post);
-            // Intersect field-assignment sets (§22.7).
-            auto fieldPost = fieldOuts.front();
-            for (std::size_t i = 1; i < fieldOuts.size(); ++i) {
-                std::unordered_set<std::string_view> tmp;
-                for (auto n : fieldPost) {
-                    if (fieldOuts[i].count(n)) tmp.insert(n);
-                }
-                fieldPost = std::move(tmp);
-            }
-            assignedFields_ = std::move(fieldPost);
-            // Intersect consumedLazy_ sets (#1226).
+            // Intersect assigned / field sets over the LIVE arms only — the
+            // try-body-completed path or a catch arm that provably diverges
+            // (throw/return) reaches no post-try join, so it must not shrink
+            // the intersection (fix #1753, §17.x/§22.7).
+            assigned_ = joinLiveBranches(outs, armTerminated, entry);
+            // Intersect field-assignment sets (§22.7), same live-arm join.
+            assignedFields_ =
+                joinLiveBranches(fieldOuts, armTerminated, fieldEntry);
+            // Intersect consumedLazy_ sets (#1226). Kept as a whole-arm
+            // intersection: lazy single-consumption is a distinct obligation
+            // from definite-assignment, out of this fix's scope.
             auto consumedPost = consumedLazyOuts.front();
             for (std::size_t i = 1; i < consumedLazyOuts.size(); ++i) {
                 std::unordered_set<std::string_view> tmp;
@@ -733,6 +777,97 @@ private:
             for (const auto& bs : ts->finallyBody) {
                 if (bs) visitStmt(*bs);
             }
+            return;
+        }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+            // §19 / §22.3 / §22.7 (fix #1681, rebased onto #1679's field-DA):
+            // a statement-position `case` is a branching construct exactly
+            // like `if`/`try` above — each arm is a mutually exclusive path
+            // from the pre-case state, joined afterward by intersecting the
+            // assigned sets (local AND field, §22.7) over the LIVE arms
+            // (fix #1753). This construct was previously entirely unvisited
+            // here (no dynamic_cast branch existed), so every statement inside
+            // a case arm — `return`s, `out`-param assignments, and
+            // `this.f := ...` field assignments — was invisible to
+            // definite-assignment: an exhaustively-assigning case body was
+            // wrongly REJECTED (the fall-off / observation check fired since
+            // no arm's assignment was ever recorded), and a `return` in one
+            // arm that never assigned an `out` param (or a field before a
+            // `this`-observation) was wrongly ACCEPTED whenever an assignment
+            // before/after the case masked the gap.
+            //
+            // §19.6: a statement-position case with no provable catch-all arm
+            // has an implicit "no match" path that "falls through with no
+            // action" — a live branch carrying the entry state unchanged,
+            // joined in below exactly like `if`'s no-else branch.
+            if (cs->scrutinee) visitExpr(*cs->scrutinee);
+            bool entryTerminated = terminated_;
+            auto entryAssigned = assigned_;
+            auto entryConsumedLazy = consumedLazy_;
+            auto fieldEntry = assignedFields_;
+            std::vector<std::unordered_set<std::string_view>> armOuts;
+            std::vector<std::unordered_set<std::string_view>> armConsumedLazyOuts;
+            std::vector<std::unordered_set<std::string_view>> armFieldOuts;
+            std::vector<bool> armTerminated;
+            bool hasCatchAll = false;
+            for (const auto& arm : cs->arms) {
+                assigned_ = entryAssigned;
+                consumedLazy_ = entryConsumedLazy;
+                assignedFields_ = fieldEntry;
+                terminated_ = false;
+                // Pattern bindings (`var t`) are non-destructive fresh names
+                // (§19 pattern binding), always definitely assigned within the
+                // arm by construction, so they are intentionally not added to
+                // declared_/assigned_ here (a read simply passes checkRead's
+                // declared_ gate silently, same as a field or outer local;
+                // §19.3).
+                if (arm.guard) visitExpr(*arm.guard);
+                if (caseArmIsUnguardedCatchAll(arm)) hasCatchAll = true;
+                if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
+                    if (arm.exprBody) visitExpr(*arm.exprBody);
+                } else {
+                    for (const auto& bs : arm.stmts) {
+                        if (bs) visitStmt(*bs);
+                    }
+                }
+                armOuts.push_back(std::move(assigned_));
+                armConsumedLazyOuts.push_back(std::move(consumedLazy_));
+                armFieldOuts.push_back(std::move(assignedFields_));
+                armTerminated.push_back(terminated_);
+            }
+            if (!hasCatchAll) {
+                // §19.6 implicit no-match fall-through: a live path that
+                // assigns nothing — carries the entry state unchanged.
+                armOuts.push_back(entryAssigned);
+                armConsumedLazyOuts.push_back(entryConsumedLazy);
+                armFieldOuts.push_back(fieldEntry);
+                armTerminated.push_back(false);
+            }
+            // Join over the LIVE arms only (fix #1753): a `return`/`throw` arm
+            // reaches no post-case join, so it must not shrink the local- or
+            // field-DA intersection. consumedLazy_ stays a whole-arm
+            // intersection (lazy single-consumption is out of DA scope).
+            assigned_ = joinLiveBranches(armOuts, armTerminated, entryAssigned);
+            assignedFields_ =
+                joinLiveBranches(armFieldOuts, armTerminated, fieldEntry);
+            if (!armConsumedLazyOuts.empty()) {
+                auto consumedOut = armConsumedLazyOuts.front();
+                for (std::size_t i = 1; i < armConsumedLazyOuts.size(); ++i) {
+                    std::unordered_set<std::string_view> tmp;
+                    for (auto n : consumedOut) {
+                        if (armConsumedLazyOuts[i].count(n)) tmp.insert(n);
+                    }
+                    consumedOut = std::move(tmp);
+                }
+                consumedLazy_ = std::move(consumedOut);
+            } else {
+                consumedLazy_ = std::move(entryConsumedLazy);
+            }
+            bool allTerminated = true;
+            for (bool t : armTerminated) {
+                if (!t) { allTerminated = false; break; }
+            }
+            terminated_ = entryTerminated || allTerminated;
             return;
         }
         if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {

@@ -386,3 +386,204 @@ BEZEL_TEST(sema_da,
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(mentionsUnassignedRead(r));
 }
+
+// -----------------------------------------------------------------------------
+// fix #1681 / §22.3, §19 (v0.184): out-param definite-assignment inside a
+// statement-position `case` (§19). Before the fix DefiniteAssignment.cpp had no
+// visitor branch for ast::CaseStmt at all — the walker treated the whole
+// construct as an inert no-op, so every statement inside a case arm (including
+// `return`s and out-param assignments) was invisible to DA. That simultaneously
+// (a) wrongly ACCEPTED a `return` inside one arm that never assigned the
+// out-param whenever some other statement before/after the case satisfied the
+// method's fall-off check, and (b) wrongly REJECTED an exhaustively-assigning
+// case body (the fall-off check fired unconditionally, since assigned_ never
+// picked up any arm's assignment).
+// -----------------------------------------------------------------------------
+
+// (a) REJECT — the exact under-reject #1681 reports: the `1` arm returns without
+// assigning `result`; a later ordinary statement re-assigns it before the
+// method's final `return`, which is what let this compile cleanly before the
+// fix (the old fall-off-only check saw `result` assigned by then and never
+// looked inside the case arms). Every arm's own return path must independently
+// satisfy §22.3.
+BEZEL_TEST(sema_da, case_arm_return_without_out_assign_rejected_spec_22_3_1681) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method TryFoo(n: int, out result: int): bool "
+        "    case n of "
+        "      1 => do return true; end, "
+        "      _ => do result := 5; return false; end "
+        "    end; "
+        "    result := 99; "
+        "    return true; "
+        "  end TryFoo; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// (b) ACCEPT — positive control: every case arm assigns `result` before its own
+// return, and the case is exhaustive (an unguarded `_` catch-all, §19.6).
+BEZEL_TEST(sema_da, case_all_arms_assign_out_before_return_accepted_spec_22_3_1681) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method TryFoo(n: int, out result: int): bool "
+        "    case n of "
+        "      1 => do result := 1; return true; end, "
+        "      2 => do result := -1; return false; end, "
+        "      _ => do result := 0; return false; end "
+        "    end; "
+        "  end TryFoo; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (c) REJECT — one arm of an otherwise-fully-assigning, exhaustive case never
+// assigns `result` on its own return path; the diagnostic must fire regardless
+// of what the other arms do.
+BEZEL_TEST(sema_da, case_one_arm_out_unassigned_rejected_spec_22_3_1681) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method TryFoo(n: int, out result: int): bool "
+        "    case n of "
+        "      1 => do result := 1; return true; end, "
+        "      2 => do return false; end, "
+        "      _ => do result := 0; return false; end "
+        "    end; "
+        "  end TryFoo; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// (d) ACCEPT — the simplest exhaustive shape: a single unguarded `_` arm that
+// assigns `result` before its own `return`.
+BEZEL_TEST(sema_da, case_single_wildcard_arm_assigns_out_accepted_spec_22_3_1681) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method GetIt(n: int, out result: int): bool "
+        "    case n of "
+        "      _ => do result := n; return true; end "
+        "    end; "
+        "  end GetIt; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (e) REJECT — §19.6: a case with no provable catch-all arm carries an implicit
+// "no match" fall-through path that assigns nothing to `result`; that live path
+// must also satisfy §22.3 even though the one declared arm assigns before its
+// own return.
+BEZEL_TEST(sema_da,
+           case_no_catchall_implicit_fallthrough_rejected_spec_19_6_22_3_1681) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method TryFoo(n: int, out result: int): bool "
+        "    case n of "
+        "      1 => do result := 1; return true; end "
+        "    end; "
+        "    return false; "
+        "  end TryFoo; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// -----------------------------------------------------------------------------
+// fix #1753 / §17.x, §22.3 (v0.184): the if/try/case JOIN must EXCLUDE branches
+// that provably diverge (throw/return) from the definite-assignment
+// intersection. A local assigned on every REACHING path is definitely assigned;
+// a branch that returns/throws reaches no join, so it must not shrink the
+// intersection. Before the fix, the terminated branch's (unassigned) state was
+// intersected in and a following read was wrongly reported unassigned. The
+// exclusion must NOT under-reject: a branch that FALLS THROUGH without assigning
+// still shrinks the intersection and must still be caught. Sibling of review-
+// filed #1752; closes #1753.
+// -----------------------------------------------------------------------------
+
+// ACCEPT — the else branch `return`s, so on every reaching path to `_ := x`, `x`
+// is assigned. Wrongly rejected before the fix.
+BEZEL_TEST(sema_da, if_else_returns_read_after_is_assigned_accepted_spec_17_1753) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method Pick(c: bool): int "
+        "    var x: int; "
+        "    if c then x := 1; else return 0; end; "
+        "    return x; "
+        "  end Pick; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ACCEPT — the else branch `throw`s (also a diverging exit); same reasoning.
+BEZEL_TEST(sema_da, if_else_throws_read_after_is_assigned_accepted_spec_17_1753) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method Pick(c: bool): int "
+        "    var x: int; "
+        "    if c then x := 1; else throw new Exception(); end; "
+        "    return x; "
+        "  end Pick; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// REJECT — under-reject guard: the else branch is LIVE (falls through) and does
+// NOT assign `x`, so `x` is not definitely assigned on that reaching path. The
+// terminated-branch exclusion must not swallow this genuine error.
+BEZEL_TEST(sema_da, if_else_live_without_assign_still_rejected_spec_17_1753) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method Pick(c: bool): int "
+        "    var x: int; "
+        "    if c then x := 1; else _ := c; end; "
+        "    return x; "
+        "  end Pick; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(mentionsUnassignedRead(r));
+}
+
+// ACCEPT — the terminated-branch exclusion in a `case` join: the `2` arm
+// `return`s (diverges, excluded), while both other live arms assign `x`, so `x`
+// is assigned on every reaching path after the case.
+BEZEL_TEST(sema_da, case_terminated_arm_excluded_read_after_accepted_spec_19_1753) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method Pick(n: int): int "
+        "    var x: int; "
+        "    case n of "
+        "      2 => do return 0; end, "
+        "      _ => do x := 1; end "
+        "    end; "
+        "    return x; "
+        "  end Pick; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// REJECT — under-reject guard for the `case` join: one arm falls through
+// without assigning `x` (it is NOT terminated), so `x` is not definitely
+// assigned after the case.
+BEZEL_TEST(sema_da, case_live_arm_without_assign_still_rejected_spec_19_1753) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "class C "
+        "  public static method Pick(n: int): int "
+        "    var x: int; "
+        "    case n of "
+        "      2 => do _ := n; end, "
+        "      _ => do x := 1; end "
+        "    end; "
+        "    return x; "
+        "  end Pick; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(mentionsUnassignedRead(r));
+}
