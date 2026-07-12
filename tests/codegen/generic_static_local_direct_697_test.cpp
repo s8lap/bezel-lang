@@ -28,20 +28,21 @@
 //   #684 — per-instantiation static state for IMPORTED generics.
 //   #696 — sema diagnostic for bare unqualified generic static access outside class.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 
 bezel::test::JitResult jit(const std::string& prog) {
-    return runJit(prog);
+    return runAot(prog);
 }
 
 // A generic class with a public static field, so the field can be directly
