@@ -14,19 +14,20 @@
 // element type are static for an inline array, and unit has exactly one
 // value, so no runtime array/receiver content is ever read.
 //
-// runJit executes and returns the program's exit code; these tests route
+// runAot executes and returns the program's exit code; these tests route
 // the rendered string back through the exit code as its LENGTH (or a
-// content comparison folded to 0/1) since JIT tests here compare integers,
+// content comparison folded to 0/1) since these tests compare integers,
 // mirroring the project's existing string-content-via-comparison pattern.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace

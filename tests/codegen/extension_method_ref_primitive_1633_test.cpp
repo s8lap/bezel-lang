@@ -33,20 +33,21 @@
 //    qualifier position as unbound (no local/parameter can be named `int`,
 //    a reserved word, so this qualifier shape is never a value).
 //
-// These tests JIT-run programs that take a type-qualified extension-method
+// These tests AOT-run programs that take a type-qualified extension-method
 // reference on a primitive and call it; without the fix they fail to compile
 // (-999).
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 // Run a whole module source and return Main's exit code, or a sentinel.
 int runMod(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 

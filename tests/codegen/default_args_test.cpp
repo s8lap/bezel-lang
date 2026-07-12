@@ -3,14 +3,15 @@
 // expression, evaluated at the call site. Observable via the int exit code.
 // (Named arguments, which reorder/skip, are a separate slice.)
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 } // namespace
@@ -188,7 +189,7 @@ BEZEL_TEST(codegen_cg45, default_value_type_default_arg_spec_22_5) {
 // message contains `needle` (and the program did not run).
 namespace {
 bool rejectedWith(const std::string& src, const std::string& needle) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     if (r.ran || !r.diagnostics.hasErrors()) return false;
     for (const auto& d : r.diagnostics.diagnostics())
         if (d.message.find(needle) != std::string::npos) return true;

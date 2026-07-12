@@ -7,11 +7,12 @@
 // THE FIX: spill only non-pointer AGGREGATE (record) receivers; a scalar
 // receiver (like an enum) is left unspilled. §26 extensions.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
-namespace { int run(const std::string& p){ auto r=runJit(p); return r.ran?r.exitCode:-999; } }
+using bezel::test::runAot;
+namespace { int run(const std::string& p){ auto r=runAot(p); return r.ran?r.exitCode:-999; } }
 
 // The verified repro: `extension int property IsZero => this = 0`.
 BEZEL_TEST(extension_property_primitive, int_bool_scalar_extension_properties) {

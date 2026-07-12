@@ -5,16 +5,17 @@
 // of raising.  The int64-target path (§5.2, fix #664) already used
 // getOVEVtable()+emitPendingCheck() correctly; the ≤32-bit path now mirrors it.
 //
-// Value tests — runJit returns the raw int (kept in 0..255).
+// Value tests — runAot returns the raw int (kept in 0..255).
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace

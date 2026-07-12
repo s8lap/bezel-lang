@@ -2,14 +2,15 @@
 // an `as` cast (§17.4). Both must be typed so the member resolves.
 // Observable via the int exit code.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int runProg(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 const char* kN = "module M; class N public V: int := 0; "
