@@ -2493,15 +2493,25 @@ void Resolver::checkAbstractImplementations() {
                 }
             }
         }
-        // #1685 / §11.2 (v0.184): "The same exact-match rule covers the
-        // `scoped` modifier, in both directions ... An implementation adding
-        // `scoped` to a parameter the interface declares plain would retain a
-        // callback ... that callers through the interface admitted under a
-        // call-bounded, non-retaining contract — a use-after-free shape. An
-        // implementation *dropping* the interface's `scoped` ... is rejected
-        // all the same: `scoped` is part of a function type's identity ...
-        // and never distinguishes overloads." Compared against the SAME
-        // concrete candidate codegen's `findInterfaceImpl`
+        // #1685 / §11.2 (v0.184), generalized by #1750: "A member matches an
+        // interface member when it ... has the same parameter modifiers
+        // (`ref`, `out`, `owned`, `scoped` — v0.184) ... Parameter modifiers
+        // must match exactly." #1685 only compared the `scoped` bit
+        // (`ip->modifier == "scoped"` on each side); an `owned`/`ref`/`out`
+        // mismatch that didn't ALSO involve `scoped` fell through both sides
+        // of that comparison as `false == false` and was silently accepted —
+        // e.g. interface `Make(owned x: T)` vs implementation `Make(x: T)`,
+        // an undischarged-ownership hazard the rationale calls out by name
+        // (§11.2 "`owned` in interface signatures": "Tightening from `T` to
+        // `owned T` in a parameter would create undischarged ownership").
+        // ParameterSymbol::modifier is a single mutually-exclusive spelling
+        // per parameter ("", "ref", "out", "out owned", "owned", "scoped" —
+        // see Parser_Decls.cpp param-modifier parsing), so a plain string
+        // compare covers every modifier axis in one shot, exactly mirroring
+        // checkOverrideSignatureMatch's `dp->modifier != bp->modifier`
+        // (§12.1) and checkStaticInterfaceConformance's `ip->modifier !=
+        // cp->modifier` (§11.8) for the instance/interface path. Compared
+        // against the SAME concrete candidate codegen's `findInterfaceImpl`
         // (LlvmBackend_impl.hpp) wires into the itable slot: most-derived
         // class first, first same-arity overload in declaration order.
         for (auto& [name, ifaceMethods] : ifaceMethodsByName) {
@@ -2534,29 +2544,56 @@ void Resolver::checkAbstractImplementations() {
                 if (!impl) impl = nameOnly;
                 if (!impl || impl->params.size() != im->params.size())
                     continue;  // missing/arity mismatch already reported above
+                auto describeModifier = [](std::string_view m) -> std::string {
+                    return m.empty() ? std::string("no modifier")
+                                      : ("`" + std::string(m) + "`");
+                };
                 for (std::size_t pi = 0; pi < im->params.size(); ++pi) {
                     auto* ip = dynamic_cast<ParameterSymbol*>(im->params[pi]);
                     auto* cp = dynamic_cast<ParameterSymbol*>(impl->params[pi]);
                     if (!ip || !cp) continue;
-                    bool ifaceScoped = ip->modifier == "scoped";
-                    bool implScoped = cp->modifier == "scoped";
-                    if (ifaceScoped == implScoped) continue;
+                    if (ip->modifier == cp->modifier) continue;
                     ctx_.diagnostics().report(
                         Severity::Error, impl->declLoc,
                         std::string("method `") + std::string(name) +
                         "` does not match interface member `" +
-                        std::string(name) + "`'s `scoped` modifier on "
-                        "parameter " + std::to_string(pi + 1) + " — " +
-                        (ifaceScoped
-                             ? std::string("the interface declares it "
-                                           "`scoped`; the implementation "
-                                           "must declare it `scoped` too")
-                             : std::string("the interface declares it "
-                                           "without `scoped`; the "
-                                           "implementation may not add "
-                                           "`scoped`")) +
-                        " (§11.2)");
+                        std::string(name) + "`'s parameter modifier on "
+                        "parameter " + std::to_string(pi + 1) +
+                        " — `ref`/`out`/`owned`/`scoped` must match exactly "
+                        "(§11.2): the interface declares it " +
+                        describeModifier(ip->modifier) +
+                        "; the implementation declares it " +
+                        describeModifier(cp->modifier) + " (§11.2)");
                     break;  // one diagnostic per member is enough
+                }
+                // §11.2 "owned in interface signatures": "an implementing
+                // method's signature and the interface method's signature
+                // must agree on ... `owned` on a return type." Loosening
+                // `OwningTask<T>`/`owned` off a return would leak ownership
+                // at the caller (§11.2 reason 1); tightening it on desyncs
+                // the itable caller's disposal contract the other direction.
+                // Compare the AST-level `returnOwned` bit the same way
+                // checkOverrideSignatureMatch does for `override`
+                // (`dDecl->returnOwned != bDecl->returnOwned`, §12.1).
+                auto* imDecl = dynamic_cast<const ast::MethodDecl*>(im->decl);
+                auto* implDecl =
+                    dynamic_cast<const ast::MethodDecl*>(impl->decl);
+                if (imDecl && implDecl &&
+                    imDecl->returnOwned != implDecl->returnOwned) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, impl->declLoc,
+                        std::string("method `") + std::string(name) +
+                        "` does not match interface member `" +
+                        std::string(name) + "`'s `owned` return modifier "
+                        "(§11.2): the interface declares the return type " +
+                        (imDecl->returnOwned
+                             ? std::string("`owned`")
+                             : std::string("without `owned`")) +
+                        "; the implementation declares it " +
+                        (implDecl->returnOwned
+                             ? std::string("`owned`")
+                             : std::string("without `owned`")) +
+                        " (§11.2)");
                 }
             }
         }
