@@ -1,0 +1,12 @@
+// Ported from tests/sema/definite_return_test.cpp
+//   (BEZEL_TEST sema_ret_path, if_return_then_trailing_return_ok).
+//
+// Clean-compile ACCEPT control: bezelc -c must exit zero and emit no diagnostics.
+//
+// RUN: %bezelc -c -o %t.o %s
+// RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
+
+module M; class C public method F(b: bool): int if b then return 1; end; return 2; end F; end C;
+
+// NODIAG-NOT: error
+// NODIAG-NOT: §
