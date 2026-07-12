@@ -90,7 +90,10 @@ if [ "$MODE" != "--quick" ]; then
     # timeout guards against a DEADLOCKED test (#1609 contention race) hanging the
     # serial binary forever; a hang leaves no clean summary -> treated as "did not
     # complete" -> retried, like a flaky crash.
-    timeout -k 30 900 "$DH" suite build/tests/bezel_tests >"$S/gate_serial.log" 2>&1 || true
+    # 1500s (was 900): the suite grew past ~11.7k tests and the fork-per-test serial
+    # run brushed 900s under producer-build contention (2026-07-12) -> spurious
+    # "did not complete" retries. 1500s clears it at moderate load.
+    timeout -k 30 1500 "$DH" suite build/tests/bezel_tests >"$S/gate_serial.log" 2>&1 || true
     if grep -qE '^\[ FAIL' "$S/gate_serial.log"; then
       echo "   serial FAILs (attempt $attempt):"; grep -E '^\[ FAIL' "$S/gate_serial.log"; fail "serial suite — assertion failure"
     fi
