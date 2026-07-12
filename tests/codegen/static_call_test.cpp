@@ -5,13 +5,14 @@
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
+#include "support/aot_support.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& members) {
-    auto r = runJit(std::string("module M; class C ") + members + " end C;");
+    auto r = runAot(std::string("module M; class C ") + members + " end C;");
     return r.ran ? r.exitCode : -999;
 }
 

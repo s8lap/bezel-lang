@@ -9,13 +9,14 @@
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
+#include "support/aot_support.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int runProg(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -144,7 +145,7 @@ BEZEL_TEST(codegen_cg40, expr_body_method_arith_returns) {
 // expr-body getter whose whole body is a throw. `ran` (compiled + JIT-executed
 // without crashing) is the assertion; the exit value is not pinned here.
 BEZEL_TEST(codegen_cg40, expr_body_property_getter_throw_no_compiler_crash) {
-    auto r = runJit(std::string(kE) +
+    auto r = runAot(std::string(kE) +
         "class C "
         "  public property Bad: int "
         "    get => throw new E(); "
