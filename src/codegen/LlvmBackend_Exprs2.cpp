@@ -1489,6 +1489,32 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                             v = wrapNullableValue(retSemaTy, v);
                     }
                 }
+                // fix #1697 / §22.6 (v0.184) "Lambda-literal arguments": a
+                // NON-nullable numeric widening at a closed function-typed
+                // slot — e.g. `M(f: (int) -> long)` called as
+                // `M((x) => x * 2)`, where the lambda's own inferred return
+                // type (int, from the body) implicitly converts to the
+                // target's return slot (long) per §22.6's admission rule
+                // ("...implicitly converts to it ([§5.1]...)"). retTy above
+                // was overridden to the target's LLVM type (i64) via
+                // expectedFunctionType_ (the `retTy == i32()` sentinel check
+                // above conflates "unresolved" with a genuinely-int body
+                // type), but `v` itself was never widened to match —
+                // CreateRet below then emitted a bare i32 into an
+                // i64-returning function ("Function return type does not
+                // match operand type of return inst"). The nullable-value
+                // branch just above handles the T? case; this handles the
+                // non-nullable one. Mirrors the block-body ReturnStmt fix for
+                // the same rule (§5.1, #746 R41-H, LlvmBackend_Stmts.cpp)
+                // that already widens a narrower numeric return value against
+                // `currentFn_->getReturnType()`. coerceNumericToType is a
+                // no-op when no §5.1 numeric widening applies (pointer/
+                // struct/already-matching values pass through unchanged), so
+                // this is safe to run unconditionally ahead of the retain
+                // checks below (which only fire on pointer types).
+                if (v->getType() != retTy)
+                    v = coerceNumericToType(v, retTy,
+                                            isUnsignedTargetExpr(*lam.exprBody));
                 // #429 (closure CALL-RETURN category) / §28.9 / §27.5: a lambda
                 // with an expression body must also mint +1 for reference-counted
                 // return types, exactly as the block-body path does via
