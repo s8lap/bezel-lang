@@ -279,3 +279,124 @@ BEZEL_TEST(sema_param, default_value_record_param_default_ok_1166) {
         "end C;");
     BEZEL_EXPECT_TRUE(!hasError(r, "17.11"));
 }
+
+// §22.5 "Defaults and modifiers" (v0.184, issue #1684): a default-value
+// expression that produces an owned value of NON-trivial-dispose class type
+// ([§28.9](Bezel_Language_Spec.md#sec-trivial-dispose-classes)) is a compile
+// error on a plain (non-`owned`) parameter — the fresh instance has no owner
+// to discharge it, a leak. `T` here declares a destructor, so `new T()` is a
+// non-trivial-dispose producer, and `w` carries no modifier.
+BEZEL_TEST(sema_param, default_owned_new_on_plain_param_rejected_1684) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class T "
+        "  destructor end destructor; "
+        "end T; "
+        "class C "
+        "  public static method M(w: T := new T()): int => 0; "
+        "  public static method Main(): int => 0; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasError(r, "non-trivial-dispose") && hasError(r, "22.5"));
+}
+
+// Control (§22.5): the identical default is admitted when the parameter is
+// declared `owned` — the owned-allocation default form the section already
+// blesses; the callee receives and discharges the fresh instance.
+BEZEL_TEST(sema_param, default_owned_new_on_owned_param_accepted_1684) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class T "
+        "  destructor end destructor; "
+        "end T; "
+        "class C "
+        "  public static method M(owned w: T := new T()): int => 0; "
+        "  public static method Main(): int => 0; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(!hasError(r, "non-trivial-dispose"));
+}
+
+// Control (§22.5 / §28.9): a default whose class is trivial-dispose (no
+// destructor, no owned field) stays admissible on a plain parameter — it
+// carries no disposal obligation to leak.
+BEZEL_TEST(sema_param,
+           default_owned_new_trivial_dispose_on_plain_param_accepted_1684) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class S end S; "
+        "class C "
+        "  public static method M(w: S := new S()): int => 0; "
+        "  public static method Main(): int => 0; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(!hasError(r, "non-trivial-dispose"));
+}
+
+// §22.5: the factory-call form of the same rule — a static method declared
+// `owned`-returning is an owned producer exactly like `new T()`. Mirrors the
+// issue's own rejected example: `M(log: Logger := Logger.Create())`.
+BEZEL_TEST(sema_param, default_owned_factory_call_on_plain_param_rejected_1684) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Logger "
+        "  destructor end destructor; "
+        "  public static method Create(): owned Logger => new Logger(); "
+        "end Logger; "
+        "class Program "
+        "  public static method M(log: Logger := Logger.Create()): int => 0; "
+        "  public static method Main(): int => 0; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(hasError(r, "non-trivial-dispose") && hasError(r, "22.5"));
+}
+
+// Control, matching the issue's accepted example: `M(owned log: Logger :=
+// Logger.Create())` — the `owned` parameter receives and discharges the
+// factory's fresh instance.
+BEZEL_TEST(sema_param,
+           default_owned_factory_call_on_owned_param_accepted_1684) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Logger "
+        "  destructor end destructor; "
+        "  public static method Create(): owned Logger => new Logger(); "
+        "end Logger; "
+        "class Program "
+        "  public static method M(owned log: Logger := Logger.Create()): "
+        "int => 0; "
+        "  public static method Main(): int => 0; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(!hasError(r, "non-trivial-dispose"));
+}
+
+// Control, matching the issue's other accepted example: a trivial-dispose
+// stdlib factory default (`new StringBuilder()`, stdlib §2.9) stays
+// admissible on a plain parameter.
+BEZEL_TEST(sema_param,
+           default_stringbuilder_trivial_dispose_on_plain_param_accepted_1684) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static method M(sb: StringBuilder := new StringBuilder()): "
+        "int => 0; "
+        "  public static method Main(): int => 0; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(!hasError(r, "non-trivial-dispose"));
+}
+
+// §22.5 / §28.9: the owned-FIELD path — a class with no destructor but an
+// `owned` field is still non-trivial-dispose (§28.9's derived-property
+// computation covers both), so a default constructing it on a plain
+// parameter is rejected too, not just the destructor case above.
+BEZEL_TEST(sema_param,
+           default_owned_new_owned_field_on_plain_param_rejected_1684) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class T end T; "
+        "class Holder "
+        "  private owned _t: T; "
+        "  public constructor() _t := new T(); end constructor; "
+        "end Holder; "
+        "class C "
+        "  public static method M(h: Holder := new Holder()): int => 0; "
+        "  public static method Main(): int => 0; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasError(r, "non-trivial-dispose") && hasError(r, "22.5"));
+}

@@ -294,6 +294,26 @@ private:
     // dropped or discarded Subscription is the hard error §21.9 / §17.13 require.
     bool isEventSubscribeDrop(const ast::Expr* e);
 
+    // §28.9 / §22.5 (issue #1684): does `decl`'s class chain make it
+    // non-trivial-dispose — a destructor, or a non-static `owned` field
+    // (declared, or a captured `owned` primary-constructor parameter,
+    // §22.10), anywhere from `decl` up through its base classes? Mirrors the
+    // walk visitStmt's ExpressionStmt arm performs inline for the §21.9
+    // bare-discard check (this file); duplicated rather than shared because
+    // that walk is not exposed as a callable predicate, but both apply the
+    // same §28.9 test.
+    bool isNonTrivialDisposeClass(TypeSymbol* decl) const;
+
+    // §22.5 v0.184 (issue #1684): is `e` a fresh owned-producing expression —
+    // `new T()` or a call to an `owned`-returning method — whose produced
+    // class type is non-trivial-dispose (isNonTrivialDisposeClass above)?
+    // Scoped to the shapes §22.5's "Permitted default-value expressions"
+    // actually admits in a default position (no `this`, no locals reach
+    // here, so only `new` and a static-factory call are possible producers).
+    // Used to reject such a default on a plain (non-`owned`) parameter — the
+    // produced instance would have no owner to discharge it.
+    bool exprIsOwnedProducerOfNonTrivialDisposeClass(const ast::Expr& e) const;
+
     // stdlib §5 (D7): the source element type T of a LINQ operator/aggregate
     // call whose lambda argument is `(T) -> …` (Where/Select/Count/Any/All/
     // First/OrderBy/…), or null otherwise. Used to set pendingLambdaParamType_

@@ -4295,6 +4295,30 @@ void ExprTC::runMethodBody(
                     "in the same list, not the parameter itself or a later one "
                     "(§22.5)");
         }
+        // §22.5 "Defaults and modifiers" (v0.184, issue #1684): a
+        // default-value expression that produces a fresh owned value of
+        // NON-trivial-dispose class type (§28.9) is admitted only when the
+        // parameter itself is declared `owned` (the owned-allocation default
+        // form this section already blesses) — the produced instance has no
+        // owner to discharge it otherwise, a leak. Gate on `modifier.empty()`
+        // (a genuinely plain/borrowing parameter): `owned` params are exempt
+        // by rule, and `ref`/`out`/`scoped` params raise a separate,
+        // syntactic-shape admissibility question this issue does not cover.
+        // A trivial-dispose producer (e.g. `new StringBuilder()`) carries no
+        // disposal obligation and stays admissible on either form, so it is
+        // excluded by exprIsOwnedProducerOfNonTrivialDisposeClass itself.
+        if (params[i].modifier.empty() &&
+            exprIsOwnedProducerOfNonTrivialDisposeClass(
+                *params[i].defaultValue)) {
+            ctx_.diagnostics().report(
+                Severity::Error, params[i].defaultValue->span.begin,
+                std::string("default value of parameter `") +
+                    std::string(params[i].name) +
+                    "` produces an owned value of non-trivial-dispose class "
+                    "type, which would have no owner to discharge it; "
+                    "declare the parameter `owned` to receive it, or use a "
+                    "trivial-dispose default (§22.5)");
+        }
     }
     forbiddenForwardParams_.clear();
     if (exprBody) {
@@ -4313,6 +4337,102 @@ void ExprTC::runMethodBody(
     currentScope_ = save;
     // §22.4 (v0.183, #1585): restore the enclosing body's postcondition set.
     currentOutPostconds_ = std::move(savedPostconds);
+}
+
+// §28.9 / §22.5 (issue #1684): does `decl`'s class chain make it
+// non-trivial-dispose — a destructor, or a non-static `owned` field
+// (declared, or a captured `owned` primary-constructor parameter, §22.10),
+// anywhere from `decl` up through its base classes? This is the same test
+// visitStmt's ExpressionStmt arm applies inline for the §21.9 bare-discard
+// check (below in this file); duplicated here as a standalone predicate
+// rather than shared, since that walk is not exposed as a callable, but both
+// apply the same §28.9 trivial-dispose classification. Cycle-guarded
+// (mirrors the #1624 precedent) so a malformed base-type graph that
+// survives error recovery cannot hang the compiler.
+bool ExprTC::isNonTrivialDisposeClass(TypeSymbol* decl) const {
+    bool reject = false;
+    std::unordered_set<const TypeSymbol*> visitedBase;
+    const std::size_t kMaxWalk = 4096;  // defensive; base chains are shallow
+    std::size_t walked = 0;
+    for (TypeSymbol* cur = decl; cur && !reject;) {
+        if (++walked > kMaxWalk) break;
+        if (!visitedBase.insert(cur).second) break;  // cycle guard (#1624)
+        for (Symbol* m : cur->members) {
+            if (dynamic_cast<DestructorSymbol*>(m)) {
+                reject = true;
+                break;
+            }
+            auto* fs = dynamic_cast<FieldSymbol*>(m);
+            if (!fs) continue;
+            if (fs->posParam) {
+                if (fs->parent &&
+                    fs->parent->kind == ast::TypeDeclKind::Class &&
+                    fs->posParam->modifier == "owned" &&
+                    fs->posParamBodyRef && !fs->posParamInitRef) {
+                    reject = true;
+                    break;
+                }
+                continue;
+            }
+            // A `static owned` field (§22.12 rule 4) is disposed at
+            // process-exit order (§22.13), not by this instance's Dispose()
+            // — exclude it, or a class whose only `owned` member is static
+            // would be wrongly classified non-trivial-dispose here.
+            bool isStatic = false, isOwned = false;
+            for (auto mod : fs->modifiers) {
+                if (mod == "static") isStatic = true;
+                if (mod == "owned") isOwned = true;
+            }
+            if (isOwned && !isStatic) {
+                reject = true;
+                break;
+            }
+        }
+        TypeSymbol* nextBase = nullptr;
+        for (TypeSymbol* b : cur->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) {
+                nextBase = b;
+                break;
+            }
+        cur = nextBase;
+    }
+    return reject;
+}
+
+// §22.5 v0.184 (issue #1684): is `e` a fresh owned-producing expression —
+// `new T()` or a call to an `owned`-returning method — whose produced class
+// type is non-trivial-dispose? Scoped to the shapes §22.5's "Permitted
+// default-value expressions" actually admits in a default position: `this`,
+// instance state, and locals are all out of scope there, so the only
+// owned-producing shapes that can reach a default-value expression are a
+// `new` expression and a call to a static factory method — mirrors the
+// ownedProduced classification the §21.9 bare-discard check performs (below
+// in this file) for the general (any-statement) case.
+bool ExprTC::exprIsOwnedProducerOfNonTrivialDisposeClass(
+    const ast::Expr& e) const {
+    bool ownedProduced = false;
+    if (dynamic_cast<const ast::NewExpr*>(&e)) {
+        ownedProduced = true;
+    } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (ce->callee) {
+            if (auto* sym = ctx_.exprSymbol(*ce->callee)) {
+                if (auto* ms = dynamic_cast<MethodSymbol*>(sym)) {
+                    if (auto* md =
+                            dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+                        ownedProduced = md->returnOwned;
+                    }
+                }
+            }
+        }
+    }
+    if (!ownedProduced) return false;
+    const TypeRef* t = ctx_.exprType(e);
+    if (!t || t->kind != TypeRef::Kind::Named || !t->declaration ||
+        t->declaration->kind != ast::TypeDeclKind::Class ||
+        t->declaration->isValueBuiltin) {
+        return false;
+    }
+    return isNonTrivialDisposeClass(t->declaration);
 }
 
 void ExprTC::visitMember(const ast::Member& m) {
