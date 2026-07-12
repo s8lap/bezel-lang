@@ -1167,8 +1167,16 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     bool isSpan =
                         cn == "ArraySpan" || cn == "ReadOnlyArraySpan" ||
                         cn == "Span" || cn == "ReadOnlySpan";
+                    // §4.8/§4.9 + §4.17 (#1354/#1764): a key-indexed dictionary
+                    // read `dict[key]` returns V = genericArgs[1]. SortedDictionary
+                    // <K, V> shares the same indexer contract as Dictionary<K, V>;
+                    // it was omitted here, so `d[key]` was left untyped and the
+                    // ownership pass conservatively rejected `return d[key]` for a
+                    // value-type V (§28.3 borrow-lifetime) — the same failure the
+                    // OwningBuffer note above describes.
                     bool isDict =
-                        cn == "Dictionary" || cn == "OwningDictionary";
+                        cn == "Dictionary" || cn == "OwningDictionary" ||
+                        cn == "SortedDictionary";
                     if ((isArrLike || isSpan) && !tt->genericArgs.empty() &&
                         tt->genericArgs[0]) {
                         // §15.6 / fix #690: `arr[range]` on Array<T> produces

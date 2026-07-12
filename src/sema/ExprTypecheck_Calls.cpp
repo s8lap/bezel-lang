@@ -9378,6 +9378,41 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // stdlib §4.17/§4.18 (#1354/#1426/#1764): the SortedSet<T> ordering
+        // properties `First` (least) / `Last` (greatest) return the element
+        // type T, and the SortedDictionary<K, V> ordering properties `FirstKey`
+        // (least key) / `LastKey` (greatest key) return the key type K. Neither
+        // built-in collection has a user TypeSymbol, so the ordinary
+        // member-lookup path never types a bare (no-parens) property read; only
+        // the CALL form is typed (ExprTypecheck_Calls §…4426/§…4445). Without
+        // typing the property form, the read fell through untyped and the
+        // ownership borrow-return check assumed a borrow, wrongly rejecting
+        // `return s.First` / `return d.FirstKey` out of a `using var` even for a
+        // value-type element (§28.3 — a value-typed projection is a copy, never
+        // a borrow of the collection). Mirrors the LinkedList<T> First/Last
+        // property typing above. The concrete element/key resolves from the
+        // receiver's genericArgs; a class-typed element still types to a
+        // borrow-bearing class ref, so a genuine escape stays rejected.
+        if (ma.target) {
+            auto* tt = ctx_.exprType(*ma.target);
+            bool isBuiltinColl = tt && tt->kind == TypeRef::Kind::Named &&
+                !tt->declaration && tt->astNode && tt->astNode->name &&
+                !tt->astNode->name->parts.empty();
+            std::string_view scn = isBuiltinColl
+                ? std::string_view(tt->headName()) : std::string_view{};
+            if (scn == "SortedSet" &&
+                (ma.member == "First" || ma.member == "Last") &&
+                !tt->genericArgs.empty() && tt->genericArgs[0]) {
+                ctx_.setExprType(&ma, tt->genericArgs[0]);  // element type T
+                return;
+            }
+            if (scn == "SortedDictionary" &&
+                (ma.member == "FirstKey" || ma.member == "LastKey") &&
+                !tt->genericArgs.empty() && tt->genericArgs[0]) {
+                ctx_.setExprType(&ma, tt->genericArgs[0]);  // key type K
+                return;
+            }
+        }
         // issue #545: Buffer<T>.Length property — returns int.
         // The ordinary member-lookup path never finds it (no user TypeDecl).
         if (ma.target) {
