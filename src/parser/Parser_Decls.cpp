@@ -117,6 +117,11 @@ std::unique_ptr<ast::SourceFile> Parser::parseCompilationUnit() {
 }
 
 std::unique_ptr<ast::Import> Parser::parseImport() {
+    // Issue #135 span-stamping (see the wrapper above parseCompilationUnit):
+    // capture the `import` keyword's location so a later pass (§2.8.1 rule 4
+    // self-import rejection, issue #1730) can report a real file:line:col
+    // instead of the 0:0 an unstamped node's default span would print.
+    const SourceLocation start = current_.location;
     auto decl = std::make_unique<ast::Import>();
     // Caller has verified `current_` is the `import` keyword.
     advance(); // past `import`
@@ -139,7 +144,7 @@ std::unique_ptr<ast::Import> Parser::parseImport() {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected ';' after import declaration");
     }
-    return decl;
+    return stampSpan(std::move(decl), start, current_.location);
 }
 
 std::unique_ptr<ast::ModuleDecl> Parser::parseModuleDecl() {

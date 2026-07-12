@@ -78,6 +78,20 @@ bool isNonNullableReferenceType(const TypeRef* t) {
 }
 
 void Resolver::run(const ast::SourceFile& src) {
+    // §2.8.1 rule 4 (v0.188): "An `import` naming the enclosing file's own
+    // module is rejected ('a module cannot import itself')." The enclosing
+    // file's own module name is whatever this file's own `module Name;`
+    // declares — computed once here so every `import` below can be compared
+    // against it. A self-loop is not the legal cross-module SCC cycle rule 4
+    // carves out; it is rejected unconditionally.
+    std::string selfModuleName;
+    if (src.module && src.module->name) {
+        for (std::size_t i = 0; i < src.module->name->parts.size(); ++i) {
+            if (i != 0) selfModuleName += '.';
+            selfModuleName += std::string(src.module->name->parts[i]);
+        }
+    }
+
     // §2.15 / issue #631: build the set of imported namespace names so that
     // import-gated builtin types (BinarySerializer / BinaryDeserializer) can be
     // checked in resolveNamed. Every `import X;` contributes its dotted name.
@@ -92,6 +106,22 @@ void Resolver::run(const ast::SourceFile& src) {
         for (std::size_t i = 0; i < imp->name->parts.size(); ++i) {
             if (i != 0) dotted += '.';
             dotted += std::string(imp->name->parts[i]);
+        }
+        // §2.8.1 rule 4: reject an `import` naming this very file's own
+        // module. Diagnose and skip — do not add the self-import to
+        // sourceImports_/importAliases_, so a self-import behaves as absent
+        // (not as a tautological self-visible import) for the rest of name
+        // resolution, matching the "rejected" verdict rather than inventing
+        // a fallback semantics (proposal 0034 §1: the compiler's prior
+        // undefined behavior of silently exposing the same-named artifact's
+        // publics is exactly the third, nowhere-specified meaning rule 4
+        // forecloses).
+        if (!selfModuleName.empty() && dotted == selfModuleName) {
+            ctx_.diagnostics().report(
+                Severity::Error, imp->span.begin,
+                std::string("module `") + selfModuleName +
+                "` cannot import itself (\xC2\xA7""2.8.1 rule 4)");
+            continue;
         }
         sourceImports_.insert(dotted);
         // §2.2 v0.164: record the alias → module name mapping.
@@ -137,6 +167,17 @@ void Resolver::run(const ast::SourceFile& src) {
                 if (i != 0) dotted += '.';
                 dotted += std::string(imp->name->parts[i]);
             }
+            // §2.8.1 rule 4: a self-import was already diagnosed above (and
+            // excluded from sourceImports_). Also skip it here so a same-
+            // named DEPENDENCY ARTIFACT — the issue #1730 second repro shape
+            // (`module Dup; import Dup;` built against a `dup1.o` that also
+            // declares `module Dup;`) — never gets its publics exposed into
+            // this file's scope. Without this, the self-import diagnostic
+            // above still fires, but the artifact's types remained visible
+            // anyway: a third, nowhere-specified semantics (neither the
+            // spec's literal no-op reading nor rejection) that proposal 0034
+            // §1 calls out as the bug to close.
+            if (!selfModuleName.empty() && dotted == selfModuleName) continue;
             const std::vector<TypeSymbol*>* exported =
                 ctx_.importedTypesOf(dotted);
             if (!exported) continue;

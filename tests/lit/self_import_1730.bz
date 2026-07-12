@@ -1,0 +1,28 @@
+// RUN: %not %bezelc -c %s 2>&1 | FileCheck %s
+//
+// (`%not` = LLVM's exit-status inverter; the compile is expected to fail — see
+// tests/lit/README.md for why every reject test wraps `bezelc` in `not`.)
+//
+// Issue #1730 — self-import must be a compile error (spec §2.8.1 rule 4,
+// v0.188).
+//
+// Spec §2.8.1 rule 4: "An `import` naming the enclosing file's own module is
+// rejected ('a module cannot import itself'). Import cycles between distinct
+// modules remain legal and compile as an SCC (§2.5); the self-loop is not a
+// cycle, it is a mistake." Before this fix the compiler silently ACCEPTED
+// `module SelfImp; import SelfImp;` (proposal 0034 §1's evidence probe) — no
+// diagnostic at all. This is repro shape 1 from #1730: a self-import with NO
+// dependency artifact supplied. See self_import_dup_artifact_1730.bz for
+// shape 2 (a same-named artifact IS supplied — the compiler used to invent a
+// third, nowhere-specified semantics instead of rejecting).
+module SelfImp;
+import SelfImp;
+
+class Program
+  public static method Main(): int return 0; end Main;
+end Program;
+
+// bezelc emits diagnostics as `file:line:col: message` with no "error:"
+// severity word, so anchor on the `:line:col:` shape and the rule text.
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: module `SelfImp` cannot import itself
+// CHECK-SAME: (§2.8.1 rule 4)

@@ -99,6 +99,21 @@ static void checkNoRefOutOnAsyncOrIterator(
 void ExprTC::run(const ast::SourceFile& src) {
     moduleScope_ = std::make_unique<Scope>();
     partialModulePaths_.clear();
+    // §2.8.1 rule 4 (v0.188): this file's own module name, mirroring
+    // Resolver::run's selfModuleName — resolveTypes already diagnosed a
+    // self-import (it runs first, per Driver::compileFile/compileObject), but
+    // this pass rebuilds its own sourceImports_/moduleScope_ independently
+    // from src.imports, so a self-import must be excluded here too or the
+    // same-named-artifact shape (`module Dup; import Dup;` against `dup1.o`,
+    // issue #1730) would still expose the artifact's publics during
+    // expression typecheck even though the compile is already rejected.
+    std::string selfModuleName;
+    if (src.module && src.module->name) {
+        for (std::size_t i = 0; i < src.module->name->parts.size(); ++i) {
+            if (i != 0) selfModuleName += '.';
+            selfModuleName += std::string(src.module->name->parts[i]);
+        }
+    }
     // §2.2 v0.164 / #1365: collect import aliases + sourceImports for
     // alias/module-prefix resolution in resolveMemberAccess (§2.7).
     importAliases_.clear();
@@ -111,6 +126,9 @@ void ExprTC::run(const ast::SourceFile& src) {
             if (i != 0) dotted += '.';
             dotted += std::string(imp->name->parts[i]);
         }
+        // §2.8.1 rule 4: skip a self-import (already diagnosed by
+        // resolveTypes) — do not register it as a visible import here either.
+        if (!selfModuleName.empty() && dotted == selfModuleName) continue;
         sourceImports_.insert(dotted);
         if (!imp->alias.empty())
             importAliases_[imp->alias] = dotted;
@@ -151,6 +169,9 @@ void ExprTC::run(const ast::SourceFile& src) {
                 if (i != 0) dotted += '.';
                 dotted += std::string(imp->name->parts[i]);
             }
+            // §2.8.1 rule 4: a self-import never exposes a same-named
+            // dependency artifact's publics (see the note above run()).
+            if (!selfModuleName.empty() && dotted == selfModuleName) continue;
             if (const std::vector<TypeSymbol*>* exported =
                     ctx_.importedTypesOf(dotted)) {
                 for (TypeSymbol* t : *exported) {
