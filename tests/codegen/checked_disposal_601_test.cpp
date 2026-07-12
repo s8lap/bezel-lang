@@ -25,25 +25,24 @@
 //   6. Instance method call on a NOT-yet-disposed instance succeeds normally
 //      in checked mode.
 
-#include "support/aot_support.hpp"   // runAot/runAotChecked — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runAot;
-using bezel::test::runAotChecked;
+using bezel::test::runJit;
+using bezel::test::runJitChecked;
 
 namespace {
 
 // Convenience wrapper: run in checked-disposal mode; returns exit code, or
 // -999 if the program failed to compile/run.
 int runChecked(const std::string& program) {
-    auto r = runAotChecked(program);
+    auto r = runJitChecked(program);
     return r.ran ? r.exitCode : -999;
 }
 
 // Convenience wrapper: run in default (unchecked) mode.
 int runDefault(const std::string& program) {
-    auto r = runAot(program);
+    auto r = runJit(program);
     return r.ran ? r.exitCode : -999;
 }
 

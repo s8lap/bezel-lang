@@ -17,16 +17,15 @@
 // path tried an ICmp on a struct pointer, which is illegal IR. Scalar/string
 // element types also regressed to pointer-identity semantics.
 
-#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runAot;
+using bezel::test::runJit;
 
 namespace {
 
 int run(const std::string& src) {
-    auto r = runAot(src);
+    auto r = runJit(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -227,7 +226,7 @@ BEZEL_TEST(contains_indexof_equals_4_6, string_indexof_by_content) {
 // The behavioral Contains/IndexOf for class elements with custom Equals is
 // covered by owned_array_contains_query_is_pure_borrow below.
 BEZEL_TEST(contains_indexof_equals_4_5, owned_array_record_contains_present) {
-    auto r = runAot(
+    auto r = runJit(
         "module T; "
         "public record P(X: int, Y: int) end P; "
         "public class Program public static method Main(): int "
@@ -242,7 +241,7 @@ BEZEL_TEST(contains_indexof_equals_4_5, owned_array_record_contains_present) {
 
 // §4.5/§14.4/#1327 v0.165: OwningArray<P> with record element rejected at sema.
 BEZEL_TEST(contains_indexof_equals_4_5, owned_array_record_indexof_present) {
-    auto r = runAot(
+    auto r = runJit(
         "module T; "
         "public record P(X: int, Y: int) end P; "
         "public class Program public static method Main(): int "

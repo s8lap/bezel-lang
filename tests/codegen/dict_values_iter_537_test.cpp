@@ -16,15 +16,14 @@
 // the live values array) and lowerDictValuesFor to the codegen (mirrors
 // lowerDictKeysFor, using genericArgs[1] for the value element type).
 
-#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runAot;
+using bezel::test::runJit;
 
 namespace {
 int run(const std::string& src) {
-    auto r = runAot(src);
+    auto r = runJit(src);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -181,7 +180,7 @@ BEZEL_TEST(dict_values_iter_537, keys_still_works_regression_guard) {
 // it is rejected at compile-time (sema error, fix #530) rather than
 // silently iterating.
 BEZEL_TEST(dict_values_iter_537, bare_dict_not_iterable_still_errors) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
         "  d[3] := 100; "

@@ -35,11 +35,10 @@
 //            into the declared return type.
 //   §22.1 — index expression `a[i]` on `Array<T>` has element type `T`.
 
-#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runAot;
+using bezel::test::runJit;
 
 namespace {
 
@@ -57,11 +56,11 @@ const char* kMakeTwo =
     "  end MakeTwo; ";
 
 int run(const std::string& prog) {
-    auto r = runAot(prog);
+    auto r = runJit(prog);
     return r.ran ? r.exitCode : -999;
 }
 
-bezel::test::JitResult jit(const std::string& prog) { return runAot(prog); }
+bezel::test::JitResult jit(const std::string& prog) { return runJit(prog); }
 
 }  // namespace
 

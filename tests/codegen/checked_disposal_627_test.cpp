@@ -40,22 +40,21 @@
 //   §4.8   "Dictionary<K,V>"
 //   §31.4  "DisposedAccessException"
 
-#include "support/aot_support.hpp"   // runAot/runAotChecked — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runAot;
-using bezel::test::runAotChecked;
+using bezel::test::runJit;
+using bezel::test::runJitChecked;
 
 namespace {
 
 int runChecked(const std::string& program) {
-    auto r = runAotChecked(program);
+    auto r = runJitChecked(program);
     return r.ran ? r.exitCode : -999;
 }
 
 int runDefault(const std::string& program) {
-    auto r = runAot(program);
+    auto r = runJit(program);
     return r.ran ? r.exitCode : -999;
 }
 
