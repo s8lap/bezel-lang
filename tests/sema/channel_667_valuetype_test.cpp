@@ -36,10 +36,11 @@
 //   stdlib §6.9: "TryReceive → false when the channel is empty or closed."
 //   stdlib §6.9: "IsClosed → true after dispose or after last sender releases."
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 // ---------------------------------------------------------------------------
 // (b) Value round-trip: Channel<int> — send 42, TryReceive → 42.
@@ -50,7 +51,7 @@ using bezel::test::runJit;
 // Send(42) stores the integer payload; TryReceive(out got) delivers 42.
 BEZEL_TEST(channel_667_valuetype,
            b1_channel_int_tryreceive_round_trip_value_payload_30_15) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class Program "
         "  public static method Main(): int "
@@ -73,7 +74,7 @@ BEZEL_TEST(channel_667_valuetype,
 // If value == 0 and TryReceive returns true, got must be 0 (not null).
 BEZEL_TEST(channel_667_valuetype,
            b2_channel_int_tryreceive_zero_value_disambiguation_30_15) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class Program "
         "  public static method Main(): int "
@@ -96,7 +97,7 @@ BEZEL_TEST(channel_667_valuetype,
 // §30.15 / stdlib §6.9: TryReceive on empty channel returns false (got stays null).
 BEZEL_TEST(channel_667_valuetype,
            b3_channel_int_tryreceive_empty_returns_false_30_15) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class Program "
         "  public static method Main(): int "
@@ -118,7 +119,7 @@ BEZEL_TEST(channel_667_valuetype,
 // §30.15: Channel<int> with a non-trivial value (99) to distinguish from zero-init.
 BEZEL_TEST(channel_667_valuetype,
            b4_channel_int_tryreceive_nontrivial_value_99_30_15) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class Program "
         "  public static method Main(): int "
@@ -143,7 +144,7 @@ BEZEL_TEST(channel_667_valuetype,
 // §30.15 / stdlib §6.9: IsClosed is false on a fresh open channel.
 BEZEL_TEST(channel_667_valuetype,
            c1_channel_isclosed_false_fresh_open_30_15) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class Program "
         "  public static method Main(): int "
@@ -161,7 +162,7 @@ BEZEL_TEST(channel_667_valuetype,
 // §30.15: IsClosed is true after the last ChannelSender is disposed.
 BEZEL_TEST(channel_667_valuetype,
            c2_channel_isclosed_true_after_last_sender_dispose_30_15) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class Program "
         "  public static method Main(): int "
@@ -182,7 +183,7 @@ BEZEL_TEST(channel_667_valuetype,
 // the null-slot call return 1.
 BEZEL_TEST(channel_667_valuetype,
            c3_channel_isclosed_true_after_channel_dispose_30_15) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class Program "
         "  public static method Main(): int "
@@ -210,7 +211,7 @@ BEZEL_TEST(channel_667_valuetype,
 // is not a fault — it returns false (null = empty-and-closed).
 BEZEL_TEST(channel_667_valuetype,
            a1_tryreceive_after_channel_dispose_returns_false_no_crash_30_15) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class Program "
         "  public static method Main(): int "
@@ -234,7 +235,7 @@ BEZEL_TEST(channel_667_valuetype,
 // Confirms null-guard works even without items in the channel at dispose time.
 BEZEL_TEST(channel_667_valuetype,
            a2_tryreceive_after_dispose_drained_channel_returns_false_30_15) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class Program "
         "  public static method Main(): int "
@@ -258,7 +259,7 @@ BEZEL_TEST(channel_667_valuetype,
 // then TryReceive again. Both calls must work correctly.
 BEZEL_TEST(channel_667_valuetype,
            a3_tryreceive_send_receive_then_dispose_then_false_30_15) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class Program "
         "  public static method Main(): int "
@@ -295,7 +296,7 @@ BEZEL_TEST(channel_667_valuetype,
 // because it goes through the ChannelSender which holds a core ref).
 BEZEL_TEST(channel_667_valuetype,
            reg1_send_after_channel_dispose_still_raises_cce_30_15) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class Program "
         "  public static method Main(): int "
@@ -318,7 +319,7 @@ BEZEL_TEST(channel_667_valuetype,
 // fix #634 regression: sender-then-channel dispose order (normal path).
 BEZEL_TEST(channel_667_valuetype,
            reg2_senders_first_dispose_order_no_crash_30_15) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class Program "
         "  public static method Main(): int "

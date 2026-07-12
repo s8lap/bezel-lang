@@ -27,10 +27,11 @@
 // codegen_support.hpp harness, not pure-sema tests. They live in sema/ for
 // organizational convenience (issue #600 scope) but use the JIT path.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 // ---------------------------------------------------------------------------
 // §30.15: Single channel send/receive round-trip with ownership transfer.
@@ -43,7 +44,7 @@ using bezel::test::runJit;
 // (OwningTask<T> Pattern B) transfers ownership to the receiver.
 BEZEL_TEST(send_600_runtime,
            single_send_receive_round_trip_30_15) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "sealed class Payload "
         "  public Val: int := 0; "
@@ -79,7 +80,7 @@ BEZEL_TEST(send_600_runtime,
 // receives raise ChannelClosedException."
 BEZEL_TEST(send_600_runtime,
            last_sender_dispose_closes_drain_then_exception_30_15) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "sealed class Item "
         "  public Val: int := 0; "
@@ -119,7 +120,7 @@ BEZEL_TEST(send_600_runtime,
 // sendable result transfers to the awaiter."
 BEZEL_TEST(send_600_runtime,
            domain_spawn_join_returns_result_30_14) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "sealed class Computed "
         "  public Val: int := 0; "
@@ -154,7 +155,7 @@ BEZEL_TEST(send_600_runtime,
            entry_fault_surfaces_as_domain_faulted_exception_30_14) {
     // The spawned domain throws; the join must raise DomainFaultedException
     // (not the original exception class), and Message must be non-empty.
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class Worker "
         "  public static method Fail() "
@@ -197,7 +198,7 @@ BEZEL_TEST(send_600_runtime,
            spawn_noncapturing_lambda_expr_body_runs_1228) {
     // spawn entry is a non-capturing expression-body lambda.
     // The spawned domain must complete without SIGSEGV/SIGABRT (exit 139/134).
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class Program "
         "  public static async method Main(): Task<int> "
@@ -216,7 +217,7 @@ BEZEL_TEST(send_600_runtime,
 BEZEL_TEST(send_600_runtime,
            spawn_noncapturing_lambda_block_body_runs_1228) {
     // spawn entry is a non-capturing block-body lambda.
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class Program "
         "  public static async method Main(): Task<int> "
