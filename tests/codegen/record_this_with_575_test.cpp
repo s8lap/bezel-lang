@@ -8,15 +8,14 @@
 // failure: "Function return type does not match operand type of return inst!
 //  ret ptr %0 / %record.Pt = type { i32, i32 }".
 
-#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runAot;
+using bezel::test::runJit;
 
 namespace {
 int run(const std::string& program) {
-    auto r = runAot(program);
+    auto r = runJit(program);
     return r.ran ? r.exitCode : -999;
 }
 } // namespace

@@ -28,11 +28,10 @@
 //   L2: dispose permutation: senders-then-channel.
 //   L3: dispose permutation: interleaved (partial sender release before channel).
 
-#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runAot;
+using bezel::test::runJit;
 
 // ---------------------------------------------------------------------------
 // P1: send-after-channel-dispose — expect ChannelClosedException (§30.15).
@@ -43,7 +42,7 @@ using bezel::test::runAot;
 // §30.15: "Disposing the Channel<T> itself closes it immediately ...;
 // subsequent sends raise ChannelClosedException."
 BEZEL_TEST(channel_634_uaf, p1_send_after_channel_dispose_raises_cce_30_15) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; "
         "sealed class Msg "
         "  public Val: int := 0; "
@@ -81,7 +80,7 @@ BEZEL_TEST(channel_634_uaf, p1_send_after_channel_dispose_raises_cce_30_15) {
 
 // fix #634 / §30.15: with two senders, both should raise CCE after ch.Dispose().
 BEZEL_TEST(channel_634_uaf, p2_two_senders_send_after_channel_dispose_cce_30_15) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; "
         "class Program "
         "  public static method Main(): int "
@@ -118,7 +117,7 @@ BEZEL_TEST(channel_634_uaf, p2_two_senders_send_after_channel_dispose_cce_30_15)
 // after Channel.Dispose the core is NOT freed while the sender is alive.
 // The sender's Send raises ChannelClosedException via bz_exc.
 BEZEL_TEST(channel_634_uaf, p3_sender_outlives_channel_domain_send_raises_cce_30_15) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; "
         "sealed class Token "
         "  public Val: int := 0; "
@@ -164,7 +163,7 @@ BEZEL_TEST(channel_634_uaf, p3_sender_outlives_channel_domain_send_raises_cce_30
 // by Channel.Dispose.  After dispose the core is still accessible to senders
 // (they hold a ref), but the items are gone and sends raise CCE.
 BEZEL_TEST(channel_634_uaf, p4_dispose_channel_with_items_flushes_in_reverse_30_15) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; "
         "sealed class Counter "
         "  public Val: int := 0; "
@@ -204,7 +203,7 @@ BEZEL_TEST(channel_634_uaf, p4_dispose_channel_with_items_flushes_in_reverse_30_
 // fix #634 refcount lifecycle: channel-first dispose. After Channel.Dispose
 // the core has refs = (sender count); core is freed when the last sender releases.
 BEZEL_TEST(channel_634_uaf, l1_channel_dispose_before_senders_no_crash_30_15) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; "
         "class Program "
         "  public static method Main(): int "
@@ -239,7 +238,7 @@ BEZEL_TEST(channel_634_uaf, l1_channel_dispose_before_senders_no_crash_30_15) {
 // §30.15: last-sender dispose closes the channel; Channel.Dispose afterwards
 // is idempotent (channel already closed and disposed).
 BEZEL_TEST(channel_634_uaf, l2_senders_before_channel_dispose_no_crash_30_15) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; "
         "sealed class Item "
         "  public Val: int := 0; "
@@ -276,7 +275,7 @@ BEZEL_TEST(channel_634_uaf, l2_senders_before_channel_dispose_no_crash_30_15) {
 // refs at peak: 3 (ch + tx1 + tx2); after tx1.Dispose = 2; after ch.Dispose = 1;
 // after tx2.Dispose = 0 → core freed.
 BEZEL_TEST(channel_634_uaf, l3_interleaved_dispose_no_crash_30_15) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; "
         "class Program "
         "  public static method Main(): int "

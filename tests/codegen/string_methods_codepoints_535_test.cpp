@@ -31,16 +31,15 @@
 //   * Emoji (4-byte U+1F600): "a😀b".IndexOf("😀") = 1
 //   * ASCII control: "hello".IndexOf("ll") = 2 (unchanged)
 
-#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runAot;
+using bezel::test::runJit;
 
 namespace {
 
 int run(const std::string& src) {
-    auto r = runAot(src);
+    auto r = runJit(src);
     return r.ran ? r.exitCode : -999;
 }
 
