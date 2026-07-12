@@ -18,26 +18,31 @@
 // (shadowing) type parameter per §26.4, not a concrete reference to the
 // class `W`; see that test's comment.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int runFull(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 bool rejected(const std::string& program) {
-    return !runJit(program).ran;
+    return !runAot(program).ran;
 }
 
 // `Bag<T>` (a generic class) + an `extension Bag<T>` declaring `body`.
+// §28.5: `_items` stores a freshly-`new`ed owning collection, so the field is
+// `owned` (the AOT path runs the ownership checker the in-process JIT harness
+// skipped; a plain field would leak and is a compile error). The compiler
+// synthesizes disposal for the owned field, discharged by the `using var b`.
 std::string prog(const std::string& ext, const std::string& mainBody) {
     return std::string(
         "module M; "
         "class Bag<T> where T: class "
-        "  private _items: Array<T>; "
+        "  private owned _items: Array<T>; "
         "  public constructor() _items := new Array<T>(); end; "
         "  public method Add(x: T): () _items.Add(x); end; "
         "  public method Count(): int => _items.Count; "

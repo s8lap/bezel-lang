@@ -8,15 +8,25 @@
 // failure: "Function return type does not match operand type of return inst!
 //  ret ptr %0 / %record.Pt = type { i32, i32 }".
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
+}
+// 8-bit exit channel (migration plan §3): a process exit status is masked to
+// 0..255 (WEXITSTATUS), so a Main returning a value outside that range cannot
+// round-trip the exit code. The program instead PRINTS the value
+// (Console.WriteLine, stdlib §2.1) and the test checks the captured stdout
+// (JitResult::stdoutText). WriteLine appends '\n'.
+std::string runOut(const std::string& program) {
+    auto r = runAot(program);
+    return r.ran ? r.stdoutText : std::string("<did-not-run>");
 }
 } // namespace
 
@@ -49,8 +59,9 @@ BEZEL_TEST(codegen_issue575, this_with_does_not_mutate_source) {
 }
 
 // §9.5 / §22.3: replace two fields at once inside a record method.
+// Result (1122) exceeds the 8-bit exit range → observed on stdout.
 BEZEL_TEST(codegen_issue575, this_with_two_fields) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runOut(
         "module M; "
         "record Pt(X: int, Y: int) "
         "  public method Shift(dx: int, dy: int): Pt "
@@ -58,8 +69,8 @@ BEZEL_TEST(codegen_issue575, this_with_two_fields) {
         "end Pt; "
         "class C public static method Main(): int "
         "  var p := new Pt(1, 2); var q := p.Shift(10, 20); "
-        "  return q.X * 100 + q.Y; "
-        "end Main; end C;"), 1122);
+        "  Console.WriteLine(q.X * 100 + q.Y); return 0; "
+        "end Main; end C;"), "1122\n");
 }
 
 // §9.5 / §22.3: replacement expression references another field from `this`

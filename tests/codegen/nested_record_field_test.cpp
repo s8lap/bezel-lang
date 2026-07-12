@@ -17,15 +17,24 @@
 //
 // Control cases (a) through (f) as specified in the bug report.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
+}
+// 8-bit exit channel (migration plan §3): a Main returning a value outside
+// 0..255 cannot round-trip the exit code (WEXITSTATUS masks it), so the program
+// PRINTS the value (Console.WriteLine, stdlib §2.1) and the test checks the
+// captured stdout (JitResult::stdoutText). WriteLine appends '\n'.
+std::string runOut(const std::string& program) {
+    auto r = runAot(program);
+    return r.ran ? r.stdoutText : std::string("<did-not-run>");
 }
 } // namespace
 
@@ -66,9 +75,10 @@ BEZEL_TEST(codegen_nested_record_field, three_level_nesting_record_method) {
 }
 
 // (c) §9.1 / §9.2 — a record method reads BOTH a record-typed field and a
-// primitive field; both should return correct values.
+// primitive field; both should return correct values. Result (305) exceeds the
+// 8-bit exit range → observed on stdout.
 BEZEL_TEST(codegen_nested_record_field, record_method_reads_record_and_primitive_fields) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runOut(
         "module M; "
         "record Tag(code: int); "
         "record Item(label: Tag, count: int) "
@@ -76,9 +86,9 @@ BEZEL_TEST(codegen_nested_record_field, record_method_reads_record_and_primitive
         "end Item; "
         "class C public static method Main(): int "
         "  var it := new Item(new Tag(3), 5); "
-        "  return it.Key(); "
+        "  Console.WriteLine(it.Key()); return 0; "
         "end Main; end C;"),
-        305);
+        "305\n");
 }
 
 // (d) §9.2 — record-typed field accessed from OUTSIDE a method (`o.Data.Val`)
