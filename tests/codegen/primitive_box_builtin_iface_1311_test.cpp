@@ -19,18 +19,19 @@
 // implements IComparable<byte>, not IComparable<int>; bool implements
 // IEquatable<bool> only, §9.4 — no IComparable<bool>).
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 bool compiles(const std::string& program) {
-    return runJit(program).ran;
+    return runAot(program).ran;
 }
 }  // namespace
 

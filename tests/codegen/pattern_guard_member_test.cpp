@@ -17,10 +17,11 @@
 // is selected"; the bound variable is usable in the guard.
 // §19.5: a typed binding pattern `var x: T` matches only values that are-a T.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
@@ -46,7 +47,7 @@ const char* kPrologue =
 
 // Run `kPrologue` + the given `classC` definition.
 int run(const std::string& classC) {
-    auto r = runJit(std::string(kPrologue) + classC);
+    auto r = runAot(std::string(kPrologue) + classC);
     return r.ran ? r.exitCode : -999;
 }
 

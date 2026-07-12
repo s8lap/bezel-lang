@@ -13,16 +13,17 @@
 // an argument with no `ref`/`out`). This both selects the right overload and
 // enforces the mandatory keyword for a single candidate.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 // Returns the program's exit code, or -999 if it failed to compile/run (used to
 // assert that a call-site `ref`/`out` mismatch is REJECTED at compile time).
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
