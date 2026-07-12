@@ -26,14 +26,15 @@
 // fix; the class control still returns the correct value; the non-generic
 // direct-call control verifies record→interface dispatch is sound on its own.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -43,7 +44,7 @@ int run(const std::string& prog) {
 // §14.2: `Point` is a record implementing `INum`; passed as T to
 // `GetVal<T>(x: T): int where T: INum`, the body `x.Val()` returns X+Y = 7.
 // Before the fix: IR verifier crash (param typed i32, call passes %record.Point),
-// runJit().ran == false → -999.
+// runAot().ran == false → -999.
 BEZEL_TEST(record_generic_constraint, record_t_interface_constraint_spec_14_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; "

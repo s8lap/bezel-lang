@@ -14,16 +14,17 @@
 // Spec references: §9.4 (record instance methods), §19.2 (case expression),
 // §27.2 (method bodies).
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 using bezel::test::JitResult;
 
 namespace {
 
 int runProg(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 

@@ -12,14 +12,15 @@
 // InvalidOperationException (§16.3). Ranges are INCLUSIVE by default, so the
 // flatten of [1,3] via (n)=>1..(n+1) is {1,2} ∪ {1,2,3,4} = 6 elements.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int runFull(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
