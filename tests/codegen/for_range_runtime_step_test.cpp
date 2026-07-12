@@ -6,10 +6,11 @@
 // ascending/descending bound test by the step's runtime sign), mirroring the
 // Range-variable path. §16.4.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
-using bezel::test::runJit;
-namespace { int run(const std::string& p){ auto r=runJit(p); return r.ran?r.exitCode:-999; } }
+using bezel::test::runAot;
+namespace { int run(const std::string& p){ auto r=runAot(p); return r.ran?r.exitCode:-999; } }
 // §16.4 (#1623): a computed step of zero must raise ArgumentException at
 // GetEnumerator time. Wrap the step-0 statement in try/catch ArgumentException
 // — returns 0 when raised (pass), 7 otherwise (fail). Without the codegen guard

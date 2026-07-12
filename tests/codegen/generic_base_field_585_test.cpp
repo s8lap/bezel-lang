@@ -21,14 +21,15 @@
 // fix and the correct value after. Non-generic-base regression confirms the
 // existing prefix layout still works. Only real stdlib surface is used.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
