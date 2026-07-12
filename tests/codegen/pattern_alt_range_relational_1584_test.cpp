@@ -19,15 +19,16 @@
 //   - a binding member in an alternative list is still rejected (§19.3),
 //   - a pure-constant `|` alternative (no range/relational) still works.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int runProg(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -142,7 +143,7 @@ BEZEL_TEST(codegen_alt_range_1584, null_or_range_falls_through_out_of_range) {
 // `var` binding cannot appear alongside a range member.
 
 BEZEL_TEST(codegen_alt_range_1584, binding_member_still_rejected) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var x := 3; "
         "  return case x of var y | 1..5 => y, _ => 0 end; "

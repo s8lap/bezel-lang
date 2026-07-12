@@ -9,14 +9,15 @@
 //
 // runJit returns the FULL int from Main() (not 8-bit wrapped); values ≤ 255.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 const char* VEC =
@@ -32,7 +33,7 @@ const char* VEC =
 // #1096: a reversed-operand use (`4 * v` with only `operator *(Vec, int)`) is a
 // clean §25 compile error — NOT an IR-verification crash.
 BEZEL_TEST(operator_operand_order_1096, reversed_operands_rejected_not_crash) {
-    auto r = runJit(
+    auto r = runAot(
         std::string(VEC) +
         "class Mn public static method Main(): int "
         "  var v := new Vec(2, 3); "
@@ -66,7 +67,7 @@ BEZEL_TEST(operator_operand_order_1096, record_plus_record_works) {
 
 // An undeclared operator on a record operand is a clean error (no crash).
 BEZEL_TEST(operator_operand_order_1096, undeclared_operator_rejected) {
-    auto r = runJit(
+    auto r = runAot(
         std::string(VEC) +
         "class Mn public static method Main(): int "
         "  var v := new Vec(2, 3); "
@@ -126,7 +127,7 @@ BEZEL_TEST(operator_operand_order_1096, first_overload_still_resolves_1131) {
 // IR. The operator previously resolved (nullability was ignored) and codegen
 // passed the {i8, Vec} wrapper struct to the bare-Vec operator function.
 BEZEL_TEST(operator_operand_order_1096, nullable_user_operator_rejected_not_crash_1132) {
-    auto r = runJit(
+    auto r = runAot(
         std::string(VEC) +
         "class Mn public static method Main(): int "
         "  var a: Vec? := new Vec(1, 2); "

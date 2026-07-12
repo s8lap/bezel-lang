@@ -21,22 +21,23 @@
 // The harness compares int exit codes, so floating results are encoded as
 // integers, e.g. `int(x * 10)` so the double 9.5 surfaces as 95.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& body) {
-    auto r = runJit(
+    auto r = runAot(
         std::string("module M; class C public static method Main(): int ") +
         body + " end Main; end C;");
     return r.ran ? r.exitCode : -999;
 }
 
 int runMod(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
