@@ -501,7 +501,18 @@ def resolve_expr(expr: str, env: dict, funcs: dict, _depth: int = 0):
 # Per-test-case extraction.
 # =============================================================================
 
-HARNESS_NAMES = ('parseAndCheckOwnership', 'runJit')
+HARNESS_NAMES = ('parseAndCheckOwnership', 'runJit', 'parseSemaAll', 'parseSema',
+                  'parseAndResolve', 'checkBody', 'semaAll', 'parseSemaFull',
+                  'parseSemaAllWithOwnership', 'parseResolve', 'checkMod', 'check')
+
+# Function names that RUN the compiled program (JIT-execute or spawn a native
+# AOT binary), as opposed to merely compiling it. A case that asserts on the
+# runtime OUTCOME of one of these calls (its `.ran` / `.exitCode` fields, or
+# a local wrapper around one of them) is a runtime-behavior test, not a pure
+# diagnostic test: `bezelc -c` (what a lit RUN line invokes) only compiles —
+# it never executes the program — so such an assertion has no lit
+# equivalent and the case must not be converted. See `find_execution_assertion`.
+EXECUTION_HARNESS_NAMES = ('run', 'runMain', 'runFull', 'runJit', 'runAot')
 
 # Text fragments that mark a diagnostic as a WARNING-shaped message (bezelc's
 # CLI output carries no explicit severity word — see lit.cfg.py's comment —
@@ -522,10 +533,60 @@ class CaseResult:
     case: str
     verdict: str  # 'reject' | 'accept'
     source: str | None = None
-    status: str = 'unresolved'  # unresolved | ok | mismatch | error
+    status: str = 'unresolved'  # unresolved | ok | mismatch | error | non_convertible
     detail: str = ''
     bz_path: str | None = None
     needles: list = field(default_factory=list)
+
+
+# =============================================================================
+# Runtime-behavior guard (hardening — see module docstring PART 1 note in the
+# commit this landed with). A test whose body ALSO contains
+# `r.diagnostics.hasErrors()` satisfies classify_verdict's primary signal, but
+# if the SAME body asserts on `.ran` / `.exitCode` (directly, or through a
+# local wrapper that calls one of the execution-harness functions), the real
+# thing under test is the PROGRAM'S RUNTIME BEHAVIOR — something `bezelc -c`
+# (compile-only; what every lit RUN line invokes) cannot observe. Emitting a
+# `.bz` for such a case would silently drop the runtime assertion and leave
+# behind a vacuous diagnostic-only control, so these must be flagged
+# NON-CONVERTIBLE and must never count toward "safe to delete the gtest file".
+# =============================================================================
+
+_EXEC_MEMBER_RE = re.compile(r'\.(?:ran|exitCode)\b')
+_EXEC_CALL_RE = re.compile(
+    r'(?<![A-Za-z0-9_])(?:' +
+    '|'.join(re.escape(n) for n in EXECUTION_HARNESS_NAMES) + r')\('
+)
+
+
+def find_execution_assertion(body: str):
+    """Scan every `BEZEL_EXPECT_(TRUE|FALSE|EQ)(...)` call in `body`
+    (the harness's full macro surface, per test_harness.hpp). If ANY of
+    their arguments references `.ran`, `.exitCode`, or calls one of
+    run/runMain/runFull/runJit/runAot (directly or via a local wrapper such
+    as `int run(const std::string& src) { auto r = runJit(src); return
+    r.ran ? r.exitCode : -999; }` called as `run(src)`), return a short
+    human-readable description of what matched; else return None.
+
+    Deliberately scans ALL assertions in the body, not just the one used as
+    classify_verdict's primary signal — the false-positive this guards
+    against is exactly a body with BOTH a `hasErrors()` assertion AND a
+    separate `.ran`/`.exitCode` assertion (e.g.
+    `owned_marker_transfer_test.cpp`'s
+    `BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors()); BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);`), where the first assertion alone would
+    let classify_verdict resolve a (wrong, incomplete) verdict."""
+    for m in re.finditer(r'BEZEL_EXPECT_(?:TRUE|FALSE|EQ)\(', body):
+        arg, _close = find_matching(body, m.end() - 1, '(', ')')
+        if arg is None:
+            continue
+        mem = _EXEC_MEMBER_RE.search(arg)
+        if mem:
+            return f"asserts on `{mem.group(0)}`"
+        call = _EXEC_CALL_RE.search(arg)
+        if call:
+            return f"calls `{call.group(0)}` (execution harness)"
+    return None
 
 
 def classify_verdict(body: str, bool_wrappers: dict):
@@ -761,6 +822,17 @@ def process_file(cpp_path: str, bezelc: str, out_dir: str, dry_run: bool):
 
     with tempfile.TemporaryDirectory(dir='/var/tmp/bezel-scratch') as tmpdir:
         for t in tests:
+            exec_reason = find_execution_assertion(t['body'])
+            if exec_reason is not None:
+                case = CaseResult(suite=t['suite'], case=t['case'], verdict='?')
+                case.status = 'non_convertible'
+                case.detail = (
+                    f'runtime-behavior test ({exec_reason}) — bezelc -c only '
+                    f'compiles, cannot observe this; not a pure-diagnostic case'
+                )
+                results.append(case)
+                continue
+
             verdict = classify_verdict(t['body'], bool_wrappers)
             case = CaseResult(suite=t['suite'], case=t['case'], verdict=verdict or '?')
             if verdict is None:
@@ -843,17 +915,25 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     all_report = {}
-    total_ok = total_cases = total_files_clean = 0
+    total_ok = total_cases = total_files_clean = total_non_convertible = 0
     for cpp in args.cpp_files:
         results, ntests = process_file(cpp, args.bezelc, args.out_dir, args.dry_run)
         ok = sum(1 for r in results if r.status == 'ok')
+        non_conv = sum(1 for r in results if r.status == 'non_convertible')
         total_ok += ok
+        total_non_convertible += non_conv
         total_cases += len(results)
+        # NB: `ok == len(results) == ntests` is false whenever ANY case is
+        # non_convertible (it's neither 'ok' nor counted in `ok`), so a file
+        # with a runtime-behavior case is NEVER reported FULL FILE COVERAGE —
+        # the hardening this guards against (see find_execution_assertion).
         file_clean = ok == len(results) == ntests
         if file_clean:
             total_files_clean += 1
-        print(f"{cpp}: {ok}/{len(results)} cases resolved+emitted"
-              f"{' (FULL FILE COVERAGE)' if file_clean else ''}")
+        note = ' (FULL FILE COVERAGE)' if file_clean else ''
+        if non_conv:
+            note += f' [{non_conv} NON-CONVERTIBLE runtime-behavior case(s) — do NOT delete this gtest file]'
+        print(f"{cpp}: {ok}/{len(results)} cases resolved+emitted{note}")
         for r in results:
             if r.status != 'ok':
                 print(f"    [{r.status}] {r.suite}.{r.case}: {r.detail}")
@@ -871,7 +951,8 @@ def main():
         }
 
     print(f"\nTOTAL: {total_ok}/{total_cases} cases across {len(args.cpp_files)} files; "
-          f"{total_files_clean}/{len(args.cpp_files)} files fully covered")
+          f"{total_files_clean}/{len(args.cpp_files)} files fully covered"
+          f"; {total_non_convertible} case(s) NON-CONVERTIBLE (runtime-behavior)")
 
     if args.report:
         with open(args.report, 'w') as fh:
