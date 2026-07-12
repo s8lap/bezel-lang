@@ -1,0 +1,21 @@
+# CMake-generated site configuration for the Bezel lit test track.
+#
+# `cmake` configures this template into <build>/tests/lit/lit.site.cfg.py with
+# the concrete tool paths substituted in (see tests/CMakeLists.txt, the
+# `check-lit` target).  Do NOT edit the generated copy — edit this `.in`.
+#
+# The tool paths are resolved at generation time: bezelc from the built target
+# ($<TARGET_FILE:bezelc>), FileCheck and `not` from find_program().
+
+config.bezelc = "@BEZELC_PATH@"
+config.filecheck = "@FILECHECK_PATH@"
+config.not_tool = "@NOT_PATH@"
+
+# Per-test scratch (`%t`) lands under the build tree, never the source tree.
+config.test_exec_root = "@LIT_EXEC_ROOT@"
+
+# Hand off to the main config (which owns everything machine-independent).
+# NOTE: we deliberately do NOT `import lit.llvm` here — the pip-installed `lit`
+# package (see requirements-dev.txt) is the minimal PyPI distribution and does
+# not ship the `lit.llvm` helper module (that lives in the LLVM source tree).
+lit_config.load_config(config, "@LIT_MAIN_CFG@")

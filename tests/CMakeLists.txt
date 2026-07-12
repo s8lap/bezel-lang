@@ -68,3 +68,55 @@ add_custom_target(check
     DEPENDS bezel_tests
     USES_TERMINAL
     COMMENT "Running full test suite in parallel shards (run_parallel.sh)")
+
+# ── lit + FileCheck diagnostic test track (tests/lit/) ───────────────────────
+# ADDITIVE and COMPLEMENTARY to the gtest suite above: `lit` drives the real
+# `bezelc` binary over the `.bz` files in tests/lit/ and matches diagnostics
+# with LLVM's FileCheck. See tests/lit/README.md for the rationale (per-process
+# isolation; the full pipeline always runs, so an ownership-pass reject can't be
+# missed by a sema-only harness; no per-test C++ compile).
+#
+# This is NOT part of the default build (`all`) and is a SEPARATE target.
+# `lit` is a dev-time-only pip dependency and FileCheck comes from the system
+# LLVM; if EITHER is missing the target is simply skipped with a status message
+# — the ordinary build never depends on it and never breaks because of it.
+find_program(BEZEL_LIT NAMES lit lit.py llvm-lit)
+find_program(BEZEL_FILECHECK NAMES FileCheck FileCheck-21
+    HINTS ${LLVM_TOOLS_BINARY_DIR})
+# LLVM's `not` (exit-status inverter) is required by the reject tests — see
+# tests/lit/lit.cfg.py for why. It ships alongside FileCheck.
+find_program(BEZEL_NOT NAMES not
+    HINTS ${LLVM_TOOLS_BINARY_DIR})
+if(BEZEL_LIT AND BEZEL_FILECHECK AND BEZEL_NOT)
+    # Values fed into lit.site.cfg.py.in. BEZELC_PATH is a generator expression
+    # (resolved at build/generate time, not configure time); the others are
+    # plain paths known at configure time.
+    set(BEZELC_PATH "$<TARGET_FILE:bezelc>")
+    set(FILECHECK_PATH "${BEZEL_FILECHECK}")
+    set(NOT_PATH "${BEZEL_NOT}")
+    set(LIT_MAIN_CFG "${CMAKE_CURRENT_SOURCE_DIR}/lit/lit.cfg.py")
+    set(LIT_EXEC_ROOT "${CMAKE_CURRENT_BINARY_DIR}/lit")
+    # Two-phase generation (mirrors LLVM's configure_lit_site_cfg): configure_file
+    # substitutes the @VAR@ text but leaves the $<TARGET_FILE:bezelc> genex
+    # verbatim; file(GENERATE) then resolves that genex into a concrete path.
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/lit/lit.site.cfg.py.in
+        ${CMAKE_CURRENT_BINARY_DIR}/lit/lit.site.cfg.py.gen
+        @ONLY)
+    file(GENERATE
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/lit/lit.site.cfg.py
+        INPUT ${CMAKE_CURRENT_BINARY_DIR}/lit/lit.site.cfg.py.gen)
+    add_custom_target(check-lit
+        COMMAND ${BEZEL_LIT} -sv ${CMAKE_CURRENT_BINARY_DIR}/lit
+        DEPENDS bezelc
+        USES_TERMINAL
+        COMMENT "Running Bezel lit + FileCheck diagnostic tests (tests/lit/)")
+    message(STATUS
+        "Bezel: lit diagnostic track enabled "
+        "(lit=${BEZEL_LIT}, FileCheck=${BEZEL_FILECHECK}, not=${BEZEL_NOT}); "
+        "target: check-lit")
+else()
+    message(STATUS
+        "Bezel: lit diagnostic track DISABLED — lit, FileCheck, or not not found "
+        "(target check-lit unavailable; ordinary build unaffected)")
+endif()

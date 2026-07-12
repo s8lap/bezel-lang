@@ -1,0 +1,17 @@
+# Dev-time-only dependency for the lit + FileCheck diagnostic test track
+# (tests/lit/).  lit is a tiny pure-Python test driver; it is NOT a runtime or
+# build dependency of the bezelc compiler — nothing that ships depends on it,
+# and a plain `cmake --build` never needs it.  It is required only to RUN this
+# test track (`cmake --build build --target check-lit`, or `lit -sv tests/lit`).
+#
+# Install (no root, no venv required):
+#   pip3 install --user -r tests/lit/requirements-dev.txt
+#
+# FileCheck itself is NOT a pip dependency — it is provided by the system LLVM
+# this project already links against (Fedora: /usr/bin/FileCheck, from
+# llvm package; a versioned /usr/bin/FileCheck-21 symlink also exists).
+#
+# Pinned to the version validated on this box (LLVM 21 system, Fedora).  lit's
+# RUN/CHECK surface is stable across versions, so a newer lit will also work;
+# the pin exists for reproducibility, not because a floor is required.
+lit==18.1.8
