@@ -41,17 +41,16 @@
 #include <sys/wait.h>
 
 #include "driver/Driver.hpp"
-#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runAot;
+using bezel::test::runJit;
 using bezel::test::JitResult;
 
 namespace {
 
 int run(const std::string& program) {
-    auto r = runAot(program);
+    auto r = runJit(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -205,7 +204,7 @@ BEZEL_TEST(codegen_owned_primary_ctor_param_1594, builtin_exception_captured_par
 // semantically pattern).
 BEZEL_TEST(codegen_owned_primary_ctor_param_1594, ref_primary_ctor_param_rejected_22_10) {
     // per §22.10 (v0.160)
-    auto r = runAot(
+    auto r = runJit(
         "module M; "
         "class Holder(ref x: int) "
         "  public method Get(): int => x; "
@@ -224,7 +223,7 @@ BEZEL_TEST(codegen_owned_primary_ctor_param_1594, ref_primary_ctor_param_rejecte
 // §22.10 (v0.160): `out` is likewise rejected on a primary-ctor parameter.
 BEZEL_TEST(codegen_owned_primary_ctor_param_1594, out_primary_ctor_param_rejected_22_10) {
     // per §22.10 (v0.160)
-    auto r = runAot(
+    auto r = runJit(
         "module M; "
         "class Holder(out x: int) "
         "  public method Get(): int => 0; "
@@ -241,7 +240,7 @@ BEZEL_TEST(codegen_owned_primary_ctor_param_1594, out_primary_ctor_param_rejecte
 // declared field.
 BEZEL_TEST(codegen_owned_primary_ctor_param_1594, scoped_primary_ctor_param_rejected_22_10) {
     // per §22.10 (v0.180)
-    auto r = runAot(
+    auto r = runJit(
         "module M; "
         "class Res destructor end destructor; end Res; "
         "class Holder(scoped r: Res) "
@@ -283,7 +282,7 @@ BEZEL_TEST(codegen_owned_primary_ctor_param_1594, plain_and_owned_params_still_a
 // never called Dispose(), genuinely leaking the captured Res.
 BEZEL_TEST(codegen_owned_primary_ctor_param_1594, bare_discard_of_captured_owned_param_rejected_21_9) {
     // per §21.9 / §3.6
-    auto r = runAot(
+    auto r = runJit(
         std::string("module M; ") + kRes +
         "class Holder(owned r: Res) "
         "  public method Use(): int => r.Id(); "
@@ -303,7 +302,7 @@ BEZEL_TEST(codegen_owned_primary_ctor_param_1594, bare_discard_of_captured_owned
 // per §28.9's derived-property computation.
 BEZEL_TEST(codegen_owned_primary_ctor_param_1594, bare_discard_of_declared_owned_field_rejected_21_9) {
     // per §21.9 / §3.6
-    auto r = runAot(
+    auto r = runJit(
         std::string("module M; ") + kRes +
         "class Holder(owned r: Res) "
         "  private owned _s: Res := r; "
@@ -348,7 +347,7 @@ BEZEL_TEST(codegen_owned_primary_ctor_param_1594, explicit_discard_of_captured_o
 // the piece-3 fix.
 BEZEL_TEST(codegen_owned_primary_ctor_param_1594, bare_discard_of_static_owned_only_field_still_accepted_21_9) {
     // per §21.9 / §22.12 rule 4
-    auto r = runAot(
+    auto r = runJit(
         std::string("module M; ") + kRes +
         "class Holder "
         "  private static readonly owned _shared: Res := new Res(1); "
@@ -367,7 +366,7 @@ BEZEL_TEST(codegen_owned_primary_ctor_param_1594, bare_discard_of_static_owned_o
 // regression guard for the piece-3 fix's general case.
 BEZEL_TEST(codegen_owned_primary_ctor_param_1594, bare_discard_of_trivial_class_still_accepted_21_9) {
     // per §21.9
-    auto r = runAot(
+    auto r = runJit(
         "module M; "
         "class Plain public method Get(): int => 5; end Plain; "
         "class C public static method Main(): int "
