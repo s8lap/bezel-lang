@@ -4,14 +4,15 @@
 // original leak has been removed from the collection surface per §4.8/§4.9
 // v0.155 — the indexer is the spec-declared write surface.) §28.11 / §4.5.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 const char* kCell =

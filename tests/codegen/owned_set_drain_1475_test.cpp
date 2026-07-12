@@ -25,14 +25,15 @@
 // (exactly-once disposal, Count == 0 after full drain, partial-drain
 // remainder still disposed by the set's own Dispose()).
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -95,7 +96,7 @@ BEZEL_TEST(owned_set_drain_1475, full_drain_empties_set_spec_4_10) {
 // §4.10: the loop visits every element exactly once — three distinct
 // elements added, three seen by the loop body.
 BEZEL_TEST(owned_set_drain_1475, drain_visits_every_element_once_spec_4_10) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "sealed class Val "
         "  public N: int := 0; "
