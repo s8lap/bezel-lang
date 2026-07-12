@@ -39,6 +39,21 @@ echo "== gate[2/*]: build bezel_tests =="
   || { grep -iE 'error:|FAILED:' "$S/gate_build.log" | head -20; fail "build"; }
 echo "   binary: $(ls -la --time-style=+%H:%M:%S build/tests/bezel_tests | awk '{print $6}')"
 
+# lit + FileCheck diagnostic track (tests/lit/): drives the REAL bezelc over .bz
+# files and matches diagnostics with FileCheck. Fast (~0.1s/test, no JIT) and
+# per-process, so it validates the accept/reject + diagnostic-text/location
+# surface without the sharding-pollution or wrong-harness (#1682) failure modes
+# the gtest suite is exposed to. Skipped cleanly if lit/FileCheck/not were absent
+# at configure (the site config is only generated when all three are found).
+echo "== gate[2b/*]: lit diagnostic track (real bezelc + FileCheck, per-process) =="
+if [ -f build/tests/lit/lit.site.cfg.py ]; then
+  "$DH" build cmake --build build --target bezelc check-lit -j16 >"$S/gate_lit.log" 2>&1; lit_rc=$?
+  grep -E 'Total Discovered|Passed:|Failed:|Unresolved|Unsupported' "$S/gate_lit.log" | tail -4 || true
+  [ "$lit_rc" -ne 0 ] && { echo "   -- lit failures --"; grep -E 'FAIL:|error:|expected string not found' "$S/gate_lit.log" | head -20; tail -8 "$S/gate_lit.log"; fail "lit diagnostic track"; }
+else
+  echo "   (check-lit target not configured — lit/FileCheck/not absent; skipping)"
+fi
+
 echo "== gate[3/*]: sharded suite (crash/undercount-checked) =="
 "$DH" suite tests/run_parallel.sh >"$S/gate_shard.log" 2>&1; rc=$?
 grep -E 'TOTAL:|## GATE FAILURE|died on|--- failing' "$S/gate_shard.log" || true
