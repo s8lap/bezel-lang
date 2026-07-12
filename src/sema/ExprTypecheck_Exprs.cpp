@@ -5303,12 +5303,32 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // (§22.5), which run the constructor and respect its invariants, or
         // binding the instance to a named local and assigning its members
         // as statements. Records are a copy and accept any record-typed
-        // source, so this gate is class/interface-only.
+        // source, so this gate is class/interface/enum-only.
+        //
+        // §9.5/§10.5 (#1738): an ENUM source is likewise rejected — §9.5's
+        // "must be record-typed" is a blanket rule with no enum carve-out,
+        // and per §10.5 an enum may not declare instance fields or
+        // backing-storage properties (its runtime representation is the
+        // underlying integer), so an enum source has no possible valid
+        // `with` target. The class-source diagnostic's two remedies (named
+        // constructor arguments, bind-and-assign) presuppose fields to set
+        // and don't fit a fieldless enum value, so enum gets its own
+        // message naming §10.5 instead of reusing the class wording.
         if (we->source) {
             if (auto* st = ctx_.exprType(*we->source)) {
                 if (st->kind == TypeRef::Kind::Named && st->declaration &&
-                    st->declaration->kind != ast::TypeDeclKind::Record &&
-                    st->declaration->kind != ast::TypeDeclKind::Enum) {
+                    st->declaration->kind == ast::TypeDeclKind::Enum) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, we->source->span.begin,
+                        "`with` requires a record-typed source; this source "
+                        "is enum-typed (§9.5) — an enum's runtime "
+                        "representation is its underlying integer and it "
+                        "may not declare instance fields or backing-storage "
+                        "properties (§10.5), so it has no possible `with` "
+                        "target; construct the desired enum constant "
+                        "directly instead");
+                } else if (st->kind == TypeRef::Kind::Named && st->declaration &&
+                           st->declaration->kind != ast::TypeDeclKind::Record) {
                     ctx_.diagnostics().report(
                         Severity::Error, we->source->span.begin,
                         "`with` requires a record-typed source; this source "
