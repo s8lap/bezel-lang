@@ -16,10 +16,11 @@
 
 #include <string>
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
@@ -28,7 +29,7 @@ int run(const std::string& body) {
     std::string src =
         "module M; class C public static method Main(): int " + body +
         " end Main; end C;";
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -37,7 +38,7 @@ bool rejected(const std::string& body) {
     std::string src =
         "module M; class C public static method Main(): int " + body +
         " end Main; end C;";
-    auto r = runJit(src);
+    auto r = runAot(src);
     return !r.ran;
 }
 
@@ -87,7 +88,7 @@ BEZEL_TEST(null_narrow_value_914, else_of_is_null) {
 
 // a narrowed PARAMETER (params are borrows; the narrowing + unwrap apply too).
 BEZEL_TEST(null_narrow_value_914, narrowed_parameter) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public static method F(n: int?): int "
         "    if n is null then return 0; end; var v: int := n; return v; "
@@ -164,7 +165,7 @@ BEZEL_TEST(null_narrow_value_914, arithmetic_narrowed_to_nullable_target) {
 // same {flag, value} struct — it narrows to the non-nullable enum in assignment
 // and return (Color.Green == 1, Color.Blue == 2).
 BEZEL_TEST(null_narrow_value_914, enum_nullable_narrowed_assign) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; enum Color Red, Green, Blue; end Color; "
         "class C public static method Main(): int "
         "  var c: Color? := Color.Green; "
@@ -174,7 +175,7 @@ BEZEL_TEST(null_narrow_value_914, enum_nullable_narrowed_assign) {
     if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
 BEZEL_TEST(null_narrow_value_914, enum_nullable_narrowed_return) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; enum Color Red, Green, Blue; end Color; "
         "class C public static method Main(): int "
         "  var c: Color? := Color.Blue; if c is null then return 0; end; "
@@ -185,7 +186,7 @@ BEZEL_TEST(null_narrow_value_914, enum_nullable_narrowed_return) {
 
 // §9 / §7.4 (#914): a narrowed `record?` narrows to the non-nullable record.
 BEZEL_TEST(null_narrow_value_914, record_nullable_narrowed_assign) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; record Pt(X: int, Y: int); "
         "class C public static method Main(): int "
         "  var p: Pt? := new Pt(7, 3); "
@@ -197,7 +198,7 @@ BEZEL_TEST(null_narrow_value_914, record_nullable_narrowed_assign) {
 
 // CONTROL: a genuinely-nullable enum? → non-nullable enum still rejects.
 BEZEL_TEST(null_narrow_value_914, enum_genuinely_nullable_rejected) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; enum Color Red, Green, Blue; end Color; "
         "class C public static method Main(): int "
         "  var c: Color? := null; var v: Color := c; return int(v); "
@@ -210,7 +211,7 @@ BEZEL_TEST(null_narrow_value_914, enum_genuinely_nullable_rejected) {
 // narrowing peels the `move` wrapper; codegen stores the (non-null) pointer
 // directly (unwrapNarrowedNullable is a no-op for a non-struct pointer).
 BEZEL_TEST(null_narrow_value_914, reference_nullable_narrowed_move_assign) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class Box public V: int := 5; end Box; "
         "class C public static method Main(): int "
         "  var b: Box? := new Box(); "
@@ -223,7 +224,7 @@ BEZEL_TEST(null_narrow_value_914, reference_nullable_narrowed_move_assign) {
 // CONTROL: a genuinely-nullable class? `move`d to a non-nullable reference still
 // rejects (the value is not narrowed).
 BEZEL_TEST(null_narrow_value_914, reference_genuinely_nullable_rejected_1056) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class Box public V: int := 5; end Box; "
         "class C public static method Main(): int "
         "  var b: Box? := null; using var x: Box := move b; return x.V; "
@@ -242,7 +243,7 @@ BEZEL_TEST(null_narrow_value_914, reference_genuinely_nullable_rejected_1056) {
 
 // A narrowed VALUE-type (int?) local as a non-nullable `int` argument. `n*2`=42.
 BEZEL_TEST(null_narrow_value_914, narrowed_value_local_in_call_argument_1191) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public static method Twice(n: int): int => n * 2; "
         "  public static method Main(): int "
@@ -258,7 +259,7 @@ BEZEL_TEST(null_narrow_value_914, narrowed_value_local_in_call_argument_1191) {
 // (unwrapNarrowedNullable is a no-op for the bare-pointer nullable string).
 // "hi".Length = 2.
 BEZEL_TEST(null_narrow_value_914, narrowed_reference_local_in_call_argument_1191) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public static method Greet(u: string): int => u.Length; "
         "  public static method Main(): int "
@@ -273,7 +274,7 @@ BEZEL_TEST(null_narrow_value_914, narrowed_reference_local_in_call_argument_1191
 // A narrowed local in a `new` CONSTRUCTOR argument (the new-ctor path shares the
 // same checkArgsAgainstParams call-arg site). record Box(v).v.Length = 5.
 BEZEL_TEST(null_narrow_value_914, narrowed_local_in_new_ctor_argument_1191) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; record Box(v: string); "
         "class C public static method Main(): int "
         "  var u: string? := \"hello\"; "
@@ -287,7 +288,7 @@ BEZEL_TEST(null_narrow_value_914, narrowed_local_in_new_ctor_argument_1191) {
 // CONTROL: a GENUINELY-nullable local (conditionally assigned, so NOT narrowed)
 // passed to a non-nullable parameter must STILL be rejected.
 BEZEL_TEST(null_narrow_value_914, genuinely_nullable_call_argument_rejected_1191) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public static method Greet(u: string): int => u.Length; "
         "  public static method Pick(b: bool, s: string): int "
@@ -302,7 +303,7 @@ BEZEL_TEST(null_narrow_value_914, genuinely_nullable_call_argument_rejected_1191
 // — forwarding `fromExpr` only adds narrowing/promotion acceptance, never relaxes
 // an ordinary §5.1 type-mismatch.
 BEZEL_TEST(null_narrow_value_914, type_mismatch_call_argument_rejected_1191) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public static method Greet(u: string): int => u.Length; "
         "  public static method Main(): int => Greet(5); "

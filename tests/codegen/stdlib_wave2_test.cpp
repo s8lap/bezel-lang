@@ -23,21 +23,22 @@
 //
 // All tests use the JIT harness (runJit/runJitChecked) and return int exit codes.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 using bezel::test::runJitChecked;
 
 namespace {
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
 bool hasSemaError(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return !r.ran && r.diagnostics.hasErrors();
 }
 

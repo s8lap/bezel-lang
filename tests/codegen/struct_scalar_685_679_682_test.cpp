@@ -16,14 +16,15 @@
 // Spec: §4.4 (decimal value type), §6.2 (Mutex/Lock), §8.3 (hash-equality contract),
 //       §15.6 (array slicing), stdlib §4.8 (Dictionary), stdlib §4.10 (Set).
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -99,7 +100,7 @@ BEZEL_TEST(struct_scalar_682, array_range_slice_inclusive_no_ice) {
     // The return value of s.Count is not checked here because sema types
     // arr[range] as the element type (T=int), so s.Count lowers as int.Count
     // which returns a default 0.  The IR-level fix is what matters for #682.
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public static method Main(): int "
         "    using var arr := new Array<int>(); "
@@ -115,7 +116,7 @@ BEZEL_TEST(struct_scalar_682, array_range_slice_inclusive_no_ice) {
 
 // #682 / §15.6: arr[1..3] inclusive — no ICE, compiles + runs.
 BEZEL_TEST(struct_scalar_682, array_range_slice_values_no_ice) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public static method Main(): int "
         "    using var arr := new Array<int>(); "
@@ -130,7 +131,7 @@ BEZEL_TEST(struct_scalar_682, array_range_slice_values_no_ice) {
 
 // #682 / §15.6: arr[1..<4] half-open — no ICE, compiles + runs.
 BEZEL_TEST(struct_scalar_682, array_range_slice_half_open_no_ice) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public static method Main(): int "
         "    using var arr := new Array<int>(); "
@@ -147,7 +148,7 @@ BEZEL_TEST(struct_scalar_682, array_range_slice_half_open_no_ice) {
 // The program throws (unhandled exception → exit 70); we just verify the IR
 // was valid (ran=true, no IR-verification SIGABRT / -999).
 BEZEL_TEST(struct_scalar_682, array_range_slice_oor_no_ice) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public static method Main(): int "
         "    using var arr := new Array<int>(); "

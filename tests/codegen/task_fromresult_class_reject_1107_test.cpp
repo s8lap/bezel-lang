@@ -9,14 +9,15 @@
 //
 // runJit returns the FULL int from Main() (not 8-bit wrapped); values ≤ 255.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 bool has305Reject(const bezel::test::JitResult& r) {
@@ -30,7 +31,7 @@ bool has305Reject(const bezel::test::JitResult& r) {
 
 // #1107/#10: explicit class type arg `Task.FromResult<MyClass>(…)` → rejected.
 BEZEL_TEST(task_fromresult_class_reject_1107, explicit_class_type_arg_rejected) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class MyC public _n: int; destructor end destructor; end MyC; "
         "class C public static async method Run(): Task<int> "
         "  using var t := Task.FromResult<MyC>(new MyC()); return 0; "
@@ -41,7 +42,7 @@ BEZEL_TEST(task_fromresult_class_reject_1107, explicit_class_type_arg_rejected) 
 
 // #1107/#10: inferred class T (from the argument) → rejected.
 BEZEL_TEST(task_fromresult_class_reject_1107, inferred_class_arg_rejected) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class MyC public _n: int; destructor end destructor; end MyC; "
         "class C public static async method Run(): Task<int> "
         "  var c := new MyC(); var t := Task.FromResult(c); return 0; "

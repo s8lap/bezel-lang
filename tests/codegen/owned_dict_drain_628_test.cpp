@@ -25,6 +25,7 @@
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
@@ -33,14 +34,14 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 namespace fs = std::filesystem;
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -303,7 +304,7 @@ BEZEL_TEST(owned_dict_drain_628, partial_drain_int_key_remainder_disposed_by_dic
 // Migrated from OwningDictionary<string,int> → OwningDictionary<string,R> per
 // stdlib §4.2/#1327 (value types rejected as owned-collection elements).
 BEZEL_TEST(owned_dict_drain_628, drain_loop_compiles_and_runs) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class R public constructor() end constructor; end R; "
         "class C "

@@ -34,6 +34,7 @@
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
@@ -41,12 +42,12 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -298,7 +299,7 @@ BEZEL_TEST(codegen_owned_dict_field_894, field_reassign_disposes_old_values) {
 BEZEL_TEST(codegen_owned_dict_field_893, value_v_rejected_at_sema_1327) {
     // stdlib §4.2/#1327: OwningDictionary<string, int> is rejected at sema
     // (int is a primitive value type with no disposal obligation).
-    auto r = runJit(kValueVNoCrash);
+    auto r = runAot(kValueVNoCrash);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(r.ran);
 }

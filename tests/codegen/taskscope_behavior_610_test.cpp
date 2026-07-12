@@ -20,15 +20,16 @@
 
 #include <string>
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 // §6.10: two spawned children run and complete before `await Join()` returns —
 // both counter increments are visible after the join.
 BEZEL_TEST(taskscope_behavior_610, children_complete_before_join_returns) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; import System.Threading; "
         "class Prog "
         "  public static async method Main(): Task<int> "
@@ -54,7 +55,7 @@ BEZEL_TEST(taskscope_behavior_610, children_complete_before_join_returns) {
 // the sibling observes cancellation through the scope's Token (§30.8
 // cooperative cancellation) — first-fault-wins + cancel-siblings.
 BEZEL_TEST(taskscope_behavior_610, first_fault_reraises_and_cancels_siblings) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; import System.Threading; "
         "class Prog "
         "  public static async method Main(): Task<int> "
@@ -90,7 +91,7 @@ BEZEL_TEST(taskscope_behavior_610, first_fault_reraises_and_cancels_siblings) {
 // §6.10: Spawn AFTER the scope closed (Join returned) raises
 // InvalidOperationException — deterministic, catchable at the Spawn site.
 BEZEL_TEST(taskscope_behavior_610, spawn_after_close_raises_ioe) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; import System.Threading; "
         "class Prog "
         "  public static async method Main(): Task<int> "
@@ -115,7 +116,7 @@ BEZEL_TEST(taskscope_behavior_610, spawn_after_close_raises_ioe) {
 // DisposeAsync. The IOE faults the helper's task at its scope disposal and is
 // caught by the awaiter — exactly the "IOE from DisposeAsync" backstop.
 BEZEL_TEST(taskscope_behavior_610, missing_join_runtime_ioe_from_dispose) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; import System.Threading; "
         "class Prog "
         "  public static method Cond(): bool => false; "
@@ -145,7 +146,7 @@ BEZEL_TEST(taskscope_behavior_610, missing_join_runtime_ioe_from_dispose) {
 // (a child's own InvalidOperationException never masks the original
 // ArgumentException; Join is the sole re-raise site).
 BEZEL_TEST(taskscope_behavior_610, exception_edge_drains_and_swallows) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; import System.Threading; "
         "class Prog "
         "  public static method Always(): bool => true; "
@@ -188,7 +189,7 @@ BEZEL_TEST(taskscope_behavior_610, exception_edge_drains_and_swallows) {
 // the token cancel and exits; Join returns normally (no fault: the child
 // completes by choice, it is not aborted).
 BEZEL_TEST(taskscope_behavior_610, cancel_after_bounds_the_scope) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; import System.Threading; "
         "class Prog "
         "  public static async method Main(): Task<int> "
@@ -215,7 +216,7 @@ BEZEL_TEST(taskscope_behavior_610, cancel_after_bounds_the_scope) {
 
 // §6.10: Cancel() cancels all children now (the same signal path).
 BEZEL_TEST(taskscope_behavior_610, explicit_cancel_reaches_children) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; import System.Threading; "
         "class Prog "
         "  public static async method Main(): Task<int> "
@@ -245,7 +246,7 @@ BEZEL_TEST(taskscope_behavior_610, explicit_cancel_reaches_children) {
 // the scope) are used by the spawned work and disposed EXACTLY ONCE — the
 // destructor counter reads 2 after the drain and the sources' scope end.
 BEZEL_TEST(taskscope_behavior_610, captured_owned_sources_disposed_exactly_once) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; import System.Threading; "
         "class Tracked "
         "  public static _count: int := 0; "
@@ -281,7 +282,7 @@ BEZEL_TEST(taskscope_behavior_610, captured_owned_sources_disposed_exactly_once)
 // the counter never reaches zero early); all of it completes before Join
 // returns.
 BEZEL_TEST(taskscope_behavior_610, respawn_during_drain_completes) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; import System.Threading; "
         "class Prog "
         "  public static async method Main(): Task<int> "

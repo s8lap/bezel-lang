@@ -19,6 +19,7 @@
 //   §28.13 "Shared<T> and Weak<T>".
 //   stdlib §2.16 "Shared<T>", "Weak<T>".
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
@@ -44,12 +45,12 @@
 #include "codegen/LlvmBackend.hpp"
 
 namespace fs = std::filesystem;
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
