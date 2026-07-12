@@ -11,15 +11,16 @@
 #include <string>
 
 #include "driver/Driver.hpp"
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -93,7 +94,7 @@ BEZEL_TEST(codegen_cg26, putchar_writes_stdout) {
 // types (pointer-sized integers). The block is declared but uncalled; that
 // `main` runs at all proves the signatures compiled.
 BEZEL_TEST(codegen_ffi_types, intptr_uintptr_resolve_32_7) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "extern \"c\" "
         "  public method f(a: IntPtr, b: UIntPtr): IntPtr; end; "
@@ -108,7 +109,7 @@ BEZEL_TEST(codegen_ffi_types, intptr_uintptr_resolve_32_7) {
 // then ...`). Before the fix, `IntPtr` errored "unresolved identifier" here.
 BEZEL_TEST(codegen_ffi_types, intptr_zero_expr_head_and_equality_32_7) {
     // var p := IntPtr.Zero; if p = IntPtr.Zero then return 0; end; return 1;
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class C public static method Main(): int "
         "  var p := IntPtr.Zero; "
@@ -123,7 +124,7 @@ BEZEL_TEST(codegen_ffi_types, intptr_zero_expr_head_and_equality_32_7) {
 // as an expression head, and `<>`. `IntPtr(0L)` equals `IntPtr.Zero`; a
 // non-zero conversion does not. Mirrors §5.2's explicit-conversion syntax.
 BEZEL_TEST(codegen_ffi_types, intptr_long_conversion_32_7) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class C public static method Main(): int "
         "  var p0 := IntPtr(0L); "
@@ -139,7 +140,7 @@ BEZEL_TEST(codegen_ffi_types, intptr_long_conversion_32_7) {
 // §32.7 / stdlib §10.0 (#1512): the UIntPtr counterparts — `UIntPtr.Zero`, the
 // `UIntPtr(ulong)` conversion, and `=`/`<>`.
 BEZEL_TEST(codegen_ffi_types, uintptr_zero_and_conversion_32_7) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class C public static method Main(): int "
         "  var z := UIntPtr.Zero; "
@@ -155,7 +156,7 @@ BEZEL_TEST(codegen_ffi_types, uintptr_zero_and_conversion_32_7) {
 // §32.7 / §5.2 / stdlib §10.0 (#1512): the reverse conversion `long(IntPtr)`
 // round-trips a value through the pointer-sized integer.
 BEZEL_TEST(codegen_ffi_types, intptr_long_roundtrip_32_7) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class C public static method Main(): int "
         "  var p := IntPtr(42L); "
@@ -168,7 +169,7 @@ BEZEL_TEST(codegen_ffi_types, intptr_long_roundtrip_32_7) {
 // §32.7 (#1512): a non-integer argument to the `IntPtr(...)` conversion is a
 // compile error (§32.7: conversions are to and from `long`/`ulong`).
 BEZEL_TEST(codegen_ffi_types, intptr_conversion_rejects_non_integer_32_7) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class C public static method Main(): int "
         "  var p := IntPtr(\"hello\"); "
@@ -179,7 +180,7 @@ BEZEL_TEST(codegen_ffi_types, intptr_conversion_rejects_non_integer_32_7) {
 
 // §32.5 / stdlib §10.1: CString resolves as an extern param + return type.
 BEZEL_TEST(codegen_ffi_types, cstring_resolve_32_5) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "extern \"c\" public method strdup(s: CString): CString; end; "
         "class C public static method Main(): int return 1; end Main; end C;");
@@ -190,7 +191,7 @@ BEZEL_TEST(codegen_ffi_types, cstring_resolve_32_5) {
 // §32.1: a nullable CString return (`CString?`, as in the spec's `strdup`
 // example) resolves and is FFI-permitted.
 BEZEL_TEST(codegen_ffi_types, nullable_cstring_resolve_32_1) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "extern \"c\" public method strdup(s: CString): CString?; end; "
         "class C public static method Main(): int return 2; end Main; end C;");
@@ -200,7 +201,7 @@ BEZEL_TEST(codegen_ffi_types, nullable_cstring_resolve_32_1) {
 
 // §32.5 / stdlib §10.2 / §10.3: WString and RawBytes resolve as extern types.
 BEZEL_TEST(codegen_ffi_types, wstring_rawbytes_resolve_32_5) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "extern \"c\" "
         "  public method w(s: WString): IntPtr; "
@@ -214,7 +215,7 @@ BEZEL_TEST(codegen_ffi_types, wstring_rawbytes_resolve_32_5) {
 // parameter end-to-end. libc atoi("42") parses the null-terminated UTF-8 data
 // pointer of the bz_string and returns 42, observable as the JIT exit code.
 BEZEL_TEST(codegen_ffi_types, cstring_arg_marshals_to_libc_atoi_32_6) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "extern \"c\" public method atoi(s: CString): int; end; "
         "class C public static method Main(): int "
@@ -246,7 +247,7 @@ BEZEL_TEST(codegen_ffi_types, cstring_arg_marshals_to_libc_puts_32_6) {
 // NUL and returns 1 (silent corruption). Ā forces a single code point
 // above 0xFF so the literal lowers to storage width 2.
 BEZEL_TEST(codegen_ffi_types, cstring_nonascii_reencoded_to_utf8_strlen_32_6) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "extern \"c\" public method strlen(s: CString): int; end; "
         "class C public static method Main(): int "
@@ -260,7 +261,7 @@ BEZEL_TEST(codegen_ffi_types, cstring_nonascii_reencoded_to_utf8_strlen_32_6) {
 // §32.5 / §32.6: a width-1 (pure-ASCII) string still marshals correctly through
 // the same path — strlen("ABC") = 3. Guards against the fast path regressing.
 BEZEL_TEST(codegen_ffi_types, cstring_ascii_strlen_unchanged_32_6) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "extern \"c\" public method strlen(s: CString): int; end; "
         "class C public static method Main(): int "
@@ -305,7 +306,7 @@ BEZEL_TEST(codegen_ffi_types, cstring_nonascii_puts_utf8_bytes_32_6) {
 // §10.1 / §32.6 / fix #977: CString.From("hello") produces a 5-byte buffer;
 // strlen returns 5. Verifies sema resolution and codegen lowering end-to-end.
 BEZEL_TEST(codegen_ffi_types, cstring_from_strlen_10_1_977) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "extern \"c\" public method strlen(s: CString): int; end; "
         "class C public static method Main(): int "
@@ -320,7 +321,7 @@ BEZEL_TEST(codegen_ffi_types, cstring_from_strlen_10_1_977) {
 // without corruption. Returns 0 if total length is correct (11 × 100 = 1100;
 // capped to byte range: 1100 mod 256 = 76).
 BEZEL_TEST(codegen_ffi_types, cstring_from_loop_disposal_10_1_977) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "extern \"c\" public method strlen(s: CString): int; end; "
         "class C public static method Main(): int "
@@ -342,7 +343,7 @@ BEZEL_TEST(codegen_ffi_types, cstring_from_loop_disposal_10_1_977) {
 // produced CString must be re-encoded UTF-8, not raw wide data. "AĀB" is
 // 3 code points but 4 UTF-8 bytes (Ā = U+0100 → 0xC4 0x80).
 BEZEL_TEST(codegen_ffi_types, cstring_from_nonascii_10_1_977) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "extern \"c\" public method strlen(s: CString): int; end; "
         "class C public static method Main(): int "

@@ -21,14 +21,15 @@
 //   (d) constraint method result used in arithmetic.
 //   (e) two type params each constrained.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -217,7 +218,7 @@ BEZEL_TEST(generic_constraint_dispatch_484, primitive_compareto_via_constraint_7
 // vtable dispatch; it is now a clean compile error. (Full-pipeline runJit test:
 // the constraint bound resolution differs in the sema-only harness.)
 BEZEL_TEST(generic_constraint_dispatch_484, method_constraint_non_conforming_rejected_729) {
-    bezel::test::JitResult r = runJit(
+    bezel::test::JitResult r = runAot(
         "module M; "
         "interface IFoo method Compute(): int; end IFoo; "
         "class NotIFoo end NotIFoo; "
@@ -357,7 +358,7 @@ BEZEL_TEST(generic_constraint_dispatch_484, dispose_on_class_constrained_ok_1293
 
 // #1293 (negative): an UNCONSTRAINED type param has no Dispose — still rejected.
 BEZEL_TEST(generic_constraint_dispatch_484, dispose_on_unconstrained_rejected_1293) {
-    bezel::test::JitResult r = runJit(
+    bezel::test::JitResult r = runAot(
         "module M; "
         "static class F "
         "  public static method Take<T>(t: T): int "
@@ -373,7 +374,7 @@ BEZEL_TEST(generic_constraint_dispatch_484, dispose_on_unconstrained_rejected_12
 
 // #1293 (negative): a VALUE-constrained type param has no Dispose — rejected.
 BEZEL_TEST(generic_constraint_dispatch_484, dispose_on_value_constrained_rejected_1293) {
-    bezel::test::JitResult r = runJit(
+    bezel::test::JitResult r = runAot(
         "module M; "
         "static class F "
         "  public static method Take<T>(t: T): int where T: value "

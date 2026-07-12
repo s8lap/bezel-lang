@@ -16,18 +16,19 @@
 //
 // runJit returns the raw exit code.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 bool rejects(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return !r.ran;  // a compile error → not run
 }
 const char* kFiveElemArray =

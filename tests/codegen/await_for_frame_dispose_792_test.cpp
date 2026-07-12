@@ -10,14 +10,15 @@
 // its pending finally blocks). A static flag records whether it ran. runJit
 // captures the outcome (caught exceptions and returned values) via the exit code.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int runFull(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 // An async iterator whose body sets `T.cleaned := true` in a `finally`, so the

@@ -15,14 +15,15 @@
 // is left alive for that owner's disposal (the 8-byte cell leaks, the sound
 // trade-off; no UAF, no double-free).
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 // R counts live instances (ctor +1, dtor -1); a final count of 0 means the one

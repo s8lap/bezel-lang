@@ -39,6 +39,7 @@
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
@@ -47,14 +48,14 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 namespace fs = std::filesystem;
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -177,7 +178,7 @@ BEZEL_TEST(generic_owned_drain_990, ownedlinkedlist_generic_drain_disposes_once_
 // Sum the drained elements' stored values inside the generic drain body — proves
 // the loop variable holds a live class object (front-to-back drain of [10,20,30]).
 BEZEL_TEST(generic_owned_drain_990, generic_drain_element_value_usable_spec_4_5) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "sealed class Val "
         "  public N: int := 0; "

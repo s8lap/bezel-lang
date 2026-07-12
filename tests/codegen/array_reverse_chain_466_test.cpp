@@ -44,6 +44,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
@@ -51,7 +52,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
@@ -60,20 +61,20 @@ namespace fs = std::filesystem;
 // Run the JIT pipeline; return the exit code, or -999 if the program did not
 // run (compile error / JIT failure).
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
 // True iff the front end rejected `src` during sema (a diagnostic was reported
 // and the program did not run).
 bool rejectedAtCompile(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return !r.ran && r.diagnostics.hasErrors();
 }
 
 // True iff at least one reported diagnostic message contains `needle`.
 bool diagContains(const std::string& src, const std::string& needle) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     for (const auto& d : r.diagnostics.diagnostics())
         if (d.message.find(needle) != std::string::npos) return true;
     return false;

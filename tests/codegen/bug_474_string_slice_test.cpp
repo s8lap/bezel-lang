@@ -29,6 +29,7 @@
 //     * Out-of-range endpoints raise IndexOutOfRangeException; an empty range is "".
 //   So `"hello"[1..3]` == "ell" (len 3), `"hello"[1..<3]` == "el" (len 2).
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
@@ -53,12 +54,12 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 

@@ -19,14 +19,15 @@
 //   §30.5 Pattern B: `OwningTask<T>` transfers ownership of T to the consumer.
 // v0.154.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 // Res: a plain class whose field value is readable via indexer.

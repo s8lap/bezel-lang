@@ -19,20 +19,21 @@
 //   §22.12 — static state is per-instantiation.
 //   §14.1  — generic classes are monomorphized per type argument.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 
 bezel::test::JitResult jit(const std::string& prog) {
-    return runJit(prog);
+    return runAot(prog);
 }
 
 // A generic counter class whose static field tracks how many times each

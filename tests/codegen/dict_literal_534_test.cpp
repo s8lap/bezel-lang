@@ -20,20 +20,21 @@
 // `lowerLocalDecl` now calls this helper when `cl->isDict && declType` resolves
 // to a Dictionary/OwningDictionary TypeRef.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 // #1297: a program that must be rejected by the front-end (typecheck) — it does
 // not run and reports at least one diagnostic.
 bool rejectedAtCompile(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return !r.ran && r.diagnostics.hasErrors();
 }
 }  // namespace

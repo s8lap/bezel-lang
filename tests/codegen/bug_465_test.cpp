@@ -29,6 +29,7 @@
 //   Spec: §15.4 (collection literals), §15.2 (heap arrays), stdlib §4.4 (Array<T>),
 //   §4.5 (OwningArray<T>), §28.3 / §28.10 (ownership/disposal of the owned result).
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
@@ -53,12 +54,12 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 

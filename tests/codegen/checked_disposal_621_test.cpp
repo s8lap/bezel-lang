@@ -31,22 +31,23 @@
 // programs produce the same result in both modes — if the guard were
 // incorrectly emitted in default mode it would raise on live instances).
 
+#include "support/aot_support.hpp"   // runAot/runAotChecked — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
-using bezel::test::runJitChecked;
+using bezel::test::runAot;
+using bezel::test::runAotChecked;
 
 namespace {
 
 // Convenience wrappers.
 int runChecked(const std::string& program) {
-    auto r = runJitChecked(program);
+    auto r = runAotChecked(program);
     return r.ran ? r.exitCode : -999;
 }
 
 int runDefault(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 

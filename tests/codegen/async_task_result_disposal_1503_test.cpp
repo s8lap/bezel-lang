@@ -55,14 +55,15 @@
 // crashes. `Cell.n == 0` after the task in question is disposed is the
 // dispose-exactly-once assertion for all cases below. v0.177 (per issue).
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 
