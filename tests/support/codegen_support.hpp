@@ -54,6 +54,12 @@ struct JitResult {
     DiagnosticEngine diagnostics;
     bool ran = false;     // true once `main` executed
     int exitCode = 0;     // value returned by `main`
+    // Captured program stdout. The in-process JIT path (runJit) inherits the
+    // test process's stdout and leaves this empty; the AOT path (runAot, see
+    // support/aot_support.hpp) runs the program as a subprocess and captures it
+    // here. This is the value channel the AOT migration uses for observables
+    // that cannot round-trip a process exit status (8-bit, 0..255) — WS1/WS3.
+    std::string stdoutText;
 };
 
 // Initialize the native target exactly once per process (required before the

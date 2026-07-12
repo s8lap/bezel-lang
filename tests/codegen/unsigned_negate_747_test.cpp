@@ -11,17 +11,25 @@
 // of raising OverflowException. The fix adds the unsigned `x != 0` overflow
 // guard while leaving signed negation (overflow only at INT_MIN) unchanged.
 //
-// The test programs CATCH the exception and return a sentinel — an unhandled
-// Bezel exception under the JIT runner would exit the whole test process.
+// The test programs CATCH the exception and return a sentinel; the sentinel is
+// the observed exit code.
+//
+// Harness: migrated to the AOT path (runAot, support/aot_support.hpp) as the
+// demonstrative swap for the JIT->AOT test-harness migration (plan §2, P0).
+// runAot compiles + links a native executable via the real bezelc driver and
+// runs it as a subprocess, so an unhandled Bezel exception would fail only that
+// subprocess (not the whole test process). All expected values here are in
+// 0..255, so they round-trip the 8-bit process exit status faithfully; parity
+// with the prior runJit run is exact (verified: 6/6 identical exit codes).
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
