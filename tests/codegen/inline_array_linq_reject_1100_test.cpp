@@ -16,15 +16,14 @@
 //
 // runJit returns the FULL int from Main() (not 8-bit wrapped); values ≤ 255.
 
-#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runAot;
+using bezel::test::runJit;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runAot(prog);
+    auto r = runJit(prog);
     return r.ran ? r.exitCode : -999;
 }
 // True iff some diagnostic cites the §15.1.2 inline-array member rule.
@@ -40,7 +39,7 @@ bool has1512Error(const bezel::test::JitResult& r) {
 // #1100: `arr.Count()` on `[5]int` was silently accepted and returned 0 — now a
 // compile error citing §15.1.2.
 BEZEL_TEST(inline_array_linq_reject_1100, count_rejected) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; class C public static method Main(): int "
         "  var arr: [5]int := [1,2,3,4,5]; "
         "  return arr.Count(); "
@@ -52,7 +51,7 @@ BEZEL_TEST(inline_array_linq_reject_1100, count_rejected) {
 
 // #1100: `.Sum()` likewise rejected.
 BEZEL_TEST(inline_array_linq_reject_1100, sum_rejected) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; class C public static method Main(): int "
         "  var arr: [5]int := [10,20,30,40,50]; "
         "  return arr.Sum(); "
@@ -67,7 +66,7 @@ BEZEL_TEST(inline_array_linq_reject_1100, sum_rejected) {
 // #1100: a predicate LINQ operator (`.All`) is rejected — its bool result fed a
 // branch and previously crashed IR verification.
 BEZEL_TEST(inline_array_linq_reject_1100, all_predicate_rejected) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; class C public static method Main(): int "
         "  var arr: [4]int := [2,4,6,8]; "
         "  if arr.All((x: int) => x mod 2 = 0) then return 1; else return 0; end "
@@ -78,7 +77,7 @@ BEZEL_TEST(inline_array_linq_reject_1100, all_predicate_rejected) {
 
 // #1100: `.Where(...)` (a deferred lazy operator) is rejected.
 BEZEL_TEST(inline_array_linq_reject_1100, where_rejected) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  var arr: [5]int := [1,2,3,4,5]; "
@@ -92,7 +91,7 @@ BEZEL_TEST(inline_array_linq_reject_1100, where_rejected) {
 // #1100: a completely unknown member (`.Frobnicate`) is also rejected — the
 // reject is general to the inline-array surface, not a LINQ allow-list.
 BEZEL_TEST(inline_array_linq_reject_1100, unknown_member_rejected) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; class C public static method Main(): int "
         "  var arr: [3]int := [1,2,3]; "
         "  return arr.Frobnicate(); "

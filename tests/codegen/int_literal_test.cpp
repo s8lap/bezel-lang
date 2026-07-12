@@ -2,11 +2,10 @@
 // integer-literal value as the process exit code (§33). Lowers integer
 // literals (decimal + 0x/0b/0o, `_` separators) and the entry point.
 
-#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runAot;
+using bezel::test::runJit;
 
 namespace {
 
@@ -18,37 +17,37 @@ std::string mainReturning(const std::string& expr) {
 } // namespace
 
 BEZEL_TEST(codegen_cg1, returns_literal_42) {
-    auto r = runAot(mainReturning("42"));
+    auto r = runJit(mainReturning("42"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
 
 BEZEL_TEST(codegen_cg1, returns_zero) {
-    auto r = runAot(mainReturning("0"));
+    auto r = runJit(mainReturning("0"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
 BEZEL_TEST(codegen_cg1, returns_large_value) {
-    auto r = runAot(mainReturning("123"));
+    auto r = runJit(mainReturning("123"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 123);
 }
 
 BEZEL_TEST(codegen_cg1, underscore_separators) {
-    auto r = runAot(mainReturning("1_000"));
+    auto r = runJit(mainReturning("1_000"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1000);
 }
 
 BEZEL_TEST(codegen_cg1, hex_literal) {
-    auto r = runAot(mainReturning("0x10"));
+    auto r = runJit(mainReturning("0x10"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 16);
 }
 
 BEZEL_TEST(codegen_cg1, binary_literal) {
-    auto r = runAot(mainReturning("0b101"));
+    auto r = runJit(mainReturning("0b101"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 5);
 }
@@ -56,7 +55,7 @@ BEZEL_TEST(codegen_cg1, binary_literal) {
 // §3.4: static properties on primitive type names (int.MaxValue, int.MinValue).
 BEZEL_TEST(codegen_cg1, int_max_value) {
     // int.MaxValue = 2^31 - 1; return 1 to fit in exit code.
-    auto r = runAot(
+    auto r = runJit(
         "module M; class C public static method Main(): int "
         "  return (1 if int.MaxValue > 0 else 0); end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
@@ -65,7 +64,7 @@ BEZEL_TEST(codegen_cg1, int_max_value) {
 
 BEZEL_TEST(codegen_cg1, int_min_value) {
     // int.MinValue = -2^31; must be negative.
-    auto r = runAot(
+    auto r = runJit(
         "module M; class C public static method Main(): int "
         "  return (1 if int.MinValue < 0 else 0); end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
@@ -83,7 +82,7 @@ BEZEL_TEST(codegen_cg1, long_min_value_literal_exact_bits) {
     // and would throw OverflowException (the value is negative). Observe the
     // literal's exact bit pattern via the unchecked reinterpret surface instead:
     // BitConverter.Reinterpret<ulong> of long.MinValue is exactly 2^63.
-    auto r = runAot(
+    auto r = runJit(
         "module M; class C public static method Main(): int "
         "  var m := -9223372036854775808L; "
         "  return (0 if BitConverter.Reinterpret<ulong>(m) = 9223372036854775808UL else 1); "
@@ -95,7 +94,7 @@ BEZEL_TEST(codegen_cg1, long_min_value_literal_exact_bits) {
 // §4.2: long.MinValue is the smallest long — strictly less than long.MinValue+1
 // (a fold to INT64_MIN+1 would have made this comparison false).
 BEZEL_TEST(codegen_cg1, long_min_value_literal_is_smallest) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; class C public static method Main(): int "
         "  return (0 if -9223372036854775808L < -9223372036854775807L else 1); "
         "end Main; end C;");
@@ -124,7 +123,7 @@ bool anyErrorContains(const bezel::test::JitResult& r, const char* substr) {
 // §4.2: `9223372036854775808L` is 2^63, one past long.MaxValue (2^63 − 1) —
 // rejected (it once wrapped to long.MinValue and compiled).
 BEZEL_TEST(codegen_cg1, suffixed_long_over_max_rejected_1155) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; class App public static method Main(): int "
         "  var a: long := 9223372036854775808L; "
         "  return (1 if a < 0 else 0); end Main; end App;");
@@ -136,7 +135,7 @@ BEZEL_TEST(codegen_cg1, suffixed_long_over_max_rejected_1155) {
 // §4.2: `5000000000U` exceeds uint.MaxValue (2^32 − 1) — rejected (it once
 // wrapped silently).
 BEZEL_TEST(codegen_cg1, suffixed_uint_over_max_rejected_1155) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; class App public static method Main(): int "
         "  var a: uint := 5000000000U; "
         "  return (1 if a < 100 else 0); end Main; end App;");
@@ -148,7 +147,7 @@ BEZEL_TEST(codegen_cg1, suffixed_uint_over_max_rejected_1155) {
 // §4.2: `9223372036854775807L` IS long.MaxValue (2^63 − 1) — in range, still
 // types and runs correctly (a > 0).
 BEZEL_TEST(codegen_cg1, suffixed_long_at_max_accepted_1155) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; class App public static method Main(): int "
         "  var a: long := 9223372036854775807L; "
         "  return (1 if a > 0 else 0); end Main; end App;");
@@ -158,7 +157,7 @@ BEZEL_TEST(codegen_cg1, suffixed_long_at_max_accepted_1155) {
 
 // §4.2: `4000000000U` is within uint's range (< 2^32) — in range, runs (a > 0).
 BEZEL_TEST(codegen_cg1, suffixed_uint_in_range_accepted_1155) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; class App public static method Main(): int "
         "  var a: uint := 4000000000U; "
         "  return (1 if a > 0 else 0); end Main; end App;");
@@ -170,7 +169,7 @@ BEZEL_TEST(codegen_cg1, suffixed_uint_in_range_accepted_1155) {
 // (−2^63); its 2^63 magnitude is admitted under a unary minus even though the
 // bare `9223372036854775808L` is rejected above. Must still compile and be < 0.
 BEZEL_TEST(codegen_cg1, long_min_value_negation_still_accepted_1155) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; class App public static method Main(): int "
         "  var a: long := -9223372036854775808L; "
         "  return (1 if a < 0 else 0); end Main; end App;");
@@ -181,7 +180,7 @@ BEZEL_TEST(codegen_cg1, long_min_value_negation_still_accepted_1155) {
 // §4.2: a magnitude one past |long.MinValue| (`-9223372036854775809L`, 2^63 + 1)
 // exceeds long even under a unary minus — rejected.
 BEZEL_TEST(codegen_cg1, negation_beyond_long_min_rejected_1155) {
-    auto r = runAot(
+    auto r = runJit(
         "module M; class App public static method Main(): int "
         "  var a: long := -9223372036854775809L; "
         "  return 0; end Main; end App;");
