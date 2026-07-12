@@ -30,6 +30,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Emit build/compile_commands.json at configure time. Required by the
+# check-tidy static-analysis tier (tests/CMakeLists.txt) — clang-tidy needs a
+# compilation database to know each TU's include paths and flags. Harmless
+# otherwise: any clangd/IDE tooling picks it up too. Test-infra migration plan
+# §2 / WS7 (see /var/tmp/bezel-scratch/impl-run-2026-07-12/aot-plan/ws7-static-analysis.md).
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # Treating warnings as errors keeps the scaffold honest as it grows; off by
 # default so a stray warning never blocks local work, on in CI.
 option(BEZEL_WERROR "Treat compiler warnings as errors" OFF)

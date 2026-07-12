@@ -120,3 +120,44 @@ else()
         "Bezel: lit diagnostic track DISABLED — lit, FileCheck, or not not found "
         "(target check-lit unavailable; ordinary build unaffected)")
 endif()
+
+# ── check-tidy: clang-tidy static-analysis tier (ADVISORY) ──────────────────
+# Mirrors check-lit above: an ADDITIONAL, OPTIONAL target that is NOT part of
+# `all` and skips gracefully if its tools are absent. Runs clang-analyzer-* +
+# bugprone-* (see the repo-root .clang-tidy) over the compiler's own C++ under
+# src/ via scripts/check_tidy.sh, which sanitizes
+# ${CMAKE_BINARY_DIR}/compile_commands.json (CMAKE_EXPORT_COMPILE_COMMANDS is
+# ON at the top level — see root CMakeLists.txt) and wraps run-clang-tidy.
+#
+# ADVISORY, not gate-blocking: test-infra migration plan §2 / WS7
+# (/var/tmp/bezel-scratch/impl-run-2026-07-12/aot-plan/ws7-static-analysis.md)
+# measured a ~70-80% false-positive rate among substantive findings on this
+# ASan-hardened codebase, so this target (and the gate.sh stage that calls it)
+# always exits 0 on findings — see check_tidy.sh's header comment for the
+# promotion-to-blocking plan. This target runs the FULL sweep (all TUs, ~4-5
+# min wall at -j16 per WS7 §2.3 — heavier than a clean build); it's the
+# consolidation/CI mode. The changed-TUs mode used in the gate cycle
+# (WS7 §2.2) isn't expressed as a build-system target — a custom target's
+# COMMAND is fixed at configure time and forwarding extra args portably across
+# generators (Ninja per the CMakePresets.json preset, but plain `cmake -B
+# build` falls back to the platform default) isn't clean — so gate.sh instead
+# invokes scripts/check_tidy.sh directly with `--changed`; both paths share
+# the same script and .clang-tidy config.
+find_program(BEZEL_CLANG_TIDY NAMES clang-tidy)
+find_program(BEZEL_RUN_CLANG_TIDY NAMES run-clang-tidy run-clang-tidy.py)
+if(BEZEL_CLANG_TIDY AND BEZEL_RUN_CLANG_TIDY)
+    add_custom_target(check-tidy
+        COMMAND ${CMAKE_SOURCE_DIR}/scripts/check_tidy.sh ${CMAKE_BINARY_DIR} --full
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        USES_TERMINAL
+        COMMENT "Running clang-tidy static-analysis tier over src/ (advisory; see .clang-tidy)")
+    message(STATUS
+        "Bezel: clang-tidy static-analysis track enabled "
+        "(clang-tidy=${BEZEL_CLANG_TIDY}, run-clang-tidy=${BEZEL_RUN_CLANG_TIDY}); "
+        "target: check-tidy (ADVISORY, not gate-blocking)")
+else()
+    message(STATUS
+        "Bezel: clang-tidy static-analysis track DISABLED — clang-tidy or "
+        "run-clang-tidy not found (target check-tidy unavailable; ordinary "
+        "build unaffected)")
+endif()

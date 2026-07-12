@@ -54,6 +54,29 @@ else
   echo "   (check-lit target not configured — lit/FileCheck/not absent; skipping)"
 fi
 
+# clang-tidy static-analysis tier (tests/CMakeLists.txt target check-tidy;
+# design + config: test-infra migration plan §2 / WS7 —
+# /var/tmp/bezel-scratch/impl-run-2026-07-12/aot-plan/ws7-static-analysis.md).
+# ADVISORY ONLY: reports findings, does NOT fail the gate — WS7 measured a
+# ~70-80% false-positive rate among substantive findings on this ASan-hardened
+# codebase (report §2.5/§4); promotion to gate-blocking is a follow-on once the
+# real findings (R1-R7) are fixed and the confirmed FPs are NOLINT-annotated.
+# Changed-TUs mode only, mirroring check-lit's "skip cleanly if absent" guard:
+# a full 62-TU sweep is ~4-5 min at -j16 (WS7 §2.3) — heavier than a clean
+# build, so it's a consolidation/CI cost (`cmake --build build --target
+# check-tidy`), not a per-merge one. Skips cleanly if clang-tidy /
+# run-clang-tidy are absent.
+echo "== gate[2c/*]: clang-tidy static-analysis (advisory; changed TUs only) =="
+if command -v clang-tidy >/dev/null 2>&1 && command -v run-clang-tidy >/dev/null 2>&1; then
+  base_ref="$(git merge-base HEAD main 2>/dev/null || true)"
+  [ -z "$base_ref" ] && base_ref="HEAD~1"
+  "$DH" build scripts/check_tidy.sh build --changed "$base_ref" >"$S/gate_tidy.log" 2>&1
+  grep -E 'check-tidy:' "$S/gate_tidy.log" | head -10 || true
+  # advisory: intentionally no `fail` call here regardless of findings/exit code
+else
+  echo "   (clang-tidy or run-clang-tidy not found — skipping; advisory tier disabled)"
+fi
+
 echo "== gate[3/*]: sharded suite (crash/undercount-checked) =="
 "$DH" suite tests/run_parallel.sh >"$S/gate_shard.log" 2>&1; rc=$?
 grep -E 'TOTAL:|## GATE FAILURE|died on|--- failing' "$S/gate_shard.log" || true

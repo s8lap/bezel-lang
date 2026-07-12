@@ -1,0 +1,41 @@
+# .clang-tidy — static-analysis tier for the Bezel compiler's own C++
+# (test-infra migration plan §2 / WS7:
+# /var/tmp/bezel-scratch/impl-run-2026-07-12/aot-plan/ws7-static-analysis.md).
+#
+# Scope: clang-analyzer-* (the clang static analyzer, path-sensitive) +
+# bugprone-*, with the families WS7 found to be pure noise on this codebase
+# disabled below (each disable is justified in the report's §2.1/§4 — e.g.
+# `optin.performance.Padding` is struct-field-order advice, not a bug;
+# `multi-level-implicit-pointer-conversion` was 158 pedantic T**->void** hits;
+# `assignment-in-if-condition` is a 100% false positive against this
+# codebase's idiomatic `if ((p = dynamic_cast<...>(x)))` pattern).
+#
+# Deliberately NOT enabled: modernize-*, readability-*, google-*, llvm-* —
+# opinionated style checks, not bug-finders.
+#
+# Wired ADVISORY ONLY via the `check-tidy` CMake target + scripts/gate.sh's
+# advisory stage — it does not block the gate yet. WS7 measured a ~70-80%
+# false-positive rate among substantive findings on this ASan-hardened
+# codebase (report §2.5/§4); promotion to gate-blocking happens after the
+# real findings (R1-R7 in the report) are fixed and the confirmed FPs are
+# annotated `// NOLINT(check) — reason`.
+Checks: >
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  -clang-analyzer-optin.performance.Padding,
+  -clang-analyzer-optin.portability.UnixAPI,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-misplaced-widening-cast,
+  -bugprone-bitwise-pointer-cast,
+  -bugprone-argument-comment,
+  -bugprone-branch-clone,
+  -bugprone-reserved-identifier,
+  -bugprone-assignment-in-if-condition
+HeaderFilterRegex: '.*/src/.*'
+ExcludeHeaderFilterRegex: '/usr/(include|lib|lib64)/'
+WarningsAsErrors: ''
+FormatStyle: none
