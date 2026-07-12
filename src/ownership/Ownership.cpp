@@ -3446,7 +3446,38 @@ void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
         // methodReturnsOnlyWrapperReceiverBorrow call-site classification below)
         // — a field of another object does not match and falls through to the
         // borrow rejection. // per §28.6, §28.3, §5.11
-        if (exprIsReceiverOwnedFieldBorrow(e)) return;
+        //
+        // §28.3 (#1660 review — reachable double-free): the #1493 receiver-
+        // owned-field carve-out is UNSOUND for the owning DEFERRED-ACTIVATION
+        // heads — `OwningTask<T>` and `IOwningEnumerable<T>`. These are
+        // consumer-disposed (producerState's name-head fallback classifies a
+        // call result of these types Owned) and their disposal is NOT
+        // idempotent-protected (unlike Shared/Weak/ChannelSender/
+        // CancellationTokenSource, whose double-dispose is a safe refcount
+        // no-op — verified). The carve-out admits `return this._field;` only
+        // because a DIRECT call resolves the concrete all-borrow method and
+        // producerState downgrades it to Borrowed
+        // (methodReturnsOnlyWrapperReceiverBorrow); but under interface /
+        // virtual-override / imported / function-value dispatch the callee is
+        // bodyless or null (common::calleeMethodDecl), producerState falls to
+        // the name-head Owned fallback, and the caller disposes the borrow — a
+        // HARD double-free of the field's real owner (confirmed via native
+        // AOT+ASan for all four dispatch forms; pre-existing on main). Because
+        // the caller cannot in general resolve the concrete method, and the
+        // name-head Owned fallback is load-bearing for fresh iterator/async
+        // returns through the SAME signature (so it cannot be flipped to
+        // Borrowed without leaking those), no call-site classification is both
+        // sound and non-regressing — these heads therefore reject the borrow
+        // return here. The remedy is the spec's own: return the borrow through
+        // the NON-owning interface (`IEnumerable<T>`/`Task<T>`, not consumer-
+        // disposed, so the alias is harmless) or declare `owned` for a fresh
+        // value. The idempotent-safe wrappers keep the carve-out. The wider
+        // owning-collection / owning-enumerator indirect-dispatch analogue is
+        // tracked separately (#1760). // per §28.3
+        const bool deferredActivationOwningHead =
+            head == "OwningTask" || head == "IOwningEnumerable";
+        if (!deferredActivationOwningHead && exprIsReceiverOwnedFieldBorrow(e))
+            return;
         bool isBorrow = ownedArgSourceIsBorrow(e);
         if (!isBorrow) {
             if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
