@@ -21,10 +21,11 @@
 #include <sys/wait.h>
 
 #include "driver/Driver.hpp"
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
@@ -60,7 +61,7 @@ int compileAndRun496(const std::string& source) {
 // atoi("9") == 9. Proves the FFI path still works for non-colliding names.
 BEZEL_TEST(codegen_ffi_496, control_atoi_non_colliding_jit) {
     // per §32 / CG26: non-colliding names must continue to work after the fix.
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "extern \"c\" public method atoi(s: CString): int; end; "
         "class C public static method Main(): int "
@@ -73,7 +74,7 @@ BEZEL_TEST(codegen_ffi_496, control_atoi_non_colliding_jit) {
 // CONTROL: strlen (another non-colliding name) still works.
 BEZEL_TEST(codegen_ffi_496, control_strlen_non_colliding_jit) {
     // per §32 / CG26: non-colliding extern still resolves correctly.
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "extern \"c\" public method strlen(s: CString): int; end; "
         "class C public static method Main(): int "
@@ -91,7 +92,7 @@ BEZEL_TEST(codegen_ffi_496, control_strlen_non_colliding_jit) {
 BEZEL_TEST(codegen_ffi_496, malloc_int_param_no_rename_jit) {
     // per §32 / CG26: extern "c" whose name collides with an internal decl
     // must reuse the existing LLVM Function (no "malloc.1" rename).
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "extern \"c\" public method malloc(size: int): IntPtr; end; "
         "class C public static method Main(): int "
@@ -122,7 +123,7 @@ BEZEL_TEST(codegen_ffi_496, malloc_int_param_no_rename_native) {
 BEZEL_TEST(codegen_ffi_496, free_intptr_param_no_rename_jit) {
     // per §32 / CG26: extern "c" free with IntPtr param reuses the internal
     // free declaration (void @free(ptr)) without creating a renamed alias.
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "extern \"c\" public method free(p: IntPtr); end; "
         "class C public static method Main(): int "
@@ -136,7 +137,7 @@ BEZEL_TEST(codegen_ffi_496, free_intptr_param_no_rename_jit) {
 // The compiler internally uses calloc(i64, i64) -> ptr.
 BEZEL_TEST(codegen_ffi_496, calloc_int_params_no_rename_jit) {
     // per §32 / CG26: calloc collision resolved by reusing internal declaration.
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "extern \"c\" public method calloc(n: int, size: int): IntPtr; end; "
         "class C public static method Main(): int "
