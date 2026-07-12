@@ -9,14 +9,15 @@
 //
 // runJit returns the FULL int from Main() (not 8-bit wrapped); values ≤ 255.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -24,7 +25,7 @@ int run(const std::string& prog) {
 // #1093: a wrong-TYPED argument to a delegate call is rejected (was: accepted,
 // miscompiled).
 BEZEL_TEST(delegate_call_argcheck_1093, wrong_typed_arg_rejected) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var f: (int)->int := (a: int) => a + 100; "
         "  var g: (int)->int := (b: int) => b * 7; "
@@ -36,7 +37,7 @@ BEZEL_TEST(delegate_call_argcheck_1093, wrong_typed_arg_rejected) {
 
 // #1093: a wrong-ARITY delegate call is rejected.
 BEZEL_TEST(delegate_call_argcheck_1093, wrong_arity_rejected) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var f: (int)->int := (a: int) => a + 100; "
         "  return f(); "                                   // 0 args, expects 1
@@ -47,7 +48,7 @@ BEZEL_TEST(delegate_call_argcheck_1093, wrong_arity_rejected) {
 
 // #1093: a wrong scalar type (string where int expected) is rejected.
 BEZEL_TEST(delegate_call_argcheck_1093, wrong_scalar_type_rejected) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var f: (int)->int := (a: int) => a + 100; "
         "  return f(\"hi\"); "

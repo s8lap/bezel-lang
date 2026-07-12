@@ -13,19 +13,20 @@
 // The legitimate `await` and literal forms, and a genuine `Task<Task<int>>`
 // result (element is itself Task-shaped), are unaffected.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int runFull(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 // True when the program is REJECTED at compile time (a diagnostic fired).
 bool rejects(const std::string& program) {
-    return runJit(program).diagnostics.hasErrors();
+    return runAot(program).diagnostics.hasErrors();
 }
 }  // namespace
 

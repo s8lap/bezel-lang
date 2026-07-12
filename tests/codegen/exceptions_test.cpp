@@ -11,16 +11,17 @@
 // Catch-arm variable binding (`catch var e: T` or `catch e: T`) and
 // `when` guards are exercised below.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -480,7 +481,7 @@ bool rejectsNonThrowable(const JitResult& r) {
 
 // A primitive (`throw 5;`) is rejected, not compiled into a crash.
 BEZEL_TEST(codegen_cg20, throw_primitive_rejected_739) {
-    JitResult r = runJit(
+    JitResult r = runAot(
         "module M; class C public static method Main(): int "
         "  throw 5; "
         "end Main; end C;");
@@ -490,7 +491,7 @@ BEZEL_TEST(codegen_cg20, throw_primitive_rejected_739) {
 
 // A string value is likewise not throwable.
 BEZEL_TEST(codegen_cg20, throw_string_rejected_739) {
-    JitResult r = runJit(
+    JitResult r = runAot(
         "module M; class C public static method Main(): int "
         "  throw \"boom\"; "
         "end Main; end C;");
@@ -500,7 +501,7 @@ BEZEL_TEST(codegen_cg20, throw_string_rejected_739) {
 
 // A record is a value type, not a class instance → not throwable.
 BEZEL_TEST(codegen_cg20, throw_record_rejected_739) {
-    JitResult r = runJit(
+    JitResult r = runAot(
         "module M; "
         "record Point(X: int, Y: int); "
         "class C public static method Main(): int "
@@ -512,7 +513,7 @@ BEZEL_TEST(codegen_cg20, throw_record_rejected_739) {
 
 // An enum value is not throwable.
 BEZEL_TEST(codegen_cg20, throw_enum_rejected_739) {
-    JitResult r = runJit(
+    JitResult r = runAot(
         "module M; "
         "enum Color Red, Green, Blue; end Color; "
         "class C public static method Main(): int "

@@ -25,10 +25,11 @@
 // time (`new T()` constructed nothing); the constructor-observing asserts are
 // the load-bearing regression check that the right T is now chosen.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 const char* kFactory =
@@ -56,7 +57,7 @@ BEZEL_TEST(generic_return_inference_391, typed_local_constructs_inferred_type) {
         "  using var w: Widget := Factory.Create(); "
         "  return Widget._n; "
         "end Main; end C;";
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);  // Widget's constructor ran exactly once
@@ -72,7 +73,7 @@ BEZEL_TEST(generic_return_inference_391, two_calls_construct_twice) {
         "  using var b: Widget := Factory.Create(); "
         "  return Widget._n; "
         "end Main; end C;";
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 2);  // two distinct Widgets constructed
@@ -92,7 +93,7 @@ BEZEL_TEST(generic_return_inference_391, return_target_constructs_inferred_type)
         "    return Widget._n; "
         "  end Main; "
         "end C;";
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);  // GetWidget's inferred Widget constructed
@@ -107,7 +108,7 @@ BEZEL_TEST(generic_return_inference_391, no_target_is_rejected) {
         "  var w := Factory.Create(); "
         "  return 0; "
         "end Main; end C;";
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(r.ran);
 }
@@ -133,7 +134,7 @@ BEZEL_TEST(generic_return_inference_391, argument_inferred_unaffected) {
         "  using var c := Factory.Clone(p); "
         "  return Widget._n; "  // p's ctor + new T()'s ctor (argument-inferred)
         "end Main; end C;";
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 2);
@@ -149,7 +150,7 @@ BEZEL_TEST(generic_return_inference_391, argument_inferred_unaffected) {
 // A return-position-only T solved by explicit type args, bound to an UNTYPED
 // local — must compile and run.
 BEZEL_TEST(generic_return_inference_391, explicit_type_args_no_target_needed_747) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class C "
         "  public static method Make<T>(): T return default(T); end Make; "
@@ -167,7 +168,7 @@ BEZEL_TEST(generic_return_inference_391, explicit_type_args_no_target_needed_747
 // parameter and whose return swaps them — `Swap<int,int>(p)` into an untyped
 // local. Returns the swapped first field.
 BEZEL_TEST(generic_return_inference_391, explicit_type_args_generic_param_swap_747) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "record Pair<A, B>(a: A, b: B); "
         "class C "
@@ -188,7 +189,7 @@ BEZEL_TEST(generic_return_inference_391, explicit_type_args_generic_param_swap_7
 // CONTROL: WITHOUT explicit type args, a return-only T into an untyped local is
 // still rejected (the diagnostic must remain for genuine inference-needs-target).
 BEZEL_TEST(generic_return_inference_391, no_explicit_args_still_rejected_747) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class C "
         "  public static method Make<T>(): T return default(T); end Make; "

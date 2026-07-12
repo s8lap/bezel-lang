@@ -12,11 +12,12 @@
 // types; `int` (a primitive value type) is now rejected at the instantiation
 // site.  The drain-loop behavior under test is unchanged.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 // Minimal class R for use as the OwningDictionary value type.
 static const char* kClassR =
@@ -32,7 +33,7 @@ static const char* kClassR =
 // §4.9 / #628 part 2: drain over OwningDictionary<string, R> — one entry
 // added, loop increments count once, returns 1.
 BEZEL_TEST(codegen_unimplemented_628, owned_dict_drain_for_is_hard_error) {
-    JitResult r = runJit(
+    JitResult r = runAot(
         std::string("module M; ") + kClassR +
         "class C "
         "  public static method Main(): int "
@@ -54,7 +55,7 @@ BEZEL_TEST(codegen_unimplemented_628, owned_dict_drain_for_is_hard_error) {
 
 // §4.9 / #628 part 2: empty drain loop body compiles and runs (count stays 0).
 BEZEL_TEST(codegen_unimplemented_628, owned_dict_drain_for_records_error) {
-    JitResult r = runJit(
+    JitResult r = runAot(
         std::string("module M; ") + kClassR +
         "class C "
         "  public static method Main(): int "
@@ -74,7 +75,7 @@ BEZEL_TEST(codegen_unimplemented_628, owned_dict_drain_for_records_error) {
 // With the old bug the loop was silently dropped (returned 0). Now it must
 // enter the loop body and return 1 (one entry was added).
 BEZEL_TEST(codegen_unimplemented_628, owned_dict_drain_does_not_silently_succeed) {
-    JitResult r = runJit(
+    JitResult r = runAot(
         std::string("module M; ") + kClassR +
         "class C "
         "  public static method Main(): int "

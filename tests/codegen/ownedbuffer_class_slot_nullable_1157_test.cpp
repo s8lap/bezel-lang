@@ -22,6 +22,7 @@
 
 #include <string_view>
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "support/ownership_support.hpp"
 #include "support/sema_support.hpp"
@@ -29,13 +30,13 @@
 #include "sema/TypeResolution.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
 
 int runFull(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -81,7 +82,7 @@ BEZEL_TEST(ownedbuffer_class_slot_nullable_1157, class_empty_slot_read_rejected)
 // §4.14: `buf[i] := null` is the natural §28.8.1 restoration for a class-typed
 // slot — it must be ACCEPTED (the setter target is `T?`). Previously rejected.
 BEZEL_TEST(ownedbuffer_class_slot_nullable_1157, class_assign_null_accepted) {
-    auto r = runJit(
+    auto r = runAot(
         std::string(kCell) +
         "class C public static method Main(): int "
         "  using var buf := new OwningBuffer<Cell>(2); "

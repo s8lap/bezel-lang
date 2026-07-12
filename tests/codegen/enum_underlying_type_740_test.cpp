@@ -12,14 +12,15 @@
 // `this`, nullable enums, and serialization. These tests pin each surface for
 // the headline `long` case and exercise every underlying type.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -260,7 +261,7 @@ BEZEL_TEST(enum_underlying_740, ulong_member_bare_literal_no_suffix) {
 // enum (default) still rejects an over-`int` member literal (no widening hint).
 BEZEL_TEST(enum_underlying_740, int_member_over_int_still_rejected) {
     // per §10.3 — default underlying type is `int`; 5e9 does not fit.
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "enum E: int A := 5000000000; end E; "
         "class C public static method Main(): int return 0; end Main; end C;");
@@ -272,7 +273,7 @@ BEZEL_TEST(enum_underlying_740, int_member_over_int_still_rejected) {
 // even with the widening hint (a `: long` member exceeding long.MaxValue).
 BEZEL_TEST(enum_underlying_740, long_member_over_long_still_rejected) {
     // per §10.3 — "all declared values must fit in the underlying type's range".
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "enum Big: long A := 99999999999999999999999; end Big; "
         "class C public static method Main(): int return 0; end Main; end C;");
@@ -342,7 +343,7 @@ BEZEL_TEST(enum_underlying_749, long_min_value_enum_member_round_trips) {
 // so `…UL` beyond ulong.MaxValue was silently accepted and miscompiled to 0.
 BEZEL_TEST(enum_underlying_749, ulong_literal_over_64bit_rejected) {
     // per §5 — 1e23 (≫ 2^64-1) carries an explicit `UL` yet is unrepresentable.
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "enum U: ulong A := 99999999999999999999999UL; end U; "
         "class C public static method Main(): int return 0; end Main; end C;");

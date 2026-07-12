@@ -36,14 +36,15 @@
 // Each test ran (IR-verify failure / miscompile) before the fix and produces the
 // spec-stated value after.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
-bezel::test::JitResult jit(const std::string& prog) { return runJit(prog); }
+bezel::test::JitResult jit(const std::string& prog) { return runAot(prog); }
 
 }  // namespace
 
