@@ -512,10 +512,32 @@ llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
         llvm::Value* ok = builder_.CreateCall(clTy, fnPtr, {envPtr, elem}, "cl.ret");
         builder_.CreateRet(builder_.CreateZExt(ok, i32()));
     } else {
-        // Key: closure returns the int key; widen to i64.
-        auto* clTy = llvm::FunctionType::get(i32(), {ptrTy(), elemTy}, false);
+        // Key: closure returns keyRetTy — defaults to `int` when the caller
+        // passes no outTy (the OrderBy/ThenBy sort-key path, which coerces its
+        // key lambda to `int` via lowerLinqLambda before reaching here); widen/
+        // convert to i64 for the runtime's key-bytes ABI (bz_lazy_to_dict /
+        // bz_lazy_orderby / bz_lazy_thenby all read an int64_t key).
+        //
+        // #1692 / stdlib §5: ToDictionary's TKey is not restricted to `int` —
+        // it can be any equality-bearing type (e.g. `string`), so the caller
+        // now passes the selector's REAL return type as outTy. Hardcoding `i32`
+        // here unconditionally called the closure through the wrong function
+        // signature for a non-i32 key (a `ptr`-returning string selector),
+        // corrupting the stored key. A pointer-sized key (string/class) is
+        // converted via ptrtoint; a 64-bit integer key passes through
+        // unchanged; anything narrower is sign-extended, matching the previous
+        // (int-only) behavior for that case.
+        llvm::Type* keyRetTy = outTy ? outTy : i32();
+        auto* clTy = llvm::FunctionType::get(keyRetTy, {ptrTy(), elemTy}, false);
         llvm::Value* k = builder_.CreateCall(clTy, fnPtr, {envPtr, elem}, "cl.ret");
-        builder_.CreateRet(builder_.CreateSExt(k, i64()));
+        llvm::Value* k64;
+        if (keyRetTy->isPointerTy())
+            k64 = builder_.CreatePtrToInt(k, i64());
+        else if (keyRetTy->isIntegerTy(64))
+            k64 = k;
+        else
+            k64 = builder_.CreateSExt(k, i64());
+        builder_.CreateRet(k64);
     }
     builder_.restoreIP(savedIP);
     currentFn_ = savedFn;
@@ -1377,6 +1399,26 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                 if (auto* t = lowerTypeRef(keyRefSema)) keyTy = t;
             }
         int64_t keyEsz = lazyElemSize(keyTy, module_->getDataLayout());
+        // #1692 / stdlib §5: the key trampoline (kind 2, below) carries the key
+        // selector's result through a SINGLE int64-return closure call — correct
+        // for an integer-lowered scalar (int/enum/char/bool) or a pointer-sized
+        // (string/class) TKey (converted via ptrtoint), but not for an aggregate
+        // TKey (record/decimal, an LLVM struct) or a floating-point TKey
+        // (float/double have no integer bit-pattern conversion in the trampoline).
+        // Reject those with a clean diagnostic rather than silently corrupting
+        // the stored key (struct/decimal) or crashing codegen's IRBuilder on an
+        // invalid sext of a non-integer type (float/double) — mirroring the
+        // existing two-selector value-type restriction just below.
+        if (keyTy->isStructTy() || keyTy->isFloatingPointTy()) {
+            ctx_.diagnostics().report(
+                Severity::Error, call.span.begin,
+                "`ToDictionary`'s key selector currently supports only a "
+                "scalar or reference-typed TKey (int/enum/char/bool/string/"
+                "class) in codegen; a key selector returning a record, "
+                "`decimal`, `float`, or `double` is not yet implemented "
+                "(stdlib \xC2\xA7""5)");
+            return llvm::PoisonValue::get(ptrTy());
+        }
 
         // Value type/encoding: with a value selector (two-arg form) the value is
         // the selector's TValue return; otherwise it is the element T.
@@ -1407,25 +1449,60 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // Note: lowerLinqLambda is not in scope here (defined later in the isOp
         // section). For ToDictionary the user always annotates the lambda key
         // type explicitly, so lowerExpr suffices.
+        //
+        // #1692 / stdlib §5: pass the selector's REAL return type (`keyTy`) as
+        // the trampoline's outTy so the internal closure call uses the correct
+        // function signature. buildLinqTrampoline's kind-2 branch previously
+        // hardcoded an `i32` return for every key selector regardless of TKey —
+        // for a `(T) -> string` key selector (a `ptr` return) this called the
+        // closure through the WRONG signature, reading only the low 32 bits of
+        // the pointer off the ABI return register and storing that garbage as
+        // the dict key, so every subsequent lookup raised KeyNotFoundException
+        // even for a key that was just inserted.
         llvm::Value* keyClosure = lowerExpr(*call.args[0].value);
         if (!keyClosure) return nullptr;
-        llvm::Function* keyTramp = buildLinqTrampoline(2, elemTy2, nullptr);
+        llvm::Function* keyTramp = buildLinqTrampoline(2, elemTy2, keyTy);
 
         // Value closure + trampoline (kind 2 over the element type: applies the
         // value selector to each element). Null when there is no value selector.
+        // valTy is already gated to `i32` above, so passing it here is a no-op
+        // relative to the trampoline's int32 default — kept for symmetry with
+        // the key trampoline above.
         llvm::Value* valClosure =
             llvm::ConstantPointerNull::get(ptrTy());
         llvm::Value* valTramp = llvm::ConstantPointerNull::get(ptrTy());
         if (hasValueSel) {
             valClosure = lowerExpr(*call.args[1].value);
             if (!valClosure) return nullptr;
-            valTramp = buildLinqTrampoline(2, elemTy2, nullptr);
+            valTramp = buildLinqTrampoline(2, elemTy2, valTy);
         }
 
-        // Key hash + equality trampolines for the dict backing.
+        // #1692 / stdlib §5: a Dictionary<string,V>'s OWN ContainsKey/indexer/
+        // Remove codegen unconditionally dispatches to the dedicated string
+        // fast path (bz_dict_contains_str / bz_dict_try_get_str / ...), which
+        // requires the underlying bz_dict_t to be in STRING-KEY mode — never
+        // the generic-key mode bz_dict_alloc_generic always produces. Tell the
+        // runtime to build a string-mode dict (bz_dict_alloc + bz_dict_set_str)
+        // when TKey is `string`, so the result is consumable by the rest of
+        // Dictionary<string,V>'s codegen, not just by construction.
+        bool keyIsString = keyRefSema &&
+            keyRefSema->kind == sema::TypeRef::Kind::Primitive &&
+            keyRefSema->primitive == sema::PrimitiveType::String;
+
+        // Key hash + equality trampolines for the dict backing — only needed
+        // for the generic-key path (a string-mode dict hashes/compares by
+        // content itself, like any other Dictionary<string,V>).
         const sema::TypeSymbol* keyRec = recordTypeOfRef(keyRefSema);
-        llvm::Function* hashTramp = buildLinqHashTrampoline(keyTy, keyRefSema, keyRec);
-        llvm::Function* eqTramp   = buildLinqTrampoline(3, keyTy, nullptr, keyRec);
+        llvm::Function* hashTramp = keyIsString
+            ? nullptr : buildLinqHashTrampoline(keyTy, keyRefSema, keyRec);
+        llvm::Function* eqTramp = keyIsString
+            ? nullptr : buildLinqTrampoline(3, keyTy, nullptr, keyRec);
+        llvm::Value* hashTrampV = hashTramp
+            ? static_cast<llvm::Value*>(hashTramp)
+            : llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* eqTrampV = eqTramp
+            ? static_cast<llvm::Value*>(eqTramp)
+            : llvm::ConstantPointerNull::get(ptrTy());
 
         // #738: the value encoding must match the codegen Dictionary<K,V> read
         // (encodeValue) — a SCALAR value (non-struct LLVM type) is stored inline
@@ -1434,11 +1511,12 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         bool valInline = hasValueSel || (valTy && !valTy->isStructTy());
         auto* toDict = declareC("bz_lazy_to_dict", ptrTy(),
             {ptrTy(), i64(), i64(), ptrTy(), ptrTy(), ptrTy(), ptrTy(), i64(),
-             ptrTy(), ptrTy()});
+             ptrTy(), ptrTy(), i64()});
         llvm::Value* result = builder_.CreateCall(toDict,
             {lazy, builder_.getInt64(valEsz), builder_.getInt64(keyEsz),
-             keyTramp, keyClosure, hashTramp, eqTramp,
-             builder_.getInt64(valInline ? 1 : 0), valTramp, valClosure},
+             keyTramp, keyClosure, hashTrampV, eqTrampV,
+             builder_.getInt64(valInline ? 1 : 0), valTramp, valClosure,
+             builder_.getInt64(keyIsString ? 1 : 0)},
             "linq.todict");
         // Release the inline-lambda key/value closures if we own them (eager
         // materialization — the closures are fully consumed during

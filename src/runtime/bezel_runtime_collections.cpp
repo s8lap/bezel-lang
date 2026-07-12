@@ -2705,25 +2705,40 @@ extern "C" void* bz_lazy_to_set(void* lazy, int64_t esz, void* hashfn, void* eqf
 
 // stdlib §5 ToDictionary<TKey>(key: (T)->TKey): materialize into a fresh
 // Dictionary<TKey, T>. Each element T is stored as value; the key is extracted
-// by the `keyfn` trampoline. Uses the generic-key dict path.
-// `key_esz` = byte size of TKey; `val_esz` = byte size of T (same as esz).
-// `hashfn` and `eqfn` are key-wise trampolines.
+// by the `keyfn` trampoline. Uses the generic-key dict path — EXCEPT when
+// TKey is `string` (key_is_string != 0): a Dictionary<string,V>'s own
+// ContainsKey/indexer/Remove codegen unconditionally dispatches to the
+// dedicated string fast path (bz_dict_contains_str / bz_dict_try_get_str /
+// ...), which requires the underlying bz_dict_t to be in STRING-KEY mode
+// (key_size == 0, populated by bz_dict_set_str) — never the generic-key mode
+// bz_dict_alloc_generic always produces. Building a `key_is_string` result via
+// the generic path left every subsequent lookup unable to find any key (#1692:
+// `xs.ToDictionary((x) => $"k{x}")` then raised KeyNotFoundException on every
+// `d[...]`), independent of whether the extracted key BYTES were even correct.
+// `key_esz` = byte size of TKey (unused in string mode); `val_esz` = byte size
+// of T (same as esz). `hashfn` and `eqfn` are key-wise trampolines (unused in
+// string mode — bz_dict_alloc()'s string path hashes/compares by content
+// itself, like any other Dictionary<string,V>).
 // The element T bytes are copied into a fresh heap block and stored as the value.
 extern "C" void* bz_lazy_to_dict(void* lazy, int64_t val_esz, int64_t key_esz,
                                  void* keyfn, void* closure,
                                  void* hashfn, void* eqfn, int64_t val_inline,
-                                 void* valfn, void* valclosure) {
+                                 void* valfn, void* valclosure,
+                                 int64_t key_is_string) {
     auto* e = (bz_lazy_t*)lazy;
-    // The dict is keyed by TKey (key_esz bytes). #738: the VALUE must use the
-    // same generic-dict encoding the codegen Dictionary<TKey,T> read expects
-    // (encodeValue): a SCALAR value (val_inline != 0 — int/enum/char/class-ref,
-    // ≤ 8 bytes) is stored INLINE in the void* slot (the indexer read does
-    // ptrtoint, not a deref); a STRUCT value (record/decimal) is heap-boxed.
-    // Previously every value was heap-boxed, so an indexed read of a scalar
-    // value returned the pointer bits reinterpreted as the value — garbage.
-    void* dict = bz_dict_alloc_generic(key_esz,
-        (uint64_t(*)(const void*))hashfn,
-        (bool(*)(const void*, const void*))eqfn);
+    // The dict is keyed by TKey (key_esz bytes) in generic mode, or by string
+    // content in string mode. #738: the VALUE must use the same generic-dict
+    // encoding the codegen Dictionary<TKey,T> read expects (encodeValue): a
+    // SCALAR value (val_inline != 0 — int/enum/char/class-ref, ≤ 8 bytes) is
+    // stored INLINE in the void* slot (the indexer read does ptrtoint, not a
+    // deref); a STRUCT value (record/decimal) is heap-boxed. Previously every
+    // value was heap-boxed, so an indexed read of a scalar value returned the
+    // pointer bits reinterpreted as the value — garbage.
+    void* dict = key_is_string
+        ? bz_dict_alloc()
+        : bz_dict_alloc_generic(key_esz,
+              (uint64_t(*)(const void*))hashfn,
+              (bool(*)(const void*, const void*))eqfn);
     void** vt = (void**)e->vtable;
     typedef int32_t (*mn_t)(void*);
     typedef void*   (*cur_t)(void*);
@@ -2736,10 +2751,11 @@ extern "C" void* bz_lazy_to_dict(void* lazy, int64_t val_esz, int64_t key_esz,
     char key_buf[64] = {};
     while (((mn_t)vt[2])(e)) {
         void* elem = ((cur_t)vt[3])(e);
-        // Extract key into key_buf (the keyfn trampoline returns int64 for the
-        // common single-int-key path — ToDictionary's key is a scalar TKey).
+        // Extract the key. The keyfn trampoline (kind 2) always returns an
+        // int64: for a string TKey it is ptrtoint of the selector's returned
+        // bz_string*; for a scalar TKey it is the (possibly sign-extended)
+        // scalar key value.
         int64_t k = ((kfn_t)keyfn)(closure, elem);
-        memcpy(key_buf, &k, (size_t)(key_esz < 8 ? key_esz : 8));
         void* val;
         if (valfn) {
             // Two-selector ToDictionary(key, value): apply the value selector to
@@ -2759,7 +2775,15 @@ extern "C" void* bz_lazy_to_dict(void* lazy, int64_t val_esz, int64_t key_esz,
             val = malloc((size_t)val_esz);
             memcpy(val, elem, (size_t)val_esz);
         }
-        bz_dict_set_gen(dict, key_buf, val);
+        if (key_is_string) {
+            auto* s = (bz_string_struct*)(intptr_t)k;
+            const char* kd = s ? (const char*)s->data : "";
+            int64_t kl = s ? s->len : 0;
+            bz_dict_set_str(dict, kd, kl, val);
+        } else {
+            memcpy(key_buf, &k, (size_t)(key_esz < 8 ? key_esz : 8));
+            bz_dict_set_gen(dict, key_buf, val);
+        }
     }
     bz_lazy_dispose(e);
     return dict;

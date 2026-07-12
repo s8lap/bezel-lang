@@ -469,6 +469,51 @@ BEZEL_TEST(linq_gaps, todict_record_value_indexed_read_738) {
         "end Main; end C;"), 30);
 }
 
+// #1692 / stdlib §5: ToDictionary's TKey may be ANY equality-bearing type, not
+// just `int` — including `string` (returned by an un-annotated lambda, e.g. a
+// string-interpolation key). buildLinqTrampoline's kind-2 "key" trampoline
+// hardcoded an `i32` return for the key-selector closure call regardless of
+// the actual TKey, so a `(T) -> string` selector (whose closure genuinely
+// returns a `ptr`) was called through the WRONG function signature — reading
+// only the low 32 bits off the ABI return register and storing that garbage
+// as the key. Separately, the resulting Dictionary<string,V> was built via
+// the GENERIC-key runtime dict (bz_dict_alloc_generic), but Dictionary<string,
+// V>'s own ContainsKey/indexer codegen always dispatches to the dedicated
+// STRING-mode fast path (bz_dict_contains_str/bz_dict_try_get_str) — a
+// representation mismatch that left every lookup unable to find any key even
+// once the key bytes were fixed. WRONG_VALUE without the fix: every d[...]
+// lookup below raised KeyNotFoundException (see the `todict_string_key_*`
+// tests). PASSES with the fix: lookups return the inserted values.
+BEZEL_TEST(linq_gaps, todict_string_key_lookup_via_lambda_1692) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var xs := new Array<int>(); "
+        "  xs.Add(1); xs.Add(2); xs.Add(3); "
+        "  using var d := xs.ToDictionary((x) => $\"k{x}\"); "
+        "  return d[\"k1\"] + d[\"k2\"] + d[\"k3\"]; "  // 1+2+3 = 6
+        "end Main; end C;"), 6);
+}
+
+// #1692 / stdlib §5: ContainsKey specifically (not just the indexer above)
+// must find a key that WAS inserted and reject one that was not. Both checks
+// matter: pre-fix, the generic-mode dict ToDictionary built for a string TKey
+// never matches ANY string-fast-path query (present or absent), so the
+// positive `ContainsKey("k1")` check alone already distinguishes broken from
+// fixed; the negative `ContainsKey("k9")` check guards against a fix that
+// makes every lookup vacuously succeed. Count reflects the 3 distinct string
+// keys inserted.
+BEZEL_TEST(linq_gaps, todict_string_key_containskey_and_count_1692) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var xs := new Array<int>(); "
+        "  xs.Add(1); xs.Add(2); xs.Add(3); "
+        "  using var d := xs.ToDictionary((x) => $\"k{x}\"); "
+        "  if not d.ContainsKey(\"k1\") then return -1; end; "
+        "  if d.ContainsKey(\"k9\") then return -2; end; "
+        "  return d.Count; "  // 3
+        "end Main; end C;"), 3);
+}
+
 // ===========================================================================
 // BUG #459 / §5 / §22 — ToDictionary with a TYPE-INFERRED local (`var d :=`).
 // When the local's type is inferred from the initializer, the ToDictionary
