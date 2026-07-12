@@ -559,6 +559,51 @@ private:
     // wrappers keep their consumer-owns semantics.
     static bool isOwningCollectionNameHead(std::string_view head);
 
+    // §28.6 / §28.11 (v0.184, #1653): the BORROWING-family collections whose
+    // elements are the keyed-transit exception's admitted source (Array,
+    // Dictionary, Set, Stack, Queue, LinkedList, and the v0.136 sorted
+    // variants SortedSet/SortedDictionary — §28.11's borrowing-family list).
+    // Derived from the SAME name registries codegen/ownership already use for
+    // collection dispatch (BuiltinRegistry.hpp), filtered to the non-"Owning"-
+    // prefixed entries, rather than a new hand-maintained list.
+    static bool isBorrowingCollectionNameHead(std::string_view head);
+
+    // §28.6 "Who may call Dispose()" (v0.184, #1653): true when `e` is an
+    // element read — a bare indexer-get `coll[i]`, a for-loop's default-
+    // iteration variable, or a field read off one of those (the dictionary-
+    // entry `.Key`/`.Value` shape, or any other per-iteration field access,
+    // §28.11's "any other element read in the transit-point regime") — whose
+    // STRUCTURAL SOURCE is statically a borrowing-family collection
+    // (isBorrowingCollectionNameHead). This is the spec's "recorded" keyed-
+    // transit exception: the source's static type, not the element's, keys
+    // the admission. Default iteration over an OWNING collection also
+    // produces element borrows (§28.11) but is NOT keyed — its source fails
+    // the borrowing-family test — nor is an IEnumerable<T>/enumerator/lazy-
+    // query-typed source (a `.Where(p)` result, etc.): both fall through to
+    // `false` here and are rejected by checkDisposeReceiverOwnership.
+    bool disposeReceiverIsTransitEligible(const ast::Expr& e) const;
+
+    // §28.6 "Who may call Dispose()" (v0.184, #1653). See the .cpp definition
+    // for the full contract and the recorded-gap note. Rejects a `.Dispose()`
+    // / `?.Dispose()` / `!.Dispose()` call only for the GENUINE-borrow receiver
+    // FORMS identifiable by symbol resolution — `this`, a non-`owned` (or
+    // foreign-`owned`) field read, a non-`owned` parameter, a catch/pattern
+    // binding, an IEnumerable/enumerator-sourced for-loop variable, and an
+    // owning-HEAP-collection element — with the keyed-transit exception
+    // (disposeReceiverIsTransitEligible) carved out. It does NOT reject a plain
+    // local, a bare call result, an inline-array slot, or anything classified
+    // only by the `Borrowed` lattice state: that state conflates a genuine
+    // borrow with an owned disposable (enumerator/subscription), so rejecting
+    // on it over-rejects — those genuine-borrow shapes are left unenforced (the
+    // recorded gap). `loc` is the diagnostic anchor (the receiver's own span —
+    // the enclosing MemberAccessExpr's span is not reliably populated by the
+    // parser). A no-op when the receiver's own static type is an owning
+    // COLLECTION — that axis is fully owned by the sibling
+    // checkBorrowedOwningCollectionCapability, called earlier in the same
+    // CallExpr handler; running both would double-report the same call.
+    void checkDisposeReceiverOwnership(const ast::Expr& recv,
+                                        SourceLocation loc);
+
     // A returned value is only a *borrow* of its local root when it has
     // reference type; a value-typed projection (e.g. `r.V` where V is an
     // int, or `r.Size()` returning int) is a copy and cannot dangle.

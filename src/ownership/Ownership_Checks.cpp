@@ -676,6 +676,19 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                 call->callee.get())) {
             if (ma->member == "Dispose") {
+                // §28.6 "Who may call Dispose()" (v0.184, #1653): the
+                // receiver must be owned (or transit-eligible) — checked
+                // BEFORE the by-name discharge below so a rejected borrow
+                // receiver is diagnosed once, at the general rule, rather
+                // than ALSO silently transitioning a tracked local's state.
+                // Runs for both the bare `x.Dispose()` and the null-forgiving
+                // `x!.Dispose()` spellings (lookThroughForceUnwrap). Anchored
+                // at the receiver's OWN span (not the enclosing MemberAccess-
+                // Expr's, which the parser does not populate) so the
+                // diagnostic points at the borrow expression. // per §28.6
+                if (const ast::Expr* recv =
+                        lookThroughForceUnwrap(ma->target.get()))
+                    checkDisposeReceiverOwnership(*recv, recv->span.begin);
                 // §28.3 (#1500): the null-forgiving receiver spelling
                 // `x!.Dispose()` — required to discharge a NULLABLE owned
                 // local (e.g. the result of `move` on a `[N owned]T?` slot,
@@ -699,6 +712,13 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(
                 call->callee.get())) {
             if (nm->member == "Dispose") {
+                // §28.6 "Who may call Dispose()" (v0.184, #1653): same
+                // receiver-ownership rule as the `.Dispose()` / `!.Dispose()`
+                // forms above, applied to the `?.Dispose()` spelling.
+                // // per §28.6
+                if (nm->target)
+                    checkDisposeReceiverOwnership(*nm->target,
+                                                   nm->target->span.begin);
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         nm->target.get())) {
                     markDisposedByName(id->name, id->span.begin);

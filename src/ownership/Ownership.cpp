@@ -3098,6 +3098,307 @@ bool MethodOwnership::isOwningCollectionNameHead(std::string_view head) {
     return common::isOwningCollectionHead(head);
 }
 
+// §28.6 / §28.11 (v0.184, #1653): the BORROWING-family collections — §28.11's
+// "Array<T>, LinkedList<T>, Dictionary<K, V>, Set<T>, Stack<T>, Queue<T>" list,
+// plus the v0.136 sorted variants (stdlib §4.17/§4.18: SortedDictionary and
+// SortedSet are "the borrowing/non-owning counterpart" of Dictionary/Set — no
+// owning counterpart exists in this revision). Rather than hand-list these,
+// derive them from BuiltinRegistry's existing collection-dispatch tables (the
+// bz_array_t*/bz_dict_t*/bz_llist_t*-backed name sets already used by codegen
+// and elsewhere in this pass) filtered to the non-"Owning"-prefixed entries —
+// which is exactly the borrowing/owning split (every owning collection is
+// spelled "Owning" + the borrowing name, and vice versa). This intentionally
+// EXCLUDES OwningBuffer (an "Owning"-prefixed storage primitive, correctly
+// filtered), and Span<T>/ReadOnlySpan<T>/ArraySpan<T>/ReadOnlyArraySpan<T>/
+// FrozenArray<T> (stdlib §4.14/§4.15/§4.19 — not in the array/dict/linked-list
+// dispatch tables at all): those view/storage types are not among §28.11's
+// enumerated borrowing collections, so a `.Dispose()` on their elements is
+// conservatively NOT admitted by the keyed-transit exception here — a
+// narrower scope than the full stdlib collection surface, left for a
+// follow-up if one of those types turns out to need the exception too.
+bool MethodOwnership::isBorrowingCollectionNameHead(std::string_view head) {
+    if (common::isOwningPrefixedName(head)) return false;
+    return common::isArrayBackedCollectionName(head) ||
+           common::isDictionaryName(head) ||
+           common::isLinkedListName(head);
+}
+
+// §28.6 "Who may call Dispose()" (v0.184, #1653). See the header comment for
+// the full contract. Peels a MemberAccessExpr chain down to its structural
+// base — so a dictionary-iteration entry's `.Key`/`.Value` field read (§28.11:
+// "the entry fields of dictionary iteration") shares its base's eligibility,
+// exactly as "any other element read in the transit-point regime" specifies —
+// then classifies the base as either a bare indexer-get (the container
+// expression's static type is the source) or a for-loop's default-iteration
+// variable (the loop's iterable expression's static type is the source).
+// TypeRef::headName() already resolves the alias-transparent / imported-name
+// fallback, so no separate astNode/importedName dance is needed here (unlike
+// the older iterableIsOwningEnumerable, which predates that helper).
+bool MethodOwnership::disposeReceiverIsTransitEligible(
+        const ast::Expr& e) const {
+    const ast::Expr* base = &e;
+    while (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(base)) {
+        if (!ma->target) return false;
+        base = ma->target.get();
+    }
+    if (auto* ie = dynamic_cast<const ast::IndexExpr*>(base)) {
+        if (!ie->target) return false;
+        const sema::TypeRef* ct = ctx_.exprType(*ie->target);
+        if (!ct || ct->kind != sema::TypeRef::Kind::Named) return false;
+        return isBorrowingCollectionNameHead(ct->headName());
+    }
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(base)) {
+        auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+        if (!loc) return false;
+        auto* fs = dynamic_cast<const ast::ForStmt*>(loc->decl);
+        if (!fs || !fs->iterable) return false;
+        const sema::TypeRef* it = ctx_.exprType(*fs->iterable);
+        if (!it || it->kind != sema::TypeRef::Kind::Named) return false;
+        return isBorrowingCollectionNameHead(it->headName());
+    }
+    return false;
+}
+
+// §28.6 "Who may call Dispose()" (v0.184, #1653): explicit disposal requires
+// a receiver the disposer OWNS. See spec §28.6's "Who may call Dispose()"
+// (anchor sec-who-may-dispose). This check rejects only the GENUINE-borrow
+// receiver FORMS it can identify by symbol resolution, and ADMITS everything
+// else — the "positive rejection only" discipline of `ownedArgSourceIsBorrow`,
+// held here far more tightly because over-rejecting a legal dispose is worse
+// than leaving a borrow-dispose uncaught (the pre-#1653 permissive status quo).
+//
+// ★ WHY THE CHECK IS DELIBERATELY PARTIAL (recorded scope, a real foundation
+//   gap). The ownership dataflow's `Borrowed` lattice state does NOT mean "a
+//   borrow the caller may not dispose." It means "carries no auto-drop
+//   OBLIGATION" — a bucket that also holds OWNED disposables the caller must
+//   dispose explicitly: an `IEnumerator<T>` from `GetEnumerator()`/an iterator
+//   factory (§29.7 EXPLICITLY permits `e.Dispose()`), a `Subscription` from
+//   `Subscribe()` (§28.14 admits `sub.Dispose()`), and any other non-`owned`-
+//   returning call result. `producerState` classifies all of these `Borrowed`,
+//   identically to a genuine borrow like `var r := h.Get();` (a bare owned-
+//   field-read return). borrowSourceForExpr attaches NO source to any of them
+//   (they are CallExpr initializers, not re-borrows of an identifier/field), so
+//   nothing at the Dispose site distinguishes "genuine borrow" from "owned
+//   disposable" for a plain LOCAL or a call result. Rejecting on the `Borrowed`
+//   state therefore over-rejects the enumerator/subscription/unwind cases (it
+//   did, and was reverted). So this check does NOT consult the lattice state and
+//   does NOT reject a plain local or a bare call result at all; those genuine-
+//   borrow shapes (`var r := h.Get(); r.Dispose();`) are left UNENFORCED, the
+//   recorded gap — correct classification needs interprocedural return-kind
+//   info the ownership pass does not carry.
+//
+//   What it DOES reject are the borrow forms that are UNAMBIGUOUS by symbol
+//   resolution — a shape that can never be an owned disposable the caller owns:
+//     - `this` (§28.6: an object may not dispose itself);
+//     - a non-`owned` field read, or an `owned` field read NOT through `this`
+//       (§28.6: the field's actual owner disposes it; `this.<owned>` is the
+//       admitted §28.7 dispose-then-assign legacy — narrowed to `this` to
+//       match checkBorrowedOwningCollectionCapability's field branch and the
+//       #1230 destructor check);
+//     - a non-`owned` parameter (§28.6: a borrowed parameter — the caller
+//       retains ownership);
+//     - a catch-arm binding (§31.1: the runtime owns the in-flight exception);
+//     - a record-destructuring pattern binding (§19.3: the scrutinee's owner
+//       still owns the matched value);
+//     - a for-loop iteration variable whose iterable is statically an
+//       IEnumerable/IEnumerator/IAsync* source (§28.11: those yield TRACKED
+//       borrows — the issue's own negative test `for var x in xs.Where(p) do
+//       x.Dispose()`); borrowing-family and owning-Drain loop vars are admitted
+//       above (transit / Owned-seed);
+//     - an OWNING-HEAP-collection element read `pool[i]` (§28.11 rejects
+//       `pool[i].Dispose()`); borrowing-family elements are admitted by the
+//       transit exception above, and an INLINE-ARRAY slot (`[N]T`, whose slot
+//       value the holder owns — e.g. a `[1]Subscription`) is admitted (not a
+//       heap owning collection).
+//
+// Skips entirely when the receiver's OWN static type is an owning COLLECTION:
+// checkBorrowedOwningCollectionCapability (called earlier in the same CallExpr
+// handler, Ownership_Checks.cpp) already fully enforces the CONTAINER's own
+// Dispose — a different question from an ELEMENT's — so running both here would
+// double-report the same call.
+void MethodOwnership::checkDisposeReceiverOwnership(const ast::Expr& recv,
+                                                     SourceLocation loc) {
+    if (const sema::TypeRef* rt = ctx_.exprType(recv))
+        if (rt->kind == sema::TypeRef::Kind::Named &&
+            isOwningCollectionNameHead(rt->headName()))
+            return;
+
+    // The keyed-transit exception applies before every other rule.
+    if (disposeReceiverIsTransitEligible(recv)) return;
+
+    // A fresh owned producer (`new T(...)`, an owned-returning call/operator)
+    // or a `move` result — producerState already classifies a class-typed
+    // `move` operand as Owned (§28.8.1), so this single check covers both the
+    // spec's "unbound owned temporary" and "a `move` result" admissions.
+    if (producerState(recv) == OwnershipState::Owned) return;
+
+    // A field read (`obj.f`, or a bare `f` implicit-`this`), resolving to a
+    // FieldSymbol. `this.<owned field>` is the admitted §28.7 dispose-then-
+    // assign / #1230 destructor idiom; every other field read is a borrow the
+    // caller does not own. A property/indexer getter is NOT a FieldSymbol, so
+    // it is left to the conservative default (unenforced) — see the gap note.
+    if (dynamic_cast<const ast::IdentifierExpr*>(&recv) ||
+        dynamic_cast<const ast::MemberAccessExpr*>(&recv)) {
+        if (dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(recv))) {
+            if (exprIsReceiverOwnedFieldBorrow(recv)) return;  // `this.<owned>`
+            report(
+                Severity::Error, loc,
+                "cannot call `Dispose()` through a field read (§28.6 \"Who "
+                "may call Dispose()\") — a non-`owned` field is always a "
+                "borrow, and an `owned` field is disposable only through "
+                "`this` (code of its declaring type); the field's actual "
+                "owner disposes it");
+            return;
+        }
+    }
+
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&recv)) {
+        if (id->name == "this") {
+            report(
+                Severity::Error, loc,
+                "cannot call `Dispose()` on `this` (§28.6 \"Who may call "
+                "Dispose()\") — an object may not dispose itself out from "
+                "under its owner; let the owner dispose it, or do the work "
+                "in this class's `destructor`");
+            return;
+        }
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (isCatchBorrow(sym)) {
+            report(
+                Severity::Error, loc,
+                std::string("cannot call `Dispose()` on `") +
+                std::string(id->name) +
+                "`: a caught exception is a borrow of the in-flight "
+                "exception whose lifetime is the catch arm (§31.1) — the "
+                "runtime disposes it after the arm (§28.6 \"Who may call "
+                "Dispose()\")");
+            return;
+        }
+        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+            // A non-`owned` parameter is a borrow (§28.6): the caller retains
+            // ownership. An `owned`/`out owned` parameter IS owned — admit.
+            if (ps->modifier != "owned" && ps->modifier != "out owned") {
+                report(
+                    Severity::Error, loc,
+                    std::string("cannot call `Dispose()` on parameter `") +
+                    std::string(id->name) +
+                    "`: a non-`owned` parameter is a borrow (§28.6 \"Who may "
+                    "call Dispose()\") — declare it `owned`, or let the "
+                    "caller dispose it");
+            }
+            return;
+        }
+        if (auto* locSym = dynamic_cast<sema::LocalSymbol*>(sym)) {
+            if (locSym->decl &&
+                dynamic_cast<const ast::BindingPattern*>(locSym->decl)) {
+                report(
+                    Severity::Error, loc,
+                    std::string("cannot call `Dispose()` on `") +
+                    std::string(id->name) +
+                    "`: a pattern binding is a non-destructive borrow of the "
+                    "matched value (§19.3, §28.6 \"Who may call Dispose()\") "
+                    "— the scrutinee's owner still owns it");
+                return;
+            }
+            if (auto* fs = locSym->decl
+                    ? dynamic_cast<const ast::ForStmt*>(locSym->decl)
+                    : nullptr) {
+                // A borrowing-family or owning-Drain loop var was already
+                // admitted above (transit exception / Owned-seed). Reaching
+                // here means neither. Reject ONLY a TRACKED-BORROW source — an
+                // IEnumerable/IEnumerator/IAsync*-typed iterable, OR the §29.11
+                // lazy-query sentinel (a `.Where(p)` result: a Named TypeRef
+                // with no declaration and no astNode, so `headName()` is empty
+                // — the SAME shape isDeferredActivationCallResult /
+                // isLazyEnumerableType recognize). §28.11 says those yield
+                // tracked (frame-/enumerator-sourced) borrows and disposing
+                // them is a compile error (the issue's negative test). The
+                // OWNING enumerables (IOwning*) are DELIBERATELY excluded — a
+                // Drain-style owning enumerable yields OWNED elements, so
+                // disposing them is legal. Every other iterable — a span, an
+                // inline array, a user collection, a range, or an owning
+                // collection's DEFAULT (non-Drain) iteration — is left
+                // unenforced (the permissive status quo) rather than risk
+                // over-rejecting a disposable the caller owns. // per §28.6, §28.11
+                bool trackedBorrowSource = false;
+                if (fs->iterable) {
+                    if (const sema::TypeRef* it =
+                            ctx_.exprType(*fs->iterable)) {
+                        if (it->kind == sema::TypeRef::Kind::Named) {
+                            // §29.11 lazy-query sentinel: no declaration, no
+                            // astNode, has generic args, no imported name.
+                            if (!it->declaration && !it->astNode &&
+                                !it->genericArgs.empty() &&
+                                it->importedName.empty()) {
+                                trackedBorrowSource = true;
+                            } else {
+                                std::string_view h = it->headName();
+                                trackedBorrowSource =
+                                    (h == "IEnumerable" || h == "IEnumerator" ||
+                                     h == "IAsyncEnumerable" ||
+                                     h == "IAsyncEnumerator");
+                            }
+                        }
+                    }
+                }
+                if (trackedBorrowSource) {
+                    report(
+                        Severity::Error, loc,
+                        std::string("cannot call `Dispose()` on iteration "
+                        "variable `") + std::string(id->name) +
+                        "`: an IEnumerable<T>/enumerator/lazy-query source "
+                        "yields a tracked borrow, not an owned value (§28.6 "
+                        "\"Who may call Dispose()\", §28.11 — the keyed-"
+                        "transit exception admits only an Array/Dictionary/"
+                        "Set/Stack/Queue/LinkedList-sourced element) — "
+                        "iterate the collection directly, or bind the item "
+                        "to an owned location first");
+                }
+                return;
+            }
+            // A plain `var`/`using var` local (LocalDecl decl), or a local
+            // absent from states_ (unreachable / other-block position): NOT
+            // rejected — the recorded gap (a genuine local-held borrow is
+            // indistinguishable from an owned disposable here). A `using var`
+            // is genuinely owned; a plain owned local is genuinely owned; a
+            // borrow local is the unenforced gap.
+            return;
+        }
+        // Unresolved / other: conservatively not rejected.
+        return;
+    }
+
+    // A bare indexer-get whose target is statically an OWNING HEAP collection
+    // (§28.11 rejects `pool[i].Dispose()` — the collection is a transit point,
+    // not the element's owner). Borrowing-family elements were admitted by the
+    // transit exception above; an INLINE-ARRAY slot (`[N]T`, e.g.
+    // `[1]Subscription`, whose slot value the holder owns) and any non-owning-
+    // collection indexer are admitted (not a heap owning collection). Restricted
+    // to owning-heap-collection targets so an owned inline-array element dispose
+    // is never over-rejected. // per §28.11
+    if (auto* ie = dynamic_cast<const ast::IndexExpr*>(&recv)) {
+        if (ie->target) {
+            const sema::TypeRef* ct = ctx_.exprType(*ie->target);
+            if (ct && ct->kind == sema::TypeRef::Kind::Named &&
+                isOwningCollectionNameHead(ct->headName())) {
+                report(
+                    Severity::Error, loc,
+                    "cannot call `Dispose()` on an owning-collection element "
+                    "read (§28.6 \"Who may call Dispose()\", §28.11) — the "
+                    "collection owns and disposes its elements; use `Remove`/"
+                    "`RemoveAt`, the indexer-set, or `move coll[i]` to take "
+                    "the element out first");
+            }
+        }
+        return;
+    }
+
+    // Anything else (a call result, a conditional expression, a cast, …):
+    // conservatively not rejected — see the gap note (a non-`owned` call
+    // result is indistinguishable from an owned disposable like an enumerator
+    // or subscription here).
+}
+
 // §28.3 / §28.6 / §5.11 (#1007): a method declared `: OwningArray<T>` (or any
 // owning-collection / owning-wrapper return type) WITHOUT the `owned` qualifier
 // hands the caller a value the caller tracks as OWNED — the caller must
