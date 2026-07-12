@@ -1209,7 +1209,8 @@ llvm::StructType* Emitter::nullableValueStructTy(const sema::TypeRef* rt) {
 // fix #568 / §14.1 / §7.1: see the declaration comment in LlvmBackend_impl.hpp.
 llvm::Value* Emitter::coerceReturnToNullableValue(llvm::Value* v,
                                                   const sema::TypeRef* declRet,
-                                                  bool srcUnsigned) {
+                                                  bool srcUnsigned,
+                                                  bool sourceIsNullableRef) {
     if (!v || !declRet) return v;
     // Resolve the EFFECTIVE nullable value type. A bare nullable type-parameter
     // (`T?`) resolves through the active monomorphization to its concrete value
@@ -1230,6 +1231,23 @@ llvm::Value* Emitter::coerceReturnToNullableValue(llvm::Value* v,
     if (v->getType() == nst) return v;  // already the tagged struct.
     // `return null` lowered to a null pointer → the {i8 0, T 0} null constant.
     if (v->getType()->isPointerTy() && llvm::isa<llvm::ConstantPointerNull>(v))
+        return nullableValueNull(nv);
+    // #1767 / §19.2: the returned expression's SEMA type is a nullable REFERENCE
+    // (`Object?`) but the declared return is a nullable VALUE (`int?`), and the
+    // value is a RUNTIME `ptr` — not a constant. This is the all-null `case … end`
+    // shape: a `null` literal defaults to `Object?` (§7 nullability), so a case
+    // whose every arm is `null` has sema result `Object?` and lowers to a bare
+    // `ptr` PHI (each arm's `null` → ConstantPointerNull, joined). Sema admits a
+    // reference-nullable value into a value-nullable return ONLY when it is
+    // provably null (no non-null reference type is assignable to `int?`, §20), so
+    // the runtime ptr is null → the {i8 0, T 0} constant. This is gated on
+    // `sourceIsNullableRef` so a genuine repr bug where a value-nullable source
+    // (`int?`) mis-lowers to a `ptr` (e.g. an unrelated `?.` / LINQ `*_or_null`
+    // divergence) is NOT masked — those still fall through to the verifier. Before
+    // this, only the ConstantPointerNull case above was handled; the runtime PHI
+    // fell through to emitReturn (also constant-null-only) → `ret ptr` from a
+    // `{i8,i32}` fn — malformed IR the JIT's missing verifier silently ran.
+    if (sourceIsNullableRef && v->getType()->isPointerTy())
         return nullableValueNull(nv);
 
     llvm::Type* slotTy = nst->getElementType(1);

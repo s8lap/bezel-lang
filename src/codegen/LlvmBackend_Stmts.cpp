@@ -1345,10 +1345,25 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // is a no-op there (v already IS the struct).
         if (v && currentReturnTypeNode_) {
             if (const sema::TypeRef* declRet =
-                    ctx_.resolvedType(*currentReturnTypeNode_))
+                    ctx_.resolvedType(*currentReturnTypeNode_)) {
+                // #1767 / §19.2: the returned expression's own sema type is a
+                // nullable REFERENCE (`Object?`) — e.g. an all-null `case … end`,
+                // whose `null` arms default to `Object?` — while the declared
+                // return is a nullable VALUE (`int?`). Such a value lowers to a
+                // bare `ptr` (a runtime PHI, not a constant null), which the
+                // reference→value coercion below rewrites to the {i8 0, T 0} null
+                // constant (sema proves it null, §20). Passing this flag keeps a
+                // value-nullable source that mis-lowered to a ptr from being
+                // silently nulled (it must still fail the verifier).
+                const sema::TypeRef* srcTy =
+                    rs->value ? ctx_.exprType(*rs->value) : nullptr;
+                bool srcNullableRef = srcTy && srcTy->nullable &&
+                                      !isNullableValueTy(srcTy);
                 v = coerceReturnToNullableValue(
                     v, declRet,
-                    rs->value && isUnsignedTargetExpr(*rs->value));  // #843
+                    rs->value && isUnsignedTargetExpr(*rs->value),  // #843
+                    srcNullableRef);
+            }
         }
         // §5.1 (#746 R41-H): a numeric return value narrower than the declared
         // return type is implicitly widened (e.g. `return arr[0]` where

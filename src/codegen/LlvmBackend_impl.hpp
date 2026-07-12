@@ -2707,9 +2707,16 @@ private:
     // generic nullable value return already lowers to the struct directly, and
     // a reference `?` / non-nullable return is untouched). Defined in
     // LlvmBackend_Layout.cpp (needs nullableValueStructTy / recordStruct).
+    // #1767 / §19.2: `sourceIsNullableRef` — the RETURNED expression's own sema
+    // type is a nullable REFERENCE (`Object?`), not the value-nullable target.
+    // Set only by the return path, it admits a RUNTIME `ptr` (a PHI/select, not
+    // just a ConstantPointerNull) as the {i8 0, T 0} null constant. See the
+    // definition's comment for the soundness argument (sema admits a reference-
+    // nullable value into a value-nullable slot ONLY when provably null).
     llvm::Value* coerceReturnToNullableValue(llvm::Value* v,
                                              const sema::TypeRef* declRet,
-                                             bool srcUnsigned = false);
+                                             bool srcUnsigned = false,
+                                             bool sourceIsNullableRef = false);
 
     // §22.10 / §23.4: find the indexer PropertySymbol on a TypeSymbol, if any.
     // When `argTy` is non-null, select the OVERLOAD (#774) whose first

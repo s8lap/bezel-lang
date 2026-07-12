@@ -13,10 +13,12 @@
 // {i8 hasValue; T value} struct.  §7.5: a bare T value widens to int? by
 // constructing the struct with hasValue=1.
 
+#include "support/aot_support.hpp"   // runAot — AOT oracle (#1767 needs the verifier)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::runAot;
 using bezel::test::runJit;
 
 namespace {
@@ -24,6 +26,14 @@ namespace {
 // Helper: run a complete program; return the Main exit code.
 int runFull(const std::string& program) {
     auto r = runJit(program);
+    return r.ran ? r.exitCode : -999;
+}
+
+// Helper: compile+run via the AOT oracle (which runs the IR VERIFIER the ORC
+// JIT skips) and return the Main exit code — or -999 if the program was
+// rejected (a failed IR verification surfaces here as ran=false). #1767.
+int runFullAot(const std::string& program) {
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -118,6 +128,34 @@ BEZEL_TEST(codegen_cg28_573, nullable_result_multi_value_arms_spec_19_2) {
 // §19.2 / §7.1: all arms produce null.  The result is always null.
 BEZEL_TEST(codegen_cg28_573, nullable_result_all_null_arms_spec_19_2) {
     BEZEL_EXPECT_EQ(runFull(
+        "module M; class C "
+        "  public static method Always(n: int): int? "
+        "    return case n of "
+        "      1 => null, "
+        "      _ => null "
+        "    end; "
+        "  end Always; "
+        "  public static method Main(): int "
+        "    var x := C.Always(1); "
+        "    return 0 if x = null else 1; "
+        "  end Main; "
+        "end C;"), 0);
+}
+
+// fix #1767 / §19.2 / §7.1: all arms produce `null`, AOT oracle (with the IR
+// verifier the ORC JIT skips). A `null` literal defaults to the nullable
+// REFERENCE `Object?` (§7), so a case whose every arm is `null` has sema result
+// `Object?` and lowers to a bare `ptr` PHI — but the declared return `int?`
+// lowers to the tagged `{i8, i32}` struct. Before the fix the case result was
+// `ret`'d as that bare `ptr` (`ret ptr %N` from a `{i8,i32}` fn) — malformed IR
+// the JIT ran silently but AOT's verifier REJECTS (so this runAot test fails
+// with ran=false pre-fix, passes post-fix). The fix coerces the provably-null
+// reference-nullable ptr to the value-nullable `{i8 0, i32 0}` null constant at
+// the return, so the `ret` type matches. Always(1)=null → Main returns 0.
+BEZEL_TEST(codegen_cg28_573, nullable_result_all_null_arms_aot_1767_spec_19_2) {
+    // ran=false (rejection at the verifier) yields -999 here, not 0 — the exact
+    // pre-fix failure. Post-fix: compiles, verifies, links, runs → 0.
+    BEZEL_EXPECT_EQ(runFullAot(
         "module M; class C "
         "  public static method Always(n: int): int? "
         "    return case n of "
