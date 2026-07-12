@@ -6,14 +6,15 @@
 // `ret <value>` (the unwrapped result) instead of a Task<T>, failing IR
 // verification ("return type does not match operand type of return inst").
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int runFull(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace

@@ -7,14 +7,15 @@
 // of the loop is identical to the no-`with` form. (§30.8 honoring the token for
 // cancellation is still deferred, as on a direct GetAsyncEnumerator path.)
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int runFull(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
