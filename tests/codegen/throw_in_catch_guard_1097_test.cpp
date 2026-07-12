@@ -9,15 +9,14 @@
 //
 // runJit returns the FULL int from Main() (not 8-bit wrapped); values ≤ 255.
 
-#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runAot;
+using bezel::test::runJit;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runAot(prog);
+    auto r = runJit(prog);
     return r.ran ? r.exitCode : -999;
 }
 const char* E2 =
