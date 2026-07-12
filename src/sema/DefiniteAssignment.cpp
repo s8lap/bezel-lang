@@ -1271,6 +1271,21 @@ private:
         }
         if (!viaThis && !viaBase) return false;
         Symbol* calleeSym = ctx_.exprSymbol(*ce.callee);
+        // §22.7 rule 1 (v0.184, #1752): when the callee resolves to a field or
+        // an auto-property, `this.X(...)`/`base.X(...)` is *not* an instance-
+        // call observation — it is a field/auto-prop READ (already excluded
+        // from the gate; see visitCtorMemberAccess) followed by an ordinary
+        // invocation of the function VALUE that read produced. Invoking a
+        // function value has no bearing on `this` — only a call whose
+        // *receiver* is `this`/`base` (a method or computed-property accessor
+        // invocation) is the observation rule 1 describes. Do not recurse into
+        // the callee (its receiver is `this`/`base`, already accounted for as
+        // a non-observing read); just visit the call arguments.
+        if (dynamic_cast<FieldSymbol*>(calleeSym) ||
+            isAutoPropertySymbol(calleeSym)) {
+            for (const auto& a : ce.args) visitCallArg(a);
+            return true;
+        }
         bool reported =
             checkVirtualDispatch(calleeSym, viaBase, ce.span.begin, mname);
         if (!reported)

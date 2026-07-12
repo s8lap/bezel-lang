@@ -432,3 +432,83 @@ BEZEL_TEST(sema_ctor_obs_2207, field_case_live_arm_without_assign_still_rejected
         "end W;");
     BEZEL_EXPECT_TRUE(daHasError(r, "before non-nullable field"));
 }
+
+// ===========================================================================
+// fix #1752 (follow-up to #1679) — invoking a function-typed member (a field
+// or auto-property whose value is a function type) is NOT a rule-1
+// this-observation. §22.7 rule 1 gates "an instance method, block-form
+// accessor, or indexer invocation with receiver `this`" — a call whose
+// *receiver* is `this`/`base`. A field or auto-property READ is explicitly
+// carved out of the gate ("Direct field assignments and reads, and
+// auto-property assignments and reads … are not observations"); invoking the
+// function VALUE that read produces is an ordinary call on that value, not a
+// call with receiver `this`. Before the fix, `visitCtorCall`
+// (DefiniteAssignment.cpp) treated any `this.X(...)`/`base.X(...)` shape as
+// an instance-call observation without checking what `X` resolves to, so
+// calling a stored delegate through `this._cb()` was wrongly gated — while
+// the bare form `_cb()` was already correctly exempt (its branch only fires
+// for a MethodSymbol callee), an asymmetry that is itself evidence the gated
+// form was wrong. The controls below confirm the fix does not broaden into
+// under-rejecting a genuine method-call observation on a class that also
+// happens to declare a function-typed member.
+// ===========================================================================
+
+// ACCEPT — invoking a function-typed FIELD via explicit `this.` before another
+// non-nullable field is assigned. Over-rejected before the fix (gated as an
+// instance-call observation on `_name`'s unassigned state); the call itself
+// observes nothing about `this` — it only reads the field (not gated) and
+// then calls the function value that read produced.
+BEZEL_TEST(sema_ctor_obs_2207, this_qualified_function_field_invoke_not_gated_1752) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "sealed class W "
+        "  private _name: string; "
+        "  private _cb: () -> (); "
+        "  public constructor(cb: () -> ()) "
+        "    _cb := cb; "
+        "    this._cb(); "        // invoking the field's function VALUE — not an observation
+        "    _name := \"n\"; "
+        "  end constructor; "
+        "end W;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ACCEPT — the same shape through a function-typed AUTO-PROPERTY (compiler-
+// known backing-field storage, §23.1): `this.Cb()` invokes the stored
+// function value, not the property's (nonexistent, since it's auto-form)
+// accessor body.
+BEZEL_TEST(sema_ctor_obs_2207, this_qualified_function_autoprop_invoke_not_gated_1752) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "sealed class W "
+        "  private _name: string; "
+        "  public property Cb: () -> (); "
+        "  public constructor(cb: () -> ()) "
+        "    Cb := cb; "
+        "    this.Cb(); "         // invoking the auto-property's function VALUE
+        "    _name := \"n\"; "
+        "  end constructor; "
+        "end W;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// REJECT — under-reject guard: a genuine instance-METHOD call through
+// `this.`, in a class that also declares a function-typed field, must still
+// be gated. Confirms the fix distinguishes calleeSym's kind (FieldSymbol/
+// auto-PropertySymbol vs. MethodSymbol) rather than disabling the gate
+// wherever a function-typed member happens to be in scope.
+BEZEL_TEST(sema_ctor_obs_2207, this_qualified_method_call_still_gated_1752) {
+    auto r = parseAndCheckDA(
+        "module M; "
+        "sealed class W "
+        "  private _name: string; "
+        "  private _cb: () -> (); "
+        "  public constructor(cb: () -> ()) "
+        "    _cb := cb; "
+        "    this.Describe(); "   // genuine instance-call observation — still gated
+        "    _name := \"n\"; "
+        "  end constructor; "
+        "  public method Describe() end Describe; "
+        "end W;");
+    BEZEL_EXPECT_TRUE(daHasError(r, "before non-nullable field"));
+}
