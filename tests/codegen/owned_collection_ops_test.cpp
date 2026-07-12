@@ -15,16 +15,32 @@
 // fix Remove(item) was a no-op (returned nullptr in codegen) and Insert did
 // nothing — so these are load-bearing.
 
+// AOT MIGRATION (#1769 / #1763): this file runs under the AOT driver (runAot).
+// Every Remove/Insert/bounds behavior is identical under AOT (verified — the
+// JIT→AOT divergence #1769 flagged for this file was purely the 8-bit exit
+// channel: `array_int_insert_shifts_up` encodes a 323 observable, which masks to
+// 67 through a process exit status). That test prints the observable with
+// Console.WriteLine (stdlib §2.1) and asserts the captured stdout; every other
+// observable is ≤255 and round-trips the exit code.
+
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
+}
+
+// Observables > 255 cannot round-trip the 8-bit exit channel; the program prints
+// the value with Console.WriteLine and the test checks the captured stdout.
+std::string runOut(const std::string& src) {
+    auto r = runAot(src);
+    return r.ran ? r.stdoutText : std::string("<did-not-run>");
 }
 
 // A resource class R (destructor bumps R._n) wrapped in a holder C with the
@@ -129,12 +145,13 @@ BEZEL_TEST(owned_coll_ops_4_5, owned_array_insert_grows_count) {
 // at `index` (and all after) up by one and stores the new element there. After
 // Insert(1, 2) on [1, 3] the array is [1, 2, 3].
 BEZEL_TEST(owned_coll_ops_4_5, array_int_insert_shifts_up) {
-    BEZEL_EXPECT_EQ(run(
+    // 3*100 + 2*10 + 3 = 323 > 255 → stdout.
+    BEZEL_EXPECT_EQ(runOut(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); a.Add(1); a.Add(3); "
         "  a.Insert(1, 2); "
-        "  return a.Count * 100 + a.Get(1) * 10 + a.Get(2); " // 3*100 + 2*10 + 3 = 323
-        "end Main; end C;"), 323);
+        "  Console.WriteLine(a.Count * 100 + a.Get(1) * 10 + a.Get(2)); return 0; "
+        "end Main; end C;"), "323\n");
 }
 
 // stdlib §4.5 / §3: Insert at index 0 prepends; Insert at Count appends.

@@ -36,15 +36,31 @@
 // Disposal is exactly-once (§28/§29.2): no leak (fewer than expected) and no
 // double-free (more than expected).
 
+// AOT MIGRATION (#1769 / #1763): this file runs under the AOT driver (runAot).
+// All three set-algebra handlers produce the spec-correct result under AOT
+// (verified — the JIT→AOT divergence #1769 flagged for this file was purely the
+// 8-bit exit channel: the encoded observables 404/301/302 all exceed 255 and
+// mask to 148/45/46 through a process exit status). Those print the observable
+// with Console.WriteLine (stdlib §2.1) and assert the captured stdout; the ≤255
+// observable (UnionWith drain = 5) round-trips the exit code.
+
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
+}
+
+// Observables > 255 cannot round-trip the 8-bit exit channel; the program prints
+// the value with Console.WriteLine and the test checks the captured stdout.
+std::string runOut(const std::string& prog) {
+    auto r = runAot(prog);
+    return r.ran ? r.stdoutText : std::string("<did-not-run>");
 }
 
 // Destructor-counting class with NO Equals override (§8.3 falls back to
@@ -107,7 +123,7 @@ BEZEL_TEST(owned_set_algebra_1259, unionwith_drains_other_no_leak_spec_4_10) {
 // 4 live. Pre-fix (#1259): no-op → Count stayed 2 and the 3 moved s2
 // elements leaked (n stayed 5).
 BEZEL_TEST(owned_set_algebra_1259, unionwith_duplicate_disposed_not_appended_spec_4_10) {
-    BEZEL_EXPECT_EQ(run(std::string(kBox) +
+    BEZEL_EXPECT_EQ(runOut(std::string(kBox) +
         "public static method Main(): int "
         "  using var s1 := new OwningSet<Box>(); "
         "  s1.Add(move (new Box(1))); "
@@ -118,9 +134,9 @@ BEZEL_TEST(owned_set_algebra_1259, unionwith_duplicate_disposed_not_appended_spe
         "  s2.Add(move (new Box(4))); "
         "    s1.UnionWith(move s2); "
         // union {1,2} ∪ {1,3,4} = {1,2,3,4} → Count 4; 5 built, 1 dup disposed
-        // → Box.n 4. (Pre-fix no-op: Count 2, n 5 → 502.)
-        "  return Box.n * 100 + s1.Count; "  // 4*100 + 4 = 404
-        "end Main; end C;"), 404);
+        // → Box.n 4. (Pre-fix no-op: Count 2, n 5 → 502.) 404 > 255 → stdout.
+        "  Console.WriteLine(Box.n * 100 + s1.Count); return 0; "  // 4*100 + 4 = 404
+        "end Main; end C;"), "404\n");
 }
 
 // #1259 / stdlib §4.10: IntersectWith(other) "disposes elements not in other"
@@ -128,7 +144,7 @@ BEZEL_TEST(owned_set_algebra_1259, unionwith_duplicate_disposed_not_appended_spe
 // kept, Box(2) has no match and is removed+disposed. Pre-fix (#1259): the call
 // no-opped and Count stayed at 2.
 BEZEL_TEST(owned_set_algebra_1259, intersectwith_keeps_only_intersection_spec_4_10) {
-    BEZEL_EXPECT_EQ(run(std::string(kBox) +
+    BEZEL_EXPECT_EQ(runOut(std::string(kBox) +
         "public static method Main(): int "
         "  using var s := new OwningSet<Box>(); "
         "  s.Add(move (new Box(1))); "
@@ -138,8 +154,9 @@ BEZEL_TEST(owned_set_algebra_1259, intersectwith_keeps_only_intersection_spec_4_
         "  other.Add(move (new Box(3))); "  // not in s
         "  s.IntersectWith(other); "
         // s = {1} → Count 1; 4 Boxes built, 1 (Box(2)) disposed → Box.n 3.
-        "  return Box.n * 100 + s.Count; "  // 3*100 + 1 = 301 (was 402 pre-fix)
-        "end Main; end C;"), 301);
+        // 301 > 255 → stdout.
+        "  Console.WriteLine(Box.n * 100 + s.Count); return 0; "  // 3*100 + 1 = 301
+        "end Main; end C;"), "301\n");
 }
 
 // #1259 / stdlib §4.10: ExceptWith(other) "disposes elements in other" —
@@ -147,7 +164,7 @@ BEZEL_TEST(owned_set_algebra_1259, intersectwith_keeps_only_intersection_spec_4_
 // and disposed; {1,3} are kept. Pre-fix (#1259): the call no-opped and Count
 // stayed at 3.
 BEZEL_TEST(owned_set_algebra_1259, exceptwith_removes_matched_elements_spec_4_10) {
-    BEZEL_EXPECT_EQ(run(std::string(kBox) +
+    BEZEL_EXPECT_EQ(runOut(std::string(kBox) +
         "public static method Main(): int "
         "  using var s := new OwningSet<Box>(); "
         "  s.Add(move (new Box(1))); "
@@ -157,6 +174,7 @@ BEZEL_TEST(owned_set_algebra_1259, exceptwith_removes_matched_elements_spec_4_10
         "  other.Add(move (new Box(2))); "  // value-equal to s's Box(2)
         "  s.ExceptWith(other); "
         // s = {1,3} → Count 2; 4 Boxes built, 1 (Box(2)) disposed → Box.n 3.
-        "  return Box.n * 100 + s.Count; "  // 3*100 + 2 = 302 (was 403 pre-fix)
-        "end Main; end C;"), 302);
+        // 302 > 255 → stdout.
+        "  Console.WriteLine(Box.n * 100 + s.Count); return 0; "  // 3*100 + 2 = 302
+        "end Main; end C;"), "302\n");
 }

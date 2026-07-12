@@ -31,16 +31,32 @@
 //   #536 — per-instantiation static state via method calls (genericSubst_ path).
 //   #816 — specialized disposer for owned type-parameter fields.
 
+// AOT MIGRATION (#1769 / #1763): this file runs under the AOT driver (runAot).
+// The per-instantiation static counters are all correct under AOT (verified —
+// the JIT→AOT divergence #1769 flagged for this file was purely the 8-bit exit
+// channel: three tests encode a 1100 observable, which masks to 76 through a
+// process exit status). Those three print the observable with Console.WriteLine
+// (stdlib §2.1) and assert the captured stdout; the ≤255 observables (10)
+// round-trip the exit code.
+
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
+}
+
+// Observables > 255 cannot round-trip the 8-bit exit channel; the program prints
+// the value with Console.WriteLine and the test checks the captured stdout.
+std::string runOut(const std::string& prog) {
+    auto r = runAot(prog);
+    return r.ran ? r.stdoutText : std::string("<did-not-run>");
 }
 
 // GBox<T> tracks live instances per-instantiation via a static counter.
@@ -100,7 +116,7 @@ BEZEL_TEST(codegen_generic_dtor_static_field_1247,
 // Return: 1*1000 + 1*100 + 0*10 + 0 = 1100 (full int, not 8-bit truncated).
 BEZEL_TEST(codegen_generic_dtor_static_field_1247,
            gbox_bool_char_dtor_decrements_per_inst_static_spec_22_12_28_3) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runOut(
         std::string("module M; ") + kGBox +
         "class Program "
         "  public static method Main(): int "
@@ -109,9 +125,10 @@ BEZEL_TEST(codegen_generic_dtor_static_field_1247,
         "       using var c := new GBox<char>('x'); "
         "       midB := GBox<bool>._m; midC := GBox<char>._m; "
         "    end; "
-        "    return midB * 1000 + midC * 100 + GBox<bool>._m * 10 + GBox<char>._m; "
+        "    Console.WriteLine(midB * 1000 + midC * 100 + GBox<bool>._m * 10 + GBox<char>._m); "
+        "    return 0; "
         "  end Main; "
-        "end Program;"), 1100);
+        "end Program;"), "1100\n");
 }
 
 // ── Two value-type instantiations: each counter is independent ────────────────
@@ -121,7 +138,7 @@ BEZEL_TEST(codegen_generic_dtor_static_field_1247,
 // Return: 1*1000 + 1*100 + 0*10 + 0 = 1100 (full int, not 8-bit truncated).
 BEZEL_TEST(codegen_generic_dtor_static_field_1247,
            two_value_instantiations_independent_counters_spec_22_12_28_3) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runOut(
         std::string("module M; ") + kGBox +
         "class Program "
         "  public static method Main(): int "
@@ -130,9 +147,10 @@ BEZEL_TEST(codegen_generic_dtor_static_field_1247,
         "       using var bl := new GBox<long>(100); "
         "       midI := GBox<int>._m; midL := GBox<long>._m; "
         "    end; "
-        "    return midI * 1000 + midL * 100 + GBox<int>._m * 10 + GBox<long>._m; "
+        "    Console.WriteLine(midI * 1000 + midL * 100 + GBox<int>._m * 10 + GBox<long>._m); "
+        "    return 0; "
         "  end Main; "
-        "end Program;"), 1100);
+        "end Program;"), "1100\n");
 }
 
 // ── Regression: class-T still gets a specialized disposer (owns field) ────────
@@ -144,7 +162,7 @@ BEZEL_TEST(codegen_generic_dtor_static_field_1247,
 // Expected: 11*100 + 0*10 + 0 = 1100 (full int, not 8-bit truncated).
 BEZEL_TEST(codegen_generic_dtor_static_field_1247,
            class_t_owned_field_and_static_both_correct_spec_28_4_28_5) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runOut(
         "module M; "
         "class Trackable "
         "  public static alive: int := 0; "
@@ -163,9 +181,10 @@ BEZEL_TEST(codegen_generic_dtor_static_field_1247,
         "    do using var b := new GBox<Trackable>(new Trackable()); "
         "       mid := GBox<Trackable>._m * 10 + Trackable.alive; "
         "    end; "
-        "    return mid * 100 + GBox<Trackable>._m * 10 + Trackable.alive; "
+        "    Console.WriteLine(mid * 100 + GBox<Trackable>._m * 10 + Trackable.alive); "
+        "    return 0; "
         "  end Main; "
-        "end Program;"), 1100);
+        "end Program;"), "1100\n");
 }
 
 // ── Regression: non-generic class dtor is unaffected ─────────────────────────

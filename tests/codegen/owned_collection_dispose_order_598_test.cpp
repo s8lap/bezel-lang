@@ -13,23 +13,33 @@
 // Before the fix, all four ordered collections disposed forward → _log == 123.
 //
 // OwningSet is unordered (order is impl-defined); it is NOT tested here.
+//
+// AOT MIGRATION (#1769 / #1763): this file runs under the AOT driver (runAot).
+// The dispose-order observable is `_log == 321`, which exceeds the 8-bit process
+// exit channel (WEXITSTATUS masks to 0..255; 321 & 0xFF == 65). Per the migration
+// convention (aot_support.hpp; int_arithmetic_test.cpp), the order tests print
+// `_log` with Console.WriteLine (stdlib §2.1) and assert the captured stdout,
+// while the ≤255 observables (single-element = 7, count = 3) round-trip the exit
+// code. AOT was verified to dispose in the SAME reverse-insertion order the JIT
+// did (stdout "321"); the JIT→AOT divergence #1769 recorded for this file was
+// purely the 8-bit exit channel, NOT a disposal-order difference.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
 // A class whose destructor appends its id to a shared static log.
 // _log starts at 0; disposal of Item(id) turns _log into _log*10 + id.
 // Three items with ids 1,2,3 in reverse order → _log == 321.
-// The Main body must return _log so the exit code is the observable result.
 std::string makeLoggingItems(const std::string& mainBody) {
     return
         "module M; "
@@ -43,8 +53,19 @@ std::string makeLoggingItems(const std::string& mainBody) {
         "end C;";
 }
 
+// ≤255 observable (single-element = 7): the Main body returns _log so the exit
+// code is the observable result.
 int runItems(const std::string& mainBody) {
     return run(makeLoggingItems(mainBody));
+}
+
+// Order observable (_log == 321) exceeds the 8-bit exit channel: `doBlock` runs
+// the collection to scope-end disposal, then _log is printed to stdout. Returns
+// the captured stdout (e.g. "321\n").
+std::string runItemsOut(const std::string& doBlock) {
+    auto r = runAot(makeLoggingItems(
+        doBlock + " Console.WriteLine(Item._log); return 0;"));
+    return r.ran ? r.stdoutText : std::string("<did-not-run>");
 }
 
 }  // namespace
@@ -59,14 +80,13 @@ int runItems(const std::string& mainBody) {
 // Before fix: forward order → _log == 123.
 BEZEL_TEST(owned_dispose_order_598_spec_28_11,
            owned_array_disposes_reverse_insertion_order) {
-    BEZEL_EXPECT_EQ(runItems(
+    BEZEL_EXPECT_EQ(runItemsOut(
         "do "
         "  using var a := new OwningArray<Item>(); "
         "  a.Add(move (new Item(1))); "
         "  a.Add(move (new Item(2))); "
         "  a.Add(move (new Item(3))); "
-        "end; "
-        "return Item._log;"), 321);
+        "end;"), "321\n");
 }
 
 // §28.11: single-element OwningArray disposes the single element exactly once.
@@ -111,14 +131,13 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
 // Before fix: forward (head-to-tail) order → _log == 123.
 BEZEL_TEST(owned_dispose_order_598_spec_28_11,
            owned_linked_list_disposes_reverse_insertion_order) {
-    BEZEL_EXPECT_EQ(runItems(
+    BEZEL_EXPECT_EQ(runItemsOut(
         "do "
         "  using var ll := new OwningLinkedList<Item>(); "
         "  ll.AddLast(move (new Item(1))); "
         "  ll.AddLast(move (new Item(2))); "
         "  ll.AddLast(move (new Item(3))); "
-        "end; "
-        "return Item._log;"), 321);
+        "end;"), "321\n");
 }
 
 // §28.11: single-element OwningLinkedList disposes the single element once.
@@ -163,14 +182,13 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
 // Before fix: forward order → _log == 123.
 BEZEL_TEST(owned_dispose_order_598_spec_28_11,
            owned_queue_disposes_reverse_insertion_order) {
-    BEZEL_EXPECT_EQ(runItems(
+    BEZEL_EXPECT_EQ(runItemsOut(
         "do "
         "  using var q := new OwningQueue<Item>(); "
         "  q.Enqueue(move (new Item(1))); "
         "  q.Enqueue(move (new Item(2))); "
         "  q.Enqueue(move (new Item(3))); "
-        "end; "
-        "return Item._log;"), 321);
+        "end;"), "321\n");
 }
 
 // §28.11: single-element OwningQueue disposes the single element once.
@@ -215,14 +233,13 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
 // coincides with reverse-insertion order; the spec mandates this for Dispose.
 BEZEL_TEST(owned_dispose_order_598_spec_28_11,
            owned_stack_disposes_reverse_insertion_order) {
-    BEZEL_EXPECT_EQ(runItems(
+    BEZEL_EXPECT_EQ(runItemsOut(
         "do "
         "  using var s := new OwningStack<Item>(); "
         "  s.Push(move (new Item(1))); "
         "  s.Push(move (new Item(2))); "
         "  s.Push(move (new Item(3))); "
-        "end; "
-        "return Item._log;"), 321);
+        "end;"), "321\n");
 }
 
 // §28.11: single-element OwningStack disposes the single element once.
@@ -265,7 +282,8 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
 // backing to be freed, cascading reverse-insertion-order element disposal.
 BEZEL_TEST(owned_dispose_order_598_spec_28_11,
            owned_array_field_disposes_reverse_insertion_order) {
-    BEZEL_EXPECT_EQ(run(
+    // Order observable (321) exceeds the 8-bit exit channel → stdout.
+    auto r = runAot(
         "module M; "
         "class Item "
         "  public static _log: int := 0; "
@@ -286,6 +304,8 @@ BEZEL_TEST(owned_dispose_order_598_spec_28_11,
         "  do "
         "    using var p := new Pool(); "
         "  end; "
-        "  return Item._log; "
-        "end Main; end C;"), 321);
+        "  Console.WriteLine(Item._log); return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "321\n");
 }

@@ -14,15 +14,36 @@
 // pre-pass and nulls a slot at `move a[i]`. All "disposed" assertions use a
 // static counter that a double-free would drive negative or corrupt.
 
+// AOT MIGRATION (#1769 / #1763): this file runs under the AOT driver (runAot).
+// Every disposal / soundness observable here is ≤255 and round-trips the exit
+// code — AOT reproduces the JIT results exactly, EXCEPT the aliasing-store case
+// `a[i] := a[j]`: the JIT test harness skips the ownership pass and fell back to
+// a conservative "safe leak" (the codegen marks the array ineligible), but the
+// REAL driver (AOT) runs the §28.11 ownership check and REJECTS the store — the
+// precise fix the pre-migration comment flagged as a follow-up is in fact present
+// in the front end. That test now asserts the AOT rejection (see below). This is
+// AOT being stricter-and-correct, not a codegen bug (#1769).
+
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
+}
+
+// True iff the front end rejected `src` (a diagnostic was reported and the
+// program did not run) AND at least one message contains `needle`.
+bool rejectedWith(const std::string& src, const std::string& needle) {
+    auto r = runAot(src);
+    if (r.ran || !r.diagnostics.hasErrors()) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(needle) != std::string::npos) return true;
+    return false;
 }
 
 // Cell: a disposable class with a static live-instance counter. ctor +1,
@@ -147,18 +168,20 @@ BEZEL_TEST(codegen_inline_owned_747, for_in_borrow_stays_eligible) {
         "return Cell.n * 100 + sum;")), 12);
 }
 
-// SOUNDNESS (adversarial verify, LENS 2) — a slot store `a[i] := a[j]` lowers to
-// a plain pointer copy that ALIASES one object into two slots; disposing both
-// would double-free / UAF (was SIGSEGV). The transfer walker marks the array
-// ineligible on any owned-slot store whose RHS is not new/move/null, so the
-// array is SKIPPED — a conservative LEAK (counter stays 2), NEVER a double-free.
-// (A precise fix — reject/move-convert `a[i] := <borrow>` per §28.11 — is a
-// follow-up; this lane guarantees no crash.)
-BEZEL_TEST(codegen_inline_owned_747, slot_alias_assignment_no_double_free) {
-    BEZEL_EXPECT_EQ(run(prog(
+// SOUNDNESS (adversarial verify, LENS 2) — a slot store `a[i] := a[j]` would
+// alias one object into two owned slots; disposing both would double-free / UAF.
+// The REAL driver (AOT) runs the §28.11 ownership check and REJECTS the store at
+// compile time: "a borrow cannot be stored into an owning array slot". (The JIT
+// test harness skips the ownership pass and instead fell back to a conservative
+// codegen "safe leak" — marking the array ineligible — which is why the
+// pre-migration runJit assertion observed a leak of 2 rather than this rejection.
+// AOT is stricter-and-correct here; #1769.)
+BEZEL_TEST(codegen_inline_owned_747, slot_alias_assignment_rejected_28_11) {
+    BEZEL_EXPECT_TRUE(rejectedWith(prog(
         "var a: [2 owned]Cell? := [new Cell(1), new Cell(2)]; "
-        "a[0] := a[1]; "        // aliases Cell(2) into both slots
-        "return Cell.n;")), 2);  // safe leak, NOT a negative count / crash
+        "a[0] := a[1]; "        // borrow stored into an owning slot → §28.11 reject
+        "return Cell.n;"),
+        "owning array slot"));
 }
 
 // §15.3 / §27.5 (#782, was #747 LENS 1) — a move-only array captured by a
