@@ -11,13 +11,12 @@
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
-#include "support/aot_support.hpp"
 
-using bezel::test::runAot;
+using bezel::test::runJit;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runAot(prog);
+    auto r = runJit(prog);
     return r.ran ? r.exitCode : -999;
 }
 const char* E2 =
