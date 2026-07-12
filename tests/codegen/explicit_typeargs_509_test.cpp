@@ -32,22 +32,23 @@
 //   §14.2 — constraint-bound substitution: `where T: class` type args supplied
 //            explicitly must also produce the correct concrete return type.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 // Helper: compile+JIT and return exit code; -999 on compile/JIT failure.
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 
 // Helper: compile+JIT and return the full JitResult (for checking diagnostics).
 bezel::test::JitResult jit(const std::string& prog) {
-    return runJit(prog);
+    return runAot(prog);
 }
 
 // Shared wrapper class used by several tests.
