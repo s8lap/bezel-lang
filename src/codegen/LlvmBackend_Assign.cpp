@@ -3830,6 +3830,15 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             // array-backed protocol. Shared with the local-decl init and the
             // method-RETURN coercion (#1310).
             v = wrapAsIEnumerableForTarget(v, formalTy, a.value.get());
+            // §9 / §9.1 (#1759): passing `this` of a record method by value —
+            // `this` lowered to the receiver POINTER (CG29 / §9.2), but a
+            // by-value record parameter expects the record STRUCT. Load the
+            // struct so the argument is a value-semantics copy, not the 8-byte
+            // pointer (which fails IR verification: `call … (ptr)` vs a
+            // `%record.T` parameter). A no-op for every argument that is not the
+            // receiver pointer, or a parameter not typed as that record's struct.
+            if (formalTy)
+                v = coerceThisRecordValue(v, lowerTypeRef(formalTy));
         }
         ordered[idx] = v;
         orderedExprs[idx] = a.value.get();

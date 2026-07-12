@@ -5307,6 +5307,12 @@ bool Emitter::emitReturn(llvm::Function* fn, llvm::Value* v) {
     if (fn->getReturnType()->isVoidTy()) builder_.CreateRetVoid();
     else {
         llvm::Type* retTy = fn->getReturnType();
+        // §9 / §9.1 (#1759): `return this` in a RECORD method — `this` lowered
+        // to the receiver POINTER (CG29 / §9.2), but a record method returns the
+        // record STRUCT by value. Load the struct so the value-semantics copy is
+        // returned, not the 8-byte pointer (which fails IR verification: `ret
+        // ptr` vs `ret %record.T`). A no-op for every other returned value.
+        v = coerceThisRecordValue(v, retTy);
         // #914: returning a narrowed value-nullable (sema proved it non-null) as
         // a non-nullable return type — unwrap the {flag, value} struct to its
         // value (the inverse of the non-nullable→nullable wrap below).
@@ -5484,6 +5490,15 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     }
     llvm::Value* v = init ? lowerExpr(*init) : nullptr;
     expectedFunctionType_ = savedExpectedForLambdaDecl;
+    // §9 / §9.1 (#1759): `var q := this` in a record method copies the record
+    // value. `this` lowered to the receiver POINTER (CG29 / §9.2); load the
+    // struct so the local holds a value-semantics copy, not the pointer bits — a
+    // `var` local would otherwise infer a `ptr` slot from currentThis_'s type
+    // and read `q.field` as garbage. A no-op for every initializer that is not
+    // the receiver pointer (coerceThisRecordValue's own guards).
+    if (v)
+        if (const sema::TypeSymbol* rec = currentReceiverRecordType())
+            v = coerceThisRecordValue(v, recordStruct(rec));
     // CG40: a diverging initializer (`var x := throw E;`) terminated the
     // block; allocate the slot but emit no store.
     if (diverged_) return;

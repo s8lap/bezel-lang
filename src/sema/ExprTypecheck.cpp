@@ -5148,6 +5148,31 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     return;  // early-return: lsym->declType intentionally null
                 }
                 lsym->declType = ctx_.exprType(*ld->initializer);
+                // §9 / §3.2 (#1759): `var q := this` — `this` is left
+                // deliberately untyped in visitExpr (memberTargetType resolves
+                // `this.member` via currentType_ directly, NOT via `this`'s
+                // exprType — see its comment "so we don't have to teach `this`
+                // to be an expression with type currentType_"). An inferred
+                // local seeded from a bare `this` therefore got no type, so
+                // every later `q.member` failed to resolve and codegen folded it
+                // to `ret i32 0` (records AND classes). Seed the local with the
+                // current receiver type so `q` is a proper value of it: a record
+                // COPY (value semantics §9.4 — the codegen side loads `*this`
+                // into the slot, the #1759 A/B/C fix) or a class-reference alias.
+                // Member lookup keys off the declaration only, so the bare Named
+                // ref suffices; codegen carries any generic substitution through
+                // its own receiver-specialization path (currentSpecMethodSymbol_).
+                if (!lsym->declType && currentType_) {
+                    if (auto* initId = dynamic_cast<const ast::IdentifierExpr*>(
+                            ld->initializer.get())) {
+                        if (initId->name == "this") {
+                            auto* selfTy = ctx_.makeTypeRef();
+                            selfTy->kind = TypeRef::Kind::Named;
+                            selfTy->declaration = currentType_;
+                            lsym->declType = selfTy;
+                        }
+                    }
+                }
                 // per §14.1 + §A.7 (issue #391): a `var x := Generic.Create();`
                 // without a type annotation gives the call no target, so a
                 // return-only type parameter cannot be solved. Per §15.4 /

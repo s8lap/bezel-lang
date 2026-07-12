@@ -1059,6 +1059,53 @@ llvm::StructType* Emitter::recordStruct(const sema::TypeSymbol* t) {
 }
 
 
+// §9 / §9.1 (#1759): recover the record TypeSymbol of the instance method
+// currently being emitted, or null when the receiver is not a record (class /
+// enum / extension), the method is static, or none is in flight. Mirrors the
+// owner recovery lowerWith uses for `this with … end` (#575 / #628): the
+// reverse-lookup of currentFn_ in methodFns_ handles ordinary bodies, and the
+// currentSpecMethodSymbol_ fallback handles a specialized generic body that
+// buildSpecializedMethodFn never registered in methodFns_.
+const sema::TypeSymbol* Emitter::currentReceiverRecordType() {
+    if (!currentThis_) return nullptr;
+    if (currentFn_) {
+        for (const auto& [ms, fn] : methodFns_)
+            if (fn == currentFn_ && ms->parent &&
+                ms->parent->kind == ast::TypeDeclKind::Record)
+                return ms->parent;
+    }
+    if (currentSpecMethodSymbol_ && currentSpecMethodSymbol_->parent &&
+        currentSpecMethodSymbol_->parent->kind == ast::TypeDeclKind::Record)
+        return currentSpecMethodSymbol_->parent;
+    return nullptr;
+}
+
+
+// §9 / §9.1 (#1759): a record has value semantics — `return this`,
+// `slot := this`, and passing `this` by value all copy the struct. Inside a
+// record method `this` lowers to a POINTER to the by-value receiver (CG29 /
+// §9.2 / #794 — spilled so `this.field` reuses record field access), so a
+// value-position use that reaches a struct-typed destination would otherwise
+// propagate the raw 8-byte pointer (garbage into the slot; `ret ptr` where the
+// struct is expected → IR verification failure). Load the struct exactly when
+// `v` is that receiver pointer and `expectedTy` is precisely the current
+// receiver record's struct layout — never for any other value, a class/enum
+// receiver (`currentThis_` is the value / a non-record pointer), or a
+// nullable-tagged {i8, T} / unrelated struct destination (whose type differs
+// from recordStruct, so the equality guard rejects it). The receiver's own
+// generic substitution is active while its body is emitted, so recordStruct
+// here yields the same specialized layout `expectedTy` was computed from.
+llvm::Value* Emitter::coerceThisRecordValue(llvm::Value* v,
+                                            llvm::Type* expectedTy) {
+    if (!v || v != currentThis_ || !v->getType()->isPointerTy() || !expectedTy)
+        return v;
+    if (const sema::TypeSymbol* rec = currentReceiverRecordType())
+        if (expectedTy == recordStruct(rec))
+            return builder_.CreateLoad(expectedTy, v);
+    return v;
+}
+
+
 // issue #460 / #462 / §14.1: install the type-parameter substitution for a
 // concrete generic-record instantiation (`Box<string>`), so a subsequent
 // recordStruct specializes the field layout, and recordMemberTypeResolved maps

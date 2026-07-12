@@ -3008,6 +3008,25 @@ private:
     // prefix-layout walk.
     llvm::StructType* recordStruct(const sema::TypeSymbol* t);
 
+    // §9 / §9.1 (#1759): if the instance method currently being emitted is a
+    // RECORD method, return its record TypeSymbol; otherwise null (class / enum
+    // / extension receiver, a static method, or no method in flight). Recovers
+    // the owner exactly as lowerWith does (#575 / #628): reverse-look currentFn_
+    // in methodFns_, then fall back to currentSpecMethodSymbol_ for a
+    // specialized generic body that is not registered there.
+    const sema::TypeSymbol* currentReceiverRecordType();
+
+    // §9 / §9.1 (#1759): a record has value semantics — assignment / return /
+    // by-value argument copies the struct. Inside a record method `this` lowers
+    // to a POINTER to the by-value receiver (CG29 / §9.2 / #794). When the whole
+    // `this` value flows to a location that expects the record STRUCT, `v` is
+    // the struct *this, not the 8-byte pointer. If `v` is exactly that receiver
+    // pointer and `expectedTy` is precisely the current receiver record's struct
+    // type, load the struct so the value-semantics copy is produced; otherwise
+    // return `v` unchanged (a no-op for every non-`this` value, class/enum
+    // receivers, and any nullable-tagged / unrelated struct destination).
+    llvm::Value* coerceThisRecordValue(llvm::Value* v, llvm::Type* expectedTy);
+
     // §9.1 / §9.2: a record's instance storage members in declaration order —
     // non-static FieldSymbols (positional + explicit body fields) and
     // auto-property PropertySymbols (body-record storage). The same ordering

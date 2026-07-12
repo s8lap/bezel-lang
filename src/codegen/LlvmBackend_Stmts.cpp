@@ -403,6 +403,15 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 builder_.SetInsertPoint(endBB);
                 return false;
             }
+            // §9 / §9.1 (#1759): `slot := this` in a record method stores the
+            // whole `this` value into a record-typed slot. `this` lowered to the
+            // receiver POINTER (CG29 / §9.2); load the struct so value semantics
+            // copy the record rather than storing the 8-byte pointer as the
+            // slot's leading bytes (garbage read back as the record's fields). A
+            // no-op for every RHS that is not the receiver pointer, and for a
+            // slot whose type is not exactly the receiver record's struct.
+            if (as->op == ":=")
+                rhs = coerceThisRecordValue(rhs, elemTy);
             // §8.6: a value-typed RHS assigned to an Object/interface lvalue is
             // boxed (so a later is/as/dispatch on the target sees a box). Keyed
             // off the target's static type; a no-op for reference RHS (#399).
