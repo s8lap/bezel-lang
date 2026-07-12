@@ -15,14 +15,15 @@
 // and if THIS operator's parameter is `owned` (it consumes the operand), the
 // temporary is not disposed here either. §28.3 / §25.1.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 // A class counting live instances: every constructor increments, every

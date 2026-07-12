@@ -16,15 +16,16 @@
 // `enum?` colliding with the value-0 member — is directly observable: a null
 // `Color?` must be `<> Color.Red`, not `=`.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& enumDecl, const std::string& body) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; " + enumDecl +
         " class C public static method Main(): int " + body +
         " end Main; end C;");

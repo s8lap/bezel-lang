@@ -18,17 +18,18 @@
 // Spec references: §10 (enums, underlying integer), §5.2 / §17 (explicit
 // conversion `int(e)` yields the underlying value, §17 conversion expressions).
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 // Helper: build a module with Container (which has a nested Status enum)
 // and a Main2 class with the given method body.
 int run482(const std::string& body) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class Container "
         "  public enum Status Active, Inactive; end Status; "
@@ -108,7 +109,7 @@ BEZEL_TEST(codegen_482_spec_10_spec_17, case_expr_on_nested_enum) {
 // (e) CONTROL: a module-level enum `int()` cast must still work (regression
 // guard — the fix must not perturb the top-level enum path).
 BEZEL_TEST(codegen_482_spec_10_spec_17, toplevel_enum_int_cast_control) {
-    BEZEL_EXPECT_EQ(runJit(
+    BEZEL_EXPECT_EQ(runAot(
         "module M; "
         "enum Direction North, South, East, West; end Direction; "
         "class C "
@@ -120,7 +121,7 @@ BEZEL_TEST(codegen_482_spec_10_spec_17, toplevel_enum_int_cast_control) {
 
 // (e2) CONTROL: a module-level enum from-int cast (E(i)) still works.
 BEZEL_TEST(codegen_482_spec_10_spec_17, toplevel_enum_from_int_cast_control) {
-    BEZEL_EXPECT_EQ(runJit(
+    BEZEL_EXPECT_EQ(runAot(
         "module M; "
         "enum Direction North, South, East, West; end Direction; "
         "class C "
@@ -132,7 +133,7 @@ BEZEL_TEST(codegen_482_spec_10_spec_17, toplevel_enum_from_int_cast_control) {
 
 // (f) §10: nested enum with explicit integer values.
 BEZEL_TEST(codegen_482_spec_10_spec_17, nested_enum_explicit_values) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "class Container2 "
         "  public enum Code Ok := 200, NotFound := 404; end Code; "
