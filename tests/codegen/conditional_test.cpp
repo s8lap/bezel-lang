@@ -3,22 +3,23 @@
 // (§20, §17.1). Observable via the int exit code: the conditional
 // selects an int branch based on a bool condition.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& expr) {
-    auto r = runJit(std::string("module M; class C "
+    auto r = runAot(std::string("module M; class C "
         "public static method Main(): int => ") + expr + "; end C;");
     return r.ran ? r.exitCode : -999;
 }
 
 int runProg(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -173,7 +174,7 @@ BEZEL_TEST(codegen_cg4, conditional_numeric_widening_int_branch) {
 // conditional; §17.12, Appendix A), whose branches are an Exception value
 // and an int — no common type exists. Sema must reject it. ---
 BEZEL_TEST(codegen_cg4, throw_of_incompatible_conditional_is_type_error) {
-    JitResult r = runJit(
+    JitResult r = runAot(
         "module M; class C "
         "  public static method Main(): int => "
         "    throw new Exception(\"e\") if 1 < 2 else 5; "
@@ -184,7 +185,7 @@ BEZEL_TEST(codegen_cg4, throw_of_incompatible_conditional_is_type_error) {
 
 // Plain incompatible branches (no throw involved) are likewise rejected.
 BEZEL_TEST(codegen_cg4, incompatible_branches_is_type_error) {
-    JitResult r = runJit(
+    JitResult r = runAot(
         "module M; class N end N; class C "
         "  public static method Main(): int "
         "    var x := new N(); "

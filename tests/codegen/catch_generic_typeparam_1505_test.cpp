@@ -24,15 +24,16 @@
 //   3. Non-match — thrown type unrelated to TEx → falls to Exception arm (2).
 //   4. TEx = base Exception — every Exception-derived throwable matches arm 1.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
