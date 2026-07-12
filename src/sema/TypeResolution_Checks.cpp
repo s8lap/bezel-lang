@@ -2111,11 +2111,36 @@ static bool memberBlocksHiding(SemaContext& ctx, TypeSymbol* derived,
     return true;
 }
 
+// §12.2 / #1749: collect `t` (if it's a class) plus every class reachable
+// through its NestedTypeSymbol members, transitively — §11.6 states nested
+// types "may themselves contain nested types" with no depth bound, so a
+// class nested inside a nested class must be visited too, not just the
+// module's direct children and their immediate nested members (the shallow,
+// one-level pattern several sibling checks in this file use, e.g.
+// checkConstTypes above). isNestedWithin (used below by
+// memberBlocksHiding's `private` case) already assumes this transitive
+// reach; the outer walk driving checkHidingAndOverride was the one piece
+// that never visited nested classes at all.
+static void collectHidingCheckClasses(TypeSymbol* t,
+                                       std::vector<TypeSymbol*>& out) {
+    if (!t) return;
+    if (t->kind == ast::TypeDeclKind::Class) out.push_back(t);
+    for (Symbol* m : t->members) {
+        if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+            if (nt->type) collectHidingCheckClasses(nt->type, out);
+        }
+    }
+}
+
 void Resolver::checkHidingAndOverride() {
     if (!ctx_.module()) return;
+    std::vector<TypeSymbol*> classes;
     for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t || t->kind != ast::TypeDeclKind::Class) continue;
+        if (auto* t = dynamic_cast<TypeSymbol*>(child)) {
+            collectHidingCheckClasses(t, classes);
+        }
+    }
+    for (TypeSymbol* t : classes) {
         // Gather base CLASS members by name (transitive). A name can map to
         // SEVERAL members — overloaded virtual methods (#1090) — so collect all
         // of them (most-derived first) and pick the matching overload below.
