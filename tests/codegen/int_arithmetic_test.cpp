@@ -5,17 +5,31 @@
 // is deferred to the exception-runtime slice; these tests stay within the
 // non-overflowing, non-zero-divisor range.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& expr) {
-    auto r = runJit(std::string("module M; class C "
+    auto r = runAot(std::string("module M; class C "
         "public static method Main(): int => ") + expr + "; end C;");
     return r.ran ? r.exitCode : -999;
+}
+
+// 8-bit exit channel (P0-E / migration plan §3): a process exit status is 8-bit
+// (WEXITSTATUS masks to 0..255), so a value outside 0..255 — here the NEGATIVE
+// results — cannot round-trip the exit code the way it did under the in-process
+// JIT (which returned the raw 32-bit int). The program instead PRINTS the value
+// (Console.WriteLine, stdlib §2.1) and the test checks the captured stdout,
+// which runAot exposes as JitResult::stdoutText. WriteLine appends '\n'.
+std::string runOut(const std::string& expr) {
+    auto r = runAot(std::string(
+        "module M; class C public static method Main(): int "
+        "  Console.WriteLine(") + expr + "); return 0; end Main; end C;");
+    return r.ran ? r.stdoutText : std::string("<did-not-run>");
 }
 
 } // namespace
@@ -37,12 +51,13 @@ BEZEL_TEST(codegen_cg2, division_truncates_toward_zero) {
 }
 
 BEZEL_TEST(codegen_cg2, mod_follows_dividend_sign) {
-    // §6.1: -7 mod 3 == -1.
-    BEZEL_EXPECT_EQ(run("-7 mod 3"), -1);
+    // §6.1: -7 mod 3 == -1. Negative → observed on stdout (8-bit exit channel).
+    BEZEL_EXPECT_EQ(runOut("-7 mod 3"), "-1\n");
 }
 
 BEZEL_TEST(codegen_cg2, unary_negation) {
-    BEZEL_EXPECT_EQ(run("-(5 + 1)"), -6);
+    // Negative result → observed on stdout (8-bit exit channel).
+    BEZEL_EXPECT_EQ(runOut("-(5 + 1)"), "-6\n");
 }
 
 BEZEL_TEST(codegen_cg2, bitwise_and_or_xor) {
@@ -54,11 +69,13 @@ BEZEL_TEST(codegen_cg2, left_shift) {
 }
 
 BEZEL_TEST(codegen_cg2, right_shift_arithmetic) {
-    BEZEL_EXPECT_EQ(run("-16 >> 2"), -4);
+    // Negative result → observed on stdout (8-bit exit channel).
+    BEZEL_EXPECT_EQ(runOut("-16 >> 2"), "-4\n");
 }
 
 BEZEL_TEST(codegen_cg2, bitwise_not) {
-    BEZEL_EXPECT_EQ(run("~0"), -1);
+    // ~0 == -1. Negative → observed on stdout (8-bit exit channel).
+    BEZEL_EXPECT_EQ(runOut("~0"), "-1\n");
 }
 
 // #1049 / §5.1 / §6.2: a relational comparison between an unsigned value and a
@@ -68,7 +85,7 @@ BEZEL_TEST(codegen_cg2, bitwise_not) {
 // high bit was set: `ulong 18e18 > 1000` returned false.
 namespace {
 int runBody(const std::string& body) {
-    auto r = bezel::test::runJit(
+    auto r = bezel::test::runAot(
         std::string("module M; class C public static method Main(): int ") +
         body + " end Main; end C;");
     return r.ran ? r.exitCode : -999;

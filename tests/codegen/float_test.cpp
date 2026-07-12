@@ -3,15 +3,16 @@
 // plus mixed int/float promotion (§6.2). No overflow/div0 checks (IEEE).
 // Results are observed through comparisons that yield an int exit code.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& body) {
-    auto r = runJit(
+    auto r = runAot(
         std::string("module M; class C public static method Main(): int ") +
         body + " end Main; end C;");
     return r.ran ? r.exitCode : -999;
@@ -120,8 +121,8 @@ BEZEL_TEST(codegen_cg24, float_suffix_typing) {
 
 BEZEL_TEST(codegen_cg24, float_record_equality) {
     // Record with float fields: equality uses FCmpOEQ on f32 values.
-    // Use runJit directly so we can define a record at module scope.
-    auto r = runJit(
+    // Use runAot directly so we can define a record at module scope.
+    auto r = runAot(
         "module M; record F(x: float, y: float); "
         "class C public static method Main(): int "
         "  var a := new F(1.0f, 2.0f); var b := new F(1.0f, 2.0f); "
@@ -132,7 +133,7 @@ BEZEL_TEST(codegen_cg24, float_record_equality) {
 
 BEZEL_TEST(codegen_cg24, float_record_inequality) {
     // Two float records with different y field compare unequal.
-    auto r = runJit(
+    auto r = runAot(
         "module M; record F(x: float, y: float); "
         "class C public static method Main(): int "
         "  var a := new F(1.0f, 2.0f); var b := new F(1.0f, 2.5f); "
