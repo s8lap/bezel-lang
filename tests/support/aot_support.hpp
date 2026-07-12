@@ -6,29 +6,56 @@
 // instead of ORC-JITting `main` in the test process, they compile the source to
 // a NATIVE executable and run it in a subprocess — the same path `bezelc` ships,
 // and therefore the stricter, correct oracle (it runs ownership + definite-
-// assignment + static-init-cycle checks the JIT harness deliberately skips).
+// assignment + static-init-cycle + §33.5 entry-point checks the JIT harness
+// deliberately skips).
 //
-// CONSOLIDATION, NOT GREEN FIELD. This reuses the machinery that already exists
-// instead of re-implementing it:
-//   * runAot        -> bezel::Driver::compileFile (src/driver/Driver.cpp) — the
-//                      real bezelc AOT path (full front-end -> emitObjectFile ->
-//                      clang link against the plain libbezel_runtime.a, whose
-//                      path is baked into bezel_core as BEZEL_RUNTIME_LIB_PATH).
-//                      The link recipe is NOT re-written here.
-//   * runAotChecked -> the same front-end in-process + emitObjectFile, linked
-//                      -fsanitize=address against the memoized ASan runtime
-//                      object from native_test_harness.hpp (asanRuntimeObject()),
-//                      run under LeakSanitizer. This is the per-program memory
-//                      net (WS2): a leak / double-free / use-after-free at exit
-//                      directly verifies Bezel's dispose-exactly-once invariant.
-//                      It generalizes the ~176 hand-rolled copies of this recipe
-//                      (canonical: tests/codegen/generic_usingvar_disposal_test
-//                      .cpp `runAotExit`).
+// CONSOLIDATION, NOT GREEN FIELD. Both helpers drive the REAL driver
+// (`bezel::Driver::compileFile`) — the shipping bezelc AOT path (full front-end
+// -> emitObjectFile -> clang link) — so the link recipe is NOT re-written here.
+// They differ by exactly ONE bit: `CodegenOptions::sanitizeAddress`.
+//
+// FORKED IN-PROCESS COMPILE (quality round 1, qr1 M1). The compile runs
+// `Driver::compileFile` IN-PROCESS but inside a fork()ed child, mirroring the
+// proven `runJit` isolation (codegen_support.hpp jit_isolate):
+//   * CRASH ISOLATION (M1). The front-end has a live crash history on error-
+//     recovery ASTs (#1622/#1615); negative tests feed it malformed programs. A
+//     front-end assert/segfault now dies in the forked CHILD -> the parent test
+//     binary survives (ran=false, isolated), instead of aborting the whole gtest
+//     shard and losing every other test in it. This is the exact hazard runJit
+//     forks to avoid. In-process (unforked) it was fatal.
+//   * COMPILE TIMEOUT (M1). The parent waitpids the compile child under a
+//     deadline and SIGKILLs on expiry, so a front-end infinite loop or a hung
+//     clang link can't wedge the shard to its 300s cap (the unforked path had no
+//     compile deadline at all).
+//   * SPEED. The forked in-process compile is ~2.11x a JIT test (P0-E shadow
+//     run) — the fork cost is negligible against the clang link already spent.
+//     Shelling out to the `bezelc` binary was measured ~11x (P0-E), ~5x slower,
+//     so the binary path was rejected: fork gives the SAME isolation far cheaper.
+//
+// ONE PIPELINE, NO DRIFT (S2). runAot and runAotChecked both call the SAME
+// `Driver::compileFile` (via the shared forkedCompile below), so they run the
+// identical front-end — INCLUDING the §33.5 entry-point check compileFile runs
+// on the executable path. They differ only by `opts.sanitizeAddress`; a program
+// runAot rejects, runAotChecked rejects identically. (The pre-qr1 runAotChecked
+// re-implemented the pipeline inline and had drifted, skipping §33.5.)
+//
+// GENERATED-CODE ASAN (S3). runAotChecked sets `opts.sanitizeAddress = true`, so
+// Driver::compileFile runs LLVM's AddressSanitizerPass over the GENERATED module
+// (emitObjectFile, LlvmBackend.cpp) and links the executable -fsanitize=address.
+// A use-after-free / out-of-bounds READ performed by an emitted Bezel load is
+// then caught at the access — not merely the allocator-level leaks/double-frees
+// an instrumented runtime alone nets. This is the in-process equivalent of
+// `bezelc --sanitize=address`, closing the WS2 gap. (LLVM 21 pass + system
+// clang 21 ASan runtime => matching ABI; verified E6.)
 //
 // RETURN TYPE: both return `JitResult` (the runJit struct), so every downstream
 // `.ran` / `.exitCode` / `.diagnostics` call site is untouched (migration plan
 // §2; WS6 §3). The added `JitResult::stdoutText` carries the captured program
 // stdout — the value channel for observables that cannot fit an 8-bit exit code.
+// On a compile/link REJECT (or compiler crash/timeout), the diagnostics carry
+// one Error whose message is the captured driver stderr text (S1: no test
+// inspects a JitResult diagnostic's .location; the stderr blob keeps
+// .hasErrors() true and message.find(...) assertions matching).
 //
 // TWO SEMANTIC DIFFERENCES FROM runJit (documented, inherent — not bugs here):
 //   1. runJit returns the raw 32-bit int from main(); a process exit status is
@@ -39,6 +66,7 @@
 //      ownership / DA / static-init / §33.5 entry-point passes) may be REJECTED
 //      here, surfacing as ran=false with the rejection in `diagnostics`.
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -46,7 +74,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <sstream>
+#include <iostream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -58,11 +86,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "support/codegen_support.hpp"   // JitResult + the FE/codegen includes
-#include "native_test_harness.hpp"       // asanRuntimeObject() (memoized)
+#include "support/codegen_support.hpp"   // JitResult + codegen::CodegenOptions
 #include "driver/Driver.hpp"             // Driver::compileFile (the AOT path)
-#include "sema/DefiniteAssignment.hpp"   // checkDefiniteAssignment (checked leg)
-#include "sema/StaticInitCycles.hpp"     // checkStaticInitCycles  (checked leg)
 
 namespace bezel::test {
 
@@ -74,7 +99,7 @@ namespace fs = std::filesystem;
 // is RAM; a scratch object tree there thrashes the box) — /var/tmp is disk.
 inline std::string scratchBase() { return "/var/tmp/bezel-scratch/aot-harness"; }
 
-// Per-test wall-clock deadline for the compiled program (seconds); mirrors
+// Per-test wall-clock deadline for the compiled PROGRAM run (seconds); mirrors
 // codegen_support::jitTimeoutSec so a hung program cannot wedge the run.
 // BEZEL_AOT_TIMEOUT_SEC overrides; 0 disables the deadline.
 inline int aotTimeoutSec() {
@@ -87,46 +112,60 @@ inline int aotTimeoutSec() {
     return v;
 }
 
-inline std::string slurp(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return {};
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return ss.str();
+// Wall-clock deadline for the forked COMPILE+LINK (seconds). qr1 M1: the
+// unforked compile had NO deadline — a front-end infinite loop or a hung `clang`
+// link would wedge the shard to its 300s cap. Linking legitimately takes a few
+// seconds cold, so the default is generous (120s): it only bounds a genuine
+// hang, not a slow-but-progressing compile. BEZEL_AOT_COMPILE_TIMEOUT_SEC
+// overrides; 0 disables.
+inline int aotCompileTimeoutSec() {
+    static const int v = [] {
+        const char* e = std::getenv("BEZEL_AOT_COMPILE_TIMEOUT_SEC");
+        if (!e || *e == '\0') return 120;
+        int n = std::atoi(e);
+        return n >= 0 ? n : 120;
+    }();
+    return v;
 }
 
-// fork/exec `argv` with fd 1 -> outPath and fd 2 -> errPath (both truncated),
-// applying `extraEnv` (setenv in the child before exec — used for ASAN_OPTIONS).
-// Blocks until the child exits or the deadline elapses; on timeout the child is
-// SIGKILLed and reaped. Returns the raw waitpid status and sets *timedOut.
-// timeoutSec <= 0 disables the deadline. Returns -1 if fork() itself fails.
-inline int spawnCaptured(const std::vector<std::string>& argv,
-                         const std::string& outPath, const std::string& errPath,
-                         int timeoutSec, bool& timedOut,
-                         const std::vector<std::pair<std::string, std::string>>&
-                             extraEnv = {}) {
-    timedOut = false;
-    pid_t pid = ::fork();
-    if (pid < 0) return -1;
-    if (pid == 0) {
-        // ---- CHILD ----
-        for (const auto& kv : extraEnv)
-            ::setenv(kv.first.c_str(), kv.second.c_str(), /*overwrite=*/1);
-        int outFd = ::open(outPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        int errFd = errPath == outPath
-                        ? outFd
-                        : ::open(errPath.c_str(),
-                                 O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (outFd >= 0) ::dup2(outFd, STDOUT_FILENO);
-        if (errFd >= 0) ::dup2(errFd, STDERR_FILENO);
-        std::vector<char*> cargv;
-        cargv.reserve(argv.size() + 1);
-        for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
-        cargv.push_back(nullptr);
-        ::execv(cargv[0], cargv.data());
-        ::_Exit(127);  // exec failed
+// Default cap on captured-output reads: 256 KiB, matching runJit's readStderr
+// (codegen_support.hpp). qr1 M2: a runaway program that prints unbounded to
+// stdout must NOT be pulled wholesale into RAM and OOM the shard under the
+// 8-12G dev_heavy cage.
+inline constexpr std::size_t kSlurpCap = 1u << 18;  // 256 KiB
+
+// Read up to `cap` bytes of `path` into a string (qr1 M2 — bounded so a
+// runaway/adversarial program can't OOM the shard). If the file is longer than
+// `cap`, the excess is dropped and a truncation marker is appended.
+inline std::string slurp(const std::string& path, std::size_t cap = kSlurpCap) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {};
+    std::string out;
+    out.reserve(std::min<std::size_t>(cap, 1u << 16));
+    char buf[8192];
+    bool truncated = false;
+    while (in) {
+        in.read(buf, sizeof(buf));
+        auto got = static_cast<std::size_t>(in.gcount());
+        if (got == 0) break;
+        std::size_t room = out.size() < cap ? cap - out.size() : 0;
+        if (got <= room) {
+            out.append(buf, got);
+        } else {
+            out.append(buf, room);
+            truncated = true;
+            break;
+        }
     }
-    // ---- PARENT ----
+    if (truncated) out += "\n[...output truncated at 256 KiB...]";
+    return out;
+}
+
+// waitpid `pid` under a wall-clock deadline. On timeout the child is SIGKILLed
+// and reaped; *timedOut is set. timeoutSec <= 0 blocks with no deadline. Returns
+// the raw waitpid status.
+inline int reapWithDeadline(pid_t pid, int timeoutSec, bool& timedOut) {
+    timedOut = false;
     int status = 0;
     if (timeoutSec <= 0) {
         while (::waitpid(pid, &status, 0) < 0) {
@@ -153,6 +192,54 @@ inline int spawnCaptured(const std::vector<std::string>& argv,
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     return status;
+}
+
+// fork/exec `argv` with fd 0 <- /dev/null, fd 1 -> outPath and fd 2 -> errPath
+// (both truncated), applying `extraEnv` (setenv in the child before exec — used
+// for ASAN_OPTIONS). Blocks until the child exits or the deadline elapses; on
+// timeout the child is SIGKILLed and reaped. Returns the raw waitpid status and
+// sets *timedOut. timeoutSec <= 0 disables the deadline. Returns -1 if fork()
+// itself fails.
+//
+// qr1 M4: stdin is redirected to /dev/null so a program that reads Console input
+// gets immediate EOF instead of blocking to the deadline (or draining the test
+// runner's own stdin).
+inline int spawnCaptured(const std::vector<std::string>& argv,
+                         const std::string& outPath, const std::string& errPath,
+                         int timeoutSec, bool& timedOut,
+                         const std::vector<std::pair<std::string, std::string>>&
+                             extraEnv = {}) {
+    timedOut = false;
+    pid_t pid = ::fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        // ---- CHILD ----
+        for (const auto& kv : extraEnv)
+            ::setenv(kv.first.c_str(), kv.second.c_str(), /*overwrite=*/1);
+        // qr1 M4: fd 0 <- /dev/null so a stdin read gets EOF, never blocks.
+        int nullFd = ::open("/dev/null", O_RDONLY);
+        if (nullFd >= 0) {
+            ::dup2(nullFd, STDIN_FILENO);
+            if (nullFd > STDERR_FILENO) ::close(nullFd);
+        } else {
+            ::close(STDIN_FILENO);
+        }
+        int outFd = ::open(outPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int errFd = errPath == outPath
+                        ? outFd
+                        : ::open(errPath.c_str(),
+                                 O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (outFd >= 0) ::dup2(outFd, STDOUT_FILENO);
+        if (errFd >= 0) ::dup2(errFd, STDERR_FILENO);
+        std::vector<char*> cargv;
+        cargv.reserve(argv.size() + 1);
+        for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
+        cargv.push_back(nullptr);
+        ::execv(cargv[0], cargv.data());
+        ::_Exit(127);  // exec failed
+    }
+    // ---- PARENT ----
+    return reapWithDeadline(pid, timeoutSec, timedOut);
 }
 
 // A per-call working directory under scratchBase(). Empty string on failure.
@@ -182,49 +269,171 @@ struct WorkDir {
     }
 };
 
-// Redirect the process's fd 2 to `path` for the duration; restore on scope exit.
-// Used to capture Driver::compileFile's diagnostics (it writes to std::cerr) AND
-// the clang link subprocess's stderr (it inherits fd 2) into `diagnostics`.
-struct StderrCapture {
-    int saved = -1;
-    explicit StderrCapture(const std::string& path) {
-        std::fflush(stderr);
-        saved = ::dup(STDERR_FILENO);
-        int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd >= 0) { ::dup2(fd, STDERR_FILENO); ::close(fd); }
-    }
-    ~StderrCapture() {
-        std::fflush(stderr);
-        if (saved >= 0) { ::dup2(saved, STDERR_FILENO); ::close(saved); }
-    }
-};
-
 // True if `text` carries an ASan / LSan report headline — the runAotChecked
-// "sanitizer fired" signal, independent of the exitcode=99 sentinel.
+// "sanitizer fired" signal (qr1 M3: the UNAMBIGUOUS signal, independent of any
+// exit-code sentinel a program might legitimately return). With
+// abort_on_error=0 the sanitizer always PRINTS one of these before exiting, so
+// the presence of a report — not the bare exit code — is the reliable oracle.
 inline bool hasSanitizerReport(const std::string& text) {
     static const char* markers[] = {
         "ERROR: AddressSanitizer", "ERROR: LeakSanitizer",
         "SUMMARY: AddressSanitizer", "detected memory leaks",
-        "runtime error:",  // UBSan, if the runtime leg ever enables it
     };
     for (const char* m : markers)
         if (text.find(m) != std::string::npos) return true;
     return false;
 }
 
+// ---- forked in-process compile -------------------------------------------
+enum class CompileOutcome { Ok, Rejected, Crashed, TimedOut, Infra };
+
+struct CompileStatus {
+    CompileOutcome outcome = CompileOutcome::Infra;
+    std::string diag;   // captured driver stderr (bounded) or an infra message
+    int signal = 0;     // valid when outcome == Crashed
+};
+
+// Compile `srcPath` to the native executable `exePath` via `Driver::compileFile`
+// run in a fork()ed CHILD (crash- and hang-isolated, qr1 M1). `opts` selects the
+// codegen mode (e.g. sanitizeAddress for the checked leg — S3). The child's
+// stderr (diagnostics + any clang link error) is captured, bounded, into the
+// result. fork() failure degrades to an in-process compile (no isolation) rather
+// than failing the test — same graceful degradation as runJit.
+inline CompileStatus forkedCompile(const std::string& srcPath,
+                                   const std::string& exePath,
+                                   const codegen::CodegenOptions& opts,
+                                   const std::string& ccErrPath) {
+    auto rejectFrom = [](std::string err, int code) -> CompileStatus {
+        if (err.empty())
+            err = "runAot: driver rejected the program (exit " +
+                  std::to_string(code) + ")";
+        return {CompileOutcome::Rejected, std::move(err), 0};
+    };
+
+    std::fflush(nullptr);   // flush parent stdio so the child can't double-print
+    std::cout.flush();
+
+    pid_t pid = ::fork();
+    if (pid < 0) {
+        // fork() failed (e.g. under the very memory pressure this guards). Fall
+        // back to an in-process compile so the test still runs — accepting the
+        // loss of isolation on this one degraded path (same policy as runJit).
+        int fd = ::open(ccErrPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int saved = -1;
+        if (fd >= 0) {
+            std::fflush(stderr);
+            saved = ::dup(STDERR_FILENO);
+            ::dup2(fd, STDERR_FILENO);
+            ::close(fd);
+        }
+        Driver driver;
+        CompileResult cc = driver.compileFile(srcPath, exePath, /*deps=*/{}, opts);
+        if (saved >= 0) {
+            std::fflush(stderr);
+            std::cerr.flush();
+            ::dup2(saved, STDERR_FILENO);
+            ::close(saved);
+        }
+        std::string err = slurp(ccErrPath);
+        if (cc.success && fs::exists(exePath)) return {CompileOutcome::Ok, err, 0};
+        return rejectFrom(std::move(err), cc.success ? 0 : 1);
+    }
+    if (pid == 0) {
+        // ---- CHILD ----
+        // qr1 M4: fd 0 <- /dev/null (a front-end that read stdin can't block).
+        int nullFd = ::open("/dev/null", O_RDONLY);
+        if (nullFd >= 0) {
+            ::dup2(nullFd, STDIN_FILENO);
+            if (nullFd > STDERR_FILENO) ::close(nullFd);
+        }
+        // Capture the driver's diagnostics (std::cerr) AND the clang link
+        // subprocess's stderr (inherited fd 2) into ccErr. Route stdout there
+        // too so nothing leaks into the test runner's stdout.
+        int fd = ::open(ccErrPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            ::dup2(fd, STDOUT_FILENO);
+            ::dup2(fd, STDERR_FILENO);
+            if (fd > STDERR_FILENO) ::close(fd);
+        }
+        // Test-only fault injection for the E2 crash-isolation self-test (qr1);
+        // never set in normal runs. Proves a compiler crash in the child is
+        // isolated to ran=false without killing the parent test binary.
+        if (std::getenv("BEZEL_AOT_TEST_CRASH_HOOK")) ::raise(SIGSEGV);
+
+        Driver driver;
+        CompileResult cc = driver.compileFile(srcPath, exePath, /*deps=*/{}, opts);
+        std::fflush(stderr);
+        std::cerr.flush();
+        // _Exit (NOT exit): skip atexit handlers and static destructors in the
+        // forked copy — the child's whole heap + LLVM allocator state is
+        // reclaimed by the OS, keeping the parent's RSS flat (qr1 E1). Same
+        // discipline as runJit's fork.
+        std::_Exit(cc.success ? 0 : 1);
+    }
+
+    // ---- PARENT ----
+    bool timedOut = false;
+    int status = reapWithDeadline(pid, aotCompileTimeoutSec(), timedOut);
+    std::string err = slurp(ccErrPath);  // bounded (M2)
+
+    if (timedOut) {
+        return {CompileOutcome::TimedOut,
+                "runAot: compile did not finish within " +
+                    std::to_string(aotCompileTimeoutSec()) +
+                    "s; killed (compile hang / runaway front-end or link)" +
+                    (err.empty() ? "" : "\n--- compiler stderr ---\n" + err),
+                0};
+    }
+    if (WIFSIGNALED(status)) {
+        // qr1 M1: the front-end/codegen crashed. In-process (unforked) this
+        // would have aborted the whole gtest shard; isolated to the child it is
+        // an isolated ran=false. Label it distinctly so triage sees a COMPILER
+        // BUG (worth filing) rather than an ordinary program rejection.
+        int sig = WTERMSIG(status);
+        return {CompileOutcome::Crashed,
+                "runAot: compiler CRASHED (signal " + std::to_string(sig) +
+                    ") — isolated; the program was not run (likely a front-end/"
+                    "codegen bug on this input)" +
+                    (err.empty() ? "" : "\n--- compiler stderr ---\n" + err),
+                sig};
+    }
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (code == 0) {
+        // qr1 N3: guard against the impossible-but-cheap case of a "success"
+        // exit with no executable (would otherwise run a missing/stale exe).
+        if (!fs::exists(exePath)) {
+            return {CompileOutcome::Infra,
+                    "runAot: driver reported success but produced no executable "
+                    "at " + exePath, 0};
+        }
+        return {CompileOutcome::Ok, err, 0};
+    }
+    return rejectFrom(std::move(err), code);
+}
+
+// Write `source` to `srcPath`. Returns false on write failure (disk full etc.).
+inline bool writeSource(const std::string& srcPath, std::string_view source) {
+    std::ofstream os(srcPath, std::ios::binary);
+    os.write(source.data(), static_cast<std::streamsize>(source.size()));
+    os.flush();
+    return static_cast<bool>(os);  // qr1 N4: report a failed write as infra
+}
+
 }  // namespace aot_detail
 
 // ---------------------------------------------------------------------------
-// runAot — compile `source` to a native executable via the REAL bezelc driver
-// (Driver::compileFile) and run it, capturing {ran, exitCode, stdout, diags}.
+// runAot — compile `source` to a native executable via the REAL driver
+// (Driver::compileFile, forked for crash/hang isolation) and run it, capturing
+// {ran, exitCode, stdout, diags}.
 //
 //   ran      : true iff it compiled, linked, and ran to normal termination.
 //   exitCode : the process exit status (8-bit) when ran==true; -1 on a crash /
 //              timeout (mirrors runJit's failWith).
-//   stdoutText: the program's captured stdout.
-//   diagnostics: on a compile/link reject, one Error diagnostic carrying the
-//              driver's stderr (so `.hasErrors()` is true and downstream
-//              wrappers that inspect diagnostics behave as under runJit).
+//   stdoutText: the program's captured stdout (bounded to 256 KiB).
+//   diagnostics: on a compile/link reject OR a compiler crash/timeout, one Error
+//              diagnostic carrying the driver stderr (so `.hasErrors()` is true
+//              and downstream wrappers that inspect diagnostics behave as under
+//              runJit). A compiler crash is isolated (ran=false), never fatal.
 // ---------------------------------------------------------------------------
 inline JitResult runAot(std::string_view source,
                         const codegen::CodegenOptions& opts) {
@@ -244,22 +453,18 @@ inline JitResult runAot(std::string_view source,
     const std::string outPath = (fs::path(wd.path) / "out.txt").string();
     const std::string errPath = (fs::path(wd.path) / "run.err").string();
 
-    {
-        std::ofstream os(srcPath, std::ios::binary);
-        os.write(source.data(), static_cast<std::streamsize>(source.size()));
+    if (!aot_detail::writeSource(srcPath, source)) {
+        r.diagnostics.report(Severity::Error, SourceLocation{},
+                             "runAot: failed to write source to " + srcPath);
+        return r;
     }
 
-    // --- Compile + link via the real driver (its link recipe, not ours). -----
-    CompileResult cc;
-    {
-        aot_detail::StderrCapture cap(ccErr);  // grab driver + clang stderr
-        Driver driver;
-        cc = driver.compileFile(srcPath, exePath, /*deps=*/{}, opts);
-    }
-    if (!cc.success) {
-        std::string diag = aot_detail::slurp(ccErr);
-        if (diag.empty()) diag = "runAot: bezelc rejected the program";
-        r.diagnostics.report(Severity::Error, SourceLocation{}, std::move(diag));
+    // --- Compile + link via the real driver, forked (crash/hang isolated). ----
+    aot_detail::CompileStatus cc =
+        aot_detail::forkedCompile(srcPath, exePath, opts, ccErr);
+    if (cc.outcome != aot_detail::CompileOutcome::Ok) {
+        r.diagnostics.report(Severity::Error, SourceLocation{},
+                             std::move(cc.diag));
         return r;  // ran stays false — AOT is the stricter oracle (see header)
     }
 
@@ -271,17 +476,23 @@ inline JitResult runAot(std::string_view source,
 
     if (timedOut) {
         r.exitCode = -1;
-        r.diagnostics.report(Severity::Error, SourceLocation{},
-                             "runAot: program did not terminate within " +
-                                 std::to_string(aot_detail::aotTimeoutSec()) +
-                                 "s; killed (runaway / deadlock)");
+        std::string runErr = aot_detail::slurp(errPath);
+        r.diagnostics.report(
+            Severity::Error, SourceLocation{},
+            "runAot: program did not terminate within " +
+                std::to_string(aot_detail::aotTimeoutSec()) +
+                "s; killed (runaway / deadlock)" +
+                (runErr.empty() ? "" : "\n--- program stderr ---\n" + runErr));
         return r;
     }
     if (WIFSIGNALED(status)) {
         r.exitCode = -1;  // mirror runJit's failWith
-        r.diagnostics.report(Severity::Error, SourceLocation{},
-                             "runAot: program terminated by signal " +
-                                 std::to_string(WTERMSIG(status)));
+        std::string runErr = aot_detail::slurp(errPath);
+        r.diagnostics.report(
+            Severity::Error, SourceLocation{},
+            "runAot: program terminated by signal " +
+                std::to_string(WTERMSIG(status)) +
+                (runErr.empty() ? "" : "\n--- program stderr ---\n" + runErr));
         return r;
     }
     r.exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
@@ -296,28 +507,39 @@ inline JitResult runAot(std::string_view source) {
 
 // ---------------------------------------------------------------------------
 // runAotChecked — the per-program AddressSanitizer/LeakSanitizer memory net
-// (migration plan §2 memory tier; WS2). Same stricter front-end as runAot
-// (ownership + DA + static-init), emitted to a native object, linked
-// -fsanitize=address against the memoized ASan runtime object, and run under
-// LeakSanitizer. A sanitizer error at exit (leak, double-free, use-after-free)
-// FAILS: it surfaces as ran=false with the sanitizer report in `diagnostics`,
-// so a wrapper doing `r.ran ? r.exitCode : -999` flips to the failure sentinel.
-// A clean program returns normally (ran=true, exitCode=program's, LSan-clean).
+// (migration plan §2 memory tier; WS2). The SAME forked Driver::compileFile as
+// runAot but with `opts.sanitizeAddress = true`, so the GENERATED Bezel code is
+// ASan-instrumented (qr1 S3: use-after-free / out-of-bounds READs in emitted
+// loads are caught at the access, not merely the allocator-level leaks/double-
+// frees the runtime interceptors net) and the executable is linked against the
+// ASan runtime, then run under LeakSanitizer. A sanitizer error at exit (leak,
+// double-free, use-after-free) FAILS: it surfaces as ran=false with the report
+// in `diagnostics`, so a wrapper doing `r.ran ? r.exitCode : -999` flips to the
+// failure sentinel. A clean program returns normally (ran=true, exitCode=
+// program's, LSan-clean).
 //
-// SKIP semantics: if the toolchain/runtime object is unavailable, returns
+// qr1 S2: one pipeline with runAot (same forkedCompile, same §33.5 entry-point
+// check) — they can't drift. qr1 M3: a real sanitizer failure is detected by the
+// ASan/LSan REPORT TEXT, never a bare exit code, so a program legitimately
+// returning 99 from Main is NOT misread as a sanitizer failure.
+//
+// SKIP semantics: if the toolchain cannot build an ASan executable, returns
 // ran=false with a diagnostic beginning "runAotChecked: SKIP" so a caller can
 // distinguish "environment can't run this" from "the program is dirty".
 // ---------------------------------------------------------------------------
 inline JitResult runAotChecked(std::string_view source) {
     JitResult r;
 
-    // The ASan-instrumented combined runtime object (built once, memoized,
-    // shared across shards). Empty => toolchain unavailable => SKIP.
-    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
-    if (rtObj.empty()) {
+    // SKIP if the C toolchain (which the driver shells out to for the ASan link)
+    // is absent — preserves the pre-existing "environment can't run this"
+    // contract. Memoized: probed once per process.
+    static const bool toolchainOk = [] {
+        return std::system("clang --version > /dev/null 2>&1") == 0;
+    }();
+    if (!toolchainOk) {
         r.diagnostics.report(Severity::Error, SourceLocation{},
-                             "runAotChecked: SKIP — ASan runtime object "
-                             "unavailable (toolchain/build)");
+                             "runAotChecked: SKIP — C toolchain (clang) "
+                             "unavailable for the ASan link");
         return r;
     }
 
@@ -328,55 +550,36 @@ inline JitResult runAotChecked(std::string_view source) {
         return r;
     }
     namespace fs = aot_detail::fs;
-    const std::string objPath = (fs::path(wd.path) / "prog.o").string();
+    const std::string srcPath = (fs::path(wd.path) / "prog.bz").string();
     const std::string exePath = (fs::path(wd.path) / "prog").string();
+    const std::string ccErr   = (fs::path(wd.path) / "cc.err").string();
     const std::string outPath = (fs::path(wd.path) / "out.txt").string();
     const std::string sanPath = (fs::path(wd.path) / "san.txt").string();
 
-    // --- Full front-end IN-PROCESS (matches Driver's executable pipeline, so
-    //     accept/reject parity with runAot holds) + emit the native object. ---
-    {
-        Lexer lexer(source, r.diagnostics);
-        Parser parser(lexer, r.diagnostics);
-        auto unit = parser.parseCompilationUnit();
-        if (!unit || r.diagnostics.hasErrors()) return r;
-
-        sema::SemaContext ctx(r.diagnostics);
-        sema::collectSymbols(*unit, ctx);
-        sema::resolveTypes(*unit, ctx);
-        sema::typecheckExpressions(*unit, ctx);
-        sema::checkDefiniteAssignment(*unit, ctx);
-        sema::checkStaticInitCycles(*unit, ctx);
-        ownership::checkOwnership(*unit, ctx);
-        if (r.diagnostics.hasErrors()) return r;  // stricter oracle, ran=false
-
-        llvm::LLVMContext llvmCtx;
-        auto module = codegen::emitModule(*unit, ctx, llvmCtx);
-        std::string err;
-        if (!module || !codegen::emitObjectFile(*module, objPath, err)) {
-            r.diagnostics.report(Severity::Error, SourceLocation{},
-                                 "runAotChecked: codegen failed" +
-                                     (err.empty() ? "" : ": " + err));
-            return r;
-        }
+    if (!aot_detail::writeSource(srcPath, source)) {
+        r.diagnostics.report(Severity::Error, SourceLocation{},
+                             "runAotChecked: failed to write source");
+        return r;
     }
 
-    // --- Link -fsanitize=address against the ASan runtime object (WS2 §1). ----
-    // Reuses native_test_harness's memoized runtime; the recipe mirrors the
-    // ~176 hand-rolled `runAotExit`/`runUnderLeakSanitizer` copies verbatim.
-    {
-        std::string link = "clang++ -fsanitize=address -g " + objPath + " " +
-                           rtObj + " -lm -lpthread -lstdc++ -o " + exePath +
-                           " > /dev/null 2>&1";
-        if (std::system(link.c_str()) != 0) {
-            r.diagnostics.report(Severity::Error, SourceLocation{},
-                                 "runAotChecked: ASan link failed");
-            return r;
-        }
+    // --- Compile + link with generated-code ASan, forked (S3). ---------------
+    codegen::CodegenOptions opts;
+    opts.sanitizeAddress = true;
+    aot_detail::CompileStatus cc =
+        aot_detail::forkedCompile(srcPath, exePath, opts, ccErr);
+    if (cc.outcome != aot_detail::CompileOutcome::Ok) {
+        std::string prefix =
+            cc.outcome == aot_detail::CompileOutcome::Infra
+                ? "runAotChecked: SKIP — "
+                : "";
+        r.diagnostics.report(Severity::Error, SourceLocation{},
+                             prefix + std::move(cc.diag));
+        return r;  // reject / compiler crash / compile timeout — ran=false
     }
 
-    // --- Run under LeakSanitizer. exitcode=99 sentinel distinguishes a
-    //     sanitizer error from the program's own exit codes (WS2 §1). ---------
+    // --- Run under LeakSanitizer. abort_on_error=0 so a sanitizer error prints
+    //     a REPORT and exits 99 (rather than SIGABRT); detection keys on the
+    //     report text (M3), not the exit code. --------------------------------
     bool timedOut = false;
     int status = aot_detail::spawnCaptured(
         {exePath}, outPath, sanPath, aot_detail::aotTimeoutSec(), timedOut,
@@ -393,8 +596,12 @@ inline JitResult runAotChecked(std::string_view source) {
 
     const bool crashed = WIFSIGNALED(status);
     const int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    // qr1 M3: a REAL sanitizer failure is signalled by the report text (always
+    // present with abort_on_error=0), OR by a hard crash that bypassed ASan's
+    // own reporting. The bare exit code 99 is NOT used as a signal — a program
+    // whose Main legitimately returns 99 stays a clean run.
     const bool sanitizerFired =
-        crashed || code == 99 || aot_detail::hasSanitizerReport(sanText);
+        crashed || aot_detail::hasSanitizerReport(sanText);
 
     if (sanitizerFired) {
         // A leak / double-free / UAF is a dispose-exactly-once violation: FAIL.
