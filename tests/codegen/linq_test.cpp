@@ -12,14 +12,15 @@
 // Eager LINQ members exercised here: Any/All/Count(pred)/Sum/Min/Max/First/
 // IndexOf/Contains.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -129,7 +130,7 @@ BEZEL_TEST(linq, max_string_1194) {
 BEZEL_TEST(linq, min_max_non_icomparable_class_rejected_1198) {
     // NotComparable has no IComparable<T> base — both Min() and Max()
     // must fail with errors and the program must not run.
-    auto r_max = runJit(
+    auto r_max = runAot(
         "module M; import System.Collections.Generic; "
         "class NotComparable "
         "  public val: int := 0; "
@@ -150,7 +151,7 @@ BEZEL_TEST(linq, min_max_non_icomparable_class_rejected_1198) {
             found_max = true;
     BEZEL_EXPECT_TRUE(found_max);
 
-    auto r_min = runJit(
+    auto r_min = runAot(
         "module M; import System.Collections.Generic; "
         "class NotComparable "
         "  public val: int := 0; "

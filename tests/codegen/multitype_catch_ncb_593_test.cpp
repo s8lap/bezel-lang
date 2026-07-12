@@ -28,21 +28,22 @@
 //
 //   5. Single-type arm regression — must still resolve exactly as before.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
 // Returns true iff the run produced an error diagnostic containing `keyword`.
 bool hasError(const std::string& program, const char* keyword) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.severity == bezel::Severity::Error &&
                 d.message.find(keyword) != std::string::npos)
