@@ -12,7 +12,7 @@ implements it. Start with `docs/Bezel_Language_Spec.md` for the language and
 
 ## Status
 
-`bezelc` AOT-compiles `.bzl` source to native executables and implements a large,
+`bezelc` compiles `.bzl` source to native executables and implements a large,
 growing subset of the spec, backed by an extensive spec-derived test suite (all
 passing on Fedora) spanning lexer through codegen.
 
@@ -79,7 +79,7 @@ linking:
 ## Testing
 
 Two tracks: a **gtest behavior suite** (compiles and runs programs through the
-real `bezelc` AOT path) and a **lit + FileCheck diagnostic track**
+real `bezelc`) and a **lit + FileCheck diagnostic track**
 (`tests/lit/*.bzl`, matching compiler diagnostics). The diagnostic track needs
 `lit` and `FileCheck` (from LLVM) on `PATH`; without them it is skipped cleanly.
 
