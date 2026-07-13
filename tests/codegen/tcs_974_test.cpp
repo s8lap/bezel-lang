@@ -24,14 +24,37 @@
 //   7. using-var disposal — scope-end faults a never-completed TCS (no hang)
 //   8. OwningTaskCompletionSource<T> — TrySetResult delivers owned result
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"   // runAot / runAotChecked (JIT->AOT migration)
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotChecked;
+using bezel::test::runJit;   // retained ONLY for tcs_task_property_bound (see #1771)
 
 namespace {
 
+// Async TCS value tests — the stricter AOT oracle (real subprocess + ownership
+// pass). Owned locals in an async body must be `using var` (§28.3; #1772 tracks
+// the compiler rejecting the plain-`var` auto-drop the JIT harness let slide).
 int run(const std::string& prog) {
+    auto r = runAot(prog);
+    return r.ran ? r.exitCode : -999;
+}
+
+// OwningTaskCompletionSource disposal tests (§28.3 / #1250): compile with
+// generated-code AddressSanitizer, run under LeakSanitizer — dispose-exactly-once
+// (a leak / double-free / use-after-free FAILS: ran=false -> -999).
+int runChecked(const std::string& prog) {
+    auto r = runAotChecked(prog);
+    return r.ran ? r.exitCode : -999;
+}
+
+// runJit — retained ONLY for tcs_task_property_bound below, which exercises a
+// scenario (binding tcs.Task to a local, stdlib §6.6) that currently HANGS under
+// the AOT runtime (#1771). Once #1771 is fixed it moves to `run` (runAot) like the
+// rest of this file. Kept on runJit — rather than left failing/hanging — so the
+// intended §6.6 semantics stay pinned while the deadlock is tracked separately.
+int runJitLegacy(const std::string& prog) {
     auto r = runJit(prog);
     return r.ran ? r.exitCode : -999;
 }
@@ -54,7 +77,7 @@ BEZEL_TEST(tcs_974, non_generic_tcs_trysetresult_void_completes_task) {
         "module M; "
         "class C "
         "  public static async method Run(): Task<int> "
-        "    var tcs := new TaskCompletionSource(); "
+        "    using var tcs := new TaskCompletionSource(); "
         "    _ := tcs.TrySetResult(0); "
         "    await tcs.Task; "
         "    return 42; "
@@ -72,7 +95,7 @@ BEZEL_TEST(tcs_974, generic_tcs_int_trysetresult_await_returns_value) {
         "module M; "
         "class C "
         "  public static async method Run(): Task<int> "
-        "    var tcs := new TaskCompletionSource<int>(); "
+        "    using var tcs := new TaskCompletionSource<int>(); "
         "    _ := tcs.TrySetResult(99); "
         "    return await tcs.Task; "
         "  end Run; "
@@ -89,7 +112,7 @@ BEZEL_TEST(tcs_974, trysetresult_idempotent_second_call_returns_false) {
         "module M; "
         "class C "
         "  public static async method Main(): Task<int> "
-        "    var tcs := new TaskCompletionSource<int>(); "
+        "    using var tcs := new TaskCompletionSource<int>(); "
         "    var first  := tcs.TrySetResult(1); "
         "    var second := tcs.TrySetResult(2); "
         "    if first and not second then "
@@ -107,7 +130,7 @@ BEZEL_TEST(tcs_974, tcs_trysetcancelled_awaiter_catches_oce) {
         "module M; "
         "class C "
         "  public static async method Run(): Task<int> "
-        "    var tcs := new TaskCompletionSource<int>(); "
+        "    using var tcs := new TaskCompletionSource<int>(); "
         "    _ := tcs.TrySetCancelled(); "
         "    var x: int := 0; "
         "    try x := await tcs.Task; return 0; "
@@ -127,7 +150,7 @@ BEZEL_TEST(tcs_974, tcs_trysetexception_awaiter_rethrows) {
         "module M; "
         "class C "
         "  public static async method Run(): Task<int> "
-        "    var tcs := new TaskCompletionSource<int>(); "
+        "    using var tcs := new TaskCompletionSource<int>(); "
         "    _ := tcs.TrySetException(new InvalidOperationException()); "
         "    var x: int := 0; "
         "    try x := await tcs.Task; return 0; "
@@ -159,8 +182,13 @@ BEZEL_TEST(tcs_974, tcs_usingvar_disposal_faults_pending_task) {
 
 // §6.6 test 7: Task property accessed before completion, then TrySetResult.
 // Bind tcs.Task to a local first, then complete, then await.
+// KEPT ON runJit (runJitLegacy) pending #1771: binding tcs.Task to a local under
+// a `using var tcs` scope deadlocks under the AOT runtime. runJit pins the
+// intended §6.6 semantics (77) while the deadlock is tracked separately; this is
+// the single test in the file not yet on the AOT harness. Move to `run` (runAot)
+// once #1771 is fixed.
 BEZEL_TEST(tcs_974, tcs_task_property_bound_then_completed) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runJitLegacy(
         "module M; "
         "class C "
         "  public static async method Run(): Task<int> "
@@ -199,7 +227,7 @@ const char* kRes =
 // §28.3 / #1250 test 1: TCS set but result never consumed — TCS disposal must
 // dispose the owned result exactly once (Res.n drops from 1 to 0; exit 1 = n==0).
 BEZEL_TEST(tcs_974, owned_tcs_unconsumed_result_disposed_on_tcs_disposal) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runChecked(
         std::string("module M; ") + kRes +
         "class C "
         "  public static method Main(): int "
@@ -216,7 +244,7 @@ BEZEL_TEST(tcs_974, owned_tcs_unconsumed_result_disposed_on_tcs_disposal) {
 // §28.3 / #1250 test 2: result consumed via .Task.Result — TCS disposal must NOT
 // re-dispose (Res.n = 0 after r's scope ends; TCS scope end is a no-op; exit 1).
 BEZEL_TEST(tcs_974, owned_tcs_consumed_via_result_not_disposed_again) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runChecked(
         std::string("module M; ") + kRes +
         "class C "
         "  public static method Main(): int "
@@ -236,7 +264,7 @@ BEZEL_TEST(tcs_974, owned_tcs_consumed_via_result_not_disposed_again) {
 // §28.3 / #1250 test 3: never set — TCS disposal must NOT spuriously call the
 // disposer (no Res created → Res.n stays 0; exit 1 = n==0; no crash).
 BEZEL_TEST(tcs_974, owned_tcs_never_set_no_spurious_dispose) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runChecked(
         std::string("module M; ") + kRes +
         "class C "
         "  public static method Main(): int "
@@ -252,7 +280,7 @@ BEZEL_TEST(tcs_974, owned_tcs_never_set_no_spurious_dispose) {
 // §28.3 / #1250 test 4: TrySetException then dispose — error path has no result;
 // no disposer should fire (no Res created → Res.n stays 0; exit 1; no crash).
 BEZEL_TEST(tcs_974, owned_tcs_setexception_no_result_dispose) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runChecked(
         std::string("module M; ") + kRes +
         "class C "
         "  public static method Main(): int "
