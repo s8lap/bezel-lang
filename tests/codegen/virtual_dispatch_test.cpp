@@ -4,15 +4,17 @@
 // static type is the base. `base.M()` bypasses dispatch (§12.3) and
 // non-virtual methods bind statically. Observable via the int exit code.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -156,15 +158,24 @@ BEZEL_TEST(codegen_cg17,
     // itself, with a genuine `null` argument, must still reach Derived::F
     // with the real boxed (hasValue=false) value — the uniform-ABI dispatch
     // must not corrupt the already-wide call.
-    BEZEL_EXPECT_EQ(run(
+    //
+    // Investigated as the flagged JIT/AOT divergence for this test (migration
+    // triage): under runAot, `bezelc` on this exact program returns process
+    // exit code 255. That is NOT a miscompile — it is -1 masked through
+    // WEXITSTATUS's 8-bit truncation (the same "TWO SEMANTIC DIFFERENCES"
+    // documented in aot_support.hpp): `./prog; echo $?` gives 255, and moving
+    // the same expression to stdout (Console.WriteLine) round-trips the real
+    // value -1 unmasked. So the divergence is the pre-existing 8-bit exit-code
+    // ceiling, not a widen bug; routed through runAotOut accordingly.
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; "
         "class Base public virtual method F(x: int): int => x; end Base; "
         "class Derived : Base "
         "  public override method F(x: int?): int => x ?? -1; "
         "  public static method Main(): int "
-        "    var d := new Derived(); return d.F(null); "
+        "    var d := new Derived(); Console.WriteLine(d.F(null)); return 0; "
         "  end Main; "
-        "end Derived;"), -1);
+        "end Derived;"), "-1");
 }
 
 BEZEL_TEST(codegen_cg17, override_valuetype_widen_sibling_branch_unaffected) {
