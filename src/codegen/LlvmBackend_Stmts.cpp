@@ -5183,6 +5183,51 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     auto* ts = iterTy->declaration;
     if (!ts) return false;  // builtin/interface without concrete class — skip
 
+    // #1776 / §21.4 / §29.2: the source's STATIC type is a user INTERFACE that
+    // (transitively) extends IEnumerable<T> — e.g. `interface IMyColl:
+    // IEnumerable<int>`. Such an interface declares no GetEnumerator of its own,
+    // so findMethodByName(ts, "GetEnumerator") below returns null and this
+    // handler bailed, dropping the statement through to the codegen NYI (the
+    // #1776 gap; sema §21.4 correctly admits the interface as iterable — #1775).
+    // GetEnumerator is inherited from the *builtin* IEnumerable, which carries
+    // no itable/vtable dispatch slot (unlike IComparable/IEquatable it is not a
+    // synthesized itable-participating interface — SemaContext::
+    // builtinInterfaceSym), so the object exposes no dynamic handle to it.
+    //
+    // Devirtualize when every class implementing this interface resolves
+    // GetEnumerator to the SAME method (the common case: a single implementing
+    // class, or a base class whose subclasses inherit its non-virtual
+    // GetEnumerator). The runtime object is then necessarily an instance of
+    // that class (or a subclass sharing the identical GetEnumerator), so a
+    // direct static call on the interface-typed receiver is sound: rewrite `ts`
+    // to the implementing class and fall into the ordinary concrete-class path
+    // below (emitMethodCall issues the direct call; the receiver pointer IS-A
+    // the class at runtime). If the implementers resolve GetEnumerator to two
+    // or more DISTINCT methods, no single static call is sound — leave `ts` as
+    // the interface so findMethodByName fails and the statement falls through to
+    // the NYI (a compile error, never a miscompile); that truly-polymorphic
+    // case needs itable dispatch over a builtin IEnumerable descriptor (#1776).
+    if (ts->kind == ast::TypeDeclKind::Interface &&
+        !findMethodByName(ts, "GetEnumerator")) {
+        sema::MethodSymbol* uniqueGetEnum = nullptr;
+        bool ambiguous = false;
+        for (const auto& sym : ctx_.symbols()) {
+            auto* cand = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+            if (!cand || cand->kind != ast::TypeDeclKind::Class) continue;
+            std::vector<const sema::TypeSymbol*> supers;
+            collectTypeAndBases(cand, supers);
+            bool implementsIface = false;
+            for (auto* s : supers) if (s == ts) { implementsIface = true; break; }
+            if (!implementsIface) continue;
+            sema::MethodSymbol* ge = findMethodByName(cand, "GetEnumerator");
+            if (!ge) continue;  // abstract implementer with no compiled body
+            if (!uniqueGetEnum) uniqueGetEnum = ge;
+            else if (uniqueGetEnum != ge) { ambiguous = true; break; }
+        }
+        if (ambiguous || !uniqueGetEnum) return false;  // → NYI (sound)
+        ts = uniqueGetEnum->parent;  // devirtualize to the implementing class
+    }
+
     // Find GetEnumerator on ts (walks base types).
     sema::MethodSymbol* getEnumSym = findMethodByName(ts, "GetEnumerator");
     if (!getEnumSym) return false;
