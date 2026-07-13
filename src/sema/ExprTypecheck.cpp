@@ -6165,6 +6165,33 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // narrow and is reported by checkAssignable.
                 TypeRef* fromTy = ctx_.exprType(*as->value);
                 TypeRef* toTy   = ctx_.exprType(*as->target);
+                // §5.1 / §9 / §22 (#1770): a bare `this` on the RHS is left
+                // deliberately UNTYPED in visitExpr (member access on `this`
+                // resolves via the enclosing type directly, not via `this`'s
+                // exprType — see the #1759 note there), so exprType(*this) is
+                // null and checkAssignable's `if (!from) return` silently
+                // ACCEPTED `slot := this` for ANY target type — a store of a
+                // record's `this` into a slot of an unrelated record type
+                // compiled and ran on garbage memory. The #1759 fix seeds the
+                // receiver type for the `var q := this` local path but not for
+                // this direct assignment path. Seed `from` with the current
+                // receiver type here (a bare Named ref keyed on currentType_,
+                // exactly the #1759 local seed) so the §5.1 convertibility gate
+                // runs on `this` just as it does for a named-variable RHS —
+                // accepting a same-type / base / implemented-interface store and
+                // rejecting a mismatched-record store. Codegen carries the
+                // value/reference semantics via its own receiver path.
+                if (!fromTy && currentType_) {
+                    if (auto* vid = dynamic_cast<const ast::IdentifierExpr*>(
+                            as->value.get())) {
+                        if (vid->name == "this") {
+                            auto* selfTy = ctx_.makeTypeRef();
+                            selfTy->kind = TypeRef::Kind::Named;
+                            selfTy->declaration = currentType_;
+                            fromTy = selfTy;
+                        }
+                    }
+                }
                 if (fromTy && toTy &&
                     fromTy->kind == TypeRef::Kind::Primitive &&
                     toTy->kind   == TypeRef::Kind::Primitive &&
