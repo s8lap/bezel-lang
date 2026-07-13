@@ -34,7 +34,6 @@
 
 using bezel::test::runAot;
 using bezel::test::runAotOut;
-using bezel::test::runJit;
 
 namespace {
 
@@ -49,7 +48,7 @@ int run(const std::string& src) {
 // did NOT run. (A spurious IR-verification failure would also set hasErrors, so
 // asserting `!ran` alone is weaker; we require the explicit diagnostic.)
 bool rejects(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.diagnostics.hasErrors() && !r.ran;
 }
 
