@@ -31,15 +31,17 @@
 //   * Emoji (4-byte U+1F600): "a😀b".IndexOf("😀") = 1
 //   * ASCII control: "hello".IndexOf("ll") = 2 (unchanged)
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -101,10 +103,13 @@ BEZEL_TEST(codegen_string_methods_535, indexof_ascii_control_is_2) {
 }
 
 // IndexOf not-found must still return -1.
+// -1 does not round-trip through the 8-bit process exit code (runAotOut).
 BEZEL_TEST(codegen_string_methods_535, indexof_not_found_is_minus1) {
-    BEZEL_EXPECT_EQ(runBody(
-        std::string("var s := \"") + kHelloJapanWorld + "\"; "
-        "return s.IndexOf(\"xyz\");"), -1);
+    BEZEL_EXPECT_EQ(runAotOut(
+        std::string("module M; class C public static method Main(): int "
+                     "var s := \"") + kHelloJapanWorld + "\"; "
+        "Console.WriteLine(s.IndexOf(\"xyz\")); return 0; "
+        "end Main; end C;"), "-1");
 }
 
 // ── §9.6 / #535: LastIndexOf — code-point index ──────────────────────────────
