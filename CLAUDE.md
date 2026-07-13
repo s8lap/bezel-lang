@@ -126,10 +126,15 @@ miss — slower, never incorrect).
 
 **Concurrency discipline (32 GiB box, parallel dev agents).** Run every full
 build and every full suite through `scripts/dev_heavy.sh {build|suite} <cmd>`:
-it serializes heavy ops across agents via a global lock (one -j16 build at a
-time beats two thrashing ones), cages memory (12G/8G), and runs at background
-CPU/IO weight so the interactive session stays responsive. Small probe
-compiles/runs use `dev_heavy.sh probe <cmd>` (cage only, no lock). Scratch
+it runs them in a shared resource-capped cgroup slice (`bezel-heavy.slice`,
+~18 cores, 24G soft / 28G hard) that bounds TOTAL cpu+mem across all concurrent
+heavy ops WITHOUT serializing them — N builds share the budget (each slower)
+rather than oversubscribing or OOMing. (An earlier exclusive flock was removed
+deliberately: it caused a producer-stall storm; the slice bounds resources
+without a lock — do not reintroduce one.) Gate ops get high CPU/IO weight so
+they stay fast; producer builds run at background weight on spare capacity; each
+op is also memory-caged (12–14G). Small probe compiles/runs use
+`dev_heavy.sh probe <cmd>` (own small cage, no slice accounting). Scratch
 artifacts (probe binaries, big logs, scratch build trees) go in
 `/var/tmp/bezel-scratch` — never `/tmp`, which is tmpfs (RAM): a scratch build
 tree parked there permanently consumes gigabytes. Keep ccache `max_size` at
