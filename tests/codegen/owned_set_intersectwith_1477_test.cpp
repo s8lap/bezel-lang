@@ -30,14 +30,20 @@
 //   * `other`'s own elements are never disposed by IntersectWith (they remain
 //     owned by `other`, disposed at `other`'s own scope end — no double free).
 
+// AOT MIGRATION (JIT->AOT): runs under the AOT driver (runAot) — the stricter
+// oracle (full ownership + definite-assignment pipeline). Tests whose packed
+// return value exceeds 255 (the 8-bit exit-code ceiling) print it via
+// Console.WriteLine and assert on stdout through runAotOut.
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -68,7 +74,8 @@ const char* kBox =
 // has no match and is removed+disposed, so Count == 1, and Box.n drops from
 // 4 constructed to 3 live. Proves the call is NOT a no-op.
 BEZEL_TEST(owned_set_intersectwith_1477, keeps_matching_removes_nonmatching_spec_4_10) {
-    BEZEL_EXPECT_EQ(run(std::string(kBox) +
+    // 301 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(std::string(kBox) +
         "public static method Main(): int "
         "  using var s := new OwningSet<Box>(); "
         "  s.Add(move (new Box(1))); "
@@ -78,8 +85,8 @@ BEZEL_TEST(owned_set_intersectwith_1477, keeps_matching_removes_nonmatching_spec
         "  other.Add(move (new Box(3))); "  // not in s
         "  s.IntersectWith(other); "
         // s = {1} → Count 1; 4 Boxes built, 1 (Box(2)) disposed → Box.n 3.
-        "  return Box.n * 100 + s.Count; "  // 3*100 + 1 = 301
-        "end Main; end C;"), 301);
+        "  Console.WriteLine(Box.n * 100 + s.Count); return 0; "  // 3*100 + 1 = 301
+        "end Main; end C;"), "301");
 }
 
 // §4.10 / §28 / §29.2: the removed (non-matching) element is disposed EXACTLY
@@ -89,7 +96,8 @@ BEZEL_TEST(owned_set_intersectwith_1477, keeps_matching_removes_nonmatching_spec
 // total, never more (double free) and never fewer (leak). Box.n (live count)
 // must settle to 0.
 BEZEL_TEST(owned_set_intersectwith_1477, nonmatching_element_disposed_exactly_once_spec_4_10) {
-    BEZEL_EXPECT_EQ(run(std::string(kBox) +
+    // Packed value 10400 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(std::string(kBox) +
         "public static method Main(): int "
         "  var midDisp := 0; "
         "  do "
@@ -103,9 +111,9 @@ BEZEL_TEST(owned_set_intersectwith_1477, nonmatching_element_disposed_exactly_on
         "    midDisp := Box.disposeCount; "  // exactly 1 disposed by IntersectWith
         "  end; "
         // midDisp 1, total disposeCount 4, live Box.n 0.
-        "  return midDisp * 10000 + Box.disposeCount * 100 + Box.n; "
+        "  Console.WriteLine(midDisp * 10000 + Box.disposeCount * 100 + Box.n); return 0; "
         // 1*10000 + 4*100 + 0 = 10400
-        "end Main; end C;"), 10400);
+        "end Main; end C;"), "10400");
 }
 
 // §4.10: IntersectWith with an `other` sharing NO element with self removes
@@ -144,7 +152,8 @@ BEZEL_TEST(owned_set_intersectwith_1477, empty_other_empties_self_spec_4_10) {
 // — Count stays 3, nothing disposed (Box.n holds all 6 constructed: 3 self +
 // 3 other, none disposed by IntersectWith).
 BEZEL_TEST(owned_set_intersectwith_1477, other_covers_all_keeps_everything_spec_4_10) {
-    BEZEL_EXPECT_EQ(run(std::string(kBox) +
+    // 603 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(std::string(kBox) +
         "public static method Main(): int "
         "  using var s := new OwningSet<Box>(); "
         "  s.Add(move (new Box(1))); "
@@ -156,8 +165,8 @@ BEZEL_TEST(owned_set_intersectwith_1477, other_covers_all_keeps_everything_spec_
         "  other.Add(move (new Box(3))); "
         "  s.IntersectWith(other); "
         // s unchanged → Count 3; nothing disposed → Box.n 6.
-        "  return Box.n * 100 + s.Count; "  // 6*100 + 3 = 603
-        "end Main; end C;"), 603);
+        "  Console.WriteLine(Box.n * 100 + s.Count); return 0; "  // 6*100 + 3 = 603
+        "end Main; end C;"), "603");
 }
 
 // §4.10: self is fully usable after IntersectWith — a subsequent Add grows
@@ -182,7 +191,8 @@ BEZEL_TEST(owned_set_intersectwith_1477, self_reusable_after_intersect_spec_4_10
 // match and is removed+disposed; the Array only borrows its elements (they
 // are owned by the `using var` boxes), so IntersectWith never disposes them.
 BEZEL_TEST(owned_set_intersectwith_1477, other_is_borrowing_array_spec_4_10) {
-    BEZEL_EXPECT_EQ(run(std::string(kBox) +
+    // 301 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(std::string(kBox) +
         "public static method Main(): int "
         "  using var s := new OwningSet<Box>(); "
         "  s.Add(move (new Box(1))); "
@@ -194,6 +204,6 @@ BEZEL_TEST(owned_set_intersectwith_1477, other_is_borrowing_array_spec_4_10) {
         "  other.Add(q3); "
         "  s.IntersectWith(other); "
         // s = {1} → Count 1; s's Box(2) disposed; q1/q3 still live → Box.n 3.
-        "  return Box.n * 100 + s.Count; "  // 3*100 + 1 = 301
-        "end Main; end C;"), 301);
+        "  Console.WriteLine(Box.n * 100 + s.Count); return 0; "  // 3*100 + 1 = 301
+        "end Main; end C;"), "301");
 }
