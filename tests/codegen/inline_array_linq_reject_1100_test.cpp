@@ -14,16 +14,18 @@
 // other than `.Length`, the intrinsics (`.ToArray()`/`.Contains()`), and the
 // universal Object members (§8.1). Found by adversarial discovery sweep #8.
 //
-// runJit returns the FULL int from Main() (not 8-bit wrapped); values ≤ 255.
+// runAot observes Main()'s return via the process exit code (8-bit wrapped,
+// aot_support.hpp); every value used here is ≤ 60, so it round-trips exactly.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 // True iff some diagnostic cites the §15.1.2 inline-array member rule.
@@ -39,7 +41,7 @@ bool has1512Error(const bezel::test::JitResult& r) {
 // #1100: `arr.Count()` on `[5]int` was silently accepted and returned 0 — now a
 // compile error citing §15.1.2.
 BEZEL_TEST(inline_array_linq_reject_1100, count_rejected) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var arr: [5]int := [1,2,3,4,5]; "
         "  return arr.Count(); "
@@ -51,7 +53,7 @@ BEZEL_TEST(inline_array_linq_reject_1100, count_rejected) {
 
 // #1100: `.Sum()` likewise rejected.
 BEZEL_TEST(inline_array_linq_reject_1100, sum_rejected) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var arr: [5]int := [10,20,30,40,50]; "
         "  return arr.Sum(); "
@@ -65,11 +67,18 @@ BEZEL_TEST(inline_array_linq_reject_1100, sum_rejected) {
 
 // #1100: a predicate LINQ operator (`.All`) is rejected — its bool result fed a
 // branch and previously crashed IR verification.
+//
+// AOT-migration finding (test-shape, class B): the `if … end` was missing its
+// trailing `;` (§21 statement termination) — the JIT harness's parser recovers
+// past the missing terminator and still reaches the sema member-check, so the
+// §15.1.2 diagnostic appeared regardless; the stricter AOT diagnostics capture
+// surfaces the parse error instead ("expected ';' after 'end' of 'if'"), so
+// `has1512Error` no longer found the expected message. Fixed the terminator.
 BEZEL_TEST(inline_array_linq_reject_1100, all_predicate_rejected) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var arr: [4]int := [2,4,6,8]; "
-        "  if arr.All((x: int) => x mod 2 = 0) then return 1; else return 0; end "
+        "  if arr.All((x: int) => x mod 2 = 0) then return 1; else return 0; end; "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(has1512Error(r));
@@ -77,7 +86,7 @@ BEZEL_TEST(inline_array_linq_reject_1100, all_predicate_rejected) {
 
 // #1100: `.Where(...)` (a deferred lazy operator) is rejected.
 BEZEL_TEST(inline_array_linq_reject_1100, where_rejected) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  var arr: [5]int := [1,2,3,4,5]; "
@@ -91,7 +100,7 @@ BEZEL_TEST(inline_array_linq_reject_1100, where_rejected) {
 // #1100: a completely unknown member (`.Frobnicate`) is also rejected — the
 // reject is general to the inline-array surface, not a LINQ allow-list.
 BEZEL_TEST(inline_array_linq_reject_1100, unknown_member_rejected) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var arr: [3]int := [1,2,3]; "
         "  return arr.Frobnicate(); "
