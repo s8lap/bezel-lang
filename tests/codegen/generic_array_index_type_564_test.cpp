@@ -35,32 +35,37 @@
 //            into the declared return type.
 //   §22.1 — index expression `a[i]` on `Array<T>` has element type `T`.
 
+#include "support/aot_support.hpp"      // runAot — AOT oracle (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 // Shared helper: a static class with a generic method that builds and returns
-// an `owned Array<T>` populated with two values.
+// an `owned Array<T>` populated with two values.  `arr` is a plain `var` (an
+// owned local), NOT a `using var`: it is transferred out through the `owned`
+// return, and a `using var` is scope-bound — it cannot be moved out of (§28.3 /
+// §28.10).  Run under the AOT oracle, which applies that ownership pass (the JIT
+// skipped it and accepted the return-of-`using var`).
 const char* kMakeTwo =
     "module M; "
     "class C "
     "  public static method MakeTwo<T>(a: T, b: T): owned Array<T> "
     "      where T: notnull "
-    "    using var arr := new Array<T>(); "
+    "    var arr := new Array<T>(); "
     "    arr.Add(a); "
     "    arr.Add(b); "
     "    return arr; "
     "  end MakeTwo; ";
 
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 
-bezel::test::JitResult jit(const std::string& prog) { return runJit(prog); }
+bezel::test::JitResult jit(const std::string& prog) { return runAot(prog); }
 
 }  // namespace
 
@@ -212,7 +217,7 @@ BEZEL_TEST(generic_array_index_564, non_generic_array_return_still_works_22_1) {
         "module M; "
         "class C "
         "  public static method MakePair(): owned Array<int> "
-        "    using var arr := new Array<int>(); "
+        "    var arr := new Array<int>(); "   // owned local, returned (not using var)
         "    arr.Add(4); arr.Add(8); "
         "    return arr; "
         "  end MakePair; "
