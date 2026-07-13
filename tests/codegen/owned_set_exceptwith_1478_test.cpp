@@ -28,12 +28,18 @@
 
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
+// AOT MIGRATION (JIT->AOT): runs under the AOT driver (runAot) — the stricter
+// oracle (full ownership + definite-assignment pipeline). Tests whose packed
+// return value exceeds 255 (the 8-bit exit-code ceiling) print it via
+// Console.WriteLine and assert on stdout through runAotOut.
+#include "support/aot_support.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -63,7 +69,8 @@ const char* kBox =
 // matching Box(1) is removed, so Count == 1, and it is disposed (Box.n drops
 // from 4 constructed to 3 live). Proves the call is NOT a no-op.
 BEZEL_TEST(owned_set_exceptwith_1478, removes_and_disposes_matching_element_spec_4_10) {
-    BEZEL_EXPECT_EQ(run(std::string(kBox) +
+    // 301 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(std::string(kBox) +
         "public static method Main(): int "
         "  using var s := new OwningSet<Box>(); "
         "  s.Add(move (new Box(1))); "
@@ -73,8 +80,8 @@ BEZEL_TEST(owned_set_exceptwith_1478, removes_and_disposes_matching_element_spec
         "  other.Add(move (new Box(3))); "  // not in s
         "  s.ExceptWith(other); "
         // s = {2} → Count 1; 4 Boxes built, 1 disposed by ExceptWith → Box.n 3.
-        "  return Box.n * 100 + s.Count; "  // 3*100 + 1 = 301
-        "end Main; end C;"), 301);
+        "  Console.WriteLine(Box.n * 100 + s.Count); return 0; "  // 3*100 + 1 = 301
+        "end Main; end C;"), "301");
 }
 
 // §4.10 / §28 / §29.2: the removed element is disposed EXACTLY once — 4 Boxes
@@ -83,7 +90,8 @@ BEZEL_TEST(owned_set_exceptwith_1478, removes_and_disposes_matching_element_spec
 // their owners' scope end — 4 destructor calls total, never more (double free)
 // and never fewer (leak). Box.n (live count) must settle to 0.
 BEZEL_TEST(owned_set_exceptwith_1478, matching_element_disposed_exactly_once_spec_4_10) {
-    BEZEL_EXPECT_EQ(run(std::string(kBox) +
+    // Packed value 10400 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(std::string(kBox) +
         "public static method Main(): int "
         "  var midDisp := 0; "
         "  do "
@@ -97,15 +105,16 @@ BEZEL_TEST(owned_set_exceptwith_1478, matching_element_disposed_exactly_once_spe
         "    midDisp := Box.disposeCount; "  // exactly 1 disposed by ExceptWith
         "  end; "
         // midDisp 1, total disposeCount 4, live Box.n 0.
-        "  return midDisp * 10000 + Box.disposeCount * 100 + Box.n; "
+        "  Console.WriteLine(midDisp * 10000 + Box.disposeCount * 100 + Box.n); return 0; "
         // 1*10000 + 4*100 + 0 = 10400
-        "end Main; end C;"), 10400);
+        "end Main; end C;"), "10400");
 }
 
 // §4.10: ExceptWith with an `other` sharing NO element with self removes
 // nothing — Count unchanged, nothing disposed (Box.n stays at all 4 live).
 BEZEL_TEST(owned_set_exceptwith_1478, disjoint_other_removes_nothing_spec_4_10) {
-    BEZEL_EXPECT_EQ(run(std::string(kBox) +
+    // 402 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(std::string(kBox) +
         "public static method Main(): int "
         "  using var s := new OwningSet<Box>(); "
         "  s.Add(move (new Box(1))); "
@@ -115,8 +124,8 @@ BEZEL_TEST(owned_set_exceptwith_1478, disjoint_other_removes_nothing_spec_4_10) 
         "  other.Add(move (new Box(4))); "
         "  s.ExceptWith(other); "
         // s unchanged {1,2} → Count 2; nothing disposed → Box.n 4.
-        "  return Box.n * 100 + s.Count; "  // 4*100 + 2 = 402
-        "end Main; end C;"), 402);
+        "  Console.WriteLine(Box.n * 100 + s.Count); return 0; "  // 4*100 + 2 = 402
+        "end Main; end C;"), "402");
 }
 
 // §4.10: ExceptWith with an EMPTY other is a no-op on self's contents (Count
@@ -136,7 +145,8 @@ BEZEL_TEST(owned_set_exceptwith_1478, except_with_empty_other_spec_4_10) {
 // elements are removed and disposed (Box.n drops from 6 constructed to 3),
 // Count == 0. The three `other` elements remain owned by `other`.
 BEZEL_TEST(owned_set_exceptwith_1478, other_covers_all_empties_self_spec_4_10) {
-    BEZEL_EXPECT_EQ(run(std::string(kBox) +
+    // 300 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(std::string(kBox) +
         "public static method Main(): int "
         "  using var s := new OwningSet<Box>(); "
         "  s.Add(move (new Box(1))); "
@@ -148,8 +158,8 @@ BEZEL_TEST(owned_set_exceptwith_1478, other_covers_all_empties_self_spec_4_10) {
         "  other.Add(move (new Box(3))); "
         "  s.ExceptWith(other); "
         // s emptied → Count 0; 3 of 6 disposed by ExceptWith → Box.n 3.
-        "  return Box.n * 100 + s.Count; "  // 3*100 + 0 = 300
-        "end Main; end C;"), 300);
+        "  Console.WriteLine(Box.n * 100 + s.Count); return 0; "  // 3*100 + 0 = 300
+        "end Main; end C;"), "300");
 }
 
 // §4.10: self is fully usable after ExceptWith — a subsequent Add grows Count,
@@ -174,7 +184,8 @@ BEZEL_TEST(owned_set_exceptwith_1478, self_reusable_after_except_spec_4_10) {
 // Array only borrows its elements (they are owned by the `using var` boxes),
 // so ExceptWith never disposes them.
 BEZEL_TEST(owned_set_exceptwith_1478, other_is_borrowing_array_spec_4_10) {
-    BEZEL_EXPECT_EQ(run(std::string(kBox) +
+    // 301 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(std::string(kBox) +
         "public static method Main(): int "
         "  using var s := new OwningSet<Box>(); "
         "  s.Add(move (new Box(1))); "
@@ -186,6 +197,6 @@ BEZEL_TEST(owned_set_exceptwith_1478, other_is_borrowing_array_spec_4_10) {
         "  other.Add(q3); "
         "  s.ExceptWith(other); "
         // s = {2} → Count 1; s's Box(1) disposed; q1/q3 still live → Box.n 3.
-        "  return Box.n * 100 + s.Count; "  // 3*100 + 1 = 301
-        "end Main; end C;"), 301);
+        "  Console.WriteLine(Box.n * 100 + s.Count); return 0; "  // 3*100 + 1 = 301
+        "end Main; end C;"), "301");
 }
