@@ -616,14 +616,24 @@ inline JitResult runAot(std::string_view source) {
 // with `Console.WriteLine(<expr>)` (stdlib §2.1 — real API, per-type numeric
 // overloads since v0.165) and `return 0`, then assert on the captured stdout
 // instead of the exit code. runAotOut is the one-call counterpart to that: it
-// returns the program's stdout (WriteLine appends '\n', so the expected string
-// is "<value>\n"), or the sentinel "<did-not-run>" if the program was rejected
-// / crashed / timed out — mirroring the `run()` helpers' `r.ran ? … : -999`
-// idiom on the string channel, and centralizing the `r.ran ? r.stdoutText : …`
-// line every already-migrated stdout test would otherwise copy locally.
+// returns the program's stdout with a SINGLE trailing line-ending stripped, so
+// the expected string is the bare "<value>" (NOT "<value>\n"). Console.WriteLine
+// appends Console.NewLine — "\n" on Unix, "\r\n" on Windows — so baking the
+// terminator into the expected string would be platform-dependent; stripping it
+// here keeps every migrated test's expectation platform-independent. Returns the
+// sentinel "<did-not-run>" if the program was rejected / crashed / timed out —
+// mirroring the `run()` helpers' `r.ran ? … : -999` idiom on the string channel.
+// A test that prints MULTIPLE lines (or needs the raw bytes) should use
+// runAot(...).stdoutText directly rather than this single-value helper.
 inline std::string runAotOut(std::string_view source) {
     auto r = runAot(source);
-    return r.ran ? r.stdoutText : std::string("<did-not-run>");
+    if (!r.ran) return std::string("<did-not-run>");
+    std::string out = r.stdoutText;
+    if (!out.empty() && out.back() == '\n') {
+        out.pop_back();
+        if (!out.empty() && out.back() == '\r') out.pop_back();  // CRLF
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
