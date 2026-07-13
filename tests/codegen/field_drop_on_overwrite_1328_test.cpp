@@ -34,6 +34,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/aot_support.hpp"      // runAot — AOT oracle (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "native_test_harness.hpp"
 #include "test_harness.hpp"
@@ -41,14 +42,19 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 namespace fs = std::filesystem;
 
-// JIT run without ownership pass (value tests).
+// AOT oracle: drop-on-overwrite (§28.7) is disposal codegen, but the programs
+// must first pass the ownership + definite-assignment passes the JIT skipped.
+// The owned link fields are `Cell?` (nullable): a non-nullable owned field that
+// a constructor leaves unassigned is a §7.9 definite-assignment error, and the
+// tests' premise is precisely that the slot STARTS null and is filled/overwritten
+// later. The Cell._n counter is the dispose-exactly-once oracle.
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -113,11 +119,15 @@ const std::string kCellHdr =
     "  destructor Cell._n := Cell._n - 1; end destructor; "
     "end Cell; ";
 
-// A container class with ONE owned Cell field and a trivial destructor.
-// (The compiler synthesizes field disposal after the destructor body.)
+// A container class with ONE owned (nullable) Cell field and a trivial
+// destructor. (The compiler synthesizes field disposal after the destructor
+// body.) `_child` is `Cell?` so the field legitimately starts null — the null
+// slot the first assignment fills (§7.9: a non-nullable owned field must be
+// assigned by every constructor; the tests' premise is a null-until-first-assign
+// slot).
 const std::string kContainerHdr =
     "class Container "
-    "  public owned _child: Cell; "
+    "  public owned _child: Cell? := null; "
     "  public constructor() end constructor; "
     "  destructor end destructor; "
     "end Container; ";
@@ -163,16 +173,22 @@ BEZEL_TEST(field_drop_on_overwrite_1328,
         "end Main; end C;"), 0);
 }
 
-// §28.7 / #1328: self-assign `c._child := c._child` must NOT dispose the field
-//   value (identity-guard prevents UAF).  The Cell is still live after the
-//   self-assign, and is disposed exactly once when c is disposed.
+// §28.7 / §28.8.1 / #1328: self-assign of an owned field via `move` must NOT
+//   dispose the field value.  A plain `c._child := c._child` is not expressible
+//   for an owned field — reading an owned field yields a BORROW, and a borrow may
+//   not be stored into an owned field (§28.3, an owned-state LHS requires an
+//   owned RHS).  The identity-preserving self-assignment is `c._child := move
+//   c._child`: `move` takes the value out (slot → moved-from/null), then drop-on-
+//   overwrite sees the moved-from slot and stores back WITHOUT disposing (§28.7 /
+//   §28.8.1 moved-from-overwrite).  The Cell is still live afterward and is
+//   disposed exactly once when c is disposed.
 BEZEL_TEST(field_drop_on_overwrite_1328,
            field_self_assign_no_dispose_spec_28_7) {
     BEZEL_EXPECT_EQ(run(kCellHdr + kContainerHdr +
         "class C public static method Main(): int "
         "  do using var c := new Container(); "
-        "    c._child := new Cell(); "   // Cell._n = 1
-        "    c._child := c._child; "     // self-assign: no dispose
+        "    c._child := new Cell(); "        // Cell._n = 1
+        "    c._child := move c._child; "     // self-move: no dispose
         "    if Cell._n <> 1 then return 101; end; "  // Cell still live
         "  end; "                        // Container disposed → Cell disposed
         "  return Cell._n; "            // 0
@@ -184,19 +200,22 @@ BEZEL_TEST(field_drop_on_overwrite_1328,
 //   stores a new value without disposing (null-guard skips the null slot).
 //   Both the moved-out value (via `x`) and the new field value are disposed once.
 //
-//   Note: `move c._field` for a non-`this` receiver is NOT nulled by the codegen
-//   (only `move this._field` inside a class method nulls the field slot), so we
-//   use an explicit `TakeChild()` method returning `owned Cell` to correctly
-//   transfer ownership and null the slot in a supported, ownership-sound way.
+//   `TakeChild()` uses §28.8.1's nullable-field detach pattern: `move this._child!`
+//   reads the owned value out (leaving the field moved-from), then `this._child :=
+//   null` restores the nullable slot to empty — a moved-from field MUST be
+//   reassigned before the method exits (§28.8.1), and for a nullable owned field
+//   `null` is the valid empty-slot restoration.
 BEZEL_TEST(field_drop_on_overwrite_1328,
            field_move_then_assign_no_double_dispose_spec_28_7) {
     BEZEL_EXPECT_EQ(run(kCellHdr +
-        // Container3 has a TakeChild method that moves this._child (properly
-        // supported: moves out of a this-field inside the class).
+        // Container3 has a TakeChild method that moves this._child out (moving
+        // from a this-field inside the class) and restores the slot to null.
         "class Container3 "
-        "  public owned _child: Cell; "
+        "  public owned _child: Cell? := null; "
         "  public constructor() end constructor; "
-        "  public method TakeChild(): owned Cell return move this._child; end TakeChild; "
+        "  public method TakeChild(): owned Cell "
+        "    var r := move this._child!; this._child := null; return r; "
+        "  end TakeChild; "
         "  destructor end destructor; "
         "end Container3; "
         "class C public static method Main(): int "
@@ -234,25 +253,32 @@ BEZEL_TEST(field_drop_on_overwrite_1328,
         "end Main; end C;"), 0);
 }
 
-// §28.7 / #1328: a NON-owned (borrow) field must NOT be disposed on overwrite.
-//   A borrow field merely aliases an object owned elsewhere.  Overwriting it
-//   only updates the alias; the original owner retains the sole disposal
-//   obligation.
+// §28.7 / §28.5 / #1328: a NON-owned (borrow) field must NOT be disposed on
+//   overwrite.  A borrow field merely aliases an object owned elsewhere.
+//   Overwriting it only updates the alias; the original owner retains the sole
+//   disposal obligation.
+//
+//   The alias is installed through a method taking a plain (borrow) parameter —
+//   `SetBorrow(b: Cell)` storing `_borrow := b` — the §28.5/§28.3 back-reference
+//   idiom.  A direct `h._borrow := c1` on a scope-bound owned local is rejected
+//   ("a borrow may not be assigned to any field of any object", §28.3); a borrow
+//   PARAMETER stored into a non-owned field is the admitted back-reference form.
 BEZEL_TEST(field_drop_on_overwrite_1328,
            borrow_field_not_disposed_on_overwrite_spec_28_7) {
     BEZEL_EXPECT_EQ(run(kCellHdr +
-        // Container with a BORROW field (no `owned` modifier).
+        // Container with a nullable BORROW field (no `owned` modifier).
         "class Holder "
-        "  public _borrow: Cell; "     // borrow, not owned
+        "  public _borrow: Cell? := null; "   // borrow, not owned
         "  public constructor() end constructor; "
+        "  public method SetBorrow(b: Cell) _borrow := b; end SetBorrow; "
         "  destructor end destructor; "  // no auto-dispose of _borrow
         "end Holder; "
         "class C public static method Main(): int "
         "  do using var c1 := new Cell(); "   // _n = 1
         "    using var c2 := new Cell(); "    // _n = 2
         "    using var h := new Holder(); "
-        "    h._borrow := c1; "       // borrow alias to c1; _n stays 2
-        "    h._borrow := c2; "       // borrow alias to c2; c1 NOT disposed
+        "    h.SetBorrow(c1); "       // borrow alias to c1; _n stays 2
+        "    h.SetBorrow(c2); "       // borrow alias to c2; c1 NOT disposed
         "    if Cell._n <> 2 then return 101; end; "  // both still live
         "  end; "   // c1 and c2 disposed by their using vars; _n = 0
         "  return Cell._n; "           // 0
@@ -265,7 +291,7 @@ BEZEL_TEST(field_drop_on_overwrite_1328,
            method_this_field_reassign_disposes_old_spec_28_7) {
     BEZEL_EXPECT_EQ(run(kCellHdr +
         "class C2 "
-        "  private owned _child: Cell; "
+        "  private owned _child: Cell? := null; "   // nullable: empty ctor leaves it null (§7.9)
         "  public constructor() end constructor; "
         "  public method SetChild(owned v: Cell) "
         "    _child := v; "   // this._child := v; disposes displaced on 2nd call
@@ -302,7 +328,7 @@ BEZEL_TEST(field_drop_on_overwrite_1328,
     BEZEL_EXPECT_EQ(rc, 0);  // 0 = ASan clean (no leak, no double-free)
 }
 
-// §28.7 / #1328: self-assign under ASan — no use-after-free.
+// §28.7 / §28.8.1 / #1328: self-move under ASan — no use-after-free.
 BEZEL_TEST(field_drop_on_overwrite_1328,
            asan_self_assign_no_uaf_spec_28_7) {
     int rc = runUnderASan(
@@ -310,7 +336,7 @@ BEZEL_TEST(field_drop_on_overwrite_1328,
         "class C public static method Main(): int "
         "  do using var c := new Container(); "
         "    c._child := new Cell(); "
-        "    c._child := c._child; "    // identity-guard prevents UAF
+        "    c._child := move c._child; "    // self-move: moved-from slot, no dispose
         "  end; return 0; end Main; end C;");
     if (rc == -1) return;  // toolchain unavailable — skip
     BEZEL_EXPECT_EQ(rc, 0);  // 0 = ASan clean (no use-after-free)
