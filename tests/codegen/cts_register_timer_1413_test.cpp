@@ -22,7 +22,8 @@
 //     lane report); Cancel() before the timer fires makes the timer a no-op; and a
 //     source disposed before its timer fires tears down safely (the UAF pin).
 //
-// The Register/timer VALUE behaviour is exercised here in-process (JIT); the memory
+// The Register/timer VALUE behaviour is exercised here via the native AOT path
+// (runAot — JIT->AOT migration); the memory
 // discipline (register→cancel→dispose lifecycle; dispose-before-timer) is checked by
 // the SYNCHRONOUS ASan/LSan probes at the bottom.  (The timer VALUE tests use small
 // 20-40 ms delays awaited across Task.Delay so the suite stays fast.)  Note: an
@@ -47,6 +48,7 @@
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
@@ -56,12 +58,12 @@
 #include "llvm/IR/Module.h"
 
 namespace fs = std::filesystem;
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -213,12 +215,25 @@ BEZEL_TEST(codegen_cts_register_1413, register_on_already_cancelled_fires_synchr
 // §6.1: the Subscription returned for an already-cancelled token is a no-op — its
 // Dispose() is safe and idempotent (the callback already fired synchronously; box.V
 // is 1 and disposing the handle twice does not crash or change it).
+//
+// AOT-migration finding (JIT->AOT divergence, class B): `sub` must be bound with
+// `using var`, not a plain `var` — §28.14's scoped-callback admission requires the
+// call producing a capture-bearing Subscription to bind its result in a `using
+// var`/`await using var` local (or receive it through `this`) so the compiler can
+// bound the callback's captured locals (`box`) against the Subscription's scope; a
+// plain `var` gives it no such scope to bound against and is rejected. The JIT
+// harness never ran the ownership pass (§28.14 lives there), so it silently
+// accepted the plain `var` form. The two explicit `.Dispose()` calls below still
+// exercise the idempotent-double-dispose behavior the test is named for; the
+// redundant second call now also draws a §28.2 informational Warning (not an
+// Error — it does not fail `.hasErrors()`), which is the compiler correctly
+// flagging exactly the pattern this test intentionally exercises.
 BEZEL_TEST(codegen_cts_register_1413, noop_subscription_dispose_is_safe) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var box := new Box(); "
         "using var cts := new CancellationTokenSource(); "
         "cts.Cancel(); "
-        "var sub := cts.Token.Register(() => do box.Bump(); end); "
+        "using var sub := cts.Token.Register(() => do box.Bump(); end); "
         "sub.Dispose(); sub.Dispose(); "
         "return box.V; ")), 1);
 }
