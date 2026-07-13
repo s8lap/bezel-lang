@@ -22,15 +22,22 @@
 // bumps; the counter (often encoded) is the exit code. Before the fix these
 // programs SEGFAULT / double-free; after, they dispose each element exactly once.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAotChecked;
 
 namespace {
 
+// Compile with generated-code AddressSanitizer, run under LeakSanitizer, and
+// return the program's exit code — the dispose-exactly-once oracle for this
+// slot-move file. A double-free / use-after-free (the #409 defect these tests
+// guard against) or a leak FAILS the run (ran=false -> -999), so the sanitizer
+// verdict rides on the same assertion as the destructor-count value. This
+// consolidates the retired hand-rolled JIT-count + bespoke-LSan pair into the
+// standard checked AOT harness.
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAotChecked(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -70,12 +77,15 @@ BEZEL_TEST(move_coll_slot_28_8_1, owned_array_move_slot_disposes_once) {
         "return afterX * 10 + R._n;"), 11);   // array skipped the slot -> 11
 }
 
-// §28.8.1 / §28.3: `move` of a `using var` LOCAL into an owning constructor
-// transfers ownership; the moved-from local's scope-end Dispose must SKIP (its
-// slot is nulled at the move) so the object is disposed EXACTLY ONCE by its new
-// owner — no double-dispose. Holder owns the moved-in R; at scope end Holder
-// disposes it (R._n -> 1) and `b` (moved-from) disposes nothing.
-// Before the fix: segfault (b re-freed the object already disposed by Holder).
+// §28.8.1 / §28.3 / §22.3: transferring a plain-`var` owned LOCAL into an owning
+// constructor consumes the local — the call-site `owned` marker announces the
+// transfer. The moved-from local has no disposal obligation, so the object is
+// disposed EXACTLY ONCE by its new owner (Holder), no double-dispose: at scope
+// end Holder disposes it (R._n -> 1) and `b` (moved-from) disposes nothing.
+// A `using var` is scope-bound and *cannot* be moved out (§28.3 — the spec's own
+// "copy is using-var, cannot move out" example); the pre-migration form moved
+// out of a `using var`, which the JIT harness ran only because it skips the
+// ownership pass the AOT/real driver enforces.
 BEZEL_TEST(move_coll_slot_28_8_1, move_usingvar_local_into_owning_ctor_disposes_once) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
@@ -88,8 +98,8 @@ BEZEL_TEST(move_coll_slot_28_8_1, move_usingvar_local_into_owning_ctor_disposes_
         "end Holder; "
         "class C public static method Main(): int "
         "  do "
-        "    using var b := new R(); "
-        "    using var a := new Holder(move b); "
+        "    var b := new R(); "
+        "    using var a := new Holder(owned b); "
         "  end; "
         "  return R._n; "                     // 1 = single dispose (correct)
         "end Main; end C;"), 1);
