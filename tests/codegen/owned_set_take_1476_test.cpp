@@ -51,14 +51,21 @@
 // exactly-once disposal (no leak, no double-free) for every scenario below
 // before promoting to gtest form.
 
+// AOT MIGRATION (JIT->AOT): runs under the AOT driver (runAot) — the stricter
+// oracle (full ownership + definite-assignment pipeline). Tests whose packed
+// return value exceeds 255 (the 8-bit exit-code ceiling) print it via
+// Console.WriteLine and assert on stdout through runAotOut; the §21.9 bare-
+// discard leak test asserts an AOT compile reject.
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -103,7 +110,8 @@ const char* kBox =
 // stored element via s.First(), so reference identity trivially matches),
 // removes it (Count decreases), and returns it — the returned Tag matches.
 BEZEL_TEST(owned_set_take_1476, take_found_returns_correct_element_and_count_spec_4_10) {
-    BEZEL_EXPECT_EQ(run(makeProgram(
+    // Packed value 3210 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(makeProgram(
         "using var s := new OwningSet<R>(); "
         "s.Add(new R(1)); s.Add(new R(2)); s.Add(new R(3)); "
         "var countBefore := s.Count; "
@@ -112,9 +120,9 @@ BEZEL_TEST(owned_set_take_1476, take_found_returns_correct_element_and_count_spe
         "using var taken := s.Take(q); "
         "var countAfter := s.Count; "
         "var tagOk := 0; if taken.Tag = expectedTag then tagOk := 1; end; "
-        "return countBefore * 1000 + countAfter * 100 + tagOk * 10;"
+        "Console.WriteLine(countBefore * 1000 + countAfter * 100 + tagOk * 10); return 0;"
         // countBefore=3, countAfter=2, tagOk=1 => 3000 + 200 + 10 = 3210
-    )), 3210);
+    )), "3210");
 }
 
 // §4.10 / §28.3: the taken element is NOT disposed while still held by the
@@ -143,7 +151,8 @@ BEZEL_TEST(owned_set_take_1476, take_disposes_exactly_once_no_leak_no_double_fre
 // and remove it. All three live objects (the surviving Box(7), the removed
 // Box(5), and the separate query instance) are accounted for exactly once.
 BEZEL_TEST(owned_set_take_1476, take_honors_user_equals_override_spec_4_10_8_3) {
-    BEZEL_EXPECT_EQ(run(std::string(kBox) +
+    // Packed value 215030 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(std::string(kBox) +
         "public static method Main(): int "
         "  var countBefore := 0; var countAfter := 0; var takenX := -1; "
         "  var nBefore := 0; "
@@ -157,10 +166,10 @@ BEZEL_TEST(owned_set_take_1476, take_honors_user_equals_override_spec_4_10_8_3) 
         "    takenX := taken.X; "
         "    nBefore := Box.n; "               // query + taken + surviving Box(7)
         "  end; "
-        "  return countBefore * 100000 + countAfter * 10000 + takenX * 1000 + "
-        "         nBefore * 10 + Box.n; "
+        "  Console.WriteLine(countBefore * 100000 + countAfter * 10000 + takenX * 1000 + "
+        "         nBefore * 10 + Box.n); return 0; "
         // 2*100000 + 1*10000 + 5*1000 + 3*10 + 0 = 215030
-        "end Main; end C;"), 215030);
+        "end Main; end C;"), "215030");
 }
 
 // stdlib §4.9 / §4.10: Take raises InvalidOperationException when no equal
@@ -209,7 +218,9 @@ BEZEL_TEST(owned_set_take_1476, take_on_empty_set_raises_spec_4_10) {
 // pass consults) instead of silently compiling and leaking the removed
 // element.
 BEZEL_TEST(owned_set_take_1476, take_bare_discard_is_compile_error_spec_21_9) {
-    auto r = runJit(makeProgram(
+    // AOT reject: the driver's front-end runs the same §21.9 leak diagnostic; a
+    // rejected program yields !ran with an Error diagnostic (the driver stderr).
+    auto r = runAot(makeProgram(
         "using var s := new OwningSet<R>(); "
         "s.Add(new R(1)); "
         "var q := s.First(); "
@@ -228,7 +239,8 @@ BEZEL_TEST(owned_set_take_1476, take_bare_discard_is_compile_error_spec_21_9) {
 // established `item?.Dispose()` idiom for a builtin Try*'s out-owned
 // recipient — owned_collection_trypop_831_test.cpp's pattern).
 BEZEL_TEST(owned_set_take_1476, trytake_found_true_transfers_and_decrements_count_spec_4_10) {
-    BEZEL_EXPECT_EQ(run(makeProgram(
+    // Packed value 1032013 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(makeProgram(
         "var ok := false; var tag := -1; "
         "var countBefore := 0; var countAfter := 0; "
         "do "
@@ -243,10 +255,10 @@ BEZEL_TEST(owned_set_take_1476, trytake_found_true_transfers_and_decrements_coun
         "  item?.Dispose(); "
         "end; "
         "var okI := 0; if ok then okI := 1; end; "
-        "return okI * 1000000 + countBefore * 10000 + countAfter * 1000 + "
-        "       tag * 10 + R._n;"
+        "Console.WriteLine(okI * 1000000 + countBefore * 10000 + countAfter * 1000 + "
+        "       tag * 10 + R._n); return 0;"
         // 1*1000000 + 3*10000 + 2*1000 + 1*10 + 3 = 1032013
-    )), 1032013);
+    )), "1032013");
 }
 
 // stdlib §4.10: TryTake's no-throw failure path — returns false, the out
@@ -255,7 +267,8 @@ BEZEL_TEST(owned_set_take_1476, trytake_found_true_transfers_and_decrements_coun
 // disturbed: both surviving elements plus the separately-owned `missing`
 // query are each disposed exactly once (no leak, no double-free).
 BEZEL_TEST(owned_set_take_1476, trytake_not_found_false_null_out_no_mutation_spec_4_10) {
-    BEZEL_EXPECT_EQ(run(makeProgram(
+    // Packed value 102203 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(makeProgram(
         "var ok := true; var isNull := false; "
         "var countBefore := 0; var countAfter := 0; "
         "do "
@@ -271,16 +284,17 @@ BEZEL_TEST(owned_set_take_1476, trytake_not_found_false_null_out_no_mutation_spe
         "end; "
         "var okI := 0; if ok then okI := 1; end; "
         "var nullI := 0; if isNull then nullI := 1; end; "
-        "return okI * 1000000 + nullI * 100000 + countBefore * 1000 + "
-        "       countAfter * 100 + R._n;"
+        "Console.WriteLine(okI * 1000000 + nullI * 100000 + countBefore * 1000 + "
+        "       countAfter * 100 + R._n); return 0;"
         // 0 + 1*100000 + 2*1000 + 2*100 + 3 = 102203
-    )), 102203);
+    )), "102203");
 }
 
 // §4.10 / §8.3: TryTake also matches by the element's equality contract (user
 // Equals override), not reference identity — mirrors the Take test above.
 BEZEL_TEST(owned_set_take_1476, trytake_honors_user_equals_override_spec_4_10_8_3) {
-    BEZEL_EXPECT_EQ(run(std::string(kBox) +
+    // Packed value 1050 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(std::string(kBox) +
         "public static method Main(): int "
         "  var ok := false; var okX := -1; "
         "  do "
@@ -293,9 +307,9 @@ BEZEL_TEST(owned_set_take_1476, trytake_honors_user_equals_override_spec_4_10_8_
         "    item?.Dispose(); "
         "  end; "
         "  var okI := 0; if ok then okI := 1; end; "
-        "  return okI * 1000 + okX * 10 + Box.n; "
+        "  Console.WriteLine(okI * 1000 + okX * 10 + Box.n); return 0; "
         // 1*1000 + 5*10 + 0 = 1050
-        "end Main; end C;"), 1050);
+        "end Main; end C;"), "1050");
 }
 
 // --------------------------------------------------------------------------
@@ -306,12 +320,13 @@ BEZEL_TEST(owned_set_take_1476, trytake_honors_user_equals_override_spec_4_10_8_
 // --------------------------------------------------------------------------
 
 BEZEL_TEST(owned_set_take_1476, linq_take_count_on_array_unaffected_regression) {
-    BEZEL_EXPECT_EQ(run(
+    // 306 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  var a: Array<int> := [1, 2, 3, 4, 5]; "
         "  var t := a.Take(3).ToArray(); "
-        "  return t.Count * 100 + t.Sum(); "  // 3*100 + (1+2+3) = 306
-        "end Main; end C;"), 306);
+        "  Console.WriteLine(t.Count * 100 + t.Sum()); return 0; "  // 3*100 + (1+2+3) = 306
+        "end Main; end C;"), "306");
 }
 
 BEZEL_TEST(owned_set_take_1476, linq_take_count_on_owning_array_unaffected_regression) {
