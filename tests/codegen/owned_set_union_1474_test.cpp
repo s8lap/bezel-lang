@@ -25,14 +25,20 @@
 //   * every element - whether kept in self or disposed as a duplicate - is
 //     destructed EXACTLY once (no leak, no double-free).
 
+// AOT MIGRATION (JIT->AOT): runs under the AOT driver (runAot) — the stricter
+// oracle that runs the full ownership + definite-assignment pipeline. Tests
+// whose packed return value exceeds 255 (the 8-bit exit-code ceiling) print it
+// via Console.WriteLine and assert on stdout through runAotOut.
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -90,7 +96,8 @@ BEZEL_TEST(owned_set_union_1474, disjoint_union_merges_both_spec_4_10) {
 // in is destructed exactly once (not zero — leaked; not more than once —
 // double free).
 BEZEL_TEST(owned_set_union_1474, merged_elements_disposed_exactly_once_spec_4_10) {
-    BEZEL_EXPECT_EQ(run(std::string(kCell) +
+    // Packed value 20220 exceeds the 8-bit exit-code ceiling → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(std::string(kCell) +
         "public static method Main(): int "
         "  var midCount := 0; "
         "  var midN := 0; "
@@ -104,9 +111,9 @@ BEZEL_TEST(owned_set_union_1474, merged_elements_disposed_exactly_once_spec_4_10
         "    midN := Cell.n; "
         "  end; "
         // after s1's using-var disposal: both cells destructed exactly once.
-        "  return midCount * 10000 + midN * 100 + Cell.disposeCount * 10 + Cell.n; "
+        "  Console.WriteLine(midCount * 10000 + midN * 100 + Cell.disposeCount * 10 + Cell.n); return 0; "
         // 2*10000 + 2*100 + 2*10 + 0 = 20220
-        "end Main; end C;"), 20220);
+        "end Main; end C;"), "20220");
 }
 
 // §4.10 / §8.3: UnionWith merging a set that contains a DUPLICATE (per the
