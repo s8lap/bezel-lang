@@ -401,19 +401,71 @@ struct CompileStatus {
 // token is held in the PARENT across the whole compile+link and released on
 // return, so it is robust even when the forked child crashes.
 //
-// N defaults to ~3/4 of the core count (headroom for the ~1-2 GiB/compile peak
-// against the dev_heavy 24-28 GiB slice cap) and is overridable via
-// BEZEL_AOT_LINK_TOKENS (0 disables the pool — e.g. for a single-process run
-// where the bound only adds latency). This is the machine-wide knob for
-// "control test parallelism when multiple agents run the suite together."
+// N defaults to min(PHYSICAL cores, RAM/1.5 GiB) and is overridable via
+// BEZEL_AOT_LINK_TOKENS (0 disables the pool — e.g. a single-process run where
+// the bound only adds latency). PHYSICAL, not logical, cores: a compile+link is
+// largely single-threaded and RAM-heavy, so SMT/hyperthread siblings add ~1.2x
+// throughput, not 2x — sizing to logical cores oversubscribes CPU and RAM.
+// (Measured on a 10-physical/20-logical box: sharded suite 125s at N=10 vs 119s
+// at N=15 vs 122s unbounded — the logical-core default bought nothing and only
+// raised the RAM/PID ceiling.) The RAM clamp keeps a many-core/small-RAM host
+// from OOMing on N concurrent ~1.5 GiB links. This is the machine-wide knob for
+// "control test parallelism when multiple agents run the suite together": when
+// several agents run the suite at once, set BEZEL_AOT_LINK_TOKENS LOWER so the
+// TOTAL concurrent-compile count across all of them stays bounded.
+
+// Physical (not hyperthread) core count — the useful concurrency ceiling for a
+// CPU+RAM-heavy compile/link. Derived from /proc/cpuinfo as
+// logical * (cpu_cores / siblings) so it is correct across sockets; falls back
+// to logical/2 (assume 2-way SMT) if /proc/cpuinfo is unreadable.
+inline int physicalCoreCount() {
+    unsigned logical = std::thread::hardware_concurrency();
+    if (logical == 0) logical = 8;
+    int cpuCores = 0, siblings = 0;
+    std::ifstream in("/proc/cpuinfo");
+    std::string line;
+    while (in && (cpuCores == 0 || siblings == 0) && std::getline(in, line)) {
+        auto field = [&](const char* key) -> int {
+            if (line.rfind(key, 0) != 0) return 0;
+            auto pos = line.find(':');
+            return pos == std::string::npos ? 0 : std::atoi(line.c_str() + pos + 1);
+        };
+        if (cpuCores == 0) cpuCores = field("cpu cores");
+        if (siblings == 0) siblings = field("siblings");
+    }
+    if (cpuCores > 0 && siblings > 0) {
+        int phys = static_cast<int>(logical) * cpuCores / siblings;
+        return phys < 1 ? 1 : phys;
+    }
+    int phys = static_cast<int>(logical) / 2;   // no topology → assume 2-way SMT
+    return phys < 1 ? 1 : phys;
+}
+
+// Cap from available RAM: each concurrent compile+link peaks ~1.5 GiB, so this
+// keeps a many-core/small-RAM box from OOMing. Returns a large number when
+// MemAvailable is unreadable, so the core count governs by default.
+inline int memoryCompileCap() {
+    std::ifstream in("/proc/meminfo");
+    std::string key;
+    long kib = 0;
+    while (in >> key) {
+        if (key == "MemAvailable:") { in >> kib; break; }
+        std::string rest;
+        std::getline(in, rest);
+    }
+    if (kib <= 0) return 1 << 20;   // unknown → do not bind on memory
+    int cap = static_cast<int>((kib / 1024.0 / 1024.0) / 1.5);
+    return cap < 2 ? 2 : cap;
+}
+
 inline int aotLinkTokenCount() {
     static const int v = [] {
         if (const char* e = std::getenv("BEZEL_AOT_LINK_TOKENS")) {
             if (*e != '\0') { int n = std::atoi(e); return n < 0 ? 0 : n; }
         }
-        unsigned hc = std::thread::hardware_concurrency();
-        if (hc == 0) hc = 8;
-        int n = static_cast<int>(hc * 3u / 4u);
+        int phys = physicalCoreCount();
+        int mem = memoryCompileCap();
+        int n = phys < mem ? phys : mem;
         return n < 1 ? 1 : n;
     }();
     return v;
