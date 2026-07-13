@@ -15,8 +15,15 @@ namespace {
 std::string wrap(const std::string& method) {
     return std::string("module M; "
         "class T end T; class View end View; "
+        // `View()` returns a borrow of an `owned` field (the field outlives the
+        // call, so this is a clean borrow return). A `=> null` stub body is now
+        // a §7 error (null into a non-nullable `View` return), since §22.2 arrow
+        // bodies run the same §5.1/§7 return-convertibility check as the block
+        // form (#1774); the field-borrow body preserves what the tests exercise
+        // — `c.View()` yields a reference-typed borrow whose escape is analyzed.
         "class Connection "
-        "  public method View(): View => null; "
+        "  public owned _v: View := new View(); "
+        "  public method View(): View => this._v; "
         "end Connection; "
         "class C ") + method + " end C;";
 }

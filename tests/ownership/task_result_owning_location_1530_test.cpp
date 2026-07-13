@@ -46,10 +46,15 @@ namespace {
 std::string wrap(const std::string& body, const std::string& sig = "M()") {
     return std::string("module M; "
         "class Conn end Conn; "
-        "class Producer "
-        "  public method MakeShared(): Task<Conn> => null; "
-        "  public method MakeOwned(): OwningTask<Conn> => null; "
-        "  public method MakeInt(): Task<int> => null; "
+        // Producer is an INTERFACE (abstract methods, no bodies): a `=> null`
+        // stub body is now a §7 error (null into a non-nullable task type),
+        // since §22.2 arrow bodies run the same §5.1/§7 return-convertibility
+        // check as the block form (#1774). The call sites the tests exercise
+        // are unchanged — Producer is only ever a `p: Producer := null;` field.
+        "interface Producer "
+        "  method MakeShared(): Task<Conn>; "
+        "  method MakeOwned(): OwningTask<Conn>; "
+        "  method MakeInt(): Task<int>; "
         "end Producer; "
         "class C "
         "  public p: Producer := null; "

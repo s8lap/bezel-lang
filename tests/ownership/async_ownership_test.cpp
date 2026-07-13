@@ -52,20 +52,22 @@ using bezel::test::parseAndCheckOwnership;
 
 namespace {
 
-// Preamble: a Producer with concrete (non-async, body-bearing) methods that
-// return the three task shapes, plus a class C hosting the async method under
-// test. Using non-async producer bodies (`=> null`) keeps the producer free
-// of its own ownership diagnostics; only the awaiting method `M` is tested.
+// Preamble: a Producer INTERFACE declaring methods that return the three task
+// shapes (abstract — no body — so the producer contributes no arrow-body of its
+// own to type-check; a `=> null` stub body is a §7 error, null into a
+// non-nullable task type, now that §22.2 arrow bodies run the same §5.1/§7
+// return-convertibility check the block form does, #1774), plus a class C
+// hosting the async method under test. Only the awaiting method `M` is tested.
 // `Conn` / `T` are class types so `OwningTask<Conn>` / `Task<Conn>` are the
 // class-typed Pattern B / Pattern A forms. A `Use(c: Conn)` borrow-consuming
 // helper sits alongside `M` for the argument-position tests.
 std::string wrap(const std::string& body, const std::string& sig = "M(): Task") {
     return std::string("module M; "
         "class Conn end Conn; class T end T; "
-        "class Producer "
-        "  public method MakeOwned(): OwningTask<Conn> => null; "
-        "  public method MakeShared(): Task<Conn> => null; "
-        "  public method MakeUnit(): Task => null; "
+        "interface Producer "
+        "  method MakeOwned(): OwningTask<Conn>; "
+        "  method MakeShared(): Task<Conn>; "
+        "  method MakeUnit(): Task; "
         "end Producer; "
         "class C "
         "  public p: Producer := null; "
@@ -272,7 +274,7 @@ BEZEL_TEST(async_own_patternA, await_value_typed_task_any_position_clean) {
     auto r = parseAndCheckOwnership(
         "module M; "
         "class C "
-        "  public method MakeInt(): Task<int> => null; "
+        "  public method MakeInt(): Task<int> => Task.FromResult(0); "
         "  public async method M(): Task "
         "    var r := await MakeInt(); "
         "  end M; "

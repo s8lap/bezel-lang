@@ -4344,6 +4344,26 @@ void ExprTC::runMethodBody(
     forbiddenForwardParams_.clear();
     if (exprBody) {
         visitExpr(*exprBody);
+        // §5.1 / §22.2 (issue #1774): an expression body `=> E` is the method's
+        // returned value — spec-equivalent to `{ return E; }` (§22.2) — so E
+        // must satisfy the SAME return-type convertibility check the block-form
+        // `return E;` runs (the ReturnStmt arm of visitStmt, "Slice T3" below).
+        // Without this, a type-mismatched arrow body (`method Foo(): int =>
+        // "x"`, or a paren-less method reference of type `() -> int`) skipped
+        // §5.1 and reached codegen, which emitted a `ret` whose operand type
+        // differed from the function's return type — malformed LLVM IR (a
+        // verifier failure / miscompile). Gate exactly as the block form does:
+        // a value-returning method/operator with a resolved return type. (A
+        // `void`/procedure arrow body has returnCtx_ VoidMethod and is exempt;
+        // an `async` value method carries the peeled element type in
+        // currentReturnType_, so `=> await P()` is checked against that element,
+        // matching the block-form `return await P();`.)
+        if (returnCtx_ == ReturnCtx::ValueMethod && currentReturnType_) {
+            checkAssignable(
+                ctx_.exprType(*exprBody), currentReturnType_,
+                exprBody->span.begin, "returned value",
+                exprBody);  // §27.6 #756 property-ref
+        }
         // §22.4 (v0.183, #1585): the expression body is the returned value; it
         // must satisfy any out-nullability postcondition. (Realistically an
         // out-param method has a statement body — an expression body cannot

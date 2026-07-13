@@ -149,7 +149,7 @@ BEZEL_TEST(async_borrow_1518, nonasync_span_param_accepted) {
 BEZEL_TEST(async_borrow_1519, local_span_across_await_caller_source_rejected) {
     auto r = parseAndCheckOwnership(
         "module M; class C "
-        "  public method Wait(): Task => null; "
+        "  public method Wait(): Task => Task.Delay(0); "
         "  public async method Work(arr: Array<byte>): Task "
         "    var s := arr.AsSpan(); "
         "    await Wait(); "
@@ -165,7 +165,7 @@ BEZEL_TEST(async_borrow_1519, local_span_across_await_caller_source_rejected) {
 BEZEL_TEST(async_borrow_1519, local_span_using_var_source_accepted) {
     auto r = parseAndCheckOwnership(
         "module M; class C "
-        "  public method Wait(): Task => null; "
+        "  public method Wait(): Task => Task.Delay(0); "
         "  public async method Work(): Task "
         "    using var arr := new Array<byte>(); "
         "    var s := arr.AsSpan(); "
@@ -182,7 +182,7 @@ BEZEL_TEST(async_borrow_1519, local_span_using_var_source_accepted) {
 BEZEL_TEST(async_borrow_1519, local_span_owned_param_source_accepted) {
     auto r = parseAndCheckOwnership(
         "module M; class C "
-        "  public method Wait(): Task => null; "
+        "  public method Wait(): Task => Task.Delay(0); "
         "  public async method Work(owned arr: Array<byte>): Task "
         "    var s := arr.AsSpan(); "
         "    await Wait(); "
@@ -198,7 +198,7 @@ BEZEL_TEST(async_borrow_1519, local_span_owned_param_source_accepted) {
 BEZEL_TEST(async_borrow_1519, local_span_used_before_await_accepted) {
     auto r = parseAndCheckOwnership(
         "module M; class C "
-        "  public method Wait(): Task => null; "
+        "  public method Wait(): Task => Task.Delay(0); "
         "  public async method Work(arr: Array<byte>): Task "
         "    var s := arr.AsSpan(); "
         "    var n := s.Length; "
@@ -214,7 +214,7 @@ BEZEL_TEST(async_borrow_1519, local_span_used_before_await_accepted) {
 BEZEL_TEST(async_borrow_1519, local_span_declared_after_await_accepted) {
     auto r = parseAndCheckOwnership(
         "module M; class C "
-        "  public method Wait(): Task => null; "
+        "  public method Wait(): Task => Task.Delay(0); "
         "  public async method Work(arr: Array<byte>): Task "
         "    await Wait(); "
         "    var s := arr.AsSpan(); "

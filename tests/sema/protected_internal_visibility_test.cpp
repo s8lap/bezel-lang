@@ -122,7 +122,7 @@ BEZEL_TEST(sema_vis_432, protected_method_from_declaring_class_ok) {
         "module M; "
         "class A "
         "  protected method Helper(): int => 42; "
-        "  public method Pub(): int => this.Helper; "
+        "  public method Pub(): int => this.Helper(); "
         "  public constructor() end constructor; "
         "  destructor end destructor; "
         "end A;");
@@ -139,7 +139,7 @@ BEZEL_TEST(sema_vis_432, protected_method_from_derived_class_ok) {
         "  destructor end destructor; "
         "end A; "
         "class B : A "
-        "  public method Pub(): int => this.Helper; "
+        "  public method Pub(): int => this.Helper(); "
         "  public constructor() end constructor; "
         "  destructor end destructor; "
         "end B;");
