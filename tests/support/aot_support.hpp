@@ -605,6 +605,28 @@ inline JitResult runAot(std::string_view source) {
 }
 
 // ---------------------------------------------------------------------------
+// runAotOut — the VALUE CHANNEL for observables that do not fit an 8-bit exit
+// code. A process exit status is masked to 0..255 (WEXITSTATUS), so a program
+// whose Main returns a value outside that range — a negative (IndexOf-not-found
+// = -1, a negative mod result), or a large one (1000, 2024, 60007) — cannot
+// round-trip through `runAot(...).exitCode` the way it did through the in-process
+// JIT's raw 32-bit int (see the header's "TWO SEMANTIC DIFFERENCES", #1).
+//
+// The mechanical migration of such a test is: make the program PRINT its result
+// with `Console.WriteLine(<expr>)` (stdlib §2.1 — real API, per-type numeric
+// overloads since v0.165) and `return 0`, then assert on the captured stdout
+// instead of the exit code. runAotOut is the one-call counterpart to that: it
+// returns the program's stdout (WriteLine appends '\n', so the expected string
+// is "<value>\n"), or the sentinel "<did-not-run>" if the program was rejected
+// / crashed / timed out — mirroring the `run()` helpers' `r.ran ? … : -999`
+// idiom on the string channel, and centralizing the `r.ran ? r.stdoutText : …`
+// line every already-migrated stdout test would otherwise copy locally.
+inline std::string runAotOut(std::string_view source) {
+    auto r = runAot(source);
+    return r.ran ? r.stdoutText : std::string("<did-not-run>");
+}
+
+// ---------------------------------------------------------------------------
 // runAotChecked — the per-program AddressSanitizer/LeakSanitizer memory net
 // (migration plan §2 memory tier; WS2). The SAME forked Driver::compileFile as
 // runAot but with `opts.sanitizeAddress = true`, so the GENERATED Bezel code is

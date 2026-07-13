@@ -28,14 +28,15 @@
 // (string.Length, §3). Each test crashed or miscompiled before the fix and
 // passes after; the always-on IR verifier proves the IR is well-formed.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -86,25 +87,25 @@ BEZEL_TEST(generic_record_with_462, with_box_string_source_unchanged) {
 // must be correct afterward — the second (string) field must survive at its
 // specialized 8-byte offset, the first replaced. a=7, b.Length=5 → 705.
 BEZEL_TEST(generic_record_with_462, with_pair_int_string_replace_int) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair<A, B>(a: A, b: B); "
         "class C public static method Main(): int "
         "  var p1 := new Pair<int, string>(1, \"hello\"); "
         "  var p2 := p1 with a := 7 end; "
-        "  return p2.a * 100 + p2.b.Length; "    // 7*100 + 5 = 705
-        "end Main; end C;"), 705);
+        "  Console.WriteLine(p2.a * 100 + p2.b.Length); return 0; "    // 7*100 + 5 = 705
+        "end Main; end C;"), "705\n");
 }
 
 // §9.5 / §14.1: `with` on Pair<int, string> replacing the STRING field. The int
 // field survives, the string replaced. a=3, b="planet".Length=6 → 306.
 BEZEL_TEST(generic_record_with_462, with_pair_int_string_replace_string) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair<A, B>(a: A, b: B); "
         "class C public static method Main(): int "
         "  var p1 := new Pair<int, string>(3, \"x\"); "
         "  var p2 := p1 with b := \"planet\" end; "
-        "  return p2.a * 100 + p2.b.Length; "    // 3*100 + 6 = 306
-        "end Main; end C;"), 306);
+        "  Console.WriteLine(p2.a * 100 + p2.b.Length); return 0; "    // 3*100 + 6 = 306
+        "end Main; end C;"), "306\n");
 }
 
 // §9.5 / §14.1: `with` on Box<long> — an 8-byte VALUE field. The placeholder i32
@@ -163,14 +164,14 @@ BEZEL_TEST(generic_record_with_462, control_with_box_int) {
 // The replaced nested record's string field must round-trip. Name "abc".Length=3,
 // Age=7 → 307.
 BEZEL_TEST(generic_record_with_462, control_with_box_record_with_string) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Named(Name: string, Age: int); "
         "record Box<T>(value: T); "
         "class C public static method Main(): int "
         "  var b1 := new Box<Named>(new Named(\"x\", 1)); "
         "  var b2 := b1 with value := new Named(\"abc\", 7) end; "
-        "  return b2.value.Name.Length * 100 + b2.value.Age; "  // 3*100 + 7 = 307
-        "end Main; end C;"), 307);
+        "  Console.WriteLine(b2.value.Name.Length * 100 + b2.value.Age); return 0; "  // 3*100 + 7 = 307
+        "end Main; end C;"), "307\n");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

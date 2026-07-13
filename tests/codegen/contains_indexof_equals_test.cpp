@@ -17,15 +17,16 @@
 // path tried an ICmp on a struct pointer, which is illegal IR. Scalar/string
 // element types also regressed to pointer-identity semantics.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -82,14 +83,14 @@ BEZEL_TEST(contains_indexof_equals_4_4, record_indexof_present) {
 
 // §8.3/§25.2: record element absent — IndexOf returns -1.
 BEZEL_TEST(contains_indexof_equals_4_4, record_indexof_absent) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module T; "
         "public record P(X: int, Y: int) end P; "
         "public class Program public static method Main(): int "
         "  using var a := new Array<P>(); "
         "  a.Add(new P(1, 2)); a.Add(new P(3, 4)); "
-        "  return a.IndexOf(new P(5, 6)); "
-        "end Main; end Program;"), -1);
+        "  Console.WriteLine(a.IndexOf(new P(5, 6))); return 0; "
+        "end Main; end Program;"), "-1\n");
 }
 
 // -----------------------------------------------------------------------
@@ -182,12 +183,12 @@ BEZEL_TEST(contains_indexof_equals_4_4, scalar_int_indexof_present) {
 
 // §8.3: scalar absent — IndexOf returns -1.
 BEZEL_TEST(contains_indexof_equals_4_4, scalar_int_indexof_absent) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(10); a.Add(20); a.Add(30); "
-        "  return a.IndexOf(99); "
-        "end Main; end C;"), -1);
+        "  Console.WriteLine(a.IndexOf(99)); return 0; "
+        "end Main; end C;"), "-1\n");
 }
 
 // -----------------------------------------------------------------------
@@ -226,7 +227,7 @@ BEZEL_TEST(contains_indexof_equals_4_6, string_indexof_by_content) {
 // The behavioral Contains/IndexOf for class elements with custom Equals is
 // covered by owned_array_contains_query_is_pure_borrow below.
 BEZEL_TEST(contains_indexof_equals_4_5, owned_array_record_contains_present) {
-    auto r = runJit(
+    auto r = runAot(
         "module T; "
         "public record P(X: int, Y: int) end P; "
         "public class Program public static method Main(): int "
@@ -241,7 +242,7 @@ BEZEL_TEST(contains_indexof_equals_4_5, owned_array_record_contains_present) {
 
 // §4.5/§14.4/#1327 v0.165: OwningArray<P> with record element rejected at sema.
 BEZEL_TEST(contains_indexof_equals_4_5, owned_array_record_indexof_present) {
-    auto r = runJit(
+    auto r = runAot(
         "module T; "
         "public record P(X: int, Y: int) end P; "
         "public class Program public static method Main(): int "

@@ -15,15 +15,16 @@
 //
 // Each test cites the stdlib section and the specific behaviour it verifies.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -67,9 +68,9 @@ BEZEL_TEST(codegen_datetime_2_5, utcnow_monotone) {
 
 // stdlib §2.5: new DateTime(year, month, day).Year == year.
 BEZEL_TEST(codegen_datetime_2_5, ctor_year_2024) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "var dt := new DateTime(2024, 3, 15); "
-        "return dt.Year; ")), 2024);
+        "Console.WriteLine(dt.Year); return 0; ")), "2024\n");
 }
 
 // stdlib §2.5: new DateTime(year, month, day).Month == month.

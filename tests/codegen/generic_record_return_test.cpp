@@ -27,14 +27,15 @@
 // All tests use only real stdlib surface; each FAILED before the fix and passes
 // after.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -45,7 +46,7 @@ int run(const std::string& prog) {
 // (A=10, B=20) must survive. Before the fix the result read 0 (record truncated
 // to the i32 generic fallback at the typed-as-`T` use site).
 BEZEL_TEST(generic_record_return_14_1, method_returns_two_field_record_both_fields) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair(A: int, B: int); "
         "class Box<T> "
         "  private _v: T; "
@@ -56,14 +57,14 @@ BEZEL_TEST(generic_record_return_14_1, method_returns_two_field_record_both_fiel
         "class C public static method Main(): int "
         "  using var b := new Box<Pair>(new Pair(10, 20)); "
         "  var v := b.GetIt(); "
-        "  return v.A * 1000 + v.B; "          // 10020
-        "end Main; end C;"), 10020);
+        "  Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 10020
+        "end Main; end C;"), "10020\n");
 }
 
 // §14.1 / §9: a 4-field record (sret-class width) returned from a generic
 // method — all four fields correct (1,2,3,4 → 1234).
 BEZEL_TEST(generic_record_return_14_1, method_returns_four_field_record_all_fields) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Quad(A: int, B: int, C: int, D: int); "
         "class Box<T> "
         "  private _v: T; "
@@ -74,15 +75,15 @@ BEZEL_TEST(generic_record_return_14_1, method_returns_four_field_record_all_fiel
         "class C public static method Main(): int "
         "  using var b := new Box<Quad>(new Quad(1, 2, 3, 4)); "
         "  var v := b.GetIt(); "
-        "  return v.A * 1000 + v.B * 100 + v.C * 10 + v.D; "   // 1234
-        "end Main; end C;"), 1234);
+        "  Console.WriteLine(v.A * 1000 + v.B * 100 + v.C * 10 + v.D); return 0; "   // 1234
+        "end Main; end C;"), "1234\n");
 }
 
 // §14.1 / §9: the record result used directly in arithmetic (no intermediate
 // `var`), confirming the call types as the record (its fields resolve) rather
 // than the erased `T`.
 BEZEL_TEST(generic_record_return_14_1, method_record_result_fields_in_arithmetic) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair(A: int, B: int); "
         "class Box<T> "
         "  private _v: T; "
@@ -92,8 +93,8 @@ BEZEL_TEST(generic_record_return_14_1, method_record_result_fields_in_arithmetic
         "end Box; "
         "class C public static method Main(): int "
         "  using var b := new Box<Pair>(new Pair(60, 7)); "
-        "  return b.GetIt().A * 1000 + b.GetIt().B; "          // 60007
-        "end Main; end C;"), 60007);
+        "  Console.WriteLine(b.GetIt().A * 1000 + b.GetIt().B); return 0; "          // 60007
+        "end Main; end C;"), "60007\n");
 }
 
 // §14.1 / §9 / §3: a record with a STRING field (a managed reference) returned
@@ -101,7 +102,7 @@ BEZEL_TEST(generic_record_return_14_1, method_record_result_fields_in_arithmetic
 // int field are both correct (no truncation, no leak/UAF: the string is a
 // borrowed literal, not owned).
 BEZEL_TEST(generic_record_return_14_1, method_returns_record_with_string_field) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Named(Name: string, Age: int); "
         "class Box<T> "
         "  private _v: T; "
@@ -112,8 +113,8 @@ BEZEL_TEST(generic_record_return_14_1, method_returns_record_with_string_field) 
         "class C public static method Main(): int "
         "  using var b := new Box<Named>(new Named(\"hello\", 6)); "
         "  var v := b.GetIt(); "
-        "  return v.Name.Length * 1000 + v.Age; "              // 5*1000 + 6 = 5006
-        "end Main; end C;"), 5006);
+        "  Console.WriteLine(v.Name.Length * 1000 + v.Age); return 0; "              // 5*1000 + 6 = 5006
+        "end Main; end C;"), "5006\n");
 }
 
 // ── Generic INDEXER returning T = record ─────────────────────────────────────
@@ -123,7 +124,7 @@ BEZEL_TEST(generic_record_return_14_1, method_returns_record_with_string_field) 
 // getter body read its `T`-typed field as the i32 erasure (one field, the other
 // garbage).
 BEZEL_TEST(generic_record_return_14_1, indexer_returns_two_field_record_both_fields) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair(A: int, B: int); "
         "class Box<T> "
         "  private _v: T; "
@@ -134,14 +135,14 @@ BEZEL_TEST(generic_record_return_14_1, indexer_returns_two_field_record_both_fie
         "class C public static method Main(): int "
         "  using var b := new Box<Pair>(new Pair(10, 20)); "
         "  var v := b[0]; "
-        "  return v.A * 1000 + v.B; "          // 10020
-        "end Main; end C;"), 10020);
+        "  Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 10020
+        "end Main; end C;"), "10020\n");
 }
 
 // §14.1 / §23.4 / §9: a 4-field record (sret-width) through the generic indexer
 // — all fields correct.
 BEZEL_TEST(generic_record_return_14_1, indexer_returns_four_field_record_all_fields) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Quad(A: int, B: int, C: int, D: int); "
         "class Box<T> "
         "  private _v: T; "
@@ -152,14 +153,14 @@ BEZEL_TEST(generic_record_return_14_1, indexer_returns_four_field_record_all_fie
         "class C public static method Main(): int "
         "  using var b := new Box<Quad>(new Quad(1, 2, 3, 4)); "
         "  var v := b[0]; "
-        "  return v.A * 1000 + v.B * 100 + v.C * 10 + v.D; "   // 1234
-        "end Main; end C;"), 1234);
+        "  Console.WriteLine(v.A * 1000 + v.B * 100 + v.C * 10 + v.D); return 0; "   // 1234
+        "end Main; end C;"), "1234\n");
 }
 
 // §14.1 / §23.4 / §9: direct field access on the generic-indexer result
 // (`b[0].A`, `b[0].B`) — the record materializes per access; each field correct.
 BEZEL_TEST(generic_record_return_14_1, indexer_record_result_direct_field_access) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair(A: int, B: int); "
         "class Box<T> "
         "  private _v: T; "
@@ -169,8 +170,8 @@ BEZEL_TEST(generic_record_return_14_1, indexer_record_result_direct_field_access
         "end Box; "
         "class C public static method Main(): int "
         "  using var b := new Box<Pair>(new Pair(60, 7)); "
-        "  return b[0].A * 1000 + b[0].B; "    // 60007
-        "end Main; end C;"), 60007);
+        "  Console.WriteLine(b[0].A * 1000 + b[0].B); return 0; "    // 60007
+        "end Main; end C;"), "60007\n");
 }
 
 // ── Controls — the fix must not perturb these working paths ───────────────────
@@ -210,7 +211,7 @@ BEZEL_TEST(generic_record_return_14_1, control_scalar_generic_indexer) {
 // CONTROL (§9 / §22): a NON-generic record-returning method still works (the
 // path the generic fix models on; its lowering must be unchanged).
 BEZEL_TEST(generic_record_return_14_1, control_nongeneric_record_returning_method) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair(A: int, B: int); "
         "class Box "
         "  private _v: Pair; "
@@ -221,14 +222,14 @@ BEZEL_TEST(generic_record_return_14_1, control_nongeneric_record_returning_metho
         "class C public static method Main(): int "
         "  using var b := new Box(new Pair(10, 20)); "
         "  var v := b.GetIt(); "
-        "  return v.A * 1000 + v.B; "          // 10020
-        "end Main; end C;"), 10020);
+        "  Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 10020
+        "end Main; end C;"), "10020\n");
 }
 
 // CONTROL (§23.4 / §9): a NON-generic record-returning user indexer still works
 // (the value-typed-indexer path the generic fix sits beside).
 BEZEL_TEST(generic_record_return_14_1, control_nongeneric_record_returning_indexer) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair(A: int, B: int); "
         "class Box "
         "  private _v: Pair; "
@@ -239,8 +240,8 @@ BEZEL_TEST(generic_record_return_14_1, control_nongeneric_record_returning_index
         "class C public static method Main(): int "
         "  using var b := new Box(new Pair(10, 20)); "
         "  var v := b[0]; "
-        "  return v.A * 1000 + v.B; "          // 10020
-        "end Main; end C;"), 10020);
+        "  Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 10020
+        "end Main; end C;"), "10020\n");
 }
 
 // #732 / §14 / §22.4: a generic METHOD whose declared return type is a generic

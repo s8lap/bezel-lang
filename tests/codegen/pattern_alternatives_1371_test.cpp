@@ -12,15 +12,16 @@
 //   - a pattern-embedded `|` parses below Shift, so a range/relational arm with
 //     arithmetic bounds coexists with a constant `|` alternatives arm.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int runProg(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -149,11 +150,13 @@ BEZEL_TEST(codegen_alt_1371, pipe_below_shift_with_range_and_relational) {
         "    end; "
         "  end Grade; "
         "  public static method Main(): int "
-        "    return Grade(5, 10) * 1000 + Grade(100, 10) * 100 "
-        "         + Grade(101, 10) * 10 + Grade(200, 10); "
+        "    Console.WriteLine(Grade(5, 10) * 1000 + Grade(100, 10) * 100 "
+        "         + Grade(101, 10) * 10 + Grade(200, 10)); return 0; "
         "  end Main; end C;";
     // Grade(5,10): 5 < 20 → 1. Grade(100,10): not <20, is 100|101 → 5.
     // Grade(101,10): not <20, is 100|101 → 5. Grade(200,10): >30 → 9.
-    // 1*1000 + 5*100 + 5*10 + 9 = 1559.
-    BEZEL_EXPECT_EQ(runProg(prog), 1559);
+    // 1*1000 + 5*100 + 5*10 + 9 = 1559. 1559 > 255, so it cannot round-trip an
+    // 8-bit exit code — observe it on stdout (runAotOut) instead (WriteLine
+    // appends '\n').
+    BEZEL_EXPECT_EQ(runAotOut(prog), "1559\n");
 }

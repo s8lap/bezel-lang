@@ -16,21 +16,22 @@
 //
 // All tests use only real stdlib surface. Each test would IR-fail (LLVM
 // assertion / verifier error) before the fix and passes after; the always-on
-// IR verifier embedded in runJit proves the IR is well-formed.
+// IR verifier embedded in the AOT driver proves the IR is well-formed.
 //
 // Spec references:
 //   §9.5  v0.135 — record `with` expression (non-destructive copy)
 //   §9.4  v0.135 — record instance methods receive `this` by pointer (CG29)
 //   §14.2 v0.135 — generics are monomorphized per concrete type argument
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 } // namespace
@@ -126,7 +127,7 @@ BEZEL_TEST(generic_record_this_with_method, box_string_with_roundtrips_content) 
 // §9.5 / §14.2: Pair<int,string> with-method replacing the int field (A).
 // a=7, b="hello".Length=5 → 7*100 + 5 = 705.
 BEZEL_TEST(generic_record_this_with_method, pair_int_string_replace_first) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; "
         "record Pair<A, B>(first: A, second: B) "
         "  public method WithFirst(v: A): Pair<A, B> "
@@ -135,14 +136,14 @@ BEZEL_TEST(generic_record_this_with_method, pair_int_string_replace_first) {
         "class C public static method Main(): int "
         "  var p := new Pair<int, string>(1, \"hello\"); "
         "  var p2 := p.WithFirst(7); "
-        "  return p2.first * 100 + p2.second.Length; "  // 7*100 + 5 = 705
-        "end Main; end C;"), 705);
+        "  Console.WriteLine(p2.first * 100 + p2.second.Length); return 0; "  // 7*100 + 5 = 705
+        "end Main; end C;"), "705\n");
 }
 
 // §9.5 / §14.2: Pair<int,string> with-method replacing the string field (B).
 // The int field must survive unchanged. first=3, "planet".Length=6 → 3*100 + 6 = 306.
 BEZEL_TEST(generic_record_this_with_method, pair_int_string_replace_second) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; "
         "record Pair<A, B>(first: A, second: B) "
         "  public method WithSecond(v: B): Pair<A, B> "
@@ -151,15 +152,15 @@ BEZEL_TEST(generic_record_this_with_method, pair_int_string_replace_second) {
         "class C public static method Main(): int "
         "  var p := new Pair<int, string>(3, \"hello\"); "
         "  var p2 := p.WithSecond(\"planet\"); "
-        "  return p2.first * 100 + p2.second.Length; "  // 3*100 + 6 = 306
-        "end Main; end C;"), 306);
+        "  Console.WriteLine(p2.first * 100 + p2.second.Length); return 0; "  // 3*100 + 6 = 306
+        "end Main; end C;"), "306\n");
 }
 
 // §9.5 / §14.2: Pair<string,int> — ptr+int ordering (ptr in slot 0, int in
 // slot 1). With-method on int field (second); string field must survive.
 // "hi".Length=2, second=99 → 2*100 + 99 = 299.
 BEZEL_TEST(generic_record_this_with_method, pair_string_int_replace_int) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; "
         "record Pair<A, B>(first: A, second: B) "
         "  public method WithSecond(v: B): Pair<A, B> "
@@ -168,8 +169,8 @@ BEZEL_TEST(generic_record_this_with_method, pair_string_int_replace_int) {
         "class C public static method Main(): int "
         "  var p := new Pair<string, int>(\"hi\", 1); "
         "  var p2 := p.WithSecond(99); "
-        "  return p2.first.Length * 100 + p2.second; "  // 2*100 + 99 = 299
-        "end Main; end C;"), 299);
+        "  Console.WriteLine(p2.first.Length * 100 + p2.second); return 0; "  // 2*100 + 99 = 299
+        "end Main; end C;"), "299\n");
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -213,7 +214,7 @@ BEZEL_TEST(generic_record_this_with_method, box_string_chained_with_calls) {
 // §9.5 / §14.2: both Box<int> and Box<string> with-methods in one module.
 // bi.WithValue(42).value = 42; bs.WithValue("hello").value.Length = 5 → 42*100+5=4205.
 BEZEL_TEST(generic_record_this_with_method, box_int_and_box_string_coexist) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; "
         "record Box<T>(value: T) "
         "  public method WithValue(v: T): Box<T> => this with value := v end; "
@@ -221,6 +222,6 @@ BEZEL_TEST(generic_record_this_with_method, box_int_and_box_string_coexist) {
         "class C public static method Main(): int "
         "  var bi := new Box<int>(1); "
         "  var bs := new Box<string>(\"x\"); "
-        "  return bi.WithValue(42).value * 100 + bs.WithValue(\"hello\").value.Length; "
-        "end Main; end C;"), 4205);
+        "  Console.WriteLine(bi.WithValue(42).value * 100 + bs.WithValue(\"hello\").value.Length); return 0; "
+        "end Main; end C;"), "4205\n");
 }

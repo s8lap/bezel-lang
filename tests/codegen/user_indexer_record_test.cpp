@@ -18,14 +18,15 @@
 // (int) user indexer, a record-returning METHOD, and a built-in collection
 // indexer (Array<int>[i]) all still produce correct values.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 } // namespace
@@ -38,34 +39,34 @@ int run(const std::string& program) {
 // and read EACH field. Load-bearing: both fields must be the constructed values
 // (not 0) — a record result mishandled as a scalar/pointer would zero a field.
 BEZEL_TEST(user_indexer_record_23_4, expr_getter_bind_then_read_both_fields) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair(A: int, B: int); "
         "class C "
         "  public property [i: int]: Pair => new Pair(i + 1, i + 2); "
         "  public static method Main(): int "
         "    using var c := new C(); "
         "    var v := c[5]; "
-        "    return v.A * 1000 + v.B; "          // 6*1000 + 7 = 6007
-        "  end Main; end C;"), 6007);
+        "    Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 6*1000 + 7 = 6007
+        "  end Main; end C;"), "6007\n");
 }
 
 // §23.4: field access DIRECTLY on the indexer result (`c[5].A`, `c[5].B`) — the
 // record materializes per access; each field is correct.
 BEZEL_TEST(user_indexer_record_23_4, expr_getter_direct_field_access) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair(A: int, B: int); "
         "class C "
         "  public property [i: int]: Pair => new Pair(i + 1, i + 2); "
         "  public static method Main(): int "
         "    using var c := new C(); "
-        "    return c[5].A * 1000 + c[5].B; "    // 6007
-        "  end Main; end C;"), 6007);
+        "    Console.WriteLine(c[5].A * 1000 + c[5].B); return 0; "    // 6007
+        "  end Main; end C;"), "6007\n");
 }
 
 // §23.4 / §9.4: the indexer reads a backing RECORD FIELD and returns a copy of
 // it; both fields of the copy are correct.
 BEZEL_TEST(user_indexer_record_23_4, expr_getter_returns_backing_record_field) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair(A: int, B: int); "
         "class C "
         "  private _p: Pair; "
@@ -74,36 +75,36 @@ BEZEL_TEST(user_indexer_record_23_4, expr_getter_returns_backing_record_field) {
         "  public static method Main(): int "
         "    using var c := new C(); "
         "    var v := c[0]; "
-        "    return v.A * 1000 + v.B; "          // 60007
-        "  end Main; end C;"), 60007);
+        "    Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 60007
+        "  end Main; end C;"), "60007\n");
 }
 
 // §23.4 / §9.4: a wider record (4 int fields, sret-class size) returns all
 // fields correctly through the user-indexer get.
 BEZEL_TEST(user_indexer_record_23_4, expr_getter_wide_record_all_fields) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Quad(A: int, B: int, C: int, D: int); "
         "class C "
         "  public property [i: int]: Quad => new Quad(i + 1, i + 2, i + 3, i + 4); "
         "  public static method Main(): int "
         "    using var c := new C(); "
         "    var v := c[5]; "
-        "    return v.A * 1000 + v.B * 100 + v.C * 10 + v.D; "   // 6789
-        "  end Main; end C;"), 6789);
+        "    Console.WriteLine(v.A * 1000 + v.B * 100 + v.C * 10 + v.D); return 0; "   // 6789
+        "  end Main; end C;"), "6789\n");
 }
 
 // §23.4 / §9.2 / §3: a record with a string field round-trips a pointer + int
 // pair through the user-indexer get; both the string and int field are correct.
 BEZEL_TEST(user_indexer_record_23_4, expr_getter_record_with_string_field) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Named(Name: string, Age: int); "
         "class C "
         "  public property [i: int]: Named => new Named(\"hello\", i + 1); "
         "  public static method Main(): int "
         "    using var c := new C(); "
         "    var v := c[5]; "
-        "    return v.Name.Length * 1000 + v.Age; "   // 5*1000 + 6 = 5006
-        "  end Main; end C;"), 5006);
+        "    Console.WriteLine(v.Name.Length * 1000 + v.Age); return 0; "   // 5*1000 + 6 = 5006
+        "  end Main; end C;"), "5006\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -116,7 +117,7 @@ BEZEL_TEST(user_indexer_record_23_4, expr_getter_record_with_string_field) {
 // bound to a local; each field correct. Before the fix the inlined block `return`
 // terminated Main with a record value against an int return → crash/garbage.
 BEZEL_TEST(user_indexer_record_23_4, block_getter_record_bind_then_read) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair(A: int, B: int); "
         "class C "
         "  public property [i: int]: Pair "
@@ -125,14 +126,14 @@ BEZEL_TEST(user_indexer_record_23_4, block_getter_record_bind_then_read) {
         "  public static method Main(): int "
         "    using var c := new C(); "
         "    var v := c[5]; "
-        "    return v.A * 1000 + v.B; "          // 6007
-        "  end Main; end C;"), 6007);
+        "    Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 6007
+        "  end Main; end C;"), "6007\n");
 }
 
 // §23.4 / §22.9: a block-form getter with intermediate statements (a local then
 // a `return` of it) returning a record — all fields correct.
 BEZEL_TEST(user_indexer_record_23_4, block_getter_record_local_then_return) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair(A: int, B: int); "
         "class C "
         "  public property [i: int]: Pair "
@@ -144,15 +145,15 @@ BEZEL_TEST(user_indexer_record_23_4, block_getter_record_local_then_return) {
         "  public static method Main(): int "
         "    using var c := new C(); "
         "    var v := c[5]; "
-        "    return v.A * 1000 + v.B; "          // 15*1000 + 25 = 15025
-        "  end Main; end C;"), 15025);
+        "    Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 15*1000 + 25 = 15025
+        "  end Main; end C;"), "15025\n");
 }
 
 // §23.4 / §22.9: a block-form getter with control flow (the `return` is inside
 // an `if`) returning a record — the standalone getter terminates correctly and
 // the chosen record is returned.
 BEZEL_TEST(user_indexer_record_23_4, block_getter_record_conditional_return) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair(A: int, B: int); "
         "class C "
         "  public property [i: int]: Pair "
@@ -164,8 +165,8 @@ BEZEL_TEST(user_indexer_record_23_4, block_getter_record_conditional_return) {
         "  public static method Main(): int "
         "    using var c := new C(); "
         "    var v := c[3]; "
-        "    return v.A * 1000 + v.B; "          // 7008
-        "  end Main; end C;"), 7008);
+        "    Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 7008
+        "  end Main; end C;"), "7008\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -202,15 +203,15 @@ BEZEL_TEST(user_indexer_record_23_4, control_scalar_block_getter_still_works) {
 // CONTROL (§9.4 / §22): a record-returning METHOD still works (the path the
 // indexer fix is modeled on).
 BEZEL_TEST(user_indexer_record_23_4, control_record_returning_method_still_works) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair(A: int, B: int); "
         "class C "
         "  public method GetP(i: int): Pair => new Pair(i + 1, i + 2); "
         "  public static method Main(): int "
         "    using var c := new C(); "
         "    var v := c.GetP(5); "
-        "    return v.A * 1000 + v.B; "          // 6007
-        "  end Main; end C;"), 6007);
+        "    Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 6007
+        "  end Main; end C;"), "6007\n");
 }
 
 // CONTROL (§4.4): a built-in COLLECTION indexer (Array<int>[i]) still reads the
@@ -234,7 +235,7 @@ BEZEL_TEST(user_indexer_record_23_4, control_collection_indexer_still_works) {
 
 // #1147: member-assign on a RECORD-valued user indexer result is rejected.
 BEZEL_TEST(user_indexer_record_23_4, value_indexer_result_member_assign_rejected_1147) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; record Pair(A: int, B: int); "
         "class C "
         "  private _p: Pair; "
@@ -252,7 +253,7 @@ BEZEL_TEST(user_indexer_record_23_4, value_indexer_result_member_assign_rejected
 // #1147: the same reject on a built-in collection (Dictionary<K, record>) whose
 // indexer returns a record value — `d[k].x := …` is a discarded-copy write.
 BEZEL_TEST(user_indexer_record_23_4, dict_record_value_member_assign_rejected_1147) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<string, Point>(); "
@@ -301,7 +302,7 @@ BEZEL_TEST(user_indexer_record_23_4, value_indexer_whole_set_and_read_unaffected
 
 // #1313: a BLOCK-form value-typed property — member-assign on its result rejected.
 BEZEL_TEST(user_indexer_record_23_4, value_block_property_result_member_assign_rejected_1313) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; record Point public property X: int; "
         "  public constructor(x: int) X := x; end constructor; end Point; "
         "class Holder "
@@ -320,7 +321,7 @@ BEZEL_TEST(user_indexer_record_23_4, value_block_property_result_member_assign_r
 
 // #1312: an AUTO value-typed property — member-assign on its result rejected.
 BEZEL_TEST(user_indexer_record_23_4, value_auto_property_result_member_assign_rejected_1312) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; record Point public property X: int; "
         "  public constructor(x: int) X := x; end constructor; end Point; "
         "class Holder public property P: Point; "

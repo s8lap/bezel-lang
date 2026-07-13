@@ -2,15 +2,16 @@
 // IndexOf, Substring. Implemented as compiler intrinsics using libc
 // memcmp / memmem / malloc+memcpy under the hood.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -82,10 +83,10 @@ BEZEL_TEST(codegen_cg27f, index_of_found) {
 }
 
 BEZEL_TEST(codegen_cg27f, index_of_not_found) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
-        "  var s := \"Hello World\"; return s.IndexOf(\"xyz\"); "
-        "end Main; end C;"), -1);
+        "  var s := \"Hello World\"; Console.WriteLine(s.IndexOf(\"xyz\")); return 0; "
+        "end Main; end C;"), "-1\n");
 }
 
 BEZEL_TEST(codegen_cg27f, index_of_start) {

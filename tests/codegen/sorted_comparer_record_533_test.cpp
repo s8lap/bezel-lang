@@ -23,20 +23,21 @@
 //   5. Controls: Array<int>.Sorted and Array<string>.Sorted still pass.
 //   6. Control: Array<Point>.Reversed() still works.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
 bool rejectedAtCompile(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return !r.ran && r.diagnostics.hasErrors();
 }
 
@@ -65,7 +66,7 @@ BEZEL_TEST(sorted_comparer_record_533, sorted_copy_by_x_ascending_spec_4_4) {
 // §4.4 / #533: original array is unchanged after Sorted(comparer).
 // a[0].X=3, a[1].X=1, a[2].X=2 → encode 3*100+1*10+2 = 312.
 BEZEL_TEST(sorted_comparer_record_533, sorted_original_unchanged_spec_4_4) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Point(X: int, Y: int); "
         "class C public static method Main(): int "
         "  using var a := new Array<Point>(); "
@@ -73,8 +74,8 @@ BEZEL_TEST(sorted_comparer_record_533, sorted_original_unchanged_spec_4_4) {
         "  a.Add(new Point(1, 2)); "
         "  a.Add(new Point(2, 0)); "
         "  using var s := a.Sorted((p, q) => p.X - q.X); "
-        "  return a.Get(0).X * 100 + a.Get(1).X * 10 + a.Get(2).X; "  // 312
-        "end Main; end C;"), 312);
+        "  Console.WriteLine(a.Get(0).X * 100 + a.Get(1).X * 10 + a.Get(2).X); return 0; "  // 312
+        "end Main; end C;"), "312\n");
 }
 
 // §4.4 / #533: Sorted(comparer) result has correct length.
@@ -182,7 +183,7 @@ BEZEL_TEST(sorted_comparer_record_533, sort_record_three_fields_spec_4_4) {
 // Input: [5, 2, 8, 1] (as Point.X). Sorted desc by X: [8, 5, 2, 1].
 // Encode: 8*1000+5*100+2*10+1 = 8521.
 BEZEL_TEST(sorted_comparer_record_533, sorted_copy_four_elements_desc_spec_4_4) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Point(X: int, Y: int); "
         "class C public static method Main(): int "
         "  using var a := new Array<Point>(); "
@@ -191,9 +192,9 @@ BEZEL_TEST(sorted_comparer_record_533, sorted_copy_four_elements_desc_spec_4_4) 
         "  a.Add(new Point(8, 0)); "
         "  a.Add(new Point(1, 0)); "
         "  using var s := a.Sorted((p, q) => q.X - p.X); "  // descending
-        "  return s.Get(0).X * 1000 + s.Get(1).X * 100 + "
-        "         s.Get(2).X * 10 + s.Get(3).X; "  // 8521
-        "end Main; end C;"), 8521);
+        "  Console.WriteLine(s.Get(0).X * 1000 + s.Get(1).X * 100 + "
+        "         s.Get(2).X * 10 + s.Get(3).X); return 0; "  // 8521
+        "end Main; end C;"), "8521\n");
 }
 
 // ===========================================================================
@@ -243,7 +244,7 @@ BEZEL_TEST(sorted_comparer_record_533, control_string_sorted_comparer_spec_4_4) 
 // [Point(1,0), Point(2,0), Point(3,0)] reversed → [Point(3,0), Point(2,0),
 // Point(1,0)]. Encode X values: 3*100+2*10+1 = 321.
 BEZEL_TEST(sorted_comparer_record_533, control_record_reversed_spec_3) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Point(X: int, Y: int); "
         "class C public static method Main(): int "
         "  using var a := new Array<Point>(); "
@@ -251,6 +252,6 @@ BEZEL_TEST(sorted_comparer_record_533, control_record_reversed_spec_3) {
         "  a.Add(new Point(2, 0)); "
         "  a.Add(new Point(3, 0)); "
         "  using var r := a.Reversed(); "
-        "  return r.Get(0).X * 100 + r.Get(1).X * 10 + r.Get(2).X; "  // 321
-        "end Main; end C;"), 321);
+        "  Console.WriteLine(r.Get(0).X * 100 + r.Get(1).X * 10 + r.Get(2).X); return 0; "  // 321
+        "end Main; end C;"), "321\n");
 }

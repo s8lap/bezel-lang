@@ -30,14 +30,15 @@
 // test compiling clean through the always-on IR verifier proves the IR is
 // well-formed.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -94,24 +95,24 @@ BEZEL_TEST(generic_record_string_field_460, box_class_value_field_read) {
 // The first field is an i32 value, the second a string pointer — the two-field
 // layout must specialize each independently. Read both: a=42, b.Length=5 → 4205.
 BEZEL_TEST(generic_record_string_field_460, pair_int_string_both_fields) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair<A, B>(a: A, b: B); "
         "class C public static method Main(): int "
         "  using var p := new Pair<int, string>(42, \"hello\"); "
-        "  return p.a * 100 + p.b.Length; "      // 42*100 + 5 = 4205
-        "end Main; end C;"), 4205);
+        "  Console.WriteLine(p.a * 100 + p.b.Length); return 0; "      // 42*100 + 5 = 4205
+        "end Main; end C;"), "4205\n");
 }
 
 // §9 / §14.1: Pair<string, int> — reference field FIRST, value field second.
 // Confirms the per-field specialization is order-independent. b=9, a.Length=5
 // → 905.
 BEZEL_TEST(generic_record_string_field_460, pair_string_int_both_fields) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair<A, B>(a: A, b: B); "
         "class C public static method Main(): int "
         "  using var p := new Pair<string, int>(\"hello\", 9); "
-        "  return p.b * 100 + p.a.Length; "      // 9*100 + 5 = 905
-        "end Main; end C;"), 905);
+        "  Console.WriteLine(p.b * 100 + p.a.Length); return 0; "      // 9*100 + 5 = 905
+        "end Main; end C;"), "905\n");
 }
 
 // ── Two distinct instantiations of the same generic record coexist ────────────
@@ -160,26 +161,26 @@ BEZEL_TEST(generic_record_string_field_460, control_box_long) {
 // CONTROL (§9 / §14.1): Box<Pair> where Pair is a value-type RECORD. A nested
 // record value field — both inner fields survive (already worked; must remain).
 BEZEL_TEST(generic_record_string_field_460, control_box_value_record) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair(A: int, B: int); "
         "record Box<T>(value: T); "
         "class C public static method Main(): int "
         "  using var b := new Box<Pair>(new Pair(10, 20)); "
-        "  return b.value.A * 1000 + b.value.B; "  // 10020
-        "end Main; end C;"), 10020);
+        "  Console.WriteLine(b.value.A * 1000 + b.value.B); return 0; "  // 10020
+        "end Main; end C;"), "10020\n");
 }
 
 // CONTROL (§9 / §14.1): Box<Named> where Named is a record CONTAINING a string —
 // the nested record's own string field must round-trip (the record value carries
 // a pointer + an int; both survive). Name.Length=5, Age=6 → 5006.
 BEZEL_TEST(generic_record_string_field_460, control_box_record_with_string_field) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Named(Name: string, Age: int); "
         "record Box<T>(value: T); "
         "class C public static method Main(): int "
         "  using var b := new Box<Named>(new Named(\"hello\", 6)); "
-        "  return b.value.Name.Length * 1000 + b.value.Age; "  // 5006
-        "end Main; end C;"), 5006);
+        "  Console.WriteLine(b.value.Name.Length * 1000 + b.value.Age); return 0; "  // 5006
+        "end Main; end C;"), "5006\n");
 }
 
 // ── Generic record returned from a method ────────────────────────────────────
