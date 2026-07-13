@@ -6,7 +6,7 @@ This file is the first thing every Claude Code session should read. It encodes t
 
 Bezel is a systems language with explicit ownership and no garbage collector. Compile-time ownership tracking ensures every heap object is disposed exactly once; borrowing lets references be passed without transferring ownership, with lifetimes checked statically.
 
-The design is mostly settled — ~10,000 lines of normative spec (currently v0.188), plus rationale, stdlib, and guides; multiple verification passes; 70+ recorded design decisions. A working compiler now exists (`build/bezelc`): an AOT front-end plus LLVM backend that implements a large fraction of the spec, exercised by a ~11,800-test suite (gtest behavior tests + a lit/FileCheck diagnostic track). There are no external users yet; the current work is closing the gap to the spec — bug-fixing, soundness hardening, and catching the implementation up to newer spec revisions — with each fix shipping a spec-cited regression test.
+The design is mostly settled — a normative spec (with rationale, stdlib, and guides alongside; each document's header carries its current revision), multiple verification passes, and dozens of recorded design decisions. A working compiler now exists (`build/bezelc`): an AOT front-end plus LLVM backend that implements a large fraction of the spec, exercised by an extensive automated test suite (gtest behavior tests + a lit/FileCheck diagnostic track). There are no external users yet; the current work is closing the gap to the spec — bug-fixing, soundness hardening, and catching the implementation up to newer spec revisions — with each fix shipping a spec-cited regression test.
 
 ## The documents (read these before doing anything)
 
@@ -102,7 +102,12 @@ checks against `__GNUC__`. The build is expected to be configurable
 with `cmake -DCMAKE_CXX_COMPILER=clang++ ...` or to set the compiler
 explicitly in the root CMakeLists.txt.
 
-### Build & test speed (the build is dominated by the ~560-TU `bezel_tests`)
+### Build & test speed (the build is dominated by the large `bezel_tests` target)
+
+(This file states sizes qualitatively on purpose — exact counts like the test
+total or TU count drift every run, so they are not hardcoded here. For a live
+number run the suite or `find tests -name '*.cpp' | wc -l`; for a spec revision
+read the relevant document's header.)
 
 The configure auto-detects accelerators (CMakeLists.txt): **ccache**, the
 **mold** linker (falls back to lld), **`-gsplit-dwarf`** (debug info out of the
