@@ -34,6 +34,7 @@
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
@@ -42,14 +43,15 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 namespace fs = std::filesystem;
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -106,6 +108,18 @@ int runUnderLeakSanitizer(const std::string& source, bool detectLeaks = true) {
 
 void expectDisposedAndLeakFree(const std::string& source, int expectedExitCode) {
     BEZEL_EXPECT_EQ(run(source), expectedExitCode);
+    int lsan = runUnderLeakSanitizer(source);
+    if (lsan == -1) return;
+    BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// stdout variant for observable values > 255 (the 8-bit exit-code ceiling): the
+// program prints its result via Console.WriteLine and returns 0; the value is
+// asserted on captured stdout (runAotOut) while the LSan leg still runs the same
+// source for leak/double-free coverage.
+void expectDisposedOutAndLeakFree(const std::string& source,
+                                  const std::string& expectedStdout) {
+    BEZEL_EXPECT_EQ(runAotOut(source), expectedStdout);
     int lsan = runUnderLeakSanitizer(source);
     if (lsan == -1) return;
     BEZEL_EXPECT_EQ(lsan, 0);
@@ -204,14 +218,15 @@ BEZEL_TEST(owned_coll_iface_619_spec_28_11_14_4,
 // Before #619 elements were never disposed → _log == 0.
 BEZEL_TEST(owned_coll_iface_619_spec_28_11_14_4,
            owned_array_iface_disposes_reverse_insertion_order) {
-    expectDisposedAndLeakFree(prog(
+    // _log packs the disposal order 3->2->1 as 321 > 255 → print + runAotOut.
+    expectDisposedOutAndLeakFree(prog(
         "do "
         "  using var a := new OwningArray<ICounter>(); "
         "  a.Add(move (new ImplA(1))); "
         "  a.Add(move (new ImplA(2))); "
         "  a.Add(move (new ImplA(3))); "
         "end; "
-        "return ImplA._log;"), 321);
+        "Console.WriteLine(ImplA._log); return 0;"), "321");
 }
 
 // §28.11: OwningArray<IFace>.Clear() disposes every interface element.
@@ -371,14 +386,15 @@ BEZEL_TEST(owned_dict_iface_619_spec_28_11_14_4,
 // → dispose 3 first, then 2, then 1 → _log == 321.
 BEZEL_TEST(owned_llist_iface_619_spec_28_11_14_4,
            owned_llist_iface_disposes_reverse_insertion_order) {
-    expectDisposedAndLeakFree(prog(
+    // _log packs the disposal order 3->2->1 as 321 > 255 → print + runAotOut.
+    expectDisposedOutAndLeakFree(prog(
         "do "
         "  using var ll := new OwningLinkedList<ICounter>(); "
         "  ll.AddLast(move (new ImplA(1))); "
         "  ll.AddLast(move (new ImplA(2))); "
         "  ll.AddLast(move (new ImplA(3))); "
         "end; "
-        "return ImplA._log;"), 321);
+        "Console.WriteLine(ImplA._log); return 0;"), "321");
 }
 
 // §28.11: all interface-typed elements in OwningLinkedList disposed exactly once.
