@@ -605,6 +605,38 @@ inline JitResult runAot(std::string_view source) {
 }
 
 // ---------------------------------------------------------------------------
+// runAotCheckedDisposal — the AOT counterpart of the JIT harness's
+// runJitChecked (support/codegen_support.hpp). This is checked-disposal MODE
+// (§28.2 v0.134 / issue #601), NOT the ASan/LSan memory net that runAotChecked
+// provides — the two "checked" helpers are ORTHOGONAL and must not be confused:
+//
+//   * runAotChecked  -> opts.sanitizeAddress = true : instruments the GENERATED
+//     code with AddressSanitizer and links -fsanitize=address, catching
+//     use-after-free / out-of-bounds READs and leaks in emitted loads (WS2).
+//   * runAotCheckedDisposal (here) -> opts.checkedDisposal = true : §28.2's
+//     LANGUAGE-LEVEL rule that any instance-member access on a logically-
+//     disposed instance raises DisposedAccessException (§31.4). Instance-method
+//     entries and property/indexer/field accessors emit a disposed-flag guard,
+//     and the heap free is quarantined so the flag check after disposal is
+//     well-defined. This is exactly `bezelc --checked-disposal` (main.cpp) and
+//     mirrors runJitChecked, which sets the identical bit (opts.checkedDisposal
+//     = true) before running.
+//
+// It drives the SAME forked Driver::compileFile + subprocess-run path as runAot
+// (via the runAot(source, opts) overload) — the shipping AOT oracle, stricter
+// than the JIT harness — differing from plain runAot by exactly one bit,
+// opts.checkedDisposal. A program that uses a disposed instance therefore raises
+// DisposedAccessException (which a `catch DisposedAccessException` arm can
+// observe, e.g. returning 1) here, whereas under plain runAot no guard is
+// emitted and the access is undefined behaviour. The return type is JitResult,
+// so `.ran` / `.exitCode` / `.diagnostics` call sites are untouched.
+inline JitResult runAotCheckedDisposal(std::string_view source) {
+    codegen::CodegenOptions opts;
+    opts.checkedDisposal = true;  // §28.2 checked-disposal MODE (not ASan)
+    return runAot(source, opts);
+}
+
+// ---------------------------------------------------------------------------
 // runAotOut — the VALUE CHANNEL for observables that do not fit an 8-bit exit
 // code. A process exit status is masked to 0..255 (WEXITSTATUS), so a program
 // whose Main returns a value outside that range — a negative (IndexOf-not-found

@@ -25,24 +25,26 @@
 //   6. Instance method call on a NOT-yet-disposed instance succeeds normally
 //      in checked mode.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
-using bezel::test::runJitChecked;
+using bezel::test::runAot;
+using bezel::test::runAotCheckedDisposal;
 
 namespace {
 
-// Convenience wrapper: run in checked-disposal mode; returns exit code, or
-// -999 if the program failed to compile/run.
+// Convenience wrapper: run in checked-disposal MODE (§28.2 — DisposedAccess-
+// Exception on use-after-dispose), via the AOT harness; returns exit code, or
+// -999 if the program failed to compile/run. NB checked-disposal MODE, not the
+// ASan memory net (that is runAotChecked) — see support/aot_support.hpp.
 int runChecked(const std::string& program) {
-    auto r = runJitChecked(program);
+    auto r = runAotCheckedDisposal(program);
     return r.ran ? r.exitCode : -999;
 }
 
 // Convenience wrapper: run in default (unchecked) mode.
 int runDefault(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
