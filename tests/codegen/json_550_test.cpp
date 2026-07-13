@@ -44,6 +44,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
@@ -51,17 +52,18 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runJit;  // graph_json_cycle_raises_spec_2_15_v0139 only — see its comment.
 
 namespace {
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
 bool compileFails(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.diagnostics.hasErrors() && !r.ran;
 }
 
@@ -789,8 +791,29 @@ BEZEL_TEST(codegen_json_675, graph_null_back_edge_json_spec_2_15_v0139) {
 
 // §2.15 v0.139: `serialized graph` cycle raises SerializationException in JSON mode.
 // (Same contract as binary mode — cycle detection is format-agnostic.)
+// JIT-CONTRAST-by-design (AOT-migration finding, class D). The self-loop this
+// test builds (`a.Next := a;`, `Next: Link?` a PLAIN nullable field) is a
+// post-construction assignment of a scope-bound local's borrow into a field —
+// and §28.3's field-store rule is unconditional: "a borrow may not be assigned
+// to any field of any object" (verified directly: `build/bezelc` rejects it
+// with "borrow of `a` stored into a field would outlive its source"). This
+// is not specific to self-loops or this test — the SAME rejection fires for
+// closing ANY cycle through a plain borrow field (a two-node A->B->A cycle
+// needs a post-hoc field write to close the loop too), which is exactly why
+// the stdlib's CURRENT (type-driven, v0.141+) serialization model requires
+// `Shared<T>`/`Weak<T>` for cyclic graphs: "the cycle is constructed in
+// ownership-valid Bezel and round-trips through the ownership checker"
+// (Bezel_Language_Spec.md §9.8, "Synthesized Deserialize" ¶). That newer
+// model, notably, no longer RAISES on a cycle — it round-trips one — so this
+// test's assertion (cycle -> SerializationException) is not just built with
+// now-invalid syntax, it also encodes the PRE-migration (v0.139 keyword-
+// clause era) semantics that the type-driven model superseded. There is no
+// reshape that is both ownership-valid AND preserves the original assertion;
+// filed as #1773 (stale-test-debt) for a spec-process decision (rewrite
+// against Shared<T>/Weak<T>'s actual current behavior, or retire). Left on
+// runJit, which — by design — skips the ownership pass this finding turns on.
 BEZEL_TEST(codegen_json_675, graph_json_cycle_raises_spec_2_15_v0139) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = runJit(
         std::string("module M; ") + kImport +
         "class Link : ISerializable, IDeserializable "
         "  public Val: int := 0; "
@@ -809,7 +832,8 @@ BEZEL_TEST(codegen_json_675, graph_json_cycle_raises_spec_2_15_v0139) {
         "    return 0; "
         "  catch SerializationException => return 42; "
         "  end; "
-        "end Main; end C;"), 42);
+        "end Main; end C;");
+    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 42);
 }
 
 // §2.15 v0.139: tree-mode JSON is UNCHANGED — no $id/$ref fields appear for
