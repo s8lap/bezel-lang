@@ -38,7 +38,6 @@
 
 using bezel::test::runAot;
 using bezel::test::runAotOut;
-using bezel::test::runJit;
 
 namespace {
 int run(const std::string& src) {
@@ -226,7 +225,7 @@ BEZEL_TEST(dict_entry_iter_548, spec_21_verbatim_entry_accessible) {
 BEZEL_TEST(dict_entry_iter_548, owned_dict_still_rejected) {
     // Value is a class (§14.4: an owning dictionary rejects a `string` value),
     // so the ONLY rejection here is the §4.9 for-in one this test targets.
-    auto r = runJit(
+    auto r = runAot(
         "module M; class V public n: int := 0; end V; "
         "class C public static method Main(): int "
         "  using var od := new OwningDictionary<string, V>(); "
