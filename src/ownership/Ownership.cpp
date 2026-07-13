@@ -1821,7 +1821,9 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     // borrow (the in-flight exception, §31.2.4) is a bare identifier, not a
     // `new`/call, so it falls through to `checkRead` and is correctly NOT
     // treated as an owned sink — the throw transfers it back to the runtime,
-    // which §31.1 explicitly permits. // per §31.1, §28.8
+    // which §31.1 explicitly permits. (A bare `throw e;` of an owned LOCAL —
+    // as opposed to a borrow — is a separate announced-consume case, handled
+    // explicitly below after the discharge walk.) // per §31.1, §28.8
     if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
         // §31.1 (issue #430): check for a catch borrow escaping via a
         // NON-OWNED constructor argument of the thrown object. This is the
@@ -1839,6 +1841,37 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                 checkCatchBorrowEscapesViaNewExpr(*ne, ne->span.begin);
             }
             handleDischarge(*th->value);
+            // §31.1 / §28.3 v0.182 (double-free fix): a bare `throw e;` of a
+            // named owned LOCAL (a `var e := new E(); … throw e;`, as opposed
+            // to a catch-arm-binding re-throw, which is Borrowed-state and
+            // skipped below) is an ANNOUNCED CONSUME — "the operand of throw:
+            // the exception machinery takes the obligation and x is left
+            // moved-from — no marker, the keyword is the announcement" (§28.3
+            // "Move semantics", and the freeze-boundary passage groups `throw
+            // x` with `.Dispose()` and discard `_ := x` as an announced kill
+            // with "the disposed-flag runtime backstop" — the same treatment
+            // DiscardStmt already gives `_ := x`, mirrored here). Without this,
+            // `e` stayed Owned past the throw, so its established scope-end /
+            // exception-path disposal ran a SECOND time during the very unwind
+            // this throw triggers — freeing the object the exception machinery
+            // was simultaneously propagating, observed as a segfault reading
+            // the caught exception's fields in the matching catch arm.
+            // checkThrowOperandNotBorrowed above already rejected a borrow
+            // operand, so a bare identifier that survives it is exactly the
+            // owned-local/parameter case this must discharge; `lookupState`
+            // returns null for a catch-arm binding read this way is moot since
+            // checkThrowOperandNotBorrowed would have already rejected that as
+            // borrowed — this only fires for a currently-Owned local. // per
+            // §28.3, §31.1
+            if (const auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(th->value.get())) {
+                if (id->name != "this" && id->name != "base") {
+                    if (auto* st = lookupState(id->name)) {
+                        if (st->state == OwnershipState::Owned)
+                            markDisposedByName(id->name, id->span.begin);
+                    }
+                }
+            }
         }
         return;
     }

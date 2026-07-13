@@ -367,6 +367,26 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 checkCatchBorrowEscapesViaNewExpr(*ne, ne->span.begin);
             }
             handleDischarge(*te->operand);
+            // §31.1 / §28.3 v0.182 (double-free fix, mirrors the ThrowStmt
+            // handling in Ownership.cpp visitStmt): a bare `x ?? throw e` /
+            // `=> throw e` of a named owned LOCAL is an announced consume — the
+            // throw keyword is the announcement, no `move` marker needed — and
+            // must be discharged here or its established scope-end / exception-
+            // path disposal double-frees the object the exception machinery is
+            // simultaneously propagating. checkThrowOperandNotBorrowed above
+            // already rejected a borrowed operand (e.g. a catch-arm binding
+            // re-thrown), so a bare identifier that survives it and is
+            // currently Owned is exactly the case to discharge. // per §28.3,
+            // §31.1
+            if (const auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(te->operand.get())) {
+                if (id->name != "this" && id->name != "base") {
+                    if (auto* st = lookupState(id->name)) {
+                        if (st->state == OwnershipState::Owned)
+                            markDisposedByName(id->name, id->span.begin);
+                    }
+                }
+            }
         }
         return;
     }
