@@ -34,14 +34,24 @@
 // post-fix case below is additionally valgrind-clean (dispose-once, no
 // leaks).
 
+// AOT MIGRATION (JIT->AOT): runs under the AOT driver (runAot) — the stricter
+// oracle (full ownership + definite-assignment pipeline). Two cases fold a
+// multi-digit sequence (419, 414141) that exceeds the 8-bit exit-code ceiling;
+// they print it and assert on stdout via runAotOut. (The pre-migration comments
+// noting the in-process JIT "observes the untruncated value" are superseded:
+// AOT's exit code is masked to 0..255, so the untruncated value must come from
+// stdout, not the exit status.) The remaining cases (41) round-trip as exit
+// codes.
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -100,7 +110,7 @@ end A;
 // the untruncated value, 419).
 BEZEL_TEST(codegen_cleanup_order_1598,
            cleanup_order_break_edge_nested_finally_chain_spec_29_7) {
-    BEZEL_EXPECT_EQ(run(R"(
+    BEZEL_EXPECT_EQ(runAotOut(R"(
 module M;
 class C
   public static _seq: int := 0;
@@ -122,14 +132,14 @@ class C
   public static method Main(): int
     C._seq := 0;
     _ := Inner();
-    return C._seq;
+    Console.WriteLine(C._seq); return 0;
   end Main;
 end C;
 class B
   public tag: int := 4;
   destructor C._seq := C._seq * 10 + 1; end destructor;
 end B;
-)"), 419);
+)"), "419");
 }
 
 // (b) §29.7/§28.10 (v0.182): CONTINUE edge. Mirrors (a) but with `continue`:
@@ -143,7 +153,7 @@ end B;
 // (segfault).
 BEZEL_TEST(codegen_cleanup_order_1598,
            cleanup_order_continue_edge_finally_before_dispose_spec_29_7) {
-    BEZEL_EXPECT_EQ(run(R"(
+    BEZEL_EXPECT_EQ(runAotOut(R"(
 module M;
 class C
   public static _seq: int := 0;
@@ -161,14 +171,14 @@ class C
   public static method Main(): int
     C._seq := 0;
     _ := Inner();
-    return C._seq;
+    Console.WriteLine(C._seq); return 0;
   end Main;
 end C;
 class A
   public tag: int := 4;
   destructor C._seq := C._seq * 10 + 1; end destructor;
 end A;
-)"), 414141);
+)"), "414141");
 }
 
 // (c) §29.7/§28.10 (v0.182): YIELD BREAK edge. `Gen` has an enclosing
