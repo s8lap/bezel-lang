@@ -33,14 +33,17 @@
 // Each test ran (IR-verify failure / SIGSEGV) before the fix and produces the
 // spec-stated value after.
 
+#include "support/aot_support.hpp"      // runAot — AOT oracle (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
-bezel::test::JitResult jit(const std::string& prog) { return runJit(prog); }
+// Run under the AOT oracle: these programs build and RETURN an owned collection
+// from a generic method, so the ownership pass (skipped by the JIT) applies.
+bezel::test::JitResult jit(const std::string& prog) { return runAot(prog); }
 
 }  // namespace
 
@@ -54,7 +57,7 @@ BEZEL_TEST(codegen_generic_coll_keyhash_567, make_dict_int_key_indexer_14_1) {
         "class Util "
         "  public static method MakeDict<K>(k: K, v: int): owned Dictionary<K, int> "
         "      where K: notnull "
-        "    using var d := new Dictionary<K, int>(); "
+        "    var d := new Dictionary<K, int>(); "
         "    d[k] := v; "
         "    return d; "
         "  end MakeDict; "
@@ -76,7 +79,7 @@ BEZEL_TEST(codegen_generic_coll_keyhash_567, make_dict_int_key_containskey_14_1)
         "class Util "
         "  public static method MakeDict<K>(k: K, v: int): owned Dictionary<K, int> "
         "      where K: notnull "
-        "    using var d := new Dictionary<K, int>(); "
+        "    var d := new Dictionary<K, int>(); "
         "    d[k] := v; "
         "    return d; "
         "  end MakeDict; "
@@ -101,7 +104,7 @@ BEZEL_TEST(codegen_generic_coll_keyhash_567, make_dict_string_key_indexer_14_1) 
         "class Util "
         "  public static method MakeDict<K>(k: K, v: int): owned Dictionary<K, int> "
         "      where K: notnull "
-        "    using var d := new Dictionary<K, int>(); "
+        "    var d := new Dictionary<K, int>(); "
         "    d[k] := v; "
         "    return d; "
         "  end MakeDict; "
@@ -126,7 +129,7 @@ BEZEL_TEST(codegen_generic_coll_keyhash_567, make_dict_record_key_indexer_14_1) 
         "class Util "
         "  public static method MakeDict<K>(k: K, v: int): owned Dictionary<K, int> "
         "      where K: notnull "
-        "    using var d := new Dictionary<K, int>(); "
+        "    var d := new Dictionary<K, int>(); "
         "    d[k] := v; "
         "    return d; "
         "  end MakeDict; "
