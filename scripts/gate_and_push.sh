@@ -16,6 +16,15 @@ if scripts/gate.sh "$@"; then
   echo "== gate_and_push: GATE PASS -> pushing =="
   if git push; then
     echo "== gate_and_push: PUSHED origin/main now $(git rev-parse --short origin/main) =="
+    # Auto-GC on land: reap worktrees whose commits are now in origin/main
+    # (branch refs kept; WIP/locked/current worktrees never touched), drop stale
+    # ASan trees, and quarantine >48h root scratch. Best-effort — a GC hiccup
+    # must never fail a push that already succeeded. Set BEZEL_NO_GC=1 to skip.
+    if [ "${BEZEL_NO_GC:-0}" != 1 ] && [ -x scripts/gc_scratch.sh ]; then
+      echo "== gate_and_push: auto-GC (landed worktrees + stale builds + root) =="
+      scripts/gc_scratch.sh --landed-only --builds --root --apply || \
+        echo "== gate_and_push: GC reported an issue (ignored; push already landed) =="
+    fi
   else
     echo "== gate_and_push: PUSH FAILED (gate passed; resolve remote + push manually) =="
     exit 3

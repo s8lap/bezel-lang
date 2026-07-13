@@ -15,5 +15,11 @@ compile_commands.json
 .vscode/
 .idea/
 
+# Blessed root scratch dir for probes / experiments / one-off investigations.
+# Put ad-hoc .bz probes and compiled probe binaries HERE (or in
+# /var/tmp/bezel-scratch) — never loose in the repo root. See CLAUDE.md.
+# scripts/gc_scratch.sh auto-quarantines strays that still land in the root.
+/scratch/
+
 # Local scheduler lock files (per-session)
 .claude/scheduled_tasks.lock

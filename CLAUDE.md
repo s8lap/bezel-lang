@@ -135,6 +135,20 @@ artifacts (probe binaries, big logs, scratch build trees) go in
 tree parked there permanently consumes gigabytes. Keep ccache `max_size` at
 80G (a full 40G cache thrashes under multi-worktree churn).
 
+**Keep the repo root clean.** Ad-hoc `.bz` probes, one-off `bezelc -o` outputs,
+and investigation scratch do NOT belong loose in the repo root — put them in
+`./scratch/` (gitignored) or `/var/tmp/bezel-scratch/`. Cleanup is automated, so
+you should rarely sweep by hand: `scripts/gate_and_push.sh` runs
+`scripts/gc_scratch.sh` after every successful push, which (a) reaps worktrees
+whose commits are already in `origin/main` (branch refs are kept; WIP, locked,
+and the current worktree are never touched), (b) drops stale
+`/var/tmp/bezel-scratch/build-asan-*` trees, and (c) quarantines >48h-old root
+scratch into `/var/tmp/bezel-scratch/root-quarantine/` (moved, not deleted;
+self-purged after 14 days). Run `scripts/gc_scratch.sh` (dry-run) any time to
+preview, `--apply` to act; `scripts/reap_orphans.sh` clears processes a dead
+agent orphaned. Per-worktree build dirs live *inside* the worktree, so reaping
+the worktree reclaims them too.
+
 **Extra gates for delicate merges.** Merges touching object layout, disposal
 machinery, or the runtime additionally run (a) one full **serial** suite pass
 (`build/tests/bezel_tests` directly — twice this project, sharded-green runs
