@@ -35,6 +35,7 @@
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
+#include "support/aot_support.hpp"      // runAot — AOT oracle (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
@@ -43,14 +44,16 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 namespace fs = std::filesystem;
 
+// AOT oracle: fresh-receiver auto-drop (§28.3/§28.7) is disposal codegen, but
+// the surrounding programs must first pass the ownership pass the JIT skipped.
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -222,7 +225,11 @@ BEZEL_TEST(fresh_owned_receiver_1039, class_reference_result_not_disposed) {
     std::string src =
         "module M; "
         "class Inner public W: int := 5; end Inner; "
-        "class Cell public static n: int := 0; public In: Inner := new Inner(); "
+        // `In` is `owned` (§28.5): a fresh `new Inner()` may not initialize a
+        // non-`owned` (borrow) field — it would leak with no owner (§28.5). The
+        // exclusion under test is unchanged: GetIn() returns a *borrow* of the
+        // receiver's sub-object, so the fresh receiver must NOT be disposed.
+        "class Cell public static n: int := 0; public owned In: Inner := new Inner(); "
         "  public constructor() n := n + 1; end constructor; "
         "  public method GetIn(): Inner return In; end GetIn; "
         "  destructor n := n - 1; end destructor; "
