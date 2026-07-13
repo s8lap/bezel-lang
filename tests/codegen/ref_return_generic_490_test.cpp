@@ -35,14 +35,14 @@
 //   (e) constraint member returning int used in arithmetic (control: already
 //       worked, must not regress).
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -121,11 +121,18 @@ BEZEL_TEST(ref_return_generic_490, constraint_property_class_ref_inferred_local_
         "  destructor end destructor; "
         "end Inner; "
         "interface IHasInner  property GetInner: Inner; end IHasInner; "
+        // `_inner` holds a freshly-produced `new Inner(...)`, so the field must
+        // be `owned` (§28.5) — a non-`owned` field cannot own the value and it
+        // would leak. Being `owned`, the field is disposed by the generated
+        // destructor's field-disposal pass (§28.4), so the explicit
+        // `_inner.Dispose()` is dropped. (The pre-migration form declared the
+        // field non-`owned` and disposed it by hand; the JIT harness accepted
+        // that because it skips the ownership pass the real driver runs.)
         "class Outer : IHasInner "
-        "  public _inner: Inner; "
+        "  public owned _inner: Inner; "
         "  public constructor(sz: int) _inner := new Inner(sz); end constructor; "
         "  public property GetInner: Inner => _inner; "
-        "  destructor _inner.Dispose(); end destructor; "
+        "  destructor end destructor; "
         "end Outer; "
         "static class G "
         "  public static method GetSize<T>(x: T): int where T: IHasInner "
