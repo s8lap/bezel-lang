@@ -8,15 +8,20 @@
 //
 // Value tests — the program returns box.V (the running total the event handler
 // accumulates). If the subscription was disposed, post-scope Fire() is a no-op.
+//
+// AOT MIGRATION (JIT->AOT): runs under the AOT driver (runAot) — the stricter
+// oracle that runs the full ownership + definite-assignment pipeline. All
+// expected values here are ≤255, so exit codes round-trip.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 // Event plumbing: a Button raises Clicked(Ev); a Box accumulates the payloads.
