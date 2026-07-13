@@ -7,14 +7,22 @@
 // Per §14: `class Box<T> { value: T; ... }` is a generic class.
 // `new Box<int>(42)` instantiates with T=int; `new Box<double>(3.14)` with T=double.
 
+#include "support/aot_support.hpp"      // runAot — AOT oracle for disposal-bearing cases
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::runAot;
 using bezel::test::runJit;
 
 namespace {
 int run(const std::string& prog) {
     auto r = runJit(prog);
+    return r.ran ? r.exitCode : -999;
+}
+// AOT counterpart — used where the program exercises owned-field disposal, so
+// the stricter oracle (ownership + DA passes the JIT skips) applies.
+int runAotProg(const std::string& prog) {
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 }
@@ -195,19 +203,24 @@ BEZEL_TEST(codegen_generic, computed_property_named_length) {
 }
 
 // Test: nullable generic field chain (root._left!._val)
+// Run under the AOT oracle (§28.3 ownership pass): the `_left` link is `owned`
+// so a produced child node can be stored into it (a borrow may not be assigned
+// to a field, §28.3), and `left` is a plain `var` — a `using var` is scope-bound
+// and cannot be moved out (§28.10), so it could not be transferred into root's
+// owned field. The `_left!._val` chain (the feature under test) is unchanged.
 BEZEL_TEST(codegen_generic, nullable_generic_field_chain) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotProg(
         "module M; "
         "class TreeNode<T> "
         "  public _val: T; "
-        "  public _left: TreeNode<T>? := null; "
+        "  public owned _left: TreeNode<T>? := null; "
         "  public constructor(v: T) _val := v; end constructor; "
         "  destructor end destructor; "
         "end TreeNode<T>; "
         "class Program "
         "  public static method Main(): int "
         "    using var root := new TreeNode<string>(\"hello\"); "
-        "    using var left := new TreeNode<string>(\"apple\"); "
+        "    var left := new TreeNode<string>(\"apple\"); "
         "    root._left := left; "
         "    if root._left is not null then "
         "      var leftVal := root._left!._val; "
