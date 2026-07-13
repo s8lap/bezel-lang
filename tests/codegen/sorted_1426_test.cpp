@@ -33,6 +33,7 @@
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
@@ -40,13 +41,15 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
-// JIT a program and return its `Main` exit code (or -999 if it did not run).
+// AOT-compile+run a program and return its `Main` exit code (or -999 if it
+// did not run: compile/link reject or program crash/timeout).
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -64,15 +67,15 @@ std::string prog(const std::string& body) {
 
 // #1426 / stdlib §4.17: out-of-order inserts → ascending int key order in for-in.
 BEZEL_TEST(sorted_1426, sorted_dict_forin_int_key_ascending_spec_4_17) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "  using var d := new SortedDictionary<int,int>(); "
         "  d[30] := 300; d[10] := 100; d[20] := 200; "
         "  var order := 0; "
         "  for var e in d do "
         "    order := order * 100 + e.Key; "
         "  end; "
-        "  return order; "
-    )), 102030);
+        "  Console.WriteLine(order); return 0; "
+    )), "102030");
 }
 
 // #1426 / stdlib §4.17: ascending string key order in for-in.
@@ -90,7 +93,7 @@ BEZEL_TEST(sorted_1426, sorted_dict_forin_string_key_ascending_spec_4_17) {
 
 // #1426 / stdlib §4.17: after Remove, remaining entries still in ascending order.
 BEZEL_TEST(sorted_1426, sorted_dict_forin_after_remove_ascending_spec_4_17) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "  using var d := new SortedDictionary<int,int>(); "
         "  d[30] := 300; d[10] := 100; d[20] := 200; "
         "  var ignored := d.Remove(20); "
@@ -98,8 +101,8 @@ BEZEL_TEST(sorted_1426, sorted_dict_forin_after_remove_ascending_spec_4_17) {
         "  for var e in d do "
         "    order := order * 100 + e.Key; "
         "  end; "
-        "  return order; "
-    )), 1030);
+        "  Console.WriteLine(order); return 0; "
+    )), "1030");
 }
 
 // ===========================================================================
@@ -126,11 +129,11 @@ BEZEL_TEST(sorted_1426, sorted_dict_lastkey_int_spec_4_17) {
 
 // #1426 / stdlib §4.17: FirstKey + LastKey combined.
 BEZEL_TEST(sorted_1426, sorted_dict_firstkey_lastkey_combined_int_spec_4_17) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "  using var d := new SortedDictionary<int,int>(); "
         "  d[30] := 300; d[10] := 100; d[20] := 200; "
-        "  return d.FirstKey * 100 + d.LastKey; "
-    )), 1030);
+        "  Console.WriteLine(d.FirstKey * 100 + d.LastKey); return 0; "
+    )), "1030");
 }
 
 // #1426 / stdlib §4.17: FirstKey on an empty dict → InvalidOperationException.
@@ -200,15 +203,15 @@ BEZEL_TEST(sorted_1426, sorted_set_add_idempotent_spec_4_18) {
 
 // #1426 / stdlib §4.18: out-of-order inserts → ascending order in for-in.
 BEZEL_TEST(sorted_1426, sorted_set_forin_int_ascending_spec_4_18) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "  using var s := new SortedSet<int>(); "
         "  s.Add(30); s.Add(10); s.Add(20); "
         "  var order := 0; "
         "  for var x in s do "
         "    order := order * 100 + x; "
         "  end; "
-        "  return order; "
-    )), 102030);
+        "  Console.WriteLine(order); return 0; "
+    )), "102030");
 }
 
 // #1426 / stdlib §4.18: empty SortedSet → zero iterations.
@@ -223,7 +226,7 @@ BEZEL_TEST(sorted_1426, sorted_set_forin_empty_zero_iters_spec_4_18) {
 
 // #1426 / stdlib §4.18: after Remove, remaining elements still ascending.
 BEZEL_TEST(sorted_1426, sorted_set_forin_after_remove_ascending_spec_4_18) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "  using var s := new SortedSet<int>(); "
         "  s.Add(30); s.Add(10); s.Add(20); "
         "  var ignored := s.Remove(20); "
@@ -231,8 +234,8 @@ BEZEL_TEST(sorted_1426, sorted_set_forin_after_remove_ascending_spec_4_18) {
         "  for var x in s do "
         "    order := order * 100 + x; "
         "  end; "
-        "  return order; "
-    )), 1030);
+        "  Console.WriteLine(order); return 0; "
+    )), "1030");
 }
 
 // ===========================================================================
@@ -259,14 +262,14 @@ BEZEL_TEST(sorted_1426, sorted_set_last_returns_greatest_spec_4_18) {
 
 // #1426 / stdlib §4.18: First and Last combined encode min + max.
 BEZEL_TEST(sorted_1426, sorted_set_first_last_combined_spec_4_18) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "  using var s := new SortedSet<int>(); "
         "  s.Add(30); s.Add(10); s.Add(20); "
         "  var result := 0; "
         "  result := result + s.First; "
         "  result := result + s.Last * 100; "
-        "  return result; "
-    )), 3010);
+        "  Console.WriteLine(result); return 0; "
+    )), "3010");
 }
 
 // #1426 / stdlib §4.18: First/Last after Remove — recalculate from remaining.

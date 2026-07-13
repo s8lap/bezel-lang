@@ -17,15 +17,18 @@
 //
 // Bezel syntax: inequality `<>` (§17.3); byte value `byte(N)`.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 using bezel::test::runJit;
 
 namespace {
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -146,13 +149,13 @@ BEZEL_TEST(deserializer_arrayspan_1358, file_then_byte_accessor_parse) {
     // per stdlib §4.15/§7.3 v0.165 (#1358): write a LE int32 into a byte array,
     // persist it, read it back, and parse it with the mirrored byte accessor —
     // `File.ReadAllBytes(p).AsReadOnlySpan().ReadUInt32LittleEndian()`.
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; import System.Collections.Generic; import System.IO; "
         "class C public static method Main(): int "
         "  using var b := new Array<byte>(4, 0); "
         "  b.AsSpan().WriteInt32LittleEndian(0x12345678); "
         "  File.WriteAllBytes(\"/tmp/bz_1358_rt5.bin\", b.AsReadOnlySpan()); "
         "  using var back := File.ReadAllBytes(\"/tmp/bz_1358_rt5.bin\"); "
-        "  return back.AsReadOnlySpan().ReadInt32LittleEndian(); "
-        "end Main; end C;"), 0x12345678);
+        "  Console.WriteLine(back.AsReadOnlySpan().ReadInt32LittleEndian()); return 0; "
+        "end Main; end C;"), "305419896");
 }

@@ -28,14 +28,16 @@
 // This uniquely encodes the output permutation as a 5-digit decimal number when
 // each v[i] ∈ {1..9} — no two permutations give the same result.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -49,7 +51,7 @@ int run(const std::string& src) {
 // Encoding: result = v0*10000 + v1*1000 + v2*100 + v3*10 + v4
 // If order is correct: result = 1*10000 + 2*1000 + 3*100 + 4*10 + 5 = 12345.
 BEZEL_TEST(dict_insertion_order_622, str_key_entry_order_5_keys) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
         "  d[\"a\"] := 1; "
@@ -63,8 +65,8 @@ BEZEL_TEST(dict_insertion_order_622, str_key_entry_order_5_keys) {
         "    result := result + e.Value * wt; "
         "    wt := wt / 10; "
         "  end; "
-        "  return result; "
-        "end Main; end C;"), 12345);
+        "  Console.WriteLine(result); return 0; "
+        "end Main; end C;"), "12345");
 }
 
 // #622 / stdlib §4.8 v0.135: Keys view iteration in insertion order.
@@ -76,7 +78,7 @@ BEZEL_TEST(dict_insertion_order_622, str_key_entry_order_5_keys) {
 // Direct: insert keys with distinct known lengths — "a"(1),"bb"(2),"ccc"(3).
 // Weighted: result = len0*100 + len1*10 + len2 → 123 if insertion order.
 BEZEL_TEST(dict_insertion_order_622, str_key_keys_view_order_3_keys) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
         "  d[\"a\"] := 0; "
@@ -90,15 +92,15 @@ BEZEL_TEST(dict_insertion_order_622, str_key_keys_view_order_3_keys) {
         "    result := result + k.Length * wt; "
         "    wt := wt / 10; "
         "  end; "
-        "  return result; "
-        "end Main; end C;"), 12345);
+        "  Console.WriteLine(result); return 0; "
+        "end Main; end C;"), "12345");
 }
 
 // #622 / stdlib §4.8 v0.135: Values view iteration in insertion order.
 // Values 1,2,3,4,5 inserted in that order; for var v in d.Values must yield
 // 1,2,3,4,5. Same positional encoding: result = 12345.
 BEZEL_TEST(dict_insertion_order_622, str_key_values_view_order_5_keys) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
         "  d[\"a\"] := 1; "
@@ -112,8 +114,8 @@ BEZEL_TEST(dict_insertion_order_622, str_key_values_view_order_5_keys) {
         "    result := result + v * wt; "
         "    wt := wt / 10; "
         "  end; "
-        "  return result; "
-        "end Main; end C;"), 12345);
+        "  Console.WriteLine(result); return 0; "
+        "end Main; end C;"), "12345");
 }
 
 // ---------------------------------------------------------------------------
@@ -125,7 +127,7 @@ BEZEL_TEST(dict_insertion_order_622, str_key_values_view_order_5_keys) {
 // After remove("c") + Set("c",9): order becomes a,b,d,e,c.
 // Encoded result = 1*10000 + 2*1000 + 4*100 + 5*10 + 9 = 12459.
 BEZEL_TEST(dict_insertion_order_622, str_key_remove_readd_moves_to_end) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
         "  d[\"a\"] := 1; "
@@ -141,8 +143,8 @@ BEZEL_TEST(dict_insertion_order_622, str_key_remove_readd_moves_to_end) {
         "    result := result + e.Value * wt; "
         "    wt := wt / 10; "
         "  end; "
-        "  return result; "
-        "end Main; end C;"), 12459);
+        "  Console.WriteLine(result); return 0; "
+        "end Main; end C;"), "12459");
 }
 
 // #622 / stdlib §4.8 v0.135: remove first key, re-add it — must go to end.
@@ -176,7 +178,7 @@ BEZEL_TEST(dict_insertion_order_622, str_key_remove_first_readd_to_end) {
 // Initial: a=1,b=2,c=3. After Clear(): empty. Re-add: c=3,a=1,b=2.
 // Order after re-add: c,a,b → result = 3*100 + 1*10 + 2 = 312.
 BEZEL_TEST(dict_insertion_order_622, str_key_clear_resets_order) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
         "  d[\"a\"] := 1; "
@@ -192,8 +194,8 @@ BEZEL_TEST(dict_insertion_order_622, str_key_clear_resets_order) {
         "    result := result + e.Value * wt; "
         "    wt := wt / 10; "
         "  end; "
-        "  return result; "
-        "end Main; end C;"), 312);
+        "  Console.WriteLine(result); return 0; "
+        "end Main; end C;"), "312");
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +206,7 @@ BEZEL_TEST(dict_insertion_order_622, str_key_clear_resets_order) {
 // the initial capacity-8 table at 75% load), then verify insertion order is
 // preserved. Values 1..8; result = 1*10000000 + 2*1000000 + ... + 8*1 = 12345678.
 BEZEL_TEST(dict_insertion_order_622, str_key_order_preserved_across_rehash) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
         "  d[\"k1\"] := 1; "
@@ -221,8 +223,8 @@ BEZEL_TEST(dict_insertion_order_622, str_key_order_preserved_across_rehash) {
         "    result := result + e.Value * wt; "
         "    wt := wt / 10; "
         "  end; "
-        "  return result; "
-        "end Main; end C;"), 12345678);
+        "  Console.WriteLine(result); return 0; "
+        "end Main; end C;"), "12345678");
 }
 
 // ---------------------------------------------------------------------------
@@ -233,7 +235,7 @@ BEZEL_TEST(dict_insertion_order_622, str_key_order_preserved_across_rehash) {
 // values 1,2,3,4,5. Entry iteration must yield (10,1),(20,2),(30,3),(40,4),(50,5).
 // Verify via values: result = 1*10000 + 2*1000 + 3*100 + 4*10 + 5 = 12345.
 BEZEL_TEST(dict_insertion_order_622, int_key_entry_order_5_keys) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
         "  d[10] := 1; "
@@ -247,14 +249,14 @@ BEZEL_TEST(dict_insertion_order_622, int_key_entry_order_5_keys) {
         "    result := result + e.Value * wt; "
         "    wt := wt / 10; "
         "  end; "
-        "  return result; "
-        "end Main; end C;"), 12345);
+        "  Console.WriteLine(result); return 0; "
+        "end Main; end C;"), "12345");
 }
 
 // #622 / stdlib §4.8 v0.135: int-keyed dict, Keys view in insertion order.
 // Keys 10,20,30; weighted: result = 10*100 + 20*10 + 30 = 1230.
 BEZEL_TEST(dict_insertion_order_622, int_key_keys_view_order) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
         "  d[10] := 0; "
@@ -266,14 +268,14 @@ BEZEL_TEST(dict_insertion_order_622, int_key_keys_view_order) {
         "    result := result + k * wt; "
         "    wt := wt / 10; "
         "  end; "
-        "  return result; "
-        "end Main; end C;"), 1230);
+        "  Console.WriteLine(result); return 0; "
+        "end Main; end C;"), "1230");
 }
 
 // #622 / stdlib §4.8 v0.135: int-keyed dict, Values view in insertion order.
 // Values 1,2,3,4,5 inserted in that order; result = 12345.
 BEZEL_TEST(dict_insertion_order_622, int_key_values_view_order_5_keys) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
         "  d[10] := 1; "
@@ -287,8 +289,8 @@ BEZEL_TEST(dict_insertion_order_622, int_key_values_view_order_5_keys) {
         "    result := result + v * wt; "
         "    wt := wt / 10; "
         "  end; "
-        "  return result; "
-        "end Main; end C;"), 12345);
+        "  Console.WriteLine(result); return 0; "
+        "end Main; end C;"), "12345");
 }
 
 // ---------------------------------------------------------------------------
@@ -299,7 +301,7 @@ BEZEL_TEST(dict_insertion_order_622, int_key_values_view_order_5_keys) {
 // Insert 10=1,20=2,30=3,40=4,50=5. Remove 30. Re-add 30=9.
 // Order: 10=1,20=2,40=4,50=5,30=9 → result = 1*10000+2*1000+4*100+5*10+9 = 12459.
 BEZEL_TEST(dict_insertion_order_622, int_key_remove_readd_moves_to_end) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
         "  d[10] := 1; "
@@ -315,15 +317,15 @@ BEZEL_TEST(dict_insertion_order_622, int_key_remove_readd_moves_to_end) {
         "    result := result + e.Value * wt; "
         "    wt := wt / 10; "
         "  end; "
-        "  return result; "
-        "end Main; end C;"), 12459);
+        "  Console.WriteLine(result); return 0; "
+        "end Main; end C;"), "12459");
 }
 
 // #622 / stdlib §4.8 v0.135: int-keyed, Clear() resets order.
 // Initial: 10=1,20=2,30=3. Clear(). Re-add: 30=3,10=1,20=2.
 // Order: 30,10,20 → result = 3*100+1*10+2 = 312.
 BEZEL_TEST(dict_insertion_order_622, int_key_clear_resets_order) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
         "  d[10] := 1; "
@@ -339,14 +341,14 @@ BEZEL_TEST(dict_insertion_order_622, int_key_clear_resets_order) {
         "    result := result + e.Value * wt; "
         "    wt := wt / 10; "
         "  end; "
-        "  return result; "
-        "end Main; end C;"), 312);
+        "  Console.WriteLine(result); return 0; "
+        "end Main; end C;"), "312");
 }
 
 // #622 / stdlib §4.8 v0.135: int-keyed, order preserved across rehash (8 keys).
 // Keys 10..80 with values 1..8; forces rehash. result = 12345678.
 BEZEL_TEST(dict_insertion_order_622, int_key_order_preserved_across_rehash) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
         "  d[10] := 1; "
@@ -363,8 +365,8 @@ BEZEL_TEST(dict_insertion_order_622, int_key_order_preserved_across_rehash) {
         "    result := result + e.Value * wt; "
         "    wt := wt / 10; "
         "  end; "
-        "  return result; "
-        "end Main; end C;"), 12345678);
+        "  Console.WriteLine(result); return 0; "
+        "end Main; end C;"), "12345678");
 }
 
 // ---------------------------------------------------------------------------

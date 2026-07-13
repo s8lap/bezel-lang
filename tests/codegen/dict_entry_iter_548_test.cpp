@@ -32,14 +32,17 @@
 //   DictionaryEntry<K,V>-typed local GEPs the struct alloca directly (before
 //   fieldAddr, which knows nothing of the synthetic DictionaryEntry type).
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 using bezel::test::runJit;
 
 namespace {
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -138,15 +141,15 @@ BEZEL_TEST(dict_entry_iter_548, empty_dict_zero_iterations) {
 // #548 / stdlib §4.8 v0.135: int-keyed dictionary entry iteration.
 // {3:100, 4:200} → sum of values = 300.
 BEZEL_TEST(dict_entry_iter_548, int_key_int_value_sum) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
         "  d[3] := 100; "
         "  d[4] := 200; "
         "  var sum := 0; "
         "  for var e in d do sum := sum + e.Value; end; "
-        "  return sum; "
-        "end Main; end C;"), 300);
+        "  Console.WriteLine(sum); return 0; "
+        "end Main; end C;"), "300");
 }
 
 // #548 / stdlib §4.8 v0.135: int keys accessible via entry.Key.

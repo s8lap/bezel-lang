@@ -4,14 +4,16 @@
 // are emitted via the shared callable-shape path (they carry an
 // `OperatorDecl` rather than a `MethodDecl`). Observable via exit code.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 } // namespace
@@ -90,21 +92,21 @@ BEZEL_TEST(codegen_cg48, unary_minus_overload) {
 }
 
 BEZEL_TEST(codegen_cg48, unary_complement_overload) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class V "
         "  public X: int := 0; "
         "  public static method operator ~(a: V): int => ~a.X; "
         "end V; "
         "class C public static method Main(): int "
-        "  var v := new V(); v.X := 0; return ~v; "
-        "end Main; end C;"), -1);
+        "  var v := new V(); v.X := 0; Console.WriteLine(~v); return 0; "
+        "end Main; end C;"), "-1");
 }
 
 BEZEL_TEST(codegen_cg48, primitive_unary_unchanged) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
-        "  var x := 5; return -x; "
-        "end Main; end C;"), -5);
+        "  var x := 5; Console.WriteLine(-x); return 0; "
+        "end Main; end C;"), "-5");
 }
 
 // #1059 / §25 + §22: an operator overload on a GENERIC record/class is a

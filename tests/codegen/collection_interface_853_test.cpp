@@ -28,16 +28,20 @@
 //     which is deferred (#853 stays open). This test pins the diagnostic so the
 //     silent miscompile cannot return.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 using bezel::test::runJit;
 
 namespace {
 
-// JIT a program and return its `main` exit code (or -999 if it didn't run).
+// AOT-compile+run a program and return its `main` exit code (or -999 if it
+// did not run: compile/link reject or program crash/timeout).
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -137,7 +141,7 @@ BEZEL_TEST(collection_interface_853, ilist_contains_4_1) {
 // → 0; Remove(100) → true and Count drops back to 2. Encoded: index(0) + 1000
 // (removed) + final Count(2) = 1002.
 BEZEL_TEST(collection_interface_853, ilist_indexof_remove_insert_4_1) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C "
         "  public static method Mutate(c: IList<int>): int "
         "    c.Insert(0, 100); "
@@ -150,8 +154,8 @@ BEZEL_TEST(collection_interface_853, ilist_indexof_remove_insert_4_1) {
         "  public static method Main(): int "
         "    using var a := new Array<int>(); "
         "    a.Add(1); a.Add(2); "
-        "    return Mutate(a) + a.Count; "                  // 1000 + 2 = 1002
-        "  end Main; end C;"), 1002);
+        "    Console.WriteLine(Mutate(a) + a.Count); return 0; "  // 1000 + 2 = 1002
+        "  end Main; end C;"), "1002");
 }
 
 // §4.1 / §3 (#853): a string-element IList<string>.Add through the interface

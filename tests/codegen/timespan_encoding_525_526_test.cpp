@@ -17,15 +17,17 @@
 //
 // Each test cites its stdlib section and verifies one specific behaviour.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -100,11 +102,11 @@ BEZEL_TEST(codegen_timespan_525, subtract_two_timespans_days) {
 // stdlib §2.5 L265: subtracting a larger span from a smaller gives a negative span.
 // 2 days - 5 days = -3 days (Days == -3).
 BEZEL_TEST(codegen_timespan_525, subtract_larger_yields_negative) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "var t1 := TimeSpan.FromDays(2.0); "
         "var t2 := TimeSpan.FromDays(5.0); "
         "var diff := t1 - t2; "
-        "return diff.Days; ")), -3);
+        "Console.WriteLine(diff.Days); return 0; ")), "-3");
 }
 
 // stdlib §2.5 L265: t - t = 0 days (self-subtraction).

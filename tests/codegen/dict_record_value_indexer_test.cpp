@@ -31,14 +31,16 @@
 // `int(... )` predicate would be 0 (or the program would mis-decode) rather than
 // the asserted 1; the missing-key test would not throw KeyNotFoundException.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -66,13 +68,13 @@ BEZEL_TEST(codegen_dict_record_value_indexer, str_key_indexer_get_spec_4_8) {
 // §4.8: `dict[key]` (get) followed immediately by field access on the read
 // value (`d[key].x`) — the record get returns a struct value usable directly.
 BEZEL_TEST(codegen_dict_record_value_indexer, str_key_indexer_get_field_spec_4_8) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<string, Point>(); "
         "  d.Add(\"a\", new Point(11, 22)); "
-        "  return d[\"a\"].x * 100 + d[\"a\"].y; "       // 11*100 + 22 = 1122
-        "end Main; end C;"), 1122);
+        "  Console.WriteLine(d[\"a\"].x * 100 + d[\"a\"].y); return 0; "  // 11*100 + 22 = 1122
+        "end Main; end C;"), "1122");
 }
 
 // §4.8: `dict[key] := v` (set) INSERTS a record value under a fresh key; a later

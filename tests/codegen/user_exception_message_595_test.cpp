@@ -18,15 +18,18 @@
 //
 // per §12 (inheritance), §31 (exceptions), stdlib Exception.Message.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 using bezel::test::runJit;
 
 namespace {
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -155,7 +158,7 @@ BEZEL_TEST(codegen_595, user_exception_first_match_wins_spec_31_2_3) {
 // the correct values simultaneously.
 // per §12 (prefix layout preserved: own fields come after inherited slots).
 BEZEL_TEST(codegen_595, user_exception_own_field_plus_message_spec_12) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; "
         "class ErrA: Exception "
         "  public _code: int; "
@@ -167,12 +170,13 @@ BEZEL_TEST(codegen_595, user_exception_own_field_plus_message_spec_12) {
         "class C public static method Main(): int "
         "  try "
         "    throw new ErrA(\"oops\", 77); "
-        "  catch var e: ErrA => "
-        "    return e.Message.Length * 100 + e._code; "
+        "  catch var e: ErrA => do "
+        "    Console.WriteLine(e.Message.Length * 100 + e._code); return 0; "
+        "  end "
         "  end; "
         "  return 0; "
         "end Main; end C;"),
-        477);   // 4 * 100 + 77 = 477
+        "477");   // 4 * 100 + 77 = 477
 }
 
 // ── Group 4: Two-level user hierarchy (ErrB: ErrA: Exception) ─────────────────

@@ -17,10 +17,12 @@
 // is selected"; the bound variable is usable in the guard.
 // §19.5: a typed binding pattern `var x: T` matches only values that are-a T.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
@@ -46,8 +48,13 @@ const char* kPrologue =
 
 // Run `kPrologue` + the given `classC` definition.
 int run(const std::string& classC) {
-    auto r = runJit(std::string(kPrologue) + classC);
+    auto r = runAot(std::string(kPrologue) + classC);
     return r.ran ? r.exitCode : -999;
+}
+
+// String-channel counterpart (runAotOut) for observables outside 0..255.
+std::string runOut(const std::string& classC) {
+    return runAotOut(std::string(kPrologue) + classC);
 }
 
 } // namespace
@@ -57,15 +64,15 @@ int run(const std::string& classC) {
 // §19.4: `var c: Circle when c.r > 5` over a Circle(10) — the guard reads the
 // narrowed field; the guard is true so the arm is selected. (Previously SIGILL.)
 BEZEL_TEST(codegen_pattern_guard_member, field_guard_true_expr_pos) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runOut(
         "class C "
         "  public static method K(sh: Shape): int "
         "    return case sh of var c: Circle when c.r > 5 => 1000, _ => 0 end; "
         "  end K; "
         "  public static method Main(): int "
-        "    using var c := new Circle(10); return K(c); "
+        "    using var c := new Circle(10); Console.WriteLine(K(c)); return 0; "
         "  end Main; "
-        "end C;"), 1000);
+        "end C;"), "1000");
 }
 
 // §19.4: same guard over a Circle(3) — the guard is false, so control falls to
@@ -88,15 +95,15 @@ BEZEL_TEST(codegen_pattern_guard_member, field_guard_false_falls_through) {
 // variable in the guard. (A method call can split blocks; the guard's
 // conditional branch must still terminate the resulting block.)
 BEZEL_TEST(codegen_pattern_guard_member, method_guard_true) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runOut(
         "class C "
         "  public static method K(sh: Shape): int "
         "    return case sh of var c: Circle when c.Area() > 5 => 1000, _ => 0 end; "
         "  end K; "
         "  public static method Main(): int "
-        "    using var c := new Circle(9); return K(c); "
+        "    using var c := new Circle(9); Console.WriteLine(K(c)); return 0; "
         "  end Main; "
-        "end C;"), 1000);
+        "end C;"), "1000");
 }
 
 BEZEL_TEST(codegen_pattern_guard_member, method_guard_false_falls_through) {
@@ -115,7 +122,7 @@ BEZEL_TEST(codegen_pattern_guard_member, method_guard_false_falls_through) {
 
 // §19.4 statement position — same field guard, arm bodies are `do … end`.
 BEZEL_TEST(codegen_pattern_guard_member, field_guard_statement_pos) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runOut(
         "class C "
         "  public static method K(sh: Shape): int "
         "    var r := 0; "
@@ -126,14 +133,14 @@ BEZEL_TEST(codegen_pattern_guard_member, field_guard_statement_pos) {
         "    return r; "
         "  end K; "
         "  public static method Main(): int "
-        "    using var c := new Circle(10); return K(c); "
+        "    using var c := new Circle(10); Console.WriteLine(K(c)); return 0; "
         "  end Main; "
-        "end C;"), 1000);
+        "end C;"), "1000");
 }
 
 // §19.4 statement position — method guard in stmt-position case.
 BEZEL_TEST(codegen_pattern_guard_member, method_guard_statement_pos) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runOut(
         "class C "
         "  public static method K(sh: Shape): int "
         "    var r := 0; "
@@ -144,9 +151,9 @@ BEZEL_TEST(codegen_pattern_guard_member, method_guard_statement_pos) {
         "    return r; "
         "  end K; "
         "  public static method Main(): int "
-        "    using var c := new Circle(9); return K(c); "
+        "    using var c := new Circle(9); Console.WriteLine(K(c)); return 0; "
         "  end Main; "
-        "end C;"), 1000);
+        "end C;"), "1000");
 }
 
 // ── FINDING [5]: more complex member expression in the guard ───────────────
@@ -154,15 +161,15 @@ BEZEL_TEST(codegen_pattern_guard_member, method_guard_statement_pos) {
 // §19.4 / §17: a guard that reads the same member twice in an arithmetic
 // expression (`c.r * 2 > c.r`). True for any r > 0.
 BEZEL_TEST(codegen_pattern_guard_member, complex_member_expr_guard) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runOut(
         "class C "
         "  public static method K(sh: Shape): int "
         "    return case sh of var c: Circle when c.r * 2 > c.r => 1000, _ => 0 end; "
         "  end K; "
         "  public static method Main(): int "
-        "    using var c := new Circle(10); return K(c); "
+        "    using var c := new Circle(10); Console.WriteLine(K(c)); return 0; "
         "  end Main; "
-        "end C;"), 1000);
+        "end C;"), "1000");
 }
 
 // ── §19.5: a typed binding pattern is a type test (must not match an

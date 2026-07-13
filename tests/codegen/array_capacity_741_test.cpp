@@ -14,15 +14,17 @@
 //      arg is now honoured (reserving slots without setting Count), falling
 //      back to the default for a non-positive request.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -45,13 +47,13 @@ BEZEL_TEST(array_capacity_741, ctor_capacity_honoured) {
 // A larger reservation is honoured exactly, not clamped to a default.
 BEZEL_TEST(array_capacity_741, ctor_capacity_large) {
     // per stdlib §4.4
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; import System.Collections.Generic; class C "
         "  public static method Main(): int "
         "    using var a := new Array<int>(1000); "
-        "    return a.Capacity; "
+        "    Console.WriteLine(a.Capacity); return 0; "
         "  end Main; "
-        "end C;"), 1000);
+        "end C;"), "1000");
 }
 
 // The capacity ctor reserves space WITHOUT populating elements: Count is 0.

@@ -8,15 +8,17 @@
 // Observable via the int exit code (string cases compare in-language and return
 // 1/0 to prove the right accessor ran).
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -231,7 +233,7 @@ BEZEL_TEST(codegen_bug481, virtual_method_alongside_virtual_property) {
 //    read/write the most-derived backing field (§23.1 / §12.1). Read 9, write
 //    50, read 50 → 9*100+50 = 950.
 BEZEL_TEST(codegen_bug481, virtual_auto_property_get_set) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; "
         "class Base "
         "  public virtual property Tag: int := 1; "
@@ -246,9 +248,9 @@ BEZEL_TEST(codegen_bug481, virtual_auto_property_get_set) {
         "  public static method Main(): int "
         "    using var d := new Derived(); "
         "    var before := Read(d); Write(d); "
-        "    return before * 100 + Read(d); "
+        "    Console.WriteLine(before * 100 + Read(d)); return 0; "
         "  end Main; "
-        "end C;"), 950);
+        "end C;"), "950");
 }
 
 // 9. interface read-write property: the SETTER also dispatches through the itab

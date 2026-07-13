@@ -18,15 +18,17 @@
 // pattern). REGRESSION GUARDS confirm a NON-null `record` is unchanged: bare
 // struct field access, structural equality, and construction still work.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -41,6 +43,22 @@ int runBox(const std::string& mainBody) {
 // A module with a two-field Pair record and a Main body (multi-field payload).
 int runPair(const std::string& mainBody) {
     return run(
+        "module M; record Pair(A: int, B: int); "
+        "class C public static method Main(): int " + mainBody +
+        " end Main; end C;");
+}
+
+// String-channel counterparts of runBox/runPair (runAotOut) for observables
+// outside 0..255 that cannot round-trip through the 8-bit process exit code.
+std::string runBoxOut(const std::string& mainBody) {
+    return runAotOut(
+        "module M; record Box(V: int); "
+        "class C public static method Main(): int " + mainBody +
+        " end Main; end C;");
+}
+
+std::string runPairOut(const std::string& mainBody) {
+    return runAotOut(
         "module M; record Pair(A: int, B: int); "
         "class C public static method Main(): int " + mainBody +
         " end Main; end C;");
@@ -91,17 +109,17 @@ BEZEL_TEST(codegen_nullable_record, narrowed_member_access_spec_7_4) {
 // §7.4 / §8.4: the null branch is taken for a null `record?` — the `<> null`
 // test correctly distinguishes null from a value (the else arm runs).
 BEZEL_TEST(codegen_nullable_record, narrowed_member_null_takes_else_spec_7_4) {
-    BEZEL_EXPECT_EQ(runBox(
+    BEZEL_EXPECT_EQ(runBoxOut(
         "var b: Box? := null; "
-        "if b <> null then return b.V; else return -1; end;"), -1);
+        "if b <> null then return b.V; else Console.WriteLine(-1); return 0; end;"), "-1");
 }
 
 // §7.4: a multi-field record narrowed member access reads each field correctly
 // (payload offset is applied to every field, not just field 0).
 BEZEL_TEST(codegen_nullable_record, narrowed_member_multi_field_spec_7_4) {
-    BEZEL_EXPECT_EQ(runPair(
+    BEZEL_EXPECT_EQ(runPairOut(
         "var p: Pair? := new Pair(11, 22); "
-        "if p <> null then return p.A * 100 + p.B; end; return 0;"), 1122);
+        "if p <> null then Console.WriteLine(p.A * 100 + p.B); return 0; end; return 0;"), "1122");
 }
 
 // ---- §7.8: `!` force-unwrap then member access ----------------------------
@@ -244,8 +262,8 @@ BEZEL_TEST(codegen_nullable_record, regress_nonnull_record_passed_by_value) {
 
 // §9.4: a multi-field non-nullable record field read still works directly.
 BEZEL_TEST(codegen_nullable_record, regress_nonnull_record_multi_field) {
-    BEZEL_EXPECT_EQ(runPair(
-        "var p := new Pair(11, 22); return p.A * 100 + p.B;"), 1122);
+    BEZEL_EXPECT_EQ(runPairOut(
+        "var p := new Pair(11, 22); Console.WriteLine(p.A * 100 + p.B); return 0;"), "1122");
 }
 
 // R40 / §9.5: a `with`-replacement of a NULLABLE VALUE-type field must store

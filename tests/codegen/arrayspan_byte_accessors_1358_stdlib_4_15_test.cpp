@@ -14,15 +14,18 @@
 // Bezel syntax: inequality `<>` (§17.3); byte value `byte(N)`; the `out`
 // parameter of a TryRead uses `out var v` (§22.4). Raises are pinned in-source.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 using bezel::test::runJit;
 
 namespace {
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -43,13 +46,13 @@ BEZEL_TEST(arrayspan_byte_accessors_1358, read_int16_le) {
 
 BEZEL_TEST(arrayspan_byte_accessors_1358, read_int16_le_256) {
     // per stdlib §4.15 v0.165 (#1358): 0x00 0x01 → LE i16 = 256.
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var b := new Array<byte>(2, 0); "
         "  b[0] := byte(0); b[1] := byte(1); "
-        "  return int(b.AsReadOnlySpan().ReadInt16LittleEndian()); "
-        "end Main; end C;"), 256);
+        "  Console.WriteLine(int(b.AsReadOnlySpan().ReadInt16LittleEndian())); return 0; "
+        "end Main; end C;"), "256");
 }
 
 BEZEL_TEST(arrayspan_byte_accessors_1358, read_int16_be) {
@@ -68,62 +71,62 @@ BEZEL_TEST(arrayspan_byte_accessors_1358, read_int16_be) {
 // ReadOnlyArraySpan (Array.AsReadOnlySpan) — the §4.15 file→parse path.
 BEZEL_TEST(arrayspan_byte_accessors_1358, read_int32_le_readonly_arrayspan) {
     // per stdlib §4.15 v0.165 (#1358): 0x78 0x56 0x34 0x12 → LE 0x12345678.
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var b := new Array<byte>(4, 0); "
         "  b[0] := byte(120); b[1] := byte(86); b[2] := byte(52); b[3] := byte(18); "
-        "  return b.AsReadOnlySpan().ReadInt32LittleEndian(); "
-        "end Main; end C;"), 0x12345678);
+        "  Console.WriteLine(b.AsReadOnlySpan().ReadInt32LittleEndian()); return 0; "
+        "end Main; end C;"), "305419896");
 }
 
 // ArraySpan (Array.AsSpan, writable form).
 BEZEL_TEST(arrayspan_byte_accessors_1358, read_int32_le_arrayspan) {
     // per stdlib §4.15 v0.165 (#1358)
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var b := new Array<byte>(4, 0); "
         "  b[0] := byte(120); b[1] := byte(86); b[2] := byte(52); b[3] := byte(18); "
-        "  return b.AsSpan().ReadInt32LittleEndian(); "
-        "end Main; end C;"), 0x12345678);
+        "  Console.WriteLine(b.AsSpan().ReadInt32LittleEndian()); return 0; "
+        "end Main; end C;"), "305419896");
 }
 
 // Span (OwningBuffer.AsSpan) — the §4.14 owning-buffer family.
 BEZEL_TEST(arrayspan_byte_accessors_1358, read_int32_le_span) {
     // per stdlib §4.14 (#1358)
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var ob := new OwningBuffer<byte>(4); "
         "  var sp := ob.AsSpan(); "
         "  sp[0] := byte(120); sp[1] := byte(86); sp[2] := byte(52); sp[3] := byte(18); "
-        "  return sp.ReadInt32LittleEndian(); "
-        "end Main; end C;"), 0x12345678);
+        "  Console.WriteLine(sp.ReadInt32LittleEndian()); return 0; "
+        "end Main; end C;"), "305419896");
 }
 
 // ReadOnlySpan (OwningBuffer.AsReadOnlySpan).
 BEZEL_TEST(arrayspan_byte_accessors_1358, read_int32_le_readonly_span) {
     // per stdlib §4.14 (#1358)
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var ob := new OwningBuffer<byte>(4); "
         "  var w := ob.AsSpan(); "
         "  w[0] := byte(120); w[1] := byte(86); w[2] := byte(52); w[3] := byte(18); "
-        "  return ob.AsReadOnlySpan().ReadInt32LittleEndian(); "
-        "end Main; end C;"), 0x12345678);
+        "  Console.WriteLine(ob.AsReadOnlySpan().ReadInt32LittleEndian()); return 0; "
+        "end Main; end C;"), "305419896");
 }
 
 BEZEL_TEST(arrayspan_byte_accessors_1358, read_int32_be) {
     // per stdlib §4.15 v0.165 (#1358): 0x12 0x34 0x56 0x78 → BE 0x12345678.
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var b := new Array<byte>(4, 0); "
         "  b[0] := byte(18); b[1] := byte(52); b[2] := byte(86); b[3] := byte(120); "
-        "  return b.AsReadOnlySpan().ReadInt32BigEndian(); "
-        "end Main; end C;"), 0x12345678);
+        "  Console.WriteLine(b.AsReadOnlySpan().ReadInt32BigEndian()); return 0; "
+        "end Main; end C;"), "305419896");
 }
 
 // ── Read: 64-bit and unsigned ─────────────────────────────────────────────────
@@ -141,52 +144,52 @@ BEZEL_TEST(arrayspan_byte_accessors_1358, read_int64_le) {
 
 BEZEL_TEST(arrayspan_byte_accessors_1358, read_uint16_le) {
     // per stdlib §4.15 v0.165 (#1358): 0xFF 0xFF → uint16 65535.
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var b := new Array<byte>(2, 0); "
         "  b[0] := byte(255); b[1] := byte(255); "
-        "  return int(b.AsReadOnlySpan().ReadUInt16LittleEndian()); "
-        "end Main; end C;"), 65535);
+        "  Console.WriteLine(int(b.AsReadOnlySpan().ReadUInt16LittleEndian())); return 0; "
+        "end Main; end C;"), "65535");
 }
 
 // ── Write (ArraySpan / Span) round-trips through Read ─────────────────────────
 
 BEZEL_TEST(arrayspan_byte_accessors_1358, round_trip_int32_le_arrayspan) {
     // per stdlib §4.15 v0.165 (#1358)
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var b := new Array<byte>(4, 0); "
         "  var sp := b.AsSpan(); "
         "  sp.WriteInt32LittleEndian(0x12345678); "
-        "  return sp.ReadInt32LittleEndian(); "
-        "end Main; end C;"), 0x12345678);
+        "  Console.WriteLine(sp.ReadInt32LittleEndian()); return 0; "
+        "end Main; end C;"), "305419896");
 }
 
 BEZEL_TEST(arrayspan_byte_accessors_1358, round_trip_int32_be_span) {
     // per stdlib §4.14 (#1358): write BE, read BE.
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var ob := new OwningBuffer<byte>(4); "
         "  var sp := ob.AsSpan(); "
         "  sp.WriteInt32BigEndian(0x0ABCDE01); "
-        "  return sp.ReadInt32BigEndian(); "
-        "end Main; end C;"), 0x0ABCDE01);
+        "  Console.WriteLine(sp.ReadInt32BigEndian()); return 0; "
+        "end Main; end C;"), "180149761");
 }
 
 // BE vs LE actually differ: write LE, read BE ⇒ byte-swapped value.
 BEZEL_TEST(arrayspan_byte_accessors_1358, endianness_distinguished) {
     // per stdlib §4.15 v0.165 (#1358): 0x00000001 LE reads as 0x01000000 BE.
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var b := new Array<byte>(4, 0); "
         "  var sp := b.AsSpan(); "
         "  sp.WriteInt32LittleEndian(1); "
-        "  return sp.ReadInt32BigEndian(); "  // 0x01000000
-        "end Main; end C;"), 0x01000000);
+        "  Console.WriteLine(sp.ReadInt32BigEndian()); return 0; "  // 0x01000000
+        "end Main; end C;"), "16777216");
 }
 
 // Float / double round-trip (bit-pattern preserving, §4.14 "Float bit handling").
@@ -233,16 +236,16 @@ BEZEL_TEST(arrayspan_byte_accessors_1358, slice_then_read_offset) {
 
 BEZEL_TEST(arrayspan_byte_accessors_1358, try_read_int32_le_success) {
     // per stdlib §4.14/§4.15 (#1358): enough room → true, out = value.
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var b := new Array<byte>(4, 0); "
         "  b[0] := byte(120); b[1] := byte(86); b[2] := byte(52); b[3] := byte(18); "
         "  if b.AsReadOnlySpan().TryReadInt32LittleEndian(out var v) then "
-        "    return v; "
+        "    Console.WriteLine(v); return 0; "
         "  end; "
         "  return -1; "
-        "end Main; end C;"), 0x12345678);
+        "end Main; end C;"), "305419896");
 }
 
 BEZEL_TEST(arrayspan_byte_accessors_1358, try_read_int32_le_too_short_false) {

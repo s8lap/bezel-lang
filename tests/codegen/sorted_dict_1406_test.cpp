@@ -30,6 +30,7 @@
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
@@ -37,13 +38,15 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
-// JIT a program and return its `Main` exit code (or -999 if it did not run).
+// AOT-compile+run a program and return its `Main` exit code (or -999 if it
+// did not run: compile/link reject or program crash/timeout).
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -156,11 +159,11 @@ BEZEL_TEST(sorted_dict_1406, indexer_set_and_get_string_key_spec_4_17) {
 }
 
 BEZEL_TEST(sorted_dict_1406, indexer_set_and_get_int_key_spec_4_17) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "  using var d := new SortedDictionary<int,int>(); "
         "  d[1] := 100; d[2] := 200; "
-        "  return d[1] + d[2] + d.Count; "
-    )), 302);
+        "  Console.WriteLine(d[1] + d[2] + d.Count); return 0; "
+    )), "302");
 }
 
 // ---------------------------------------------------------------------------
@@ -249,13 +252,13 @@ BEZEL_TEST(sorted_dict_1406, forin_empty_dict_zero_iterations_spec_4_17) {
 
 // #1406 / stdlib §4.17: int-keyed SortedDictionary for-in iteration.
 BEZEL_TEST(sorted_dict_1406, forin_int_key_sum_values_spec_4_17) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "  using var d := new SortedDictionary<int,int>(); "
         "  d[5] := 50; d[10] := 100; d[15] := 150; "
         "  var sum := 0; "
         "  for var e in d do sum := sum + e.Value; end; "
-        "  return sum; "
-    )), 300);
+        "  Console.WriteLine(sum); return 0; "
+    )), "300");
 }
 
 // ---------------------------------------------------------------------------

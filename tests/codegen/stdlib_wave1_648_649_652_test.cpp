@@ -16,15 +16,17 @@
 // comparisons are expressed as `(1 if s = "expected" else 0)` so the program
 // returns 1 on success and 0 on failure.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -44,9 +46,9 @@ std::string prog(const std::string& mainBody) {
 
 // stdlib §2.5: Parse("yyyy-MM-dd").Year == 2024.
 BEZEL_TEST(codegen_stdlib_648_datetime_parse, parse_date_year) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "var dt := DateTime.Parse(\"2024-03-15\"); "
-        "return dt.Year; ")), 2024);
+        "Console.WriteLine(dt.Year); return 0; ")), "2024");
 }
 
 // stdlib §2.5: Parse("yyyy-MM-dd").Month == 3.
@@ -86,9 +88,9 @@ BEZEL_TEST(codegen_stdlib_648_datetime_parse, parse_datetime_second) {
 
 // stdlib §2.5: Parse with space separator ("yyyy-MM-dd HH:mm:ss") — year.
 BEZEL_TEST(codegen_stdlib_648_datetime_parse, parse_space_sep_year) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "var dt := DateTime.Parse(\"2024-03-15 13:45:30\"); "
-        "return dt.Year; ")), 2024);
+        "Console.WriteLine(dt.Year); return 0; ")), "2024");
 }
 
 // stdlib §2.5: Parse with space separator — hour.
@@ -100,9 +102,9 @@ BEZEL_TEST(codegen_stdlib_648_datetime_parse, parse_space_sep_hour) {
 
 // stdlib §2.5: Parse("yyyy-MM-ddTHH:mm:ss.fff") with milliseconds — year.
 BEZEL_TEST(codegen_stdlib_648_datetime_parse, parse_ms_year) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "var dt := DateTime.Parse(\"2024-03-15T13:45:30.123\"); "
-        "return dt.Year; ")), 2024);
+        "Console.WriteLine(dt.Year); return 0; ")), "2024");
 }
 
 // stdlib §2.5: Parse("yyyy-MM-ddTHH:mm:ss.fff") — Millisecond == 123.
@@ -156,11 +158,11 @@ BEZEL_TEST(codegen_stdlib_648_datetime_tostring, format_time_only) {
 // stdlib §2.5: Parse round-trip — Parse(ToString("yyyy-MM-dd")).Year.
 // Construct, format, parse back and check Year survives the round-trip.
 BEZEL_TEST(codegen_stdlib_648_datetime_tostring, round_trip_year) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "var dt := new DateTime(2024, 3, 15); "
         "var s := dt.ToString(\"yyyy-MM-dd\"); "
         "var dt2 := DateTime.Parse(s); "
-        "return dt2.Year; ")), 2024);
+        "Console.WriteLine(dt2.Year); return 0; ")), "2024");
 }
 
 // stdlib §2.5: Parse round-trip — Month survives.
@@ -191,11 +193,11 @@ BEZEL_TEST(codegen_stdlib_648_datetime_tryparse, valid_input_returns_true) {
 
 // stdlib §2.5: TryParse valid input → out param Year == 2024.
 BEZEL_TEST(codegen_stdlib_648_datetime_tryparse, valid_input_year) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "var result: DateTime; "
         "var ok := DateTime.TryParse(\"2024-03-15\", out result); "
-        "if ok then return result.Year; end; "
-        "return 0; ")), 2024);
+        "if ok then Console.WriteLine(result.Year); return 0; end; "
+        "return 0; ")), "2024");
 }
 
 // stdlib §2.5: TryParse invalid input → returns false (0).
@@ -234,16 +236,16 @@ BEZEL_TEST(codegen_stdlib_649_indexof_start, start_at_match) {
 
 // §9.6: IndexOf(sub, start) where start is one past the match — returns -1.
 BEZEL_TEST(codegen_stdlib_649_indexof_start, start_past_last_match) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "var s := \"Hello World\"; "
-        "return s.IndexOf(\"World\", 7); ")), -1);
+        "Console.WriteLine(s.IndexOf(\"World\", 7)); return 0; ")), "-1");
 }
 
 // §9.6: IndexOf(sub, start) where start equals string length — returns -1.
 BEZEL_TEST(codegen_stdlib_649_indexof_start, start_at_len_returns_neg1) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "var s := \"abc\"; "
-        "return s.IndexOf(\"a\", 3); ")), -1);
+        "Console.WriteLine(s.IndexOf(\"a\", 3)); return 0; ")), "-1");
 }
 
 // §9.6: IndexOf(empty, start) where needle is empty — returns start (clamped).
@@ -255,9 +257,9 @@ BEZEL_TEST(codegen_stdlib_649_indexof_start, empty_needle_returns_start) {
 
 // §9.6: IndexOf(sub, start) not found at all — returns -1.
 BEZEL_TEST(codegen_stdlib_649_indexof_start, not_found_returns_neg1) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "var s := \"Hello World\"; "
-        "return s.IndexOf(\"xyz\", 0); ")), -1);
+        "Console.WriteLine(s.IndexOf(\"xyz\", 0)); return 0; ")), "-1");
 }
 
 // §9.6: IndexOf with multi-occurrence string, scan from second occurrence.
@@ -269,9 +271,9 @@ BEZEL_TEST(codegen_stdlib_649_indexof_start, third_occurrence) {
 
 // §9.6: IndexOf(sub, start) — start skips all occurrences → -1.
 BEZEL_TEST(codegen_stdlib_649_indexof_start, start_after_all_occurrences) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "var s := \"aaa\"; "
-        "return s.IndexOf(\"a\", 3); ")), -1);
+        "Console.WriteLine(s.IndexOf(\"a\", 3)); return 0; ")), "-1");
 }
 
 // ---------------------------------------------------------------------------

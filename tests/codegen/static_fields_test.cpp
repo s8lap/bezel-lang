@@ -9,15 +9,17 @@
 // same backing global (#213). Non-literal static initializers — which the
 // spec runs in a static constructor, §22 — remain deferred.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& members) {
-    auto r = runJit(std::string("module M; class C ") + members + " end C;");
+    auto r = runAot(std::string("module M; class C ") + members + " end C;");
     return r.ran ? r.exitCode : -999;
 }
 
@@ -87,7 +89,7 @@ BEZEL_TEST(codegen_cg12, two_static_fields_independent) {
 // initializer value and the write was dropped).
 namespace {
 int runProg(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 } // namespace
@@ -126,11 +128,11 @@ BEZEL_TEST(codegen_cg12, cross_class_static_read) {
 // literal, so the store was skipped and the global stayed null → null deref on
 // first access (`Type.All.Length` → SIGSEGV).
 BEZEL_TEST(codegen_cg12, static_array_literal_field_743) {
-    BEZEL_EXPECT_EQ(runProg(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class H public static readonly Nums: Array<int> := [10, 20, 30]; end H; "
         "class C public static method Main(): int "
-        "  return H.Nums.Length * 100 + H.Nums.Get(0) + H.Nums.Get(2); "  // 3*100+10+30 = 340
-        "end Main; end C;"), 340);
+        "  Console.WriteLine(H.Nums.Length * 100 + H.Nums.Get(0) + H.Nums.Get(2)); return 0; "  // 3*100+10+30 = 340
+        "end Main; end C;"), "340");
 }
 
 // On an ENUM (the original repro): a static array of the enum's values.

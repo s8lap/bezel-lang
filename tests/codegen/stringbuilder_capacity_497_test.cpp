@@ -17,15 +17,17 @@
 //
 // StringBuilder is an owned type — bound with `using var` (§28.3).
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -74,7 +76,7 @@ BEZEL_TEST(codegen_sb_capacity_497, sixtyfive_appends_length) {
 
 BEZEL_TEST(codegen_sb_capacity_497, two_hundred_appends_multichar_length) {
     // 200 appends of "ab" (2 chars each) → Length = 400.
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var sb := new StringBuilder(); "
         "  var i := 0; "
@@ -82,8 +84,8 @@ BEZEL_TEST(codegen_sb_capacity_497, two_hundred_appends_multichar_length) {
         "    sb.Append(\"ab\"); "
         "    i := i + 1; "
         "  end; "
-        "  return sb.Length; "
-        "end Main; end C;"), 400);
+        "  Console.WriteLine(sb.Length); return 0; "
+        "end Main; end C;"), "400");
 }
 
 // -------------------------------------------------------------------------
