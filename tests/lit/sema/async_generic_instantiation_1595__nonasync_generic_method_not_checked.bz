@@ -1,0 +1,20 @@
+// Ported from tests/sema/async_generic_instantiation_borrow_1595_test.cpp
+//   (BEZEL_TEST async_generic_instantiation_1595, nonasync_generic_method_not_checked).
+//
+// §30.1 / #1595 (scope guard): the instantiation-site check is `async`-only,
+// exactly like the declaration-site check (#1518
+// `nonasync_span_param_accepted`) — a SYNCHRONOUS generic method's borrow
+// captured by a value argument is bounded by the ordinary call frame
+// (§28.3) and needs no state-machine-frame rule at all. Same borrow-bearing
+// type argument as the rejected async case above, on the sync twin: no
+// error.
+//
+// ACCEPT-WITH-WARNING control: bezelc -c must exit zero (the program is legal), but it DOES emit a diagnostic — pinned below so the warning itself stays observed.
+//
+// RUN: %bezelc -c -o %t.o %s
+// RUN: %bezelc -c %s 2>&1 | FileCheck %s
+
+module M; class Res end Res; record Holder(R: Res); static class G public static method Work<T>(x: T): T return x; end Work; end G; class C public static method Main(): int var res := new Res(); var h := new Holder(res); var t := G.Work(h); return 0; end Main; end C;
+
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: owned value in `res` is implicitly disposed at the end of its scope
+// CHECK-SAME: (§28.3 auto-drop)
