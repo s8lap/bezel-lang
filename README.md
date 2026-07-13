@@ -80,7 +80,7 @@ linking:
 
 Two tracks: a **gtest behavior suite** (compiles and runs programs through the
 real `bezelc` AOT path) and a **lit + FileCheck diagnostic track**
-(`tests/lit/*.bz`, matching compiler diagnostics). The diagnostic track needs
+(`tests/lit/*.bzl`, matching compiler diagnostics). The diagnostic track needs
 `lit` and `FileCheck` (from LLVM) on `PATH`; without them it is skipped cleanly.
 
 ```sh

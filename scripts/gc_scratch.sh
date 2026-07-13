@@ -95,7 +95,7 @@ if [ "$DO_ROOT" = 1 ]; then
     # Ephemeral by NAME, or a stray ELF executable dropped by a probe compile.
     keep=1
     case "$e" in
-      probe*|repro*|sw22_*|p[0-9]*|test_*|*.bz|scratch_*|tmp_*|out_*|hello_*|sanity*) keep=0 ;;
+      probe*|repro*|sw22_*|p[0-9]*|test_*|*.bz|*.bzl|scratch_*|tmp_*|out_*|hello_*|sanity*) keep=0 ;;
       *) if [ -f "$p" ] && [ "$(head -c4 "$p" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' ')" = "7f454c46" ]; then keep=0; fi ;;
     esac
     [ "$keep" = 1 ] && continue

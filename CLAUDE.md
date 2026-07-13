@@ -4,7 +4,7 @@ This file is the first thing every Claude Code session should read. It encodes t
 
 ## What this repository is
 
-Bezel is a systems language with explicit ownership and no garbage collector. Compile-time ownership tracking ensures every heap object is disposed exactly once; borrowing lets references be passed without transferring ownership, with lifetimes checked statically.
+Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. Compile-time ownership tracking ensures every heap object is disposed exactly once; borrowing lets references be passed without transferring ownership, with lifetimes checked statically.
 
 The design is mostly settled — a normative spec (with rationale, stdlib, and guides alongside; each document's header carries its current revision), multiple verification passes, and dozens of recorded design decisions. A working compiler now exists (`build/bezelc`): an AOT front-end plus LLVM backend that implements a large fraction of the spec, exercised by an extensive automated test suite (gtest behavior tests + a lit/FileCheck diagnostic track). There are no external users yet; the current work is closing the gap to the spec — bug-fixing, soundness hardening, and catching the implementation up to newer spec revisions — with each fix shipping a spec-cited regression test.
 
@@ -154,7 +154,7 @@ artifacts (probe binaries, big logs, scratch build trees) go in
 tree parked there permanently consumes gigabytes. Keep ccache `max_size` at
 80G (a full 40G cache thrashes under multi-worktree churn).
 
-**Keep the repo root clean.** Ad-hoc `.bz` probes, one-off `bezelc -o` outputs,
+**Keep the repo root clean.** Ad-hoc `.bzl` probes, one-off `bezelc -o` outputs,
 and investigation scratch do NOT belong loose in the repo root — put them in
 `./scratch/` (gitignored) or `/var/tmp/bezel-scratch/`. Cleanup is automated, so
 you should rarely sweep by hand: `scripts/gate_and_push.sh` runs

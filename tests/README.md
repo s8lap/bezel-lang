@@ -25,7 +25,7 @@ phase's spec-derived tests go:
 
 Every `*.cpp` under these directories joins the suite automatically
 (`file(GLOB … CONFIGURE_DEPENDS)` in `tests/CMakeLists.txt`); to **exclude** a
-file, rename it `*.cpp.disabled`. Diagnostic tests increasingly live as `.bz`
+file, rename it `*.cpp.disabled`. Diagnostic tests increasingly live as `.bzl`
 files under `lit/` instead (see "Diagnostic tests" below).
 
 ## Harness
@@ -70,9 +70,9 @@ valid Bezel, don't work around the AOT check.**
   checking — distinct from checked-disposal *mode*, `bezelc --checked-disposal`
   §28.2, which inserts `DisposedAccessException` guards.)
 
-### Diagnostic tests → lit + FileCheck (`tests/lit/*.bz`)
+### Diagnostic tests → lit + FileCheck (`tests/lit/*.bzl`)
 
-Reject/accept **diagnostic** tests live as `.bz` files with `// RUN:` directives
+Reject/accept **diagnostic** tests live as `.bzl` files with `// RUN:` directives
 (config in `lit/lit.cfg.py`: `%bezelc`, `%not`, `%s`, `%t`, `FileCheck`).
 
 Reject:

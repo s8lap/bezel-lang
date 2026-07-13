@@ -1,0 +1,20 @@
+// RUN: %not %bezelc -c %s 2>&1 | FileCheck %s
+//
+// Ported from tests/sema/scoped_static_owned_return_1606_test.cpp
+//   (BEZEL_TEST scoped_static_owned_return_1606,
+//   spec_27_2_identity_still_works_with_owned_return — second of two
+//   independent parseAndCheckOwnership() assertions in that BEZEL_TEST body,
+//   split into its own .bzl per the extractor's manual-split convention).
+//
+// §27.2 / §28.14 interaction (the reason this fix was deferred from #1541):
+// a static method with a `scoped` parameter and an `owned` return still
+// participates correctly in §27.1/§27.2 function-signature identity — a
+// plain-signature target (missing `scoped`) is rejected as an identity
+// mismatch. This is a self-contained regression test for the exact
+// interaction that caused the first #1541 attempt (commit d5066da) to be
+// reverted.
+
+module M; class C   public static method Take(scoped f: () -> ()): owned C     f();     return new C();   end Take;   public static method Main(): int     var h: (() -> ()) -> () := C.Take;     return 0;   end Main; end C;
+
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: the initializer for `h` has a function type whose parameter 1 is `scoped` but the target's is not — modifier slots are part of a function signature's identity; there is no conversion between them
+// CHECK-SAME: (§27.1, §27.1.1 v0.180, §27.2/§28.14 v0.175)

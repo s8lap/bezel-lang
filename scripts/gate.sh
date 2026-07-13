@@ -39,7 +39,7 @@ echo "== gate[2/*]: build bezel_tests =="
   || { grep -iE 'error:|FAILED:' "$S/gate_build.log" | head -20; fail "build"; }
 echo "   binary: $(ls -la --time-style=+%H:%M:%S build/tests/bezel_tests | awk '{print $6}')"
 
-# lit + FileCheck diagnostic track (tests/lit/): drives the REAL bezelc over .bz
+# lit + FileCheck diagnostic track (tests/lit/): drives the REAL bezelc over .bzl
 # files and matches diagnostics with FileCheck. Fast (~0.1s/test, no JIT) and
 # per-process, so it validates the accept/reject + diagnostic-text/location
 # surface without the sharding-pollution or wrong-harness (#1682) failure modes

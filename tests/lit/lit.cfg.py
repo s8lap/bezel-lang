@@ -1,7 +1,7 @@
 # lit configuration for the Bezel compile-behavior / diagnostic test track.
 #
 # This is the ADDITIVE, COMPLEMENTARY test harness described in
-# tests/lit/README.md.  It drives the REAL `bezelc` binary over `.bz` source
+# tests/lit/README.md.  It drives the REAL `bezelc` binary over `.bzl` source
 # files and matches its diagnostics with LLVM's FileCheck — the idiomatic way
 # an LLVM-based compiler tests its front-end diagnostics.
 #
@@ -21,17 +21,17 @@ import lit.util
 # ── Suite identity ───────────────────────────────────────────────────────────
 config.name = "Bezel-lit"
 
-# Each test is a shell script embedded in `// RUN:` lines of a `.bz` file;
+# Each test is a shell script embedded in `// RUN:` lines of a `.bzl` file;
 # ShTest runs those RUN lines and reports PASS/FAIL per file.  Because lit runs
 # each test as its OWN process, cross-test global-state leakage (the shard-
 # pollution flake class the in-process suite is exposed to) cannot happen here.
 config.test_format = lit.formats.ShTest(execute_external=False)
 
-# Only `.bz` files are tests.  (README, requirements, *.py configs are ignored.)
-config.suffixes = [".bz"]
+# Only `.bzl` files are tests.  (README, requirements, *.py configs are ignored.)
+config.suffixes = [".bzl"]
 
 # ── Roots ────────────────────────────────────────────────────────────────────
-# Source root: the directory holding this config (and the .bz tests).
+# Source root: the directory holding this config (and the .bzl tests).
 config.test_source_root = os.path.dirname(__file__)
 # Exec root: where lit writes per-test scratch (`%t`).  The site config sets
 # this to the CMake build tree; fall back to the source tree for a hand-run

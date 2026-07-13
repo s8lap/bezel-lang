@@ -7,7 +7,7 @@ block that drives the compiler through `parseAndCheckOwnership(...)` (or a
 same-shaped harness call / a local boolean pass-through wrapper around it)
 and asserts on `.diagnostics.hasErrors()`, resolves the concatenated C++
 source-string expression into a standalone Bezel compilation unit, actually
-COMPILES it with the real `bezelc` binary, and emits one `.bz` lit test per
+COMPILES it with the real `bezelc` binary, and emits one `.bzl` lit test per
 case:
 
   - a REJECT case (`BEZEL_EXPECT_TRUE(...hasErrors...)`) emits
@@ -21,7 +21,7 @@ case:
       * clean compile (no diagnostics) → a second RUN piping through
         FileCheck with `--check-prefix=NODIAG --allow-empty` and
         `NODIAG-NOT: error` / `NODIAG-NOT: §` (mirrors
-        tests/lit/ref_out_local_accept_1682.bz);
+        tests/lit/ref_out_local_accept_1682.bzl);
       * compiles clean but a WARNING fires (e.g. an auto-drop must-use
         warning) → a second RUN piping through FileCheck with a positive
         `WARN:` check on the actual warning text (never NODIAG, since the
@@ -43,7 +43,7 @@ USAGE
 
 Every test in the input file must be resolvable end-to-end (source built,
 compiled, verdict matches, CHECK line derived) or the script reports it as
-UNRESOLVED and does NOT emit a `.bz` for it — by design, so a caller can
+UNRESOLVED and does NOT emit a `.bzl` for it — by design, so a caller can
 decide whether "whole-file" deletion of the original gtest file is safe
 (only when unresolved == 0 for that file).
 """
@@ -568,7 +568,7 @@ class CaseResult:
 # local wrapper that calls one of the execution-harness functions), the real
 # thing under test is the PROGRAM'S RUNTIME BEHAVIOR — something `bezelc -c`
 # (compile-only; what every lit RUN line invokes) cannot observe. Emitting a
-# `.bz` for such a case would silently drop the runtime assertion and leave
+# `.bzl` for such a case would silently drop the runtime assertion and leave
 # behind a vacuous diagnostic-only control, so these must be flagged
 # NON-CONVERTIBLE and must never count toward "safe to delete the gtest file".
 # =============================================================================
@@ -686,9 +686,9 @@ def collect_needles(body: str, harness_call_end: int):
 
 
 def run_bezelc(bezelc: str, source: str, tmpdir: str):
-    """Write `source` to a temp .bz, compile it with bezelc -c, return
+    """Write `source` to a temp .bzl, compile it with bezelc -c, return
     (exit_code, stderr_lines: list[(line, col, msg)], raw_stderr)."""
-    path = os.path.join(tmpdir, 'case.bz')
+    path = os.path.join(tmpdir, 'case.bzl')
     with open(path, 'w') as fh:
         fh.write(source)
     proc = subprocess.run(
@@ -763,7 +763,7 @@ def leading_comment(text: str, decl_start: int):
 
 
 def emit_bz(case: CaseResult, src_file: str, out_dir: str, comment: str):
-    fname = f"{case.suite}__{case.case}.bz"
+    fname = f"{case.suite}__{case.case}.bzl"
     path = os.path.join(out_dir, fname)
     lines = []
     ported_from = src_file

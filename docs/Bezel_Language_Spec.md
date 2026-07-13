@@ -2,7 +2,7 @@
 
 **Version 0.188 — July 2026**
 
-Bezel is a systems language designed to feel high-level. It has no garbage collector; instead, the compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
+Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
 This document is the normative reference for the language. It defines syntax, type system, ownership rules, and the semantics of every construct. The specification is partitioned into a Core level and a set of Extended features; Appendix D defines the levels and what a conformance claim at each means. It is intentionally dense — written to be precise rather than introductory — and is best read alongside its two companion documents: the design rationale, which explains *why* each decision was made and records the alternatives considered, and the standard library, which catalogs the types and methods the language ships with.
 
@@ -241,7 +241,7 @@ An honest cost, stated plainly: definition-site visibility makes a module's `int
 **The diamond, worked.** `App` imports `Lib1` and `Lib2`; both import `Base`; `App` never imports `Base`.
 
 ```bezel
-// base.bz
+// base.bzl
 module Base;
 
 public class Money
@@ -260,7 +260,7 @@ end Money;
 ```
 
 ```bezel
-// lib1.bz
+// lib1.bzl
 module Lib1;
 import Base;
 
@@ -272,7 +272,7 @@ end Payroll;
 ```
 
 ```bezel
-// lib2.bz
+// lib2.bzl
 module Lib2;
 import Base;
 
@@ -284,7 +284,7 @@ end Invoices;
 ```
 
 ```bezel
-// app.bz
+// app.bzl
 module App;
 import Lib1;
 import Lib2;
@@ -305,7 +305,7 @@ end Program;
 //   var box := new OwningArray<Money>();         — generic type argument
 ```
 
-The build compiles `Base` first, then `Lib1` and `Lib2` against `Base`'s artifact, and finally compiles `App` presenting the artifacts of `Lib1`, `Lib2`, **and `Base`** — the closure of rule 1 — even though `app.bz` never writes `import Base;`; omitting `Base`'s artifact is the rule-1 build error naming `Base` and the artifacts that reference it. `Money` arrives in `App`'s compilation three ways — embedded in `Lib1`'s interface, embedded in `Lib2`'s, and directly from `Base`'s artifact — and all three descriptions are `(Base, Money, arity 0)`: **one type** (rule 3); `pay` flows from `Lib1`'s surface into `Lib2`'s parameter with no conversion. Had `Lib1` been compiled against an older, different `Base.Money`, the descriptions would disagree and the build fails naming the stale artifact — and supplying both an old and a new artifact for `Base` is two distinct artifacts declaring one module name, the [§2.8.1](#sec-module-identity-and-closure) rule 3 error. (`Money` is trivial-dispose — no destructor, no owned fields ([§28.9](#sec-runtime-managed-types)) — so the disposal the `using var` inserts is a no-op here; the legality of the binding is the point. A `Base` type with an owned field behaves identically under rule 2 — disposal of the transitive value is still use, not naming.)
+The build compiles `Base` first, then `Lib1` and `Lib2` against `Base`'s artifact, and finally compiles `App` presenting the artifacts of `Lib1`, `Lib2`, **and `Base`** — the closure of rule 1 — even though `app.bzl` never writes `import Base;`; omitting `Base`'s artifact is the rule-1 build error naming `Base` and the artifacts that reference it. `Money` arrives in `App`'s compilation three ways — embedded in `Lib1`'s interface, embedded in `Lib2`'s, and directly from `Base`'s artifact — and all three descriptions are `(Base, Money, arity 0)`: **one type** (rule 3); `pay` flows from `Lib1`'s surface into `Lib2`'s parameter with no conversion. Had `Lib1` been compiled against an older, different `Base.Money`, the descriptions would disagree and the build fails naming the stale artifact — and supplying both an old and a new artifact for `Base` is two distinct artifacts declaring one module name, the [§2.8.1](#sec-module-identity-and-closure) rule 3 error. (`Money` is trivial-dispose — no destructor, no owned fields ([§28.9](#sec-runtime-managed-types)) — so the disposal the `using var` inserts is a no-op here; the legality of the binding is the point. A `Base` type with an owned field behaves identically under rule 2 — disposal of the transitive value is still use, not naming.)
 
 When the root compilation is an SCC of several modules, the rules of this section and [§2.8.1](#sec-module-identity-and-closure) interact as follows: each member module is still produced by exactly one compilation — the same one (rule 1); co-compilation grants no `internal` access between members (rule 2); imports between members along the cycle are legal while self-import stays an error (rule 4); and a consumer importing any one member must still present every member's artifact in its closure — [§2.5](#sec-dependency-resolution) already requires an SCC's artifacts to have been produced together.
 

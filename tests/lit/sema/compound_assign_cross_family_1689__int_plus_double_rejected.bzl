@@ -1,0 +1,15 @@
+// RUN: %not %bezelc -c %s 2>&1 | FileCheck %s
+//
+// Ported from tests/sema/compound_assign_cross_family_1689_test.cpp
+//   (BEZEL_TEST compound_assign_cross_family_1689, int_plus_double_rejected).
+//
+// §6.6: types-probes/q2_int_plus_double.bzl — `i += 2.5` on `i: int`. Same
+// rule: R = double does not convert back to int. Before the fix this
+// crashed LLVM IR verification (`llvm.sadd.with.overflow.i32` called with a
+// double operand — "Call parameter type does not match function
+// signature").
+
+module M; class C public static method Main(): int var i: int := 2; i += 2.5; return i; end Main; end C;
+
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: compound assignment `+=` has no valid result: `int + double` computes `double`, which is neither `int` nor implicitly convertible to it, and `int` is not an integer/char target receiving an integer result (the only case §6.6's write-back narrows) — convert the right-hand operand explicitly, or write `x := int(x + e);` if the loss is intended
+// CHECK-SAME: (§6.6)

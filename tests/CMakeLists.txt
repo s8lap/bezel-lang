@@ -71,7 +71,7 @@ add_custom_target(check
 
 # ── lit + FileCheck diagnostic test track (tests/lit/) ───────────────────────
 # ADDITIVE and COMPLEMENTARY to the gtest suite above: `lit` drives the real
-# `bezelc` binary over the `.bz` files in tests/lit/ and matches diagnostics
+# `bezelc` binary over the `.bzl` files in tests/lit/ and matches diagnostics
 # with LLVM's FileCheck. See tests/lit/README.md for the rationale (per-process
 # isolation; the full pipeline always runs, so an ownership-pass reject can't be
 # missed by a sema-only harness; no per-test C++ compile).

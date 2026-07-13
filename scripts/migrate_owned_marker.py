@@ -19,8 +19,8 @@ because they signal that the source already had a wrong marker, not a mechanical
 omission.
 
 Usage:
-    scripts/migrate_owned_marker.py --bezelc build/bezelc FILE.bz [FILE.bz ...]
-    scripts/migrate_owned_marker.py --bezelc build/bezelc --glob 'tests/**/*.bz'
+    scripts/migrate_owned_marker.py --bezelc build/bezelc FILE.bzl [FILE.bzl ...]
+    scripts/migrate_owned_marker.py --bezelc build/bezelc --glob 'tests/**/*.bzl'
 
 The bezelc invocation is memory-caged with systemd-run (matching the project's
 build/run discipline) unless --no-cage is given.

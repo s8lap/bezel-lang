@@ -2,7 +2,7 @@
 
 This directory holds an **additive, complementary** test track for the Bezel
 compiler: [LLVM `lit`](https://llvm.org/docs/CommandGuide/lit.html) drives the
-real `bezelc` binary over `.bz` source files, and LLVM's `FileCheck` matches the
+real `bezelc` binary over `.bzl` source files, and LLVM's `FileCheck` matches the
 compiler's diagnostics against `// CHECK:` directives embedded in each file.
 This is the idiomatic way an LLVM-based compiler tests its front-end
 diagnostics and compile-time behavior.
@@ -29,14 +29,14 @@ It **complements — does not replace** — the two existing test suites:
    (issue #1682). lit invokes the **real `bezelc`, which always runs the full
    pipeline** (lex → parse → sema → ownership → codegen), so a diagnostic from
    any pass is always in the observed output. See
-   `ref_out_owned_local_1682.bz` — the flagship example.
+   `ref_out_owned_local_1682.bzl` — the flagship example.
 
 3. **Build cost.** These tests are plain text files: no per-test C++
    compilation, no relink. Adding a diagnostic test costs nothing at build time.
 
 lit + FileCheck also does something neither existing suite can: **fine-grained
 diagnostic-content matching** — the exact rule wording, the spec section cited,
-and the precise `file:line:col` location (see `const_div_by_zero_1688.bz`, which
+and the precise `file:line:col` location (see `const_div_by_zero_1688.bzl`, which
 pins the error to an exact source line with `[[@LINE-1]]`). The conformance
 manifest's single expectation column (`compiles` / `fails`) cannot express any
 of that.
@@ -57,12 +57,12 @@ runtime/disposal tests here.
 
 ## Layout
 
-- `lit.cfg.py` — machine-independent lit config (suite name, `.bz` suffix,
+- `lit.cfg.py` — machine-independent lit config (suite name, `.bzl` suffix,
   `%bezelc` / `%FileCheck` / `FileCheck` substitutions, `ShTest` format).
 - `lit.site.cfg.py.in` — CMake template; `cmake` configures it into
   `<build>/tests/lit/lit.site.cfg.py` with the concrete `bezelc` and
   `FileCheck` paths, then loads `lit.cfg.py`.
-- `*.bz` — the tests. Each begins with `// RUN:` lines and carries `// CHECK:`
+- `*.bzl` — the tests. Each begins with `// RUN:` lines and carries `// CHECK:`
   directives. Each is ported from a named gtest and cites its spec section.
 - `requirements-dev.txt` — pins `lit` (dev-time only; see below).
 
@@ -125,7 +125,7 @@ own front-end tests are written `not %clang … | FileCheck`. **Accept** tests
 
 ## Adding a test
 
-1. For a **reject**, write a `.bz` file whose first line is
+1. For a **reject**, write a `.bzl` file whose first line is
    `// RUN: %not %bezelc -c %s 2>&1 | FileCheck %s` (note the `%not`). For an
    **accept**, use `// RUN: %bezelc -c -o %t.o %s` — a zero exit *is* the pass.
 2. Add `// CHECK:` directives matching the expected diagnostic. Use

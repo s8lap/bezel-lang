@@ -721,7 +721,7 @@ inline JitResult runAot(std::string_view source,
         return r;
     }
     namespace fs = aot_detail::fs;
-    const std::string srcPath = (fs::path(wd.path) / "prog.bz").string();
+    const std::string srcPath = (fs::path(wd.path) / "prog.bzl").string();
     const std::string exePath = (fs::path(wd.path) / "prog").string();
     const std::string ccErr   = (fs::path(wd.path) / "cc.err").string();
     const std::string outPath = (fs::path(wd.path) / "out.txt").string();
@@ -888,7 +888,7 @@ inline JitResult runAotChecked(std::string_view source) {
         return r;
     }
     namespace fs = aot_detail::fs;
-    const std::string srcPath = (fs::path(wd.path) / "prog.bz").string();
+    const std::string srcPath = (fs::path(wd.path) / "prog.bzl").string();
     const std::string exePath = (fs::path(wd.path) / "prog").string();
     const std::string ccErr   = (fs::path(wd.path) / "cc.err").string();
     const std::string outPath = (fs::path(wd.path) / "out.txt").string();
