@@ -52,6 +52,7 @@
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
@@ -60,15 +61,19 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 namespace fs = std::filesystem;
 
-// JIT a program and return its `main` exit code (or -999 if it didn't run).
+// AOT MIGRATION (JIT->AOT): the AOT driver (runAot) runs the full ownership +
+// definite-assignment pipeline — the stricter oracle. Most packed values here
+// exceed the 8-bit exit-code ceiling, so those tests print the value and assert
+// on stdout via runAotOut (and the *OutAndLeakFree helper keeps the LSan leg).
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -127,10 +132,13 @@ int runUnderLeakSanitizer(const std::string& source) {
     return 0;                                                      // clean
 }
 
-// Assert the exit code (always) and, if the toolchain is present, that
-// LeakSanitizer reports no leak / no double-free / no use-after-free.
-void expectValueAndLeakFree(const std::string& source, int expectedExitCode) {
-    BEZEL_EXPECT_EQ(run(source), expectedExitCode);
+// Assert an observable value that exceeds the 8-bit exit-code ceiling: the
+// program prints its result via Console.WriteLine and returns 0, so the value is
+// checked on captured stdout (runAotOut) while the LSan leg still runs the same
+// source for leak / double-free / use-after-free coverage.
+void expectValueOutAndLeakFree(const std::string& source,
+                               const std::string& expectedStdout) {
+    BEZEL_EXPECT_EQ(runAotOut(source), expectedStdout);
     int lsan = runUnderLeakSanitizer(source);
     if (lsan == -1) return;       // toolchain unavailable: skip the LSan leg
     BEZEL_EXPECT_EQ(lsan, 0);     // 0 == LSan clean (no leak, no UAF/DF)
@@ -163,13 +171,14 @@ std::string prog(const std::string& mainBody) {
 // stored under the key, and that value is returned. F._n == 1 (factory ran).
 // Encoded: returned*100 + F._n*10 + Count = 7*100 + 1*10 + 1 = 711.
 BEZEL_TEST(dict_get_or_add_4_8, str_key_int_value_miss_invokes_factory_and_stores) {
-    BEZEL_EXPECT_EQ(run(
+    // 711 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class F public static _n: int := 0; end F; "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
         "  var got := d.GetOrAdd(\"a\", (k: string) => do F._n := F._n + 1; return 7; end); "
-        "  return got * 100 + F._n * 10 + d.Count; "
-        "end Main; end C;"), 711);
+        "  Console.WriteLine(got * 100 + F._n * 10 + d.Count); return 0; "
+        "end Main; end C;"), "711");
 }
 
 // §4.8 HIT: the key is already present → GetOrAdd returns the EXISTING value and
@@ -177,52 +186,56 @@ BEZEL_TEST(dict_get_or_add_4_8, str_key_int_value_miss_invokes_factory_and_store
 // distinguishable value, proving it never ran.
 // Encoded: returned*100 + F._n*10 + Count = 5*100 + 0*10 + 1 = 501.
 BEZEL_TEST(dict_get_or_add_4_8, str_key_int_value_hit_returns_existing_no_factory) {
-    BEZEL_EXPECT_EQ(run(
+    // 501 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class F public static _n: int := 0; end F; "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
         "  d.Add(\"a\", 5); "
         "  var got := d.GetOrAdd(\"a\", (k: string) => do F._n := F._n + 1; return 99; end); "
-        "  return got * 100 + F._n * 10 + d.Count; "
-        "end Main; end C;"), 501);
+        "  Console.WriteLine(got * 100 + F._n * 10 + d.Count); return 0; "
+        "end Main; end C;"), "501");
 }
 
 // §4.8 MISS then read-back: after a miss stores the factory value, a subsequent
 // indexer read returns the SAME value (the store is durable). got == d["a"] == 42
 // → got*10 + d["a"] = 42*10 + 42 = 462.
 BEZEL_TEST(dict_get_or_add_4_8, str_key_miss_stored_value_is_readable_afterward) {
-    BEZEL_EXPECT_EQ(run(
+    // 462 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
         "  var got := d.GetOrAdd(\"a\", (k: string) => 42); "
-        "  return got * 10 + d[\"a\"]; "
-        "end Main; end C;"), 462);
+        "  Console.WriteLine(got * 10 + d[\"a\"]); return 0; "
+        "end Main; end C;"), "462");
 }
 
 // §4.8 / D3 generic (int) key — MISS routes through the generic-key table
 // (bz_dict_*_gen). Factory runs, value stored, returned. F._n == 1.
 // Encoded: returned*100 + F._n*10 + Count = 8*100 + 1*10 + 1 = 811.
 BEZEL_TEST(dict_get_or_add_4_8, generic_key_miss_invokes_factory_and_stores) {
-    BEZEL_EXPECT_EQ(run(
+    // 811 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class F public static _n: int := 0; end F; "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
         "  var got := d.GetOrAdd(3, (k: int) => do F._n := F._n + 1; return 8; end); "
-        "  return got * 100 + F._n * 10 + d.Count; "
-        "end Main; end C;"), 811);
+        "  Console.WriteLine(got * 100 + F._n * 10 + d.Count); return 0; "
+        "end Main; end C;"), "811");
 }
 
 // §4.8 / D3 generic (int) key — HIT returns the existing value, factory not run.
 // Encoded: returned*100 + F._n*10 + Count = 6*100 + 0*10 + 1 = 601.
 BEZEL_TEST(dict_get_or_add_4_8, generic_key_hit_returns_existing_no_factory) {
-    BEZEL_EXPECT_EQ(run(
+    // 601 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class F public static _n: int := 0; end F; "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
         "  d.Add(3, 6); "
         "  var got := d.GetOrAdd(3, (k: int) => do F._n := F._n + 1; return 77; end); "
-        "  return got * 100 + F._n * 10 + d.Count; "
-        "end Main; end C;"), 601);
+        "  Console.WriteLine(got * 100 + F._n * 10 + d.Count); return 0; "
+        "end Main; end C;"), "601");
 }
 
 // §4.8 string value — MISS stores a string; a subsequent read returns the same
@@ -245,14 +258,15 @@ BEZEL_TEST(dict_get_or_add_4_8, str_value_miss_stores_and_reads_back) {
 // closure cell is reclaimed too) and no double-free. got == again == P(3,4):
 // got.X*1000 + got.Y*100 + again.X*10 + again.Y = 3*1000 + 4*100 + 3*10 + 4 = 3434.
 BEZEL_TEST(dict_get_or_add_4_8, record_value_miss_boxes_and_reads_back) {
-    expectValueAndLeakFree(
+    // 3434 > 255 → print + runAotOut (LSan leg preserved).
+    expectValueOutAndLeakFree(
         "module M; record P(X: int, Y: int); "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<string, P>(); "
         "  var got := d.GetOrAdd(\"a\", (k: string) => new P(3, 4)); "
         "  var again := d[\"a\"]; "
-        "  return got.X * 1000 + got.Y * 100 + again.X * 10 + again.Y; "
-        "end Main; end C;", 3434);
+        "  Console.WriteLine(got.X * 1000 + got.Y * 100 + again.X * 10 + again.Y); return 0; "
+        "end Main; end C;", "3434");
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +280,8 @@ BEZEL_TEST(dict_get_or_add_4_8, record_value_miss_boxes_and_reads_back) {
 // the return was a borrow, not a transfer). The borrow is usable: got.Tag() == 7.
 // Encoded: tag*100 + inside*10 + final = 7*100 + 0*10 + 1 = 701.
 BEZEL_TEST(owned_dict_get_or_add_4_9, str_key_miss_stores_owned_and_returns_borrow) {
-    expectValueAndLeakFree(prog(
+    // 701 > 255 → print + runAotOut (LSan leg preserved).
+    expectValueOutAndLeakFree(prog(
         "var tag := -1; var inside := -1; "
         "do "
         "  using var d := new OwningDictionary<string, R>(); "
@@ -274,7 +289,7 @@ BEZEL_TEST(owned_dict_get_or_add_4_9, str_key_miss_stores_owned_and_returns_borr
         "  tag := got.Tag(); "
         "  inside := R._n; "
         "end; "
-        "return tag * 100 + inside * 10 + R._n;"), 701);
+        "Console.WriteLine(tag * 100 + inside * 10 + R._n); return 0;"), "701");
 }
 
 // §4.9 HIT: the key is already present → the factory is NOT invoked (no owned R
@@ -283,7 +298,8 @@ BEZEL_TEST(owned_dict_get_or_add_4_9, str_key_miss_stores_owned_and_returns_borr
 // owns the single pre-existing value, disposed once at scope end.
 // Encoded: tag*100 + F._n*10 + final = 3*100 + 0*10 + 1 = 301.
 BEZEL_TEST(owned_dict_get_or_add_4_9, str_key_hit_no_factory_returns_existing_borrow) {
-    expectValueAndLeakFree(prog(
+    // 301 > 255 → print + runAotOut (LSan leg preserved).
+    expectValueOutAndLeakFree(prog(
         "var tag := -1; "
         "do "
         "  using var d := new OwningDictionary<string, R>(); "
@@ -291,14 +307,15 @@ BEZEL_TEST(owned_dict_get_or_add_4_9, str_key_hit_no_factory_returns_existing_bo
         "  var got := d.GetOrAdd(\"a\", (k: string) => do F._n := F._n + 1; return move (new R(9)); end); "
         "  tag := got.Tag(); "
         "end; "
-        "return tag * 100 + F._n * 10 + R._n;"), 301);
+        "Console.WriteLine(tag * 100 + F._n * 10 + R._n); return 0;"), "301");
 }
 
 // §4.9 / D3 generic (int) key — MISS stores the owned R via the generic-key
 // table; the return is a borrow; the dict disposes the value once at scope end.
 // got.Tag() == 5 → tag*100 + inside*10 + final = 5*100 + 0*10 + 1 = 501.
 BEZEL_TEST(owned_dict_get_or_add_4_9, generic_key_miss_stores_owned_and_returns_borrow) {
-    expectValueAndLeakFree(prog(
+    // 501 > 255 → print + runAotOut (LSan leg preserved).
+    expectValueOutAndLeakFree(prog(
         "var tag := -1; var inside := -1; "
         "do "
         "  using var d := new OwningDictionary<int, R>(); "
@@ -306,7 +323,7 @@ BEZEL_TEST(owned_dict_get_or_add_4_9, generic_key_miss_stores_owned_and_returns_
         "  tag := got.Tag(); "
         "  inside := R._n; "
         "end; "
-        "return tag * 100 + inside * 10 + R._n;"), 501);
+        "Console.WriteLine(tag * 100 + inside * 10 + R._n); return 0;"), "501");
 }
 
 // §4.9 MISS then HIT on the SAME key — the second GetOrAdd must NOT invoke its
@@ -315,7 +332,8 @@ BEZEL_TEST(owned_dict_get_or_add_4_9, generic_key_miss_stores_owned_and_returns_
 // leak, no double-free). The second factory's R(9) is never produced (F._n == 0).
 // Encoded: tag1*100 + tag2*10 + final = 4*100 + 4*10 + 1 = 441.
 BEZEL_TEST(owned_dict_get_or_add_4_9, second_call_same_key_is_hit_no_second_value) {
-    expectValueAndLeakFree(prog(
+    // 441 > 255 → print + runAotOut (LSan leg preserved).
+    expectValueOutAndLeakFree(prog(
         "var tag1 := -1; var tag2 := -1; "
         "do "
         "  using var d := new OwningDictionary<string, R>(); "
@@ -324,5 +342,5 @@ BEZEL_TEST(owned_dict_get_or_add_4_9, second_call_same_key_is_hit_no_second_valu
         "  var g2 := d.GetOrAdd(\"a\", (k: string) => do F._n := F._n + 1; return move (new R(9)); end); "
         "  tag2 := g2.Tag(); "
         "end; "
-        "return tag1 * 100 + tag2 * 10 + R._n;"), 441);
+        "Console.WriteLine(tag1 * 100 + tag2 * 10 + R._n); return 0;"), "441");
 }
