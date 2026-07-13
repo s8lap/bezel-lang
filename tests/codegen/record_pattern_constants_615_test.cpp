@@ -14,14 +14,16 @@
 // first arm, and string ConstantPattern sub-patterns compared by pointer
 // instead of content → always false → fell to the discard arm.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int runProg(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -155,16 +157,18 @@ BEZEL_TEST(record_pattern_constants_615, int_subpat_regression) {
 
 BEZEL_TEST(record_pattern_constants_615, int_subpat_no_match_regression) {
     // §19.3: int sub-pattern that doesn't match → falls to discard.
-    BEZEL_EXPECT_EQ(runProg(
+    // -1 does not round-trip through the 8-bit process exit code (runAotOut).
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; "
         "record IntPair(a: int, b: int); "
         "class C public static method Main(): int "
         "  var p := new IntPair(1, 5); "
-        "  return case p of "
+        "  Console.WriteLine(case p of "
         "    IntPair(0, b) => b, "
         "    _ => -1 "
-        "  end; "
-        "end Main; end C;"), -1);
+        "  end); "
+        "  return 0; "
+        "end Main; end C;"), "-1");
 }
 
 // ── §19.3: mixed enum-constant + binding sub-pattern ─────────────────────
@@ -184,14 +188,16 @@ BEZEL_TEST(record_pattern_constants_615, enum_constant_and_binding_mixed) {
 
 BEZEL_TEST(record_pattern_constants_615, enum_constant_and_binding_no_match) {
     // §19.3: enum sub-pattern doesn't match → discard arm.
-    BEZEL_EXPECT_EQ(runProg(std::string(kColorEnum) +
+    // -1 does not round-trip through the 8-bit process exit code (runAotOut).
+    BEZEL_EXPECT_EQ(runAotOut(std::string(kColorEnum) +
         "class C public static method Main(): int "
         "  var p := new Colored(42, Color.Green); "
-        "  return case p of "
+        "  Console.WriteLine(case p of "
         "    Colored(n, Color.Red) => n, "
         "    _ => -1 "
-        "  end; "
-        "end Main; end C;"), -1);
+        "  end); "
+        "  return 0; "
+        "end Main; end C;"), "-1");
 }
 
 // ── §19.3: nested record with enum constant one level deep ────────────────
@@ -277,17 +283,19 @@ BEZEL_TEST(record_pattern_constants_615, qualified_const_nonfinal_then_binding) 
 BEZEL_TEST(record_pattern_constants_615, qualified_const_nonfinal_then_binding_no_match) {
     // §A.7/§19.3: non-final QN constant that doesn't match → discard arm
     // (the binding arm must NOT fire).
-    BEZEL_EXPECT_EQ(runProg(
+    // -1 does not round-trip through the 8-bit process exit code (runAotOut).
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; "
         "enum Color Red, Green, Blue; end Color; "
         "record ColorInt(c: Color, n: int); "
         "class C public static method Main(): int "
         "  var p := new ColorInt(Color.Green, 42); "
-        "  return case p of "
+        "  Console.WriteLine(case p of "
         "    ColorInt(Color.Red, n) => n, "
         "    _ => -1 "
-        "  end; "
-        "end Main; end C;"), -1);
+        "  end); "
+        "  return 0; "
+        "end Main; end C;"), "-1");
 }
 
 BEZEL_TEST(record_pattern_constants_615, qualified_const_two_nonfinal_slots) {
