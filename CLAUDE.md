@@ -6,7 +6,7 @@ This file is the first thing every Claude Code session should read. It encodes t
 
 Bezel is a systems language with explicit ownership and no garbage collector. Compile-time ownership tracking ensures every heap object is disposed exactly once; borrowing lets references be passed without transferring ownership, with lifetimes checked statically.
 
-The language is paper-designed: there are no users yet, and the compiler does not yet exist. The design itself is mostly settled — 17,000 lines of normative spec, multiple verification passes, 70+ recorded design decisions — and the work this repository hosts is implementing that design.
+The design is mostly settled — ~10,000 lines of normative spec (currently v0.188), plus rationale, stdlib, and guides; multiple verification passes; 70+ recorded design decisions. A working compiler now exists (`build/bezelc`): an AOT front-end plus LLVM backend that implements a large fraction of the spec, exercised by a ~11,800-test suite (gtest behavior tests + a lit/FileCheck diagnostic track). There are no external users yet; the current work is closing the gap to the spec — bug-fixing, soundness hardening, and catching the implementation up to newer spec revisions — with each fix shipping a spec-cited regression test.
 
 ## The documents (read these before doing anything)
 
@@ -55,6 +55,8 @@ The project's discipline is that decisions get recorded with their reasoning. A 
 
 ## Per-milestone workflow
 
+> **Current mode:** with the compiler substantially built, most day-to-day work is now **bug-fixing and spec-catch-up**, not greenfield milestones — each fix ships a spec-cited regression test that *fails without the fix and passes with it* (see `tests/README.md`). The greenfield milestone flow below still applies when opening a genuinely new feature area.
+
 Implementation milestones (e.g., "lexer for §1," "parser for §17 expression grammar," "type checker for §11 classes") follow the same pattern. Each milestone's first PR is *not* implementation code.
 
 1. **Spec-derived tests first.** The first PR for a milestone contains tests that derive directly from the spec section: every example in the spec that the milestone covers should be a test case, with the spec-stated input and the spec-stated output (parsed AST, compile error, runtime value). The PR description should cite the spec section and list which examples are covered. The tests should fail (because no implementation exists yet); CI failure is expected at this stage.
@@ -100,7 +102,7 @@ checks against `__GNUC__`. The build is expected to be configurable
 with `cmake -DCMAKE_CXX_COMPILER=clang++ ...` or to set the compiler
 explicitly in the root CMakeLists.txt.
 
-### Build & test speed (the build is dominated by the ~770-TU `bezel_tests`)
+### Build & test speed (the build is dominated by the ~560-TU `bezel_tests`)
 
 The configure auto-detects accelerators (CMakeLists.txt): **ccache**, the
 **mold** linker (falls back to lld), **`-gsplit-dwarf`** (debug info out of the
@@ -113,11 +115,18 @@ default`, which sets jobs); the bundled scripts default to `-j16`. A clean build
 is ~2 min and a one-file edit→relink is ~1–2s.
 
 **Run the test suite in parallel**, not as the raw binary — the single binary is
-serial gtest (~4–5 min). Use `tests/run_parallel.sh` (or `cmake --build build
---target check`): it shards `bezel_tests` across cores (each shard a separate
-JIT process via `BEZEL_SHARD_*`), running the whole suite in ~40s. The full
-*in-process* JIT suite is still the load-bearing correctness check (a disposal
-double-free once surfaced only there, not in per-process ASan).
+serial gtest (several minutes). Use `tests/run_parallel.sh 16` (or `cmake --build
+build --target check`): it shards `bezel_tests` across cores (each shard a
+separate process via `BEZEL_SHARD_*`), running the whole suite in ~2 min. Tests
+drive the *real* `bezelc` AOT path (fork-isolated `Driver::compileFile` + clang
+link + native exec) — the strict oracle. **Serial is authoritative**: the
+sharded runner can over-report under fork/link contention, so a real failure
+must reproduce under the serial `build/tests/bezel_tests`. See `tests/README.md`
+for the harness (`runAot` / `runAotChecked` / lit+FileCheck) and how to write a
+test; `BEZEL_AOT_LINK_TOKENS` caps concurrent compiles when several agents run
+the suite at once. (The older in-process JIT harness — a *lenient* oracle that
+skipped the ownership and definite-assignment passes and `verifyModule` — is
+being retired.)
 
 One machine-local, not-tracked step is required for ccache to cache the PCH'd
 compiles: `~/.config/ccache/ccache.conf` must contain
