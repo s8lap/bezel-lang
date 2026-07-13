@@ -58,27 +58,20 @@
 // proves SOME built-in exception type was bound, via `.Message` resolving
 // on any of them, not that the NCB itself is correct).
 
-#include <chrono>
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
-#include <sys/wait.h>
-#include <thread>
-#include <unistd.h>
-
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 // True iff the program produced a §31.2.1 no-common-base error diagnostic.
 bool hasNoCommonBaseError(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.severity != bezel::Severity::Error) continue;
         if (d.message.find("common base class more specific") != std::string::npos &&
@@ -94,7 +87,7 @@ bool hasNoCommonBaseError(const std::string& src) {
 // the nearest-common-base rule of §31.2.1, which applies only to multi-type
 // catch bindings)").
 bool hasNoCommonType20Error(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.severity != bezel::Severity::Error) continue;
         if (d.message.find("no common type") != std::string::npos &&
@@ -249,17 +242,17 @@ BEZEL_TEST(catch_multitype_no_common_base_v182, single_type_binding_unaffected_s
 //    never terminates on the A->B->A->B cycle.
 //
 // REPRODUCING THE BUG is only useful if a regression FAILS THE TEST rather than
-// hanging CI. The front-end (`runJit`) therefore runs in a forked child under a
-// hard wall-clock deadline; the parent `waitpid`s and kills the child if it does
-// not exit. Pre-fix, `collectAncestors` loops forever in the child and the
-// parent kills it -> the test reports "did not terminate". Post-fix the child
-// returns promptly, and the parent additionally asserts the §12.10 "circular
-// inheritance" diagnostic was recorded — confirming the cycle was reached and
-// reported (distinguishing a real termination from an early parse/scope abort),
-// not bypassed. `runJit` does not run the ownership pass (off unless
-// BEZEL_CHECK_OWNERSHIP=1) and skips codegen when sema has errors, so this path
-// isolates the §31.2.1 sema NCB hang (#1624) from the separate cyclic-hierarchy
-// codegen/ownership hangs tracked elsewhere.
+// hanging CI. `runAot` (support/aot_support.hpp) already runs the front-end in
+// a forked child under its own hard wall-clock COMPILE deadline
+// (`aotCompileTimeoutSec`, 120s default, `BEZEL_AOT_COMPILE_TIMEOUT_SEC`
+// overrides) and SIGKILLs + reaps on expiry — the exact fork/waitpid/deadline
+// machinery this test used to hand-roll (qr1 M1 "COMPILE TIMEOUT" in
+// aot_support.hpp). Pre-fix, `collectAncestors` loops forever in that forked
+// compile child and the timeout fires, surfacing here as `r.ran == false` with
+// a "did not finish" diagnostic. Post-fix the child returns promptly, and the
+// test additionally asserts the §12.10 "circular inheritance" diagnostic was
+// recorded — confirming the cycle was reached and reported (distinguishing a
+// real termination from an early parse/scope abort), not bypassed.
 //
 // VERIFIED to fail-without / pass-with the fix: pre-fix bezelc on this input
 // hangs in ExprTC::catchArmNcb's collectAncestors (push_back loop); post-fix it
@@ -285,69 +278,33 @@ BEZEL_TEST(catch_multitype_no_common_base_v182,
         "  return 0; "
         "end Main; end Runner;";
 
-    namespace fs = std::filesystem;
-    static int counter = 0;
-    const std::string diagPath =
-        (fs::temp_directory_path() /
-         ("bezel_1624_" + std::to_string(counter++) + ".diag")).string();
-
-    pid_t pid = ::fork();
-    BEZEL_EXPECT_TRUE(pid >= 0);
-    if (pid < 0) { std::remove(diagPath.c_str()); return; }
-
-    if (pid == 0) {
-        // Child: run the front-end on the cyclic graph. With the #1624 fix this
-        // returns (sema records the §12.10 cycle + §31.2.1 no-common-base
-        // errors, so runJit returns before codegen); without the fix
-        // collectAncestors loops forever here and the parent kills this child.
-        // Write the recorded errors to a file the parent inspects, then _Exit
-        // (NOT exit): skip atexit/static destructors in the forked copy.
-        auto r = runJit(src);
-        std::ofstream out(diagPath);
-        for (const auto& d : r.diagnostics.diagnostics()) {
-            if (d.severity == bezel::Severity::Error)
-                out << d.message << "\n";
-        }
-        out.flush();
-        out.close();
-        std::_Exit(0);
-    }
-
-    // Parent: bounded wait. A normal sema of this fragment is sub-second, so a
-    // generous deadline still catches the pre-fix infinite walk quickly.
-    constexpr int kDeadlineSec = 20;
-    int status = 0;
-    bool terminated = false;
-    auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::seconds(kDeadlineSec);
-    while (std::chrono::steady_clock::now() < deadline) {
-        pid_t w = ::waitpid(pid, &status, WNOHANG);
-        if (w == pid) { terminated = true; break; }
-        if (w == -1) break;  // error other than EINTR; treat as not-terminated
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    if (!terminated) {
-        ::kill(pid, SIGKILL);
-        ::waitpid(pid, &status, 0);  // reap the killed child
-    }
+    auto r = runAot(src);
 
     // Assertion 1 (#1624): the §31.2.1 NCB walk TERMINATED on a cyclic base
-    // graph. This is the load-bearing assertion — it fails (killed child) iff
-    // the visited-set cycle guard is dropped.
-    BEZEL_EXPECT_TRUE(terminated);
+    // graph — this is the load-bearing assertion. It fails iff the visited-set
+    // cycle guard is dropped: `collectAncestors` then loops forever in the
+    // forked compile child, `runAot` hits its own compile deadline, and the
+    // rejection diagnostic reads "did not finish" instead of carrying the
+    // sema errors below.
+    bool timedOut = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("did not finish within") != std::string::npos)
+            timedOut = true;
+    }
+    BEZEL_EXPECT_FALSE(timedOut);
+    if (timedOut) return;  // avoid a misleading second failure
 
     // Assertion 2: the §12.10 cycle was reached and reported, confirming sema
-    // ran (vs. an early parse/scope abort that would also "terminate").
-    std::string diags;
-    {
-        std::ifstream in(diagPath);
-        diags.assign(std::istreambuf_iterator<char>(in),
-                     std::istreambuf_iterator<char>());
+    // ran (vs. an early parse/scope abort that would also "not hang"). A
+    // compile reject's stderr is captured as a single diagnostic whose message
+    // is the whole driver stderr blob, so both the §12.10 and §31.2.1 errors
+    // are findable as substrings of it.
+    bool foundCycle = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("circular inheritance detected") != std::string::npos)
+            foundCycle = true;
     }
-    std::remove(diagPath.c_str());
-    if (!terminated) return;  // avoid a misleading second failure
-    BEZEL_EXPECT_TRUE(diags.find("circular inheritance detected") !=
-                      std::string::npos);
+    BEZEL_EXPECT_TRUE(foundCycle);
 }
 
 // ── #1621: NCB reliability when a built-in exception type participates ────
