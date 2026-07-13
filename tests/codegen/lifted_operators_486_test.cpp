@@ -242,7 +242,7 @@ BEZEL_TEST(codegen_lifted_ops_486, int_unary_neg_present_spec_7_11) {
         "var a: int? := 5; "
         "var r: int? := -a; "
         "Console.WriteLine(r ?? -99); return 0; "
-        " end Main; end C;"), "-5\n");
+        " end Main; end C;"), "-5");
 }
 
 // §7.11: unary `-` on null int? → null.
@@ -261,7 +261,7 @@ BEZEL_TEST(codegen_lifted_ops_486, int_unary_bitnot_present_spec_7_11) {
         "var a: int? := 0; "
         "var r: int? := ~a; "
         "Console.WriteLine(r ?? 0); return 0; "
-        " end Main; end C;"), "-1\n");
+        " end Main; end C;"), "-1");
 }
 
 // §7.11: unary `~` on null int? → null.

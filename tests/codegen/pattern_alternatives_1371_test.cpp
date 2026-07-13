@@ -158,5 +158,5 @@ BEZEL_TEST(codegen_alt_1371, pipe_below_shift_with_range_and_relational) {
     // 1*1000 + 5*100 + 5*10 + 9 = 1559. 1559 > 255, so it cannot round-trip an
     // 8-bit exit code — observe it on stdout (runAotOut) instead (WriteLine
     // appends '\n').
-    BEZEL_EXPECT_EQ(runAotOut(prog), "1559\n");
+    BEZEL_EXPECT_EQ(runAotOut(prog), "1559");
 }

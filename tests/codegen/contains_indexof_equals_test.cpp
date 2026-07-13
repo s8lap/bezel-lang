@@ -90,7 +90,7 @@ BEZEL_TEST(contains_indexof_equals_4_4, record_indexof_absent) {
         "  using var a := new Array<P>(); "
         "  a.Add(new P(1, 2)); a.Add(new P(3, 4)); "
         "  Console.WriteLine(a.IndexOf(new P(5, 6))); return 0; "
-        "end Main; end Program;"), "-1\n");
+        "end Main; end Program;"), "-1");
 }
 
 // -----------------------------------------------------------------------
@@ -188,7 +188,7 @@ BEZEL_TEST(contains_indexof_equals_4_4, scalar_int_indexof_absent) {
         "  using var a := new Array<int>(); "
         "  a.Add(10); a.Add(20); a.Add(30); "
         "  Console.WriteLine(a.IndexOf(99)); return 0; "
-        "end Main; end C;"), "-1\n");
+        "end Main; end C;"), "-1");
 }
 
 // -----------------------------------------------------------------------

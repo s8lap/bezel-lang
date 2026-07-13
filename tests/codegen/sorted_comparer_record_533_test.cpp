@@ -75,7 +75,7 @@ BEZEL_TEST(sorted_comparer_record_533, sorted_original_unchanged_spec_4_4) {
         "  a.Add(new Point(2, 0)); "
         "  using var s := a.Sorted((p, q) => p.X - q.X); "
         "  Console.WriteLine(a.Get(0).X * 100 + a.Get(1).X * 10 + a.Get(2).X); return 0; "  // 312
-        "end Main; end C;"), "312\n");
+        "end Main; end C;"), "312");
 }
 
 // §4.4 / #533: Sorted(comparer) result has correct length.
@@ -194,7 +194,7 @@ BEZEL_TEST(sorted_comparer_record_533, sorted_copy_four_elements_desc_spec_4_4) 
         "  using var s := a.Sorted((p, q) => q.X - p.X); "  // descending
         "  Console.WriteLine(s.Get(0).X * 1000 + s.Get(1).X * 100 + "
         "         s.Get(2).X * 10 + s.Get(3).X); return 0; "  // 8521
-        "end Main; end C;"), "8521\n");
+        "end Main; end C;"), "8521");
 }
 
 // ===========================================================================
@@ -253,5 +253,5 @@ BEZEL_TEST(sorted_comparer_record_533, control_record_reversed_spec_3) {
         "  a.Add(new Point(3, 0)); "
         "  using var r := a.Reversed(); "
         "  Console.WriteLine(r.Get(0).X * 100 + r.Get(1).X * 10 + r.Get(2).X); return 0; "  // 321
-        "end Main; end C;"), "321\n");
+        "end Main; end C;"), "321");
 }

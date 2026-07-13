@@ -100,7 +100,7 @@ BEZEL_TEST(generic_record_string_field_460, pair_int_string_both_fields) {
         "class C public static method Main(): int "
         "  using var p := new Pair<int, string>(42, \"hello\"); "
         "  Console.WriteLine(p.a * 100 + p.b.Length); return 0; "      // 42*100 + 5 = 4205
-        "end Main; end C;"), "4205\n");
+        "end Main; end C;"), "4205");
 }
 
 // §9 / §14.1: Pair<string, int> — reference field FIRST, value field second.
@@ -112,7 +112,7 @@ BEZEL_TEST(generic_record_string_field_460, pair_string_int_both_fields) {
         "class C public static method Main(): int "
         "  using var p := new Pair<string, int>(\"hello\", 9); "
         "  Console.WriteLine(p.b * 100 + p.a.Length); return 0; "      // 9*100 + 5 = 905
-        "end Main; end C;"), "905\n");
+        "end Main; end C;"), "905");
 }
 
 // ── Two distinct instantiations of the same generic record coexist ────────────
@@ -167,7 +167,7 @@ BEZEL_TEST(generic_record_string_field_460, control_box_value_record) {
         "class C public static method Main(): int "
         "  using var b := new Box<Pair>(new Pair(10, 20)); "
         "  Console.WriteLine(b.value.A * 1000 + b.value.B); return 0; "  // 10020
-        "end Main; end C;"), "10020\n");
+        "end Main; end C;"), "10020");
 }
 
 // CONTROL (§9 / §14.1): Box<Named> where Named is a record CONTAINING a string —
@@ -180,7 +180,7 @@ BEZEL_TEST(generic_record_string_field_460, control_box_record_with_string_field
         "class C public static method Main(): int "
         "  using var b := new Box<Named>(new Named(\"hello\", 6)); "
         "  Console.WriteLine(b.value.Name.Length * 1000 + b.value.Age); return 0; "  // 5006
-        "end Main; end C;"), "5006\n");
+        "end Main; end C;"), "5006");
 }
 
 // ── Generic record returned from a method ────────────────────────────────────

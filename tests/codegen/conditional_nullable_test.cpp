@@ -100,7 +100,7 @@ BEZEL_TEST(codegen_conditional_nullable, int_nullable_false_branch_is_null_spec_
         "module M; class C public static method Main(): int "
         "var r: int? := (42 if false else null); "
         "Console.WriteLine(r ?? -1); return 0;"
-        " end Main; end C;"), "-1\n");
+        " end Main; end C;"), "-1");
 }
 
 // Confirm with `= null` (§8.4): a null int? is `= null`.
@@ -144,7 +144,7 @@ BEZEL_TEST(codegen_conditional_nullable, int_nullable_var_cond_false_spec_17_7) 
         "var flag := false; "
         "var r: int? := (42 if flag else null); "
         "Console.WriteLine(r ?? -1); return 0;"
-        " end Main; end C;"), "-1\n");
+        " end Main; end C;"), "-1");
 }
 
 // ── (d) bool? variant, §17/§7 ─────────────────────────────────────────────

@@ -231,7 +231,7 @@ BEZEL_TEST(generic_record_field_590, multi_field_record_all_members) {
         "class C public static method Main(): int "
         "  using var b := new Box<Triple>(new Triple(2, 3, 4)); "
         "  Console.WriteLine(b.Sum()); return 0; "
-        "end Main; end C;"), "432\n");
+        "end Main; end C;"), "432");
 }
 
 // ── §14 regression: the #585 int/string-T cases stay correct ──

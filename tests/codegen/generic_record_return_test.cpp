@@ -58,7 +58,7 @@ BEZEL_TEST(generic_record_return_14_1, method_returns_two_field_record_both_fiel
         "  using var b := new Box<Pair>(new Pair(10, 20)); "
         "  var v := b.GetIt(); "
         "  Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 10020
-        "end Main; end C;"), "10020\n");
+        "end Main; end C;"), "10020");
 }
 
 // §14.1 / §9: a 4-field record (sret-class width) returned from a generic
@@ -76,7 +76,7 @@ BEZEL_TEST(generic_record_return_14_1, method_returns_four_field_record_all_fiel
         "  using var b := new Box<Quad>(new Quad(1, 2, 3, 4)); "
         "  var v := b.GetIt(); "
         "  Console.WriteLine(v.A * 1000 + v.B * 100 + v.C * 10 + v.D); return 0; "   // 1234
-        "end Main; end C;"), "1234\n");
+        "end Main; end C;"), "1234");
 }
 
 // §14.1 / §9: the record result used directly in arithmetic (no intermediate
@@ -94,7 +94,7 @@ BEZEL_TEST(generic_record_return_14_1, method_record_result_fields_in_arithmetic
         "class C public static method Main(): int "
         "  using var b := new Box<Pair>(new Pair(60, 7)); "
         "  Console.WriteLine(b.GetIt().A * 1000 + b.GetIt().B); return 0; "          // 60007
-        "end Main; end C;"), "60007\n");
+        "end Main; end C;"), "60007");
 }
 
 // §14.1 / §9 / §3: a record with a STRING field (a managed reference) returned
@@ -114,7 +114,7 @@ BEZEL_TEST(generic_record_return_14_1, method_returns_record_with_string_field) 
         "  using var b := new Box<Named>(new Named(\"hello\", 6)); "
         "  var v := b.GetIt(); "
         "  Console.WriteLine(v.Name.Length * 1000 + v.Age); return 0; "              // 5*1000 + 6 = 5006
-        "end Main; end C;"), "5006\n");
+        "end Main; end C;"), "5006");
 }
 
 // ── Generic INDEXER returning T = record ─────────────────────────────────────
@@ -136,7 +136,7 @@ BEZEL_TEST(generic_record_return_14_1, indexer_returns_two_field_record_both_fie
         "  using var b := new Box<Pair>(new Pair(10, 20)); "
         "  var v := b[0]; "
         "  Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 10020
-        "end Main; end C;"), "10020\n");
+        "end Main; end C;"), "10020");
 }
 
 // §14.1 / §23.4 / §9: a 4-field record (sret-width) through the generic indexer
@@ -154,7 +154,7 @@ BEZEL_TEST(generic_record_return_14_1, indexer_returns_four_field_record_all_fie
         "  using var b := new Box<Quad>(new Quad(1, 2, 3, 4)); "
         "  var v := b[0]; "
         "  Console.WriteLine(v.A * 1000 + v.B * 100 + v.C * 10 + v.D); return 0; "   // 1234
-        "end Main; end C;"), "1234\n");
+        "end Main; end C;"), "1234");
 }
 
 // §14.1 / §23.4 / §9: direct field access on the generic-indexer result
@@ -171,7 +171,7 @@ BEZEL_TEST(generic_record_return_14_1, indexer_record_result_direct_field_access
         "class C public static method Main(): int "
         "  using var b := new Box<Pair>(new Pair(60, 7)); "
         "  Console.WriteLine(b[0].A * 1000 + b[0].B); return 0; "    // 60007
-        "end Main; end C;"), "60007\n");
+        "end Main; end C;"), "60007");
 }
 
 // ── Controls — the fix must not perturb these working paths ───────────────────
@@ -223,7 +223,7 @@ BEZEL_TEST(generic_record_return_14_1, control_nongeneric_record_returning_metho
         "  using var b := new Box(new Pair(10, 20)); "
         "  var v := b.GetIt(); "
         "  Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 10020
-        "end Main; end C;"), "10020\n");
+        "end Main; end C;"), "10020");
 }
 
 // CONTROL (§23.4 / §9): a NON-generic record-returning user indexer still works
@@ -241,7 +241,7 @@ BEZEL_TEST(generic_record_return_14_1, control_nongeneric_record_returning_index
         "  using var b := new Box(new Pair(10, 20)); "
         "  var v := b[0]; "
         "  Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 10020
-        "end Main; end C;"), "10020\n");
+        "end Main; end C;"), "10020");
 }
 
 // #732 / §14 / §22.4: a generic METHOD whose declared return type is a generic

@@ -248,7 +248,7 @@ BEZEL_TEST(codegen_cg28_destructure, const_then_binding_no_match) {
         "    Pair(0, b) => b, "
         "    _ => -1 "
         "  end); return 0; "
-        "end Main; end C;"), "-1\n");
+        "end Main; end C;"), "-1");
 }
 
 BEZEL_TEST(codegen_cg28_destructure, binding_then_const) {
@@ -1184,7 +1184,7 @@ BEZEL_TEST(codegen_cg28b, parenthesized_when_guard_false_1256) {
         "module M; class C public static method Main(): int "
         "var x := -3; "
         "Console.WriteLine(case x of var t when (t > 0) => t, _ => -1 end); return 0; "
-        " end Main; end C;"), "-1\n");
+        " end Main; end C;"), "-1");
 }
 
 // §19.4/§17 (#1256): more complex parenthesised guard: `(t >= 1 and t <= 9)`.

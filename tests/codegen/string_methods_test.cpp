@@ -86,7 +86,7 @@ BEZEL_TEST(codegen_cg27f, index_of_not_found) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  var s := \"Hello World\"; Console.WriteLine(s.IndexOf(\"xyz\")); return 0; "
-        "end Main; end C;"), "-1\n");
+        "end Main; end C;"), "-1");
 }
 
 BEZEL_TEST(codegen_cg27f, index_of_start) {

@@ -128,7 +128,7 @@ BEZEL_TEST(codegen_generic_static_sameclass_715,
         "    var ds := Registry<string>.derived; "
         "    Console.WriteLine(si * 1000 + di * 100 + ss * 10 + ds); return 0; "
         "  end Main; "
-        "end Program;"), "8787\n");
+        "end Program;"), "8787");
 }
 
 // §22.12 / §22.13 / #715: seed itself is still correct (sanity check —

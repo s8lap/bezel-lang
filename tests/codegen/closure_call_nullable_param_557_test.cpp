@@ -86,7 +86,7 @@ BEZEL_TEST(closure_call_nullable_param_557,
         "  var result: int := fn(null); "
         "  Console.WriteLine(result); return 0;"
         " end Main; end Program;"),
-        "-1\n");
+        "-1");
 }
 
 // Multi-arg closure: (int?, int, bool?) -> int.

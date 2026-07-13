@@ -113,7 +113,7 @@ BEZEL_TEST(builtin_collection_compound_overload_626, array_money_nonzero_index_4
         "    Console.WriteLine(arr[0].Amount + arr[1].Amount); return 0; "  // 100 + 250 = 350
         "  end Main; "
         "end Program;"),
-        "350\n");
+        "350");
 }
 
 // ---------------------------------------------------------------------------
@@ -216,7 +216,7 @@ BEZEL_TEST(builtin_collection_compound_overload_626, array_overload_index_evalua
         "    Console.WriteLine(arr[0].Amount * 1000 + arr[1].Amount); return 0; "  // 110020
         "  end Main; "
         "end C;"),
-        "110020\n");
+        "110020");
 }
 
 // Direct assertion that Idx() is called exactly once (§17.6): Main returns N,
@@ -257,5 +257,5 @@ BEZEL_TEST(builtin_collection_compound_overload_626, array_int_index_evaluated_o
         "    Console.WriteLine(arr[0] * 1000 + arr[1] + N); return 0; "  // 110020 + 1 = 110021
         "  end Main; "
         "end C;"),
-        "110021\n");
+        "110021");
 }

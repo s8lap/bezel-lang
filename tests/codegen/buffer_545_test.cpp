@@ -197,7 +197,7 @@ BEZEL_TEST(codegen_buffer_545, short_set_get_545) {
         "b[0] := 100; "
         "b[1] := 200; "
         "Console.WriteLine(b[0] + b[1]); return 0; "
-    )), "300\n");
+    )), "300");
 }
 
 // issue #545: Buffer<long> — set then get.

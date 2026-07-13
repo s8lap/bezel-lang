@@ -83,5 +83,5 @@ BEZEL_TEST(iter_yield_widen_byte_1596, sbyte_local_sign_extends) {
         "    var v := 0; "
         "    for var x in C.Gen() do v := x; end; "
         "    Console.WriteLine(v); return 0; "                // -5, not 251
-        "  end Main; end C;"), "-5\n");
+        "  end Main; end C;"), "-5");
 }

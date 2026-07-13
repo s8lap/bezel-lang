@@ -81,7 +81,7 @@ BEZEL_TEST(codegen_cg_513, signed_shift_right_fills_sign_bit_spec_6_5) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "var n := -8; Console.WriteLine(n >> 1); return 0; "
-        " end Main; end C;"), "-4\n");
+        " end Main; end C;"), "-4");
 }
 
 // §6.5: long shift — `1L << 64` wraps: 64 % 64 == 0, result is 1L (returned
@@ -201,7 +201,7 @@ BEZEL_TEST(codegen_cg_517, char_max_codepoint_ok_spec_5_2) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "var c := char(0x10FFFF); Console.WriteLine(int(c)); return 0; "
-        " end Main; end C;"), "1114111\n");
+        " end Main; end C;"), "1114111");
 }
 
 // §5.2: CONTROL — char(0) is the null character U+0000, valid.
@@ -216,7 +216,7 @@ BEZEL_TEST(codegen_cg_517, char_just_below_surrogate_ok_spec_5_2) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "var c := char(0xD7FF); Console.WriteLine(int(c)); return 0; "
-        " end Main; end C;"), "55295\n");
+        " end Main; end C;"), "55295");
 }
 
 // §5.2: char(0xE000) — one above the surrogate range — is valid. 0xE000 =
@@ -225,7 +225,7 @@ BEZEL_TEST(codegen_cg_517, char_just_above_surrogate_ok_spec_5_2) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "var c := char(0xE000); Console.WriteLine(int(c)); return 0; "
-        " end Main; end C;"), "57344\n");
+        " end Main; end C;"), "57344");
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +269,7 @@ BEZEL_TEST(codegen_cg_1094, ushort_shr_logical_masks_by_ushort_width) {
         "var a: ushort := 32768; var n: int := 17; var c: ushort := a >> n; "
         "Console.WriteLine(int(c)); return 0; "
         " end Main; end C;"),
-        "16384\n");
+        "16384");
 }
 
 // sbyte(-128) >> int(1): arithmetic (signed) shift → -64. -64 does not fit an
@@ -279,7 +279,7 @@ BEZEL_TEST(codegen_cg_1094, sbyte_shr_arithmetic) {
         "module M; class C public static method Main(): int "
         "var a: sbyte := -128; var n: int := 1; var c: sbyte := a >> n; "
         "Console.WriteLine(int(c)); return 0; "
-        " end Main; end C;"), "-64\n");
+        " end Main; end C;"), "-64");
 }
 
 // byte(128) >> int(1): logical (unsigned) shift → 64 (not -64).

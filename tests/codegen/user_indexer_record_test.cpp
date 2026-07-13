@@ -47,7 +47,7 @@ BEZEL_TEST(user_indexer_record_23_4, expr_getter_bind_then_read_both_fields) {
         "    using var c := new C(); "
         "    var v := c[5]; "
         "    Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 6*1000 + 7 = 6007
-        "  end Main; end C;"), "6007\n");
+        "  end Main; end C;"), "6007");
 }
 
 // §23.4: field access DIRECTLY on the indexer result (`c[5].A`, `c[5].B`) — the
@@ -60,7 +60,7 @@ BEZEL_TEST(user_indexer_record_23_4, expr_getter_direct_field_access) {
         "  public static method Main(): int "
         "    using var c := new C(); "
         "    Console.WriteLine(c[5].A * 1000 + c[5].B); return 0; "    // 6007
-        "  end Main; end C;"), "6007\n");
+        "  end Main; end C;"), "6007");
 }
 
 // §23.4 / §9.4: the indexer reads a backing RECORD FIELD and returns a copy of
@@ -76,7 +76,7 @@ BEZEL_TEST(user_indexer_record_23_4, expr_getter_returns_backing_record_field) {
         "    using var c := new C(); "
         "    var v := c[0]; "
         "    Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 60007
-        "  end Main; end C;"), "60007\n");
+        "  end Main; end C;"), "60007");
 }
 
 // §23.4 / §9.4: a wider record (4 int fields, sret-class size) returns all
@@ -90,7 +90,7 @@ BEZEL_TEST(user_indexer_record_23_4, expr_getter_wide_record_all_fields) {
         "    using var c := new C(); "
         "    var v := c[5]; "
         "    Console.WriteLine(v.A * 1000 + v.B * 100 + v.C * 10 + v.D); return 0; "   // 6789
-        "  end Main; end C;"), "6789\n");
+        "  end Main; end C;"), "6789");
 }
 
 // §23.4 / §9.2 / §3: a record with a string field round-trips a pointer + int
@@ -104,7 +104,7 @@ BEZEL_TEST(user_indexer_record_23_4, expr_getter_record_with_string_field) {
         "    using var c := new C(); "
         "    var v := c[5]; "
         "    Console.WriteLine(v.Name.Length * 1000 + v.Age); return 0; "   // 5*1000 + 6 = 5006
-        "  end Main; end C;"), "5006\n");
+        "  end Main; end C;"), "5006");
 }
 
 // ---------------------------------------------------------------------------
@@ -127,7 +127,7 @@ BEZEL_TEST(user_indexer_record_23_4, block_getter_record_bind_then_read) {
         "    using var c := new C(); "
         "    var v := c[5]; "
         "    Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 6007
-        "  end Main; end C;"), "6007\n");
+        "  end Main; end C;"), "6007");
 }
 
 // §23.4 / §22.9: a block-form getter with intermediate statements (a local then
@@ -146,7 +146,7 @@ BEZEL_TEST(user_indexer_record_23_4, block_getter_record_local_then_return) {
         "    using var c := new C(); "
         "    var v := c[5]; "
         "    Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 15*1000 + 25 = 15025
-        "  end Main; end C;"), "15025\n");
+        "  end Main; end C;"), "15025");
 }
 
 // §23.4 / §22.9: a block-form getter with control flow (the `return` is inside
@@ -166,7 +166,7 @@ BEZEL_TEST(user_indexer_record_23_4, block_getter_record_conditional_return) {
         "    using var c := new C(); "
         "    var v := c[3]; "
         "    Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 7008
-        "  end Main; end C;"), "7008\n");
+        "  end Main; end C;"), "7008");
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +211,7 @@ BEZEL_TEST(user_indexer_record_23_4, control_record_returning_method_still_works
         "    using var c := new C(); "
         "    var v := c.GetP(5); "
         "    Console.WriteLine(v.A * 1000 + v.B); return 0; "          // 6007
-        "  end Main; end C;"), "6007\n");
+        "  end Main; end C;"), "6007");
 }
 
 // CONTROL (§4.4): a built-in COLLECTION indexer (Array<int>[i]) still reads the

@@ -93,7 +93,7 @@ BEZEL_TEST(generic_record_with_462, with_pair_int_string_replace_int) {
         "  var p1 := new Pair<int, string>(1, \"hello\"); "
         "  var p2 := p1 with a := 7 end; "
         "  Console.WriteLine(p2.a * 100 + p2.b.Length); return 0; "    // 7*100 + 5 = 705
-        "end Main; end C;"), "705\n");
+        "end Main; end C;"), "705");
 }
 
 // §9.5 / §14.1: `with` on Pair<int, string> replacing the STRING field. The int
@@ -105,7 +105,7 @@ BEZEL_TEST(generic_record_with_462, with_pair_int_string_replace_string) {
         "  var p1 := new Pair<int, string>(3, \"x\"); "
         "  var p2 := p1 with b := \"planet\" end; "
         "  Console.WriteLine(p2.a * 100 + p2.b.Length); return 0; "    // 3*100 + 6 = 306
-        "end Main; end C;"), "306\n");
+        "end Main; end C;"), "306");
 }
 
 // §9.5 / §14.1: `with` on Box<long> — an 8-byte VALUE field. The placeholder i32
@@ -171,7 +171,7 @@ BEZEL_TEST(generic_record_with_462, control_with_box_record_with_string) {
         "  var b1 := new Box<Named>(new Named(\"x\", 1)); "
         "  var b2 := b1 with value := new Named(\"abc\", 7) end; "
         "  Console.WriteLine(b2.value.Name.Length * 100 + b2.value.Age); return 0; "  // 3*100 + 7 = 307
-        "end Main; end C;"), "307\n");
+        "end Main; end C;"), "307");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

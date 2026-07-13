@@ -131,7 +131,7 @@ BEZEL_TEST(math_convert, math_round_bankers_spec_2_2) {
         "  var r05 := int(Math.Round(0.5)); "
         "  var r15 := int(Math.Round(1.5)); "
         "  Console.WriteLine(r25 * 1000 + r35 * 100 + r05 * 10 + r15); return 0; "
-        "end Main; end C;"), "2402\n");
+        "end Main; end C;"), "2402");
 }
 
 // --- Math.Round(x): ordinary (non-half) cases round to nearest — stdlib §2.2 ---
@@ -146,7 +146,7 @@ BEZEL_TEST(math_convert, math_round_nearest_spec_2_2) {
         "  var r26 := int(Math.Round(2.6)); "
         "  var rn  := int(Math.Round(0.0 - 2.6)); "
         "  Console.WriteLine((r24 + 10) * 100 + (r26 + 10) * 10 + (rn + 10)); return 0; "
-        "end Main; end C;"), "1337\n");
+        "end Main; end C;"), "1337");
 }
 
 // --- Math.Round(x, digits): round to N fractional digits — stdlib §2.2 ---
@@ -281,7 +281,7 @@ BEZEL_TEST(math_comparable_1141, clamp_record_in_range) {
 BEZEL_TEST(math_comparable_1141, numeric_int_unaffected) {
     BEZEL_EXPECT_EQ(runAotOut(mainBody(
         "Console.WriteLine(Math.Min(8, 3) * 100 + Math.Max(8, 3) + Math.Clamp(20, 0, 10)); return 0;")),
-        "318\n");
+        "318");
 }
 
 // #1141 CONTROL: the numeric double path is unaffected — Min(2.5,7.5)=2,

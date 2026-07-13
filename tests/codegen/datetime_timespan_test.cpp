@@ -70,7 +70,7 @@ BEZEL_TEST(codegen_datetime_2_5, utcnow_monotone) {
 BEZEL_TEST(codegen_datetime_2_5, ctor_year_2024) {
     BEZEL_EXPECT_EQ(runAotOut(prog(
         "var dt := new DateTime(2024, 3, 15); "
-        "Console.WriteLine(dt.Year); return 0; ")), "2024\n");
+        "Console.WriteLine(dt.Year); return 0; ")), "2024");
 }
 
 // stdlib §2.5: new DateTime(year, month, day).Month == month.

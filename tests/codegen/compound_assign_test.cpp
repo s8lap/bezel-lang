@@ -95,7 +95,7 @@ BEZEL_TEST(codegen_1041_compound_shift, shl_count_reduced_mod_width) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "var x: int := 1; x <<= 40; Console.WriteLine(x); return 0; "
-        " end Main; end C;"), "256\n");
+        " end Main; end C;"), "256");
 }
 BEZEL_TEST(codegen_1041_compound_shift, shr_count_reduced_mod_width) {
     // 40 mod 32 = 8 → 256 >> 8 = 1.
@@ -107,7 +107,7 @@ BEZEL_TEST(codegen_1041_compound_shift, shl_variable_count_reduced) {
         "module M; class C public static method Main(): int "
         "var x: int := 1; var y: int := 40; x <<= y; "
         "Console.WriteLine(x); return 0; "
-        " end Main; end C;"), "256\n");
+        " end Main; end C;"), "256");
 }
 BEZEL_TEST(codegen_1041_compound_shift, long_count_reduced_mod_64) {
     // long is 64-bit: 65 mod 64 = 1 → 1 << 1 = 2 (confirms per-type width).

@@ -260,7 +260,7 @@ BEZEL_TEST(dict_nullable_read_544, control_scalar_int_add_indexer_spec_4_8) {
         "  d.Add(\"a\", 100); "
         "  d.Add(\"b\", 200); "
         "  Console.WriteLine(d[\"a\"] + d[\"b\"]); return 0; "  // 300
-        "end Main; end C;"), "300\n");
+        "end Main; end C;"), "300");
 }
 
 // #544 CONTROL / stdlib §4.8: Dictionary<string, Point> (non-nullable record)

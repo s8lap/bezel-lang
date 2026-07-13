@@ -60,7 +60,7 @@ BEZEL_TEST(generic_out_nullable_tryparse_1470, int_value_delivered) {
         "    if b = null then return -1; end; "
         "    Console.WriteLine(b!); return 0; "
         "  end Main; "
-        "end C;"), "12345\n");
+        "end C;"), "12345");
 }
 
 // A WIDER value type (`long?`, {i8,i64}): the companion inner field is i64. The
@@ -181,7 +181,7 @@ BEZEL_TEST(generic_out_nullable_tryparse_1470, two_step_local_temp_variant) {
         "    if b = null then return -1; end; "
         "    Console.WriteLine(b!); return 0; "
         "  end Main; "
-        "end C;"), "12345\n");
+        "end C;"), "12345");
 }
 
 // Regression: a DIRECT non-generic `int.TryParse(s, out var b)` — the concrete
@@ -198,5 +198,5 @@ BEZEL_TEST(generic_out_nullable_tryparse_1470, direct_int_tryparse_unaffected) {
         "    end; "
         "    return -1; "
         "  end Main; "
-        "end C;"), "12345\n");
+        "end C;"), "12345");
 }

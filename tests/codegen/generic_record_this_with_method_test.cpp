@@ -137,7 +137,7 @@ BEZEL_TEST(generic_record_this_with_method, pair_int_string_replace_first) {
         "  var p := new Pair<int, string>(1, \"hello\"); "
         "  var p2 := p.WithFirst(7); "
         "  Console.WriteLine(p2.first * 100 + p2.second.Length); return 0; "  // 7*100 + 5 = 705
-        "end Main; end C;"), "705\n");
+        "end Main; end C;"), "705");
 }
 
 // §9.5 / §14.2: Pair<int,string> with-method replacing the string field (B).
@@ -153,7 +153,7 @@ BEZEL_TEST(generic_record_this_with_method, pair_int_string_replace_second) {
         "  var p := new Pair<int, string>(3, \"hello\"); "
         "  var p2 := p.WithSecond(\"planet\"); "
         "  Console.WriteLine(p2.first * 100 + p2.second.Length); return 0; "  // 3*100 + 6 = 306
-        "end Main; end C;"), "306\n");
+        "end Main; end C;"), "306");
 }
 
 // §9.5 / §14.2: Pair<string,int> — ptr+int ordering (ptr in slot 0, int in
@@ -170,7 +170,7 @@ BEZEL_TEST(generic_record_this_with_method, pair_string_int_replace_int) {
         "  var p := new Pair<string, int>(\"hi\", 1); "
         "  var p2 := p.WithSecond(99); "
         "  Console.WriteLine(p2.first.Length * 100 + p2.second); return 0; "  // 2*100 + 99 = 299
-        "end Main; end C;"), "299\n");
+        "end Main; end C;"), "299");
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -223,5 +223,5 @@ BEZEL_TEST(generic_record_this_with_method, box_int_and_box_string_coexist) {
         "  var bi := new Box<int>(1); "
         "  var bs := new Box<string>(\"x\"); "
         "  Console.WriteLine(bi.WithValue(42).value * 100 + bs.WithValue(\"hello\").value.Length); return 0; "
-        "end Main; end C;"), "4205\n");
+        "end Main; end C;"), "4205");
 }

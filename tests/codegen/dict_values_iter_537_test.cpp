@@ -123,7 +123,7 @@ BEZEL_TEST(dict_values_iter_537, int_key_int_values_sum) {
         "  var sum := 0; "
         "  for var v in d.Values do sum := sum + v; end; "
         "  Console.WriteLine(sum); return 0; "
-        "end Main; end C;"), "300\n");
+        "end Main; end C;"), "300");
 }
 
 // #537 / stdlib §4.8: int-keyed dict, iteration count == d.Count.
@@ -197,7 +197,7 @@ BEZEL_TEST(dict_values_iter_537, bare_dict_not_iterable_still_errors) {
         "end Main; end C;");
     // Either it didn't run (compile error = correct) or it ran but not 300.
     if (r.ran) {
-        BEZEL_EXPECT_TRUE(r.stdoutText != "300\n");
+        BEZEL_EXPECT_TRUE(r.stdoutText != "300");
     }
     // If !r.ran, the test passes — compile-time error is the correct behavior.
 }

@@ -268,7 +268,7 @@ BEZEL_TEST(builtin_collection_incdec_613, array_increment_index_evaluated_once_1
         "    arr[Idx()]++; "
         "    Console.WriteLine(arr[0] * 1000 + arr[1] * 10 + N); return 0; "  // 11201
         "  end Main; "
-        "end C;"), "11201\n");
+        "end C;"), "11201");
 }
 
 // `arr[Idx()]--`: single evaluation → arr[0] becomes 9, arr[1] stays 20,
@@ -287,5 +287,5 @@ BEZEL_TEST(builtin_collection_incdec_613, array_decrement_index_evaluated_once_1
         "    arr[Idx()]--; "
         "    Console.WriteLine(arr[0] * 1000 + arr[1] * 10 + N); return 0; "  // 9201
         "  end Main; "
-        "end C;"), "9201\n");
+        "end C;"), "9201");
 }

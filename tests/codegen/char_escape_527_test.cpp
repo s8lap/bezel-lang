@@ -52,7 +52,7 @@ BEZEL_TEST(codegen_char_escape_527, spec_18_8_u4hex_i_tilde) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "Console.WriteLine(int('\\u0129')); return 0; "
-        " end Main; end C;"), "297\n");
+        " end Main; end C;"), "297");
 }
 
 // §18.8: '中' = U+4E2D = 20013 (中, CJK Unified Ideograph).
@@ -119,7 +119,7 @@ BEZEL_TEST(codegen_char_escape_527, spec_18_3_raw_utf8_i_tilde_297) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "Console.WriteLine(int('ĩ')); return 0; "
-        " end Main; end C;"), "297\n");
+        " end Main; end C;"), "297");
 }
 
 // ── Control cases: existing escapes must still be correct ───────────────────

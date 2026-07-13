@@ -141,7 +141,7 @@ BEZEL_TEST(array_sized_fill_1375, byte_fill_bare_int_literal_200) {
         "class C public static method Main(): int "
         "  using var arr := new Array<byte>(2, 200); "
         "  Console.WriteLine(int(arr[0]) + int(arr[1])); return 0; "
-        "end Main; end C;"), "400\n");
+        "end Main; end C;"), "400");
 }
 
 // The §7.1 canonical buffer size (64 KiB) fills correctly.

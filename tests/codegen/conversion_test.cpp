@@ -39,7 +39,7 @@ BEZEL_TEST(codegen_cg44, long_to_int) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "var x := 300L; Console.WriteLine(int(x)); return 0; "
-        " end Main; end C;"), "300\n");
+        " end Main; end C;"), "300");
 }
 
 BEZEL_TEST(codegen_cg44, int_to_byte_in_range) {
@@ -79,7 +79,7 @@ BEZEL_TEST(codegen_cg44, negative_int_to_long_sign_extends) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "var n := -3; var x := long(n); Console.WriteLine(int(x)); return 0; "
-        " end Main; end C;"), "-3\n");
+        " end Main; end C;"), "-3");
 }
 
 BEZEL_TEST(codegen_cg44, conversion_in_arithmetic) {
