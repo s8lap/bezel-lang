@@ -5,16 +5,17 @@
 // handles constant, relational-operator, and discard patterns.
 // Observable via the int exit code.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& body) {
-    auto r = runJit(
+    auto r = runAot(
         std::string("module M; class C public static method Main(): int ") +
         body + " end Main; end C;");
     return r.ran ? r.exitCode : -999;
@@ -153,7 +154,7 @@ BEZEL_TEST(codegen_cg28b, binding_pattern_with_guard_false) {
 
 namespace {
 int runFull(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 } // namespace
@@ -239,15 +240,15 @@ BEZEL_TEST(codegen_cg28_destructure, const_then_binding) {
 
 BEZEL_TEST(codegen_cg28_destructure, const_then_binding_no_match) {
     // Point(0, y) should NOT match when first field != 0.
-    BEZEL_EXPECT_EQ(runFull(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; record Pair(a: int, b: int); "
         "class C public static method Main(): int "
         "  var p := new Pair(5, 7); "
-        "  return case p of "
+        "  Console.WriteLine(case p of "
         "    Pair(0, b) => b, "
         "    _ => -1 "
-        "  end; "
-        "end Main; end C;"), -1);
+        "  end); return 0; "
+        "end Main; end C;"), "-1\n");
 }
 
 BEZEL_TEST(codegen_cg28_destructure, binding_then_const) {
@@ -386,7 +387,7 @@ BEZEL_TEST(codegen_cg28, numeric_widening_int_arm) {
 // `N` — neither is implicitly convertible to the other. (The bottom-typed
 // throw arm imposes no constraint, so it is the two value arms that conflict.)
 BEZEL_TEST(codegen_cg28, incompatible_value_arms_is_type_error) {
-    JitResult r = runJit(
+    JitResult r = runAot(
         "module M; class N end N; class C "
         "  public static method Main(): int "
         "    var x := new N(); "
@@ -864,7 +865,7 @@ BEZEL_TEST(codegen_cg28, leading_open_first_arm_not_swallowed_744) {
 // membership; a stride has no meaning). Previously this reached codegen and
 // emitted malformed IR (unterminated case.end); now it is a clean diagnostic.
 BEZEL_TEST(codegen_cg28, step_in_range_pattern_rejected_738) {
-    JitResult r = runJit(
+    JitResult r = runAot(
         "module M; class C public static method Main(): int "
         "  var x := 4; "
         "  var r := case x of 0..10 step 2 => 1, _ => 0 end; "
@@ -885,7 +886,7 @@ BEZEL_TEST(codegen_cg28, step_in_for_in_range_still_ok_738) {
 // #738 / §19.6: an unguarded `_` catch-all must be the last arm; an earlier one
 // makes the following arms unreachable — now a clean diagnostic.
 BEZEL_TEST(codegen_cg28, discard_not_last_arm_rejected_738) {
-    JitResult r = runJit(
+    JitResult r = runAot(
         "module M; class C public static method Main(): int "
         "  var x := 5; "
         "  var r := case x of _ => 0, 1 => 1, 5 => 5 end; "
@@ -1175,11 +1176,15 @@ BEZEL_TEST(codegen_cg28b, parenthesized_when_guard_1256) {
 }
 
 // §19.4/§17 (#1256): parenthesised guard is false — falls through to `_`.
-// Scrutinee -3 is not > 0; guard fails; wildcard yields -1.
+// Scrutinee -3 is not > 0; guard fails; wildcard yields -1. -1 does not fit an
+// 8-bit exit code, so this test builds the full program directly and observes
+// it on stdout (runAotOut) rather than going through the run(body) wrapper.
 BEZEL_TEST(codegen_cg28b, parenthesized_when_guard_false_1256) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
         "var x := -3; "
-        "return case x of var t when (t > 0) => t, _ => -1 end;"), -1);
+        "Console.WriteLine(case x of var t when (t > 0) => t, _ => -1 end); return 0; "
+        " end Main; end C;"), "-1\n");
 }
 
 // §19.4/§17 (#1256): more complex parenthesised guard: `(t >= 1 and t <= 9)`.

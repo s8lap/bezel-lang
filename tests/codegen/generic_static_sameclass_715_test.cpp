@@ -40,15 +40,16 @@
 //   #697 — per-instantiation globals for direct external access.
 //   #701 — cross-named access from a different generic method.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -116,7 +117,8 @@ BEZEL_TEST(codegen_generic_static_sameclass_715,
 // 7*1000 + 17*100 + 7*10 + 17 = 7000 + 1700 + 70 + 17 = 8787.
 BEZEL_TEST(codegen_generic_static_sameclass_715,
            all_four_values_correct_spec_22_12_22_13) {
-    BEZEL_EXPECT_EQ(run(
+    // 8787 does not fit an 8-bit exit code — observe on stdout.
+    BEZEL_EXPECT_EQ(runAotOut(
         std::string(kRepro) +
         "class Program "
         "  public static method Main(): int "
@@ -124,9 +126,9 @@ BEZEL_TEST(codegen_generic_static_sameclass_715,
         "    var di := Registry<int>.derived; "
         "    var ss := Registry<string>.seed; "
         "    var ds := Registry<string>.derived; "
-        "    return si * 1000 + di * 100 + ss * 10 + ds; "
+        "    Console.WriteLine(si * 1000 + di * 100 + ss * 10 + ds); return 0; "
         "  end Main; "
-        "end Program;"), 8787);
+        "end Program;"), "8787\n");
 }
 
 // §22.12 / §22.13 / #715: seed itself is still correct (sanity check —

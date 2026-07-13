@@ -24,14 +24,15 @@
 // Spec authority: §25.1 (read-modify-write through indexer), §4.4 (Array<T>
 // indexer get/set), §4.8 (Dictionary<K,V> indexer get/set).
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 } // namespace
@@ -254,7 +255,7 @@ BEZEL_TEST(builtin_collection_incdec_613, inline_array_increment_regression_15_1
 // `arr[Idx()]++`: Idx() must fire once (returns 0) → arr[0] becomes 11,
 // arr[1] stays 20, N == 1. 11*1000 + 20*10 + 1 = 11201.
 BEZEL_TEST(builtin_collection_incdec_613, array_increment_index_evaluated_once_17_6) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C "
         "  public static N: int; "
         "  public static method Idx(): int "
@@ -265,15 +266,15 @@ BEZEL_TEST(builtin_collection_incdec_613, array_increment_index_evaluated_once_1
         "    var arr := new Array<int>(); "
         "    arr.Add(10); arr.Add(20); "
         "    arr[Idx()]++; "
-        "    return arr[0] * 1000 + arr[1] * 10 + N; "  // 11201
+        "    Console.WriteLine(arr[0] * 1000 + arr[1] * 10 + N); return 0; "  // 11201
         "  end Main; "
-        "end C;"), 11201);
+        "end C;"), "11201\n");
 }
 
 // `arr[Idx()]--`: single evaluation → arr[0] becomes 9, arr[1] stays 20,
 // N == 1. 9*1000 + 20*10 + 1 = 9201.
 BEZEL_TEST(builtin_collection_incdec_613, array_decrement_index_evaluated_once_17_6) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C "
         "  public static N: int; "
         "  public static method Idx(): int "
@@ -284,7 +285,7 @@ BEZEL_TEST(builtin_collection_incdec_613, array_decrement_index_evaluated_once_1
         "    var arr := new Array<int>(); "
         "    arr.Add(10); arr.Add(20); "
         "    arr[Idx()]--; "
-        "    return arr[0] * 1000 + arr[1] * 10 + N; "  // 9201
+        "    Console.WriteLine(arr[0] * 1000 + arr[1] * 10 + N); return 0; "  // 9201
         "  end Main; "
-        "end C;"), 9201);
+        "end C;"), "9201\n");
 }

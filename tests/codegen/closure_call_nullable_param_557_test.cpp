@@ -18,15 +18,16 @@
 //   §17.14 — lambda / closure expressions
 //   §27 — closures
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -72,15 +73,20 @@ BEZEL_TEST(closure_call_nullable_param_557,
 }
 
 // Already-nullable arg: fn(null) → default -1. Regression: a T? arg must
-// pass through unchanged (not double-wrapped).
+// pass through unchanged (not double-wrapped). -1 does not fit an 8-bit exit
+// code, so this builds the full program directly and observes stdout
+// (runMain's body-only wrapper can't route through runAotOut).
 // per §7.5 / §22.1
 BEZEL_TEST(closure_call_nullable_param_557,
            null_arg_to_nullable_int_param_spec_7_5) {
-    BEZEL_EXPECT_EQ(runMain(
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module P36; class Program "
+        "  public static method Main(): int "
         "  var fn: (int?) -> int := (x: int?) => x ?? -1; "
         "  var result: int := fn(null); "
-        "  return result;"),
-        -1);
+        "  Console.WriteLine(result); return 0;"
+        " end Main; end Program;"),
+        "-1\n");
 }
 
 // Multi-arg closure: (int?, int, bool?) -> int.

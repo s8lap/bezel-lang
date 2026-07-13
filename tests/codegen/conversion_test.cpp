@@ -4,14 +4,15 @@
 // (fpext / fptrunc). Narrowing overflow checks are deferred. Observable via
 // the int exit code.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& body) {
-    auto r = runJit(
+    auto r = runAot(
         std::string("module M; class C public static method Main(): int ") +
         body + " end Main; end C;");
     return r.ran ? r.exitCode : -999;
@@ -32,7 +33,13 @@ BEZEL_TEST(codegen_cg44, int_to_double) {
 }
 
 BEZEL_TEST(codegen_cg44, long_to_int) {
-    BEZEL_EXPECT_EQ(run("var x := 300L; return int(x);"), 300);
+    // 300 does not fit an 8-bit exit code, so this builds the full program
+    // directly and observes stdout (run()'s body-only wrapper can't route
+    // through runAotOut).
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
+        "var x := 300L; Console.WriteLine(int(x)); return 0; "
+        " end Main; end C;"), "300\n");
 }
 
 BEZEL_TEST(codegen_cg44, int_to_byte_in_range) {
@@ -67,8 +74,12 @@ BEZEL_TEST(codegen_cg44, int_to_long_widens) {
     BEZEL_EXPECT_EQ(run("var n := 5; var x := long(n); return int(x);"), 5);
 }
 
+// -3 does not fit an 8-bit exit code — observe on stdout.
 BEZEL_TEST(codegen_cg44, negative_int_to_long_sign_extends) {
-    BEZEL_EXPECT_EQ(run("var n := -3; var x := long(n); return int(x);"), -3);
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
+        "var n := -3; var x := long(n); Console.WriteLine(int(x)); return 0; "
+        " end Main; end C;"), "-3\n");
 }
 
 BEZEL_TEST(codegen_cg44, conversion_in_arithmetic) {
@@ -78,14 +89,14 @@ BEZEL_TEST(codegen_cg44, conversion_in_arithmetic) {
 // §5.4 enum casts: `int(E.X)` is the constant's value; `E(i)` builds an
 // enum from an integer (the enum is represented by its underlying i32).
 BEZEL_TEST(codegen_cg44, int_of_enum_constant) {
-    BEZEL_EXPECT_EQ(runJit(
+    BEZEL_EXPECT_EQ(runAot(
         "module M; enum E Red, Green, Blue; end E; "
         "class C public static method Main(): int return int(E.Blue); "
         "end Main; end C;").exitCode, 2);
 }
 
 BEZEL_TEST(codegen_cg44, enum_of_int_roundtrips_through_case) {
-    BEZEL_EXPECT_EQ(runJit(
+    BEZEL_EXPECT_EQ(runAot(
         "module M; enum E Red, Green, Blue; end E; "
         "class C public static method Main(): int "
         "  var e := E(2); return case e of E.Blue => 9, _ => 0, end; "
@@ -93,7 +104,7 @@ BEZEL_TEST(codegen_cg44, enum_of_int_roundtrips_through_case) {
 }
 
 BEZEL_TEST(codegen_cg44, enum_of_int_then_back_to_int) {
-    BEZEL_EXPECT_EQ(runJit(
+    BEZEL_EXPECT_EQ(runAot(
         "module M; enum E Red, Green, Blue; end E; "
         "class C public static method Main(): int "
         "  var e := E(1); return int(e); "
@@ -101,7 +112,7 @@ BEZEL_TEST(codegen_cg44, enum_of_int_then_back_to_int) {
 }
 
 BEZEL_TEST(codegen_cg44, int_of_enum_with_explicit_values) {
-    BEZEL_EXPECT_EQ(runJit(
+    BEZEL_EXPECT_EQ(runAot(
         "module M; enum E A := 10, B := 20; end E; "
         "class C public static method Main(): int return int(E.B); "
         "end Main; end C;").exitCode, 20);

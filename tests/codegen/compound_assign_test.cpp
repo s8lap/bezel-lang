@@ -4,15 +4,16 @@
 // overflow/zero-checked as usual), and writes back. Targets may be
 // locals, static fields, or instance fields. Observable via exit code.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& body) {
-    auto r = runJit(
+    auto r = runAot(
         std::string("module M; class C public static method Main(): int ") +
         body + " end Main; end C;");
     return r.ran ? r.exitCode : -999;
@@ -59,7 +60,7 @@ BEZEL_TEST(codegen_cg31, increment_in_loop) {
 }
 
 BEZEL_TEST(codegen_cg31, compound_on_static_field) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public static _n: int := 100; "
         "  public static method Main(): int "
@@ -70,7 +71,7 @@ BEZEL_TEST(codegen_cg31, compound_on_static_field) {
 }
 
 BEZEL_TEST(codegen_cg31, compound_on_instance_field) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public _v: int := 10; "
         "  public method Bump() _v += 32; end Bump; "
@@ -88,15 +89,25 @@ BEZEL_TEST(codegen_cg31, compound_on_instance_field) {
 // `shl`/`lshr`/`ashr` with the unmasked count, so `x <<= 40` on an i32
 // produced poison (a wrong value) while `x << 40` correctly gave `x << 8`.
 BEZEL_TEST(codegen_1041_compound_shift, shl_count_reduced_mod_width) {
-    // 40 mod 32 = 8 → 1 << 8 = 256.
-    BEZEL_EXPECT_EQ(run("var x: int := 1; x <<= 40; return x;"), 256);
+    // 40 mod 32 = 8 → 1 << 8 = 256. 256 does not fit an 8-bit exit code, so
+    // this builds the full program directly and observes stdout (run()'s
+    // body-only wrapper can't route through runAotOut).
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
+        "var x: int := 1; x <<= 40; Console.WriteLine(x); return 0; "
+        " end Main; end C;"), "256\n");
 }
 BEZEL_TEST(codegen_1041_compound_shift, shr_count_reduced_mod_width) {
     // 40 mod 32 = 8 → 256 >> 8 = 1.
     BEZEL_EXPECT_EQ(run("var x: int := 256; x >>= 40; return x;"), 1);
 }
 BEZEL_TEST(codegen_1041_compound_shift, shl_variable_count_reduced) {
-    BEZEL_EXPECT_EQ(run("var x: int := 1; var y: int := 40; x <<= y; return x;"), 256);
+    // 256 does not fit an 8-bit exit code — observe on stdout.
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
+        "var x: int := 1; var y: int := 40; x <<= y; "
+        "Console.WriteLine(x); return 0; "
+        " end Main; end C;"), "256\n");
 }
 BEZEL_TEST(codegen_1041_compound_shift, long_count_reduced_mod_64) {
     // long is 64-bit: 65 mod 64 = 1 → 1 << 1 = 2 (confirms per-type width).
@@ -136,7 +147,7 @@ BEZEL_TEST(codegen_1042_subint_compound, byte_shl_equals) {
 }
 // LHS-width overflow (200 + 100 = 300 > byte max) raises OverflowException.
 BEZEL_TEST(codegen_1042_subint_compound, byte_plus_overflow_throws) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var b: byte := 200; "
         "  try b += 100; return 0; catch OverflowException => return 1; end; "
@@ -154,7 +165,7 @@ namespace {
 // Returns 1 if the body raises OverflowException, 0 otherwise (or -999 on
 // front-end failure).
 int throwsOverflow(const std::string& stmt) {
-    auto r = bezel::test::runJit(
+    auto r = bezel::test::runAot(
         std::string("module M; class C public static method Main(): int "
                     "  try ") + stmt +
         " return 0; catch OverflowException => return 1; end; return 0; "

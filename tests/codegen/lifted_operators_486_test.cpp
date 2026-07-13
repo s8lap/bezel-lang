@@ -17,16 +17,17 @@
 //   - Control: non-nullable int/double arithmetic + relational unchanged.
 //   - Equality (`=`, `<>`) unchanged (already null-safe per §8.4).
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 // Helper: run a Bezel program that returns an int exit code.
 int run(const std::string& body) {
-    auto r = runJit(
+    auto r = runAot(
         std::string("module M; class C public static method Main(): int ") +
         body + " end Main; end C;");
     return r.ran ? r.exitCode : -999;
@@ -232,12 +233,16 @@ BEZEL_TEST(codegen_lifted_ops_486, int_ge_left_null_yields_false_spec_7_11) {
 // §7.11 — unary `-` and `~` on int?
 // =========================================================================
 
-// §7.11: unary `-` on present int? → negated value (narrow with ??).
+// §7.11: unary `-` on present int? → negated value (narrow with ??). -5 does
+// not fit an 8-bit exit code, so this builds the full program directly and
+// observes stdout (run()'s body-only wrapper can't route through runAotOut).
 BEZEL_TEST(codegen_lifted_ops_486, int_unary_neg_present_spec_7_11) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
         "var a: int? := 5; "
         "var r: int? := -a; "
-        "return (r ?? -99);"), -5);
+        "Console.WriteLine(r ?? -99); return 0; "
+        " end Main; end C;"), "-5\n");
 }
 
 // §7.11: unary `-` on null int? → null.
@@ -248,12 +253,15 @@ BEZEL_TEST(codegen_lifted_ops_486, int_unary_neg_null_yields_null_spec_7_11) {
         "return int(r = null);"), 1);
 }
 
-// §7.11: unary `~` on present int? → bitwise complement (~0 == -1).
+// §7.11: unary `~` on present int? → bitwise complement (~0 == -1). -1 does
+// not fit an 8-bit exit code — observe on stdout.
 BEZEL_TEST(codegen_lifted_ops_486, int_unary_bitnot_present_spec_7_11) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
         "var a: int? := 0; "
         "var r: int? := ~a; "
-        "return (r ?? 0);"), -1);
+        "Console.WriteLine(r ?? 0); return 0; "
+        " end Main; end C;"), "-1\n");
 }
 
 // §7.11: unary `~` on null int? → null.

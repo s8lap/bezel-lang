@@ -35,7 +35,7 @@
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
@@ -44,7 +44,8 @@
 #include "llvm/IR/Module.h"
 
 namespace fs = std::filesystem;
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
@@ -53,7 +54,7 @@ namespace {
 // ---------------------------------------------------------------------------
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -191,12 +192,12 @@ BEZEL_TEST(codegen_buffer_545, byte_set_get_545) {
 
 // issue #545: Buffer<short> — set then get.
 BEZEL_TEST(codegen_buffer_545, short_set_get_545) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_EQ(runAotOut(prog(
         "using var b := new Buffer<short>(2); "
         "b[0] := 100; "
         "b[1] := 200; "
-        "return b[0] + b[1]; "
-    )), 300);
+        "Console.WriteLine(b[0] + b[1]); return 0; "
+    )), "300\n");
 }
 
 // issue #545: Buffer<long> — set then get.

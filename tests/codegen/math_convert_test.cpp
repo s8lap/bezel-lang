@@ -29,20 +29,21 @@
 // the JIT reads the raw int return (not the 8-bit-masked process exit status),
 // tests can return values above 255 directly.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
 bool hasSemaError(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return !r.ran && r.diagnostics.hasErrors();
 }
 
@@ -122,14 +123,15 @@ BEZEL_TEST(math_convert, math_tau_constant_spec_2_2) {
 // Encodes the four results as a single integer: r25*1000 + r35*100 + r05*10 + r15.
 // Expected: 2*1000 + 4*100 + 0*10 + 2 = 2402.
 BEZEL_TEST(math_convert, math_round_bankers_spec_2_2) {
-    BEZEL_EXPECT_EQ(run(
+    // 2402 does not fit an 8-bit exit code — observe on stdout.
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  var r25 := int(Math.Round(2.5)); "
         "  var r35 := int(Math.Round(3.5)); "
         "  var r05 := int(Math.Round(0.5)); "
         "  var r15 := int(Math.Round(1.5)); "
-        "  return r25 * 1000 + r35 * 100 + r05 * 10 + r15; "
-        "end Main; end C;"), 2402);
+        "  Console.WriteLine(r25 * 1000 + r35 * 100 + r05 * 10 + r15); return 0; "
+        "end Main; end C;"), "2402\n");
 }
 
 // --- Math.Round(x): ordinary (non-half) cases round to nearest — stdlib §2.2 ---
@@ -137,13 +139,14 @@ BEZEL_TEST(math_convert, math_round_bankers_spec_2_2) {
 // Encode: (r24 + 10) * 100 + (r26 + 10) * 10 + (r_neg + 10)
 //       = 12*100 + 13*10 + 7 = 1337.
 BEZEL_TEST(math_convert, math_round_nearest_spec_2_2) {
-    BEZEL_EXPECT_EQ(run(
+    // 1337 does not fit an 8-bit exit code — observe on stdout.
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  var r24 := int(Math.Round(2.4)); "
         "  var r26 := int(Math.Round(2.6)); "
         "  var rn  := int(Math.Round(0.0 - 2.6)); "
-        "  return (r24 + 10) * 100 + (r26 + 10) * 10 + (rn + 10); "
-        "end Main; end C;"), 1337);
+        "  Console.WriteLine((r24 + 10) * 100 + (r26 + 10) * 10 + (rn + 10)); return 0; "
+        "end Main; end C;"), "1337\n");
 }
 
 // --- Math.Round(x, digits): round to N fractional digits — stdlib §2.2 ---
@@ -273,11 +276,12 @@ BEZEL_TEST(math_comparable_1141, clamp_record_in_range) {
 }
 
 // #1141 CONTROL: the numeric int path is unaffected — Min(8,3)=3, Max(8,3)=8,
-// Clamp(20,0,10)=10 → 3*100 + 8 + 10 = 318 (runJit returns the full int).
+// Clamp(20,0,10)=10 → 3*100 + 8 + 10 = 318. 318 does not fit an 8-bit exit
+// code — observe on stdout.
 BEZEL_TEST(math_comparable_1141, numeric_int_unaffected) {
-    BEZEL_EXPECT_EQ(run(mainBody(
-        "return Math.Min(8, 3) * 100 + Math.Max(8, 3) + Math.Clamp(20, 0, 10);")),
-        318);
+    BEZEL_EXPECT_EQ(runAotOut(mainBody(
+        "Console.WriteLine(Math.Min(8, 3) * 100 + Math.Max(8, 3) + Math.Clamp(20, 0, 10)); return 0;")),
+        "318\n");
 }
 
 // #1141 CONTROL: the numeric double path is unaffected — Min(2.5,7.5)=2,

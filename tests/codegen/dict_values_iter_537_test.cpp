@@ -16,14 +16,15 @@
 // the live values array) and lowerDictValuesFor to the codegen (mirrors
 // lowerDictKeysFor, using genericArgs[1] for the value element type).
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -113,15 +114,16 @@ BEZEL_TEST(dict_values_iter_537, string_key_string_values_length_sum) {
 // #537 / stdlib §4.8: `for var v in d.Values` over a generic-key
 // (int-keyed) dictionary — values {100, 200} → sum 300.
 BEZEL_TEST(dict_values_iter_537, int_key_int_values_sum) {
-    BEZEL_EXPECT_EQ(run(
+    // 300 does not fit an 8-bit exit code — observe on stdout.
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
         "  d[3] := 100; "
         "  d[4] := 200; "
         "  var sum := 0; "
         "  for var v in d.Values do sum := sum + v; end; "
-        "  return sum; "
-        "end Main; end C;"), 300);
+        "  Console.WriteLine(sum); return 0; "
+        "end Main; end C;"), "300\n");
 }
 
 // #537 / stdlib §4.8: int-keyed dict, iteration count == d.Count.
@@ -180,18 +182,22 @@ BEZEL_TEST(dict_values_iter_537, keys_still_works_regression_guard) {
 // it is rejected at compile-time (sema error, fix #530) rather than
 // silently iterating.
 BEZEL_TEST(dict_values_iter_537, bare_dict_not_iterable_still_errors) {
-    auto r = runJit(
+    // The sum is observed on stdout, not the exit code: an exit code caps at
+    // 8 bits (0..255), so `r.exitCode != 300` would be trivially true under
+    // runAot regardless of the actual (correct-or-buggy) computed value,
+    // silently defeating this check. stdoutText carries the untruncated value.
+    auto r = runAot(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
         "  d[3] := 100; "
         "  d[4] := 200; "
         "  var sum := 0; "
         "  for var e in d do sum := sum + e; end; "
-        "  return sum; "
+        "  Console.WriteLine(sum); return 0; "
         "end Main; end C;");
     // Either it didn't run (compile error = correct) or it ran but not 300.
     if (r.ran) {
-        BEZEL_EXPECT_TRUE(r.exitCode != 300);
+        BEZEL_EXPECT_TRUE(r.stdoutText != "300\n");
     }
     // If !r.ran, the test passes — compile-time error is the correct behavior.
 }

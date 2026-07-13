@@ -24,15 +24,16 @@
 // §7.2 (null literal), §7.8 (force-unwrap !), §8.4 (null-safe =/<>),
 // §17.1 (?? coalesce).
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -91,11 +92,15 @@ BEZEL_TEST(codegen_conditional_nullable, int_nullable_true_branch_coalesce_spec_
 // ── (b) int? — false branch (null), §17/§7 ────────────────────────────────
 
 // `(42 if false else null)` yields int? with hasValue=0 (null).
-// `?? -1` returns the right operand (-1) because r is null.
+// `?? -1` returns the right operand (-1) because r is null. -1 does not fit
+// an 8-bit exit code, so this builds the full program directly and observes
+// stdout (runMain's body-only wrapper can't route through runAotOut).
 BEZEL_TEST(codegen_conditional_nullable, int_nullable_false_branch_is_null_spec_17_7) {
-    BEZEL_EXPECT_EQ(runMain(
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
         "var r: int? := (42 if false else null); "
-        "return r ?? -1;"), -1);
+        "Console.WriteLine(r ?? -1); return 0;"
+        " end Main; end C;"), "-1\n");
 }
 
 // Confirm with `= null` (§8.4): a null int? is `= null`.
@@ -132,11 +137,14 @@ BEZEL_TEST(codegen_conditional_nullable, int_nullable_var_cond_true_spec_17_7) {
         "return r ?? -1;"), 42);
 }
 
+// -1 does not fit an 8-bit exit code — observe on stdout.
 BEZEL_TEST(codegen_conditional_nullable, int_nullable_var_cond_false_spec_17_7) {
-    BEZEL_EXPECT_EQ(runMain(
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
         "var flag := false; "
         "var r: int? := (42 if flag else null); "
-        "return r ?? -1;"), -1);
+        "Console.WriteLine(r ?? -1); return 0;"
+        " end Main; end C;"), "-1\n");
 }
 
 // ── (d) bool? variant, §17/§7 ─────────────────────────────────────────────

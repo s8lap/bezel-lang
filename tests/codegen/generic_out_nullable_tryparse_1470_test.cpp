@@ -24,14 +24,15 @@
 // false path reads as null) whenever the out slot's element type is that tagged
 // struct; a bare out slot (the direct concrete-member path) is stored unchanged.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -49,16 +50,17 @@ const char* kWrapper =
 // The reported repro: T=int. Parse succeeds → ok=True, `out var b` is a non-null
 // `int?` carrying 12345. Before the fix `b!` read uninitialized memory.
 BEZEL_TEST(generic_out_nullable_tryparse_1470, int_value_delivered) {
-    BEZEL_EXPECT_EQ(run(
+    // 12345 does not fit an 8-bit exit code — observe on stdout.
+    BEZEL_EXPECT_EQ(runAotOut(
         std::string(kWrapper) +
         "class C "
         "  public static method Main(): int "
         "    var ok := U.TryIt<int>(\"12345\", out var b); "
         "    if not ok then return -2; end; "
         "    if b = null then return -1; end; "
-        "    return b!; "  // 12345 → JIT returns the raw int
+        "    Console.WriteLine(b!); return 0; "
         "  end Main; "
-        "end C;"), 12345);
+        "end C;"), "12345\n");
 }
 
 // A WIDER value type (`long?`, {i8,i64}): the companion inner field is i64. The
@@ -160,7 +162,8 @@ BEZEL_TEST(generic_out_nullable_tryparse_1470, failed_parse_is_false_and_null) {
 // issue — the nested write targets a LOCAL `T?` slot rather than a forwarded
 // refParam, and must marshal identically.
 BEZEL_TEST(generic_out_nullable_tryparse_1470, two_step_local_temp_variant) {
-    BEZEL_EXPECT_EQ(run(
+    // 12345 does not fit an 8-bit exit code — observe on stdout.
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; "
         "static class U "
         "  public static method TryIt<T>(s: string, out v: T?): bool "
@@ -176,21 +179,24 @@ BEZEL_TEST(generic_out_nullable_tryparse_1470, two_step_local_temp_variant) {
         "    var ok := U.TryIt<int>(\"12345\", out var b); "
         "    if not ok then return -2; end; "
         "    if b = null then return -1; end; "
-        "    return b!; "
+        "    Console.WriteLine(b!); return 0; "
         "  end Main; "
-        "end C;"), 12345);
+        "end C;"), "12345\n");
 }
 
 // Regression: a DIRECT non-generic `int.TryParse(s, out var b)` — the concrete
 // member's out is a bare `int` (stdlib §9.1), so the bare store path is
 // exercised and must be unchanged by the fix.
 BEZEL_TEST(generic_out_nullable_tryparse_1470, direct_int_tryparse_unaffected) {
-    BEZEL_EXPECT_EQ(run(
+    // 12345 does not fit an 8-bit exit code — observe on stdout.
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; "
         "class C "
         "  public static method Main(): int "
-        "    if int.TryParse(\"12345\", out var b) then return b; end; "
+        "    if int.TryParse(\"12345\", out var b) then "
+        "      Console.WriteLine(b); return 0; "
+        "    end; "
         "    return -1; "
         "  end Main; "
-        "end C;"), 12345);
+        "end C;"), "12345\n");
 }

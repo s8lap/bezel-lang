@@ -34,14 +34,15 @@
 // literal that lowerExpr emits as i32; encodeValue saw a non-struct and fell
 // through to the ZExt/inttoptr path, bypassing the box.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -253,13 +254,13 @@ BEZEL_TEST(dict_nullable_read_544, add_mixed_count_spec_4_8_7) {
 // #544 CONTROL / stdlib §4.8: Dictionary<string, int> (non-nullable, scalar)
 // Add + indexer-get still works — the fix must not touch the scalar path.
 BEZEL_TEST(dict_nullable_read_544, control_scalar_int_add_indexer_spec_4_8) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
         "  d.Add(\"a\", 100); "
         "  d.Add(\"b\", 200); "
-        "  return d[\"a\"] + d[\"b\"]; "  // 300
-        "end Main; end C;"), 300);
+        "  Console.WriteLine(d[\"a\"] + d[\"b\"]); return 0; "  // 300
+        "end Main; end C;"), "300\n");
 }
 
 // #544 CONTROL / stdlib §4.8: Dictionary<string, Point> (non-nullable record)

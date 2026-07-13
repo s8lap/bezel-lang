@@ -15,15 +15,16 @@
 //   - non-ASCII comparison: 'ĩ' > 'Ĩ' (297 > 296)
 //   - char range over a small non-ASCII range yields the right count
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& body) {
-    auto r = runJit(
+    auto r = runAot(
         std::string("module M; class C public static method Main(): int ") +
         body + " end Main; end C;");
     return r.ran ? r.exitCode : -999;
@@ -44,9 +45,14 @@ BEZEL_TEST(codegen_char_escape_527, spec_18_8_u4hex_e_acute) {
     BEZEL_EXPECT_EQ(run("return int('\\u00E9');"), 233);
 }
 
-// §18.8: 'ĩ' = U+0129 = 297 (ĩ, Latin small letter i with tilde).
+// §18.8: 'ĩ' = U+0129 = 297 (ĩ, Latin small letter i with tilde). 297 does not
+// fit an 8-bit exit code, so observe it on stdout (full program built
+// directly; run()'s body-only wrapper can't route through runAotOut).
 BEZEL_TEST(codegen_char_escape_527, spec_18_8_u4hex_i_tilde) {
-    BEZEL_EXPECT_EQ(run("return int('\\u0129');"), 297);
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
+        "Console.WriteLine(int('\\u0129')); return 0; "
+        " end Main; end C;"), "297\n");
 }
 
 // §18.8: '中' = U+4E2D = 20013 (中, CJK Unified Ideograph).
@@ -107,9 +113,13 @@ BEZEL_TEST(codegen_char_escape_527, spec_18_3_raw_utf8_e_acute_233) {
     BEZEL_EXPECT_EQ(run("return int('é');"), 233);
 }
 
-// §18.3: 'ĩ' is U+0129 = 297 (2-byte UTF-8: \xC4\xA9).
+// §18.3: 'ĩ' is U+0129 = 297 (2-byte UTF-8: \xC4\xA9). 297 does not fit an
+// 8-bit exit code, so observe it on stdout.
 BEZEL_TEST(codegen_char_escape_527, spec_18_3_raw_utf8_i_tilde_297) {
-    BEZEL_EXPECT_EQ(run("return int('ĩ');"), 297);
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
+        "Console.WriteLine(int('ĩ')); return 0; "
+        " end Main; end C;"), "297\n");
 }
 
 // ── Control cases: existing escapes must still be correct ───────────────────

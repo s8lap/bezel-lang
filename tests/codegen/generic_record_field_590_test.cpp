@@ -30,14 +30,15 @@
 // after. Regressions pin the #585 int/string-`T` cases and the standalone
 // Container<Pt> control. Only real stdlib surface is used.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -216,7 +217,8 @@ BEZEL_TEST(generic_record_field_590, two_level_inheritance_record_field) {
 // that every offset is correct, not only the first. Triple(2,3,4): 2+3*10+4*100
 // = 432.
 BEZEL_TEST(generic_record_field_590, multi_field_record_all_members) {
-    BEZEL_EXPECT_EQ(run(
+    // 432 does not fit an 8-bit exit code — observe on stdout.
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; "
         "record Triple(A: int, B: int, C: int); "
         "class Box<T> "
@@ -228,8 +230,8 @@ BEZEL_TEST(generic_record_field_590, multi_field_record_all_members) {
         "end Box; "
         "class C public static method Main(): int "
         "  using var b := new Box<Triple>(new Triple(2, 3, 4)); "
-        "  return b.Sum(); "
-        "end Main; end C;"), 432);
+        "  Console.WriteLine(b.Sum()); return 0; "
+        "end Main; end C;"), "432\n");
 }
 
 // ── §14 regression: the #585 int/string-T cases stay correct ──

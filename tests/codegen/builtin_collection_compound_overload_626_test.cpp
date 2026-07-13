@@ -24,14 +24,15 @@
 // Spec authority: §25.1 (compound-assignment desugar rule, v0.135),
 // §4.4 (Array<T> indexer get/set), §4.8 (Dictionary<K,V> indexer get/set).
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -101,7 +102,7 @@ BEZEL_TEST(builtin_collection_compound_overload_626, array_money_plus_loop_4_4) 
 
 // §25.1 / §4.4: compound += at a non-zero index updates only that slot.
 BEZEL_TEST(builtin_collection_compound_overload_626, array_money_nonzero_index_4_4) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         std::string("module M; ") + kMoneyRecord +
         "class Program "
         "  public static method Main(): int "
@@ -109,10 +110,10 @@ BEZEL_TEST(builtin_collection_compound_overload_626, array_money_nonzero_index_4
         "    arr.Add(new Money(100)); "  // slot 0
         "    arr.Add(new Money(200)); "  // slot 1
         "    arr[1] += new Money(50); "
-        "    return arr[0].Amount + arr[1].Amount; "  // 100 + 250 = 350
+        "    Console.WriteLine(arr[0].Amount + arr[1].Amount); return 0; "  // 100 + 250 = 350
         "  end Main; "
         "end Program;"),
-        350);
+        "350\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +201,7 @@ BEZEL_TEST(builtin_collection_compound_overload_626, dict_str_int_plus_regressio
 // the SAME slot. Idx() returns 0 on its (single) call, so arr[0] becomes
 // Money(10+100)=110 and arr[1] stays 20.  110*1000 + 20 = 110020.
 BEZEL_TEST(builtin_collection_compound_overload_626, array_overload_index_evaluated_once_17_6) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         std::string("module M; ") + kMoneyRecord +
         "class C "
         "  public static N: int; "
@@ -212,10 +213,10 @@ BEZEL_TEST(builtin_collection_compound_overload_626, array_overload_index_evalua
         "    using var arr := new Array<Money>(); "
         "    arr.Add(new Money(10)); arr.Add(new Money(20)); "
         "    arr[Idx()] += new Money(100); "
-        "    return arr[0].Amount * 1000 + arr[1].Amount; "  // 110020
+        "    Console.WriteLine(arr[0].Amount * 1000 + arr[1].Amount); return 0; "  // 110020
         "  end Main; "
         "end C;"),
-        110020);
+        "110020\n");
 }
 
 // Direct assertion that Idx() is called exactly once (§17.6): Main returns N,
@@ -242,7 +243,7 @@ BEZEL_TEST(builtin_collection_compound_overload_626, array_overload_index_call_c
 // The non-overload (intrinsic int) path was already single-evaluation; guard it
 // stays so — Idx() fires once, arr[0] becomes 110, arr[1] stays 20.
 BEZEL_TEST(builtin_collection_compound_overload_626, array_int_index_evaluated_once_17_6) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C "
         "  public static N: int; "
         "  public static method Idx(): int "
@@ -253,8 +254,8 @@ BEZEL_TEST(builtin_collection_compound_overload_626, array_int_index_evaluated_o
         "    using var arr := new Array<int>(); "
         "    arr.Add(10); arr.Add(20); "
         "    arr[Idx()] += 100; "
-        "    return arr[0] * 1000 + arr[1] + N; "  // 110020 + 1 = 110021
+        "    Console.WriteLine(arr[0] * 1000 + arr[1] + N); return 0; "  // 110020 + 1 = 110021
         "  end Main; "
         "end C;"),
-        110021);
+        "110021\n");
 }

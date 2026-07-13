@@ -13,15 +13,16 @@
 //   in U+0000–U+10FFFF excluding the surrogate range; otherwise
 //   OverflowException." §5.2 (L2283): "char(0xD800) raises OverflowException."
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& body) {
-    auto r = runJit(
+    auto r = runAot(
         std::string("module M; class C public static method Main(): int ") +
         body + " end Main; end C;");
     return r.ran ? r.exitCode : -999;
@@ -73,9 +74,14 @@ BEZEL_TEST(codegen_cg_513, shift_right_count_33_wraps_to_1_spec_6_5) {
 }
 
 // §6.5 / §6.2: signed right-shift fills with sign bit.
-// -8 >> 1 == -4 (arithmetic right shift).
+// -8 >> 1 == -4 (arithmetic right shift). -4 does not fit an 8-bit exit code,
+// so this builds the full program directly and observes stdout (run()'s
+// body-only wrapper can't route through runAotOut).
 BEZEL_TEST(codegen_cg_513, signed_shift_right_fills_sign_bit_spec_6_5) {
-    BEZEL_EXPECT_EQ(run("var n := -8; return n >> 1;"), -4);
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
+        "var n := -8; Console.WriteLine(n >> 1); return 0; "
+        " end Main; end C;"), "-4\n");
 }
 
 // §6.5: long shift — `1L << 64` wraps: 64 % 64 == 0, result is 1L (returned
@@ -188,8 +194,14 @@ BEZEL_TEST(codegen_cg_517, char_valid_ascii_no_exception_spec_5_2) {
 }
 
 // §5.2: CONTROL — char(0x10FFFF) is the maximum valid code point, no exception.
+// 0x10FFFF = 1114111 does not fit an 8-bit exit code (this was already an OOR
+// value even before this file's runJit->runAot migration — a pre-existing
+// masked-exit-code gap, caught here) — observe on stdout.
 BEZEL_TEST(codegen_cg_517, char_max_codepoint_ok_spec_5_2) {
-    BEZEL_EXPECT_EQ(run("var c := char(0x10FFFF); return int(c);"), 0x10FFFF);
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
+        "var c := char(0x10FFFF); Console.WriteLine(int(c)); return 0; "
+        " end Main; end C;"), "1114111\n");
 }
 
 // §5.2: CONTROL — char(0) is the null character U+0000, valid.
@@ -197,14 +209,23 @@ BEZEL_TEST(codegen_cg_517, char_zero_ok_spec_5_2) {
     BEZEL_EXPECT_EQ(run("var c := char(0); return int(c);"), 0);
 }
 
-// §5.2: char(0xD7FF) — one below the surrogate range — is valid.
+// §5.2: char(0xD7FF) — one below the surrogate range — is valid. 0xD7FF =
+// 55295 does not fit an 8-bit exit code (pre-existing masked-exit-code gap,
+// caught here) — observe on stdout.
 BEZEL_TEST(codegen_cg_517, char_just_below_surrogate_ok_spec_5_2) {
-    BEZEL_EXPECT_EQ(run("var c := char(0xD7FF); return int(c);"), 0xD7FF);
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
+        "var c := char(0xD7FF); Console.WriteLine(int(c)); return 0; "
+        " end Main; end C;"), "55295\n");
 }
 
-// §5.2: char(0xE000) — one above the surrogate range — is valid.
+// §5.2: char(0xE000) — one above the surrogate range — is valid. 0xE000 =
+// 57344 does not fit an 8-bit exit code — observe on stdout.
 BEZEL_TEST(codegen_cg_517, char_just_above_surrogate_ok_spec_5_2) {
-    BEZEL_EXPECT_EQ(run("var c := char(0xE000); return int(c);"), 0xE000);
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
+        "var c := char(0xE000); Console.WriteLine(int(c)); return 0; "
+        " end Main; end C;"), "57344\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -241,16 +262,24 @@ BEZEL_TEST(codegen_cg_1094, short_shl_int_count_masks_by_short_width) {
 }
 
 // ushort(0x8000) >> int(17): 17 & 15 == 1 → logical >> 1 == 0x4000 (16384).
+// 16384 does not fit an 8-bit exit code — observe on stdout.
 BEZEL_TEST(codegen_cg_1094, ushort_shr_logical_masks_by_ushort_width) {
-    BEZEL_EXPECT_EQ(run(
-        "var a: ushort := 32768; var n: int := 17; var c: ushort := a >> n; return int(c);"),
-        16384);
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
+        "var a: ushort := 32768; var n: int := 17; var c: ushort := a >> n; "
+        "Console.WriteLine(int(c)); return 0; "
+        " end Main; end C;"),
+        "16384\n");
 }
 
-// sbyte(-128) >> int(1): arithmetic (signed) shift → -64.
+// sbyte(-128) >> int(1): arithmetic (signed) shift → -64. -64 does not fit an
+// 8-bit exit code — observe on stdout.
 BEZEL_TEST(codegen_cg_1094, sbyte_shr_arithmetic) {
-    BEZEL_EXPECT_EQ(run(
-        "var a: sbyte := -128; var n: int := 1; var c: sbyte := a >> n; return int(c);"), -64);
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
+        "var a: sbyte := -128; var n: int := 1; var c: sbyte := a >> n; "
+        "Console.WriteLine(int(c)); return 0; "
+        " end Main; end C;"), "-64\n");
 }
 
 // byte(128) >> int(1): logical (unsigned) shift → 64 (not -64).

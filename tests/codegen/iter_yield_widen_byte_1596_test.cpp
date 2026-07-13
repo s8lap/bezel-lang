@@ -19,14 +19,15 @@
 //
 // runJit returns the FULL int from Main() (not 8-bit wrapped).
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -71,7 +72,8 @@ BEZEL_TEST(iter_yield_widen_byte_1596, byte_local_zero_extends) {
 // A signed `sbyte` local widened to `int` through yield: sign-extension must
 // preserve a negative value (-5), not zero-extend it to 251.
 BEZEL_TEST(iter_yield_widen_byte_1596, sbyte_local_sign_extends) {
-    BEZEL_EXPECT_EQ(run(
+    // -5 does not fit an 8-bit exit code — observe on stdout.
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C "
         "  public static method Gen(): IEnumerable<int> "
         "    var b: sbyte := -5; "
@@ -80,6 +82,6 @@ BEZEL_TEST(iter_yield_widen_byte_1596, sbyte_local_sign_extends) {
         "  public static method Main(): int "
         "    var v := 0; "
         "    for var x in C.Gen() do v := x; end; "
-        "    return v; "                                    // -5, not 251
-        "  end Main; end C;"), -5);
+        "    Console.WriteLine(v); return 0; "                // -5, not 251
+        "  end Main; end C;"), "-5\n");
 }

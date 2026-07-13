@@ -12,21 +12,22 @@
 //   * there is no `Nb` byte-literal suffix — a byte value is written `byte(N)`
 //     or, in the typed fill context, a bare in-range int literal (§4.2).
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
 // A source that must be rejected at compile time (front-end error, no run).
 bool rejects(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return !r.ran && r.diagnostics.hasErrors();
 }
 
@@ -135,12 +136,12 @@ BEZEL_TEST(array_sized_fill_1375, byte_fill_bare_int_literal) {
 
 BEZEL_TEST(array_sized_fill_1375, byte_fill_bare_int_literal_200) {
     // per stdlib §4.4 v0.165 (#1375): 200 fits byte, admitted at byte.
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var arr := new Array<byte>(2, 200); "
-        "  return int(arr[0]) + int(arr[1]); "
-        "end Main; end C;"), 400);
+        "  Console.WriteLine(int(arr[0]) + int(arr[1])); return 0; "
+        "end Main; end C;"), "400\n");
 }
 
 // The §7.1 canonical buffer size (64 KiB) fills correctly.
