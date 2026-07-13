@@ -3481,6 +3481,18 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
                     v = coerceReturnToNullableValue(
                         v, declRet, isUnsignedTargetExpr(*ci.exprBody));
             }
+            // §5.1 (#1778): a numeric arrow-body result narrower than the
+            // declared return type is implicitly WIDENED (`=> 42` for a `long`
+            // method, `=> 1.5f` for a `double`, `=> byte(5)` for `int`, …).
+            // The ReturnStmt path (LlvmBackend_Stmts.cpp ~line 1383) applies the
+            // same coercion; the arrow path emitted the bare narrow value as the
+            // `ret` operand (e.g. `ret i32` into an `i64` function) — malformed
+            // IR that fails the verifier for VALID code. coerceNumericToType is a
+            // no-op for ptr/struct returns and for an already-matching width, so
+            // the nullable-value case coerced just above is unaffected.
+            if (v && ci.exprBody && !fn->getReturnType()->isVoidTy())
+                v = coerceNumericToType(v, fn->getReturnType(),
+                                        isUnsignedTargetExpr(*ci.exprBody));
             terminated = emitReturn(fn, v);
         }
     } else if (ci.bodyKind == ast::MethodBodyKind::Block) {
