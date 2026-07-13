@@ -42,18 +42,29 @@
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
 #include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"   // runAot (JIT->AOT migration, §9.8 graph tests)
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
+using bezel::test::runAot;
 using bezel::test::runJit;
 
 namespace {
 
 int run(const std::string& src) {
     auto r = runJit(src);
+    return r.ran ? r.exitCode : -999;
+}
+
+// §9.8 polymorphic × graph back-edge round-trip migrated to the AOT harness
+// (real driver, full front-end incl. §28.3 ownership). runJit masked the former
+// serialize-side borrow-into-field wiring by skipping the ownership pass; the AOT
+// path is the correct oracle. See the migrated test's note on the reshape.
+int runGraphAot(const std::string& src) {
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -393,9 +404,16 @@ BEZEL_TEST(codegen_serialization_t4_poly,
 // the Shape's $type + $id on first occurrence; the back-edge writes only $ref.
 // Deserialize reconstructs the Container with both fields pointing to the
 // same concrete (Circle) instance.
+// Construction (v0.180 §28.3 / AOT migration): the self-alias is wired inside a
+// convenience constructor from the receiver (`this.Primary` — receiver-sourced,
+// admissible per §28.3), replacing the former `hub.Alias := hub.Primary` which
+// stored a borrow sourced from the scope-bound local `hub` into a field (rejected
+// by the real driver; only runJit's skipped ownership pass accepted it). The
+// two-arg ctor is retained for §9.8 Deserialize; the one-arg ctor is not a §9.8
+// selection match, so selection stays unambiguous.
 BEZEL_TEST(codegen_serialization_t4_poly,
            poly_graph_backref_composition_spec_9_8) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runGraphAot(
         std::string("module M; ") + kImport + kHierarchy +
         // Hub: owns a Shape (polymorphic) and borrows the same via Alias.
         "class Hub : ISerializable, IDeserializable "
@@ -404,10 +422,13 @@ BEZEL_TEST(codegen_serialization_t4_poly,
         "  public constructor(owned primary: Shape, alias: Shape?) "
         "    Primary := move primary; Alias := alias; "
         "  end constructor; "
+        // Serialize-side convenience ctor: wire the self-alias from the receiver.
+        "  public constructor(owned primary: Shape) "
+        "    Primary := move primary; Alias := Primary; "
+        "  end constructor; "
         "end Hub; "
         "class C public static method Main(): int "
-        "  using var hub := new Hub(new Circle(4.0), null); "
-        "  hub.Alias := hub.Primary; "
+        "  using var hub := new Hub(new Circle(4.0)); "
         "  using var s := new BinarySerializer(); "
         "  hub.Serialize(s); "
         "  using var bytes := s.ToBytes(); "

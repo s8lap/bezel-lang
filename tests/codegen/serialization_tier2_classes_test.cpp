@@ -68,18 +68,30 @@
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
 #include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"   // runAot (JIT->AOT migration, §9.8 graph tests)
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
+using bezel::test::runAot;
 using bezel::test::runJit;
 
 namespace {
 
 int run(const std::string& src) {
     auto r = runJit(src);
+    return r.ran ? r.exitCode : -999;
+}
+
+// §9.8 graph back-edge tests migrated to the AOT harness (real driver, full
+// front-end incl. §28.3 ownership + §22.7 v0.184 definite assignment). runJit
+// masked these programs' front-end faults by skipping the ownership/DA passes
+// (codegen_support.hpp runJitInProcess runs neither); the AOT path is the
+// correct oracle. Each migrated test carries a note on the reshape it needed.
+int runGraphAot(const std::string& src) {
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -664,18 +676,27 @@ BEZEL_TEST(codegen_serialization_t2_classes,
 // Wire: BZ_SER_INLINE(0x01)+LE32 tag before inline body; BZ_SER_REF(0x02)+LE32
 // tag for back-edges.  Owner-before-borrower order guaranteed by declaration order.
 //
-// Construction note: Bezel's ownership rules forbid borrowing a variable after
-// moving it, so the nullable-back-edge pattern is used: Hub.Alias (Slot?) starts
-// null and is set to borrow Hub.Target after the Hub is constructed.  During
-// serialization, Alias is written as a $ref to Target's tag_id.  On deserialize,
-// Alias is resolved from the tag table and passed as a constructor argument.
+// Construction note (v0.180 §28.3 / AOT migration): the borrow-into-field
+// wiring must be admissible under the front-end's structural check. The former
+// serialize-side pattern `hub.Alias := hub.Target` stored a borrow whose SOURCE
+// is a scope-bound local (`hub`) into a field — a §28.3 violation the real
+// driver rejects ("parameter-sourced and receiver-sourced borrows are
+// admissible; scope-bound locals and temporaries are rejected"); only runJit's
+// skipped ownership pass let it through. The reshape wires the self-alias inside
+// a convenience constructor where the source `Target` is RECEIVER-sourced
+// (`this.Target`) — admissible per §28.3. The two-arg constructor is retained
+// for §9.8 Deserialize (which binds the plain-borrow back-edge as a ctor arg
+// resolved from the tag table); the one-arg convenience ctor is not a §9.8
+// constructor-selection match ({Target} ≠ {Target, Alias}), so selection stays
+// unambiguous. Wire form and deserialize path are unchanged: Alias is a $ref to
+// Target's tag on write, resolved to the same object on read.
 BEZEL_TEST(codegen_serialization_t2_classes,
            graph_class_with_back_edge_field_compiles_and_round_trips_spec_9_8) {
     // §9.8 tier 3: a `serialized graph` class with a nullable back-edge field
     // (Slot?) rounds trips correctly.  Hub owns Target and has Alias: Slot?
     // (nullable back-edge) pointing to Target.  After deserialization, Alias
     // resolves to the same object as Target (identity preserved per §9.8).
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runGraphAot(
         std::string("module M; ") + kImport +
         // Slot: a simple graph-serializable class.
         "class Slot : ISerializable, IDeserializable "
@@ -688,17 +709,19 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "class Hub : ISerializable, IDeserializable "
         "  public owned Target: Slot; "
         "  public Alias: Slot?; "  // nullable back-edge
+        // §9.8 Deserialize binds {Target, Alias} through this constructor.
         "  public constructor(owned target: Slot, alias: Slot?) "
         "    Target := move target; Alias := alias; "
         "  end constructor; "
+        // Serialize-side convenience ctor: wire the self-alias from the receiver
+        // (`this.Target`), admissible under §28.3. Not a §9.8 selection match.
+        "  public constructor(owned target: Slot) "
+        "    Target := move target; Alias := Target; "
+        "  end constructor; "
         "end Hub; "
         "class C public static method Main(): int "
-        // Create Hub with Alias = null initially.
-        // Inline new-Slot avoids the `using var t` + `move t` pattern that
-        // the ownership checker rejects (§28.3 `using var` is scope-bound).
-        "  using var hub := new Hub(new Slot(\"alpha\"), null); "
-        // Set back-edge: hub.Alias borrows hub.Target.
-        "  hub.Alias := hub.Target; "
+        // Build Hub with Alias borrowing its own Target (receiver-sourced).
+        "  using var hub := new Hub(new Slot(\"alpha\")); "
         // Serialize.
         "  using var s := new BinarySerializer(); "
         "  hub.Serialize(s); "
@@ -760,17 +783,26 @@ BEZEL_TEST(codegen_serialization_t2_classes,
 // constructor" rule (no instance-method call on `this` during construction) was
 // retired with the keyword — cycles are now expressed via Shared<T>/Weak<T>,
 // which carry no such constraint. A keyword-less class with a borrow back-edge
-// whose constructor calls an instance method now COMPILES (the rule is gone).
+// whose constructor calls an instance method now COMPILES: the blanket ban is
+// gone.  What governs a construction-time `this`-observation now is the narrower
+// §22.7 (v0.184) null-watermark rule — an instance call on `this` is admitted
+// only where every non-nullable field is already definitely assigned.  The
+// reshape assigns the non-nullable `Label` field BEFORE the `this.ComputeLabel()`
+// call (then overwrites it with the computed value), so the observation is safe
+// and the program compiles.  (The former body called `ComputeLabel()` before any
+// `Label` assignment; the real driver correctly rejects that under §22.7, and
+// only runJit's skipped definite-assignment pass let it through.)
 BEZEL_TEST(codegen_serialization_t2_classes,
            keyword_less_ctor_instance_method_call_is_allowed_spec_9_8_v0141) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runGraphAot(
         std::string("module M; ") + kImport +
         "class Bad : ISerializable, IDeserializable "
         "  public property Label: string; "
         "  public Parent: Bad?; "
         "  public constructor(label: string, parent: Bad?) "
-        "    Parent := parent; "
-        "    Label := this.ComputeLabel(); "  // now allowed (rule retired)
+        "    Label := label; "  // §22.7: non-nullable field assigned before the
+        "    Parent := parent; "  // this-observation below
+        "    Label := this.ComputeLabel(); "  // instance call on this now allowed
         "  end constructor; "
         "  public method ComputeLabel(): string return \"label\"; end ComputeLabel; "
         "end Bad; "

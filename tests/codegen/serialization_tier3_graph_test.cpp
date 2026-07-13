@@ -35,18 +35,30 @@
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
 #include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"   // runAot (JIT->AOT migration, §9.8 graph tests)
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
+using bezel::test::runAot;
 using bezel::test::runJit;
 
 namespace {
 
 int run(const std::string& src) {
     auto r = runJit(src);
+    return r.ran ? r.exitCode : -999;
+}
+
+// §9.8 graph back-edge round-trips migrated to the AOT harness (real driver,
+// full front-end incl. §28.3 ownership). runJit masked the former serialize-side
+// borrow-into-field wiring by skipping the ownership pass (codegen_support.hpp
+// runJitInProcess runs neither ownership nor definite assignment); the AOT path
+// is the correct oracle. Migrated tests carry a note on the reshape they needed.
+int runGraphAot(const std::string& src) {
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -130,12 +142,19 @@ const char* kImport3 = "import System.Serialization; ";
 
 // §9.8: `serialized graph` back-edge round-trip — Hub owns Target, Alias borrows Target.
 // After round-trip: Alias resolves to same target as Target (identity preserved).
-// Construction pattern: Alias is initially null (Slot?), set via field assignment
-// to hub.Target after Hub is constructed — this is valid Bezel since Alias is
-// a borrow field and hub.Target is owned by hub.
+// Construction pattern (v0.180 §28.3 / AOT migration): the self-alias is wired
+// inside a convenience constructor where the borrow SOURCE is receiver-sourced
+// (`this.Target`) — admissible per §28.3 ("parameter-sourced and receiver-sourced
+// borrows are admissible; scope-bound locals ... are rejected"). The former
+// serialize-side `hub.Alias := hub.Target` stored a borrow sourced from the
+// scope-bound local `hub` into a field, which the real driver rejects; only
+// runJit's skipped ownership pass accepted it. The two-arg ctor is kept for §9.8
+// Deserialize (binds the plain-borrow back-edge as a ctor arg from the tag
+// table); the one-arg ctor is not a §9.8 selection match, so selection is
+// unambiguous. Wire form and deserialize path are unchanged.
 BEZEL_TEST(codegen_serialization_t3_graph,
            graph_back_edge_nullable_round_trip_spec_9_8) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runGraphAot(
         std::string("module M; ") + kImport3 +
         "class Slot : ISerializable, IDeserializable"
         "  public property Name: string; "
@@ -147,10 +166,12 @@ BEZEL_TEST(codegen_serialization_t3_graph,
         "  public constructor(owned target: Slot, alias: Slot?) "
         "    Target := move target; Alias := alias; "
         "  end constructor; "
+        "  public constructor(owned target: Slot) "
+        "    Target := move target; Alias := Target; "
+        "  end constructor; "
         "end Hub; "
         "class C public static method Main(): int "
-        "  using var hub := new Hub(new Slot(\"alpha\"), null); "
-        "  hub.Alias := hub.Target; "
+        "  using var hub := new Hub(new Slot(\"alpha\")); "
         "  using var s := new BinarySerializer(); "
         "  hub.Serialize(s); "
         "  using var bytes := s.ToBytes(); "
@@ -211,9 +232,14 @@ BEZEL_TEST(codegen_serialization_t3_graph,
 // ===========================================================================
 
 // §9.8: `serialized graph` with two back-edges to two distinct owned objects.
+// Reshape mirrors graph_back_edge_nullable_round_trip: a convenience ctor wires
+// both back-edges from the receiver (`this.NodeA`/`this.NodeB` — receiver-sourced,
+// admissible per §28.3), replacing the former scope-bound-local field-store
+// (`rack.PrimaryRef := rack.NodeA`) the real driver rejects. The four-arg ctor is
+// retained for §9.8 Deserialize.
 BEZEL_TEST(codegen_serialization_t3_graph,
            graph_two_back_edges_round_trip_spec_9_8) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runGraphAot(
         std::string("module M; ") + kImport3 +
         "class Slot : ISerializable, IDeserializable"
         "  public property Name: string; "
@@ -229,11 +255,13 @@ BEZEL_TEST(codegen_serialization_t3_graph,
         "    NodeA := move nodeA; NodeB := move nodeB; "
         "    PrimaryRef := primaryRef; SecondaryRef := secondaryRef; "
         "  end constructor; "
+        "  public constructor(owned nodeA: Slot, owned nodeB: Slot) "
+        "    NodeA := move nodeA; NodeB := move nodeB; "
+        "    PrimaryRef := NodeA; SecondaryRef := NodeB; "
+        "  end constructor; "
         "end Rack; "
         "class C public static method Main(): int "
-        "  using var rack := new Rack(new Slot(\"alpha\"), new Slot(\"beta\"), null, null); "
-        "  rack.PrimaryRef := rack.NodeA; "
-        "  rack.SecondaryRef := rack.NodeB; "
+        "  using var rack := new Rack(new Slot(\"alpha\"), new Slot(\"beta\")); "
         "  using var s := new BinarySerializer(); "
         "  rack.Serialize(s); "
         "  using var bytes := s.ToBytes(); "
