@@ -4686,9 +4686,38 @@ void ExprTC::visitMember(const ast::Member& m) {
         // Use pd->indexerParams as the param reference (move-only but
         // we only need its .name field in runMethodBody).
         const auto& pdParams = pd->isIndexer ? pd->indexerParams : none;
-        if (pd->exprBody)
+        // §5.1 / §23.2 / §23.3 (issue #1777): a property GETTER's body — the
+        // expression-body form (`property P: T => E;`, §23.2), a block
+        // `get => E;`, or a block `get => do … return E; … end;` (§23.3) —
+        // yields the property's value, exactly as a value method's body yields
+        // its return (§22.2's `=> E ≡
+        // return E`). It must therefore run the SAME §5.1 return-type
+        // convertibility check a value method runs, against the property's
+        // declared type as the "return type". Without this the getter body
+        // skipped BOTH the arrow-body check (runMethodBody, #1774) and the
+        // block-form `return E;` check (the ReturnStmt "Slice T3" arm): both
+        // gate on `returnCtx_ == ValueMethod && currentReturnType_`, which a
+        // property decl never set (returnCtx_ stayed at its ReturnCtx::None
+        // default here), so a type-mismatched getter (`property P: int => "x"`)
+        // reached codegen and emitted malformed LLVM IR ("Function return type
+        // does not match operand type of return inst! ret ptr / i32"), a
+        // verifier failure — the same gap #1774 fixed for methods. Wire the
+        // getter bodies through the value-method return context (property type
+        // as currentReturnType_) so they share that code path. A SETTER body is
+        // a void statement context (its `=> E` runs E for effect, not as a
+        // returned value), so it keeps the enclosing None context and is exempt
+        // — matching a void method.
+        ReturnCtx savePropRet = returnCtx_;
+        TypeRef* savePropRetTy = currentReturnType_;
+        TypeRef* propRetTy = pd->type ? ctx_.resolvedType(*pd->type) : nullptr;
+        if (pd->exprBody) {
+            returnCtx_ = ReturnCtx::ValueMethod;
+            currentReturnType_ = propRetTy;
             runMethodBody(pdParams, nullptr, pd->exprBody.get(),
                           idxSymsPtr);
+            returnCtx_ = savePropRet;
+            currentReturnType_ = savePropRetTy;
+        }
         if (pd->autoInitializer) {
             // §22.8 applies to auto-property initializers too.
             bool save = inFieldInitializer_;
@@ -4765,12 +4794,21 @@ void ExprTC::visitMember(const ast::Member& m) {
                     runMethodBody(sp, &a.stmts, nullptr, &ssyms);
                 continue;
             }
-            // Getter: include indexer params.
+            // Getter: include indexer params. §5.1/§23.3 (#1777): run the
+            // getter body against the property type as its return type (see the
+            // note above the expression-body form), so a mismatched `get => E;`
+            // or `get => do … return E; … end;` is rejected instead of reaching
+            // codegen. Restored to the enclosing (None) context afterwards so a
+            // sibling setter accessor stays a void context.
+            returnCtx_ = ReturnCtx::ValueMethod;
+            currentReturnType_ = propRetTy;
             if (a.exprBody)
                 runMethodBody(pdParams, nullptr, a.exprBody.get(),
                               idxSymsPtr);
             if (!a.stmts.empty())
                 runMethodBody(pdParams, &a.stmts, nullptr, idxSymsPtr);
+            returnCtx_ = savePropRet;
+            currentReturnType_ = savePropRetTy;
         }
     } else if (auto* cd = dynamic_cast<const ast::ConstDecl*>(&m)) {
         if (cd->value) {
