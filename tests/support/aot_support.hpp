@@ -101,6 +101,7 @@
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/file.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -383,6 +384,78 @@ struct CompileStatus {
     int signal = 0;     // valid when outcome == Crashed
 };
 
+// ── AOT link-concurrency token pool (#1780) ───────────────────────────────
+// Every runAot compile forks a driver that invokes `clang` → `ld` — a PID- and
+// RAM-heavy external process (~1-2 GiB peak each). Under the 16-shard runner —
+// and worse, several dev agents each running the suite at once — the UNBOUNDED
+// fan-out of concurrent clang/ld links exhausts fork/PID/RAM. That is exactly
+// what makes the sharded runner spuriously over-report crashes on innocent
+// tests: the compile step, not the program, ran out of resources.
+//
+// This bounds the number of CONCURRENT compiles MACHINE-WIDE — across every
+// shard AND every agent's test run — with an flock-based counting semaphore:
+// N token files, each acquired with a non-blocking exclusive flock. The kernel
+// releases an flock when the holding fd is closed OR the holding process dies,
+// so a crashed/SIGKILLed/OOM-reaped compile NEVER leaks a token (the failure
+// mode a POSIX/SysV semaphore has, and the reason flock is used here). The
+// token is held in the PARENT across the whole compile+link and released on
+// return, so it is robust even when the forked child crashes.
+//
+// N defaults to ~3/4 of the core count (headroom for the ~1-2 GiB/compile peak
+// against the dev_heavy 24-28 GiB slice cap) and is overridable via
+// BEZEL_AOT_LINK_TOKENS (0 disables the pool — e.g. for a single-process run
+// where the bound only adds latency). This is the machine-wide knob for
+// "control test parallelism when multiple agents run the suite together."
+inline int aotLinkTokenCount() {
+    static const int v = [] {
+        if (const char* e = std::getenv("BEZEL_AOT_LINK_TOKENS")) {
+            if (*e != '\0') { int n = std::atoi(e); return n < 0 ? 0 : n; }
+        }
+        unsigned hc = std::thread::hardware_concurrency();
+        if (hc == 0) hc = 8;
+        int n = static_cast<int>(hc * 3u / 4u);
+        return n < 1 ? 1 : n;
+    }();
+    return v;
+}
+
+// RAII holder for one link-pool token. Ctor blocks (polling, non-blocking
+// flock) until a token is free; dtor releases it by closing the fd. Copy is
+// deleted — the fd (hence the lock) has single ownership.
+class LinkToken {
+public:
+    LinkToken() {
+        int n = aotLinkTokenCount();
+        if (n <= 0) return;  // pool disabled → no bound
+        const std::string dir = "/var/tmp/bezel-scratch/aot-link-tokens";
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        // Poll the N token files with a NON-blocking exclusive flock until one
+        // is free. Because a held token is released only by fd-close or process
+        // death, this always converges even if a prior run was killed mid-link
+        // (no stale-token recovery step needed — the kernel already did it).
+        for (;;) {
+            for (int i = 0; i < n; ++i) {
+                std::string p = dir + "/tok." + std::to_string(i);
+                int fd = ::open(p.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+                if (fd < 0) continue;  // dir race / fd exhaustion → try next
+                if (::flock(fd, LOCK_EX | LOCK_NB) == 0) { fd_ = fd; return; }
+                ::close(fd);
+            }
+            // All N held; back off briefly. 20 ms is negligible against a
+            // multi-second compile+link, and the wait is bounded by the compile
+            // timeout of whichever holder finishes first.
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ~LinkToken() { if (fd_ >= 0) ::close(fd_); }  // close() releases the flock
+    LinkToken(const LinkToken&) = delete;
+    LinkToken& operator=(const LinkToken&) = delete;
+
+private:
+    int fd_ = -1;
+};
+
 // Compile `srcPath` to the native executable `exePath` via `Driver::compileFile`
 // run in a fork()ed CHILD (crash- and hang-isolated, qr1 M1). `opts` selects the
 // codegen mode (e.g. sanitizeAddress for the checked leg — S3). The child's
@@ -393,6 +466,13 @@ inline CompileStatus forkedCompile(const std::string& srcPath,
                                    const std::string& exePath,
                                    const codegen::CodegenOptions& opts,
                                    const std::string& ccErrPath) {
+    // Bound machine-wide concurrent compiles (#1780). Held for the whole
+    // compile+link (both the forked and the fork-failure in-process path) and
+    // released when this function returns — including on timeout/crash, since
+    // the parent always reaps before returning. Acquired BEFORE the fork so the
+    // front-end + clang/ld link all run under the one token.
+    LinkToken linkToken;
+
     auto rejectFrom = [](std::string err, int code) -> CompileStatus {
         if (err.empty())
             err = "runAot: driver rejected the program (exit " +
