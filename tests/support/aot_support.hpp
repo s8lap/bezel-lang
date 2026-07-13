@@ -471,9 +471,31 @@ inline int aotLinkTokenCount() {
     return v;
 }
 
-// RAII holder for one link-pool token. Ctor blocks (polling, non-blocking
-// flock) until a token is free; dtor releases it by closing the fd. Copy is
-// deleted — the fd (hence the lock) has single ownership.
+// RAII holder for one link-pool token (#1780). Ctor blocks (polling a
+// non-blocking flock) until a token is free; dtor releases it by closing the
+// fd. Copy is deleted — the fd (hence the lock) has single ownership.
+//
+// CRASH ROBUSTNESS. An flock is released by the KERNEL when the holding fd is
+// closed OR the holding process dies — for ANY reason: SIGSEGV, SIGKILL, the
+// OOM-killer, an assertion abort, a normal exit. So a process that dies while
+// holding a token NEVER leaks it (this is exactly why flock is used and not a
+// POSIX/SysV semaphore, which a crash DOES leak). That covers a crashing shard
+// outright. Two guards close the only remaining windows:
+//
+//   • dropInChild() — after fork(), a token fd is INHERITED by the compile
+//     child (fork duplicates fds → both refer to the same open-file-description,
+//     and an flock is held on the OFD until *every* fd on it closes). If the
+//     PARENT died mid-compile, the orphaned child's inherited copy would keep
+//     the OFD — hence the lock — alive until that child finally exits. The
+//     child drops its copy immediately, making the parent's fd the SOLE holder,
+//     so a parent death releases the token at once regardless of the child.
+//
+//   • fail-open deadline — if no token frees within a deadline far beyond any
+//     legitimate wait (a holder is bounded by the compile timeout, so a token
+//     can't be held longer than that), stop waiting and proceed UNBOUNDED. The
+//     pool is a resource optimization, not a correctness requirement, so
+//     failing open (throttling degrades) beats failing closed (suite wedges).
+//     With the guard above this should be unreachable; it is a logged backstop.
 class LinkToken {
 public:
     LinkToken() {
@@ -482,6 +504,9 @@ public:
         const std::string dir = "/var/tmp/bezel-scratch/aot-link-tokens";
         std::error_code ec;
         fs::create_directories(dir, ec);
+        const int failOpenSec = std::max(600, aotCompileTimeoutSec() * 5);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(failOpenSec);
         // Poll the N token files with a NON-blocking exclusive flock until one
         // is free. Because a held token is released only by fd-close or process
         // death, this always converges even if a prior run was killed mid-link
@@ -494,6 +519,14 @@ public:
                 if (::flock(fd, LOCK_EX | LOCK_NB) == 0) { fd_ = fd; return; }
                 ::close(fd);
             }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                // All N held longer than any holder can legitimately live.
+                // Degrade rather than wedge: proceed with no token.
+                std::fprintf(stderr,
+                    "runAot: link-pool starved > %ds; proceeding UNBOUNDED "
+                    "(all %d tokens stuck?)\n", failOpenSec, n);
+                return;  // fd_ stays -1 → no bound; dtor is a no-op
+            }
             // All N held; back off briefly. 20 ms is negligible against a
             // multi-second compile+link, and the wait is bounded by the compile
             // timeout of whichever holder finishes first.
@@ -501,6 +534,12 @@ public:
         }
     }
     ~LinkToken() { if (fd_ >= 0) ::close(fd_); }  // close() releases the flock
+
+    // Called in the forked compile child: drop this process's INHERITED copy of
+    // the token fd so the parent is the sole lock holder (see class comment).
+    // Idempotent; safe to call before _Exit.
+    void dropInChild() { if (fd_ >= 0) { ::close(fd_); fd_ = -1; } }
+
     LinkToken(const LinkToken&) = delete;
     LinkToken& operator=(const LinkToken&) = delete;
 
@@ -562,6 +601,10 @@ inline CompileStatus forkedCompile(const std::string& srcPath,
     }
     if (pid == 0) {
         // ---- CHILD ----
+        // Drop the inherited link-token fd at once: the parent is the sole lock
+        // holder, so a parent death releases the token immediately even if this
+        // child is orphaned (#1780 crash robustness — see LinkToken).
+        linkToken.dropInChild();
         // qr1 M4: fd 0 <- /dev/null (a front-end that read stdin can't block).
         int nullFd = ::open("/dev/null", O_RDONLY);
         if (nullFd >= 0) {
