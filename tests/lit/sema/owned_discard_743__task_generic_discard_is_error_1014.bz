@@ -1,0 +1,11 @@
+// RUN: %not %bezelc -c %s 2>&1 | FileCheck %s
+//
+// Ported from tests/sema/owned_discard_stmt_743_test.cpp
+//   (BEZEL_TEST owned_discard_743, task_generic_discard_is_error_1014).
+//
+// REJECT: `_ := <Task<T>>` discard of an async call result.
+
+module M; class C public static async method Work(): Task<int> return 0; end Work; public static method Main(): int _ := Work(); return 0; end Main; end C;
+
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: cannot discard a `Task` — disposing it abandons a running operation; use `Task.FireAndForget(expr)` for supervised fire-and-forget, or `using var _ := expr;` to dispose it at scope end
+// CHECK-SAME: (§17.13 / §30.10)

@@ -333,11 +333,16 @@ def find_bezel_tests(text: str):
 
 def parse_consts(text_masked: str):
     """Return {name: decoded_str} for
-    `[static ][constexpr ]const char* NAME = <lit-run>;` and
-    `[static ]std::string NAME = <lit-run>;`."""
+    `[static ][constexpr ]const char* NAME = <lit-run>;`,
+    `[static ]std::string NAME = <lit-run>;`, and
+    `[static ][constexpr ]std::string_view NAME = <lit-run>;` (the latter
+    used interchangeably with `std::string` for read-only source-fragment
+    constants; a use-site typically wraps it back with `std::string(NAME)`,
+    which `resolve_expr`'s `std::string(...)` branch already unwraps)."""
     consts = {}
     pat = re.compile(
-        r'(?:static\s+)?(?:constexpr\s+)?(?:const\s+char\s*\*|std::string)\s+'
+        r'(?:static\s+)?(?:constexpr\s+)?'
+        r'(?:const\s+char\s*\*|std::string_view|std::string)\s+'
         r'(\w+)\s*=\s*'
     )
     for m in pat.finditer(text_masked):
@@ -365,12 +370,20 @@ def extract_return_expr(body_text: str):
 
 
 def parse_string_helpers(text_masked: str):
-    """Return {name: (param_name, return_expr_text)} for
-    `std::string NAME(const std::string& PARAM) { ... return <expr>; ... }`."""
+    """Return {name: (param_names_tuple, return_expr_text)} for
+    `std::string NAME(const std::string& P1[, const std::string& P2, ...]) {
+    ... return <expr>; ... }` — i.e. any arity of `const std::string&`
+    parameters, not just one (e.g. the `m(sig, body)` / `prog(inside,
+    outside)` two-arg idiom used to build a full `module M; class C ...`
+    wrapper around two independently-varying fragments)."""
     helpers = {}
     pat = re.compile(
-        r'std::string\s+(\w+)\s*\(\s*const\s+std::string\s*&\s*(\w+)\s*\)\s*\{'
+        r'std::string\s+(\w+)\s*\(\s*'
+        r'const\s+std::string\s*&\s*\w+\s*'
+        r'(?:,\s*const\s+std::string\s*&\s*\w+\s*)*'
+        r'\)\s*\{'
     )
+    param_pat = re.compile(r'const\s+std::string\s*&\s*(\w+)')
     for m in pat.finditer(text_masked):
         brace_open = m.end() - 1
         body, close = find_matching(text_masked, brace_open, '{', '}')
@@ -378,7 +391,8 @@ def parse_string_helpers(text_masked: str):
             continue
         ret = extract_return_expr(body)
         if ret is not None:
-            helpers[m.group(1)] = (m.group(2), ret)
+            params = tuple(param_pat.findall(m.group(0)))
+            helpers[m.group(1)] = (params, ret)
     return helpers
 
 
@@ -484,10 +498,17 @@ def resolve_expr(expr: str, env: dict, funcs: dict, _depth: int = 0):
         m2 = re.fullmatch(r'([A-Za-z_]\w*)\((.*)\)', part, re.S)
         if m2 and m2.group(1) in funcs:
             fname, argtext = m2.groups()
-            argval = resolve_expr(argtext, env, funcs, _depth + 1)
-            pname, fbody_expr = funcs[fname]
-            out.append(resolve_expr(fbody_expr, {**env, pname: argval}, funcs,
-                                     _depth + 1))
+            pnames, fbody_expr = funcs[fname]
+            argtexts = split_top_level(argtext, ',')
+            if len(argtexts) != len(pnames):
+                raise Unresolvable(
+                    f"call to `{fname}` passes {len(argtexts)} arg(s) but "
+                    f"helper takes {len(pnames)}: {part[:80]!r}"
+                )
+            call_env = dict(env)
+            for pname, atext in zip(pnames, argtexts):
+                call_env[pname] = resolve_expr(atext, env, funcs, _depth + 1)
+            out.append(resolve_expr(fbody_expr, call_env, funcs, _depth + 1))
             continue
         dec = decode_literal_run(part)
         if dec is not None:
