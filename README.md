@@ -1,142 +1,58 @@
 # bezel-lang
 
-Bezel is a systems language designed to feel high-level. It has no garbage
-collector; instead, the compiler tracks ownership of every heap object and
-ensures that each one is disposed exactly once. Borrowing lets you pass
-references without transferring ownership, with lifetimes checked at compile
-time rather than enforced by a runtime.
+Bezel is a compiled language for services and tools, with ownership-based memory
+management and no GC. Instead of a garbage collector, the compiler tracks
+ownership of every heap object and guarantees each is disposed exactly once;
+borrowing lets you pass references without transferring ownership, with lifetimes
+checked at compile time.
 
-The language is paper-designed: the normative spec lives in `docs/`, and this
-repository hosts the compiler that implements it. Start with `CLAUDE.md` for the
-project's working discipline and `docs/Bezel_Language_Spec.md` for the
-language itself.
+The normative spec lives in `docs/`; this repository hosts the compiler that
+implements it. Start with `docs/Bezel_Language_Spec.md` for the language and
+`CLAUDE.md` for the project's working discipline.
 
 ## Status
 
-The project is a compiler-under-construction for a language with no users yet.
-The compiler AOT-compiles `.bzl` source files to native executables and
-implements a large and growing subset of the spec. The test suite runs
-4,262 spec-derived test cases (all passing on Fedora), spanning the full
-compiler pipeline from lexer through codegen.
+`bezelc` AOT-compiles `.bzl` source to native executables and implements a large,
+growing subset of the spec, backed by an extensive spec-derived test suite (all
+passing on Fedora) spanning lexer through codegen.
 
-**What works:**
+**Works:** ownership tracking (dispose-exactly-once) and borrow checking;
+classes, interfaces, generics, records, enums; inheritance and virtual/interface
+dispatch (incl. cross-module); exceptions (`try`/`catch`/`finally`);
+reference-counted strings, closures, and boxes; standard-library collections
+(`Array<T>`, `Dictionary<K,V>`, `Set<T>`, `Stack<T>`, `Queue<T>`,
+`LinkedList<T>`, and owned variants), `String`/`StringBuilder`, LINQ,
+`Encoding.UTF8`, `Math`/`Convert`, `DateTime`/`TimeSpan`/`Guid`,
+`CancellationToken`/`Task`; async/await end-to-end (scheduler, async iterators /
+`await for`, `Task` combinators, `await using`); multi-module separate
+compilation (`bezelc -c` / `--import`).
 
-- Ownership tracking with dispose-exactly-once semantics; borrow checking
-- Classes, interfaces, generics, records, enums
-- Inheritance, virtual dispatch, interface dispatch (including cross-module)
-- Exceptions: `try` / `catch` / `finally`
-- Reference-counted runtime-managed types: strings, closures, boxes
-- Standard library: `Array<T>`, `Dictionary<K,V>`, `Set<T>`, `Stack<T>`,
-  `Queue<T>`, `LinkedList<T>` (and owned variants); `String`, `StringBuilder`;
-  LINQ; `Encoding.UTF8`; `Math`, `Convert`; `DateTime`, `TimeSpan`, `Guid`;
-  `CancellationToken`, `Task`
-- Async/await end-to-end: cross-thread scheduler, async iterators / `await for`,
-  `Task` combinators, `await using`
-- Multi-module separate compilation (`bezelc -c` / `--import`)
+**Not yet implemented** (the compiler emits a diagnostic): runtime reflection
+(`typeof(T)`, `.GetType()`; §17.10, §8.2); async lambdas (§30.6); cross-module
+construction of imported generic types (§14, §2.5); a few `await`-in-guard /
+-finally corners (§30, §29). See the issue tracker for the live list.
 
-**Not yet implemented (compiler emits a diagnostic):**
-
-- `typeof(T)` and `.GetType()` — runtime reflection (§17.10, §8.2); deferred
-  pending `System.Reflection`
-- Async lambdas (§30.6) — the state-machine lowering for lambda-specific async
-  frames is not yet implemented; sync and async methods work
-- Cross-module instantiation of generic types (§14, §2.5) — importing a generic
-  class or record and constructing it cross-module; generic methods work
-- `await` inside a catch guard (`catch ... when`) or inside a try/catch/finally
-  body with an async-iterator (§30 / §29)
-- Open-ended range patterns in `case` (§19)
-
-**Platform:** developed and tested on Fedora Linux. The runtime uses POSIX
-threads, `clock_gettime`, `pthread`, and `/dev/urandom`, so Windows is not yet
-supported. See [Cross-platform notes](#cross-platform-notes) below.
+Developed and tested on **Fedora Linux**; the runtime uses POSIX APIs, so other
+platforms are untested (tracked in #446).
 
 ## Building
 
-**Prerequisites:** CMake ≥ 3.20, clang/clang++, LLVM 21 dev headers and
-libraries. The compiler calls the LLVM 21 C++ API extensively; older LLVM
-versions are untested and will likely need source-level changes.
-
----
-
-### Fedora (verified)
+**Requirements:** CMake ≥ 3.20, clang/clang++, and LLVM 21 dev headers and
+libraries (the compiler uses the LLVM 21 C++ API extensively; other versions are
+untested).
 
 ```sh
 sudo dnf install cmake clang llvm llvm-devel
-```
-
-`llvm-devel` provides `llvm-config` and `LLVMConfig.cmake`, which CMake uses to
-locate the LLVM installation. Optionally install `ccache` and `lld` for faster
-incremental builds — the build system detects and uses them automatically:
-
-```sh
-sudo dnf install ccache lld   # optional; auto-detected
-```
-
-Then configure and build:
-
-```sh
 cmake -B build -DCMAKE_CXX_COMPILER=clang++
 cmake --build build -j$(nproc)
 ```
 
-CMake prints `Bezel: using LLVM 21.x.x` and, if installed, `Bezel: using
-ccache` and `Bezel: using lld linker`.
-
----
-
-### Cross-platform notes
-
-The build has only been verified on Fedora Linux. The notes below are
-best-effort guidance for other platforms; they are **untested**. Verification
-and any needed fixes are tracked in issue #446.
-
-#### Debian / Ubuntu — UNTESTED
-
-```sh
-sudo apt install cmake clang llvm-dev
-cmake -B build -DCMAKE_CXX_COMPILER=clang++
-cmake --build build -j$(nproc)
-```
-
-Ubuntu 24.04 LTS ships LLVM 18; you may need to install LLVM 21 from
-[apt.llvm.org](https://apt.llvm.org/) and point CMake at it with
-`-DLLVM_DIR=/path/to/llvm21/lib/cmake/llvm`.
-
-#### Arch Linux — UNTESTED
-
-```sh
-sudo pacman -S cmake clang llvm
-cmake -B build -DCMAKE_CXX_COMPILER=clang++
-cmake --build build -j$(nproc)
-```
-
-Arch typically ships a recent LLVM.
-
-#### macOS — UNTESTED
-
-Apple's system clang does not include LLVM development headers; install
-the Homebrew `llvm` formula which provides them:
-
-```sh
-brew install llvm cmake
-cmake -B build \
-    -DCMAKE_CXX_COMPILER=$(brew --prefix llvm)/bin/clang++ \
-    -DLLVM_DIR=$(brew --prefix llvm)/lib/cmake/llvm
-cmake --build build -j$(nproc)
-```
-
-#### Windows — NOT SUPPORTED
-
-The runtime uses POSIX threads (`<pthread.h>`), `clock_gettime`, and
-`/dev/urandom`. Cross-platform runtime portability work is tracked in issue
-#446.
+Optional, auto-detected accelerators: `ccache` and the `mold` (or `lld`) linker
+— CMake prints which it found (`Bezel: using LLVM 21.x.x`, `… using ccache`, …).
 
 ## Usage
 
-### AOT compilation
-
-Source files use the `.bzl` extension. A minimal program — `Main` returns an
-integer that becomes the process exit code:
+`.bzl` source; `Main`'s return value becomes the process exit code:
 
 ```
 module M;
@@ -148,82 +64,55 @@ end C;
 ```
 
 ```sh
-./build/bezelc hello.bzl -o hello && ./hello; echo $?
-# 42
+./build/bezelc hello.bzl -o hello && ./hello; echo $?   # 42
 ```
 
-### Multi-module separate compilation
-
-Compile a library to a native object with embedded interface metadata (§2.4):
+Multi-module separate compilation — compile a library to a native object with
+embedded interface metadata (§2.4), then import it (§2.5) for metadata and
+linking:
 
 ```sh
 ./build/bezelc -c lib.bzl -o lib.o
+./build/bezelc app.bzl --import lib.o -o app     # repeat --import for more deps
 ```
-
-Compile an application that imports the library (§2.5); `--import` supplies the
-dependency object for both metadata resolution and linking:
-
-```sh
-./build/bezelc app.bzl --import lib.o -o app
-```
-
-Multiple `--import` flags are accepted for multiple dependencies.
 
 ## Testing
 
-Run the full test suite:
+Two tracks: a **gtest behavior suite** (compiles and runs programs through the
+real `bezelc` AOT path) and a **lit + FileCheck diagnostic track**
+(`tests/lit/*.bz`, matching compiler diagnostics). The diagnostic track needs
+`lit` and `FileCheck` (from LLVM) on `PATH`; without them it is skipped cleanly.
 
 ```sh
-./build/tests/bezel_tests
+tests/run_parallel.sh 16                    # sharded gtest suite (~2 min)
+cmake --build build --target check-lit      # diagnostic track
+scripts/gate.sh                             # both + a serial pass; prints a combined total
+BEZEL_TEST_FILTER=<substr> build/tests/bezel_tests   # a subset, serially
 ```
 
-Or use the helper script, which removes any stale binary before rebuilding (the
-stale-binary problem is documented in `scripts/run-tests.sh`):
-
-```sh
-scripts/run-tests.sh
-```
-
-Run a subset by name substring:
-
-```sh
-BEZEL_TEST_FILTER=<substring> ./build/tests/bezel_tests
-```
-
-For example, `BEZEL_TEST_FILTER=codegen` runs only codegen tests,
-`BEZEL_TEST_FILTER=ownership` runs only ownership tests.
+`scripts/gate.sh` is the blessed pre-push gate (`--full` adds a whole-suite ASan
+sweep). The serial binary (`build/tests/bezel_tests`) is authoritative — the
+sharded runner can over-report under load. See `tests/README.md` for how to
+write a test (the `runAot` harness and lit conventions).
 
 ## Repository layout
 
 ```
-src/
-  lexer/      Lexer (§1, §18, §34, Appendix B)
-  ast/        AST node definitions (Appendix A, §9–§27)
-  parser/     Parser (Appendix A, §17, §19–§21)
-  sema/       Type checking (§3–§14)
-  flow/       Control-flow graph
-  ownership/  Ownership & borrow checking (§28, Appendix C)
-  codegen/    LLVM IR code generation (decision #147)
-  runtime/    Bezel standard library native layer (Array, Dict, Task, …)
-  module/     Module metadata codec + cross-module loader (§2)
-  driver/     Pipeline orchestration (§2, §33)
-  main.cpp    bezelc CLI entry point
-tests/        Spec-derived tests, mirroring src/ phase layout
-scripts/      Build and test helpers (run-tests.sh)
-docs/         Normative spec, standard library, design rationale, guides
+src/    lexer, ast, parser, sema, flow, ownership, codegen, runtime, module, driver
+tests/  spec-derived gtest tests + lit/ diagnostic track, mirroring src/ phases
+scripts/ build/test/gate helpers (gate.sh, dev_heavy.sh, run_parallel.sh, …)
+docs/   normative spec, standard library, design rationale, guides
 ```
 
 ## Further reading
 
-- `docs/Bezel_Language_Spec.md` — the normative reference; Appendix A is
-  the complete grammar, Appendix C lists compiler-enforced invariants
+- `docs/Bezel_Language_Spec.md` — normative reference (Appendix A grammar,
+  Appendix C invariants)
 - `docs/Bezel_Standard_Library.md` — every stdlib type and method
-- `docs/Bezel_Design_Rationale.md` — the recorded reasoning behind each
-  language decision
-- `docs/Bezel_Guide_01_Memory_and_Ownership.md` and
-  `docs/Bezel_Guide_02_Errors_and_Nullability.md` — example-first guides to
-  idiomatic Bezel
-- `CLAUDE.md` — working discipline for contributors and AI sessions
+- `docs/Bezel_Design_Rationale.md` — the recorded reasoning behind each decision
+- `docs/Bezel_Guide_01_Memory_and_Ownership.md`,
+  `docs/Bezel_Guide_02_Errors_and_Nullability.md` — example-first guides
+- `CLAUDE.md` — working discipline; `tests/README.md` — test-writing guide
 
 ## License
 

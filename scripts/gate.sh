@@ -171,4 +171,13 @@ if [ "$MODE" = "--full" ]; then
   [ "$errs" -ne 0 ] && { grep -iE 'ERROR: AddressSanitizer|runtime error:|shard [0-9]+: [1-9]' "$S/gate_asan.log" | head; fail "asan_sweep"; }
 fi
 
+# Combined coverage: the gtest behavior track and the lit diagnostic track are
+# separate runners, so neither alone reports the real total. Sum them here (this
+# is the one place that ran both). Best-effort — never fails the gate.
+gtests=$(grep -oE 'TOTAL: [0-9]+ passed' "$S/gate_shard.log" 2>/dev/null | grep -oE '[0-9]+' | tail -1)
+littests=$(grep -oE 'Passed: *[0-9]+' "$S/gate_lit.log" 2>/dev/null | grep -oE '[0-9]+' | tail -1)
+if [ -n "${gtests:-}" ]; then
+  echo "== gate: coverage: ${gtests} gtest + ${littests:-0} lit = $(( gtests + ${littests:-0} )) tests passing =="
+fi
+
 echo "== GATE PASS =="
