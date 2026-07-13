@@ -28,104 +28,33 @@
 //     double-free / use-after-free (load-bearing for the displaced+surviving
 //     case, where the displaced value must NOT be disposed twice).
 
-#include <cstdio>
-#include <cstdlib>
-#include <filesystem>
 #include <string>
-#include <sys/wait.h>
 
-#include "codegen/LlvmBackend.hpp"
-#include "lexer/Lexer.hpp"
-#include "ownership/Ownership.hpp"
-#include "parser/Parser.hpp"
-#include "sema/DefiniteAssignment.hpp"
-#include "sema/ExprTypecheck.hpp"
-#include "sema/SemaContext.hpp"
-#include "sema/SymbolCollection.hpp"
-#include "sema/TypeResolution.hpp"
-#include "support/codegen_support.hpp"
-#include "support/Diagnostic.hpp"
+#include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
 #include "test_harness.hpp"
-#include "native_test_harness.hpp"
 
-#include "llvm/IR/LLVMContext.h"
-#include "llvm/IR/Module.h"
-
-using bezel::test::runJit;
+using bezel::test::runAotChecked;
 
 namespace {
 
-namespace fs = std::filesystem;
-
-// JIT a program and return its `main` exit code (or -999 if it didn't run).
+// Compile with generated-code AddressSanitizer, run under LeakSanitizer, and
+// return the program's exit code — the dispose-exactly-once oracle. A leak /
+// double-free / use-after-free (the load-bearing checks for #394/#396/#1214)
+// FAILS the run (ran=false -> -999), so the sanitizer verdict rides on the same
+// assertion as the destructor-count value. This consolidates the retired
+// hand-rolled JIT-count + bespoke-LSan pair (which lowered the program to an
+// object file and linked -fsanitize=address by hand) into the one standard
+// checked AOT pipeline.
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAotChecked(src);
     return r.ran ? r.exitCode : -999;
 }
 
-// LeakSanitizer verification (mirrors undisposed_leak_test.cpp). Lowers `source`
-// through the full front-end to an object file, links against an
-// ASan-instrumented runtime, runs under LSan. Returns:
-//   0  — clean (no problem of the kinds being detected).
-//   1  — sanitizer reported a problem: test failure.
-//  -1  — toolchain unavailable / build step failed: SKIP (not a failure).
-// Uses the memoized ASan runtime object (compiled once per process).
-int runUnderLeakSanitizer(const std::string& source, bool detectLeaks = true) {
-    const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
-    if (rtObj.empty()) return -1;  // toolchain unavailable or compile failed
-
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_394_lsan_" + std::to_string(counter++);
-    std::string objPath = (dir / (stem + ".o")).string();
-    std::string exe     = (dir / stem).string();
-
-    {
-        bezel::DiagnosticEngine diags;
-        bezel::Lexer lexer(source, diags);
-        bezel::Parser parser(lexer, diags);
-        auto unit = parser.parseCompilationUnit();
-        if (!unit) return -1;
-        bezel::sema::SemaContext ctx(diags);
-        bezel::sema::collectSymbols(*unit, ctx);
-        bezel::sema::resolveTypes(*unit, ctx);
-        bezel::sema::typecheckExpressions(*unit, ctx);
-        bezel::sema::checkDefiniteAssignment(*unit, ctx);
-        bezel::ownership::checkOwnership(*unit, ctx);
-        if (diags.hasErrors()) return -1;
-        llvm::LLVMContext llvmCtx;
-        auto module = bezel::codegen::emitModule(*unit, ctx, llvmCtx);
-        if (!module) return -1;
-        std::string err;
-        if (!bezel::codegen::emitObjectFile(*module, objPath, err)) return -1;
-    }
-
-    auto cleanup = [&] {
-        std::remove(objPath.c_str());
-        std::remove(exe.c_str());
-    };
-    std::string linkCmd = "clang++ -fsanitize=address -g " + objPath + " " +
-                          rtObj + " -lm -lpthread -lstdc++ -o " + exe +
-                          " > /dev/null 2>&1";
-    if (std::system(linkCmd.c_str()) != 0) { cleanup(); return -1; }
-    std::string runCmd =
-        std::string("ASAN_OPTIONS=detect_leaks=") +
-        (detectLeaks ? "1" : "0") + ":exitcode=99 " + exe +
-        " > /dev/null 2>&1";
-    int status = std::system(runCmd.c_str());
-    cleanup();
-    if (status == -1) return -1;
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 99) return 1;  // sanitizer
-    return 0;                                                      // clean
-}
-
-// Assert the destructor-count (always) and, if the toolchain is present, that
-// LeakSanitizer reports no leak / no double-free / no use-after-free.
+// Assert the program disposes each surviving value exactly once (no leak, no
+// double-free, no use-after-free) AND returns `expectedExitCode` — both verdicts
+// ride on the single checked run.
 void expectDisposedAndLeakFree(const std::string& source, int expectedExitCode) {
     BEZEL_EXPECT_EQ(run(source), expectedExitCode);
-    int lsan = runUnderLeakSanitizer(source);
-    if (lsan == -1) return;       // toolchain unavailable: skip the LSan leg
-    BEZEL_EXPECT_EQ(lsan, 0);     // 0 == LSan clean (no leak, no UAF/DF)
 }
 
 // A resource class R (destructor bumps R._n) and a Main holding the given body.
@@ -234,15 +163,17 @@ const char* kDictExplicitDispose =
     "end; "                       // scope-end disposal is a no-op (slot nulled)
     "return inside * 10 + R._n;"; // 2*10 + 2 = 22
 
-// #396 / §4.9: an explicit `this._d.Dispose()` inside a DESTRUCTOR disposes the
-// owned dict field's surviving values once. An owned OwningDictionary FIELD is
-// not auto-disposed by the destructor's field-disposal pass (that pass handles
-// class objects and array-backed collections, not hash-backed dicts), so the
-// explicit call in the destructor is the only disposal — it must dispose the
-// value. The owner is a `using var`; at its scope end the destructor runs,
-// disposes the dict's one value (R._n → 1), then the field-disposal pass leaves
-// the (now self-freed) dict field alone. The count is read after the owner's
-// scope → 1. Before #396 the value leaked (NULL value-disposer) → 0.
+// #396 / §4.9 + §28.4/§28.5: an owned `OwningDictionary` FIELD is auto-disposed
+// by the destructor's field-disposal pass, which cascades into the dict's
+// surviving values. The pass runs AFTER the (here empty) destructor body, so no
+// explicit call is needed — indeed an explicit `this._d.Dispose()` in the
+// destructor is a compile error (§28.5), because the generated Dispose() runs
+// the body and THEN auto-disposes the field, so a hand call would double-free.
+// The owner is a `using var`; at its scope end the field-disposal pass disposes
+// the dict's one value exactly once (R._n → 1). (The pre-migration form called
+// `this._d.Dispose()` by hand on the stale premise that hash-backed dict fields
+// were not auto-disposed; that premise is fixed, and the JIT harness ran the
+// now-rejected double-free shape only because it skips the ownership pass.)
 const char* kDictFieldDestructorDispose =
     "module M; "
     "class R "
@@ -255,7 +186,7 @@ const char* kDictFieldDestructorDispose =
     "    this._d := new OwningDictionary<string, R>(); "
     "    this._d.Add(\"a\", move (new R())); "
     "  end constructor; "
-    "  destructor this._d.Dispose(); end destructor; "
+    "  destructor end destructor; "
     "end Owner; "
     "class C public static method Main(): int "
     "  do using var o := new Owner(); end; "
@@ -307,10 +238,11 @@ BEZEL_TEST(codegen_owned_dict_396, explicit_dispose_disposes_values_exactly_once
     expectDisposedAndLeakFree(prog(kDictExplicitDispose), 22);
 }
 
-BEZEL_TEST(codegen_owned_dict_396, explicit_dispose_of_owned_field_in_destructor_4_9) {
-    // this._d.Dispose() in a destructor disposes the owned dict field's one
-    // value exactly once → R._n == 1. Before #396 the value leaked (NULL value-
-    // disposer) → 0. LSan leg: no leak, no double-free.
+BEZEL_TEST(codegen_owned_dict_396, owned_dict_field_auto_disposed_by_destructor_4_9) {
+    // The destructor's §28.4 field-disposal pass auto-disposes the owned dict
+    // field, cascading into its one value exactly once → R._n == 1. The checked
+    // run confirms no leak and no double-free (an explicit hand-Dispose of the
+    // field would double-free and is a compile error, §28.5).
     expectDisposedAndLeakFree(kDictFieldDestructorDispose, 1);
 }
 
