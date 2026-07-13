@@ -24,7 +24,6 @@
 
 using bezel::test::runAot;
 using bezel::test::runAotOut;
-using bezel::test::runJit;
 
 namespace {
 
@@ -35,7 +34,7 @@ int run(const std::string& program) {
 
 // Returns true iff the run produced an error diagnostic containing `keyword`.
 bool hasError(const std::string& program, const char* keyword) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.severity == bezel::Severity::Error &&
                 d.message.find(keyword) != std::string::npos)
