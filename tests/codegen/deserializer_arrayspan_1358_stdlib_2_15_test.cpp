@@ -23,7 +23,6 @@
 
 using bezel::test::runAot;
 using bezel::test::runAotOut;
-using bezel::test::runJit;
 
 namespace {
 
@@ -32,8 +31,10 @@ int run(const std::string& src) {
     return r.ran ? r.exitCode : -999;
 }
 
+// A compile-time reject — doesn't run, so the stricter AOT front end
+// (ownership/DA/§33.5 entry-point checks runJit skips) is the correct oracle.
 bool rejects(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return !r.ran && r.diagnostics.hasErrors();
 }
 
