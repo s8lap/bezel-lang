@@ -5,14 +5,16 @@
 // predicate codegen path). Each predicate form is now equivalent to the
 // no-argument method applied after Where(predicate).
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int runFull(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 const char* arr123 =
@@ -89,12 +91,15 @@ BEZEL_TEST(linq_last_single_predicate_789, last_or_null_predicate_match) {
 }
 
 // stdlib §5/#789: LastOrNull(pred) returns null when no element matches.
+// -1 does not round-trip through the 8-bit process exit code (runAotOut: the
+// value channel for negative/out-of-range results).
 BEZEL_TEST(linq_last_single_predicate_789, last_or_null_predicate_none) {
-    BEZEL_EXPECT_EQ(runFull(
+    BEZEL_EXPECT_EQ(runAotOut(
         std::string("module M; class C public static method Main(): int ") +
         arr123 +
-        "  return (arr.LastOrNull((x) => x > 9) ?? -1); "  // null → -1
-        "end Main; end C;"), -1);
+        "  Console.WriteLine(arr.LastOrNull((x) => x > 9) ?? -1); "  // null → -1
+        "  return 0; "
+        "end Main; end C;"), "-1");
 }
 
 // stdlib §5/#789: the predicate forms also work over a LAZY source (Range),
