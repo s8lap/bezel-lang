@@ -48,6 +48,7 @@
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
@@ -56,15 +57,18 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 namespace fs = std::filesystem;
 
-// JIT a program and return its `main` exit code (or -999 if it didn't run).
+// AOT MIGRATION (JIT->AOT): the AOT driver (runAot) runs the full ownership +
+// definite-assignment pipeline — the stricter oracle. Two tests whose packed
+// value exceeds 255 print it and assert on stdout via runAotOut.
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -153,13 +157,14 @@ BEZEL_TEST(collection_indexer_388, array_int_indexer_get_4_4) {
 // Load-bearing: before the fix the setter was silently dropped and Get returned
 // the original 20.
 BEZEL_TEST(collection_indexer_388, array_int_indexer_set_4_4) {
-    BEZEL_EXPECT_EQ(run(
+    // Packed value 31099 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(10); a.Add(20); a.Add(30); "
         "  a[1] := 99; "
-        "  return a.Get(0) * 100 + a.Get(1) * 1 + a.Get(2) * 1000; " // 10*100+99+30000=31099
-        "end Main; end C;"), 31099);
+        "  Console.WriteLine(a.Get(0) * 100 + a.Get(1) * 1 + a.Get(2) * 1000); return 0; " // 10*100+99+30000=31099
+        "end Main; end C;"), "31099");
 }
 
 // §4.4: set then read through the indexer itself (round-trip), no method calls.
@@ -294,14 +299,15 @@ BEZEL_TEST(collection_indexer_388, dict_str_int_indexer_set_4_8) {
 // §4.8: an int-keyed dictionary routes through the generic-key runtime; the
 // indexer get/set must follow the same path.
 BEZEL_TEST(collection_indexer_388, dict_int_int_indexer_set_get_4_8) {
-    BEZEL_EXPECT_EQ(run(
+    // 311 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
         "  d[1] := 100; d[2] := 200; "
         "  d[1] := 111; "                               // replace
         "  var s := d[1] + d[2]; "
-        "  return s; "                                  // 111 + 200 = 311
-        "end Main; end C;"), 311);
+        "  Console.WriteLine(s); return 0; "            // 111 + 200 = 311
+        "end Main; end C;"), "311");
 }
 
 // §4.8: `dict[key]` raises KeyNotFoundException when the key is absent. The
