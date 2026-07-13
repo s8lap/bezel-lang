@@ -31,6 +31,7 @@
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
@@ -39,56 +40,27 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
 namespace fs = std::filesystem;
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
-// Like run() but includes checkDefiniteAssignment + checkOwnership in the
-// pipeline. Required for §29.2/#1329 auto-drop tests: the ownership pass sets
-// ownedIterVarAutoDropAtBodyEnd on ForStmt, which lowerForBody reads; without
-// checkOwnership the flag is never set and per-iteration auto-drop is skipped.
+// The §29.2/#1329 auto-drop tests need the FULL front-end (checkDefiniteAssign-
+// ment + checkOwnership) so the ownership pass sets ownedIterVarAutoDropAtBody-
+// End on the ForStmt. The AOT driver (runAot -> Driver::compileFile) runs that
+// full pipeline — strictly more than the plain JIT harness once did — so runFull
+// is now just runAot (kept as a named alias to preserve the call sites and make
+// the "needs the ownership pass" intent explicit).
 int runFull(const std::string& src) {
-    bezel::test::ensureNativeTargetInitialized();
-    bezel::DiagnosticEngine diags;
-    bezel::Lexer lexer(src, diags);
-    bezel::Parser parser(lexer, diags);
-    auto unit = parser.parseCompilationUnit();
-    if (!unit) return -999;
-    bezel::sema::SemaContext ctx(diags);
-    bezel::sema::collectSymbols(*unit, ctx);
-    bezel::sema::resolveTypes(*unit, ctx);
-    bezel::sema::typecheckExpressions(*unit, ctx);
-    bezel::sema::checkDefiniteAssignment(*unit, ctx);
-    bezel::ownership::checkOwnership(*unit, ctx);
-    if (diags.hasErrors()) return -999;
-    auto llvmCtx = std::make_unique<llvm::LLVMContext>();
-    auto module = bezel::codegen::emitModule(*unit, ctx, *llvmCtx);
-    if (!module) return -999;
-    auto jitOrErr = llvm::orc::LLJITBuilder().create();
-    if (!jitOrErr) { llvm::consumeError(jitOrErr.takeError()); return -999; }
-    auto jit = std::move(*jitOrErr);
-    if (auto gen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
-            jit->getDataLayout().getGlobalPrefix())) {
-        jit->getMainJITDylib().addGenerator(std::move(*gen));
-    } else {
-        llvm::consumeError(gen.takeError());
-    }
-    llvm::orc::ThreadSafeModule tsm(std::move(module), std::move(llvmCtx));
-    if (auto err = jit->addIRModule(std::move(tsm))) {
-        llvm::consumeError(std::move(err)); return -999;
-    }
-    auto sym = jit->lookup("main");
-    if (!sym) { llvm::consumeError(sym.takeError()); return -999; }
-    int exitCode = sym->toPtr<int(*)()>()();
-    bz_flush_static_owned();
-    return exitCode;
+    auto r = runAot(src);
+    return r.ran ? r.exitCode : -999;
 }
 
 // LSan/ASan helper — compile → object → link with ASan runtime → run.
@@ -194,7 +166,7 @@ BEZEL_TEST(owned_drain_639, ownedarray_full_drain_empties_array_spec_4_5) {
 // last should be 3. Encode: first*100 + last.
 BEZEL_TEST(owned_drain_639, ownedarray_drain_order_front_to_back_spec_4_5) {
     // Sealed class with stored value N.
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "sealed class Val "
         "  public N: int := 0; "
@@ -300,7 +272,7 @@ BEZEL_TEST(owned_drain_639, ownedlinkedlist_full_drain_empties_list_spec_4_7) {
 // §4.7 / §28.11: drain order is head-to-tail.
 // AddLast [1,2,3]; first drained should be 1 (head), last should be 3 (tail).
 BEZEL_TEST(owned_drain_639, ownedlinkedlist_drain_order_head_to_tail_spec_4_7) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "sealed class Val "
         "  public N: int := 0; "
@@ -390,7 +362,8 @@ BEZEL_TEST(owned_drain_639, ownedstack_full_drain_empties_stack_spec_4_11) {
 // §4.11 / §28.11: drain order is LIFO (top-first = last-pushed first).
 // Push [1,2,3]; drain should yield 3 first, 1 last.
 BEZEL_TEST(owned_drain_639, ownedstack_drain_order_lifo_spec_4_11) {
-    auto r = runJit(
+    // Packed value 301 > 255 → print + runAotOut.
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; "
         "sealed class Val "
         "  public N: int := 0; "
@@ -408,10 +381,8 @@ BEZEL_TEST(owned_drain_639, ownedstack_drain_order_lifo_spec_4_11) {
         "    if first = -1 then first := u.N; end; "
         "    last := u.N; "
         "  end; "
-        "  return first * 100 + last; "  // 3*100 + 1 = 301
-        "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 301);
+        "  Console.WriteLine(first * 100 + last); return 0; "  // 3*100 + 1 = 301
+        "end Main; end C;"), "301");
 }
 
 // §4.11: partial drain (break after first element, LIFO so top is drained).
@@ -480,7 +451,7 @@ BEZEL_TEST(owned_drain_639, ownedqueue_full_drain_empties_queue_spec_4_11) {
 // §4.11 / §28.11: drain order is FIFO (front-first = first-enqueued first).
 // Enqueue [1,2,3]; drain should yield 1 first, 3 last.
 BEZEL_TEST(owned_drain_639, ownedqueue_drain_order_fifo_spec_4_11) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; "
         "sealed class Val "
         "  public N: int := 0; "
@@ -543,7 +514,7 @@ BEZEL_TEST(owned_drain_639, ownedqueue_empty_drain_no_iterations_spec_4_11) {
 // R27 repro r25b_ownedarray_drain.bzl: OwningArray drain, sum should be 60.
 // Pass condition: Main returns 42 (42 if sum = 60 else 91).
 BEZEL_TEST(owned_drain_639, r27_repro_r25b_ownedarray_drain) {
-    auto r = runJit(
+    auto r = runAot(
         "module R27; "
         "sealed class Val "
         "  public N: int := 0; "
@@ -570,7 +541,7 @@ BEZEL_TEST(owned_drain_639, r27_repro_r25b_ownedarray_drain) {
 // R27 repro r25c_owned_collections_drain.bzl: OwningLinkedList drain, sum=15.
 // Pass condition: Main returns 42.
 BEZEL_TEST(owned_drain_639, r27_repro_r25c_ownedlinkedlist_drain) {
-    auto r = runJit(
+    auto r = runAot(
         "module R27; "
         "sealed class Val "
         "  public N: int := 0; "
@@ -596,7 +567,7 @@ BEZEL_TEST(owned_drain_639, r27_repro_r25c_ownedlinkedlist_drain) {
 // R27 repro r25d_ownedstack_drain.bzl: OwningStack drain, sum=15.
 // Pass condition: Main returns 42.
 BEZEL_TEST(owned_drain_639, r27_repro_r25d_ownedstack_drain) {
-    auto r = runJit(
+    auto r = runAot(
         "module R27; "
         "sealed class Val "
         "  public N: int := 0; "
