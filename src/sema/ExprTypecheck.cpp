@@ -4913,6 +4913,52 @@ void ExprTC::checkStaticReadonlyForwardRef(const ast::FieldDecl* fd) {
     walk(fd->initializer.get());
 }
 
+// §21.4 / §29: does a locally-declared user type (or any type in its base
+// closure) support synchronous `for`-in iteration — i.e. expose a
+// `GetEnumerator` method (the §29 `IEnumerable<T>` contract) or derive from a
+// builtin `IEnumerable`/collection-family interface? Cycle-guarded BFS over the
+// base closure.
+static bool userTypeSupportsForIn(const TypeSymbol* root) {
+    // The §29 iteration / §4 collection interface family — every builtin whose
+    // element chain terminates at IEnumerable<T>. A base named from this set
+    // makes the deriving type for-in iterable.
+    auto isEnumerableFamily = [](std::string_view n) {
+        return n == "IEnumerable" || n == "IEnumerator" ||
+               n == "IOwningEnumerable" || n == "IOwningEnumerator" ||
+               n == "IReadOnlyCollection" || n == "IReadOnlyList" ||
+               n == "IList" || n == "ICollection" ||
+               n == "IOwningList" || n == "IOwningCollection" ||
+               n == "IGrouping";
+    };
+    std::vector<const TypeSymbol*> queue = {root};
+    std::unordered_set<const TypeSymbol*> seen = {root};
+    for (std::size_t qi = 0; qi < queue.size(); ++qi) {
+        const TypeSymbol* t = queue[qi];
+        if (!t) continue;
+        // §29: a concrete type implementing IEnumerable<T> always declares
+        // GetEnumerator (the interface is abstract), so a member scan across the
+        // base closure is authoritative for such types.
+        for (auto* m : t->members)
+            if (auto* ms = dynamic_cast<const MethodSymbol*>(m))
+                if (ms->name == "GetEnumerator") return true;
+        // A builtin IEnumerable-family base carries declaration==null and is
+        // therefore dropped from `baseTypes`/`baseTypeRefs` (TypeResolution only
+        // records bases with a resolved TypeSymbol). Recover it from the
+        // SYNTACTIC base list on the AST TypeDecl — this is what makes an
+        // interface that merely EXTENDS IEnumerable<T> (declaring no
+        // GetEnumerator of its own) count as iterable.
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl))
+            for (const auto& bt : td->baseTypes)
+                if (bt && bt->name && !bt->name->parts.empty() &&
+                    isEnumerableFamily(bt->name->parts.back()))
+                    return true;
+        // Recurse into user (declaration-bearing) base types.
+        for (auto* bt : t->baseTypes)
+            if (bt && seen.insert(bt).second) queue.push_back(bt);
+    }
+    return false;
+}
+
 void ExprTC::visitStmt(const ast::Stmt& s) {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         // Initializer evaluates BEFORE the local comes into scope.
@@ -6389,6 +6435,70 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
     } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
         if (fs->iterable) visitExpr(*fs->iterable);
         if (fs->withExpr) visitExpr(*fs->withExpr);
+        // §21.4 / §29 (#1775): a synchronous `for var x in <source>` requires an
+        // ITERABLE source — a value whose type implements `IEnumerable<T>`
+        // (exposes `GetEnumerator`, §29), an inline array (`[N]T`, §15.1.2), a
+        // string (§4.6), or a `Range<T>`. A non-iterable source (a bare
+        // `int`/`bool`/`char`, or a plain class/record/enum that does not
+        // implement `IEnumerable<T>`) otherwise slips past the type checker and
+        // falls through every codegen for-shape handler to a "codegen for this
+        // for statement" NYI. Diagnose it here instead.
+        //
+        // Conservative — only DEFINITE non-iterables are reported:
+        //   • a non-`string` primitive is never iterable;
+        //   • a LOCALLY-declared user type (`declaration->decl != null`) whose
+        //     base closure has neither `GetEnumerator` nor an IEnumerable-family
+        //     base is not iterable.
+        // Everything else is left to the existing element-inference and codegen
+        // for-shape handlers: builtin collections/interfaces and `Range<T>`
+        // (synthetic `builtinClassSym` declarations carry `decl==null`),
+        // imported types, the lazy-LINQ marker TypeRef, range/collection
+        // literals (handled by AST shape below), and any source whose type did
+        // not resolve. `await for` (§30.7) iterates an async source through a
+        // separate path, so it is excluded here.
+        if (!fs->isAwait && fs->iterable &&
+            !dynamic_cast<const ast::RangeExpr*>(fs->iterable.get()) &&
+            !dynamic_cast<const ast::CollectionLiteralExpr*>(
+                fs->iterable.get())) {
+            bool nonIterable = false;
+            if (const TypeRef* ty = ctx_.exprType(*fs->iterable)) {
+                if (ty->kind == TypeRef::Kind::Primitive) {
+                    // §4.6: a string iterates its chars; every other primitive
+                    // (int, bool, char, float, …) is not iterable.
+                    nonIterable = ty->primitive != PrimitiveType::String;
+                } else if (ty->kind == TypeRef::Kind::Named &&
+                           ty->declaration && ty->declaration->decl) {
+                    // Restrict the reject to genuinely USER-authored types. Some
+                    // builtins carry a SYNTHESIZED `decl` (via
+                    // builtinInterfaceSym): `IReadOnlySpan<T>` — which IS
+                    // for-in iterable (§4.16/#1262, a direct indexed loop) —
+                    // and the §2.19/§11.8 static-abstraction / comparison
+                    // interfaces. Those must not be treated as plain
+                    // non-iterable classes. (`Range`, the collections, and the
+                    // value builtins carry `decl==null` and were already skipped
+                    // by the guard above.)
+                    std::string_view tn = ty->declaration->name;
+                    bool builtin =
+                        common::isHeapPointerReferenceBuiltin(tn) ||
+                        isValueBuiltinByName(tn) ||
+                        tn == "IReadOnlySpan" || tn == "INumber" ||
+                        tn == "ISteppable" || tn == "IParsable" ||
+                        tn == "IComparable" || tn == "IEquatable" ||
+                        tn == "IEqualityComparer";
+                    if (!builtin && !userTypeSupportsForIn(ty->declaration))
+                        nonIterable = true;
+                }
+                // InlineArray → iterable; Named builtins / imported types → left
+                // to the existing paths.
+            }
+            if (nonIterable) {
+                ctx_.diagnostics().report(
+                    Severity::Error, fs->span.begin,
+                    "`for` requires an iterable source: a type implementing "
+                    "`IEnumerable<T>`, an inline array, a string, or a "
+                    "`Range<T>` (\xC2\xA7""21.4); this source is not iterable");
+            }
+        }
         // §16.5: symbolize the loop variable so the body can refer to it.
         // The variable's type is the explicit annotation if given; for a
         // range literal iterable (`1..3`) it is the element type inferred

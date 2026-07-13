@@ -93,9 +93,13 @@ BEZEL_TEST(own_cfg, if_else_owned_both_then_dispose_clean) {
 
 // A for-loop body acquiring an owned local without disposal: the field/
 // local is dropped on the body path the analysis walks → diagnosed.
+// (§21.4: the source is `0..10`, a `Range<int>`. An earlier form iterated the
+// `items: Stream` parameter, but a plain non-`IEnumerable` class is not an
+// iterable source — now a §21.4 error, #1775 — and that is orthogonal to the
+// ownership behaviour this test pins.)
 BEZEL_TEST(own_cfg, for_body_owned_undischarged_diagnosed) {
     auto r = parseAndCheckOwnership(wrap(
-        "for var it in items do var x := new Stream(); end;"));
+        "for var it in 0..10 do var x := new Stream(); end;"));
     // §28.3 v0.150: a fresh owned local in a for-body auto-drops each iteration.
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(r, "x"));

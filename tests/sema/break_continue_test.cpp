@@ -31,7 +31,10 @@ BEZEL_TEST(sema_loop, break_in_while_ok) {
 }
 
 BEZEL_TEST(sema_loop, continue_in_for_ok) {
-    auto r = parseSemaAll(wrap("for var x in n do continue; end;"));
+    // §21.4: the source must be iterable — `0..n` is a `Range<int>`. (An earlier
+    // form iterated `n` directly, a bare `int`; that is not iterable and is now
+    // a §21.4 error — see for_source_iterability_1775_test.cpp.)
+    auto r = parseSemaAll(wrap("for var x in 0..n do continue; end;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
