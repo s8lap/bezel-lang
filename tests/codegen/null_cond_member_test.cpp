@@ -6,22 +6,31 @@
 // {hasValue, value} `T?` struct, FINDING [3]) are covered. Observable via the
 // int exit code.
 
+#include "support/aot_support.hpp"      // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int runProg(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
 // N has a value field V and a self-referential nullable link `next`.
+// The `next`/`n` links are `owned` (§28.5): under the AOT oracle (which runs
+// the §28.3 ownership pass the JIT skipped) storing a borrow of a scope-bound
+// owned local into a field is rejected — "a borrow may not be assigned to any
+// field of any object". A linked/tree structure whose nodes own their links is
+// the sound model; `?.` member-access lowering (§7.5, the feature under test)
+// is identical whether the field is owned or a borrow. Owned links let the
+// tests store a produced node (e.g. `t.n := inner;`) with no marker — the
+// declared `owned` slot is itself the transfer announcement (§28.3, v0.180).
 const char* kP =
-    "module M; class N public V: int := 0; public next: N? := null; end N; "
-    "class T public n: N? := null; end T; ";
+    "module M; class N public V: int := 0; public owned next: N? := null; end N; "
+    "class T public owned n: N? := null; end T; ";
 
 } // namespace
 
