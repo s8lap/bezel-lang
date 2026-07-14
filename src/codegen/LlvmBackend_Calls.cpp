@@ -7332,7 +7332,23 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // the aggregate with the array pointer. Otherwise (Array<Task>, no
         // generic arg on Task), call the plain bz_task_when_all.
         if (m == "WhenAll" && !call.args.empty() && call.args[0].value) {
-            llvm::Value* arr = lowerExpr(*call.args[0].value);
+            // #1616 / §30.10: mirror WhenAny. An INLINE task-array literal
+            // argument — `Task.WhenAll([t1, t2])` — is not a general expression
+            // value: WhenAll is a compiler intrinsic with no MethodDecl param, so
+            // sema never gave the literal a materialization target and a bare
+            // lowerExpr returns null for the CollectionLiteralExpr (§15.4).
+            // `arr` was then null and the whole WhenAll call silently dropped out
+            // of codegen — the `using var w := Task.WhenAll([…])` store never
+            // executed, leaving `w` (and the async frame's pending-task slot)
+            // holding stack garbage; the subsequent `await w` dereferenced it and
+            // SIGSEGV'd (bound elements) or hung (anonymous elements). lowerTaskArrayArg
+            // materializes the literal into an owned Array<Task> temporary (freed
+            // SYNCHRONOUSLY after the borrowing runtime call, freeTaskArrayArgTemp —
+            // both bz_task_when_all and bz_task_when_all_results snapshot the input
+            // task pointers before returning and never retain the array), exactly
+            // as WhenAny does; a pre-bound Array<Task> argument is unaffected
+            // (plain lowerExpr, isLiteralTemp=false).
+            auto [arr, isLiteralTemp] = lowerTaskArrayArg(*call.args[0].value);
             if (!arr) return nullptr;
             // Check if the arg is Array<Task<T>> (generic result variant).
             // arrTy is the sema TypeRef for the argument expression.
@@ -7359,17 +7375,23 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     isTyped = true;
                 }
             }
+            llvm::Value* result;
             if (isTyped) {
                 // Task.WhenAll<T>: collect results into Array<T>.
                 auto* whenAllResFn = declareC("bz_task_when_all_results",
                                               ptrTy(), {ptrTy(), i64()});
-                return builder_.CreateCall(whenAllResFn,
+                result = builder_.CreateCall(whenAllResFn,
                     {arr, builder_.getInt64(elemSz)},
                     "task.when_all_results");
             } else {
                 auto* whenAllFn = declareC("bz_task_when_all", ptrTy(), {ptrTy()});
-                return builder_.CreateCall(whenAllFn, {arr}, "task.when_all");
+                result = builder_.CreateCall(whenAllFn, {arr}, "task.when_all");
             }
+            // #1616: free a literal temp array synchronously, right after the
+            // runtime call that borrowed it — mirror WhenAny (see freeTaskArrayArgTemp
+            // / lowerTaskArrayArg for why this must not be a deferred scope-end free).
+            if (isLiteralTemp) freeTaskArrayArgTemp(arr);
+            return result;
         }
         // stdlib §6.7 (line 2884): Task.WhenAny(tasks: Array<Task>): Task<int>
         // (v0.162 / #1332). Returns a new task that completes with the i32 INDEX

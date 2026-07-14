@@ -530,6 +530,46 @@ BEZEL_TEST(task_combinators_1501, when_any_inline_literal_over_channel_receive_l
 }
 
 // ============================================================
+// #1616 / stdlib §6.7 (line 2872) / §30.10: Task.WhenAll over an INLINE
+// Array<Task> literal — the exact WhenAny-inline-literal bug (#1501) in the
+// sibling WhenAll branch, which had never been given the lowerTaskArrayArg
+// fix. WhenAll is a compiler intrinsic with no MethodDecl param, so sema
+// never gave the literal a materialization target and a bare lowerExpr
+// returns null for the CollectionLiteralExpr (§15.4). `arr` was then null and
+// `if (!arr) return nullptr` dropped the WHOLE WhenAll call out of codegen —
+// the `using var w := Task.WhenAll([…])` store never executed, so `w` held
+// native-stack garbage and the following `await w` dereferenced it
+// (SIGSEGV for bound elements; a hang for anonymous elements). The fix mirrors
+// WhenAny exactly: lowerTaskArrayArg materializes the literal into an owned
+// Array<Task> temp, and freeTaskArrayArgTemp frees it SYNCHRONOUSLY right
+// after the borrowing bz_task_when_all call (both when_all runtime entries
+// snapshot the input task pointers before returning and never retain the
+// array, so a synchronous free is safe — see LlvmBackend_Setup.cpp).
+// ============================================================
+
+// #1616: `Task.WhenAll([ta, tb])` over an inline literal of two bound
+// (`using var`) already-complete tasks. Before the fix this SIGSEGV'd on
+// `await w` (the dropped WhenAll left `w` as stack garbage); the fix awaits
+// all inputs correctly. Both elements are bound `using var`s (freed at scope
+// end) and the temp array is freed by freeTaskArrayArgTemp, so the whole
+// thing is LSan-clean — verified via expectValueLeakFree. Exit code 7 = 3 + 4
+// (the two FromResult values, read back after WhenAll completes).
+BEZEL_TEST(task_combinators_1616, when_all_inline_literal_bound_tasks) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    using var ta := Task.FromResult(3); "
+        "    using var tb := Task.FromResult(4); "
+        "    using var w := Task.WhenAll([ta, tb]); "
+        "    await w; "
+        "    var a := await ta; "
+        "    var b := await tb; "
+        "    return a + b; "
+        "  end Main; end C;",
+        7);
+}
+
+// ============================================================
 // stdlib §6.7 line 2885: Task.FireAndForget(owned task: Task)
 // ============================================================
 
