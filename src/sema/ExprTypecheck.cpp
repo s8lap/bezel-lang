@@ -4488,6 +4488,69 @@ bool ExprTC::exprIsOwnedProducerOfNonTrivialDisposeClass(
     return isNonTrivialDisposeClass(t->declaration);
 }
 
+// stdlib §4.13 (v0.196, #1645): the owning-enumeration interfaces
+// `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, and the async pair each
+// constrain `where T: class` — ownership transfer through iteration is
+// meaningful only for class-typed elements (they own a disposable value).
+static bool isOwningEnumerableHead(std::string_view n) {
+    return n == "IOwningEnumerable" || n == "IOwningEnumerator" ||
+           n == "IOwningAsyncEnumerable" || n == "IOwningAsyncEnumerator";
+}
+
+// Is `ta` a class-like element type — a proper user class, or a compiler-known
+// builtin named type with no user TypeDecl (Mutex, OwningArray<T>, …)?  Mirrors
+// the Shared<T>/Weak<T> element-class detection (§28.13, ExprTypecheck_Exprs.cpp):
+// primitives, records, enums, interfaces, and function types are NOT class-like.
+static bool isClassLikeElementArg(const TypeRef* ta) {
+    if (!ta) return false;
+    if (ta->kind == TypeRef::Kind::Named && ta->declaration &&
+        ta->declaration->kind == ast::TypeDeclKind::Class)
+        return true;
+    if (ta->kind == TypeRef::Kind::Named && !ta->declaration &&
+        ta->astNode && ta->astNode->name && !ta->astNode->name->parts.empty())
+        return true;  // builtin named type, no user decl — class-like
+    return false;
+}
+
+// Human-readable name of a non-class element type for the §4.13 diagnostic.
+// Mirrors the Shared<T>/Weak<T> diagnostic name mapping.
+static std::string nonClassElementName(const TypeRef* ta) {
+    if (!ta) return "<no type argument>";
+    if (ta->kind == TypeRef::Kind::Primitive) {
+        using P = sema::PrimitiveType;
+        switch (ta->primitive) {
+            case P::Bool:    return "bool";
+            case P::Char:    return "char";
+            case P::String:  return "string";
+            case P::Byte:    return "byte";
+            case P::SByte:   return "sbyte";
+            case P::Short:   return "short";
+            case P::UShort:  return "ushort";
+            case P::Int:     return "int";
+            case P::UInt:    return "uint";
+            case P::Long:    return "long";
+            case P::ULong:   return "ulong";
+            case P::Float:   return "float";
+            case P::Double:  return "double";
+            case P::Decimal: return "decimal";
+            case P::Object:  return "Object";
+            default:         return "primitive type";
+        }
+    }
+    if (ta->kind == TypeRef::Kind::Function) return "function type";
+    if (ta->kind == TypeRef::Kind::Named && ta->declaration) {
+        std::string name(ta->declaration->name);
+        if (ta->declaration->kind == ast::TypeDeclKind::Interface)
+            name += " (interface)";
+        else if (ta->declaration->kind == ast::TypeDeclKind::Record)
+            name += " (record/value type)";
+        else if (ta->declaration->kind == ast::TypeDeclKind::Enum)
+            name += " (enum/value type)";
+        return name;
+    }
+    return "<non-class type>";
+}
+
 void ExprTC::visitMember(const ast::Member& m) {
     if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
         if (fd->initializer) {
@@ -4611,6 +4674,37 @@ void ExprTC::visitMember(const ast::Member& m) {
         // flag BEFORE visiting the body so checkReturnForm can reject a plain
         // `return;` (the async iterator case slips past §21.7). Restore after.
         bool isIteratorMethod = stmts && stmtsContainYield(*stmts);
+        // stdlib §4.13 (v0.196, #1645): an iterator method declared to return
+        // one of the owning-enumeration interfaces (`IOwningEnumerable<T>`,
+        // `IOwningEnumerator<T>`, or the async pair) must have a CLASS-like
+        // element type T — those interfaces constrain `where T: class` because
+        // iteration transfers ownership of each element, which is meaningful
+        // only for a disposable class value. A value/primitive (or other
+        // non-class) element type was accepted here and then crashed the
+        // owning-iterator lowering (an ICmp type-mismatch on the take/advance
+        // path). Reject it at the source, mirroring the Shared<T>/Weak<T>
+        // element-class rule (§28.13). Plain (non-owning) `IEnumerable<T>`
+        // carries no such constraint and is unaffected.
+        if (isIteratorMethod && md->returnType) {
+            if (TypeRef* rr = ctx_.resolvedType(*md->returnType)) {
+                if (rr->kind == TypeRef::Kind::Named &&
+                    isOwningEnumerableHead(rr->headName()) &&
+                    !rr->genericArgs.empty() && rr->genericArgs[0] &&
+                    !isClassLikeElementArg(rr->genericArgs[0])) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, md->span.begin,
+                        std::string("iterator method `") +
+                        std::string(md->name) + "` returns `" +
+                        std::string(rr->headName()) +
+                        "<T>` but its element type `" +
+                        nonClassElementName(rr->genericArgs[0]) +
+                        "` is not a class — the owning-enumeration interfaces "
+                        "require T to be a class type, because iteration "
+                        "transfers ownership of each element (stdlib \xC2\xA7"
+                        "4.13)");
+                }
+            }
+        }
         // §30.1 / §29.3 (v0.184, #1670): reject `ref`/`out` params on an
         // `async` method or an iterator method (sync or async) — declaration-
         // level, independent of body kind (a block-bodied method is the only
