@@ -132,20 +132,31 @@ CompileResult Driver::compileFile(const std::string& path,
         // THIS module's symbols); the loader adds imported types as a separate,
         // import-gated set. With no dependencies this loop is a no-op and the
         // pipeline is byte-for-byte the single-module path.
-        for (const Dependency& dep : deps) {
-            if (dep.metadataPath.empty()) continue;
-            // §2.8.4 rule 4 (#1733): loadDependency sets `depErr` when it rejects
-            // an executable artifact presented as a dependency; print that (it
-            // names the artifact + its kind) instead of the generic message.
-            std::string depErr;
-            if (!bezel::module::loadDependency(dep.metadataPath, semaCtx,
-                                               &depErr)) {
+        // §2.5 / #1487: load ALL dependencies in two global passes (all exported
+        // type shells registered, then all members filled) so a Named reference
+        // in one dependency to a user type declared in ANOTHER binds by name
+        // regardless of the order the `--import`s are listed. The old per-dep loop
+        // resolved artifact N's references before artifact N+1 loaded, silently
+        // degrading a forward reference to a garbage-valued TypeRef.
+        {
+            std::vector<std::string> depMetaPaths;
+            depMetaPaths.reserve(deps.size());
+            for (const Dependency& dep : deps)
+                if (!dep.metadataPath.empty())
+                    depMetaPaths.push_back(dep.metadataPath);
+            // §2.8.4 rule 4 (#1733): loadDependencies sets `depErr` when it
+            // rejects an executable artifact presented as a dependency; print that
+            // (it names the artifact + its kind) instead of the generic message.
+            std::string depErr, failedPath;
+            if (!depMetaPaths.empty() &&
+                !bezel::module::loadDependencies(depMetaPaths, semaCtx, &depErr,
+                                                 &failedPath)) {
                 if (!depErr.empty())
                     std::cerr << "bezelc: error: " << depErr << "\n";
                 else
                     std::cerr
                         << "bezelc: error: cannot load module metadata from '"
-                        << dep.metadataPath << "'\n";
+                        << failedPath << "'\n";
                 return CompileResult{false, 1};
             }
         }
@@ -265,20 +276,27 @@ CompileResult Driver::compileObject(const std::string& path,
     if (unit && !diagnostics.hasErrors()) {
         sema::SemaContext semaCtx(diagnostics);
         sema::collectSymbols(*unit, semaCtx);
-        // §2.5: a library may itself import dependencies (acyclic).
-        for (const Dependency& dep : deps) {
-            if (dep.metadataPath.empty()) continue;
+        // §2.5: a library may itself import dependencies (acyclic). #1487: load
+        // them in two global passes (see the compileFile path) so cross-artifact
+        // Named references resolve independently of the `--import` order.
+        {
+            std::vector<std::string> depMetaPaths;
+            depMetaPaths.reserve(deps.size());
+            for (const Dependency& dep : deps)
+                if (!dep.metadataPath.empty())
+                    depMetaPaths.push_back(dep.metadataPath);
             // §2.8.4 rule 4 (#1733): reject an executable artifact presented as
             // a dependency — see the compileFile path above for the rationale.
-            std::string depErr;
-            if (!bezel::module::loadDependency(dep.metadataPath, semaCtx,
-                                               &depErr)) {
+            std::string depErr, failedPath;
+            if (!depMetaPaths.empty() &&
+                !bezel::module::loadDependencies(depMetaPaths, semaCtx, &depErr,
+                                                 &failedPath)) {
                 if (!depErr.empty())
                     std::cerr << "bezelc: error: " << depErr << "\n";
                 else
                     std::cerr
                         << "bezelc: error: cannot load module metadata from '"
-                        << dep.metadataPath << "'\n";
+                        << failedPath << "'\n";
                 return CompileResult{false, 1};
             }
         }

@@ -1259,20 +1259,28 @@ static bool parseAndAttachMethodBody(
 
 }  // namespace
 
-bool loadMetadata(const ModuleMetadata& md, sema::SemaContext& ctx) {
-    std::unordered_map<std::string, sema::TypeSymbol*> localTypes;
-    Loader loader{ctx, localTypes};
-
-    // Pass 1: create a TypeSymbol shell per exported type so cross-references
-    // (a member whose type is a sibling exported type) resolve by name (§2.5).
-    std::vector<sema::TypeSymbol*> created;
+// §2.5 / #1487 — Pass 1: create a TypeSymbol shell per exported type AND
+// register it globally, so a cross-reference (a member/base whose type is a
+// sibling or a type from ANOTHER dependency) resolves by name in pass 2
+// regardless of the order in which dependencies are loaded. `localTypes` records
+// this module's own name→shell map (same-module priority in Loader::lookupNamed);
+// `created` is parallel to md.types for pass 2. Registration is done HERE (it
+// used to happen at the end of pass 2, per type) so that a Named reference from a
+// dependency loaded *before* this one still binds to this type's shell — the
+// order-dependent silent-degradation fixed by #1487.
+static void loadMetadataPass1(
+    const ModuleMetadata& md, sema::SemaContext& ctx,
+    std::unordered_map<std::string, sema::TypeSymbol*>& localTypes,
+    std::vector<sema::TypeSymbol*>& created) {
     created.reserve(md.types.size());
     for (const MetaTypeDecl& td : md.types) {
         auto* t = ctx.makeImportedSymbol<sema::TypeSymbol>();
         t->name = ctx.internString(td.name);
         t->kind = fromMetaTypeDeclKind(td.kind);
         t->visibility = fromMetaVisibility(td.visibility);
-        t->modifiers = loader.intern(td.modifiers);
+        t->modifiers.clear();
+        for (const std::string& m : td.modifiers)
+            t->modifiers.push_back(ctx.internString(m));
         t->scope = sema::kModuleScope;
         t->memberScope = ctx.newScope();
         // §9.2 (schema v4, issue #501): carry the positional-record flag so the
@@ -1281,10 +1289,20 @@ bool loadMetadata(const ModuleMetadata& md, sema::SemaContext& ctx) {
         t->hasPositionalFields = td.hasPositionalFields;
         localTypes[td.name] = t;
         created.push_back(t);
+        ctx.registerImportedType(md.moduleName, t);
     }
+}
 
-    // Pass 2: fill generic params, base types, and members (now that every
-    // sibling TypeSymbol exists for by-name binding).
+// §2.5 / #1487 — Pass 2 (+ pass 3 + side-table publish): fill generic params,
+// base types, and members (every dependency's shells are already registered by
+// pass 1, so a Named ref resolves by name whatever the load order), then re-parse
+// exported generic bodies and publish the loader's member-type side tables.
+static void loadMetadataPass2(
+    const ModuleMetadata& md, sema::SemaContext& ctx,
+    std::unordered_map<std::string, sema::TypeSymbol*>& localTypes,
+    const std::vector<sema::TypeSymbol*>& created) {
+    Loader loader{ctx, localTypes};
+
     for (std::size_t i = 0; i < md.types.size(); ++i) {
         const MetaTypeDecl& td = md.types[i];
         sema::TypeSymbol* t = created[i];
@@ -1300,7 +1318,7 @@ bool loadMetadata(const ModuleMetadata& md, sema::SemaContext& ctx) {
             if (sema::Symbol* m = loader.convertMember(mm, *t))
                 t->members.push_back(m);
         }
-        ctx.registerImportedType(md.moduleName, t);
+        // (registration moved to pass 1 for order-independent by-name binding.)
     }
 
     // Pass 3 (§14/#662c, schema v5): for imported generic CLASSES, re-parse
@@ -1404,7 +1422,17 @@ bool loadMetadata(const ModuleMetadata& md, sema::SemaContext& ctx) {
     // codegen can fold an imported `const` read without a storage symbol.
     for (auto& [m, val] : loader.constValues_)
         ctx.setImportedConstValue(m, val);
+}
 
+bool loadMetadata(const ModuleMetadata& md, sema::SemaContext& ctx) {
+    // Single-artifact load: the two passes run back-to-back over one module, so
+    // the observable behaviour is byte-for-byte the pre-#1487 path. The
+    // cross-artifact order-independence fix is loadDependencies, which runs pass 1
+    // over EVERY dependency before pass 2 over any (see below).
+    std::unordered_map<std::string, sema::TypeSymbol*> localTypes;
+    std::vector<sema::TypeSymbol*> created;
+    loadMetadataPass1(md, ctx, localTypes, created);
+    loadMetadataPass2(md, ctx, localTypes, created);
     return true;
 }
 
@@ -1429,6 +1457,68 @@ std::optional<ModuleMetadata> loadDependency(const std::string& artifactPath,
     }
     if (!loadMetadata(*md, ctx)) return std::nullopt;
     return md;
+}
+
+bool loadDependencies(const std::vector<std::string>& artifactPaths,
+                      sema::SemaContext& ctx, std::string* diag,
+                      std::string* failedPath) {
+    // §2.5 / #1487: load a set of dependency artifacts so that a Named type
+    // reference is resolved INDEPENDENTLY of the order they appear on the command
+    // line. The old per-artifact loop (loadDependency once each, in sequence) did
+    // pass 1+2 for artifact N before artifact N+1 even started, so a reference in
+    // an earlier-loaded artifact to a user type declared in a later-loaded one
+    // (e.g. LibM's `Maker.Make(): Payload` when Payload lives in LibB, loaded
+    // second) missed by-name resolution and silently degraded to an
+    // importedName-only TypeRef (declaration=nullptr) — the path meant for
+    // genuinely-external builtins (§29.3 / #495) — yielding a garbage runtime
+    // value. Reconstructing in two GLOBAL passes (all shells registered, then all
+    // members filled) closes that gap while leaving the single-artifact and
+    // builtin-import paths untouched.
+    struct DepState {
+        ModuleMetadata md;
+        std::unordered_map<std::string, sema::TypeSymbol*> localTypes;
+        std::vector<sema::TypeSymbol*> created;
+    };
+    std::vector<DepState> states;
+    states.reserve(artifactPaths.size());
+
+    // Read + validate every dependency FIRST (so a bad/executable artifact is
+    // rejected before any symbol is imported, exactly as loadDependency does).
+    for (const std::string& path : artifactPaths) {
+        std::optional<std::vector<std::uint8_t>> bytes =
+            readMetadataSection(path);
+        if (!bytes) {
+            if (failedPath) *failedPath = path;
+            return false;
+        }
+        std::optional<ModuleMetadata> md = deserialize(*bytes);
+        if (!md) {
+            if (failedPath) *failedPath = path;
+            return false;
+        }
+        // §2.8.4 rule 4 (issue #1733): reject an executable presented as a
+        // dependency (see loadDependency for the rationale).
+        if (md->isExecutable) {
+            if (diag)
+                *diag = "dependency artifact '" + path +
+                        "' is an executable, not a library (§2.8.4 rule 4)";
+            if (failedPath) *failedPath = path;
+            return false;
+        }
+        DepState st;
+        st.md = std::move(*md);
+        states.push_back(std::move(st));
+    }
+
+    // Pass 1 across ALL dependencies: register every exported type's shell, so
+    // the global by-name lookup in pass 2 sees the whole import set at once.
+    for (DepState& st : states)
+        loadMetadataPass1(st.md, ctx, st.localTypes, st.created);
+    // Pass 2 across ALL dependencies: fill members/bases, now that every shell is
+    // registered — a Named ref binds by name whatever the load order.
+    for (DepState& st : states)
+        loadMetadataPass2(st.md, ctx, st.localTypes, st.created);
+    return true;
 }
 
 }  // namespace bezel::module

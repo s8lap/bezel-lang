@@ -69,6 +69,22 @@ std::optional<ModuleMetadata> loadDependency(const std::string& artifactPath,
                                              sema::SemaContext& ctx,
                                              std::string* diag = nullptr);
 
+// §2.5 / issue #1487: load a SET of dependency artifacts so that Named type
+// references resolve INDEPENDENTLY of the order the artifacts are listed. Reads
+// and validates every artifact, then reconstructs them in two global passes —
+// all exported-type shells registered (pass 1), then all members filled (pass 2)
+// — so a reference in one dependency to a user type declared in another binds by
+// name whichever loads first. Loading each dependency separately (a loop over
+// loadDependency) instead resolves each artifact's references against only the
+// artifacts loaded before it, silently degrading a forward reference to a
+// declaration=nullptr TypeRef (garbage runtime value). Returns true on success;
+// on failure returns false and, for an executable-artifact rejection (§2.8.4
+// rule 4), sets `*diag`; `*failedPath` (when non-null) names the offending
+// artifact for a generic "cannot load metadata" message.
+bool loadDependencies(const std::vector<std::string>& artifactPaths,
+                      sema::SemaContext& ctx, std::string* diag = nullptr,
+                      std::string* failedPath = nullptr);
+
 // Load an already-deserialized ModuleMetadata into `ctx` (the artifact bytes
 // were obtained elsewhere — e.g. a sema-level test). Reconstructs and registers
 // the exported types as above. Returns true on success.
