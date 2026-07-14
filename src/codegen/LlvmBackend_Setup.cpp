@@ -9262,7 +9262,14 @@ bool Emitter::isOwnedClassFieldLvalue(const ast::Expr& target) {
     // fields (with generic-type-param substitution) while excluding collection
     // types (which are handled by lowerOwnedCollectionFieldStore) and
     // Shared<T>/Weak<T> (handled by their own refcount release paths).
-    return isOwnedReferenceField(fs);
+    //
+    // #1644 / §29.7: builtin iterator-interface fields (owned IEnumerable<T> /
+    // IOwningEnumerable<T>) also need drop-on-overwrite, but isOwnedReferenceField
+    // rejects them (they have no user `declaration`) — the same root cause #1643
+    // fixed for the SCOPE-END path. Accept them here so lowerOwnedClassFieldStore
+    // disposes the displaced iterator FRAME on reassignment (via the iterator-
+    // vtable slot-1 protocol, mirroring emitOwnedFieldDisposals' iterField branch).
+    return isOwnedReferenceField(fs) || isOwnedIteratorInterfaceField(fs);
 }
 
 
@@ -9303,7 +9310,27 @@ bool Emitter::lowerOwnedClassFieldStore(const ast::Expr& target,
     auto* contBB = llvm::BasicBlock::Create(llvm_, "ocls.cont", currentFn_);
     builder_.CreateCondBr(doDispose, dispBB, contBB);
     builder_.SetInsertPoint(dispBB);
-    emitDisposeAndReclaim(oldVal);
+    // #1644 / §29.7: an owned iterator-interface field (IEnumerable<T> /
+    // IOwningEnumerable<T>) holds an iterator-vtable object whose Dispose is at
+    // slot 1 (iterator format [0]=td,[1]=Dispose,[2]=MoveNext,[3]=Current) — and
+    // that Dispose FREES THE FRAME ITSELF (§29.7). Dispatch slot 1 directly; do
+    // NOT use the class-vtable slot-2 emitDisposeAndReclaim, which would invoke
+    // MoveNext and never free the frame. The doDispose guard above already
+    // excluded null / self-assign, so no per-object null-guard is needed here.
+    // Mirrors emitOwnedFieldDisposals' iterField branch (the scope-end analog).
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
+    if (fs && isOwnedIteratorInterfaceField(fs)) {
+        llvm::Value* vt = builder_.CreateLoad(ptrTy(), oldVal);
+        llvm::Value* dispSlot =
+            builder_.CreateGEP(ptrTy(), vt, {builder_.getInt32(1)});
+        llvm::Value* dispFnPtr = builder_.CreateLoad(ptrTy(), dispSlot);
+        auto* dispTy = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
+        builder_.CreateCall(dispTy, dispFnPtr, {oldVal});
+    } else {
+        emitDisposeAndReclaim(oldVal);
+    }
     builder_.CreateBr(contBB);
     builder_.SetInsertPoint(contBB);
 
