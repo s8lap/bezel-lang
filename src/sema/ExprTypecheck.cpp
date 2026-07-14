@@ -2539,23 +2539,85 @@ static bool typeArgSameBase(const TypeRef* a, const TypeRef* b) {
     return false;
 }
 
-// §12.9: for a COVARIANT position, is `fromArg` a reference-type subtype of
-// `toArg`?  Exact match is always a subtype; PrimitiveType::Object is the
-// universal root; otherwise both must be Named with non-null declarations and
-// `isSubtypeFn(from, to)` must hold.
-static bool typeArgRefSubtype(const TypeRef* fromArg, const TypeRef* toArg,
-                               bool (*isSubtypeFn)(TypeSymbol*, TypeSymbol*)) {
-    if (!fromArg || !toArg) return false;
-    if (typeArgSameBase(fromArg, toArg)) return true;
-    // PrimitiveType::Object is the universal root type.
+// §12.9: recursive type-argument IDENTITY. Two arguments are identical when
+// their bases match (typeArgSameBase) AND every nested generic argument is
+// identical, component-wise. This is the only relation an INVARIANT position
+// (a concrete generic type — Array, records, classes) or a value-typed
+// argument admits (§12.9 "concrete generic types are always invariant"): it is
+// what makes `Array<Dog>` distinct from `Array<Animal>`. Nullability is ignored,
+// matching typeArgSameBase (variance operates on the base type).
+static bool typeArgIdentical(const TypeRef* a, const TypeRef* b) {
+    if (!a || !b) return a == b;
+    if (!typeArgSameBase(a, b)) return false;
+    if (a->genericArgs.size() != b->genericArgs.size()) return false;
+    for (std::size_t i = 0; i < a->genericArgs.size(); ++i)
+        if (!typeArgIdentical(a->genericArgs[i], b->genericArgs[i]))
+            return false;
+    return true;
+}
+
+// §12.9: does `from` reference-convert to `to` in a COVARIANT position — i.e.
+// is `from` `to` or a subtype under §5.1 reference conversions, composed
+// recursively through nested generic arguments? This is the single relation the
+// covariant/contravariant argument checks share (contravariant just swaps the
+// operands). It composes, per §12.9 ("Position is composed across nested type
+// constructors"):
+//   - recursive identity (always convertible; the ONLY relation an invariant
+//     base admits, so `Array<Dog>` does NOT convert to `Array<Animal>`),
+//   - value-typed arguments admit identity only (§12.9 L1592 — no variant
+//     conversion; checked BEFORE the Object root so `IEnumerable<int>` does not
+//     convert to `IEnumerable<Object>`),
+//   - `Object` as the universal root reference type,
+//   - a base-type reference conversion — builtin interface hierarchy walk
+//     (Array<T>→…→IEnumerable<T>) or user-declared subtype chain — followed by
+//     recursion into each shared type parameter per its own variance.
+// Returns false on a genuine mismatch; the caller reports the §5.1 error.
+static bool typeArgCovariantAssignable(
+    const TypeRef* fromArg, const TypeRef* toArg,
+    bool (*isSubtypeFn)(TypeSymbol*, TypeSymbol*)) {
+    if (!fromArg || !toArg) return fromArg == toArg;
+    // Identity (recursive) is always a legal conversion.
+    if (typeArgIdentical(fromArg, toArg)) return true;
+    // §12.9 L1592: a value-typed argument admits no variant conversion — only
+    // identity (already ruled out). Checked before the Object root so
+    // `IEnumerable<int>` is NOT covariantly assignable to `IEnumerable<Object>`.
+    if (isValueTypeArg(fromArg) || isValueTypeArg(toArg)) return false;
+    // `Object` (a Primitive TypeRef) is the universal root reference type.
     if (toArg->kind == TypeRef::Kind::Primitive &&
         toArg->primitive == PrimitiveType::Object)
         return true;
-    // Both Named with user declarations: walk the subtype chain.
-    if (fromArg->kind == TypeRef::Kind::Named &&
-        toArg->kind == TypeRef::Kind::Named &&
-        fromArg->declaration && toArg->declaration)
+    if (fromArg->kind != TypeRef::Kind::Named ||
+        toArg->kind != TypeRef::Kind::Named)
+        return false;
+    // Same base (same declaration, or same builtin name): the base is invariant
+    // or variant per its own kind — recurse into arguments via
+    // variantGenericAssignable, which reads the declared/hardcoded variance and
+    // requires argument identity for an invariant base (e.g. Array).
+    if (typeArgSameBase(fromArg, toArg))
+        return variantGenericAssignable(fromArg, toArg, isSubtypeFn);
+    // Different base, both builtin: `fromArg`'s base must reference-convert to
+    // `toArg`'s base via the builtin interface hierarchy (e.g.
+    // Array<Dog>→IEnumerable<Dog>). Find the ancestor whose base matches
+    // `toArg`, then recurse into its arguments per `toArg`'s variance. No
+    // matching ancestor ⇒ `fromArg` is not a subtype of `toArg` ⇒ reject.
+    // (This is NOT variantGenericAssignable's conservative no-candidate accept,
+    // which is safe only at the top level where the base relation is established
+    // separately — at an argument position the base relation must be proven.)
+    if (!fromArg->declaration && !toArg->declaration) {
+        std::string_view toName = namedTypeSimpleName(toArg);
+        std::vector<std::unique_ptr<TypeRef>> owned;
+        for (const TypeRef* anc : builtinInterfaceAncestorsOf(fromArg, owned))
+            if (namedTypeSimpleName(anc) == toName)
+                return variantGenericAssignable(anc, toArg, isSubtypeFn);
+        return false;
+    }
+    // Different base, both user-declared: the base must be a subtype. Recursing
+    // into the substituted base arguments is a residual (cross-type user-declared
+    // variance), conservatively accepted once the base subtype holds — matching
+    // the top-level cross-declaration treatment.
+    if (fromArg->declaration && toArg->declaration)
         return isSubtypeFn(fromArg->declaration, toArg->declaration);
+    // Mixed builtin/user-declared base: no known relation — reject.
     return false;
 }
 
@@ -2658,30 +2720,20 @@ static bool variantGenericAssignable(
 
         bool ok;
         if (variance == "out") {
-            // Covariant: exact match is always OK; otherwise both args must be
-            // reference types and fromArg must be a subtype of toArg.
-            // §12.9 L1592: value-typed T → variant assignment is forbidden even
-            // for covariant interfaces; only exact-match is permitted.
-            if (typeArgSameBase(fromArg, toArg)) {
-                ok = true;
-            } else if (isValueTypeArg(fromArg) || isValueTypeArg(toArg)) {
-                ok = false;  // per §12.9 L1592
-            } else {
-                ok = typeArgRefSubtype(fromArg, toArg, isSubtypeFn);
-            }
+            // Covariant: fromArg must reference-convert to toArg, composed
+            // recursively through nested generic arguments (§12.9 — a nested
+            // invariant base such as Array requires argument identity, so
+            // `IEnumerable<Array<Dog>>` does NOT admit `IEnumerable<Array<Animal>>`).
+            ok = typeArgCovariantAssignable(fromArg, toArg, isSubtypeFn);
         } else if (variance == "in") {
-            // Contravariant: exact match OK; otherwise toArg must be a
-            // reference-type subtype of fromArg.
-            if (typeArgSameBase(fromArg, toArg)) {
-                ok = true;
-            } else if (isValueTypeArg(fromArg) || isValueTypeArg(toArg)) {
-                ok = false;
-            } else {
-                ok = typeArgRefSubtype(toArg, fromArg, isSubtypeFn);
-            }
+            // Contravariant: toArg must reference-convert to fromArg (operands
+            // swapped), same recursive composition.
+            ok = typeArgCovariantAssignable(toArg, fromArg, isSubtypeFn);
         } else {
-            // Invariant (or unknown variance): exact base match required.
-            ok = typeArgSameBase(fromArg, toArg);
+            // Invariant (or unknown variance): recursive argument identity —
+            // NOT a shallow same-base check, which would ignore nested args and
+            // treat `Array<Dog>` as identical to `Array<Animal>` (§12.9).
+            ok = typeArgIdentical(fromArg, toArg);
         }
 
         if (!ok) return false;
