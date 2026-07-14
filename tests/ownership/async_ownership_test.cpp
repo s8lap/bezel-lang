@@ -17,8 +17,10 @@
 //      suspend-local dropped without discharge on the normal path is
 //      diagnosed; one discharged on every path is clean. An activation-local
 //      (no await in its live range) behaves exactly as a synchronous owned
-//      local — the across-suspend annotation never changes a non-suspend
-//      diagnosis.
+//      local — dropped without discharge it is auto-dropped at scope end with
+//      the §28.3 must-use warning (§28.12 synchronous implicit discharge, v0.184,
+//      #1663), not rejected; the across-suspend annotation never changes a
+//      non-suspend disposition.
 //
 //   2. Pattern A / Pattern B enforcement at the await SITE (§30.5
 //      "Consumer-side rules"; Appendix C.6). For `await <task>` where the
@@ -117,12 +119,17 @@ BEZEL_TEST(async_own_suspend, using_var_suspend_local_clean) {
 
 // An ACTIVATION-local owned value — one whose live range does NOT cross any
 // await — behaves exactly as a synchronous owned local: dropped without
-// discharge is diagnosed. This guards that the across-suspend machinery does
-// not silence a plain leak in an async body. // per §30.5, §28.3
-BEZEL_TEST(async_own_suspend, activation_local_drop_diagnosed_as_today) {
+// discharge it is AUTO-DROPPED at scope end with the §28.3 must-use *warning*
+// (no error), taking the synchronous Dispose() path (§28.12 "implicit discharge
+// is synchronous", v0.184, #1663). It never reaches a suspend point, so it is
+// created-and-disposed within one resume activation and is exactly-once-safe;
+// the across-suspend machinery must not convert this into a hard reject (its
+// pre-#1663 behavior). A local that DOES cross an await stays the reject — see
+// suspend_local_dropped_on_normal_path_diagnosed above. // per §28.12, §28.3
+BEZEL_TEST(async_own_suspend, activation_local_drop_auto_dropped_1663) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new T(); "));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // An activation-local owned value that IS discharged is clean — identical to

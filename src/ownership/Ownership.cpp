@@ -448,6 +448,53 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     }
                 }
             }
+            // §28.12/§30.5 (#1663, v0.184): affine auto-drop for a plain `var`
+            // owned LOCAL in a NON-ITERATOR `async` body whose live range never
+            // crosses an `await`. §28.12's "implicit discharge is synchronous"
+            // settlement makes the auto-drop uniform across body kinds: an owned
+            // local that never reaches a suspension point is created-and-disposed
+            // within a single resume activation — no suspend occurs during its
+            // live range, so task abandonment can never catch it live — and its
+            // scope-end disposal takes the synchronous `Dispose()` path exactly as
+            // the sync case above (registerUsingDisposal → emitDisposals; a plain
+            // `var` is never `await using`, so DisposeAsync is never dispatched,
+            // and the async frame free disposes no locals, so this never doubles
+            // with the §30.5 completion edges). GATED to a local NOT flagged a
+            // suspend-local (suspendLocalDecls_ — a sound over-approximation of
+            // "crosses an await", computed by annotateSuspendLocals): a local that
+            // DOES cross an await stays the §28.3 reject, its frame-teardown
+            // disposal on the §30.5 abandonment edges being a separate piece.
+            // `!sawYield_` keeps async ITERATORS (whose locals are captured into
+            // the iterator frame and disposed at iterator-Dispose) on the reject.
+            // Restricted to the LocalDecl form; an inline `out owned var` in an
+            // async body (ls->decl is an IdentifierExpr, which annotateSuspendLocals
+            // never marks) has no suspend-local signal to gate on, so it keeps the
+            // reject. // per §28.12/§30.5
+            if (isAsync_ && !sawYield_ && !isDestructor_ &&
+                everDischarged_.count(sym) == 0 &&
+                (reassignedLocals.count(sym) == 0 ||
+                 reassignedDropCovered_.count(sym) != 0)) {
+                if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                    if (auto* ld =
+                            dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
+                        if (suspendLocalDecls_.count(ld) == 0) {
+                            const_cast<ast::LocalDecl*>(ld)->autoDropAtScopeEnd =
+                                true;
+                            ctx_.diagnostics().report(
+                                Severity::Warning,
+                                st.obligationOrigin ? st.obligationOrigin->span.begin
+                                                    : SourceLocation{},
+                                std::string("owned value in `") +
+                                std::string(sym->name) +
+                                "` is implicitly disposed at the end of its scope "
+                                "(§28.3 auto-drop); declare it `using var` to make "
+                                "the scope-bound disposal explicit, or `move` / "
+                                "`return` / `.Dispose()` / `_ := …` to discharge it");
+                            continue;
+                        }
+                    }
+                }
+            }
             ctx_.diagnostics().report(
                 Severity::Error,
                 st.obligationOrigin ? st.obligationOrigin->span.begin
