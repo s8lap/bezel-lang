@@ -1,6 +1,18 @@
 #include "sema/ExprTypecheck_impl.hpp"
 
+#include <cmath>
 #include <unordered_set>
+
+// §4.3/§4.4 (v0.190, #1781): decimal literal range-check at formation reuses the
+// runtime's compile-time decimal parser — the SAME entry codegen uses to
+// materialize a decimal literal (LlvmBackend_Exprs.cpp). The runtime is linked
+// into `bezelc`, so these symbols resolve at final link. `bz_decimal_parse_cstr`
+// signals an out-of-range mantissa by storing an OverflowException object in the
+// thread-local `bz_exc` slot (reachable via `bz_exc_addr()`) when handed a
+// non-null OverflowException vtable; we probe that slot then restore it.
+extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
+                                      void* ove_vtable, void* fe_vtable);
+extern "C" void** bz_exc_addr();
 
 namespace bezel::sema {
 
@@ -33,6 +45,34 @@ bool intLiteralMagnitude(std::string_view text, unsigned long long& out) {
     errno = 0;
     out = std::strtoull(digits.c_str(), nullptr, base);
     return true;
+}
+
+// §4.3/§4.4 (v0.190, #1781): true iff the `m`/`M`-suffixed decimal literal
+// `text` denotes a value outside `decimal`'s range. Parses at compile time via
+// the runtime's `bz_decimal_parse_cstr` — the identical parser codegen uses
+// (LlvmBackend_Exprs.cpp) — passing a non-null sentinel OverflowException
+// vtable so an out-of-range mantissa sets the thread-local `bz_exc` slot. The
+// lexer already validated the literal's shape, so `fe_vtable` is null (only
+// OverflowException can fire). The slot is saved and restored around the probe.
+bool decimalLiteralOutOfRange(std::string_view text) {
+    // Strip underscores and the m/M suffix, exactly as codegen does before its
+    // own bz_decimal_parse_cstr call.
+    std::string digits;
+    for (char c : text) {
+        if (c == '_' || c == 'm' || c == 'M') continue;
+        digits.push_back(c);
+    }
+    unsigned char sentinelVtable = 0;   // any non-null address serves as the flag
+    unsigned int dec[4] = {0, 0, 0, 0};
+    void** excSlot = bz_exc_addr();
+    void* saved = *excSlot;
+    *excSlot = nullptr;
+    bz_decimal_parse_cstr(digits.c_str(), dec, &sentinelVtable, nullptr);
+    bool overflowed = (*excSlot != nullptr);
+    // Restore the slot. On overflow the sentinel triggered a small runtime
+    // allocation we intentionally drop — this is the compile-error path.
+    *excSlot = saved;
+    return overflowed;
 }
 
 // §6.2: a primitive that participates in mixed-type arithmetic promotion.
@@ -908,6 +948,46 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 pt = PrimitiveType::Decimal;
             }
             // `d`/`D` → double (already default).
+        }
+        // §4.3 (v0.190, #1781): a floating-point literal denotes the nearest
+        // representable value of its type; a literal whose magnitude exceeds the
+        // type's largest finite value (`1e999` for double, `1e40f` for float) is
+        // a compile error AT FORMATION — it never rounds to ±Infinity (§6.3's
+        // overflow-to-Infinity governs arithmetic operations, not literals).
+        // Range-check here, uniformly with the integer literals of §4.2 above.
+        // The same rule bounds `decimal` (§4.4) against decimal's range.
+        if (pt == PrimitiveType::Decimal) {
+            if (decimalLiteralOutOfRange(fl->text)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, fl->span.begin,
+                    "decimal literal is out of range for `decimal` "
+                    "(magnitude exceeds `decimal.MaxValue`) (\xC2\xA7""4.3)");
+            }
+        } else {
+            // Float/Double: parse the magnitude exactly as codegen does (strip
+            // underscores and the f/F/d/D suffix, then strtod). The value
+            // materialized for `float` is `(float)v`, so check the overflow
+            // against the target type's own largest finite value.
+            std::string digits;
+            for (char c : fl->text) {
+                if (c == '_' || c == 'f' || c == 'F' || c == 'd' || c == 'D')
+                    continue;
+                digits.push_back(c);
+            }
+            if (!digits.empty()) {
+                double v = std::strtod(digits.c_str(), nullptr);
+                bool overflow = (pt == PrimitiveType::Float)
+                                    ? std::isinf(static_cast<float>(v))
+                                    : std::isinf(v);
+                if (overflow) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, fl->span.begin,
+                        std::string("floating-point literal is out of range for "
+                                    "`") + primitiveSpelling(pt) +
+                            "` (magnitude exceeds the largest finite `" +
+                            primitiveSpelling(pt) + "`) (\xC2\xA7""4.3)");
+                }
+            }
         }
         ctx_.setExprType(&e, ctx_.primitiveTypeRef(pt));
         return;
