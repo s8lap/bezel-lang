@@ -9,24 +9,61 @@ llvm::Value* Emitter::loadCodePoint(llvm::Value* strPtr, llvm::Value* idx) {
     llvm::Value* w = builder_.CreateZExt(loadStringWidth(strPtr), i32(), "cp.w");
     llvm::Value* idx64 = idx->getType() == i64() ? idx
                          : builder_.CreateSExt(idx, i64(), "cp.idx64");
-    // Width=1: data[idx]
-    llvm::Value* ptr1 = builder_.CreateGEP(i8Ty, data, idx64, "cp.p1");
-    llvm::Value* val1 = builder_.CreateZExt(
-        builder_.CreateLoad(i8Ty, ptr1, "cp.v1"), i32());
-    // Width=2: ((i16*)data)[idx] → byte offset = idx*2
+    // #1848: dispatch on the string's per-code-point storage width and load ONLY
+    // at the matching width. The earlier form computed all three width loads
+    // (i8/i16/i32) speculatively and selected the right one — but for a narrow
+    // string the i16/i32 loads read idx*2 / idx*4 bytes into a buffer that only
+    // holds idx*width bytes, an out-of-bounds READ past the tail of every short
+    // string (e.g. the width-4 load at idx=0 over "ab" reads bytes 0..3 of a
+    // 3-byte buffer). The discarded value made it benign in practice, but it is
+    // a genuine OOB read (surfaced under generated-code ASan). Branching keeps
+    // only the in-bounds load live on each path: idx < len is guaranteed by
+    // every caller, so idx*width < len*width ≤ the buffer's byte size.
+    auto* w4BB    = llvm::BasicBlock::Create(llvm_, "cp.w4",    currentFn_);
+    auto* w2chkBB = llvm::BasicBlock::Create(llvm_, "cp.w2chk", currentFn_);
+    auto* w2BB    = llvm::BasicBlock::Create(llvm_, "cp.w2",    currentFn_);
+    auto* w1BB    = llvm::BasicBlock::Create(llvm_, "cp.w1",    currentFn_);
+    auto* doneBB  = llvm::BasicBlock::Create(llvm_, "cp.done",  currentFn_);
+
+    llvm::Value* is4 = builder_.CreateICmpEQ(w, builder_.getInt32(4), "cp.is4");
+    builder_.CreateCondBr(is4, w4BB, w2chkBB);
+
+    // Width=4: ((i32*)data)[idx] → byte offset idx*4.
+    builder_.SetInsertPoint(w4BB);
+    llvm::Value* off4 = builder_.CreateMul(idx64, builder_.getInt64(4), "cp.o4");
+    llvm::Value* ptr4 = builder_.CreateGEP(i8Ty, data, off4, "cp.p4");
+    llvm::Value* val4 = builder_.CreateLoad(i32(), ptr4, "cp.v4");
+    auto* w4End = builder_.GetInsertBlock();
+    builder_.CreateBr(doneBB);
+
+    // Width=2 vs width=1.
+    builder_.SetInsertPoint(w2chkBB);
+    llvm::Value* is2 = builder_.CreateICmpEQ(w, builder_.getInt32(2), "cp.is2");
+    builder_.CreateCondBr(is2, w2BB, w1BB);
+
+    // Width=2: ((i16*)data)[idx] → byte offset idx*2, zero-extended.
+    builder_.SetInsertPoint(w2BB);
     llvm::Value* off2 = builder_.CreateMul(idx64, builder_.getInt64(2), "cp.o2");
     llvm::Value* ptr2 = builder_.CreateGEP(i8Ty, data, off2, "cp.p2");
     llvm::Value* val2 = builder_.CreateZExt(
         builder_.CreateLoad(i16Ty, ptr2, "cp.v2"), i32());
-    // Width=4: ((i32*)data)[idx] → byte offset = idx*4
-    llvm::Value* off4 = builder_.CreateMul(idx64, builder_.getInt64(4), "cp.o4");
-    llvm::Value* ptr4 = builder_.CreateGEP(i8Ty, data, off4, "cp.p4");
-    llvm::Value* val4 = builder_.CreateLoad(i32(), ptr4, "cp.v4");
-    // Select on width: if w==4 → val4, elif w==2 → val2, else → val1
-    llvm::Value* is4 = builder_.CreateICmpEQ(w, builder_.getInt32(4), "cp.is4");
-    llvm::Value* is2 = builder_.CreateICmpEQ(w, builder_.getInt32(2), "cp.is2");
-    return builder_.CreateSelect(is4, val4,
-           builder_.CreateSelect(is2, val2, val1), "cp.result");
+    auto* w2End = builder_.GetInsertBlock();
+    builder_.CreateBr(doneBB);
+
+    // Width=1: data[idx], zero-extended.
+    builder_.SetInsertPoint(w1BB);
+    llvm::Value* ptr1 = builder_.CreateGEP(i8Ty, data, idx64, "cp.p1");
+    llvm::Value* val1 = builder_.CreateZExt(
+        builder_.CreateLoad(i8Ty, ptr1, "cp.v1"), i32());
+    auto* w1End = builder_.GetInsertBlock();
+    builder_.CreateBr(doneBB);
+
+    builder_.SetInsertPoint(doneBB);
+    auto* cp = builder_.CreatePHI(i32(), 3, "cp.result");
+    cp->addIncoming(val4, w4End);
+    cp->addIncoming(val2, w2End);
+    cp->addIncoming(val1, w1End);
+    return cp;
 }
 
 // §3.4 / §4.6 / issue #474: `s[range]` — a Range index over a string — returns
