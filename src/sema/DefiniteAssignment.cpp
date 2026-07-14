@@ -273,7 +273,14 @@ public:
         for (std::size_t i = startIdx; i < cd.body.size(); ++i) {
             if (cd.body[i]) visitStmt(*cd.body[i]);
         }
-        if (!terminated_) checkOutParams(/*loc=*/nullptr);
+        if (!terminated_) {
+            checkOutParams(/*loc=*/nullptr);
+            // §7.9 (Appendix C.1): the constructor's fall-off is a normal-exit
+            // path — every non-nullable field must be definitely assigned here.
+            // Reported at the constructor's own location (there is no falling-
+            // off statement to point at).
+            checkCtorFieldCompletion(&cd.span.begin);
+        }
     }
 
 private:
@@ -518,6 +525,11 @@ private:
             if (rs->value) visitExpr(*rs->value);
             // §22.3: every out-param must be assigned at each return.
             checkOutParams(&rs->span.begin);
+            // §7.9 (Appendix C.1): an explicit `return` from a constructor is a
+            // normal-exit path too, so every non-nullable field must already be
+            // assigned on THIS path (a later assignment does not help a path
+            // that returned before it). No-ops outside a constructor.
+            checkCtorFieldCompletion(&rs->span.begin);
             terminated_ = true;
             return;
         }
@@ -1105,6 +1117,39 @@ private:
                     "` is not definitely assigned on every exit path "
                     "(§22.3 — the callee must assign every `out` parameter "
                     "before returning)");
+            }
+        }
+    }
+
+    // §7.9 (Appendix C.1) / §22.7 (v0.184): at a constructor's normal exit — a
+    // fall-off or an explicit `return` — every non-nullable field the class must
+    // initialize (`fieldsNeedingInit_`) must be definitely assigned on THIS path
+    // (`assignedFields_`, threaded as the all-paths join over branches, loops,
+    // and case arms). A field missing here is exactly §7.9's forbidden state: an
+    // object escaping construction with a non-nullable field unset — a null
+    // dereference (SIGSEGV) on first read. The all-paths join makes this sound
+    // where the ownership pass's earlier *any-path* collector (Slice O9) was not:
+    // a field assigned on only some branch/arm/loop paths is now caught, while a
+    // field assigned on every LIVE branch (including one whose sibling diverges,
+    // #1755) is accepted. This is the §7.9 normal-exit completeness gate; the
+    // ownership pass retains only the no-explicit-constructor screen (a class
+    // with such a field and no constructor at all — a shape this pass never
+    // visits). No-ops outside a constructor (`fieldsNeedingInit_` is empty). A
+    // `this(...)` chain seeds every field as assigned (runConstructor), so a
+    // delegating constructor reports nothing here. per §7.9, Appendix C.1
+    void checkCtorFieldCompletion(const SourceLocation* loc) {
+        if (!ctorMode_) return;
+        for (auto n : fieldsNeedingInit_) {
+            if (!assignedFields_.count(n)) {
+                SourceLocation sl;
+                if (loc) sl = *loc;
+                ctx_.diagnostics().report(
+                    Severity::Error, sl,
+                    std::string("constructor does not initialize non-nullable "
+                                "field `") +
+                        std::string(n) +
+                        "` (§7.9 — every constructor's normal-exit path must "
+                        "assign it, or chain to `this(…)`)");
             }
         }
     }

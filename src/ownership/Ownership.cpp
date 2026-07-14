@@ -3984,17 +3984,22 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx) {
 // ---------- Slice O9: owned-field definite-assignment (§7.9) --------
 //
 // Per §7.9 / Appendix C.1, every non-nullable field — which owned
-// class-typed fields are — must be assigned by a field initializer or
-// in every constructor. This slice enforces that for `owned` fields
-// specifically. A `this(...)` chained constructor transfers the
-// responsibility to the chained target. `base(...)` chaining does not
-// — the derived class's fields are still the derived ctor's job.
+// class-typed fields are — must be assigned by a field initializer or by
+// every constructor on every normal-exit path. That per-constructor
+// completeness check is enforced in the definite-assignment pass
+// (checkCtorFieldCompletion in DefiniteAssignment.cpp), which threads the
+// correct ALL-paths field-assignment join across branches, loops, and case
+// arms — the sound placement (#1823/#1755). It supersedes the any-path
+// collector this slice previously ran, which counted a field assigned on ANY
+// path as assigned and so let a partially-assigned field escape construction
+// unset.
 //
-// This is a syntactic over-approximation: we accept any
-// `this.<field> := …` assignment anywhere in the body (not necessarily
-// on every CFG path). The full DA check awaits the CFG-based ownership
-// refactor; for now a constructor that initializes only on some paths
-// passes here but would fail under the stricter pass once landed.
+// What remains here is the one obligation the DA constructor walk cannot see:
+// a class that declares a non-nullable reference field without an initializer
+// AND has NO instance constructor. The DA pass only walks declared
+// constructors, so this no-constructor case (equivalently, synthesized default
+// construction that cannot satisfy the field) is reported here, at the field's
+// declaration site.
 
 // §7.9: a field of non-nullable *reference* type (class, interface,
 // string, function, non-nullable Object) has no default value and must
@@ -4028,100 +4033,6 @@ bool isNonNullableReferenceField(const ast::FieldDecl& f,
     }
 }
 
-// True if `e` assigns a field of the current instance — either
-// `this.<member>` (explicit) or a bare `<field>` that resolves to a field
-// of the declaring class (implicit `this`). §7.9 requires the field to be
-// "assigned"; it does not mandate `this.` qualification, and the bare form
-// resolves to the field in sema and codegen alike.
-bool isDirectThisFieldRef(const ast::Expr& e, std::string_view& outName,
-                          sema::SemaContext& ctx) {
-    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
-        auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
-        if (!id || id->name != "this") return false;
-        outName = ma->member;
-        return true;
-    }
-    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
-        if (auto* fs =
-                dynamic_cast<sema::FieldSymbol*>(ctx.exprSymbol(*id))) {
-            outName = fs->name;
-            return true;
-        }
-    }
-    return false;
-}
-
-// Returns true if the constructor body's first statement is a
-// `this(...)` call (chained-ctor delegation). Per spec the chained
-// target carries the field-initialization burden.
-bool ctorChainsToThis(const ast::ConstructorDecl& cd) {
-    if (cd.body.empty() || !cd.body.front()) return false;
-    auto* es = dynamic_cast<const ast::ExpressionStmt*>(cd.body.front().get());
-    if (!es || !es->expr) return false;
-    auto* call = dynamic_cast<const ast::CallExpr*>(es->expr.get());
-    if (!call || !call->callee) return false;
-    auto* id = dynamic_cast<const ast::IdentifierExpr*>(call->callee.get());
-    return id && id->name == "this";
-}
-
-// Walk the body collecting every owned-field name that gets an
-// outright assignment `this.<f> := …` somewhere in it. This walks
-// recursively into control-flow blocks; over-approximates by counting
-// any path-assignment as definitely-assigned.
-void collectThisFieldAssignments(
-    const std::vector<std::unique_ptr<ast::Stmt>>& body,
-    std::unordered_set<std::string_view>& assigned, sema::SemaContext& ctx);
-
-void collectThisFieldAssignmentsStmt(
-    const ast::Stmt& s,
-    std::unordered_set<std::string_view>& assigned, sema::SemaContext& ctx) {
-    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
-        if (as->op == ":=" && as->target) {
-            std::string_view name;
-            if (isDirectThisFieldRef(*as->target, name, ctx)) {
-                assigned.insert(name);
-            }
-        }
-        return;
-    }
-    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
-        collectThisFieldAssignments(ifs->ifBranch.body, assigned, ctx);
-        for (const auto& el : ifs->elifBranches)
-            collectThisFieldAssignments(el.body, assigned, ctx);
-        collectThisFieldAssignments(ifs->elseBody, assigned, ctx);
-        return;
-    }
-    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-        collectThisFieldAssignments(ws->body, assigned, ctx);
-        return;
-    }
-    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
-        collectThisFieldAssignments(fs->body, assigned, ctx);
-        return;
-    }
-    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
-        collectThisFieldAssignments(dob->body, assigned, ctx);
-        return;
-    }
-    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
-        collectThisFieldAssignments(ts->body, assigned, ctx);
-        for (const auto& arm : ts->catches) {
-            if (arm.body)
-                collectThisFieldAssignmentsStmt(*arm.body, assigned, ctx);
-        }
-        collectThisFieldAssignments(ts->finallyBody, assigned, ctx);
-        return;
-    }
-}
-
-void collectThisFieldAssignments(
-    const std::vector<std::unique_ptr<ast::Stmt>>& body,
-    std::unordered_set<std::string_view>& assigned, sema::SemaContext& ctx) {
-    for (const auto& s : body) {
-        if (s) collectThisFieldAssignmentsStmt(*s, assigned, ctx);
-    }
-}
-
 void checkOwnedFieldDA(const ast::TypeDecl& td, sema::SemaContext& ctx) {
     // Gather non-nullable reference fields without initializers (§7.9).
     // Owned fields are a subset.
@@ -4134,40 +4045,33 @@ void checkOwnedFieldDA(const ast::TypeDecl& td, sema::SemaContext& ctx) {
         ownedNoInit.push_back(f);
     }
     if (ownedNoInit.empty()) return;
-    // Collect ctors.
-    std::vector<const ast::ConstructorDecl*> ctors;
+    // Does this class declare any non-static (instance) constructor?
+    bool hasInstanceCtor = false;
     for (const auto& m : td.members) {
         if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(m.get())) {
-            if (!cd->isStatic) ctors.push_back(cd);
+            if (!cd->isStatic) { hasInstanceCtor = true; break; }
         }
     }
-    // No ctors at all: each owned-without-init field is reported at
-    // its declaration site as needing initialization.
-    if (ctors.empty()) {
+    // No instance constructor at all: nothing assigns the field, and the
+    // synthesized default construction cannot satisfy it — report at each
+    // field's declaration site. This is the ONLY §7.9 field-completeness
+    // obligation the ownership pass still enforces: the per-constructor
+    // normal-exit completeness check now lives in the definite-assignment
+    // pass (checkCtorFieldCompletion in DefiniteAssignment.cpp), which threads
+    // the correct ALL-paths field-assignment join — a soundness fix over the
+    // any-path collector this slice used to run here, which accepted a field
+    // assigned on only some control-flow paths and let a null field escape
+    // construction (a SIGSEGV on first read, #1823) and false-rejected a field
+    // assigned on every live path where one arm diverges (#1755). A class WITH
+    // a constructor is checked there; a class with NONE is not visited by the
+    // DA constructor walk, so that case stays here.
+    if (!hasInstanceCtor) {
         for (auto* f : ownedNoInit) {
             ctx.diagnostics().report(
                 Severity::Error, f->span.begin,
                 std::string("non-nullable field `") + std::string(f->name) +
                 "` needs an initializer or a constructor that assigns "
                 "it (§7.9)");
-        }
-        return;
-    }
-    // Per-ctor: walk body and check assignments cover ownedNoInit.
-    for (auto* cd : ctors) {
-        if (ctorChainsToThis(*cd)) continue; // delegated
-        std::unordered_set<std::string_view> assigned;
-        collectThisFieldAssignments(cd->body, assigned, ctx);
-        for (auto* f : ownedNoInit) {
-            if (!assigned.count(f->name)) {
-                ctx.diagnostics().report(
-                    Severity::Error, cd->span.begin,
-                    std::string("constructor does not initialize "
-                                "non-nullable field `") +
-                    std::string(f->name) +
-                    "` (§7.9 — every constructor's normal-exit path "
-                    "must assign it, or chain to `this(…)`)");
-            }
         }
     }
 }

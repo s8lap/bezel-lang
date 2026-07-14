@@ -11,6 +11,7 @@
 #include "lexer/Lexer.hpp"
 #include "ownership/Ownership.hpp"
 #include "parser/Parser.hpp"
+#include "sema/DefiniteAssignment.hpp"
 #include "sema/ExprTypecheck.hpp"
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
@@ -55,6 +56,28 @@ inline OwnershipResult parseAndCheckOwnership(std::string_view source) {
         sema::collectSymbols(*r.sourceFile, *r.ctx);
         sema::resolveTypes(*r.sourceFile, *r.ctx);
         sema::typecheckExpressions(*r.sourceFile, *r.ctx);
+        ownership::checkOwnership(*r.sourceFile, *r.ctx);
+    }
+    return r;
+}
+
+// §7.9 (Appendix C.1) non-nullable field-init completeness spans two passes:
+// the definite-assignment pass enforces per-constructor normal-exit
+// completeness (checkCtorFieldCompletion, all-paths join), and the ownership
+// pass reports the no-constructor case. This helper drives BOTH in the driver's
+// order (DA before ownership) so a §7.9 field-init test observes the full check
+// regardless of which pass reports — the combination the real `bezelc` runs.
+inline OwnershipResult parseAndCheckFieldInit(std::string_view source) {
+    OwnershipResult r;
+    Lexer lexer(source, r.diagnostics);
+    Parser parser(lexer, r.diagnostics);
+    r.sourceFile = parser.parseCompilationUnit();
+    r.ctx = std::make_unique<sema::SemaContext>(r.diagnostics);
+    if (r.sourceFile) {
+        sema::collectSymbols(*r.sourceFile, *r.ctx);
+        sema::resolveTypes(*r.sourceFile, *r.ctx);
+        sema::typecheckExpressions(*r.sourceFile, *r.ctx);
+        sema::checkDefiniteAssignment(*r.sourceFile, *r.ctx);
         ownership::checkOwnership(*r.sourceFile, *r.ctx);
     }
     return r;
