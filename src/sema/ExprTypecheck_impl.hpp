@@ -1124,6 +1124,18 @@ private:
     std::string moveThroughBorrowedMoveOnlyArrayBindingName(
         const ast::Expr& operand) const;
 
+    // §19.3 / §15.3 (v0.196, #1745): the whole-binding sibling of the above.
+    // If `operand` is a bare identifier `s` naming a `case`/`when` pattern
+    // binding (a LocalSymbol whose `decl` is a pattern `BindingPattern`) over a
+    // MOVE-ONLY owning-inline-array scrutinee, return the bound name; otherwise
+    // the empty string. The binding is a borrow of the scrutinee's value — it
+    // does not own the array — so `move s` (moving the WHOLE binding) is
+    // rejected by `typeUnary`'s `move` branch, just as `move s[i]` (a single
+    // slot) is: laundering the whole borrowed value would duplicate ownership
+    // the original scrutinee still holds.
+    std::string moveThroughBorrowedMoveOnlyArrayWholeBindingName(
+        const ast::Expr& operand) const;
+
     // §30.14 / §3.6 (#600): sendability derived-type property.
     // Returns true iff `rt` satisfies the §30.14 sendable table for a
     // Channel<T> element or Domain.Spawn argument/result.

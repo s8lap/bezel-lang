@@ -111,6 +111,56 @@ BEZEL_TEST(move_only_scrutinee_pattern_binding_borrow_1665,
     BEZEL_EXPECT_TRUE(rejectsMoveThroughPatternBinding(r, "s"));
 }
 
+// §19.3 / §15.3 (v0.196, #1745, follow-up to #1665): moving the WHOLE binding
+// (`var w := move s`, a bare identifier — not an `s[i]` slot) over a move-only
+// `[2 owned]Cell?` scrutinee is rejected for the same reason `move s[0]` is:
+// `s` is a borrow of `slots`, so laundering the whole borrowed value through
+// `move s` would duplicate ownership the original scrutinee still holds (`w`'s
+// scope-end auto-dispose and `slots`'s own later `move slots[i]` both reach the
+// same Cells — a double-free). Before the #1745 fix the slot check matched only
+// the IndexExpr shape, so `move s` compiled clean. REJECTED, naming `s`.
+BEZEL_TEST(move_only_scrutinee_pattern_binding_borrow_1665,
+           move_through_whole_naked_binding_rejected) {
+    auto r = parseAndCheckOwnership(wrap(
+        "do "
+        "  var slots: [2 owned]Cell? := [new Cell(), new Cell()]; "
+        "  case slots of "
+        "    var s => do "
+        "      var w := move s; "
+        "      var t0 := move w[0]; t0!.Dispose(); "
+        "      var t1 := move w[1]; t1!.Dispose(); "
+        "    end "
+        "  end; "
+        "  var w0 := move slots[0]; w0!.Dispose(); "
+        "  var w1 := move slots[1]; w1!.Dispose(); "
+        "end; "
+        "return 0;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(rejectsMoveThroughPatternBinding(r, "s"));
+}
+
+// §19.3 / §15.3 (v0.196, #1745): the whole-binding move in EXPRESSION-position
+// `case` (the arm body is `move s` directly). Same borrow rule, regardless of
+// arm-body shape. REJECTED, naming `s`.
+BEZEL_TEST(move_only_scrutinee_pattern_binding_borrow_1665,
+           move_through_whole_binding_rejected_in_expression_position_case) {
+    auto r = parseAndCheckOwnership(
+        "module M; class Cell public n: int := 0; end Cell; "
+        "class C "
+        "  public static method Grab(slots: [2 owned]Cell?): int "
+        "    var w := case slots of "
+        "      var s => move s "
+        "    end; "
+        "    var t0 := move w[0]; t0!.Dispose(); "
+        "    var t1 := move w[1]; t1!.Dispose(); "
+        "    return 0; "
+        "  end Grab; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(rejectsMoveThroughPatternBinding(r, "s"));
+}
+
 // =============================================================================
 // POSITIVE — slot reads through the binding are admitted; the scrutinee
 // itself stays usable (movable, disposable) after the match.
@@ -153,6 +203,27 @@ BEZEL_TEST(move_only_scrutinee_pattern_binding_borrow_1665,
         "  end; "
         "  var w0 := move slots[0]; w0!.Dispose(); "
         "  var w1 := move slots[1]; w1!.Dispose(); "
+        "end; "
+        "return 0;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §19.3 / §15.3 (v0.196, #1745): the #1745 whole-binding rejection is gated on
+// the operand being a `case`/`when` pattern BINDING (a BindingPattern-declared
+// LocalSymbol) — it must NOT over-reject a move of the ORIGINAL scrutinee. The
+// whole-value move `move slots` of the plain-`var` move-only local (a legal
+// local-to-local move, §15.3) after the match compiles clean. ACCEPTED.
+BEZEL_TEST(move_only_scrutinee_pattern_binding_borrow_1665,
+           whole_move_of_original_scrutinee_after_match_accepted) {
+    auto r = parseAndCheckOwnership(wrap(
+        "do "
+        "  var slots: [2 owned]Cell? := [new Cell(), new Cell()]; "
+        "  case slots of "
+        "    var s => do end "
+        "  end; "
+        "  var moved := move slots; "
+        "  var w0 := move moved[0]; w0!.Dispose(); "
+        "  var w1 := move moved[1]; w1!.Dispose(); "
         "end; "
         "return 0;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

@@ -3466,6 +3466,31 @@ std::string ExprTC::moveThroughBorrowedMoveOnlyArrayBindingName(
     return std::string(id->name);
 }
 
+// §19.3 / §15.3 (v0.196, #1745): the whole-binding sibling of
+// moveThroughBorrowedMoveOnlyArrayBindingName. Detects `operand` = a bare
+// identifier `s` (not an IndexExpr) that resolves to a LocalSymbol whose
+// declaration node is a pattern `BindingPattern` and whose type is a move-only
+// owning inline array (kind == InlineArray && arrayOwned). `move s[i]` (a
+// single slot) is already rejected by the sibling above; this catches `move s`
+// on the WHOLE binding, which the sibling's IndexExpr shape does not match.
+// The binding is a borrow of the scrutinee — moving the whole value out would
+// launder ownership the original scrutinee still holds, a double-ownership
+// hazard identical to the slot case. Returns the bound name when this shape is
+// matched, else the empty string.
+std::string ExprTC::moveThroughBorrowedMoveOnlyArrayWholeBindingName(
+        const ast::Expr& operand) const {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&operand);
+    if (!id) return {};
+    Symbol* sym = ctx_.exprSymbol(*id);
+    auto* loc = dynamic_cast<LocalSymbol*>(sym);
+    if (!loc || !loc->decl) return {};
+    if (!dynamic_cast<const ast::BindingPattern*>(loc->decl)) return {};
+    const TypeRef* tt = ctx_.exprType(*id);
+    if (!tt || tt->kind != TypeRef::Kind::InlineArray || !tt->arrayOwned)
+        return {};
+    return std::string(id->name);
+}
+
 void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
     const auto& op = ue.op;
     // §25: a user-defined unary operator overload.
@@ -3576,6 +3601,26 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                 "array and there is no slot to take ownership of (§19.3 / "
                 "§15.3 — read the slot with the plain indexer, or move from "
                 "the original scrutinee after the match instead)");
+        }
+        // §19.3 / §15.3 (v0.196, #1745): `move s` on the WHOLE binding is
+        // rejected for the same reason as `move s[i]` above — the binding is a
+        // borrow of the scrutinee and owns nothing, so moving the whole value
+        // out would launder ownership the original scrutinee still holds (a
+        // double-ownership hazard). The `patBinding` helper above matches only
+        // the `s[i]` slot shape; this matches the bare identifier `s`.
+        std::string wholePatBinding =
+            moveThroughBorrowedMoveOnlyArrayWholeBindingName(*ue.operand);
+        if (!wholePatBinding.empty()) {
+            ctx_.diagnostics().report(
+                Severity::Error, ue.span.begin,
+                std::string("`move` is not admitted through a `case`/`when` "
+                            "pattern binding of move-only value type: `") +
+                wholePatBinding +
+                "` is a borrow of the scrutinee — the case construct never "
+                "moves from the scrutinee, so the whole binding does not own "
+                "the array and there is nothing to take ownership of (§19.3 / "
+                "§15.3 — read slots with the plain indexer, or move from the "
+                "original scrutinee after the match instead)");
         }
         // §4.14 (#779): `move sp[i]` on a VALUE-typed owning `Span<T>` is not
         // admitted — value elements are read with the plain indexer and copied
