@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.188 — July 2026**
+**Version 0.189 — July 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -165,7 +165,7 @@ The compilation unit — a module, or an import-cycle SCC of modules ([§2.5](#s
 
 Dependencies are declared through `import` statements. In the acyclic case the compiler resolves each dependency by reading the imported module's compiled artifact, which embeds the module's interface ([§2.8.2](#sec-artifact-interface)).
 
-**Circular imports compile as one unit (v0.164 — previously this section permitted circularity while also requiring artifact-based resolution, which are jointly impossible: neither of two mutually-importing modules could be compiled first).** Modules whose imports form a cycle constitute a **strongly-connected component**, and an SCC is the unit of compilation: the build supplies the sources of all SCC members to one compiler invocation, which resolves their types against each other directly (no artifacts consumed within the SCC) and still emits one artifact per member module. A build that presents only part of an SCC is an error naming the missing members. Between SCCs, resolution is artifact-based as above; the module dependency graph condensed by SCCs is processed in topological order. Circular *static-initialization* dependencies are checked per [§22.13](#sec-static-initialization-order)'s two-part rule regardless of compilation grouping: the compile-time approximation rejects the cycles it can see, and the runtime re-entrancy backstop converts the rest into `TypeInitializationException` — never silent observation of partially-initialized statics (v0.181; this sentence previously asserted unconditional rejection).
+Circular imports compile as one unit. Modules whose imports form a cycle constitute a **strongly-connected component**, and an SCC is the unit of compilation: the build supplies the sources of all SCC members to one compiler invocation, which resolves their types against each other directly (no artifacts consumed within the SCC) and still emits one artifact per member module. A build that presents only part of an SCC is an error naming the missing members. Between SCCs, resolution is artifact-based as above; the module dependency graph condensed by SCCs is processed in topological order. Circular *static-initialization* dependencies are checked per [§22.13](#sec-static-initialization-order)'s two-part rule regardless of compilation grouping: the compile-time approximation rejects the cycles it can see, and the runtime re-entrancy backstop converts the rest into `TypeInitializationException` — never silent observation of partially-initialized statics.
 
 <a id="sec-build-phases"></a>
 ### 2.6 Build phases
