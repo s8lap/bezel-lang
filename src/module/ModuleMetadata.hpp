@@ -107,7 +107,24 @@ inline constexpr std::uint32_t kMetadataMagic = 0x644D7A42; // 'B','z','M','d' L
 //     reader rejects a v5 blob via the version check. No bump is required (the
 //     rule: a bump is reserved for a change that makes an old reader MISINTERPRET
 //     an existing field — this only ADDS a trailing record that old readers skip).
-inline constexpr std::uint32_t kSchemaVersion = 5;
+//
+// v6 (issue #1733, spec §2.8.4 rule 4, v0.188): ARTIFACT KIND. ModuleMetadata
+// gains `isExecutable` — true when the artifact was emitted as an executable
+// build (§2.8.4 rule 1: it carries a native entry symbol), false for a library.
+// It rides the MODULE_BLOCK's top-level counts record as a 4th scalar
+// (`[types, functions, constants, isExecutable]`); a reader that finds only 3
+// scalars (a v<=5 blob) reads it as false = library, so existing LIBRARY
+// artifacts still load unchanged (back-compat). The loader
+// (module::loadDependency) reads it to REJECT an executable artifact presented
+// as a dependency — a build error per §2.8.4 rule 4. The additive 4th scalar
+// alone would not require a bump (old readers skip a trailing scalar), but the
+// bump is deliberate: a v5 reader given a v6 executable artifact must REJECT it
+// outright (version > its kSchemaVersion) rather than silently mishandle a
+// native-entry-carrying artifact as a library — the safe direction for a
+// soundness-relevant field. `isExecutable` is NOT folded into semanticHash:
+// artifact kind is a build property, not part of the public-INTERFACE content
+// that staleness detection tracks.
+inline constexpr std::uint32_t kSchemaVersion = 6;
 
 // --- Type representation (decoupled mirror of sema::TypeRef) ----------------
 
@@ -383,6 +400,14 @@ struct ModuleMetadata {
     std::vector<MetaTypeDecl> types;
     std::vector<MetaFunction> functions;
     std::vector<MetaConstant> constants;
+
+    // §2.8.4 rule 1 / rule 4 (issue #1733, schema v6): the artifact's KIND.
+    // true = this artifact was emitted as an EXECUTABLE build (it carries a
+    // native entry symbol); false = a LIBRARY (the default, and the value a
+    // v<=5 blob without this field deserializes to). The loader rejects a
+    // dependency whose artifact is executable-kind (§2.8.4 rule 4). Not part of
+    // the semantic hash (a build property, not public-interface content).
+    bool isExecutable = false;
 
     bool operator==(const ModuleMetadata&) const;
     bool operator!=(const ModuleMetadata& other) const {

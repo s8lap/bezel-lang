@@ -288,7 +288,8 @@ bool MetaConstant::operator==(const MetaConstant& o) const {
 bool ModuleMetadata::operator==(const ModuleMetadata& o) const {
     return moduleName == o.moduleName && exports == o.exports &&
            types == o.types && functions == o.functions &&
-           constants == o.constants;
+           constants == o.constants &&
+           isExecutable == o.isExecutable;  // §2.8.4 rule 4 (#1733, v6)
 }
 
 // --- Serialize --------------------------------------------------------------
@@ -502,8 +503,15 @@ std::vector<std::uint8_t> serializeImpl(const ModuleMetadata& md,
             for (const std::string& e : md.exports) emitString(w, e);
         }
         {
-            llvm::SmallVector<std::uint64_t, 3> counts{
-                md.types.size(), md.functions.size(), md.constants.size()};
+            // §2.8.4 rule 4 (issue #1733, schema v6): isExecutable rides as a
+            // 4th scalar after the three top-level counts. A v<=5 reader reads
+            // only the first three (it never sees a v6 blob — the version bump
+            // makes it reject one); a v6 reader reads the flag, and a v<=5 BLOB
+            // read by a v6 reader has only three scalars → isExecutable = false
+            // (library), preserving back-compat for existing library artifacts.
+            llvm::SmallVector<std::uint64_t, 4> counts{
+                md.types.size(), md.functions.size(), md.constants.size(),
+                md.isExecutable ? 1u : 0u};
             w.EmitRecord(REC_SCALARS, counts);
         }
         for (const MetaTypeDecl& ty : md.types) emitTypeDecl(w, ty);
@@ -1011,8 +1019,12 @@ std::optional<ModuleMetadata> deserialize(
         }
     }
     // Top-level counts.
-    llvm::SmallVector<std::uint64_t, 3> counts;
+    llvm::SmallVector<std::uint64_t, 4> counts;
     if (!expectScalars(r, counts) || counts.size() < 3) return std::nullopt;
+    // §2.8.4 rule 4 (issue #1733, schema v6): the optional 4th scalar is the
+    // artifact-kind flag. Absent (a v<=5 blob) → false = library-kind, so an
+    // existing library artifact still loads as a library (back-compat).
+    md.isExecutable = counts.size() >= 4 && counts[3] != 0;
     md.types.resize(counts[0]);
     for (std::uint64_t i = 0; i < counts[0]; ++i) {
         if (!readTypeDecl(r, md.types[i])) return std::nullopt;

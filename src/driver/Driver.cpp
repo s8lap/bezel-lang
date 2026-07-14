@@ -134,9 +134,18 @@ CompileResult Driver::compileFile(const std::string& path,
         // pipeline is byte-for-byte the single-module path.
         for (const Dependency& dep : deps) {
             if (dep.metadataPath.empty()) continue;
-            if (!bezel::module::loadDependency(dep.metadataPath, semaCtx)) {
-                std::cerr << "bezelc: error: cannot load module metadata from '"
-                          << dep.metadataPath << "'\n";
+            // §2.8.4 rule 4 (#1733): loadDependency sets `depErr` when it rejects
+            // an executable artifact presented as a dependency; print that (it
+            // names the artifact + its kind) instead of the generic message.
+            std::string depErr;
+            if (!bezel::module::loadDependency(dep.metadataPath, semaCtx,
+                                               &depErr)) {
+                if (!depErr.empty())
+                    std::cerr << "bezelc: error: " << depErr << "\n";
+                else
+                    std::cerr
+                        << "bezelc: error: cannot load module metadata from '"
+                        << dep.metadataPath << "'\n";
                 return CompileResult{false, 1};
             }
         }
@@ -185,7 +194,12 @@ CompileResult Driver::compileFile(const std::string& path,
             if (module) {
                 // §14 / #662c: pass `source` so ctor/dtor bodies for generic
                 // classes are span-extracted into the metadata (Foundation C).
-                bezel::module::embedModuleMetadata(*module, semaCtx, source);
+                // §2.8.4 rule 1 (#1733): this is the EXECUTABLE build path
+                // (non-empty outputPath, entry-point-checked above) — record
+                // the artifact as executable-kind so an importer rejects it as a
+                // dependency (§2.8.4 rule 4).
+                bezel::module::embedModuleMetadata(*module, semaCtx, source,
+                                                   /*isExecutable=*/true);
             }
             std::string objectPath = outputPath + ".o";
             std::string err;
@@ -254,9 +268,17 @@ CompileResult Driver::compileObject(const std::string& path,
         // §2.5: a library may itself import dependencies (acyclic).
         for (const Dependency& dep : deps) {
             if (dep.metadataPath.empty()) continue;
-            if (!bezel::module::loadDependency(dep.metadataPath, semaCtx)) {
-                std::cerr << "bezelc: error: cannot load module metadata from '"
-                          << dep.metadataPath << "'\n";
+            // §2.8.4 rule 4 (#1733): reject an executable artifact presented as
+            // a dependency — see the compileFile path above for the rationale.
+            std::string depErr;
+            if (!bezel::module::loadDependency(dep.metadataPath, semaCtx,
+                                               &depErr)) {
+                if (!depErr.empty())
+                    std::cerr << "bezelc: error: " << depErr << "\n";
+                else
+                    std::cerr
+                        << "bezelc: error: cannot load module metadata from '"
+                        << dep.metadataPath << "'\n";
                 return CompileResult{false, 1};
             }
         }

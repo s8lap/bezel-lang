@@ -57,8 +57,17 @@ std::optional<std::vector<std::uint8_t>> readMetadataSection(
 // Returns the deserialized ModuleMetadata on success (so the driver can report
 // the module name) or std::nullopt on any failure (no section / bad bytes /
 // unreadable artifact).
+//
+// §2.8.4 rule 4 (issue #1733, v0.188): a dependency artifact must be
+// library-kind. If the artifact is executable-kind (ModuleMetadata::isExecutable
+// — it carries a native entry symbol), the load FAILS: std::nullopt is returned
+// and, when `diag` is non-null, `*diag` is set to a human-readable build error
+// naming the artifact and its kind for the caller to print. `diag` is left
+// untouched for every OTHER failure mode, so the caller distinguishes the
+// §2.8.4 rejection from an unreadable/corrupt artifact.
 std::optional<ModuleMetadata> loadDependency(const std::string& artifactPath,
-                                             sema::SemaContext& ctx);
+                                             sema::SemaContext& ctx,
+                                             std::string* diag = nullptr);
 
 // Load an already-deserialized ModuleMetadata into `ctx` (the artifact bytes
 // were obtained elsewhere — e.g. a sema-level test). Reconstructs and registers

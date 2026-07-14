@@ -76,7 +76,15 @@ ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
 // the byte length of the embedded blob.
 //
 // `source` — see buildModuleMetadata.
+//
+// `isExecutable` (§2.8.4 rule 1 / rule 4, issue #1733) — the artifact KIND to
+// record in the metadata: true for an executable build (the driver's
+// compileFile path, which carries a native entry symbol), false for a library
+// (the `-c` compileObject path, the default). module::loadDependency reads it
+// back to reject an executable artifact presented as a dependency (§2.8.4
+// rule 4).
 std::size_t embedModuleMetadata(llvm::Module& module, sema::SemaContext& ctx,
-                                std::string_view source = {});
+                                std::string_view source = {},
+                                bool isExecutable = false);
 
 }  // namespace bezel::module

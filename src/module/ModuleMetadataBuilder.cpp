@@ -685,11 +685,15 @@ ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
 }
 
 std::size_t embedModuleMetadata(llvm::Module& module, sema::SemaContext& ctx,
-                                std::string_view source) {
+                                std::string_view source, bool isExecutable) {
     // §2.6 step 4: build → serialize → embed. Build the by-value metadata for
     // the just-compiled module and serialize it with Increment 1's bitstream
     // codec.
     ModuleMetadata md = buildModuleMetadata(ctx, source);
+    // §2.8.4 rule 1 / rule 4 (issue #1733, schema v6): record the artifact kind
+    // so module::loadDependency can reject this artifact if it is presented as a
+    // dependency while being an executable (it carries a native entry symbol).
+    md.isExecutable = isExecutable;
     std::vector<std::uint8_t> bytes = serialize(md);
 
     llvm::LLVMContext& llvm = module.getContext();

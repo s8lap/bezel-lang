@@ -1409,12 +1409,24 @@ bool loadMetadata(const ModuleMetadata& md, sema::SemaContext& ctx) {
 }
 
 std::optional<ModuleMetadata> loadDependency(const std::string& artifactPath,
-                                             sema::SemaContext& ctx) {
+                                             sema::SemaContext& ctx,
+                                             std::string* diag) {
     std::optional<std::vector<std::uint8_t>> bytes =
         readMetadataSection(artifactPath);
     if (!bytes) return std::nullopt;
     std::optional<ModuleMetadata> md = deserialize(*bytes);
     if (!md) return std::nullopt;
+    // §2.8.4 rule 4 (issue #1733, v0.188): "Presenting an executable artifact as
+    // a dependency is a build error naming the artifact and its kind." An
+    // executable carries a native entry symbol; admitting it as a dependency
+    // re-opens rule 3's entry-point perturbation hole from the other side. Reject
+    // BEFORE loadMetadata imports any of its symbols.
+    if (md->isExecutable) {
+        if (diag)
+            *diag = "dependency artifact '" + artifactPath +
+                    "' is an executable, not a library (§2.8.4 rule 4)";
+        return std::nullopt;
+    }
     if (!loadMetadata(*md, ctx)) return std::nullopt;
     return md;
 }
