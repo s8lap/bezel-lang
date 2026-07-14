@@ -22,10 +22,18 @@
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::runAotChecked;
 
 namespace {
 int run(const std::string& src) {
     auto r = runAot(src);
+    return r.ran ? r.exitCode : -999;
+}
+// #1845: same as run() but the generated code is ASan/LSan-instrumented — a
+// heap-buffer-overflow / UAF / leak flips r.ran to false (→ -999), so a
+// memory-unsafe program fails the exit-code assertion.
+int runChecked(const std::string& src) {
+    auto r = runAotChecked(src);
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace
@@ -196,6 +204,73 @@ BEZEL_TEST(linq_complete, zip_spec_5) {
         "  for var z in a.Zip(b, (x: int, y: int) => x + y) do s := s + z; n := n + 1; end; "
         "  return int(s = 33 and n = 2); "  // 11 + 22, length 2 (shorter)
         "end Main; end C;"), 1);
+}
+
+// --- Zip with a `string` element type (#1845): the combiner is `(T,U)->R` and
+// its parameters were left UN-annotated, so before the fix sema never seeded
+// them → the combiner's return type R never resolved → the Zip result was typed
+// IEnumerable<T> (the receiver element) instead of IEnumerable<R>, and codegen
+// sized the yielded element / built the combine trampoline+closure return by the
+// wrong type. Two distinct faults, both requiring `string` (a runtime-managed
+// reference) as one of T/U/R. The existing `zip_spec_5` above cannot catch these
+// — its params are annotated `(x: int, y: int)`, so R was always resolved.
+
+// MEMORY-SAFETY regression (stdlib §5 Zip<U,R> / spec §29.4 lazy evaluation,
+// v0.196): a `string`-RECEIVER Zip with an `int` result. Before the fix the
+// result was typed IEnumerable<string>, so the for-loop consumer read the 4-byte
+// int `cur` at 8-byte (string) width → deterministic heap-buffer-overflow READ
+// of size 8 (SIGSEGV). runAotChecked's ASan catches it: fails-without (r.ran
+// false → -999), passes-with (3, ASan-clean).
+BEZEL_TEST(linq_complete, zip_string_receiver_int_result_no_overflow_spec_5) {
+    // "aa".Length + "x".Length = 2 + 1 = 3. Un-annotated (p, q) infer to string.
+    BEZEL_EXPECT_EQ(runChecked(
+        "module M; import System.Collections.Generic; import System.Collections.Linq; "
+        "class C public static method Main(): int "
+        "  using var a: Array<string> := [\"aa\"]; "
+        "  using var b: Array<string> := [\"x\"]; "
+        "  var s := 0; "
+        "  for var v in a.Zip(b, (p, q) => p.Length + q.Length) do s := s + v; end; "
+        "  return s; "
+        "end Main; end C;"), 3);
+}
+
+// MALFORMED-IR regression (stdlib §5 Zip<U,R> / spec §29.4, v0.196): a
+// `string`-RESULT combiner `(p, q) => p + q`. Before the fix R stayed unresolved,
+// so the combine closure returned `ptr` (string) against an `i32`-typed function
+// → "Function return type does not match operand type of return inst" → the
+// compile ABORTED. Fails-without (compile abort → r.ran false → -999),
+// passes-with (compiles; "aa"+"x" = "aax", .Length = 3).
+//
+// NOTE: uses runAot (value oracle), NOT runAotChecked — a string-producing lazy
+// projection lambda leaks its owned result today (pre-existing, general to
+// Select/Zip; tracked as #1849), which LSan would flag. This test guards the
+// malformed-IR compile regression on the VALUE; #1849 covers the leak.
+BEZEL_TEST(linq_complete, zip_string_result_combiner_compiles_spec_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System.Collections.Generic; import System.Collections.Linq; "
+        "class C public static method Main(): int "
+        "  using var a: Array<string> := [\"aa\"]; "
+        "  using var b: Array<string> := [\"x\"]; "
+        "  var n := 0; "
+        "  for var v in a.Zip(b, (p, q) => p + q) do n := n + v.Length; end; "
+        "  return n; "
+        "end Main; end C;"), 3);
+}
+
+// Value-type control (stdlib §5 Zip<U,R> / spec §29.4, v0.196): un-annotated
+// (p, q) over int arrays — the common value case. Confirms the new combiner
+// param-seeding does not regress inferred value-typed Zips and stays ASan-clean.
+BEZEL_TEST(linq_complete, zip_value_result_inferred_params_no_regression_spec_5) {
+    // [1,2,3] zip [10,20] with (p,q)=>p+q = [11,22]; sum = 33 (length = shorter).
+    BEZEL_EXPECT_EQ(runChecked(
+        "module M; import System.Collections.Generic; import System.Collections.Linq; "
+        "class C public static method Main(): int "
+        "  using var a: Array<int> := [1, 2, 3]; "
+        "  using var b: Array<int> := [10, 20]; "
+        "  var s := 0; "
+        "  for var v in a.Zip(b, (p, q) => p + q) do s := s + v; end; "
+        "  return s; "
+        "end Main; end C;"), 33);
 }
 
 // --- Laziness witness: Concat over a Where pipeline does not over-enumerate ---

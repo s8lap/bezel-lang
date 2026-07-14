@@ -4296,6 +4296,18 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     else if (auto aggP = aggregateFoldLambdaParamTypes(*ce);
                              aggP.size() == 2 && lam->params.size() == 2)
                         pendingLambdaParamTypes_ = aggP;
+                    // stdlib §5 Combination (#1845): a `Zip(other, (p, q) => …)`
+                    // combine lambda is `(T, U) -> R` — seed BOTH params (T from
+                    // the receiver element, U from the `other` arg's element) so
+                    // an un-annotated `(p, q)` resolves its body and its return
+                    // type R. Without this R stays unresolved: the Zip result is
+                    // typed IEnumerable<T> (not IEnumerable<R>) and codegen sizes
+                    // the yielded element / combine trampoline return by the wrong
+                    // type — a heap overflow for an `int` R over a `string`
+                    // receiver, or malformed IR for a `string` R.
+                    else if (auto zipP = zipCombineLambdaParamTypes(*ce);
+                             zipP.size() == 2 && lam->params.size() == 2)
+                        pendingLambdaParamTypes_ = zipP;
                     // fix #829: a lambda bound to a function-typed parameter
                     // `(T1, …, Tn) -> R` — thread the positional Ti so an untyped
                     // lambda arg `(a, b) => …` gets its inferred param types (the

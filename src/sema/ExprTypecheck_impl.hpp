@@ -321,6 +321,20 @@ private:
     // is typed as the element type (its body can then resolve `p.x`).
     TypeRef* linqLambdaElementType(const ast::Expr* callee);
 
+    // stdlib §5 / §9.6: the element type T of a LINQ *source* TypeRef (a
+    // collection, lazy IEnumerable sentinel, Range<T>, or string). Factored out
+    // of linqLambdaElementType so both a LINQ operator's receiver element and a
+    // Zip combiner's `other` element (U) can be derived uniformly. Null when the
+    // TypeRef is not a LINQ source.
+    TypeRef* linqSourceElementType(TypeRef* recvTy);
+
+    // stdlib §5 Combination (#1845): for a `Zip(other, (p, q) => …)` call, return
+    // the combine lambda's two parameter types {T, U} — T = the receiver's source
+    // element, U = the `other` argument's source element — so an untyped `(p, q)`
+    // combiner gets its parameters typed (its body then resolves and its return
+    // type R is known). Empty when not such a call.
+    std::vector<TypeRef*> zipCombineLambdaParamTypes(const ast::CallExpr& ce);
+
     // stdlib §5 (#1124): for an `Aggregate(seed, (acc, x) => …)` call, return the
     // fold lambda's two parameter types {TAccum, T} — TAccum = the seed argument's
     // type, T = the source element type — so an untyped `(acc, x)` fold lambda gets

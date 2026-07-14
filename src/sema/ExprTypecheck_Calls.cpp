@@ -7310,7 +7310,18 @@ TypeRef* ExprTC::linqLambdaElementType(const ast::Expr* callee) {
         // IOrderedEnumerable<T> (the lazy sentinel); genericArgs[0] = T.
         m == "ThenBy" || m == "ThenByDescending";
     if (!elemLambda) return nullptr;
-    auto* recvTy = ctx_.exprType(*ma->target);
+    return linqSourceElementType(ctx_.exprType(*ma->target));
+}
+
+// stdlib §5 / §9.6: the element type T of a LINQ *source* TypeRef — the
+// receiver of a LINQ operator, or the `other` argument of a set-like/Zip
+// operator. A collection (Array/Set/… — Named with astNode, no declaration),
+// a lazy IEnumerable sentinel (Named with neither), a `Range<T>` (#775), and
+// `string` (IEnumerable<char>, §9.6) are all valid sources; a Dictionary
+// yields DictionaryEntry<K,V>. Returns null for anything that is not a LINQ
+// source. Factored out of linqLambdaElementType so both the receiver element
+// (T) and the `other` element (U) of a Zip combiner can be derived uniformly.
+TypeRef* ExprTC::linqSourceElementType(TypeRef* recvTy) {
     if (!recvTy) return nullptr;
     // fix #1220 / §9.6: string is IEnumerable<char> — seed the LINQ lambda
     // param with char so `s.Where((c) => c = 'A')` types `c` as char and the
@@ -7387,6 +7398,31 @@ std::vector<TypeRef*> ExprTC::aggregateFoldLambdaParamTypes(const ast::CallExpr&
     if (recvTy->declaration && recvTy->declaration->name != "Range")
         return {};
     return { seedTy, recvTy->genericArgs[0] };            // {TAccum, T}
+}
+
+// stdlib §5 Combination / issue #1845: `src.Zip(other, (p, q) => …)` — the
+// combine lambda is `(T, U) -> R`, where T is the receiver's source element
+// and U is the `other` argument's source element. Return {T, U} so an
+// un-annotated `(p, q)` combiner gets its parameters typed before its body is
+// visited, and thus its return type R resolves. Without this the combiner's
+// return type stays unresolved: sema types the Zip result as IEnumerable<T>
+// (the srcElem fallback in typeLinqOperator) rather than IEnumerable<R>, and
+// codegen sizes the yielded element / builds the combine trampoline+closure
+// return by the wrong type. When R is `int` over a `string` receiver, the
+// consumer reads the 4-byte result at 8-byte (string) width → heap overflow;
+// when R is `string`, the closure returns `ptr` against an `i32`-typed
+// function → malformed IR aborts compilation. (Mirrors the two-parameter
+// Aggregate fold seeding above; the single-param linqLambdaElementType does
+// not apply because the two params come from different sources.) Empty otherwise.
+std::vector<TypeRef*> ExprTC::zipCombineLambdaParamTypes(const ast::CallExpr& ce) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+    if (!ma || !ma->target || ma->member != "Zip" || ce.args.size() < 2)
+        return {};
+    if (!ce.args[0].value) return {};
+    TypeRef* elemT = linqSourceElementType(ctx_.exprType(*ma->target));      // T
+    TypeRef* elemU = linqSourceElementType(ctx_.exprType(*ce.args[0].value)); // U
+    if (!elemT || !elemU) return {};
+    return { elemT, elemU };                              // {T, U}
 }
 
 // per §24.3: enforce the event visibility fence. `op` is the producer-side
