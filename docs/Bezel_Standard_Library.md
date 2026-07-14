@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.189 — July 2026**
+**Companion to the Bezel Language Specification, v0.190 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -3342,6 +3342,8 @@ end TaskCompletionSource;
 ### 6.7 `Task` static helpers
 
 See [§30.10](Bezel_Language_Spec.md#sec-standard-library-task-helpers) of the language spec for the full list. They live on `Task` and `Task<T>`.
+
+**Task-family returns are caller-owned productions (v0.190).** Every method in this library whose declared return type is `Task`, `Task<T>`, or `OwningTask<T>` — the async acquisitions (`AcquireAsync`/`TryAcquireAsync`, §6.2–§6.3), `Locked<T>`/`RwLocked<T>`'s `LockAsync`/`ReadAsync`/`WriteAsync` families (§6.11), `Channel<T>.Receive`/`SendAsync` (§6.9), stream and file I/O (`ReadAsync`/`WriteAsync`/`ReadAllAsync`, §7.1–§7.3), `RaiseAsync` (§6.5), `TaskScope.Join` (§6.10), `IAsyncDisposable.DisposeAsync` and `MoveNextAsync` (§2.10, §4.12–§4.13), and the static helpers below — mints a **fresh task owned by the caller** at every call site (language spec [§28.3](Bezel_Language_Spec.md#sec-producers), v0.190). The signatures carry no `owned` marker: the `Task`-family return type is itself the transfer announcement. Where a signature does spell it out — `Domain.Spawn(...): owned Task` (§6.8), the `Parallel` combinators (§6.12) — the marker states the same contract explicitly and is retained for emphasis at the domain boundary; it is not a semantic difference from the unmarked async forms. Stored tasks are exposed as **properties** (`TaskCompletionSource<T>.Task`, `OwningTaskCompletionSource<T>.Task`, §6.6), whose reads are borrows of the source's storage (spec [§30.11](Bezel_Language_Spec.md#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet)).
 
 ```bezel
 public class Task
