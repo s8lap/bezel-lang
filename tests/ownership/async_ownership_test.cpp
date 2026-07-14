@@ -331,12 +331,19 @@ BEZEL_TEST(async_own_patternB, await_into_plain_var_discharged_clean) {
 // statically-detectable slice of the §30.4 single-consumer rule — diagnosed.
 // (The general cross-method / aliased second await is NOT statically
 // preventable per Appendix C.6 and is left to the runtime.) // per §30.5, §30.4
-BEZEL_TEST(async_own_patternB, second_await_of_consumed_task_diagnosed) {
+// Pattern B: a `using var`-bound task is §28.3-immovable, so `await t` reads it
+// as a BORROW, not a consume — a second await is therefore NOT statically
+// prevented; the single-consumer guarantee is the runtime InvalidOperationException
+// (§30.5 / Appendix C.6, v0.196). The compile-time moved-from error is reserved for
+// a *plain* owned local (see the plain-local reject test). The runtime IOE is pinned
+// by the #1785 runAotChecked gtest. (Corrected with #1785 — this previously asserted
+// a static error, the pre-v0.196 spec-incorrect behavior.)
+BEZEL_TEST(async_own_patternB, second_await_of_usingvar_task_not_statically_diagnosed) {
     auto r = parseAndCheckOwnership(wrap(
         "using var t := p.MakeOwned(); "
         "using var a := await t; "
         "using var b := await t; "));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // Pattern B: `return await Producer()` from an `OwningTask<T>`-returning async
