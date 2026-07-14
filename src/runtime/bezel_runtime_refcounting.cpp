@@ -33,9 +33,26 @@ static std::vector<bz_static_owned_entry_t>* g_static_owned = nullptr;
 
 static void bz_dispose_static_owned(void) {
     if (!g_static_owned) return;
-    // Reverse init order (§22.13): last-initialized is first-disposed.
-    for (int i = (int)g_static_owned->size() - 1; i >= 0; --i) {
-        void* obj = (*g_static_owned)[i].obj;
+    // §22.13 (v0.196) / #1799: DRAIN the registry LIFO, do not iterate a
+    // fixed index range captured once. Popping from the back disposes in
+    // reverse-of-registration = reverse-of-initialization order (last-initialized
+    // first-disposed), AND picks up any entry appended mid-pass: a destructor the
+    // pass invokes may make its FIRST touch of an as-yet-uninitialized type, whose
+    // lazy static initialization (permitted at exit, §22.12 rule 1) constructs a
+    // static owned field and calls bz_register_static_owned → push_back onto THIS
+    // same vector. The old `for i = size()-1 .. 0` bound was evaluated once at
+    // entry, so such a late entry was left undisposed → leak. The drain takes it
+    // next (LIFO = "reverse order of its own initialization", §22.13); strict
+    // reverse order is guaranteed only among pre-exit initializations, exactly as
+    // the spec states. The vector is deleted ONLY after the drain empties, so a
+    // late push_back always lands in a live vector.
+    while (!g_static_owned->empty()) {
+        // Copy-then-pop: hold NO reference into the vector across the Dispose call
+        // below — Dispose may trigger a bz_register_static_owned push_back that
+        // reallocates the vector's buffer.
+        bz_static_owned_entry_t entry = g_static_owned->back();
+        g_static_owned->pop_back();
+        void* obj = entry.obj;
         if (!obj) continue;
         // vtable layout (CG35-itable): [0]=td$, [1]=itmap$, [2]=Dispose.
         // Dispose is idempotent — a prior explicit .Dispose() is a no-op here.
