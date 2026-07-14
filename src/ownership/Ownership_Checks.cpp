@@ -1,7 +1,10 @@
 #include "ownership/Ownership_impl.hpp"
 
+#include <algorithm>
 #include <functional>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace bezel::ownership {
@@ -3212,10 +3215,23 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
             // spuriously make a consumed binding look "used after". Compound
             // assignments and field/index targets do read, so record those.
             auto* tid = dynamic_cast<const ast::IdentifierExpr*>(as->target.get());
-            if (tid && as->op == ":=")
+            if (tid && as->op == ":=") {
                 noteLoopScanOffset(tid->span.begin.offset);  // extent only
-            else
+                // §28.3 (#1741): a plain `:=` rebind of a borrow-bearing-record
+                // / span local retires its old carried source and installs the
+                // new producer's source at this offset, so a later use of the
+                // local keeps the NEW source live rather than the stale one.
+                // Only at depth 0, where the rebind is unconditional and
+                // definitely retires the old view; a conditional rebind might
+                // not execute, so the old source stays live on the not-taken
+                // paths (windows left open — sound over-rejection).
+                if (borrowUseCondDepth_ == 0 && as->value)
+                    if (sema::Symbol* lsym = ctx_.exprSymbol(*tid))
+                        recollectRecordBorrowSourceOnReassign(
+                            lsym, *as->value, tid->span.begin.offset);
+            } else {
                 recordBorrowUseExpr(*as->target);
+            }
         }
         return;
     }
@@ -3248,6 +3264,11 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        // §28.3 (#1741): branch bodies are conditional — a span reassignment
+        // inside one might not execute, so it must not retire an old source on
+        // the not-taken paths. Raise the depth so the AssignmentStmt case skips
+        // the precise window retirement (leaving the sound over-rejection).
+        ++borrowUseCondDepth_;
         if (ifs->ifBranch.condition) recordBorrowUseExpr(*ifs->ifBranch.condition);
         collectBorrowUses(ifs->ifBranch.body);
         for (const auto& el : ifs->elifBranches) {
@@ -3255,9 +3276,11 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
             collectBorrowUses(el.body);
         }
         collectBorrowUses(ifs->elseBody);
+        --borrowUseCondDepth_;
         return;
     }
     if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        ++borrowUseCondDepth_;  // per §28.3 (#1741): loop body is conditional
         loopScanStack_.push_back({UINT32_MAX, 0});
         if (ws->condition) recordBorrowUseExpr(*ws->condition);
         collectBorrowUses(ws->body);
@@ -3268,9 +3291,11 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
             noteLoopScanOffset(lr.second);
             loopBodySpans_.push_back(lr);
         }
+        --borrowUseCondDepth_;
         return;
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        ++borrowUseCondDepth_;  // per §28.3 (#1741): loop body is conditional
         loopScanStack_.push_back({UINT32_MAX, 0});
         if (fs->iterable) recordBorrowUseExpr(*fs->iterable);
         if (fs->withExpr) recordBorrowUseExpr(*fs->withExpr);
@@ -3282,18 +3307,49 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
             noteLoopScanOffset(lr.second);
             loopBodySpans_.push_back(lr);
         }
+        --borrowUseCondDepth_;
         return;
     }
     if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        // A `do…end` block always executes — unconditional, so depth is
+        // unchanged and a straight-line reassignment inside it is still precise.
         collectBorrowUses(dob->body);
         return;
     }
     if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        // §28.3 (#1741): try / catch / finally bodies may execute partially or
+        // not at all — conditional, so raise the depth (sound over-rejection).
+        ++borrowUseCondDepth_;
         collectBorrowUses(ts->body);
         for (const auto& arm : ts->catches)
             if (arm.body) collectBorrowUsesStmt(*arm.body);
         collectBorrowUses(ts->finallyBody);
+        --borrowUseCondDepth_;
         return;
+    }
+}
+
+void MethodOwnership::collectRecordBorrowRoots(
+    const ast::Expr& e, const sema::Symbol* self,
+    std::vector<const sema::Symbol*>& srcs) {
+    auto addRoot = [&](const ast::Expr& sub) {
+        // The carried source is the identifier at the root of the chain:
+        // `buf.AsSpan()` / `s.Slice(r)` → `buf` / `s`, a bare alias `s` → `s`.
+        if (const ast::IdentifierExpr* r = identifierRoot(sub)) {
+            if (sema::Symbol* sym = ctx_.exprSymbol(*r))
+                if (sym != self) srcs.push_back(sym);
+        }
+    };
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        // A `new Rec(a, b)` borrow-bearing record carries a borrow from each
+        // borrow-carrying constructor argument; record every arg root (the
+        // spec's "every carried borrow's source"). Over-recording a value-typed
+        // arg root is harmless — a value arg can never be an owned binding the
+        // freeze protects, so it never matches a consumed binding.
+        for (const ast::CallArgument& a : ne->args)
+            if (a.value) addRoot(*a.value);
+    } else {
+        addRoot(e);
     }
 }
 
@@ -3309,26 +3365,62 @@ void MethodOwnership::collectRecordBorrowSource(const ast::LocalDecl& ld) {
     sema::LocalSymbol* lsym = findLocalSymbol(ld);
     if (!lsym) return;
     std::vector<const sema::Symbol*> srcs;
-    auto addRoot = [&](const ast::Expr& e) {
-        // The carried source is the identifier at the root of the chain:
-        // `buf.AsSpan()` / `s.Slice(r)` → `buf` / `s`, a bare alias `s` → `s`.
-        if (const ast::IdentifierExpr* r = identifierRoot(e)) {
-            if (sema::Symbol* sym = ctx_.exprSymbol(*r))
-                if (sym != lsym) srcs.push_back(sym);
-        }
-    };
-    if (auto* ne = dynamic_cast<const ast::NewExpr*>(ld.initializer.get())) {
-        // A `new Rec(a, b)` borrow-bearing record carries a borrow from each
-        // borrow-carrying constructor argument; record every arg root (the
-        // spec's "every carried borrow's source"). Over-recording a value-typed
-        // arg root is harmless — a value arg can never be an owned binding the
-        // freeze protects, so it never matches a consumed binding.
-        for (const ast::CallArgument& a : ne->args)
-            if (a.value) addRoot(*a.value);
-    } else {
-        addRoot(*ld.initializer);
+    collectRecordBorrowRoots(*ld.initializer, lsym, srcs);
+    if (srcs.empty()) return;
+    // §28.3 (#1741): the declaration opens each source's view window at the
+    // initializer offset and leaves it open (until = MAX) until a later
+    // straight-line reassignment retires it.
+    const std::uint32_t from = ld.initializer->span.begin.offset;
+    std::vector<RecordBorrowSource>& entries = recordBorrowLocalSource_[lsym];
+    for (const sema::Symbol* src : srcs)
+        entries.push_back({src, from, UINT32_MAX});
+}
+
+void MethodOwnership::recollectRecordBorrowSourceOnReassign(
+    const sema::Symbol* lsym, const ast::Expr& producer,
+    std::uint32_t reassignOffset) {
+    // §28.3 (#1741): `s := <producer>;` on a borrow-bearing-record / span local.
+    // The producer's borrow-bearing-ness and roots decide what happens to `s`'s
+    // carried sources from `reassignOffset` on:
+    //   (a) borrow-bearing producer with fresh roots (`s := other.AsSpan();`) —
+    //       REPLACE: close every still-open source window at R, open the new
+    //       roots' windows [R, MAX).
+    //   (b) NON-borrow-bearing producer (`s` drops its borrow entirely) —
+    //       ERASE: close every still-open window at R, open nothing.
+    //   (c) self-derivation (`s := s.Slice(r);`) — KEEP: `s` still views the
+    //       same sources; leave the windows open (do nothing).
+    //   (d) borrow-bearing producer with NO identifiable root (`s := f();`,
+    //       `s := cond ? a : b;`, #1739/#1740 gap #2) — KEEP the old windows
+    //       open (sound over-rejection): the new view is untracked and MIGHT
+    //       alias the old source, so retiring it could under-reject.
+    auto it = recordBorrowLocalSource_.find(lsym);
+    const bool wasTracked = it != recordBorrowLocalSource_.end();
+
+    const sema::TypeRef* rt = ctx_.exprType(producer);
+    const bool borrowBearing = isBorrowBearingRecordOrSpan(rt);
+
+    std::vector<const sema::Symbol*> newSrcs;
+    if (borrowBearing)
+        collectRecordBorrowRoots(producer, lsym, newSrcs);
+
+    if (borrowBearing && newSrcs.empty()) {
+        // (c) self-derivation (`s := s.Slice(r)` — root is `self`, no new root)
+        // or (d) untracked producer (`s := f()` / `s := cond ? a : b`) — keep
+        // the old windows open (sound over-rejection): the new view may still
+        // alias an old source, so retiring it could under-reject.
+        return;
     }
-    if (!srcs.empty()) recordBorrowLocalSource_[lsym] = std::move(srcs);
+    // (a)/(b): the old view is retired at R. Close every still-open window.
+    if (wasTracked) {
+        for (RecordBorrowSource& e : it->second)
+            if (e.until == UINT32_MAX) e.until = reassignOffset;
+    }
+    // (a): open the new roots' windows from R. (b) opens nothing.
+    if (!newSrcs.empty()) {
+        std::vector<RecordBorrowSource>& entries = recordBorrowLocalSource_[lsym];
+        for (const sema::Symbol* src : newSrcs)
+            entries.push_back({src, reassignOffset, UINT32_MAX});
+    }
 }
 
 bool MethodOwnership::recordBorrowAliasesConsumed(
@@ -3345,27 +3437,63 @@ bool MethodOwnership::recordBorrowAliasesConsumed(
         if (!seen.insert(cur).second) continue;
         auto it = recordBorrowLocalSource_.find(cur);
         if (it == recordBorrowLocalSource_.end()) continue;
-        for (const sema::Symbol* src : it->second) {
-            if (src == consumed) return true;
-            work.push_back(src);
+        for (const RecordBorrowSource& e : it->second) {
+            if (e.source == consumed) return true;
+            work.push_back(e.source);
         }
     }
     return false;
 }
 
+std::optional<std::pair<std::uint32_t, std::uint32_t>>
+MethodOwnership::recordBorrowConsumedWindow(const sema::Symbol* recLocal,
+                                            const sema::Symbol* consumed) const {
+    // §28.3 (#1741). The precise view-window applies only to a DIRECT source of
+    // `recLocal`; a source reached transitively through an intermediate record
+    // local uses the coarse full range (sound over-approximation).
+    auto it = recordBorrowLocalSource_.find(recLocal);
+    if (it == recordBorrowLocalSource_.end()) return std::nullopt;
+    std::optional<std::pair<std::uint32_t, std::uint32_t>> best;
+    auto widen = [&](std::uint32_t from, std::uint32_t until) {
+        if (!best) best = {from, until};
+        else {
+            best->first = std::min(best->first, from);
+            best->second = std::max(best->second, until);
+        }
+    };
+    for (const RecordBorrowSource& e : it->second) {
+        if (e.source == consumed) {
+            widen(e.from, e.until);
+        } else if (recordBorrowLocalSource_.count(e.source) &&
+                   recordBorrowAliasesConsumed(e.source, consumed)) {
+            widen(0, UINT32_MAX);
+        }
+    }
+    return best;
+}
+
 bool MethodOwnership::borrowHolderUsedAfter(const sema::Symbol* holder,
                                             std::uint32_t consumeOffset) const {
+    return borrowHolderUsedAfterInWindow(holder, consumeOffset, 0, UINT32_MAX);
+}
+
+bool MethodOwnership::borrowHolderUsedAfterInWindow(
+    const sema::Symbol* holder, std::uint32_t consumeOffset,
+    std::uint32_t winFrom, std::uint32_t winUntil) const {
     auto it = borrowUseOffsets_.find(holder);
     if (it == borrowUseOffsets_.end()) return false;
+    auto inWindow = [&](std::uint32_t off) {
+        return off >= winFrom && off < winUntil;
+    };
     for (std::uint32_t off : it->second)
-        if (off > consumeOffset) return true;
+        if (off > consumeOffset && inWindow(off)) return true;
     // Loop back edge: a use textually BEFORE the consume but inside the same
     // enclosing loop body re-executes AFTER the consume on the next iteration,
     // so it keeps the borrow live. Sound closure of the textual query over loops.
     for (const auto& lr : loopBodySpans_) {
         if (consumeOffset < lr.first || consumeOffset > lr.second) continue;
         for (std::uint32_t off : it->second)
-            if (off >= lr.first && off <= lr.second) return true;
+            if (off >= lr.first && off <= lr.second && inWindow(off)) return true;
     }
     return false;
 }
@@ -3406,14 +3534,19 @@ void MethodOwnership::checkConsumeFreeze(std::string_view consumedName,
     // no LocalOwnership.source (see recordBorrowLocalSource_), so they are
     // checked here: a span whose carried source is the consumed binding, and
     // which has a reachable later use, freezes the consume exactly as a plain
-    // alias does. Liveness reuses borrowHolderUsedAfter (the same backward query
-    // as plain borrows); a span whose only uses precede the consume is not live
-    // and does not freeze (the accept-after-last-use case). // per §28.3, §4.19
+    // alias does. Liveness reuses borrowHolderUsedAfterInWindow (the backward
+    // query, restricted to the span's view-window of that source — #1741: a use
+    // after a straight-line reassignment retired the source no longer counts); a
+    // span whose only in-window uses precede the consume is not live and does
+    // not freeze (the accept-after-last-use case). // per §28.3, §4.19
     for (const auto& [recLocal, srcs] : recordBorrowLocalSource_) {
         (void)srcs;
         if (recLocal == consumed) continue;
-        if (!recordBorrowAliasesConsumed(recLocal, consumed)) continue;
-        if (!borrowHolderUsedAfter(recLocal, consumeLoc.offset)) continue;
+        auto win = recordBorrowConsumedWindow(recLocal, consumed);
+        if (!win) continue;
+        if (!borrowHolderUsedAfterInWindow(recLocal, consumeLoc.offset,
+                                           win->first, win->second))
+            continue;
         report(Severity::Error, consumeLoc,
                std::string("cannot consume `") + std::string(consumedName) +
                    "` here: the borrow held by `" + std::string(recLocal->name) +

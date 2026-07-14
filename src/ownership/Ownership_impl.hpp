@@ -11,6 +11,7 @@
 // gave, while allowing the definitions to live in separately-compiled units.
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -299,16 +300,39 @@ private:
     // (`buf.AsSpan()` / `s.Slice(r)` → `buf`/`s`; a `new Rec(a, b)` record →
     // the borrow-carrying arg roots). The spec (v0.186): "A live local of
     // borrow-bearing record type ... counts as a live local borrow of every
-    // carried borrow's source." These record locals carry NO
-    // LocalOwnership.source (they are value-typed records; setting one would
-    // perturb the §9.7 escape-on-return / field-store checks, which the spec
-    // assigns to §9.7's own escape bullets, not to this freeze). So the freeze
-    // consults this map IN ADDITION to states_. A root may itself be another
-    // record local — the query resolves transitively. Populated by
-    // collectRecordBorrowSource in the same pre-pass as borrowUseOffsets_, so
-    // liveness reuses borrowHolderUsedAfter unchanged. // per §28.3, §4.19, §9.7
-    std::unordered_map<const sema::Symbol*, std::vector<const sema::Symbol*>>
+    // carried borrow's source ... for as long as `s` is live." These record
+    // locals carry NO LocalOwnership.source (they are value-typed records;
+    // setting one would perturb the §9.7 escape-on-return / field-store checks,
+    // which the spec assigns to §9.7's own escape bullets, not to this freeze).
+    // So the freeze consults this map IN ADDITION to states_. A root may itself
+    // be another record local — the query resolves transitively.
+    //
+    // §28.3 (#1741): each carried source records the source-offset WINDOW
+    // [from, until) during which the local views it, so a straight-line
+    // reassignment (`s := other.AsSpan();`) retires the old source and installs
+    // the new one at the reassignment offset R — the old window closes at R (a
+    // use of `s` after R no longer keeps the old source live, fixing the stale
+    // over-rejection) and the new source opens [R, MAX) (a use of `s` after R
+    // now keeps the NEW source live, closing the symmetric under-rejection).
+    // A declaration opens [initOffset, MAX). Populated by
+    // collectRecordBorrowSource / re-collected on reassignment in the same
+    // pre-pass as borrowUseOffsets_. // per §28.3, §4.19, §9.7
+    struct RecordBorrowSource {
+        const sema::Symbol* source;
+        std::uint32_t from;   // source offset at/after which the local views it
+        std::uint32_t until;  // source offset before which it views it (MAX=open)
+    };
+    std::unordered_map<const sema::Symbol*, std::vector<RecordBorrowSource>>
         recordBorrowLocalSource_;
+    // §28.3 (#1741): conditional-nesting depth of the freeze pre-pass walk. The
+    // method body and unconditional `do…end` blocks are depth 0; each if / elif
+    // / else / while / for / try-catch-finally body adds one. A reassignment's
+    // precise old-source retirement (window close) is applied ONLY at depth 0,
+    // where the rebind is unconditional and definitely retires the old view; a
+    // conditional rebind might not execute, so the old source stays live on the
+    // not-taken paths and the window is left open (sound over-rejection, the
+    // pre-#1741 behavior). // per §28.3
+    unsigned borrowUseCondDepth_ = 0;
     // §28.3 / §28.7 (v0.180, #1465): reassigned owned locals whose drop-on-
     // overwrite codegen implements (disposeDisplacedOwnedClassLocal — plain owned
     // class/interface locals; collections/wrappers/tasks excluded). For these the
@@ -809,6 +833,22 @@ private:
     // of a `new Rec(...)` construction). Called from the freeze pre-pass at each
     // LocalDecl. // per §28.3
     void collectRecordBorrowSource(const ast::LocalDecl& ld);
+    // §28.3 (#1741): re-collect the carried source of a borrow-bearing-record /
+    // span local `s` when it is REASSIGNED (`s := <producer>;`) at source offset
+    // `reassignOffset`. The old source windows are closed at that offset and the
+    // new producer's source windows opened from it, so a later use of `s` keeps
+    // the NEW source live, not the stale one. Called only at depth 0 (an
+    // unconditional rebind). // per §28.3
+    void recollectRecordBorrowSourceOnReassign(const sema::Symbol* lsym,
+                                               const ast::Expr& producer,
+                                               std::uint32_t reassignOffset);
+    // §28.3: collect the identifier-root source symbols the borrow-bearing
+    // producer `e` carries (the initializer chain root, or every arg root of a
+    // `new Rec(...)`) into `srcs`, excluding the local `self` itself (a
+    // self-derivation `s := s.Slice(r)` yields no new root — the local keeps the
+    // source it already held). // per §28.3
+    void collectRecordBorrowRoots(const ast::Expr& e, const sema::Symbol* self,
+                                  std::vector<const sema::Symbol*>& srcs);
     // §28.3 (v0.186, #1726): true when the borrow-bearing-record local `recLocal`
     // transitively carries a borrow of `consumed` — a DFS over
     // recordBorrowLocalSource_ following record-local roots to a binding root.
@@ -816,6 +856,24 @@ private:
     // span over it survives. // per §28.3
     bool recordBorrowAliasesConsumed(const sema::Symbol* recLocal,
                                      const sema::Symbol* consumed) const;
+    // §28.3 (#1741): the source-offset window [from, until) during which
+    // `recLocal` (directly or transitively) views `consumed`, or nullopt if it
+    // never does. A DIRECT source match yields that entry's precise view-window;
+    // a match reached TRANSITIVELY through an intermediate record local yields
+    // the coarse full range [0, MAX) (over-approximation — reassignment of an
+    // intermediate span is rare and over-freezing there is the safe direction).
+    // Multiple contributions are unioned to [min from, max until). // per §28.3
+    std::optional<std::pair<std::uint32_t, std::uint32_t>>
+    recordBorrowConsumedWindow(const sema::Symbol* recLocal,
+                               const sema::Symbol* consumed) const;
+    // §28.3 (#1741): like borrowHolderUsedAfter, but the surviving use must also
+    // fall inside the source-view window [winFrom, winUntil) — a use of a
+    // reassigned span after its old source's window has closed no longer keeps
+    // that (now-retired) source live. // per §28.3
+    bool borrowHolderUsedAfterInWindow(const sema::Symbol* holder,
+                                       std::uint32_t consumeOffset,
+                                       std::uint32_t winFrom,
+                                       std::uint32_t winUntil) const;
     // Record each identifier read inside `e` into borrowUseOffsets_ (and into any
     // enclosing loop's identifier extent). `attributeOffset` != 0 forces every
     // recorded use to that source offset instead of the identifier's own — used
