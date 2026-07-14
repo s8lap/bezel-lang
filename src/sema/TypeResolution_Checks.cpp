@@ -6,6 +6,7 @@
 
 #include "sema/TypeResolution.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <functional>
 #include <unordered_set>
@@ -529,8 +530,14 @@ void Resolver::checkGenericConstraintConsistency() {
     // compile errors." Check each generic declaration's `where` clauses once,
     // independent of instantiation (an un-instantiated generic was never
     // checked by the per-instantiation checkGenericConstraints).
+    // `paramOrder` is the type parameters in scope for this `where`-clause set,
+    // in declaration order (a method's own parameters first, then the enclosing
+    // type's). A bound whose head names one of these is a type-parameter bound
+    // (§14.2's `where T: U`), as opposed to a bound naming a real class or
+    // interface — the distinction the self/cycle checks below turn on.
     auto checkList =
-        [&](const std::vector<ast::GenericConstraint>& gcs, SourceLocation loc) {
+        [&](const std::vector<ast::GenericConstraint>& gcs,
+            const std::vector<std::string_view>& paramOrder, SourceLocation loc) {
             // Per type-parameter: does it require both `class` and `value`?
             std::unordered_map<std::string_view, std::pair<bool, bool>> kinds;
             for (const auto& gc : gcs)
@@ -545,16 +552,119 @@ void Resolver::checkGenericConstraintConsistency() {
                         "contradictory constraints on type parameter `" +
                         std::string(kv.first) +
                         "`: `class` and `value` cannot both be required (§14.2)");
+
+            // §14.2 (v0.196): "A self-referential bound (`where T: T`) or a cycle
+            // among type-parameter bounds (`where T: U` together with `where U:
+            // T`) is a compile error at the declaration." Detected here — once
+            // per declaration, independent of instantiation.
+            std::unordered_set<std::string_view> paramSet(paramOrder.begin(),
+                                                          paramOrder.end());
+            // A bound is a *type-parameter bound* only when it is a bare name (a
+            // single-part `QualifiedName` with no generic arguments) that matches
+            // a type parameter in scope. `where T: IComparable<T>` is NOT such a
+            // bound: its head is the interface `IComparable`; `T` appears only as
+            // a generic argument, so this leaves it accepted.
+            auto boundParam = [&](const ast::ConstraintItem& item)
+                -> std::string_view {
+                if (item.kind != "type" || !item.typeArg) return {};
+                const ast::Type& bt = *item.typeArg;
+                if (bt.kind != ast::TypeKind::Named || !bt.name ||
+                    bt.name->parts.size() != 1 || !bt.genericArgs.empty())
+                    return {};
+                std::string_view head = bt.name->parts.back();
+                return paramSet.count(head) ? head : std::string_view{};
+            };
+            // Directed graph "gc.typeParam is bounded by U" over type-parameter
+            // bounds; a self-edge is the self-referential error, reported here.
+            std::unordered_map<std::string_view, std::vector<std::string_view>>
+                edges;
+            std::unordered_set<std::string_view> selfReported;
+            for (const auto& gc : gcs) {
+                if (!gc.modifierConstraint.empty()) continue;
+                for (const auto& item : gc.items) {
+                    std::string_view u = boundParam(item);
+                    if (u.empty()) continue;
+                    if (u == gc.typeParam) {
+                        if (selfReported.insert(gc.typeParam).second)
+                            ctx_.diagnostics().report(
+                                Severity::Error, loc,
+                                "self-referential constraint on type parameter `" +
+                                std::string(gc.typeParam) +
+                                "`: a type parameter cannot be bounded by itself "
+                                "(`where " + std::string(gc.typeParam) + ": " +
+                                std::string(gc.typeParam) + "`) (§14.2)");
+                        continue;  // no self-loop edge — reported already
+                    }
+                    edges[gc.typeParam].push_back(u);
+                }
+            }
+            // Report each distinct cycle once (covers the 2-cycle `T: U`,
+            // `U: T` and transitive cycles `T: U`, `U: V`, `V: T`). DFS coloring;
+            // a back edge to a gray node closes a cycle. Roots are visited in
+            // declaration order so the diagnostic is deterministic.
+            std::unordered_map<std::string_view, int> color;  // 0 white,1 gray,2 black
+            std::vector<std::string_view> stack;
+            std::unordered_set<std::string> reported;
+            std::function<void(std::string_view)> dfs = [&](std::string_view n) {
+                color[n] = 1;
+                stack.push_back(n);
+                auto it = edges.find(n);
+                if (it != edges.end())
+                    for (std::string_view m : it->second) {
+                        if (color[m] == 1) {
+                            std::vector<std::string_view> cyc;
+                            auto s = std::find(stack.begin(), stack.end(), m);
+                            for (auto i = s; i != stack.end(); ++i)
+                                cyc.push_back(*i);
+                            std::vector<std::string> key;
+                            for (std::string_view c : cyc) key.emplace_back(c);
+                            std::sort(key.begin(), key.end());
+                            std::string canon;
+                            for (const auto& c : key) canon += c + ",";
+                            if (reported.insert(canon).second) {
+                                std::string chain;
+                                for (std::string_view c : cyc)
+                                    chain += "`" + std::string(c) + "` -> ";
+                                chain += "`" + std::string(cyc.front()) + "`";
+                                ctx_.diagnostics().report(
+                                    Severity::Error, loc,
+                                    "cyclic constraint among type parameters: " +
+                                    chain +
+                                    " — a cycle among type-parameter bounds is a "
+                                    "compile error at the declaration (§14.2)");
+                            }
+                        } else if (color[m] == 0) {
+                            dfs(m);
+                        }
+                    }
+                stack.pop_back();
+                color[n] = 2;
+            };
+            for (std::string_view p : paramOrder)
+                if (color[p] == 0) dfs(p);
         };
     for (Symbol* child : ctx_.module()->children) {
         auto* ts = dynamic_cast<TypeSymbol*>(child);
         if (!ts || !ts->decl) continue;
         auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
         if (!td) continue;
-        checkList(td->genericConstraints, td->span.begin);
+        std::vector<std::string_view> typeParams;
+        for (const auto& gp : td->genericParams) typeParams.push_back(gp.name);
+        checkList(td->genericConstraints, typeParams, td->span.begin);
         for (const auto& m : td->members)
-            if (auto* mdl = dynamic_cast<const ast::MethodDecl*>(m.get()))
-                checkList(mdl->genericConstraints, mdl->span.begin);
+            if (auto* mdl = dynamic_cast<const ast::MethodDecl*>(m.get())) {
+                // A method's `where` clause may bound a method parameter by an
+                // enclosing-type parameter (§14.2), so both are in scope. A
+                // cycle can only form among the method's own parameters (the
+                // enclosing declaration cannot name a method parameter), but
+                // including the enclosing parameters lets `where T: U` (U the
+                // enclosing param) be recognized as a type-parameter bound.
+                std::vector<std::string_view> methodParams;
+                for (const auto& gp : mdl->genericParams)
+                    methodParams.push_back(gp.name);
+                for (std::string_view p : typeParams) methodParams.push_back(p);
+                checkList(mdl->genericConstraints, methodParams, mdl->span.begin);
+            }
     }
 }
 
