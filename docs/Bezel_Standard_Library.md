@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.193 — July 2026**
+**Companion to the Bezel Language Specification, v0.194 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -136,6 +136,8 @@ public static class Math
   public static method IEEERemainder(x: double, y: double): double;
 end Math;
 ```
+
+**Ownership at class-typed substitutions (v0.194).** `Min`, `Max`, and `Clamp` return one of their arguments. Under the bare-type-parameter rule (language spec [§28.3](Bezel_Language_Spec.md#sec-bare-type-parameter-returns)), at a class or interface substitution of `T` the call produces a **borrow** whose sources are the arguments: the caller takes no disposal obligation, and the result is usable only while every argument's source is live. At value and runtime-managed substitutions (the common numeric cases; `string`) no ownership attaches.
 
 `Fmod(x, y)` returns `x - n*y` where `n` is the integer truncated toward zero such that the result has the same sign as `x` and magnitude less than `|y|`. Matches C's `fmod`. Returns `NaN` if `y = 0` or if either operand is `NaN`; returns `x` if `x` is finite and `y` is `±Infinity`.
 

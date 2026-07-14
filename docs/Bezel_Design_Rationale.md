@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.193 — July 2026**
+**Companion to the Bezel Language Specification, v0.194 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -264,6 +264,8 @@ v0.59 left a gap in the producers table for static factory methods. A method lik
 The v0.60 rule is: when a method returns a class type without `owned` and the compiler cannot identify a borrow source (the method is static, or returns a value documented as freshly allocated), the return is treated as owned. The compiler warns and recommends that the callee add `owned` to its return type.
 
 The `owned` annotation remains the preferred mechanism. The compiler-inferred rule exists as a safety net for two reasons: (1) third-party libraries may not annotate their returns, and (2) adding `owned` to every factory method across the standard library in one step would be a large surface-area change. The v0.60 standard library adds `owned` to the most common factory methods; future revisions will complete the pass.
+
+(v0.194) The premise — *cannot identify a borrow source* — was completed for generic signatures. A static method whose declared return type is a bare type parameter *does* have identifiable sources: its T-reaching plain arguments. Treating `Math.Max<T>(a, b)` as a fresh-owned factory at a class substitution had made the caller a second owner of one of its own still-owned arguments (two owners, one obligation — the exactly-once invariant broken through the argument binding), while the callee-side borrow-return prohibition made the selector body unwritable in-language. The bare-type-parameter rule (spec [§28.3](Bezel_Language_Spec.md#sec-bare-type-parameter-returns)) classifies such calls as borrows carrying the union of the receiver's and the T-reaching arguments' source-liveness constraints, and reserves this section's owned-with-warning fallback for the genuinely sourceless shapes (`Create<T>(): T where T: new()`, `Parse(s: string): T`) — where fresh production is the only writable body and owned is the right answer (with one v0.194 tightening: a static-storage-sourced borrow return is rejected under such an empty-set signature — the caller side mints ownership there, so the borrow would acquire a second owner; a static property is the sound spelling). Callee-side, the bare-type-parameter return admits parameter- and receiver-sourced borrows, enforced per instantiation category (§3.6 rule 2's pattern): the announcement-by-declared-type doctrine of the iterator and `Task`-family conventions, and what makes the standard library's own `Min`/`Max`/`Clamp` writable at class substitutions. Fresh-producing generic signatures spell `owned T`, as `OwningSet<T>.Take(query: T): owned T` does under `where T: class`.
 
 <a id="sec-collection-literal-ownership"></a>
 ### 5.8 Collection literal ownership
