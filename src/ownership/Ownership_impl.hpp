@@ -411,6 +411,10 @@ private:
     // initial ownership state (slice O1 producer table — minimal).
     OwnershipState producerState(const ast::Expr& e);
 
+    // §28.3 arm-meet (v0.184, #1661): reject an if-expression / expression-
+    // position `case`/`when` whose arms mix an owned value with a borrow.
+    void checkArmMeetMixed(const ast::Expr& e);
+
     void handleLocalDecl(const ast::LocalDecl& ld);
 
     // Walk an expression and side-effect any `move` operations it

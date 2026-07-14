@@ -3,6 +3,7 @@
 
 #include <string_view>
 #include <unordered_set>
+#include <vector>
 
 #include "ast/Node.hpp"
 #include "sema/SemaContext.hpp"
@@ -65,6 +66,59 @@ bool isFreshOwnedClassProducer(const ast::Expr* e, const sema::SemaContext& ctx,
         return false;
     const auto* rtd = dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
     return rtd && rtd->kind == ast::TypeDeclKind::Class;
+}
+
+namespace {
+
+// One arm of an if/case expression is an OWNED arm iff it is a fresh owned
+// producer or a nested owned-meet if/case. // §28.3 arm-meet (v0.184, #1661)
+bool armIsOwnedProducer(const ast::Expr* arm, const sema::SemaContext& ctx,
+                        const TypeParamResolver& resolveParam) {
+    if (!arm) return false;
+    if (dynamic_cast<const ast::ConditionalExpr*>(arm) ||
+        dynamic_cast<const ast::CaseExpr*>(arm))
+        return conditionalCaseArmMeetIsOwned(*arm, ctx, resolveParam);
+    return isFreshOwnedClassProducer(arm, ctx, resolveParam);
+}
+
+// The shared arm-meet decision (see the header). Every non-absorbing arm must
+// be an owned producer; at least one must exist.
+bool armsMeetOwned(const std::vector<const ast::Expr*>& arms,
+                   const sema::SemaContext& ctx,
+                   const TypeParamResolver& resolveParam) {
+    bool sawOwned = false;
+    for (const ast::Expr* arm : arms) {
+        if (!arm) return false;
+        // A `throw` arm is bottom-typed and a `null`-literal arm has no value
+        // to own — both absorb to the other arms' state (§28.3, §17.12).
+        if (dynamic_cast<const ast::ThrowExpr*>(arm)) continue;
+        if (dynamic_cast<const ast::NullLiteralExpr*>(arm)) continue;
+        if (!armIsOwnedProducer(arm, ctx, resolveParam)) return false;
+        sawOwned = true;
+    }
+    return sawOwned;
+}
+
+}  // namespace
+
+bool conditionalCaseArmMeetIsOwned(const ast::Expr& e,
+                                   const sema::SemaContext& ctx,
+                                   const TypeParamResolver& resolveParam) {
+    if (const auto* c = dynamic_cast<const ast::ConditionalExpr*>(&e))
+        return armsMeetOwned({c->thenValue.get(), c->elseValue.get()}, ctx,
+                             resolveParam);
+    if (const auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        std::vector<const ast::Expr*> arms;
+        for (const ast::CaseArm& arm : ce->arms) {
+            // A block-body arm's value expression is not structurally
+            // inspectable here — bail conservatively to a borrow meet.
+            if (arm.bodyKind != ast::CaseArmBodyKind::Expression) return false;
+            arms.push_back(arm.exprBody.get());
+        }
+        if (arms.empty()) return false;
+        return armsMeetOwned(arms, ctx, resolveParam);
+    }
+    return false;
 }
 
 bool isBuiltinOwnedTransferCall(const ast::CallExpr& call,

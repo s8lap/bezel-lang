@@ -2331,8 +2331,78 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                     return OwnershipState::Owned;
         }
     }
+    // §28.3 arm-meet (v0.184, #1661): an if-expression (`v1 if c else v2`) or an
+    // expression-position `case`/`when` whose arms meet to OWNED is itself an
+    // owned producer — exactly one arm runs and yields a +1 the caller owns. The
+    // shared predicate is the SAME one codegen consults
+    // (usingVarOwnsClassObjectDynamically / unwindOwnedLocalClass), so the
+    // ownership pass and codegen never diverge on the disposal obligation. A
+    // borrowed-meet (or a named-owned-binding arm, demoted to a borrow per the
+    // local-read row) falls through to Borrowed below — no obligation, and a
+    // `using var` over it is a borrow-pin (handleLocalDecl). A MIXED
+    // owned/borrowed arm set is rejected at the binding site (checkArmMeetMixed),
+    // not here — producerState is a side-effect-free classifier. // per §28.3
+    if ((dynamic_cast<const ast::ConditionalExpr*>(&e) ||
+         dynamic_cast<const ast::CaseExpr*>(&e)) &&
+        common::conditionalCaseArmMeetIsOwned(
+            e, ctx_, [](const sema::TypeRef* t) { return t; }))
+        return OwnershipState::Owned;
     // Default: Borrowed.
     return OwnershipState::Borrowed;
+}
+
+// §28.3 arm-meet (v0.184, #1661): reject an if-expression or expression-position
+// `case`/`when` whose arms MIX an owned value with a borrow. The meet is
+// well-defined only when the arms agree — owned⊓owned=owned, borrowed⊓
+// borrowed=borrowed — so a mixed set (`new Buffer() if c else source` where
+// `source` is a borrow) has no coherent ownership and must be equalized. A
+// named owned binding written as an arm is an unmarked read and therefore a
+// BORROW arm (there is no arm-position transfer marker), so `new T if c else
+// ownedLocal` is a mixed set and is likewise rejected. A `throw` arm (bottom)
+// and a `null`-literal arm impose no ownership and absorb. Only class/interface-
+// typed arms carry an ownership meaning; a value-typed conditional has no meet.
+void MethodOwnership::checkArmMeetMixed(const ast::Expr& e) {
+    std::vector<const ast::Expr*> arms;
+    if (const auto* c = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        arms = {c->thenValue.get(), c->elseValue.get()};
+    } else if (const auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        for (const ast::CaseArm& arm : ce->arms) {
+            // A block-body arm's value expression is not inspected here; a mixed
+            // diagnosis over it would be unreliable, so leave it unflagged
+            // (conservative — the whole expression is then a borrow meet, which
+            // carries no disposal obligation, never a wrong dispose).
+            if (arm.bodyKind != ast::CaseArmBodyKind::Expression) return;
+            arms.push_back(arm.exprBody.get());
+        }
+    } else {
+        return;
+    }
+    bool ownedArm = false;
+    bool borrowArm = false;
+    SourceLocation borrowLoc = e.span.begin;
+    for (const ast::Expr* arm : arms) {
+        if (!arm) continue;
+        if (dynamic_cast<const ast::ThrowExpr*>(arm)) continue;      // absorbing
+        if (dynamic_cast<const ast::NullLiteralExpr*>(arm)) continue;  // absorbing
+        OwnershipState s = producerState(*arm);
+        if (s == OwnershipState::Owned) {
+            ownedArm = true;
+        } else if (s == OwnershipState::Borrowed &&
+                   isClassOrInterfaceResult(ctx_.exprType(*arm))) {
+            borrowArm = true;
+            borrowLoc = arm->span.begin;
+        }
+        // PolyNull and value-typed borrows impose no ownership state (absorb).
+    }
+    if (ownedArm && borrowArm)
+        report(Severity::Error, borrowLoc,
+               "the arms of this if/case expression mix an owned value with a "
+               "borrow — the ownership meet is undefined (§28.3, v0.184): "
+               "owned⊓owned is owned and borrowed⊓borrowed is borrowed, but a "
+               "mixed set has no coherent owner (a named owned binding written "
+               "as an arm is a borrow arm). Equalize the arms — bind the owned "
+               "source first, or transfer both arms — so every arm has the same "
+               "ownership");
 }
 
 bool MethodOwnership::localDropOnOverwriteCovered(const sema::Symbol* sym) {
@@ -2492,10 +2562,34 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
                         }
                     }
                 }
+            } else if (dynamic_cast<const ast::ConditionalExpr*>(
+                           ld.initializer.get()) ||
+                       dynamic_cast<const ast::CaseExpr*>(
+                           ld.initializer.get())) {
+                // §28.3 arm-meet (v0.184, #1661): a `using var` bound to an
+                // if-expression / expression-position `case`/`when`. Reject a
+                // mixed owned/borrowed arm set; then, when the meet is a BORROW
+                // (`using var x := b1 if c else b2;` over two borrows, or a
+                // named-owned-binding arm), pin without a disposal obligation —
+                // its real owner disposes it. Without the pin flag a TYPED
+                // borrow-pin reaches classOfLocal (which returns the declared
+                // class regardless of ownership) and double-frees the borrow at
+                // scope end. An owned-meet stays Owned + implicitDischarge above
+                // and is disposed once by codegen (usingVarOwnsClassObject-
+                // Dynamically / the typed classOfLocal path). // per §28.3
+                checkArmMeetMixed(*ld.initializer);
+                if (producerState(*ld.initializer) != OwnershipState::Owned)
+                    const_cast<ast::LocalDecl&>(ld).usingVarSourceIsBorrow =
+                        true;
             }
         }
     } else if (ld.initializer) {
         lo.state = producerState(*ld.initializer);
+        // §28.3 arm-meet (v0.184, #1661): reject a mixed owned/borrowed arm set
+        // in a plain `var x := … if … else …;` / `case`/`when` initializer too.
+        if (dynamic_cast<const ast::ConditionalExpr*>(ld.initializer.get()) ||
+            dynamic_cast<const ast::CaseExpr*>(ld.initializer.get()))
+            checkArmMeetMixed(*ld.initializer);
     } else {
         lo.state = OwnershipState::Uninitialized;
     }

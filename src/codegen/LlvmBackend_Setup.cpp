@@ -6122,6 +6122,17 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     auto it = locals_.find(ld);
     if (it == locals_.end()) return;
 
+    // §28.10 / §28.3 (v0.184, #1661): a `using var` the ownership pass flagged a
+    // BORROW-PIN registers NO disposal — its real owner disposes it. This holds
+    // for a borrow-local alias, a borrowing-loop element, and (v0.184) a
+    // borrowed-meet if/case expression (`using var x: Res := b1 if c else b2;`).
+    // A TYPED borrow-pin otherwise reaches classOfLocal below, which returns the
+    // declared class regardless of ownership — a double-free of the borrow at
+    // scope end. Honor the flag uniformly here so no disposal path can dispose a
+    // pin. (The untyped bare-identifier pin was already handled inside
+    // classOfLocal; this generalizes it to the typed and if/case forms.)
+    if (ld->usingVarSourceIsBorrow) return;
+
     // §29.11 (#943): a sync `using var source := P.Seq();` whose value is a
     // vtable-backed re-iterable IEnumerable<T>/IOwningEnumerable<T> (yield-iterator
     // result, or an array/user-class wrapped into one) is disposed via the
@@ -7174,6 +7185,32 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
     if (ld->type && isSubscriptionType(ctx_.resolvedType(*ld->type)))
         return nullptr;
     if (isSubscriptionExpr(*ld->initializer)) return nullptr;
+    // (a0) §28.3 arm-meet (v0.184, #1661): a plain `var x := new T() if c else
+    // Make();` (owned-meet if/case). The initializer is neither a NewExpr nor a
+    // call, so (a)/(b) below miss it — the owned value was never reclaimed on an
+    // explicit `x.Dispose()` (the destructor ran, the block leaked — the LSan
+    // finding) nor disposed on an exception unwind. Recognize the owned-meet via
+    // the SAME shared predicate the ownership pass (producerState) consults and
+    // route it through the dynamic dispose+reclaim, exactly like an owned `new`/
+    // call result — exactly one arm runs, so disposal is exactly-once. A
+    // borrowed-meet (predicate false) carries no obligation and a mixed set is
+    // rejected in sema, so neither registers here. // per §28.3
+    if ((dynamic_cast<const ast::ConditionalExpr*>(ld->initializer.get()) ||
+         dynamic_cast<const ast::CaseExpr*>(ld->initializer.get())) &&
+        common::conditionalCaseArmMeetIsOwned(
+            *ld->initializer, ctx_,
+            [this](const sema::TypeRef* t) { return resolveTypeParamRef(t); })) {
+        const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
+        if (isClassOrInterfaceRef(initTy) ||
+            isClassOrInterfaceRef(resolveTypeParamRef(initTy))) {
+            if (initTy && initTy->kind == sema::TypeRef::Kind::Named &&
+                initTy->declaration &&
+                initTy->declaration->kind == ast::TypeDeclKind::Class)
+                return initTy->declaration;
+            return reinterpret_cast<const sema::TypeSymbol*>(1);
+        }
+        return nullptr;
+    }
     // (a) `new ClassType(...)` — an owned class instance.
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(ld->initializer.get())) {
         const sema::TypeSymbol* cls = classOfLocal(ld);
@@ -11291,6 +11328,28 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
         const sema::TypeRef* rt = ctx_.resolvedType(*ld->type);
         if (rt && rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
             rt->declaration->kind == ast::TypeDeclKind::Interface)
+            return true;
+    }
+    // (a2) §28.3 arm-meet (v0.184, #1661): an inferred `using var x := new T()
+    // if c else Make();` (both arms fresh owned producers) — an owned-meet
+    // if/case initializer. classOfLocal captures no class for an untyped
+    // conditional/case initializer (it is neither a NewExpr nor a type
+    // annotation), so without this it fell through every branch and leaked.
+    // Exactly one arm runs and yields a +1 the caller owns; dispose it once
+    // dynamically at scope end. The shared arm-meet predicate is the SAME one
+    // the ownership pass consults (producerState), so a borrowed-meet (which
+    // pins, usingVarSourceIsBorrow) and a mixed set (rejected in sema) never
+    // reach here. A typed owned-meet is disposed by classOfLocal earlier and
+    // never reaches this function. // per §28.3
+    if (ld->initializer &&
+        (dynamic_cast<const ast::ConditionalExpr*>(ld->initializer.get()) ||
+         dynamic_cast<const ast::CaseExpr*>(ld->initializer.get())) &&
+        common::conditionalCaseArmMeetIsOwned(
+            *ld->initializer, ctx_,
+            [this](const sema::TypeRef* t) { return resolveTypeParamRef(t); })) {
+        const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
+        if (isClassOrInterfaceRef(initTy) ||
+            isClassOrInterfaceRef(resolveTypeParamRef(initTy)))
             return true;
     }
     // (b) An inferred using var whose initializer is a call returning `owned T`

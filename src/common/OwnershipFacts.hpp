@@ -79,6 +79,25 @@ bool isFreshOwnedClassProducer(const ast::Expr* e,
                                const sema::SemaContext& ctx,
                                const TypeParamResolver& resolveParam);
 
+// §28.3 arm-meet (v0.184, #1661): true when `e` is an if-expression
+// (`v1 if c else v2`) or an expression-position `case`/`when` whose ownership
+// meets to OWNED — i.e. EVERY value-producing arm is itself a fresh owned
+// producer (isFreshOwnedClassProducer, or a nested owned-meet if/case) and at
+// least one such arm exists. A `throw` arm (bottom-typed) and a `null`-literal
+// arm are ABSORBING (they impose no ownership and are skipped); a borrow /
+// named-owned-binding / non-fresh arm DISQUALIFIES the whole expression (the
+// meet is then a borrow — `false` here). A `case`/`when` with any BLOCK-body
+// arm (`do … end`) is conservatively NOT owned-meet (its value expression is
+// not structurally inspectable here) — leak-but-sound, never a wrong dispose.
+// The single home both the ownership pass (producerState) and codegen
+// (usingVarOwnsClassObjectDynamically / unwindOwnedLocalClass) consult, so the
+// two never diverge on whether such an initializer carries a disposal
+// obligation. Exactly one arm runs at runtime and yields a +1 the caller owns,
+// so disposing the bound value once is leak-free and double-free-free.
+bool conditionalCaseArmMeetIsOwned(const ast::Expr& e,
+                                   const sema::SemaContext& ctx,
+                                   const TypeParamResolver& resolveParam);
+
 // EXPRESSION-SHAPE transfer classification (#1349 / #642 / §4.5–§4.11 / §2.14 /
 // §29.1): builtin methods that TRANSFER an owned class element to the caller.
 // These have no MethodSymbol, so recognition keys on the callee name plus — for
