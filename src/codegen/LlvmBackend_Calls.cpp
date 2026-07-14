@@ -1477,16 +1477,58 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 return builder_.CreateLoad(decTy, accSlot, "sum.r");
             }
 
-            sema::TypeRef* retTyRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Int);
+            // fix #1757 / stdlib §5 / §22.6: accumulate the sum in the
+            // *selected* Sum overload's result type — the selector's return
+            // type R (one of int/uint/long/ulong/float/double; decimal took the
+            // path above, and the ambiguous co-equal-convert case, e.g. a byte
+            // selector, was rejected in sema). The pre-fix accumulator was
+            // hardwired to i32, which truncated a long/uint/ulong selector's
+            // result to 32 bits and emitted malformed IR for a float/double
+            // selector (its i32-typed sum then mismatched the double-typed use
+            // site — #1697/#1757). Derive the accumulator LLVM type from R; the
+            // no-selector Sum() form keeps R = int (its per-type §5.1 widening
+            // is separate and unchanged here).
+            sema::PrimitiveType retP = sema::PrimitiveType::Int;
+            if (!call.args.empty() && call.args[0].value) {
+                if (auto* lamTy = ctx_.exprType(*call.args[0].value))
+                    if (lamTy->kind == sema::TypeRef::Kind::Function &&
+                        lamTy->funcReturn &&
+                        lamTy->funcReturn->kind ==
+                            sema::TypeRef::Kind::Primitive &&
+                        !lamTy->funcReturn->nullable) {
+                        switch (lamTy->funcReturn->primitive) {
+                            case sema::PrimitiveType::Int:
+                            case sema::PrimitiveType::UInt:
+                            case sema::PrimitiveType::Long:
+                            case sema::PrimitiveType::ULong:
+                            case sema::PrimitiveType::Float:
+                            case sema::PrimitiveType::Double:
+                                retP = lamTy->funcReturn->primitive;
+                                break;
+                            default:
+                                break;  // keep Int (legacy) for anything else
+                        }
+                    }
+            }
+            sema::TypeRef* retTyRef = ctx_.primitiveTypeRef(retP);
+            const bool accIsFP = (retP == sema::PrimitiveType::Float ||
+                                  retP == sema::PrimitiveType::Double);
+            llvm::Type* accLLTy = lowerTypeRef(retTyRef);
+            if (!accLLTy) accLLTy = i32();
             llvm::Value* closure = call.args.empty() ? nullptr
                 : lowerLinqLambda(call.args[0].value.get(), retTyRef);
             if (!call.args.empty() && !closure) return nullptr;
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
             auto* idxSlot = entryAlloca(i64());
-            auto* accSlot = entryAlloca(i32());
+            auto* accSlot = entryAlloca(accLLTy);
             builder_.CreateStore(builder_.getInt64(0), idxSlot);
-            builder_.CreateStore(builder_.getInt32(0), accSlot);
+            builder_.CreateStore(
+                accIsFP ? static_cast<llvm::Value*>(
+                              llvm::ConstantFP::get(accLLTy, 0.0))
+                        : static_cast<llvm::Value*>(
+                              llvm::ConstantInt::get(accLLTy, 0)),
+                accSlot);
             auto* condBB = llvm::BasicBlock::Create(llvm_, "sum.c", currentFn_);
             auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sum.b", currentFn_);
             auto* endBB  = llvm::BasicBlock::Create(llvm_, "sum.e", currentFn_);
@@ -1498,17 +1540,22 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
             llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
             llvm::Value* el = builder_.CreateLoad(elemTy, ep);
-            llvm::Value* val = closure ? callClosure(closure, el, i32()) : el;
-            // Widen to i32 if needed
-            if (val->getType() != i32()) val = builder_.CreateTrunc(val, i32());
-            llvm::Value* acc = builder_.CreateLoad(i32(), accSlot);
-            builder_.CreateStore(builder_.CreateAdd(acc, val), accSlot);
+            llvm::Value* val = closure ? callClosure(closure, el, accLLTy) : el;
+            // No-selector form: the element is loaded at its own width; keep the
+            // legacy narrowing to the (int) accumulator. The selector form
+            // already returns accLLTy, so this branch is a no-op there.
+            if (val->getType() != accLLTy) val = builder_.CreateTrunc(val, accLLTy);
+            llvm::Value* acc = builder_.CreateLoad(accLLTy, accSlot);
+            builder_.CreateStore(
+                accIsFP ? builder_.CreateFAdd(acc, val)
+                        : builder_.CreateAdd(acc, val),
+                accSlot);
             builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
             if (relCl && closure) emitClosureRelease(closure);  // #422: inline-lambda
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
-            return builder_.CreateLoad(i32(), accSlot, "sum.r");
+            return builder_.CreateLoad(accLLTy, accSlot, "sum.r");
         }
         // per §5 LINQ: .Aggregate<TAccum>(seed: TAccum, fold: (TAccum, T) -> TAccum)
         // — eager left fold. The accumulator starts at `seed` and folds each

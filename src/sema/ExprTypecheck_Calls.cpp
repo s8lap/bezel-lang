@@ -3648,6 +3648,102 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             bool elemIsDecimal =
                                 elem && elem->kind == TypeRef::Kind::Primitive &&
                                 elem->primitive == P::Decimal;
+                            // fix #1757 / stdlib §5 / §22.6 (v0.196): the result
+                            // type of Sum(selector) is the return type of the
+                            // *selected* Sum overload. The stdlib §5 selector set
+                            // pairs each of the seven numeric result types with a
+                            // selector returning that same type ((T)->int : int,
+                            // (T)->long : long, (T)->uint : uint, (T)->ulong :
+                            // ulong, (T)->float : float, (T)->double : double,
+                            // (T)->decimal : decimal). Classify the selector
+                            // lambda's inferred return type against those seven
+                            // candidates exactly as §22.6 overload resolution
+                            // ranks a single argument position: an exact-match
+                            // candidate wins outright; else a lone §5.1-widening
+                            // candidate wins; else two-or-more co-equal widenings
+                            // (e.g. a byte-returning selector, which widens to
+                            // int/long/uint/… with no exact match) are ambiguous
+                            // (§22.6) — report it rather than silently defaulting
+                            // to int (the pre-fix behavior, which mis-typed every
+                            // non-int/decimal selector as int and miscompiled the
+                            // sum — #1697/#1757).
+                            bool sumSelectorClassified = false;
+                            if (m == "Sum" && !ce.args.empty() &&
+                                ce.args[0].value) {
+                                if (auto* lt = ctx_.exprType(*ce.args[0].value))
+                                    if (lt->kind == TypeRef::Kind::Function &&
+                                        lt->funcReturn &&
+                                        lt->funcReturn->kind ==
+                                            TypeRef::Kind::Primitive &&
+                                        !lt->funcReturn->nullable) {
+                                        P rp = lt->funcReturn->primitive;
+                                        static constexpr P sumCands[] = {
+                                            P::Int,   P::Long,  P::UInt,
+                                            P::ULong, P::Float, P::Double,
+                                            P::Decimal};
+                                        // §22.6 classification over one position:
+                                        // Exact (rp == candidate) beats every
+                                        // Convert; two Converts are co-equal.
+                                        bool haveExact = false;
+                                        P exactPrim = P::Int;
+                                        std::vector<P> converts;
+                                        for (P cp : sumCands) {
+                                            if (rp == cp) {
+                                                haveExact = true;
+                                                exactPrim = cp;
+                                            } else if (primitiveWidens(rp, cp))
+                                                converts.push_back(cp);
+                                        }
+                                        if (haveExact) {
+                                            ctx_.setExprType(
+                                                &ce, ctx_.primitiveTypeRef(
+                                                         exactPrim));
+                                            sumSelectorClassified = true;
+                                        } else if (converts.size() == 1) {
+                                            ctx_.setExprType(
+                                                &ce, ctx_.primitiveTypeRef(
+                                                         converts[0]));
+                                            sumSelectorClassified = true;
+                                        } else if (converts.size() >= 2) {
+                                            std::string msg =
+                                                "ambiguous call to "
+                                                "Sum(selector): the selector "
+                                                "returns `" +
+                                                spellTypeRefForDiag(
+                                                    lt->funcReturn) +
+                                                "`, which converts co-equally "
+                                                "(§5.1) to more than one Sum "
+                                                "overload's result type; no "
+                                                "overload is unambiguously "
+                                                "better (§22.6); candidates:";
+                                            for (P cp : converts) {
+                                                std::string s =
+                                                    spellTypeRefForDiag(
+                                                        ctx_.primitiveTypeRef(
+                                                            cp));
+                                                msg +=
+                                                    "\n  Sum(selector: (T) -> " +
+                                                    s + "): " + s;
+                                            }
+                                            msg +=
+                                                "\ncast the selector's result "
+                                                "to the intended numeric type "
+                                                "to select one overload";
+                                            ctx_.diagnostics().report(
+                                                Severity::Error, ce.span.begin,
+                                                msg);
+                                            // recovery: type as int so
+                                            // downstream typing does not cascade.
+                                            ctx_.setExprType(
+                                                &ce,
+                                                ctx_.primitiveTypeRef(P::Int));
+                                            sumSelectorClassified = true;
+                                        }
+                                        // else: no applicable candidate — leave
+                                        // to the element/decimal default below.
+                                    }
+                            }
+                            if (!sumSelectorClassified) {
                             // Check selector return type (if a lambda arg).
                             if (!elemIsDecimal && !ce.args.empty() &&
                                 ce.args[0].value) {
@@ -3663,6 +3759,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 elemIsDecimal
                                     ? ctx_.primitiveTypeRef(P::Decimal)
                                     : ctx_.primitiveTypeRef(P::Int));
+                            }
                             }
                         }
                         // stdlib §5/§5.1: Average → double (int/long/double forms)
