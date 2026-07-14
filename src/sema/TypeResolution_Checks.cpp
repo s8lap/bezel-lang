@@ -3595,6 +3595,14 @@ bool Resolver::isFfiCompatibleType(const ast::Type& t, bool returnPosition) {
             }
             // §32.5 / stdlib §10: IntPtr, UIntPtr, CString, WString, RawBytes.
             if (isFfiBoundaryNamedType(n)) {
+                // §32.5 (v0.186): a `RawBytes` extern RETURN is rejected — a C
+                // function returns one value and the two-slot (pointer, length)
+                // marshalling shape has no return convention. RawBytes stays
+                // admitted in parameter positions (of extern methods and of FFI
+                // function types), where it occupies two consecutive C slots.
+                // The rejection precedes the nullable branch so `RawBytes?`
+                // returns are rejected too (#1720).
+                if (n == "RawBytes" && returnPosition) return false;
                 // §32.5 (v0.186) "Nullable boundary forms": only `CString?`,
                 // `WString?`, and `RawBytes?` are admitted nullable — the
                 // nullability rides the same pointer representation (Bezel
@@ -3647,6 +3655,22 @@ bool Resolver::isFfiCompatibleType(const ast::Type& t, bool returnPosition) {
 bool Resolver::checkExternType(const ast::Type& t, bool returnPosition,
                                const std::string& declSpelling) {
     if (isFfiCompatibleType(t, returnPosition)) return true;
+    // §32.5 (v0.186, #1720): a `RawBytes` (or `RawBytes?`) extern RETURN is
+    // specifically rejected — the two-slot (pointer, length) marshalling shape
+    // has no C return convention. Give an actionable diagnostic naming the
+    // honest C contract rather than the generic "not permitted" message, since
+    // RawBytes *is* permitted in parameter positions.
+    if (returnPosition && t.kind == ast::TypeKind::Named && t.name &&
+        t.name->parts.size() == 1 && t.name->parts.front() == "RawBytes") {
+        ctx_.diagnostics().report(
+            Severity::Error, t.span.begin,
+            "an extern method's `RawBytes` return type is rejected — a C "
+            "function returns one value and RawBytes' two-slot (pointer, "
+            "length) shape has no return convention; declare the pointer return "
+            "plus a length out-parameter and wrap with RawBytes.FromForeign "
+            "(§32.5)");
+        return false;
+    }
     // per §32.5: report the offending type and signature site. Use the
     // AST type's source span so the diagnostic points at the declaration.
     std::string what = spellExternType(t);

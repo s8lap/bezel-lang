@@ -2727,34 +2727,36 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                    pt->name->parts.size() == 1 &&
                    pt->name->parts.front() == "CString";
         };
-        // fix #985: a `RawBytes` extern parameter (§32.5) receives the raw byte
-        // buffer (void*), not the { ptr, len } struct that is RawBytes' runtime
-        // value. When a RawBytes argument is passed here, extract rb->ptr via
-        // bz_rawbytes_ptr so the C side sees the buffer pointer (as it did under
-        // the prior bare-buffer rep).
+        // fix #985 / fix #1720: a `RawBytes` extern parameter (§32.5, v0.186)
+        // occupies TWO consecutive C slots — the buffer pointer (const void*)
+        // then the length (size_t) — not the single { ptr, len } struct that is
+        // RawBytes' runtime value. The two-slot expansion below is kept in
+        // lockstep with declareExterns' matching (ptr, i64) declaration.
         auto rawbytesParamAt = [&](std::size_t i) -> bool {
             if (!ed || i >= ed->params.size()) return false;
-            const ast::Type* pt = ed->params[i].type.get();
-            return pt && pt->kind == ast::TypeKind::Named && pt->name &&
-                   pt->name->parts.size() == 1 &&
-                   pt->name->parts.front() == "RawBytes";
+            return isRawBytesFfiType(ed->params[i].type.get());
         };
         std::vector<llvm::Value*> args;
-        std::size_t idx = 0;
+        std::size_t idx = 0;      // Bezel parameter index (call.args / ed->params)
+        std::size_t llvmIdx = 0;  // LLVM argument index (a RawBytes spans two)
         for (const auto& a : call.args) {
             if (!a.value) return nullptr;
             llvm::Value* v = lowerExpr(*a.value);
             if (!v) return nullptr;
-            // fix #985: marshal a RawBytes argument to its underlying buffer
-            // pointer (rb->ptr) for a RawBytes-typed extern parameter (§32.5).
+            // fix #1720 (§32.5, v0.186): marshal a RawBytes argument to its two
+            // C slots — the buffer pointer (bz_rawbytes_ptr) then the length
+            // (bz_rawbytes_length) — and push BOTH. A null `RawBytes?` value
+            // marshals to (NULL, 0): both accessors are null-guarded (§32.5
+            // "for RawBytes?: NULL pointer, zero length"). llvmIdx advances by
+            // two so the width-coercion below indexes the right declared slot.
             if (rawbytesParamAt(idx)) {
-                const sema::TypeRef* at = ctx_.exprType(*a.value);
-                bool isRaw = at && at->kind == sema::TypeRef::Kind::Named &&
-                    at->declaration && at->declaration->name == "RawBytes";
-                if (isRaw) {
-                    auto* fn = declareC("bz_rawbytes_ptr", ptrTy(), {ptrTy()});
-                    v = builder_.CreateCall(fn, {v}, "raw.arg.ptr");
-                }
+                auto* ptrFn = declareC("bz_rawbytes_ptr", ptrTy(), {ptrTy()});
+                auto* lenFn = declareC("bz_rawbytes_length", i64(), {ptrTy()});
+                args.push_back(builder_.CreateCall(ptrFn, {v}, "raw.arg.ptr"));
+                args.push_back(builder_.CreateCall(lenFn, {v}, "raw.arg.len"));
+                llvmIdx += 2;
+                ++idx;
+                continue;
             }
             // Marshal a Bezel `string` argument into a CString parameter
             // (§32.5 / §32.6). Branch on the string's runtime byte width:
@@ -2799,9 +2801,9 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             // to the canonical parameter type so the call is well-typed.
             // Only integer width adjustments and int/ptr conversions are
             // needed: the ABI-relevant case is int (i32) vs. size_t (i64).
-            if (idx < it->second->getFunctionType()->getNumParams()) {
+            if (llvmIdx < it->second->getFunctionType()->getNumParams()) {
                 llvm::Type* want = it->second->getFunctionType()
-                                       ->getParamType(idx);
+                                       ->getParamType(llvmIdx);
                 llvm::Type* have = v->getType();
                 if (have != want) {
                     bool haveInt = have->isIntegerTy();
@@ -2823,6 +2825,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 }
             }
             args.push_back(v);
+            ++llvmIdx;
             ++idx;
         }
         if (args.size() != it->second->arg_size()) return nullptr;

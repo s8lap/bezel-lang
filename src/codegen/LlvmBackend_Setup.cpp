@@ -120,8 +120,23 @@ void Emitter::declareExterns() {
                                     ? lowerType(ed->returnType.get())
                                     : llvm::Type::getVoidTy(llvm_);
             std::vector<llvm::Type*> paramTys;
-            for (const auto& p : ed->params)
+            for (const auto& p : ed->params) {
+                // fix #1720 (§32.5, v0.186): a `RawBytes` parameter — of an
+                // extern method or FFI function type — occupies TWO consecutive
+                // C argument slots: the buffer pointer (const void*) then the
+                // length (size_t). Lower it as (ptr, i64) so the extern's
+                // C-ABI signature matches the two-argument marshalling emitted
+                // at the call site (lowerExternCall). `RawBytes?` is the same
+                // two slots (NULL/0 for null). Kept in step with the call site:
+                // an inconsistent 1-slot-here/2-slot-there lowering would
+                // corrupt the ABI for every following argument.
+                if (isRawBytesFfiType(p.type.get())) {
+                    paramTys.push_back(ptrTy());
+                    paramTys.push_back(i64());
+                    continue;
+                }
                 paramTys.push_back(lowerType(p.type.get()));
+            }
             // per §32 / issue #496: if the module already contains a function
             // with this name (e.g. malloc/calloc/free declared internally by
             // the codegen runtime), REUSE it instead of creating a second

@@ -1545,6 +1545,16 @@ private:
     llvm::Type* i1() { return llvm::Type::getInt1Ty(llvm_); }
     llvm::Type* i64() { return llvm::Type::getInt64Ty(llvm_); }
     llvm::PointerType* ptrTy() { return llvm::PointerType::get(llvm_, 0); }
+    // fix #1720 (§32.5, v0.186): is `t` the FFI-boundary `RawBytes` type
+    // (nullable or not)? A RawBytes parameter marshals as two consecutive C
+    // slots (pointer, then length), so both the extern declaration
+    // (declareExterns) and the call site (lowerExternCall) special-case it —
+    // shared here so the two stay in lockstep.
+    static bool isRawBytesFfiType(const ast::Type* t) {
+        return t && t->kind == ast::TypeKind::Named && t->name &&
+               t->name->parts.size() == 1 &&
+               t->name->parts.front() == "RawBytes";
+    }
     // CG22: zero / signed-minimum constants matching an integer value's type.
     llvm::Constant* zeroLike(llvm::Value* v) {
         return llvm::ConstantInt::get(v->getType(), 0);

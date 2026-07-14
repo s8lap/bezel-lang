@@ -527,3 +527,54 @@ BEZEL_TEST(codegen_ffi_types, rawbytes_pointer_nonnull_985) {
         "  return 0; "
         "end Main; end C;"), 1);
 }
+
+// fix #1720 / spec §32.5 (v0.196): a `RawBytes` extern PARAMETER occupies TWO
+// consecutive C argument slots — the buffer pointer (const void*) then the
+// length (size_t). Before the fix RawBytes lowered to ONE slot (the pointer
+// only), dropping the length, so every C argument after the RawBytes was
+// shifted by one slot and the callee read a garbage/wrong length.
+//
+// This pins the slot layout deterministically against a real libc call. write(2)
+// is write(int fd, const void* buf, size_t count). We declare a bogus trailing
+// `extra` parameter to expose the layout: under the correct two-slot
+// marshalling the C call is write(1, ptr, LEN, extra) and write reads the first
+// three — (1, ptr, 13) — writing all 13 bytes ("Hello, World!"), with `extra`
+// landing in an unused fourth register slot. Under the one-slot bug the call is
+// write(1, ptr, extra) and write reads count = extra = 5, writing only "Hello".
+// Fails-without → stdout "Hello"; passes-with → stdout "Hello, World!".
+BEZEL_TEST(codegen_ffi_types, rawbytes_param_two_slot_marshalling_spec_32_5_1720) {
+    BEZEL_EXPECT_EQ(compileAndCapture(
+        "module M; "
+        "extern \"c\" "
+        "  public method write(fd: int, data: RawBytes, extra: long): long; end; "
+        "class C public static method Main(): int "
+        "  var b: Array<byte> := "
+        "    [72, 101, 108, 108, 111, 44, 32, 87, 111, 114, 108, 100, 33]; "
+        "  using var rb := RawBytes.From(b); "
+        "  var _ := write(1, rb, 5); "
+        "  return 0; "
+        "end Main; end C;"), std::string("Hello, World!"));
+}
+
+// fix #1720 / spec §32.5 (v0.196): a `RawBytes` extern RETURN is rejected — a C
+// function returns one value and the two-slot (pointer, length) shape has no
+// return convention (§32.5 directs declaring the pointer return plus a length
+// out-parameter and wrapping with RawBytes.FromForeign). Before the fix
+// isFfiCompatibleType admitted `RawBytes` in return position. Fails-without →
+// the program compiles and runs; passes-with → checkExternType rejects it with
+// the §32.5 diagnostic.
+BEZEL_TEST(codegen_ffi_types, rawbytes_extern_return_rejected_spec_32_5_1720) {
+    auto r = runAot(
+        "module M; "
+        "extern \"c\" public method bad(): RawBytes; end; "
+        "class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool cited = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("`RawBytes` return type is rejected") !=
+                std::string::npos &&
+            d.message.find("\xC2\xA7""32.5") != std::string::npos)
+            cited = true;
+    BEZEL_EXPECT_TRUE(cited);
+}
