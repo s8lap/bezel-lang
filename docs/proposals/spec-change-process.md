@@ -1,6 +1,6 @@
 # The spec-change process
 
-*Supporting record (not a numbered proposal). Written 2026-07-11, distilled from the two whole-language review runs (2026-07-07 → v0.183, 2026-07-11 → v0.184) that produced most of the spec's recent revisions. This document formalizes **how** the five normative documents in `docs/` change: the classes of change, the gate each class must pass, the artifacts each leaves behind, and the tooling. It is meta-process — it does not itself change the language.*
+*Supporting record (not a numbered proposal). Written 2026-07-11, distilled from the two whole-language review runs (2026-07-07 → v0.183, 2026-07-11 → v0.184) that produced most of the spec's recent revisions. This document formalizes **how** the six normative documents in `docs/` change: the classes of change, the gate each class must pass, the artifacts each leaves behind, and the tooling. It is meta-process — it does not itself change the language.*
 
 Status: proposed (owner review). The rules below describe what the last two runs did *plus* the improvements this document introduces (the change-class gates, the composition gate, the one-command validation, the review queue). Where the runs already worked this way, the doc records the practice; where it improves on it, the improvement is marked **NEW**.
 
@@ -17,21 +17,22 @@ The governing principle is unchanged from `CLAUDE.md`: **the spec is the source 
 
 ---
 
-## 1. The five documents and what "changing the spec" means
+## 1. The six documents and what "changing the spec" means
 
-The normative language is exactly the five documents in `docs/`:
+The normative language is exactly the six documents in `docs/`:
 
 | Document | Role | Carries the revision number? |
 |---|---|---|
 | `Bezel_Language_Spec.md` | normative reference; every syntactic/semantic rule | **yes** — `**Version 0.NNN**` header |
 | `Bezel_Standard_Library.md` | every stdlib type/method/constant | **yes** — `**Companion … v0.NNN**` header |
-| `Bezel_Design_Rationale.md` | *why* each decision was made; alternatives declined; the per-revision changelog | **yes** — companion header **and** the changelog |
+| `Bezel_Design_Rationale.md` | *why* each decision was made; alternatives declined | **yes** — companion header |
+| `Bezel_Changelog.md` | the per-revision narrative history; one entry per revision, pinned | **yes** — companion header |
 | `Bezel_Guide_01_Memory_and_Ownership.md` | example-first idiom guide | no (revalidation pin only) |
 | `Bezel_Guide_02_Errors_and_Nullability.md` | example-first idiom guide | no (revalidation pin only) |
 
-`docs/proposals/` is **not** normative. A proposal is a design under consideration; it becomes normative only by *graduating* — being amended into the five documents through this process, at which point the proposal file's `Status` flips to `superseded` with a pointer to the landed revision.
+`docs/proposals/` is **not** normative. A proposal is a design under consideration; it becomes normative only by *graduating* — being amended into the normative documents through this process, at which point the proposal file's `Status` flips to `superseded` with a pointer to the landed revision.
 
-A single **revision** (v0.NNN → v0.NNN+1) is the atomic unit of change: one version-header bump across the three versioned documents, one changelog entry in the rationale, one commit (or a tight sequence pushed together). Everything below is about how a revision is proposed, gated, and landed.
+A single **revision** (v0.NNN → v0.NNN+1) is the atomic unit of change: one version-header bump across the four versioned documents, one changelog entry in `Bezel_Changelog.md`, one commit (or a tight sequence pushed together). Everything below is about how a revision is proposed, gated, and landed.
 
 ---
 
@@ -43,7 +44,7 @@ Not every change deserves the same ceremony. Classify the change first; the clas
 |---|---|---|---|
 | **Editorial** | wording, typos, dead cross-references, stale prose that no longer describes any rule | fixing a dangling `§` link; a currency sweep of terminology a prior revision renamed | mechanical gate (§3) only |
 | **Clarification** | states an already-implied rule explicitly; adds an example; consolidates text that lived in several places | the v0.184 "Choosing a disposal form" recap of the three disposal patterns | mechanical gate + one reviewer confirms the rule is genuinely unchanged |
-| **Ruling** | resolves an underspecified or contradictory case by *deciding* it | who-may-call-`Dispose()`; the construction-window rule for observing `this`; out-parameter copy-out semantics | mechanical gate + **adversarial critique** (§4) + a rationale changelog entry recording the decision, the alternatives, and why |
+| **Ruling** | resolves an underspecified or contradictory case by *deciding* it | who-may-call-`Dispose()`; the construction-window rule for observing `this`; out-parameter copy-out semantics | mechanical gate + **adversarial critique** (§4) + a changelog entry recording the decision, the alternatives, and why |
 | **Design change** | changes a settled rule, adds/removes a language feature, or repartitions conformance | removing a member kind; demoting a feature to Extended; a new operator | a **proposal document** first (§6), then — only after owner acceptance — a ruling-class landing |
 
 Two rules make the classification honest:
@@ -58,7 +59,7 @@ Two rules make the classification honest:
 **NEW (this document ships it).** Every revision, of every class, must pass `scripts/check_docs.sh` before it lands. It is the docs-side counterpart to `scripts/gate.sh`: one blessed command, four checks, non-zero exit on any structural failure.
 
 1. **Anchor resolution** — every intra/cross-doc `[…](file#anchor)` link resolves, against both anchor styles the repo uses (explicit `<a id="sec-…">` for cross-references and GitHub heading-slugs for the tables of contents).
-2. **Version consistency** — the spec/stdlib/rationale headers agree on the revision, and the rationale has exactly one `### v0.NNN changelog` entry for it. *(This is the check that caught the v0.184 header drift.)*
+2. **Version consistency** — the spec/stdlib/rationale/changelog headers agree on the revision, and `Bezel_Changelog.md` has exactly one `### v0.NNN changelog` entry for it. *(This is the check that caught the v0.184 header drift.)*
 3. **§-citation typo lint** (advisory) — spec §-references to section numbers with no heading are flagged; advisory because legitimately-cross-doc citations produce residual noise.
 4. **Example-extraction parity** — `scripts/extract_doc_examples.py` runs clean over the *current* docs into a scratch tree, so a malformed code example is a hard failure. It never touches the committed conformance corpus (see §7 on `#1380`).
 
@@ -89,7 +90,7 @@ Rulings and design-change landings additionally pass a **meaning gate** that the
 A revision is not done when the text changes; it is done when the record is complete.
 
 1. **The edit itself**, in the three versioned documents, with the version headers bumped in lockstep.
-2. **A rationale changelog entry** `### v0.NNN changelog (v0.NNN-1 → v0.NNN)` — the single source of narrative history. When several trains land in one revision, they share **one** entry (the trains append blocks; there is never a second entry for the same version). The entry states, for each ruling: what was decided, what was declined, and why. It ends with a **Migration** note: what becomes newly-rejected, newly-defined, newly-warned, and what is doc-only.
+2. **A changelog entry** in `Bezel_Changelog.md`, `### v0.NNN changelog (v0.NNN-1 → v0.NNN)` — the single source of narrative history. When several trains land in one revision, they share **one** entry (the trains append blocks; there is never a second entry for the same version). The entry states, for each ruling: what was decided, what was declined, and why. It ends with a **Migration** note: what becomes newly-rejected, newly-defined, newly-warned, and what is doc-only.
 3. **A tracking issue for every spec-ahead-of-impl delta.** The spec routinely leads the compiler. Each semantic change that the compiler does not yet implement gets a GitHub issue filed *in the same landing*, citing the section and the revision (`§28.3, v0.184`) and stating what the spec now requires vs. what the compiler does. This is how "the spec is normative and the compiler is behind on exactly these items" stays legible. (`CLAUDE.md`'s spec-citation discipline applies: cite section *and* revision so the reference stays pinned.)
 4. **Comments closing the loop on prior issues** the revision resolves (close with the citation; or comment "landed in <sha>, tracking the impl delta").
 5. **Guide revalidation** when a revision changes idiom. The guides carry a revalidation pin, not a version number; bump it and re-trace every example. A guide that teaches a retired idiom is a defect (Guide 02 was 26 revisions stale when the 2026-07-11 run found it).
@@ -132,7 +133,7 @@ Two supporting rules the runs learned:
 - **Version headers drift silently.** Three documents carry the revision in two different header formats. Bump all three; the mechanical gate now enforces it.
 - **Impl divergence is not a spec defect.** The compiler implements an older revision than the spec by design. A probe disagreeing with new spec text proves nothing by itself — it is expected impl lag, tracked by the issue filed at landing. Only report a *spec-text* problem as a spec defect.
 - **Verify every `§`-citation against the actual heading before writing it.** Section numbers move between revisions; a cited number is only as good as its last check.
-- **History narration creeps into normative text.** The five documents state *current* rules only; the rationale changelog is the sole home for history. A bare landing pin — `(v0.NNN)` — is acceptable where it dates a rule. An explanatory narration of a superseded state is a defect wherever it appears: "previously this section permitted…", "no longer…", "this sentence formerly asserted…", "(v0.NNN — the old rule said X, which was impossible because…)". The correction's story belongs in the changelog entry that landed it; the normative text states only what the rule *is*. This applies to grammar comments in Appendix A and to stdlib prose as much as to spec sections. (The 2026-07-14 sweep removed ~140 accumulated instances; the owner's review had flagged the pattern in §2.5 — write the rule here so it doesn't regrow.)
+- **History narration creeps into normative text.** The normative documents state *current* rules only; the changelog (`Bezel_Changelog.md`) is the sole home for history. A bare landing pin — `(v0.NNN)` — is acceptable where it dates a rule. An explanatory narration of a superseded state is a defect wherever it appears: "previously this section permitted…", "no longer…", "this sentence formerly asserted…", "(v0.NNN — the old rule said X, which was impossible because…)". The correction's story belongs in the changelog entry that landed it; the normative text states only what the rule *is*. This applies to grammar comments in Appendix A and to stdlib prose as much as to spec sections. (The 2026-07-14 sweep removed ~140 accumulated instances; the owner's review had flagged the pattern in §2.5 — write the rule here so it doesn't regrow.)
 
 ---
 
@@ -157,10 +158,10 @@ For a **ruling** or a **design-change graduation** (the full path):
 - [ ] Adversarial critique; resolve every blocking finding (no silent drops) (§4).
 - [ ] If multiple trains in one revision: run the composition gate over the union (§4).
 - [ ] Dry-run all edits as one sequence — each `old` unique, applies clean.
-- [ ] Bump the three version headers in lockstep; write the single shared changelog entry with its Migration note (§5).
+- [ ] Bump the four version headers in lockstep; write the single shared changelog entry with its Migration note (§5).
 - [ ] `scripts/check_docs.sh` passes (§3).
 - [ ] File a tracking issue for every spec-ahead-of-impl delta; comment/close the issues the revision resolves (§5).
 - [ ] Revalidate the guides if idiom changed; bump their pins (§5).
 - [ ] Commit (one revision = one commit or a tight pushed sequence), push, and — for a graduation — flip the proposal to `superseded` and update the README status (§8).
 
-For **editorial** / **clarification** revisions, the path is the same minus the critique/composition steps: still classify, still `check_docs.sh`, still a changelog entry (editorial batches may share one), still push.
+For **editorial** / **clarification** revisions, the path is the same minus the critique/composition steps: still classify, still `check_docs.sh`, still a changelog entry in `Bezel_Changelog.md` (editorial batches may share one), still push.

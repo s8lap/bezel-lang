@@ -10,14 +10,15 @@ The design is mostly settled — a normative spec (with rationale, stdlib, and g
 
 ## The documents (read these before doing anything)
 
-Five documents in `docs/`. Their roles are distinct; consult the right one for the question at hand.
+Six documents in `docs/`. Their roles are distinct; consult the right one for the question at hand.
 
 - **`Bezel_Language_Spec.md`** — the normative reference. Every syntactic and semantic rule. If you need to know what the language *is*, this is the answer. Appendix A is the complete grammar; Appendix C lists compiler-enforced invariants.
 - **`Bezel_Standard_Library.md`** — every type, method, and constant the stdlib provides. **Do not invent stdlib APIs.** If you need a type or method that isn't in this document, either (a) it doesn't exist and you need to use the real one, or (b) the stdlib genuinely lacks it and that's worth flagging as an issue.
 - **`Bezel_Design_Rationale.md`** — explains *why* each decision was made and what alternatives were considered and declined. When the spec says "X is forbidden," the rationale typically says why and what was tried instead. Read this when you're tempted to wonder "why doesn't Bezel just do Y?" — the answer is usually there.
+- **`Bezel_Changelog.md`** — the per-revision narrative history: one entry per revision, oldest first, normative for migration. Pinned history — entries are written at their revision and never retroactively edited; never the place to look up a current rule.
 - **`Bezel_Guide_01_Memory_and_Ownership.md`** and **`Bezel_Guide_02_Errors_and_Nullability.md`** — short example-first guides showing idiomatic Bezel. Useful for understanding what *good* Bezel code looks like, and for spec-derived test material.
 
-The filenames are stable across revisions (since v0.131; earlier revisions carried the version in the filename, e.g. `Bezel_Language_Spec_0_130.md` — such citations refer to that archived revision in git history). The current revision number lives in each document's header and in the rationale's per-revision changelog. When citing the spec in a PR, test, or issue, cite the section *and* the revision (e.g. "spec §28.2, v0.131") so the reference stays pinned as revisions land.
+The filenames are stable across revisions (since v0.131; earlier revisions carried the version in the filename, e.g. `Bezel_Language_Spec_0_130.md` — such citations refer to that archived revision in git history). The current revision number lives in each document's header and in the changelog (`Bezel_Changelog.md`). When citing the spec in a PR, test, or issue, cite the section *and* the revision (e.g. "spec §28.2, v0.131") so the reference stays pinned as revisions land.
 
 ## The rules of engagement
 

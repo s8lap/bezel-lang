@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# check_docs.sh — the one-command docs gate for the five normative documents.
+# check_docs.sh — the one-command docs gate for the six normative documents.
 #
 # Symmetric with scripts/gate.sh (the compiler gate): a single blessed signal
 # that a docs revision is internally consistent before it lands. Runs four
@@ -7,9 +7,9 @@
 #
 #   1. Anchor resolution   — every intra/cross-doc [...](file#anchor) link whose
 #                            target is an explicit <a id="..."> resolves.
-#   2. Version consistency — the spec/stdlib/rationale headers agree on the
-#                            revision, and the rationale changelog has an entry
-#                            for it.
+#   2. Version consistency — the spec/stdlib/rationale/changelog headers agree
+#                            on the revision, and Bezel_Changelog.md has exactly
+#                            one entry for it.
 #   3. §-citation sanity   — flags §N.M references to section numbers that have
 #                            no heading anywhere in that document (typos only;
 #                            prose mentions of other docs' sections are ignored).
@@ -36,6 +36,7 @@ DOCS = {
     'spec':      'docs/Bezel_Language_Spec.md',
     'stdlib':    'docs/Bezel_Standard_Library.md',
     'rationale': 'docs/Bezel_Design_Rationale.md',
+    'changelog': 'docs/Bezel_Changelog.md',
     'guide01':   'docs/Bezel_Guide_01_Memory_and_Ownership.md',
     'guide02':   'docs/Bezel_Guide_02_Errors_and_Nullability.md',
 }
@@ -86,7 +87,7 @@ else:
 
 # ---- 2. Version consistency ----------------------------------------------
 ver = {}
-for k in ('spec', 'stdlib', 'rationale'):
+for k in ('spec', 'stdlib', 'rationale', 'changelog'):
     # spec: '**Version 0.184 ...**'; stdlib/rationale: '**Companion ... v0.184 ...**'
     m = re.search(r'\*\*Version (\d+\.\d+)', text[k]) or re.search(r'\bv(\d+\.\d+) —', text[k])
     ver[k] = m.group(1) if m else None
@@ -95,11 +96,11 @@ if len(set(ver.values())) != 1 or None in ver.values():
     print(f"VERSION: header mismatch {ver}")
 else:
     v = ver['spec']
-    if f"### v{v} changelog" not in text['rationale']:
+    if f"### v{v} changelog" not in text['changelog']:
         fail = 1
-        print(f"VERSION: headers agree on v{v} but rationale has no '### v{v} changelog' entry")
+        print(f"VERSION: headers agree on v{v} but Bezel_Changelog.md has no '### v{v} changelog' entry")
     else:
-        n = text['rationale'].count(f"### v{v} changelog")
+        n = text['changelog'].count(f"### v{v} changelog")
         if n != 1:
             fail = 1
             print(f"VERSION: v{v} changelog entry appears {n} times (expected 1)")
