@@ -4,6 +4,8 @@
 
 *Sources: `docs/proposals/README.md` (status ground truth, per spec-change-process §8), `phase8-interactions.json` (the 37-item verified interaction map — primary dependency data), `phase8-scoreboard.json` (issue state), and the headers of the ten most-entangled proposals. Written against docs **v0.185**; **refreshed 2026-07-12** for the graduation run (docs now **v0.188**, main `ebfa7e0`). **Nine proposals have now graduated into the normative docs** (`superseded`): 0003/0032/0033 (v0.186), 0035 (v0.187), 0034/0036/0037/0038/0039 (v0.188) — see §1's graduated ledger. The graduation is docs-only; no *implementation* has landed yet, so the R1–R8 build tracks are unchanged in size — but the nine graduated proposals are now spec-complete and their remaining work is pure compiler catch-up (impl trackers #1705–#1737).*
 
+*Currency note 2026-07-14: docs are now **v0.191** (defect-sweep revisions v0.189–v0.191, main `1469b21`); no proposal status changed — the delta is six new R0-layer compiler trackers (#1781–#1786, headlined by the §28.3 Task-family ownership ruling, #1786) and one new design-review item (#1787, iterable-frame ownership). The roadmap's 2026-07-14 refresh note carries the detail; this plan's dependency graph is unaffected.*
+
 ---
 
 ## 1. Status ledger
