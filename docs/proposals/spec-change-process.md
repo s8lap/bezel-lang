@@ -132,6 +132,7 @@ Two supporting rules the runs learned:
 - **Version headers drift silently.** Three documents carry the revision in two different header formats. Bump all three; the mechanical gate now enforces it.
 - **Impl divergence is not a spec defect.** The compiler implements an older revision than the spec by design. A probe disagreeing with new spec text proves nothing by itself — it is expected impl lag, tracked by the issue filed at landing. Only report a *spec-text* problem as a spec defect.
 - **Verify every `§`-citation against the actual heading before writing it.** Section numbers move between revisions; a cited number is only as good as its last check.
+- **History narration creeps into normative text.** The five documents state *current* rules only; the rationale changelog is the sole home for history. A bare landing pin — `(v0.NNN)` — is acceptable where it dates a rule. An explanatory narration of a superseded state is a defect wherever it appears: "previously this section permitted…", "no longer…", "this sentence formerly asserted…", "(v0.NNN — the old rule said X, which was impossible because…)". The correction's story belongs in the changelog entry that landed it; the normative text states only what the rule *is*. This applies to grammar comments in Appendix A and to stdlib prose as much as to spec sections. (The 2026-07-14 sweep removed ~140 accumulated instances; the owner's review had flagged the pattern in §2.5 — write the rule here so it doesn't regrow.)
 
 ---
 
