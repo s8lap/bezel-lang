@@ -101,7 +101,7 @@ write a test (the `runAot` harness and lit conventions).
 src/    lexer, ast, parser, sema, flow, ownership, codegen, runtime, module, driver
 tests/  spec-derived gtest tests + lit/ diagnostic track, mirroring src/ phases
 scripts/ build/test/gate helpers (gate.sh, dev_heavy.sh, run_parallel.sh, …)
-docs/   normative spec, standard library, design rationale, guides
+docs/   normative spec, standard library, design rationale, changelog, guides
 ```
 
 ## Further reading
@@ -110,6 +110,7 @@ docs/   normative spec, standard library, design rationale, guides
   Appendix C invariants)
 - `docs/Bezel_Standard_Library.md` — every stdlib type and method
 - `docs/Bezel_Design_Rationale.md` — the recorded reasoning behind each decision
+- `docs/Bezel_Changelog.md` — the per-revision narrative history and migration notes
 - `docs/Bezel_Guide_01_Memory_and_Ownership.md`,
   `docs/Bezel_Guide_02_Errors_and_Nullability.md` — example-first guides
 - `CLAUDE.md` — working discipline; `tests/README.md` — test-writing guide

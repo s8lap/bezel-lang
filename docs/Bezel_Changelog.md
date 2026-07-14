@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.192 — July 2026**
+**Companion to the Bezel Language Specification, v0.193 — July 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -6065,7 +6065,7 @@ None. No capability, grammar, or behavior change; the §13.6 wording aligns the 
 
 v0.166 is the **case-of revision** — the first of the review's breaking-syntax adoptions (#1370; RFC filed from the 2026-07 syntax pass).
 
-- **`case Expression of Arms end`** (§19.1, Appendix A.7): the keyword `of` delimits the scrutinee from the first arm. The scrutinee becomes a **full Expression**; the multiplicative-level restriction and its mandatory-parenthesization rule (normative since v0.158, the subject of #1320/#1233) are **removed** — they existed only to substitute for the missing boundary. New rationale [§3.7](#) records the trade and the declined alternatives. `when` is unaffected.
+- **`case Expression of Arms end`** (§19.1, Appendix A.7): the keyword `of` delimits the scrutinee from the first arm. The scrutinee becomes a **full Expression**; the multiplicative-level restriction and its mandatory-parenthesization rule (normative since v0.158, the subject of #1320/#1233) are **removed** — they existed only to substitute for the missing boundary. New rationale [§3.7](Bezel_Design_Rationale.md#sec-case-scrutinee-of-delimiter) records the trade and the declined alternatives. `when` is unaffected.
 - **Diagnostic**: a missing `of` is a syntax error at the first arm token, worded "expected `of` after the case scrutinee".
 
 #### Migration
@@ -6079,7 +6079,7 @@ v0.167 is the **pattern-alternatives revision** — the second breaking-syntax a
 
 - **Alternatives are `|`-separated** (§19.3, A.7 `AltPattern`, A.6 `CatchPattern`, §31.2): `1 | 2 => "low"`; `catch FormatException | OverflowException => …`. The comma is exclusively the arm/slot separator; the `=>` disambiguation lookahead is removed from the grammar.
 - **Per-slot alternatives** (§19.3, A.7 `PositionalPattern`): `TwoColor(Color.Red | Color.Blue, var x)` — previously inexpressible (#1300 had banned slot alternatives to keep the comma unambiguous).
-- **Members stay constants-only in case patterns**; catch alternatives stay types-only; the binding rule for `catch var e: T1 | T2` (nearest common base) is unchanged. New rationale [§3.8](#) records the trade.
+- **Members stay constants-only in case patterns**; catch alternatives stay types-only; the binding rule for `catch var e: T1 | T2` (nearest common base) is unchanged. New rationale [§3.8](Bezel_Design_Rationale.md#sec-pattern-alternatives-pipe) records the trade.
 - **No bitwise-or collision** (normative note, §19.3): pattern-embedded expressions parse below `|`; the scrutinee is `of`-delimited (v0.166).
 
 #### Migration
@@ -6091,7 +6091,7 @@ Breaking but purely mechanical: `,` → `|` inside pattern-alternative lists (ca
 
 v0.168 is the **owning-rename revision** — the third breaking-syntax adoption from the review (#1372, folding in #1359's I-prefix deferral).
 
-- **`Owned…` → `Owning…`** across the owning family: `OwningArray/Dictionary/Set/Stack/Queue/LinkedList/Buffer`, `OwningTask`, `OwningTaskCompletionSource`. The two ownership axes get lexically distinct words: `owned` (container qualifier) vs `Owning` (element prefix). New rationale [§3.9](#).
+- **`Owned…` → `Owning…`** across the owning family: `OwningArray/Dictionary/Set/Stack/Queue/LinkedList/Buffer`, `OwningTask`, `OwningTaskCompletionSource`. The two ownership axes get lexically distinct words: `owned` (container qualifier) vs `Owning` (element prefix). New rationale [§3.9](Bezel_Design_Rationale.md#sec-owning-prefix).
 - **Owning interfaces gain the `I` prefix**: `IOwningEnumerable`, `IOwningEnumerator`, `IOwningAsyncEnumerable`, `IOwningAsyncEnumerator`, `IOwningList`, `IOwningCollection`; `GetOwnedEnumerator()` → `GetOwningEnumerator()` (and the async form).
 - **Not renamed**: `owned` (the qualifier), `AppendOwned`/`FromOwnedResult` (they name an owned *argument*), the inline-array slot marker (deferred, §3.9), and historical changelog entries (which record the names as of their revision).
 
@@ -6104,7 +6104,7 @@ Breaking but purely textual: a global, word-boundary rename over the map above (
 
 v0.169 is the **call-site transfer-marker revision** — the fourth breaking-syntax adoption from the review (#1348).
 
-- **`M(owned x)`** (§22.3, §28.3, §28.8, A.7): passing a **named owned binding** to an `owned` parameter requires the `owned` call-site marker; fresh producers stay unmarked. The previously-orphaned A.7 bare-`owned` `ArgModifiers` alternative is defined (it had no prose semantics — itself a latent grammar/prose inconsistency). Diagnostics name the fix in both directions (missing marker on a named binding; spurious marker on a borrow/fresh producer/non-owned position). New rationale [§3.10](#).
+- **`M(owned x)`** (§22.3, §28.3, §28.8, A.7): passing a **named owned binding** to an `owned` parameter requires the `owned` call-site marker; fresh producers stay unmarked. The previously-orphaned A.7 bare-`owned` `ArgModifiers` alternative is defined (it had no prose semantics — itself a latent grammar/prose inconsistency). Diagnostics name the fix in both directions (missing marker on a named binding; spurious marker on a borrow/fresh producer/non-owned position). New rationale [§3.10](Bezel_Design_Rationale.md#sec-call-site-transfer-marker).
 - **§22.6 overload ban stands** (recorded follow-on): the marker satisfies the ban's carve-out criterion for named bindings, but lifting the ban is deliberately not part of this revision.
 
 #### Migration
@@ -6116,7 +6116,7 @@ Breaking, compiler-guided: every call passing a named owned binding to an `owned
 
 v0.170 is the **uniform-closer revision** — the fifth and final syntax adoption from the review (#1374). Fully additive.
 
-- **One end-label rule** (§1.6, Appendix A): `end` may optionally repeat the construct's name or introducing keyword, checked when present. Newly legal-and-checked: `end if;`, `end while;`, `end for;`, `end do;`, `end try;`, `end case;`, `end when;`, `end extension;`, `end extern;`. Bare `end;` remains valid everywhere. New rationale [§3.11](#).
+- **One end-label rule** (§1.6, Appendix A): `end` may optionally repeat the construct's name or introducing keyword, checked when present. Newly legal-and-checked: `end if;`, `end while;`, `end for;`, `end do;`, `end try;`, `end case;`, `end when;`, `end extension;`, `end extern;`. Bare `end;` remains valid everywhere. New rationale [§3.11](Bezel_Design_Rationale.md#sec-uniform-end-closer).
 
 #### Migration
 
@@ -6717,3 +6717,17 @@ v0.186 is the **shared-state & data-parallelism graduation** — accepted propos
 **The changelog moves to its own document (owner-directed, 2026-07-14).** The per-revision changelog — roughly four-fifths of the design rationale by volume — now lives here, in `Bezel_Changelog.md`, as a fourth versioned companion. The rationale returns to its actual job (the *why* of each decision, ~1,700 lines); its §19 is a pointer here. Mechanics of the move, recorded because entries are otherwise pinned: intra-document links inside historical entries were mechanically requalified so they keep resolving (`(#anchor)` → `(Bezel_Design_Rationale.md#anchor)` for the 317 links whose targets stayed behind; no other text inside any entry changed), inbound links from the other documents to changelog anchors were repointed here, and the old §19 preamble was subsumed by this document's front matter. `scripts/check_docs.sh` now validates this file's companion header and the one-entry-per-revision rule against it; `spec-change-process.md` and `CLAUDE.md` name six documents.
 
 **Migration.** None — documentation-structure only; no rule changes, no entry content changes.
+
+### v0.193 changelog (v0.192 → v0.193)
+
+**Round-2 defect revision (2026-07-14, owner-directed second sweep).** Two fresh-lens Fable sweeps — adversarial program-writing over rule interactions, and a composition audit of the day's own v0.189–v0.192 edit mass — produced 40 findings (1 critical, 12 major); 39 were adversarially verified by an independent lane (38 confirmed, 1 amended, 0 refuted), of which 35 land here as 62 edits, 4 became design issues (#1790 iterator-frame capture rules, #1791 generic-leaf exhaustiveness, #1792 char/bool Parse-witness gap, and a #1667 rider), and the round's critical — PG-01, bare-type-parameter return ownership — passed its designer→critic cycle with amendments and lands in the next revision.
+
+**The v0.190 task-ownership ruling threaded through its missed sites.** The composition audit hunted for un-carved survivors of "calls mint, storage lends" and found three: the v0.187 static-storage borrow-return admission in §28.3's borrow-lifetime rules now carries the Task-family carve its §28.6/C.3 twins already had (a static method may not re-expose a stored task through a non-`owned` return — FS-01); the ruling's callee-side return sources (owned task locals, `owned` parameters, `move`d fields) are now threaded into the three operational lists that classify returns — consuming positions, discharge forms, the consume-site freeze (FS-02/FS-03); and the §28.14 call-bounded-callback forward (`method Wrap(f: () -> Task): Task => return f();`) is now cross-referenced from the callee-side enumeration as rejected — §28.14's v0.179 retention rule wins over the forwarded-call-result admission, stated in both places (PG-05). Compiler deltas ride the existing tracker #1786.
+
+**The #1696/#1782 conformance resolution completed.** Two passages still stated the pre-v0.190 position — §14.2's constraint-table row and Appendix C.4 both said primitives conform through §11.8 only, denying `int` under `where T: IComparable<int>`; both now state the two-source rule (declaration-listed + per-type compiler-provided) landed in v0.190 (FS-05/FS-06).
+
+**Rulings (each with its decline recorded; tracking #1793–#1800):** exception supersession excepts the two owner-owned instances — a superseded task-fault or cached `TypeInitializationException` is dropped from the in-flight slot undisposed, preserving multi-await re-raise and the process-lifetime cache (PG-02, #1793). An owning enumerator owns its advanced-but-untaken pending value and disposes it on `Dispose()` — the leak reading violated dispose-exactly-once; strategy-dependence declined (PG-03, #1794). The *full expression* — every unbound temporary's disposal boundary — is defined as the maximal expression, per-evaluation for conditions and guards, with a `case` scrutinee's boundary extending through the construct in both positions; rejecting binding patterns over temporary scrutinees was declined as it would outlaw the long-admitted expression-position form (PG-06, #1795). §28.8.1's `TransferToHelper` example now carries the `// ERROR` marker its own exception-edge rule demands — the restore-before-call form is the compiling idiom (PG-08, #1796). `owned` on parameters, returns, `out`, and function-type slots requires class/interface/bare-type-parameter type, checked per instantiation for bare-T, admitted-redundant on move-only value types (PG-09, #1797). Null-producing `default` forms join the producers table's null row, keyed on §17.11's value rule — §17.14's decline of `default` as a constant expression is untouched (PG-11 as amended, #1798). The shutdown pass appends-and-drains: lazy static initialization during exit is permitted and appends to the recorded order, the pass drains until no initialized-but-undisposed `static owned` field remains, and the shutdown thread runs outside any domain so blocking sync forms are legal in exit-time destructors; shutdown-time `TypeInitializationException` declined (PG-12, #1799). Borrowed task locals and parameters join §30.5's Pattern A admitted await positions, per the section's own named-location principle and the #1533 precedent (PG-13, #1800). Any await of an already-disposed task — not only "a second" — raises `InvalidOperationException` (PG-14).
+
+**Splice and split repairs.** The v0.191 history-narration sweep's six residual splice artifacts are repaired (including §7.11's lost "advisory" qualifier — restored as should-level); the v0.192 split's residue is closed (README.md now lists `Bezel_Changelog.md`; five dead `[§3.x](#)` links in the v0.166–v0.170 entries of this document are repaired by adding the five missing rationale §3.7–§3.11 anchors and pointing the links at them — the split's own link-requalification practice, not a pinned-history change); §28.10's capacity-constructor example sibling corrected (FS-04).
+
+**Migration.** Compile-time, newly **rejected**: static-method re-exposure of stored tasks (#1786); the call-bounded-callback forward shape (#1786); `M(move _field); _field := fresh;` argument-position move without pre-call restoration (#1796); `owned` on inadmissible types (#1797). Newly **defined**: full-expression boundaries (#1795), supersession exemptions (#1793), pending-value disposal (#1794), shutdown drain semantics (#1799), `default(T?)` production (#1798), borrowed-task awaits (#1800 — newly legal). Doc-only: everything else. The guides are unaffected (no idiom change).

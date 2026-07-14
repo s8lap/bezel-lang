@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.192 — July 2026**
+**Companion to the Bezel Language Specification, v0.193 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -994,7 +994,7 @@ The static properties (`UTF8`, `UTF16`, `UTF32`, `ASCII`) return singleton insta
 
 `Encoding` is `abstract` to permit implementation-provided concrete subclasses. User code may subclass `Encoding` for custom encodings; user subclasses are subject to normal class disposal rules (they may have destructors and owned fields).
 
-**Semantics of the standard encodings (specified in v0.136).** All four standard encodings follow one error model: malformed or unrepresentable input is a **defined fault**, never a silent substitution. `GetString` raises `FormatException` when the input bytes are not a well-formed sequence in the encoding; `GetBytes` raises `FormatException` when the string contains a code point the encoding cannot represent (possible only for `ASCII`). No replacement characters are produced. (The lenient decode-with-replacement mode was considered and declined — rationale changelog, v0.136.)
+**Semantics of the standard encodings (specified in v0.136).** All four standard encodings follow one error model: malformed or unrepresentable input is a **defined fault**, never a silent substitution. `GetString` raises `FormatException` when the input bytes are not a well-formed sequence in the encoding; `GetBytes` raises `FormatException` when the string contains a code point the encoding cannot represent (possible only for `ASCII`). No replacement characters are produced. (The lenient decode-with-replacement mode was considered and declined — [`Bezel_Changelog.md`](Bezel_Changelog.md), v0.136.)
 
 - **`UTF8`** (`Name` = `"utf-8"`): bytes are the UTF-8 form of the string's code points. `GetBytes` never emits a byte-order mark; `GetString` does not treat a leading `EF BB BF` specially (it decodes to U+FEFF). Ill-formed sequences — overlong forms, unpaired-surrogate encodings, truncated tails — raise `FormatException`.
 - **`UTF16`** (`Name` = `"utf-16le"`): little-endian, no BOM emitted. `GetString` requires an even byte count, consumes one leading little-endian BOM (`FF FE`) if present, and raises `FormatException` on an odd count, a big-endian BOM (`FE FF`), or an unpaired surrogate. Big-endian UTF-16 is not provided; a program that needs it byte-swaps explicitly.
@@ -2643,7 +2643,7 @@ end SortedDictionary;
 
 Ordering is defined by `K`'s `IComparable<K>.CompareTo` — there is no separate comparer parameter; a type that needs a different order wraps its key in a record with the desired `CompareTo` (the single-order rule keeps equality, ordering, and hashing in one place, on the type). Two keys are the same key exactly when `CompareTo` returns `0`. Point operations (`[k]`, `ContainsKey`, `TryGetValue`, `Remove`) are **O(log n)**; iteration is **O(n)** in ascending key order and is the single-pass borrowing form of [§4.8](#sec-dictionaryk-v) (`for var e in sd` yields entries with `e.Key`/`e.Value` borrows, one live pass at a time, structural modification during iteration raises `InvalidOperationException`).
 
-Value semantics match `Dictionary<K, V>`: values are copied in and out for value types and `string`, borrowed for class types. There is no owning `OwningSortedDictionary` in this revision — owning sorted collections ride the self-hosted-collections work (rationale changelog, v0.136).
+Value semantics match `Dictionary<K, V>`: values are copied in and out for value types and `string`, borrowed for class types. There is no owning `OwningSortedDictionary` in this revision — owning sorted collections ride the self-hosted-collections work (changelog, v0.136).
 
 <a id="sec-sorted-set"></a>
 ### 4.18 `SortedSet<T>` (added in v0.136)
@@ -3097,7 +3097,7 @@ public class Atomic<T> where T: value
 end Atomic;
 ```
 
-`Value`'s read and write are atomic with respect to other `Value` reads, `Value` writes, and the `Exchange`/`CompareExchange` methods on the same instance. All §6.4 atomic operations are **sequentially consistent** (specified in v0.140): they participate in a single global order; no weaker ordering is offered. (Relaxed/acquire-release variants were considered and declined — see the rationale changelog; the surface stays minimal until profiles demand otherwise.) `Atomic<T>` and `AtomicInteger<T>` are **sendable** (language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)) and internally synchronized, and participate in the `Shared<T>` cross-domain rule of language-spec §28.13 (v0.140). The accessors are compiler-intrinsic; they are not auto-property storage.
+`Value`'s read and write are atomic with respect to other `Value` reads, `Value` writes, and the `Exchange`/`CompareExchange` methods on the same instance. All §6.4 atomic operations are **sequentially consistent** (specified in v0.140): they participate in a single global order; no weaker ordering is offered. (Relaxed/acquire-release variants were considered and declined — see the changelog, v0.140; the surface stays minimal until profiles demand otherwise.) `Atomic<T>` and `AtomicInteger<T>` are **sendable** (language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)) and internally synchronized, and participate in the `Shared<T>` cross-domain rule of language-spec §28.13 (v0.140). The accessors are compiler-intrinsic; they are not auto-property storage.
 
 `Exchange(value)` atomically replaces `Value` with `value` and returns the previous value. `CompareExchange(expected, replacement)` atomically replaces `Value` with `replacement` if and only if the current value equals `expected`, and returns the value observed (the original value, equal to `expected` on success, or the value that prevented the swap on failure).
 
@@ -4059,7 +4059,7 @@ public record Int32: IComparable<int>, IEquatable<int>
 end Int32;
 ```
 
-Records implement `IEquatable<T>` implicitly through the auto-generated equality (language spec [§9.2](Bezel_Language_Spec.md#sec-body-records)): `Equals(other: int): bool` exists on `Int32` and is invoked when calling `someInt.Equals(otherInt)` directly or when an `IEquatable<int>`-constrained generic uses `Equals` through the constraint. The same convention applies to every primitive-wrapper record in [§9.1](#sec-integer-types)–[§9.5](#sec-char).
+Records implement `IEquatable<T>` implicitly through the auto-generated equality (language spec [§9.2](Bezel_Language_Spec.md#sec-body-records)): `Equals(other: int): bool` exists on `Int32` and is invoked when calling `someInt.Equals(otherInt)` directly or when an `IEquatable<int>`-constrained generic uses `Equals` through the constraint. The same convention applies to every primitive declaration in [§9.1](#sec-integer-types)–[§9.5](#sec-char).
 
 <a id="sec-double-and-float"></a>
 ### 9.2 `Double` and `Float`
