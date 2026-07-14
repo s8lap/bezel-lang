@@ -3917,11 +3917,48 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 }
             }
         }
-        // #1349 / §29.1 v0.161: explicit `src.GetOwningEnumerator()` on builtin
-        // IOwningEnumerable<T>. Dispatches vtable slot 4 (same as GetEnumerator in
-        // lowerIEnumerableBuiltinFor) to produce a fresh, independent
-        // IOwningEnumerator<T> clone. The result is typed IOwningEnumerator<T> (by
-        // sema), so using-var disposal wires up via isSyncIterEnum in Setup.cpp.
+        // #1349 / §29.1 v0.161 / #1641 / §29.2: explicit
+        // `src.GetOwningEnumerator()` on a builtin IOwningEnumerable<T>. The
+        // result is typed IOwningEnumerator<T> (by sema), so using-var disposal
+        // wires up via isSyncIterEnum in Setup.cpp (iterEnumDispose = a slot-1
+        // dispatch on whatever this returns).
+        //
+        // The handling splits on whether the SOURCE is a NAMED value
+        // (local/param/field/property — any non-producer expression) or a
+        // FRESHLY PRODUCED temporary (a CallExpr/NewExpr with no persistent
+        // owner). This mirrors the §29.2 for-loop desugaring, which binds BOTH
+        // `using var __source := source;` AND
+        // `using var __enumerator := __source.GetOwningEnumerator();` and
+        // disposes both (enumerator first, then source, in reverse order): the
+        // enumerator clone BORROWS the source's owned captures and the source
+        // owns and disposes them.
+        //
+        //   * NAMED source (`using var g := Gen(); g.GetOwningEnumerator()`, or a
+        //     field/property): DISPATCH VTABLE SLOT 4 to produce a fresh,
+        //     INDEPENDENT owning-enumerator clone — the same dispatch the for-loop
+        //     desugaring performs. The clone BORROWS the source's owned captures
+        //     (cloneDisposeFn, disposeOwned=false — LlvmBackend_Iterators.cpp),
+        //     and the named source is disposed exactly once at its OWN scope end
+        //     (its using-var / owned-field cascade), so it must NOT be disposed
+        //     here — disposing it would double-free the captures.
+        //
+        //   * TEMPORARY source (`Gen().GetOwningEnumerator()`): return the source
+        //     ITSELF (do NOT clone). A temporary is single-use and fresh (state 0),
+        //     so driving it is observationally identical to driving a fresh clone,
+        //     and the source struct's own vtable slot 1 is the FULL Dispose
+        //     (disposeFn, disposeOwned=true), so the caller's `using var e`
+        //     disposes the source — its owned captures AND its frame — exactly
+        //     once via iterEnumDispose AFTER driving. Before #1641 this path
+        //     ALWAYS cloned via slot 4, so the temporary source (a distinct
+        //     calloc'd frame) was never bound to anything and LEAKED — the clone's
+        //     cloneDisposeFn frees only the clone frame, never the source (#1641).
+        //     Cloning-then-disposing the source here would instead be a
+        //     USE-AFTER-FREE: the slot-4 clone is a shallow memcpy that SHARES the
+        //     source's owned captures (GetEnumerator, LlvmBackend_Iterators.cpp),
+        //     so disposing the source before the clone is driven frees captures the
+        //     clone still reads. Returning the source itself avoids both — there is
+        //     no separate clone, and this exactly mirrors the #1265 explicit-
+        //     GetEnumerator temporary-source handling.
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                 call.callee.get())) {
             if (ma->member == "GetOwningEnumerator" && ma->target &&
@@ -3935,8 +3972,18 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     !recvTy->astNode->name->parts.empty() &&
                     recvTy->headName() == "IOwningEnumerable";
                 if (isOwnedEnumerable) {
+                    // A fresh producer (CallExpr/NewExpr) is the only owner of the
+                    // source; anything else (an identifier — local/param/field/
+                    // property — or a member access) is a NAMED value with its own
+                    // disposer. Matches registerUsingDisposal's `ownsSource =
+                    // isCall || isNew` so codegen and disposal-registration agree.
+                    bool sourceIsTemporary =
+                        dynamic_cast<const ast::CallExpr*>(ma->target.get()) ||
+                        dynamic_cast<const ast::NewExpr*>(ma->target.get());
                     llvm::Value* src = lowerExpr(*ma->target);
                     if (src && src->getType()->isPointerTy()) {
+                        if (sourceIsTemporary)
+                            return src;  // #1641: `using var e` disposes it (slot 1)
                         llvm::Value* vt = builder_.CreateLoad(ptrTy(), src);
                         auto* geTy =
                             llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
