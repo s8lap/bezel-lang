@@ -85,6 +85,8 @@
 //      here, surfacing as ran=false with the rejection in `diagnostics`.
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -108,6 +110,10 @@
 
 #include "support/codegen_support.hpp"   // JitResult + codegen::CodegenOptions
 #include "driver/Driver.hpp"             // Driver::compileFile (the AOT path)
+
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Support/SHA256.h"         // content-addressed link-cache key
 
 namespace bezel::test {
 
@@ -685,6 +691,355 @@ inline CompileStatus forkedCompile(const std::string& srcPath,
     return rejectFrom(std::move(err), code);
 }
 
+// ── Content-addressed compiled-test cache (the "link-cache") ───────────────
+// A single gate compiles every AOT test 2-3x under the SAME compiler state
+// (the sharded pass, the serial confirmation, and any flake/arbitration
+// reruns). The compile+link — a real `clang` → `ld`, ~1-2 GiB and the dominant
+// cost of an AOT test — is a PURE function of its inputs, so a SUCCESSFUL link
+// product can be reused across those repeats, collapsing them to 1x. This is a
+// test-infra optimization only: a cache hit runs the very same executable the
+// real compiler would have produced, fork+exec-isolated EXACTLY as today.
+//
+// KEY (SHA-256 over):
+//   (a) COMPILER IDENTITY — the test binary itself (/proc/self/exe). The
+//       compile runs IN-PROCESS (Driver::compileFile) inside bezel_tests, so
+//       the running binary's own bytes are the soundest identity: any change to
+//       the front-end, codegen, or the whole-archived bezel_runtime relinks
+//       bezel_tests and changes this hash. Conservative — a test-only edit also
+//       relinks bezel_tests and invalidates the whole cache — but it can NEVER
+//       yield a stale hit. Soundness first (a refinement that hashes only the
+//       compiler libs is possible follow-up, not done here).
+//   (b) RUNTIME-LIBRARY IDENTITY — libbezel_runtime.a (BEZEL_RUNTIME_LIB_PATH),
+//       what the driver's link actually consumes. Redundant with (a) in a
+//       normal build (the archive is whole-archived INTO bezel_tests), but it
+//       closes the window where the .a is rebuilt WITHOUT relinking the running
+//       bezel_tests: then (a) is unchanged yet a fresh link would pull a
+//       DIFFERENT runtime. Hashing the .a directly keeps that from ever being a
+//       stale hit. (If the macro is somehow undefined, (a) still covers the
+//       whole-archived runtime, so the key stays sound — just one layer thinner.)
+//   (c) COMPILE/LINK MODE — the CodegenOptions bits that change the emitted
+//       object AND the link line: sanitizeAddress (plain vs --sanitize=address
+//       → -fsanitize=address -g), checkedDisposal (§28.2 guards), isMainModule.
+//       Each mode is a DISTINCT artifact and keys separately, so a plain, an
+//       ASan, and a checked-disposal build of the same source never collide.
+//   (d) the PROGRAM SOURCE TEXT — exactly the bytes writeSource() wrote.
+//
+// VALUE: the linked executable ONLY. Only SUCCESSFUL compile+link products are
+// cached; every reject / compiler-crash / compile-timeout path runs the REAL
+// compiler so its diagnostics stay live (the oracle is exact where it matters).
+// Nothing on the runAot/runAotChecked SUCCESS path consumes a compile-time side
+// output: the captured compiler stderr is DISCARDED on CompileOutcome::Ok, the
+// driver deletes the .o after linking, and no metadata file is read back — so
+// the executable is the whole product and caching it is observationally exact.
+//
+// STORE: <cacheDir>/<first2>/<hash>, installed atomically (hardlink|copy to a
+// temp in the same dir, then rename) so concurrent shards race benignly. A hit
+// hardlinks (or, across a filesystem boundary, copies) the cached exe into the
+// test's workdir and runs it as a fresh build would. A hit performs NO link, so
+// it does NOT consume a #1780 LinkToken.
+//
+// KNOBS: BEZEL_AOT_CACHE=0 disables (default ON); BEZEL_AOT_CACHE_DIR overrides
+// the location; BEZEL_AOT_CACHE_STATS=1 prints a hits/misses line at process
+// (shard) exit. GC: once per process, under an flock so only one shard sweeps,
+// if the store exceeds ~5 GiB the oldest-mtime entries are deleted down to half
+// (scripts/gc_scratch.sh may also reap the directory).
+
+// Default 0755 for an installed/stored executable.
+inline constexpr fs::perms kExePerms =
+    fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec |
+    fs::perms::others_read | fs::perms::others_exec;
+
+inline bool cacheEnabled() {
+    static const bool v = [] {
+        const char* e = std::getenv("BEZEL_AOT_CACHE");
+        return !(e && std::string(e) == "0");  // default ON
+    }();
+    return v;
+}
+
+inline const std::string& cacheDir() {
+    // Leaked on purpose (never destroyed): the BEZEL_AOT_CACHE_STATS atexit hook
+    // reads this AT PROCESS TEARDOWN, after ordinary function-local statics have
+    // already run their destructors. A leaked object has no destructor to race.
+    static const std::string* v = [] {
+        const char* e = std::getenv("BEZEL_AOT_CACHE_DIR");
+        return new std::string((e && *e) ? e
+                                         : "/var/tmp/bezel-scratch/aot-bincache");
+    }();
+    return *v;
+}
+
+// SHA-256 the contents of `path` into `out`. Streams in chunks so a large
+// artifact (the test binary, the runtime archive) never lands wholesale in RAM.
+inline bool sha256File(const std::string& path, std::array<uint8_t, 32>& out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    llvm::SHA256 h;
+    char buf[1 << 16];
+    while (in) {
+        in.read(buf, sizeof(buf));
+        std::streamsize got = in.gcount();
+        if (got > 0)
+            h.update(llvm::ArrayRef<uint8_t>(
+                reinterpret_cast<const uint8_t*>(buf),
+                static_cast<std::size_t>(got)));
+    }
+    if (in.bad()) return false;
+    out = h.final();
+    return true;
+}
+
+// SHA-256(compiler-identity ‖ runtime-library-identity), computed ONCE per
+// process (hashing /proc/self/exe is a few hundred ms; amortized over the whole
+// shard it is negligible). Returns nullptr if the test binary cannot be hashed
+// — with no sound compiler identity the cache DISABLES itself rather than risk a
+// stale hit.
+inline const std::array<uint8_t, 32>* combinedIdentity() {
+    static std::array<uint8_t, 32> out{};
+    static const bool ok = [] {
+        std::array<uint8_t, 32> exeHash;
+        if (!sha256File("/proc/self/exe", exeHash)) return false;
+        llvm::SHA256 h;
+        h.update(llvm::ArrayRef<uint8_t>(exeHash.data(), exeHash.size()));
+#ifdef BEZEL_RUNTIME_LIB_PATH
+        // (b): fold in the runtime archive the driver's link consumes.
+        std::array<uint8_t, 32> rtHash;
+        if (sha256File(BEZEL_RUNTIME_LIB_PATH, rtHash))
+            h.update(llvm::ArrayRef<uint8_t>(rtHash.data(), rtHash.size()));
+#endif
+        out = h.final();
+        return true;
+    }();
+    return ok ? &out : nullptr;
+}
+
+// The mode component of the key (c): every CodegenOptions bit that alters the
+// emitted object or the link line. The "k1;" schema tag is bumped if the key
+// composition ever changes, so old entries fall out cleanly.
+inline std::string modeString(const codegen::CodegenOptions& opts) {
+    std::string s = "k1;";
+    s += "sa=";  s += opts.sanitizeAddress ? '1' : '0';
+    s += ";cd="; s += opts.checkedDisposal ? '1' : '0';
+    s += ";mm="; s += opts.isMainModule ? '1' : '0';
+    s += ';';
+    return s;
+}
+
+inline std::string toHex(const std::array<uint8_t, 32>& d) {
+    static const char* k = "0123456789abcdef";
+    std::string s(64, '0');
+    for (std::size_t i = 0; i < 32; ++i) {
+        s[2 * i]     = k[d[i] >> 4];
+        s[2 * i + 1] = k[d[i] & 0xF];
+    }
+    return s;
+}
+
+// The full cache key hex, or "" when no sound compiler identity is available
+// (→ the caller compiles for real rather than risk a stale hit).
+inline std::string computeCacheKey(std::string_view source,
+                                   const codegen::CodegenOptions& opts) {
+    const auto* ident = combinedIdentity();
+    if (!ident) return {};
+    llvm::SHA256 h;
+    h.update(llvm::ArrayRef<uint8_t>(ident->data(), ident->size()));
+    const std::string mode = modeString(opts);
+    h.update(llvm::StringRef(mode.data(), mode.size()));
+    h.update(llvm::StringRef(source.data(), source.size()));
+    return toHex(h.final());
+}
+
+// Per-process hit/miss counters (a hit is served from the cache; a miss ran the
+// real compiler — including reject/crash/timeout, which are never cacheable).
+struct CacheStats {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> misses{0};
+};
+inline CacheStats& cacheStats() {
+    // Leaked on purpose: the BEZEL_AOT_CACHE_STATS atexit hook reads these
+    // counters at process teardown, so they must outlive static destruction.
+    static CacheStats* s = new CacheStats();
+    return *s;
+}
+
+inline bool cacheStatsEnabled() {
+    static const bool v = [] {
+        const char* e = std::getenv("BEZEL_AOT_CACHE_STATS");
+        return e && std::string(e) == "1";
+    }();
+    return v;
+}
+
+// Register (once) an atexit hook that prints the hits/misses line at shard exit
+// when BEZEL_AOT_CACHE_STATS=1. Default off → normal runs print nothing.
+inline void ensureStatsAtExit() {
+    static const bool once = [] {
+        if (cacheStatsEnabled()) {
+            std::atexit([] {
+                auto& s = cacheStats();
+                unsigned long long h = s.hits.load(std::memory_order_relaxed);
+                unsigned long long m = s.misses.load(std::memory_order_relaxed);
+                std::fprintf(stderr,
+                    "[aot-cache] hits=%llu misses=%llu (%.0f%% hit) dir=%s\n",
+                    h, m, (h + m) ? 100.0 * h / (h + m) : 0.0,
+                    cacheDir().c_str());
+            });
+        }
+        return true;
+    }();
+    (void)once;
+}
+
+// Install a cached executable into the test's workdir at `exePath`: a hardlink
+// (no byte copy; the cache and workdir share /var/tmp) or, across a filesystem
+// boundary (a custom BEZEL_AOT_CACHE_DIR), a copy. Returns false on failure, in
+// which case the caller falls back to a real compile.
+inline bool installFromCache(const std::string& cachePath,
+                             const std::string& exePath) {
+    std::error_code ec;
+    fs::create_hard_link(cachePath, exePath, ec);
+    if (ec) {
+        ec.clear();
+        fs::copy_file(cachePath, exePath,
+                      fs::copy_options::overwrite_existing, ec);
+        if (ec) return false;
+    }
+    // A hardlink already shares the cached inode's 0755; a fresh copy may not,
+    // so set the exec bits explicitly either way.
+    fs::permissions(exePath, kExePerms, fs::perm_options::replace, ec);
+    return fs::exists(exePath, ec);
+}
+
+// Atomically install the freshly-linked `exePath` into the cache at `cachePath`
+// (write a temp in the SAME directory, then rename). Best-effort: any failure is
+// swallowed — the next run simply recomputes. Concurrent shards racing on the
+// same key rename benignly (identical content; the last writer wins).
+inline void storeToCache(const std::string& exePath,
+                         const std::string& cachePath) {
+    static std::atomic<std::uint64_t> ctr{0};
+    std::error_code ec;
+    const std::string sub = fs::path(cachePath).parent_path().string();
+    const std::string tmp =
+        sub + "/.tmp." + std::to_string(::getpid()) + "." +
+        std::to_string(ctr.fetch_add(1, std::memory_order_relaxed));
+    // Prefer a hardlink of the just-linked exe (no copy). WorkDir later unlinks
+    // the workdir's link; the cache's link survives.
+    fs::create_hard_link(exePath, tmp, ec);
+    if (ec) {
+        ec.clear();
+        fs::copy_file(exePath, tmp, fs::copy_options::overwrite_existing, ec);
+        if (ec) return;
+    }
+    fs::permissions(tmp, kExePerms, fs::perm_options::replace, ec);
+    ec.clear();
+    fs::rename(tmp, cachePath, ec);  // atomic install (same filesystem)
+    if (ec) { std::error_code e2; fs::remove(tmp, e2); }  // clean the temp
+}
+
+// Size-bounded GC, run ONCE per process under a non-blocking flock so only one
+// shard sweeps (losers skip; GC is a coarse safety valve, not per-run-critical).
+// If the store exceeds ~5 GiB, delete oldest-mtime entries down to half.
+inline void maybeGcCache() {
+    static const bool once = [] {
+        if (!cacheEnabled()) return true;
+        const std::string dir = cacheDir();
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        const std::string lockPath = dir + "/.gc.lock";
+        int fd = ::open(lockPath.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (fd < 0) return true;
+        if (::flock(fd, LOCK_EX | LOCK_NB) != 0) { ::close(fd); return true; }
+
+        const std::uintmax_t cap = static_cast<std::uintmax_t>(5) << 30;  // 5 GiB
+        const std::uintmax_t target = cap / 2;                            // 2.5 GiB
+        struct Ent { std::string path; std::uintmax_t size; fs::file_time_type mt; };
+        std::vector<Ent> ents;
+        std::uintmax_t total = 0;
+        for (fs::recursive_directory_iterator it(dir, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            std::error_code e2;
+            if (!it->is_regular_file(e2) || e2) continue;
+            const std::string name = it->path().filename().string();
+            if (name == ".gc.lock" || name.rfind(".tmp.", 0) == 0) continue;
+            std::uintmax_t sz = fs::file_size(it->path(), e2); if (e2) continue;
+            fs::file_time_type mt = fs::last_write_time(it->path(), e2);
+            if (e2) continue;
+            total += sz;
+            ents.push_back({it->path().string(), sz, mt});
+        }
+        if (total > cap) {
+            std::sort(ents.begin(), ents.end(),
+                      [](const Ent& a, const Ent& b) { return a.mt < b.mt; });
+            for (const Ent& e : ents) {
+                if (total <= target) break;
+                std::error_code e2;
+                if (fs::remove(e.path, e2) && !e2) total -= e.size;
+            }
+        }
+        ::flock(fd, LOCK_UN);
+        ::close(fd);
+        return true;
+    }();
+    (void)once;
+}
+
+// Compile `srcPath` to `exePath`, serving a cached link product when the key
+// (compiler ‖ runtime ‖ mode ‖ source) already has one. A hit runs NO link (and
+// no #1780 token); a miss delegates to forkedCompile and, on success, installs
+// the product. On a compile REJECT/CRASH/TIMEOUT nothing is cached (the real
+// diagnostics stay live). The returned CompileStatus is indistinguishable from
+// forkedCompile's — a hit yields {Ok, "", 0} with exePath populated.
+inline CompileStatus cachedCompile(std::string_view source,
+                                   const std::string& srcPath,
+                                   const std::string& exePath,
+                                   const codegen::CodegenOptions& opts,
+                                   const std::string& ccErrPath) {
+    // The crash-isolation regression test (aot_crash_isolation_test.cpp) arms
+    // BEZEL_AOT_TEST_CRASH_HOOK to force the forked compile CHILD to SIGSEGV and
+    // asserts the isolated ran=false. That fault is injected INSIDE the real
+    // forked compile, so a cache HIT — which skips the compile entirely — would
+    // bypass it and the test would observe a successful run (a cache-on vs
+    // cache-off divergence). When the hook is armed, always take the real
+    // compile path. The hook is a test-only affordance, never set in normal runs.
+    if (std::getenv("BEZEL_AOT_TEST_CRASH_HOOK"))
+        return forkedCompile(srcPath, exePath, opts, ccErrPath);
+
+    if (!cacheEnabled())
+        return forkedCompile(srcPath, exePath, opts, ccErrPath);
+
+    ensureStatsAtExit();
+    const std::string key = computeCacheKey(source, opts);
+    if (key.empty())  // no sound compiler identity → never risk a stale hit
+        return forkedCompile(srcPath, exePath, opts, ccErrPath);
+
+    maybeGcCache();  // once per process (guarded)
+
+    const std::string sub = cacheDir() + "/" + key.substr(0, 2);
+    const std::string cachePath = sub + "/" + key;
+
+    std::error_code ec;
+    if (fs::exists(cachePath, ec) && !ec) {
+        if (installFromCache(cachePath, exePath)) {
+            cacheStats().hits.fetch_add(1, std::memory_order_relaxed);
+            // Best-effort LRU touch so a hot entry survives the size GC.
+            std::error_code e2;
+            fs::last_write_time(cachePath,
+                                fs::file_time_type::clock::now(), e2);
+            return {CompileOutcome::Ok, {}, 0};
+        }
+        // Install failed (disk error / vanished entry) → fall through to a real
+        // compile rather than fail the test.
+    }
+
+    CompileStatus cc = forkedCompile(srcPath, exePath, opts, ccErrPath);
+    cacheStats().misses.fetch_add(1, std::memory_order_relaxed);
+    if (cc.outcome == CompileOutcome::Ok) {
+        fs::create_directories(sub, ec);
+        storeToCache(exePath, cachePath);  // best-effort atomic install
+    }
+    return cc;
+}
+
 // Write `source` to `srcPath`. Returns false on write failure (disk full etc.).
 inline bool writeSource(const std::string& srcPath, std::string_view source) {
     std::ofstream os(srcPath, std::ios::binary);
@@ -733,9 +1088,10 @@ inline JitResult runAot(std::string_view source,
         return r;
     }
 
-    // --- Compile + link via the real driver, forked (crash/hang isolated). ----
+    // --- Compile + link via the real driver, forked (crash/hang isolated),
+    //     served from the content-addressed link-cache on an unchanged input. --
     aot_detail::CompileStatus cc =
-        aot_detail::forkedCompile(srcPath, exePath, opts, ccErr);
+        aot_detail::cachedCompile(source, srcPath, exePath, opts, ccErr);
     if (cc.outcome != aot_detail::CompileOutcome::Ok) {
         r.diagnostics.report(Severity::Error, SourceLocation{},
                              std::move(cc.diag));
@@ -900,11 +1256,13 @@ inline JitResult runAotChecked(std::string_view source) {
         return r;
     }
 
-    // --- Compile + link with generated-code ASan, forked (S3). ---------------
+    // --- Compile + link with generated-code ASan, forked (S3), served from the
+    //     link-cache (keyed sanitizeAddress=1, so it never collides with a plain
+    //     build of the same source). ---------------------------------------
     codegen::CodegenOptions opts;
     opts.sanitizeAddress = true;
     aot_detail::CompileStatus cc =
-        aot_detail::forkedCompile(srcPath, exePath, opts, ccErr);
+        aot_detail::cachedCompile(source, srcPath, exePath, opts, ccErr);
     if (cc.outcome != aot_detail::CompileOutcome::Ok) {
         std::string prefix =
             cc.outcome == aot_detail::CompileOutcome::Infra

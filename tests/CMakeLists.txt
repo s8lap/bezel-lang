@@ -44,6 +44,13 @@ target_precompile_headers(bezel_tests PRIVATE
     <llvm/ExecutionEngine/Orc/LLJIT.h>
     <llvm/ExecutionEngine/Orc/ExecutionUtils.h>)
 target_link_libraries(bezel_tests PRIVATE bezel_core bezel_warnings)
+# Teach the AOT harness's content-addressed link-cache (support/aot_support.hpp)
+# the path to libbezel_runtime.a, so it can fold the runtime archive's identity
+# into the cache key (constraint (b)/(d)): a runtime rebuilt WITHOUT relinking
+# bezel_tests must invalidate cached link products. Mirrors the same definition
+# on bezel_core (which is where Driver.cpp reads it to drive the actual link).
+target_compile_definitions(bezel_tests PRIVATE
+    BEZEL_RUNTIME_LIB_PATH="$<TARGET_FILE:bezel_runtime>")
 # Force all bezel_runtime object files into bezel_tests, then export-dynamic
 # so the JIT (DynamicLibrarySearchGenerator::GetForCurrentProcess) can resolve
 # bz_array_*, bz_dict_*, etc. from the process symbol table at JIT run time.
