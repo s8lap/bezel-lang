@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.195 — July 2026**
+**Companion to the Bezel Language Specification, v0.196 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -925,27 +925,29 @@ The static-interface abstractions (language spec [§11.8](Bezel_Language_Spec.md
 
 ```bezel
 public interface INumber<T> where T: INumber<T>
-  static method Zero(): T;
-  static method One(): T;
-  static operator +(a: T, b: T): T;
-  static operator -(a: T, b: T): T;
-  static operator *(a: T, b: T): T;
-  static operator /(a: T, b: T): T;      // raises per the operand type's division rules
+  static method Zero(): owned T;               // producers spell owned (v0.196): a fresh value at
+  static method One(): owned T;                //   class/interface conformers; erased at value ones (§28.1)
+  static operator +(a: T, b: T): owned T;
+  static operator -(a: T, b: T): owned T;
+  static operator *(a: T, b: T): owned T;
+  static operator /(a: T, b: T): owned T;      // raises per the operand type's division rules
   static operator <(a: T, b: T): bool;
 end INumber;
 
 public interface ISteppable<T> where T: ISteppable<T>
-  static method Step(value: T, by: long): T;   // advance in T's space
+  static method Step(value: T, by: long): owned T;   // advance in T's space — a fresh value
   static operator <(a: T, b: T): bool;
 end ISteppable;
 
 public interface IParsable<T> where T: IParsable<T>
-  static method Parse(s: string): T;                       // FormatException on bad input
-  static method TryParse(s: string, out value: T?): bool;  // the §1 Try convention
+  static method Parse(s: string): owned T;                       // FormatException on bad input
+  static method TryParse(s: string, out owned value: T?): bool;  // the §1 Try convention
 end IParsable;
 ```
 
-Conformances: `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `float`, `double`, `decimal` conform to all three; `char` to `ISteppable<char>` and `IParsable<char>`. `string` conforms to none (concatenation is not addition; parsing a string to a string is meaningless). `Parse` is witnessed by the existing per-type members unchanged. For `TryParse`, the per-type members keep their non-nullable value-typed outs (the shape-(c) convention, [§1](#sec-conventions)); the **compiler-provided conformance bridges the out-nullability difference**, so `T.TryParse(s, out v)` **through the constraint** has the declared `out value: T?` shape while a **direct** call keeps `out result: T` (language spec [§11.8](Bezel_Language_Spec.md#sec-static-interface-members)).
+Conformances: `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `float`, `double`, `decimal` conform to all three; `char` to `ISteppable<char>` and `IParsable<char>`. `string` conforms to none (concatenation is not addition; parsing a string to a string is meaningless). `Parse` is witnessed by the existing per-type members unchanged. For `TryParse`, the per-type members keep their non-nullable value-typed outs (the shape-(c) convention, [§1](#sec-conventions)); the **compiler-provided conformance bridges the out-nullability difference**, so `T.TryParse(s, out using var v)` **through the constraint** has the declared `out owned value: T?` shape (the marker erased at value substitutions, language spec [§28.1](Bezel_Language_Spec.md#sec-where-the-owned-modifier-can-appear)) while a **direct** call keeps `out result: T` (language spec [§11.8](Bezel_Language_Spec.md#sec-static-interface-members)).
+
+**Producer markers (v0.196).** Every §2.19 member that produces a value spells the production: `owned` returns on `Zero`, `One`, the four arithmetic operators, `Step`, and `Parse`, and the `out owned` slot on `TryParse` — arithmetic mints a *new* number, never one of its operands, so at a class or interface conformer each witness transfers a fresh value on every path (language spec [§28.8](Bezel_Language_Spec.md#sec-ownership-transfer)), which is what makes the [§11.8](Bezel_Language_Spec.md#sec-static-interface-members) `Sum<T>` accumulator sound there (each iteration's displaced total is disposed by drop-on-overwrite, language spec [§28.7](Bezel_Language_Spec.md#sec-reassigning-owned-fields)). The `<` operators return `bool` and carry no marker, and the free selectors `Math.Min`/`Max`/`Clamp` ([§2.2](#sec-math)) deliberately keep their bare-`T` borrow signatures — a selector transfers nothing. At every **value or runtime-managed** conformer the markers are erased by the substitution (language spec [§28.1](Bezel_Language_Spec.md#sec-where-the-owned-modifier-can-appear)): the primitive tower's intrinsic witnesses and any user record or enum conformer are declared — and remain — unmarked, matching the erased signatures exactly; only class and interface conformers spell the markers.
 
 <a id="sec-system-text-auto-imported"></a>
 ## 3. `System.Text` (auto-imported)
@@ -2822,7 +2824,7 @@ A bound lazy query is single-consumption with the normative consumption-point li
 
 **Ownership at class-typed substitutions (v0.194; noted v0.195).** Under the bare-type-parameter rule (language spec [§28.3](Bezel_Language_Spec.md#sec-bare-type-parameter-returns)), the element-access and no-selector aggregation results at a class or interface element type are **borrows sourced from the receiver** — `First`/`Last`/`Single`/`ElementAt` (with the `*OrNull` and predicate forms), `Min()`/`Max()` ([§5.1](#sec-no-selector-aggregation-overloads)), and `Min<U>`/`Max<U>(selector)`: the caller takes no disposal obligation, and the result is usable while the source sequence's own source is live. `Aggregate<TAccum>(seed, fold)` additionally carries **`seed`** as a source: at class `TAccum` the result is a borrow of {receiver, seed} — usable only while both are live, an empty source returning the seed itself (the one §5 classification v0.194 tightened). At value and runtime-managed substitutions no ownership attaches (§2.2's note, applied to this module).
 
-**Callback retention (the callback-taking lazy operators store their callbacks).** A predicate/selector/key/combiner passed to a **lazy** operator that takes one — `Where`, `Select`, `SelectMany`, `TakeWhile`, `SkipWhile`, `OrderBy`, `OrderByDescending`, `ThenBy`, `ThenByDescending`, `GroupBy`, `Zip` — is **retained by the returned query value until enumeration**, not just for the duration of the call. These are **stdlib-certified storing signatures** (language spec [§28.14](Bezel_Language_Spec.md#sec-scoped-callback-parameters), [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows)): capture admission for a capturing lambda is checked against the **query value** as the deferred-activation frame, and the retention ends at the query's [§29.11](Bezel_Language_Spec.md#sec-multiple-enumeration) single-consumption point. The callback-free lazy operators (`Take`, `Skip`, `Reverse`, `Distinct`, `OfType`, `Concat`, `Union`, `Intersect`, `Except`) hold no callback and carry no such obligation. The **eager** operators (`First(pred)`, `Last(pred)`, `Single(pred)`, `Count(pred)`, `Any(pred)`, `All(pred)`, `Sum`, `Min`, `Max`, `Average`, `Aggregate`, `ToArray`, `ToDictionary`, `ToSet`) are **call-bounded** as their unmarked signatures state — they invoke the callback during the call and retain nothing.
+**Callback retention (the callback-taking lazy operators store their callbacks).** A predicate/selector/key/combiner passed to a **lazy** operator that takes one — `Where`, `Select`, `SelectMany`, `TakeWhile`, `SkipWhile`, `OrderBy`, `OrderByDescending`, `ThenBy`, `ThenByDescending`, `GroupBy`, `Zip` — is **retained by the returned query value until enumeration**, not just for the duration of the call. These signatures are the normative instance of the language spec's deferred-activation frame-residence rule (spec [§28.14](Bezel_Language_Spec.md#sec-scoped-callback-parameters) *Call-bounded × deferred activation*, v0.196): the callback resides in the returned **query value** — the deferred-activation frame — its captured borrows' sources are carried sources of that frame (spec [§28.3](Bezel_Language_Spec.md#sec-unbound-owned-temporaries)'s capture-set contribution, v0.196), and the retention ends at the query's [§29.11](Bezel_Language_Spec.md#sec-multiple-enumeration) single-consumption point. A user-authored callback-taking iterator method follows the identical rule — a general language rule, not a stdlib certification. The callback-free lazy operators (`Take`, `Skip`, `Reverse`, `Distinct`, `OfType`, `Concat`, `Union`, `Intersect`, `Except`) hold no callback and carry no such obligation. The **eager** operators (`First(pred)`, `Last(pred)`, `Single(pred)`, `Count(pred)`, `Any(pred)`, `All(pred)`, `Sum`, `Min`, `Max`, `Average`, `Aggregate`, `ToArray`, `ToDictionary`, `ToSet`) are **call-bounded** as their unmarked signatures state — they invoke the callback during the call and retain nothing.
 
 ```bezel
 public extension IEnumerable<T>
