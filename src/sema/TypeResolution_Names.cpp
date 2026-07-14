@@ -668,6 +668,14 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         // bodies get via resolveTypesInBody below.
         if (fd->initializer) resolveTypesInExpr(*fd->initializer, parent);
     } else if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
+        // §28.1 (v0.196, #1817): expose this method's own `where T: …` clauses
+        // to checkOwnedDeclType (below) so it can reject an `owned` marker on a
+        // bare type parameter constrained `where T: value`. Save/restore around
+        // the whole branch, mirroring currentOuterType_ — a leaked pointer would
+        // misattribute these constraints to a later member.
+        const std::vector<ast::GenericConstraint>* savedConstraints =
+            currentMethodConstraints_;
+        currentMethodConstraints_ = &md->genericConstraints;
         Scope methodScope;
         methodScope.parent = parent;
         for (const auto& g : md->genericParams) {
@@ -738,8 +746,17 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
             // factory method's `new T()` has no resolved type.
             resolveTypesInExpr(*md->exprBody, &methodScope);
         }
+        currentMethodConstraints_ = savedConstraints;  // §28.1 (v0.196, #1817)
     } else if (auto* od =
                    dynamic_cast<const ast::OperatorDecl*>(&m)) {
+        // §28.1 (v0.196, #1817): an operator carries no own generic constraints
+        // (OperatorDecl has none); its `where T: value` bound comes from the
+        // enclosing type (currentOuterType_). Null this out so a prior method's
+        // constraints cannot leak into checkOwnedDeclType for the operator
+        // return; restore on exit.
+        const std::vector<ast::GenericConstraint>* savedConstraints =
+            currentMethodConstraints_;
+        currentMethodConstraints_ = nullptr;
         Scope methodScope;
         methodScope.parent = parent;
         for (const auto& p : od->params) {
@@ -768,6 +785,7 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
                    od->exprBody) {
             resolveTypesInExpr(*od->exprBody, &methodScope);
         }
+        currentMethodConstraints_ = savedConstraints;  // §28.1 (v0.196, #1817)
     } else if (auto* cd =
                    dynamic_cast<const ast::ConstructorDecl*>(&m)) {
         Scope ctorScope;
@@ -975,6 +993,33 @@ void Resolver::checkScopedIsFunctionTyped(const ast::Type* declaredType,
 void Resolver::checkOwnedDeclType(const TypeRef* t, SourceLocation loc,
                                   std::string_view positionDesc) {
     if (!t) return;
+    // §28.1 (v0.196, #1817): is the bare type parameter `param` constrained
+    // `where param: value` — the one bound that excludes class and interface
+    // substitutions outright? Consult the current method/operator's own clauses
+    // (currentMethodConstraints_) UNION the enclosing type's clauses
+    // (currentOuterType_'s TypeDecl). NARROW by design: only the `value`
+    // constraint-item kind triggers; other exclusion shapes (a sealed-value
+    // bound, an enum bound) are deliberately NOT decided here — under-rejecting
+    // is the safe direction (over-rejecting would close valid mixed-domain
+    // generics whose class/interface substitutions the marker is meant for).
+    auto hasValueConstraint = [&](std::string_view param) -> bool {
+        auto scan = [&](const std::vector<ast::GenericConstraint>& gcs) -> bool {
+            for (const auto& gc : gcs) {
+                if (gc.typeParam != param) continue;
+                for (const auto& item : gc.items)
+                    if (item.kind == "value") return true;
+            }
+            return false;
+        };
+        if (currentMethodConstraints_ && scan(*currentMethodConstraints_))
+            return true;
+        if (currentOuterType_) {
+            if (auto* td = dynamic_cast<const ast::TypeDecl*>(
+                    currentOuterType_->decl))
+                if (scan(td->genericConstraints)) return true;
+        }
+        return false;
+    };
     std::string badDesc;
     switch (t->kind) {
     case TypeRef::Kind::Error:
@@ -1022,12 +1067,31 @@ void Resolver::checkOwnedDeclType(const TypeRef* t, SourceLocation loc,
             // builtins (DateTime/Guid/… — isValueBuiltinByName, #1463) reject;
             // the class/interface builtins (Array<T>, Task, …) and bare type
             // parameters are admitted. A bare type parameter is admitted here
-            // unconditionally — the per-instantiation erasure of the marker at
-            // value/runtime-managed substitutions (v0.196) is #1817, not this
-            // declaration-site check.
+            // unless it is constrained `where T: value` (§28.1 v0.196, #1817):
+            // that parameter can never be a class or interface, so the marker
+            // could never be more than redundant — reject at the declaration,
+            // the one decidable point. The per-instantiation erasure of the
+            // marker at value/runtime-managed substitutions of an otherwise-
+            // unconstrained bare parameter is the rest of #1817, not this check.
             std::string_view nm = t->headName();
-            if (isValueBuiltinByName(nm))
+            if (isValueBuiltinByName(nm)) {
                 badDesc = "a value-type builtin";
+            } else if (hasValueConstraint(nm)) {
+                // §28.1 (v0.196): "A declaration whose constraints exclude class
+                // and interface substitutions outright (`where T: value`) rejects
+                // the marker at the declaration." Emit the bare-parameter-specific
+                // diagnostic directly (the generic message below names a bare type
+                // parameter as admissible, which would contradict this reject).
+                SourceLocation dloc = loc;
+                if (t->astNode && t->astNode->span.begin.line != 0)
+                    dloc = t->astNode->span.begin;
+                ctx_.diagnostics().report(
+                    Severity::Error, dloc,
+                    "`owned` is not admissible on " + std::string(positionDesc) +
+                    " of type a type parameter that can never be a class or "
+                    "interface (`where " + std::string(nm) + ": value`) (§28.1)");
+                return;
+            }
         }
         break;
     }

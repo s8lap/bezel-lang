@@ -476,9 +476,14 @@ private:
     // disposal obligation to transfer (§28.9, the same reasoning as §28.5's
     // field restriction) and is a compile error at `loc`. `positionDesc` names
     // the position for the diagnostic ("parameter", "return type", …). A bare
-    // type parameter is ADMITTED here; the per-instantiation erasure of the
-    // marker at value/runtime-managed substitutions (v0.196) is tracked
-    // separately as #1817 and is NOT enforced by this declaration-site check.
+    // type parameter is ADMITTED here UNLESS it is constrained `where T: value`
+    // (§28.1 v0.196, #1817): such a parameter can never be a class or interface,
+    // so the marker could never be more than redundant and is rejected at the
+    // declaration — the one decidable point (the constraint set is read from
+    // currentMethodConstraints_ and currentOuterType_). The per-instantiation
+    // erasure of the marker at value/runtime-managed substitutions of an
+    // OTHERWISE-unconstrained bare parameter (v0.196) is the rest of #1817 and
+    // is NOT enforced by this declaration-site check.
     // A no-op for admissible / move-only / unresolved (Error) types.
     void checkOwnedDeclType(const TypeRef* t, SourceLocation loc,
                             std::string_view positionDesc);
@@ -660,6 +665,20 @@ private:
     // resolveTypeDecl). Null at module scope. Used to attribute a deferred
     // generic-param argument to the type parameter / owner it belongs to.
     TypeSymbol* currentOuterType_ = nullptr;
+
+    // §28.1 (v0.196, #1817): the generic constraints of the method/operator
+    // whose signature is currently being resolved (set at the top of
+    // resolveMember's MethodDecl/OperatorDecl branches, save/restored like
+    // currentOuterType_). Consulted — in UNION with the enclosing type's
+    // constraints (currentOuterType_->decl->genericConstraints) — by
+    // checkOwnedDeclType so that an `owned` marker on a bare type parameter
+    // constrained `where T: value` is rejected at the declaration (that
+    // parameter can never be a class or interface, so the marker could never
+    // be more than redundant). An operator carries no own constraints, so the
+    // OperatorDecl branch sets this to null and the enclosing type supplies
+    // the `where T: value` bound. Null outside a method/operator signature.
+    const std::vector<ast::GenericConstraint>* currentMethodConstraints_ =
+        nullptr;
 
     struct DeferredNestedObligation {
         TypeSymbol* outerType = nullptr;        // e.g. Box (owns outerParam)
