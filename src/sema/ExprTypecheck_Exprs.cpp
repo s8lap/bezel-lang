@@ -4732,6 +4732,40 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         finallyLoopBoundary_ = -1;
         finallyDepth_ = 0;  // per §21.7 (#1589)
         if (lam->exprBody) visitExpr(*lam->exprBody);
+        // per §15.4 (#1693): a collection literal has no standalone type — it is
+        // well-typed only where a *determinable, admissible concrete* target
+        // exists (the §15.4 closed list: an inline array, or one of
+        // `Array`/`OwningArray`, `Set`, `Stack`, `Queue`, `LinkedList`,
+        // `Dictionary` and their owning forms, or a `FromCollectionLiteral`
+        // type). A collection INTERFACE — the `IEnumerable<U>` a
+        // `SelectMany`/`Select` selector returns — is deliberately NOT on that
+        // list, and an expression-bodied lambda supplies no annotation, so a
+        // bare collection-literal body has no target: the selector's own
+        // element type is itself inferred FROM the body (circular). Without a
+        // target the literal stayed untyped, `ctx_.exprType` was null, and
+        // codegen emitted a null/empty sequence — a SILENT miscompile
+        // (`xs.SelectMany((x) => [x, x + 10])` yielded an empty flattened
+        // sequence). This is the same §15.4 defect #1174 fixed for a literal
+        // passed DIRECTLY to an `IEnumerable<T>` parameter (rejected there);
+        // reject it here too rather than miscompile. The idiom is a block body
+        // binding an explicitly-typed local:
+        // `(x) => do var inner: Array<U> := [...]; return inner; end`.
+        if (lam->exprBody &&
+            dynamic_cast<const ast::CollectionLiteralExpr*>(lam->exprBody.get()) &&
+            !ctx_.exprType(*lam->exprBody)) {
+            ctx_.diagnostics().report(
+                Severity::Error, lam->exprBody->span.begin,
+                "collection literal has no determinable target type as a "
+                "lambda's expression body — a collection literal is well-typed "
+                "only against a concrete collection target (an inline array, or "
+                "`Array<T>`/`OwningArray<T>`, `Set`, `Stack`, `Queue`, "
+                "`LinkedList`, `Dictionary` and their owning forms), never a "
+                "collection interface such as the `IEnumerable<U>` a "
+                "`SelectMany`/`Select` selector returns; use a block body with "
+                "an explicitly-typed local instead "
+                "(`(x) => do var inner: Array<U> := [...]; return inner; end`) "
+                "(§15.4)");
+        }
         for (const auto& s : lam->stmts) if (s) visitStmt(*s);
         // issue #777 / §30.6: forgotten `await` in an expression-bodied async
         // lambda. The body must produce the element type T threaded in as
