@@ -4952,7 +4952,30 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         } else if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
             if (checkNamed(loc->declType) || checkPureIEnumerable(loc->declType))
                 isArrayBacked = false;
+        } else if (dynamic_cast<sema::FieldSymbol*>(sym) ||
+                   dynamic_cast<sema::PropertySymbol*>(sym)) {
+            // §29.2 / §28.5 (#1642): a bare field/property source (`for var x in
+            // seq` where `seq` is an owned field or a property) holds a vtable-
+            // backed iterator object for the pure iterator interfaces
+            // IEnumerable<T> / IOwningEnumerable<T> — the same coercion invariant
+            // (#1310) that makes a local/param vtable-backed applies to storage
+            // members. Without this the source defaults to the bz_array protocol
+            // and reads the iterator frame as an array (a 0-element silent
+            // miscompile). Richer interfaces (IReadOnlyList, etc.) keep the
+            // indexer-based array protocol, exactly as for a local/param.
+            if (n == "IEnumerable" || n == "IOwningEnumerable")
+                isArrayBacked = false;
         }
+    } else if (dynamic_cast<const ast::MemberAccessExpr*>(fs.iterable.get())) {
+        // §29.2 / §28.5 (#1642): an explicit `this.seq` / `obj.seq` field or
+        // property read — the same object-owned, vtable-backed iterator source as
+        // the bare-identifier field/property case above (exprSymbol resolves the
+        // member access to its FieldSymbol / PropertySymbol).
+        sema::Symbol* sym = ctx_.exprSymbol(*fs.iterable);
+        if ((dynamic_cast<sema::FieldSymbol*>(sym) ||
+             dynamic_cast<sema::PropertySymbol*>(sym)) &&
+            (n == "IEnumerable" || n == "IOwningEnumerable"))
+            isArrayBacked = false;
     }
 
     if (isArrayBacked) {
@@ -5075,11 +5098,23 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     // loop — dispose it once when the loop ends, alongside the enumerator. A named
     // local/param source (an IdentifierExpr) is disposed at its own scope end, so
     // it is NOT disposed here (that would double-free).
+    // §29.2 / §28.5 (#1642): a for-in source that is a NAMED owned binding — a
+    // local/param, or a field/property owned by the enclosing object — is
+    // disposed at ITS OWN lifetime end (the local's scope end, or the object's
+    // owned-field cascade, §28.5), NOT here. Per §29.2 the loop BORROWS such a
+    // source (pins it, `using var __source` becomes a no-op borrow) and does not
+    // assume its disposal obligation; only a freshly produced temporary (a
+    // CallExpr/NewExpr result with no owning binding) is loop-owned and disposed
+    // here. exprSymbol resolves both a bare identifier (`seq`) and a member
+    // access (`this.seq` / `obj.seq`) to the underlying binding symbol, so a
+    // field/property source (whether spelled bare or `this.`-qualified) is
+    // correctly recognized and NOT double-freed against the field cascade.
     bool sourceIsNamedLocal = false;
-    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(fs.iterable.get())) {
-        sema::Symbol* sym = ctx_.exprSymbol(*id);
+    if (sema::Symbol* sym = ctx_.exprSymbol(*fs.iterable)) {
         sourceIsNamedLocal = dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
-                             dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr;
+                             dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr ||
+                             dynamic_cast<sema::FieldSymbol*>(sym) != nullptr ||
+                             dynamic_cast<sema::PropertySymbol*>(sym) != nullptr;
     }
     if (!sourceIsNamedLocal) {
         Disposal ds{srcSlot, nullptr};
