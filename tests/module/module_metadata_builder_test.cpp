@@ -366,8 +366,16 @@ BEZEL_TEST(module_metadata_emit, object_section_roundtrip_spec_2_6) {
             BEZEL_EXPECT_TRUE(findMember(*acct, "Deposit") != nullptr);
             BEZEL_EXPECT_TRUE(findMember(*acct, "balance") == nullptr);
         }
-        // The recovered metadata equals a fresh build from the same source.
+        // The source declares App.Main, so the driver stamped the artifact
+        // executable-kind (#1733, §2.8.4); verify that survived the roundtrip.
+        BEZEL_EXPECT_TRUE(recovered->isExecutable);
+        // The recovered metadata equals a fresh build from the same source. The
+        // metadata-only buildFromSource helper does not run the driver's
+        // output-mode decision, so it leaves isExecutable at its default —
+        // normalize that one field (it is orthogonal to the public-interface
+        // roundtrip this test verifies).
         auto fresh = buildFromSource(source);
+        fresh->meta.isExecutable = recovered->isExecutable;
         BEZEL_EXPECT_TRUE(*recovered == fresh->meta);
     }
 
