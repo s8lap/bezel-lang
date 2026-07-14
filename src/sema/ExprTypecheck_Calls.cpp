@@ -7845,6 +7845,56 @@ bool ExprTC::unifyReturnAgainstTarget(
     return true;
 }
 
+// §28.1 owned-marker erasure at value substitution (v0.196, #1817 sub-task E2).
+// A LAYER-LOCAL copy of the value-kind predicate the declaration-site check
+// (Resolver::checkOwnedDeclType, §28.1) uses to decide where `owned` is
+// admissible: it returns true on exactly that check's REJECT set — the value
+// and runtime-managed types (§28.9) on which `owned` carries no disposal
+// obligation to transfer. When a bare type parameter carrying an `owned` marker
+// on a function-type slot is substituted at such a type, §28.1 (v0.196) ERASES
+// the marker — `(owned T) -> ()` at `T = int` *is* `(int) -> ()` (§27.1) — so
+// the substituted function type is markerless and matches a plain function type
+// for §27.1 assignability / §22.3 call rules. The marker is RETAINED at class
+// and interface substitutions (ordinary transfer meaning), at move-only value
+// substitutions (admitted-but-redundant, §15.3), and while the inner slot stays
+// an abstract bare type parameter — for all of which this predicate returns
+// false. Kept as a private copy (not a call into the Resolver) so the two layers
+// do not share mutable state; the classification is deliberately identical.
+static bool ownedMarkerErasedAtSubstitutedType(const TypeRef* t) {
+    if (!t) return false;
+    switch (t->kind) {
+    case TypeRef::Kind::Error:
+        return false;  // resolution failed — leave the marker untouched.
+    case TypeRef::Kind::Unit:
+        return true;   // the unit type `()` — a value type.
+    case TypeRef::Kind::Function:
+        return true;   // a function value is a runtime-managed reference (§28.9).
+    case TypeRef::Kind::Primitive:
+        // Every primitive is a value type, or — for `string`/`Object` — a
+        // runtime-managed reference type (§28.9); none carries a disposal
+        // obligation, mirroring checkOwnedDeclType's uniform primitive reject.
+        return true;
+    case TypeRef::Kind::InlineArray:
+        // §15.3: an owning inline array is a MOVE-ONLY value type — the marker
+        // is retained (admitted-but-redundant), so return false; a non-owning
+        // inline array is a plain value type and erases.
+        return !t->arrayOwned;
+    case TypeRef::Kind::Named: {
+        const TypeSymbol* ts = t->declaration;
+        if (ts)
+            return ts->isValueBuiltin ||
+                   ts->kind == ast::TypeDeclKind::Record ||
+                   ts->kind == ast::TypeDeclKind::Enum;
+        // No TypeSymbol: a value-type builtin (DateTime/Guid/… —
+        // isValueBuiltinByName) erases; a class/interface builtin (Array<T>,
+        // Task, …) and an UNRESOLVED bare type parameter (a nested generic still
+        // abstract at this instantiation) both RETAIN the marker.
+        return isValueBuiltinByName(t->headName());
+    }
+    }
+    return false;
+}
+
 // per §14.1 (issue #391) — see the header comment. Rebuild a declared return
 // TypeRef with each solved type-parameter name replaced by its concrete
 // TypeRef.
@@ -7937,16 +7987,37 @@ TypeRef* ExprTC::substituteReturnType(
             if (sub != fp.type) changed = true;
             TypeRef::FuncParam np = fp;  // preserve modifier/name
             np.type = sub;
+            // §28.1 owned-marker erasure (v0.196, #1817 E2): a bare type
+            // parameter carrying `owned`/`out owned` on this parameter slot,
+            // substituted at a value/runtime-managed type, drops the marker so
+            // the produced function type is markerless — `(owned T) -> ()` at
+            // `T = int` *is* `(int) -> ()` (§27.1). Gated strictly: only when the
+            // slot was ACTUALLY substituted (sub != fp.type, so a still-abstract
+            // bare-T retains) AND the substituted type is value/runtime-managed
+            // (class/interface/move-only substitutions retain). `owned` -> "",
+            // `out owned` -> "out" (an `out owned` slot delivers a plain value).
+            if ((np.modifier == "owned" || np.modifier == "out owned") &&
+                sub != fp.type && ownedMarkerErasedAtSubstitutedType(sub)) {
+                np.modifier = np.modifier == "out owned" ? "out" : "";
+            }
             newParams.push_back(np);
         }
         TypeRef* newRet = declared->funcReturn
                               ? substituteReturnType(declared->funcReturn, solved)
                               : declared->funcReturn;
         if (newRet != declared->funcReturn) changed = true;
+        // §28.1 owned-marker erasure (v0.196, #1817 E2): the same rule for a
+        // function-type RETURN slot — `() -> owned T` at `T = int` *is*
+        // `() -> int`. Same strict gate: the return slot was substituted AND the
+        // substituted return type is value/runtime-managed.
+        bool retOwnedErased = declared->funcReturnOwned &&
+                              newRet != declared->funcReturn &&
+                              ownedMarkerErasedAtSubstitutedType(newRet);
         if (!changed) return declared;
         TypeRef* result = ctx_.makeTypeRef(*declared);
         result->funcParams = std::move(newParams);
         result->funcReturn = newRet;
+        if (retOwnedErased) result->funcReturnOwned = false;
         return result;
     }
     // #1261 (§14.1): an inline-array return (`[N]T`) embeds a type parameter in
