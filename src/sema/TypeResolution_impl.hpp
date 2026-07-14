@@ -64,6 +64,18 @@ public:
                                          const TypeRef* baseTy,
                                          bool isByRefParam = false);
 
+    // §19.3 (#1847): is `n` the simple name of a BUILT-IN (stdlib) type — any
+    // built-in class/interface/record/enum/value type the compiler resolves
+    // without a user `TypeDecl` (Exception and its hierarchy, DateTime, the
+    // collections, StringBuilder, …)? A thin predicate over the authoritative
+    // `builtinTypeArity` table, exposed (via the free-function wrapper
+    // `isBuiltinTypeName` in TypeResolution.hpp) so ExprTC's top-level
+    // case-pattern validator can recognize a built-in type-test pattern
+    // (`case e of IOException => …`) without re-listing the built-in name set.
+    static bool isBuiltinTypeName(std::string_view n) {
+        return builtinTypeArity(n) != kNotBuiltin;
+    }
+
 private:
     // Lookup environment in scope. A stack of scopes (module-level + per-type
     // + per-method). Each scope contributes a small name → Symbol table.

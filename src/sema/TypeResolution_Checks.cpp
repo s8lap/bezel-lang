@@ -69,6 +69,13 @@ bool overrideParamTypeMatches(const TypeRef* derivedTy, const TypeRef* baseTy,
     return Resolver::overrideParamTypeMatches(derivedTy, baseTy, isByRefParam);
 }
 
+// Free-function wrapper exposing the resolver's built-in-type-name recognizer
+// for reuse by the §19.3 top-level case-pattern validator (#1847). Single
+// source of truth: delegates to Resolver::isBuiltinTypeName.
+bool isBuiltinTypeName(std::string_view n) {
+    return Resolver::isBuiltinTypeName(n);
+}
+
 int Resolver::effVisRank(ast::Visibility v) {
     int r = visRank(v);
     return r == 0 ? 2 : r;  // None → internal

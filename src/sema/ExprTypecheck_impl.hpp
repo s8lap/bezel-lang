@@ -422,6 +422,27 @@ private:
     void checkCasePatternConstantRanges(const std::vector<ast::CaseArm>& arms,
                                         TypeRef* scrutTy);
 
+    // §19.3 (#1847): validate a TOP-LEVEL bare-identifier `case`/`when` pattern.
+    // The grammar leaves a single-/qualified-identifier pattern ambiguous (§A.7):
+    // it is a TYPE TEST when the name resolves to a type (or a type parameter,
+    // v0.182), a CONSTANT pattern when it resolves to a named `const`, and an
+    // ENUM-CONSTANT pattern when it names a constant of the scrutinee enum. A
+    // bare identifier that resolves to none of these — a runtime local/parameter/
+    // field VALUE, or an entirely unresolved name — is neither a type nor a
+    // constant and must be a compile error. Sema previously let it through and
+    // codegen's NamedPattern handler returned nullptr ("deferred"): in statement
+    // position the arm silently vanished (the mandatory `_` catch-all skipped,
+    // §19.6); in expression position `case.end` was left unterminated (malformed
+    // IR / ICE). Engaged for a top-level NamedPattern from both the CaseExpr and
+    // CaseStmt handlers.
+    void checkTopLevelNamedPattern(const ast::NamedPattern* np, TypeRef* scrutTy);
+
+    // §19.3 (#1847): shared diagnostic for a top-level bare-identifier pattern
+    // that resolves to a runtime VALUE (a local, parameter, or field) rather
+    // than a type or constant.
+    void reportNamedPatternIsValue(const ast::NamedPattern* np,
+                                   std::string_view name);
+
     // Slice S21: does a callable with this return-type ascription
     // produce a value? No ascription → no (unit). An ascription that
     // resolves to the unit type → no. Anything else → yes.

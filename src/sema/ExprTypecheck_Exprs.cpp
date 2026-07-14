@@ -5210,6 +5210,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     }
                 }
             }
+            // §19.3 (#1847): a top-level bare-identifier pattern must be a type
+            // test, a named constant, or an enum constant; reject one that
+            // resolves to a runtime value or an unresolved name — otherwise
+            // codegen leaves `case.end` unterminated (malformed IR / ICE).
+            if (auto* np =
+                    dynamic_cast<const ast::NamedPattern*>(arm.pattern.get()))
+                checkTopLevelNamedPattern(np, scrutTy);
             // §19: a BindingPattern arm introduces a new scope with the
             // bound name visible inside the guard and body (per §19.2).
             auto* bp =

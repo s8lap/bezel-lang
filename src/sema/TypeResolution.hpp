@@ -29,6 +29,8 @@
 //   - Constraint-clause resolution (sema slice with constraint handling).
 //   - Variance compatibility checks (typecheck-time).
 
+#include <string_view>
+
 #include "ast/Node.hpp"
 #include "sema/SemaContext.hpp"
 #include "sema/TypeRef.hpp"
@@ -54,5 +56,13 @@ bool typeRefEqual(const TypeRef* a, const TypeRef* b);
 // admitted for a plain by-value parameter (see TypeResolution_Checks.cpp).
 bool overrideParamTypeMatches(const TypeRef* derivedTy, const TypeRef* baseTy,
                               bool isByRefParam = false);
+
+// §19.3 (#1847): is `n` the simple name of a built-in (stdlib) type? Exposes
+// the resolver's authoritative built-in-type-name recognizer (a thin predicate
+// over `builtinTypeArity`) so the top-level case-pattern validator in ExprTC
+// can accept a built-in type-test pattern (`case e of IOException => …`)
+// without duplicating the built-in name list. Single source of truth:
+// delegates to Resolver::isBuiltinTypeName.
+bool isBuiltinTypeName(std::string_view n);
 
 } // namespace bezel::sema

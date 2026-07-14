@@ -14,6 +14,7 @@
 #include "sema/ConstFold.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
+#include "sema/TypeResolution.hpp"
 
 namespace bezel::sema {
 
@@ -881,6 +882,128 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
     // statically-knowable value set to enumerate. Without a catch-all arm
     // (handled above) the case is non-exhaustive.
     warn("scrutinee type cannot be proven exhaustive");
+}
+
+// §19.3 (#1847): validate a TOP-LEVEL bare-identifier `case`/`when` pattern.
+// See the declaration comment (ExprTypecheck_impl.hpp) for the defect. The
+// grammar (§A.7) makes a single-/qualified-identifier pattern a TYPE TEST when
+// the name resolves to a type or a type parameter (v0.182), a CONSTANT pattern
+// when it resolves to a named `const`, and an ENUM-CONSTANT pattern when it
+// names a constant of the scrutinee enum (§10.6/§19.8). Anything else — a
+// runtime local/parameter/field value, or an unresolved name — is neither and
+// is rejected here (codegen would otherwise silently drop the arm / emit
+// malformed IR).
+void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
+                                       TypeRef* scrutTy) {
+    if (!np || !np->name || np->name->parts.empty()) return;
+    // A scrutinee-less `case`/`when` (its arms are boolean CONDITION patterns,
+    // §19.1) and a scrutinee whose type failed to resolve (Error kind — a
+    // follow-on diagnostic here would be a confusing cascade, cf. line ~877)
+    // are both out of scope for this type-vs-constant check.
+    if (!scrutTy || scrutTy->kind == TypeRef::Kind::Error) return;
+    // Only a BARE single identifier reaches codegen's silent-drop path; a
+    // qualified name (`C.K`, `Color.Red`, `System.IO.Stream`) is resolved by
+    // codegen's constValueForPatternName / enum / type-descriptor handlers and
+    // is not the reported defect.
+    if (np->name->parts.size() != 1) return;
+    std::string_view last = np->name->parts.back();
+
+    // (1) Enum-constant pattern: a bare name that is a constant of the scrutinee
+    //     ENUM (nullable or not, §10.6 / §19.8). Checked directly on the
+    //     scrutinee's enum declaration so it holds for `Color?` as well as
+    //     `Color`.
+    if (scrutTy->declaration &&
+        scrutTy->declaration->kind == ast::TypeDeclKind::Enum) {
+        for (Symbol* m : scrutTy->declaration->members)
+            if (dynamic_cast<EnumConstantSymbol*>(m) && m->name == last)
+                return;  // valid enum-constant pattern
+    }
+
+    // (2) Type-test pattern: `last` names a user/imported type (any
+    //     TypeDeclKind — class/interface/record/enum), a type alias, or a
+    //     built-in type. Mirrors codegen's descriptorForPatternName /
+    //     record-enum / built-in-descriptor resolution.  §19.3 "Type patterns
+    //     without binding: `string`, `int`, `Dog`".
+    for (const auto& sym : ctx_.symbols()) {
+        if (auto* ts = dynamic_cast<const TypeSymbol*>(sym.get()))
+            if (ts->name == last) return;  // valid type-test pattern
+        if (auto* ta = dynamic_cast<const TypeAliasSymbol*>(sym.get()))
+            if (ta->name == last) return;  // type-alias type test
+    }
+    if (isBuiltinTypeName(last)) return;   // built-in type (authoritative table)
+
+    // (2b) Type-parameter pattern (§19.3, v0.182): in a generic body a bare
+    //      type parameter `T` is a type test against the substituted type
+    //      argument, per instantiation. A generic parameter is not in the value
+    //      scope (lookupName does not find it), so recognize it directly from
+    //      the enclosing method's / type's declared parameters (the same lookup
+    //      the `new T()` and type-argument-inference paths use).
+    if (currentMethodDecl_)
+        for (const auto& gp : currentMethodDecl_->genericParams)
+            if (gp.name == last) return;
+    if (currentType_ && currentType_->decl)
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(currentType_->decl))
+            for (const auto& gp : td->genericParams)
+                if (gp.name == last) return;
+
+    // (3) Named-`const` pattern: `last` is a `const` member anywhere (mirrors
+    //     codegen's constValueForPatternName ConstMemberSymbol search — module
+    //     or type const). §19.3 "Constants: … a named `const`".
+    for (const auto& sym : ctx_.symbols()) {
+        if (auto* cm = dynamic_cast<const ConstMemberSymbol*>(sym.get()))
+            if (cm->name == last) return;
+        if (auto* ts = dynamic_cast<const TypeSymbol*>(sym.get()))
+            for (Symbol* m : ts->members)
+                if (auto* cm2 = dynamic_cast<const ConstMemberSymbol*>(m))
+                    if (cm2->name == last) return;
+    }
+
+    // Resolve in the current lexical scope. A `const` LOCAL (`const K := 5`) is
+    // a valid constant pattern; a type parameter (v0.182 — `case x of T`), an
+    // enum constant, a const member, or a (nested) type all resolve here too
+    // and are accepted. Anything that resolves to a *runtime value* — a `var`
+    // local, a parameter, or a mutable field/property — is NOT a type or
+    // constant and is the reported defect.
+    Symbol* s = lookupName(last);
+    if (s) {
+        if (auto* ls = dynamic_cast<LocalSymbol*>(s)) {
+            if (ls->isConst) return;  // const local — valid constant pattern
+            reportNamedPatternIsValue(np, last);
+            return;
+        }
+        if (dynamic_cast<ParameterSymbol*>(s) ||
+            dynamic_cast<FieldSymbol*>(s) ||
+            dynamic_cast<PropertySymbol*>(s)) {
+            reportNamedPatternIsValue(np, last);
+            return;
+        }
+        // Any other resolved symbol kind (TypeSymbol / NestedTypeSymbol /
+        // GenericParamSymbol / ConstMemberSymbol / EnumConstantSymbol /
+        // TypeAliasSymbol / MethodSymbol …) is a type, constant, or otherwise
+        // not a plain runtime value — accept conservatively (never over-reject).
+        return;
+    }
+
+    // Unresolved: not a type, not a constant, and not in scope. An undefined
+    // identifier in a top-level pattern position (§19.3).
+    ctx_.diagnostics().report(
+        Severity::Error, np->span.begin,
+        "`" + std::string(last) + "` does not name a type or a constant, so it "
+        "cannot be a top-level `case` pattern (\xC2\xA7""19.3): a bare "
+        "identifier there is a type test, and this name is not in scope");
+}
+
+// §19.3 (#1847): shared diagnostic for a top-level bare-identifier pattern that
+// resolves to a runtime VALUE (a local, parameter, or field) rather than a type
+// or constant.
+void ExprTC::reportNamedPatternIsValue(const ast::NamedPattern* np,
+                                       std::string_view name) {
+    ctx_.diagnostics().report(
+        Severity::Error, np->span.begin,
+        "`" + std::string(name) + "` is a value, not a type or constant, so it "
+        "cannot be a top-level `case` pattern (\xC2\xA7""19.3): a bare "
+        "identifier there is a type test. To compare the scrutinee against a "
+        "value, use a guard: `var x when x = " + std::string(name) + " => …`");
 }
 
 // Slice S21: does a callable with this return-type ascription
@@ -7097,6 +7220,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     }
                 }
             }
+            // §19.3 (#1847): a top-level bare-identifier pattern must be a type
+            // test, a named constant, or an enum constant; reject one that
+            // resolves to a runtime value or an unresolved name (codegen would
+            // silently drop the arm — the mandatory `_` skipped, §19.6).
+            if (auto* np =
+                    dynamic_cast<const ast::NamedPattern*>(arm.pattern.get()))
+                checkTopLevelNamedPattern(np, scrutTy);
             // §19: a BindingPattern arm introduces a new scope with the
             // bound name visible inside the guard and body (per §19.2).
             auto* bp =

@@ -5804,7 +5804,30 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 }
             }
         }
-        return nullptr;  // unresolved name — deferred
+        // §19.3 (#1847): a top-level NamedPattern that resolved to none of the
+        // handlers above — an enum constant, a named `const`, a class/interface
+        // type descriptor, or a record/enum type name. Sema now rejects the
+        // reported ill-formed forms (a bare identifier naming a runtime VALUE or
+        // an unresolved name — checkTopLevelNamedPattern, ExprTypecheck.cpp), so
+        // the only patterns still reaching here are VALID-per-spec forms the
+        // backend does not yet lower: a `const` LOCAL used as a pattern
+        // (constValueForPatternName searches only const MEMBERS) and a bare
+        // type-parameter pattern (`case x of T`, §19.3 v0.182 — needs the
+        // substituted type argument). Returning nullptr here left `case.end`
+        // unterminated in expression position (a malformed-IR ICE) and silently
+        // truncated the arm chain in statement position (the mandatory `_`
+        // skipped — a silent miscompile). Fail LOUDLY and consistently instead:
+        // emit a diagnostic and a never-match so the block stays terminated.
+        // (Proper lowering of these two forms is tracked separately.)
+        if (np->name && !np->name->parts.empty())
+            ctx_.diagnostics().report(
+                Severity::Error, np->span.begin,
+                "the `case`/`when` pattern `" +
+                std::string(np->name->parts.back()) +
+                "` is not supported by the backend: it did not resolve to a "
+                "type, enum constant, or named constant to match against "
+                "(\xC2\xA7""19.3)");
+        return builder_.getInt1(false);
     }
     // #473 / §19.3: a primitive type pattern `int`, `string`, … (TypePattern).
     // The parser routes primitive-type-keyword patterns here (Parser_Exprs
