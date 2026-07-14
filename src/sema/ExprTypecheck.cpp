@@ -2016,7 +2016,9 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
 // through, not a fresh value; #206's `a!.V := 7` is a real lvalue and must
 // stay accepted) — looking for the chain's actual base. A CallExpr or
 // NullCondCallExpr found there means the base is a method-call (or
-// null-conditional-invocation) RESULT, which grammar A.6 does not admit.
+// null-conditional-invocation) RESULT, which grammar A.6 does not admit; a
+// NewExpr base (`new C().field := v`, #1744) is likewise a fresh value, not
+// a storage location, and is rejected the same way.
 void ExprTC::checkLValueChainNotCallBased(const ast::Expr& target) {
     const ast::Expr* e = &target;
     for (;;) {
@@ -2039,6 +2041,16 @@ void ExprTC::checkLValueChainNotCallBased(const ast::Expr& target) {
             "target — grammar A.6's lvalue base must be an identifier or "
             "`this`; extract the call result into a local first "
             "(`var c := getCache(); c.items[0] := v;`) (§6.6)");
+    } else if (dynamic_cast<const ast::NewExpr*>(e)) {
+        // §6.6 / A.6 (v0.196, #1744): a `new` expression is a fresh value,
+        // not a storage location — `new C().field := v` bases the chain on a
+        // NewExpr, which A.6 does not admit. Bind it to a local first.
+        ctx_.diagnostics().report(
+            Severity::Error, target.span.begin,
+            "a newly-constructed object cannot be the base of an assignment "
+            "target — grammar A.6's lvalue base must be an identifier or "
+            "`this`; bind the `new` expression to a local first "
+            "(`var c := new C(); c.items[0] := v;`) (§6.6)");
     }
 }
 
