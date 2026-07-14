@@ -46,8 +46,20 @@ for (( i = 0; i < shards; i++ )); do
     # race, #1609) otherwise hangs `wait` below forever and wedges the whole gate.
     # timeout kills the hung shard (exit 124/137 -> counted as a crashed shard ->
     # the gate's flake arbitration re-runs it). A shard normally finishes in ~45s.
-    TMPDIR="$shard_tmp" BEZEL_SHARD_COUNT="$shards" BEZEL_SHARD_INDEX="$i" \
-        timeout -k 10 "${BEZEL_SHARD_TIMEOUT:-300}" "$bin" > "$logdir/shard.$i.log" 2>&1 &
+    #
+    # Wrapped in a subshell purely to record the shard's OWN wall time (appended as
+    # a SHARD_ELAPSED marker to its log, surfaced below) — observation only. The
+    # timeout still DIRECTLY wraps $bin so hung-test kill semantics are unchanged,
+    # and `exit $_rc` preserves the shard's exit code for the `wait` below.
+    (
+        _s=$(awk '{print $1; exit}' /proc/uptime 2>/dev/null || date +%s)
+        TMPDIR="$shard_tmp" BEZEL_SHARD_COUNT="$shards" BEZEL_SHARD_INDEX="$i" \
+            timeout -k 10 "${BEZEL_SHARD_TIMEOUT:-300}" "$bin" > "$logdir/shard.$i.log" 2>&1
+        _rc=$?
+        _e=$(awk '{print $1; exit}' /proc/uptime 2>/dev/null || date +%s)
+        awk "BEGIN{printf \"SHARD_ELAPSED %.2f\\n\", $_e-$_s}" >> "$logdir/shard.$i.log"
+        exit $_rc
+    ) &
     pids+=("$!")
 done
 
@@ -108,6 +120,13 @@ if [[ "${#crashed_shards[@]}" -gt 0 || "$count_ok" -eq 0 ]]; then
     done
     echo "############################################################"
 fi
+
+# Per-shard wall times (observation only — lets the gate's timing log spot shard
+# imbalance). Harvested from each shard's SHARD_ELAPSED marker before cleanup.
+for (( i = 0; i < shards; i++ )); do
+    et="$(grep -oE 'SHARD_ELAPSED [0-9.]+' "$logdir/shard.$i.log" 2>/dev/null | awk '{print $2}' | tail -1)"
+    [[ -n "$et" ]] && echo "shard $i: ${et}s"
+done
 
 echo "============================================================"
 echo "TOTAL: $total_pass passed, $total_fail failed  (across $shards shards, $((end - start))s)"
