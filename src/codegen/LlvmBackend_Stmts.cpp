@@ -771,15 +771,32 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     genericSubst_       = std::move(savedOpSubst);
                     genericSubstSemaTy_ = std::move(savedOpSema);
                     if (res) {
-                        // §28.7 (#913): `c++` ≡ `c := T.operator++(c)` — reassigning
-                        // an owned class local disposes the displaced old value
-                        // first (the operator already borrowed `cur` above, so it is
-                        // safe to dispose now, before the store). No-op for a borrow
-                        // local/param (no disposal entry → no double-free).
-                        disposeDisplacedOwnedClassLocal(inc->target.get(), addr,
-                                                        elemTy, res);
-                        builder_.CreateStore(res, addr);
-                        // §27.5 / #673: sync to original alloca.
+                        // §28.7 / §17.6 (#1702): `c++` ≡ `c := T.operator++(c)` —
+                        // the store must drop-on-overwrite (dispose the displaced
+                        // value). For an owned class/interface FIELD, route through
+                        // lowerOwnedClassFieldStore — the field analog of the local
+                        // disposal below — which self-contains load-old /
+                        // null+identity-guard / dispose-old / store-new (§17.6: the
+                        // operator result is produced first, then the displaced
+                        // previous value is disposed implicitly, then the new value
+                        // is stored). Without this the displaced field value leaked
+                        // (the plain path stored only via the local branch, which is
+                        // a no-op for a field). Returns false for non-owned-field
+                        // targets (locals, ref params, static/record/borrow fields),
+                        // which fall through to the LOCAL path below. Mirrors the
+                        // plain-assignment path's lowerOwnedClassFieldStore call.
+                        if (!lowerOwnedClassFieldStore(*inc->target, addr, res)) {
+                            // §28.7 (#913): reassigning an owned class LOCAL disposes
+                            // the displaced old value first (the operator already
+                            // borrowed `cur` above, so it is safe to dispose now,
+                            // before the store). No-op for a borrow local/param (no
+                            // disposal entry → no double-free).
+                            disposeDisplacedOwnedClassLocal(inc->target.get(), addr,
+                                                            elemTy, res);
+                            builder_.CreateStore(res, addr);
+                        }
+                        // §27.5 / #673: sync to original alloca (a no-op for a field
+                        // target — localSlot returns null for a non-local).
                         if (llvm::AllocaInst* ns = localSlot(*inc->target))
                             syncCellToOrigSlot(ns, res);
                     }
