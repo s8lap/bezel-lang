@@ -58,6 +58,11 @@ void scanReassignStmts(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                        std::unordered_set<const sema::Symbol*>& out);
 }  // namespace
 
+// §28.1 (v0.196, #1817): forward declaration — true when a bare-type-parameter
+// `owned` slot's SUBSTITUTED type is a value/runtime-managed kind whose marker
+// is erased (no disposal obligation). Definition lives below near producerState.
+static bool isValueSubstitutionErased(const sema::TypeRef* rt);
+
 void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
          const std::vector<sema::Symbol*>* paramSyms, bool isAsync,
          bool isDestructor, const ast::Type* returnType, bool returnOwned,
@@ -147,6 +152,20 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             if (!ps) continue;
             if (ps->modifier == "owned" ||
                 ps->modifier == "out owned") {
+                // §28.1 (v0.196, #1817): mirror the value-substitution erasure
+                // on the parameter side. A bare-type-parameter `owned`/`out
+                // owned` slot substituted to a value or runtime-managed type
+                // carries NO obligation (the marker is erased), so it must not
+                // be seeded Owned. Definition-side seeding runs with T abstract
+                // — a bare-T param resolves to a Named with no declaration and
+                // is NOT erased (isValueSubstitutionErased is conservative), so
+                // this is a no-op there and the generic body still discharges
+                // the seeded obligation; only the concrete-substitution boundary
+                // erases. // per §28.1 v0.196 #1817
+                const sema::TypeRef* prt =
+                    ps->declType ? ctx_.resolvedType(*ps->declType)
+                                 : ps->resolvedDeclType;
+                if (isValueSubstitutionErased(prt)) continue;
                 LocalOwnership lo;
                 lo.state = OwnershipState::Owned;
                 lo.implicitDischarge = false;
@@ -2027,6 +2046,69 @@ static bool isClassOrInterfaceResult(const sema::TypeRef* rt) {
            rt->declaration->kind == ast::TypeDeclKind::Interface;
 }
 
+// §28.1 (v0.196, #1817): owned-marker erasure at a VALUE substitution. For a
+// bare-type-parameter `owned` slot (an `owned T` return, an `owned`/`out owned`
+// parameter), the marker's meaning is fixed per instantiation: at a class or
+// interface substitution it has its ordinary transfer meaning; at a move-only
+// value substitution it is admitted-but-redundant (the marker is retained — the
+// type's own move semantics transfer the obligation); and at EVERY OTHER value
+// or runtime-managed substitution it is ERASED — the substituted signature is
+// unmarked and the result/parameter is a plain value carrying no disposal
+// obligation (§28.9). This predicate reports that erased case by keying off the
+// SUBSTITUTED type's KIND — it NEVER re-derives the substitution — and mirrors
+// the `new T` value-kind detection in producerState's NewExpr branch. It is
+// deliberately conservative in the one direction that matters for soundness:
+// a still-generic bare-T result (a Named with no declaration and a
+// non-value-builtin name — an unsubstituted type parameter, or an
+// unresolved/imported reference) is NOT erased, because erasing a class
+// substitution there would leak its resource; keeping the marker over-warns at
+// worst, never under-disposes. // per §28.1 v0.196 #1817
+static bool isValueSubstitutionErased(const sema::TypeRef* rt) {
+    if (!rt) return false;
+    switch (rt->kind) {
+        case sema::TypeRef::Kind::Primitive:
+            // Every primitive is value/runtime-managed with no disposal
+            // obligation (`string` is runtime-managed, §28.9) — EXCEPT `Object`,
+            // the root reference type, whose substitution is a class-like
+            // transfer that must stay Owned.
+            return rt->primitive != sema::PrimitiveType::Object &&
+                   rt->primitive != sema::PrimitiveType::None;
+        case sema::TypeRef::Kind::Named:
+            if (rt->declaration) {
+                // A value-builtin (DateTime/Guid/TimeSpan/CancellationToken/…)
+                // carries kind==Class but no obligation; a record or enum is a
+                // value type. Any of these erase; a genuine class/interface
+                // does not (it stays on the Owned transfer path).
+                if (rt->declaration->isValueBuiltin) return true;
+                return rt->declaration->kind != ast::TypeDeclKind::Class &&
+                       rt->declaration->kind != ast::TypeDeclKind::Interface;
+            }
+            // declaration == null: a value-builtin resolved by-name (Path B of
+            // the NewExpr branch) erases; ANY OTHER null-declaration Named is an
+            // unsubstituted bare type parameter or an unresolved/imported type —
+            // NOT erased (the conservative, leak-safe direction).
+            if (rt->astNode && rt->astNode->name &&
+                rt->astNode->name->parts.size() == 1) {
+                std::string_view n = rt->headName();
+                if (n == "DateTime" || n == "TimeSpan" || n == "Guid" ||
+                    n == "CancellationToken" || n == "DateOnly" ||
+                    n == "TimeOnly")  // per §2.5 / #1357
+                    return true;
+            }
+            return false;
+        case sema::TypeRef::Kind::InlineArray:
+            // A non-owning inline array is a value type with no obligation; a
+            // MOVE-ONLY owning inline array RETAINS the marker (§28.1
+            // admitted-but-redundant) and stays on the owned path.
+            return !rt->arrayOwned;
+        case sema::TypeRef::Kind::Unit:
+        case sema::TypeRef::Kind::Function:
+        case sema::TypeRef::Kind::Error:
+            return false;
+    }
+    return false;
+}
+
 OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
     // `new T(...)` is the canonical producer of Owned values — but only
     // for reference types (classes). §9: a record is a value type with
@@ -2128,7 +2210,24 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
         // byte-identical: it is non-null under exactly the pre-refactor
         // ce->callee / MethodSymbol / MethodDecl chain.
         if (const ast::MethodDecl* md = common::calleeMethodDecl(*ce, ctx_)) {
-            if (md->returnOwned) return OwnershipState::Owned;
+            if (md->returnOwned) {
+                // §28.1 (v0.196, #1817): a bare-type-parameter `owned T` return
+                // substituted to a value or runtime-managed type has its marker
+                // ERASED — the result is a plain value with no disposal
+                // obligation. Classifying it Owned emitted a spurious §28.3
+                // auto-drop warning (`var n := f.Make(5)` at `Factory<int>`) and
+                // a bogus scope-end dispose of a value. Gate on the SUBSTITUTED
+                // result type's KIND (never re-derive substitution); a bare-T
+                // abstract or class/interface result is NOT erased and stays on
+                // the Owned transfer path below. This early return also keeps an
+                // owned-return outside §28.3's argument-source-union borrow
+                // reclassification (spec §28.1: a declared `owned T` return
+                // remains outside the bare-type-parameter rule at every
+                // instantiation). // per §28.1 v0.196 #1817
+                if (isValueSubstitutionErased(ctx_.exprType(e)))
+                    return OwnershipState::Borrowed;
+                return OwnershipState::Owned;
+            }
             // §28.6 / §5.11 (#1008 Part C): a USER method returning a
             // non-`owned` owning COLLECTION (OwningArray, …) yields a
             // BORROW (the `Owned*` name denotes ELEMENT ownership,
