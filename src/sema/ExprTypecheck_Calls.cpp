@@ -11358,7 +11358,6 @@ bool ExprTC::isSendable(const TypeRef* rt,
             // Walk fields directly from the TypeDecl to check owned modifiers.
             {
                 const auto* td = dynamic_cast<const ast::TypeDecl*>(decl->decl);
-                if (!td) { inProgress.erase(decl); return true; }
 
                 // Helper: check one TypeRef + owned modifier pair.
                 // Rule 2: class-typed fields must be `owned` AND the class sendable.
@@ -11407,15 +11406,58 @@ bool ExprTC::isSendable(const TypeRef* rt,
                     return true;
                 };
 
-                if (!walkMembersForSend(td)) {
+                // §2.8.2 clause 1 / §30.14 (#1732): an IMPORTED class has no
+                // ast::TypeDecl (decl->decl is null), so the AST walk above
+                // cannot see its fields. Do NOT vacuously default to sendable —
+                // that silently lets a non-sendable imported class (e.g. one
+                // with a non-owned class-typed / interface-typed field) cross a
+                // domain boundary, a data race. Instead walk the reconstructed
+                // sema member list: a field/auto-property's resolved type rides
+                // ctx_.importedMemberType() (the loader's §2.5 side table) and
+                // its `owned` modifier rides MemberSymbol::modifiers. Apply the
+                // SAME per-field Rule 2/3 check as the AST path.
+                //
+                // Metadata does not distinguish an auto-property (storage) from
+                // a computed one (no storage) — both reconstruct as
+                // PropertySymbol — so a computed property whose type is a
+                // reference type is treated conservatively here as storage: a
+                // SOUND over-approximation (may over-reject, never under-reject).
+                // Carrying the §3.6 auto/computed structural fact in the artifact
+                // interface is tracked by the parent issue #1732.
+                auto walkReconstructedMembersForSend =
+                    [&](const TypeSymbol* ts) -> bool {
+                    for (Symbol* ms : ts->members) {
+                        const MemberSymbol* mem = nullptr;
+                        if (auto* fs = dynamic_cast<const FieldSymbol*>(ms)) {
+                            mem = fs;
+                        } else if (auto* ps =
+                                       dynamic_cast<const PropertySymbol*>(ms)) {
+                            if (ps->isIndexer) continue; // indexer: not storage
+                            mem = ps;
+                        } else {
+                            continue; // methods/ctors/consts/nested: not storage
+                        }
+                        const TypeRef* ft = ctx_.importedMemberType(ms);
+                        bool isOwned = false;
+                        for (auto mod : mem->modifiers)
+                            if (mod == "owned") { isOwned = true; break; }
+                        if (!checkField(ft, isOwned)) return false;
+                    }
+                    return true;
+                };
+
+                if (td ? !walkMembersForSend(td)
+                       : !walkReconstructedMembersForSend(decl)) {
                     inProgress.erase(decl); return false;
                 }
-                // Walk inherited fields from base classes.
+                // Walk inherited fields from base classes. An imported base has
+                // no ast::TypeDecl, so use the reconstructed-member walk for it
+                // too (#1732); a local base uses the AST walk.
                 for (TypeSymbol* base : decl->baseTypes) {
                     if (!base || base->kind != ast::TypeDeclKind::Class) continue;
                     const auto* btd = dynamic_cast<const ast::TypeDecl*>(base->decl);
-                    if (!btd) continue;
-                    if (!walkMembersForSend(btd)) {
+                    if (btd ? !walkMembersForSend(btd)
+                            : !walkReconstructedMembersForSend(base)) {
                         inProgress.erase(decl); return false;
                     }
                 }
