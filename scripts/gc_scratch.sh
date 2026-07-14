@@ -81,6 +81,19 @@ if [ "$DO_BUILDS" = 1 ]; then
     tag "remove stale ASan build $d ($(du -sh "$d" 2>/dev/null | cut -f1))"
     [ "$APPLY" = 1 ] && rm -rf "$d"
   done
+  # AOT test link-cache (tests/support/aot_support.hpp). The harness self-GCs it
+  # to ~2.5 GiB once per process when it exceeds ~5 GiB, but that only runs while
+  # a test process is alive; reap the whole store here as a backstop when it has
+  # grown past a generous cap (e.g. no test has run to trigger the in-process GC).
+  # Dropping it merely forces a re-warm — the next run recompiles on a miss.
+  binc=/var/tmp/bezel-scratch/aot-bincache
+  if [ -d "$binc" ]; then
+    szk="$(du -sk "$binc" 2>/dev/null | cut -f1)"
+    if [ -n "$szk" ] && [ "$szk" -gt $((6*1024*1024)) ]; then
+      tag "trim oversized AOT link-cache $binc ($(du -sh "$binc" 2>/dev/null | cut -f1))"
+      [ "$APPLY" = 1 ] && rm -rf "$binc"
+    fi
+  fi
 fi
 
 # ── root scratch → quarantine (age-gated, reversible) ─────────────────────
