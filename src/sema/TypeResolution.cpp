@@ -199,6 +199,30 @@ void Resolver::run(const ast::SourceFile& src) {
                 // else: same module listed twice (no-op).
             }
         }
+        // §2.2 (v0.183, #1515 / #1489): an import alias may not collide with an
+        // unambiguously imported public bare name. §2.7 rule 1 resolves
+        // imported bare names before import aliases with no backtracking, so a
+        // same-named alias would be unreachable in every chain-head position —
+        // the collision is an error at the alias declaration rather than a
+        // silently dead alias. A name is unambiguously imported iff some import
+        // exported it (importedNameOrigin) and no second import made it
+        // ambiguous (ambiguousImportNames_). A name shadowed by a local
+        // declaration was never added to importedNameOrigin, so the alias/local
+        // collision — a distinct entry in §2.2's list — is not diagnosed here.
+        for (const auto& imp : src.imports) {
+            if (!imp || imp->alias.empty()) continue;
+            auto originIt = importedNameOrigin.find(imp->alias);
+            if (originIt == importedNameOrigin.end()) continue;
+            if (ambiguousImportNames_.count(imp->alias)) continue;
+            ctx_.diagnostics().report(
+                Severity::Error, imp->span.begin,
+                std::string("import alias `") + imp->alias +
+                "` collides with the unambiguously imported public bare name `" +
+                imp->alias + "` (from module `" + originIt->second +
+                "`); \xC2\xA7""2.7 rule 1 resolves imported bare names before "
+                "aliases with no backtracking, so the alias would be "
+                "unreachable — choose a different alias (\xC2\xA7""2.2)");
+        }
     }
     for (const auto& decl : src.topDecls) {
         if (!decl) continue;
