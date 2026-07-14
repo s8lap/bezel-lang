@@ -8,6 +8,7 @@
 #include "support/aot_support.hpp"
 
 using bezel::test::runAot;
+using bezel::test::runAotChecked;
 
 namespace {
 
@@ -136,6 +137,57 @@ BEZEL_TEST(codegen_string_linq_1220, string_toarray_length) {
         "  using var a := s.ToArray(); "
         "  return a.Length; "
         "end Main; end C;"), 3);
+}
+
+// ===== #1856 / §5 / §9.6: memory-unsound over-read in string LINQ terminals =====
+// A string LINQ terminal (.Any/.All/.Count(pred)/.First/…) materializes the
+// string into a char Array<char> via bz_lazy_to_array with elem_size 4 (one i32
+// code point per slot), then runs the array-backed terminal loop over it. The
+// loop's element stride was taken from collectionElemSize(recvTy), but recvTy is
+// the `string` primitive (no genericArgs) so that reports 8, NOT 4 — the loop
+// then strided by 8 over a 4-byte-per-slot buffer and bz_array_ptr_at computed
+// idx*8, reading one element (4 bytes) past the end of the materialized array on
+// the last iteration (heap-buffer-overflow). Because the wrong bytes still never
+// equalled the (absent) needle, the plain `runAot` .Any test above returned the
+// CORRECT bool and never caught the fault — only per-program ASan does. These
+// tests use runAotChecked (ASan/LSan-instrumented): without the fix the over-read
+// aborts under ASan (r.ran == false); with the fix (stride 4) they are clean.
+
+// #1856: `.Any(pred)` with NO match scans every char — hits the over-read on the
+// last iteration without the fix. Correct result: "Hello".Any(c='x') == false.
+BEZEL_TEST(codegen_string_linq_1856, string_any_pred_no_match_asan_clean) {
+    auto r = runAotChecked(
+        "module M; class C public static method Main(): int "
+        "  var s := \"Hello\"; "
+        "  return int(s.Any((c) => c = 'x')); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);        // ASan-clean: no read past the char array
+    BEZEL_EXPECT_EQ(r.exitCode, 0);  // no 'x' in "Hello" → false
+}
+
+// #1856: `.Any(pred)` with a match — with the buggy stride the loop read the
+// wrong (even-byte-offset) slots and reached the over-read before finding the
+// needle; with the fix it reads the right slots and returns true.
+BEZEL_TEST(codegen_string_linq_1856, string_any_pred_match_asan_clean) {
+    auto r = runAotChecked(
+        "module M; class C public static method Main(): int "
+        "  var s := \"Hello\"; "
+        "  return int(s.Any((c) => c = 'e')); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);        // ASan-clean
+    BEZEL_EXPECT_EQ(r.exitCode, 1);  // 'e' is in "Hello" → true
+}
+
+// #1856: the same stride bug affects sibling string terminals. `.Count(pred)`
+// runs the identical array loop and over-reads on the last iteration too.
+BEZEL_TEST(codegen_string_linq_1856, string_count_pred_asan_clean) {
+    auto r = runAotChecked(
+        "module M; class C public static method Main(): int "
+        "  var s := \"Hello\"; "
+        "  return s.Count((c) => c = 'l'); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);        // ASan-clean
+    BEZEL_EXPECT_EQ(r.exitCode, 2);  // two 'l' in "Hello"
 }
 
 // Anti-regression: intrinsic string member Length still resolves as before.

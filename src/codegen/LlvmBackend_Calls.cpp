@@ -914,7 +914,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // Array / Stack / Queue / Set / LinkedList methods
     // -----------------------------------------------------------------------
     if (isArr) {
-        int64_t esz = collectionElemSize(recvTy);
+        // fix #1856 / §5 / §9.6: for a STRING terminal receiver the array-backed
+        // path runs over the char array materialized at the `lazyTerminal` step
+        // above via bz_lazy_to_array(lazy, /*esz=*/4) — one i32 code point per
+        // slot. recvTy is the `string` primitive (no genericArgs), so
+        // collectionElemSize(recvTy) reports 8, NOT 4; using it as the element
+        // stride made bz_array_ptr_at compute idx*8 over a 4-byte-stride buffer,
+        // reading one element (4 bytes) past the end on the last iteration
+        // (heap-buffer-overflow in .Any/.All/.Count(pred)/.First/…). Mirror the
+        // materialization's element size exactly (matches the `esz` at line ~845).
+        int64_t esz = isStringRecvTerm ? 4 : collectionElemSize(recvTy);
 
         // §28.2 v0.135 / issue #627: checked-disposal mode guard for array-backed
         // collection methods. bz_array_is_disposed reads the disposed byte on the
