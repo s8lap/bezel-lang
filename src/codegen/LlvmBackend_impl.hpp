@@ -1098,6 +1098,17 @@ private:
     // read this immediately after lowering a sub-expression to exclude a
     // diverged branch from the join.
     bool diverged_ = false;
+    // #1467 / §22.4 / §28.3: scratch slots holding an `out owned`
+    // (class/interface) value that a call passed via `out _` (discard). The
+    // callee writes a fresh OWNED heap object into each such slot, but no
+    // binding takes ownership — so §28.3 makes it an unbound owned temporary
+    // that must be disposed at the end of the full statement (else the object
+    // is neither disposed nor reclaimed → leak). buildOrderedArgs records the
+    // slot here; lowerCall disposes+reclaims it (null-guarded, exactly once)
+    // right after the call on the normal-return path. Used as a stack: each
+    // lowerCall snapshots the size before buildOrderedArgs and consumes only
+    // the entries it added, so a nested `M(out _, N(out _))` stays correct.
+    std::vector<llvm::AllocaInst*> discardOwnedOutSlots_;
     // CG21: the disposeStack_ depth to unwind to when branching to
     // unwindTarget_ — using-var scopes from here up are disposed as an
     // exception propagates out of them (§28.3). 0 = dispose all (the

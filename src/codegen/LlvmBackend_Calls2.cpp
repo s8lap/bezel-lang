@@ -4689,6 +4689,12 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // issue #421 / #410: source expression per arg (index-aligned with `args`)
     // so emitMethodCall can recover each argument's signedness when widening.
     std::vector<const ast::Expr*> argExprs;
+    // #1467 / §28.3: snapshot of discardOwnedOutSlots_ before this call's
+    // buildOrderedArgs; entries added by it (an `out _` of an `out owned`
+    // class/interface param) are disposed+erased right after the call. Snapshot
+    // (not clear) so a nested call whose args this call is still evaluating has
+    // already consumed its own entries under the same stack discipline.
+    const std::size_t discardOwnedBase = discardOwnedOutSlots_.size();
     bool baseQualified = false;  // `base.M()` → non-virtual (§12.3)
     if (!isStaticMethod(ms)) {
         // Receiver: the member-access target, else the current `this`.
@@ -4940,6 +4946,9 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     genericSubst_ = std::move(preSavedSubst);
                     genericSubstSemaTy_ = std::move(preSavedSema);
                 }
+                // #1467: drop any discard-owned slots this failed call recorded
+                // so the stack stays consistent for subsequent calls.
+                discardOwnedOutSlots_.resize(discardOwnedBase);
                 return nullptr;
             }
         } else {
@@ -5337,6 +5346,40 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             recvExpr = ma->target.get();
         disposeFreshNewReceiverTemp(recvExpr, args[0], ctx_.exprType(call));
     }
+
+    // #1467 / §22.4 / §28.3: dispose each `out owned` (class/interface) value
+    // that this call received via `out _`. buildOrderedArgs recorded the scratch
+    // slot (null-initialized) for each such discard; the callee wrote a fresh
+    // OWNED heap object into it. With no binding to take ownership, §28.3 makes
+    // it an unbound owned temporary disposed at end-of-statement — dispatch its
+    // Dispose (destructor) and reclaim the block, null-guarded (a false-returning
+    // `Try*` may have left the slot null) and exactly once (the caller's scratch
+    // is its sole owner). Emitted ONLY on the normal-return path (`!diverged_`);
+    // on an unwind the call never wrote the slot and control does not reach here.
+    // A real `out owned var x` binding is not recorded here, so its ownership
+    // transfer is untouched (no double-dispose). Consume only THIS call's entries
+    // (from discardOwnedBase), keeping nested `M(out _, N(out _))` correct.
+    if (!diverged_) {
+        for (std::size_t di = discardOwnedBase;
+             di < discardOwnedOutSlots_.size(); ++di) {
+            llvm::AllocaInst* slot = discardOwnedOutSlots_[di];
+            llvm::Value* obj = builder_.CreateLoad(ptrTy(), slot, "outdisc.obj");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                obj, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* dispBB = llvm::BasicBlock::Create(
+                llvm_, "outdisc.dispose", currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(
+                llvm_, "outdisc.cont", currentFn_);
+            builder_.CreateCondBr(isNull, contBB, dispBB);
+            builder_.SetInsertPoint(dispBB);
+            emitDisposeAndReclaim(obj);
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), slot);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+        }
+    }
+    discardOwnedOutSlots_.resize(discardOwnedBase);
 
     return result;
 }

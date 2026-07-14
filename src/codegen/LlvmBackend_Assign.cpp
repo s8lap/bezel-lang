@@ -3671,7 +3671,38 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 ? ctx_.resolvedType(*params[idx].type) : nullptr;
             llvm::Type* slotTy = pt ? lowerTypeRef(pt) : nullptr;
             if (!slotTy) slotTy = i32();
-            ordered[idx] = entryAlloca(slotTy);
+            llvm::AllocaInst* scratch = entryAlloca(slotTy);
+            // #1467 / §22.4 / §28.3: `out _` against an `out owned` CLASS or
+            // INTERFACE parameter. The callee writes a fresh OWNED heap object
+            // into this scratch slot; the discard binds it to nothing, so §28.3
+            // makes it an unbound owned temporary that must be disposed at the
+            // end of the full statement — otherwise the object is neither
+            // disposed (its destructor never runs) nor reclaimed (leak, #1467).
+            // Null-initialize the slot and record it so lowerCall disposes it
+            // (dynamic vtable Dispose + reclaim, null-guarded, exactly once)
+            // right after the call. Definite assignment (§22.4) guarantees the
+            // callee writes null-or-value into the out param before a normal
+            // return, so the null-guard reclaims a produced value and skips the
+            // null a false-returning `Try*` leaves. Gated to a user class /
+            // interface (dynamic disposal dispatches through vtable slot 2): a
+            // value-typed or builtin-collection/handle `out owned` is left
+            // untouched here. A REAL `out owned var x` binding is not a discard
+            // (a.value is set → ensureOutVarSlots), so its ownership transfer is
+            // never touched by this path (no double-dispose). per §28.3
+            if (params[idx].modifier == "out owned" &&
+                slotTy == ptrTy() && pt &&
+                pt->kind == sema::TypeRef::Kind::Named && pt->declaration) {
+                if (auto* td = dynamic_cast<const ast::TypeDecl*>(
+                        pt->declaration->decl)) {
+                    if (td->kind == ast::TypeDeclKind::Class ||
+                        td->kind == ast::TypeDeclKind::Interface) {
+                        builder_.CreateStore(
+                            llvm::ConstantPointerNull::get(ptrTy()), scratch);
+                        discardOwnedOutSlots_.push_back(scratch);
+                    }
+                }
+            }
+            ordered[idx] = scratch;
             orderedExprs[idx] = nullptr;
             continue;
         }
