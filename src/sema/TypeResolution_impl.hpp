@@ -451,6 +451,26 @@ private:
                                     std::string_view what,
                                     SourceLocation loc);
 
+    // §28.1 "Type requirement" (v0.193; bare-type-parameter arm v0.196): the
+    // `owned` modifier, in an owned-admitting DECLARATION position — a method
+    // parameter, a return type, an `out` parameter, a lambda parameter, or a
+    // function-type parameter/return slot — requires the declared type
+    // (nullability stripped) to be a class type, an interface type, or a bare
+    // type parameter. A move-only value type (an owning inline array, §15.3)
+    // admits the marker but redundantly (its own move semantics already
+    // transfer the obligation), so it is accepted with NO diagnostic. Any
+    // other type — a primitive, `string`, a function type, an ordinary record,
+    // an enum, a non-owning inline array, or the unit type — carries no
+    // disposal obligation to transfer (§28.9, the same reasoning as §28.5's
+    // field restriction) and is a compile error at `loc`. `positionDesc` names
+    // the position for the diagnostic ("parameter", "return type", …). A bare
+    // type parameter is ADMITTED here; the per-instantiation erasure of the
+    // marker at value/runtime-managed substitutions (v0.196) is tracked
+    // separately as #1817 and is NOT enforced by this declaration-site check.
+    // A no-op for admissible / move-only / unresolved (Error) types.
+    void checkOwnedDeclType(const TypeRef* t, SourceLocation loc,
+                            std::string_view positionDesc);
+
     // §28.14 (v0.180): a `scoped` parameter on a STATIC method is admitted
     // only when the method's return is `owned` — otherwise no call site can
     // ever resolve a bounding object (form 2 "using var" or form 3 "owned

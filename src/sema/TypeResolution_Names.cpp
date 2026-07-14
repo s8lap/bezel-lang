@@ -679,6 +679,16 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
             if (p.modifier == "scoped")
                 checkScopedIsFunctionTyped(p.type.get(), &methodScope, p.name,
                                            "parameter", md->span.begin);
+            // §28.1 "Type requirement" (v0.193): an `owned` / `out owned`
+            // parameter's type must be a class, interface, or bare type
+            // parameter (move-only value types admitted-redundant). Read the
+            // already-cached resolved type — re-resolving would double-report
+            // any function-type-slot error the Function case emits.
+            if ((p.modifier == "owned" || p.modifier == "out owned") && p.type)
+                checkOwnedDeclType(ctx_.resolvedType(*p.type), md->span.begin,
+                                   p.modifier == "out owned"
+                                       ? "an `out` parameter"
+                                       : "a parameter");
             // per §17.11 (#1166): resolve the inner type nodes of a parameter's
             // default-value expression (e.g. the `T` in `:= default(T)`) so the
             // §17.11 defaultIllFormed well-formedness check in ExprTypecheck can
@@ -701,6 +711,12 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
                                               md->span.begin);
         }
         if (md->returnType) resolveType(*md->returnType, &methodScope);
+        // §28.1 "Type requirement" (v0.193): an `owned` return type must be a
+        // class, interface, or bare type parameter (move-only value types
+        // admitted-redundant). Uses the cached resolved return type.
+        if (md->returnOwned && md->returnType)
+            checkOwnedDeclType(ctx_.resolvedType(*md->returnType),
+                               md->span.begin, "a return type");
         // §22.4 (v0.183, #1585): validate any out-nullability postcondition
         // against the resolved return/parameter types.
         checkOutNullPostcond(md->params, md->returnType.get(), &methodScope,
@@ -736,6 +752,13 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
             if (p.defaultValue) resolveTypesInExpr(*p.defaultValue, &methodScope);
         }
         if (od->returnType) resolveType(*od->returnType, &methodScope);
+        // §28.1 "Type requirement" (v0.193): an operator's `owned` return type
+        // (the only owned-admitting position on an operator — §25.2 rejects
+        // `owned` on operator parameters) must be a class, interface, or bare
+        // type parameter. Uses the cached resolved return type.
+        if (od->returnOwned && od->returnType)
+            checkOwnedDeclType(ctx_.resolvedType(*od->returnType),
+                               od->span.begin, "a return type");
         // §22.4 (v0.183, #1585): the postcondition is a method-only feature —
         // an operator declaration never admits it (returnType passed as null).
         checkOutNullPostcond(od->params, nullptr, &methodScope, od->span.begin);
@@ -880,10 +903,22 @@ TypeRef* Resolver::resolveType(const ast::Type& t, Scope* scope) {
                 if (fp.modifier == "scoped")
                     checkScopedIsFunctionTyped(p.type.get(), scope, p.name,
                                                "parameter", t.span.begin);
+                // §28.1 "Type requirement" (v0.193): an `owned` (or `out
+                // owned`) function-type parameter slot must carry a class,
+                // interface, or bare-type-parameter type (move-only value
+                // types admitted-redundant). `(owned int) -> ()` is rejected.
+                if (fp.modifier == "owned" || fp.modifier == "out owned")
+                    checkOwnedDeclType(fp.type, t.span.begin,
+                                       "a function-type parameter slot");
                 ref->funcParams.push_back(std::move(fp));
             }
             if (t.funcReturn) {
                 ref->funcReturn = resolveType(*t.funcReturn, scope);
+                // §28.1 "Type requirement" (v0.193): an `owned` function-type
+                // return slot (`() -> owned T`) has the same type requirement.
+                if (ref->funcReturnOwned)
+                    checkOwnedDeclType(ref->funcReturn, t.span.begin,
+                                       "a function-type return slot");
             }
             break;
         case ast::TypeKind::Named:
@@ -927,6 +962,90 @@ void Resolver::checkScopedIsFunctionTyped(const ast::Type* declaredType,
                      "typed, or interface-typed ") +
         std::string(what) + " (§22.3, §28.14 v0.175/v0.180); `" +
         std::string(name) + "` does not have any of those types");
+}
+
+// §28.1 "Type requirement" (v0.193; bare-type-parameter arm v0.196). See the
+// declaration in TypeResolution_impl.hpp for the full contract. The
+// classification mirrors the owning-collection element-type check in
+// resolveNamed (which enforces the same "value types have no disposal
+// obligation and cannot be owned" rule for stdlib §4.2 owning collections),
+// with one difference: §28.1 ADMITS a move-only value type (an owning inline
+// array, §15.3) — the modifier is redundant there but not an error — whereas
+// an owning collection rejects an inline-array element outright.
+void Resolver::checkOwnedDeclType(const TypeRef* t, SourceLocation loc,
+                                  std::string_view positionDesc) {
+    if (!t) return;
+    std::string badDesc;
+    switch (t->kind) {
+    case TypeRef::Kind::Error:
+        return;  // resolution already failed — suppress cascade diagnostics.
+    case TypeRef::Kind::Unit:
+        badDesc = "the unit type `()`";
+        break;
+    case TypeRef::Kind::Function:
+        badDesc = "a function type";
+        break;
+    case TypeRef::Kind::Primitive:
+        // `string` is a runtime-managed reference type (§28.9) and every other
+        // primitive — including `Object`, which §28.2 excludes from the
+        // `IDisposable` contract ("`Dispose()` is not on `Object`") — carries
+        // no disposal obligation to transfer, so all are rejected. This
+        // matches the owning-collection element-type check, whose "value types
+        // have no disposal obligation" reasoning §28.1 explicitly aligns with
+        // ("the same reasoning as §28.5's field restriction").
+        badDesc = t->primitive == PrimitiveType::String
+            ? "`string` (a runtime-managed reference type)"
+            : "a primitive value type";
+        break;
+    case TypeRef::Kind::InlineArray:
+        // §15.3: an owning inline array (`[N owned]T` / `[N owned]T?`) is a
+        // move-only value type — the modifier is admitted-but-redundant (its
+        // own move semantics already transfer the obligation), so accept with
+        // no diagnostic. A non-owning inline array is a plain value type and
+        // rejects the marker.
+        if (t->arrayOwned) return;
+        badDesc = "a non-owning inline array (a value type)";
+        break;
+    case TypeRef::Kind::Named: {
+        const TypeSymbol* ts = t->declaration;
+        if (ts) {
+            if (ts->isValueBuiltin)
+                badDesc = "a value-type builtin";
+            else if (ts->kind == ast::TypeDeclKind::Record)
+                badDesc = "a record (value type)";
+            else if (ts->kind == ast::TypeDeclKind::Enum)
+                badDesc = "an enum (value type)";
+            // Class or Interface → admitted; badDesc stays empty.
+        } else {
+            // No TypeSymbol: a bare type parameter OR a builtin whose Named
+            // TypeRef intentionally carries declaration=null. The value-type
+            // builtins (DateTime/Guid/… — isValueBuiltinByName, #1463) reject;
+            // the class/interface builtins (Array<T>, Task, …) and bare type
+            // parameters are admitted. A bare type parameter is admitted here
+            // unconditionally — the per-instantiation erasure of the marker at
+            // value/runtime-managed substitutions (v0.196) is #1817, not this
+            // declaration-site check.
+            std::string_view nm = t->headName();
+            if (isValueBuiltinByName(nm))
+                badDesc = "a value-type builtin";
+        }
+        break;
+    }
+    }
+    if (badDesc.empty()) return;
+    // Prefer the offending type's own source span when the parser populated one
+    // (a line of 0 means it did not — function-type nodes and some lambda-param
+    // annotations carry no span); otherwise fall back to the caller-supplied
+    // position (the enclosing method/operator decl).
+    if (t->astNode && t->astNode->span.begin.line != 0)
+        loc = t->astNode->span.begin;
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        "`owned` is not admissible on " + std::string(positionDesc) +
+        " of type " + badDesc +
+        " — such a value carries no disposal obligation to transfer; `owned` "
+        "requires a class type, an interface type, or a bare type parameter "
+        "(§28.1)");
 }
 
 // §28.14 (v0.180, #1606): a `scoped` parameter on a STATIC method is admitted
@@ -1878,7 +1997,19 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
     if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
         // Lambda parameter types are themselves Types when present.
         for (const auto& p : lam->params) {
-            if (p.type) resolveType(*p.type, scope);
+            if (p.type) {
+                TypeRef* pt = resolveType(*p.type, scope);
+                // §28.1 "Type requirement" (v0.193): an `owned` lambda
+                // parameter with an EXPLICIT type must carry a class,
+                // interface, or bare-type-parameter type. `(owned x: int) =>
+                // ...` is rejected. (An UNANNOTATED `owned` lambda parameter
+                // has no type of its own here — its admissibility is governed
+                // by the target function type's slot, checked at that function
+                // type's resolution.)
+                if (p.modifier == "owned" || p.modifier == "out owned")
+                    checkOwnedDeclType(pt, lam->span.begin,
+                                       "a lambda parameter");
+            }
         }
         if (lam->exprBody) resolveTypesInExpr(*lam->exprBody, scope);
         for (const auto& s : lam->stmts) {

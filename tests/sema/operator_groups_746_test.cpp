@@ -201,11 +201,20 @@ BEZEL_TEST(operator_groups_746, unmodified_operator_params_accepted_1664) {
 
 // §25.2: `owned` on an operator's RETURN type (not a parameter) is unaffected
 // — the return slot is the sole permitted ownership annotation on operators.
+// The return type here is a CLASS: §28.1's type requirement (v0.193, #1797)
+// admits `owned` only on a class/interface/bare-type-parameter return, so this
+// intent ("owned on an operator return is permitted") must be exercised with a
+// class-typed operator — the value-typed `record V` this test formerly used is
+// now itself a §28.1 compile error, which would silently mask the §25.2
+// property under test. The assertion still targets the §25.2 param-modifier
+// diagnostic, which must be absent.
 BEZEL_TEST(operator_groups_746, owned_return_type_unaffected_1664) {
     auto r = parseSemaAll(
-        std::string(kRec) +
+        "module M; class V "
+        "  public n: int; "
+        "  public constructor(x: int) n := x; end constructor; "
         "  public static method operator +(a: V, b: V): owned V => "
-        "new V(a.n + b.n); "
+        "    new V(a.n + b.n); "
         "end V; class F public static method Main(): int return 0; end Main; "
         "end F;");
     BEZEL_EXPECT_FALSE(hasParamModifierError(r));
