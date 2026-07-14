@@ -4861,9 +4861,25 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         // CG29: a record method receives `this` as a pointer to the record
         // value; if the receiver is a struct value (the usual case), spill
         // it to a stack slot and pass its address.
+        //
+        // fix #1855 / §14.2: size the spill slot to the RECEIVER VALUE's own
+        // type (`recv->getType()`), not the unspecialized `recordStruct(ms->
+        // parent)` placeholder layout. For a GENERIC record instantiation
+        // (`Box<string>`) the receiver was lowered under the concrete
+        // substitution → the specialized struct (`%record.Box$spec0` = {ptr},
+        // 8 bytes), but `recordStruct(ms->parent)` here (the record's own type
+        // args are not active in this call frame) yields the i32-placeholder
+        // struct (`%record.Box` = {i32}, 4 bytes). Storing the 8-byte value
+        // into the 4-byte slot is a stack-buffer-overflow WRITE (ASan), and
+        // the specialized callee then loads 8 bytes back from the 4-byte slot.
+        // `recv->getType()` is exactly the record struct of this instantiation
+        // (recv is a non-pointer record value here), so the slot matches both
+        // the store and the callee's `this` load — identical to the
+        // extension-method receiver spill just above. A no-op for a
+        // non-generic record (recv->getType() == recordStruct(ms->parent)).
         if (ms->parent && ms->parent->kind == ast::TypeDeclKind::Record &&
             !recv->getType()->isPointerTy()) {
-            llvm::Value* tmp = entryAlloca(recordStruct(ms->parent));
+            llvm::Value* tmp = entryAlloca(recv->getType());
             builder_.CreateStore(recv, tmp);
             recv = tmp;
         }

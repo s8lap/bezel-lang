@@ -28,6 +28,7 @@
 
 using bezel::test::runAot;
 using bezel::test::runAotOut;
+using bezel::test::runAotChecked;
 
 namespace {
 int run(const std::string& program) {
@@ -224,4 +225,59 @@ BEZEL_TEST(generic_record_this_with_method, box_int_and_box_string_coexist) {
         "  var bs := new Box<string>(\"x\"); "
         "  Console.WriteLine(bi.WithValue(42).value * 100 + bs.WithValue(\"hello\").value.Length); return 0; "
         "end Main; end C;"), "4205");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// #1855 — ASan regression: a GENERIC record with a REFERENCE-typed field
+// (`Box<string>`) + a `this`-taking method must spill its receiver into a slot
+// sized to the MONOMORPHIZED layout, not the i32-placeholder layout.
+//
+// CG29 spills a record method's receiver value to a stack slot and passes its
+// address as `this`. The spill slot was allocated from `recordStruct(ms->parent)`
+// — the record's own type args are NOT active in this call frame, so it yields
+// the UNSPECIALIZED struct (`{i32}`, 4 bytes). The receiver value was lowered
+// under the concrete instantiation → the SPECIALIZED struct (`{ptr}`, 8 bytes).
+// Storing the 8-byte value into the 4-byte slot is a stack-buffer-overflow WRITE
+// (and the callee then reloads 8 bytes from the 4-byte slot). The two shapes
+// below are ASan-clean AND value-correct only with the fix (slot sized to
+// `recv->getType()`). Under runAotChecked the pre-fix overflow flips `r.ran`
+// false — these fail WITHOUT the fix, pass WITH it. (The plain-runAot tests
+// above still passed pre-fix: the overflow was benign in practice, so only the
+// per-program ASan of runAotChecked catches the genuine UB.)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// #1855 / §9.5 / §14.2: Box<string> with-method — ASan-clean (no stack overflow)
+// AND the replaced string pointer round-trips ("planet" survives) → exit 1.
+BEZEL_TEST(generic_record_this_with_method, box_string_asan_clean_roundtrip_1855) {
+    auto r = runAotChecked(
+        "module M; "
+        "record Box<T>(value: T) "
+        "  public method WithValue(v: T): Box<T> => this with value := v end; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  var b := new Box<string>(\"hi\"); "
+        "  var b2 := b.WithValue(\"planet\"); "
+        "  return (1 if b2.value = \"planet\" else 0); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);        // ASan-clean: no stack-buffer-overflow WRITE
+    BEZEL_EXPECT_EQ(r.exitCode, 1);  // string field round-trips
+}
+
+// #1855 / §9.5 / §14.2: Pair<int,string> (mixed value+reference fields) replacing
+// the string field — ASan-clean AND the untouched int field survives while the
+// replaced string field is correct. first=3 survives, "planet".Length=6 → 3+6=9.
+BEZEL_TEST(generic_record_this_with_method, pair_int_string_asan_clean_1855) {
+    auto r = runAotChecked(
+        "module M; "
+        "record Pair<A, B>(first: A, second: B) "
+        "  public method WithSecond(v: B): Pair<A, B> "
+        "    => this with second := v end; "
+        "end Pair; "
+        "class C public static method Main(): int "
+        "  var p := new Pair<int, string>(3, \"hi\"); "
+        "  var p2 := p.WithSecond(\"planet\"); "
+        "  return p2.first + p2.second.Length; "  // 3 + 6 = 9
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);        // ASan-clean: no stack-buffer-overflow WRITE
+    BEZEL_EXPECT_EQ(r.exitCode, 9);  // int field survives (3) + replaced string len (6)
 }
