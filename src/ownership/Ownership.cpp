@@ -290,6 +290,26 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     if (ps->modifier == "owned" &&
                         everDischarged_.count(sym) == 0) {
                         ps->iteratorAutoDispose = true;
+                        // §28.3/§29.8/§30.1 (#1657, v0.184): the frame teardown
+                        // disposes this undischarged owned parameter; that
+                        // implicit drop carries the §28.3 must-use warning,
+                        // attached at the parameter declaration, uniformly with
+                        // the synchronous owned-parameter auto-drop below (the
+                        // rule is "uniform across body kinds" per §28.3). The
+                        // adoption idiom `using var … := owned …` is the
+                        // warning-free spelling. Diagnostic-only: the frame
+                        // disposal itself is unchanged. // per §28.3/§29.8/§30.1
+                        ctx_.diagnostics().report(
+                            Severity::Warning,
+                            st.obligationOrigin ? st.obligationOrigin->span.begin
+                                                : SourceLocation{},
+                            std::string("owned parameter `") +
+                            std::string(sym->name) +
+                            "` is implicitly disposed by the frame at teardown "
+                            "(§28.3/§29.8/§30.1 auto-drop); `move` / `return` / "
+                            "`.Dispose()` it, or adopt it with `using var _ := "
+                            "owned " + std::string(sym->name) +
+                            "`, to discharge it explicitly");
                         continue;
                     }
                 }
@@ -490,9 +510,22 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
         for (sema::Symbol* sym : *paramSyms) {
             auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
             if (!ps || ps->modifier != "owned") continue;
-            if (ps->iteratorAutoDispose) continue;  // already flagged above
+            if (ps->iteratorAutoDispose) continue;  // already flagged (+warned) above
             if (everDischarged_.count(sym) != 0) continue;  // discharged on some path
             ps->iteratorAutoDispose = true;
+            // §28.3/§29.8/§30.1 (#1657, v0.184): same must-use warning as the
+            // endState branch above — a throw-only-exit owned parameter is
+            // frame-disposed on the fault edge (§30.1 "on every completion path
+            // (success, fault, and cancellation)"), and the lint fires there
+            // too, attached at the parameter declaration. Diagnostic-only.
+            ctx_.diagnostics().report(
+                Severity::Warning,
+                ps->decl ? ps->decl->span.begin : SourceLocation{},
+                std::string("owned parameter `") + std::string(sym->name) +
+                "` is implicitly disposed by the frame at teardown "
+                "(§28.3/§29.8/§30.1 auto-drop); `move` / `return` / "
+                "`.Dispose()` it, or adopt it with `using var _ := owned " +
+                std::string(sym->name) + "`, to discharge it explicitly");
         }
     }
     // §28.3 (#1257): a plain-var owned local declared in a NESTED scope that exits
