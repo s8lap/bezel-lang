@@ -3586,12 +3586,24 @@ bool Resolver::isFfiCompatibleType(const ast::Type& t, bool returnPosition) {
             std::string_view n = t.name->parts.front();
             // §32.5: integer types, float, double, bool.
             PrimitiveType prim = primitiveFromName(n);
-            if (prim != PrimitiveType::None) return isFfiPrimitive(prim);
+            if (prim != PrimitiveType::None) {
+                // §32.5 (v0.186): "Nullable value types are rejected" —
+                // `int?`, `bool?`, etc. have no C representation. Only the
+                // pointer-carrying boundary types below admit a `?`.
+                if (t.nullable) return false;
+                return isFfiPrimitive(prim);
+            }
             // §32.5 / stdlib §10: IntPtr, UIntPtr, CString, WString, RawBytes.
-            // A nullable FFI-boundary type (`CString?`, e.g. `strdup`'s return
-            // in the §32.1 example) is admitted — the nullability rides the
-            // same pointer representation.
-            if (isFfiBoundaryNamedType(n)) return true;
+            if (isFfiBoundaryNamedType(n)) {
+                // §32.5 (v0.186) "Nullable boundary forms": only `CString?`,
+                // `WString?`, and `RawBytes?` are admitted nullable — the
+                // nullability rides the same pointer representation (Bezel
+                // `null` ⇄ C `NULL`). `IntPtr?`/`UIntPtr?` are nullable value
+                // types with no C representation and are rejected, like `int?`.
+                if (t.nullable)
+                    return n == "CString" || n == "WString" || n == "RawBytes";
+                return true;
+            }
             // Anything else with a name — user classes/records/interfaces,
             // `Array<T>`, generic params, etc. — is not FFI-compatible (§32.5
             // "Not allowed: ... classes, records, interfaces, generic type
