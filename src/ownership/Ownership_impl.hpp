@@ -1382,10 +1382,14 @@ private:
     // syntactically-visible OWNING location whose lifetime bounds the borrowed
     // result — a reference to a `using var`/`await using var`-bound local of
     // `Task<T>`, an `owned` parameter, an `owned` field of `this`, an
-    // owning-collection indexer slot, or a borrowing-iteration variable. The
-    // list mirrors §30.5's admitted positions; anything else (a bare producer
-    // call, an arbitrary expression) is NOT an owning location. // per §30.5
-    bool awaitOperandIsOwningLocation(const ast::Expr& taskExpr);
+    // owning-collection indexer slot, or a borrowing-iteration variable — or (a
+    // plain borrowed local/parameter of `Task<T>`, v0.193) a reference to any
+    // admitted operand ABOVE via a borrowed ALIAS: `var t2 := t; await t2;`
+    // where `t` is admitted (§30.5 rule (a), #1800). `depth` bounds the alias
+    // walk against a pathological error-recovery cycle. The list mirrors §30.5's
+    // admitted positions; anything else (a bare producer call, an arbitrary
+    // expression) is NOT an owning location. // per §30.5
+    bool awaitOperandIsOwningLocation(const ast::Expr& taskExpr, int depth = 0);
 
     // §30.5/§28.3 (v0.182, #1570): true when `e` is a syntactically fresh,
     // UNNAMED producer expression — a bare call (`Producer()`) or `new`

@@ -266,6 +266,63 @@ BEZEL_TEST(async_own_patternA, await_owned_param_task_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// Pattern A (§30.5 rule (a), v0.193): awaiting a PLAIN (non-`owned`) parameter
+// of `Task<T>` (class T) is admitted — a parameter is a named binding whose
+// scope is visible at the await site (§30.5: "A reference to a plain (non-
+// `owned`) local or parameter"; the everyday `public async method Report(t:
+// Task<Data>): Task` shape). Guards the bare-parameter half of the v0.193 rule.
+// // per §30.5 rule (a) / C.6
+BEZEL_TEST(async_own_patternA, await_plain_param_task_clean) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var d := await t; ",
+        "M(t: Task<Conn>): Task"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// Pattern A (§30.5 rule (a), v0.193, #1800): a borrowed ALIAS of an admitted
+// operand INHERITS its admission — `var t2 := t; var d := await t2;` where `t`
+// is a plain borrowed parameter (itself an admitted operand). The alias is a
+// borrow of the source operand; its own scope bounds the result borrow, so
+// awaiting the alias is exactly awaiting the source. This is the exact defect
+// #1800 records: without the fix the await of the alias is REJECTED (the
+// LocalDecl-with-initializer operand fell to the plain-producer-bound reject
+// branch). // per §30.5 rule (a) / C.6
+BEZEL_TEST(async_own_patternA, await_borrowed_alias_of_plain_param_clean) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var t2 := t; "
+        "var d := await t2; ",
+        "M(t: Task<Conn>): Task"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// Pattern A (§30.5 rule (a), v0.193, #1800): a borrowed alias of a `using var`-
+// bound task local is likewise admitted — the alias inherits the using-var's
+// admission, and its own scope bounds the result borrow. // per §30.5 rule (a)
+BEZEL_TEST(async_own_patternA, await_borrowed_alias_of_using_var_clean) {
+    auto r = parseAndCheckOwnership(wrap(
+        "using var t := p.MakeShared(); "
+        "var t2 := t; "
+        "var d := await t2; "));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// Pattern A (§30.5 rule (a), v0.193, #1800 keep-reject): aliasing does NOT
+// launder a NON-admitted operand into admission. `var t := p.MakeShared();` is
+// a fresh producer-bound `var` — the still-open plain-owned-local gap (#1672 /
+// #1533) leaves it NOT an owning location — and a borrowed alias `var t2 := t`
+// of it inherits exactly that non-admission, so `await t2` stays REJECTED. This
+// pins the boundary of the #1800 fix: the alias admission recurses into the
+// source operand's own classification, which for a producer-bound `var` is
+// still a reject. (The borrow-escaping-scope reject that §30.5 requires.)
+// // per §30.5 rule (a) / C.6, §28.3
+BEZEL_TEST(async_own_patternA, await_alias_of_producer_var_still_diagnosed) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var t := p.MakeShared(); "
+        "var t2 := t; "
+        "Use(await t2); "));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
 // Pattern A: a non-class `Task<T>` (here `Task<int>`) carries no ownership
 // obligation across the await boundary, so any await position is admitted —
 // a bare `var r := await producer()` is clean. Guards that the Pattern A

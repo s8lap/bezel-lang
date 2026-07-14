@@ -4675,7 +4675,7 @@ MethodOwnership::awaitTaskKind(const ast::UnaryExpr& await) const {
 }
 
 bool MethodOwnership::awaitOperandIsOwningLocation(
-    const ast::Expr& taskExpr) {
+    const ast::Expr& taskExpr, int depth) {
     // §30.5 Pattern A admitted owning locations. Classified by the operand's
     // DECLARATION (not by the transient dataflow state) so the result is
     // stable regardless of where in the analysis it is queried:
@@ -4693,10 +4693,14 @@ bool MethodOwnership::awaitOperandIsOwningLocation(
     //   - an `owned` field of `this` (exprIsOwnedFieldRead).
     //   - an owning-collection indexer slot `coll[i]` (indexerSetterTakesOwned).
     //
-    // A plain `var t := <producer>()` (a non-`using` LocalDecl with an
-    // initializer) is NOT an owning location — it is the bare-producer form the
-    // rule rejects, just expressed through one binding; the borrow it would
-    // yield has no bounded source. // per §30.5
+    // A plain `var t := <producer>()` (a non-`using` LocalDecl whose
+    // initializer is a fresh producer CALL/`new`) is NOT an owning location — it
+    // is the bare-producer form the rule rejects, just expressed through one
+    // binding; the borrow it would yield has no bounded source. But a plain
+    // `var t2 := <admitted operand>` — a LocalDecl whose initializer is itself a
+    // REFERENCE to an already-admitted operand — is a borrowed ALIAS of that
+    // operand and INHERITS its admission (v0.193, #1800: `var t2 := t;` where
+    // `t` is a plain borrowed parameter). // per §30.5 rule (a) / C.6
     if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&taskExpr)) {
         sema::Symbol* sym = ctx_.exprSymbol(*id);
         if (dynamic_cast<sema::ParameterSymbol*>(sym)) {
@@ -4713,6 +4717,24 @@ bool MethodOwnership::awaitOperandIsOwningLocation(
             const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
             if (!ld) return true;            // iteration variable (or similar)
             if (!ld->initializer) return true;  // `var t: Task<T>;` slot, owned by scope
+            // §30.5 rule (a) / C.6, v0.193 (#1800): a plain `var` whose
+            // initializer is itself a REFERENCE to an already-admitted operand
+            // is a BORROWED ALIAS of it and inherits its admission — the
+            // everyday `var t2 := t; await t2;` where `t` is an admitted operand
+            // (e.g. a plain borrowed parameter). Recursing here yields exactly
+            // "the alias is admitted iff its source operand is": a reference
+            // initializer (identifier / owned-field / owning-slot read) is
+            // re-classified through this same function, and the alias's own
+            // scope bounds the result borrow. A `var t := Producer();` — a fresh
+            // producer CALL/`new`, NOT a reference to named storage — takes none
+            // of the identifier/member/index branches and reaches this function's
+            // final `return false`, so the still-open plain-owned-local gap
+            // (#1672 / #1533) is left DELIBERATELY untouched: this admits ONLY a
+            // borrowed alias of an ALREADY-admitted operand, never a fresh
+            // producer-bound `var`. `depth` bounds the walk against a
+            // pathological error-recovery alias cycle. // per §30.5 rule (a)/C.6
+            if (depth < 64)
+                return awaitOperandIsOwningLocation(*ld->initializer, depth + 1);
             return false;                    // plain producer-bound `var`
         }
         // Not a local/parameter (e.g. a bare field) — owned-field read?
