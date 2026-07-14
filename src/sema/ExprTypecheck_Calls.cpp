@@ -11221,6 +11221,51 @@ bool ExprTC::isSendable(const TypeRef* rt,
         TypeSymbol* decl = rt->declaration;
         if (!decl) return false;
 
+        // §2.8.2 clause 1 / §30.14 (#1732, #1824): a cross-module-IMPORTED
+        // record OR class has no ast::TypeDecl (decl->decl is null) — the
+        // ModuleLoader reconstructs its members as sema::FieldSymbol /
+        // PropertySymbol on a side table (§2.5) — so an AST walk cannot see its
+        // fields. Both the record and the class branch below must therefore
+        // NOT vacuously default such a type to sendable (that silently lets a
+        // borrow-bearing imported value cross a domain boundary: a data race).
+        // This shared helper walks the reconstructed storage members instead:
+        // a field / auto-property's resolved type rides ctx_.importedMemberType()
+        // and its `owned` modifier rides MemberSymbol::modifiers. It applies the
+        // caller-supplied per-field predicate `check(fieldType, isOwned)` — the
+        // SAME check the branch's AST path uses — and returns false on the first
+        // rejection. Positional record fields, body fields, and auto-properties
+        // all reconstruct here (Field/Property members with a side-table type),
+        // so all three are covered.
+        //
+        // Metadata does not distinguish an auto-property (storage) from a
+        // computed one (no storage) — both reconstruct as PropertySymbol — so a
+        // computed property whose type is a reference type is treated
+        // conservatively here as storage: a SOUND over-approximation (may
+        // over-reject, never under-reject). Carrying the §3.6 auto/computed
+        // structural fact in the artifact interface is tracked by #1732.
+        auto forEachReconstructedStorageMember =
+            [&](const TypeSymbol* ts,
+                const std::function<bool(const TypeRef*, bool)>& check) -> bool {
+            for (Symbol* ms : ts->members) {
+                const MemberSymbol* mem = nullptr;
+                if (auto* fs = dynamic_cast<const FieldSymbol*>(ms)) {
+                    mem = fs;
+                } else if (auto* ps =
+                               dynamic_cast<const PropertySymbol*>(ms)) {
+                    if (ps->isIndexer) continue; // indexer: not storage
+                    mem = ps;
+                } else {
+                    continue; // methods/ctors/consts/nested: not storage
+                }
+                const TypeRef* ft = ctx_.importedMemberType(ms);
+                bool isOwned = false;
+                for (auto mod : mem->modifiers)
+                    if (mod == "owned") { isOwned = true; break; }
+                if (!check(ft, isOwned)) return false;
+            }
+            return true;
+        };
+
         // Enum: value type → sendable.
         if (decl->kind == ast::TypeDeclKind::Enum) return true;
 
@@ -11235,7 +11280,6 @@ bool ExprTC::isSendable(const TypeRef* rt,
         if (decl->kind == ast::TypeDeclKind::Record) {
             const auto* td =
                 dynamic_cast<const ast::TypeDecl*>(decl->decl);
-            if (!td) return true; // no decl → conservative: accept
 
             // Collect all fields and check each.
             auto fieldSendable = [&](const TypeRef* ft) -> bool {
@@ -11274,6 +11318,25 @@ bool ExprTC::isSendable(const TypeRef* rt,
                     return isSendable(ft, inProgress);
                 return true; // conservative: accept unknown
             };
+
+            // §2.8.2 clause 1 / §30.14 (#1824): an IMPORTED record has no
+            // ast::TypeDecl, so the AST field walk below cannot see its fields.
+            // Do NOT vacuously default to sendable — a borrow-bearing imported
+            // record (e.g. one with a non-owned class-typed or interface-typed
+            // field) would then silently satisfy the §30.15 Channel<T> element
+            // rule and cross a domain boundary: a data race (the exact sibling
+            // of the #1732 class-branch hole). Walk the reconstructed members
+            // instead, applying the SAME per-field `fieldSendable` check the AST
+            // path uses. A record cannot carry `owned` fields (§9.7), so the
+            // helper's isOwned bit is ignored here (fieldSendable rejects any
+            // class-typed field regardless — a sound over-approximation).
+            if (!td) {
+                return forEachReconstructedStorageMember(
+                    decl,
+                    [&](const TypeRef* ft, bool /*isOwned*/) {
+                        return fieldSendable(ft);
+                    });
+            }
 
             // Check positional fields.
             for (const ast::Param& f : td->positionalFields) {
@@ -11412,42 +11475,11 @@ bool ExprTC::isSendable(const TypeRef* rt,
                 // that silently lets a non-sendable imported class (e.g. one
                 // with a non-owned class-typed / interface-typed field) cross a
                 // domain boundary, a data race. Instead walk the reconstructed
-                // sema member list: a field/auto-property's resolved type rides
-                // ctx_.importedMemberType() (the loader's §2.5 side table) and
-                // its `owned` modifier rides MemberSymbol::modifiers. Apply the
-                // SAME per-field Rule 2/3 check as the AST path.
-                //
-                // Metadata does not distinguish an auto-property (storage) from
-                // a computed one (no storage) — both reconstruct as
-                // PropertySymbol — so a computed property whose type is a
-                // reference type is treated conservatively here as storage: a
-                // SOUND over-approximation (may over-reject, never under-reject).
-                // Carrying the §3.6 auto/computed structural fact in the artifact
-                // interface is tracked by the parent issue #1732.
-                auto walkReconstructedMembersForSend =
-                    [&](const TypeSymbol* ts) -> bool {
-                    for (Symbol* ms : ts->members) {
-                        const MemberSymbol* mem = nullptr;
-                        if (auto* fs = dynamic_cast<const FieldSymbol*>(ms)) {
-                            mem = fs;
-                        } else if (auto* ps =
-                                       dynamic_cast<const PropertySymbol*>(ms)) {
-                            if (ps->isIndexer) continue; // indexer: not storage
-                            mem = ps;
-                        } else {
-                            continue; // methods/ctors/consts/nested: not storage
-                        }
-                        const TypeRef* ft = ctx_.importedMemberType(ms);
-                        bool isOwned = false;
-                        for (auto mod : mem->modifiers)
-                            if (mod == "owned") { isOwned = true; break; }
-                        if (!checkField(ft, isOwned)) return false;
-                    }
-                    return true;
-                };
-
+                // sema member list via forEachReconstructedStorageMember (shared
+                // with the record branch, #1824), applying the SAME per-field
+                // Rule 2/3 `checkField` the AST path uses.
                 if (td ? !walkMembersForSend(td)
-                       : !walkReconstructedMembersForSend(decl)) {
+                       : !forEachReconstructedStorageMember(decl, checkField)) {
                     inProgress.erase(decl); return false;
                 }
                 // Walk inherited fields from base classes. An imported base has
@@ -11457,7 +11489,7 @@ bool ExprTC::isSendable(const TypeRef* rt,
                     if (!base || base->kind != ast::TypeDeclKind::Class) continue;
                     const auto* btd = dynamic_cast<const ast::TypeDecl*>(base->decl);
                     if (btd ? !walkMembersForSend(btd)
-                            : !walkReconstructedMembersForSend(base)) {
+                            : !forEachReconstructedStorageMember(base, checkField)) {
                         inProgress.erase(decl); return false;
                     }
                 }
