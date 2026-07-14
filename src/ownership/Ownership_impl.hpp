@@ -837,6 +837,18 @@ private:
     // of a `new Rec(...)` construction). Called from the freeze pre-pass at each
     // LocalDecl. // per §28.3
     void collectRecordBorrowSource(const ast::LocalDecl& ld);
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801): a DISJOINT sibling of
+    // collectRecordBorrowSource. When `ld`'s initializer is a call whose callee's
+    // declared (pre-substitution) return type is a bare type parameter (of the
+    // method or its enclosing type) and the call's potential source set is
+    // NON-empty (receiver + T-reaching plain borrowable args), record each source
+    // root into recordBorrowLocalSource_ with window [initOffset, MAX). The
+    // result is a borrow carrying the UNION of its sources' liveness, so the
+    // existing checkConsumeFreeze scan freezes consumption (move / owned-arg
+    // transfer / drop-on-overwrite) of any contributing source while the result
+    // has a reachable later use. Keyed on the bare-T-call recognizer, never on
+    // the record predicate, so span/record freeze is untouched. // per §28.3
+    void collectBareTypeParamCallBorrowSource(const ast::LocalDecl& ld);
     // §28.3 (#1741): re-collect the carried source of a borrow-bearing-record /
     // span local `s` when it is REASSIGNED (`s := <producer>;`) at source offset
     // `reassignOffset`. The old source windows are closed at that offset and the

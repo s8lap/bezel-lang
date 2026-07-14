@@ -414,6 +414,84 @@ bool isBorrowBearingRecordCommon(const sema::TypeRef* rt,
     return false;
 }
 
+// §28.3 (v0.194, #1801) helpers for the bare-type-parameter source set. Kept in
+// this shared core so the ownership pass reaches ONE copy.
+
+// Mirrors MethodOwnership::isBorrowableType (Ownership_Checks.cpp): true when a
+// resolved argument type is a borrow-bearing class/interface reference. A
+// value type, a value-builtin, a function value, `string`/`Object`
+// (runtime-managed primitives), and a bare generic-param arg type (null
+// declaration) are NOT borrowable — such an argument carries no lifetime
+// constraint into the result (§28.3: "any argument … whose substituted type is
+// a value or runtime-managed type[] contributes no constraint"). Unknown /
+// unresolved → conservative (borrowable, so the source is kept).
+bool bareArgIsBorrowable(const sema::TypeRef* rt) {
+    if (!rt) return true;  // unknown → conservative
+    switch (rt->kind) {
+        case sema::TypeRef::Kind::Primitive:
+        case sema::TypeRef::Kind::Function:
+            return false;
+        case sema::TypeRef::Kind::Named:
+            if (!rt->declaration) return false;  // bare generic param
+            if (rt->declaration->isValueBuiltin) return false;
+            return rt->declaration->kind == ast::TypeDeclKind::Class ||
+                   rt->declaration->kind == ast::TypeDeclKind::Interface;
+        case sema::TypeRef::Kind::Error:
+            return true;  // unresolved → conservative
+        default:
+            return false;  // Unit, InlineArray, enum, record
+    }
+}
+
+// The identifier root of an access chain (`buf.f[i].g` → `buf`, a bare `a` →
+// `a`) resolved to its symbol — mirrors MethodOwnership::identifierRoot +
+// ctx.exprSymbol, replicated here (that peel is an ownership-pass member, a
+// layer above common/). Null for a non-identifier-rooted expression.
+sema::Symbol* bareRootSymbolOf(const ast::Expr& e, const sema::SemaContext& ctx) {
+    const ast::Expr* cur = &e;
+    while (cur) {
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(cur))
+            return ctx.exprSymbol(*id);
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(cur))
+            cur = ma->target.get();
+        else if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(cur))
+            cur = nm->target.get();
+        else if (auto* c = dynamic_cast<const ast::CallExpr*>(cur))
+            cur = c->callee.get();
+        else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(cur))
+            cur = ix->target.get();
+        else
+            return nullptr;
+    }
+    return nullptr;
+}
+
+// §28.3: does the declared parameter type `t` MENTION the returned type
+// parameter `name`? A bare `T`, and any nesting that reaches it (`List<T>`,
+// `[N]T`, `(T) -> ()`), qualifies — so an argument that carries `T` as an
+// element/component is a source of the returned `T`.
+bool bareTypeMentionsParam(const ast::Type& t, std::string_view name) {
+    if (t.kind == ast::TypeKind::Named && t.name &&
+        t.name->parts.size() == 1 && t.name->parts[0] == name)
+        return true;
+    for (const auto& ga : t.genericArgs)
+        if (ga && bareTypeMentionsParam(*ga, name)) return true;
+    if (t.arrayElement && bareTypeMentionsParam(*t.arrayElement, name))
+        return true;
+    if (t.funcReturn && bareTypeMentionsParam(*t.funcReturn, name)) return true;
+    for (const auto& fp : t.funcParams)
+        if (fp.type && bareTypeMentionsParam(*fp.type, name)) return true;
+    return false;
+}
+
+// The single-part head name of a method's declared return type, or empty.
+std::string_view bareReturnHead(const ast::MethodDecl& md) {
+    if (md.returnType && md.returnType->name &&
+        md.returnType->name->parts.size() == 1)
+        return md.returnType->name->parts[0];
+    return {};
+}
+
 }  // namespace
 
 bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt,
@@ -430,6 +508,72 @@ bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt,
         return true;
     std::unordered_set<const ast::TypeDecl*> seen;
     return isBorrowBearingRecordCommon(rt, ctx, seen);
+}
+
+bool declaredReturnIsBareTypeParam(const ast::MethodDecl& md,
+                                   const sema::SemaContext& ctx) {
+    // `owned T` is the ordinary ownership-transferring return (§28.8), not a
+    // bare parameter — it is classified Owned, outside this rule.
+    if (md.returnOwned) return false;
+    if (!md.returnType) return false;
+    // A bare type parameter resolves to a Named TypeRef with a NULL declaration
+    // (TypeResolution_Names.cpp's isGeneric branch). Nullability is stripped —
+    // the `nullable` flag lives on the TypeRef, not the head — so `T?` qualifies.
+    const sema::TypeRef* rt = ctx.resolvedType(*md.returnType);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named ||
+        rt->declaration != nullptr)
+        return false;
+    // Distinguish a bare type parameter from a 0-arity builtin (`Task`, `Object`
+    // via its class form, …), which ALSO resolves to a null-declaration Named
+    // ref: require the head to be one of `md`'s own (method-level) generic
+    // parameters. The enclosing-type-parameter case is matched at the call site
+    // (the caller has the callee symbol's parent type). // per §28.3, v0.194
+    const std::string_view head = bareReturnHead(md);
+    if (head.empty()) return false;
+    for (const ast::GenericParam& g : md.genericParams)
+        if (g.name == head) return true;
+    return false;
+}
+
+std::vector<sema::Symbol*> bareTypeParamCallSourceRoots(
+    const ast::CallExpr& ce, const ast::MethodDecl& md,
+    const sema::SemaContext& ctx) {
+    std::vector<sema::Symbol*> roots;
+    const std::string_view retParam = bareReturnHead(md);
+    if (retParam.empty()) return roots;
+
+    bool isStatic = false;
+    for (std::string_view m : md.modifiers)
+        if (m == "static") { isStatic = true; break; }
+
+    // Receiver source: for an instance / extension callee the returned borrow
+    // may alias the receiver (§28.3 "the call's receiver … together with …").
+    // A STATIC call has no value receiver — its callee target is a type name,
+    // never a consumable binding — so it contributes none.
+    if (!isStatic && ce.callee)
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+            if (ma->target)
+                if (sema::Symbol* s = bareRootSymbolOf(*ma->target, ctx))
+                    roots.push_back(s);
+
+    // Positional plain (non-`owned`) parameters whose declared type mentions the
+    // returned parameter; keep only borrowable arguments. `owned` and `out`
+    // parameters are never sources (the former is consumed into the callee and
+    // dies there; the latter is an output). Named/discard/out-of-range args are
+    // skipped (positional keying only, §28.3).
+    for (std::size_t i = 0; i < md.params.size(); ++i) {
+        const ast::Param& p = md.params[i];
+        if (p.modifier.find("owned") != std::string_view::npos) continue;
+        if (p.modifier.find("out") != std::string_view::npos) continue;
+        if (!p.type || !bareTypeMentionsParam(*p.type, retParam)) continue;
+        if (i >= ce.args.size()) continue;
+        const ast::CallArgument& arg = ce.args[i];
+        if (arg.isDiscard || !arg.value || !arg.name.empty()) continue;
+        if (!bareArgIsBorrowable(ctx.exprType(*arg.value))) continue;
+        if (sema::Symbol* s = bareRootSymbolOf(*arg.value, ctx))
+            roots.push_back(s);
+    }
+    return roots;
 }
 
 }  // namespace bezel::common

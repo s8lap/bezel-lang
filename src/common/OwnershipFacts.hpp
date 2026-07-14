@@ -34,6 +34,7 @@
 // are Phase B, deliberately NOT done here.
 
 #include <functional>
+#include <vector>
 
 namespace bezel::ast {
 struct Expr;
@@ -44,6 +45,7 @@ struct MethodDecl;
 namespace bezel::sema {
 class SemaContext;
 struct TypeRef;
+struct Symbol;
 }  // namespace bezel::sema
 
 namespace bezel::common {
@@ -161,5 +163,36 @@ bool staticFactoryReturnsFreshOwned(const ast::MethodDecl& md,
 // two checks from drifting apart.
 bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt,
                                  const sema::SemaContext& ctx);
+
+// §28.3 *Bare-type-parameter returns* (v0.194, #1801). True when `md`'s
+// DECLARED return type — read *before* generic substitution, nullability
+// stripped (`T?` qualifies) — is a **bare type parameter** of `md` itself: a
+// non-`owned` Named return that resolves to a null-`declaration` TypeRef (the
+// generic-param shape TypeResolution stamps, TypeResolution_Names.cpp) whose
+// head name is one of `md`'s method-level `genericParams`. `owned T` returns
+// are excluded (they are the ordinary ownership-transferring return, §28.8).
+//
+// This is the *method-level* half of the recognizer. A return that is a bare
+// parameter of `md`'s ENCLOSING TYPE (`class Box<T> ... method Get(): T`)
+// resolves to the same shape but its head is a type-level param, matched at the
+// call site through the callee symbol's parent (the caller passes it) — the
+// name-set membership test that distinguishes a bare type parameter from a
+// 0-arity builtin, which shares the null-declaration Named shape.
+bool declaredReturnIsBareTypeParam(const ast::MethodDecl& md,
+                                   const sema::SemaContext& ctx);
+
+// §28.3 (v0.194, #1801). The call's **potential source set** for a
+// bare-type-parameter return: the receiver root (for an instance or extension
+// callee — a static call has no value receiver), together with, read
+// **positionally**, the identifier root of every argument bound to a **plain**
+// (non-`owned`) parameter whose declared type **mentions** the returned type
+// parameter — keeping **only** arguments whose resolved type is borrowable (a
+// class/interface reference); value and runtime-managed arguments contribute no
+// constraint and are dropped (so `Pick(1, 2)` yields the empty set). The
+// returned roots are the source bindings whose consumption the union borrow of
+// the result freezes while the result is live. Pre-substitution keyed.
+std::vector<sema::Symbol*> bareTypeParamCallSourceRoots(
+    const ast::CallExpr& ce, const ast::MethodDecl& md,
+    const sema::SemaContext& ctx);
 
 }  // namespace bezel::common

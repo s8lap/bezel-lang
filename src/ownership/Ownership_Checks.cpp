@@ -7,6 +7,8 @@
 #include <utility>
 #include <vector>
 
+#include "common/OwnershipFacts.hpp"  // #1801: bare-type-parameter source set
+
 namespace bezel::ownership {
 
 // The MethodOwnership class is declared in Ownership_impl.hpp; this
@@ -3245,6 +3247,11 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
         // record / span local so the consume-site freeze can see it as a live
         // local borrow of that source.
         collectRecordBorrowSource(*ld);
+        // §28.3 (v0.194, #1801): DISJOINT sibling — a bare-type-parameter call
+        // result carries the union borrow of the call's receiver + T-reaching
+        // plain args, so consuming a contributing source while the result is live
+        // must freeze exactly as a live span over that source does.
+        collectBareTypeParamCallBorrowSource(*ld);
         return;
     }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
@@ -3374,6 +3381,70 @@ void MethodOwnership::collectRecordBorrowSource(const ast::LocalDecl& ld) {
     std::vector<RecordBorrowSource>& entries = recordBorrowLocalSource_[lsym];
     for (const sema::Symbol* src : srcs)
         entries.push_back({src, from, UINT32_MAX});
+}
+
+void MethodOwnership::collectBareTypeParamCallBorrowSource(
+    const ast::LocalDecl& ld) {
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801). DISJOINT sibling of
+    // collectRecordBorrowSource: a `var m := Pick(a, b);` over a static (or
+    // instance) method whose DECLARED return is a bare type parameter yields a
+    // borrow carrying the UNION of the receiver's and the T-reaching plain
+    // arguments' liveness — "the result is usable only where every contributing
+    // source is still live" (§28.3 caller side, v0.194). producerState leaves
+    // such a result Borrowed (the §28.3 producers row falls through to Borrowed,
+    // Ownership.cpp); this pre-pass attaches its source set into
+    // recordBorrowLocalSource_ so the SAME consume-site freeze that protects a
+    // live span over `buf` protects `m`'s borrow over `{a, b}`: consuming a
+    // source (a `move`, an owned-argument transfer, or a drop-on-overwrite —
+    // NOT an explicit `Dispose()`, which is the announced kill with the
+    // checked-mode backstop, §28.2) while `m` has a reachable later use is
+    // rejected. Only class-typed bare-T results reach here (a value/runtime-
+    // managed instantiation attaches no constraint, §28.9), and the record
+    // predicate never matches a class result — so span/record freeze is
+    // untouched. // per §28.3, v0.194
+    if (!ld.initializer) return;
+    auto* ce = dynamic_cast<const ast::CallExpr*>(ld.initializer.get());
+    if (!ce) return;
+    const ast::MethodDecl* md = common::calleeMethodDecl(*ce, ctx_);
+    if (!md) return;
+
+    // Recognizer: the pre-substitution declared return is a bare type parameter
+    // of the METHOD (the shared helper) OR of its ENCLOSING TYPE. The latter is
+    // matched here, where the callee symbol's parent type (and its generic
+    // params) is reachable — the name-set membership that separates a bare type
+    // parameter from a 0-arity builtin, since both resolve to a null-declaration
+    // Named ref. `owned T` returns are excluded (ordinary transfer, §28.8).
+    bool bareT = common::declaredReturnIsBareTypeParam(*md, ctx_);
+    if (!bareT && !md->returnOwned && md->returnType && md->returnType->name &&
+        md->returnType->name->parts.size() == 1) {
+        const sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
+        if (rt && rt->kind == sema::TypeRef::Kind::Named &&
+            rt->declaration == nullptr) {
+            const std::string_view head = md->returnType->name->parts[0];
+            if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                    ce->callee ? ctx_.exprSymbol(*ce->callee) : nullptr))
+                if (ms->parent)
+                    for (const sema::Symbol* g : ms->parent->genericParams)
+                        if (g && g->name == head) { bareT = true; break; }
+        }
+    }
+    if (!bareT) return;
+
+    // The potential source set (receiver + T-reaching plain borrowable args). An
+    // EMPTY set (`Pick(1, 2)`, `Create<T>(): T`) attaches nothing — the sourceless
+    // factory rule governs that case, not this one (§28.3 caller side, empty-set
+    // fallback). // per §28.3, v0.194
+    std::vector<sema::Symbol*> roots =
+        common::bareTypeParamCallSourceRoots(*ce, *md, ctx_);
+    if (roots.empty()) return;
+
+    sema::LocalSymbol* lsym = findLocalSymbol(ld);
+    if (!lsym) return;
+    const std::uint32_t from = ld.initializer->span.begin.offset;
+    std::vector<RecordBorrowSource>& entries = recordBorrowLocalSource_[lsym];
+    for (const sema::Symbol* src : roots)
+        if (src && src != lsym)  // a self-reference carries no constraint
+            entries.push_back({src, from, UINT32_MAX});
 }
 
 void MethodOwnership::recollectRecordBorrowSourceOnReassign(
