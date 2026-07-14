@@ -381,6 +381,45 @@ inline bool hasSanitizerReport(const std::string& text) {
     return false;
 }
 
+// #1822: whole-suite ASan sweep switch. When BEZEL_AOT_FORCE_SANITIZE is set to
+// "address" / "asan" / "1", EVERY runAot program is compiled and linked with
+// generated-code AddressSanitizer (opts.sanitizeAddress) and run under ASan — the
+// same proven recipe runAotChecked uses per-test (S3), applied suite-wide so a
+// memory error (use-after-free / out-of-bounds / double-free) in ANY test program
+// is caught. scripts/asan_sweep.sh sets this; unset/empty (the default) leaves
+// normal runs byte-for-byte unchanged. Memoized once per process.
+//
+// This replaces the pre-#1822 sweep, which rebuilt the C++ HARNESS with
+// -fsanitize=address — instrumenting bezel_tests, not the generated Bezel code —
+// and under the AOT harness only broke the per-program links (plain-clang links
+// against an ASan-instrumented runtime archive → undefined __asan_* refs), so no
+// program ran under ASan and the sweep validated NOTHING (false-green).
+inline bool forceSanitizeAddress() {
+    static const bool v = [] {
+        const char* e = std::getenv("BEZEL_AOT_FORCE_SANITIZE");
+        if (!e || *e == '\0') return false;
+        std::string s(e);
+        return s == "address" || s == "asan" || s == "1";
+    }();
+    return v;
+}
+
+// #1822: re-emit a fired sanitizer report to the harness's real stderr (fd 2) so
+// the whole-suite sweep (scripts/asan_sweep.sh) can grep the shard log for the
+// "ERROR: AddressSanitizer" / "ERROR: LeakSanitizer" headline. A clean suite
+// never reaches here (a report only exists on a real memory error), so this is
+// silent in normal operation. Bounded so an adversarial report cannot flood the
+// shard log.
+inline void emitSanitizerReportToStderr(std::string_view report) {
+    const std::size_t cap = 1u << 15;  // 32 KiB — the headline + backtrace
+    std::fprintf(stderr,
+        "\n===== [aot-asan #1822] sanitizer fired in an AOT test program =====\n"
+        "%.*s\n"
+        "===== [aot-asan #1822] end sanitizer report =====\n",
+        static_cast<int>(std::min(report.size(), cap)), report.data());
+    std::fflush(stderr);
+}
+
 // ---- forked in-process compile -------------------------------------------
 enum class CompileOutcome { Ok, Rejected, Crashed, TimedOut, Infra };
 
@@ -1065,8 +1104,14 @@ inline bool writeSource(const std::string& srcPath, std::string_view source) {
 //              runJit). A compiler crash is isolated (ran=false), never fatal.
 // ---------------------------------------------------------------------------
 inline JitResult runAot(std::string_view source,
-                        const codegen::CodegenOptions& opts) {
+                        const codegen::CodegenOptions& optsIn) {
     JitResult r;
+
+    // #1822: in the whole-suite ASan sweep, force generated-code ASan on every
+    // program (the runAotChecked recipe, suite-wide). A local copy keeps the
+    // public signature and every call site unchanged.
+    codegen::CodegenOptions opts = optsIn;
+    if (aot_detail::forceSanitizeAddress()) opts.sanitizeAddress = true;
 
     aot_detail::WorkDir wd{aot_detail::makeWorkDir()};
     if (wd.path.empty()) {
@@ -1099,9 +1144,20 @@ inline JitResult runAot(std::string_view source,
     }
 
     // --- Run the executable, capturing stdout (stderr -> separate file). ------
+    // #1822: under forced ASan (the sweep) run with LSan OFF (detect_leaks=0) and
+    // report-not-abort (abort_on_error=0). LSan is deliberately off suite-wide —
+    // whole-suite leak detection is too noisy: negative tests that exit via an
+    // uncaught exception legitimately leave heap live at exit. LSan coverage
+    // stays on the curated runAotChecked call-sites (leak-clean by construction).
+    // abort_on_error=0 makes ASan PRINT the report and exit rather than SIGABRT,
+    // so the report text is captured intact.
     bool timedOut = false;
+    std::vector<std::pair<std::string, std::string>> runEnv;
+    if (opts.sanitizeAddress)
+        runEnv.push_back({"ASAN_OPTIONS", "detect_leaks=0:abort_on_error=0"});
     int status = aot_detail::spawnCaptured({exePath}, outPath, errPath,
-                                           aot_detail::aotTimeoutSec(), timedOut);
+                                           aot_detail::aotTimeoutSec(), timedOut,
+                                           runEnv);
     r.stdoutText = aot_detail::slurp(outPath);
 
     if (timedOut) {
@@ -1114,6 +1170,21 @@ inline JitResult runAot(std::string_view source,
                 "s; killed (runaway / deadlock)" +
                 (runErr.empty() ? "" : "\n--- program stderr ---\n" + runErr));
         return r;
+    }
+    // #1822: surface any ASan report the program printed to its stderr so the
+    // whole-suite sweep detects a memory error in ANY program. A clean program
+    // prints nothing here → normal forced-ASan runs are unaffected. Only active
+    // under sanitizeAddress (the forced sweep, or an explicit caller).
+    if (opts.sanitizeAddress) {
+        std::string errText = aot_detail::slurp(errPath);
+        if (aot_detail::hasSanitizerReport(errText)) {
+            aot_detail::emitSanitizerReportToStderr(errText);
+            r.exitCode = -1;
+            r.diagnostics.report(
+                Severity::Error, SourceLocation{},
+                "runAot: AddressSanitizer fired in the test program\n" + errText);
+            return r;
+        }
     }
     if (WIFSIGNALED(status)) {
         r.exitCode = -1;  // mirror runJit's failWith
@@ -1300,6 +1371,12 @@ inline JitResult runAotChecked(std::string_view source) {
         crashed || aot_detail::hasSanitizerReport(sanText);
 
     if (sanitizerFired) {
+        // #1822: in the whole-suite sweep, re-emit the report to the harness
+        // stderr so scripts/asan_sweep.sh's grep catches a runAotChecked
+        // detection too (otherwise it surfaces only as this test's own FAIL,
+        // which the sweep's report-marker grep would miss).
+        if (aot_detail::forceSanitizeAddress() && !sanText.empty())
+            aot_detail::emitSanitizerReportToStderr(sanText);
         // A leak / double-free / UAF is a dispose-exactly-once violation: FAIL.
         r.exitCode = crashed ? -1 : code;
         std::string msg = "runAotChecked: sanitizer fired (";
