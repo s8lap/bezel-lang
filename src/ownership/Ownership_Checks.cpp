@@ -4616,9 +4616,29 @@ static bool taskResultArgIsClass(const sema::TypeRef* arg) {
     if (arg->astNode && arg->astNode->name &&
         arg->astNode->name->parts.size() == 1) {
         std::string_view an = arg->headName();
-        return an == "OwningArray" || an == "OwningStack" ||
-               an == "OwningQueue" || an == "OwningLinkedList" ||
-               an == "OwningDictionary" || an == "OwningSet";
+        if (an == "OwningArray" || an == "OwningStack" ||
+            an == "OwningQueue" || an == "OwningLinkedList" ||
+            an == "OwningDictionary" || an == "OwningSet")
+            return true;
+        // §30.5 / stdlib §6.2/§6.3/§6.11 (#1785): the async sync-primitive
+        // acquisitions produce a Pattern B `OwningTask<G>` whose result G is a
+        // built-in CLASS synthesized with a NULL declaration — the same null-
+        // declaration blind spot the owning-collection fallback above closes.
+        // Without recognizing these heads, `awaitTaskKind` wrongly reports
+        // NotTask for `OwningTask<Lock>` etc., so the second-await split
+        // (§30.5: plain-owned-local consume vs using-var borrow-await) never
+        // fires and a plain `var t := m.AcquireAsync()` is mis-diagnosed as
+        // "dropped without disposal". The synthesis sites live in
+        // ExprTypecheck_Calls.cpp (`makeLockTypeRef` for Mutex.AcquireAsync →
+        // `OwningTask<Lock>`, and the SemaphoreToken builder for
+        // Semaphore.AcquireAsync → `OwningTask<SemaphoreToken>`). LockGuard/
+        // ReadGuard/WriteGuard are the §6.11 `Locked<T>`/`RwLocked<T>` guard
+        // heads; their `LockAsync`/`ReadAsync`/`WriteAsync` producers are not
+        // yet synthesized in sema (`Locked` does not resolve today), so those
+        // three are forward-looking — recognized here so the split works
+        // automatically once those acquisitions land. // per §30.5, §6.2/§6.3/§6.11
+        return an == "Lock" || an == "SemaphoreToken" ||
+               an == "LockGuard" || an == "ReadGuard" || an == "WriteGuard";
     }
     return false;
 }
@@ -5684,6 +5704,17 @@ void MethodOwnership::recordAwaitOperandConsume(
     if (!id) return;
     LocalOwnership* st = lookupState(id->name);
     if (!st) return;
+    // §30.5 (v0.190, #1785): a `using var`/`await using var`-bound OwningTask is
+    // §28.3-immovable — a read of it is a BORROW, so its Pattern B await is the
+    // BORROWED-OPERAND case: the await neither consumes the operand nor spends a
+    // static single-consumer use. Multiple awaits are permitted at compile time;
+    // the single-consumer guarantee is enforced at RUNTIME (a second await of a
+    // spent OwningTask raises InvalidOperationException — codegen `markSpentAfter`
+    // in LlvmBackend_Async.cpp). Only a PLAIN owned local (movable, below) is
+    // statically consumed by the await, making its straight-line second await a
+    // moved-from compile error. `implicitDischarge` marks exactly the immovable
+    // using-var bindings. // per §30.5
+    if (st->implicitDischarge) return;
     if (st->state == OwnershipState::Disposed ||
         st->state == OwnershipState::MovedFrom) {
         // The task local was already consumed by an earlier await — this is the
@@ -5708,10 +5739,11 @@ void MethodOwnership::recordAwaitOperandConsume(
         st->state = OwnershipState::Poisoned;
         return;
     }
-    // Mark the owned task local consumed by the await's implicit disposal
-    // (§30.5: the implicit task-disposal IS the discharge). A `using var` task
-    // local goes to Disposed without complaint (markDisposedByName tolerates
-    // the using-var implicit-discharge state); a plain owned local likewise.
+    // Mark the PLAIN owned task local consumed by the await's implicit disposal
+    // (§30.5: the implicit task-disposal IS the discharge). Reached only for a
+    // movable owned local (`using var` bindings return early above as the
+    // borrowed-operand case); the transition to Disposed makes a straight-line
+    // second await a moved-from read. // per §30.5
     if (st->state == OwnershipState::Owned)
         st->state = OwnershipState::Disposed;
 }
