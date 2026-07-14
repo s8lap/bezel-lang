@@ -1,6 +1,6 @@
 # Bezel Guide 1: Memory and Ownership
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.185.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.195.*
 
 Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope (with a must-use warning), and a use-after-free or double-free is rejected outright. This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 
@@ -84,10 +84,11 @@ using var a := new Buffer();          // new T(...)            -> owned
 var b := source.OpenBuffer();         // returns owned Buffer   -> owned
 var c := source.Buffer;               // field / property read  -> borrowed (source: source)
 var d := registry.Find("key");        // returns Buffer (no owned) -> borrowed
+var t := source.PrefetchAsync();      // returns Task<Buffer>  -> owned (task calls mint, v0.190)
 var e := move holder.slot;            // move out of owned field -> owned
 ```
 
-The rule of thumb: `new` and any method whose return type says `owned` give you an owned value (you must discharge it). A plain field read or a plain (non-`owned`) return is a borrow (you must not). When in doubt, the spec's producers table (§28.3) is exhaustive.
+The rule of thumb: `new` and any method whose return type says `owned` give you an owned value (you must discharge it). A plain field read or a plain (non-`owned`) return from an *instance* method is a borrow (you must not). Three refinements cover the rest: a *static* method's plain return is treated as owned, with a warning nudging the API author toward writing `owned` (the factory safety net); a call whose declared return type is `Task`/`Task<T>`/`OwningTask<T>` is **owned** no matter the callee — task-returning calls mint a fresh frame at every call, no marker needed (v0.190); and a generic call returning bare `T`, like `Math.Max(a, b)`, is a **borrow of its arguments** (v0.194). When in doubt, the spec's producers table (§28.3) is exhaustive.
 
 ---
 
@@ -125,7 +126,7 @@ method CloneBuffer(): owned Buffer
 end CloneBuffer;
 ```
 
-Note this is plain `var`, not `using var`. Ownership is tracked on the value no matter how the local is declared — `new` produces an owned value. An owned value *should* reach a discharge point before the method ends — an `owned` field, a `using var`, an `owned` parameter, an **`owned` return**, an explicit `.Dispose()`, or the discard `_ := …` — and if it reaches none, it is auto-dropped at scope end and the compiler warns (§2). `return fresh` under the `owned` return type *is* such a discharge point, so the obligation is discharged by the return itself. (Transferring a *named* owned local into another local or a `using var` is spelled with the marker, `:= owned x` — §7.) Nothing is disposed here; ownership transfers to the caller, who writes:
+Note this is plain `var`, not `using var`. Ownership is tracked on the value no matter how the local is declared — `new` produces an owned value. An owned value *should* reach a discharge point before the method ends — an `owned` field, a `using var`, an `owned` parameter, an **`owned` return**, an explicit `.Dispose()`, or the discard `_ := …` — and if it reaches none, it is auto-dropped at scope end and the compiler warns (§2). `return fresh` under the `owned` return type *is* such a discharge point, so the obligation is discharged by the return itself. (Transferring a *named* owned local into another local or a `using var` is spelled with the marker, `:= owned x` — §8.) Nothing is disposed here; ownership transfers to the caller, who writes:
 
 ```bezel
 using var s := factory.CloneBuffer();   // caller now owns it, disposes it
@@ -149,7 +150,7 @@ end TakeTransactions;
 
 So a caller that needs to *look at* `_transactions` gets a borrow (the bare-field-read return above, or a dedicated borrowing view); a caller that must *take* it uses `move` with an `owned` return (next section).
 
-**Returning a lazy pipeline is fine — over your own inputs.** A method may build and return a lazy query (or an iterator, or a `Task`) over its *own parameters or receiver* — `method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` — even though the returned frame borrows them. The caller re-establishes that borrow against its *own* argument and must keep it alive while it enumerates. What you may *not* return this way is a pipeline over a local you created inside the method; that borrow would dangle — materialize it into an `owned Array<T>` instead.
+**Returning a lazy pipeline is fine — over your own inputs.** A method may build and return a lazy query (or an iterator, or a `Task`) over its *own parameters or receiver* — `method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` — even though the returned frame borrows them. The caller re-establishes that borrow against its *own* argument and must keep it alive while it enumerates — for a returned `Task`, until the task settles (and the returned task is itself caller-owned: task calls mint, v0.190, so it is discharged like any other owned value). What you may *not* return this way is a pipeline over a local you created inside the method; that borrow would dangle — materialize it into an `owned Array<T>` instead.
 
 ---
 
@@ -170,14 +171,16 @@ end DetachLog;
 `move _log` reads `_log` as an owned value and leaves the field moved-from. The **field-restoration rule** applies: if you `move` out of a field, every path to the end of that method must put something back:
 
 ```bezel
+// A non-nullable owned field this time: private owned _log: Logfile;
 method Rotate()
-  using var old := move _log;          // moved out
-  _log := new Logfile(NextName());     // restored before method exits — required
+  var fresh := new Logfile(NextName());  // build the replacement first — it may throw
+  using var old := move _log;            // then take — nothing throwable follows
+  _log := fresh;                         // restore — a store into a moved-from slot cannot throw
   old.Flush();
-end Rotate;                            // old disposed here
+end Rotate;                              // old disposed here
 ```
 
-Forgetting to reassign `_log` is a compile error, not a runtime surprise. The same `move` form works on owning-collection slots (`move buffer[i]`); see spec §28.8.1 (the move expression) and §28.11 (collection element ownership).
+Forgetting to reassign `_log` is a compile error, not a runtime surprise. So is restoring *via* something that can throw: a call between the move and the reassignment puts an exception edge there, and on that edge the method would exit with the field still moved-from — hence the *build before take* order above (§28.8.1, “Exception paths are not exempt”). The same `move` form works on owning-collection slots (`move buffer[i]`); see spec §28.8.1 (the move expression) and §28.11 (collection element ownership).
 
 ---
 
