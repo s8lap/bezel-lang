@@ -6351,11 +6351,78 @@ void MethodOwnership::reportSuspCross(const sema::Symbol* sym,
         "into frame-owned storage before it");
 }
 
+// §30.7 / §28.12 (v0.184, #1677): does a CLASS type declare a synchronous-
+// disposal fallback — a `destructor`, transitively through its base classes?
+// This is the class-level fact §28.12's no-destructor warning keys on. It is
+// used to EXCLUDE from the across-yield reject the one accepted shape: an
+// `await using var` binding whose static type is a class WITH a destructor —
+// for those, §28.12's synchronous-fallback path on consumer abandonment remains
+// the defined degraded behavior. Returns false for a no-destructor class
+// (`TaskScope`, the canonical instance) and for every non-class type.
+static bool awaitUsingClassHasSyncDisposeFallback(const sema::TypeRef* t) {
+    if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
+    const sema::TypeSymbol* ts = t->declaration;
+    if (!ts || ts->kind != ast::TypeDeclKind::Class) return false;
+    // Walk the class and its base classes for a user destructor. A visited-set
+    // and a hard cap bound the walk against an error-recovery base-type cycle
+    // (mirrors the §21.9 bare-discard walk in ExprTypecheck.cpp).
+    std::unordered_set<const sema::TypeSymbol*> visited;
+    std::vector<const sema::TypeSymbol*> work{ts};
+    const std::size_t kMaxWalk = 4096;
+    std::size_t walked = 0;
+    while (!work.empty()) {
+        if (++walked > kMaxWalk) break;
+        const sema::TypeSymbol* cur = work.back();
+        work.pop_back();
+        if (!cur || !visited.insert(cur).second) continue;
+        for (const sema::Symbol* m : cur->members)
+            if (dynamic_cast<const sema::DestructorSymbol*>(m)) return true;
+        for (const sema::TypeSymbol* b : cur->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) work.push_back(b);
+    }
+    return false;
+}
+
+// §30.7 (v0.184, #1677): true when an `await using var` local of static type `t`
+// may not be live across a `yield return` in an async iterator. The reject set
+// is every await-using binding EXCEPT a class type carrying a synchronous-
+// disposal fallback (above):
+//   - a class implementing IAsyncDisposable with NO destructor (`TaskScope`) —
+//     no synchronous fallback, so consumer abandonment at the yield takes
+//     §28.12's fallback path, skips DisposeAsync, and voids the type's cleanup;
+//   - an interface static type (IAsyncDisposable or any interface deriving from
+//     it) — an interface cannot promise a destructor, so the runtime type's
+//     fallback posture is statically unknowable; conservatively included.
+// A class WITH a destructor is the sole accepted shape (its fallback is defined).
+static bool awaitUsingYieldSensitive(const sema::TypeRef* t) {
+    if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
+    return !awaitUsingClassHasSyncDisposeFallback(t);
+}
+
+void MethodOwnership::reportAwaitUsingYield(std::string_view name,
+                                            const ast::Node* yieldNode) {
+    SourceLocation loc = yieldNode ? yieldNode->span.begin : SourceLocation{};
+    report(
+        Severity::Error, loc,
+        std::string("await-using local `") + std::string(name) +
+        "` is held live across a `yield return`, but its static type has no "
+        "synchronous disposal fallback: it is a class implementing "
+        "`IAsyncDisposable` with no `destructor` (`TaskScope` is the canonical "
+        "instance), or an interface type — an interface cannot promise a "
+        "`destructor`. On consumer abandonment at the yield suspension, §28.12's "
+        "synchronous-fallback path runs and `DisposeAsync()` is skipped, "
+        "silently voiding the type's cleanup. Dispose the binding before the "
+        "`yield return` (close its scope), or hoist the work into a non-yielding "
+        "`async` helper called between yields (§30.7)");
+}
+
 void MethodOwnership::checkBorrowBearingLocalsAcrossSuspension(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     suspCands_.clear();
     suspInScope_.clear();
     suspReported_.clear();
+    awaitUsingYieldInScope_.clear();
+    awaitUsingYieldReported_.clear();
     std::unordered_map<const sema::Symbol*, const ast::Node*> crossed;
     walkSuspStmts(stmtPtrs(body), crossed);
 }
@@ -6392,6 +6459,10 @@ void MethodOwnership::walkSuspStmts(
                 if (!dst.count(k)) dst[k] = v;
         };
     std::vector<const sema::Symbol*> declaredHere;
+    // §30.7 (v0.184, #1677): `await using var` locals in scope on this path
+    // whose static type has no synchronous disposal fallback — reported at any
+    // `yield return` they are live across (below). Popped at block end.
+    std::vector<const sema::Symbol*> auYieldDeclaredHere;
 
     for (const ast::Stmt* s : stmts) {
         if (!s) continue;
@@ -6422,6 +6493,13 @@ void MethodOwnership::walkSuspStmts(
                     suspInScope_.insert(ls);
                     declaredHere.push_back(ls);
                     crossed.erase(ls);  // a fresh binding has not yet crossed
+                }
+                // §30.7 (v0.184, #1677): an `await using var` binding with no
+                // synchronous disposal fallback becomes a candidate whose
+                // presence at a `yield return` is a reject (below).
+                if (ld->isAwaitUsing && awaitUsingYieldSensitive(lt)) {
+                    awaitUsingYieldInScope_[ls] = ld->name;
+                    auYieldDeclaredHere.push_back(ls);
                 }
             }
             continue;
@@ -6480,7 +6558,19 @@ void MethodOwnership::walkSuspStmts(
         if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
             checkReads(ys->value.get());
             if (ys->value && exprContainsAwait(ys->value.get())) markCrossed(s);
-            if (!ys->isBreak) markCrossed(s);  // yield return suspends the frame
+            if (!ys->isBreak) {
+                markCrossed(s);  // yield return suspends the frame
+                // §30.7 (v0.184, #1677): a `yield return` suspends the frame
+                // while the consumer runs; an `await using var` with no
+                // synchronous disposal fallback that is live here would have its
+                // DisposeAsync skipped on abandonment. Reject at the yield,
+                // naming the binding (yield-scoped: unlike the borrow-bearing-
+                // record rule, this fires only at `yield return`, not every
+                // suspension).
+                for (const auto& [sym, name] : awaitUsingYieldInScope_)
+                    if (awaitUsingYieldReported_.insert(sym).second)
+                        reportAwaitUsingYield(name, s);
+            }
             continue;
         }
 
@@ -6567,6 +6657,10 @@ void MethodOwnership::walkSuspStmts(
     }
     // Pop this block's candidates as they leave scope.
     for (const sema::Symbol* sym : declaredHere) suspInScope_.erase(sym);
+    // §30.7 (v0.184, #1677): an `await using var` binding disposes at its
+    // block's end, so it is no longer live at a `yield return` after the block.
+    for (const sema::Symbol* sym : auYieldDeclaredHere)
+        awaitUsingYieldInScope_.erase(sym);
 }
 
 bool MethodOwnership::builtinScopedCallbackFormal(const ast::Expr* callee,

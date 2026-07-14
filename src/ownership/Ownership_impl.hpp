@@ -1028,6 +1028,12 @@ private:
         const std::vector<const ast::Stmt*>& stmts,
         std::unordered_map<const sema::Symbol*, const ast::Node*>& crossed);
     void reportSuspCross(const sema::Symbol* sym, const ast::Node* suspNode);
+    // §30.7 (v0.184, #1677): report an `await using var` binding held live
+    // across a `yield return` whose static type has no synchronous disposal
+    // fallback (a no-destructor IAsyncDisposable class such as `TaskScope`, or
+    // an interface type). Emitted at the yield, naming the binding. // per §30.7
+    void reportAwaitUsingYield(std::string_view name,
+                               const ast::Node* yieldNode);
     // True when `init`'s borrow source is a frame-resident owner (per §30.1).
     bool suspSourceIsFrameResident(const ast::Expr& init);
     // Collect the identifiers read anywhere in `e` (no descent into lambdas).
@@ -1045,6 +1051,12 @@ private:
     std::unordered_map<const sema::Symbol*, SuspCandidate> suspCands_;
     std::unordered_set<const sema::Symbol*> suspInScope_;
     std::unordered_set<const sema::Symbol*> suspReported_;
+    // §30.7 (v0.184, #1677): `await using var` bindings currently in scope whose
+    // static type has no synchronous disposal fallback (symbol → binding name),
+    // and the per-binding de-dup set for the across-`yield return` reject. // per §30.7
+    std::unordered_map<const sema::Symbol*, std::string_view>
+        awaitUsingYieldInScope_;
+    std::unordered_set<const sema::Symbol*> awaitUsingYieldReported_;
 
     // Find the identifier at the root of a chain like `x.f.g[i].M(...)`.
     // Returns null if the root isn't a bare identifier.
