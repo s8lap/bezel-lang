@@ -2271,6 +2271,23 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     // value the constructor wrote (the call-site analogue of ensureOutVarSlots).
     ensureCtorOutVarSlots(ne, rt);
     if (!rt->declaration) {
+        // §6.5 / §24.3 (#1646): user construction of a producer-side event source
+        // — `new EventSource<T>()` / `new AsyncEventSource<T>()` (the constructors
+        // are public as of stdlib §6.5, v0.187). These have no user TypeSymbol
+        // (rt->declaration == null); their runtime value is a plain
+        // bz_event_source_t* (isEventSourceTypeName / the event-as-value model),
+        // the same object emitInstanceInit mints for a keyword-form event and that
+        // Subscribe/Add/Remove/Raise/RaiseAsync dispatch against (tryLowerEventCall).
+        // A fresh, empty source is allocated by bz_event_source_new (sync and async
+        // share one runtime representation — RaiseAsync differs only in codegen).
+        // Without this branch the construction fell through to `return nullptr`,
+        // which ICE'd as a field initializer (#1386) and silently left a
+        // ctor-assigned field null (Subscribe/Raise then no-op'd). The owned field
+        // is freed via bz_event_source_free in emitOwnedFieldDisposals.
+        if (isEventSourceTypeName(rt)) {
+            auto* newFn = declareC("bz_event_source_new", ptrTy(), {});
+            return builder_.CreateCall(newFn, {}, "event.source");
+        }
         // CG22: built-in exception types (Exception, ArgumentException, …)
         // have no user TypeSymbol (rt->declaration == null) but do have a
         // built-in vtable from setupBuiltinExceptions. Construct a 16-byte

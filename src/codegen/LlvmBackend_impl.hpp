@@ -4650,6 +4650,44 @@ private:
         return isSubscriptionType(rt);
     }
 
+    // §6.5 / §24.3 (#1646): true when `fs` is an `owned` field of type
+    // EventSource<T> or AsyncEventSource<T> — the producer-side event sources a
+    // user may now construct directly (`new EventSource<T>()`; the pattern's
+    // `private owned readonly _e: EventSource<T> := new();`). These are
+    // compiler-known heap objects with no user TypeDecl / no vtable (the same
+    // bz_event_source_t* emitInstanceInit mints for a keyword-form event); they
+    // are freed via bz_event_source_free (null-safe — `if (!s) return;`), which
+    // frees the subscriber (handler) list and the struct, NOT the borrowed handler
+    // closures (those are owned by their Subscriptions, disposed separately). This
+    // mirrors isOwnedSharedWeakField / isOwnedSubscriptionField: a builtin runtime
+    // object released outside the vtable-Dispose path. Async and sync sources share
+    // one runtime representation, so both free identically.
+    bool isOwnedEventSourceField(const sema::FieldSymbol* fs) const {
+        if (fs->posParam) {
+            const sema::TypeRef* pt = capturedOwnedPrimaryParamType(fs);
+            return isEventSourceTypeName(pt);
+        }
+        if (!hasOwnedModifier(fs)) return false;
+        const sema::TypeRef* rt = nullptr;
+        if (!fs->decl) {
+            rt = ctx_.importedMemberType(fs);
+        } else {
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (!fd || !fd->type) return false;
+            rt = ctx_.resolvedType(*fd->type);
+        }
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+            return false;
+        if (isEventSourceTypeName(rt)) return true;
+        // #662 foundation B: an IMPORTED field has no astNode; the type name
+        // rides importedName (isEventSourceTypeName inspects astNode only).
+        if (!fs->decl) {
+            std::string_view n = rt->importedName;
+            return n == "EventSource" || n == "AsyncEventSource";
+        }
+        return false;
+    }
+
     // #362 / stdlib §4.5: if `fs` is an `owned` field whose type is a heap
     // collection (Array<T>/OwningArray<T>/…, builtins with no TypeSymbol so
     // isOwnedReferenceField does not match them), return its resolved TypeRef;

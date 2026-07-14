@@ -4334,7 +4334,11 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
                    // #1643 / §29.7: owned IEnumerable<T>/IOwningEnumerable<T>
                    // field's iterator frame needs cleanup (slot-1 dispose) if
                    // the constructor body throws after it was assigned.
-                   isOwnedIteratorInterfaceField(fs))) {
+                   isOwnedIteratorInterfaceField(fs) ||
+                   // §6.5 / §24.3 (#1646): owned EventSource<T>/AsyncEventSource<T>
+                   // field (user-constructed) also needs freeing if the ctor body
+                   // throws after it was assigned.
+                   isOwnedEventSourceField(fs))) {
             hasOwnedToClean = true;
             break;
         }

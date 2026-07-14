@@ -231,6 +231,10 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         // frees the frame itself), dispatched below via the iterEnumDispose
         // path, NOT the class-vtable slot-2 dynamicDispose.
         bool iterField = false;
+        // §6.5 / §24.3 (#1646): true for an owned EventSource<T>/AsyncEventSource<T>
+        // field — a bz_event_source_t* freed via bz_event_source_free (null-safe),
+        // which reclaims the subscriber list and the struct. No vtable.
+        bool eventSourceField = false;
     };
     std::vector<OwnedField> owned;
     for (const sema::Symbol* m : ts->members) {
@@ -264,6 +268,14 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // slot-1 path, NOT the class-vtable slot-2 emitDisposeAndReclaim.
             OwnedField of{fs, nullptr};
             of.iterField = true;
+            owned.push_back(of);
+        } else if (isOwnedEventSourceField(fs)) {
+            // §6.5 / §24.3 (#1646): an `owned` EventSource<T>/AsyncEventSource<T>
+            // field (the event pattern's source, now user-constructible). A
+            // bz_event_source_t* with no vtable; freed via bz_event_source_free
+            // (null-safe), which reclaims the subscriber list + struct.
+            OwnedField of{fs, nullptr};
+            of.eventSourceField = true;
             owned.push_back(of);
         } else {
             // §28.13 / stdlib §2.16 (#620): an `owned` field of Shared<T> or
@@ -353,6 +365,21 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             auto* dispFn = declareC("bz_subscription_dispose",
                                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(dispFn, {val});
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+            continue;
+        }
+        // §6.5 / §24.3 (#1646): owned EventSource<T>/AsyncEventSource<T> field —
+        // free the subscriber list + struct via bz_event_source_free (null-safe:
+        // `if (!s) return;`, so a ctor that threw before the field was assigned is
+        // safe). This is the same runtime free the keyword-form EventSymbol
+        // backing-field loop later in this function uses (#480). The freed source
+        // does NOT cascade into the borrowed handler closures (those are owned by
+        // their Subscriptions). Null the field after so a re-entrant dispose is a
+        // no-op.
+        if (it->eventSourceField) {
+            auto* freeFn = declareC("bz_event_source_free",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(freeFn, {val});
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
             continue;
         }
