@@ -527,28 +527,41 @@ private:
     // methods, constructors, destructors, and operators. Uses
     // ownedArgSourceIsBorrow to classify the returned expression: a fresh
     // producer (`new`, an owned-returning call, a `move`), a static property
-    // read (process-lived storage, §28.3 producers table), or anything the
-    // classifier cannot positively identify as a borrow is left unflagged —
-    // conservative, so a legal factory return is never over-rejected. A
-    // STATIC FIELD read (`exprIsStaticMemberRead`) is exempted the same way a
-    // static PROPERTY read already is (§28.3 #1499 regression guard,
-    // `borrow_field_return_stays_borrowed`): both are the declaring type's own
-    // static storage, process-lived, so every intra-program liveness
-    // constraint is satisfied — the same reasoning the producers table states
-    // for "Static property access". Fires from handleReturn (block bodies)
-    // and runExprBodyOwningReturnCheck (`=>` expression bodies). // per §28.3
+    // read (process-lived storage, §28.3 producers table — and, resolving to a
+    // property rather than a FieldSymbol, not classified a borrow at all), or
+    // anything the classifier cannot positively identify as a borrow is left
+    // unflagged — conservative, so a legal factory return is never
+    // over-rejected. **Static-storage re-exposure is property-getter-only
+    // (v0.196, #1815).** A static method returning a bare read of a `static`
+    // `owned` field (`exprIsStaticMemberRead`) IS now flagged: v0.187 admitted
+    // such a read returned from either a static property getter or a static
+    // method, and v0.196 RETIRES the static-method arm — nothing
+    // signature-visible distinguishes a storage-returning static method from a
+    // factory, so every caller classifies the call as the sourceless-factory
+    // case (§28.3 *Factory methods*) and would mint a second owner for the
+    // borrowed-out storage. Re-exposure is the static PROPERTY getter (whose
+    // `T.P` read is the sound caller-side dual); property getters never reach
+    // this function (checkMember's PropertyDecl branch routes them to
+    // checkGetterFreshOwnedReturn / scanGetterReturns), and a static-method
+    // return of a static PROPERTY read stays admitted because
+    // ownedArgSourceIsBorrow does not classify a property read as a borrow.
+    // Fires from handleReturn (block bodies) and runExprBodyOwningReturnCheck
+    // (`=>` expression bodies). // per §28.3, §28.6
     void checkStaticBorrowReturn(const ast::Expr& e);
 
-    // §28.3 (v0.180, #1547): true when `e` is a bare identifier or member
-    // access resolving to a STATIC field or property member (a `modifiers`
-    // list containing "static" on the resolved MemberSymbol). Used by
-    // checkStaticBorrowReturn to exempt a static method's read of its own (or
-    // another type's) static storage — process-lived, so it always outlives
-    // the call, the same "Static property access" exception the §28.3
-    // producers table states explicitly for properties; a static FIELD read
-    // (`_shared` in the #1499 regression-guard test) carries the identical
-    // process-lived-storage reasoning, so it is exempted here rather than
-    // rejected as an ordinary borrowed-field read.
+    // §28.3 / §28.6 (v0.180 #1547; role changed v0.196 #1815): true when `e` is
+    // a bare identifier or member access resolving to a STATIC field or property
+    // member (a `modifiers` list containing "static" on the resolved
+    // MemberSymbol). It once EXEMPTED a static method's read of static storage
+    // from checkStaticBorrowReturn; v0.196 retires that exemption (the
+    // static-method static-storage re-exposure arm), so the helper now SELECTS
+    // the diagnostic instead: a flagged borrow that IS a static-member read
+    // (`_instance` / `Other._instance`) gets the message naming the
+    // static-property remedy and the `T.P()` -> `T.P` call-site migration; every
+    // other borrow return keeps the ordinary no-receiver message. (A static
+    // PROPERTY read is never a flagged borrow here — ownedArgSourceIsBorrow
+    // resolves it to a property, not a FieldSymbol — so it never reaches the
+    // selection.)
     bool exprIsStaticMemberRead(const ast::Expr& e) const;
 
     // §28.6 *Borrowed owning collections* (#1008 Part C): reject an ownership-

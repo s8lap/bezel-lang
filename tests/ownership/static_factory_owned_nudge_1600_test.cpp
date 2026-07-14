@@ -172,12 +172,15 @@ BEZEL_TEST(static_factory_owned_nudge_1600, value_typed_return_no_nudge) {
     BEZEL_EXPECT_FALSE(hasFactoryNudgeWarning(r, "Make"));
 }
 
-// --- Negative: a static method returning a BORROW (a static-field read) has
-// no fresh-owned return on any path — the same #1499 regression guard shape
-// (`borrow_field_return_stays_borrowed` in sourceless_static_factory_1499_
-// test.cpp) applies here: no nudge, since there is nothing to annotate
-// `owned` — the callee genuinely returns a borrow, not an ambiguous fresh
-// value. ---
+// --- v0.196 RETIREMENT (#1815): a static method returning a BORROW (a static-
+// field read) is now REJECTED (§28.3 ~L5898 / §28.6 ~L6085 — the static-method
+// static-storage re-exposure arm is retired; re-exposure is the static property
+// getter only). This shape previously pinned the now-retired acceptance (no
+// error, no nudge); flipping the error expectation IS the spec-mandated behavior
+// change. The nudge assertion still holds: the nudge fires only for a
+// fresh-owned return (`staticFactoryReturnsFreshOwned`), and a static-field read
+// is a borrow, not fresh — so there is still nothing to annotate `owned` and no
+// nudge fires. The borrow-return Error, not a nudge, is now what is diagnosed. ---
 
 BEZEL_TEST(static_factory_owned_nudge_1600, borrow_field_return_no_nudge) {
     auto r = parseAndCheckOwnership(
@@ -193,7 +196,7 @@ BEZEL_TEST(static_factory_owned_nudge_1600, borrow_field_return_no_nudge) {
         "    return 0; "
         "  end Main; "
         "end Holder;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasFactoryNudgeWarning(r, "Get"));
 }
 

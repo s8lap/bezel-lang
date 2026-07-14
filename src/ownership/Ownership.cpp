@@ -3897,11 +3897,16 @@ void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
 // fields are never `this`-rooted), an indexer read, a caught-exception
 // borrow, and a destructuring binding are all flagged; a fresh producer
 // (`new`, an owned-returning call, a `move`d owned value), a static
-// property read (process-lived storage, always safe per the §28.3
-// producers table), and anything the classifier cannot positively identify
-// are left unflagged — conservative, so a legal factory return is never
-// over-rejected. Fires from handleReturn (block bodies) and
-// runExprBodyOwningReturnCheck (`=>` expression bodies). // per §28.3
+// property read (process-lived storage, and — resolving to a property, not
+// a FieldSymbol — not classified a borrow here at all), and anything the
+// classifier cannot positively identify are left unflagged — conservative,
+// so a legal factory return is never over-rejected. A static FIELD read is
+// now flagged, not exempt (v0.196, #1815 — retiring the v0.187 static-method
+// static-storage re-exposure arm): re-exposure is the static PROPERTY getter,
+// whose `T.P` caller-side read is the sound dual; the flag emits the property
+// remedy (exprIsStaticMemberRead selects that message). Fires from
+// handleReturn (block bodies) and runExprBodyOwningReturnCheck (`=>`
+// expression bodies). // per §28.3, §28.6
 void MethodOwnership::checkStaticBorrowReturn(const ast::Expr& e) {
     if (!isStatic_) return;
     if (returnOwned_) return;
@@ -3911,12 +3916,40 @@ void MethodOwnership::checkStaticBorrowReturn(const ast::Expr& e) {
         isOwningTypeNameHead(returnType_->name->parts.front()))
         return;
     if (!isBorrowableType(ctx_.resolvedType(*returnType_))) return;
-    // §28.3 (#1499 regression guard, `borrow_field_return_stays_borrowed`): a
-    // STATIC field read is the declaring type's own process-lived storage —
-    // the same always-outlives-the-call reasoning the producers table states
-    // for "Static property access" — so it is exempt, not a violation.
-    if (exprIsStaticMemberRead(e)) return;
     if (!ownedArgSourceIsBorrow(e)) return;
+    // §28.3 / §28.6 (v0.196, #1815): a flagged borrow that is a read of the
+    // declaring (or another) type's STATIC storage — a bare `_instance` (a
+    // static `FieldSymbol`) or `Other._instance` (a static-member access) — is
+    // a static-storage RE-EXPOSURE. v0.187 admitted such a read returned from a
+    // static property getter OR a static method; v0.196 RETIRES the static-
+    // METHOD arm: nothing signature-visible distinguishes a storage-returning
+    // static method from a factory, so every caller classifies the call as the
+    // sourceless-factory case (§28.3 *Factory methods*) and would mint a second
+    // owner for the borrowed-out storage. Property getters never reach this
+    // function — checkMember's PropertyDecl branch routes them to
+    // checkGetterFreshOwnedReturn / scanGetterReturns — and a static-method
+    // return of a static PROPERTY read (`=> T.P`) is not classified a borrow by
+    // ownedArgSourceIsBorrow above (it resolves to a property, not a
+    // FieldSymbol), so the surviving getter admission is left unflagged. The
+    // static-member-read branch only re-shapes the DIAGNOSTIC: it names the
+    // static-property remedy so the migration is mechanical; every other borrow
+    // return (a borrowed parameter/local, a field reached through one) keeps the
+    // ordinary no-receiver message below. // per §28.3, §28.6
+    if (exprIsStaticMemberRead(e)) {
+        report(
+            Severity::Error, e.span.begin,
+            "a static method may not re-expose static storage — returning a "
+            "bare read of a `static` `owned` field through a non-`owned` "
+            "return re-exposes ownership, and because nothing in the signature "
+            "distinguishes this from a factory, every caller (§28.3 *Factory "
+            "methods*) mints a second owner for the borrowed-out storage "
+            "(§28.6, v0.196 retires the v0.187 static-method arm); re-expose "
+            "the field through a static property, whose `T.P` read is the sound "
+            "caller-side dual — e.g. `static property Instance: Config => "
+            "_instance;`, migrating call sites `T.Instance()` to `T.Instance` — "
+            "or transfer ownership with an `owned` return");
+        return;
+    }
     report(
         Severity::Error, e.span.begin,
         "a borrow may not be returned from a static method — a static "
@@ -3929,13 +3962,17 @@ void MethodOwnership::checkStaticBorrowReturn(const ast::Expr& e) {
         "transfer ownership");
 }
 
-// §28.3 (v0.180, #1547): see the header comment. Resolves `e`'s symbol (for
-// a bare identifier or a member access) and checks whether the declaring
-// MemberSymbol's modifier list contains "static" — the same textual-modifier
-// representation `methodIsStatic` reads for MethodDecl and
-// `staticFactoryReturnsFreshOwned` reads for FieldSymbol/ConstMemberSymbol
-// (OwnershipFacts.cpp has no direct equivalent; this is the ownership pass's
-// own copy, scoped to the one call site above).
+// §28.3 / §28.6 (v0.180 #1547; role changed v0.196 #1815): see the header
+// comment. Resolves `e`'s symbol (for a bare identifier or a member access) and
+// checks whether the declaring MemberSymbol's modifier list contains "static" —
+// the same textual-modifier representation `methodIsStatic` reads for MethodDecl
+// and `staticFactoryReturnsFreshOwned` reads for FieldSymbol/ConstMemberSymbol
+// (OwnershipFacts.cpp has no direct equivalent; this is the ownership pass's own
+// copy, scoped to the one call site above). It once EXEMPTED a static-storage
+// read from checkStaticBorrowReturn; v0.196 retired that exemption, so it now
+// SELECTS the diagnostic instead — a flagged borrow that is a static-member read
+// gets the static-property-remedy message, everything else the ordinary
+// no-receiver message.
 bool MethodOwnership::exprIsStaticMemberRead(const ast::Expr& e) const {
     sema::Symbol* sym = nullptr;
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {

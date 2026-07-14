@@ -100,27 +100,20 @@ BEZEL_TEST(codegen_sourceless_static_factory_1499, interface_return_fresh_dispos
     BEZEL_EXPECT_EQ(run(src), 1);
 }
 
-// --- Borrow-return half (§28.10): the REGRESSION GUARD. ---
+// --- Borrow-return half: the REGRESSION GUARD. ---
 
-// A static method whose body returns a static-field READ (`_shared`) is a
-// BORROW, not a fresh owned value. `using var r := Get();` must NOT dispose it
-// — the field's process-lived object is owned by the static storage, and
-// disposing the borrow would double-free it (this is exactly the soundness
-// regression the previous #1499 attempt introduced by classifying EVERY
-// unannotated static return owned). The destructor must not run inside Main:
-// Res._n stays 0 at return. (The static `_shared` is reclaimed only at
-// program-exit static disposal, after Main's value is captured.)
-BEZEL_TEST(codegen_sourceless_static_factory_1499, borrow_field_return_not_disposed) {
-    std::string src = std::string(kRes) +
-        "class Holder "
-        "  public static readonly _shared: Res := new Res(); "
-        "  public static method Get(): Res => Holder._shared; "
-        "  public static method Main(): int "
-        "    do using var r := Get(); end; return Res._n; "
-        "  end Main; "
-        "end Holder;";
-    BEZEL_EXPECT_EQ(run(src), 0);
-}
+// (Removed in v0.196, #1815.) The former `borrow_field_return_not_disposed`
+// case compiled a static method returning a static-field read
+// (`static method Get(): Res => Holder._shared;`) and observed that the
+// `using var`-bound borrow was not disposed. v0.196 retires the static-method
+// static-storage re-exposure arm (§28.3 ~L5898 / §28.6 ~L6085), so that program
+// no longer compiles — it is rejected by the ownership pass before codegen. A
+// rejected program never reaches codegen, so the codegen-side guard is gone;
+// the reject is pinned instead in tests/ownership/sourceless_static_factory_
+// 1499_test.cpp (`static_owned_field_reexposed_by_method_rejected` and the
+// flipped `borrow_field_return_stays_borrowed`). The receiver-sourced INSTANCE
+// borrow below is unaffected (instance methods are outside this rule) and still
+// exercises the not-disposed-until-owner-disposes disposal path.
 
 // Same borrow-return through a receiver-sourced INSTANCE method: `h.Get()`
 // borrows the receiver's owned field, so the `using var` does not dispose it;

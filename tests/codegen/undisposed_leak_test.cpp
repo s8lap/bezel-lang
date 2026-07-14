@@ -223,25 +223,17 @@ const char* kOwnedCallClass =
     "  end Main; "
     "end R;";
 
-// §28.10 (negative): `using var r := Get()` where Get(): R is a BORROW return
-// (no `owned`) — the using var assumes NO disposal. The shared object's
-// destructor must NOT run here (it is process-bound static state). Count stays
-// 0. This guards against over-disposal (which would double-free the shared
-// instance). No LSan leg — the shared static R intentionally outlives main.
-// §22.12 rule 2 (v0.163, #1363): mutable static class-typed fields are
-// compile errors; _shared uses `static readonly` instead (never reassigned
-// after init). Rule 4 emits a warning for the singleton pattern, which is
-// expected and does not prevent compilation.
-const char* kBorrowCallNotDisposed =
-    "module M; class R "
-    "  public static _n: int := 0; "
-    "  public static readonly _shared: R := new R(); "
-    "  destructor _n := _n + 1; end destructor; "
-    "  public static method Get(): R => _shared; "
-    "  public static method Main(): int "
-    "    do using var r := Get(); end; return _n; "
-    "  end Main; "
-    "end R;";
+// (Removed in v0.196, #1815.) `kBorrowCallNotDisposed` compiled a static
+// method returning a static-field read (`public static method Get(): R =>
+// _shared;`) and observed at runtime that the `using var`-bound borrow was not
+// disposed. v0.196 retires the static-method static-storage re-exposure arm
+// (§28.3 ~L5898 / §28.6 ~L6085): that program is now rejected by the ownership
+// pass before codegen, so a runtime observation is no longer reachable. The
+// reject is pinned in tests/ownership/sourceless_static_factory_1499_test.cpp
+// (`static_owned_field_reexposed_by_method_rejected` and the flipped
+// `borrow_field_return_stays_borrowed`). Re-exposure is now the static property
+// getter only; the paired `borrow_return_call_using_var_not_disposed_28_10`
+// test below is removed with it.
 
 // --- Gap 3: using var := move owned field (§28.8.1). ----------------------
 
@@ -456,11 +448,12 @@ BEZEL_TEST(codegen_undisposed_383, owned_return_call_using_var_disposed_28_10) {
     expectDisposedAndLeakFree(kOwnedCallClass, 1);
 }
 
-BEZEL_TEST(codegen_undisposed_383, borrow_return_call_using_var_not_disposed_28_10) {
-    // §28.10: a borrow-return using var assumes no disposal — destructor does
-    // not run (guards against double-disposing a borrowed/shared object).
-    BEZEL_EXPECT_EQ(run(kBorrowCallNotDisposed), 0);
-}
+// (Removed in v0.196, #1815: `borrow_return_call_using_var_not_disposed_28_10`.)
+// Its program returned a static-field read from a static method — a
+// static-storage re-exposure the v0.196 retirement now rejects before codegen
+// (§28.3 ~L5898 / §28.6 ~L6085). See the breadcrumb at the former
+// `kBorrowCallNotDisposed` definition above; the reject is pinned in
+// tests/ownership/sourceless_static_factory_1499_test.cpp.
 
 // ---- Gap 3 ---------------------------------------------------------------
 

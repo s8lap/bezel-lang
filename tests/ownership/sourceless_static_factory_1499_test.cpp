@@ -93,13 +93,17 @@ BEZEL_TEST(sourceless_static_factory_1499, fresh_owned_return_transfer_accepted)
 
 // --- Borrow-return half: the SEMA REGRESSION GUARD. ---
 
-// A static method whose body returns a static-field READ (`_shared`) is a
-// BORROW. Its call-site result must NOT be flagged Owned — `var r := Get();`
-// carries no auto-drop obligation. Classifying it owned is the exact soundness
-// regression the previous attempt introduced (it would auto-drop / dispose the
-// process-lived shared object — a double-free, §28.10). The §22.12-rule-4
-// domain warning on the static readonly field is unrelated and is a Warning,
-// not an error, so hasErrors() stays false.
+// v0.196 RETIREMENT (#1815): a static method whose body returns a static-field
+// READ (`_shared`) is a static-storage RE-EXPOSURE. v0.187 admitted this from a
+// static method alongside a static property getter; v0.196 retires the static-
+// METHOD arm (§28.3 ~L5898 "A static **method** may not return such a read";
+// §28.6 ~L6085 "a static **method** returning such a read is rejected"): every
+// caller classifies the call as the sourceless-factory case and would mint a
+// second owner for the borrowed-out storage. This test previously pinned the
+// now-retired acceptance; flipping it to expect an error IS the spec-mandated
+// behavior change. (The §22.12-rule-4 domain warning on the static readonly
+// field is a separate Warning; the borrow-return Error is what makes hasErrors
+// true. `Get()` still returns a borrow, so its call site does not auto-drop.)
 BEZEL_TEST(sourceless_static_factory_1499, borrow_field_return_stays_borrowed) {
     auto r = parseAndCheckOwnership(
         "module M; class Res "
@@ -114,8 +118,54 @@ BEZEL_TEST(sourceless_static_factory_1499, borrow_field_return_stays_borrowed) {
         "    return 0; "
         "  end Main; "
         "end Holder;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasAutoDropWarning(r, "r"));
+}
+
+// §28.3 / §28.6 (v0.196, #1815) — the retirement's own FINGERPRINT: the exact
+// v0.187-admitted-then-v0.196-retired shape, a `static owned` field re-exposed
+// through a static method returning a bare read of it. (The field is spelled
+// `static readonly owned` — a *mutable* static of class type is rejected upstream
+// by §22.12 rule 2, so the realizable "static-owned" shape the issue names is the
+// readonly one.) Both the `=>`-expression and block-`return` method bodies must
+// reject, and the diagnostic must name the static-PROPERTY remedy so migration is
+// mechanical.
+namespace {
+// True when some ERROR diagnostic names the static-property re-exposure remedy.
+bool hasStaticPropertyRemedyError(const bezel::test::OwnershipResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("static property") != std::string::npos) return true;
+    }
+    return false;
+}
+}  // namespace
+
+BEZEL_TEST(sourceless_static_factory_1499, static_owned_field_reexposed_by_method_rejected) {
+    auto r = parseAndCheckOwnership(
+        "module M; class Config "
+        "  public static readonly owned _instance: Config := new Config(); "
+        "  public constructor() end constructor; "
+        "  destructor end destructor; "
+        "  public static method Instance(): Config => _instance; "
+        "end Config;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasStaticPropertyRemedyError(r));
+}
+
+// Sibling block-body form (`return _instance;`) — the full-body dataflow path
+// (handleReturn) must reject it identically to the `=>` expression-body path
+// (runExprBodyOwningReturnCheck) above.
+BEZEL_TEST(sourceless_static_factory_1499, static_owned_field_reexposed_by_method_blockbody_rejected) {
+    auto r = parseAndCheckOwnership(
+        "module M; class Config "
+        "  public static readonly owned _instance: Config := new Config(); "
+        "  public constructor() end constructor; "
+        "  destructor end destructor; "
+        "  public static method Instance(): Config return _instance; end Instance; "
+        "end Config;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasStaticPropertyRemedyError(r));
 }
 
 // Negative control: the rule is STATIC-only. An INSTANCE method's non-`owned`

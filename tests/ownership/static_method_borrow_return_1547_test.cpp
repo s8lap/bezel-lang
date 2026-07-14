@@ -128,17 +128,21 @@ BEZEL_TEST(static_borrow_return_1547, fresh_owned_return_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// A static method returning its own STATIC field is process-lived storage
-// — always outlives the call — and must stay accepted (the #1499
-// regression-guard shape; this is the same "static storage" exemption the
-// §28.3 producers table states explicitly for a static PROPERTY read).
+// v0.196 RETIREMENT (#1815): a static method returning a bare read of its own
+// STATIC field is a static-storage RE-EXPOSURE, and v0.196 retires the static-
+// METHOD arm the v0.187 admission opened (§28.3 ~L5898 "A static **method** may
+// not return such a read (v0.196 — retiring the static-*method* arm)"; §28.6
+// ~L6085 same). This shape previously pinned that now-retired acceptance;
+// flipping it to expect an error IS the spec-mandated behavior change. Re-
+// exposure is now the static PROPERTY getter only — see
+// `static_property_read_stays_accepted` below, which survives unchanged.
 BEZEL_TEST(static_borrow_return_1547, static_field_read_stays_accepted) {
     auto r = parseAndCheckOwnership(mod(
         "class Holder "
         "  public static readonly _shared: Res := new Res(); "
         "  public static method Get(): Res => _shared; "
         "end Holder;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // §28.3 producers table (v0.180), #1546 conformance batch: a static method
