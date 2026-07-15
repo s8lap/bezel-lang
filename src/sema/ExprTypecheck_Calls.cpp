@@ -1788,12 +1788,6 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         // by the compiler-provided conformance
                                         // table (numeric tower → all three;
                                         // char → ISteppable/IParsable only).
-                                        // A primitive against any OTHER
-                                        // static-member-bearing interface can
-                                        // never conform (primitives cannot
-                                        // declare conformances). Non-static
-                                        // interface bounds keep the historical
-                                        // defer-on-primitive behaviour.
                                         if (argRef->kind !=
                                             TypeRef::Kind::Primitive)
                                             continue;
@@ -1810,25 +1804,28 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                                 report(std::string(bn));
                                             continue;
                                         }
-                                        bool boundHasStatics = false;
-                                        if (bound->declaration->kind ==
-                                            ast::TypeDeclKind::Interface) {
-                                            for (Symbol* bm :
-                                                 bound->declaration->members) {
-                                                auto* bms = dynamic_cast<
-                                                    MethodSymbol*>(bm);
-                                                if (!bms) continue;
-                                                bool st = bms->isOperator;
-                                                for (auto mod : bms->modifiers)
-                                                    if (mod == "static")
-                                                        st = true;
-                                                if (st) {
-                                                    boundHasStatics = true;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        if (boundHasStatics)
+                                        // per §14.2 clause 5 v0.196: a primitive
+                                        // conforms ONLY to the interfaces its
+                                        // stdlib declaration lists plus the §11.8
+                                        // compiler-provided abstractions (handled
+                                        // above) — every one of which is a
+                                        // compiler-known builtin interface
+                                        // (IComparable/IEquatable/IEqualityComparer/
+                                        // IReadOnlySpan carry a synthesized decl
+                                        // via builtinInterfaceSym). A bound whose
+                                        // declaration is any OTHER type — a
+                                        // USER-declared interface or class, or a
+                                        // builtin class — is one a primitive can
+                                        // never conform to: primitives cannot
+                                        // declare conformances. Reject rather than
+                                        // defer (closes the soundness hole where
+                                        // `M<int>()` under `where T: IShape` was
+                                        // silently accepted and then dispatched a
+                                        // bad itable slot). The synthesized
+                                        // builtin interfaces keep the historical
+                                        // conservative accept.
+                                        if (bound->declaration !=
+                                            ctx_.builtinInterfaceSym(bn))
                                             report(std::string(bn));
                                         continue;
                                     }

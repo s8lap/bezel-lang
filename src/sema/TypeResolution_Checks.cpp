@@ -3326,8 +3326,7 @@ void Resolver::checkOneConstraint(const ast::Type& t,
         // of the static-abstraction bounds (INumber/ISteppable/IParsable) is
         // decided by the compiler-provided conformance table — the numeric
         // tower conforms to all three, `char` to ISteppable/IParsable only,
-        // everything else (string, bool, Object) to none. Other builtin bounds
-        // keep the historical defer-on-primitive behaviour.
+        // everything else (string, bool, Object) to none.
         if (arg->kind == TypeRef::Kind::Primitive) {
             std::string_view bn = bound->declaration->name;
             if ((bn == "INumber" || bn == "ISteppable" || bn == "IParsable") &&
@@ -3337,19 +3336,19 @@ void Resolver::checkOneConstraint(const ast::Type& t,
                     report(std::string(bn));
                 return;
             }
-            // §11.8: a primitive can never conform to a USER interface that
-            // carries static members (primitives cannot declare conformances;
-            // only the §2.19 builtins have compiler-provided ones).
-            if (bound->declaration->kind == ast::TypeDeclKind::Interface) {
-                for (Symbol* bm : bound->declaration->members) {
-                    auto* bms = dynamic_cast<MethodSymbol*>(bm);
-                    if (!bms) continue;
-                    if (bms->isOperator || hasMod(bms, "static")) {
-                        report(std::string(bn));
-                        break;
-                    }
-                }
-            }
+            // per §14.2 clause 5 v0.196: a primitive conforms ONLY to the
+            // interfaces its stdlib declaration lists plus the §11.8
+            // compiler-provided abstractions (handled above) — all of which are
+            // compiler-known builtin interfaces (IComparable/IEquatable/
+            // IEqualityComparer/IReadOnlySpan carry a synthesized decl via
+            // builtinInterfaceSym). A bound resolving to any OTHER declaration —
+            // a USER-declared interface or class, or a builtin class — is one a
+            // primitive can never conform to (primitives cannot declare
+            // conformances); reject rather than defer. Mirrors the method-call-
+            // site check in ExprTypecheck_Calls.cpp. The synthesized builtin
+            // interfaces keep the historical conservative accept.
+            if (bound->declaration != ctx_.builtinInterfaceSym(bn))
+                report(std::string(bn));
             return;
         }
         if (arg->kind != TypeRef::Kind::Named || !arg->declaration) {
