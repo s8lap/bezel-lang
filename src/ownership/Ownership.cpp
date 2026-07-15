@@ -1953,7 +1953,40 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     // `yield return c.V` keep `c` Owned and are correctly auto-disposed. A
     // `yield break` (null value) carries nothing to walk.
     if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
-        if (ys->value) handleDischarge(*ys->value);
+        if (ys->value) {
+            handleDischarge(*ys->value);
+            // fix #1863 / §29.1 v0.196 (IOwningEnumerable ownership transfer): in
+            // an OWNING iterator (return type IOwningEnumerable<T> /
+            // IOwningAsyncEnumerable<T>), `yield return <owned value>` TRANSFERS
+            // ownership of the yielded value to the consumer — the consumer takes
+            // it via `TakeCurrent()` and disposes it. A BARE yielded identifier
+            // that names a currently-Owned local / owned parameter is therefore
+            // DISCHARGED here (exactly as a bare `return x;` / `throw e;` is), so
+            // the §29.8 owned-parameter frame-teardown auto-dispose does NOT also
+            // dispose it — the double-free that #1863 reproduced. This does NOT
+            // apply to a NON-owning `IEnumerable<owned T>` iterator, whose
+            // enumerator RETAINS ownership of the yielded value (the consumer only
+            // borrows it via `Current`) and MUST auto-dispose it at teardown — so
+            // there the bare identifier stays a read (handleDischarge above leaves
+            // it Owned) and is left unchanged. Mirrors the ThrowExpr / handleReturn
+            // bare-identifier discharge fast-paths. // per §29.1, §29.8
+            bool owningIter =
+                returnType_ && returnType_->kind == ast::TypeKind::Named &&
+                returnType_->name && !returnType_->name->parts.empty() &&
+                (returnType_->name->parts.front() == "IOwningEnumerable" ||
+                 returnType_->name->parts.front() == "IOwningAsyncEnumerable");
+            if (owningIter) {
+                if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        ys->value.get())) {
+                    if (id->name != "this" && id->name != "base") {
+                        if (auto* st = lookupState(id->name)) {
+                            if (st->state == OwnershipState::Owned)
+                                markDisposedByName(id->name, id->span.begin);
+                        }
+                    }
+                }
+            }
+        }
         return;
     }
     // §31.1 / §28.8 (issue #406): the operand of a `throw` is an ordinary
