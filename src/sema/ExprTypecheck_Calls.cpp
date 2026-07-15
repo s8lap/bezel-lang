@@ -6509,6 +6509,31 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 // #1215 / §14.2: nullable types do not satisfy
                                 // interface constraints — reject with a clean
                                 // diagnostic so the call never reaches codegen.
+                                //
+                                // #1875 / §14.2 (clause 4) / stdlib §2.2:
+                                // Math.Min/Max/Clamp<T> are declared ONLY as
+                                // `where T: IComparable<T>`. A class/record/enum
+                                // type argument satisfies the bound *only* when
+                                // it explicitly implements IComparable<T> — there
+                                // is no implicit conformance; an enum or record
+                                // must list it in its inheritance clause, and a
+                                // class must implement it (§14.2 clause 4). This
+                                // builtin special-case bypasses the ordinary
+                                // generic-method constraint check (Min/Max/Clamp
+                                // resolve to no MethodSymbol), so the constraint
+                                // was previously unenforced here: a NON-conforming
+                                // class/record flowed to codegen and emitted
+                                // malformed IR (`sitofp ptr/record to double` — the
+                                // numeric lowering path has no CompareTo to route
+                                // through). Enforce the constraint so a
+                                // non-conforming type is rejected at sema and the
+                                // malformed-IR crash is unreachable. A conforming
+                                // type is typed as T (the operand type) so member
+                                // access on the returned borrow resolves, and
+                                // codegen dispatches via its CompareTo
+                                // (tryLowerBuiltinClassCall's comparableCompareTo).
+                                TypeSymbol* icomparable =
+                                    ctx_.builtinInterfaceSym("IComparable");
                                 if (argTy->nullable) {
                                     ctx_.diagnostics().report(
                                         Severity::Error, ce.span.begin,
@@ -6518,6 +6543,19 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         "IComparable<T>` constraint — nullable "
                                         "types do not implement interface "
                                         "constraints (§14.2)");
+                                } else if (icomparable &&
+                                           !isSubtype(argTy->declaration,
+                                                      icomparable)) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        "type argument `" +
+                                        std::string(argTy->declaration->name) +
+                                        "` does not satisfy the constraint `where "
+                                        "T: IComparable<T>` — `Math." +
+                                        std::string(ma->member) +
+                                        "` requires an argument type that "
+                                        "implements `IComparable<T>` (§14.2, "
+                                        "stdlib §2.2)");
                                 } else {
                                     ctx_.setExprType(&ce, argTy);
                                 }

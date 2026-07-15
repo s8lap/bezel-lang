@@ -419,6 +419,114 @@ BEZEL_TEST(math_comparable_1215, min_nonnull_class_still_works) {
         "  return Math.Min(a, b).v;")), 99);
 }
 
+// ── #1875 / §14.2 (clause 4) / stdlib §2.2: enforce `where T: IComparable<T>` ─
+// on Math.Min/Max/Clamp for a class/record/enum type argument. These selectors
+// resolve to no MethodSymbol (handled as a builtin), so the ordinary
+// generic-method constraint check never ran: a NON-conforming type (a class
+// with no `: IComparable`, no CompareTo) was silently accepted at sema and then
+// flowed to the numeric codegen path, which emitted malformed IR
+// (`sitofp ptr/record to double` — no CompareTo to route through) and aborted
+// codegen (IR verification failed). Sema now rejects a non-conforming type with
+// a §14.2 constraint diagnostic, so the malformed-IR crash is unreachable.
+//
+// The `diagContains` probe pins the SPECIFIC fix: before the fix the compile
+// still failed, but via the codegen IR-verification error (no "does not satisfy
+// the constraint" text — for the enum case it did not fail at all); after the
+// fix it fails at sema with the constraint diagnostic. So each test both
+// fails-without and passes-with.
+namespace {
+// True iff at least one reported error message contains `needle`.
+bool diagContains(const std::string& src, const std::string& needle) {
+    auto r = runAot(src);
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(needle) != std::string::npos) return true;
+    return false;
+}
+// A class that does NOT implement IComparable<T> (the issue-repro shape:
+// no `: IComparable`, a `Cmp` method rather than `CompareTo`).
+const char* kUncomparable =
+    "module M; import System; "
+    "class Plain(v: int) "
+    "  public method Cmp(o: Plain): int return 0; end Cmp; "
+    "end Plain; ";
+std::string plainMain(const std::string& body) {
+    return std::string(kUncomparable) +
+           "class App public static method Main(): int " + body +
+           " end Main; end App;";
+}
+const char* kConstraintNeedle = "does not satisfy the constraint";
+}  // namespace
+
+// #1875: Math.Max over a class NOT implementing IComparable<T> → §14.2 reject
+// (previously: `sitofp ptr to double` malformed-IR codegen crash).
+BEZEL_TEST(math_comparable_1875, max_nonconforming_class_rejected) {
+    BEZEL_EXPECT_TRUE(diagContains(plainMain(
+        "  using var a := new Plain(1); using var b := new Plain(2); "
+        "  var m := Math.Max(a, b); return m.v;"),
+        kConstraintNeedle));
+}
+
+// #1875: Math.Min over a non-conforming class → §14.2 reject.
+BEZEL_TEST(math_comparable_1875, min_nonconforming_class_rejected) {
+    BEZEL_EXPECT_TRUE(diagContains(plainMain(
+        "  using var a := new Plain(1); using var b := new Plain(2); "
+        "  var m := Math.Min(a, b); return m.v;"),
+        kConstraintNeedle));
+}
+
+// #1875: Math.Clamp over a non-conforming class → §14.2 reject.
+BEZEL_TEST(math_comparable_1875, clamp_nonconforming_class_rejected) {
+    BEZEL_EXPECT_TRUE(diagContains(plainMain(
+        "  using var v := new Plain(1); "
+        "  using var lo := new Plain(0); using var hi := new Plain(2); "
+        "  var m := Math.Clamp(v, lo, hi); return m.v;"),
+        kConstraintNeedle));
+}
+
+// #1875: explicit type arg `Math.Max<Plain>` is rejected the same way (the
+// check keys on the operand type, so inferred and explicit forms both reject).
+BEZEL_TEST(math_comparable_1875, max_nonconforming_class_explicit_rejected) {
+    BEZEL_EXPECT_TRUE(diagContains(plainMain(
+        "  using var a := new Plain(1); using var b := new Plain(2); "
+        "  var m := Math.Max<Plain>(a, b); return m.v;"),
+        kConstraintNeedle));
+}
+
+// #1875: the same defect for a RECORD not implementing IComparable<T> — it also
+// hit the sitofp-on-a-struct malformed-IR path. Now rejected at sema (§14.2).
+BEZEL_TEST(math_comparable_1875, max_nonconforming_record_rejected) {
+    BEZEL_EXPECT_TRUE(diagContains(
+        "module M; import System; record Bare(v: int); "
+        "class App public static method Main(): int "
+        "  var a := new Bare(1); var b := new Bare(2); "
+        "  var m := Math.Max(a, b); return m.v;"
+        " end Main; end App;",
+        kConstraintNeedle));
+}
+
+// #1875: an ENUM not listing IComparable<E> in its inheritance clause does NOT
+// satisfy `where T: IComparable<T>` (§14.2 clause 4 — no implicit conformance).
+// This case did not crash (enum ordinals lower to a valid sitofp), but it was
+// silently accepted, a soundness hole. Now rejected at sema.
+BEZEL_TEST(math_comparable_1875, max_nonconforming_enum_rejected) {
+    BEZEL_EXPECT_TRUE(diagContains(
+        "module M; import System; enum Color Red, Green, Blue; end Color; "
+        "class App public static method Main(): int "
+        "  var a := Color.Red; var b := Color.Blue; "
+        "  var m := Math.Max(a, b); return 0;"
+        " end Main; end App;",
+        kConstraintNeedle));
+}
+
+// #1875 regression control: a class that DOES implement IComparable<Box> still
+// compiles and runs — the fix must not over-reject a conforming type. Max
+// returns the greater instance (Box(150) > Box(99)) via CompareTo dispatch.
+BEZEL_TEST(math_comparable_1875, conforming_class_still_runs) {
+    BEZEL_EXPECT_EQ(run(boxMain(
+        "  using var a := new Box(150); using var b := new Box(99); "
+        "  return Math.Max(a, b).v;")), 150);
+}
+
 // ===========================================================================
 // #1238 — Convert.To*/TryTo* strict validation (stdlib §2.3)
 //
