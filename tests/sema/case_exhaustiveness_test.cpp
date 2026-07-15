@@ -709,6 +709,100 @@ BEZEL_TEST(sema_case_exhaust, rigid_determined_leaf_stays_exhaustive_spec_19_6) 
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// --- #1862: ARG-SENSITIVE coverage (spec §19.6 v0.196) ----------------------
+//
+// The determination rule fixes a determined leaf's obligation to its SOLE
+// admitted instantiation and requires it "covered exactly as a non-generic leaf
+// is — by an unguarded type pattern it is assignable to". Coverage is therefore
+// arg-SENSITIVE: a WRONG-instantiation arm does NOT discharge a determined
+// leaf's obligation. The rejected "declaration-coverage" reading (§19.6: "is
+// unsound … an `Ok<string>` value matches no arm and raises
+// MatchFailureException") matched an arm to a leaf by declaration NAME alone,
+// wrongly deeming a non-exhaustive match exhaustive (the false-exhaustive hole,
+// the UNSOUND direction). These pin the arg-sensitive coverage match.
+
+// (a) GROUND wrong-instantiation. Scrutinee `Result<int>`; `Ok` is DETERMINED
+// (`T := int`) so its obligation is `Ok<int>`, but the arm is `Ok<string>` —
+// which is UNINHABITED at `Result<int>` (`Ok<string>` derives `Result<string>`,
+// not `Result<int>`) and does NOT cover `Ok<int>`. With `Err<int>` covered,
+// `Ok<int>` is uncovered and the case is non-exhaustive. FAILS WITHOUT the fix:
+// name-match discharges `Ok` by declaration name, wrongly deeming the case
+// exhaustive (no warning). PASSES WITH: the arg-sensitive check leaves `Ok<int>`
+// uncovered and the warning names the leaf.
+BEZEL_TEST(sema_case_exhaust,
+           wrong_instantiation_ground_arm_does_not_cover_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<T> end Result; "
+        "sealed class Ok<T> : Result<T> end Ok; "
+        "sealed class Err<T> : Result<T> end Err; "
+        "class Calc "
+        "  public method M(r: Result<int>): int "
+        "    var a := case r of "
+        "      var a2: Ok<string> => 1, "  // WRONG inst — does NOT cover Ok<int>
+        "      var e: Err<int> => 2 "      // T := int — covers Err<int>
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));            // Ok<int> uncovered
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "Ok"));  // names the leaf
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (b) RIGID wrong-instantiation. Scrutinee `Result<T>` (rigid `T`, from the
+// enclosing `Handle<T>`); `Ok<Y>: Result<Y>` is DETERMINED (`Y := T`) so its
+// obligation is `Ok<T>`, but the arm is `Ok<int>` — one instantiation of the
+// rigid family, not the determined `Ok<T>`. It does NOT cover the obligation, so
+// with `Err<T>` covered the case is non-exhaustive. FAILS WITHOUT the fix
+// (name-match discharges `Ok`); PASSES WITH (arg-sensitive: `int` ≠ rigid `T`).
+BEZEL_TEST(sema_case_exhaust,
+           wrong_instantiation_rigid_arm_does_not_cover_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<A> end Result; "
+        "sealed class Ok<Y> : Result<Y> end Ok; "
+        "sealed class Err<Y> : Result<Y> end Err; "
+        "class Handle<T> "
+        "  public method h(r: Result<T>): int "
+        "    var a := case r of "
+        "      var o: Ok<int> => 1, "   // WRONG inst — does NOT cover Ok<T>
+        "      var e: Err<T> => 2 "     // Y := T — covers Err<T>
+        "    end; "
+        "    return a; "
+        "  end h; "
+        "end Handle;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));            // Ok<T> uncovered
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "Ok"));  // names the leaf
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (c) NO-OVER-WARN control (both directions). A CORRECTLY-instantiated arm MUST
+// still cover its determined leaf — the arg-sensitive check must not regress the
+// determined idiom. `Ok<int>` + `Err<int>` at `Result<int>` are each the sole
+// admitted instantiation and each covered, so the case is exhaustive with no
+// `_` and no warning (and no error). Guards the opposite failure mode of the
+// #1862 fix: a spurious missing-leaf warning on a legitimately-covered leaf.
+BEZEL_TEST(sema_case_exhaust,
+           correct_instantiation_control_stays_covered_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<T> end Result; "
+        "sealed class Ok<T> : Result<T> end Ok; "
+        "sealed class Err<T> : Result<T> end Err; "
+        "class Calc "
+        "  public method M(r: Result<int>): int "
+        "    var a := case r of "
+        "      var o: Ok<int> => 1, "   // T := int — covers Ok<int>
+        "      var e: Err<int> => 2 "   // T := int — covers Err<int>
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));  // both correctly covered
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // --- s5: leaf-chain scalar where-constraint filtering (spec §19.6 v0.196;
 //     clause (b)) --------------------------------------------------------------
 //

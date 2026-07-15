@@ -1419,6 +1419,68 @@ bool ExprTC::leafSolutionViolatesScalarConstraint(
     return false;
 }
 
+// §19.6 v0.196 (#1862): sound structural equality of a case-arm generic
+// argument `arm` against a determined leaf-instantiation component `det`, for
+// the arg-SENSITIVE coverage match below. Ground components compare via
+// typeRefEqual; a RIGID enclosing-body type parameter (a bare Named TypeRef
+// with no declaration, §19.6's rigid component) is compared by HEAD NAME —
+// never by declaration pointer, since typeRefEqual is null-declaration blind
+// and would equate two DISTINCT rigid parameters (an `Ok<U>` arm wrongly
+// covering the determined `Ok<T>`), reopening the false-exemption hole. Any
+// component this cannot PROVE identical returns false, so an uncertain arm does
+// NOT discharge the obligation — the sound, warn-leaning direction.
+static bool sameInstantiationArg(const TypeRef* arm, const TypeRef* det) {
+    if (!arm || !det) return false;
+    if (arm->nullable != det->nullable) return false;
+    bool armRigid = arm->kind == TypeRef::Kind::Named && !arm->declaration;
+    bool detRigid = det->kind == TypeRef::Kind::Named && !det->declaration;
+    if (armRigid || detRigid) {
+        // A rigid parameter is covered only by the SAME-named rigid parameter.
+        return armRigid && detRigid && arm->genericArgs.empty() &&
+               det->genericArgs.empty() && !arm->headName().empty() &&
+               arm->headName() == det->headName();
+    }
+    if (arm->kind != det->kind) return false;
+    if (arm->kind == TypeRef::Kind::Named) {
+        if (arm->declaration != det->declaration) return false;
+        if (arm->genericArgs.size() != det->genericArgs.size()) return false;
+        for (std::size_t i = 0; i < arm->genericArgs.size(); ++i)
+            if (!sameInstantiationArg(arm->genericArgs[i], det->genericArgs[i]))
+                return false;
+        return true;
+    }
+    // Primitive / Unit / InlineArray / Function: ground-decidable, no rigid-
+    // parameter blindness for these kinds — defer to typeRefEqual.
+    return typeRefEqual(arm, det);
+}
+
+// §19.6 v0.196 (#1862): does the case arm whose resolved typed-binding type is
+// `armTy` COVER the DETERMINED generic leaf `leaf`, whose sole inhabiting
+// instantiation is `leaf<solution…>`? Arg-SENSITIVE: the arm must name `leaf`
+// itself with generic arguments that match the determined substitution σ
+// component-wise (the determination rule's "covered exactly as a non-generic
+// leaf is — by an unguarded type pattern it is assignable to"). A wrong-
+// instantiation arm (`Ok<string>` at determined `Ok<int>`, or a rigid `Ok<int>`
+// against determined `Ok<T>`) — or a bare arm carrying no instantiation
+// (`armTy == nullptr`) — does NOT discharge it, so a match that is not
+// exhaustive is no longer wrongly deemed exhaustive by declaration NAME alone.
+static bool armCoversDeterminedLeaf(
+    const TypeRef* armTy, const TypeSymbol* leaf,
+    const std::unordered_map<std::string_view, TypeRef*>& solution) {
+    if (!armTy || armTy->kind != TypeRef::Kind::Named) return false;
+    if (armTy->declaration != leaf) return false;
+    if (armTy->genericArgs.size() != leaf->genericParams.size()) return false;
+    for (std::size_t i = 0; i < leaf->genericParams.size(); ++i) {
+        const Symbol* gp = leaf->genericParams[i];
+        if (!gp) return false;
+        auto it = solution.find(gp->name);
+        if (it == solution.end() || !it->second) return false;  // unsolved param
+        if (!sameInstantiationArg(armTy->genericArgs[i], it->second))
+            return false;
+    }
+    return true;
+}
+
 // §19.6: emit a non-exhaustiveness WARNING for an expression-position
 // `case` whose arms the compiler cannot prove cover every possible value.
 // The spec lists the scrutinee shapes for which exhaustiveness IS provable
@@ -1688,6 +1750,16 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
         // such a leaf, only an irrefutable arm (already returned above).
         std::unordered_map<const TypeSymbol*, std::vector<std::string_view>>
             unattainable;
+        // §19.6 v0.196 (#1862): the DETERMINED generic leaves' sole inhabiting
+        // substitution σ (leaf-param name -> its determined type), recorded so
+        // the coverage match below is arg-SENSITIVE — a determined generic leaf
+        // is discharged only by an arm naming it with generic args matching σ,
+        // not by declaration name alone. Only GENERIC determined leaves are
+        // recorded; a non-generic determined leaf has no args to check and is
+        // covered by name as before.
+        std::unordered_map<const TypeSymbol*,
+                           std::unordered_map<std::string_view, TypeRef*>>
+            determined;
         if (genericsInPlay && scrutTy) {
             TypeRef scrutNonNull = *scrutTy;  // stack copy; typeRefEqual reads
             scrutNonNull.nullable = false;    // through the pointer only here
@@ -1732,6 +1804,12 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
                             LeafInstSolutions::Outcome::Undetermined &&
                         !sol.freeParams.empty())
                         unattainable.emplace(lf, std::move(sol.freeParams));
+                    // §19.6 v0.196 (#1862): record a determined GENERIC leaf's
+                    // σ so its coverage requires an arg-matching arm below.
+                    else if (sol.outcome ==
+                                 LeafInstSolutions::Outcome::Determined &&
+                             !lf->genericParams.empty())
+                        determined.emplace(lf, std::move(sol.solution));
                 } else {
                     // s4: NON-GROUND (rigid) scrutinee — the case s1–s3 defer.
                     // A leaf is NEVER exempt under a rigid `S`; classify by the
@@ -1749,6 +1827,14 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
                         solveLeafInstantiationsRigid(lf, sub, &scrutNonNull);
                     if (sol.unattainable)
                         unattainable.emplace(lf, std::move(sol.freeParams));
+                    // §19.6 v0.196 (#1862): a determined GENERIC leaf under a
+                    // rigid `S` (`Ok<Y>: Result<Y>` ⇒ `Y := T`) is likewise
+                    // arg-checked below — its σ maps the leaf param to the rigid
+                    // scrutinee component, so `Ok<int>` no longer covers `Ok<T>`.
+                    else if (sol.outcome ==
+                                 LeafInstSolutions::Outcome::Determined &&
+                             !lf->genericParams.empty())
+                        determined.emplace(lf, std::move(sol.solution));
                 }
                 kept.push_back(lf);
             }
@@ -1763,20 +1849,26 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
             TypeSymbol* matchTy = nullptr;
             // A type-test arm names the matched class either as a bare
             // NamedPattern (`Circle => …`) or as a typed binding
-            // (`var c: Circle => …`). Resolve the named class by its last
-            // name part against the closed hierarchy's leaf set — the
-            // BindingPattern's `bp->type` annotation is NOT resolved by
-            // TypeResolution inside case arms (no `resolvedType` entry), so
-            // we match by name, consistent with the NamedPattern path.
+            // (`var c: Circle => …`). The named class is located by its last
+            // name part against the closed hierarchy's leaf set (the
+            // NamedPattern path carries no resolved type). §19.6 v0.196
+            // (#1862): a BindingPattern's `bp->type` IS resolved by
+            // TypeResolution's resolveTypesInPattern, so `armTy` carries the
+            // arm's full INSTANTIATION — used below to make coverage of a
+            // determined generic leaf arg-SENSITIVE (a bare NamedPattern leaves
+            // `armTy` null and never discharges a determined generic leaf).
             std::string_view typeName;
+            const TypeRef* armTy = nullptr;
             if (auto* np = dynamic_cast<const ast::NamedPattern*>(p)) {
                 if (np->name && !np->name->parts.empty())
                     typeName = np->name->parts.back();
             } else if (auto* bp =
                            dynamic_cast<const ast::BindingPattern*>(p)) {
                 if (bp->type && bp->type->name &&
-                    !bp->type->name->parts.empty())
+                    !bp->type->name->parts.empty()) {
                     typeName = bp->type->name->parts.back();
+                    armTy = ctx_.resolvedType(*bp->type);
+                }
             }
             // Resolve against the full descendant set (a leaf, or an
             // abstract intermediate that subtype-covers its own leaves), or
@@ -1790,7 +1882,24 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
                 // A pattern naming an ancestor also covers all its leaf
                 // descendants (subtype matching, §19.3).
                 for (auto* lf : leaves) {
-                    if (lf == matchTy) { coveredLeaves.insert(lf); continue; }
+                    if (lf == matchTy) {
+                        // §19.6 v0.196 (#1862): a DETERMINED generic leaf is
+                        // discharged only by an arm whose instantiation matches
+                        // the leaf's sole admitted instantiation — not by its
+                        // declaration name alone. A wrong-instantiation arm
+                        // (`Ok<string>` at determined `Ok<int>`, or a rigid
+                        // `Ok<int>` at `Ok<T>`) does NOT cover it, so a match
+                        // that is not exhaustive is correctly reported (the
+                        // false-exhaustive hole this closes). Non-generic /
+                        // undetermined / exempt leaves are not in `determined`,
+                        // so the plain name-match discharge is undisturbed.
+                        auto di = determined.find(lf);
+                        if (di != determined.end() &&
+                            !armCoversDeterminedLeaf(armTy, lf, di->second))
+                            continue;  // arg mismatch — leaf stays uncovered
+                        coveredLeaves.insert(lf);
+                        continue;
+                    }
                     std::vector<TypeSymbol*> work = lf->baseTypes;
                     std::unordered_set<TypeSymbol*> seen;
                     while (!work.empty()) {
