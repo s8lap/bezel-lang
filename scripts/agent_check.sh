@@ -44,7 +44,9 @@ set -uo pipefail
 # --- locate the repo/worktree root (so this works from any agent worktree) ----
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
   echo "agent_check: not inside a git worktree" >&2; exit 2; }
-cd "$ROOT"
+# NB: do NOT `cd "$ROOT"` — every build/test path below is absolute, and staying
+# in the caller's cwd keeps a RELATIVE `--probe FILE.bzl` resolving where the
+# agent expects (its own cwd), not the repo root.
 DH="$ROOT/scripts/dev_heavy.sh"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
 JOBS="${JOBS:-16}"
@@ -123,10 +125,22 @@ build_target bezel_tests "$BIN"
 rc_all=0
 for f in "$@"; do
   echo "== agent_check: BEZEL_TEST_FILTER=$f (dev_heavy suite, capped) =="
+  log="$SCRATCH/test_${f//[^A-Za-z0-9_.]/_}.log"
   # dev_heavy suite runs in the shared slice; env is passed explicitly.
-  "$DH" suite env BEZEL_TEST_FILTER="$f" "$BIN"; rc=$?
-  if [ "$rc" -ne 0 ]; then echo "agent_check: FILTER '$f' had failures (exit $rc)"; rc_all=1
-  else echo "agent_check: filter '$f' green"; fi
+  "$DH" suite env BEZEL_TEST_FILTER="$f" "$BIN" 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  # A filter matching ZERO tests is almost always a typo — or the file basename
+  # passed instead of the gtest SUITE-or-name substring. gtest exits 0 on 0
+  # matches, so without this check it would report a FALSE GREEN.
+  summ="$(grep -oE '[0-9]+ passed, [0-9]+ failed' "$log" | tail -1)"
+  ran="$(printf '%s' "$summ" | awk '{print $1 + $3}')"   # passed + failed
+  if [ "$rc" -ne 0 ]; then
+    echo "agent_check: FILTER '$f' had failures (exit $rc)"; rc_all=1
+  elif [ -z "$summ" ] || [ "${ran:-0}" -eq 0 ]; then
+    echo "agent_check: ERROR filter '$f' matched 0 tests — a typo, or you passed the FILE basename instead of the gtest suite-or-name substring. Nothing was verified; treating as FAILURE (not a false green)."; rc_all=1
+  else
+    echo "agent_check: filter '$f' green ($summ)"
+  fi
 done
 [ "$rc_all" -eq 0 ] && echo "== agent_check: ALL requested filters green ==" \
                     || echo "== agent_check: some filters FAILED (see above) =="
