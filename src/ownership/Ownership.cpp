@@ -3138,6 +3138,31 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
     // implicitly discharged and need no flag.
     if (!ld.isUsing && lo.state == OwnershipState::Owned)
         everOwnedPlainLocals_.insert(lsym);
+    // §28.3 v0.190 SB-01 (#1872): thread the Owned-vs-Borrow verdict for a plain
+    // `var` whose CALL initializer borrows an EXISTING task frame into codegen.
+    // Codegen's plain-`var` task disposal gate treats every CallExpr initializer
+    // as a mint ("calls mint") — correct for a Task-family mint call (user
+    // `async` method, `Task.FromResult`), but WRONG for the two exotic CALL
+    // shapes producerState downgrades to Borrowed: a bare-type-parameter-return
+    // call whose T is instantiated to a task (`First<T>(a): T` at `Task<int>`,
+    // #1801) and an owning-wrapper method returning a bare receiver owned-field
+    // (the #1493 shape). For those the caller only BORROWS a frame owned
+    // elsewhere, so a scope-end `d.task` would double-free it. Recognize the two
+    // shapes with the SAME helpers producerState uses (single source of truth),
+    // gated on the Borrowed verdict so a genuine owner is never flagged, and
+    // record the fact on the decl for codegen to consult. // per §28.3 v0.190 SB-01
+    if (!ld.isUsing && lo.state == OwnershipState::Borrowed) {
+        if (auto* ce =
+                dynamic_cast<const ast::CallExpr*>(ld.initializer.get())) {
+            if (const ast::MethodDecl* md =
+                    common::calleeMethodDecl(*ce, ctx_)) {
+                if (callDeclaredReturnIsBareTypeParam(*ce, *md) ||
+                    methodReturnsOnlyWrapperReceiverBorrow(*md))
+                    const_cast<ast::LocalDecl&>(ld).initializerCallIsBorrow =
+                        true;
+            }
+        }
+    }
     // Async-readiness 3c (§30.5 line ~6110): a `using var`/`var` initializer
     // `:= await <bound owned task local>` consumes that operand task local
     // (the Pattern B await is owned-consuming with respect to its operand).

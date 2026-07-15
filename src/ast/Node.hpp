@@ -167,6 +167,23 @@ struct LocalDecl : Stmt {
     // unwindOwnedLocalClass; the ownership-side mirror localDropOnOverwriteCovered
     // reads it to admit the local to affine auto-drop.
     bool becomesOwnedViaReassign = false;
+    // §28.3 v0.190 SB-01 (#1872): set by the ownership pass on a plain
+    // (non-`using`) local whose CALL initializer producerState classifies
+    // BORROWED because the call BORROWS an existing frame owned elsewhere —
+    // a bare-type-parameter-return call (`First<T>(a): T`, #1801/§28.3 v0.194)
+    // or an owning-wrapper method returning a bare receiver owned-field (the
+    // #1493 shape). Codegen's plain-`var` task disposal gate
+    // (LlvmBackend_Stmts.cpp) treats EVERY CallExpr initializer as a task-frame
+    // mint ("calls mint") via taskLocalInitializerIsBorrowSource, which only
+    // recognizes the SYNTACTIC borrow sources (alias / storage read). These two
+    // exotic CALL shapes are borrows the shape-gate misses, so codegen would
+    // register a second scope-end `d.task` alongside the real owner's — a
+    // double-free of the one `bz_task_t*`. Consulting this flag makes codegen
+    // agree with producerState on who holds the disposal obligation instead of
+    // re-deriving ownership from the AST shape. A genuine Task-family mint call
+    // (a user `async` method, `Task.FromResult`, …) is classified Owned (or
+    // stays an unrecognized owner) and is NOT flagged, so it keeps its `d.task`.
+    bool initializerCallIsBorrow = false;
     std::string_view name;
     std::unique_ptr<Type> type;        // null when no `: Type`
     std::unique_ptr<Expr> initializer; // null only when plain `var x;`

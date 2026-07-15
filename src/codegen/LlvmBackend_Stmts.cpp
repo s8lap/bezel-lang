@@ -52,8 +52,21 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // agree on who holds the disposal obligation. A borrow source falls through
         // to the unwind-owned path below (a no-op for task types), registering no
         // disposal. // per §28.3 v0.190 SB-01 (storage lends)
+        //
+        // The syntactic shape gate above covers the alias / storage-read borrows,
+        // but two exotic CALL shapes are ALSO borrows producerState classifies
+        // Borrowed while this gate would treat as mints: a bare-type-parameter-
+        // return call at a task instantiation (`First<T>(a): T` at `Task<int>`,
+        // #1801) and an owning-wrapper method returning a bare receiver owned-
+        // field (the #1493 shape). Re-deriving that from the AST here would drift
+        // from producerState, so the ownership pass records its Borrowed verdict
+        // for those on the decl (`initializerCallIsBorrow`); consulting it keeps
+        // codegen and the ownership pass in agreement — the borrow no longer
+        // registers a second `d.task` (a double-free of the real owner's frame).
+        // // per §28.3 v0.190 SB-01 (#1872)
         else if (taskTypeOfLocal(ld) && !disposeStack_.empty() &&
-                 !taskLocalInitializerIsBorrowSource(ld)) {
+                 !taskLocalInitializerIsBorrowSource(ld) &&
+                 !ld->initializerCallIsBorrow) {
             auto it = locals_.find(ld);
             if (it != locals_.end()) {
                 Disposal d{it->second, nullptr};
