@@ -706,3 +706,97 @@ BEZEL_TEST(deferred_activation_capture_1818, async_awaited_in_scope_accepted) {
         "end Report;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ===========================================================================
+// T8 — EXPRESSION-BODY (`=>`) PARITY for the deferred-activation frame-return
+// capture check (§28.14 frame residence / §28.3 capture-set contribution,
+// v0.196).
+//
+// An `=>` body IS the return value — `M(...): T => E` is equivalent to
+// `M(...): T { return E; }` — so a deferred-activation frame that carries a
+// captured LIVE OWNED obligation and escapes through the `=>` return must be
+// rejected EXACTLY as the block-body `return` form is (the T2/T7 sink). An
+// expression body cannot declare a `using var`, so the escaping-capture shape it
+// admits is a captured `owned` PARAMETER — a live owned obligation the method
+// disposes at scope exit (§28.3 auto-drop) — the direct `=>` analog of the
+// block-body `owned_param_capture_rejected` test. Before this parity fix
+// `runExprBodyOwningReturnCheck` never seeded `methodParamSet_`, so
+// deferredActivationCaptureSources classified EVERY parameter capture as
+// lambda-internal and the owned-param capture was silently admitted on the `=>`
+// path while `{ return <same>; }` rejected it. The REJECT below compiles CLEAN
+// without the parity fix (the expr-body hole) and produces the identical
+// capture-set-contribution error with it; each ACCEPT compiles clean either way.
+// Every shape was hand-verified against `build/bezelc -c` on a standalone probe
+// before being folded in.
+// ===========================================================================
+
+namespace {
+
+// Expression-body sibling of `wrap()`: the SAME Scaler / Program / Doubled
+// preamble, but the method under test is an EXPRESSION-bodied `=>` method (no
+// `end M`), so `<sig> => <exprBody>;` IS the whole method — the `exprBody`
+// expression is the returned frame. // per §28.14 v0.196
+std::string exprWrap(const std::string& exprBody, const std::string& sig) {
+    return std::string(
+        "module M; "
+        "class Scaler "
+        "  public constructor() end constructor; "
+        "  destructor end destructor; "
+        "  public method Apply(x: int): int => x * 2; "
+        "  public method Test(x: int): bool => x > 0; "
+        "end Scaler; "
+        "class Program "
+        "  public static Factor: int := 3; "
+        "  public method Scale(x: int): int => x + 1; "
+        "  public static method Doubled(nums: Array<int>, f: (int) -> int): "
+        "      IEnumerable<int> "
+        "    for var x in nums do yield return f(x); end; "
+        "  end Doubled; "
+        "  public ") + sig + " => " + exprBody + "; end Program;";
+}
+
+}  // namespace
+
+// ★ Primary T8 regression: the expr-body analog of `owned_param_capture_rejected`.
+// The lambda `(x) => s.Apply(x)` captures the `owned` parameter `s` — a live owned
+// obligation the method disposes at scope exit — and the `=>` body returns the
+// `Doubled` frame carrying it, so the frame escapes `s`'s scope. Rejected with the
+// SAME capture-set-contribution diagnostic as the block-body `{ return <same>; }`
+// form. Compiles CLEAN without the T8 parity fix (the expr-body hole: the missing
+// `methodParamSet_` seed made the owned-param capture invisible); produces the
+// capture-set error with it. // per §28.14 frame residence, §28.3 capture-set
+// contribution, v0.196
+BEZEL_TEST(deferred_activation_capture_1818, exprbody_owned_param_capture_returned_rejected) {
+    auto r = parseAndCheckOwnership(exprWrap(
+        "Doubled(nums, (x) => s.Apply(x))",
+        "method M(nums: Array<int>, owned s: Scaler): IEnumerable<int>"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(sawCaptureSetError(r));
+}
+
+// ADMIT (control) — the expr-body frame-residence admit: `=> Doubled(nums, f)`
+// forwards the method's OWN plain call-bounded parameter `f` into the deferred-
+// activation factory and returns the frame under a deferred-activation return
+// type (`IEnumerable<int>`). The outer caller re-establishes the frame's carried
+// sources against its own argument (§28.14), so it is admitted — exactly as the
+// block-body `return Doubled(nums, f);` and the spec's `=> xs.Where(f)` are. The
+// load-bearing over-rejection guard for T8: seeding `methodParamSet_` must NOT
+// reject a plain (non-owned) parameter forwarded into a returned frame.
+// // per §28.14 frame residence, v0.196
+BEZEL_TEST(deferred_activation_capture_1818, exprbody_frame_residence_accepted) {
+    auto r = parseAndCheckOwnership(exprWrap(
+        "Doubled(nums, f)",
+        "method M(nums: Array<int>, f: (int) -> int): IEnumerable<int>"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ADMIT (control) — the spec's canonical `=> xs.Where(f)` frame residence,
+// verbatim: a stdlib lazy query minted over the method's own plain function-typed
+// parameter, returned under `IEnumerable<int>`. Admitted, exactly as the
+// block-body form is. Pins the task's literal accept example. // per §28.14 v0.196
+BEZEL_TEST(deferred_activation_capture_1818, exprbody_lazy_query_frame_residence_accepted) {
+    auto r = parseAndCheckOwnership(exprWrap(
+        "nums.Where(f)",
+        "method M(nums: Array<int>, f: (int) -> bool): IEnumerable<int>"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

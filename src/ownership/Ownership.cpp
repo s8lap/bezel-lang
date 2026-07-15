@@ -765,6 +765,18 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): classify the return
     // context before the narrow checks run (the `=>` body IS the return value).
     computeBareReturnContext(paramSyms, genericCtx);
+    // #1818 T8 (§28.14 frame residence / §28.3 capture-set contribution, v0.196):
+    // seed the enclosing method's parameter symbols (as run() does), so the
+    // deferred-activation capture check below (checkDeferredActivationTempSites-
+    // Expr) can distinguish a captured ENCLOSING `owned` parameter — a live owned
+    // obligation whose escaping frame must be rejected — from a lambda-internal
+    // parameter. Without this the `=>` sibling of the block-body ReturnStmt sink
+    // silently admitted `M(owned s): IEnumerable<int> => Doubled(nums, (x) =>
+    // s.Apply(x));`, which the block-body `{ return <same>; }` form rejects
+    // (deferredActivationCaptureSources' methodParamSet_ gate treats every
+    // parameter capture as lambda-internal when the set is empty). // per §28.14 v0.196
+    if (paramSyms)
+        for (sema::Symbol* sym : *paramSyms) methodParamSet_.insert(sym);
     // Seed `owned` / `out owned` parameters as Owned locals (as run() does) so
     // returning an owned param is classified as an owned transfer, not a borrow.
     // Non-owned params stay out of `states_`; the ParameterSymbol branch in
