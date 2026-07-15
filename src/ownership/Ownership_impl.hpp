@@ -1770,16 +1770,19 @@ private:
 
     // #1818 (§28.3 "capture-set contribution", v0.196): collect the carried
     // sources a plain function-typed ARGUMENT contributes to a deferred-
-    // activation frame. This is the FIRST provenance row only — a LAMBDA LITERAL
-    // argument: enumerate its captures (scopedCollectCaptures) and reduce them
-    // EXACTLY as checkScopedAdmission does (`this`/`base` and receiver-mediated
-    // members contribute nothing — a receiver is a caller-frame borrow that
-    // outlives every local of this frame; a static / const / type / module ref
+    // activation frame. Two provenance rows are handled: a LAMBDA LITERAL (T2 —
+    // enumerate its captures via scopedCollectCaptures) and a METHOD REFERENCE
+    // `obj.M` (T3 — its captured environment is the receiver, §27.6, reduced via
+    // scopedCaptureWalkExpr; a static method reference reduces to a type root
+    // that drops out). Both feed the SAME reduction, EXACTLY as
+    // checkScopedAdmission does (`this`/`base` and receiver-mediated members
+    // contribute nothing — a receiver is a caller-frame borrow that outlives
+    // every local of this frame; a static / const / type / module ref
     // contributes nothing; a value-typed local lives in its heap capture cell —
     // the isBorrowableType gate; a lambda-internal parameter is not a capture of
-    // the enclosing frame). A non-lambda argument (method reference, opaque
-    // function-typed parameter, traced local) is a later provenance row and
-    // contributes nothing here. // per §28.3, §28.14, v0.196
+    // the enclosing frame). Any other argument (opaque function-typed parameter,
+    // traced local, plain-storage field fetch) is a later provenance row and
+    // contributes nothing here. // per §28.3, §27.6, §28.14, v0.196
     void deferredActivationCaptureSources(const ast::Expr& arg,
                                           std::vector<CapSource>& out);
     // True when the LocalSymbol names a *live owned obligation* — an owned local

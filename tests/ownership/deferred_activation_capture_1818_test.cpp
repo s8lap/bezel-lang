@@ -14,16 +14,25 @@
 // function-typed parameter, or a capture sourced from its parameters or
 // receiver, is admitted."
 //
-// T2 covers the FIRST provenance row only: a LAMBDA LITERAL argument. Its
-// captures are reduced EXACTLY as §28.14's storage-bounded admission
+// T2 covers the FIRST provenance row: a LAMBDA LITERAL argument. Its captures
+// are reduced EXACTLY as §28.14's storage-bounded admission
 // (checkScopedAdmission) reduces them — `this`/receiver-members and statics and
 // value-typed locals contribute nothing — and a captured LIVE OWNED obligation
 // of the enclosing frame (an owned local / `using var`, or an `owned`
 // parameter) is flagged when the frame ESCAPES (bound to a name, returned, or
 // stored — not a direct `for`/`await for` source, whose desugared `using var`
 // bounds the frame by the loop, which every captured method-scope source
-// outlives). Method references, opaque function-typed parameters, and traced
-// locals are later #1818 provenance rows, out of scope here.
+// outlives).
+//
+// T3 adds the METHOD-REFERENCE provenance row (§28.3 provenance table, §27.6,
+// v0.196): a method reference `obj.M` passed into a plain function slot carries
+// its RECEIVER as the captured source — reduced to the receiver's root sources
+// EXACTLY as the lambda captures are. A STATIC method reference (`Program.Helper`)
+// carries no owned receiver; an instance method reference whose receiver is a
+// LIVE OWNED obligation and whose frame escapes is rejected, mirroring the
+// lambda `(x) => scale.Apply(x)` twin. Opaque function-typed parameters, traced
+// locals, and plain-storage (function-typed field) fetches are later #1818
+// provenance rows, out of scope here.
 //
 // Every shape below was hand-verified against `build/bezelc -c` on a standalone
 // probe before being folded in (the REJECT shapes compile CLEAN without the T2
@@ -48,6 +57,9 @@ namespace {
 //    sources that must contribute NOTHING.
 //  - Program.Scale / Program.Factor — an instance method and a static field,
 //    the `this`-mediated and static capture sources that contribute nothing.
+//  - Program.Helper — a STATIC `(int) -> int` method, referenced as
+//    `Program.Helper` (a method reference with a type-name receiver that carries
+//    no owned obligation — the T3 static-reference admit control).
 std::string wrap(const std::string& body, const std::string& sig) {
     return std::string(
         "module M; "
@@ -60,6 +72,7 @@ std::string wrap(const std::string& body, const std::string& sig) {
         "class Program "
         "  public static Factor: int := 3; "
         "  public method Scale(x: int): int => x + 1; "
+        "  public static method Helper(x: int): int => x + 1; "
         "  public static method Doubled(nums: Array<int>, f: (int) -> int): "
         "      IEnumerable<int> "
         "    for var x in nums do yield return f(x); end; "
@@ -201,5 +214,107 @@ BEZEL_TEST(deferred_activation_capture_1818, borrow_local_capture_accepted) {
         "var q := Doubled(nums, (x) => b.Apply(x)); "
         "return q;",
         "method M(nums: Array<int>, s: Scaler): IEnumerable<int>"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ===========================================================================
+// T3 — METHOD-REFERENCE provenance row (§28.3 provenance table, §27.6, v0.196).
+// A method reference `obj.M` carries its RECEIVER as the captured source; the
+// receiver is reduced to its root sources exactly as a lambda's captures are.
+// Each REJECT below compiles CLEAN without the T3 fix (the method-reference
+// capture hole — a method reference is a MemberAccessExpr, not a LambdaExpr, so
+// the T2 dispatch missed it) and produces the capture-set-contribution error
+// with it; each ADMIT compiles clean either way. Every shape was hand-verified
+// against `build/bezelc -c` on a standalone probe before being folded in.
+// ===========================================================================
+
+// ★ Primary T3 regression: the spec's canonical reject with the LAMBDA replaced
+// by its method-reference twin — `return Doubled(nums, scale.Apply);` directly
+// returns the frame over a `using var scale`. The method reference closes over
+// the owned receiver `scale`; returning the frame strands that borrow past
+// `scale`'s disposal. Rejected. // per §28.3 provenance method-reference row, §27.6, v0.196
+BEZEL_TEST(deferred_activation_capture_1818, methodref_direct_return_owned_local_rejected) {
+    auto r = parseAndCheckOwnership(wrap(
+        "using var scale := new Scaler(); "
+        "return Doubled(nums, scale.Apply);",
+        "method M(nums: Array<int>): IEnumerable<int>"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(sawCaptureSetError(r));
+}
+
+// The bind-then-return variant: the frame is bound to `q`, then `q` is returned.
+// Rejected at the binding, exactly as the lambda twin. // per §28.3, §28.14, v0.196
+BEZEL_TEST(deferred_activation_capture_1818, methodref_bind_then_return_owned_local_rejected) {
+    auto r = parseAndCheckOwnership(wrap(
+        "using var scale := new Scaler(); "
+        "var q := Doubled(nums, scale.Apply); "
+        "return q;",
+        "method M(nums: Array<int>): IEnumerable<int>"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(sawCaptureSetError(r));
+}
+
+// The receiver of the method reference is an `owned` PARAMETER — a live owned
+// obligation the method disposes at exit (§28.3 auto-drop). The escaping frame
+// would dangle after that disposal; rejected. (The owned param also draws the
+// must-use auto-drop warning; the capture-set error is the load-bearing
+// diagnostic pinned here.) // per §28.3, §28.14, v0.196
+BEZEL_TEST(deferred_activation_capture_1818, methodref_owned_param_receiver_rejected) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var q := Doubled(nums, s.Apply); "
+        "return q;",
+        "method M(nums: Array<int>, owned s: Scaler): IEnumerable<int>"));
+    BEZEL_EXPECT_TRUE(sawCaptureSetError(r));
+}
+
+// ADMIT — a STATIC method reference (`Program.Helper`) carries no receiver: its
+// type-name root reduces to nothing, so the frame carries no owned obligation.
+// Admitted even though the frame is returned. Pins the "static reference
+// contributes nothing" reduction. // per §28.3, §27.6, v0.196
+BEZEL_TEST(deferred_activation_capture_1818, methodref_static_reference_accepted) {
+    auto r = parseAndCheckOwnership(wrap(
+        "return Doubled(nums, Program.Helper);",
+        "method M(nums: Array<int>): IEnumerable<int>"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ADMIT — the method reference's receiver is a plain (borrow) PARAMETER, which
+// outlives the method; the caller re-establishes the returned frame's constraint
+// against its own actual argument (§28.3's parameter-sourced admission). Guards
+// against over-rejecting a borrow-receiver method reference. // per §28.3, v0.196
+BEZEL_TEST(deferred_activation_capture_1818, methodref_borrow_param_receiver_accepted) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var q := Doubled(nums, s.Apply); "
+        "return q;",
+        "method M(nums: Array<int>, s: Scaler): IEnumerable<int>"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ADMIT — the method reference's receiver is `this` (`this.Scale`). `this` is a
+// caller-frame borrow that outlives every local of this frame — it contributes
+// nothing (checkScopedAdmission's rule), exactly as a lambda capturing only
+// `this` does. Admitted even when returned. // per §28.3, §28.14, v0.196
+BEZEL_TEST(deferred_activation_capture_1818, methodref_this_receiver_accepted) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var q := Doubled(nums, this.Scale); "
+        "return q;",
+        "method M(nums: Array<int>): IEnumerable<int>"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ADMIT — the frame is NOT escaped: the method reference over the owned `using
+// var scale` feeds a direct `for` source, whose desugared `using var` bounds the
+// frame by the loop, which `scale` (declared in the enclosing method scope)
+// outlives. Sound, admitted — the T3 check excludes the for-source position
+// exactly as the T2 lambda check does. // per §28.3, §29.2, §28.14, v0.196
+BEZEL_TEST(deferred_activation_capture_1818, methodref_direct_for_source_not_escaped_accepted) {
+    auto r = parseAndCheckOwnership(wrap(
+        "using var scale := new Scaler(); "
+        "var total := 0; "
+        "for var v in Doubled(nums, scale.Apply) do "
+        "  total := total + v; "
+        "end; "
+        "return total;",
+        "method M(nums: Array<int>): int"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

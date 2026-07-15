@@ -5815,13 +5815,36 @@ bool MethodOwnership::localIsOwnedObligation(const sema::LocalSymbol* ls) const 
 
 // #1818 (§28.3 "capture-set contribution", §28.14 frame residence, v0.196):
 // the load-bearing collector. See the header comment for the reduction and the
-// FIRST-provenance-row scope (lambda literal only).
+// provenance-row scope (T2 lambda literal + T3 method reference).
 void MethodOwnership::deferredActivationCaptureSources(
     const ast::Expr& arg, std::vector<CapSource>& out) {
-    const auto* lam = dynamic_cast<const ast::LambdaExpr*>(&arg);
-    if (!lam) return;  // first provenance row: a lambda LITERAL argument only
     std::vector<const ast::IdentifierExpr*> rawIds;
-    scopedCollectCaptures(*lam, rawIds);
+    if (const auto* lam = dynamic_cast<const ast::LambdaExpr*>(&arg)) {
+        // FIRST provenance row (T2): a lambda LITERAL — enumerate its captures.
+        scopedCollectCaptures(*lam, rawIds);
+    } else if (const auto* mref =
+                   dynamic_cast<const ast::MemberAccessExpr*>(&arg)) {
+        // METHOD-REFERENCE provenance row (T3, §28.3, v0.196): a method
+        // reference `obj.M`'s captured environment is its RECEIVER (§27.6) —
+        // reduce the receiver to its root identifiers via scopedCaptureWalkExpr,
+        // EXACTLY as checkScopedAdmission's method-ref row does, and feed them
+        // through the SAME reduction below. A STATIC method reference
+        // (`Program.Helper`) reduces to a type-name root that the reduction
+        // drops — it contributes nothing; an instance method reference
+        // contributes the receiver's root sources. A non-method
+        // MemberAccessExpr (a function-typed FIELD read — a plain-storage
+        // fetch) resolves to no MethodSymbol and contributes nothing.
+        // // per §28.3, §27.6, §28.14, v0.196
+        if (dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(arg)) &&
+            mref->target)
+            scopedCaptureWalkExpr(*mref->target, rawIds);
+        else
+            return;
+    } else {
+        // Opaque function-typed parameters and traced locals are later #1818
+        // provenance rows — they contribute nothing here.
+        return;
+    }
     std::unordered_set<sema::Symbol*> seen;
     for (const ast::IdentifierExpr* id : rawIds) {
         // `this`/`base`: a caller-frame borrow that outlives every local of
@@ -5990,21 +6013,31 @@ void MethodOwnership::checkDeferredActivationTempSitesExpr(const ast::Expr& e,
                 if (!a.value || !a.modifier.empty()) { ++pos; continue; }
                 // #1818 (§28.3 "capture-set contribution", §28.14 frame
                 // residence, v0.196): a plain function-typed argument's captured
-                // borrows' SOURCES are carried sources of the returned frame. A
-                // lambda-literal argument (the FIRST provenance row) whose
-                // captures reach a LIVE OWNED obligation of THIS method — an
-                // owned local (a `using var`) or an `owned` parameter it disposes
-                // at scope exit — mints a frame carrying a borrow of that value;
-                // when the frame is bound to a name, returned, or stored (this
+                // borrows' SOURCES are carried sources of the returned frame.
+                // Two provenance rows are function-value literals handled here: a
+                // LAMBDA literal (T2 — its captures) and a METHOD REFERENCE `obj.M`
+                // (T3 — its receiver, §27.6). When such an argument's captures
+                // reach a LIVE OWNED obligation of THIS method — an owned local
+                // (a `using var`) or an `owned` parameter it disposes at scope
+                // exit — it mints a frame carrying a borrow of that value; when
+                // the frame is bound to a name, returned, or stored (this
                 // branch's `escaping`, excluding a for-source — `forSource`),
                 // the consumer would enumerate into a closure over the disposed
                 // value. Reject at the capture, exactly as a directly-carried
                 // borrow of a scope-bound local is rejected — the canonical
                 // `return Doubled(nums, (x) => scale.Apply(x));` over a `using
-                // var scale`. A lambda literal is never an unbound owned
-                // temporary, so it is fully handled here and never falls through
-                // to the temp check below. // per §28.3, §28.14, v0.196
-                if (dynamic_cast<const ast::LambdaExpr*>(a.value.get())) {
+                // var scale` (T2), and its `return Doubled(nums, scale.Apply);`
+                // method-reference twin (T3). Neither a lambda literal nor a
+                // method reference is an unbound owned temporary, so both are
+                // fully handled here and never fall through to the temp check
+                // below. A non-method MemberAccessExpr (a function-typed FIELD
+                // read — a plain-storage fetch) is NOT a method reference and is
+                // not routed here (it contributes nothing). // per §28.3, §28.14, v0.196
+                const bool isMethodRefArg =
+                    dynamic_cast<const ast::MemberAccessExpr*>(a.value.get()) &&
+                    dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*a.value));
+                if (dynamic_cast<const ast::LambdaExpr*>(a.value.get()) ||
+                    isMethodRefArg) {
                     // Only a PLAIN function-parameter slot mints a frame the
                     // callback resides in: a `scoped` slot is storage-bounded and
                     // its capture admission is owned by checkScopedAdmission
@@ -6021,8 +6054,9 @@ void MethodOwnership::checkDeferredActivationTempSitesExpr(const ast::Expr& e,
                             report(
                                 Severity::Error, cs.id->span.begin,
                                 std::string(
-                                    "a deferred-activation call whose lambda "
-                                    "argument captures the owned value `") +
+                                    "a deferred-activation call whose "
+                                    "function-typed argument (a lambda or a "
+                                    "method reference) captures the owned value `") +
                                     std::string(cs.id->name) +
                                     "` mints a frame that carries a borrow of `" +
                                     std::string(cs.id->name) +
