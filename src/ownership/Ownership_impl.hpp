@@ -141,10 +141,17 @@ public:
     // Type(exprBody)` and — v0.180, #1547 — `checkStaticBorrowReturn(exprBody)`
     // when `isStatic` — nothing else, so no unrelated diagnostics are
     // introduced on expression bodies. // per §28.3, §5.11
+    // `isAsync` (v0.190, SB01-B / #1786): threaded so the Task-family callee-
+    // return check (`checkBorrowReturnedThroughOwningType`) can exempt an
+    // `async` expression body — its `=> E` body is the AWAITED value (type T),
+    // not a task, and an async body auto-satisfies the owned-frame obligation.
+    // Without it, `async method N(v): Task<int> => v` (v0.190) misfires: the
+    // block-body path already passes `methodIsAsync(*md)`, this path did not.
     void runExprBodyOwningReturnCheck(
         const ast::Expr& exprBody,
         const std::vector<sema::Symbol*>* paramSyms,
         const ast::Type* returnType, bool returnOwned,
+        bool isAsync = false,
         bool isStatic = false,
         const GenericReturnContext* genericCtx = nullptr);
 

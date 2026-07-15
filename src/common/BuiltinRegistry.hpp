@@ -40,6 +40,16 @@ bool isOwningCollectionHead(std::string_view head);
 // CancellationTokenSource) whose non-`owned` return is an owned producer.
 bool isOwningTypeHead(std::string_view head);
 
+// The Task-family type heads — `Task` and `OwningTask` (§28.3 "Task-family
+// calls produce owned frames", v0.190, SB-01). A pre-substitution, name-keyed
+// test used by the ownership pass to recognize a `Task`/`Task<T>` return whose
+// container ownership transfers to the caller. Note this INCLUDES the plain
+// `Task` head that `isOwningTypeHead` deliberately excludes: a `Task` return is
+// ownership-transferring only in a NON-`async` body (the caller consults this
+// under a `!isAsync_` guard), whereas the owning-type set applies to both sync
+// and async bodies. `OwningTask` is in both sets.
+bool isTaskFamilyHead(std::string_view head);
+
 // Array-backed collections (bz_array_t*): the receiver names whose indexer /
 // .Count lower through the bz_array_* runtime.  Backs isCollectionTypeName.
 // per §4.4–§4.7 / §4.14

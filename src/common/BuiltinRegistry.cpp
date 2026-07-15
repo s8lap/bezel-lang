@@ -35,6 +35,20 @@ constexpr std::array<std::string_view, 12> kOwningTypeHeads = {
     "OwningTask",  "IOwningEnumerable", "CancellationTokenSource",
 };
 
+// §28.3 "Task-family calls produce owned frames" (v0.190, SB-01): the
+// Task-family type heads. Distinct from kOwningTypeHeads, which carries
+// `OwningTask` but NOT the plain `Task` head — a `Task`/`Task<T>` return is
+// container-ownership-transferring only in a NON-`async` body (an `async`
+// state machine is its own fresh frame), so plain `Task` cannot join the
+// unconditional owning-type set without regressing async return paths; the
+// `Task` head's ownership-transferring role is gated on `!isAsync_` at the
+// one ownership-pass site that consults this predicate. A new name-set fact
+// (not a #1414 refactor of a pre-existing hand-list), so it has no
+// pre-refactor snapshot row to pin.
+constexpr std::array<std::string_view, 2> kTaskFamilyHeads = {
+    "Task", "OwningTask",
+};
+
 // §4.4–§4.7 / §4.14: the bz_array_t*-backed collections (isCollectionTypeName).
 // LinkedList/OwningLinkedList are bz_llist_t-backed and excluded here.
 constexpr std::array<std::string_view, 10> kArrayBackedCollections = {
@@ -147,6 +161,10 @@ bool isOwningCollectionHead(std::string_view head) {
 
 bool isOwningTypeHead(std::string_view head) {
     return contains(kOwningTypeHeads, head);
+}
+
+bool isTaskFamilyHead(std::string_view head) {
+    return contains(kTaskFamilyHeads, head);
 }
 
 bool isArrayBackedCollectionName(std::string_view n) {

@@ -724,10 +724,15 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
 void MethodOwnership::runExprBodyOwningReturnCheck(
         const ast::Expr& exprBody,
         const std::vector<sema::Symbol*>* paramSyms,
-        const ast::Type* returnType, bool returnOwned, bool isStatic,
-        const GenericReturnContext* genericCtx) {
+        const ast::Type* returnType, bool returnOwned, bool isAsync,
+        bool isStatic, const GenericReturnContext* genericCtx) {
     returnType_ = returnType;
     returnOwned_ = returnOwned;
+    // SB01-B (§28.3, v0.190, #1786): set `isAsync_` so
+    // `checkBorrowReturnedThroughOwningType` exempts an `async` expression body
+    // (its `=> E` body is the awaited value, not a task). The block-body path
+    // seeds this via `run(...)`; the `=>` path previously left it default-false.
+    isAsync_ = isAsync;
     isStatic_ = isStatic;
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): classify the return
     // context before the narrow checks run (the `=>` body IS the return value).
@@ -3751,7 +3756,22 @@ void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
         !returnType_->name || returnType_->name->parts.empty())
         return;
     std::string head(returnType_->name->parts.front());
-    if (!isOwningTypeNameHead(head)) return;
+    // SB01-B (§28.3 "Task-family calls produce owned frames", v0.190, SB-01):
+    // a plain `Task`/`Task<T>` return in a NON-`async` body is
+    // container-ownership-transferring exactly like an `owned` return or an
+    // `OwningTask` return — its declared type is the announcement, so every
+    // return path must supply an OWNED task and a borrow return is rejected
+    // here. `isTaskFamilyHead` (Task || OwningTask) folds SB01-0 in;
+    // `OwningTask` is already an owning-type head (rejected in BOTH sync and
+    // async bodies, unchanged), so the newly-checked surface is exactly the
+    // plain `Task` head, and only in a `!isAsync_` body. An `async` body
+    // auto-satisfies the obligation — its return *is* its own fresh
+    // state-machine frame (§30.1), and its return expression is the awaited
+    // value (type T), not a task, so it must NOT be classified here. `owned
+    // Task` returned above via `returnOwned_`. // per §28.3 (v0.190, SB-01)
+    const bool plainTaskInSyncBody =
+        common::isTaskFamilyHead(head) && !isAsync_;
+    if (!isOwningTypeNameHead(head) && !plainTaskInSyncBody) return;
     if (!isOwningCollectionNameHead(head)) {
         // Owning WRAPPER (OwningTask, Shared, Weak, ChannelSender,
         // IOwningEnumerable, CancellationTokenSource): consumer-owns semantics are
@@ -3801,8 +3821,19 @@ void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
         // value. The idempotent-safe wrappers keep the carve-out. The wider
         // owning-collection / owning-enumerator indirect-dispatch analogue is
         // tracked separately (#1760). // per §28.3
+        //
+        // SB01-B (§28.3, v0.190): the plain `Task` head joins the
+        // deferred-activation set (`isTaskFamilyHead` covers Task + OwningTask).
+        // The §28.6 (v0.190) borrow-lifetime rule excludes a `Task`-family-typed
+        // field read from the admissible receiver-sourced-borrow forms — "a bare
+        // owned-field read — not of a `Task`-family-typed field" — precisely
+        // because a stored task is re-exposed through a property/field/slot BORROW
+        // and a task callee's ownership transfers to the caller. So the
+        // receiver-owned-field carve-out must NOT admit `return this._cachedTask;`
+        // for a plain-`Task` return; excluding `Task` here routes it to the borrow
+        // rejection below. // per §28.3, §28.6 (v0.190)
         const bool deferredActivationOwningHead =
-            head == "OwningTask" || head == "IOwningEnumerable";
+            common::isTaskFamilyHead(head) || head == "IOwningEnumerable";
         if (!deferredActivationOwningHead && exprIsReceiverOwnedFieldBorrow(e))
             return;
         bool isBorrow = ownedArgSourceIsBorrow(e);
@@ -3818,6 +3849,27 @@ void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
             }
         }
         if (!isBorrow) return;
+        // SB01-B (§28.3 "Task-family calls produce owned frames", v0.190,
+        // SB-01): the plain `Task` head gets a Task-specific diagnostic naming
+        // the property/field re-exposure remedy the spec prescribes. (Only
+        // plain `Task` reaches here in a `!isAsync_` body; `OwningTask` keeps
+        // its owning-wrapper message below, unchanged.)
+        if (head == "Task") {
+            report(
+                Severity::Error, e.span.begin,
+                "a borrow may not be returned through the non-`async` "
+                "`Task`-family return `Task<…>`: an unmarked `Task` return is "
+                "container-ownership-transferring — the caller owns and disposes "
+                "the task frame — so every return path must supply an OWNED task "
+                "(§28.3 \"Task-family calls produce owned frames\", v0.190, "
+                "SB-01); return a fresh or forwarded task-returning call, a "
+                "completed-task factory (§30.10), an `owned` task local or "
+                "parameter, or a `move`d owned task field. A stored task is "
+                "re-exposed through a property, field, or collection slot (whose "
+                "reads are borrows of their storage), never through a non-`owned` "
+                "method return; or make the body `async`");
+            return;
+        }
         report(
             Severity::Error, e.span.begin,
             std::string("a borrow may not be returned through the owning-type "
@@ -4430,8 +4482,8 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
             MethodOwnership mo(ctx);
             mo.runExprBodyOwningReturnCheck(
                 *md->exprBody, paramSymsOf(m, ctx),
-                md->returnType.get(), md->returnOwned, methodIsStatic(*md),
-                &genericCtx);
+                md->returnType.get(), md->returnOwned, methodIsAsync(*md),
+                methodIsStatic(*md), &genericCtx);
         }
         // §28.3 (fix #1600): the declaration-level "add `owned`" nudge —
         // independent of bodyKind (both Block and Expression bodies are
