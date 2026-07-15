@@ -90,9 +90,19 @@ scripted by `scripts/extract_diag_to_lit.py`.
 
 ### Running
 
-- Sharded: `tests/run_parallel.sh 16`. **Serial** (`build/tests/bezel_tests`) is
-  the authoritative oracle — the sharded runner can over-report under
-  fork-resource contention; a real failure reproduces serially.
+- **A producer/fix lane building+testing its OWN change → `scripts/agent_check.sh
+  <filter>`.** One command: reconfigure (picks up a new test `.cpp`) + build via
+  `dev_heavy` (slice-capped, foreground) + run ONLY that targeted filter
+  (substring on gtest suite-or-name — *not* the file basename). `--probe FILE.bzl`
+  (or `--probe --asan FILE.bzl`) for a single program; output goes to the scratch
+  dir. It refuses an empty filter and `--gtest_filter` (the binary ignores that
+  flag). A lane must NOT run the whole suite — see the last two bullets, those are
+  the coordinator/gate's job.
+- Targeted, by hand: `BEZEL_TEST_FILTER=<substr> build/tests/bezel_tests` (the
+  binary ignores `--gtest_filter`).
+- Sharded (whole suite): `tests/run_parallel.sh 16`. **Serial**
+  (`build/tests/bezel_tests`) is the authoritative oracle — the sharded runner can
+  over-report under fork-resource contention; a real failure reproduces serially.
 - lit track: `cmake --build build --target check-lit`.
 - Full gate: `scripts/gate.sh` (`--full` adds the whole-suite ASan sweep, for
   codegen/runtime/disposal/layout changes).

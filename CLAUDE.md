@@ -155,6 +155,22 @@ artifacts (probe binaries, big logs, scratch build trees) go in
 tree parked there permanently consumes gigabytes. Keep ccache `max_size` at
 80G (a full 40G cache thrashes under multi-worktree churn).
 
+**Producer/fix lanes: build+test your change with `scripts/agent_check.sh`.** It
+is the single, opinionated entry-point that encodes the correct lane protocol so
+you cannot get it wrong — it reconfigures (so a *new* test `.cpp` is picked up;
+`cmake --build` alone can't see it), builds via `dev_heavy` (slice-capped,
+foreground — no background waiter to stall on), removes the stale binary first,
+and runs ONLY your targeted filter:
+`scripts/agent_check.sh <filter> [filter2 …]` (substring on gtest suite-or-name,
+NOT the file basename). For a single `.bzl`: `scripts/agent_check.sh --probe
+FILE.bzl` (or `--probe --asan FILE.bzl` for memory/disposal fixes, with a hang
+timeout); all probe output goes to the scratch dir, never the repo root. It
+REFUSES an empty filter and `--gtest_filter` (the binary silently ignores that
+flag and runs everything). **A lane must NEVER run the full suite / `run_parallel`
+/ `check` — that is the integration GATE's job** (`scripts/gate.sh`, coordinator
+only); a lane running the whole suite just burns the shared budget on ~100
+redundant fork+link+exec tasks.
+
 **Keep the repo root clean.** Ad-hoc `.bzl` probes, one-off `bezelc -o` outputs,
 and investigation scratch do NOT belong loose in the repo root — put them in
 `./scratch/` (gitignored) or `/var/tmp/bezel-scratch/`. Cleanup is automated, so
