@@ -78,11 +78,28 @@ done
 # full registry size as "... T total" (identical across shards) — capture it as
 # the EXPECTED count so a shard that dies mid-run (its passed count missing) is
 # detected as an undercount rather than passing silently.
+#
+# summaries_seen ALSO records, EXPLICITLY, how many shards printed a completion
+# summary at all. A shard that exits 0 yet never printed a summary — e.g. a
+# residual in-process path that abort()s or exit()s the harness mid-loop — drops
+# its whole slice while evading detection: crashed_shards misses it (exit 0), and
+# the ran!=expected_total undercount check can only catch it when SOME OTHER
+# shard managed to establish expected_total. This direct "every shard must
+# complete" check closes that window unconditionally, and is the safety basis for
+# gate.sh --fast dropping the always-on serial pass. It is purely additive: a
+# healthy run has summaries_seen == shards and prints nothing new below.
 total_pass=0
 total_fail=0
 expected_total=0
+summaries_seen=0
+missing_summary_shards=()
 for (( i = 0; i < shards; i++ )); do
     line="$(grep -E '^[0-9]+ passed, [0-9]+ failed' "$logdir/shard.$i.log" | tail -1)"
+    if [[ -n "$line" ]]; then
+        summaries_seen=$(( summaries_seen + 1 ))
+    else
+        missing_summary_shards+=("$i")
+    fi
     p="$(sed -E 's/^([0-9]+) passed.*/\1/' <<<"$line")"
     f="$(sed -E 's/^[0-9]+ passed, ([0-9]+) failed.*/\1/' <<<"$line")"
     t="$(sed -E 's/.*, ([0-9]+) total.*/\1/' <<<"$line")"
@@ -110,10 +127,22 @@ count_ok=1
 if [[ "$expected_total" -gt 0 && "$ran" -ne "$expected_total" ]]; then
     count_ok=0
 fi
-if [[ "${#crashed_shards[@]}" -gt 0 || "$count_ok" -eq 0 ]]; then
+# EVERY shard must have printed a completion summary. A shard missing one
+# validated NONE of its slice (it died before the summary), so a "0 failed"
+# aggregate is not trustworthy regardless of exit code — this is stricter than
+# the undercount check (which needs another shard to have set expected_total) and
+# never lets a dropped slice pass green.
+summary_ok=1
+if [[ "$summaries_seen" -ne "$shards" ]]; then
+    summary_ok=0
+fi
+if [[ "${#crashed_shards[@]}" -gt 0 || "$count_ok" -eq 0 || "$summary_ok" -eq 0 ]]; then
     echo "############################################################"
     echo "## GATE FAILURE: shard crash / undercount — result is NOT trustworthy"
     echo "##   ran $ran of $expected_total registered tests ($(( expected_total - ran )) unaccounted)"
+    if [[ "$summary_ok" -eq 0 ]]; then
+        echo "##   $(( shards - summaries_seen )) of $shards shards printed NO completion summary (slice not validated): shard(s) ${missing_summary_shards[*]}"
+    fi
     for i in "${crashed_shards[@]}"; do
         last="$(grep -E '^\[ RUN' "$logdir/shard.$i.log" | tail -1 | sed -E 's/^\[ RUN  \] //')"
         echo "##   shard $i exited nonzero — died on: ${last:-<none>}"
@@ -132,7 +161,7 @@ echo "============================================================"
 echo "TOTAL: $total_pass passed, $total_fail failed  (across $shards shards, $((end - start))s)"
 echo "============================================================"
 
-if [[ "$shard_rc" -ne 0 || "$total_fail" -ne 0 || "$count_ok" -eq 0 ]]; then
+if [[ "$shard_rc" -ne 0 || "$total_fail" -ne 0 || "$count_ok" -eq 0 || "$summary_ok" -eq 0 ]]; then
     exit 1
 fi
 exit 0

@@ -24,11 +24,47 @@
 #   scripts/gate.sh            # reconfigure + build + shard + serial  (default)
 #   scripts/gate.sh --full     # + asan_sweep   (disposal/codegen/runtime batches)
 #   scripts/gate.sh --quick    # reconfigure + build + shard only (sema-only checks)
+#   scripts/gate.sh --fast     # reconfigure + build + lit + tidy + ONE authoritative
+#                              #   ASan-instrumented sharded pass; NO serial pass.
+#
+# --fast (AOT-native, shard-authoritative). Since the JIT->AOT test migration
+# every test's COMPILE runs in a fork()ed child and the generated program runs as
+# a SEPARATE native process (tests/support/aot_support.hpp), so the classic
+# "serial-order heap corruption that a sharded-green run masked" is structurally
+# eliminated — each test is process-isolated. The always-on serial pass (~68% of
+# the default gate's wall) existed to catch exactly that heap-order class, so
+# under AOT it is largely redundant. --fast drops it and instead makes the SINGLE
+# sharded pass BOTH the correctness net (run_parallel.sh's hardened "every shard
+# completes + no undercount" check + the flake arbitration below) AND, when
+# viable, the memory-safety net (generated-code AddressSanitizer forced on every
+# program, the asan_sweep recipe folded into the one parallel pass). Measured
+# warm sharded-ASan is ~5 min (vs a ~10 min serial), so one fast ASan pass
+# replaces both the serial pass and the separate --full sweep for routine gating;
+# --full's dedicated 8-shard asan_sweep stays the periodic belt-and-suspenders.
+# GATE_FAST_ASAN=0 forces plain-shard --fast (ASan then only in periodic --full).
+# ADDITIVE: the default/--quick/--full paths are behaviourally unchanged.
 set -u
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "gate: not in a git repo" >&2; exit 2; }
 MODE="${1:-default}"
 S=/var/tmp/bezel-scratch; mkdir -p "$S"
 DH=scripts/dev_heavy.sh
+
+# --fast configuration (see header). These are inert in every other mode: FAST=0
+# leaves SHARD_ENV/ARB_ENV empty arrays, so the shard phase runs the exact same
+# command the default gate always has.
+FAST=0; [ "$MODE" = "--fast" ] && FAST=1
+FAST_ASAN=1; [ "${GATE_FAST_ASAN:-1}" = "0" ] && FAST_ASAN=0
+SHARD_ENV=(); ARB_ENV=(); SHARD_NOTE=""; SHARD_LABEL="crash/undercount-checked"
+if [ "$FAST" -eq 1 ] && [ "$FAST_ASAN" -eq 1 ]; then
+  # Fold the asan_sweep recipe into the parallel pass: force generated-code ASan
+  # on every program (BEZEL_AOT_FORCE_SANITIZE=address, honoured by runAot). The
+  # arbitration re-runs must force it too, or an ASan-only failure would be
+  # falsely cleared as flaky (it passes without ASan).
+  SHARD_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address)
+  ARB_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address)
+  SHARD_NOTE="asan-instrumented"
+  SHARD_LABEL="crash/undercount + generated-code ASan"
+fi
 
 # ---------------------------------------------------------------------------
 # Per-phase timing instrumentation — PURE OBSERVATION, never affects gating.
@@ -158,15 +194,37 @@ else
   rec_skip tidy "no clang-tidy"
 fi
 
-echo "== gate[3/*]: sharded suite (crash/undercount-checked) =="
+echo "== gate[3/*]: sharded suite ($SHARD_LABEL) =="
 PHASE_T0=$(now)
-"$DH" suite tests/run_parallel.sh >"$S/gate_shard.log" 2>&1; rc=$?
-rec_ran shard "$rc"
+"$DH" suite "${SHARD_ENV[@]}" tests/run_parallel.sh >"$S/gate_shard.log" 2>&1; rc=$?
+# The shard phase's recorded duration INCLUDES the ASan compile+run in --fast
+# (SHARD_NOTE marks it), so the ASan cost is captured in the phases array here —
+# there is no separate 0s-duration asan phase in --fast.
+rec_ran shard "$rc" "$SHARD_NOTE"
 # Harvest run_parallel's own aggregate wall + shard count + per-shard times (obs only).
 SHARD_COUNT=$(grep -oE 'across [0-9]+ shards' "$S/gate_shard.log" | grep -oE '[0-9]+' | tail -1); SHARD_COUNT=${SHARD_COUNT:-0}
 SHARD_REPORTED_S=$(grep -oE 'across [0-9]+ shards, [0-9]+s' "$S/gate_shard.log" | grep -oE '[0-9]+s' | tr -d 's' | tail -1); SHARD_REPORTED_S=${SHARD_REPORTED_S:-0}
 SHARD_TIMES=$(grep -oE '^shard [0-9]+: [0-9.]+s$' "$S/gate_shard.log" | sed -E 's/^shard [0-9]+: ([0-9.]+)s$/\1/' | paste -sd, -)
 grep -E 'TOTAL:|## GATE FAILURE|died on|--- failing' "$S/gate_shard.log" || true
+# --fast + ASan: a fired generated-code sanitizer report is DETERMINISTIC
+# evidence of a memory error — fail hard here, independent of the flake
+# arbitration (which re-runs a suspect alone and, absent this, could clear an
+# ASan-only failure). The harness re-emits any report with the '[aot-asan #1822]'
+# banner; also catch the raw sanitizer headline. Only active in --fast+ASan; a
+# clean suite never matches, so default/quick/full are unaffected.
+if [ "$FAST" -eq 1 ] && [ "$FAST_ASAN" -eq 1 ]; then
+  PHASE_T0=$(now)  # shard_asan is only the grep; the ASan compile+run time is
+                   # already attributed to the 'shard' phase above (no double-count).
+  asan_hits=$(grep -cE 'ERROR: (Address|Leak)Sanitizer|aot-asan #1822\] sanitizer fired' "$S/gate_shard.log" 2>/dev/null)
+  ASAN_ERRS=${asan_hits:-0}; ASAN_SHARDS=$SHARD_COUNT
+  if [ "${asan_hits:-0}" -gt 0 ]; then
+    echo "   -- generated-code ASan fired in the sharded pass ($asan_hits report marker(s)) --"
+    grep -m3 -A18 -E 'ERROR: (Address|Leak)Sanitizer' "$S/gate_shard.log" | head -60
+    rec_ran shard_asan "1" "$asan_hits ASan report(s)"
+    fail "sharded ASan — memory error in a test program (see $S/gate_shard.log)"
+  fi
+  rec_ran shard_asan "0" "no ASan report"
+fi
 if [ "$rc" -ne 0 ]; then
   PHASE_T0=$(now)  # the flake-arbitration re-runs are their own (exceptional) phase
   # Collect ALL suspects: shard CRASHES (died on: a JIT'd program killed its host)
@@ -194,7 +252,9 @@ if [ "$rc" -ne 0 ]; then
     suite="${t%%.*}"
     passed_alone=0
     for k in 1 2 3 4 5; do
-      if BEZEL_TEST_FILTER="$suite" timeout 180 build/tests/bezel_tests >/dev/null 2>&1; then passed_alone=1; break; fi
+      # ARB_ENV forces ASan on the re-run in --fast+ASan mode so an ASan-only
+      # failure reproduces (empty array in every other mode -> identical command).
+      if BEZEL_TEST_FILTER="$suite" "${ARB_ENV[@]}" timeout 180 build/tests/bezel_tests >/dev/null 2>&1; then passed_alone=1; break; fi
     done
     if [ "$passed_alone" -eq 1 ]; then
       echo "   FLAKY: $t — its suite PASSES alone within 5 tries (sharding pollution/timing, not a deterministic failure)"
@@ -207,7 +267,14 @@ if [ "$rc" -ne 0 ]; then
   echo "   all sharded suspects flaky (pass alone) -> continuing to serial (authoritative)"
 fi
 
-if [ "$MODE" != "--quick" ]; then
+if [ "$FAST" -eq 1 ]; then
+  # --fast deliberately DROPS the always-on serial pass: under the AOT harness
+  # every test is process-isolated (forked compile + subprocess run), so the
+  # serial-order heap corruption this pass historically caught is structurally
+  # impossible. The single hardened (+ASan) sharded pass above is the oracle.
+  echo "== gate[4/*]: serial suite SKIPPED (--fast: AOT process-isolation makes serial-order heap corruption structurally impossible) =="
+  rec_skip serial "--fast: shard-authoritative"
+elif [ "$MODE" != "--quick" ]; then
   echo "== gate[4/*]: serial suite (heap-order, catches sharded-hidden fails) =="
   # A flaky-crash test (rc=70 mid-run) aborts the serial binary with NO summary
   # line and NO '[ FAIL' — which the old grep passed silently. Require a COMPLETE

@@ -92,6 +92,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -592,12 +593,71 @@ private:
     int fd_ = -1;
 };
 
+// ── fork()-failure degradation: OBSERVABLE, never silent ──────────────────
+// When fork() fails, forkedCompile falls back to an IN-PROCESS compile, losing
+// the crash/hang isolation the fork provides: a front-end crash on that one test
+// would then abort the WHOLE gtest shard (killing every other test in it)
+// instead of being contained to ran=false. Historically this degradation was
+// SILENT — so a lost-isolation shard death was indistinguishable from an
+// unrelated flake, and the crux hypothesis behind gate.sh --fast (each test is
+// process-isolated, so serial-order heap corruption is structurally impossible)
+// would be quietly violated. This makes it loud instead:
+//   * a greppable per-occurrence marker on the harness stderr (captured in the
+//     shard log / asan_sweep log), and
+//   * a per-process total printed at exit, so the count survives even if the
+//     individual markers scroll past.
+// BEZEL_AOT_FORKFAIL_FATAL=1 promotes the degradation to a hard non-run (the
+// test does NOT compile un-isolated) for runs that want isolation GUARANTEED
+// rather than merely observable; the default stays graceful (run, but loudly).
+inline std::atomic<std::uint64_t>& forkFailureCount() {
+    // Leaked on purpose: the atexit hook below reads it at process teardown,
+    // after ordinary function-local statics would already have been destroyed.
+    static std::atomic<std::uint64_t>* c = new std::atomic<std::uint64_t>(0);
+    return *c;
+}
+
+inline bool forkFailIsFatal() {
+    static const bool v = [] {
+        const char* e = std::getenv("BEZEL_AOT_FORKFAIL_FATAL");
+        return e && std::string(e) == "1";
+    }();
+    return v;
+}
+
+// Emit the loud marker + count one fork()-failure degradation. Call in the
+// PARENT, BEFORE any fd 2 redirect, so the marker reaches the real harness
+// stderr the shard log captures.
+inline void noteForkFailureDegradation(int savedErrno) {
+    static const bool once = [] {
+        std::atexit([] {
+            unsigned long long n =
+                forkFailureCount().load(std::memory_order_relaxed);
+            if (n > 0)
+                std::fprintf(stderr,
+                    "[aot-degraded #fork-fail] %llu test(s) in this process fell "
+                    "back to an UN-ISOLATED in-process compile (fork() failed); "
+                    "crash isolation was lost for those tests\n", n);
+        });
+        return true;
+    }();
+    (void)once;
+    forkFailureCount().fetch_add(1, std::memory_order_relaxed);
+    std::fflush(stderr);
+    std::fprintf(stderr,
+        "\n[aot-degraded #fork-fail] fork() failed (errno=%d: %s); DEGRADED to "
+        "an in-process compile — crash isolation LOST for this test%s\n",
+        savedErrno, std::strerror(savedErrno),
+        forkFailIsFatal() ? " (BEZEL_AOT_FORKFAIL_FATAL=1 -> not run)" : "");
+    std::fflush(stderr);
+}
+
 // Compile `srcPath` to the native executable `exePath` via `Driver::compileFile`
 // run in a fork()ed CHILD (crash- and hang-isolated, qr1 M1). `opts` selects the
 // codegen mode (e.g. sanitizeAddress for the checked leg — S3). The child's
 // stderr (diagnostics + any clang link error) is captured, bounded, into the
 // result. fork() failure degrades to an in-process compile (no isolation) rather
-// than failing the test — same graceful degradation as runJit.
+// than failing the test — same graceful degradation as runJit — but LOUDLY now
+// (noteForkFailureDegradation), and optionally fatally (BEZEL_AOT_FORKFAIL_FATAL).
 inline CompileStatus forkedCompile(const std::string& srcPath,
                                    const std::string& exePath,
                                    const codegen::CodegenOptions& opts,
@@ -621,9 +681,22 @@ inline CompileStatus forkedCompile(const std::string& srcPath,
 
     pid_t pid = ::fork();
     if (pid < 0) {
-        // fork() failed (e.g. under the very memory pressure this guards). Fall
-        // back to an in-process compile so the test still runs — accepting the
-        // loss of isolation on this one degraded path (same policy as runJit).
+        // fork() failed (e.g. under the very memory pressure this guards). Make
+        // the degradation OBSERVABLE first (never silent) — the marker must hit
+        // the harness stderr BEFORE the fd-2 redirect below captures it into the
+        // per-test cc.err. errno is still fresh here, right after fork().
+        const int forkErrno = errno;
+        noteForkFailureDegradation(forkErrno);
+        // Optionally refuse to run un-isolated (isolation GUARANTEED, opt-in):
+        // return without compiling so a front-end crash can't take the shard.
+        if (forkFailIsFatal())
+            return {CompileOutcome::Infra,
+                    "runAot: fork() failed (errno=" + std::to_string(forkErrno) +
+                        ") and BEZEL_AOT_FORKFAIL_FATAL=1 — refusing an "
+                        "un-isolated in-process compile",
+                    0};
+        // Fall back to an in-process compile so the test still runs — accepting
+        // the loss of isolation on this one degraded path (same policy as runJit).
         int fd = ::open(ccErrPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         int saved = -1;
         if (fd >= 0) {
