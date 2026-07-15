@@ -5858,9 +5858,45 @@ void MethodOwnership::deferredActivationCaptureSources(
             scopedCaptureWalkExpr(*mref->target, rawIds);
         else
             return;
+    } else if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&arg)) {
+        // TRACED-LOCAL provenance row (T5, §28.3, v0.196): a plain identifier
+        // argument bound to a LOCAL. Trace the local to its SOUND provenance
+        // and contribute the UNION of the traced forms' capture sources. Only
+        // two provenance forms are verifiable and traced; every other binding
+        // — a reassigned local, an identifier-chain alias, an opaque
+        // function-typed value — contributes NOTHING (conservative admit,
+        // matching the pre-T5 behavior, so an untraceable local is never
+        // over-rejected). // per §28.3 v0.196
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (!dynamic_cast<sema::LocalSymbol*>(sym)) return;
+        // A reassigned local is not verifiable — the flow-insensitive pre-scan
+        // cannot pin which value it holds at the call site (the same gate the
+        // §28.14 scoped-admission widening uses). // per §28.14, §28.3 v0.196
+        if (scopedAssignedSyms_.count(sym)) return;
+        // Trace 1 — bound to a LAMBDA LITERAL: recurse into the FIRST row
+        // applied to that literal, so its captures are reduced exactly as if
+        // the literal were passed directly. // per §28.3 v0.196
+        auto lit = scopedLambdaLocalInit_.find(sym);
+        if (lit != scopedLambdaLocalInit_.end())
+            deferredActivationCaptureSources(*lit->second, out);
+        // Trace 2 — bound to a METHOD REFERENCE `obj.M`: recurse into the
+        // METHOD-REFERENCE row applied to that reference, so its receiver's
+        // sources are reduced identically (`var f := scale.Apply;` →
+        // owned receiver `scale`). // per §28.3, §27.6 v0.196
+        auto mrit = deferredMethodRefLocalInit_.find(sym);
+        if (mrit != deferredMethodRefLocalInit_.end())
+            deferredActivationCaptureSources(*mrit->second, out);
+        // Trace 3 — a CARRIER of a CALL-BOUNDED parameter contributes ITSELF:
+        // a plain function-typed parameter of this method whose captures the
+        // CALLER re-established (§28.14), so it is NOT an owned obligation and
+        // is admitted. Recorded distinctly from the untraceable case so the
+        // union is explicit. // per §28.3, §28.14 v0.196
+        if (callBoundedAlias_.count(sym))
+            out.push_back({id, sym, /*ownedObligation=*/false});
+        return;
     } else {
-        // Opaque function-typed parameters and traced locals are later #1818
-        // provenance rows — they contribute nothing here.
+        // Opaque function-typed parameters and plain-storage field fetches are
+        // later #1818 provenance rows — they contribute nothing here.
         return;
     }
     std::unordered_set<sema::Symbol*> seen;
@@ -6054,8 +6090,29 @@ void MethodOwnership::checkDeferredActivationTempSitesExpr(const ast::Expr& e,
                 const bool isMethodRefArg =
                     dynamic_cast<const ast::MemberAccessExpr*>(a.value.get()) &&
                     dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*a.value));
+                // T5 (#1818, §28.3, v0.196): a plain IDENTIFIER argument bound to
+                // a TRACEABLE function-value LOCAL — a lambda literal
+                // (scopedLambdaLocalInit_) or a method reference
+                // (deferredMethodRefLocalInit_), each never reassigned, or a
+                // carrier of a call-bounded parameter (callBoundedAlias_) — is
+                // routed into the same capture check; deferredActivationCapture-
+                // Sources' traced-local row reduces it to the union of the traced
+                // forms' sources. An untraceable / reassigned local is NOT routed
+                // here (it stays with the existing fall-through, which classifies
+                // it conservatively — never over-rejected). // per §28.3 v0.196
+                bool isTracedLocalArg = false;
+                if (const auto* aid = dynamic_cast<const ast::IdentifierExpr*>(
+                        a.value.get())) {
+                    sema::Symbol* asym = ctx_.exprSymbol(*aid);
+                    if (dynamic_cast<sema::LocalSymbol*>(asym) &&
+                        scopedAssignedSyms_.count(asym) == 0)
+                        isTracedLocalArg =
+                            scopedLambdaLocalInit_.count(asym) ||
+                            deferredMethodRefLocalInit_.count(asym) ||
+                            callBoundedAlias_.count(asym);
+                }
                 if (dynamic_cast<const ast::LambdaExpr*>(a.value.get()) ||
-                    isMethodRefArg) {
+                    isMethodRefArg || isTracedLocalArg) {
                     // Only a PLAIN function-parameter slot mints a frame the
                     // callback resides in: a `scoped` slot is storage-bounded and
                     // its capture admission is owned by checkScopedAdmission
@@ -7299,6 +7356,17 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
                     ld->initializer.get())) {
                 if (sema::LocalSymbol* ls = findLocalSymbol(*ld))
                     scopedLambdaLocalInit_[ls] = lam;
+            } else if (dynamic_cast<const ast::MemberAccessExpr*>(
+                           ld->initializer.get()) &&
+                       dynamic_cast<sema::MethodSymbol*>(
+                           ctx_.exprSymbol(*ld->initializer))) {
+                // #1818 (§28.3 traced-local row, v0.196): a local bound to a
+                // METHOD REFERENCE `obj.M` traces (unless reassigned) to that
+                // reference's captured receiver in the deferred-activation
+                // capture check — the sibling of the lambda-literal row above.
+                // // per §28.3 v0.196
+                if (sema::LocalSymbol* ls = findLocalSymbol(*ld))
+                    deferredMethodRefLocalInit_[ls] = ld->initializer.get();
             }
             scopedPreScanExpr(*ld->initializer);
         }

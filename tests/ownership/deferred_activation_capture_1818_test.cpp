@@ -30,9 +30,17 @@
 // EXACTLY as the lambda captures are. A STATIC method reference (`Program.Helper`)
 // carries no owned receiver; an instance method reference whose receiver is a
 // LIVE OWNED obligation and whose frame escapes is rejected, mirroring the
-// lambda `(x) => scale.Apply(x)` twin. Opaque function-typed parameters, traced
-// locals, and plain-storage (function-typed field) fetches are later #1818
-// provenance rows, out of scope here.
+// lambda `(x) => scale.Apply(x)` twin.
+//
+// T5 adds the TRACED-LOCAL provenance row (§28.3, v0.196): when the plain
+// function-slot argument is an IDENTIFIER bound to a LOCAL, the local is traced
+// to its provenance and contributes the UNION of the traced forms' capture
+// sources — a lambda-literal / method-reference binding (never reassigned)
+// recurses into the T2 / T3 reduction; a call-bounded-parameter carrier
+// contributes itself (admitted); a reassigned or opaque binding contributes
+// nothing (conservative admit). Opaque function-typed parameters and
+// plain-storage (function-typed field) fetches remain later #1818 provenance
+// rows, out of scope here.
 //
 // Every shape below was hand-verified against `build/bezelc -c` on a standalone
 // probe before being folded in (the REJECT shapes compile CLEAN without the T2
@@ -374,5 +382,114 @@ BEZEL_TEST(deferred_activation_capture_1818, methodref_fresh_receiver_for_source
         "end; "
         "return total;",
         "method M(nums: Array<int>): int"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ===========================================================================
+// T5 — TRACED-LOCAL provenance row (§28.3, v0.196). When the deferred-
+// activation call's plain function-slot argument is an IDENTIFIER bound to a
+// LOCAL, the local is traced to its provenance and contributes the UNION of the
+// traced forms' capture sources: a local bound to a LAMBDA LITERAL or a METHOD
+// REFERENCE and never reassigned contributes that function value's captures
+// (reduced exactly as the T2/T3 rows do); a local carrying a CALL-BOUNDED
+// parameter contributes itself (a plain function param the caller
+// re-establishes — admitted). A reassigned or otherwise untraceable local is
+// conservative — it contributes nothing and is admitted, so an opaque binding
+// is never over-rejected. Each REJECT below compiles CLEAN without the T5 fix
+// (the traced-local hole: an IdentifierExpr argument fell through the T2/T3/T4
+// dispatch, which handled only literal lambda / method-reference arguments) and
+// produces the capture-set-contribution error with it; each ADMIT compiles
+// clean either way. Every shape was hand-verified against `build/bezelc -c` on a
+// standalone probe before being folded in.
+// ===========================================================================
+
+// ★ Primary T5 regression (the §28.3 traced-local reject): the method reference
+// `scale.Apply` is bound to `f`, then `Doubled(nums, f)` is returned. `f` traces
+// to `scale.Apply`, whose receiver `scale` is the owned `using var`; the escaping
+// frame would enumerate into a closure over `scale` after its disposal. Rejected.
+// // per §28.3 traced-local row, §27.6, v0.196
+BEZEL_TEST(deferred_activation_capture_1818, traced_local_methodref_return_owned_local_rejected) {
+    auto r = parseAndCheckOwnership(wrap(
+        "using var scale := new Scaler(); "
+        "var f := scale.Apply; "
+        "return Doubled(nums, f);",
+        "method M(nums: Array<int>): IEnumerable<int>"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(sawCaptureSetError(r));
+}
+
+// The lambda-literal twin: `f` is bound to the lambda `(x) => scale.Apply(x)`
+// (never reassigned), which captures the owned `using var scale`; returning the
+// frame strands the borrow past `scale`'s disposal. Traced through the lambda-
+// literal provenance and rejected. // per §28.3 traced-local row, v0.196
+BEZEL_TEST(deferred_activation_capture_1818, traced_local_lambda_return_owned_local_rejected) {
+    auto r = parseAndCheckOwnership(wrap(
+        "using var scale := new Scaler(); "
+        "var f := (x: int) => scale.Apply(x); "
+        "return Doubled(nums, f);",
+        "method M(nums: Array<int>): IEnumerable<int>"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(sawCaptureSetError(r));
+}
+
+// ADMIT — a local bound to a lambda capturing NOTHING OWNED (`this`, a
+// value-typed local, a static field). Traced through the lambda-literal
+// provenance, the reduction finds no owned obligation, so the frame carries no
+// scope-bound borrow — admitted even though it is returned. Guards against
+// over-rejecting the traced lambda's exempt captures. // per §28.3, §28.14, v0.196
+BEZEL_TEST(deferred_activation_capture_1818, traced_local_lambda_capture_nothing_owned_accepted) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var bump: int := 5; "
+        "var f := (x: int) => this.Scale(x) + bump + Program.Factor; "
+        "return Doubled(nums, f);",
+        "method M(nums: Array<int>): IEnumerable<int>"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ADMIT — a REASSIGNED local is untraceable: the flow-insensitive pre-scan
+// cannot pin which value `f` holds at the call site, so it contributes nothing
+// and the frame is admitted CONSERVATIVELY — even though `f` was once bound to
+// `scale.Apply` over the owned `using var scale`. This is the load-bearing
+// over-rejection guard for T5: a reassigned/opaque binding must NOT be rejected.
+// // per §28.3, §28.14, v0.196
+BEZEL_TEST(deferred_activation_capture_1818, traced_local_reassigned_conservative_accepted) {
+    auto r = parseAndCheckOwnership(wrap(
+        "using var scale := new Scaler(); "
+        "var f := scale.Apply; "
+        "f := Program.Helper; "
+        "return Doubled(nums, f);",
+        "method M(nums: Array<int>): IEnumerable<int>"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ADMIT — the frame is NOT escaped: the method-reference-bound local `f` feeds a
+// direct `for` source, whose desugared `using var` bounds the frame by the loop,
+// which the owned `using var scale` (declared in the enclosing method scope)
+// outlives. Sound, admitted — the traced-local check excludes the for-source
+// position exactly as the T2/T3 rows do. // per §28.3, §29.2, §28.14, v0.196
+BEZEL_TEST(deferred_activation_capture_1818, traced_local_methodref_for_source_not_escaped_accepted) {
+    auto r = parseAndCheckOwnership(wrap(
+        "using var scale := new Scaler(); "
+        "var f := scale.Apply; "
+        "var total := 0; "
+        "for var v in Doubled(nums, f) do "
+        "  total := total + v; "
+        "end; "
+        "return total;",
+        "method M(nums: Array<int>): int"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ADMIT — the method-reference-bound local's receiver is a plain (borrow)
+// PARAMETER, which outlives the method; the caller re-establishes the returned
+// frame's constraint against its own actual argument (§28.3's parameter-sourced
+// admission). Guards against over-rejecting a borrow-receiver traced local.
+// // per §28.3, v0.196
+BEZEL_TEST(deferred_activation_capture_1818, traced_local_methodref_borrow_param_receiver_accepted) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var f := s.Apply; "
+        "var q := Doubled(nums, f); "
+        "return q;",
+        "method M(nums: Array<int>, s: Scaler): IEnumerable<int>"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

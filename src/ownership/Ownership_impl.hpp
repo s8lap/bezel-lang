@@ -1792,9 +1792,17 @@ private:
     // every local of this frame; a static / const / type / module ref
     // contributes nothing; a value-typed local lives in its heap capture cell —
     // the isBorrowableType gate; a lambda-internal parameter is not a capture of
-    // the enclosing frame). Any other argument (opaque function-typed parameter,
-    // traced local, plain-storage field fetch) is a later provenance row and
-    // contributes nothing here. // per §28.3, §27.6, §28.14, v0.196
+    // the enclosing frame). A third row (T5, §28.3, v0.196) traces a plain
+    // IDENTIFIER argument bound to a LOCAL to its provenance and contributes the
+    // UNION of the traced forms' sources: a local bound to a lambda literal
+    // (scopedLambdaLocalInit_) or a method reference (deferredMethodRefLocalInit_)
+    // and never reassigned (scopedAssignedSyms_) recurses into that function
+    // value's own row; a local carrying a call-bounded parameter
+    // (callBoundedAlias_) contributes itself (a plain function param the caller
+    // re-establishes — admitted). A reassigned or untraceable local contributes
+    // nothing (conservative admit). An opaque function-typed parameter and a
+    // plain-storage field fetch are later provenance rows and contribute nothing
+    // here. // per §28.3, §27.6, §28.14, v0.196
     void deferredActivationCaptureSources(const ast::Expr& arg,
                                           std::vector<CapSource>& out);
     // True when the LocalSymbol names a *live owned obligation* — an owned local
@@ -1919,6 +1927,17 @@ private:
     // is absent from scopedAssignedSyms_.
     std::unordered_map<sema::Symbol*, const ast::LambdaExpr*>
         scopedLambdaLocalInit_;
+    // #1818 (§28.3 traced-local provenance row, v0.196): a local initialized
+    // with a METHOD REFERENCE `obj.M` and never reassigned traces to that
+    // reference's captured receiver — the deferred-activation capture check
+    // (deferredActivationCaptureSources' traced-local row) consults this
+    // alongside scopedLambdaLocalInit_ to reduce `var f := scale.Apply;
+    // return Doubled(nums, f);` to the owned receiver `scale`. Maps the
+    // LocalSymbol to its initializer MemberAccessExpr; consulted only when the
+    // symbol is absent from scopedAssignedSyms_. Recorded by scopedPreScanStmt
+    // in the same LocalDecl pass as scopedLambdaLocalInit_. // per §28.3 v0.196
+    std::unordered_map<sema::Symbol*, const ast::Expr*>
+        deferredMethodRefLocalInit_;
     // Every symbol that is an assignment target anywhere in the body
     // (including through an `out`/`ref` call argument). A lambda-literal
     // local among them is NOT verifiable (the binding may have been swapped
