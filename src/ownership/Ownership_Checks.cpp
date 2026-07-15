@@ -1991,6 +1991,57 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
     if (!id) return;
     sema::Symbol* sym = ctx_.exprSymbol(*id);
+
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S2). A holder bound
+    // from a bare-type-parameter call (`var m := Pick(a, b);`) carries a borrow
+    // of the UNION of the call's sources, attached into recordBorrowLocalSource_
+    // (NOT st->source) by collectBareTypeParamCallBorrowSource. Returning the
+    // bare holder lets that borrow escape every contributing source that is
+    // still a live owned scope-bound local (§28.9/§9.7) — or catch binding
+    // (§31.1) — at the return, exactly as returning a plain re-borrow holder
+    // does below; the single-source path below misses it because such a holder
+    // has no st->source. Mirror that path's guard precisely: reject only when a
+    // carried source is still a live escape-bound obligation (a parameter or a
+    // returned-through source outlives the return and is NOT escape-bound, so it
+    // is left accepted), and only while the source's view-window is open at the
+    // return (a straight-line reassignment that dropped the borrow closes it). A
+    // borrow-bearing record / span holder keeps its own §9.7 return handling
+    // (checkRecordBorrowEscapesOnReturn / the direct-return checks) — this
+    // branch is scoped to the non-record (class-typed) bare-T holder, which the
+    // record predicate never matches. // per §28.3, §28.9, §9.7, v0.194
+    if (sym && !isBorrowBearingRecordOrSpan(ctx_.exprType(e))) {
+        if (sema::Symbol* src =
+                carriedEscapeBoundSourceLiveAt(sym, id->span.begin.offset)) {
+            if (isCatchBorrow(src)) {
+                report(
+                    Severity::Error, id->span.begin,
+                    std::string("returned `") + std::string(id->name) +
+                    "` carries a borrow of the caught exception `" +
+                    std::string(src->name) +
+                    "` — the result of a bare-type-parameter call borrows the "
+                    "union of the call's sources, and a caught exception is a "
+                    "borrow whose lifetime is the catch arm body (the runtime "
+                    "disposes it after the arm completes), so it may not escape "
+                    "the arm (§28.3 bare-type-parameter returns / §31.1; copy "
+                    "the data you need out of it into an owned value instead)");
+            } else {
+                report(
+                    Severity::Error, id->span.begin,
+                    std::string("returned `") + std::string(id->name) +
+                    "` carries a borrow of `" + std::string(src->name) +
+                    "` — the result of a bare-type-parameter call borrows the "
+                    "union of the call's sources, and `" +
+                    std::string(src->name) +
+                    "` is an owned scope-bound local disposed at scope end, so "
+                    "returning the borrow lets it outlive that local (§28.3 "
+                    "bare-type-parameter returns / §28.9 / §9.7 borrow-lifetime "
+                    "rule; bind the source in the caller's scope and build the "
+                    "aliasing value there instead)");
+            }
+            return;
+        }
+    }
+
     const LocalOwnership* st = nullptr;
     if (sym) {
         auto it = states_.find(sym);
@@ -2037,9 +2088,73 @@ sema::Symbol* MethodOwnership::ownedLocalBorrowSource(const ast::Expr& rhs) {
     // is excluded: assigning an owned parameter into an owned field is the
     // §28.8 ownership-transfer pattern, not a borrow store. // per §28.3, §28.8
     sema::Symbol* src = borrowSourceForExpr(rhs);
-    if (!src) return nullptr;
-    if (!dynamic_cast<sema::LocalSymbol*>(src)) return nullptr;
-    return src;
+    if (src) {
+        if (!dynamic_cast<sema::LocalSymbol*>(src)) return nullptr;
+        return src;
+    }
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S2): a bare-T call
+    // result holder (`var m := Pick(a, b);`) carries its union borrow in
+    // recordBorrowLocalSource_, not in states_.source, so borrowSourceForExpr
+    // above does not see it. When such a holder is stored into an owned field /
+    // out-param / longer-lived local, the store escapes every contributing
+    // source that is still a live owned scope-bound local — treat it as a
+    // borrow store of that source, so the callers (checkBorrowStoreEscape /
+    // checkCollectionBorrowStoreEscape) diagnose it exactly as they do a plain
+    // re-borrow store. Restricted to a bare identifier holder whose type is NOT
+    // a borrow-bearing record/span (those keep their existing type-based store
+    // handling untouched — the record predicate never matches a class bare-T
+    // result anyway). // per §28.3, §28.9, v0.194
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&rhs);
+    if (!id) return nullptr;
+    if (isBorrowBearingRecordOrSpan(ctx_.exprType(rhs))) return nullptr;
+    sema::Symbol* holder = ctx_.exprSymbol(*id);
+    if (!holder) return nullptr;
+    sema::Symbol* carried =
+        carriedEscapeBoundSourceLiveAt(holder, id->span.begin.offset);
+    if (carried && dynamic_cast<sema::LocalSymbol*>(carried)) return carried;
+    return nullptr;
+}
+
+sema::Symbol* MethodOwnership::carriedEscapeBoundSourceLiveAt(
+    const sema::Symbol* holder, std::uint32_t atOffset) const {
+    // §28.3 (v0.194, #1801 S2). DFS over recordBorrowLocalSource_ following each
+    // carried source; a source that is itself a tracked bare-T / record local (a
+    // bare-T result derived from another, `var n := Pick(m, c)`, or a span of a
+    // span) is resolved transitively. `seen` guards the (structurally unlikely
+    // but cheap-to-defend) cycle. The view-window is applied precisely to the
+    // holder's DIRECT sources — a use at `atOffset` after a straight-line
+    // reassignment that retired a source no longer views it; a transitive hop
+    // uses the full range (sound over-approximation, mirroring
+    // recordBorrowConsumedWindow). The first reached source that is a live
+    // escape-bound obligation (isEscapeBoundLocal — an owned scope-bound local
+    // still in the Owned state, or a catch binding) is returned; a source that
+    // outlives the return / store (a parameter, a returned-through source) is
+    // not escape-bound and so is skipped. // per §28.3, §28.9, §9.7
+    std::unordered_set<const sema::Symbol*> seen;
+    struct Item {
+        const sema::Symbol* sym;
+        bool direct;
+    };
+    std::vector<Item> work{{holder, true}};
+    while (!work.empty()) {
+        Item cur = work.back();
+        work.pop_back();
+        if (!seen.insert(cur.sym).second) continue;
+        auto it = recordBorrowLocalSource_.find(cur.sym);
+        if (it == recordBorrowLocalSource_.end()) continue;
+        for (const RecordBorrowSource& e : it->second) {
+            const bool active =
+                !cur.direct || (atOffset >= e.from && atOffset < e.until);
+            if (!active) continue;
+            // isEscapeBoundLocal / states_ are keyed by the (non-const) symbol
+            // table pointers; the const on RecordBorrowSource::source is only
+            // for the map's own use, so the cast is safe.
+            sema::Symbol* srcRoot = const_cast<sema::Symbol*>(e.source);
+            if (isEscapeBoundLocal(srcRoot)) return srcRoot;
+            work.push_back({e.source, false});
+        }
+    }
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------

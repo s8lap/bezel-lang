@@ -719,6 +719,25 @@ private:
     // is still in the Owned state at the return point.
     void checkIndirectEscapeOnReturn(const ast::Expr& e);
 
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S2): given a holder
+    // local bound from a bare-type-parameter call (`var m := Pick(a, b);`),
+    // return the first carried borrow source that is still a LIVE escape-bound
+    // scope-bound obligation at `atOffset` — an owned scope-bound local
+    // (§28.9/§9.7) or a catch binding (§31.1) — or nullptr if none. Such a
+    // holder carries the UNION of the call's sources in recordBorrowLocalSource_
+    // (not in states_.source), so returning it, or storing it into an owned
+    // field / out-param / longer-lived local, escapes every contributing source
+    // that is still a live owned obligation. A carried source that OUTLIVES the
+    // return (a parameter, a returned-through source) is not escape-bound, so it
+    // is never returned here — the same guard the single-source paths apply. The
+    // view-window is honoured precisely for the holder's DIRECT sources (a
+    // straight-line reassignment that dropped the borrow closes it); a transitive
+    // hop through an intermediate bare-T / record local uses the full range
+    // (sound over-approximation, matching recordBorrowConsumedWindow). // per
+    // §28.3, §28.9, §9.7, v0.194
+    sema::Symbol* carriedEscapeBoundSourceLiveAt(const sema::Symbol* holder,
+                                                 std::uint32_t atOffset) const;
+
     // §28.3 (#386 cases 1+2) INDIRECT escape through an assignment. When the
     // assignment target is a *field of an object* (`obj.f := …`, including
     // `this.f := …`) or an *out / ref / out-owned parameter* (`p := …`), and

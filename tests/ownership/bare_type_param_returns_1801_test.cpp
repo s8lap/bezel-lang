@@ -265,3 +265,150 @@ BEZEL_TEST(bare_type_param_returns,
         "end Prog;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ===========================================================================
+// S2 (#1801) — the ESCAPE side. S1 attaches the union source set and freezes a
+// consume while the result is live; S2 closes the complementary hole where the
+// bare-T borrow ESCAPES its sources: returning the holder, or storing it into
+// an owned field / longer-lived sink, when a carried source is a live owned
+// scope-bound local. §28.9 / §9.7 borrow-lifetime rule, adapted to the union
+// source set (§28.3 *Bare-type-parameter returns*, v0.194).
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// (g) THE ESCAPE-VIA-RETURN HOLE. An INSTANCE method binds `m := Pick(a, b)`
+// over owned scope-bound locals `a`/`b`, then `return m;`. `m` borrows the
+// union {a, b}; both are disposed at the method's scope end, so the returned
+// borrow dangles in the caller — a use-after-dispose. Before S2 the holder
+// carried its source set only in recordBorrowLocalSource_ (not st->source), so
+// the indirect-return escape check missed it and this compiled CLEAN. (A STATIC
+// method would already be rejected by the broader static-borrow-return rule
+// §28.3 #1547; the hole is specifically the instance-method form.) // per §28.9
+// ---------------------------------------------------------------------------
+
+BEZEL_TEST(bare_type_param_returns,
+           return_holder_escapes_owned_local_source_rejected_spec_28_9) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public constructor() end constructor; "
+        "  destructor end destructor; "
+        "end C; "
+        "class Util "
+        "  public static method Pick<T>(a: T, b: T): T return a; end Pick; "
+        "end Util; "
+        "class Prog "
+        "  public constructor() end constructor; "
+        "  destructor end destructor; "
+        "  public method Make(): C "
+        "    var a := new C(); "
+        "    var b := new C(); "
+        "    var m := Util.Pick(a, b); "
+        "    return m; "                       // escapes owned locals a/b
+        "  end Make; "
+        "  public static method Main(): int return 0; end Main; "
+        "end Prog;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(errorSays(r, "returned `m` carries a borrow of `a`"));
+    BEZEL_EXPECT_TRUE(errorSays(r, "bare-type-parameter"));
+}
+
+// ---------------------------------------------------------------------------
+// (h) OVER-REJECT GUARD — PARAM-sourced result outlives the return. The same
+// shape but the contributing sources are PARAMETERS (`p`/`q`), whose lifetime
+// is the caller's frame and so outlives the return. §28.3 "the result is usable
+// only where every contributing source is still live" — a parameter is still
+// live at (and past) the return, so it is not an escape and the return must be
+// ACCEPTED. This is the mirror of the single-source guard: only a still-live
+// owned scope-bound obligation is flagged, never a source that outlives it.
+// ---------------------------------------------------------------------------
+
+BEZEL_TEST(bare_type_param_returns,
+           return_holder_param_sourced_accepted_spec_28_3) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public constructor() end constructor; "
+        "  destructor end destructor; "
+        "end C; "
+        "class Util "
+        "  public static method Pick<T>(a: T, b: T): T return a; end Pick; "
+        "end Util; "
+        "class Prog "
+        "  public constructor() end constructor; "
+        "  destructor end destructor; "
+        "  public method FromParams(p: C, q: C): C "
+        "    var m := Util.Pick(p, q); "
+        "    return m; "                        // p/q outlive the return — OK
+        "  end FromParams; "
+        "  public static method Main(): int return 0; end Main; "
+        "end Prog;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ---------------------------------------------------------------------------
+// (i) OVER-REJECT GUARD — a freshly produced owned value carries no borrow.
+// `return new C();` (via a local bound to a fresh `new C()`) is an owned-value
+// transfer, not a borrow: no bare-T holder, no carried source, nothing to
+// escape. Must be ACCEPTED. Guards the return-escape scan against firing on
+// ordinary owned returns.
+// ---------------------------------------------------------------------------
+
+BEZEL_TEST(bare_type_param_returns,
+           return_fresh_owned_value_accepted_spec_28_3) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public constructor() end constructor; "
+        "  destructor end destructor; "
+        "end C; "
+        "class Prog "
+        "  public constructor() end constructor; "
+        "  destructor end destructor; "
+        "  public method MakeFresh(): C "
+        "    var c := new C(); "
+        "    return c; "                        // fresh owned transfer — OK
+        "  end MakeFresh; "
+        "  public static method Main(): int return 0; end Main; "
+        "end Prog;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ---------------------------------------------------------------------------
+// (j) ESCAPE-VIA-OWNED-STORE. Storing the bare-T holder into an OWNED FIELD of
+// `this` (which outlives the method) lets the borrow of owned local `a` outlive
+// its source — the same §28.9/§9.7 escape as the return, through the store path
+// (checkBorrowStoreEscape, fed by the extended ownedLocalBorrowSource). Before
+// S2 the holder's source set was invisible to the store check and this compiled
+// clean. // per §28.9, §9.7
+// ---------------------------------------------------------------------------
+
+BEZEL_TEST(bare_type_param_returns,
+           store_holder_into_owned_field_rejected_spec_28_9) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public constructor() end constructor; "
+        "  destructor end destructor; "
+        "end C; "
+        "class Util "
+        "  public static method Pick<T>(a: T, b: T): T return a; end Pick; "
+        "end Util; "
+        "class Prog "
+        "  public owned _held: C; "
+        "  public constructor() _held := new C(); end constructor; "
+        "  destructor end destructor; "
+        "  public method Stash(): int "
+        "    var a := new C(); "
+        "    var b := new C(); "
+        "    var m := Util.Pick(a, b); "
+        "    _held := m; "                      // borrow stored into owned field
+        "    a.Dispose(); "
+        "    b.Dispose(); "
+        "    return 0; "
+        "  end Stash; "
+        "  public static method Main(): int return 0; end Main; "
+        "end Prog;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(errorSays(r, "borrow of `a` stored into a field"));
+}
