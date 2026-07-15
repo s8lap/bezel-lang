@@ -449,6 +449,98 @@ BEZEL_TEST(sema_case_exhaust,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// --- §19.6 (v0.196) generic-leaf DETERMINATION for a GROUND scrutinee (#1816
+// s2) -----------------------------------------------------------------------
+//
+// "Generic leaves: the determination rule": for a ground scrutinee `S`, a
+// leaf's exhaustiveness obligation is fixed by solving the leaf's parameters
+// against `S` — its root instantiation matched against `S` component-wise,
+// invariant, exact (§12.9; no §5.1 conversion, no variance). Empty solution set
+// ⇒ uninhabited ⇒ EXEMPT; exactly one ⇒ DETERMINED, the sole admitted
+// instantiation is the obligation; more than one / undetermined ⇒ a `_` is
+// required. s1 handled only the ground-mismatch edge (a leaf with a *ground*
+// root instantiation unequal to `S`); s2 solves the leaf's parameters, which
+// covers the determined idiom and the repeated-parameter-inconsistency edge.
+
+// (a) The canonical determined idiom (spec §19.6 example): `Result<T>` with
+// `Ok<T>: Result<T>` and `Err<T>: Result<T>`, scrutinee `Result<int>`. Each
+// leaf's root instantiation `Result<T>` matched against `Result<int>` solves
+// `T := int` — the sole inhabiting instantiation — so `Ok<int>` and `Err<int>`
+// are the only inhabitants and the two-arm case is exhaustive with no `_`. This
+// is the accept shape the determination rule must NOT regress (the rejected
+// "blanket never-exhaustive" reading would spuriously warn here).
+BEZEL_TEST(sema_case_exhaust, determined_idiom_stays_exhaustive_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<T> end Result; "
+        "sealed class Ok<T> : Result<T> end Ok; "
+        "sealed class Err<T> : Result<T> end Err; "
+        "class Calc "
+        "  public method M(r: Result<int>): int "
+        "    var a := case r of "
+        "      var o: Ok<int> => 1, "   // T := int — the sole solution
+        "      var e: Err<int> => 2 "   // T := int — the sole solution
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));  // both determined — no `_`
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (b) THE s2 fails-without/passes-with delta. A repeated-parameter leaf
+// `L<Y>: D<Y, Y>` under scrutinee `D<int, string>` has NO inhabiting
+// instantiation: solving its root instantiation `D<Y, Y>` against
+// `D<int, string>` binds `Y := int` then requires `Y := string` — inconsistent,
+// the empty solution set (§19.6 "No inhabiting instantiation … `L<Y>: D<Y, Y>`
+// against `D<int, string>`"). By invariance no value of static type
+// `D<int, string>` has an `L<…>` runtime class, so `L` is EXEMPT; covering the
+// ground leaf `P: D<int, string>` alone is exhaustive. Before s2 the solver did
+// not run (L's root instantiation `D<Y, Y>` is non-ground, so s1's
+// ground-mismatch slice left it in the leaf set) and the name-match drew a
+// spurious "missing leaf type(s): L" warning.
+BEZEL_TEST(sema_case_exhaust, repeated_param_inconsistent_leaf_exempt_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class D<A, B> end D; "
+        "sealed class L<Y> : D<Y, Y> end L; "      // root inst D<Y,Y> — inconsistent
+        "sealed class P : D<int, string> end P; "  // ground — the required arm
+        "class Calc "
+        "  public method M(d: D<int, string>): int "
+        "    var a := case d of "
+        "      var p: P => 1 "  // L is uninhabited at D<int, string>
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));  // L exempt — no arm needed
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (c) The determination rule must NEVER suppress a genuinely-missing determined
+// leaf. Same `Result<T>` hierarchy and `Result<int>` scrutinee as (a) but the
+// `Err<int>` arm is omitted: `Err` is DETERMINED at `Result<int>` (`T := int`,
+// one solution) and left uncovered, so the case is non-exhaustive and the
+// warning still fires — the sound instantiation-coverage reading, not the
+// rejected "declaration-coverage" that would call a single leaf covered.
+BEZEL_TEST(sema_case_exhaust, determined_missing_leaf_still_warns_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<T> end Result; "
+        "sealed class Ok<T> : Result<T> end Ok; "
+        "sealed class Err<T> : Result<T> end Err; "
+        "class Calc "
+        "  public method M(r: Result<int>): int "
+        "    var a := case r of "
+        "      var o: Ok<int> => 1 "  // Err<int> determined but omitted
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));   // Err<int> still required
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // --- Open hierarchy (§19.6 final paragraph) --------------------------------
 
 // "When the hierarchy is open (the base is not sealed ...), exhaustiveness

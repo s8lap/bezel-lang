@@ -595,6 +595,101 @@ bool isFullyGroundTypeRef(const TypeRef* t) {
     return false;
 }
 
+// §19.6 (v0.196, #1816 s2): the tri-state outcome of matching one component of a
+// leaf's root instantiation against the corresponding GROUND scrutinee component
+// under COMPONENT-WISE INVARIANT EXACT identity (§12.9 — class hierarchies are
+// invariant; no §5.1 conversion, no variance).
+//   Fail    — a decidable structural mismatch (distinct ground constructors or
+//             ground arguments, or a repeated leaf parameter bound two
+//             inconsistent ways). By invariance this proves the leaf uninhabited.
+//   Ok      — matched; any leaf parameters encountered were bound in `solved`.
+//   Unknown — undecidable HERE (a nullable-marker occurrence / an alias-shaped
+//             or arity edge / a rigid non-leaf reference). Never a false exempt:
+//             the caller keeps such a leaf, deferring to the name-match / later
+//             lanes. Fail dominates Unknown dominates Ok when composing.
+enum class InvMatch { Fail, Unknown, Ok };
+
+// Structural-invariant match of a root-instantiation component `declared`
+// (expressed in the leaf's own parameters) against a GROUND scrutinee component
+// `target`, solving `paramNames` into `solved`. Modeled on
+// unifyReturnAgainstTarget (ExprTypecheck_Calls.cpp) but STRICT — the lenient
+// "concrete vs concrete ⇒ succeed" arm there is here a real ground-equality test
+// (a ground mismatch is Fail, not a silent pass) — and three-valued rather than
+// a bool, per §19.6's determination (all solutions, not one witness).
+static InvMatch matchLeafInvariant(
+    const TypeRef* declared, const TypeRef* target,
+    const std::unordered_set<std::string_view>& paramNames,
+    std::unordered_map<std::string_view, TypeRef*>& solved) {
+    if (!declared || !target) return InvMatch::Unknown;
+
+    // (1) A bare leaf-parameter reference on the DECLARED (root-instantiation)
+    // side — a Named TypeRef with no declaration whose head names a leaf param
+    // (mirrors unifyReturnAgainstTarget's bare-parameter recognition). This is a
+    // SOLVE VARIABLE. A nullable-marker occurrence (`T?`) is the §7.10 ?-split
+    // (a later lane): undecidable here, never a false exempt.
+    if (declared->kind == TypeRef::Kind::Named && !declared->declaration &&
+        paramNames.count(declared->headName())) {
+        if (declared->nullable) return InvMatch::Unknown;  // ?-split — later lane
+        std::string_view nm = declared->headName();
+        auto it = solved.find(nm);
+        if (it != solved.end()) {
+            // Repeated occurrence: consistent only if the two ground bindings are
+            // identical (invariant). `D<Y,Y>` against `D<int,string>` fails here.
+            // Both operands are ground scrutinee components, so typeRefEqual's
+            // null-declaration blindness (the s1 guard) cannot bite.
+            return typeRefEqual(it->second, target) ? InvMatch::Ok
+                                                    : InvMatch::Fail;
+        }
+        solved[nm] = const_cast<TypeRef*>(target);
+        return InvMatch::Ok;
+    }
+    // A declaration-less Named that is NOT a leaf parameter: a rigid enclosing-
+    // body parameter or a null-declaration builtin. Its identity to a ground
+    // target is undecidable at this declaration — never exempt on it.
+    if (declared->kind == TypeRef::Kind::Named && !declared->declaration)
+        return InvMatch::Unknown;
+
+    // (2) Nullability is part of invariant identity, but a mismatch here rides an
+    // edge (the scrutinee's nested nullability) — stay conservative: only ACT on
+    // agreeing nullability; a mismatch is Unknown (kept), never a false exempt.
+    if (declared->nullable != target->nullable) return InvMatch::Unknown;
+
+    switch (declared->kind) {
+        case TypeRef::Kind::Primitive:
+            if (target->kind != TypeRef::Kind::Primitive)
+                return InvMatch::Unknown;  // primitive/Named alias edge — keep
+            return declared->primitive == target->primitive ? InvMatch::Ok
+                                                             : InvMatch::Fail;
+        case TypeRef::Kind::Named: {
+            if (target->kind != TypeRef::Kind::Named) return InvMatch::Unknown;
+            if (declared->declaration != target->declaration)
+                return InvMatch::Fail;  // distinct ground constructors
+            if (declared->genericArgs.size() != target->genericArgs.size())
+                return InvMatch::Unknown;  // arity edge — keep, never exempt
+            InvMatch acc = InvMatch::Ok;
+            for (std::size_t i = 0; i < declared->genericArgs.size(); ++i) {
+                InvMatch r = matchLeafInvariant(declared->genericArgs[i],
+                                                target->genericArgs[i],
+                                                paramNames, solved);
+                if (r == InvMatch::Fail) return InvMatch::Fail;  // Fail dominates
+                if (r == InvMatch::Unknown) acc = InvMatch::Unknown;
+            }
+            return acc;
+        }
+        case TypeRef::Kind::Unit:
+            return target->kind == TypeRef::Kind::Unit ? InvMatch::Ok
+                                                       : InvMatch::Fail;
+        case TypeRef::Kind::InlineArray:
+            if (target->kind != TypeRef::Kind::InlineArray) return InvMatch::Unknown;
+            return matchLeafInvariant(declared->arrayElement, target->arrayElement,
+                                      paramNames, solved);
+        case TypeRef::Kind::Function:
+        case TypeRef::Kind::Error:
+            return InvMatch::Unknown;  // structural function match — later lane
+    }
+    return InvMatch::Unknown;
+}
+
 } // namespace
 
 // §19.6 (v0.196, #1816): see the header comment. Walk `leaf`'s single-
@@ -650,6 +745,53 @@ TypeRef* ExprTC::leafRootInstantiation(TypeSymbol* leaf, TypeSymbol* root) {
         curSubst = std::move(nextSubst);
     }
     return nullptr;  // `root` not reached on the class chain
+}
+
+// §19.6 (v0.196, #1816 s2): see the header comment. Solve `leaf`'s parameters
+// against the GROUND scrutinee `scrutTy` by composing `leaf`'s root
+// instantiation and matching it against `scrutTy` under component-wise invariant
+// exact identity (matchLeafInvariant). The caller has already established
+// `isFullyGroundTypeRef(scrutTy)` — this solver is the ground-scrutinee branch of
+// the determination rule; a rigid `S` is a later lane's domain.
+ExprTC::LeafInstSolutions ExprTC::solveLeafInstantiations(
+    TypeSymbol* leaf, TypeSymbol* root, const TypeRef* scrutTy) {
+    LeafInstSolutions result;  // defaults to Undetermined (caller keeps the leaf)
+    if (!leaf || !root || !scrutTy) return result;
+
+    TypeRef* rootInst = leafRootInstantiation(leaf, root);
+    if (!rootInst) return result;  // uncomposable chain — keep (name-match)
+
+    // The leaf's own parameters are the solve variables; a non-generic leaf has
+    // none and its only candidate is the empty substitution.
+    std::unordered_set<std::string_view> paramNames;
+    for (const Symbol* gp : leaf->genericParams)
+        if (gp) paramNames.insert(gp->name);
+
+    std::unordered_map<std::string_view, TypeRef*> solved;
+    InvMatch m = matchLeafInvariant(rootInst, scrutTy, paramNames, solved);
+
+    if (m == InvMatch::Fail) {
+        // No inhabiting instantiation — uninhabited at S (§19.6), exempt.
+        result.outcome = LeafInstSolutions::Outcome::NoSolution;
+        return result;
+    }
+    if (m == InvMatch::Unknown) {
+        result.outcome = LeafInstSolutions::Outcome::Undetermined;
+        return result;
+    }
+    // m == Ok: a clean solve. Determined iff every leaf parameter is bound; an
+    // unbound parameter (no occurrence in the root instantiation) leaves the
+    // solution set unbounded — undetermined (§19.6: "a parameter with no
+    // occurrence in the root instantiation … never exempt or determined").
+    for (std::string_view nm : paramNames) {
+        if (!solved.count(nm)) {
+            result.outcome = LeafInstSolutions::Outcome::Undetermined;
+            return result;
+        }
+    }
+    result.outcome = LeafInstSolutions::Outcome::Determined;
+    result.solution = std::move(solved);
+    return result;
 }
 
 // §19.6: emit a non-exhaustiveness WARNING for an expression-position
@@ -914,14 +1056,35 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
         if (genericsInPlay && scrutTy) {
             TypeRef scrutNonNull = *scrutTy;  // stack copy; typeRefEqual reads
             scrutNonNull.nullable = false;    // through the pointer only here
+            // SECOND TRICHOTOMY SLICE (v0.196, #1816 s2 — the determination
+            // engine for a GROUND scrutinee): when `S` is FULLY GROUND, solve
+            // each leaf's parameters against `S` (solveLeafInstantiations,
+            // structural-invariant, per §12.9). 0 solutions — a structural
+            // mismatch OR a repeated-parameter inconsistency (`L<Y>: D<Y,Y>`
+            // against `D<int,string>`) — ⇒ the leaf is uninhabited at `S` and is
+            // EXEMPT (dropped); exactly-one (determined) or undetermined ⇒ the
+            // leaf is KEPT and the name-match below settles coverage (the
+            // determined idiom `Ok<int>`/`Err<int>` at `Result<int>` stays
+            // exhaustive; later lanes s3–s7 refine the >1 / undetermined /
+            // rigid-`S` cases). ENGAGE ONLY on a fully-ground `S`: a rigid `S` is
+            // a later lane's exclusive domain — solving against it would hit the
+            // typeRefEqual/unify null-declaration blindness and could wrongly
+            // exempt or keep, so the solver does not run and the leaf set is
+            // unchanged. s1's ground-mismatch check is retained ahead of it
+            // (a strict subset — same-module ground-vs-ground inequality — kept
+            // intact so its behavior and test are undisturbed).
+            bool groundScrut = isFullyGroundTypeRef(&scrutNonNull);
             std::vector<TypeSymbol*> kept;
             kept.reserve(leaves.size());
             for (auto* lf : leaves) {
                 TypeRef* rootInst = leafRootInstantiation(lf, sub);
-                if (rootInst && isFullyGroundTypeRef(rootInst) &&
-                    isFullyGroundTypeRef(&scrutNonNull) &&
+                if (rootInst && isFullyGroundTypeRef(rootInst) && groundScrut &&
                     !typeRefEqual(rootInst, &scrutNonNull))
-                    continue;  // uninhabited at S — exempt from coverage
+                    continue;  // s1: ground-mismatch ⇒ exempt from coverage
+                if (groundScrut &&
+                    solveLeafInstantiations(lf, sub, &scrutNonNull).outcome ==
+                        LeafInstSolutions::Outcome::NoSolution)
+                    continue;  // s2: no inhabiting instantiation ⇒ exempt (§19.6)
                 kept.push_back(lf);
             }
             leaves = std::move(kept);

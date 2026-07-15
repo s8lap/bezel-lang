@@ -428,6 +428,36 @@ private:
     // substituteReturnType as the per-level substitution engine.
     TypeRef* leafRootInstantiation(TypeSymbol* leaf, TypeSymbol* root);
 
+    // §19.6 (v0.196, #1816 s2): the determination outcome of solving a closed-
+    // hierarchy leaf's type parameters against a GROUND scrutinee `S` — the
+    // multiplicity of the leaf's inhabiting instantiations at `S`. `NoSolution`
+    // (empty set) ⇒ the leaf is uninhabited at `S` and EXEMPT from coverage;
+    // `Determined` (a singleton) ⇒ the leaf's obligation is the single admitted
+    // instantiation carried in `solution`; `Undetermined` (>1, or undecidable at
+    // this decidability level) ⇒ leaf coverage is not pinned here (later lanes).
+    struct LeafInstSolutions {
+        enum class Outcome { NoSolution, Determined, Undetermined };
+        Outcome outcome = Outcome::Undetermined;
+        // The sole inhabiting substitution (leaf-param name -> ground TypeRef),
+        // populated only when `outcome == Determined`.
+        std::unordered_map<std::string_view, TypeRef*> solution;
+    };
+
+    // §19.6 (v0.196, #1816 s2): solve `leaf`'s type parameters against a GROUND
+    // scrutinee `scrutTy` (the caller passes the NON-NULLABLE form of `S`).
+    // Composes `leaf`'s root instantiation (leafRootInstantiation) and unifies it
+    // against `scrutTy` COMPONENT-WISE, INVARIANT, EXACT — no §5.1 conversion and
+    // no §12.9 variance step, the syntactic/decidable image of the runtime test.
+    // A structural mismatch (distinct ground constructors or ground arguments) or
+    // a repeated-parameter inconsistency (`L<Y>: D<Y,Y>` against `D<int,string>`)
+    // yields NoSolution ⇒ exempt; a clean solve binding every leaf parameter
+    // yields Determined; a leaf parameter left unbound (no occurrence in the root
+    // instantiation) or any undecidable component yields Undetermined. The caller
+    // MUST gate this on `isFullyGroundTypeRef(scrutTy)` — a rigid `S` is a later
+    // lane's domain and this solver does not engage on it.
+    LeafInstSolutions solveLeafInstantiations(TypeSymbol* leaf, TypeSymbol* root,
+                                              const TypeRef* scrutTy);
+
     // §5.1 / §19 (#1153): range-check each integer `case` pattern constant /
     // range-bound literal against an integer scrutinee's type. A literal that
     // does not fit was silently truncated to the scrutinee width at codegen
