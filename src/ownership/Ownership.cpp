@@ -2416,6 +2416,58 @@ MethodOwnership::analyzeBareBorrowCall(const ast::CallExpr& ce) {
         return info;
     }
 
+    // §5 / §5.1 LINQ element-access + no-selector/selector Min/Max — the result
+    // at a class or interface element type is a borrow SOURCED FROM THE RECEIVER
+    // (stdlib §5's "Ownership at class-typed substitutions" note, v0.194: the
+    // caller takes no disposal obligation, and the result is usable while the
+    // source sequence's own source is live). Like `Aggregate` (S13) these are
+    // LINQ intrinsics with no user MethodDecl — reaching this name-keyed branch
+    // means `calleeMethodDecl` resolved nothing, so a user method also named
+    // `First`/`Min`/… (which resolves to a MethodDecl) never lands here and is
+    // never mis-carved. The §28.9 borrowable-result gate above already dropped a
+    // value-typed element result (`Array<int>.First()` → `int`), which attaches
+    // nothing. The RECEIVER is the sole source: element-access returns an element
+    // the receiver owns; for the selector `Min<U>/Max<U>(sel)` the projected `U`
+    // is drawn from the receiver's elements (the selector is a function value —
+    // runtime-managed, no constraint, exactly like `fold`). The predicate
+    // overloads (`First(pred)` etc.) likewise contribute only the receiver.
+    // // per §28.3 v0.194 / stdlib §5
+    {
+        const std::string_view mem = ma->member;
+        // Element access: `First`/`Last`/`Single` (+ `*OrNull`), each 0-arg or a
+        // single predicate arg; `ElementAt(index)`, a single `int` arg.
+        const bool elementAccess =
+            (mem == "First" || mem == "FirstOrNull" || mem == "Last" ||
+             mem == "LastOrNull" || mem == "Single" || mem == "SingleOrNull") &&
+            ce.args.size() <= 1;
+        const bool elementAt = mem == "ElementAt" && ce.args.size() == 1;
+        // No-selector `Min()`/`Max()` (§5.1, 0-arg) and selector
+        // `Min<U>/Max<U>(sel)` (§5, a single function arg). `Math.Min`/`Max` were
+        // already handled and returned above, so a `Min`/`Max` reaching here is
+        // the LINQ receiver form.
+        const bool minMax = (mem == "Min" || mem == "Max") && ce.args.size() <= 1;
+        if (elementAccess || elementAt || minMax) {
+            // The receiver root is a source UNCONDITIONALLY — do NOT gate it on
+            // isBorrowableType(receiver) as pushRootIfBorrowable does for
+            // ARGUMENTS. The receiver of a LINQ sequence operator is a builtin
+            // collection (`Array`/`OwningArray`/the lazy `IEnumerable` sentinel),
+            // whose resolved TypeRef carries a NULL `declaration` — so the
+            // borrowable predicate (which reads `false` for a null-declaration
+            // Named ref, treating it as a bare type parameter) would wrongly drop
+            // it. The borrowable-RESULT gate above already decided this is a
+            // borrow; the receiver it is borrowed from is definitionally its
+            // source, mirroring bareTypeParamCallSourceRoots (which likewise
+            // pushes the receiver root without a borrowable check, gating only
+            // arguments). // per §28.3 v0.194 / stdlib §5
+            noteTemp(ma->target.get());
+            if (const ast::IdentifierExpr* root = identifierRoot(*ma->target))
+                if (sema::Symbol* s = ctx_.exprSymbol(*root))
+                    info.sources.push_back(s);
+            info.recognized = !info.sources.empty() || info.unboundOwnedTemp;
+            return info;
+        }
+    }
+
     return info;
 }
 

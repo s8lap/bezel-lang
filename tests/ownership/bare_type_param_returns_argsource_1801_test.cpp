@@ -376,3 +376,207 @@ BEZEL_TEST(bare_type_param_returns_argsource,
         "return p; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ===========================================================================
+// #1876 — LINQ ELEMENT-ACCESS + no-selector Min()/Max() at a CLASS element type
+// are §28.3 *receiver-sourced borrows* (stdlib §5 "Ownership at class-typed
+// substitutions", v0.194): the result borrows the RECEIVER sequence, so a
+// consume of the receiver while the result is live freezes (S1), returning /
+// laundering the result past the receiver's lifetime is rejected (S2), and
+// disposing the result is rejected (S4/§28.6). A value-typed element result
+// attaches nothing (§28.9). Members: First/Last/Single/ElementAt (+ *OrNull +
+// predicate forms) and no-selector Min()/Max() (§5.1). Each REJECT below FAILS
+// WITHOUT THE FIX (the intrinsic had no user MethodDecl, so no source set was
+// attached and the escape compiled clean — a standing under-reject).
+// // per §28.3 v0.194 / stdlib §5
+// ===========================================================================
+
+namespace {
+
+// An owned class collection (`OwningArray<Obj>`), a comparable `Obj` (for the
+// no-selector `Min()`/`Max()` §5.1 forms), and owned sinks that consume a
+// receiver (a class collection or an int array) while a First/Min borrow is
+// live. `Obj` is a class, so `arr.First()`/`arr.Min()` return a class element
+// borrow of `arr`; `Array<int>.First()` returns an `int` value (attaches
+// nothing).
+constexpr std::string_view kLinqPrelude =
+    "module M; "
+    "class Obj: IComparable<Obj> "
+    "  public constructor() end constructor; "
+    "  destructor end destructor; "
+    "  public method CompareTo(o: Obj): int return 0; end CompareTo; "
+    "  public method Poke(): int return 1; end Poke; "
+    "end Obj; "
+    "class Sink "
+    "  public static method Arr(owned a: OwningArray<Obj>): int "
+    "    a.Dispose(); return 0; "
+    "  end Arr; "
+    "  public static method Ints(owned a: Array<int>): int "
+    "    a.Dispose(); return 0; "
+    "  end Ints; "
+    "end Sink; ";
+
+std::string linqProg(std::string_view body) {
+    return std::string(kLinqPrelude) +
+           "class Prog "
+           "  public static method Main(): int " +
+           std::string(body) +
+           "  end Main; "
+           "end Prog;";
+}
+
+}  // namespace
+
+// REJECT: `var e := arr.First();` binds a borrow of a receiver element; consuming
+// the receiver `arr` (an `owned` transfer into the sink) while `e` has a later
+// use is a consume-site freeze. FAILS WITHOUT THE FIX (compiled clean; `e`
+// dangled after `arr` was disposed). // §28.3 v0.194 / stdlib §5
+BEZEL_TEST(bare_type_param_returns_argsource,
+           n1876_first_consume_receiver_freeze_rejected_spec_28_3) {
+    auto r = parseAndCheckOwnership(linqProg(
+        "var arr := new OwningArray<Obj>(); "
+        "arr.Add(new Obj()); "
+        "var e := arr.First(); "
+        "var _ := Sink.Arr(owned arr); "  // consume the receiver while `e` is live
+        "var p := e.Poke(); "
+        "return p; "));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(errorSays(r, "cannot consume `arr`"));
+    BEZEL_EXPECT_TRUE(errorSays(r, "borrow held by `e`"));
+}
+
+// ACCEPT (over-reject guard): the SAME shape with the receiver consumed AFTER the
+// borrow's last use — the borrow is dead at the consume, nothing freezes.
+BEZEL_TEST(bare_type_param_returns_argsource,
+           n1876_first_consume_after_last_use_accepted_spec_28_3) {
+    auto r = parseAndCheckOwnership(linqProg(
+        "var arr := new OwningArray<Obj>(); "
+        "arr.Add(new Obj()); "
+        "var e := arr.First(); "
+        "var p := e.Poke(); "             // last use of the borrow
+        "var _ := Sink.Arr(owned arr); "  // now safe — the borrow is dead
+        "return p; "));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// REJECT via RETURN: `var m := arr.Min(); return m;` returns a borrow of the
+// local receiver `arr`, which is disposed at scope end — the borrow outlives its
+// source. An INSTANCE method, so the return is not first rejected by the
+// static-borrow-return rule (#1547). FAILS WITHOUT THE FIX (no source attached;
+// `arr` was auto-dropped and the borrow escaped silently). // §28.3 / §5.1 v0.194
+BEZEL_TEST(bare_type_param_returns_argsource,
+           n1876_min_result_return_escapes_receiver_rejected_spec_28_3) {
+    auto r = parseAndCheckOwnership(
+        std::string(kLinqPrelude) +
+        "class Prog "
+        "  public constructor() end constructor; "
+        "  destructor end destructor; "
+        "  public method GetMin(): Obj "
+        "    var arr := new OwningArray<Obj>(); "
+        "    arr.Add(new Obj()); "
+        "    var m := arr.Min(); "
+        "    return m; "
+        "  end GetMin; "
+        "  public static method Main(): int return 0; end Main; "
+        "end Prog;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(errorSays(r, "carries a borrow of `arr`"));
+}
+
+// REJECT: `e.Dispose()` on a `arr.First()` borrow result — the caller does not
+// own it, so disposing it would free a value the receiver still owns (a latent
+// double-owner). FAILS WITHOUT THE FIX (a `.Dispose()` on the unrecognized holder
+// was silently admitted). // §28.6 / §28.3 v0.194
+BEZEL_TEST(bare_type_param_returns_argsource,
+           n1876_dispose_of_first_borrow_rejected_spec_28_6) {
+    auto r = parseAndCheckOwnership(linqProg(
+        "using var arr := new OwningArray<Obj>(); "
+        "arr.Add(new Obj()); "
+        "var e := arr.First(); "
+        "e.Dispose(); "
+        "return 0; "));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(
+        errorSays(r, "cannot call `Dispose()` on a bare-type-parameter call "
+                     "result"));
+}
+
+// REJECT: `arr.Last()` — element-access borrows the receiver exactly as `First`;
+// consuming the receiver while the borrow is live freezes.
+BEZEL_TEST(bare_type_param_returns_argsource,
+           n1876_last_consume_receiver_freeze_rejected_spec_28_3) {
+    auto r = parseAndCheckOwnership(linqProg(
+        "var arr := new OwningArray<Obj>(); "
+        "arr.Add(new Obj()); "
+        "var e := arr.Last(); "
+        "var _ := Sink.Arr(owned arr); "
+        "var p := e.Poke(); "
+        "return p; "));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(errorSays(r, "cannot consume `arr`"));
+    BEZEL_EXPECT_TRUE(errorSays(r, "borrow held by `e`"));
+}
+
+// REJECT: `arr.ElementAt(0)` — positional element-access borrows the receiver.
+BEZEL_TEST(bare_type_param_returns_argsource,
+           n1876_element_at_consume_receiver_freeze_rejected_spec_28_3) {
+    auto r = parseAndCheckOwnership(linqProg(
+        "var arr := new OwningArray<Obj>(); "
+        "arr.Add(new Obj()); "
+        "var e := arr.ElementAt(0); "
+        "var _ := Sink.Arr(owned arr); "
+        "var p := e.Poke(); "
+        "return p; "));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(errorSays(r, "cannot consume `arr`"));
+    BEZEL_EXPECT_TRUE(errorSays(r, "borrow held by `e`"));
+}
+
+// REJECT: `arr.FirstOrNull()` — the `*OrNull` form returns `Obj?`, a nullable
+// class borrow of the receiver (stdlib §5's note includes the `*OrNull` forms).
+BEZEL_TEST(bare_type_param_returns_argsource,
+           n1876_first_or_null_consume_receiver_freeze_rejected_spec_28_3) {
+    auto r = parseAndCheckOwnership(linqProg(
+        "var arr := new OwningArray<Obj>(); "
+        "arr.Add(new Obj()); "
+        "var e := arr.FirstOrNull(); "
+        "var _ := Sink.Arr(owned arr); "
+        "var p := e!.Poke(); "
+        "return p; "));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(errorSays(r, "cannot consume `arr`"));
+    BEZEL_EXPECT_TRUE(errorSays(r, "borrow held by `e`"));
+}
+
+// REJECT: `arr.First((o) => true)` — the predicate overload restricts to matching
+// elements but still returns a receiver-sourced element borrow (the predicate is
+// a function value, runtime-managed, contributing no source of its own).
+BEZEL_TEST(bare_type_param_returns_argsource,
+           n1876_first_predicate_consume_receiver_freeze_rejected_spec_28_3) {
+    auto r = parseAndCheckOwnership(linqProg(
+        "var arr := new OwningArray<Obj>(); "
+        "arr.Add(new Obj()); "
+        "var e := arr.First((o: Obj) => true); "
+        "var _ := Sink.Arr(owned arr); "
+        "var p := e.Poke(); "
+        "return p; "));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(errorSays(r, "cannot consume `arr`"));
+    BEZEL_EXPECT_TRUE(errorSays(r, "borrow held by `e`"));
+}
+
+// ACCEPT (§28.9 value-substitution gate): on an `Array<int>` the element type is
+// a VALUE type, so `arr.First()` returns an `int` COPY, not a borrow — it
+// attaches no liveness constraint and consuming the receiver is admitted. This is
+// the exact receiver/consume shape the class case above rejects; only the element
+// type differs. // §28.9 v0.194
+BEZEL_TEST(bare_type_param_returns_argsource,
+           n1876_value_typed_element_attaches_nothing_accepted_spec_28_9) {
+    auto r = parseAndCheckOwnership(linqProg(
+        "var arr := new Array<int>(); "
+        "arr.Add(5); "
+        "var e := arr.First(); "
+        "var _ := Sink.Ints(owned arr); "  // consuming the receiver is fine — `e` is a copy
+        "return e; "));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
