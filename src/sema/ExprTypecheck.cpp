@@ -690,6 +690,27 @@ static InvMatch matchLeafInvariant(
     return InvMatch::Unknown;
 }
 
+// §19.6 (v0.196, #1816 s3): format the missing-coverage obligation for an
+// UNDETERMINED generic leaf whose parameter(s) have NO occurrence in the leaf's
+// root instantiation. Such a parameter is free after solving against the ground
+// scrutinee, so infinitely many instantiations of the leaf inhabit `S` and no
+// single type-test arm can cover it — leaf coverage is statically UNATTAINABLE,
+// completable only by an irrefutable arm. §19.6 requires the warning to "name
+// the leaf and its undetermined parameter(s)"; this produces that text for the
+// missing-leaf list (e.g. "Tagged (undetermined parameter `U`)").
+static std::string formatMissingGenericLeaf(
+    const TypeSymbol* leaf, const std::vector<std::string_view>& params) {
+    std::string s(leaf->name);
+    s += params.size() == 1 ? " (undetermined parameter `"
+                            : " (undetermined parameters `";
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        if (i) s += "`, `";
+        s += std::string(params[i]);
+    }
+    s += "` — coverage statically unattainable, requires a `_` arm)";
+    return s;
+}
+
 } // namespace
 
 // §19.6 (v0.196, #1816): see the header comment. Walk `leaf`'s single-
@@ -783,11 +804,16 @@ ExprTC::LeafInstSolutions ExprTC::solveLeafInstantiations(
     // unbound parameter (no occurrence in the root instantiation) leaves the
     // solution set unbounded — undetermined (§19.6: "a parameter with no
     // occurrence in the root instantiation … never exempt or determined").
-    for (std::string_view nm : paramNames) {
-        if (!solved.count(nm)) {
-            result.outcome = LeafInstSolutions::Outcome::Undetermined;
-            return result;
-        }
+    // (#1816 s3) Collect the FREE parameters in declaration order, so the
+    // caller can name them in the unattainable-coverage warning; a free
+    // parameter is the OPPOSITE of s2's NoSolution — every substitution
+    // inhabits, so coverage is statically unattainable rather than exempt.
+    for (const Symbol* gp : leaf->genericParams)
+        if (gp && !solved.count(gp->name))
+            result.freeParams.push_back(gp->name);
+    if (!result.freeParams.empty()) {
+        result.outcome = LeafInstSolutions::Outcome::Undetermined;
+        return result;
     }
     result.outcome = LeafInstSolutions::Outcome::Determined;
     result.solution = std::move(solved);
@@ -1053,6 +1079,16 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
         // uncomposable chain) falls through to the name-match unchanged,
         // pending later determination lanes (rigid identity, `where`-clause
         // filtering, the `?`-split, undetermined-warning naming).
+        //
+        // (#1816 s3) Leaves the solver classifies UNDETERMINED because a
+        // parameter has NO occurrence in the root instantiation (free after a
+        // clean solve → infinitely many inhabiting instantiations) — coverage
+        // statically UNATTAINABLE. Kept in the leaf set like any other, but
+        // recorded here with their free parameter(s) so the missing-leaf
+        // computation reports them unconditionally: no type-test arm can cover
+        // such a leaf, only an irrefutable arm (already returned above).
+        std::unordered_map<const TypeSymbol*, std::vector<std::string_view>>
+            unattainable;
         if (genericsInPlay && scrutTy) {
             TypeRef scrutNonNull = *scrutTy;  // stack copy; typeRefEqual reads
             scrutNonNull.nullable = false;    // through the pointer only here
@@ -1081,10 +1117,23 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
                 if (rootInst && isFullyGroundTypeRef(rootInst) && groundScrut &&
                     !typeRefEqual(rootInst, &scrutNonNull))
                     continue;  // s1: ground-mismatch ⇒ exempt from coverage
-                if (groundScrut &&
-                    solveLeafInstantiations(lf, sub, &scrutNonNull).outcome ==
-                        LeafInstSolutions::Outcome::NoSolution)
-                    continue;  // s2: no inhabiting instantiation ⇒ exempt (§19.6)
+                if (groundScrut) {
+                    LeafInstSolutions sol =
+                        solveLeafInstantiations(lf, sub, &scrutNonNull);
+                    if (sol.outcome == LeafInstSolutions::Outcome::NoSolution)
+                        continue;  // s2: no inhabiting instantiation ⇒ exempt
+                    // s3: a FREE parameter (no occurrence in the root
+                    // instantiation) leaves infinitely many instantiations
+                    // inhabiting `S` ⇒ coverage statically unattainable. The
+                    // OPPOSITE of s2's exempt: recorded, not dropped, so the
+                    // leaf is always reported missing below (§19.6). Distinct
+                    // from the undecidable Undetermined sub-case (freeParams
+                    // empty), which stays deferred to the name-match.
+                    if (sol.outcome ==
+                            LeafInstSolutions::Outcome::Undetermined &&
+                        !sol.freeParams.empty())
+                        unattainable.emplace(lf, std::move(sol.freeParams));
+                }
                 kept.push_back(lf);
             }
             leaves = std::move(kept);
@@ -1139,15 +1188,24 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
                 }
             }
         }
-        std::vector<std::string_view> missing;
-        for (auto* lf : leaves)
-            if (!coveredLeaves.count(lf)) missing.push_back(lf->name);
+        std::vector<std::string> missing;
+        for (auto* lf : leaves) {
+            // s3: an undetermined free-parameter leaf is UNATTAINABLE by any
+            // type-test arm — always reported, naming the leaf and its
+            // undetermined parameter(s) (§19.6), regardless of name-match.
+            auto un = unattainable.find(lf);
+            if (un != unattainable.end()) {
+                missing.push_back(formatMissingGenericLeaf(lf, un->second));
+                continue;
+            }
+            if (!coveredLeaves.count(lf)) missing.push_back(std::string(lf->name));
+        }
         if (!missing.empty() || nullableUncovered) {
             std::string detail =
                 "closed hierarchy `" + std::string(sub->name) + "`";
             if (!missing.empty()) {
                 detail += " is missing leaf type(s):";
-                for (auto n : missing) detail += " " + std::string(n);
+                for (const auto& n : missing) detail += " " + n;
             }
             if (nullableUncovered)
                 detail += (missing.empty() ? " nullable value not covered"

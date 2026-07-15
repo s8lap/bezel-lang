@@ -52,6 +52,21 @@ bool hasNonExhaustiveWarning(const bezel::test::SemaResult& r) {
     return false;
 }
 
+// True iff a non-exhaustiveness warning also contains `needle` — used to assert
+// §19.6's requirement that an undetermined-leaf warning NAMES the leaf and its
+// undetermined parameter(s).
+bool nonExhaustiveWarningMentions(const bezel::test::SemaResult& r,
+                                  std::string_view needle) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Warning &&
+            d.message.find("non-exhaustive") != std::string::npos &&
+            d.message.find(needle) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 // --- Enum scrutinee (§19.6: "every declared constant has a matching
@@ -539,6 +554,63 @@ BEZEL_TEST(sema_case_exhaust, determined_missing_leaf_still_warns_spec_19_6) {
         "end Calc;");
     BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));   // Err<int> still required
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (d) s3 — the UNDETERMINED free-parameter case (spec §19.6 example, v0.196).
+// A leaf parameter with NO occurrence in the leaf's root instantiation is FREE
+// after solving against the ground scrutinee: `Tagged<U>: Message` under a
+// NON-GENERIC sealed `Message` — U never reaches the base clause `Message`, so
+// Tagged<int>, Tagged<string>, … all inhabit Message (INFINITELY many). Leaf
+// coverage is therefore statically UNATTAINABLE: a `Tagged<int>` arm names one
+// instantiation, not the leaf, so the case is NOT exhaustive without an
+// irrefutable arm, and §19.6 requires the warning to NAME the leaf and its
+// undetermined parameter(s). This is the OPPOSITE of s2's NoSolution (0
+// inhabitants ⇒ exempt): here every substitution inhabits. Fails without s3 —
+// before it, the name-match counted `var g: Tagged<int>` as covering the
+// `Tagged` leaf (the rejected "declaration-coverage" reading, §19.6) and no
+// warning fired.
+BEZEL_TEST(sema_case_exhaust, no_occurrence_param_undetermined_spec_19_6) {
+    // No irrefutable arm: Tagged is undetermined ⇒ non-exhaustive, and the
+    // warning names Tagged and its undetermined parameter U.
+    auto warned = parseSemaAll(
+        "module M; "
+        "sealed abstract class Message end Message; "
+        "sealed class Text : Message end Text; "
+        "sealed class Tagged<U> : Message end Tagged; "  // U free — Message non-generic
+        "class Calc "
+        "  public method M(m: Message): int "
+        "    var a := case m of "
+        "      var t: Text => 1, "
+        "      var g: Tagged<int> => 2 "  // one instantiation — not the leaf
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(warned));      // Tagged unattainable
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(warned, "Tagged"));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(warned, "undetermined"));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(warned, "U"));
+    BEZEL_EXPECT_FALSE(warned.diagnostics.hasErrors());
+
+    // Same hierarchy WITH a `_` catch-all — the only remedy for an undetermined
+    // leaf (§19.6): now exhaustive, no warning.
+    auto cleared = parseSemaAll(
+        "module M; "
+        "sealed abstract class Message end Message; "
+        "sealed class Text : Message end Text; "
+        "sealed class Tagged<U> : Message end Tagged; "
+        "class Calc "
+        "  public method M(m: Message): int "
+        "    var a := case m of "
+        "      var t: Text => 1, "
+        "      var g: Tagged<int> => 2, "
+        "      _ => 0 "
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(cleared));    // `_` covers the rest
+    BEZEL_EXPECT_FALSE(cleared.diagnostics.hasErrors());
 }
 
 // --- Open hierarchy (§19.6 final paragraph) --------------------------------

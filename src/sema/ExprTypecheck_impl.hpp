@@ -441,6 +441,14 @@ private:
         // The sole inhabiting substitution (leaf-param name -> ground TypeRef),
         // populated only when `outcome == Determined`.
         std::unordered_map<std::string_view, TypeRef*> solution;
+        // §19.6 (v0.196, #1816 s3): the leaf parameters left FREE after a clean
+        // solve — those with NO occurrence in the root instantiation. Populated
+        // (in declaration order) only in the free-parameter `Undetermined` sub-
+        // case; empty for the undecidable (InvMatch::Unknown) `Undetermined`
+        // sub-case. A non-empty list marks the leaf's coverage statically
+        // UNATTAINABLE (every substitution inhabits — the opposite of exempt):
+        // no type-test arm covers it, only an irrefutable arm does.
+        std::vector<std::string_view> freeParams;
     };
 
     // §19.6 (v0.196, #1816 s2): solve `leaf`'s type parameters against a GROUND
