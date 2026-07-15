@@ -94,6 +94,18 @@ struct GenericReturnContext {
     const std::vector<ast::GenericConstraint>* enclosingConstraints = nullptr;
 };
 
+// §28.1 (v0.196, #1817/#1860): true when a bare-type-parameter `owned` slot's
+// SUBSTITUTED type is a value/runtime-managed kind whose marker is erased (no
+// disposal obligation) — a primitive incl. string, a record/enum/value-builtin,
+// a non-owning inline array. Conservative in the leak-safe direction: a still-
+// generic bare-T (Named, no declaration, non-value-builtin) is NOT erased, so
+// the definition-side boundary keeps every obligation and only the concrete-
+// substitution boundary erases. Defined in Ownership.cpp near producerState;
+// shared here so the out-owned RECIPIENT gate in Ownership_Checks.cpp
+// (markOutOwnedArgs, #1860) reuses the exact classification E1 applied to the
+// owned return + owned-param seeding. // per §28.1 v0.196
+bool isValueSubstitutionErased(const sema::TypeRef* rt);
+
 class MethodOwnership {
 public:
     MethodOwnership(sema::SemaContext& ctx) : ctx_(ctx) {}

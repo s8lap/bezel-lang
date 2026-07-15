@@ -1249,13 +1249,28 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
                         llvm::ConstantPointerNull::get(ptrTy()), outSlot);
                     locals_[id2] = outSlot;
                     if (loc2 && loc2->decl) locals_[loc2->decl] = outSlot;
+                    // §28.1 (v0.196, #1860): at a value/runtime-managed
+                    // substitution the `out owned T` marker is erased, so the
+                    // recipient carries NO disposal obligation — dynamic-disposing
+                    // the erased value as an object segfaults (bz_obj_is_string on
+                    // a non-pointer). Register the class-element dispose only when
+                    // the recipient's SUBSTITUTED type is a genuine class/
+                    // interface. The Weak.TryUpgrade Shared<T> handle path is
+                    // unaffected (Weak<T> is always a reference substitution).
+                    const sema::TypeRef* recipTy =
+                        (loc2 && loc2->declType) ? loc2->declType
+                                                 : ctx_.exprType(*id2);
                     if (!disposeStack_.empty()) {
-                        Disposal disp{outSlot, nullptr};
-                        if (isUpgrade)
+                        if (isUpgrade) {
+                            Disposal disp{outSlot, nullptr};
                             disp.sharedHandle = true;  // §28.13: Shared<T> handle
-                        else
+                            disposeStack_.back().push_back(disp);
+                        } else if (outOwnedRecipientDisposes(recipTy)) {
+                            Disposal disp{outSlot, nullptr};
                             disp.dynamicDispose = true;  // §28.11: owned class elem
-                        disposeStack_.back().push_back(disp);
+                            disposeStack_.back().push_back(disp);
+                        }
+                        // value substitution: marker erased → no disposal (no-op).
                     }
                 }
             }
@@ -1321,10 +1336,19 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
                         // out (whose plain-var slot a move may not null) registers
                         // nothing — its owner disposes it — mirroring
                         // registerUnwindOwnedLocal; and on the analyzed-body guard.
+                        // §28.1 (v0.196, #1860): a value/runtime-managed
+                        // substitution erases the marker — the recipient owns
+                        // nothing, so register no disposal (dynamic-disposing the
+                        // erased value as an object segfaults). Only a genuine
+                        // class/interface substitution disposes.
+                        const sema::TypeRef* recipTy =
+                            locoo->declType ? locoo->declType
+                                            : ctx_.exprType(*idoo);
                         auto slotIt = locals_.find(locoo->decl);
                         if (slotIt != locals_.end() && !disposeStack_.empty() &&
                             currentFn_ == unwindIneligibleFn_ &&
                             !emittingDisposerBody_ &&
+                            outOwnedRecipientDisposes(recipTy) &&
                             !unwindIneligible_.count(
                                 static_cast<const void*>(locoo->decl))) {
                             Disposal d{slotIt->second, nullptr};
@@ -1375,9 +1399,18 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
                     // Otherwise register the prior unwindOnly entry (exception edge
                     // only; an explicit Dispose() / _ := item / move will handle
                     // the normal path). // per §28.3, §22.4, §28.11
+                    // §28.1 (v0.196, #1860): a value/runtime-managed substitution
+                    // erases the marker — the inline recipient owns nothing, so
+                    // register no disposal (dynamic-disposing the erased value as
+                    // an object segfaults; the ownership pass likewise leaves
+                    // autoDropAtScopeEnd false via the markOutOwnedArgs gate).
+                    const sema::TypeRef* recipTy =
+                        (locoo && locoo->declType) ? locoo->declType
+                                                   : ctx_.exprType(*idoo);
                     if (!disposeStack_.empty() &&
                         currentFn_ == unwindIneligibleFn_ &&
                         !emittingDisposerBody_ &&
+                        outOwnedRecipientDisposes(recipTy) &&
                         !unwindIneligible_.count(declKey)) {
                         Disposal d{outSlot, nullptr};
                         if (locoo && locoo->autoDropAtScopeEnd)

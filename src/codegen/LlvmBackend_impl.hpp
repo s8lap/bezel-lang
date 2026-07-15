@@ -7093,6 +7093,34 @@ private:
         return ty;
     }
 
+    // §28.1 (v0.196, #1817 E1 / #1860): does an `out owned T` RECIPIENT of type
+    // `rt` carry a scope-end disposal obligation at THIS substitution?  Only a
+    // genuine class/interface substitution does; at a value/runtime-managed
+    // substitution the marker is erased (§28.1) — a primitive incl. string, a
+    // record/enum, or a value-builtin (DateTime/Guid/…, whose declaration kind
+    // is Class but is `isValueBuiltin`) carries no obligation.  Root `Object`
+    // (Primitive::Object) is the class-like exception and DOES dispose.  Mirrors
+    // the ownership pass's `isValueSubstitutionErased` (its inverse over the
+    // heap-obligation cases), the drift locus these two must track.  Resolves a
+    // bare-T ref through the ACTIVE substitution first (the recipient is
+    // monomorphic here), so a class instantiation still disposes and a value one
+    // is a clean no-op.  Gates ensureOutVarSlots' out-owned dispose emission so
+    // the erased value is not dynamic-disposed as an object.  // per §28.1 v0.196
+    bool outOwnedRecipientDisposes(const sema::TypeRef* rt) const {
+        auto genuineHeapObligation = [](const sema::TypeRef* t) {
+            if (!t) return false;
+            if (t->kind == sema::TypeRef::Kind::Primitive)
+                return t->primitive == sema::PrimitiveType::Object;
+            if (t->kind != sema::TypeRef::Kind::Named || !t->declaration)
+                return false;
+            if (t->declaration->isValueBuiltin) return false;  // value type
+            return t->declaration->kind == ast::TypeDeclKind::Class ||
+                   t->declaration->kind == ast::TypeDeclKind::Interface;
+        };
+        return genuineHeapObligation(rt) ||
+               genuineHeapObligation(resolveTypeParamRef(rt));
+    }
+
     // fix #568 / §14.1 / §7.1: given a NULLABLE bare type-parameter ref `ty`
     // (`T?`), resolve `T` to its concrete substituted sema type and write a
     // NULLABLE COPY of it into `out` (so isNullableValueTy / nullableValueStructTy

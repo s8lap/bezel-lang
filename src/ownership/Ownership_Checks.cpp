@@ -4207,6 +4207,24 @@ void MethodOwnership::markOutOwnedArgs(
         if (userOutOwned || builtinOutOwned) {
             if (auto* id =
                     dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+                // §28.1 (v0.196, #1860): the out-owned RECIPIENT's marker is
+                // ERASED at a value/runtime-managed substitution — the recipient
+                // is a plain value with NO disposal obligation, so it must not be
+                // classified Owned (a spurious §28.3 auto-drop warning + a bogus
+                // scope-end dispose otherwise; the codegen segfault half is gated
+                // in ensureOutVarSlots). Key off the recipient local's
+                // SUBSTITUTED type KIND, mirroring the E1 gate on the owned return
+                // + owned-param seeding: a still-generic bare-T recipient resolves
+                // to a Named with no declaration and is NOT erased (leak-safe), so
+                // the abstract definition-side boundary keeps its obligation and
+                // only the concrete-substitution boundary erases. // per §28.1
+                // v0.196 #1860 (#1817 E1)
+                const sema::TypeRef* recipTy = nullptr;
+                if (sema::Symbol* rs = ctx_.exprSymbol(*id))
+                    if (auto* ls = dynamic_cast<sema::LocalSymbol*>(rs))
+                        recipTy = ls->declType;
+                if (!recipTy) recipTy = ctx_.exprType(*id);
+                if (isValueSubstitutionErased(recipTy)) { ++pos; continue; }
                 // §22.4 / v0.160 (#1305): `out owned var x` declares a FRESH
                 // local inline.  The LocalSymbol was registered in
                 // currentScope_ by ExprTypecheck_Exprs.cpp, but the ownership

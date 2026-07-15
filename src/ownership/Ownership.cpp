@@ -58,10 +58,9 @@ void scanReassignStmts(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                        std::unordered_set<const sema::Symbol*>& out);
 }  // namespace
 
-// §28.1 (v0.196, #1817): forward declaration — true when a bare-type-parameter
-// `owned` slot's SUBSTITUTED type is a value/runtime-managed kind whose marker
-// is erased (no disposal obligation). Definition lives below near producerState.
-static bool isValueSubstitutionErased(const sema::TypeRef* rt);
+// §28.1 (v0.196, #1817/#1860): isValueSubstitutionErased is declared in
+// Ownership_impl.hpp (external linkage) so the out-owned RECIPIENT gate in
+// Ownership_Checks.cpp reuses it; the definition lives below near producerState.
 
 void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
          const std::vector<sema::Symbol*>* paramSyms, bool isAsync,
@@ -2078,7 +2077,7 @@ static bool isClassOrInterfaceResult(const sema::TypeRef* rt) {
 // unresolved/imported reference) is NOT erased, because erasing a class
 // substitution there would leak its resource; keeping the marker over-warns at
 // worst, never under-disposes. // per §28.1 v0.196 #1817
-static bool isValueSubstitutionErased(const sema::TypeRef* rt) {
+bool isValueSubstitutionErased(const sema::TypeRef* rt) {
     if (!rt) return false;
     switch (rt->kind) {
         case sema::TypeRef::Kind::Primitive:

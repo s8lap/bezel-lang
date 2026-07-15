@@ -4046,6 +4046,32 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         // narrowing and ordinary null checks on it apply; a
                         // non-nullable `out owned T` parameter is unaffected
                         // (declType->nullable is already false).
+                        //
+                        // §28.1 / §22.4 (v0.196, #1860): the formal type is the
+                        // callee's UNSUBSTITUTED parameter. For a GENERIC method
+                        // — including a CLASS-generic one
+                        // (`Factory<T>.TryMake(out owned result: T)`) — resolve
+                        // it through the RECEIVER's concrete generic args so the
+                        // recipient carries its SUBSTITUTED type (`T`→`int`), not
+                        // the bare `T`. Left as bare-`T`, codegen lowers the
+                        // recipient to a pointer and a value read (`n.ToString()`)
+                        // dispatches it as an object → SIGSEGV at a value
+                        // substitution, and the ownership pass cannot see the
+                        // §28.1 marker erasure so it draws a spurious §28.3 auto-
+                        // drop warning. Generalizes the #807 interface
+                        // substitution the plain `out var` handler does above to
+                        // any generic parent; a non-generic / non-member callee
+                        // is a no-op (substituteMemberType returns its input).
+                        if (lsym->declType && calleeParent2 &&
+                            !calleeParent2->genericParams.empty()) {
+                            if (auto* maCal =
+                                    dynamic_cast<const ast::MemberAccessExpr*>(
+                                        ce->callee.get()))
+                                if (maCal->target)
+                                    lsym->declType = substituteMemberType(
+                                        lsym->declType, maCal->target.get(),
+                                        calleeParent2);
+                        }
                     }
                     // §28.11 / v0.160 (#1305): for BUILTIN owning-collection Try*
                     // methods (TryPop/TryDequeue/TryPopFirst/TryPopLast/TryTake/
@@ -4169,6 +4195,26 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         calleeMd2->params[pos2].type) {
                         lsym->declType = ctx_.resolvedType(
                             *calleeMd2->params[pos2].type);
+                        // §28.1 / §22.4 (v0.196, #1860): resolve a GENERIC
+                        // method's formal `out owned T` through the RECEIVER's
+                        // concrete generic args (incl. a CLASS-generic
+                        // `Factory<T>.TryMake`) so the `out using var` recipient
+                        // carries its SUBSTITUTED type (`T`→`int`), not the bare
+                        // `T`. See the parallel note in the `out owned var`
+                        // handler above: a bare-`T` recipient lowers to a pointer
+                        // and a value read dispatches as an object → SIGSEGV at a
+                        // value substitution. A non-generic / non-member callee is
+                        // a no-op. // per §28.1 v0.196 #1860
+                        if (lsym->declType && calleeParent2 &&
+                            !calleeParent2->genericParams.empty()) {
+                            if (auto* maCal =
+                                    dynamic_cast<const ast::MemberAccessExpr*>(
+                                        ce->callee.get()))
+                                if (maCal->target)
+                                    lsym->declType = substituteMemberType(
+                                        lsym->declType, maCal->target.get(),
+                                        calleeParent2);
+                        }
                     }
                     // Derive the type from the builtin receiver.
                     if (!lsym->declType) {
