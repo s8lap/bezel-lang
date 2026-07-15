@@ -560,7 +560,97 @@ bool hasModifier(const TypeSymbol* t, std::string_view m) {
     return false;
 }
 
+// §19.6 (v0.196, #1816): is `t` a FULLY GROUND type — one with no rigid/param
+// component anywhere? A `Named` TypeRef with `declaration == nullptr` is a
+// rigid type-parameter reference (a bare `T` left declaration-less by type
+// resolution) — or a null-declaration stdlib builtin; BOTH are treated as
+// non-ground. This is the soundness guard the ground-mismatch exemption rests
+// on: typeRefEqual compares by `declaration` pointer and is BLIND to a null
+// declaration (§ TypeResolution typeRefEqual), so a rigid `T` inside either
+// operand could be mistaken for a ground type and wrongly report inequality —
+// wrongly exempting an inhabited leaf. Requiring both operands fully ground
+// before typeRefEqual makes a `false` result mean genuine ground inequality.
+// Conservative on purpose: fewer exemptions, never a wrong one.
+bool isFullyGroundTypeRef(const TypeRef* t) {
+    if (!t) return false;
+    switch (t->kind) {
+        case TypeRef::Kind::Primitive:
+        case TypeRef::Kind::Unit:
+            return true;
+        case TypeRef::Kind::Named:
+            if (!t->declaration) return false;  // rigid param / null-decl builtin
+            for (const auto* ga : t->genericArgs)
+                if (!isFullyGroundTypeRef(ga)) return false;
+            return true;
+        case TypeRef::Kind::InlineArray:
+            return isFullyGroundTypeRef(t->arrayElement);
+        case TypeRef::Kind::Function: {
+            for (const auto& fp : t->funcParams)
+                if (!isFullyGroundTypeRef(fp.type)) return false;
+            return isFullyGroundTypeRef(t->funcReturn);
+        }
+        case TypeRef::Kind::Error:
+            return false;
+    }
+    return false;
+}
+
 } // namespace
+
+// §19.6 (v0.196, #1816): see the header comment. Walk `leaf`'s single-
+// inheritance class chain up to `root`, composing the base-clause type-arg
+// substitutions level by level, and return `root`'s instantiation expressed
+// in `leaf`'s own type parameters. Template: the base-chain compose loop in
+// ExprTypecheck_Calls.cpp (substituteMemberType), which walks a derived class
+// up to a parent composing type-arg bindings and substitutes with
+// substituteReturnType.
+TypeRef* ExprTC::leafRootInstantiation(TypeSymbol* leaf, TypeSymbol* root) {
+    if (!leaf || !root || leaf == root) return nullptr;
+    const TypeSymbol* cur = leaf;
+    // curSubst maps cur's generic-param NAME -> the TypeRef it stands for,
+    // expressed in `leaf`'s own params. Empty at `leaf` itself = identity
+    // (leaf's params are not keys, so substituteReturnType passes them through
+    // unchanged). Composed forward at each derivation step.
+    std::unordered_map<std::string_view, TypeRef*> curSubst;
+    std::unordered_set<const TypeSymbol*> seen;
+    while (cur && cur != root) {
+        if (!seen.insert(cur).second) return nullptr;  // cycle guard
+        // The single class base (base clauses list the base class first, then
+        // interfaces; §11 single inheritance). baseTypeRefs is parallel to
+        // baseTypes and carries the base instantiation's generic args.
+        const TypeSymbol* base = nullptr;
+        TypeRef* baseRef = nullptr;
+        for (std::size_t bi = 0; bi < cur->baseTypes.size(); ++bi) {
+            if (cur->baseTypes[bi] &&
+                cur->baseTypes[bi]->kind == ast::TypeDeclKind::Class) {
+                base = cur->baseTypes[bi];
+                baseRef =
+                    (bi < cur->baseTypeRefs.size()) ? cur->baseTypeRefs[bi]
+                                                    : nullptr;
+                break;
+            }
+        }
+        if (!base || !baseRef) return nullptr;  // broken / unresolved chain
+        // Re-express the base instantiation in leaf's params by substituting
+        // cur's params (which curSubst already maps to leaf params).
+        TypeRef* baseInLeaf = substituteReturnType(baseRef, curSubst);
+        if (base == root) return baseInLeaf;  // the composed root instantiation
+        // Compose forward: base's param -> the arg it received, in leaf params.
+        std::unordered_map<std::string_view, TypeRef*> nextSubst;
+        if (!base->genericParams.empty()) {
+            if (!baseInLeaf ||
+                baseInLeaf->genericArgs.size() != base->genericParams.size())
+                return nullptr;  // arity mismatch — unresolvable generic link
+            for (std::size_t gi = 0; gi < base->genericParams.size(); ++gi)
+                if (base->genericParams[gi])
+                    nextSubst[base->genericParams[gi]->name] =
+                        baseInLeaf->genericArgs[gi];
+        }
+        cur = base;
+        curSubst = std::move(nextSubst);
+    }
+    return nullptr;  // `root` not reached on the class chain
+}
 
 // §19.6: emit a non-exhaustiveness WARNING for an expression-position
 // `case` whose arms the compiler cannot prove cover every possible value.
@@ -793,6 +883,48 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
             warn("class hierarchy rooted at `" + std::string(sub->name) +
                  "` is open");
             return;
+        }
+
+        // §19.6 (v0.196, #1816): generic-leaf determination. When the root or
+        // any leaf/intermediate is generic — or the scrutinee is an
+        // instantiation `D<s…>` — *leaf type* means the leaf INSTANTIATION
+        // admitted at the scrutinee's static type, not merely the leaf
+        // declaration. This gate is OFF for a wholly non-generic hierarchy
+        // (`scrutTy` has no generic args and no class in the closed set is
+        // generic), in which case the name-match below runs unchanged.
+        bool genericsInPlay =
+            (scrutTy && !scrutTy->genericArgs.empty()) ||
+            !sub->genericParams.empty();
+        for (auto* d : descendants)
+            if (!d->genericParams.empty()) genericsInPlay = true;
+
+        // FIRST TRICHOTOMY SLICE (v0.196 "No inhabiting instantiation" edge —
+        // ground mismatch ⇒ exempt): a leaf whose composed ROOT INSTANTIATION
+        // is fully ground and DECIDABLY UNEQUAL to the (non-nullable) scrutinee
+        // type is uninhabited at `S` by invariance — no value of static type
+        // `S` has that leaf's instantiation as its runtime class — so it is
+        // EXEMPT and needs no arm (e.g. `IntBox: Box<int>` under `Box<string>`).
+        // Both operands are required fully ground before typeRefEqual so its
+        // null-declaration blindness cannot mistake a rigid `T` for a ground
+        // type and wrongly exempt an inhabited leaf. Every OTHER shape (a
+        // non-ground root instantiation, a ground-equal one, or an
+        // uncomposable chain) falls through to the name-match unchanged,
+        // pending later determination lanes (rigid identity, `where`-clause
+        // filtering, the `?`-split, undetermined-warning naming).
+        if (genericsInPlay && scrutTy) {
+            TypeRef scrutNonNull = *scrutTy;  // stack copy; typeRefEqual reads
+            scrutNonNull.nullable = false;    // through the pointer only here
+            std::vector<TypeSymbol*> kept;
+            kept.reserve(leaves.size());
+            for (auto* lf : leaves) {
+                TypeRef* rootInst = leafRootInstantiation(lf, sub);
+                if (rootInst && isFullyGroundTypeRef(rootInst) &&
+                    isFullyGroundTypeRef(&scrutNonNull) &&
+                    !typeRefEqual(rootInst, &scrutNonNull))
+                    continue;  // uninhabited at S — exempt from coverage
+                kept.push_back(lf);
+            }
+            leaves = std::move(kept);
         }
 
         // Collect the leaf types covered by an unguarded type-test arm.

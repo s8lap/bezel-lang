@@ -414,6 +414,20 @@ private:
     // catch-all that is always exhaustive.
     void checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy);
 
+    // §19.6 (v0.196, #1816): compose a leaf class's ROOT INSTANTIATION — the
+    // instantiation of the root declaration `root` that `leaf` derives from,
+    // obtained by composing the base-clause substitutions along `leaf`'s
+    // single-inheritance derivation chain (unique per §19.6). The result is a
+    // Named TypeRef of `root` whose generic args are expressed in LEAF's own
+    // type parameters: for `IntBox: Box<int>` it is `Box<int>`; for
+    // `L<Y>: M<Y>` with `M<Z>: D<Array<Z>>` it is `D<Array<Y>>`. Returns null
+    // when the chain cannot be composed (a missing/unresolved base ref, a
+    // generic base link with mismatched arity, a cycle, or `root` not on the
+    // class chain) — the caller then falls back to today's name-match. Reads
+    // baseTypeRefs (parallel to baseTypes, carrying generic args) and reuses
+    // substituteReturnType as the per-level substitution engine.
+    TypeRef* leafRootInstantiation(TypeSymbol* leaf, TypeSymbol* root);
+
     // §5.1 / §19 (#1153): range-check each integer `case` pattern constant /
     // range-bound literal against an integer scrutinee's type. A literal that
     // does not fit was silently truncated to the scrutinee width at codegen

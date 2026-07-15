@@ -391,6 +391,64 @@ BEZEL_TEST(sema_case_exhaust, sealed_hierarchy_bare_type_patterns_ok_spec_19_3) 
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// --- Generic leaves: the determination rule (§19.6, v0.196) ----------------
+//
+// §19.6 (v0.196) "Generic leaves: the determination rule", the "No inhabiting
+// instantiation … ground mismatch ⇒ exempt" edge: when the closed hierarchy's
+// root is generic, *leaf type* means the leaf INSTANTIATION admitted at the
+// scrutinee's static type. A leaf whose composed root instantiation is a ground
+// type distinct from the scrutinee's instantiation is UNINHABITED at S — "by
+// invariance no value of static type `S` has an instantiation of `L` as its
+// runtime class" — and is EXEMPT from coverage: "an exempt leaf needs no arm."
+//
+// `Box<T>` with `IntBox: Box<int>` and `StrBox: Box<string>`, scrutinee
+// `Box<string>`: IntBox's root instantiation `Box<int>` is ground and unequal
+// to `Box<string>`, so IntBox is exempt; covering StrBox alone is exhaustive.
+// Before the s1 fix the name-match added IntBox to the leaf set and drew a
+// spurious "missing leaf type(s): IntBox" warning.
+BEZEL_TEST(sema_case_exhaust, generic_ground_mismatch_leaf_exempt_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Box<T> end Box; "
+        "sealed class IntBox : Box<int> end IntBox; "
+        "sealed class StrBox : Box<string> end StrBox; "
+        "class Calc "
+        "  public method M(b: Box<string>): int "
+        "    var a := case b of "
+        "      var s: StrBox => 0 "  // IntBox is uninhabited at Box<string>
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));  // IntBox exempt — no arm
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// Companion: the exemption is gated on generics being in play, so a wholly
+// non-generic closed hierarchy is UNAFFECTED — a genuinely-missing leaf still
+// draws the warning (the gate-off name-match path is unchanged). This pins the
+// guard that the s1 filter never suppresses a real missing-leaf diagnostic.
+BEZEL_TEST(sema_case_exhaust,
+           nongeneric_missing_leaf_unaffected_by_generic_filter_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Shape end Shape; "
+        "sealed class Circle : Shape end Circle; "
+        "sealed class Square : Shape end Square; "
+        "sealed class Triangle : Shape end Triangle; "
+        "class Calc "
+        "  public method M(s: Shape): int "
+        "    var a := case s of "
+        "      var c: Circle => 1, "
+        "      var q: Square => 2 "  // Triangle genuinely missing, no `_`
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));   // Triangle still required
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // --- Open hierarchy (§19.6 final paragraph) --------------------------------
 
 // "When the hierarchy is open (the base is not sealed ...), exhaustiveness
