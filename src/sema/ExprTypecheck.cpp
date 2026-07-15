@@ -835,6 +835,50 @@ static std::string formatMissingGenericLeaf(
     return s;
 }
 
+// §19.6 (v0.196, #1816 s5): the three-valued value/reference category of a
+// FULLY-GROUND solved type, mirroring Resolver::categorize (§14.2 value table).
+// Used to decide a `class` / `value` scalar `where`-constraint against a leaf's
+// ground solution. A ground solution carries a declaration on every Named node
+// (isFullyGroundTypeRef), so Unknown is only the defensive fallback — and the
+// caller acts ONLY on the definite Value / Reference verdict, never on Unknown
+// (never a false exemption of an inhabited leaf).
+enum class GroundCat { Reference, Value, Unknown };
+static GroundCat groundCategorize(const TypeRef* a) {
+    if (!a) return GroundCat::Unknown;
+    switch (a->kind) {
+        case TypeRef::Kind::Unit:         // the unit type is a value type (§14.2)
+        case TypeRef::Kind::InlineArray:  // inline arrays are value types (§15.1)
+            return GroundCat::Value;
+        case TypeRef::Kind::Function:     // function values are reference (§14.2)
+            return GroundCat::Reference;
+        case TypeRef::Kind::Primitive:
+            // `string` / `Object` are reference; every other primitive
+            // (bool/char/numerics) is a value type (§14.2 / §3).
+            return (a->primitive == PrimitiveType::String ||
+                    a->primitive == PrimitiveType::Object)
+                       ? GroundCat::Reference
+                       : GroundCat::Value;
+        case TypeRef::Kind::Named:
+            // Classes and interfaces are reference types; records and enums are
+            // value types (§9 / §10 / §14.2). A ground Named always carries a
+            // declaration.
+            if (a->declaration) {
+                switch (a->declaration->kind) {
+                    case ast::TypeDeclKind::Class:
+                    case ast::TypeDeclKind::Interface:
+                        return GroundCat::Reference;
+                    case ast::TypeDeclKind::Record:
+                    case ast::TypeDeclKind::Enum:
+                        return GroundCat::Value;
+                }
+            }
+            return GroundCat::Unknown;
+        case TypeRef::Kind::Error:
+            return GroundCat::Unknown;
+    }
+    return GroundCat::Unknown;
+}
+
 } // namespace
 
 // §19.6 (v0.196, #1816): see the header comment. Walk `leaf`'s single-
@@ -939,6 +983,18 @@ ExprTC::LeafInstSolutions ExprTC::solveLeafInstantiations(
         result.outcome = LeafInstSolutions::Outcome::Undetermined;
         return result;
     }
+    // (#1816 s5) CLAUSE (b): filter the sole ground solution by the leaf-chain
+    // scalar `where`-constraints. A solution that PROVABLY violates a
+    // class/value/notnull/new constraint on the leaf or any base along its
+    // derivation chain is not a well-formed instantiation (§14.2) — the
+    // singleton solution set is emptied ⇒ the leaf is uninhabited at `S` and
+    // EXEMPT (§19.6 v0.196: "every solution fails clause (b) … uninhabited …
+    // exempt"). Only the fully-bound Determined case is filtered; a free
+    // parameter (above) already left the set unbounded whatever its bounds.
+    if (leafSolutionViolatesScalarConstraint(leaf, root, solved)) {
+        result.outcome = LeafInstSolutions::Outcome::NoSolution;
+        return result;
+    }
     result.outcome = LeafInstSolutions::Outcome::Determined;
     result.solution = std::move(solved);
     return result;
@@ -1000,6 +1056,193 @@ ExprTC::LeafInstSolutions ExprTC::solveLeafInstantiationsRigid(
     result.outcome = LeafInstSolutions::Outcome::Determined;
     result.solution = std::move(solved);
     return result;
+}
+
+// §19.6 (v0.196, #1816 s5): does a FULLY-GROUND solved type PROVABLY satisfy a
+// `new` (accessible parameterless ctor) constraint? Mirrors
+// Resolver::argSatisfiesNew (§14.2 / §17.11), reoriented to a ground leaf
+// solution. `decided` is left false whenever the answer is not verifiable here —
+// the caller then KEEPS the solution (a `new` filter never causes a false
+// exemption of an inhabited leaf).
+bool ExprTC::groundSatisfiesNew(const TypeRef* arg, bool& decided) {
+    decided = false;
+    if (!arg) return false;
+    if (arg->kind == TypeRef::Kind::Primitive) {
+        // `string` / `Object` are reference primitives — undecided here (the
+        // conservative default). Every value primitive has a well-defined zero.
+        if (arg->primitive == PrimitiveType::String ||
+            arg->primitive == PrimitiveType::Object)
+            return false;
+        decided = true;
+        return true;
+    }
+    if (arg->kind == TypeRef::Kind::Unit ||
+        arg->kind == TypeRef::Kind::InlineArray) {
+        decided = true;  // value types with a well-defined default (§17.11)
+        return true;
+    }
+    if (arg->kind == TypeRef::Kind::Named && arg->declaration) {
+        TypeSymbol* d = arg->declaration;
+        if (d->kind == ast::TypeDeclKind::Enum) {
+            decided = true;  // enum default is the underlying-0 value (§17.11)
+            return true;
+        }
+        if (d->kind == ast::TypeDeclKind::Interface) {
+            decided = true;
+            return false;  // interfaces are not constructible (§11.2)
+        }
+        if (d->kind == ast::TypeDeclKind::Record) {
+            // A positional record satisfies new() iff default(R) is well-defined
+            // — every field has a well-defined default (§14.2 / §17.11): reject a
+            // non-nullable reference field.
+            auto* td = dynamic_cast<const ast::TypeDecl*>(d->decl);
+            if (!td) return false;  // can't verify — defer (decided stays false)
+            decided = true;
+            for (const auto& pf : td->positionalFields) {
+                if (!pf.type) continue;
+                TypeRef* ft = ctx_.resolvedType(*pf.type);
+                if (!ft) { decided = false; return false; }  // can't verify
+                if (ft->nullable) continue;  // nullable field → defaults null
+                if (groundCategorize(ft) == GroundCat::Reference)
+                    return false;  // non-nullable reference field: no default
+            }
+            return true;
+        }
+        if (d->kind == ast::TypeDeclKind::Class) {
+            // A class satisfies new() iff it has an accessible parameterless
+            // constructor, or declares no constructor at all (the implicit
+            // default). A non-empty primary param list is a non-parameterless
+            // constructor (mirroring Resolver::argSatisfiesNew).
+            auto* td = dynamic_cast<const ast::TypeDecl*>(d->decl);
+            if (td && td->hasPositionalFields && !td->positionalFields.empty()) {
+                decided = true;
+                return false;  // primary ctor has parameters
+            }
+            std::vector<const ConstructorSymbol*> ctors;
+            for (Symbol* m : d->members)
+                if (auto* cs = dynamic_cast<const ConstructorSymbol*>(m))
+                    if (!cs->isStatic) ctors.push_back(cs);
+            decided = true;
+            if (ctors.empty()) return true;  // implicit default ctor
+            for (const ConstructorSymbol* cs : ctors)
+                if (cs->params.empty() &&
+                    cs->visibility != ast::Visibility::Private)
+                    return true;  // accessible parameterless ctor
+            return false;
+        }
+    }
+    // Built-ins / generic-param / function args: defer (decided stays false).
+    return false;
+}
+
+// §19.6 (v0.196, #1816 s5): CLAUSE (b) of the determination rule. After the
+// ground solver (s2) yields the leaf's SOLE inhabiting substitution (a
+// Determined singleton solution), FILTER it by the leaf's own + every chain-
+// base's SCALAR `where`-constraints (`class` / `value` / `notnull` / `new`; a
+// type-bound `where Y: I` is s6's decidable-conformance lane, ignored here).
+// A ground solution σ that PROVABLY violates such a constraint is not a
+// well-formed instantiation (§14.2) ⇒ not a real inhabitant ⇒ the singleton
+// solution set becomes empty ⇒ the leaf is uninhabited at `S` and EXEMPT (the
+// caller collapses this to s2's NoSolution outcome). Only a PROVABLE violation
+// drops a solution; a satisfied or undecidable constraint keeps it (dropping a
+// satisfying/undecidable solution would wrongly exempt an inhabited leaf).
+// Walks the single-inheritance derivation chain `leaf` → `root`, mapping each
+// decl level's own generic-param NAMES to their ground types under σ (mirroring
+// leafRootInstantiation's compose loop), so a base clause's `where` reaches the
+// ground argument it constrains.
+bool ExprTC::leafSolutionViolatesScalarConstraint(
+    TypeSymbol* leaf, TypeSymbol* root,
+    const std::unordered_map<std::string_view, TypeRef*>& solution) {
+    if (!leaf) return false;
+
+    // Apply ONE scalar constraint item to a ground argument; true iff it is
+    // PROVABLY violated (the §14.2 reported-violation conditions of
+    // Resolver::checkOneConstraint, restricted to the ground/decidable cases).
+    auto violates = [&](const ast::ConstraintItem& item,
+                        const TypeRef* arg) -> bool {
+        if (!arg || !isFullyGroundTypeRef(arg))
+            return false;  // non-ground (rigid) σ component — s6, never dropped here
+        if (item.kind == "notnull")
+            return arg->nullable;  // §14.2: excludes every nullable type
+        if (item.kind == "class") {
+            // §14.2: non-nullable reference types only.
+            if (arg->nullable) return true;
+            return groundCategorize(arg) == GroundCat::Value;
+        }
+        if (item.kind == "value") {
+            // §14.2: non-nullable value types only.
+            if (arg->nullable) return true;
+            return groundCategorize(arg) == GroundCat::Reference;
+        }
+        if (item.kind == "new") {
+            bool decided = false;
+            bool ok = groundSatisfiesNew(arg, decided);
+            return decided && !ok;  // provably no accessible parameterless ctor
+        }
+        return false;  // "type" (s6) / unknown kind: not a scalar filter
+    };
+
+    const TypeSymbol* cur = leaf;
+    // argSubst: cur's own generic-param NAME -> the ground TypeRef it stands for
+    // under σ. At the leaf itself each param maps to its σ binding; at each base
+    // level the param maps to the arg it received (expressed in leaf params,
+    // then σ-substituted). curSubst: cur's param -> its arg expressed in LEAF
+    // params, the composition state that carries to the next base (identity at
+    // the leaf), mirroring leafRootInstantiation.
+    std::unordered_map<std::string_view, TypeRef*> argSubst;
+    for (const Symbol* gp : leaf->genericParams)
+        if (gp) {
+            auto it = solution.find(gp->name);
+            argSubst[gp->name] = (it != solution.end()) ? it->second : nullptr;
+        }
+    std::unordered_map<std::string_view, TypeRef*> curSubst;
+    std::unordered_set<const TypeSymbol*> seen;
+    while (cur) {
+        if (!seen.insert(cur).second) break;  // cycle guard
+        // (b): this decl's own scalar where-constraints against the ground args.
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(cur->decl)) {
+            for (const auto& gc : td->genericConstraints) {
+                auto ai = argSubst.find(gc.typeParam);
+                if (ai == argSubst.end() || !ai->second)
+                    continue;  // param not solved to a ground type — keep
+                for (const auto& item : gc.items)
+                    if (violates(item, ai->second))
+                        return true;  // provable violation ⇒ σ drops out
+            }
+        }
+        if (cur == root) break;
+        // Advance to the single class base, composing the substitution level by
+        // level (identical shape to leafRootInstantiation).
+        const TypeSymbol* base = nullptr;
+        TypeRef* baseRef = nullptr;
+        for (std::size_t bi = 0; bi < cur->baseTypes.size(); ++bi)
+            if (cur->baseTypes[bi] &&
+                cur->baseTypes[bi]->kind == ast::TypeDeclKind::Class) {
+                base = cur->baseTypes[bi];
+                baseRef = (bi < cur->baseTypeRefs.size()) ? cur->baseTypeRefs[bi]
+                                                          : nullptr;
+                break;
+            }
+        if (!base || !baseRef) break;  // broken / unresolved chain — stop (keep)
+        TypeRef* baseInLeaf = substituteReturnType(baseRef, curSubst);
+        std::unordered_map<std::string_view, TypeRef*> nextArg, nextSubst;
+        if (!base->genericParams.empty()) {
+            if (!baseInLeaf ||
+                baseInLeaf->genericArgs.size() != base->genericParams.size())
+                break;  // arity mismatch — stop (keep)
+            for (std::size_t gi = 0; gi < base->genericParams.size(); ++gi)
+                if (base->genericParams[gi]) {
+                    TypeRef* argInLeaf = baseInLeaf->genericArgs[gi];
+                    nextSubst[base->genericParams[gi]->name] = argInLeaf;
+                    nextArg[base->genericParams[gi]->name] =
+                        substituteReturnType(argInLeaf, solution);
+                }
+        }
+        cur = base;
+        curSubst = std::move(nextSubst);
+        argSubst = std::move(nextArg);
+    }
+    return false;
 }
 
 // §19.6: emit a non-exhaustiveness WARNING for an expression-position

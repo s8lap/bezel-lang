@@ -709,6 +709,69 @@ BEZEL_TEST(sema_case_exhaust, rigid_determined_leaf_stays_exhaustive_spec_19_6) 
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// --- s5: leaf-chain scalar where-constraint filtering (spec §19.6 v0.196;
+//     clause (b)) --------------------------------------------------------------
+//
+// §19.6 clause (b) *filters* clause (a)'s solutions: an inhabiting instantiation
+// must also be a WELL-FORMED instantiation — the leaf's own `where` clauses and
+// those of every base along its derivation chain are satisfied (§14.2). When
+// every solution fails clause (b), "L is uninhabited at S … and is exempt."
+// s5 implements the SCALAR fragment of clause (b): `class` / `value` / `notnull`
+// / `new`, decidable against a ground solution (a type-bound `where Y: I` is s6).
+//
+// (g) THE s5 fails-without/passes-with delta. `L<Y>: B<Y> where Y: value` under
+// scrutinee `B<string>`: clause (a) solves `Y := string` (the sole solution),
+// but `string` is a reference type, so `where Y: value` (§14.2) CONTRADICTS it —
+// the solution fails clause (b), the solution set empties, and L is UNINHABITED
+// at `B<string>` ⇒ EXEMPT. Covering only the ground leaf `R: B<string>` is then
+// exhaustive with no `_`. Fails without s5: before the filter the solver
+// reported `Y := string` Determined and the name-match drew a spurious
+// "missing leaf type(s): L" warning (the filter hole).
+BEZEL_TEST(sema_case_exhaust, leaf_where_value_filters_solutions_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class B<T> end B; "
+        "sealed class L<Y> : B<Y> where Y: value end L; "  // Y:=string ✗ value
+        "sealed class R : B<string> end R; "               // ground — the arm
+        "class Calc "
+        "  public method M(b: B<string>): int "
+        "    var a := case b of "
+        "      var r: R => 1 "  // L exempt: string is not a value type
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));  // L filtered out — exempt
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (h) The COMPANION: the constraint is SATISFIED, so the filter must NOT drop
+// the solution and the leaf stays REQUIRED. Same hierarchy but `where Y: class`
+// — `string` IS a non-nullable reference type, so `Y := string` satisfies the
+// constraint (§14.2), L is DETERMINED and inhabited at `B<string>`, and omitting
+// its arm is non-exhaustive: the warning still fires, NAMING L. This is the
+// guard the RISK note demands — s5 may only drop a PROVABLY-violating solution,
+// never a satisfying one (that would wrongly exempt an inhabited leaf).
+BEZEL_TEST(sema_case_exhaust,
+           leaf_where_class_satisfied_keeps_leaf_required_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class B<T> end B; "
+        "sealed class L<Y> : B<Y> where Y: class end L; "  // Y:=string ✓ class
+        "sealed class R : B<string> end R; "
+        "class Calc "
+        "  public method M(b: B<string>): int "
+        "    var a := case b of "
+        "      var r: R => 1 "  // L still required: string satisfies `class`
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));   // L inhabited — required
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "L"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // --- Open hierarchy (§19.6 final paragraph) --------------------------------
 
 // "When the hierarchy is open (the base is not sealed ...), exhaustiveness

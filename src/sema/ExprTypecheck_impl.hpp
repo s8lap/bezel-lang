@@ -493,6 +493,27 @@ private:
                                                    TypeSymbol* root,
                                                    const TypeRef* scrutTy);
 
+    // §19.6 (v0.196, #1816 s5): CLAUSE (b) of the determination rule — FILTER
+    // the ground solver's sole (Determined) solution `solution` by the leaf's
+    // own + every chain-base's SCALAR `where`-constraints (`class` / `value` /
+    // `notnull` / `new`; a type-bound `where Y: I` is s6). Returns true iff
+    // `solution` PROVABLY violates such a constraint on some decl along the
+    // `leaf` → `root` derivation chain — then σ is not a well-formed
+    // instantiation (§14.2), the singleton solution set empties, and the caller
+    // marks the leaf uninhabited/EXEMPT. Only a PROVABLE violation drops the
+    // solution; a satisfied or undecidable constraint keeps it (never a false
+    // exemption of an inhabited leaf).
+    bool leafSolutionViolatesScalarConstraint(
+        TypeSymbol* leaf, TypeSymbol* root,
+        const std::unordered_map<std::string_view, TypeRef*>& solution);
+
+    // §19.6 (v0.196, #1816 s5): does a FULLY-GROUND solved type PROVABLY satisfy
+    // a `new` constraint (an accessible parameterless ctor / a well-defined
+    // default)? Mirrors Resolver::argSatisfiesNew (§14.2 / §17.11). `decided` is
+    // set false when unverifiable here — the `new` filter then keeps the
+    // solution (never a false exemption).
+    bool groundSatisfiesNew(const TypeRef* arg, bool& decided);
+
     // §5.1 / §19 (#1153): range-check each integer `case` pattern constant /
     // range-bound literal against an integer scrutinee's type. A literal that
     // does not fit was silently truncated to the scrutinee width at codegen
