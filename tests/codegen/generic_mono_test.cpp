@@ -48,6 +48,11 @@ int run(const std::string& prog) {
 // `Maker<Widget>.Make()` returns `new T()`; with T=Widget the parameterless
 // constructor must run exactly once, so the static counter is 1.
 // Before the fix: 0 (constructor never called).
+// §28.3 v0.194 (#1801): the return is spelled `owned T` — a bare-`T` return from
+// an instance method has a non-empty potential source set (the receiver), so a
+// FRESH `new T()` value must transfer via `owned T` rather than a non-`owned`
+// bare-`T` return (the callee-side per-instantiation admission rejects the
+// latter as an owner the caller cannot establish).
 BEZEL_TEST(generic_mono_361, new_t_class_instance_method_calls_ctor) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
@@ -58,7 +63,7 @@ BEZEL_TEST(generic_mono_361, new_t_class_instance_method_calls_ctor) {
         "end Widget; "
         "class Maker<T> where T: class, new() "
         "  public constructor() end constructor; "
-        "  public method Make(): T return new T(); end Make; "
+        "  public method Make(): owned T return new T(); end Make; "
         "  destructor end destructor; "
         "end Maker; "
         "class C public static method Main(): int "
@@ -80,8 +85,12 @@ BEZEL_TEST(generic_mono_361, new_t_class_static_method_calls_ctor) {
         "  public constructor() _n := _n + 1; end constructor; "
         "  destructor end destructor; "
         "end Widget; "
+        // §28.3 v0.194 (#1801): `Clone` returns a FRESH `new T()` while its
+        // potential source set is non-empty ({proto}); the callee side rejects a
+        // fresh owned value returned through a non-`owned` bare-`T` return, so the
+        // v0.194-conformant spelling is `owned T` (the transfer the body performs).
         "static class Factory "
-        "  public static method Clone<T>(proto: T): T where T: class, new() "
+        "  public static method Clone<T>(proto: T): owned T where T: class, new() "
         "    return new T(); "
         "  end Clone; "
         "end Factory; "

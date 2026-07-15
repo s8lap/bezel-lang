@@ -66,12 +66,17 @@ static bool isValueSubstitutionErased(const sema::TypeRef* rt);
 void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
          const std::vector<sema::Symbol*>* paramSyms, bool isAsync,
          bool isDestructor, const ast::Type* returnType, bool returnOwned,
-         bool isStatic) {
+         bool isStatic, const GenericReturnContext* genericCtx) {
     isAsync_ = isAsync;
     isDestructor_ = isDestructor;
     returnType_ = returnType;
     returnOwned_ = returnOwned;
     isStatic_ = isStatic;
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): recognize a bare-T
+    // return and classify its potential source set BEFORE any statement is
+    // visited, so checkBareTypeParamReturn (called from handleReturn) sees a
+    // stable classification across the dataflow fixpoint. // per §28.3 v0.194
+    computeBareReturnContext(paramSyms, genericCtx);
     // §29.3 / §29.8 (#945): classify iterator methods up-front so the end-of-
     // method check can apply the state-machine auto-dispose rule to owned params.
     sawYield_ = bodyContainsYield(body);
@@ -720,10 +725,14 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
 void MethodOwnership::runExprBodyOwningReturnCheck(
         const ast::Expr& exprBody,
         const std::vector<sema::Symbol*>* paramSyms,
-        const ast::Type* returnType, bool returnOwned, bool isStatic) {
+        const ast::Type* returnType, bool returnOwned, bool isStatic,
+        const GenericReturnContext* genericCtx) {
     returnType_ = returnType;
     returnOwned_ = returnOwned;
     isStatic_ = isStatic;
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): classify the return
+    // context before the narrow checks run (the `=>` body IS the return value).
+    computeBareReturnContext(paramSyms, genericCtx);
     // Seed `owned` / `out owned` parameters as Owned locals (as run() does) so
     // returning an owned param is classified as an owned transfer, not a borrow.
     // Non-owned params stay out of `states_`; the ParameterSymbol branch in
@@ -746,6 +755,12 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // a;` exactly as the block-body `return a;` form is rejected. A no-op
     // when `isStatic` is false. // per §28.3
     checkStaticBorrowReturn(exprBody);
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): the `=>` sibling of
+    // the handleReturn call — the callee-side per-instantiation admission for a
+    // bare-type-parameter return (`Sel<T>(a: T, owned b: T): T => b;` is rejected;
+    // `=> a;` and a value instantiation stay accepted). A no-op unless the return
+    // type is a bare parameter with a non-empty source set. // per §28.3 v0.194
+    checkBareTypeParamReturn(exprBody);
     // §28.6 (#1005): the `=>` expression-body sibling of the handleReturn call —
     // rejects `Take(): Cell? => move v;` (the bare-read `=> v;` borrow is
     // legal). // per §28.6
@@ -3335,6 +3350,13 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // must not silently fall into the discharge fast-path first. A no-op for
     // instance/extension methods (isStatic_ false). // per §28.3
     checkStaticBorrowReturn(e);
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): the callee-side,
+    // per-instantiation-category admission for a bare-type-parameter return. Runs
+    // BEFORE the bare-identifier discharge fast-path below (which returns early
+    // for `return b;`) so a `return <owned param>;` under a bare-T non-`owned`
+    // return is examined in its owned state. A no-op unless the return type is a
+    // bare parameter with a non-empty source set. // per §28.3 v0.194
+    checkBareTypeParamReturn(e);
     // §28.6 (#1005): reject returning an owned field's `move`d value
     // (`move this.f` / `move f`) through a non-`owned` return type — the moved
     // field value escapes with no owner (leak). A bare field read is a legal
@@ -3962,6 +3984,176 @@ void MethodOwnership::checkStaticBorrowReturn(const ast::Expr& e) {
         "transfer ownership");
 }
 
+// §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6). Does the declared
+// type `t` MENTION the generic parameter `name`? A bare `T`, and any nesting
+// that reaches it (`List<T>`, `[N]T`, `(T) -> ()`), qualifies — an argument
+// that carries `T` as an element/component is a source of the returned `T`.
+// Mirrors OwnershipFacts.cpp's file-local `bareTypeMentionsParam` (which is in
+// an anonymous namespace there); kept as this pass's own copy scoped to the
+// callee-side source-set computation. // per §28.3 v0.194
+static bool bareReturnTypeMentionsParam(const ast::Type& t,
+                                        std::string_view name) {
+    if (t.kind == ast::TypeKind::Named && t.name &&
+        t.name->parts.size() == 1 && t.name->parts[0] == name)
+        return true;
+    for (const auto& ga : t.genericArgs)
+        if (ga && bareReturnTypeMentionsParam(*ga, name)) return true;
+    if (t.arrayElement && bareReturnTypeMentionsParam(*t.arrayElement, name))
+        return true;
+    if (t.funcReturn && bareReturnTypeMentionsParam(*t.funcReturn, name))
+        return true;
+    for (const auto& fp : t.funcParams)
+        if (fp.type && bareReturnTypeMentionsParam(*fp.type, name)) return true;
+    return false;
+}
+
+// §28.3 (v0.194, #1801 S6) / §14.2 `where T: value`. True when `constraints`
+// declare `where <name>: value` — the exclusion (spec item 5) that keeps a
+// returned parameter constrained to VALUE substitutions outside this rule on
+// both sides (a value return is a copy, never a borrow). Null vector → no
+// constraints → not excluded. // per §28.3 v0.194, §14.2
+static bool bareReturnParamIsValueConstrained(
+    std::string_view name,
+    const std::vector<ast::GenericConstraint>* constraints) {
+    if (!constraints) return false;
+    for (const ast::GenericConstraint& gc : *constraints) {
+        if (gc.typeParam != name) continue;
+        for (const ast::ConstraintItem& item : gc.items)
+            if (item.kind == "value") return true;
+    }
+    return false;
+}
+
+// §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6). See the header for the
+// full contract. Recognizes the bare-type-parameter return positionally (the
+// return head names a method-level or enclosing-type generic parameter, not a
+// 0-arity builtin), applies the `where T: value` exclusion, and classifies the
+// potential source set as empty or non-empty. // per §28.3 v0.194, §3.6 rule 2
+void MethodOwnership::computeBareReturnContext(
+        const std::vector<sema::Symbol*>* paramSyms,
+        const GenericReturnContext* genericCtx) {
+    returnIsBareTypeParam_ = false;
+    bareReturnSourceSetEmpty_ = true;
+    // `owned T` is the ordinary ownership-transferring return (§28.8), outside
+    // this rule; and a bare parameter is a single-part Named head.
+    if (returnOwned_ || !genericCtx || !returnType_ ||
+        returnType_->kind != ast::TypeKind::Named || !returnType_->name ||
+        returnType_->name->parts.size() != 1)
+        return;
+    const std::string_view head = returnType_->name->parts.front();
+    // Positional recognition: the head must name one of THIS method's generic
+    // parameters or one of the ENCLOSING type's — the name-set membership test
+    // that distinguishes a bare type parameter from a 0-arity builtin sharing the
+    // null-declaration Named shape.
+    auto inParams = [&](const std::vector<ast::GenericParam>* ps) -> bool {
+        if (!ps) return false;
+        for (const ast::GenericParam& g : *ps)
+            if (g.name == head) return true;
+        return false;
+    };
+    const bool methodLevel = inParams(genericCtx->methodParams);
+    const bool enclosingLevel = inParams(genericCtx->enclosingParams);
+    if (!methodLevel && !enclosingLevel) return;
+    // §14.2 `where T: value` exclusion (spec item 5): a value-only parameter's
+    // bare-T return is always a copy — vacuous on both sides.
+    if (bareReturnParamIsValueConstrained(head, genericCtx->methodConstraints) ||
+        bareReturnParamIsValueConstrained(head, genericCtx->enclosingConstraints))
+        return;
+    returnIsBareTypeParam_ = true;
+    // Potential source set (§28.3, v0.194): the receiver (present for any
+    // non-static method — instance or extension) together with every PLAIN
+    // (non-`owned`, non-`out`, non-`ref`) parameter whose declared type mentions
+    // the returned parameter. `owned` parameters are never sources (consumed into
+    // the callee and dying there). A static method with no such plain parameter
+    // has a structurally empty set — the factory regime governs it instead.
+    bool nonEmpty = !isStatic_;
+    if (!nonEmpty && paramSyms) {
+        for (sema::Symbol* sym : *paramSyms) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+            if (!ps || !ps->modifier.empty()) continue;  // plain params only
+            if (ps->declType &&
+                bareReturnTypeMentionsParam(*ps->declType, head)) {
+                nonEmpty = true;
+                break;
+            }
+        }
+    }
+    bareReturnSourceSetEmpty_ = !nonEmpty;
+}
+
+// §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6) — CALLEE side. See the
+// header comment for the full contract. Under a recognized bare-type-parameter
+// return with a NON-EMPTY source set, admits `null` and any borrow whose source
+// outlives the call (a plain source parameter, the receiver, or static storage —
+// every caller re-establishes these), and REJECTS a fresh owned value or a
+// borrow of an owned local / `using var` / `owned` parameter (declare `owned T`).
+// A no-op at the abstract declaration for the ADMIT patterns, at value / runtime-
+// managed substitutions, and under an empty source set (the factory regime).
+// // per §28.3 v0.194, §3.6 rule 2
+void MethodOwnership::checkBareTypeParamReturn(const ast::Expr& e) {
+    if (!returnIsBareTypeParam_) return;
+    // Empty source set → the factory regime governs the body (owned/fresh returns
+    // admitted, static-storage rejected — checkStaticBorrowReturn and the factory
+    // rule handle it); this check does not fire. // per §28.3 v0.194
+    if (bareReturnSourceSetEmpty_) return;
+    // ADMIT `null` — no value to own; the caller's owned/borrowed target absorbs
+    // it (§28.3 null-literal producers row).
+    if (dynamic_cast<const ast::NullLiteralExpr*>(&e)) return;
+    // REJECT a FRESH OWNED value — `new T(...)`, an owned-returning call, an
+    // arm-meet-owned, a `move` of an owned local/parameter (producerState ==
+    // Owned). The value would escape the non-`owned` return with no owner (the
+    // caller re-establishes a BORROW against its arguments, not a +1). One
+    // exception: `move <owned field>` is diagnosed by checkOwnedFieldReturn with
+    // its own message — skip it here to avoid a duplicate diagnostic. // per §28.3
+    bool isOwnedFieldMove = false;
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e))
+        if (un->op == "move" && un->operand && exprIsOwnedFieldRead(*un->operand))
+            isOwnedFieldMove = true;
+    if (!isOwnedFieldMove && producerState(e) == OwnershipState::Owned) {
+        reportBareTypeParamOwnedReturn(e);
+        return;
+    }
+    // REJECT a borrow of an OWNED LOCAL / `using var` / `owned` PARAMETER read by
+    // bare identifier — its source dies with the callee frame, so the caller's
+    // re-established borrow would dangle. An owned local / `owned` parameter is in
+    // `states_` as Owned; a `using var` carries `implicitDischarge`. A backstop
+    // symbol check catches an `owned` parameter not (yet) in `states_`. Everything
+    // else — a plain-parameter-, receiver-, or static-storage-sourced borrow — is
+    // ADMITTED: every caller re-establishes it against its own receiver and
+    // arguments (§28.3 v0.194 lifts the parameter-sourced prohibition here). // per §28.3
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        if (auto* st = lookupState(id->name)) {
+            if (st->implicitDischarge ||
+                st->state == OwnershipState::Owned) {
+                reportBareTypeParamOwnedReturn(e);
+                return;
+            }
+        }
+        if (auto* ps =
+                dynamic_cast<sema::ParameterSymbol*>(ctx_.exprSymbol(*id)))
+            if (ps->modifier == "owned" || ps->modifier == "out owned") {
+                reportBareTypeParamOwnedReturn(e);
+                return;
+            }
+    }
+    // Admit: a plain-parameter- / receiver- / static-storage-sourced borrow.
+}
+
+// §28.3 (v0.194, #1801 S6): the shared reject diagnostic for a bare-type-
+// parameter return that hands back a value the caller cannot own — a fresh owned
+// value or a borrow of an owned local / `using var` / `owned` parameter. // per §28.3
+void MethodOwnership::reportBareTypeParamOwnedReturn(const ast::Expr& e) {
+    report(
+        Severity::Error, e.span.begin,
+        "a bare-type-parameter return may not hand back a value the caller "
+        "cannot own — a fresh owned value, or a borrow of an owned local, a "
+        "`using var`, or an `owned` parameter, dies with the callee frame while "
+        "the caller re-establishes only a borrow against its own arguments "
+        "(§28.3 *Bare-type-parameter returns*, v0.194); return `null`, a "
+        "receiver- or plain-parameter-sourced borrow, or declare the return type "
+        "`owned T` to transfer ownership");
+}
+
 // §28.3 / §28.6 (v0.180 #1547; role changed v0.196 #1815): see the header
 // comment. Resolves `e`'s symbol (for a bare identifier or a member access) and
 // checks whether the declaring MemberSymbol's modifier list contains "static" —
@@ -4201,13 +4393,27 @@ void checkStaticFactoryNudgeWarning(const ast::MethodDecl& md,
         "` to make the ownership transfer explicit");
 }
 
-void checkMember(const ast::Member& m, sema::SemaContext& ctx) {
+void checkMember(const ast::Member& m, sema::SemaContext& ctx,
+                 const ast::TypeDecl* enclosingType = nullptr) {
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
+        // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): assemble the
+        // generic context the callee-side check keys on — this method's generic
+        // parameters and `where` constraints, and (when the method is a type
+        // member) the enclosing type's, so a bare `T` return that names either
+        // level is recognized positionally and the `where T: value` exclusion is
+        // seen. Threaded into run() / runExprBodyOwningReturnCheck(). // per §28.3
+        GenericReturnContext genericCtx;
+        genericCtx.methodParams = &md->genericParams;
+        genericCtx.methodConstraints = &md->genericConstraints;
+        if (enclosingType) {
+            genericCtx.enclosingParams = &enclosingType->genericParams;
+            genericCtx.enclosingConstraints = &enclosingType->genericConstraints;
+        }
         if (md->bodyKind == ast::MethodBodyKind::Block) {
             MethodOwnership mo(ctx);
             mo.run(md->stmts, paramSymsOf(m, ctx), methodIsAsync(*md),
                    /*isDestructor=*/false, md->returnType.get(),
-                   md->returnOwned, methodIsStatic(*md));
+                   md->returnOwned, methodIsStatic(*md), &genericCtx);
         } else if (md->bodyKind == ast::MethodBodyKind::Expression &&
                    md->exprBody) {
             // §28.3 / §5.11 (#1007): an expression-bodied method `M(): T => E`
@@ -4225,7 +4431,8 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx) {
             MethodOwnership mo(ctx);
             mo.runExprBodyOwningReturnCheck(
                 *md->exprBody, paramSymsOf(m, ctx),
-                md->returnType.get(), md->returnOwned, methodIsStatic(*md));
+                md->returnType.get(), md->returnOwned, methodIsStatic(*md),
+                &genericCtx);
         }
         // §28.3 (fix #1600): the declaration-level "add `owned`" nudge —
         // independent of bodyKind (both Block and Expression bodies are
@@ -4260,8 +4467,10 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx) {
         }
     } else if (auto* nt = dynamic_cast<const ast::NestedTypeMember*>(&m)) {
         if (nt->decl) {
+            // §28.3 (#1801 S6): the nested type is the enclosing type for its own
+            // members' bare-type-parameter recognition.
             for (const auto& innerM : nt->decl->members) {
-                if (innerM) checkMember(*innerM, ctx);
+                if (innerM) checkMember(*innerM, ctx, nt->decl.get());
             }
         }
     } else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(&m)) {
@@ -4392,10 +4601,15 @@ void checkTopDecl(const ast::TopDecl& d, sema::SemaContext& ctx) {
         if (td->kind == ast::TypeDeclKind::Class) {
             checkOwnedFieldDA(*td, ctx);
         }
+        // §28.3 (#1801 S6): `td` is the enclosing type for its members' bare-
+        // type-parameter recognition (a `class Box<T> ... method Get(): T`).
         for (const auto& m : td->members) {
-            if (m) checkMember(*m, ctx);
+            if (m) checkMember(*m, ctx, td);
         }
     } else if (auto* ext = dynamic_cast<const ast::ExtensionDecl*>(&d)) {
+        // §28.3 (#1801 S6): an ExtensionDecl carries no `genericParams` vector
+        // (extension type parameters ride the target type), so only a method-
+        // LEVEL bare-T return is recognized here — extensionType stays null.
         for (const auto& m : ext->members) {
             if (m) checkMember(*m, ctx);
         }

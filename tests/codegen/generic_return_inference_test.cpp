@@ -124,8 +124,13 @@ BEZEL_TEST(generic_return_inference_391, argument_inferred_unaffected) {
         "  public constructor() _n := _n + 1; end constructor; "
         "  destructor end destructor; "
         "end Widget; "
+        // §28.3 v0.194 (#1801): a fresh `new T()` returned while the source set is
+        // non-empty ({proto}) must transfer via `owned T` — the callee-side bare-
+        // `T` admission rejects a fresh owned value through a non-`owned` return.
+        // T is still argument-inferred from `proto` (the return spelling does not
+        // affect the §14.1 inference this test exercises).
         "static class Factory "
-        "  public static method Clone<T>(proto: T): T where T: class, new() "
+        "  public static method Clone<T>(proto: T): owned T where T: class, new() "
         "    return new T(); "
         "  end Clone; "
         "end Factory; "

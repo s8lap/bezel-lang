@@ -75,6 +75,25 @@ struct FlowState {
     FieldMovedFrom fields;
 };
 
+// §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): the generic context a
+// callee needs to recognize a bare-type-parameter return POSITIONALLY and to
+// classify its potential source set. A method's declared return type is a "bare
+// type parameter" when its single-part head names either one of the method's own
+// generic parameters (`method Sel<T>(...): T`) or one of the ENCLOSING type's
+// (`class Box<T> ... method Get(...): T`) — the name-set membership test that
+// distinguishes a bare parameter from a 0-arity builtin sharing the null-
+// declaration Named shape. The `where T: value` exclusion (spec item 5) needs
+// both levels' constraints. Threaded from checkMember, where the MethodDecl and
+// its enclosing TypeDecl are in scope; every pointer is null for constructors,
+// destructors, operators, and lambdas (no bare-type-parameter return rule
+// applies), and a non-generic method leaves the vectors empty. // per §28.3
+struct GenericReturnContext {
+    const std::vector<ast::GenericParam>* methodParams = nullptr;
+    const std::vector<ast::GenericParam>* enclosingParams = nullptr;
+    const std::vector<ast::GenericConstraint>* methodConstraints = nullptr;
+    const std::vector<ast::GenericConstraint>* enclosingConstraints = nullptr;
+};
+
 class MethodOwnership {
 public:
     MethodOwnership(sema::SemaContext& ctx) : ctx_(ctx) {}
@@ -100,7 +119,8 @@ public:
              const std::vector<sema::Symbol*>* paramSyms = nullptr,
              bool isAsync = false, bool isDestructor = false,
              const ast::Type* returnType = nullptr, bool returnOwned = false,
-             bool isStatic = false);
+             bool isStatic = false,
+             const GenericReturnContext* genericCtx = nullptr);
 
     // §28.3 / §5.11 (#1007): apply ONLY the borrow-returned-through-owning-type
     // check to an expression-bodied method `M(): T => exprBody` (which the full
@@ -113,7 +133,8 @@ public:
         const ast::Expr& exprBody,
         const std::vector<sema::Symbol*>* paramSyms,
         const ast::Type* returnType, bool returnOwned,
-        bool isStatic = false);
+        bool isStatic = false,
+        const GenericReturnContext* genericCtx = nullptr);
 
     // #926 / §28.6 (v0.153): a property/indexer GETTER may not return a freshly-
     // produced owned value — a getter is a borrow-producing position (properties
@@ -197,6 +218,22 @@ private:
     // False for constructors/destructors/operators (no return-borrow rule
     // applies to them here) and for instance methods. // per §28.3
     bool isStatic_ = false;
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): true when this
+    // method's declared return type is a bare type parameter (method- or
+    // enclosing-type-level, non-`owned`) that is NOT `where T: value`-constrained.
+    // Gates checkBareTypeParamReturn's callee-side admission. Computed once by
+    // computeBareReturnContext. // per §28.3 v0.194
+    bool returnIsBareTypeParam_ = false;
+    // §28.3 (v0.194, #1801 S6): true when the bare-type-parameter return's
+    // POTENTIAL SOURCE SET is structurally empty — a static method with no plain
+    // (non-`owned`) parameter whose declared type mentions the returned parameter.
+    // With an empty set the factory regime governs the callee body (owned/fresh
+    // returns admitted, static-storage rejected — checkStaticBorrowReturn and the
+    // factory rule), so checkBareTypeParamReturn is a no-op. Only a NON-empty set
+    // (an instance receiver or a plain source parameter) admits the receiver- /
+    // parameter-sourced borrow returns. Defaults true (a no-op) so a non-bare-T
+    // method is never affected. // per §28.3 v0.194
+    bool bareReturnSourceSetEmpty_ = true;
     // §29.3 / §29.8 (#945): true when this method's body uses `yield` (it is an
     // iterator method). A SYNC iterator (sawYield_ && !isAsync_) whose `owned`
     // parameter is never moved out gets §29.8 state-machine auto-dispose instead
@@ -548,6 +585,43 @@ private:
     // Fires from handleReturn (block bodies) and runExprBodyOwningReturnCheck
     // (`=>` expression bodies). // per §28.3, §28.6
     void checkStaticBorrowReturn(const ast::Expr& e);
+
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6) — the CALLEE-side,
+    // per-instantiation-category admission that SUPERSEDES checkStaticBorrowReturn's
+    // vacuous bare-T behaviour (isBorrowableType is false for an abstract bare
+    // `T`, so the static-borrow check never fired). When the declared return type
+    // is a bare type parameter (method-level or enclosing-type-level, non-`owned`,
+    // not `where T: value`) AND the call's potential source set is NON-EMPTY (an
+    // instance receiver, or a plain — non-`owned` — parameter whose type mentions
+    // the returned parameter), the return-path admission of the §3.6 rule-2 pattern
+    // applies: `null`, and a borrow whose source outlives the call (the receiver,
+    // a plain source parameter, or static storage — every caller re-establishes
+    // these against its own receiver and arguments), are ADMITTED; a fresh owned
+    // value, or a borrow of an owned local / `using var` / `owned` parameter, is
+    // REJECTED at the return site (declare `owned T`). The check is VACUOUS at the
+    // abstract declaration for the ADMIT patterns (a plain-parameter passthrough
+    // `return a;` and every §11.8 `Sum<T>`-style `owned T` accumulator stay
+    // accepted) and at value / runtime-managed substitutions (the reject's remedy,
+    // `owned T`, is erased there, §28.1 v0.196); it bites the unsound owned-escape
+    // patterns, which are wrong at every class / interface instantiation. With an
+    // EMPTY source set the factory regime governs the body instead (checkStatic-
+    // BorrowReturn / the factory rule) — this check is a no-op there. Fires from
+    // handleReturn (block bodies) and runExprBodyOwningReturnCheck (`=>` bodies).
+    // // per §28.3 v0.194, §3.6 rule 2
+    void checkBareTypeParamReturn(const ast::Expr& e);
+    // §28.3 (v0.194, #1801 S6): precompute `returnIsBareTypeParam_` and
+    // `bareReturnSourceSetEmpty_` from the declared return type, the static-ness,
+    // the parameter symbols (for the source set), and the threaded generic context
+    // (for positional recognition and the `where T: value` exclusion). Runs once
+    // at the top of run() / runExprBodyOwningReturnCheck(), before any return is
+    // classified. // per §28.3 v0.194
+    void computeBareReturnContext(
+        const std::vector<sema::Symbol*>* paramSyms,
+        const GenericReturnContext* genericCtx);
+    // §28.3 (v0.194, #1801 S6): the shared reject diagnostic for a bare-type-
+    // parameter return of a value the caller cannot own (a fresh owned value or a
+    // borrow of an owned local / `using var` / `owned` parameter). // per §28.3
+    void reportBareTypeParamOwnedReturn(const ast::Expr& e);
 
     // §28.3 / §28.6 (v0.180 #1547; role changed v0.196 #1815): true when `e` is
     // a bare identifier or member access resolving to a STATIC field or property
