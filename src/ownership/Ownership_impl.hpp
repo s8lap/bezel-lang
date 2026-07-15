@@ -1910,6 +1910,28 @@ private:
     bool deferredActivationArgIsPlainFuncSlot(const ast::CallExpr& ce,
                                               std::size_t pos) const;
 
+    // #1818 T9 (§28.14 `scoped`-field read-out bar, v0.196): true when `e` reads
+    // a `scoped` FIELD as a value — a bare `_f`, `this._f`, or another object's
+    // `other._f` — resolving to a `scoped`-modified FieldSymbol; names it in
+    // `nameOut`. Passing such a read into a deferred-activation plain function-
+    // typed position is the barred escaping read-out §28.14 names (the critique's
+    // `Sneak` counterexample): the stored capture-bearing callback would ride the
+    // returned frame beyond the bounding object's control and past severance's
+    // reach. `this`'s OWN scoped field read out as a bare `_f`/`this._f` is
+    // already rejected by the callee-side scoped scan (scopedCalleeWalkExpr,
+    // kind 2); this covers the case that scan misses — another object's scoped
+    // field — with a distinct diagnostic. // per §28.14 v0.196
+    bool scopedFieldReadArg(const ast::Expr& e,
+                            std::string_view* nameOut = nullptr) const;
+
+    // #1818 T10 (§28.14 frame residence / §30.1, v0.196): true when the call
+    // result is a Task-family (async) deferred-activation frame — `Task<T>` /
+    // `OwningTask<T>`. The carried-source reject uses it to speak the §30.1
+    // async settlement remedy (await the task in the source's scope) rather than
+    // the iterator/lazy-query "materialize a collection" remedy. // per §28.14,
+    // §30.1 v0.196
+    bool callResultIsAsyncTask(const ast::CallExpr& ce) const;
+
     // -- Async-readiness 3c: SuspendLocal annotation + completion edges --------
     //
     // §30.5 / §30.9. Classify each owned local as suspend-local (live range

@@ -5976,6 +5976,56 @@ bool MethodOwnership::deferredActivationArgIsPlainFuncSlot(
     return (*params)[pos].modifier.empty();
 }
 
+// #1818 T9 (§28.14 `scoped`-field read-out bar, v0.196): true when `e` reads a
+// `scoped` FIELD as a value. Resolves the referent — a bare `_f`
+// (IdentifierExpr) or a qualified `recv._f` (MemberAccessExpr) — to its
+// FieldSymbol and checks for the `scoped` modifier, mirroring scopedUseKind's
+// FieldSymbol navigation but WITHOUT its `this`-receiver restriction: the read
+// this bar targets is another object's scoped field (`btn._handler`), which
+// scopedUseKind deliberately returns 0 for (it verifies uses of `this`'s OWN
+// scoped members). See the header comment for the E13 / `Sneak` counterexample.
+// // per §28.14 v0.196
+bool MethodOwnership::scopedFieldReadArg(const ast::Expr& e,
+                                         std::string_view* nameOut) const {
+    sema::Symbol* sym = nullptr;
+    std::string_view nm;
+    if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        sym = ctx_.exprSymbol(*id);
+        nm = id->name;
+    } else if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        sym = ctx_.exprSymbol(e);
+        nm = ma->member;
+    } else {
+        return false;
+    }
+    const auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
+    if (!fs) return false;
+    for (std::string_view mod : fs->modifiers)
+        if (mod == "scoped") {
+            if (nameOut) *nameOut = nm;
+            return true;
+        }
+    return false;
+}
+
+// #1818 T10 (§28.14 frame residence / §30.1, v0.196): true when call `ce`'s
+// result type is a Task-family (async) deferred-activation frame — a Named,
+// non-nullable, single-part-name TypeRef whose head is `Task` / `OwningTask`.
+// Mirrors isDeferredActivationCallResult's head-name navigation, narrowed to the
+// async kinds so the carried-source reject can offer the §30.1 settlement remedy
+// (await the task in the source's scope) instead of the iterator/lazy-query
+// "materialize a collection" remedy. // per §28.14, §30.1 v0.196
+bool MethodOwnership::callResultIsAsyncTask(const ast::CallExpr& ce) const {
+    const sema::TypeRef* rt = ctx_.exprType(ce);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->nullable)
+        return false;
+    if (!rt->astNode || !rt->astNode->name ||
+        rt->astNode->name->parts.size() != 1)
+        return false;
+    std::string_view head = rt->headName();
+    return head == "Task" || head == "OwningTask";
+}
+
 // #1526 (§28.3 "Deferred-activation callees", v0.179): drive the whole-body
 // walk. See the header comment (Ownership_impl.hpp) for the escape-position
 // list and the rationale for reusing the checkAwaitSites/checkResultSites
@@ -6087,6 +6137,43 @@ void MethodOwnership::checkDeferredActivationTempSitesExpr(const ast::Expr& e,
             std::size_t pos = 0;
             for (const auto& a : ce->args) {
                 if (!a.value || !a.modifier.empty()) { ++pos; continue; }
+                // #1818 T9 (§28.14 `scoped`-field read-out bar, v0.196): a read
+                // of a `scoped` FIELD passed as a function-typed argument into a
+                // deferred-activation plain function slot is the barred escaping
+                // read-out — the E13 "sneak bar", the critique's `Sneak`
+                // counterexample. The stored capture-bearing callback would ride
+                // the returned frame beyond the bounding object's control and past
+                // severance's reach (quiescence severs the field, not the frame's
+                // independent reference to the callback value, whose captured
+                // owned source may already be dead). Reject distinctly. `this`'s
+                // OWN scoped field read out (a bare `_f` / `this._f`) is already
+                // rejected by the callee-side scoped scan (scopedCalleeWalkExpr,
+                // kind 2); the `scopedUseKind == 0` gate keeps T9 from
+                // double-reporting that case and confines it to the read that scan
+                // misses — another object's scoped field (`btn._handler`).
+                // // per §28.14 v0.196
+                if (!forSource && deferredActivationArgIsPlainFuncSlot(*ce, pos)) {
+                    std::string_view sfName;
+                    if (scopedFieldReadArg(*a.value, &sfName) &&
+                        scopedUseKind(*a.value) == 0) {
+                        report(
+                            Severity::Error, a.value->span.begin,
+                            std::string("the `scoped` field `") +
+                                std::string(sfName) +
+                                "` may not be read out here into a deferred-"
+                                "activation call's function-typed argument — the "
+                                "callback it stores would ride the returned frame "
+                                "beyond the bounding object's control and past "
+                                "severance's reach, stranding whatever that "
+                                "callback captures (§28.14 `scoped`-field "
+                                "read-out bar + frame residence, v0.196); a "
+                                "`scoped` field's callback may only be invoked, "
+                                "never read out as an escaping value into a "
+                                "frame-carrying position");
+                        ++pos;
+                        continue;
+                    }
+                }
                 // #1818 (§28.3 "capture-set contribution", §28.14 frame
                 // residence, v0.196): a plain function-typed argument's captured
                 // borrows' SOURCES are carried sources of the returned frame.
@@ -6194,31 +6281,58 @@ void MethodOwnership::checkDeferredActivationTempSitesExpr(const ast::Expr& e,
                                 continue;
                             }
                         }
+                        // T10 (#1818, §28.14 frame residence / §30.1, v0.196):
+                        // async's structural carried-source enumeration is fixed
+                        // by this same rule — a Task-family frame carrying a
+                        // capture of a scope-bound owned source that escapes via
+                        // return / field-store / scope-crossing is statically
+                        // REJECTED, exactly as the iterator/lazy-query frame is.
+                        // The remedy differs by frame kind: an async task settles
+                        // (await it within the source's scope, §30.1), whereas an
+                        // iterator/lazy-query frame is consumed by enumeration
+                        // (materialize it). The awaited-in-scope positive stays
+                        // admitted upstream — an inline `await Call(...)` reaches
+                        // this branch with `escaping=false` (the await consumes
+                        // the task within the full expression), so it is never
+                        // rejected here. // per §28.14, §30.1 v0.196
+                        const bool asyncFrame = callResultIsAsyncTask(*ce);
                         std::vector<CapSource> caps;
                         deferredActivationCaptureSources(*a.value, caps);
                         for (const CapSource& cs : caps) {
                             if (!cs.ownedObligation) continue;
+                            const std::string nm(cs.id->name);
+                            const std::string tail =
+                                asyncFrame
+                                    ? ("` is disposed when its enclosing scope "
+                                       "exits, so the escaping task would resume "
+                                       "after suspension into a closure over a "
+                                       "disposed object. Await the returned task "
+                                       "to settlement within `" +
+                                       nm +
+                                       "`'s scope (§30.1), or move `" + nm +
+                                       "`'s ownership into the frame as an "
+                                       "`owned` parameter (§29.8)")
+                                    : ("` is disposed when its enclosing scope "
+                                       "exits, so the escaping frame would "
+                                       "enumerate into a closure over a disposed "
+                                       "object. Keep the frame within `" +
+                                       nm +
+                                       "`'s scope, or return a materialized "
+                                       "`owned` collection instead");
                             report(
                                 Severity::Error, cs.id->span.begin,
                                 std::string(
                                     "a deferred-activation call whose "
                                     "function-typed argument (a lambda or a "
                                     "method reference) captures the owned value `") +
-                                    std::string(cs.id->name) +
+                                    nm +
                                     "` mints a frame that carries a borrow of `" +
-                                    std::string(cs.id->name) +
+                                    nm +
                                     "` (§28.3 capture-set contribution, §28.14 "
                                     "frame residence, v0.196); that frame escapes "
                                     "this full expression — bound to a name, "
                                     "returned, or stored — but `" +
-                                    std::string(cs.id->name) +
-                                    "` is disposed when its enclosing scope "
-                                    "exits, so the escaping frame would enumerate "
-                                    "into a closure over a disposed object. Keep "
-                                    "the frame within `" +
-                                    std::string(cs.id->name) +
-                                    "`'s scope, or return a materialized `owned` "
-                                    "collection instead");
+                                    nm + tail);
                             break;  // one diagnostic per escaping argument
                         }
                     }

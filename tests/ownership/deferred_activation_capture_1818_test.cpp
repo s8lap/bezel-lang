@@ -493,3 +493,216 @@ BEZEL_TEST(deferred_activation_capture_1818, traced_local_methodref_borrow_param
         "method M(nums: Array<int>, s: Scaler): IEnumerable<int>"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ===========================================================================
+// T9 — `scoped`-field read-out bar (§28.14, v0.196; the E13 / `Sneak` bar).
+//
+// §28.14 (v0.196): a `scoped` field's callback "may only be invoked, never read
+// out as an escaping value" — and passing its value into a deferred-activation
+// plain function-typed position IS the barred escaping read-out (the critique's
+// `Sneak` counterexample): the stored capture-bearing callback would ride the
+// returned frame beyond the bounding object's control and past severance's reach
+// (quiescence severs the field, not the frame's independent reference to the
+// callback value, whose captured owned source may already be dead).
+//
+// `this`'s OWN scoped field read out (a bare `_f` / `this._f`) is already
+// rejected by the callee-side scoped scan (scopedCalleeWalkExpr); T9 covers the
+// read that scan misses — ANOTHER object's scoped field (`btn._pred`) — with a
+// distinct diagnostic. The REJECT compiles CLEAN without the T9 fix (the field
+// read fell through the capture dispatch as a plain-storage fetch — "contributes
+// nothing") and produces the distinct read-out-bar error with it; each ADMIT
+// compiles clean either way. Every shape was hand-verified against
+// `build/bezelc -c` on a standalone probe before being folded in.
+// ===========================================================================
+
+namespace {
+
+// The `Sneak` preamble: a Widget with a function-typed `scoped` field `_pred`
+// populated from a `scoped` ctor parameter (§28.14 storage-bounded admission),
+// and a deferred-activation callee `Filter` taking a PLAIN `(int) -> bool`
+// parameter (a frame-residence position, §28.14 v0.196). `readOut` is the
+// enclosing `Program` method whose body reads `btn._pred` back out. `scopedField`
+// toggles the field's `scoped` modifier (false = the plain-field control).
+std::string sneakWrap(const std::string& readOut, bool scopedField = true) {
+    const std::string fieldDecl = scopedField
+        ? "  public scoped _pred: (int) -> bool; "
+          "  public constructor(scoped p: (int) -> bool) _pred := p; "
+          "  end constructor; "
+        : "  public _pred: ((int) -> bool)?; "
+          "  public constructor() _pred := null; end constructor; ";
+    return std::string(
+        "module M; "
+        "class Widget ") + fieldDecl + "end Widget; "
+        "class Program "
+        "  public static method Filter(nums: Array<int>, f: (int) -> bool): "
+        "      IEnumerable<int> "
+        "    for var x in nums do if f(x) then yield return x; end; end; "
+        "  end Filter; "
+        "  public " + readOut + " "
+        "end Program;";
+}
+
+// True when the T9 `scoped`-field read-out bar diagnostic is present — pins THIS
+// bar (its distinctive "frame-carrying position" tail) rather than the generic
+// scoped-field or capture-set error.
+bool sawScopedFieldReadOutError(const bezel::test::OwnershipResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("frame-carrying position") != std::string::npos)
+            return true;
+    return false;
+}
+
+}  // namespace
+
+// ★ Primary T9 regression: the critique's `Sneak` counterexample. `btn._pred`
+// reads ANOTHER object's `scoped` field into `Filter`'s plain function slot and
+// the frame is returned; the stored callback would ride the frame past `btn`'s
+// control and severance's reach. Rejected with the distinct read-out-bar
+// diagnostic. Compiles CLEAN without the T9 fix (the plain-storage-fetch hole);
+// produces the read-out-bar error with it. // per §28.14 v0.196
+BEZEL_TEST(deferred_activation_capture_1818, scoped_field_readout_into_deferred_slot_rejected) {
+    auto r = parseAndCheckOwnership(sneakWrap(
+        "method Sneak(nums: Array<int>, btn: Widget): IEnumerable<int> "
+        "  return Filter(nums, btn._pred); "
+        "end Sneak;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(sawScopedFieldReadOutError(r));
+}
+
+// ADMIT — capture-free storage (design test vi). A PLAIN (non-`scoped`) field
+// read passed into the same deferred-activation plain slot contributes nothing:
+// the closure-escape rules keep borrow-capturing closures OUT of plain storage,
+// so a plain-field function value is borrow-free by construction. Admitted even
+// though the frame is returned. Pins the "plain field read → nothing, soundly"
+// row and guards against over-rejecting every function-typed field read.
+// // per §28.3, §28.14 v0.196
+BEZEL_TEST(deferred_activation_capture_1818, plain_field_readout_capture_free_accepted) {
+    auto r = parseAndCheckOwnership(sneakWrap(
+        "method Ok(nums: Array<int>, btn: Widget): IEnumerable<int> "
+        "  return Filter(nums, btn._pred!); "
+        "end Ok;",
+        /*scopedField=*/false));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ADMIT — the scoped-field read feeds a DIRECT `for` source, not an escaping
+// position: the frame (and its reference to the callback) is loop-bounded and
+// dies at the loop, within `btn`'s life, so the callback's captures — bounded by
+// `btn`'s scoped construction — outlive every invocation. Sound, admitted — T9
+// excludes the for-source position exactly as the T2/T3/T5 capture rows do.
+// The over-rejection guard for T9. // per §28.14, §29.2 v0.196
+BEZEL_TEST(deferred_activation_capture_1818, scoped_field_readout_for_source_accepted) {
+    auto r = parseAndCheckOwnership(sneakWrap(
+        "method Loop(nums: Array<int>, btn: Widget): int "
+        "  var total := 0; "
+        "  for var v in Filter(nums, btn._pred) do total := total + v; end; "
+        "  return total; "
+        "end Loop;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ===========================================================================
+// T10 — async carried-source controls (§28.14 frame residence / §30.1, v0.196).
+//
+// §28.14 / §30.1 (v0.196): async's structural carried-source enumeration is
+// fixed by the SAME capture-set rule — a `Task`-family frame carrying a capture
+// of a scope-bound owned source that escapes via return / field-store /
+// scope-crossing is statically REJECTED (a `Task` is in the deferred-activation
+// kind list), exactly as the iterator/lazy-query frame is. The awaited-in-scope
+// POSITIVE stays admitted: an inline `await Call(...)` consumes the task within
+// the full expression (the async analogue of a direct `for` source), so the
+// captured source outlives settlement (§30.1). T10 makes the reject speak the
+// §30.1 settlement remedy (await the task in the source's scope) rather than the
+// iterator "materialize a collection" remedy. Each REJECT compiles CLEAN of the
+// async-settlement remedy WITHOUT the T10 wording (it fell back to the iterator
+// remedy) and carries it WITH T10; the ACCEPT compiles clean either way. Every
+// shape was hand-verified against `build/bezelc -c` before folding in.
+// ===========================================================================
+
+namespace {
+
+// The async preamble: `SumAsync` is a USER async factory taking a PLAIN
+// `(int) -> int` parameter `f` (a state-machine frame-residence position,
+// §28.14 v0.196) and returning `Task<int>`. `caller` is the enclosing `Program`
+// method whose body composes it.
+std::string asyncWrap(const std::string& caller) {
+    return std::string(
+        "module M; "
+        "class Scaler "
+        "  public constructor() end constructor; "
+        "  destructor end destructor; "
+        "  public method Apply(x: int): int => x * 2; "
+        "end Scaler; "
+        "class Program "
+        "  public static async method SumAsync(nums: Array<int>, "
+        "      f: (int) -> int): Task<int> "
+        "    var total := 0; "
+        "    for var x in nums do total := total + f(x); end; "
+        "    return total; "
+        "  end SumAsync; "
+        "  public ") + caller + " "
+        "end Program;";
+}
+
+// True when the async carried-source reject carries the §30.1 settlement remedy
+// (its distinctive "to settlement within" tail) — the T10 wording, absent when
+// the reject falls back to the iterator "materialize a collection" remedy.
+bool sawAsyncSettlementRemedy(const bezel::test::OwnershipResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("to settlement within") != std::string::npos)
+            return true;
+    return false;
+}
+
+}  // namespace
+
+// ★ Primary T10 regression (design tests i + ix, async return variant): the
+// lambda `(x) => scale.Apply(x)` captures the owned `using var scale`; the
+// `Task<int>` frame is RETURNED, escaping `scale`'s scope. Rejected — via the
+// same capture-set machinery as the iterator case (a `Task` is a deferred-
+// activation frame) — and the reject speaks the §30.1 settlement remedy. The
+// capture-set reject itself fires from rule (b); the async-settlement wording is
+// the load-bearing T10 signal (absent → the iterator remedy). // per §28.14,
+// §30.1 v0.196
+BEZEL_TEST(deferred_activation_capture_1818, async_carried_source_return_rejected) {
+    auto r = parseAndCheckOwnership(asyncWrap(
+        "method Trouble(nums: Array<int>): Task<int> "
+        "  using var scale := new Scaler(); "
+        "  return SumAsync(nums, (x) => scale.Apply(x)); "
+        "end Trouble;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(sawCaptureSetError(r));
+    BEZEL_EXPECT_TRUE(sawAsyncSettlementRemedy(r));
+}
+
+// REJECT — the bind-then-return async variant (a scope-crossing escape, the
+// object-borrow parallel `var t := …; return t;`): the capturing `Task` frame is
+// bound to `t` and returned. Rejected at the binding, exactly as the iterator
+// bind-then-return twin. // per §28.14, §30.1 v0.196
+BEZEL_TEST(deferred_activation_capture_1818, async_carried_source_bind_then_return_rejected) {
+    auto r = parseAndCheckOwnership(asyncWrap(
+        "method Trouble(nums: Array<int>): Task<int> "
+        "  using var scale := new Scaler(); "
+        "  var t := SumAsync(nums, (x) => scale.Apply(x)); "
+        "  return t; "
+        "end Trouble;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(sawCaptureSetError(r));
+}
+
+// ADMIT — the awaited-in-scope POSITIVE (design test ix): the callback captures
+// the owned `using var scale`, and the returned task is awaited to settlement
+// WITHIN `scale`'s scope. The inline `await SumAsync(...)` consumes the task
+// within the full expression (the async analogue of a direct `for` source), so
+// the captured source outlives settlement (§30.1) — admitted. The load-bearing
+// over-rejection guard for T10: this shape must stay legal. // per §28.14,
+// §30.1 v0.196
+BEZEL_TEST(deferred_activation_capture_1818, async_awaited_in_scope_accepted) {
+    auto r = parseAndCheckOwnership(asyncWrap(
+        "async method Report(nums: Array<int>): Task<int> "
+        "  using var scale := new Scaler(); "
+        "  var total := await SumAsync(nums, (x) => scale.Apply(x)); "
+        "  return total; "
+        "end Report;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
