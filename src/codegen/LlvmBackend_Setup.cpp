@@ -5590,7 +5590,16 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                  initTR->headName() == "Queue" ||
                  initTR->headName() == "OwningQueue");
             if (initIsArray) {
-                v = wrapArrayAsIEnumerable(v, declTR);
+                // §29 / §12.9 (#1850): a nested covariant view whose elements
+                // are themselves array-backed collections viewed as pure
+                // IEnumerable<T> (Array<Array<Dog>> → IEnumerable<IEnumerable<Dog>>)
+                // needs the per-element re-wrapping nested enumerator — the plain
+                // wrapper hands out raw bz_array_t* elements the inner for-in then
+                // vtable-dispatches on → SIGSEGV.
+                if (nestedIEnumViewNeeded(initTR, declTR))
+                    v = wrapNestedArrayAsIEnumerable(v, initTR, declTR);
+                else
+                    v = wrapArrayAsIEnumerable(v, declTR);
             } else if (initTR && isLinkedListTypeName(initTR)) {
                 // #1177: (Owned)LinkedList<T> is node-based (bz_llist) — wrap
                 // with the node-walking enumerator, mirroring buildOrderedArgs.

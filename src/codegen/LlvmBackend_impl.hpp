@@ -3900,6 +3900,49 @@ private:
     llvm::Value* wrapArrayAsIEnumerable(llvm::Value* arr,
                                         const sema::TypeRef* iEnumTy);
 
+    // §29.2 (#437 / #1850): the cached machinery (struct type, vtable global,
+    // element stride) for the array enumerator over a given lowered element type.
+    // Extracted from wrapArrayAsIEnumerable so both the top-level wrap and the
+    // per-element inner wrap of a nested covariant view (via ensureIEnumViewFactory)
+    // share the exact same functions/vtable (keyed by element type).
+    struct ArrEnumMachinery {
+        llvm::StructType* stTy = nullptr;
+        llvm::GlobalVariable* vtGV = nullptr;
+        int64_t esz = 8;
+    };
+    ArrEnumMachinery ensureArrayEnumMachinery(llvm::Type* elemTy);
+
+    // §29 / §12.9 (#1850): wrap an array-backed collection whose ELEMENTS are
+    // themselves array-backed collections viewed covariantly as IEnumerable<T>
+    // (`Array<Array<Dog>>` → `IEnumerable<IEnumerable<Dog>>`). The plain
+    // wrapArrayAsIEnumerable hands out each stored element raw (a bz_array_t*),
+    // but the consumer iterates it as `IEnumerable<T>` via vtable dispatch → a
+    // null-function-pointer call (SIGSEGV). This variant's Current lazily
+    // materialises a proper vtable-backed inner view per element (disposing the
+    // previous one on MoveNext / at Dispose), so the doubly-nested for-in works.
+    // `storedTy` is the concrete source collection type (e.g. Array<Array<Dog>>);
+    // `viewTy` is the target IEnumerable<IEnumerable<T>>.
+    llvm::Value* wrapNestedArrayAsIEnumerable(llvm::Value* arr,
+                                              const sema::TypeRef* storedTy,
+                                              const sema::TypeRef* viewTy);
+
+    // §29 / §12.9 (#1850): a factory function `ptr F(ptr backingArray)` that
+    // wraps a backing array-backed collection of `storedTy` as `viewTy`
+    // (IEnumerable-family). Chooses a plain array enumerator when the element
+    // representation matches the view, or a nested wrapper (recursing through
+    // this factory for the inner level) when the element itself needs a
+    // covariant-view re-representation. Cached/keyed by the wrap shape.
+    llvm::Function* ensureIEnumViewFactory(const sema::TypeRef* storedTy,
+                                           const sema::TypeRef* viewTy);
+
+    // §29 / §12.9 (#1850): true when wrapping the array-backed collection
+    // `storedTy` as the IEnumerable view `viewTy` requires the nested wrapper —
+    // i.e. the ELEMENT is itself an array-backed collection viewed as a pure
+    // (vtable-dispatched) IEnumerable<T>. The plain wrapArrayAsIEnumerable is
+    // used otherwise (including ordinary single-level covariance).
+    bool nestedIEnumViewNeeded(const sema::TypeRef* storedTy,
+                               const sema::TypeRef* viewTy) const;
+
     // §29.2 / §4.3 (#1310): if `targetTy` is the pure declaration-less
     // `IEnumerable<T>` and the source value `srcExpr` is a dense array-backed
     // collection / a (Owned)LinkedList / a user class implementing IEnumerable,

@@ -2947,8 +2947,14 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         (an == "Array" || an == "OwningArray" || an == "OwningBuffer" ||
          an == "Stack" || an == "OwningStack" ||
          an == "Queue" || an == "OwningQueue");
-    if (actualIsArray)
+    if (actualIsArray) {
+        // §29 / §12.9 (#1850): a nested covariant view whose elements are
+        // themselves array-backed collections viewed as pure IEnumerable<T>
+        // needs the per-element re-wrapping nested enumerator, not the plain one.
+        if (nestedIEnumViewNeeded(actualTy, targetTy))
+            return wrapNestedArrayAsIEnumerable(v, actualTy, targetTy);
         return wrapArrayAsIEnumerable(v, targetTy);
+    }
     if (actualTy && isLinkedListTypeName(actualTy))
         return wrapLinkedListAsIEnumerable(v, targetTy);
     // A user class implementing IEnumerable<T> (declaration-carrying). A source
@@ -2969,22 +2975,44 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
 // both Array<T> and iterator-method IEnumerable<T> sources.
 llvm::Value* Emitter::wrapArrayAsIEnumerable(llvm::Value* arr,
                                              const sema::TypeRef* iEnumTy) {
-    // Determine element type and size.
-    // per §9 (bug D): a record element type lowers to an LLVM StructType whose
-    // allocation size may exceed 8 bytes; use DataLayout for structs so the
-    // esz stored in the enumerator frame matches the stride used by
-    // bz_array_ptr_at (same fix as collectionElemSize in Calls.cpp).
+    // Determine the element type; ensureArrayEnumMachinery derives the stride and
+    // the cached vtable/struct from it, then we allocate + fill one instance.
     llvm::Type* elemTy = i32();
-    int64_t esz = 8;
-    if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0]) {
+    if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
         elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);
-        if (elemTy->isIntegerTy(32) || elemTy->isFloatTy()) esz = 4;
-        else if (elemTy->isIntegerTy(1) || elemTy->isIntegerTy(8)) esz = 1;
-        else if (elemTy->isIntegerTy(16)) esz = 2;
-        else if (elemTy->isStructTy())
-            esz = (int64_t)module_->getDataLayout().getTypeAllocSize(elemTy);
-        else esz = 8;
-    }
+    ArrEnumMachinery m = ensureArrayEnumMachinery(elemTy);
+    llvm::StructType* stTy = m.stTy;
+    // Allocate and fill the enumerator struct { vtable, arr, idx=-1, esz }.
+    uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stTy);
+    auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
+    llvm::Value* en = builder_.CreateCall(callocFn2,
+        {builder_.getInt64(1), builder_.getInt64(stSz)}, "arrenum");
+    builder_.CreateStore(m.vtGV, builder_.CreateStructGEP(stTy, en, 0));
+    builder_.CreateStore(arr, builder_.CreateStructGEP(stTy, en, 1));
+    builder_.CreateStore(builder_.getInt64(-1),
+        builder_.CreateStructGEP(stTy, en, 2));
+    builder_.CreateStore(builder_.getInt64(m.esz),
+        builder_.CreateStructGEP(stTy, en, 3));
+    return en;
+}
+
+// §29.2 (#437 / #1850): create-or-reuse the array-enumerator machinery (struct
+// type, method functions, vtable) keyed on the lowered element type. Factored
+// out of wrapArrayAsIEnumerable so the nested covariant-view factory
+// (ensureIEnumViewFactory) can build fresh enumerator instances over the same
+// cached functions/vtable.
+Emitter::ArrEnumMachinery Emitter::ensureArrayEnumMachinery(llvm::Type* elemTy) {
+    // per §9 (bug D): a record element type lowers to an LLVM StructType whose
+    // allocation size may exceed 8 bytes; use DataLayout for structs so the esz
+    // stored in the enumerator frame matches the stride used by bz_array_ptr_at
+    // (same fix as collectionElemSize in Calls.cpp).
+    int64_t esz = 8;
+    if (elemTy->isIntegerTy(32) || elemTy->isFloatTy()) esz = 4;
+    else if (elemTy->isIntegerTy(1) || elemTy->isIntegerTy(8)) esz = 1;
+    else if (elemTy->isIntegerTy(16)) esz = 2;
+    else if (elemTy->isStructTy())
+        esz = (int64_t)module_->getDataLayout().getTypeAllocSize(elemTy);
+    else esz = 8;
 
     // Enumerator struct: { ptr vtable, ptr arr, i64 idx, i64 esz }
     // We use a unique struct name keyed on the element type to allow caching.
@@ -3117,24 +3145,302 @@ llvm::Value* Emitter::wrapArrayAsIEnumerable(llvm::Value* arr,
         vtGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
     }
 
-    // Allocate and fill the enumerator struct.
+    return {stTy, vtGV, esz};
+}
+
+// §29 / §12.9 (#1850): a factory `ptr F(ptr backing)` wrapping a bz_array_t*
+// `backing` (whose static type is `storedTy`) as the covariant view `viewTy`.
+//
+// When the element representation matches the view (a plain covariant view such
+// as Array<Dog> → IEnumerable<Animal>, both stored/viewed as object ptrs), F
+// allocates the ordinary array enumerator. When the ELEMENT itself is an
+// array-backed collection viewed as a pure IEnumerable<T> (Array<Array<Dog>> →
+// IEnumerable<IEnumerable<Dog>>), the stored element is a raw bz_array_t* but
+// the consumer iterates it via vtable dispatch — so F allocates a NESTED wrapper
+// whose Current lazily materialises a proper inner view per element (recursing
+// through this same factory for deeper nesting). The nested wrapper owns the one
+// live inner view: MoveNext disposes the previous element's inner view, and
+// Dispose disposes the last one, before freeing the wrapper struct itself. The
+// backing array is borrowed (shared), exactly like the plain wrapper.
+// §29 / §12.9 (#1850): the nested-wrap decision — element is an array-backed
+// collection (bz_array_t*, lowers to ptr) VIEWED as a pure IEnumerable<T>.
+// Only the pure vtable-dispatched interfaces (IEnumerable / IOwningEnumerable)
+// make the consumer's inner for-in vtable-dispatch
+// (lowerIEnumerableBuiltinFor's checkPureIEnumerable / the field
+// IOwningEnumerable case); richer interfaces keep the array-index protocol, so
+// they must NOT be nest-wrapped (that would break their raw-array iteration).
+bool Emitter::nestedIEnumViewNeeded(const sema::TypeRef* storedTy,
+                                    const sema::TypeRef* viewTy) const {
+    auto isArrayBacked = [](const sema::TypeRef* t) -> bool {
+        if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
+        std::string_view h = t->headName();
+        return h == "Array" || h == "OwningArray" || h == "OwningBuffer" ||
+               h == "Stack" || h == "OwningStack" ||
+               h == "Queue" || h == "OwningQueue";
+    };
+    auto isPureIEnumView = [](const sema::TypeRef* t) -> bool {
+        if (!t || t->kind != sema::TypeRef::Kind::Named || t->declaration)
+            return false;
+        std::string_view h = t->headName();
+        return h == "IEnumerable" || h == "IOwningEnumerable";
+    };
+    const sema::TypeRef* storedElem =
+        (storedTy && !storedTy->genericArgs.empty()) ? storedTy->genericArgs[0]
+                                                     : nullptr;
+    const sema::TypeRef* viewElem =
+        (viewTy && !viewTy->genericArgs.empty()) ? viewTy->genericArgs[0]
+                                                 : nullptr;
+    return isArrayBacked(storedElem) && isPureIEnumView(viewElem);
+}
+
+llvm::Function* Emitter::ensureIEnumViewFactory(const sema::TypeRef* storedTy,
+                                                const sema::TypeRef* viewTy) {
+    const sema::TypeRef* storedElem =
+        (storedTy && !storedTy->genericArgs.empty()) ? storedTy->genericArgs[0]
+                                                     : nullptr;
+    const sema::TypeRef* viewElem =
+        (viewTy && !viewTy->genericArgs.empty()) ? viewTy->genericArgs[0]
+                                                 : nullptr;
+    bool elemNeedsWrap = nestedIEnumViewNeeded(storedTy, viewTy);
+
+    llvm::Type* elemTy = viewElem ? lowerTypeRef(viewElem) : i32();
+    std::string elemName = elemTy->isIntegerTy()
+        ? ("i" + std::to_string(elemTy->getIntegerBitWidth()))
+        : (elemTy->isPointerTy() ? "ptr" : "f");
+
+    if (!elemNeedsWrap) {
+        // Leaf: a plain array enumerator over the (borrowed) backing array.
+        std::string name = "bz$viewfac$P$" + elemName;
+        if (auto* f = module_->getFunction(name)) return f;
+        ArrEnumMachinery m = ensureArrayEnumMachinery(elemTy);
+        auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+        auto* f = llvm::Function::Create(ft, llvm::Function::InternalLinkage,
+                                         name, module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value* backing = f->arg_begin();
+        uint64_t stSz = module_->getDataLayout().getTypeAllocSize(m.stTy);
+        auto* callocFT = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+        auto* callocC = module_->getOrInsertFunction("calloc", callocFT)
+                            .getCallee();
+        llvm::Value* en = b.CreateCall(callocFT, callocC,
+            {llvm::ConstantInt::get(i64(), 1),
+             llvm::ConstantInt::get(i64(), (int64_t)stSz)});
+        b.CreateStore(m.vtGV, b.CreateStructGEP(m.stTy, en, 0));
+        b.CreateStore(backing, b.CreateStructGEP(m.stTy, en, 1));
+        b.CreateStore(llvm::ConstantInt::get(i64(), -1),
+                      b.CreateStructGEP(m.stTy, en, 2));
+        b.CreateStore(llvm::ConstantInt::get(i64(), m.esz),
+                      b.CreateStructGEP(m.stTy, en, 3));
+        b.CreateRet(en);
+        return f;
+    }
+
+    // Nested: each element (a bz_array_t*) is itself wrapped as `viewElem` via
+    // the inner factory. Recurse to get it first (its name encodes the inner
+    // shape, so this factory's cache key is unique per whole wrap shape).
+    llvm::Function* innerFac = ensureIEnumViewFactory(storedElem, viewElem);
+    std::string name = "bz$viewfac$N$" + innerFac->getName().str();
+    if (auto* f = module_->getFunction(name)) return f;
+
+    // Nested enumerator struct: { ptr vtable, ptr arr, i64 idx, i64 esz,
+    //                             ptr curInner }.  esz here is 8 — the outer
+    //  backing array's elements are collection pointers (bz_array_t*).
+    std::string stName = "arrenumnest." + elemName;
+    auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
+    if (!stTy)
+        stTy = llvm::StructType::create(
+            llvm_, {ptrTy(), ptrTy(), i64(), i64(), ptrTy()}, stName);
+
+    std::string prefix = "bz$arrenumnest$" + elemName + "$";
+    auto* voidTy = llvm::Type::getVoidTy(llvm_);
+    auto getOrCreate = [&](const std::string& fname, llvm::FunctionType* ft,
+                           std::function<void(llvm::Function*)> fill)
+        -> llvm::Function* {
+        if (auto* g = module_->getFunction(fname)) return g;
+        auto* g = llvm::Function::Create(ft, llvm::Function::InternalLinkage,
+                                         fname, module_.get());
+        fill(g);
+        return g;
+    };
+    auto* freeFT = llvm::FunctionType::get(voidTy, {ptrTy()}, false);
+
+    // Dispatch the current inner view's slot-1 Dispose (if any), then null it.
+    // The inner view carries its own vtable at slot 0; slot 1 is Dispose (§29.11).
+    auto disposeCurInner = [&](llvm::IRBuilder<>& b, llvm::Value* self) {
+        auto* fn = b.GetInsertBlock()->getParent();
+        auto* haveBB = llvm::BasicBlock::Create(llvm_, "ci.have", fn);
+        auto* contBB = llvm::BasicBlock::Create(llvm_, "ci.cont", fn);
+        llvm::Value* ciF = b.CreateStructGEP(stTy, self, 4);
+        llvm::Value* ci = b.CreateLoad(ptrTy(), ciF);
+        llvm::Value* isNull =
+            b.CreateICmpEQ(ci, llvm::ConstantPointerNull::get(ptrTy()));
+        b.CreateCondBr(isNull, contBB, haveBB);
+        b.SetInsertPoint(haveBB);
+        // vt = ci[0]; dispFn = vt[1] (Dispose slot); dispFn(ci). The vtable is a
+        // dense array of ptr — index it as the rest of codegen does (getelementptr
+        // ptr, vt, i32 1), not via a struct GEP.
+        llvm::Value* vt = b.CreateLoad(ptrTy(), ci);
+        llvm::Value* dispSlot = b.CreateGEP(ptrTy(), vt, {b.getInt32(1)});
+        llvm::Value* dispFn = b.CreateLoad(ptrTy(), dispSlot);
+        b.CreateCall(freeFT, dispFn, {ci});
+        b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), ciF);
+        b.CreateBr(contBB);
+        b.SetInsertPoint(contBB);
+    };
+
+    // Dispose(self): dispose the last live inner view, then free(self).
+    auto* dispFn = getOrCreate(prefix + "Dispose", freeFT,
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            disposeCurInner(b, f->arg_begin());
+            auto* freeC = module_->getOrInsertFunction("free", freeFT)
+                              .getCallee();
+            b.CreateCall(freeFT, freeC, {f->arg_begin()});
+            b.CreateRetVoid();
+        });
+
+    // MoveNext(self): dispose the previous element's inner view, advance idx,
+    // return idx < len(arr).
+    auto* mnFn = getOrCreate(prefix + "MoveNext",
+        llvm::FunctionType::get(i1(), {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            llvm::Value* self = f->arg_begin();
+            disposeCurInner(b, self);
+            llvm::Value* idxF = b.CreateStructGEP(stTy, self, 2);
+            llvm::Value* idx = b.CreateLoad(i64(), idxF);
+            llvm::Value* next =
+                b.CreateAdd(idx, llvm::ConstantInt::get(i64(), 1));
+            b.CreateStore(next, idxF);
+            llvm::Value* arrPtr =
+                b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 1));
+            auto* lenFT = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+            auto* lenFn = module_->getOrInsertFunction("bz_array_len", lenFT)
+                              .getCallee();
+            llvm::Value* len = b.CreateCall(lenFT, lenFn, {arrPtr});
+            b.CreateRet(b.CreateICmpSLT(next, len));
+        });
+
+    // Current(self): if the inner view for this element is already materialised,
+    // return it; else load the element (a bz_array_t*), wrap it via innerFac,
+    // cache it in curInner, and return it.
+    auto* curFn = getOrCreate(prefix + "Current",
+        llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* entry = llvm::BasicBlock::Create(llvm_, "entry", f);
+            auto* mkBB = llvm::BasicBlock::Create(llvm_, "ci.make", f);
+            auto* retBB = llvm::BasicBlock::Create(llvm_, "ci.ret", f);
+            llvm::IRBuilder<> b(entry);
+            llvm::Value* self = f->arg_begin();
+            llvm::Value* ciF = b.CreateStructGEP(stTy, self, 4);
+            llvm::Value* ci = b.CreateLoad(ptrTy(), ciF);
+            llvm::Value* isNull =
+                b.CreateICmpEQ(ci, llvm::ConstantPointerNull::get(ptrTy()));
+            b.CreateCondBr(isNull, mkBB, retBB);
+            b.SetInsertPoint(mkBB);
+            llvm::Value* arrPtr =
+                b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 1));
+            llvm::Value* idx =
+                b.CreateLoad(i64(), b.CreateStructGEP(stTy, self, 2));
+            auto* ptrAtFT =
+                llvm::FunctionType::get(ptrTy(), {ptrTy(), i64(), i64()}, false);
+            auto* ptrAtFn =
+                module_->getOrInsertFunction("bz_array_ptr_at", ptrAtFT)
+                    .getCallee();
+            llvm::Value* ep = b.CreateCall(ptrAtFT, ptrAtFn,
+                {arrPtr, idx, llvm::ConstantInt::get(i64(), 8)});
+            llvm::Value* innerArr = b.CreateLoad(ptrTy(), ep);
+            auto* facFT = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+            llvm::Value* inner = b.CreateCall(facFT, innerFac, {innerArr});
+            b.CreateStore(inner, ciF);
+            b.CreateBr(retBB);
+            b.SetInsertPoint(retBB);
+            llvm::PHINode* phi = b.CreatePHI(ptrTy(), 2);
+            phi->addIncoming(ci, entry);
+            phi->addIncoming(inner, mkBB);
+            b.CreateRet(phi);
+        });
+
+    // GetEnumerator(self): a FRESH nested enumerator over the same backing array,
+    // before the first element (idx = -1, curInner = null) — §29.11 replay.
+    auto* geFn = getOrCreate(prefix + "GetEnumerator",
+        llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            llvm::Value* self = f->arg_begin();
+            uint64_t cloneSz = module_->getDataLayout().getTypeAllocSize(stTy);
+            auto* callocFT =
+                llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+            auto* callocC = module_->getOrInsertFunction("calloc", callocFT)
+                                .getCallee();
+            llvm::Value* clone = b.CreateCall(callocFT, callocC,
+                {llvm::ConstantInt::get(i64(), 1),
+                 llvm::ConstantInt::get(i64(), (int64_t)cloneSz)});
+            llvm::Value* vt =
+                b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 0));
+            b.CreateStore(vt, b.CreateStructGEP(stTy, clone, 0));
+            llvm::Value* arrCp =
+                b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 1));
+            b.CreateStore(arrCp, b.CreateStructGEP(stTy, clone, 1));
+            b.CreateStore(llvm::ConstantInt::get(i64(), -1),
+                          b.CreateStructGEP(stTy, clone, 2));
+            b.CreateStore(llvm::ConstantInt::get(i64(), 8),
+                          b.CreateStructGEP(stTy, clone, 3));
+            // curInner (slot 4) already null from calloc.
+            b.CreateRet(clone);
+        });
+
+    // vtable: [0]=self sentinel, [1]=Dispose, [2]=MoveNext, [3]=Current,
+    // [4]=GetEnumerator (the same 5-slot shape as every sync IEnumerable
+    // producer, §29.11 #943).
+    std::string vtName = prefix + "vtable";
+    auto* vtGV = module_->getGlobalVariable(vtName);
+    if (!vtGV) {
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
+        std::vector<llvm::Constant*> elems = {
+            llvm::ConstantPointerNull::get(ptrTy()), dispFn, mnFn, curFn, geFn};
+        vtGV = new llvm::GlobalVariable(*module_, vtTy, /*isConst=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(vtTy, elems), vtName);
+        elems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy());
+        vtGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
+    }
+
+    // The factory itself: allocate + fill a nested enumerator over `backing`.
+    auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+    auto* f = llvm::Function::Create(ft, llvm::Function::InternalLinkage,
+                                     name, module_.get());
+    auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+    llvm::IRBuilder<> b(bb);
+    llvm::Value* backing = f->arg_begin();
     uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stTy);
-    auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
-    llvm::Value* en = builder_.CreateCall(callocFn2,
-        {builder_.getInt64(1), builder_.getInt64(stSz)}, "arrenum");
-    // [0] vtable
-    builder_.CreateStore(vtGV,
-        builder_.CreateStructGEP(stTy, en, 0));
-    // [1] arr
-    builder_.CreateStore(arr,
-        builder_.CreateStructGEP(stTy, en, 1));
-    // [2] idx = -1 (calloc zeroed it, but -1 means "before first")
-    builder_.CreateStore(builder_.getInt64(-1),
-        builder_.CreateStructGEP(stTy, en, 2));
-    // [3] esz
-    builder_.CreateStore(builder_.getInt64(esz),
-        builder_.CreateStructGEP(stTy, en, 3));
-    return en;
+    auto* callocFT = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+    auto* callocC = module_->getOrInsertFunction("calloc", callocFT).getCallee();
+    llvm::Value* en = b.CreateCall(callocFT, callocC,
+        {llvm::ConstantInt::get(i64(), 1),
+         llvm::ConstantInt::get(i64(), (int64_t)stSz)});
+    b.CreateStore(vtGV, b.CreateStructGEP(stTy, en, 0));
+    b.CreateStore(backing, b.CreateStructGEP(stTy, en, 1));
+    b.CreateStore(llvm::ConstantInt::get(i64(), -1),
+                  b.CreateStructGEP(stTy, en, 2));
+    b.CreateStore(llvm::ConstantInt::get(i64(), 8),
+                  b.CreateStructGEP(stTy, en, 3));
+    // curInner (slot 4) already null from calloc.
+    b.CreateRet(en);
+    return f;
+}
+
+// §29 / §12.9 (#1850): wrap a nested covariant IEnumerable view by calling the
+// shape-specific factory built by ensureIEnumViewFactory.
+llvm::Value* Emitter::wrapNestedArrayAsIEnumerable(llvm::Value* arr,
+                                                   const sema::TypeRef* storedTy,
+                                                   const sema::TypeRef* viewTy) {
+    llvm::Function* fac = ensureIEnumViewFactory(storedTy, viewTy);
+    return builder_.CreateCall(fac, {arr}, "nestview");
 }
 
 
