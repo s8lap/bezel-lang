@@ -1087,6 +1087,21 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // called TakeCurrent (manual-protocol abandonment) and we must dispose.
         auto disposeYieldedVal = [&]() {
             if (!elemIsOwnedClass && !isOwningIter) return;
+            // #1837 / §4.13 / §29.1 (v0.196): the cleanup below loads current_val
+            // and compares it against a null POINTER, so it requires elemTy to be
+            // a pointer. An IOwningEnumerable<T> iterator emitted as its
+            // UNSPECIALIZED generic template (T is an unresolved type parameter, so
+            // lowerTypeRef falls to the i32 value-kind placeholder) has isOwningIter
+            // true but a non-pointer elemTy — the raw i32-vs-ptr ICmp then trips
+            // llvm::ICmpInst::AssertOK. The template is never called (each call site
+            // emits a monomorphized specialization where the class-constrained T is
+            // a concrete reference type ⇒ elemTy is ptr and this dispose runs in
+            // full), so skip it here — mirroring the `isOwningIter &&
+            // elemTy->isPointerTy()` guards already at the TakeCurrent (§29.1) and
+            // MoveNext-exhaustion sites. (elemIsOwnedClass always implies a
+            // class/interface element ⇒ a pointer elemTy, so this never elides a
+            // real IEnumerable<owned T> disposal.)
+            if (!elemTy->isPointerTy()) return;
             llvm::Value* cvField = builder_.CreateStructGEP(
                 stateStructTy, self, CURRENT_VAL_FIELD);
             llvm::Value* yv = builder_.CreateLoad(elemTy, cvField, "ity.yv");
