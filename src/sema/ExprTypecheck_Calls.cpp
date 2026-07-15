@@ -111,8 +111,9 @@ static std::string_view callsNamedTypeSimpleName(const TypeRef* ref) {
 // empty/garbage value (a silent miscompile — the call-argument materializer
 // `materializeCollectionLiteralForArg` declines an interface target). This
 // predicate recognises a non-admissible interface target so the caller can
-// reject it per §15.4.
-static bool isCollectionLiteralInterfaceTarget(const TypeRef* t) {
+// reject it per §15.4. Declared in ExprTypecheck_impl.hpp — shared with the
+// local-declaration position (#1866) in ExprTypecheck.cpp.
+bool isCollectionLiteralInterfaceTarget(const TypeRef* t) {
     if (!t || t->kind != TypeRef::Kind::Named) return false;
     // A user-declared interface (§11.x InterfaceDecl).
     if (t->declaration)
@@ -128,8 +129,9 @@ static bool isCollectionLiteralInterfaceTarget(const TypeRef* t) {
 // per §15.4 (#1174): emit the "collection literal cannot target an interface"
 // diagnostic. Shared by the user-method argument path (checkArgsAgainstParams)
 // and the builtin string-method paths (string.Trim / string.Join) whose
-// IEnumerable<T> parameters are not modelled as `ast::Param`s.
-static void reportCollectionLiteralInterfaceTarget(
+// IEnumerable<T> parameters are not modelled as `ast::Param`s. Declared in
+// ExprTypecheck_impl.hpp — shared with the local-declaration position (#1866).
+void reportCollectionLiteralInterfaceTarget(
     DiagnosticEngine& diags, SourceLocation loc, std::string_view ifaceName) {
     std::string named = ifaceName.empty()
                             ? std::string("an interface")

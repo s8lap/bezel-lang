@@ -6296,6 +6296,28 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         }
                     }
                 }
+                // per §15.4 (#1866): a collection literal whose declared target
+                // is a collection INTERFACE (`IEnumerable<T>`/`IList<T>`/
+                // `ICollection<T>`/`IReadOnly*`/`ISet`/`IDictionary`/…) is not
+                // admissible — §15.4's target list is a CLOSED set of concrete
+                // collection types, and an interface has no concrete backing the
+                // literal could materialize into. Left un-rejected, the literal
+                // reached codegen with a `ptr`-typed target and emitted malformed
+                // IR (an Invalid-GEP verifier abort — a compile-time ICE). Reject
+                // it here, exactly as the call-argument position (#1174) and the
+                // lambda expression-body position (#1693) already do. A CONCRETE
+                // collection init (`var v: Array<T> := [...]`) is unaffected; the
+                // remedy names a concrete backing and (covariantly) assigns it:
+                // `var xs: Array<T> := [...]; var v: IEnumerable<T> := xs;`.
+                if (dynamic_cast<const ast::CollectionLiteralExpr*>(
+                        ld->initializer.get()) &&
+                    isCollectionLiteralInterfaceTarget(lsym->declType)) {
+                    reportCollectionLiteralInterfaceTarget(
+                        ctx_.diagnostics(), ld->initializer->span.begin,
+                        namedTypeSimpleName(lsym->declType));
+                    currentScope_->names[ld->name] = lsym;
+                    return;  // reported; skip the assignability check below
+                }
                 // per §14.1/§14.2 + §A.7 (issue #391): return-target generic
                 // type-argument inference. When the initializer is a call to a
                 // generic method whose type parameter appears only in the

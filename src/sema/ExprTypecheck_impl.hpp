@@ -32,6 +32,21 @@
 
 namespace bezel::sema {
 
+// per §15.4 (#1174 / #1866): a collection literal's admissible TARGET types are
+// a CLOSED list of CONCRETE collections (inline array, `Array`/`OwningArray`,
+// `Set`, `Stack`, `Queue`, `LinkedList`, `Dictionary`, and their owning forms,
+// or a `FromCollectionLiteral` user type). A collection INTERFACE
+// (`IEnumerable<T>`/`IList<T>`/`ICollection<T>`/`IReadOnly*`/…) is NOT on that
+// list — it has no concrete backing the literal could be materialized into.
+// `isCollectionLiteralInterfaceTarget` recognises a non-admissible interface
+// target; `reportCollectionLiteralInterfaceTarget` emits the §15.4 rejection.
+// Shared across the call-argument (#1174), string-method (#1174), and
+// local-declaration (#1866) positions.
+bool isCollectionLiteralInterfaceTarget(const TypeRef* t);
+void reportCollectionLiteralInterfaceTarget(DiagnosticEngine& diags,
+                                            SourceLocation loc,
+                                            std::string_view ifaceName);
+
 class ExprTC {
 public:
     ExprTC(SemaContext& ctx) : ctx_(ctx) {}
