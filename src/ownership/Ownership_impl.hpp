@@ -1744,6 +1744,17 @@ private:
     // Task/Task<T>/OwningTask<T>. // per §28.3, §29.3, §29.11, §30.1
     bool isDeferredActivationCallResult(const ast::Expr& callResult) const;
 
+    // True when the enclosing method's DECLARED return type (`returnType_`) is
+    // one of the deferred-activation frame shapes — an iterator/async-iterator
+    // interface or a Task-family type. Read from the AST return-type node's head
+    // name (as checkBorrowReturnedThroughOwningType reads it), so a frame
+    // RETURNED under a deferred-activation type is recognized as the announced
+    // frame residence rather than an escape (§28.14 *Call-bounded × deferred
+    // activation*, v0.196). The lazy-query sentinel never appears as a written
+    // return type, so only the named interfaces / Task are matched here.
+    // // per §28.14, §28.3 v0.196
+    bool returnTypeIsDeferredActivation() const;
+
     // True when `arg` is a plain-argument "unbound owned temporary" per the
     // §28.3 Producers table: a bare `new T(...)` or call already classified
     // Owned by producerState, OR a call to a STATIC method (no receiver)

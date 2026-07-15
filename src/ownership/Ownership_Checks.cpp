@@ -5726,6 +5726,24 @@ bool MethodOwnership::isDeferredActivationCallResult(
            head == "Task" || head == "OwningTask";
 }
 
+// §28.14 *Call-bounded × deferred activation* (v0.196): the declared-return-type
+// sibling of isDeferredActivationCallResult, used by the call-bounded frame-
+// residence check. Read directly from the AST return-type node's single-part
+// head name — the same navigation checkBorrowReturnedThroughOwningType uses — so
+// a frame RETURNED under one of these types is the announced frame residence,
+// not an escape of the callback it carries. // per §28.14, §28.3 v0.196
+bool MethodOwnership::returnTypeIsDeferredActivation() const {
+    if (!returnType_ || returnType_->kind != ast::TypeKind::Named ||
+        !returnType_->name || returnType_->name->parts.size() != 1)
+        return false;
+    std::string_view head = returnType_->name->parts.front();
+    return head == "IEnumerable" || head == "IEnumerator" ||
+           head == "IAsyncEnumerable" || head == "IAsyncEnumerator" ||
+           head == "IOwningEnumerable" || head == "IOwningEnumerator" ||
+           head == "IOwningAsyncEnumerable" || head == "IOwningAsyncEnumerator" ||
+           head == "Task" || head == "OwningTask";
+}
+
 // #1526 (§28.3): true when `arg` is a plain-argument "unbound owned
 // temporary" per the Producers table — a bare `new T(...)` or call already
 // classified Owned by producerState (an `owned`-returning call, a fresh
@@ -8869,6 +8887,28 @@ sema::ParameterSymbol* MethodOwnership::callBoundedSourceOf(
                     return s;
         return nullptr;
     }
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        // §28.14 *Call-bounded × deferred activation* (v0.196): a call that mints
+        // a DEFERRED-ACTIVATION frame and receives the callback in one of its
+        // arguments produces a frame that CARRIES the callback — the callback
+        // rides the returned frame, bounded by the frame's life. Classifying the
+        // frame as a carrier routes it into the same transitive sink machinery:
+        // consumed within the callee, or returned under a deferred-activation
+        // return type (handled at the return sinks), leaves no sink — admitted;
+        // "a frame that carries the callback and escapes any other way — stored
+        // in a field or an escaping collection, captured by an escaping closure —
+        // is an escape of the callback itself, rejected by these same rules
+        // applied transitively." A non-deferred call result — a terminal/eager
+        // operator (`xs.Where(f).Count()`), an ordinary method — carries nothing:
+        // the callback is not retained past that call. // per §28.14 v0.196
+        if (isDeferredActivationCallResult(*ce)) {
+            for (const auto& a : ce->args)
+                if (a.value)
+                    if (sema::ParameterSymbol* s = callBoundedSourceOf(*a.value))
+                        return s;
+        }
+        return nullptr;
+    }
     if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e))
         return pb->operand ? callBoundedSourceOf(*pb->operand) : nullptr;
     return nullptr;
@@ -9065,6 +9105,16 @@ void MethodOwnership::callBoundedWalkStmt(const ast::Stmt& s) {
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
         if (rs->value) {
             if (sema::ParameterSymbol* src = callBoundedSourceOf(*rs->value)) {
+                // §28.14 *Call-bounded × deferred activation* (v0.196): a
+                // deferred-activation FRAME that carries the callback is admitted
+                // when "returned under a deferred-activation return type" — the
+                // announcement composes and the outer caller re-establishes the
+                // frame's carried sources against its own arguments. Every other
+                // returned carrier (the bare callback, a capturing closure, a
+                // frame handed back under a plain type) is the return escape sink.
+                if (isDeferredActivationCallResult(*rs->value) &&
+                    returnTypeIsDeferredActivation())
+                    return;
                 reportCallBounded(rs->value->span.begin, src->name,
                                   "returned");
                 return;
@@ -9195,10 +9245,25 @@ void MethodOwnership::callBoundedWalkExpr(const ast::Expr& e) {
                         a.value->span.begin, src->name,
                         "stored into a collection reachable beyond the call");
                     continue;
+                } else if (const auto* deferCe =
+                               dynamic_cast<const ast::CallExpr*>(&e);
+                           deferCe && isDeferredActivationCallResult(*deferCe)) {
+                    // §28.14 *Call-bounded × deferred activation* (v0.196):
+                    // forwarding the callback into a call that mints a deferred-
+                    // activation frame is admitted as FRAME RESIDENCE — the
+                    // callback rides the returned frame, bounded by the frame's
+                    // life. The forward itself is no sink; the RESULTING frame is
+                    // a call-bounded carrier (callBoundedSourceOf), so its escape
+                    // is judged transitively: admitted when consumed within the
+                    // callee or returned under a deferred-activation return type,
+                    // rejected when it is field-stored, stored into an escaping
+                    // collection, or captured by an escaping closure. Keyed off
+                    // frame residence explicitly, not admitted by fall-through.
                 }
-                // Any other argument position: plain→plain forwarding, or a
-                // builtin callee whose retention is signature-certified —
-                // allowed.
+                // Otherwise: plain→plain forwarding into another verified call-
+                // bounded position (whose own §28.14 pre-pass bounds the
+                // retention), or a terminal/eager builtin — the callback is not
+                // retained past the call. // per §28.14 v0.177
             }
             callBoundedWalkExpr(*a.value);
         }

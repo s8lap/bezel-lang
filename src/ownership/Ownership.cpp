@@ -802,8 +802,17 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
                  ps->declType->kind == ast::TypeKind::Function);
             if (fnTyped) callBoundedParams_.insert(sym);
         }
-        if (sema::ParameterSymbol* src = callBoundedSourceOf(exprBody))
-            reportCallBounded(exprBody.span.begin, src->name, "returned");
+        if (sema::ParameterSymbol* src = callBoundedSourceOf(exprBody)) {
+            // §28.14 *Call-bounded × deferred activation* (v0.196): an `=>
+            // xs.Where(f)` body returns a deferred-activation FRAME carrying the
+            // callback under a deferred-activation return type — the announced
+            // frame residence, admitted (the outer caller re-establishes the
+            // frame's carried sources). Every other returned carrier is the
+            // escape sink, exactly as `return f;` is.
+            if (!(isDeferredActivationCallResult(exprBody) &&
+                  returnTypeIsDeferredActivation()))
+                reportCallBounded(exprBody.span.begin, src->name, "returned");
+        }
     }
 }
 

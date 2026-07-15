@@ -368,3 +368,100 @@ BEZEL_TEST(call_bounded_2814, scoped_to_scoped_forward_still_admitted) {
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ===========================================================================
+// §28.14 v0.196: Call-bounded × deferred activation — frame residence, shape (1)
+// ===========================================================================
+//
+// "a call-bounded callback FORWARDED to a plain function-typed parameter of
+// another deferred-activation call rides that call's frame — admitted when the
+// frame is consumed within the callee or returned under a deferred-activation
+// return type … a frame that carries the callback and escapes any other way —
+// stored in a field or an escaping collection, captured by an escaping closure —
+// is an escape of the callback itself, rejected by these same rules applied
+// transitively."  — §28.14, v0.196
+
+// §28.14 v0.196 (frame residence, ACCEPT): forwarding the callback into a lazy-
+// query operator (`xs.Where(f)` — a deferred-activation call) and returning the
+// resulting frame UNDER a deferred-activation return type is the announced frame
+// residence — admitted. (The lazy operators' plain signatures are this shape's
+// normative instance, stdlib §5.)
+BEZEL_TEST(call_bounded_2814,
+           forward_into_lazy_returned_under_deferred_type_clean) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public static method Filtered(xs: Array<int>, f: (int) -> bool)"
+        ": IEnumerable<int> => xs.Where(f); "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §28.14 v0.196 (frame residence, ACCEPT): forwarding the callback into ANOTHER
+// deferred-activation call (a user method returning `IEnumerable<int>`) and
+// returning that frame under a deferred-activation type is admitted — "the
+// announcement composes: the outer caller re-establishes against its own
+// arguments."
+BEZEL_TEST(call_bounded_2814,
+           forward_into_user_deferred_returned_under_deferred_type_clean) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public static method AnotherLazy(xs: Array<int>, f: (int) -> bool)"
+        ": IEnumerable<int> => xs.Where(f); "
+        "  public static method Doubled(xs: Array<int>, f: (int) -> bool)"
+        ": IEnumerable<int> => AnotherLazy(xs, f); "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §28.14 v0.196 (frame residence, REJECT — design test viii, field store): a
+// body that builds a deferred-activation frame over the callback and then
+// FIELD-STORES it lets the callback ride the frame beyond the call — "an escape
+// of the callback itself." The receiver `_src` is a `this`-field collection
+// (its borrow is fine to hold on `this`), so the ONLY escape is the callback's,
+// and the diagnostic must name it.
+BEZEL_TEST(call_bounded_2814, frame_over_callback_field_stored_rejected) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  private _src: Array<int> := []; "
+        "  private _q: IEnumerable<int>?; "
+        "  public method Stash(f: (int) -> bool) "
+        "    _q := _src.Where(f); "
+        "  end Stash; "
+        "  destructor end; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagContains(r, "call-bounded"));
+}
+
+// §28.14 v0.196 (frame residence, REJECT — design test viii, collection store):
+// storing the callback-carrying frame into a parameter-reachable collection is
+// the escaping-collection sink, applied transitively to the frame.
+BEZEL_TEST(call_bounded_2814, frame_over_callback_into_collection_rejected) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public static method Enlist(xs: Array<int>, f: (int) -> bool, "
+        "                              sink: Array<IEnumerable<int>>) "
+        "    sink.Add(xs.Where(f)); "
+        "  end Enlist; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagContains(r, "call-bounded"));
+}
+
+// §28.14 v0.196 (frame residence, REJECT — design test viii, escaping closure):
+// binding the callback-carrying frame to a local and RETURNING a closure that
+// captures it is the escaping-closure sink, followed transitively through the
+// local alias — "captured by an escaping closure … is an escape of the callback
+// itself."
+BEZEL_TEST(call_bounded_2814, frame_over_callback_via_escaping_closure_rejected) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public static method Leak(xs: Array<int>, f: (int) -> bool)"
+        ": () -> int "
+        "    var q := xs.Where(f); "
+        "    return () => q.Count(); "
+        "  end Leak; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagContains(r, "call-bounded"));
+}
