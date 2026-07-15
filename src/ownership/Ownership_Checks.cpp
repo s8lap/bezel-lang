@@ -5790,6 +5790,93 @@ bool MethodOwnership::deferredActivationArgIsPlainRefParam(
     return (*params)[pos].modifier != "owned";
 }
 
+// #1818 (§28.3 v0.196): true when a captured LOCAL is a live owned obligation
+// of the enclosing frame — a value the enclosing method itself disposes at
+// scope exit, so a deferred-activation frame that captures a borrow of it and
+// then escapes that scope would strand the borrow past disposal. The three
+// owned-local shapes: a disposing `using var` (`isUsing` with a non-borrow
+// source — the #1285 `usingVarSourceIsBorrow` exclusion keeps a borrow-aliasing
+// using var out); an affine auto-drop plain owned local (`autoDropAtScopeEnd`,
+// §28.3 v0.150); and a null-initialized local that becomes owned via reassign
+// (`becomesOwnedViaReassign`, §28.7/§28.3 #1625). All three flags are populated
+// by the dataflow, which runs before checkDeferredActivationTempSites. A borrow
+// local (none of the flags) is a carried source but NOT an owned obligation —
+// its real owner outlives the enclosing frame. // per §28.3 v0.196
+bool MethodOwnership::localIsOwnedObligation(const sema::LocalSymbol* ls) const {
+    if (!ls) return false;
+    if (const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
+        if (ld->isUsing) return !ld->usingVarSourceIsBorrow;
+        return ld->autoDropAtScopeEnd || ld->becomesOwnedViaReassign;
+    }
+    // An `out owned var` inline local has no LocalDecl node; its owned-obligation
+    // auto-drop flag lives on the LocalSymbol itself (§28.3 #1387).
+    return ls->autoDropAtScopeEnd;
+}
+
+// #1818 (§28.3 "capture-set contribution", §28.14 frame residence, v0.196):
+// the load-bearing collector. See the header comment for the reduction and the
+// FIRST-provenance-row scope (lambda literal only).
+void MethodOwnership::deferredActivationCaptureSources(
+    const ast::Expr& arg, std::vector<CapSource>& out) {
+    const auto* lam = dynamic_cast<const ast::LambdaExpr*>(&arg);
+    if (!lam) return;  // first provenance row: a lambda LITERAL argument only
+    std::vector<const ast::IdentifierExpr*> rawIds;
+    scopedCollectCaptures(*lam, rawIds);
+    std::unordered_set<sema::Symbol*> seen;
+    for (const ast::IdentifierExpr* id : rawIds) {
+        // `this`/`base`: a caller-frame borrow that outlives every local of
+        // this frame — contributes nothing (checkScopedAdmission's rule).
+        if (id->name == "this" || id->name == "base") continue;
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (!sym || !seen.insert(sym).second) continue;
+        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+            // A lambda-internal parameter is not a capture of the enclosing
+            // frame (checkScopedAdmission's methodParamSet_ gate).
+            if (!methodParamSet_.count(sym)) continue;
+            // An enclosing `owned` parameter is a live owned obligation this
+            // method discharges at exit; a plain (borrow) parameter outlives
+            // the method and the caller re-establishes the frame's constraint
+            // against its own actual argument (admitted).
+            out.push_back({id, sym, ps->modifier == "owned"});
+            continue;
+        }
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+            // Value-typed captures live in their heap capture cell — no borrow,
+            // no lifetime hazard (checkScopedAdmission's isBorrowableType gate;
+            // a null declType stays conservative → treated as a reference).
+            if (ls->declType && !isBorrowableType(ls->declType)) continue;
+            out.push_back({id, sym, localIsOwnedObligation(ls)});
+            continue;
+        }
+        // A field / method / property / event reference is an implicit `this`
+        // capture — receiver-mediated, contributes nothing. A type / const /
+        // enum constant / module reference is not a capture at all.
+    }
+}
+
+// #1818 (§28.14 "Call-bounded × deferred activation", v0.196): the plain-
+// function-parameter gate for the FIRST-provenance-row capture check. Mirrors
+// deferredActivationArgIsPlainRefParam's symbol→decl→params navigation but
+// requires the parameter modifier be EXACTLY empty: an `owned` param is a sink
+// (§29.8/§30.14), a `scoped` param is storage-bounded (checkScopedAdmission owns
+// its capture admission), and a builtin callee with no resolvable param list is
+// deliberately out of scope here. // per §28.14 v0.196
+bool MethodOwnership::deferredActivationArgIsPlainFuncSlot(
+    const ast::CallExpr& ce, std::size_t pos) const {
+    if (!ce.callee) return false;
+    sema::Symbol* sym = ctx_.exprSymbol(*ce.callee);
+    const std::vector<ast::Param>* params = nullptr;
+    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym)) {
+        if (const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
+            params = &md->params;
+    } else if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym)) {
+        if (const auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
+            params = &cd->params;
+    }
+    if (!params || pos >= params->size()) return false;
+    return (*params)[pos].modifier.empty();
+}
+
 // #1526 (§28.3 "Deferred-activation callees", v0.179): drive the whole-body
 // walk. See the header comment (Ownership_impl.hpp) for the escape-position
 // list and the rationale for reusing the checkAwaitSites/checkResultSites
@@ -5865,9 +5952,14 @@ void MethodOwnership::checkDeferredActivationTempSitesStmt(
         // the await/.Result siblings deliberately leave `iterable` at
         // bindingValue=false (their concern is embedded awaits/`.Result`
         // reads elsewhere in the iterable expression, not the top-level
-        // call's own position). // per §28.3, §29.2
+        // call's own position). The #1818 capture-set check treats this
+        // position as `forSource` — the desugared `using var` bounds the frame
+        // by the loop, which every captured method-scope source outlives, so a
+        // direct for-source over a capturing frame is NOT rejected there
+        // (unlike a bind/return/store). // per §28.3, §29.2, §28.14 v0.196
         if (fs->iterable)
-            checkDeferredActivationTempSitesExpr(*fs->iterable, true);
+            checkDeferredActivationTempSitesExpr(*fs->iterable, true,
+                                                  /*forSource=*/true);
         for (const auto& bs : fs->body)
             if (bs) checkDeferredActivationTempSitesStmt(*bs);
         return;
@@ -5889,12 +5981,69 @@ void MethodOwnership::checkDeferredActivationTempSitesStmt(
 }
 
 void MethodOwnership::checkDeferredActivationTempSitesExpr(const ast::Expr& e,
-                                                             bool escaping) {
+                                                             bool escaping,
+                                                             bool forSource) {
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
         if (escaping && isDeferredActivationCallResult(*ce)) {
             std::size_t pos = 0;
             for (const auto& a : ce->args) {
                 if (!a.value || !a.modifier.empty()) { ++pos; continue; }
+                // #1818 (§28.3 "capture-set contribution", §28.14 frame
+                // residence, v0.196): a plain function-typed argument's captured
+                // borrows' SOURCES are carried sources of the returned frame. A
+                // lambda-literal argument (the FIRST provenance row) whose
+                // captures reach a LIVE OWNED obligation of THIS method — an
+                // owned local (a `using var`) or an `owned` parameter it disposes
+                // at scope exit — mints a frame carrying a borrow of that value;
+                // when the frame is bound to a name, returned, or stored (this
+                // branch's `escaping`, excluding a for-source — `forSource`),
+                // the consumer would enumerate into a closure over the disposed
+                // value. Reject at the capture, exactly as a directly-carried
+                // borrow of a scope-bound local is rejected — the canonical
+                // `return Doubled(nums, (x) => scale.Apply(x));` over a `using
+                // var scale`. A lambda literal is never an unbound owned
+                // temporary, so it is fully handled here and never falls through
+                // to the temp check below. // per §28.3, §28.14, v0.196
+                if (dynamic_cast<const ast::LambdaExpr*>(a.value.get())) {
+                    // Only a PLAIN function-parameter slot mints a frame the
+                    // callback resides in: a `scoped` slot is storage-bounded and
+                    // its capture admission is owned by checkScopedAdmission
+                    // (deferredActivationArgIsPlainFuncSlot excludes it, so no
+                    // double diagnostic); a for-source frame is loop-bounded and
+                    // every captured method-scope source outlives it (`forSource`
+                    // excludes it — sound, not over-rejected). // per §28.14 v0.196
+                    if (!forSource &&
+                        deferredActivationArgIsPlainFuncSlot(*ce, pos)) {
+                        std::vector<CapSource> caps;
+                        deferredActivationCaptureSources(*a.value, caps);
+                        for (const CapSource& cs : caps) {
+                            if (!cs.ownedObligation) continue;
+                            report(
+                                Severity::Error, cs.id->span.begin,
+                                std::string(
+                                    "a deferred-activation call whose lambda "
+                                    "argument captures the owned value `") +
+                                    std::string(cs.id->name) +
+                                    "` mints a frame that carries a borrow of `" +
+                                    std::string(cs.id->name) +
+                                    "` (§28.3 capture-set contribution, §28.14 "
+                                    "frame residence, v0.196); that frame escapes "
+                                    "this full expression — bound to a name, "
+                                    "returned, or stored — but `" +
+                                    std::string(cs.id->name) +
+                                    "` is disposed when its enclosing scope "
+                                    "exits, so the escaping frame would enumerate "
+                                    "into a closure over a disposed object. Keep "
+                                    "the frame within `" +
+                                    std::string(cs.id->name) +
+                                    "`'s scope, or return a materialized `owned` "
+                                    "collection instead");
+                            break;  // one diagnostic per escaping argument
+                        }
+                    }
+                    ++pos;
+                    continue;
+                }
                 // §28.3: the frame borrows only its PLAIN (non-`owned`)
                 // reference-typed arguments. Skip an argument owned-TRANSFERRED
                 // into the frame (an `owned` param, §29.8; a Domain.Spawn arg,
@@ -5984,7 +6133,8 @@ void MethodOwnership::checkDeferredActivationTempSitesExpr(const ast::Expr& e,
     if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
         // Postfix `!` is a pass-through — see checkAwaitSitesExpr's twin.
         if (bg->operand)
-            checkDeferredActivationTempSitesExpr(*bg->operand, escaping);
+            checkDeferredActivationTempSitesExpr(*bg->operand, escaping,
+                                                  forSource);
         return;
     }
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
@@ -5997,9 +6147,11 @@ void MethodOwnership::checkDeferredActivationTempSitesExpr(const ast::Expr& e,
             checkDeferredActivationTempSitesExpr(*cd->condition, false);
         // Pass-through: see checkAwaitSitesExpr's twin.
         if (cd->thenValue)
-            checkDeferredActivationTempSitesExpr(*cd->thenValue, escaping);
+            checkDeferredActivationTempSitesExpr(*cd->thenValue, escaping,
+                                                  forSource);
         if (cd->elseValue)
-            checkDeferredActivationTempSitesExpr(*cd->elseValue, escaping);
+            checkDeferredActivationTempSitesExpr(*cd->elseValue, escaping,
+                                                  forSource);
         return;
     }
     if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {

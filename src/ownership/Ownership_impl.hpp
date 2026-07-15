@@ -1631,8 +1631,17 @@ private:
     void checkDeferredActivationTempSites(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void checkDeferredActivationTempSitesStmt(const ast::Stmt& s);
+    // `forSource` marks the ONE escaping position whose frame is bounded by a
+    // loop rather than binding/returning/storing: a `for`/`await for` source
+    // (§29.2's desugared `using var`). The #1526 unbound-temp check fires on it
+    // (a temporary source dies at the full expression's end, before the loop
+    // runs), but the #1818 capture-set check does NOT — a captured method-scope
+    // owned source outlives the loop, so a direct for-source over a capturing
+    // frame is sound. Propagated through the pass-through forms. // per §28.3,
+    // §28.14, v0.196
     void checkDeferredActivationTempSitesExpr(const ast::Expr& e,
-                                               bool escaping);
+                                               bool escaping,
+                                               bool forSource = false);
 
     // True when `callResult`'s resolved type is one of the deferred-
     // activation frame shapes above: an iterator/async-iterator interface,
@@ -1665,6 +1674,58 @@ private:
     // which OWN or copy their args) return false, so an owned temp transferred
     // into a sink is not over-rejected. // per §28.3, §28.8, §29.8, §30.14
     bool deferredActivationArgIsPlainRefParam(const ast::CallExpr& ce,
+                                              std::size_t pos) const;
+
+    // #1818 (§28.3 "capture-set contribution", §28.14 frame residence, v0.196):
+    // a carried source contributed to a deferred-activation frame by a plain
+    // function-typed argument's captures. `ownedObligation` is true when the
+    // captured source is a *live owned obligation of the enclosing frame* — an
+    // `owned` parameter, or an owned local (a disposing `using var`, or a plain
+    // owned local that auto-drops / becomes owned at scope end): a source the
+    // enclosing frame itself disposes at scope exit, so a frame that captures it
+    // and then escapes that scope would strand a borrow of a disposed object.
+    // A plain (borrow) parameter or a borrow local is a carried source too but
+    // NOT an owned obligation — it outlives the enclosing frame and the caller
+    // re-establishes it (the transitive rows are later #1818 sub-tasks). // per
+    // §28.3, §28.14, v0.196
+    struct CapSource {
+        const ast::IdentifierExpr* id;
+        sema::Symbol* sym;
+        bool ownedObligation;
+    };
+
+    // #1818 (§28.3 "capture-set contribution", v0.196): collect the carried
+    // sources a plain function-typed ARGUMENT contributes to a deferred-
+    // activation frame. This is the FIRST provenance row only — a LAMBDA LITERAL
+    // argument: enumerate its captures (scopedCollectCaptures) and reduce them
+    // EXACTLY as checkScopedAdmission does (`this`/`base` and receiver-mediated
+    // members contribute nothing — a receiver is a caller-frame borrow that
+    // outlives every local of this frame; a static / const / type / module ref
+    // contributes nothing; a value-typed local lives in its heap capture cell —
+    // the isBorrowableType gate; a lambda-internal parameter is not a capture of
+    // the enclosing frame). A non-lambda argument (method reference, opaque
+    // function-typed parameter, traced local) is a later provenance row and
+    // contributes nothing here. // per §28.3, §28.14, v0.196
+    void deferredActivationCaptureSources(const ast::Expr& arg,
+                                          std::vector<CapSource>& out);
+    // True when the LocalSymbol names a *live owned obligation* — an owned local
+    // the enclosing frame disposes at scope exit (a disposing `using var`, an
+    // affine auto-drop local, or a null-then-reassigned owned local). The
+    // owned-ness flags are populated by the dataflow before this post-pass runs
+    // (Ownership.cpp). // per §28.3 v0.196
+    bool localIsOwnedObligation(const sema::LocalSymbol* ls) const;
+
+    // #1818 (§28.14 "Call-bounded × deferred activation", v0.196): true when
+    // argument `pos` of the deferred-activation call `ce` sits at a PLAIN
+    // (empty-modifier) parameter of a resolved USER method/ctor — the frame-
+    // residence position whose callback captures the returned frame carries.
+    // A `scoped` function parameter is storage-bounded and its capture admission
+    // is handled by checkScopedAdmission (excluded here to avoid a double
+    // diagnostic); an `owned`/`ref`/`out` parameter is a sink; a builtin callee
+    // with no resolvable param list stays out of this FIRST-row check
+    // (conservative — the stdlib lazy operators are a later #1818 sub-task).
+    // // per §28.14 v0.196
+    bool deferredActivationArgIsPlainFuncSlot(const ast::CallExpr& ce,
                                               std::size_t pos) const;
 
     // -- Async-readiness 3c: SuspendLocal annotation + completion edges --------
