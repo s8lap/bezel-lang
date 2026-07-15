@@ -10,6 +10,14 @@
 # that caught the v0.175 exception-layout heap corruption and the pre-existing
 # #1390 — run it for merges that touch object layout, disposal, or the runtime.
 #
+# Unified into the gate since #1861: `scripts/gate.sh --full` runs the WHOLE suite
+# under generated-code ASan in its one sharded pass (16 shards, the same
+# BEZEL_AOT_FORCE_SANITIZE=address recipe), so the gate's whole-suite ASan is now
+# that sharded pass — no separate sweep phase. This 8-shard script is retained as
+# an optional STANDALONE belt-and-suspenders (no per-shard timeout, so it always
+# completes a cold ASan compile) you can run on its own for a delicate merge
+# without paying for the full gate.
+#
 # Pre-#1822 this rebuilt bezel_tests itself with CMAKE `-fsanitize=address`, i.e.
 # it instrumented the C++ HARNESS, not the generated Bezel code. Under the AOT
 # harness each program is linked per-test with plain `clang`, so no program ran

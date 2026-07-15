@@ -86,8 +86,9 @@ done
 # the ran!=expected_total undercount check can only catch it when SOME OTHER
 # shard managed to establish expected_total. This direct "every shard must
 # complete" check closes that window unconditionally, and is the safety basis for
-# gate.sh --fast dropping the always-on serial pass. It is purely additive: a
-# healthy run has summaries_seen == shards and prints nothing new below.
+# the shard-authoritative gate (scripts/gate.sh, #1861) having no serial backstop.
+# It is purely additive: a healthy run has summaries_seen == shards and prints
+# nothing new below.
 total_pass=0
 total_fail=0
 expected_total=0

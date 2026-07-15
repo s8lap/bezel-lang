@@ -599,16 +599,20 @@ private:
 // would then abort the WHOLE gtest shard (killing every other test in it)
 // instead of being contained to ran=false. Historically this degradation was
 // SILENT — so a lost-isolation shard death was indistinguishable from an
-// unrelated flake, and the crux hypothesis behind gate.sh --fast (each test is
-// process-isolated, so serial-order heap corruption is structurally impossible)
-// would be quietly violated. This makes it loud instead:
+// unrelated flake, and the crux hypothesis behind the shard-authoritative gate
+// (each test is process-isolated, so serial-order heap corruption is
+// structurally impossible) would be quietly violated. This makes it loud, and —
+// since #1861 promoted the shard-authoritative pass to the DEFAULT gate with no
+// serial backstop — FATAL BY DEFAULT: process isolation is the safety basis for
+// dropping serial, so it must never be silently lost. The behaviours are:
 //   * a greppable per-occurrence marker on the harness stderr (captured in the
-//     shard log / asan_sweep log), and
+//     shard log), and
 //   * a per-process total printed at exit, so the count survives even if the
-//     individual markers scroll past.
-// BEZEL_AOT_FORKFAIL_FATAL=1 promotes the degradation to a hard non-run (the
-// test does NOT compile un-isolated) for runs that want isolation GUARANTEED
-// rather than merely observable; the default stays graceful (run, but loudly).
+//     individual markers scroll past, and
+//   * by default a hard NON-RUN (the test does NOT compile un-isolated; it
+//     surfaces as ran=false), so isolation is GUARANTEED, not merely observable.
+// BEZEL_AOT_FORKFAIL_FATAL=0 opts back into the old graceful degradation (run
+// un-isolated, but loudly) for a caller that would rather run than not-run.
 inline std::atomic<std::uint64_t>& forkFailureCount() {
     // Leaked on purpose: the atexit hook below reads it at process teardown,
     // after ordinary function-local statics would already have been destroyed.
@@ -616,10 +620,18 @@ inline std::atomic<std::uint64_t>& forkFailureCount() {
     return *c;
 }
 
+// FATAL BY DEFAULT (#1861): a fork() failure refuses the un-isolated in-process
+// compile, so process isolation — the basis for the shard-authoritative gate
+// dropping the serial pass — is never silently lost. fork() only fails under
+// genuine resource exhaustion (PID/RAM), which the #1780 link-token pool already
+// bounds, so this changes nothing in normal operation. Set
+// BEZEL_AOT_FORKFAIL_FATAL=0 to opt back into the graceful (run un-isolated,
+// loudly) fallback.
 inline bool forkFailIsFatal() {
     static const bool v = [] {
         const char* e = std::getenv("BEZEL_AOT_FORKFAIL_FATAL");
-        return e && std::string(e) == "1";
+        if (!e || *e == '\0') return true;   // default: fatal
+        return std::string(e) != "0";
     }();
     return v;
 }
@@ -644,10 +656,13 @@ inline void noteForkFailureDegradation(int savedErrno) {
     forkFailureCount().fetch_add(1, std::memory_order_relaxed);
     std::fflush(stderr);
     std::fprintf(stderr,
-        "\n[aot-degraded #fork-fail] fork() failed (errno=%d: %s); DEGRADED to "
-        "an in-process compile — crash isolation LOST for this test%s\n",
+        "\n[aot-degraded #fork-fail] fork() failed (errno=%d: %s)%s\n",
         savedErrno, std::strerror(savedErrno),
-        forkFailIsFatal() ? " (BEZEL_AOT_FORKFAIL_FATAL=1 -> not run)" : "");
+        forkFailIsFatal()
+            ? " -> test NOT run un-isolated (fatal by default; "
+              "BEZEL_AOT_FORKFAIL_FATAL=0 to degrade instead)"
+            : " -> DEGRADED to an in-process compile — crash isolation LOST for "
+              "this test");
     std::fflush(stderr);
 }
 
@@ -655,9 +670,11 @@ inline void noteForkFailureDegradation(int savedErrno) {
 // run in a fork()ed CHILD (crash- and hang-isolated, qr1 M1). `opts` selects the
 // codegen mode (e.g. sanitizeAddress for the checked leg — S3). The child's
 // stderr (diagnostics + any clang link error) is captured, bounded, into the
-// result. fork() failure degrades to an in-process compile (no isolation) rather
-// than failing the test — same graceful degradation as runJit — but LOUDLY now
-// (noteForkFailureDegradation), and optionally fatally (BEZEL_AOT_FORKFAIL_FATAL).
+// result. fork() failure is FATAL by default (#1861: refuse the un-isolated
+// compile so process isolation is never silently lost — the basis for the
+// shard-authoritative gate having no serial backstop); it is always LOUD
+// (noteForkFailureDegradation), and BEZEL_AOT_FORKFAIL_FATAL=0 opts back into a
+// graceful in-process (un-isolated) fallback — same policy runJit had.
 inline CompileStatus forkedCompile(const std::string& srcPath,
                                    const std::string& exePath,
                                    const codegen::CodegenOptions& opts,
@@ -687,13 +704,14 @@ inline CompileStatus forkedCompile(const std::string& srcPath,
         // per-test cc.err. errno is still fresh here, right after fork().
         const int forkErrno = errno;
         noteForkFailureDegradation(forkErrno);
-        // Optionally refuse to run un-isolated (isolation GUARANTEED, opt-in):
-        // return without compiling so a front-end crash can't take the shard.
+        // Refuse to run un-isolated (isolation GUARANTEED — FATAL BY DEFAULT
+        // since #1861): return without compiling so a front-end crash can't take
+        // the shard. BEZEL_AOT_FORKFAIL_FATAL=0 opts into the fallback below.
         if (forkFailIsFatal())
             return {CompileOutcome::Infra,
                     "runAot: fork() failed (errno=" + std::to_string(forkErrno) +
-                        ") and BEZEL_AOT_FORKFAIL_FATAL=1 — refusing an "
-                        "un-isolated in-process compile",
+                        ") — refusing an un-isolated in-process compile (fatal by "
+                        "default; set BEZEL_AOT_FORKFAIL_FATAL=0 to degrade)",
                     0};
         // Fall back to an in-process compile so the test still runs — accepting
         // the loss of isolation on this one degraded path (same policy as runJit).
