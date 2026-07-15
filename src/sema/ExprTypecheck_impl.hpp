@@ -514,6 +514,15 @@ private:
     // solution (never a false exemption).
     bool groundSatisfiesNew(const TypeRef* arg, bool& decided);
 
+    // §19.6 (v0.196, #1816 s6): does a FULLY-GROUND solved type PROVABLY satisfy
+    // a type-bound `where Y: I` (§14.2)? Discharged by declaration-based
+    // subtyping (isSubtype) on an already-GROUND σ(Y) — a free parameter is
+    // NEVER rescued by a census of the bound's conformers (the §19.6 census
+    // prohibition). `decided` is set false when unverifiable here — the filter
+    // then keeps the solution (never a false exemption; declines D8).
+    bool groundSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound,
+                                  bool& decided);
+
     // §5.1 / §19 (#1153): range-check each integer `case` pattern constant /
     // range-bound literal against an integer scrutinee's type. A literal that
     // does not fit was silently truncated to the scrutinee width at codegen

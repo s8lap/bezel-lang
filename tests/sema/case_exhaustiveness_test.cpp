@@ -772,6 +772,107 @@ BEZEL_TEST(sema_case_exhaust,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// --- s6: type-bound where-constraint filtering (spec §19.6 v0.196; clause (b)) -
+//
+// s6 extends s5's clause-(b) filter to a TYPE bound `where Y: I` (§14.2): a
+// SOLVED ground σ(Y) is kept only if σ(Y) is a subtype of the resolved bound,
+// decided by declaration-based subtyping (ExprTC::isSubtype) on the ground
+// solution. A solution that PROVABLY falls outside the bound is not a well-
+// formed instantiation, so the singleton solution set empties and the leaf is
+// EXEMPT; a satisfying (or undecidable) solution keeps the leaf REQUIRED.
+//
+// (a) THE s6 fails-without/passes-with delta, both directions. `L<Y>: B<Y>
+// where Y: IShape`:
+//   • at scrutinee `B<Square>` (Square: IShape) clause (a) solves `Y := Square`,
+//     which SATISFIES `where Y: IShape` ⇒ L is DETERMINED and INHABITED; its
+//     obligation `L<Square>` is present, so omitting its arm warns, NAMING L.
+//   • at scrutinee `B<int>` clause (a) solves `Y := int`; `int` is not a subtype
+//     of the user interface IShape (a primitive conforms only to the builtin
+//     interfaces, §3.5/§8.6/stdlib §2.19) ⇒ `where Y: IShape` CONTRADICTS the
+//     solution ⇒ L is UNINHABITED at `B<int>` and EXEMPT, so covering only the
+//     ground leaf `Ri: B<int>` is exhaustive with no `_`.
+// Fails without s6: the `type` case returned false (no filter), so at `B<int>`
+// the solver reported `Y := int` Determined & inhabited and the name-match drew
+// a spurious "missing leaf type(s): L" warning (the filter hole).
+BEZEL_TEST(sema_case_exhaust, type_bound_filters_solved_param_spec_19_6) {
+    // §19.6 v0.196 "Generic leaves: the determination rule" + declines D8.
+    // Direction 1 — the bound is SATISFIED: L<Square> inhabited ⇒ REQUIRED
+    // (guards against dropping a satisfying solution — a false exemption).
+    auto present = parseSemaAll(
+        "module M; "
+        "interface IShape end IShape; "
+        "class Square : IShape end Square; "
+        "sealed abstract class B<T> end B; "
+        "sealed class L<Y> : B<Y> where Y: IShape end L; "  // Y:=Square ✓ IShape
+        "sealed class R : B<Square> end R; "                // ground leaf — arm
+        "class Calc "
+        "  public method M(b: B<Square>): int "
+        "    var a := case b of "
+        "      var r: R => 1 "  // L<Square> NOT covered → required
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(present));  // L<Square> inhabited
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(present, "L"));
+    BEZEL_EXPECT_FALSE(present.diagnostics.hasErrors());
+
+    // Direction 2 — the bound is PROVABLY VIOLATED: int is not IShape ⇒ L exempt.
+    auto exempt = parseSemaAll(
+        "module M; "
+        "interface IShape end IShape; "
+        "sealed abstract class B<T> end B; "
+        "sealed class L<Y> : B<Y> where Y: IShape end L; "  // Y:=int ✗ IShape
+        "sealed class Ri : B<int> end Ri; "                 // ground leaf at B<int>
+        "class Calc "
+        "  public method M(b: B<int>): int "
+        "    var a := case b of "
+        "      var r: Ri => 1 "  // L exempt: int is not a subtype of IShape
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(exempt));  // L<int> filtered out
+    BEZEL_EXPECT_FALSE(exempt.diagnostics.hasErrors());
+}
+
+// (b) THE CENSUS PROHIBITION guard. `L<Z>: Message where Z: SealedC`, with Z
+// having NO occurrence in the root instantiation `Message`. §19.6 v0.196: "a
+// parameter of L with no occurrence in the root instantiation leaves the
+// solution set unbounded WHATEVER that parameter's bounds, so a leaf with such a
+// parameter is never exempt or determined by a census of a bound's conformers."
+// SealedC is a `sealed` class with ZERO further conformers, so a conformer
+// census would (wrongly) either mark L exempt (0 conformers ⇒ "uninhabited") or
+// determine it (1 conformer ⇒ bind Z). The filter-only reading keeps Z FREE ⇒ L
+// stays UNDETERMINED ⇒ the warning fires and NAMES L and its undetermined
+// parameter Z. This FAILS if an implementer census-resolves the bound; PASSES
+// with the filter-only reading — isSubtype is used ONLY on a ground σ(Z), never
+// to enumerate SealedC's conformers.
+BEZEL_TEST(sema_case_exhaust,
+           sealed_bound_no_census_stays_undetermined_spec_19_6) {
+    // §19.6 v0.196 "Zero-conformer / sealed bound must NOT be census-resolved"
+    // + declines D8.
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed class SealedC end SealedC; "  // a sealed bound, zero conformers
+        "sealed abstract class Message end Message; "
+        "sealed class Text(body: string) : Message end Text; "  // ground leaf
+        "sealed class L<Z>(z: Z) : Message where Z: SealedC end L; "  // Z free
+        "class Calc "
+        "  public method M(m: Message): int "
+        "    var a := case m of "
+        "      var t: Text => 1 "  // L undetermined: Z never reaches the root
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));                // NOT census-resolved
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "L"));      // names the leaf
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "undetermined"));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "Z"));      // names its param
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // --- Open hierarchy (§19.6 final paragraph) --------------------------------
 
 // "When the hierarchy is open (the base is not sealed ...), exhaustiveness

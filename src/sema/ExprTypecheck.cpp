@@ -1135,11 +1135,63 @@ bool ExprTC::groundSatisfiesNew(const TypeRef* arg, bool& decided) {
     return false;
 }
 
-// §19.6 (v0.196, #1816 s5): CLAUSE (b) of the determination rule. After the
+// §19.6 (v0.196, #1816 s6): does a FULLY-GROUND solved type PROVABLY satisfy a
+// type-bound `where Y: I` (`item.kind == "type"`)? A type bound is discharged by
+// §14.2 declaration-based subtyping — ExprTC::isSubtype walks the class- and
+// interface-base chain and (deliberately) IGNORES generic arguments, which is
+// decidable ONLY on an already-GROUND σ(Y). A still-free parameter is NEVER
+// rescued here by enumerating the bound's conformers: that is the §19.6 CENSUS
+// PROHIBITION — a bound's conformer set is module-visibility-dependent, so a
+// census would make the verdict cross-module-unstable and could WRONGLY prove
+// exhaustiveness (declines D8: zero-conformer / sealed bounds do NOT become
+// census-resolved). A free param never reaches this filter anyway — the s3
+// no-occurrence check already returned Undetermined. `decided` is left false
+// whenever satisfaction is not verifiable here, so the caller KEEPS the solution
+// (a type-bound filter never causes a FALSE exemption of an inhabited leaf).
+bool ExprTC::groundSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound,
+                                      bool& decided) {
+    decided = false;
+    if (!arg || !bound) return false;
+    // The bound must resolve to a concrete Named interface/class. A type-
+    // PARAMETER bound (`where Y: U`, U another enclosing parameter) carries no
+    // declaration — undecidable here, defer (keep). A non-Named bound (e.g.
+    // `Object`) likewise: every type is its subtype, so never a violation.
+    if (bound->kind != TypeRef::Kind::Named || !bound->declaration) return false;
+    // §14.2: a type-bound constraint excludes every nullable type argument — a
+    // nullable σ(Y) is not assignable to the non-nullable bound (mirrors the
+    // method-call-site check, ExprTypecheck_Calls.cpp). Provably violated.
+    if (arg->nullable) { decided = true; return false; }
+    if (arg->kind == TypeRef::Kind::Named && arg->declaration) {
+        // §14.2 declaration-based subtyping — decidable on a ground σ(Y). It
+        // conservatively ignores generic args, so a same-declaration but wrong-
+        // generic-arg conformer reads as SATISFYING (a spurious KEEP, never a
+        // false exemption — the sound direction).
+        decided = true;
+        return isSubtype(arg->declaration, bound->declaration);
+    }
+    if (arg->kind == TypeRef::Kind::Primitive) {
+        // A primitive conforms ONLY to the compiler-provided builtin interfaces
+        // (§3.5 / §8.6 / stdlib §2.19) — it can never subtype a USER-declared
+        // interface or class. Against a builtin interface bound, DEFER (it may
+        // conform via a shape not modeled here — keep, conservative); against a
+        // user-declared bound, the primitive PROVABLY does not conform ⇒ drop.
+        if (bound->declaration ==
+            ctx_.builtinInterfaceSym(bound->declaration->name))
+            return false;  // builtin bound — defer (decided stays false, keep)
+        decided = true;
+        return false;  // user-declared bound: primitive can't conform → violates
+    }
+    // Unit / InlineArray / Function ground σ(Y): value/function types whose
+    // conformance to an interface bound is not modeled here — defer (keep).
+    return false;
+}
+
+// §19.6 (v0.196, #1816 s5+s6): CLAUSE (b) of the determination rule. After the
 // ground solver (s2) yields the leaf's SOLE inhabiting substitution (a
 // Determined singleton solution), FILTER it by the leaf's own + every chain-
-// base's SCALAR `where`-constraints (`class` / `value` / `notnull` / `new`; a
-// type-bound `where Y: I` is s6's decidable-conformance lane, ignored here).
+// base's `where`-constraints — the SCALAR fragment (`class` / `value` /
+// `notnull` / `new`, s5) AND the type-bound `where Y: I` (s6, decided by
+// declaration-based subtyping on the ground σ(Y), never a census of conformers).
 // A ground solution σ that PROVABLY violates such a constraint is not a
 // well-formed instantiation (§14.2) ⇒ not a real inhabitant ⇒ the singleton
 // solution set becomes empty ⇒ the leaf is uninhabited at `S` and EXEMPT (the
@@ -1179,7 +1231,19 @@ bool ExprTC::leafSolutionViolatesScalarConstraint(
             bool ok = groundSatisfiesNew(arg, decided);
             return decided && !ok;  // provably no accessible parameterless ctor
         }
-        return false;  // "type" (s6) / unknown kind: not a scalar filter
+        if (item.kind == "type") {
+            // §19.6 v0.196 (s6): a type-bound `where Y: I`. Drop σ(Y) ONLY on a
+            // PROVABLE non-subtype of the resolved bound (declaration-based, on
+            // the ground σ(Y)). The census prohibition holds structurally — a
+            // free param never reaches this filter, and isSubtype is used only on
+            // ground σ(Y), never to enumerate a bound's conformers.
+            if (!item.typeArg) return false;  // malformed — keep
+            TypeRef* bound = ctx_.resolvedType(*item.typeArg);
+            bool decided = false;
+            bool ok = groundSatisfiesTypeBound(arg, bound, decided);
+            return decided && !ok;  // provably outside the bound ⇒ σ drops out
+        }
+        return false;  // unknown kind: not a scalar filter
     };
 
     const TypeSymbol* cur = leaf;
