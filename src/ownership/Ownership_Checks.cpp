@@ -3516,48 +3516,33 @@ void MethodOwnership::collectBareTypeParamCallBorrowSource(
     // rejected. Only class-typed bare-T results reach here (a value/runtime-
     // managed instantiation attaches no constraint, §28.9), and the record
     // predicate never matches a class result — so span/record freeze is
-    // untouched. // per §28.3, v0.194
+    // untouched. The unified classifier analyzeBareBorrowCall (Ownership.cpp)
+    // recognizes the four producer shapes — a user bare-T method (S1), a user
+    // method inheriting a generic bare-T declaration (S10), and the intrinsics
+    // `Math.Min`/`Max`/`Clamp` (S11) and `Aggregate` (S13) — and returns the
+    // resolved source set. // per §28.3, v0.194
     if (!ld.initializer) return;
     auto* ce = dynamic_cast<const ast::CallExpr*>(ld.initializer.get());
     if (!ce) return;
-    const ast::MethodDecl* md = common::calleeMethodDecl(*ce, ctx_);
-    if (!md) return;
-
-    // Recognizer: the pre-substitution declared return is a bare type parameter
-    // of the METHOD (the shared helper) OR of its ENCLOSING TYPE. The latter is
-    // matched here, where the callee symbol's parent type (and its generic
-    // params) is reachable — the name-set membership that separates a bare type
-    // parameter from a 0-arity builtin, since both resolve to a null-declaration
-    // Named ref. `owned T` returns are excluded (ordinary transfer, §28.8).
-    bool bareT = common::declaredReturnIsBareTypeParam(*md, ctx_);
-    if (!bareT && !md->returnOwned && md->returnType && md->returnType->name &&
-        md->returnType->name->parts.size() == 1) {
-        const sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
-        if (rt && rt->kind == sema::TypeRef::Kind::Named &&
-            rt->declaration == nullptr) {
-            const std::string_view head = md->returnType->name->parts[0];
-            if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
-                    ce->callee ? ctx_.exprSymbol(*ce->callee) : nullptr))
-                if (ms->parent)
-                    for (const sema::Symbol* g : ms->parent->genericParams)
-                        if (g && g->name == head) { bareT = true; break; }
-        }
-    }
-    if (!bareT) return;
-
-    // The potential source set (receiver + T-reaching plain borrowable args). An
-    // EMPTY set (`Pick(1, 2)`, `Create<T>(): T`) attaches nothing — the sourceless
-    // factory rule governs that case, not this one (§28.3 caller side, empty-set
-    // fallback). // per §28.3, v0.194
-    std::vector<sema::Symbol*> roots =
-        common::bareTypeParamCallSourceRoots(*ce, *md, ctx_);
-    if (roots.empty()) return;
+    BareBorrowCallInfo info = analyzeBareBorrowCall(*ce);
+    if (!info.recognized) return;
 
     sema::LocalSymbol* lsym = findLocalSymbol(ld);
     if (!lsym) return;
+    // §28.3 (v0.194, #1801 S3/S4): the holder carries a BORROW, never ownership —
+    // record it so a `using var` over it pins (handleLocalDecl) and an explicit
+    // `.Dispose()` of it is rejected (checkDisposeReceiverOwnership).
+    bareBorrowHolders_.insert(lsym);
+
+    // The resolved potential source set (receiver + T-reaching plain borrowable
+    // args + the seed, for a fold). An EMPTY set — `Pick(1, 2)` (value
+    // instantiation), `Identity(new C())` (only an unbound temporary source, S3),
+    // `Create<T>(): T` (factory) — attaches no liveness constraint; the S3 launder
+    // reject and the factory rule govern those instead. // per §28.3, v0.194
+    if (info.sources.empty()) return;
     const std::uint32_t from = ld.initializer->span.begin.offset;
     std::vector<RecordBorrowSource>& entries = recordBorrowLocalSource_[lsym];
-    for (const sema::Symbol* src : roots)
+    for (const sema::Symbol* src : info.sources)
         if (src && src != lsym)  // a self-reference carries no constraint
             entries.push_back({src, from, UINT32_MAX});
 }

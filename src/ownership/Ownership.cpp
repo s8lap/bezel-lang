@@ -62,6 +62,12 @@ void scanReassignStmts(const std::vector<std::unique_ptr<ast::Stmt>>& body,
 // Ownership_impl.hpp (external linkage) so the out-owned RECIPIENT gate in
 // Ownership_Checks.cpp reuses it; the definition lives below near producerState.
 
+// §28.3 *Bare-type-parameter returns* (v0.194, #1801): does declared type `t`
+// mention the generic parameter `name`? Defined below (near the callee-side
+// bare-T checks); forward-declared here for the caller-side classifier
+// (analyzeBareBorrowCall) that runs earlier in the file. // per §28.3 v0.194
+static bool bareReturnTypeMentionsParam(const ast::Type& t, std::string_view name);
+
 void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
          const std::vector<sema::Symbol*>* paramSyms, bool isAsync,
          bool isDestructor, const ast::Type* returnType, bool returnOwned,
@@ -2220,6 +2226,260 @@ bool MethodOwnership::callDeclaredReturnIsBareTypeParam(
     return false;
 }
 
+// §28.3 *Bare-type-parameter returns* (v0.194, #1801 S10). True when `bmd`'s
+// declared return type is a bare type parameter of the declaring type `baseType`
+// or of `bmd` itself — the shape a generic *declaration* (an interface signature
+// or a virtual/abstract base method) carries so that its implementers/overriders
+// inherit the argument-source-union classification. `owned T` is excluded (the
+// ordinary transfer, §28.8). // per §28.3 v0.194
+static bool baseReturnIsBareTypeParam(const ast::MethodDecl& bmd,
+                                      const sema::TypeSymbol& baseType,
+                                      const sema::SemaContext& ctx) {
+    if (bmd.returnOwned || !bmd.returnType || !bmd.returnType->name ||
+        bmd.returnType->name->parts.size() != 1)
+        return false;
+    const sema::TypeRef* rt = ctx.resolvedType(*bmd.returnType);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named ||
+        rt->declaration != nullptr)
+        return false;  // a bare type parameter resolves to a null-declaration ref
+    const std::string_view head = bmd.returnType->name->parts[0];
+    // The head must name a generic parameter of the declaring type (the common
+    // `IChooser<T>.Pick(...): T` interface shape) or of the method itself — the
+    // name-set membership that separates a bare parameter from a 0-arity builtin.
+    for (const sema::Symbol* g : baseType.genericParams)
+        if (g && g->name == head) return true;
+    for (const ast::GenericParam& g : bmd.genericParams)
+        if (g.name == head) return true;
+    return false;
+}
+
+const ast::MethodDecl* MethodOwnership::findInheritedBareReturnDecl(
+        const ast::CallExpr& ce, const ast::MethodDecl& implMd) {
+    // §28.3 (v0.194, #1801 S10). The classification is inherited by
+    // implementations and overrides of a generic declaration whose return type is
+    // a bare type parameter (spec: "dispatch flows through the generic signature,
+    // so its classification is the only one call sites can be checked against").
+    // A DISPATCHED call already resolves to the interface/base method directly
+    // (recognized by callDeclaredReturnIsBareTypeParam); this closes the DIRECT
+    // call on a concrete implementer/overrider — `vc.Pick(a, b)` where `vc`'s
+    // static type is the class implementing `IChooser<T>` — whose own signature
+    // names concrete types and so is not itself bare-T. Walk the callee type's
+    // base types/interfaces (transitively) for a same-name, same-arity method
+    // with a bare-type-parameter return. // per §28.3 v0.194
+    auto* ms = ce.callee ? dynamic_cast<sema::MethodSymbol*>(
+                               ctx_.exprSymbol(*ce.callee))
+                         : nullptr;
+    if (!ms || !ms->parent) return nullptr;
+    std::vector<sema::TypeSymbol*> work(ms->parent->baseTypes.begin(),
+                                        ms->parent->baseTypes.end());
+    std::unordered_set<const sema::TypeSymbol*> seen;
+    while (!work.empty()) {
+        sema::TypeSymbol* base = work.back();
+        work.pop_back();
+        if (!base || !seen.insert(base).second) continue;
+        for (const sema::Symbol* mem : base->members) {
+            auto* bms = dynamic_cast<const sema::MethodSymbol*>(mem);
+            if (!bms || bms->name != implMd.name) continue;
+            const auto* bmd = dynamic_cast<const ast::MethodDecl*>(bms->decl);
+            if (!bmd || bmd->params.size() != implMd.params.size()) continue;
+            if (baseReturnIsBareTypeParam(*bmd, *base, ctx_)) return bmd;
+        }
+        for (sema::TypeSymbol* b2 : base->baseTypes) work.push_back(b2);
+    }
+    return nullptr;
+}
+
+MethodOwnership::BareBorrowCallInfo
+MethodOwnership::analyzeBareBorrowCall(const ast::CallExpr& ce) {
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S3/S10/S11/S13). See the
+    // header for the full contract. Returns the caller-side potential source set
+    // (borrowable roots), the first unbound-owned-temporary source position, and
+    // whether the call is a recognized argument-source-union borrow. // per §28.3
+    BareBorrowCallInfo info;
+
+    // Records the first T-reaching source position bound to an unbound owned
+    // temporary (a fresh producer / `move` result — producerState == Owned), the
+    // S3 laundering shape. A bare identifier binding is NOT a temporary (its owner
+    // persists — S1's consume-freeze governs it), so producerState leaves it
+    // Borrowed and it is not caught here.
+    auto noteTemp = [&](const ast::Expr* arg) {
+        if (arg && !info.unboundOwnedTemp &&
+            producerState(*arg) == OwnershipState::Owned)
+            info.unboundOwnedTemp = arg;
+    };
+    // The receiver expression of an instance/extension call (for the temp scan).
+    auto receiverExpr = [&]() -> const ast::Expr* {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+            return ma->target.get();
+        return nullptr;
+    };
+
+    if (const ast::MethodDecl* md = common::calleeMethodDecl(ce, ctx_)) {
+        // The signature carrying the bare-T classification: `md` itself (S1) or
+        // the generic declaration `md` implements/overrides (S10).
+        const ast::MethodDecl* sigMd =
+            callDeclaredReturnIsBareTypeParam(ce, *md)
+                ? md
+                : findInheritedBareReturnDecl(ce, *md);
+        if (!sigMd) return info;  // a user call, not bare-T on either face
+        info.sources = common::bareTypeParamCallSourceRoots(ce, *sigMd, ctx_);
+        // Signature-level: is the potential source set non-empty (a borrow, not
+        // the empty-set factory)? plus the S3 temp scan over T-reaching positions.
+        std::string_view retParam;
+        if (sigMd->returnType && sigMd->returnType->name &&
+            sigMd->returnType->name->parts.size() == 1)
+            retParam = sigMd->returnType->name->parts.front();
+        bool isStatic = false;
+        for (std::string_view m : sigMd->modifiers)
+            if (m == "static") { isStatic = true; break; }
+        bool hasSource = !isStatic;
+        if (!isStatic) noteTemp(receiverExpr());
+        for (std::size_t i = 0; i < sigMd->params.size(); ++i) {
+            const ast::Param& p = sigMd->params[i];
+            if (p.modifier.find("owned") != std::string_view::npos) continue;
+            if (p.modifier.find("out") != std::string_view::npos) continue;
+            if (!p.type || retParam.empty() ||
+                !bareReturnTypeMentionsParam(*p.type, retParam))
+                continue;
+            hasSource = true;
+            if (i < ce.args.size()) {
+                const ast::CallArgument& arg = ce.args[i];
+                if (!arg.isDiscard && arg.value && arg.name.empty())
+                    noteTemp(arg.value.get());
+            }
+        }
+        info.recognized =
+            hasSource && (!info.sources.empty() || info.unboundOwnedTemp);
+        return info;
+    }
+
+    // Intrinsic selector / fold calls have no user MethodDecl. Recognized by
+    // name; the no-user-method gate above keeps a user-defined `Min`/`Max`/
+    // `Aggregate` (which resolves to a MethodDecl) on the user path.
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+    if (!ma || !ma->target) return info;
+    // §28.9: only a CLASS/INTERFACE result is a borrow — at a value or
+    // runtime-managed instantiation the result is a copy and no constraint
+    // attaches. This gate is essential for `Aggregate`, whose RECEIVER (an
+    // `Array<int>`) is a class even when the accumulator `T` is a value: without
+    // it, `a.Aggregate(0, (acc, x) => acc + x)` would spuriously borrow `a`.
+    // // per §28.9 v0.194
+    if (!isBorrowableType(ctx_.exprType(ce))) return info;
+
+    auto pushRootIfBorrowable = [&](const ast::Expr* arg) {
+        if (!arg) return;
+        if (!isBorrowableType(ctx_.exprType(*arg))) return;
+        if (const ast::IdentifierExpr* root = identifierRoot(*arg))
+            if (sema::Symbol* s = ctx_.exprSymbol(*root)) info.sources.push_back(s);
+    };
+
+    // §2.2 `Math.Min`/`Max`/`Clamp<T>(...): T` — the result borrows all operands
+    // (S11). Every argument is a T-reaching source. // per §28.3 v0.194
+    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+        if (tid->name == "Math" &&
+            (ma->member == "Min" || ma->member == "Max" ||
+             ma->member == "Clamp")) {
+            for (const ast::CallArgument& arg : ce.args) {
+                if (arg.isDiscard || !arg.value || !arg.name.empty()) continue;
+                noteTemp(arg.value.get());
+                pushRootIfBorrowable(arg.value.get());
+            }
+            info.recognized = !info.sources.empty() || info.unboundOwnedTemp;
+            return info;
+        }
+    }
+
+    // §5 LINQ `Aggregate<TAccum>(seed, fold): TAccum` — the result borrows
+    // {receiver, seed} (S13; an empty source returns `seed` itself). `fold` is a
+    // function value — runtime-managed, no constraint. // per §28.3 v0.194
+    if (ma->member == "Aggregate" && ce.args.size() == 2) {
+        noteTemp(ma->target.get());
+        pushRootIfBorrowable(ma->target.get());
+        const ast::CallArgument& seed = ce.args[0];
+        if (!seed.isDiscard && seed.value && seed.name.empty()) {
+            noteTemp(seed.value.get());
+            pushRootIfBorrowable(seed.value.get());
+        }
+        info.recognized = !info.sources.empty() || info.unboundOwnedTemp;
+        return info;
+    }
+
+    return info;
+}
+
+void MethodOwnership::checkBareBorrowTempLaunder(const ast::Expr& e) {
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S3). An argument that is
+    // an UNBOUND OWNED TEMPORARY (a fresh producer, a `move` result) bounds the
+    // bare-type-parameter borrow result to the same full expression; a binding,
+    // store, return, or other escape of the result past that expression is
+    // rejected (§9.7's reject-not-extend posture — Bezel has no lifetime
+    // extension). Fired from the escape sites (handleLocalDecl / handleAssignment
+    // / handleReturn) on the escaping expression. Within-statement use of such a
+    // result (never reaching those sites) is admitted, the temporary's
+    // end-of-statement disposal running after the uses. // per §28.3 v0.194
+    auto* ce = dynamic_cast<const ast::CallExpr*>(&e);
+    if (!ce) return;
+    BareBorrowCallInfo info = analyzeBareBorrowCall(*ce);
+    if (!info.unboundOwnedTemp) return;
+    report(Severity::Error, info.unboundOwnedTemp->span.begin,
+           "a freshly-produced owned value passed as an argument to a "
+           "bare-type-parameter call is an unbound owned temporary — the call's "
+           "result borrows it, so the result is bounded to this full expression "
+           "and may not be bound, stored, or returned (§28.3 *Bare-type-parameter "
+           "returns*, v0.194 — laundering a fresh owned value out through the "
+           "borrow result; bind the source first, `using var s := <producer>;`, "
+           "so it outlives the result's uses)");
+}
+
+bool MethodOwnership::checkBareBorrowLoopCarriedEscape(
+        const ast::AssignmentStmt& as) {
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S5). A loop-carried
+    // accumulation `prev := Math.Max(prev, cur)` where `cur` is declared inside
+    // the loop body: `prev` (the accumulator, at the loop's enclosing depth)
+    // borrows the union {prev, cur}, but `cur` is disposed at each iteration's end
+    // — a source that does not outlive the loop back edge. This is the
+    // borrow-lifetime rule's back-edge bullet (v0.180) applied to the
+    // argument-source-union borrow: reject at the reassignment. Reuses
+    // checkBorrowStoreEscape's localDepth_ / isEscapeBoundLocal machinery.
+    // // per §28.3 v0.194
+    if (as.op != ":=" || !as.target || !as.value) return false;
+    auto* ce = dynamic_cast<const ast::CallExpr*>(as.value.get());
+    if (!ce) return false;
+    auto* tid = dynamic_cast<const ast::IdentifierExpr*>(as.target.get());
+    if (!tid) return false;
+    auto* targetLocal =
+        dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*tid));
+    if (!targetLocal || !targetLocal->decl) return false;
+    BareBorrowCallInfo info = analyzeBareBorrowCall(*ce);
+    if (!info.recognized) return false;
+    auto depthOf = [&](const ast::Node* declNode) -> int {
+        auto it = localDepth_.find(declNode);
+        return it == localDepth_.end() ? -1 : it->second;
+    };
+    const int td = depthOf(targetLocal->decl);
+    if (td < 0) return false;
+    for (sema::Symbol* src : info.sources) {
+        auto* ls = dynamic_cast<sema::LocalSymbol*>(src);
+        if (!ls || ls == targetLocal || !ls->decl) continue;
+        const int sd = depthOf(ls->decl);
+        if (sd < 0 || sd <= td) continue;  // same/enclosing scope: outlives target
+        if (!isEscapeBoundLocal(src)) continue;  // only a live owned obligation
+        report(Severity::Error, as.span.begin,
+               std::string("borrow held by `") + std::string(targetLocal->name) +
+               "` would outlive its source `" + std::string(ls->name) +
+               "` — the result of a bare-type-parameter call borrows the union "
+               "of the call's sources, and `" + std::string(ls->name) +
+               "` is an owned scope-bound local disposed at the end of its block "
+               "(each loop iteration), but `" + std::string(targetLocal->name) +
+               "` lives in an enclosing scope, so a later read — around the loop "
+               "back edge — would see a disposed value (§28.3 *Bare-type-parameter "
+               "returns* / borrow-lifetime rule, v0.194; accumulate with indices "
+               "or an owned clone instead)");
+        return true;
+    }
+    return false;
+}
+
 OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
     // `new T(...)` is the canonical producer of Owned values — but only
     // for reference types (classes). §9: a record is a value type with
@@ -2733,6 +2993,12 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
             topLevelConsume = (ue->op == "move" || ue->op == "await");
         if (!topLevelConsume)
             checkRead(*ld.initializer, /*selfTarget=*/false);
+        // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S3): binding the
+        // result of a bare-type-parameter call whose source is an unbound owned
+        // temporary (`var m := Identity(new C());`) launders a fresh owned value
+        // out through the borrow result — rejected (the temporary bounds the
+        // result to the full expression). // per §28.3 v0.194
+        checkBareBorrowTempLaunder(*ld.initializer);
     }
     LocalOwnership lo;
     lo.obligationOrigin = &ld;
@@ -2817,6 +3083,22 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
                 // Dynamically / the typed classOfLocal path). // per §28.3
                 checkArmMeetMixed(*ld.initializer);
                 if (producerState(*ld.initializer) != OwnershipState::Owned)
+                    const_cast<ast::LocalDecl&>(ld).usingVarSourceIsBorrow =
+                        true;
+            } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(
+                           ld.initializer.get())) {
+                // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S4): a
+                // `using var m := Math.Max(a, b);` over a bare-type-parameter
+                // argument-source-union borrow (a non-empty potential source set)
+                // is a §28.10 BORROW-PIN, not an owning binding — the result is a
+                // borrow of the call's receiver and arguments, whose real owners
+                // dispose them. Pin without a disposal obligation (as the
+                // borrowed-arm-meet case above does); disposing it would
+                // double-free a source the argument still owns. An EMPTY-set
+                // bare-T call (the factory case) stays the owned-with-warning
+                // binding handled above. // per §28.3 v0.194
+                BareBorrowCallInfo info = analyzeBareBorrowCall(*ce);
+                if (info.recognized && !info.sources.empty())
                     const_cast<ast::LocalDecl&>(ld).usingVarSourceIsBorrow =
                         true;
             }
@@ -2921,6 +3203,21 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // but ref/out captures are a SEPARATE source not covered by §28.3 scope-
     // bound locals, so we always run this check regardless of flagged386). // per §27.5, §28.6
     checkRefOutLambdaCaptureOnStore(as);
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S5): a loop-carried
+    // accumulation `prev := Math.Max(prev, cur)` whose contributing source is a
+    // scope-bound owned local declared inside the loop body — a source that does
+    // not outlive the loop back edge (§28.3 borrow-lifetime rule). Reuses the
+    // localDepth_ back-edge machinery. // per §28.3 v0.194
+    bool flaggedBareLoop = checkBareBorrowLoopCarriedEscape(as);
+    // §28.3 (v0.194, #1801 S3): storing the result of a bare-type-parameter call
+    // whose source is an unbound owned temporary launders a fresh owned value out
+    // through the borrow result. Owned-field / owning-slot targets already reject
+    // a borrow store below (handleOwnedFieldAssignment / the slot check), and
+    // checkBorrowStoreEscape covers re-borrow-holder stores, so skip those to
+    // avoid a duplicate diagnostic. // per §28.3 v0.194
+    if (!flagged386 && !flaggedBareLoop && !targetIsOwnedField(*as.target) &&
+        !targetIsOwningInlineArraySlot(*as.target))
+        checkBareBorrowTempLaunder(*as.value);
     // §28.3 / §28.5 / §28.8 (issue #402): an `owned` FIELD is an owned storage
     // location and may only receive an OWNED value. A BORROW RHS is the
     // double-free hazard (the field's owner and the borrow's real owner both
@@ -3452,6 +3749,11 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     if (const auto* ne = dynamic_cast<const ast::NewExpr*>(&e))
         checkRecordFromTemporary(*ne);
     checkIndirectEscapeOnReturn(e);       // §28.9/§9.7 indirect-via-local
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S3): `return
+    // Identity(new C());` launders a fresh owned temporary out through the borrow
+    // result — the temporary bounds the result to the full expression, so
+    // returning it is an escape. // per §28.3 v0.194
+    checkBareBorrowTempLaunder(e);
     checkCatchBorrowEscapesOnReturn(e);   // §31.1 caught-exception escape
     // §31.1 (issue #430): `return new Wrap(ex)` where Wrap's ctor stores
     // ex in a non-owned field. The returned object escapes the catch arm;
@@ -3683,6 +3985,26 @@ void MethodOwnership::checkDisposeReceiverOwnership(const ast::Expr& recv,
     // `move` operand as Owned (§28.8.1), so this single check covers both the
     // spec's "unbound owned temporary" and "a `move` result" admissions.
     if (producerState(recv) == OwnershipState::Owned) return;
+
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S4): a local bound to a
+    // bare-type-parameter argument-source-union borrow (`var m := Math.Max(a,
+    // b);`) is a BORROW of the call's receiver and arguments — the caller
+    // acquires no disposal obligation — so an explicit `.Dispose()` of it is
+    // rejected: disposing it would free a value a source still owns (a latent
+    // double-owner, the defect this rule closes). A plain-local receiver
+    // otherwise falls through to the permissive default below, so this is the
+    // only place the borrow-result dispose is caught. The freeze of a *source*
+    // stays the announced kill (§28.2). // per §28.3 v0.194
+    if (bareBorrowHolders_.count(ctx_.exprSymbol(recv))) {
+        report(
+            Severity::Error, loc,
+            "cannot call `Dispose()` on a bare-type-parameter call result "
+            "(§28.6 \"Who may call Dispose()\" / §28.3 *Bare-type-parameter "
+            "returns*, v0.194) — it is a borrow of the call's receiver and "
+            "arguments, which the caller does not own; disposing it would free "
+            "a value a source still owns; dispose the owning source instead");
+        return;
+    }
 
     // A field read (`obj.f`, or a bare `f` implicit-`this`), resolving to a
     // FieldSymbol. `this.<owned field>` is the admitted §28.7 dispose-then-

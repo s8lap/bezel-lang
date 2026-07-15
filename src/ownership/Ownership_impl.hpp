@@ -843,6 +843,61 @@ private:
     sema::Symbol* carriedEscapeBoundSourceLiveAt(const sema::Symbol* holder,
                                                  std::uint32_t atOffset) const;
 
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S3/S10/S11/S13). The
+    // unified CALLER-side classification of a call whose result is an
+    // argument-source-union borrow of a bare type parameter — covering:
+    //   * a user method whose declared (pre-substitution) return is a bare type
+    //     parameter of the method or its enclosing type (S1);
+    //   * a user method that IMPLEMENTS or OVERRIDES a generic declaration whose
+    //     return type is a bare type parameter — the source set is read
+    //     POSITIONALLY from the generic declaration (S10);
+    //   * the intrinsic selector calls `Math.Min`/`Max`/`Clamp` (stdlib §2.2),
+    //     whose result borrows all their operands (S11);
+    //   * the intrinsic fold `Aggregate(seed, fold)` (stdlib §5), whose result
+    //     borrows {receiver, seed} (S13).
+    // `sources` is the resolved potential source set (borrowable class/interface
+    // roots) — the receiver plus each T-reaching plain argument bound to a live
+    // binding; `unboundOwnedTemp` names a T-reaching source position bound to an
+    // UNBOUND OWNED TEMPORARY (a fresh producer / `move` result), which bounds the
+    // result to the full expression and is the S3 laundering shape. `recognized`
+    // is true when the call is such a borrow at a class/interface instantiation
+    // (a value/runtime-managed instantiation, or the empty-set factory case, is
+    // not recognized). // per §28.3 v0.194
+    struct BareBorrowCallInfo {
+        bool recognized = false;
+        std::vector<sema::Symbol*> sources;
+        const ast::Expr* unboundOwnedTemp = nullptr;
+    };
+    BareBorrowCallInfo analyzeBareBorrowCall(const ast::CallExpr& ce);
+    // §28.3 (v0.194, #1801 S10): the generic declaration (interface/base-class
+    // method) that `implMd` implements or overrides whose declared return type is
+    // a bare type parameter, or nullptr. Found by walking the callee type's base
+    // types/interfaces for a same-name, same-arity method with a bare-type-
+    // parameter return; the source set is then read positionally from it. // per
+    // §28.3 v0.194
+    const ast::MethodDecl* findInheritedBareReturnDecl(
+        const ast::CallExpr& ce, const ast::MethodDecl& implMd);
+    // §28.3 (v0.194, #1801 S3): reject a launder of a fresh owned value out
+    // through a bare-type-parameter borrow result — an unbound owned temporary
+    // argument bounds the result to the full expression, so binding / storing /
+    // returning it is an escape. Fired from handleLocalDecl, handleReturn, and
+    // handleAssignment on the escaping expression `e`. A no-op unless `e` is such
+    // a call with a temporary source. // per §28.3 v0.194
+    void checkBareBorrowTempLaunder(const ast::Expr& e);
+    // §28.3 (v0.194, #1801 S5): reject a loop-carried bare-type-parameter
+    // accumulation — `prev := Math.Max(prev, cur)` — where a contributing source
+    // is a scope-bound owned local declared in a block the assignment target's
+    // block strictly encloses (a source that does not outlive the loop back
+    // edge). Reuses the localDepth_ / isEscapeBoundLocal machinery of
+    // checkBorrowStoreEscape. // per §28.3 v0.194
+    bool checkBareBorrowLoopCarriedEscape(const ast::AssignmentStmt& as);
+    // §28.3 (v0.194, #1801 S3/S4): the LocalSymbols currently bound to a
+    // bare-type-parameter argument-source-union borrow — the result is a BORROW,
+    // never owned, so a `using var` over it is a §28.10 borrow-pin and an explicit
+    // `.Dispose()` of it is rejected (you do not own it). Populated at the binding
+    // site. // per §28.3 v0.194
+    std::unordered_set<const sema::Symbol*> bareBorrowHolders_;
+
     // §28.3 (#386 cases 1+2) INDIRECT escape through an assignment. When the
     // assignment target is a *field of an object* (`obj.f := …`, including
     // `this.f := …`) or an *out / ref / out-owned parameter* (`p := …`), and
