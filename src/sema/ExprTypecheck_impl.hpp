@@ -449,6 +449,16 @@ private:
         // UNATTAINABLE (every substitution inhabits — the opposite of exempt):
         // no type-test arm covers it, only an irrefutable arm does.
         std::vector<std::string_view> freeParams;
+        // §19.6 (v0.196, #1816 s4): set by the RIGID-scrutinee solver when the
+        // leaf's coverage is statically UNATTAINABLE — either an undecidable
+        // rigid-identity component (a ground/composite/different-rigid component
+        // of the root instantiation equated against a rigid enclosing parameter,
+        // e.g. `IntError: Result<int>` at `Result<T>`) or a free leaf parameter.
+        // The leaf is NEVER exempt under a rigid `S`; when this is set the caller
+        // records it in the unattainable set (naming `freeParams`, possibly
+        // empty). Defaults false — the ground solver never sets it, so s1/s2/s3
+        // are undisturbed.
+        bool unattainable = false;
     };
 
     // §19.6 (v0.196, #1816 s2): solve `leaf`'s type parameters against a GROUND
@@ -465,6 +475,23 @@ private:
     // lane's domain and this solver does not engage on it.
     LeafInstSolutions solveLeafInstantiations(TypeSymbol* leaf, TypeSymbol* root,
                                               const TypeRef* scrutTy);
+
+    // §19.6 (v0.196, #1816 s4): the NON-GROUND (rigid) counterpart of
+    // solveLeafInstantiations — engaged when the scrutinee `S` contains a rigid
+    // enclosing-body type parameter (`isFullyGroundTypeRef(scrutTy)` is false),
+    // the case the ground solver defers. Matches the leaf's composed root
+    // instantiation against `S` under a RIGID-AWARE three-valued identity that
+    // keys rigidity SYNTACTICALLY (isInScopeTypeParam — never null-decl
+    // typeRefEqual, whose blindness would wrongly solve a rigid equation and
+    // reopen the false-exemption hole). A leaf is NEVER exempt under a rigid `S`:
+    // an undecidable rigid-identity component (`IntError: Result<int>` at
+    // `Result<T>`) or a free leaf parameter sets `unattainable` (coverage
+    // statically unattainable — requires a `_` arm, §19.6); a clean determined
+    // solve (`Ok<T>: Result<T>` at `Result<T>` ⇒ `T`) is left for the name-match
+    // to discharge, so the determined rigid shape stays exhaustive.
+    LeafInstSolutions solveLeafInstantiationsRigid(TypeSymbol* leaf,
+                                                   TypeSymbol* root,
+                                                   const TypeRef* scrutTy);
 
     // §5.1 / §19 (#1153): range-check each integer `case` pattern constant /
     // range-bound literal against an integer scrutinee's type. A literal that

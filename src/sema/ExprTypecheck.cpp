@@ -690,6 +690,121 @@ static InvMatch matchLeafInvariant(
     return InvMatch::Unknown;
 }
 
+// §19.6 (v0.196, #1816 s4): the tri-state-plus outcome of matching one component
+// of a leaf's root instantiation against the corresponding NON-GROUND (rigid)
+// scrutinee component. Adds `Unattainable` to the ground matcher's trichotomy:
+//   Fail         — a decidable ground-structure mismatch (distinct ground
+//                  constructors / ground arguments, both sides concrete). By
+//                  invariance no instantiation of the enclosing body reconciles
+//                  it; the leaf is genuinely uninhabited on that component.
+//   Unattainable — an UNDECIDABLE rigid identity: a ground/composite (non-solve-
+//                  variable) declared component equated against a rigid
+//                  enclosing parameter. Satisfiable at some enclosing
+//                  instantiations, not others (`IntError: Result<int>` at
+//                  `Result<T>` is inhabited exactly at `T = int`) ⇒ neither
+//                  exempt nor determined, coverage statically unattainable.
+//   Ok           — matched; leaf solve variables bound in `solved` (a solve
+//                  variable binds to a rigid target too: `Ok<Y>` ⇒ `Y := T`).
+//   Unknown      — undecidable edge (nullability / arity / function / a
+//                  null-decl target that is not an in-scope rigid parameter):
+//                  kept, deferred to the name-match, never a false verdict.
+// Composition precedence: Fail > Unattainable > Unknown > Ok.
+enum class RigidInv { Fail, Unattainable, Unknown, Ok };
+
+// Rigid-aware structural-invariant match of a root-instantiation component
+// `declared` (in the leaf's own parameters) against a NON-GROUND scrutinee
+// component `target`. Rigidity is keyed SYNTACTICALLY via `isRigidParam` (a
+// null-declaration Named whose head names an in-scope enclosing type parameter)
+// — NEVER via null-declaration typeRefEqual, whose blindness would treat two
+// distinct null-decl Named refs as equal/solvable and reopen the false-
+// exemption hole (the #1816 soundness invariant).
+static RigidInv matchLeafRigid(
+    const TypeRef* declared, const TypeRef* target,
+    const std::unordered_set<std::string_view>& paramNames,
+    std::unordered_map<std::string_view, TypeRef*>& solved,
+    const std::function<bool(std::string_view)>& isRigidParam) {
+    if (!declared || !target) return RigidInv::Unknown;
+
+    // (1) DECLARED side: a bare leaf-parameter reference is a SOLVE VARIABLE — it
+    // binds to the target WHATEVER the target is (ground OR rigid). `Ok<Y>:
+    // Result<Y>` against `Result<T>` solves `Y := T`: the determined rigid shape
+    // (§19.6 v0.196 — "a solution mentioning [a rigid parameter] is expressible
+    // in an arm"). A `Y?` occurrence is the §7.10 ?-split, a later lane.
+    if (declared->kind == TypeRef::Kind::Named && !declared->declaration &&
+        paramNames.count(declared->headName())) {
+        if (declared->nullable) return RigidInv::Unknown;  // ?-split — later lane
+        std::string_view nm = declared->headName();
+        auto it = solved.find(nm);
+        if (it != solved.end()) {
+            // Repeated occurrence: consistent only if the two bindings are
+            // identical. Decide ONLY on fully-ground bindings (typeRefEqual is
+            // safe there); any non-ground binding — a rigid parameter — is
+            // undecidable here (kept), never compared via null-decl typeRefEqual.
+            if (isFullyGroundTypeRef(it->second) && isFullyGroundTypeRef(target))
+                return typeRefEqual(it->second, target) ? RigidInv::Ok
+                                                        : RigidInv::Fail;
+            return RigidInv::Unknown;
+        }
+        solved[nm] = const_cast<TypeRef*>(target);
+        return RigidInv::Ok;
+    }
+    // A declaration-less DECLARED Named that is not a leaf parameter — a
+    // well-formed leaf root instantiation should not carry one; be conservative.
+    if (declared->kind == TypeRef::Kind::Named && !declared->declaration)
+        return RigidInv::Unknown;
+
+    // (2) TARGET side: a RIGID enclosing-body type parameter matched against a
+    // concrete (ground/composite) declared component — case (1) already peeled
+    // off a declared solve variable, so this is the rigid-vs-ground /
+    // rigid-vs-composite identity, UNDECIDABLE at the declaration ⇒ statically
+    // UNATTAINABLE. A null-decl target that is NOT an in-scope type parameter (a
+    // null-decl builtin edge) is merely Unknown — kept, never forced to warn.
+    if (target->kind == TypeRef::Kind::Named && !target->declaration)
+        return isRigidParam(target->headName()) ? RigidInv::Unattainable
+                                                : RigidInv::Unknown;
+
+    // (3) Both sides concrete: decidable structural-invariant identity, exactly
+    // as the ground matcher — a ground mismatch is a genuine Fail (no
+    // instantiation reconciles distinct ground structure, §19.6 "fails
+    // statically only on ground structure").
+    if (declared->nullable != target->nullable) return RigidInv::Unknown;
+    switch (declared->kind) {
+        case TypeRef::Kind::Primitive:
+            if (target->kind != TypeRef::Kind::Primitive) return RigidInv::Unknown;
+            return declared->primitive == target->primitive ? RigidInv::Ok
+                                                            : RigidInv::Fail;
+        case TypeRef::Kind::Named: {
+            if (target->kind != TypeRef::Kind::Named) return RigidInv::Unknown;
+            if (declared->declaration != target->declaration)
+                return RigidInv::Fail;  // distinct ground constructors
+            if (declared->genericArgs.size() != target->genericArgs.size())
+                return RigidInv::Unknown;  // arity edge — keep
+            RigidInv acc = RigidInv::Ok;
+            for (std::size_t i = 0; i < declared->genericArgs.size(); ++i) {
+                RigidInv r = matchLeafRigid(declared->genericArgs[i],
+                                            target->genericArgs[i], paramNames,
+                                            solved, isRigidParam);
+                if (r == RigidInv::Fail) return RigidInv::Fail;  // Fail dominates
+                if (r == RigidInv::Unattainable) acc = RigidInv::Unattainable;
+                else if (r == RigidInv::Unknown && acc == RigidInv::Ok)
+                    acc = RigidInv::Unknown;
+            }
+            return acc;
+        }
+        case TypeRef::Kind::Unit:
+            return target->kind == TypeRef::Kind::Unit ? RigidInv::Ok
+                                                       : RigidInv::Fail;
+        case TypeRef::Kind::InlineArray:
+            if (target->kind != TypeRef::Kind::InlineArray) return RigidInv::Unknown;
+            return matchLeafRigid(declared->arrayElement, target->arrayElement,
+                                  paramNames, solved, isRigidParam);
+        case TypeRef::Kind::Function:
+        case TypeRef::Kind::Error:
+            return RigidInv::Unknown;
+    }
+    return RigidInv::Unknown;
+}
+
 // §19.6 (v0.196, #1816 s3): format the missing-coverage obligation for an
 // UNDETERMINED generic leaf whose parameter(s) have NO occurrence in the leaf's
 // root instantiation. Such a parameter is free after solving against the ground
@@ -701,6 +816,15 @@ static InvMatch matchLeafInvariant(
 static std::string formatMissingGenericLeaf(
     const TypeSymbol* leaf, const std::vector<std::string_view>& params) {
     std::string s(leaf->name);
+    // §19.6 (v0.196, #1816 s4): a rigid-identity-undecidable leaf (e.g.
+    // `IntError: Result<int>` matched at `Result<T>`) is statically unattainable
+    // with NO free leaf parameter to name — the undecidability is in the
+    // scrutinee. Name just the leaf; the `_`-arm remedy is the same.
+    if (params.empty()) {
+        s += " (coverage statically unattainable — an undecidable rigid "
+             "scrutinee component, requires a `_` arm)";
+        return s;
+    }
     s += params.size() == 1 ? " (undetermined parameter `"
                             : " (undetermined parameters `";
     for (std::size_t i = 0; i < params.size(); ++i) {
@@ -813,6 +937,64 @@ ExprTC::LeafInstSolutions ExprTC::solveLeafInstantiations(
             result.freeParams.push_back(gp->name);
     if (!result.freeParams.empty()) {
         result.outcome = LeafInstSolutions::Outcome::Undetermined;
+        return result;
+    }
+    result.outcome = LeafInstSolutions::Outcome::Determined;
+    result.solution = std::move(solved);
+    return result;
+}
+
+// §19.6 (v0.196, #1816 s4): see the header comment. Solve `leaf`'s parameters
+// against a NON-GROUND (rigid) scrutinee `scrutTy` using the rigid-aware
+// three-valued identity (matchLeafRigid, keyed on isInScopeTypeParam). A leaf is
+// NEVER exempt under a rigid `S`: an undecidable rigid-identity component
+// (`IntError: Result<int>` at `Result<T>`) or a free leaf parameter marks the
+// leaf UNATTAINABLE (the caller reports it unconditionally); a clean determined
+// solve (`Ok<T>: Result<T>` at `Result<T>` ⇒ `Y := T`) is DETERMINED and left
+// for the name-match, so the determined rigid shape stays exhaustive (§19.6
+// Test 2). A decidable ground-structure Fail or an undecidable edge is KEPT
+// (deferred to the name-match) — conservative: at worst a spurious missing-leaf
+// warning, never a false exemption.
+ExprTC::LeafInstSolutions ExprTC::solveLeafInstantiationsRigid(
+    TypeSymbol* leaf, TypeSymbol* root, const TypeRef* scrutTy) {
+    LeafInstSolutions result;  // defaults: Undetermined, unattainable = false
+    if (!leaf || !root || !scrutTy) return result;
+
+    TypeRef* rootInst = leafRootInstantiation(leaf, root);
+    if (!rootInst) return result;  // uncomposable chain — keep (name-match)
+
+    std::unordered_set<std::string_view> paramNames;
+    for (const Symbol* gp : leaf->genericParams)
+        if (gp) paramNames.insert(gp->name);
+
+    std::unordered_map<std::string_view, TypeRef*> solved;
+    auto isRigid = [this](std::string_view n) { return isInScopeTypeParam(n); };
+    RigidInv m = matchLeafRigid(rootInst, scrutTy, paramNames, solved, isRigid);
+
+    // A rigid-identity undecidable component ⇒ statically UNATTAINABLE. The leaf
+    // is never exempt and no specific-instantiation type-test arm discharges it
+    // — only an irrefutable arm (§19.6 v0.196). Reported with NO parameter names
+    // (the undecidability is in the scrutinee, not a free leaf parameter).
+    if (m == RigidInv::Unattainable) {
+        result.unattainable = true;
+        return result;
+    }
+    // Fail (a genuine ground-structure mismatch on a partially-rigid `S`) or an
+    // undecidable edge (Unknown): KEEP — never exempt under a rigid `S`; the
+    // name-match settles coverage.
+    if (m != RigidInv::Ok) return result;
+
+    // m == Ok: a clean solve. A leaf parameter left FREE (no occurrence in the
+    // root instantiation) leaves infinitely many instantiations inhabiting `S`
+    // ⇒ statically UNATTAINABLE, named in the warning (as in the ground s3
+    // case). Otherwise every leaf parameter is bound (to a rigid or ground type)
+    // — the leaf is DETERMINED and its obligation is expressible as an arm
+    // (§19.6 v0.196); KEPT, the name-match discharges it.
+    for (const Symbol* gp : leaf->genericParams)
+        if (gp && !solved.count(gp->name))
+            result.freeParams.push_back(gp->name);
+    if (!result.freeParams.empty()) {
+        result.unattainable = true;
         return result;
     }
     result.outcome = LeafInstSolutions::Outcome::Determined;
@@ -1132,6 +1314,23 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
                     if (sol.outcome ==
                             LeafInstSolutions::Outcome::Undetermined &&
                         !sol.freeParams.empty())
+                        unattainable.emplace(lf, std::move(sol.freeParams));
+                } else {
+                    // s4: NON-GROUND (rigid) scrutinee — the case s1–s3 defer.
+                    // A leaf is NEVER exempt under a rigid `S`; classify by the
+                    // rigid-aware three-valued identity (solveLeafInstantiations-
+                    // Rigid, keyed on isInScopeTypeParam — never null-decl
+                    // typeRefEqual). An undecidable rigid-identity component
+                    // (`IntError: Result<int>` at `Result<T>`) or a free leaf
+                    // parameter makes coverage statically UNATTAINABLE: recorded
+                    // and reported unconditionally (§19.6 v0.196, Test 8), so a
+                    // specific-instantiation arm does not discharge it. A clean
+                    // determined solve (`Ok<T>` at `Result<T>` ⇒ `T`) is KEPT and
+                    // the name-match discharges it — the determined rigid shape
+                    // stays exhaustive (Test 2).
+                    LeafInstSolutions sol =
+                        solveLeafInstantiationsRigid(lf, sub, &scrutNonNull);
+                    if (sol.unattainable)
                         unattainable.emplace(lf, std::move(sol.freeParams));
                 }
                 kept.push_back(lf);

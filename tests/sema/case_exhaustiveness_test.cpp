@@ -613,6 +613,102 @@ BEZEL_TEST(sema_case_exhaust, no_occurrence_param_undetermined_spec_19_6) {
     BEZEL_EXPECT_FALSE(cleared.diagnostics.hasErrors());
 }
 
+// --- s4: RIGID-scrutinee determination (spec §19.6 v0.196; design doc Tests 2
+//     & 8) --------------------------------------------------------------------
+//
+// s1–s3 solve only a FULLY-GROUND scrutinee `S`. s4 handles the case they defer:
+// `S` contains a rigid enclosing-body type parameter (`case r: Result<T>` inside
+// a generic body, `T` rigid). Identity against a rigid parameter is three-valued
+// (§19.6 v0.196): a leaf whose root instantiation equates a GROUND/COMPOSITE
+// component against the rigid parameter is UNDECIDABLE at the declaration —
+// neither exempt nor determined, coverage statically unattainable — while a leaf
+// whose OWN parameter solves against the rigid one is determined (the solution
+// mentions the rigid parameter and is expressible as an arm).
+
+// (e) THE s4 fails-without/passes-with delta — the rigid-identity NEVER-EXEMPT
+// case (design doc Test 8). `IntError: Result<int>` under scrutinee `Result<T>`
+// (`T` rigid, from the enclosing `Handle<T>`): its root instantiation
+// `Result<int>` matched against `Result<T>` equates ground `int` against the
+// rigid `T` — inhabited exactly at the instantiations with `T = int`, undecidable
+// at the declaration ⇒ statically UNATTAINABLE. The leaf is NEVER exempt and a
+// specific-instantiation type-test arm (`var x: IntError`) does NOT discharge it;
+// only an irrefutable arm does. Fails without s4: the name-match counted the
+// `IntError` arm as covering the leaf (matching by declaration name) and no
+// warning fired — a proof that `Handle<int>(new IntError())` falsifies at
+// runtime. `Ok<Y>: Result<Y>` in the same hierarchy is DETERMINED (`Y := T`) and
+// covered by `var o: Ok<T>`, so only `IntError` is the obligation.
+BEZEL_TEST(sema_case_exhaust, rigid_result_leaf_never_exempt_spec_19_6) {
+    // Both leaves have arms, no `_`: IntError is unattainable at rigid `Result<T>`
+    // so the case is non-exhaustive and the warning NAMES IntError.
+    auto warned = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<A> end Result; "
+        "sealed class Ok<Y> : Result<Y> end Ok; "       // determined: Y := T
+        "sealed class IntError : Result<int> end IntError; "  // int ≡ T undecidable
+        "class Handle<T> "
+        "  public method h(r: Result<T>): int "
+        "    var a := case r of "
+        "      var o: Ok<T> => 1, "        // Ok determined and covered
+        "      var x: IntError => 2 "      // one instantiation — does NOT cover
+        "    end; "
+        "    return a; "
+        "  end h; "
+        "end Handle;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(warned));        // IntError unattainable
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(warned, "IntError"));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(warned, "unattainable"));
+    BEZEL_EXPECT_FALSE(warned.diagnostics.hasErrors());
+
+    // The only remedy for a statically-unattainable rigid-identity leaf (§19.6):
+    // an irrefutable `_` arm — now exhaustive, no warning.
+    auto cleared = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<A> end Result; "
+        "sealed class Ok<Y> : Result<Y> end Ok; "
+        "sealed class IntError : Result<int> end IntError; "
+        "class Handle<T> "
+        "  public method h(r: Result<T>): int "
+        "    var a := case r of "
+        "      var o: Ok<T> => 1, "
+        "      var x: IntError => 2, "
+        "      _ => 0 "
+        "    end; "
+        "    return a; "
+        "  end h; "
+        "end Handle;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(cleared));      // `_` completes it
+    BEZEL_EXPECT_FALSE(cleared.diagnostics.hasErrors());
+}
+
+// (f) The determined RIGID shape stays exhaustive (design doc Test 2 / the §7
+// migration note: "the determined shape — `Ok<T>/Err<T>: Result<T>` matched at …
+// rigid `Result<T>` without `_`" is newly proven). `Ok<Y>: Result<Y>` and
+// `Err<Y>: Result<Y>` under scrutinee `Result<T>` (rigid `T`): each leaf's root
+// instantiation `Result<Y>` matched against `Result<T>` solves `Y := T` — the
+// sole inhabiting instantiation — so `Ok<T>` and `Err<T>` are the only
+// inhabitants and the two-arm case is exhaustive with no `_`. s4 must NOT
+// regress the canonical generic-body sealed-match idiom into a warning ("blanket
+// never-exhaustive" is the rejected reading); the solution mentions the rigid
+// `T` and is expressible as the arm.
+BEZEL_TEST(sema_case_exhaust, rigid_determined_leaf_stays_exhaustive_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<A> end Result; "
+        "sealed class Ok<Y> : Result<Y> end Ok; "
+        "sealed class Err<Y> : Result<Y> end Err; "
+        "class Handle<T> "
+        "  public method h(r: Result<T>): int "
+        "    var a := case r of "
+        "      var o: Ok<T> => 1, "        // T := T — the sole solution
+        "      var e: Err<T> => 2 "        // T := T — the sole solution
+        "    end; "
+        "    return a; "
+        "  end h; "
+        "end Handle;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));  // both determined — no `_`
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // --- Open hierarchy (§19.6 final paragraph) --------------------------------
 
 // "When the hierarchy is open (the base is not sealed ...), exhaustiveness
