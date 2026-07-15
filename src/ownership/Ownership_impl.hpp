@@ -467,6 +467,18 @@ private:
     // initial ownership state (slice O1 producer table — minimal).
     OwnershipState producerState(const ast::Expr& e);
 
+    // SB01-A (§28.3 "Task-family calls produce owned frames", v0.190, SB-01,
+    // #1786): the GENERIC GUARD for the caller-side task-family classification.
+    // True when the callee `md`'s DECLARED (pre-substitution) return type is a
+    // bare type parameter — of `md` itself OR of its enclosing type — so a
+    // `Task`-family CALL classification must NOT fire (a bare-T return at
+    // `T = Task<int>` is governed by *Bare-type-parameter returns*, #1801, not
+    // by this rule). Mirrors the recognizer collectBareTypeParamCallBorrowSource
+    // uses (method-level via the shared fact, enclosing-type via the callee
+    // symbol's parent generic params).
+    bool callDeclaredReturnIsBareTypeParam(const ast::CallExpr& ce,
+                                           const ast::MethodDecl& md);
+
     // §28.3 arm-meet (v0.184, #1661): reject an if-expression / expression-
     // position `case`/`when` whose arms mix an owned value with a borrow.
     void checkArmMeetMixed(const ast::Expr& e);
@@ -1862,6 +1874,32 @@ private:
     // created. Empty for a synchronous body (annotateSuspendLocals is not
     // called) and for an async body with no await. // per §30.5
     std::unordered_set<const ast::Node*> suspendLocalDecls_;
+
+    // SB01-C1 (§30.5 "A reference to a plain owned local of static type
+    // `Task<T>`", v0.184 resolving #1533; the v0.190 SB-01 caller-side
+    // classification that makes it reachable, §28.3 #1786): the set of plain
+    // `var` owned-task LocalDecls that are BORROW-AWAITED in this body — an
+    // `await t` (Pattern A) whose operand resolves, through the v0.193 (#1800)
+    // alias chain, to a plain owned task local (minting initializer). §30.5
+    // (line 7341) says such an awaited owned local "keeps its ordinary §28.3
+    // discharge (auto-drop at scope end)" — exactly the disposition of an
+    // ADMITTED `using var` task suspend-local (also disposed at scope end via
+    // the codegen task path, normal+unwind edges) — so the async endState gate
+    // routes it to auto-drop (with the must-use nudge to `using var`) rather
+    // than the §28.3 suspend-local hard reject. The genuine D2 residual — a
+    // NEVER-awaited plain owned task held live ACROSS a suspend point — is NOT
+    // recorded here and stays rejected (its frame-teardown disposal on the
+    // abandonment/cancellation completion edges is unimplemented). Populated by
+    // collectBorrowAwaitedOwnedTaskLocals before the dataflow; empty for a
+    // synchronous body. // per §30.5, §28.3 (v0.190)
+    std::unordered_set<const ast::LocalDecl*> borrowAwaitedOwnedTaskDecls_;
+    void collectBorrowAwaitedOwnedTaskLocals(const flow::CFG& cfg);
+    // The root plain-`var` owned-task LocalDecl an `await` operand borrows,
+    // following the #1800 alias chain (`var t2 := t`) to the underlying binding;
+    // null unless that binding's initializer MINTS an owned task
+    // (producerState == Owned). // per §30.5, §28.3 (v0.190)
+    const ast::LocalDecl* awaitedOwnedTaskLocalRoot(const ast::Expr& operand,
+                                                    int depth);
 
     // Async-readiness 3c (§30.5 line ~6068): the set of `await` UnaryExprs that
     // appear directly as the value of a `return` statement. A Pattern A

@@ -214,19 +214,23 @@ BEZEL_TEST(async_own_patternA, await_bare_producer_bare_statement_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// Pattern A (v0.182): the confinement admission is scoped to an UNBOUND
-// producer expression (a bare call), not to "any operand
-// `awaitOperandIsOwningLocation` rejects." A reference to a plain
-// (non-`using`) owned local — `var t := p.MakeShared();` — is a NAMED value
-// whose lifetime is its declaring scope, not the statement that reads it;
-// reading it in a later, argument-position statement must NOT be admitted by
-// the new rule (it is a different case from a fresh, unnamed producer call).
-// Diagnosed. // per §30.5, §28.3
-BEZEL_TEST(async_own_patternA, await_plain_var_task_in_arg_still_diagnosed) {
+// Pattern A (v0.190 SB-01, §28.3 "Task-family calls produce owned frames" +
+// §30.5 "A reference to a plain owned local of static type `Task<T>`", line
+// 7351, resolving #1533; issue #1786 SB01-A/C1). A `Task`-family CALL now MINTS
+// an OWNED task at the call site (SB01-A), so `var t := p.MakeShared();` is a
+// plain owned task local — an ADMITTED Pattern A owning location (SB01-C1): the
+// local's scope bounds the borrow the await produces, and the §28.3 consume-
+// site freeze protects it. Awaiting it is BORROW-await (§30.5 — the await
+// neither consumes nor disposes a `Task<T>` operand), so `t` keeps its ordinary
+// §28.3 discharge and auto-drops at scope end (a must-use WARNING, not an
+// error) — exactly the disposition of an admitted `using var` task local. FLIP
+// (was rejected pre-v0.190 under the storage model, where a plain task call was
+// a borrow with no admitted source). Clean. // per §28.3, §30.5 (v0.190)
+BEZEL_TEST(async_own_patternA, await_plain_var_task_admitted_v0190) {
     auto r = parseAndCheckOwnership(wrap(
         "var t := p.MakeShared(); "
         "Use(await t); "));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // Pattern A (v0.182): the confinement admission does NOT extend to a borrow
@@ -313,21 +317,23 @@ BEZEL_TEST(async_own_patternA, await_borrowed_alias_of_using_var_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// Pattern A (§30.5 rule (a), v0.193, #1800 keep-reject): aliasing does NOT
-// launder a NON-admitted operand into admission. `var t := p.MakeShared();` is
-// a fresh producer-bound `var` — the still-open plain-owned-local gap (#1672 /
-// #1533) leaves it NOT an owning location — and a borrowed alias `var t2 := t`
-// of it inherits exactly that non-admission, so `await t2` stays REJECTED. This
-// pins the boundary of the #1800 fix: the alias admission recurses into the
-// source operand's own classification, which for a producer-bound `var` is
-// still a reject. (The borrow-escaping-scope reject that §30.5 requires.)
-// // per §30.5 rule (a) / C.6, §28.3
-BEZEL_TEST(async_own_patternA, await_alias_of_producer_var_still_diagnosed) {
+// Pattern A (§30.5 rule (a) alias chain, v0.193 #1800; v0.190 SB-01 #1786): a
+// borrowed ALIAS inherits its source operand's admission. Under v0.190 a
+// `Task`-family CALL mints an OWNED task (SB01-A), so `var t := p.MakeShared();`
+// is now an ADMITTED plain owned task local (SB01-C1, §30.5 line 7351 —
+// resolving #1533), and the borrowed alias `var t2 := t` of it INHERITS that
+// admission: `await t2` borrows t2, which borrows t, whose scope bounds the
+// result. `t` (borrow-awaited through the alias) auto-drops at scope end (a
+// must-use warning), `t2` is a plain borrow with no obligation. FLIP: this was
+// rejected pre-v0.190 (the plain task call was a borrow with no admitted
+// source, so the alias inherited non-admission — the old #1672/#1533 boundary).
+// Clean. // per §30.5 rule (a) / C.6, §28.3 (v0.190)
+BEZEL_TEST(async_own_patternA, await_alias_of_producer_var_admitted_v0190) {
     auto r = parseAndCheckOwnership(wrap(
         "var t := p.MakeShared(); "
         "var t2 := t; "
         "Use(await t2); "));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // Pattern A: a non-class `Task<T>` (here `Task<int>`) carries no ownership
@@ -343,6 +349,54 @@ BEZEL_TEST(async_own_patternA, await_value_typed_task_any_position_clean) {
         "    var r := await MakeInt(); "
         "  end M; "
         "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ---------------------------------------------------------------------------
+// v0.190 SB-01 (§28.3 "Task-family calls produce owned frames", #1786) —
+// caller-side classification: the flip's boundary cases.
+// ---------------------------------------------------------------------------
+
+// v0.190 SB-01 KEEP-REJECT (the D2 residual boundary): a plain owned task local
+// that is NEVER awaited but held live ACROSS a suspend point stays REJECTED. Its
+// scope-end task disposal covers the normal + unwind edges, but the frame-
+// teardown disposal on the §30.5 abandonment/cancellation completion edges is
+// unimplemented (SB01-D2), so — unlike a BORROW-awaited task, whose await is its
+// use and which §30.5 line 7341 auto-drops — this dangling task is conservatively
+// rejected. Remedy: await it (its use), or `using var` it. Pins that SB01-A/C1
+// does NOT over-admit the genuine across-suspend case. // per §28.3, §30.5 (v0.190)
+BEZEL_TEST(async_own_patternA, plain_owned_task_never_awaited_across_suspend_rejected) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var t := p.MakeShared(); "
+        "await p.MakeUnit(); "));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// v0.190 SB-01 GENERIC GUARD (#1801 keying): a call whose DECLARED (pre-
+// substitution) return is a BARE TYPE PARAMETER is NOT classified by the
+// Task-family rule, even when that parameter is bound to `Task<int>` at the call
+// site. `Pick<T>(a, b): T` at `T = Task<int>` yields a BORROW of its arguments
+// (governed by *Bare-type-parameter returns*, #1801), NOT an owned mint — so its
+// result carries NO auto-drop obligation. Keyed off the callee's DECLARED return
+// head (`T`, not `Task`); a resolved/post-substitution key would misclassify it
+// as owned and emit a spurious §28.3 auto-drop. The DIRECT task calls `pa`/`pb`
+// ARE minted owned (SB01-A) and auto-drop; the bare-T result `picked` is not.
+// Clean (only the two direct owned-task locals warn; no error). // per §28.3 (v0.190), #1801
+BEZEL_TEST(async_own_patternA, task_family_generic_guard_bare_T_not_minted) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public static method Pick<T>(a: T, b: T): T return a; end Pick; "
+        "  public static async method P(): Task<int> return 1; end P; "
+        "  public method Test(): int "
+        "    var pa := P(); "
+        "    var pb := P(); "
+        "    var picked := Pick<Task<int>>(pa, pb); "
+        "    return 0; "
+        "  end Test; "
+        "end C;");
+    // No ERROR — a bare-T result is not owned-minted, so `picked` is not an
+    // undischarged owned local; `pa`/`pb` auto-drop with a must-use warning.
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 

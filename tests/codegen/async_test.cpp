@@ -1970,6 +1970,32 @@ BEZEL_TEST(async_30_5_445, two_plain_var_tasks_awaited_cross_thread_clean) {
         30);
 }
 
+// v0.190 SB-01 (§28.3 "Task-family calls produce owned frames" + §30.5, #1786):
+// caller-side mint + exactly-once disposal. Under v0.190 a `Task`-family CALL
+// MINTS an OWNED task at the call site (SB01-A), so `var t := Producer();` is a
+// plain OWNED task local — where pre-v0.190 it was a borrow. Being borrow-awaited
+// (§30.5 line 7341), it keeps its ordinary §28.3 discharge and auto-drops at
+// scope end. This test pins that the new Owned classification does NOT introduce
+// a SECOND disposal on top of the codegen task path (#445): the task frame is
+// freed EXACTLY ONCE (LSan / ASan verify no leak AND no double-free). The
+// codegen else-if chain routes the plain-var task through the single #445
+// `d.task` disposal (taskTypeOfLocal), skipping the auto-drop registerUsing-
+// Disposal — so the Owned+autoDrop flag is disposal-inert here. Result 42.
+// // per §28.3, §30.5 (v0.190 SB-01)
+BEZEL_TEST(async_30_5_445, v0190_minted_plain_var_task_disposed_exactly_once) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Producer(): Task<int> "
+        "    return 42; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var t := Producer(); "
+        "    var x := await t; "
+        "    return x; "
+        "  end Main; end C;",
+        42);
+}
+
 // ===========================================================================
 // §30.2 / §14.1 (#444 / #509): `await` requires a Task / Task<T> / OwningTask<T>
 // operand.  Before #509, `Task.FromResult<int>(42)` was misparsed (§A.7 had no

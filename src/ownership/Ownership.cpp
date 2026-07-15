@@ -196,6 +196,11 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     if (isAsync_) {
         annotateSuspendLocals(*cfg);
         addCompletionEdges(*cfg);
+        // SB01-C1 (§30.5 line 7341, v0.190, #1786): record the plain owned task
+        // locals that are borrow-awaited, so the endState gate below auto-drops
+        // them (their ordinary §28.3 scope-end discharge) rather than the
+        // suspend-local hard reject. // per §30.5, §28.3
+        collectBorrowAwaitedOwnedTaskLocals(*cfg);
     }
     FlowState endFlow = runDataflow(*cfg, entry);
     const BlockState& endState = endFlow.locals;
@@ -493,6 +498,22 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             // async body (ls->decl is an IdentifierExpr, which annotateSuspendLocals
             // never marks) has no suspend-local signal to gate on, so it keeps the
             // reject. // per §28.12/§30.5
+            //
+            // SB01-C1 (§30.5 line 7341/7351, v0.190, #1786): a plain owned TASK
+            // local that is BORROW-AWAITED (borrowAwaitedOwnedTaskDecls_) is
+            // exempted from the suspend-local reject even when it crosses a
+            // suspend point — §30.5 admits it (line 7351) and says it "keeps its
+            // ordinary §28.3 discharge (auto-drop at scope end)" (line 7341),
+            // exactly like an admitted `using var` task suspend-local, which is
+            // disposed at scope end on the normal+unwind edges via codegen's task
+            // path (LlvmBackend_Stmts, #445) — the SAME disposal coverage a
+            // `using var` task gets. The abandonment/cancellation completion-edge
+            // disposal (D2) is a separate, still-unimplemented piece, but it is a
+            // PRE-EXISTING residual shared with the already-admitted `using var`
+            // task suspend-local, not a regression this admission introduces. A
+            // NEVER-awaited plain owned task held live across a suspend point is
+            // NOT in this set and stays the §28.3 reject (its remedy is `await`
+            // it or `using var`). // per §30.5, §28.3 (v0.190)
             if (isAsync_ && !sawYield_ && !isDestructor_ &&
                 everDischarged_.count(sym) == 0 &&
                 (reassignedLocals.count(sym) == 0 ||
@@ -500,7 +521,8 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
                     if (auto* ld =
                             dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
-                        if (suspendLocalDecls_.count(ld) == 0) {
+                        if (suspendLocalDecls_.count(ld) == 0 ||
+                            borrowAwaitedOwnedTaskDecls_.count(ld) != 0) {
                             const_cast<ast::LocalDecl*>(ld)->autoDropAtScopeEnd =
                                 true;
                             ctx_.diagnostics().report(
@@ -2137,6 +2159,34 @@ bool isValueSubstitutionErased(const sema::TypeRef* rt) {
     return false;
 }
 
+bool MethodOwnership::callDeclaredReturnIsBareTypeParam(
+        const ast::CallExpr& ce, const ast::MethodDecl& md) {
+    // SB01-A (§28.3, v0.190, SB-01, #1786) generic guard. Method-level bare-T
+    // return via the shared fact. // per §28.3 (v0.194, #1801)
+    if (common::declaredReturnIsBareTypeParam(md, ctx_)) return true;
+    // Enclosing-type bare-T return: a `class Box<T> ... method Get(): T` whose
+    // head `T` names a TYPE-level generic parameter — matched here where the
+    // callee symbol's parent type (and its generic params) is reachable. Both a
+    // bare type parameter and a 0-arity builtin resolve to a null-`declaration`
+    // Named ref, so the name-set membership test separates them. Mirrors the
+    // inline enclosing-type check collectBareTypeParamCallBorrowSource uses.
+    // `owned T` returns are excluded (ordinary transfer, §28.8).
+    if (md.returnOwned || !md.returnType || !md.returnType->name ||
+        md.returnType->name->parts.size() != 1)
+        return false;
+    const sema::TypeRef* rt = ctx_.resolvedType(*md.returnType);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named ||
+        rt->declaration != nullptr)
+        return false;
+    const std::string_view head = md.returnType->name->parts[0];
+    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
+            ce.callee ? ctx_.exprSymbol(*ce.callee) : nullptr))
+        if (ms->parent)
+            for (const sema::Symbol* g : ms->parent->genericParams)
+                if (g && g->name == head) return true;
+    return false;
+}
+
 OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
     // `new T(...)` is the canonical producer of Owned values — but only
     // for reference types (classes). §9: a record is a value type with
@@ -2289,6 +2339,34 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                         methodReturnsOnlyWrapperReceiverBorrow(*md))
                         return OwnershipState::Borrowed;
                 }
+            // SB01-A (§28.3 "Task-family calls produce owned frames", v0.190,
+            // SB-01, #1786): the CALLER-side half — a CALL whose DECLARED
+            // (pre-substitution, alias-resolved, nullability-stripped) return
+            // head is a `Task`-family type (`Task`/`Task<T>`/`OwningTask<T>`)
+            // mints an OWNED task frame at the call site; the caller owns and
+            // disposes it, no factory warning. Keyed PRE-SUBSTITUTION off the
+            // callee's DECLARED return (`md->returnType`, alias-resolved through
+            // `headName()`), NEVER the resolved/substituted result type — so the
+            // GENERIC GUARD holds: a bare-type-parameter return (`First<T>(): T`)
+            // whose T is later bound to `Task<int>` has declared head `T`, not
+            // `Task`, and is NOT classified here — it is governed by
+            // *Bare-type-parameter returns* (#1801). `callDeclaredReturnIsBare-
+            // TypeParam` additionally excludes the (pathological) case of a
+            // generic parameter literally named `Task`/`OwningTask`.
+            // `isTaskFamilyHead` (Task || OwningTask) keys both; `OwningTask`'s
+            // #1493 wrapper-receiver-borrow carve-out already returned Borrowed
+            // above, and SB01-B guarantees a non-`async` plain-`Task` callee
+            // return is never a borrow — so at this point the callee hands a
+            // fresh owned frame. Only a CALL mints; a READ of task-typed STORAGE
+            // (property/field/indexer/local — a MemberAccessExpr / IndexExpr /
+            // IdentifierExpr, never a CallExpr) does not reach this CallExpr
+            // block and stays a Borrow ("storage lends"). // per §28.3 (v0.190)
+            if (md->returnType && !callDeclaredReturnIsBareTypeParam(*ce, *md))
+                if (const sema::TypeRef* declRet =
+                        ctx_.resolvedType(*md->returnType))
+                    if (declRet->kind == sema::TypeRef::Kind::Named &&
+                        common::isTaskFamilyHead(declRet->headName()))
+                        return OwnershipState::Owned;
             // §28.3 "Factory methods and sourceless returns" / Appendix C.3
             // (fix #1499): an unannotated STATIC method whose EVERY return is a
             // fresh owned producer (`new T(...)` / an `owned`-returning call)

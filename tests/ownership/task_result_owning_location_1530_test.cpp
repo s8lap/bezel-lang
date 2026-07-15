@@ -104,33 +104,34 @@ BEZEL_TEST(result_own_patternA, result_bare_producer_bare_statement_clean) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// A plain (non-`using`) `var task := producer()` local read via `.Result` and
-// bound to `var r` is STILL not an owning location — this is the classic
-// ESCAPE case (the borrow is bound to `r`, which survives the statement),
-// unchanged by v0.182. // per §30.3, §30.5
-BEZEL_TEST(result_own_patternA, result_plain_var_bound_producer_diagnosed) {
+// v0.190 SB-01 (§28.3 "Task-family calls produce owned frames" + §30.5 plain
+// owned task local admission, line 7351; #1786 SB01-A/C1). A `Task`-family CALL
+// mints an OWNED task (SB01-A), so `var task := p.MakeShared();` is a plain
+// owned task local — an ADMITTED `.Result` owning location (SB01-C1 reuses
+// awaitOperandIsOwningLocation for the `.Result` site). `.Result` borrows the
+// result within `task`'s scope; `r` is a borrow of it; `task` auto-drops at
+// scope end (a must-use WARNING, not an error). FLIP: was rejected pre-v0.190
+// (a plain task call was a borrow with no admitted source). Clean.
+// // per §30.3, §30.5, §28.3 (v0.190)
+BEZEL_TEST(result_own_patternA, result_plain_var_bound_producer_admitted_v0190) {
     auto r = parseAndCheckOwnership(wrap(
         "var task := p.MakeShared(); "
         "var r := task.Result; "
         "Use(r); "));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// v0.182 (§30.3/§28.3, #1570): the confinement admission is scoped to an
-// UNBOUND producer expression (a bare call), not to "any operand
-// `awaitOperandIsOwningLocation` rejects." A reference to a plain
-// (non-`using`) owned local — `var task := p.MakeShared();` — is a NAMED
-// value whose lifetime is its declaring scope, not the statement that reads
-// it; reading `task.Result` directly in a later argument-position statement
-// must NOT be admitted by the new rule even though the borrow stays confined
-// to that statement — the temporary was produced (and would need disposal)
-// in the FIRST statement, not the one being read. Diagnosed.
-// // per §30.3, §30.5, §28.3
-BEZEL_TEST(result_own_patternA, result_plain_var_task_in_arg_still_diagnosed) {
+// v0.190 SB-01 (§28.3 + §30.5 line 7351, #1786): the argument-position sibling
+// of the above — `Use(task.Result)` reading a plain owned task local's result.
+// Same admission: `task` is a plain owned task local (SB01-A/C1), so its
+// `.Result` read is admitted and `task` auto-drops at scope end (a must-use
+// warning). FLIP (was rejected pre-v0.190). Clean.
+// // per §30.3, §30.5, §28.3 (v0.190)
+BEZEL_TEST(result_own_patternA, result_plain_var_task_in_arg_admitted_v0190) {
     auto r = parseAndCheckOwnership(wrap(
         "var task := p.MakeShared(); "
         "Use(task.Result); "));
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // ---------------------------------------------------------------------------

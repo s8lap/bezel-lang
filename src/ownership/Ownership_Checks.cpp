@@ -5054,6 +5054,25 @@ bool MethodOwnership::awaitOperandIsOwningLocation(
             const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
             if (!ld) return true;            // iteration variable (or similar)
             if (!ld->initializer) return true;  // `var t: Task<T>;` slot, owned by scope
+            // SB01-C1 (§30.5 "A reference to a plain owned local of static type
+            // `Task<T>`", v0.184 resolving #1533; the caller-side v0.190 SB-01
+            // classification that makes it reachable, §28.3 #1786): a plain
+            // `var t := Producer()` whose initializer is a task-family CALL that
+            // MINTS an owned frame (producerState == Owned — SB01-A) is an
+            // admitted Pattern A owning location. The local's scope bounds the
+            // borrow the await produces, and the §28.3 consume-site freeze
+            // rejects consuming or reassigning the binding while that borrow
+            // lives; the local keeps its ordinary §28.3 discharge — await
+            // BORROWS a `Task<T>` operand, it neither consumes nor disposes it
+            // (§30.5 named-operand borrow-await), so the owned task local
+            // auto-drops at scope end (bz_task_free). `using var` stays the
+            // canonical spelling (the pin makes the bound obvious). Only an
+            // owned-MINTING initializer is admitted here; a task-STORAGE read
+            // initializer (`var t := this._taskField;`) is a Borrow and falls to
+            // the alias recursion below, which re-derives its admission from the
+            // storage's own owning-location status. // per §30.5, §28.3 (v0.190)
+            if (producerState(*ld->initializer) == OwnershipState::Owned)
+                return true;
             // §30.5 rule (a) / C.6, v0.193 (#1800): a plain `var` whose
             // initializer is itself a REFERENCE to an already-admitted operand
             // is a BORROWED ALIAS of it and inherits its admission — the
@@ -5062,13 +5081,13 @@ bool MethodOwnership::awaitOperandIsOwningLocation(
             // "the alias is admitted iff its source operand is": a reference
             // initializer (identifier / owned-field / owning-slot read) is
             // re-classified through this same function, and the alias's own
-            // scope bounds the result borrow. A `var t := Producer();` — a fresh
-            // producer CALL/`new`, NOT a reference to named storage — takes none
-            // of the identifier/member/index branches and reaches this function's
-            // final `return false`, so the still-open plain-owned-local gap
-            // (#1672 / #1533) is left DELIBERATELY untouched: this admits ONLY a
-            // borrowed alias of an ALREADY-admitted operand, never a fresh
-            // producer-bound `var`. `depth` bounds the walk against a
+            // scope bounds the result borrow. This recursion covers the
+            // BORROWED-alias case; the owned-minting producer-bound `var t :=
+            // Producer();` is admitted by the SB01-A/SB01-C1 check ABOVE (v0.190
+            // resolves #1533 — a plain owned task local IS an owning location).
+            // A `var t := <borrowed producer>;` whose initializer is neither
+            // owned-minting nor a reference to named storage still reaches the
+            // final `return false`. `depth` bounds the walk against a
             // pathological error-recovery alias cycle. // per §30.5 rule (a)/C.6
             if (depth < 64)
                 return awaitOperandIsOwningLocation(*ld->initializer, depth + 1);
@@ -6468,6 +6487,63 @@ void MethodOwnership::annotateSuspendLocals(const flow::CFG& cfg) {
         for (const ast::Stmt* st : order[idx]->stmts) {
             if (auto* ld = dynamic_cast<const ast::LocalDecl*>(st))
                 suspendLocalDecls_.insert(ld);
+        }
+    }
+}
+
+const ast::LocalDecl* MethodOwnership::awaitedOwnedTaskLocalRoot(
+    const ast::Expr& operand, int depth) {
+    // SB01-C1 (§30.5, v0.190, #1786): resolve an `await` operand to the plain
+    // `var` owned task LocalDecl it borrows, following the #1800 alias chain to
+    // the underlying binding (`var t2 := t;` — the everyday borrowed alias).
+    // A `using var`, parameter, field, storage read, or a borrowed producer is
+    // NOT a plain owned task local and returns null (no plain-owned-local
+    // scope-end obligation to reclassify). `depth` bounds a pathological
+    // error-recovery alias cycle, mirroring awaitOperandIsOwningLocation.
+    if (depth > 64) return nullptr;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(&operand);
+    if (!id) return nullptr;
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!ls || ls->isUsing) return nullptr;
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+    if (!ld || !ld->initializer) return nullptr;
+    // A bare-identifier initializer is a borrowed alias — follow it to the
+    // owned source (`var t2 := t;`). // per §30.5 rule (a), v0.193 (#1800)
+    if (dynamic_cast<const ast::IdentifierExpr*>(ld->initializer.get()))
+        return awaitedOwnedTaskLocalRoot(*ld->initializer, depth + 1);
+    // An owned-MINTING initializer (a task-family CALL, SB01-A) → this is the
+    // plain owned task local §30.5 (line 7351) admits.
+    if (producerState(*ld->initializer) == OwnershipState::Owned)
+        return ld;
+    return nullptr;
+}
+
+void MethodOwnership::collectBorrowAwaitedOwnedTaskLocals(const flow::CFG& cfg) {
+    // SB01-C1 (§30.5 line 7341, v0.190, #1786): record every plain `var` owned
+    // task local that is BORROW-AWAITED — the operand of a borrow-await (Pattern
+    // A `Task<class>`, ValueResult `Task<value>`, or UnitTask `Task`), through
+    // the alias chain — so the async endState gate auto-drops it (its ordinary
+    // §28.3 scope-end discharge, §30.5) instead of the suspend-local hard reject.
+    // Iterates the CFG's per-block await sites (3a). Runs before the dataflow so
+    // the endState loop can consult it. // per §30.5, §28.3
+    borrowAwaitedOwnedTaskDecls_.clear();
+    for (const auto& bp : cfg.blocks()) {
+        for (const ast::Node* n : bp->awaitSites) {
+            auto* ue = dynamic_cast<const ast::UnaryExpr*>(n);
+            if (!ue || !ue->operand) continue;
+            // The BORROW-await kinds: `Task<class>` (Pattern A), `Task<value>`
+            // (ValueResult), and unit `Task` (UnitTask) all borrow a NAMED
+            // operand — the await neither consumes nor disposes it, and the
+            // owned task local auto-drops at scope end (§30.5, line 7341).
+            // Pattern B (`OwningTask<T>`) instead CONSUMES its operand
+            // (recordAwaitOperandConsume discharges it, so it never reaches the
+            // endState reject); NotTask carries no obligation. // per §30.5
+            const AwaitTaskKind k = awaitTaskKind(*ue);
+            if (k == AwaitTaskKind::PatternB || k == AwaitTaskKind::NotTask)
+                continue;
+            if (const ast::LocalDecl* root =
+                    awaitedOwnedTaskLocalRoot(*ue->operand, 0))
+                borrowAwaitedOwnedTaskDecls_.insert(root);
         }
     }
 }
