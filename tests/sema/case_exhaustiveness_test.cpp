@@ -995,6 +995,279 @@ BEZEL_TEST(sema_case_exhaust, qmark_split_constraint_suppresses_nullable_spec_19
     BEZEL_EXPECT_FALSE(exempt.diagnostics.hasErrors());
 }
 
+// --- s10: composed-trichotomy validation (spec §19.6 v0.196; #1816 s1–s8 all
+//     landed) -----------------------------------------------------------------
+//
+// s1–s8 each pin ONE determination mechanism in isolation (ground mismatch,
+// parameter solving, free-parameter undetermination, rigid identity, scalar
+// `where`, type-bound `where`, the `?`-split). §19.6 v0.196's soundness
+// argument (design doc §3, critique amendment A3) is explicit that the
+// completeness proof holds only "when every leaf is determined or exempt" —
+// i.e. covering determined leaves and ignoring exempt ones is complete ONLY as
+// long as no leaf is left undetermined. These tests confirm the trichotomy
+// COMPOSES: several mechanisms firing together inside one hierarchy at one
+// match site must still yield the same per-leaf verdicts as they do in
+// isolation, and a single undetermined leaf must still force `_` even when
+// every other leaf in the same hierarchy is cleanly determined-and-covered or
+// exempt.
+
+// (a) THE s10 composed delta. `Result<T>` mixes THREE mechanisms in one
+// hierarchy: `Ok<T>: Result<T>` is DETERMINED (s2, `T := int`) and its arm is
+// given; `IntOnly: Result<string>` is EXEMPT (s1, ground mismatch against the
+// `Result<int>` scrutinee) and needs no arm; `Tagged<U>: Result<int>` has U
+// with NO occurrence in its (already-ground) root instantiation, so U is free
+// after solving (s3) — infinitely many inhabiting instantiations — and is
+// UNDETERMINED however the arm is typed. Per the design doc's A3 fix, the
+// determined-and-exempt leaves being fully resolved does NOT rescue the
+// hierarchy: coverage is statically unattainable while Tagged remains
+// undetermined, so the case is non-exhaustive without `_` even though `Ok` is
+// covered and `IntOnly` needs nothing.
+BEZEL_TEST(sema_case_exhaust,
+           mixed_determined_exempt_undetermined_still_needs_discard_spec_19_6) {
+    // §19.6 v0.196 "Generic leaves: the determination rule", design doc A3 —
+    // completeness holds only when EVERY leaf is determined or exempt; one
+    // undetermined leaf (Tagged) still forces `_` despite Ok determined+covered
+    // and IntOnly exempt.
+    auto warned = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<T> end Result; "
+        "sealed class Ok<T> : Result<T> end Ok; "               // determined: T:=int
+        "sealed class IntOnly : Result<string> end IntOnly; "   // exempt: ground mismatch
+        "sealed class Tagged<U> : Result<int> end Tagged; "     // U free -> undetermined
+        "class Calc "
+        "  public method M(r: Result<int>): int "
+        "    var a := case r of "
+        "      var o: Ok<int> => 1, "        // Ok determined and covered
+        "      var g: Tagged<int> => 2 "     // one instantiation — does NOT cover Tagged
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(warned));       // Tagged unattainable
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(warned, "Tagged"));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(warned, "undetermined"));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(warned, "U"));
+    BEZEL_EXPECT_FALSE(warned.diagnostics.hasErrors());
+
+    // Same hierarchy WITH a `_` catch-all — the only remedy for the
+    // undetermined leaf (§19.6); Ok's determined coverage and IntOnly's
+    // exemption were never the problem, so adding `_` alone clears it.
+    auto cleared = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<T> end Result; "
+        "sealed class Ok<T> : Result<T> end Ok; "
+        "sealed class IntOnly : Result<string> end IntOnly; "
+        "sealed class Tagged<U> : Result<int> end Tagged; "
+        "class Calc "
+        "  public method M(r: Result<int>): int "
+        "    var a := case r of "
+        "      var o: Ok<int> => 1, "
+        "      var g: Tagged<int> => 2, "
+        "      _ => 0 "
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(cleared));      // `_` completes it
+    BEZEL_EXPECT_FALSE(cleared.diagnostics.hasErrors());
+}
+
+// (b) The canonical DETERMINED idiom — "every leaf parameter mentioned in the
+// base clause" — stays exhaustive with NO `_`, composed across TWO
+// determination mechanisms landing on the same verdict in one hierarchy: `Ok`
+// and `Err` are determined by direct parameter solving (s2, `T := int?`), and
+// `Nullable<Y>: Result<Y?> where Y: notnull` is determined by the §7.10
+// `?`-split collapsing to a singleton under the `notnull` bound (s7: the
+// nullable pre-image `Y := int?` is excluded, leaving only `Y := int`). All
+// three leaves are determined and covered, so the three-arm case is exhaustive
+// without `_` — the s2+s7 composition must not regress the accept-delta either
+// mechanism pins alone.
+BEZEL_TEST(sema_case_exhaust,
+           determined_idiom_composed_with_qmark_split_stays_exhaustive_spec_19_6) {
+    // §19.6 v0.196 + §7.10 v0.159 — s2 (direct parameter solving) and s7
+    // (`?`-idempotence pre-image split, constraint-collapsed to determined)
+    // composed in one hierarchy: every leaf determined-and-covered, no `_`.
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<T> end Result; "
+        "sealed class Ok<T> : Result<T> end Ok; "               // T:=int? — determined
+        "sealed class Err<T> : Result<T> end Err; "             // T:=int? — determined
+        "sealed class Nullable<Y> : Result<Y?> where Y: notnull end Nullable; "
+        "class Calc "
+        "  public method M(r: Result<int?>): int "
+        "    var a := case r of "
+        "      var o: Ok<int?> => 1, "      // T:=int? — the sole solution
+        "      var e: Err<int?> => 2, "     // T:=int? — the sole solution
+        "      var n: Nullable<int> => 3 "  // Y:=int — the sole surviving pre-image
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));  // all three determined — no `_`
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (c) A mix of DETERMINED+covered and EXEMPT leaves — with NO undetermined
+// leaf in the hierarchy — is exhaustive with NO `_`: `Ok`/`Err` are determined
+// by direct parameter solving (s2) and covered, while `Shapely<Y>: Result<Y>
+// where Y: IShape` is EXEMPT because the solved `Y := int` provably fails the
+// type-bound (s6: `int` is not a subtype of the user interface `IShape`, so
+// the sole clause-(a) solution fails clause (b) and the set empties). Unlike
+// (a) above, no leaf here is left undetermined, so the completeness argument
+// (design doc §3) applies cleanly: covering the determined leaves and ignoring
+// the exempt one is a complete proof.
+BEZEL_TEST(sema_case_exhaust,
+           determined_and_exempt_mix_no_undetermined_stays_exhaustive_spec_19_6) {
+    // §19.6 v0.196 — s2 (determined) composed with s6 (type-bound exempt), no
+    // undetermined leaf present: exhaustive without `_`.
+    auto r = parseSemaAll(
+        "module M; "
+        "interface IShape end IShape; "
+        "sealed abstract class Result<T> end Result; "
+        "sealed class Ok<T> : Result<T> end Ok; "               // determined: T:=int
+        "sealed class Err<T> : Result<T> end Err; "             // determined: T:=int
+        "sealed class Shapely<Y> : Result<Y> where Y: IShape end Shapely; "  // exempt
+        "class Calc "
+        "  public method M(r: Result<int>): int "
+        "    var a := case r of "
+        "      var o: Ok<int> => 1, "
+        "      var e: Err<int> => 2 "  // Shapely exempt — int is not IShape
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));  // Shapely exempt, rest covered
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// --- s11: cross-module determination stability (spec §19.6 v0.196, the
+//     cross-module subsection, line ~3897/~3902; design doc A16) -------------
+//
+// §19.6's cross-module subsection: "the closed leaf set is computed from the
+// declaring module's source, and determination is evaluated at each match
+// site against that set and the site's scrutinee type — an upstream-added
+// leaf enters a recompiled match as determined, undetermined, or exempt by
+// the same computation." The checker implements this by walking
+// `ctx_.symbols()` for descendants of the scrutinee's root at EACH call to
+// `checkCaseExhaustiveness` (src/sema/ExprTypecheck.cpp) — i.e. the closed set
+// is recomputed fresh per compilation from the declaring module's own
+// declarations, never cached or keyed off which other modules happen to be
+// imported at the match site. The invariant under test: the verdict for a
+// given leaf depends ONLY on the declaring module's closed set and the site's
+// scrutinee type, never on ambient visibility (what else is declared/visible
+// in the compilation) or declaration order.
+//
+// LIMITATION: `parseSemaAll` drives the single-file sema-unit harness (one
+// `module` declaration, no `import`/multi-artifact linking) — it cannot
+// exercise a genuine two-module compile+import (that is `tests/module/*_test.cpp`,
+// which drives the full Driver). These tests approximate the cross-module
+// story at the closed-set-from-declaring-symbols granularity the task
+// describes: each independent `parseSemaAll` call is a fresh, from-scratch
+// recomputation (mirroring "recompiled downstream match" against a changed
+// declaring-module source), and the census-prohibition-style probe in (b)
+// pins that the computation reads only descendants of the matched root, never
+// unrelated ambient symbols or their declaration order.
+
+// (a) Upstream leaf addition — recompiling a downstream match against a
+// declaring-module source that has gained a new sealed leaf. BEFORE: `Ok<T>`
+// and `Err<T>` are the hierarchy's only leaves; the two-arm match at
+// `Result<int>` is exhaustive (both determined and covered). AFTER: the same
+// declaring module gains `Pending<T>: Result<T>` (a new sealed leaf, as if an
+// upstream recompile added one); the SAME match site (same two arms, no `_`)
+// is now non-exhaustive, because the SAME determination computation applies
+// to `Pending` too — `T := int` is its sole solution, so it is determined and
+// (being uncovered) draws the warning naming it. §19.6: "an upstream-added
+// leaf enters a recompiled match as determined, undetermined, or exempt by
+// the same computation" — here Pending enters as determined.
+BEZEL_TEST(sema_case_exhaust,
+           cross_module_upstream_leaf_addition_recomputes_same_site_spec_19_6) {
+    // BEFORE the upstream addition: Ok/Err alone are exhaustive at Result<int>.
+    auto before = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<T> end Result; "
+        "sealed class Ok<T> : Result<T> end Ok; "
+        "sealed class Err<T> : Result<T> end Err; "
+        "class Calc "
+        "  public method M(r: Result<int>): int "
+        "    var a := case r of "
+        "      var o: Ok<int> => 1, "
+        "      var e: Err<int> => 2 "
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(before));
+    BEZEL_EXPECT_FALSE(before.diagnostics.hasErrors());
+
+    // AFTER: the declaring module gained `Pending<T>: Result<T>`; the SAME
+    // match site (same arms, still no `_`) recomputes non-exhaustive, and
+    // names the newly-determined, newly-uncovered leaf.
+    auto after = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<T> end Result; "
+        "sealed class Ok<T> : Result<T> end Ok; "
+        "sealed class Err<T> : Result<T> end Err; "
+        "sealed class Pending<T> : Result<T> end Pending; "  // upstream addition
+        "class Calc "
+        "  public method M(r: Result<int>): int "
+        "    var a := case r of "
+        "      var o: Ok<int> => 1, "
+        "      var e: Err<int> => 2 "
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(after));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(after, "Pending"));
+    BEZEL_EXPECT_FALSE(after.diagnostics.hasErrors());
+}
+
+// (b) Ambient-visibility / declaration-order independence — the census
+// prohibition (s6, design doc B2) generalized: the SAME hierarchy and SAME
+// match site as (a)'s AFTER snapshot, but with unrelated declarations (an
+// unrelated class, an unrelated interface, a wholly separate closed
+// hierarchy) interleaved BEFORE, BETWEEN, and AFTER the `Result` family's own
+// declarations, and with the leaves declared out of the "natural" order
+// (`Pending` first, `Ok` last). The verdict must be byte-for-byte identical to
+// (a)'s AFTER: the warning still fires and still names exactly `Pending` — a
+// change to what else is visible in the compilation, or to the order leaves
+// are declared in, must never change a leaf's determination. This pins that
+// the closed-set walk (`ctx_.symbols()` filtered by descends-from-`sub`) reads
+// structure, not a happens-to-be-visible census.
+BEZEL_TEST(sema_case_exhaust,
+           cross_module_verdict_independent_of_ambient_visibility_spec_19_6) {
+    // §19.6 v0.196 cross-module subsection + design doc A16/B2 — ambient
+    // unrelated declarations and leaf declaration order must not perturb the
+    // determination verdict from (a)'s AFTER snapshot.
+    auto r = parseSemaAll(
+        "module M; "
+        "class Unrelated1 end Unrelated1; "
+        "interface IUnrelated end IUnrelated; "
+        "sealed abstract class OtherHierarchy end OtherHierarchy; "
+        "sealed class OtherLeaf : OtherHierarchy end OtherLeaf; "
+        "sealed abstract class Result<T> end Result; "
+        "sealed class Pending<T> : Result<T> end Pending; "  // declared FIRST this time
+        "sealed class Err<T> : Result<T> end Err; "
+        "class Padding end Padding; "                        // more ambient noise
+        "sealed class Ok<T> : Result<T> end Ok; "             // declared LAST this time
+        "class Calc "
+        "  public method M(r: Result<int>): int "
+        "    var a := case r of "
+        "      var o: Ok<int> => 1, "
+        "      var e: Err<int> => 2 "
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "Pending"));
+    // The ambient/reordered declarations must not themselves be misreported
+    // as part of the Result closed set.
+    BEZEL_EXPECT_FALSE(nonExhaustiveWarningMentions(r, "OtherLeaf"));
+    BEZEL_EXPECT_FALSE(nonExhaustiveWarningMentions(r, "Unrelated1"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // --- Open hierarchy (§19.6 final paragraph) --------------------------------
 
 // "When the hierarchy is open (the base is not sealed ...), exhaustiveness
