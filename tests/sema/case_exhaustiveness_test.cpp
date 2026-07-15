@@ -873,6 +873,128 @@ BEZEL_TEST(sema_case_exhaust,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// --- s7: §7.10 `?`-idempotence pre-image split (spec §19.6 + §7.10 v0.196) ---
+//
+// `?` is the one non-injective type constructor: `(U?)? ≡ U?` (§7.10). So a `Y?`
+// occurrence in a leaf's root instantiation matched against a NULLABLE scrutinee
+// argument `U?` has a finite pre-image SET — BOTH `Y := U` (`U? = U?`) and
+// `Y := U?` (`(U?)? = U?`) inhabit. Two solutions ⇒ the leaf is UNDETERMINED
+// (coverage statically unattainable). A §14.2 constraint on Y that excludes
+// nullable arguments (`notnull` / `class` / `value` / a type or type-parameter
+// bound) kills the nullable pre-image `Y := U?`, collapsing the split to the
+// single non-null pre-image ⇒ DETERMINED (or, if that pre-image also violates a
+// bound, EXEMPT). `new` is NOT such a constraint (a nullable type satisfies it
+// via its `null` default).
+
+// (a) THE s7 fails-without/passes-with delta — the UNCONSTRAINED split ⇒
+// UNDETERMINED. `L<Y>: B<Y?>` under scrutinee `B<int?>`: the occurrence `Y?`
+// matched against `int?` admits `Y := int` AND `Y := int?` (§7.10) — two
+// inhabiting instantiations, so `L` coverage is statically unattainable and the
+// case is NOT exhaustive even WITH a `var l: L<int>` arm (that names one
+// instantiation, not the leaf). §19.6 requires the warning to NAME the leaf and
+// its undetermined parameter. Fails without s7: the `Y?` occurrence returned
+// Unknown (undetermined with no free parameter), so the leaf was kept and the
+// `var l: L<int>` name-match counted it covered ⇒ no warning (the rejected
+// declaration-coverage reading) — a proof that `L<int?>` matches no arm.
+BEZEL_TEST(sema_case_exhaust, qmark_split_unconstrained_undetermined_spec_19_6) {
+    // §7.10 / §19.6 v0.196. Unconstrained Y ⇒ both pre-images inhabit ⇒
+    // undetermined; the warning names L and Y despite the `var l: L<int>` arm.
+    auto warned = parseSemaAll(
+        "module M; "
+        "sealed abstract class B<T> end B; "
+        "sealed class L<Y> : B<Y?> end L; "   // Y? occurrence — the §7.10 split
+        "sealed class R : B<int?> end R; "    // ground leaf — determined, covered
+        "class Calc "
+        "  public method M(b: B<int?>): int "
+        "    var a := case b of "
+        "      var r: R => 1, "
+        "      var l: L<int> => 2 "  // one instantiation — does NOT cover the leaf
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(warned));        // L undetermined
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(warned, "L"));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(warned, "undetermined"));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(warned, "Y"));
+    BEZEL_EXPECT_FALSE(warned.diagnostics.hasErrors());
+
+    // The only remedy for an undetermined split leaf (§19.6): an irrefutable arm.
+    auto cleared = parseSemaAll(
+        "module M; "
+        "sealed abstract class B<T> end B; "
+        "sealed class L<Y> : B<Y?> end L; "
+        "sealed class R : B<int?> end R; "
+        "class Calc "
+        "  public method M(b: B<int?>): int "
+        "    var a := case b of "
+        "      var r: R => 1, "
+        "      var l: L<int> => 2, "
+        "      _ => 0 "
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(cleared));      // `_` completes it
+    BEZEL_EXPECT_FALSE(cleared.diagnostics.hasErrors());
+}
+
+// (b) THE COMPANION — a §14.2 constraint on Y that excludes nullable arguments
+// SUPPRESSES the nullable pre-image, collapsing the split back to a single
+// solution. Two directions:
+//   • `where Y: notnull` under `B<int?>`: the nullable pre-image `Y := int?` is
+//     excluded (§14.2 notnull ⇒ non-null Y), leaving only `Y := int` ⇒ L is
+//     DETERMINED and covered by the `var l: L<int>` arm ⇒ NO warning.
+//   • `where Y: IShape` under `B<int?>` (int not IShape): the nullable pre-image
+//     `Y := int?` is excluded (a type bound implies non-null Y), AND the non-null
+//     pre-image `Y := int` violates the same bound (int is not a subtype of the
+//     user interface IShape, §3.5) ⇒ BOTH pre-images fail ⇒ L is EXEMPT, so
+//     covering only the ground leaf `R` is exhaustive with no `_` and no L arm.
+// The second direction FAILS WITHOUT s7 (and s5/s6 alone): before s7 the `Y?`
+// occurrence returned Unknown, so L was kept, uncovered, and drew a spurious
+// missing-leaf warning; the constraint could not collapse a split the solver
+// never recognized.
+BEZEL_TEST(sema_case_exhaust, qmark_split_constraint_suppresses_nullable_spec_19_6) {
+    // §7.10 / §19.6 v0.196 — notnull collapses the split to the DETERMINED
+    // non-null pre-image, covered by the arm ⇒ no warning.
+    auto determined = parseSemaAll(
+        "module M; "
+        "sealed abstract class B<T> end B; "
+        "sealed class L<Y> : B<Y?> where Y: notnull end L; "  // kills Y := int?
+        "sealed class R : B<int?> end R; "
+        "class Calc "
+        "  public method M(b: B<int?>): int "
+        "    var a := case b of "
+        "      var r: R => 1, "
+        "      var l: L<int> => 2 "  // covers the sole (determined) obligation
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(determined));   // determined+covered
+    BEZEL_EXPECT_FALSE(determined.diagnostics.hasErrors());
+
+    // §7.10 / §19.6 v0.196 — a type bound both suppresses the nullable pre-image
+    // AND (here) rejects the non-null one ⇒ L EXEMPT ⇒ no warning without an L
+    // arm. Fails without s7: L kept + uncovered ⇒ spurious missing-leaf warning.
+    auto exempt = parseSemaAll(
+        "module M; "
+        "interface IShape end IShape; "
+        "sealed abstract class B<T> end B; "
+        "sealed class L<Y> : B<Y?> where Y: IShape end L; "   // int? and int both ✗
+        "sealed class R : B<int?> end R; "                    // the only obligation
+        "class Calc "
+        "  public method M(b: B<int?>): int "
+        "    var a := case b of "
+        "      var r: R => 1 "  // L exempt: neither pre-image satisfies IShape
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(exempt));       // L filtered out
+    BEZEL_EXPECT_FALSE(exempt.diagnostics.hasErrors());
+}
+
 // --- Open hierarchy (§19.6 final paragraph) --------------------------------
 
 // "When the hierarchy is open (the base is not sealed ...), exhaustiveness

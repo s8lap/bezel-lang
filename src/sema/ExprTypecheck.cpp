@@ -619,18 +619,61 @@ enum class InvMatch { Fail, Unknown, Ok };
 static InvMatch matchLeafInvariant(
     const TypeRef* declared, const TypeRef* target,
     const std::unordered_set<std::string_view>& paramNames,
-    std::unordered_map<std::string_view, TypeRef*>& solved) {
+    std::unordered_map<std::string_view, TypeRef*>& solved, SemaContext& ctx,
+    std::unordered_set<std::string_view>& splitParams) {
     if (!declared || !target) return InvMatch::Unknown;
 
     // (1) A bare leaf-parameter reference on the DECLARED (root-instantiation)
     // side — a Named TypeRef with no declaration whose head names a leaf param
     // (mirrors unifyReturnAgainstTarget's bare-parameter recognition). This is a
-    // SOLVE VARIABLE. A nullable-marker occurrence (`T?`) is the §7.10 ?-split
-    // (a later lane): undecidable here, never a false exempt.
+    // SOLVE VARIABLE.
     if (declared->kind == TypeRef::Kind::Named && !declared->declaration &&
         paramNames.count(declared->headName())) {
-        if (declared->nullable) return InvMatch::Unknown;  // ?-split — later lane
         std::string_view nm = declared->headName();
+        if (declared->nullable) {
+            // §7.10 v0.196 (#1816 s7): a nullable-marker occurrence `Y?`. `?` is
+            // idempotent (`(U?)? ≡ U?`) — the one non-injective type constructor —
+            // so its pre-image is a finite SET. Against a NULLABLE target `U?` the
+            // split admits BOTH `Y := U` (`U? = U?`) and `Y := U?` (`(U?)? = U?`):
+            // two inhabiting solutions. Bind the NON-null pre-image `Y := U` here
+            // (the primary solution) and record `Y` as a split param;
+            // solveLeafInstantiations then decides whether the nullable pre-image
+            // ALSO survives (⇒ >1 solution ⇒ undetermined) or a §14.2 constraint on
+            // `Y` (notnull / class / value / a type or type-parameter bound — all
+            // imply non-null `Y`) kills it (⇒ the split collapses to this single
+            // binding ⇒ determined). Against a NON-nullable target `Y?` can never
+            // equal it (`Y?` is always nullable) — an undecidable edge, kept
+            // (Unknown), deferred to the name-match, never a false exempt.
+            if (!target->nullable) return InvMatch::Unknown;
+            // The non-nullable pre-image `U` of the nullable target `U?`.
+            TypeRef* nn;
+            if (target->kind == TypeRef::Kind::Primitive) {
+                nn = ctx.primitiveTypeRef(target->primitive, /*nullable=*/false);
+            } else {
+                nn = ctx.makeTypeRef();
+                *nn = *target;
+                nn->nullable = false;
+            }
+            auto it = solved.find(nm);
+            if (it != solved.end()) {
+                // A prior binding of `Y`. The non-null pre-image is consistent only
+                // if it equals that binding; decide only on ground bindings
+                // (typeRefEqual is safe there), else keep (Unknown). A prior bare
+                // (non-`?`) occurrence already erased `Y` from splitParams and
+                // pins it non-nullable, so no split is (re-)recorded here.
+                if (isFullyGroundTypeRef(it->second) && isFullyGroundTypeRef(nn))
+                    return typeRefEqual(it->second, nn) ? InvMatch::Ok
+                                                        : InvMatch::Fail;
+                return InvMatch::Unknown;
+            }
+            solved[nm] = nn;
+            splitParams.insert(nm);
+            return InvMatch::Ok;
+        }
+        // A bare (non-nullable) occurrence pins `Y` to the target exactly and
+        // COLLAPSES any prior `?`-split on `Y` — a non-nullable occurrence forbids
+        // the nullable pre-image (§7.10 v0.196).
+        splitParams.erase(nm);
         auto it = solved.find(nm);
         if (it != solved.end()) {
             // Repeated occurrence: consistent only if the two ground bindings are
@@ -670,7 +713,8 @@ static InvMatch matchLeafInvariant(
             for (std::size_t i = 0; i < declared->genericArgs.size(); ++i) {
                 InvMatch r = matchLeafInvariant(declared->genericArgs[i],
                                                 target->genericArgs[i],
-                                                paramNames, solved);
+                                                paramNames, solved, ctx,
+                                                splitParams);
                 if (r == InvMatch::Fail) return InvMatch::Fail;  // Fail dominates
                 if (r == InvMatch::Unknown) acc = InvMatch::Unknown;
             }
@@ -682,7 +726,7 @@ static InvMatch matchLeafInvariant(
         case TypeRef::Kind::InlineArray:
             if (target->kind != TypeRef::Kind::InlineArray) return InvMatch::Unknown;
             return matchLeafInvariant(declared->arrayElement, target->arrayElement,
-                                      paramNames, solved);
+                                      paramNames, solved, ctx, splitParams);
         case TypeRef::Kind::Function:
         case TypeRef::Kind::Error:
             return InvMatch::Unknown;  // structural function match — later lane
@@ -805,33 +849,74 @@ static RigidInv matchLeafRigid(
     return RigidInv::Unknown;
 }
 
-// §19.6 (v0.196, #1816 s3): format the missing-coverage obligation for an
-// UNDETERMINED generic leaf whose parameter(s) have NO occurrence in the leaf's
-// root instantiation. Such a parameter is free after solving against the ground
-// scrutinee, so infinitely many instantiations of the leaf inhabit `S` and no
-// single type-test arm can cover it — leaf coverage is statically UNATTAINABLE,
-// completable only by an irrefutable arm. §19.6 requires the warning to "name
-// the leaf and its undetermined parameter(s)"; this produces that text for the
-// missing-leaf list (e.g. "Tagged (undetermined parameter `U`)").
+// §14.2 / §7.10 (v0.196, #1816 s7): does the leaf's OWN `where`-clause impose a
+// constraint on parameter `param` that EXCLUDES a nullable type argument? Per
+// §14.2 the `notnull`, `class`, and `value` constraints and EVERY type bound
+// (`where Y: I`, or the type-parameter bound `where Y: U`) imply a non-null
+// argument. Used to collapse the §7.10 `?`-idempotence pre-image split: when such
+// a constraint is present the nullable pre-image `Y := U?` is not a well-formed
+// argument, so the split's two solutions reduce to the single non-null pre-image
+// (⇒ determined); absent one, both pre-images inhabit (⇒ undetermined). A purely
+// SYNTACTIC check on the constraint KIND — never a census of a bound's conformers
+// (the §19.6 census prohibition). `new` is deliberately EXCLUDED: a nullable type
+// satisfies `new` via its `null` default, so §14.2 does not make `new` imply
+// non-null (the nullable pre-image's non-`new`-exclusion is why this runs BEFORE
+// clause (b), which would otherwise EXEMPT a `new`-constrained non-`new` non-null
+// pre-image while the nullable pre-image still inhabits).
+static bool leafParamExcludesNullable(const TypeSymbol* leaf,
+                                      std::string_view param) {
+    if (!leaf) return false;
+    if (auto* td = dynamic_cast<const ast::TypeDecl*>(leaf->decl)) {
+        for (const auto& gc : td->genericConstraints) {
+            if (gc.typeParam != param) continue;
+            for (const auto& item : gc.items)
+                if (item.kind == "notnull" || item.kind == "class" ||
+                    item.kind == "value" || item.kind == "type")
+                    return true;  // §14.2: all imply non-null Y
+        }
+    }
+    return false;
+}
+
+// §19.6 (v0.196, #1816 s3/s7/s8): format the missing-coverage obligation for an
+// UNDETERMINED / statically-unattainable generic leaf. The leaf is completable
+// only by an irrefutable arm OR by restructuring the hierarchy into the
+// determined shape (§19.6 v0.196: the warning "names the leaf and its
+// undetermined parameter(s)" and prescribes both remedies). Three shapes reach
+// here: a leaf parameter with NO occurrence in the root instantiation (s3 — free
+// after solving, infinitely many inhabiting instantiations); a §7.10 `?`-split
+// parameter whose nullable pre-image survives (s7 — two inhabiting instantiations
+// per §7.10); and a rigid-identity-undecidable leaf with no free parameter to
+// name (s4 — the undecidability is in the scrutinee). `params` names the
+// undetermined leaf parameter(s), empty for the rigid-identity case.
 static std::string formatMissingGenericLeaf(
     const TypeSymbol* leaf, const std::vector<std::string_view>& params) {
     std::string s(leaf->name);
-    // §19.6 (v0.196, #1816 s4): a rigid-identity-undecidable leaf (e.g.
-    // `IntError: Result<int>` matched at `Result<T>`) is statically unattainable
-    // with NO free leaf parameter to name — the undecidability is in the
-    // scrutinee. Name just the leaf; the `_`-arm remedy is the same.
     if (params.empty()) {
-        s += " (coverage statically unattainable — an undecidable rigid "
-             "scrutinee component, requires a `_` arm)";
+        // s4: a rigid-identity-undecidable leaf (e.g. `IntError: Result<int>`
+        // matched at `Result<T>`) — no free leaf parameter to name. Both remedies:
+        // an irrefutable arm, or restructuring so the leaf's instantiation is
+        // determined at the scrutinee type.
+        s += " (coverage statically unattainable — an undecidable rigid scrutinee "
+             "component): either add a `_` arm (or an unguarded untyped `var`), or "
+             "restructure the hierarchy so the leaf's instantiation is determined "
+             "at the scrutinee type";
         return s;
     }
+    // s3/s7: name the undetermined parameter(s) and prescribe BOTH remedies —
+    // (a) an irrefutable arm, or (b) restructuring to the determined shape by
+    // mentioning every leaf parameter in the base clause and, for a `?`-split
+    // parameter, constraining it non-nullable (§7.10 / §19.6 v0.196).
     s += params.size() == 1 ? " (undetermined parameter `"
                             : " (undetermined parameters `";
     for (std::size_t i = 0; i < params.size(); ++i) {
         if (i) s += "`, `";
         s += std::string(params[i]);
     }
-    s += "` — coverage statically unattainable, requires a `_` arm)";
+    s += "`): coverage is statically unattainable — either add a `_` arm (or an "
+         "unguarded untyped `var`), or restructure to the determined shape by "
+         "mentioning every leaf parameter in the base clause (and, for a `?`-split "
+         "parameter, constraining it non-nullable)";
     return s;
 }
 
@@ -957,7 +1042,11 @@ ExprTC::LeafInstSolutions ExprTC::solveLeafInstantiations(
         if (gp) paramNames.insert(gp->name);
 
     std::unordered_map<std::string_view, TypeRef*> solved;
-    InvMatch m = matchLeafInvariant(rootInst, scrutTy, paramNames, solved);
+    // §7.10 (v0.196, #1816 s7): leaf params occurring as `Y?` against a nullable
+    // scrutinee argument — the idempotence pre-image split points (see below).
+    std::unordered_set<std::string_view> splitParams;
+    InvMatch m =
+        matchLeafInvariant(rootInst, scrutTy, paramNames, solved, ctx_, splitParams);
 
     if (m == InvMatch::Fail) {
         // No inhabiting instantiation — uninhabited at S (§19.6), exempt.
@@ -979,6 +1068,27 @@ ExprTC::LeafInstSolutions ExprTC::solveLeafInstantiations(
     for (const Symbol* gp : leaf->genericParams)
         if (gp && !solved.count(gp->name))
             result.freeParams.push_back(gp->name);
+    if (!result.freeParams.empty()) {
+        result.outcome = LeafInstSolutions::Outcome::Undetermined;
+        return result;
+    }
+    // (#1816 s7) §7.10 `?`-IDEMPOTENCE PRE-IMAGE SPLIT. A `Y?` occurrence in the
+    // root instantiation matched against a NULLABLE scrutinee argument admits the
+    // finite pre-image set {`Y := U`, `Y := U?`} (`(U?)? ≡ U?`, §7.10). The
+    // NON-null pre-image is already bound in `solved`; the NULLABLE pre-image ALSO
+    // inhabits UNLESS a §14.2 constraint on `Y` excludes nullable arguments
+    // (leafParamExcludesNullable). A split param whose nullable pre-image survives
+    // ⇒ ≥2 inhabiting solutions ⇒ the leaf is UNDETERMINED — coverage statically
+    // unattainable, so it is named like a free parameter. When every split param's
+    // nullable pre-image is excluded, the split collapses to the sole non-null
+    // pre-image and the leaf falls through to clause (b) / Determined. Checked
+    // BEFORE clause (b) so an unconstrained (or only `new`-constrained) `Y` whose
+    // nullable pre-image inhabits is never wrongly EXEMPTED by its non-null
+    // pre-image failing clause (b) (§7.10 v0.196).
+    for (const Symbol* gp : leaf->genericParams)
+        if (gp && splitParams.count(gp->name) &&
+            !leafParamExcludesNullable(leaf, gp->name))
+            result.freeParams.push_back(gp->name);  // nullable pre-image survives
     if (!result.freeParams.empty()) {
         result.outcome = LeafInstSolutions::Outcome::Undetermined;
         return result;
