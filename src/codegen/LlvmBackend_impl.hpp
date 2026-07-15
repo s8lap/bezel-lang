@@ -7054,6 +7054,14 @@ private:
     // Used to route the task-local's scope-end drop through the abandonment
     // give-back protocol instead of the ordinary task disposal.
     bool isChannelReceiveInitializer(const ast::LocalDecl* ld);
+    // §28.3 v0.190 SB-01 (#1786 / #1870): true when a task-typed local's
+    // initializer is a BORROW SOURCE — a bare-identifier ALIAS of another task
+    // binding, or a READ of task-typed STORAGE (a field/property access, incl.
+    // the null-conditional form, or an indexer read). Under "calls mint,
+    // storage lends" such a local does NOT own the task frame, so it must NOT
+    // register a scope-end task disposal — its owner (the mint CALL) disposes
+    // the one frame. Mirrors producerState's Owned-vs-Borrow split.
+    bool taskLocalInitializerIsBorrowSource(const ast::LocalDecl* ld);
 
     // issue #401 / stdlib §4.1 / §4.2: is `rt` one of the int-indexed list
     // INTERFACES (IReadOnlyList<T>, IList<T>, IOwningList<T>)? These are the only

@@ -40,7 +40,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // site does NOT free a named local → fire-and-forget at scope end is the
         // single free site; using-var takes the `isUsing` branch above, so this
         // branch never fires for it. (per §30.5 / §28)
-        else if (taskTypeOfLocal(ld) && !disposeStack_.empty()) {
+        //
+        // §28.3 v0.190 SB-01 (#1786 / #1870, "calls mint, storage lends"): register
+        // this disposal ONLY for a task local that OWNS the frame — one whose
+        // initializer is a mint CALL. A task local that merely BORROWS the frame (a
+        // bare-identifier ALIAS, or a task-typed STORAGE read — field/property/
+        // indexer) is skipped: its owner already disposes the single `bz_task_t*`,
+        // so a second `d.task` here would double-free it (→ UAF that corrupts async
+        // continuation state → hang). taskLocalInitializerIsBorrowSource mirrors
+        // producerState's Owned-vs-Borrow split so codegen and the ownership pass
+        // agree on who holds the disposal obligation. A borrow source falls through
+        // to the unwind-owned path below (a no-op for task types), registering no
+        // disposal. // per §28.3 v0.190 SB-01 (storage lends)
+        else if (taskTypeOfLocal(ld) && !disposeStack_.empty() &&
+                 !taskLocalInitializerIsBorrowSource(ld)) {
             auto it = locals_.find(ld);
             if (it != locals_.end()) {
                 Disposal d{it->second, nullptr};

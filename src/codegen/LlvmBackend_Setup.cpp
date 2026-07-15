@@ -12525,6 +12525,31 @@ bool Emitter::isChannelReceiveInitializer(const ast::LocalDecl* ld) {
            builtinTypeName(recvTy) == "Channel";
 }
 
+// §28.3 v0.190 SB-01 (#1786 / #1870): a task-typed local that merely BORROWS
+// the frame — its initializer is a bare-identifier ALIAS of another task
+// binding (`var t2 := t;`), or a READ of task-typed STORAGE: a field/property
+// access (`obj.taskField`, incl. the null-conditional `obj?.taskField`) or an
+// indexer read (`arr[i]`) — does NOT own the task frame. Under "calls mint,
+// storage lends" the OWNER is the mint CALL that produced the frame; it
+// disposes it exactly once. Registering a scope-end `d.task` for such a borrow
+// too would delete the SAME `bz_task_t*` a second time — a double-free / UAF
+// that corrupts async continuation state (symptom: a hang; ASan traps no report
+// before it). Mirrors producerState (src/ownership/Ownership.cpp): only a
+// CallExpr on the task-family-mint path returns Owned — a MemberAccessExpr /
+// NullCondMemberExpr / IndexExpr / IdentifierExpr never reaches that block and
+// stays Borrowed ("storage lends"). Recognised syntactically here (this pass
+// walks the LocalDecl with only AST/type info), the same way
+// isChannelReceiveInitializer above matches its shape. // per §28.3 v0.190
+// SB-01 (storage lends)
+bool Emitter::taskLocalInitializerIsBorrowSource(const ast::LocalDecl* ld) {
+    const ast::Expr* init = ld->initializer.get();
+    if (!init) return false;
+    return dynamic_cast<const ast::IdentifierExpr*>(init) != nullptr ||
+           dynamic_cast<const ast::MemberAccessExpr*>(init) != nullptr ||
+           dynamic_cast<const ast::NullCondMemberExpr*>(init) != nullptr ||
+           dynamic_cast<const ast::IndexExpr*>(init) != nullptr;
+}
+
 
 const sema::TypeSymbol* Emitter::classOfLocal(const ast::LocalDecl* ld) {
     if (ld->type) {
