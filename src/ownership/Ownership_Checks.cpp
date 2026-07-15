@@ -6065,6 +6065,56 @@ void MethodOwnership::checkDeferredActivationTempSitesExpr(const ast::Expr& e,
                     // excludes it — sound, not over-rejected). // per §28.14 v0.196
                     if (!forSource &&
                         deferredActivationArgIsPlainFuncSlot(*ce, pos)) {
+                        // T4 (#1818, §28.3, v0.196): a method reference over a
+                        // FRESH PRODUCER receiver — a MemberAccessExpr whose
+                        // target is a `new`/call producing an UNBOUND OWNED
+                        // TEMPORARY (`new Scaler(2).Apply`) — carries that
+                        // temporary as its captured environment (§27.6). Unlike
+                        // a named scope-bound local (handled by the identifier
+                        // reduction below), the temporary has no name whose
+                        // scope the check reasons about: it is disposed at the
+                        // end of THIS full expression, so an escaping frame
+                        // (bound to a name / returned / stored — the `forSource`
+                        // for-header admit is already excluded above, keeping
+                        // the same-full-expression consumption case sound) would
+                        // enumerate into a closure over the disposed temporary.
+                        // Reject. isUnboundOwnedTempArg is the exact §28.3
+                        // Producers-table classifier — a fresh `new` of any
+                        // class, an owned-returning call, or a static factory
+                        // returning a disposable/deferred-activation type: in
+                        // the no-GC model every such temporary is freed at the
+                        // full expression's end, so a stranded borrow dangles
+                        // whether or not the class declares a destructor. A
+                        // fresh producer whose result is NOT an owned temporary
+                        // (a call returning a borrow) carries no such hazard and
+                        // is not flagged. // per §28.3 capture-set contribution, §27.6, v0.196
+                        if (const auto* mref =
+                                dynamic_cast<const ast::MemberAccessExpr*>(
+                                    a.value.get())) {
+                            if (mref->target &&
+                                isUnboundOwnedTempArg(*mref->target)) {
+                                report(
+                                    Severity::Error, mref->target->span.begin,
+                                    "a deferred-activation call whose function-"
+                                    "typed argument is a method reference over a "
+                                    "fresh producer receiver — an unbound owned "
+                                    "temporary such as `new T(...).M` — mints a "
+                                    "frame that carries a borrow of that "
+                                    "temporary (§28.3 capture-set contribution, "
+                                    "§28.14 frame residence, v0.196); that frame "
+                                    "escapes this full expression — bound to a "
+                                    "name, returned, or stored — but the "
+                                    "temporary is disposed at the end of the "
+                                    "full expression that produces it, so the "
+                                    "escaping frame would enumerate into a "
+                                    "closure over a disposed object. Bind the "
+                                    "receiver to a named local first, or keep "
+                                    "the frame within this full expression (a "
+                                    "direct `for`/`await for` source)");
+                                ++pos;
+                                continue;
+                            }
+                        }
                         std::vector<CapSource> caps;
                         deferredActivationCaptureSources(*a.value, caps);
                         for (const CapSource& cs : caps) {

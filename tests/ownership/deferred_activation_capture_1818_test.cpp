@@ -318,3 +318,61 @@ BEZEL_TEST(deferred_activation_capture_1818, methodref_direct_for_source_not_esc
         "method M(nums: Array<int>): int"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ===========================================================================
+// T4 — METHOD-REFERENCE over a FRESH PRODUCER receiver (§28.3, v0.196). When the
+// method reference's receiver is a fresh producer — a `MemberAccessExpr` whose
+// target is a `new`/call producing an UNBOUND OWNED TEMPORARY (`new Scaler().Apply`)
+// — the captured source is that temporary, not a named scope-bound local. Per
+// §28.3's same-full-expression rule it is admissible ONLY when the returned frame
+// is fully consumed within the same full expression (a direct `for` source);
+// rejected when the frame is bound/returned/stored. Each REJECT compiles CLEAN
+// without the T4 fix (the fresh-receiver hole: `isUnboundProducerExpr` sees the
+// MemberAccessExpr wrapper, not its NewExpr/CallExpr target, so the receiver's
+// unbound-owned-temporary status was never classified) and produces the
+// capture-set-contribution error with it; the ADMIT compiles clean either way.
+// Every shape was hand-verified against `build/bezelc -c` before folding in.
+// ===========================================================================
+
+// ★ Primary T4 regression: the frame is bound to `q`, then `q` is returned. The
+// method reference closes over the fresh owned temporary `new Scaler()`, which
+// is disposed at the end of the full expression that produces it; the escaping
+// frame would enumerate into a closure over that disposed temporary. Rejected.
+// Compiles CLEAN without the T4 fix; produces the capture-set-contribution error
+// with it. // per §28.3 capture-set contribution, §27.6, v0.196
+BEZEL_TEST(deferred_activation_capture_1818, methodref_fresh_receiver_bind_then_return_rejected) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var q := Doubled(nums, new Scaler().Apply); "
+        "return q;",
+        "method M(nums: Array<int>): IEnumerable<int>"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(sawCaptureSetError(r));
+}
+
+// The direct-return variant: `return Doubled(nums, new Scaler().Apply);` returns
+// the frame directly. Same hazard, rejected. // per §28.3, §27.6, v0.196
+BEZEL_TEST(deferred_activation_capture_1818, methodref_fresh_receiver_direct_return_rejected) {
+    auto r = parseAndCheckOwnership(wrap(
+        "return Doubled(nums, new Scaler().Apply);",
+        "method M(nums: Array<int>): IEnumerable<int>"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(sawCaptureSetError(r));
+}
+
+// ADMIT — the same fresh-receiver method reference where the frame is fully
+// consumed WITHIN the full expression: a direct `for` source, whose desugared
+// `using var` bounds the frame — and its captured temporary — by the loop, which
+// lives and dies in the loop header. Sound, admitted. This is the same-full-
+// expression admission the §28.3 ruling names, and the over-rejection guard for
+// the T4 fix: the fresh-receiver reject must NOT fire when the frame is consumed
+// in the expression (the `forSource` position is excluded). // per §28.3, §29.2, v0.196
+BEZEL_TEST(deferred_activation_capture_1818, methodref_fresh_receiver_for_source_accepted) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var total := 0; "
+        "for var v in Doubled(nums, new Scaler().Apply) do "
+        "  total := total + v; "
+        "end; "
+        "return total;",
+        "method M(nums: Array<int>): int"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
