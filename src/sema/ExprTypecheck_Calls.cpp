@@ -2772,6 +2772,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (valElem) tr->genericArgs.push_back(valElem);
                     return tr;
                 };
+                // stdlib §5 / fix #1846: ToDictionary's value type V. The
+                // two-selector form ToDictionary(key: (T)->K, value: (T)->V)
+                // types the result as Dictionary<K, V>, where V is the VALUE
+                // selector's return type — not the element T. The single-
+                // selector form ToDictionary(key: (T)->K): Dictionary<K, T>
+                // falls back to `defaultVal` (the element type). Without this
+                // the two-selector result was mistyped Dictionary<K, T>, so the
+                // codegen indexer read decoded the stored V-typed value as a T:
+                // for a scalar V (int) under a reference-typed T (string) it
+                // reinterpreted the inline int bits as a string pointer and
+                // SIGSEGV'd on the next field read (#1846).
+                auto toDictValueType = [&](const ast::CallExpr& c,
+                                           TypeRef* defaultVal) -> TypeRef* {
+                    if (c.args.size() >= 2 && c.args[1].value)
+                        if (auto* lamTy = ctx_.exprType(*c.args[1].value))
+                            if (lamTy->kind == TypeRef::Kind::Function &&
+                                lamTy->funcReturn)
+                                return lamTy->funcReturn;
+                    return defaultVal;
+                };
                 // per §5 + §14: build a concrete Array<T> or Set<T> TypeRef
                 // for ToArray/ToSet materializers so that un-annotated inferred
                 // locals (`var b := seq.ToArray()`) carry the right concrete
@@ -3100,7 +3120,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     lamTy->funcReturn)
                                     keyTy = lamTy->funcReturn;
                         }
-                        ctx_.setExprType(&ce, makeDictResult(keyTy, srcElem));
+                        ctx_.setExprType(
+                            &ce,
+                            makeDictResult(keyTy, toDictValueType(ce, srcElem)));
                     }
                     // stdlib §5 Ordering: Reverse() on a lazy receiver — preserves T.
                     // NOT added to typeLinqOperator (would clash with Array.Reverse
@@ -3223,7 +3245,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 if (lt->kind == TypeRef::Kind::Function &&
                                     lt->funcReturn)
                                     keyTy = lt->funcReturn;
-                        ctx_.setExprType(&ce, makeDictResult(keyTy, charTy));
+                        ctx_.setExprType(
+                            &ce,
+                            makeDictResult(keyTy, toDictValueType(ce, charTy)));
                     }
                     else if (m == "Reverse" && ce.args.empty())
                         ctx_.setExprType(&ce, makeLazyEnumerable(charTy));
@@ -4052,7 +4076,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         keyTy = lamTy->funcReturn;
                             }
                             ctx_.setExprType(&ce,
-                                makeDictResult(keyTy, recvTy->genericArgs[0]));
+                                makeDictResult(keyTy, toDictValueType(
+                                                   ce, recvTy->genericArgs[0])));
                         }
                         // stdlib §5 *OrNull (Array receiver): return nullable T.
                         else if ((m == "FirstOrNull" || m == "LastOrNull" ||
