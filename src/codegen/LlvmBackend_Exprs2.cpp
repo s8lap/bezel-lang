@@ -5142,6 +5142,39 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
                         v = builder_.CreateLoad(recSt, v, "rec.this.val");
                 }
             }
+            // fix #1934 / §19.2 / §28.3 (producers arm-meet, v0.184) / §28.9:
+            // an expression-position `case`/`when` whose result is a
+            // (non-nullable) owned `string`. §28.3's producers table makes the
+            // result the arm-meet of the arms — for a runtime-managed `string`
+            // (§28.9) that means the result must carry EXACTLY +1 (one reference
+            // the consumer discharges once), on WHICHEVER arm is taken. Because a
+            // PHI joins the arms into a single value, the consumer (return /
+            // assign / bind) can only make ONE retain-or-transfer decision for
+            // the merged value, so each arm must be normalized to +1 HERE, in the
+            // arm's own block, before it reaches the result PHI — mirroring the
+            // per-expression normalization the ReturnStmt / Assign paths already
+            // apply to a plain `return <concat>` (which is why that form is clean
+            // while this one leaked). An arm body that is itself a +1 producer
+            // (`+`/interpolation/nested string-returning call, or a string local
+            // owning +1) already carries its single reference — leave it; any
+            // other arm (a param/field borrow, a string-literal sentinel) is a +0
+            // borrow and is RETAINED to mint the +1 (bz_string_retain is a no-op
+            // on a sentinel/literal/null). The whole case-expression is then a
+            // single +1 producer (isPlusOneStringProducer recognizes it), so the
+            // consumer TRANSFERS the reference out without a second retain. Before
+            // this, a producer arm's +1 was double-counted by the consumer's
+            // borrow-retain — the arm's original reference leaked (#1934); and
+            // recognizing the case-expression as a producer WITHOUT this per-arm
+            // mint would drop a borrow arm's reference (a use-after-free). Only a
+            // non-nullable owned `string` result (a `ptr` value) is affected; a
+            // `string?` result stays on its existing (retain-free) path.
+            if (v && resultSemaTy && !resultSemaTy->nullable &&
+                resultSemaTy->kind == sema::TypeRef::Kind::Primitive &&
+                resultSemaTy->primitive == sema::PrimitiveType::String &&
+                v->getType()->isPointerTy() &&
+                !isPlusOneStringProducer(arm.exprBody.get()) &&
+                !returnedStringLocalOwnsPlusOne(arm.exprBody.get()))
+                emitStringRetain(v);
             // fix #573 / §19.2 / §7.1 / §7.5: defer the branch-to-endBB so
             // nullable widening can emit into this block after all arms are
             // seen (same discipline as lowerConditional — see Path A/B there).

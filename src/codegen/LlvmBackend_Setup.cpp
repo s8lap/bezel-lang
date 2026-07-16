@@ -8955,6 +8955,22 @@ void Emitter::collectMoveOnlyArrayTransferred(
 bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     if (!init) return false;
     if (dynamic_cast<const ast::InterpolatedStringExpr*>(init)) return true;
+    // fix #1934 / §19.2 / §28.3 (producers arm-meet, v0.184) / §28.9: an
+    // expression-position `case`/`when` whose result is a non-nullable owned
+    // `string` is a single +1 producer. lowerCaseExpr normalizes every arm to
+    // own exactly +1 (a producer arm transfers its reference; a borrow arm is
+    // retained), so the case-expression result carries exactly one reference —
+    // the consumer (return / assign / bind) must TRANSFER it, not mint a second
+    // borrow-retain. Without recognizing it here, the consumer's borrow-retain
+    // double-counted the arm's +1 and the arm's original reference leaked
+    // (#1934). Recognized for the same non-nullable `string` result the per-arm
+    // mint in lowerCaseExpr is keyed on, so the two decisions stay in lockstep.
+    if (auto* ce = dynamic_cast<const ast::CaseExpr*>(init)) {
+        const sema::TypeRef* rt = ctx_.exprType(*ce);
+        return rt && !rt->nullable &&
+               rt->kind == sema::TypeRef::Kind::Primitive &&
+               rt->primitive == sema::PrimitiveType::String;
+    }
     if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(init)) {
         if (bin->op != "+") return false;
         auto* rt = ctx_.exprType(*init);
