@@ -3434,6 +3434,20 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
         if (ix->target &&
             isMoveOnlyInlineArrayType(ctx_.exprType(*ix->target), moSize))
             checkRead(*ix->target, /*selfTarget=*/false);
+        // §15.3 (#1932): each index sub-expression of an assignment TARGET
+        // `a[<idx>] := …` is itself a READ position — a moved-from local
+        // surfaced through it (e.g. `a[s.V()] := x` after `move s`) is a §15.3
+        // read-of-moved-from, exactly as in a read-position index `x := a[s.V()]`
+        // (#1928 half a). #1928 half b above read-checks only the array TARGET
+        // (`ix->target`) of a move-only-array slot write, never the index
+        // sub-expressions, so a moved-from index in the write-target position
+        // fell through both gates. Recurse `checkRead` into each index, mirroring
+        // half a's read-position recursion. Unconditional (not gated to a move-
+        // only-array target): the index is a read regardless of what is indexed,
+        // and `checkRead` reports ONLY for a local already in an error state, so a
+        // live index never triggers it — no over-rejection. // per §15.3 (#1932)
+        for (const auto& idx : ix->indices)
+            if (idx.value) checkRead(*idx.value, /*selfTarget=*/false);
     }
     // §28.14 (v0.175): a captured source frozen by a scoped-callback admission
     // may not be REASSIGNED until the bounding scope exits.
