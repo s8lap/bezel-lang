@@ -7015,10 +7015,20 @@ private:
     // non-null, appends the source expression for each emitted argument in the
     // same order (a defaulted parameter contributes nullptr) — used to recover
     // each argument's signedness for numeric widening (issue #421 / #410).
+    // #1918 / §28.3: when `nullTransferredOwned` is set (only the ordinary
+    // user-method call site passes it), the caller's slot for each bare owned
+    // local/param argument transferred to an `owned` parameter is NULLED at the
+    // "call about to run" point — so a plain owned local discharged on ONE branch
+    // via an owned-argument transfer, but LIVE at a throw on a SIBLING branch,
+    // is unwind-disposed exactly once (the null-guarded unwindOnly disposal skips
+    // the transferred value on the transfer/post-transfer edge, disposes the live
+    // one on the sibling-throw edge). Paired with UnwindIneligibleWalker no longer
+    // tainting that exact argument shape (LlvmBackend_Setup.cpp).
     bool buildOrderedArgs(const std::vector<ast::Param>& params,
                           const std::vector<ast::CallArgument>& args,
                           std::vector<llvm::Value*>& out,
-                          std::vector<const ast::Expr*>* outExprs = nullptr);
+                          std::vector<const ast::Expr*>* outExprs = nullptr,
+                          bool nullTransferredOwned = false);
 
     // CG29 (§9): build a record value from positional arguments — used by
     // `new Record(a, b, …)` (the spec construction form, §9.5). Positional

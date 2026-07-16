@@ -7613,6 +7613,25 @@ inline const std::vector<sema::Symbol*>* calleeParamList(
     return nullptr;
 }
 
+// #1918 / §28.3: true iff the CallExpr callee resolves to an ORDINARY user
+// method — a MethodSymbol backed by an ast::MethodDecl. That is precisely the
+// call path lowered through `buildOrderedArgs(md->params, …,
+// nullTransferredOwned=true)` (LlvmBackend_Calls2.cpp), which nulls the caller's
+// slot for a bare owned local/param transferred to an `owned` parameter. Only
+// for such a callee may the walker leave that argument's local eligible for
+// unwind disposal (the null keeps it exactly-once). An imported method
+// (ms->decl not a MethodDecl → the non-buildOrderedArgs call path), a
+// constructor, an extern, or a call through a function-typed value does NOT null
+// the slot, so the argument stays conservatively unwind-INELIGIBLE (a safe leak,
+// never a double-free).
+inline bool calleeIsUserMethod(const sema::SemaContext& ctx,
+                               const ast::Expr* callee) {
+    if (!callee) return false;
+    sema::Symbol* s = ctx.exprSymbol(*callee);
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(s);
+    return ms && dynamic_cast<const ast::MethodDecl*>(ms->decl) != nullptr;
+}
+
 struct UnwindIneligibleWalker {
     const sema::SemaContext& ctx;
     std::unordered_set<const void*>& out;
@@ -7647,7 +7666,8 @@ struct UnwindIneligibleWalker {
     // argument was treated as consuming, which dropped a borrow-passed owned
     // param from the unwind set → leak on a later throw.
     void walkCallArgs(const ast::Expr* callee,
-                      const std::vector<ast::CallArgument>& args) {
+                      const std::vector<ast::CallArgument>& args,
+                      bool untaintOwnedLocalTransfer = false) {
         const std::vector<sema::Symbol*>* params = calleeParamList(ctx, callee);
         std::size_t pos = 0;
         for (const auto& a : args) {
@@ -7684,7 +7704,35 @@ struct UnwindIneligibleWalker {
                 // consuming; `owned`/`out owned`/`ref` transfer ⇒ consuming.
                 consuming = (pm == "owned" || pm == "out owned" || pm == "ref");
             }
-            expr(a.value.get(), consuming);
+            // #1918 / §28.3: a bare owned LOCAL / owned PARAMETER passed with an
+            // ownership TRANSFER (explicit `owned` arg, or a mapped `owned`
+            // callee param) to an ORDINARY user method does NOT taint the local
+            // as unwind-INELIGIBLE. The codegen for that exact call path
+            // (buildOrderedArgs nullTransferredOwned) nulls the caller's slot at
+            // the transfer, so the null-guarded unwindOnly disposal is exactly-
+            // once: it skips the transferred value on the transfer / post-transfer
+            // throw edge (no double-free with the callee's owned-param disposal),
+            // and disposes a SIBLING-branch value still live at a throw (fixes the
+            // #1918 leak). Only for this shape — `ref`/`out owned`/an unmapped or
+            // non-user-method callee still taints (the slot is NOT nulled there,
+            // so eligibility would risk a double-free). Restricted to a plain
+            // `var` owned local or an `owned` parameter, mirroring the slots
+            // buildOrderedArgs actually nulls. // per §28.3
+            bool branchSensitiveOwnedTransfer = false;
+            if (untaintOwnedLocalTransfer && a.value &&
+                (a.modifier == "owned" || pm == "owned")) {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        a.value.get())) {
+                    sema::Symbol* asym = ctx.exprSymbol(*id);
+                    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(asym))
+                        branchSensitiveOwnedTransfer = loc->decl && !loc->isUsing;
+                    else if (auto* ps =
+                                 dynamic_cast<sema::ParameterSymbol*>(asym))
+                        branchSensitiveOwnedTransfer = (ps->modifier == "owned");
+                }
+            }
+            expr(a.value.get(),
+                 branchSensitiveOwnedTransfer ? /*consuming=*/false : consuming);
         }
     }
 
@@ -7737,7 +7785,12 @@ struct UnwindIneligibleWalker {
             }
             // §28.3 (#994): a borrow argument retains the caller's ownership; only
             // an `owned`/`ref` parameter (or explicit `owned` arg) transfers.
-            walkCallArgs(c->callee.get(), c->args);
+            // #1918: for an ordinary user-method callee (the buildOrderedArgs
+            // nullTransferredOwned path) a transferred owned local/param is left
+            // eligible (branch-sensitive) — see walkCallArgs.
+            walkCallArgs(c->callee.get(), c->args,
+                         /*untaintOwnedLocalTransfer=*/
+                         calleeIsUserMethod(ctx, c->callee.get()));
             return;
         }
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {

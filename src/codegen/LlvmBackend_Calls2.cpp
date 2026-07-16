@@ -5039,7 +5039,13 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         }
         // §22.4/§22.7: place arguments into parameter order.
         if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-            if (!buildOrderedArgs(md->params, call.args, args, &argExprs)) {
+            // #1918 / §28.3: this is the ordinary user-method (ast::MethodDecl)
+            // call path — the exact shape UnwindIneligibleWalker now leaves
+            // eligible for a transferred owned local/param. Ask buildOrderedArgs
+            // to null the caller's transferred-owned slots at the call, so the
+            // null-guarded unwind disposal is exactly-once across branches.
+            if (!buildOrderedArgs(md->params, call.args, args, &argExprs,
+                                  /*nullTransferredOwned=*/true)) {
                 // Restore before early-return.
                 if (didPrePass) {
                     genericSubst_ = std::move(preSavedSubst);

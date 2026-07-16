@@ -4093,7 +4093,8 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
 bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                       const std::vector<ast::CallArgument>& args,
                       std::vector<llvm::Value*>& out,
-                      std::vector<const ast::Expr*>* outExprs) {
+                      std::vector<const ast::Expr*>* outExprs,
+                      bool nullTransferredOwned) {
     std::vector<llvm::Value*> ordered(params.size(), nullptr);
     // issue #421 / #410: parallel source expression per parameter position, so
     // the caller can recover each argument's signedness for numeric widening.
@@ -4121,6 +4122,11 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
     // collection-literal-arg temp at the top of this loop, which must SURVIVE the
     // call to be disposed at the enclosing scope's end) are left intact.
     std::vector<llvm::AllocaInst*> argTempSlots;
+    // #1918 / §28.3: slots of bare owned local/param arguments transferred to an
+    // `owned` parameter — nulled below at the "call about to run" point when
+    // `nullTransferredOwned` is set (the ordinary user-method call path). See the
+    // discharge block and the header comment.
+    std::vector<llvm::AllocaInst*> transferredOwnedArgSlots;
     for (const auto& a : args) {
         std::size_t idx = params.size();
         if (a.name.empty()) {
@@ -4130,6 +4136,34 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 if (params[j].name == a.name) { idx = j; break; }
         }
         if (idx >= params.size() || ordered[idx]) return false;
+        // #1918 / §28.3: record the caller's slot for a bare owned LOCAL / owned
+        // PARAMETER passed with an ownership TRANSFER (explicit `owned` argument
+        // modifier, or a mapped `owned` callee parameter). After the whole
+        // argument list is evaluated this slot is nulled (below), so the caller's
+        // null-guarded unwindOnly disposal (registerUnwindOwnedLocal /
+        // registerUnwindOwnedParam) — which UnwindIneligibleWalker now leaves
+        // eligible for exactly this shape — skips the just-transferred value on
+        // the transfer / post-transfer throw edge (no double-free with the
+        // callee's own owned-param disposal) while still disposing a SIBLING-
+        // branch value that is live at a throw (no leak). Restricted to a plain
+        // `var` owned local or an `owned` parameter of pointer (class/interface)
+        // representation — exactly what those registrations cover; a `using var`,
+        // collection, or value-typed binding is untouched. // per §28.3
+        if (nullTransferredOwned && a.value && !a.isDiscard &&
+            (a.modifier == "owned" || params[idx].modifier == "owned")) {
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+                sema::Symbol* asym = ctx_.exprSymbol(*id);
+                bool eligible = false;
+                if (auto* loc = dynamic_cast<sema::LocalSymbol*>(asym))
+                    eligible = loc->decl && !loc->isUsing;
+                else if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(asym))
+                    eligible = (ps->modifier == "owned");
+                if (eligible)
+                    if (llvm::AllocaInst* s = localSlot(*id))
+                        transferredOwnedArgSlots.push_back(s);
+            }
+        }
         // §22.4 (#1301): an `out _` / `ref _` discard has no destination lvalue —
         // the parser leaves a.value null with a.isDiscard set. Allocate a
         // throwaway scratch slot of the parameter's type and pass its address so
@@ -4538,6 +4572,25 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                                                 d.slot) != argTempSlots.end();
                            }),
             scope.end());
+    }
+    // #1918 / §28.3: now that every argument is evaluated (so a THROW while
+    // evaluating a LATER argument has already unwound with the owned local still
+    // LIVE — its disposal correctly fired), and the call is ABOUT TO RUN, null the
+    // caller's slot for each bare owned local/param transferred to an `owned`
+    // parameter. This store dominates the call's unwind edge, so if the CALLEE
+    // throws (it now owns the value) the caller's null-guarded unwindOnly disposal
+    // reads null and skips — dispose-exactly-once with the callee's owned-param
+    // disposal. On a sibling branch where the transfer never runs, the slot stays
+    // live and the unwind disposal reclaims it (the #1918 leak). Mirrors how an
+    // explicit `x.Dispose()` / `_ := x` discharge nulls the slot for the same
+    // null-guarded machinery. // per §28.3
+    for (llvm::AllocaInst* slot : transferredOwnedArgSlots) {
+        if (!slot) continue;
+        llvm::Type* ety = nullptr;
+        llvm::Value* addr = boxedStorage(slot, ety);
+        if (addr && ety && ety->isPointerTy())
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), addr);
     }
     return true;
 }
