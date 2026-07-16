@@ -3889,6 +3889,19 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* fn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy(), i64()});
             builder_.CreateCall(fn, {recv, slot, builder_.getInt64(esz)});
+            // #1955 / §28.3: for an OWNING collection the element parameter is
+            // `owned` (the collection takes over the element's disposal), so a
+            // bare owned local/param element argument's ownership just
+            // transferred into the collection. Null its caller slot so the
+            // caller's null-guarded unwindOnly disposal — which
+            // UnwindIneligibleWalker now leaves eligible for this callee shape
+            // (calleeIsOwningCollectionTransfer) — is exactly-once: it skips the
+            // just-moved value (no double-free with the collection's element
+            // disposal) yet disposes a value still live at a throw that PRECEDES
+            // the transfer. A BORROWING Array<T>.Add keeps the caller as owner —
+            // no transfer, no nulling.
+            if (arrIsOwning)
+                nullTransferredOwnedLocalSlot(call.args[0].value.get());
             return llvm::ConstantInt::get(i32(), 0);  // unit/void result
         }
         // fix #654-tail B / stdlib §4.10: OwningSet<T>.TryAdd(owned item): bool
@@ -4136,6 +4149,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* fn = declareC("bz_array_insert_at", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), i64(), ptrTy(), i64()});
             builder_.CreateCall(fn, {recv, idx, slot, builder_.getInt64(esz)});
+            // #1955 / §28.3: for an OWNING collection Insert takes ownership of
+            // the element (arg 1) — null the caller's slot for a bare owned
+            // local/param so the caller's null-guarded unwind disposal stays
+            // exactly-once (see the Add/Push/Enqueue path above). Borrowing
+            // Array<T>.Insert keeps the caller as owner — no nulling.
+            if (arrIsOwning)
+                nullTransferredOwnedLocalSlot(call.args[1].value.get());
             return llvm::ConstantInt::get(i32(), 0);  // unit/void result
         }
         // .Get(i): T / .Peek(): T (top/front element)

@@ -4649,4 +4649,33 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
 }
 
 
+// #1955 / §28.3: null the caller's slot for a bare owned LOCAL / owned PARAMETER
+// argument whose ownership just transferred at an owning-collection element-
+// transfer lowering site (LlvmBackend_Calls.cpp Add/Push/Enqueue + Insert),
+// mirroring the `transferredOwnedArgSlots` nulling buildOrderedArgs does for the
+// user-method / constructor call paths. Restricted to a plain `var` owned local
+// or an `owned` parameter of pointer representation — exactly the slots the
+// unwindOnly disposal (registerUnwindOwnedLocal / registerUnwindOwnedParam)
+// covers and that UnwindIneligibleWalker leaves eligible for this callee shape;
+// a `using var`, collection, or value-typed binding is untouched (no slot
+// nulled). // per §28.3
+void Emitter::nullTransferredOwnedLocalSlot(const ast::Expr* argValue) {
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(argValue);
+    if (!id) return;
+    sema::Symbol* asym = ctx_.exprSymbol(*id);
+    bool eligible = false;
+    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(asym))
+        eligible = loc->decl && !loc->isUsing;
+    else if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(asym))
+        eligible = (ps->modifier == "owned");
+    if (!eligible) return;
+    llvm::AllocaInst* slot = localSlot(*id);
+    if (!slot) return;
+    llvm::Type* ety = nullptr;
+    llvm::Value* addr = boxedStorage(slot, ety);
+    if (addr && ety && ety->isPointerTy())
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+}
+
+
 }  // namespace bezel::codegen

@@ -8345,6 +8345,75 @@ inline bool calleeIsUserMethod(const sema::SemaContext& ctx,
     return ms && dynamic_cast<const ast::MethodDecl*>(ms->decl) != nullptr;
 }
 
+// #1955 / §28.3: true iff `callee` is an ARRAY-BACKED owning-collection element-
+// transfer method — `OwningArray.Add` / `.Insert`, `OwningStack.Push`,
+// `OwningQueue.Enqueue`. For these the element parameter is definitionally
+// `owned` (the collection takes over the element's disposal), and the element
+// lowers through bz_array_add / bz_array_insert_at (LlvmBackend_Calls.cpp) —
+// EXACTLY the paths that now NULL the caller's slot for a bare owned local/param
+// element argument (nullTransferredOwnedLocalSlot). So the walker may leave that
+// argument's local eligible for unwind disposal (the null-guarded unwindOnly
+// disposal stays exactly-once), as it does for an ordinary user method.
+//
+// This is a deliberate ALLOWLIST, not a broad `isOwningPrefixedName` check,
+// because the invariant the two sites must jointly preserve is `eligible ⟹
+// nulled`. The other owning collections take insert paths that do NOT null:
+// OwningSet.Add dedup-inserts (emitSetDedupInsert), OwningLinkedList uses the
+// linked-list runtime, OwningDictionary the hash runtime. Admitting them here
+// would leave their transferred local eligible with a NON-null slot → a double-
+// free on the transfer-window throw edge. They stay tainted (a safe residual
+// leak on a preceding-throw edge, never a double-free) until their own paths
+// null too. A BORROWING collection (`Array<T>.Add`) is likewise excluded — no
+// ownership transfer, the caller keeps ownership.
+inline bool calleeIsOwningCollectionTransfer(const sema::SemaContext& ctx,
+                                             const ast::Expr* callee) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+    if (!ma || !ma->target) return false;
+    const auto& m = ma->member;
+    if (m != "Add" && m != "Push" && m != "Enqueue" && m != "Insert")
+        return false;
+    const sema::TypeRef* recvTy = ctx.exprType(*ma->target);
+    if (!recvTy) return false;
+    std::string_view h = recvTy->headName();
+    return h == "OwningArray" || h == "OwningStack" || h == "OwningQueue";
+}
+
+// #1955 / §28.3: true iff `new <type>(args)` resolves to an EXPLICIT user
+// constructor — a non-static ConstructorSymbol backed by an ast::ConstructorDecl
+// whose arity matches. That is EXACTLY the `new` shape whose lowerNew arg-
+// lowering routes through `buildOrderedArgs(nullTransferredOwned=true)` (via
+// `ctorForArgs`, LlvmBackend_Exprs2.cpp) and therefore NULLS the caller's slot
+// for a bare owned local/param `owned x` argument — so the walker may leave that
+// local eligible for unwind disposal (the null-guarded unwindOnly disposal stays
+// exactly-once).
+//
+// It is NOT enough to key on `TypeDeclKind::Class`/`Record`: a PRIMARY-ctor class
+// (`class Box(owned r: Resource)`) has NO ConstructorSymbol — sema stores its
+// params on the TypeDecl (TypeResolution_Checks.cpp), so `ctorForArgs` returns
+// null and NO buildOrderedArgs runs; the captured owned param is stored via the
+// positional-field path (LlvmBackend_Exprs2.cpp), which does NOT null the slot.
+// Untainting there would leave a NON-null slot eligible → the class's field
+// disposer frees the value on unwind, then the caller's unwind disposal frees it
+// AGAIN (double-free). A builtin owned-consuming ctor (Shared<T>/Weak<T> — null
+// `declaration`) and an imported ctor likewise lower manually without nulling.
+// All of those stay TAINTED (a safe residual leak on a throw-BEFORE-transfer
+// edge, a tracked #1955 follow-up, never a double-free). This predicate keeps
+// the walker's `eligible ⟹ nulled` invariant EXACT.
+inline bool newExprRoutesThroughNullingCtor(const sema::SemaContext& ctx,
+                                            const ast::NewExpr* n) {
+    if (!n || !n->type) return false;
+    const sema::TypeRef* nt = ctx.resolvedType(*n->type);
+    if (!nt || !nt->declaration) return false;          // builtin (null decl)
+    if (ctx.isImported(nt->declaration)) return false;  // imported → manual lower
+    for (sema::Symbol* m : nt->declaration->members) {
+        auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+        if (!cs || cs->isStatic) continue;
+        if (cs->params.size() != n->args.size()) continue;
+        if (dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) return true;
+    }
+    return false;
+}
+
 struct UnwindIneligibleWalker {
     const sema::SemaContext& ctx;
     std::unordered_set<const void*>& out;
@@ -8501,9 +8570,14 @@ struct UnwindIneligibleWalker {
             // #1918: for an ordinary user-method callee (the buildOrderedArgs
             // nullTransferredOwned path) a transferred owned local/param is left
             // eligible (branch-sensitive) — see walkCallArgs.
+            // #1955: an owning-collection element-transfer method
+            // (`OwningArray.Add(owned x)` / Push / Enqueue / Insert) NULLS the
+            // caller's slot at its lowering site too, so its transferred owned
+            // local/param is likewise left eligible.
             walkCallArgs(c->callee.get(), c->args,
                          /*untaintOwnedLocalTransfer=*/
-                         calleeIsUserMethod(ctx, c->callee.get()));
+                         calleeIsUserMethod(ctx, c->callee.get()) ||
+                         calleeIsOwningCollectionTransfer(ctx, c->callee.get()));
             return;
         }
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
@@ -8550,7 +8624,59 @@ struct UnwindIneligibleWalker {
             return;
         }
         if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
-            for (auto& a : n->args) expr(a.value.get(), /*consuming=*/true);
+            // #1955 / §28.3: a constructor argument transferred via an explicit
+            // `owned x` (a bare owned local / owned parameter) is NULLED at the
+            // ctor's arg-lowering site (lowerNew's buildOrderedArgs, now
+            // nullTransferredOwned=true), so the walker leaves that local
+            // ELIGIBLE for unwind disposal — exactly as it does for a user-method
+            // `owned` argument (#1918): the null-guarded unwindOnly disposal skips
+            // the value on the transfer / post-transfer throw edge (no double-free
+            // with the constructor's own owned-field cleanup) and disposes it on a
+            // throw edge that PRECEDES the transfer (fixes the #1955 leak). Every
+            // OTHER constructor argument is a consuming position (an owned
+            // temporary, a `move`, a field init) and stays tainted. Restricted to
+            // the EXPLICIT `owned` modifier + a plain `var` owned local or an
+            // `owned` parameter — exactly the slots buildOrderedArgs nulls for
+            // `a.modifier == "owned"`. An IMPLICIT bare-to-owned-param ctor
+            // argument stays tainted (a safe leak, never a double-free): the
+            // walker cannot resolve the exact overloaded ctor here to confirm the
+            // param is `owned`, so it does not claim eligibility the nulling might
+            // not cover.
+            //
+            // CRITICAL — the untaint fires ONLY when `new` routes through the
+            // NULLING arg-lowering path: an EXPLICIT user constructor (a matching
+            // ConstructorSymbol backed by a ConstructorDecl → ctorForArgs →
+            // buildOrderedArgs, nullTransferredOwned=true). It is NOT enough to be
+            // a class/record: a PRIMARY-ctor class (`class Box(owned r)`) has NO
+            // ConstructorSymbol, so its captured owned arg is stored via the
+            // positional-field path (LlvmBackend_Exprs2.cpp) which does NOT null
+            // the slot; a COMPILER-KNOWN BUILTIN owned-consuming ctor (Shared<T>/
+            // Weak<T> via bz_shared_new — null `declaration`) and an IMPORTED ctor
+            // likewise lower manually without nulling. Untainting any of those
+            // would leave a NON-null slot eligible → a DOUBLE-FREE on the
+            // transfer-window throw edge (the ctor/field disposer frees the value
+            // on unwind, then the caller's unwind disposal frees it AGAIN). All of
+            // them stay TAINTED — a safe residual leak on a throw-BEFORE-transfer
+            // edge (tracked #1970 follow-up), never a double-free.
+            // newExprRoutesThroughNullingCtor keeps `eligible ⟹ nulled` EXACT.
+            // per §28.3
+            bool nullingCtor = newExprRoutesThroughNullingCtor(ctx, n);
+            for (auto& a : n->args) {
+                bool untaint = false;
+                if (nullingCtor && a.modifier == "owned" && a.value) {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                            a.value.get())) {
+                        sema::Symbol* asym = ctx.exprSymbol(*id);
+                        if (auto* loc =
+                                dynamic_cast<sema::LocalSymbol*>(asym))
+                            untaint = loc->decl && !loc->isUsing;
+                        else if (auto* ps =
+                                     dynamic_cast<sema::ParameterSymbol*>(asym))
+                            untaint = (ps->modifier == "owned");
+                    }
+                }
+                expr(a.value.get(), /*consuming=*/!untaint);
+            }
             return;
         }
         if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
@@ -8614,11 +8740,30 @@ struct UnwindIneligibleWalker {
             expr(ts->value.get(), /*consuming=*/true); return;
         }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
-            // `x := ...` reassigns x — its prior owned value's obligation is
-            // released here, so x is no longer the same owned value on the way
-            // to a later throw. Taint the target (a bare-identifier lvalue) and
-            // walk the RHS as consuming (`x := y` moves y).
-            markIdent(as->target.get());
+            // fix #1956 / §28.3: a bare-identifier reassignment `x := …` does
+            // NOT taint x as unwind-INELIGIBLE. The slot holds exactly ONE live
+            // owned value between declaration and discharge: on the normal path
+            // the reassignment lowering evaluates the RHS, disposes the displaced
+            // OLD value (disposeDisplacedOwnedClassLocal — null+identity guarded),
+            // then stores the new one; and the unwindOnly disposal reloads the
+            // slot null-guarded (dynamic dispatch). So the slot always holds
+            // exactly the currently-live value at any throw edge:
+            //   - a throw BEFORE the reassignment (or while evaluating its RHS)
+            //     leaves the OLD value live in the slot → unwind-disposed once
+            //     (the reassignment never ran to dispose it) — fixes the #1956
+            //     leak;
+            //   - a throw AFTER the reassignment finds the NEW value in the slot
+            //     → unwind-disposed once (the old was disposed at the reassign).
+            // Tainting x here was a flow-INSENSITIVE over-approximation: it saw
+            // `x := …` anywhere in the body and dropped the unwind disposal for
+            // the throw edge that PRECEDES the reassignment, leaking the pre-
+            // reassignment value. A NON-identifier target (`obj.f := …`,
+            // `a[i] := …`) is NOT an unwind-eligible owned LOCAL/param key at
+            // all, so it is still walked (markIdent → expr, borrow rules) exactly
+            // as before. The RHS is walked as consuming (`x := y` moves y).
+            // per §28.3
+            if (!dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
+                markIdent(as->target.get());
             expr(as->value.get(), /*consuming=*/true);
             return;
         }

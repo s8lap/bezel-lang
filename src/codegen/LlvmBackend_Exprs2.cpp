@@ -3653,8 +3653,14 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     // against the enclosing `this`, not the new object.
                     llvm::Value* savedThisForArgs = currentThis_;
                     currentThis_ = savedThisForInit;
+                    // #1955 / §28.3: null the caller's slot for a bare owned
+                    // local/param transferred via `owned x` into an `owned` ctor
+                    // parameter, so the caller's null-guarded unwindOnly disposal
+                    // (which UnwindIneligibleWalker now leaves eligible for this
+                    // shape) stays exactly-once across the transfer.
                     bool ok = buildOrderedArgs(earlyCd->params, ne.args, eArgs,
-                                              &eArgExprs);
+                                              &eArgExprs,
+                                              /*nullTransferredOwned=*/true);
                     currentThis_ = savedThisForArgs;
                     if (ok) {
                         // Store for the ctor-call section below to reuse.
@@ -3735,7 +3741,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             genericSubst_ = savedSubst;
             genericSubstSemaTy_ = savedSemaTy;
             std::vector<const ast::Expr*> ctorArgExprs;
-            bool builtArgs = buildOrderedArgs(cd->params, ne.args, args, &ctorArgExprs);
+            // #1955 / §28.3: null the caller's slot for a bare owned local/param
+            // transferred via `owned x` into an `owned` ctor parameter (see the
+            // early-ctor path above and buildOrderedArgs).
+            bool builtArgs = buildOrderedArgs(cd->params, ne.args, args,
+                                              &ctorArgExprs,
+                                              /*nullTransferredOwned=*/true);
             genericSubst_ = std::move(ctorArgSubst);
             genericSubstSemaTy_ = std::move(ctorArgSemaTy);
             if (builtArgs && args.size() == cs->params.size() + 1) {
@@ -3856,8 +3867,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             args.push_back(obj);
             // #429 (ARGUMENT-PASS category): collect per-param arg expressions
             // so we can release any +1 string producer after the ctor runs.
+            // #1955 / §28.3: null the caller's slot for a bare owned local/param
+            // transferred via `owned x` into an `owned` ctor parameter, so the
+            // caller's null-guarded unwindOnly disposal (left eligible by
+            // UnwindIneligibleWalker for this shape) stays exactly-once.
             builtArgs = buildOrderedArgs(cd->params, ne.args, args,
-                                              &ctorArgExprs);
+                                              &ctorArgExprs,
+                                              /*nullTransferredOwned=*/true);
             genericSubst_ = std::move(ctorArgSubst);
             genericSubstSemaTy_ = std::move(ctorArgSemaTy);
             }
@@ -4913,7 +4929,12 @@ llvm::Value* Emitter::buildRecordValue(
         auto recSemaTy = genericSubstSemaTy_;
         genericSubst_ = argSubst;
         genericSubstSemaTy_ = argSemaTy;
-        bool builtRecArgs = buildOrderedArgs(cd->params, args, ordered);
+        // #1955 / §28.3: null the caller's slot for a bare owned local/param
+        // transferred via `owned x` into an `owned` ctor parameter (mirrors the
+        // class-ctor paths above; harmless for the common record ctor whose
+        // params are value-typed — no bare owned local/param slot is nulled).
+        bool builtRecArgs = buildOrderedArgs(cd->params, args, ordered, nullptr,
+                                             /*nullTransferredOwned=*/true);
         genericSubst_ = std::move(recSubst);
         genericSubstSemaTy_ = std::move(recSemaTy);
         if (!builtRecArgs) return nullptr;

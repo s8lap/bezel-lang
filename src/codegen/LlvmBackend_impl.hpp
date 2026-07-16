@@ -7228,6 +7228,19 @@ private:
                           std::vector<const ast::Expr*>* outExprs = nullptr,
                           bool nullTransferredOwned = false);
 
+    // #1955 / §28.3: null the caller's slot for a call ARGUMENT that transferred
+    // a bare owned LOCAL / owned PARAMETER's ownership to an owned recipient at a
+    // lowering site OUTSIDE buildOrderedArgs — an owning-collection element-
+    // transfer method (`OwningArray.Add(owned x)` / Push / Enqueue / Insert). The
+    // null store dominates the transfer's post-throw edge so the caller's null-
+    // guarded unwindOnly disposal — which UnwindIneligibleWalker leaves eligible
+    // for exactly this shape (calleeIsOwningCollectionTransfer) — is exactly-once
+    // (skips the moved value; disposes one still live at a preceding throw). Same
+    // effect buildOrderedArgs' `nullTransferredOwned` has for the call/ctor paths.
+    // A no-op unless `argValue` is a bare `var` owned local or an `owned`
+    // parameter of pointer representation. Call AFTER the element is consumed.
+    void nullTransferredOwnedLocalSlot(const ast::Expr* argValue);
+
     // CG29 (§9): build a record value from positional arguments — used by
     // `new Record(a, b, …)` (the spec construction form, §9.5). Positional
     // arguments map to the record's fields in declaration order; the value is
