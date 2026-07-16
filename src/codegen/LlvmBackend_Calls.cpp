@@ -1997,7 +1997,133 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 }
             }
 
-            sema::TypeRef* retTyRef = ctx_.primitiveTypeRef(sema::PrimitiveType::Int);
+            // fix #1901 / stdlib §5: the selector overload `Min<U>/Max<U>(sel):
+            // U` — generalize over the selector's actual return type U. The
+            // legacy generic path below hardwired an i32 accumulator: it
+            // truncated a long/uint/ulong projection, emitted garbage IR for a
+            // float/double projection, and mangled a class/string projection.
+            // (decimal U and the no-selector class/string forms are handled
+            // above; a *no-selector* numeric Min()/Max() keeps the legacy i32
+            // path here — its result is typed int by sema, a separate concern.)
+            // U is read from the selector lambda's inferred return TypeRef.
+            sema::TypeRef* uRef = nullptr;
+            if (!call.args.empty() && call.args[0].value)
+                if (auto* lamTy = ctx_.exprType(*call.args[0].value))
+                    if (lamTy->kind == sema::TypeRef::Kind::Function &&
+                        lamTy->funcReturn)
+                        uRef = lamTy->funcReturn;
+
+            // --- Selector projecting to a POINTER U: a class implementing
+            // IComparable<U> (§14.2) or string (§9.6). Mirror the no-selector
+            // pointer path (above), but project each element through the
+            // selector first; compare the projected values via CompareTo /
+            // ordinal strcmp and return the winning projection. The result is a
+            // borrow (§28.3, tracked in the ownership pass); codegen returns the
+            // pointer and takes no disposal obligation. ---
+            if (uRef) {
+                bool uIsStr = isStringTypeRefNonNull(uRef);
+                sema::MethodSymbol* uCmpMs = nullptr;
+                if (!uIsStr && uRef->kind == sema::TypeRef::Kind::Named &&
+                    uRef->declaration &&
+                    (uRef->declaration->kind == ast::TypeDeclKind::Class ||
+                     uRef->declaration->kind == ast::TypeDeclKind::Interface)) {
+                    if (sema::MethodSymbol* cm =
+                            findMethodByName(uRef->declaration, "CompareTo"))
+                        if (cm->params.size() == 1) uCmpMs = cm;
+                }
+                if (uIsStr || uCmpMs) {
+                    llvm::Value* closureP =
+                        lowerLinqLambda(call.args[0].value.get(), uRef);
+                    if (!closureP) return nullptr;
+                    auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                    llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+                    llvm::Value* isEmpty =
+                        builder_.CreateICmpEQ(len, builder_.getInt64(0));
+                    emitGuardThrow(isEmpty, "InvalidOperationException");
+                    auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                           {ptrTy(), i64(), i64()});
+                    auto* idxSlot = entryAlloca(i64());
+                    auto* accSlot = entryAlloca(ptrTy());
+                    // Seed the accumulator with selector(element[0]) and scan
+                    // from index 1 (avoids comparing against a null accumulator).
+                    llvm::Value* p0 = builder_.CreateCall(
+                        ptrFn, {recv, builder_.getInt64(0), builder_.getInt64(esz)});
+                    llvm::Value* e0 = builder_.CreateLoad(elemTy, p0);
+                    builder_.CreateStore(callClosure(closureP, e0, ptrTy()),
+                                         accSlot);
+                    builder_.CreateStore(builder_.getInt64(1), idxSlot);
+                    auto* condBB = llvm::BasicBlock::Create(llvm_, "mm.c", currentFn_);
+                    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "mm.b", currentFn_);
+                    auto* updBB  = llvm::BasicBlock::Create(llvm_, "mm.u", currentFn_);
+                    auto* nextBB = llvm::BasicBlock::Create(llvm_, "mm.n", currentFn_);
+                    auto* endBB  = llvm::BasicBlock::Create(llvm_, "mm.e", currentFn_);
+                    builder_.CreateBr(condBB);
+                    builder_.SetInsertPoint(condBB);
+                    llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+                    builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len),
+                                          bodyBB, endBB);
+                    builder_.SetInsertPoint(bodyBB);
+                    llvm::Value* ep = builder_.CreateCall(
+                        ptrFn, {recv, idx, builder_.getInt64(esz)});
+                    llvm::Value* el = builder_.CreateLoad(elemTy, ep);
+                    llvm::Value* pv = callClosure(closureP, el, ptrTy());
+                    llvm::Value* acc = builder_.CreateLoad(ptrTy(), accSlot, "mm.acc");
+                    llvm::Value* cmp = nullptr;
+                    if (uIsStr) {
+                        llvm::Value* pvData = builder_.CreateLoad(ptrTy(),
+                            builder_.CreateStructGEP(stringType(), pv, 0));
+                        llvm::Value* accData = builder_.CreateLoad(ptrTy(),
+                            builder_.CreateStructGEP(stringType(), acc, 0));
+                        auto* strcmpFn = module_->getFunction("strcmp");
+                        if (!strcmpFn) {
+                            auto* ft = llvm::FunctionType::get(
+                                i32(), {ptrTy(), ptrTy()}, false);
+                            strcmpFn = llvm::Function::Create(
+                                ft, llvm::Function::ExternalLinkage, "strcmp",
+                                module_.get());
+                        }
+                        cmp = builder_.CreateCall(strcmpFn, {pvData, accData},
+                                                  "mm.cmp");
+                    } else {
+                        std::vector<llvm::Value*> cargs{pv, acc};
+                        cmp = emitMethodCall(uCmpMs, cargs, /*baseQualified=*/false);
+                        if (!cmp) return nullptr;
+                    }
+                    llvm::Value* zero = llvm::ConstantInt::get(cmp->getType(), 0);
+                    llvm::Value* shouldUpdate = isMax
+                        ? builder_.CreateICmpSGT(cmp, zero)
+                        : builder_.CreateICmpSLT(cmp, zero);
+                    builder_.CreateCondBr(shouldUpdate, updBB, nextBB);
+                    builder_.SetInsertPoint(updBB);
+                    builder_.CreateStore(pv, accSlot);
+                    builder_.CreateBr(nextBB);
+                    builder_.SetInsertPoint(nextBB);
+                    builder_.CreateStore(
+                        builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                    builder_.CreateBr(condBB);
+                    builder_.SetInsertPoint(endBB);
+                    if (relCl) emitClosureRelease(closureP);  // #422 inline-lambda
+                    freeLazyTemp();
+                    return builder_.CreateLoad(ptrTy(), accSlot, "mm.r");
+                }
+            }
+
+            // --- Numeric U (selector) or the legacy no-selector form. Derive
+            // the accumulator LLVM type, float-ness, and signedness from U so a
+            // long/uint/ulong projection is not truncated and a float/double
+            // projection uses FP compare (mirrors the #1757 Sum-selector fix). A
+            // no-selector Min()/Max() keeps U = int and the legacy i32 slot. ---
+            sema::PrimitiveType retP = sema::PrimitiveType::Int;
+            const bool selNumeric =
+                uRef && uRef->kind == sema::TypeRef::Kind::Primitive &&
+                !uRef->nullable;
+            if (selNumeric) retP = uRef->primitive;
+            sema::TypeRef* retTyRef = ctx_.primitiveTypeRef(retP);
+            const bool accIsFP = (retP == sema::PrimitiveType::Float ||
+                                  retP == sema::PrimitiveType::Double);
+            const bool accIsUnsigned = isUnsignedPrim(retP);
+            llvm::Type* accLLTy = selNumeric ? lowerTypeRef(retTyRef) : i32();
+            if (!accLLTy) accLLTy = i32();
             llvm::Value* closure = call.args.empty() ? nullptr
                 : lowerLinqLambda(call.args[0].value.get(), retTyRef);
             if (!call.args.empty() && !closure) return nullptr;
@@ -2008,10 +2134,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* isEmpty = builder_.CreateICmpEQ(len, builder_.getInt64(0));
             emitGuardThrow(isEmpty, "InvalidOperationException");
             auto* idxSlot  = entryAlloca(i64());
-            auto* accSlot  = entryAlloca(i32());
+            auto* accSlot  = entryAlloca(accLLTy);
             auto* initSlot = entryAlloca(i1());
             builder_.CreateStore(builder_.getInt64(0), idxSlot);
-            builder_.CreateStore(builder_.getInt32(0), accSlot);
+            builder_.CreateStore(
+                accIsFP ? static_cast<llvm::Value*>(
+                              llvm::ConstantFP::get(accLLTy, 0.0))
+                        : static_cast<llvm::Value*>(
+                              llvm::ConstantInt::get(accLLTy, 0)),
+                accSlot);
             builder_.CreateStore(builder_.getFalse(), initSlot);
             auto* condBB = llvm::BasicBlock::Create(llvm_, "mm.c",  currentFn_);
             auto* bodyBB = llvm::BasicBlock::Create(llvm_, "mm.b",  currentFn_);
@@ -2026,12 +2157,24 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
             llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
             llvm::Value* el = builder_.CreateLoad(elemTy, ep);
-            llvm::Value* val = closure ? callClosure(closure, el, i32()) : el;
-            if (val->getType() != i32()) val = builder_.CreateTrunc(val, i32());
+            llvm::Value* val = closure ? callClosure(closure, el, accLLTy) : el;
+            // Legacy no-selector narrowing to the i32 accumulator; the selector
+            // form already returns accLLTy so this is a no-op there. Guard the
+            // trunc to integer→integer (a float/double selector value equals
+            // accLLTy and never reaches here).
+            if (val->getType() != accLLTy && val->getType()->isIntegerTy() &&
+                accLLTy->isIntegerTy())
+                val = builder_.CreateTrunc(val, accLLTy);
             llvm::Value* inited = builder_.CreateLoad(i1(), initSlot);
-            llvm::Value* acc = builder_.CreateLoad(i32(), accSlot);
-            llvm::Value* cmp = isMax ? builder_.CreateICmpSGT(val, acc)
-                                     : builder_.CreateICmpSLT(val, acc);
+            llvm::Value* acc = builder_.CreateLoad(accLLTy, accSlot);
+            llvm::Value* cmp = accIsFP
+                ? (isMax ? builder_.CreateFCmpOGT(val, acc)
+                         : builder_.CreateFCmpOLT(val, acc))
+                : (isMax
+                       ? (accIsUnsigned ? builder_.CreateICmpUGT(val, acc)
+                                        : builder_.CreateICmpSGT(val, acc))
+                       : (accIsUnsigned ? builder_.CreateICmpULT(val, acc)
+                                        : builder_.CreateICmpSLT(val, acc)));
             builder_.CreateCondBr(builder_.CreateOr(builder_.CreateNot(inited), cmp),
                                   updBB, nextBB);
             builder_.SetInsertPoint(updBB);
@@ -2044,7 +2187,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.SetInsertPoint(endBB);
             if (relCl && closure) emitClosureRelease(closure);  // #422: inline-lambda
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
-            return builder_.CreateLoad(i32(), accSlot, "mm.r");
+            return builder_.CreateLoad(accLLTy, accSlot, "mm.r");
         }
         // per §5 LINQ: .First(pred: (T)->bool): T  (throws if empty/not found)
         // stdlib §5 line 2446 + 2515: throws InvalidOperationException if no

@@ -191,6 +191,46 @@ BEZEL_TEST(linq, min_max_selector_non_icomparable_accepted_1198) {
         "end Main; end C;"), 1);
 }
 
+// fix #1901 / stdlib §5: the selector overload
+// `Min<U>(selector: (T) -> U): U` / `Max<U>(sel): U` types its RESULT as `U`
+// — the selector's inferred return type — NOT the element type or `int`. Here
+// the element is `int` but the selector projects to `double` (`x + 0.5`), so
+// U = double and the maximum must be the *double* 9.5, not the truncated int 9.
+// Before the fix the result typed as `int`, so `var mx: double := a.Max(...)`
+// silently truncated 9.5 -> 9.0 (9 not in (9.4, 9.6)) and this returned 0.
+BEZEL_TEST(linq, min_max_selector_double_result_type_1901) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(9); a.Add(5); "
+        "  var mx: double := a.Max((x) => x + 0.5); "   // U = double -> 9.5
+        "  var mn: double := a.Min((x) => x + 0.5); "   // U = double -> 1.5
+        "  return int(mx > 9.4 and mx < 9.6 and mn > 1.4 and mn < 1.6); "
+        "end Main; end C;"), 1);
+}
+
+// fix #1901 / stdlib §5 / §28.3 (v0.194): the selector overload projecting to a
+// CLASS `U` — `Max<U>((o) => o): U` where U is the (owned) element type. The
+// result types as the class (not int), so member access on it resolves AND the
+// §28.3 receiver-sourced-borrow carve tracks it as a borrow of the receiver
+// (the caller takes no disposal obligation; the OwningArray disposes each Box
+// exactly once). Before the fix the result typed as `int`, so `.v` below could
+// not resolve / the value was mis-dispatched.
+BEZEL_TEST(linq, min_max_selector_class_result_type_1901) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; import System; "
+        "class Box(v: int): IComparable<Box> "
+        "  public method CompareTo(other: Box): int => "
+        "    (1 if v > other.v else (-1 if v < other.v else 0)); "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  using var a := new OwningArray<Box>(); "
+        "  a.Add(new Box(3)); a.Add(new Box(9)); a.Add(new Box(5)); "
+        "  var top := a.Max((o) => o); "   // U = Box (borrow of receiver element)
+        "  return top.v; "                 // resolves only if result types as Box
+        "end Main; end C;"), 9);
+}
+
 // --- First (eager element access) ---
 
 BEZEL_TEST(linq, first) {

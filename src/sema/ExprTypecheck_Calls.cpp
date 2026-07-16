@@ -2962,6 +2962,23 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                     else if (m == "Count")
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                    // fix #1901 / stdlib §5: the selector overload
+                    // `Min<U>/Max<U>(sel: (T) -> U): U` on a lazy IEnumerable<T>
+                    // returns `U`, the selector's inferred return type — not int.
+                    // (Same defect as the concrete-collection path; kept ahead of
+                    // the decimal-or-int Sum/no-selector fallback below so the
+                    // selector's full return type — double, string, a class `U` —
+                    // survives rather than collapsing to int.)
+                    else if ((m == "Min" || m == "Max") && !ce.args.empty() &&
+                             ce.args[0].value) {
+                        TypeRef* uTy = nullptr;
+                        if (auto* lt = ctx_.exprType(*ce.args[0].value))
+                            if (lt->kind == TypeRef::Kind::Function &&
+                                lt->funcReturn)
+                                uTy = lt->funcReturn;
+                        ctx_.setExprType(
+                            &ce, uTy ? uTy : ctx_.primitiveTypeRef(P::Int));
+                    }
                     // fix #666 / stdlib §5/§5.1: Sum/Min/Max/Average on a lazy
                     // IEnumerable<decimal> return decimal, not int/double.
                     else if (m == "Sum" || m == "Min" || m == "Max") {
@@ -3101,7 +3118,23 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     else if (m == "First" || m == "Last" || m == "Single" ||
                              m == "ElementAt")
                         ctx_.setExprType(&ce, srcElem2);
-                    else if (m == "Sum" || m == "Min" || m == "Max")
+                    else if (m == "Min" || m == "Max") {
+                        // fix #1901 / stdlib §5: the selector overload
+                        // `Min<U>/Max<U>(sel: (T) -> U): U` returns `U`, the
+                        // selector's inferred return type — not int. (Same defect
+                        // as the concrete-collection path; here the receiver is a
+                        // vtable-backed IEnumerable<T> — an unspecialized template
+                        // stub, §26.5.)
+                        TypeRef* uTy = nullptr;
+                        if (!ce.args.empty() && ce.args[0].value)
+                            if (auto* lt = ctx_.exprType(*ce.args[0].value))
+                                if (lt->kind == TypeRef::Kind::Function &&
+                                    lt->funcReturn)
+                                    uTy = lt->funcReturn;
+                        ctx_.setExprType(
+                            &ce, uTy ? uTy : ctx_.primitiveTypeRef(P::Int));
+                    }
+                    else if (m == "Sum")
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                     else if (m == "Average")
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Double));
@@ -3166,7 +3199,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         if (auto* st = ctx_.exprType(*ce.args[0].value))
                             ctx_.setExprType(&ce, st);
                     }
-                    else if (m == "Sum" || m == "Min" || m == "Max")
+                    else if (m == "Min" || m == "Max") {
+                        // fix #1901 / stdlib §5: `Min<U>/Max<U>(sel: (char) -> U)`
+                        // on a string (IEnumerable<char>, §9.6) returns `U`, the
+                        // selector's inferred return type — not int.
+                        TypeRef* uTy = nullptr;
+                        if (!ce.args.empty() && ce.args[0].value)
+                            if (auto* lt = ctx_.exprType(*ce.args[0].value))
+                                if (lt->kind == TypeRef::Kind::Function &&
+                                    lt->funcReturn)
+                                    uTy = lt->funcReturn;
+                        ctx_.setExprType(
+                            &ce, uTy ? uTy : ctx_.primitiveTypeRef(P::Int));
+                    }
+                    else if (m == "Sum")
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                     else if (m == "Average")
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Double));
@@ -3643,6 +3689,37 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     return;
                                 }
                                 ctx_.setExprType(&ce, elem);
+                            } else if ((m == "Min" || m == "Max") &&
+                                       !ce.args.empty() && ce.args[0].value) {
+                                // fix #1901 / stdlib §5 (v0.194): the selector
+                                // overload `Min<U>(selector: (T) -> U): U` /
+                                // `Max<U>(sel): U` returns `U` — the selector's
+                                // inferred return type — NOT the element type or
+                                // int. `U` is `Min`/`Max`'s own type parameter, so
+                                // (unlike `Sum`, whose seven fixed numeric
+                                // overloads need §22.6 widening resolution above)
+                                // the result is exactly the selector's return
+                                // type, whatever it is: a numeric primitive
+                                // (int/long/double/decimal/…), string, or a
+                                // class/interface `U: IComparable<U>`. Typing it as
+                                // `U` (a) makes the result type-correct — a
+                                // `double` projection is no longer truncated to
+                                // `int` — and (b) at a class `U` lets the §28.3
+                                // receiver-sourced-borrow carve (Ownership.cpp
+                                // ~L2419, #1876) fire: that carve gates on
+                                // isBorrowableType(result), so it only tracks the
+                                // receiver once the result types as the class.
+                                // Falls back to int only if the arg is not a
+                                // resolved lambda (recovery — an unrelated error
+                                // was already reported).
+                                TypeRef* uTy = nullptr;
+                                if (auto* lt = ctx_.exprType(*ce.args[0].value))
+                                    if (lt->kind == TypeRef::Kind::Function &&
+                                        lt->funcReturn)
+                                        uTy = lt->funcReturn;
+                                ctx_.setExprType(
+                                    &ce, uTy ? uTy
+                                             : ctx_.primitiveTypeRef(P::Int));
                             } else {
                             bool elemIsDecimal =
                                 elem && elem->kind == TypeRef::Kind::Primitive &&
