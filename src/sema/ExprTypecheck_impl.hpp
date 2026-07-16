@@ -462,6 +462,18 @@ private:
     // arity mismatch) — the caller then conservatively admits the pattern.
     TypeRef* projectTypeToAncestorDecl(const TypeRef* sub, TypeSymbol* ancDecl);
 
+    // §19.6 v0.196 (#1874/#1912): does an unguarded typed binding `var x: bt`
+    // cover EVERY non-null value of a scrutinee whose instantiation, projected
+    // to `bt`'s declaration, is `proj`? (In the same-declaration case `proj` is
+    // the scrutinee itself; in the cross-declaration/ancestor case it is the
+    // scrutinee projected up the class chain, cf. projectTypeToAncestorDecl.)
+    // Arg-SENSITIVE per §12.9: variance-compatible AND — because the "covers all
+    // values" proof must hold at EVERY instantiation of the enclosing body
+    // (§31.2.1) — a RIGID scrutinee argument is covered only by that SAME rigid
+    // parameter, never a ground or other arg. Shared by the same-declaration and
+    // cross-declaration disjuncts of checkCaseExhaustiveness's #784 block.
+    bool typedBindingCoversAllValues(const TypeRef* proj, const TypeRef* bt);
+
     // §19.3/§19.5/§5.1/§12.9 (v0.196, #1913): is the typed binding pattern
     // `var x: patTy` a type-test that NO runtime value of scrutinee type
     // `scrutTy` could ever satisfy — because its generic INSTANTIATION is

@@ -998,6 +998,135 @@ BEZEL_TEST(sema_case_exhaust,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// --- #1912: CROSS-DECLARATION ancestor arm — the #784 full-type block (spec
+//     §19.6 v0.196) --------------------------------------------------------------
+//
+// #1874 made the #784 "typed binding covers the WHOLE scrutinee type" check
+// arg-SENSITIVE for the SAME-declaration disjunct (scrutinee `Result<int>`, arm
+// `var x: Result<string>`). #1912 closes the residual its CROSS-declaration
+// disjunct left: when the arm names a proper class-chain ANCESTOR of the
+// scrutinee's declaration (scrutinee `Wrap<int>`/`Wrap<T>`, arm `Result<…>`), the
+// check discharged coverage by declaration NAME alone (`isSubtype(Wrap, Result)`),
+// ignoring the generic-argument mismatch. Per §19.6 v0.196 a typed binding covers
+// every value only when the scrutinee is ASSIGNABLE to the arm's type (§5.1) —
+// arg-SENSITIVE, class hierarchies being invariant (§12.9). The fix projects the
+// scrutinee up the class chain to the arm's declaration and compares
+// arg-sensitively, mirroring the same-declaration branch. Distinct from the
+// #1874 (a)-(e) tests, whose scrutinee is the ROOT `Result` — here the scrutinee
+// is a proper SUBTYPE, so `isSubtype(scrutinee-decl, arm-decl)` is TRUE and the
+// #784 CROSS-declaration disjunct (not the leaf analysis) is what over-covered.
+
+// (#1912 a) GROUND wrong-instantiation cross-declaration ancestor. Scrutinee
+// `Wrap<int>` (an intermediate-abstract SUBTYPE of `Result`); the sole arm
+// `var x: Result<string>` names the ancestor `Result` with the WRONG argument.
+// `Wrap<int>` is not assignable to `Result<string>` (invariant, §12.9), so neither
+// determined leaf `Ok<int>`/`Err<int>` is covered and the case is non-exhaustive.
+// FAILS WITHOUT the fix: the #784 cross-declaration disjunct matched by
+// declaration alone (`isSubtype(Wrap, Result)`) and returned "exhaustive" with no
+// warning. PASSES WITH: the arg-sensitive projection leaves both leaves uncovered.
+BEZEL_TEST(sema_case_exhaust,
+           crossdecl_wrong_instantiation_ancestor_ground_does_not_cover_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<T> end Result; "
+        "sealed abstract class Wrap<T> : Result<T> end Wrap; "
+        "sealed class Ok<T> : Wrap<T> end Ok; "
+        "sealed class Err<T> : Wrap<T> end Err; "
+        "class Calc "
+        "  public method M(w: Wrap<int>): int "
+        "    var a := case w of "
+        "      var x: Result<string> => 0 "  // WRONG-inst cross-decl ANCESTOR
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));            // leaves uncovered
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "Ok"));  // names the leaf
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "Err"));
+    // #1913: the GROUND wrong-instantiation ancestor is ALSO a hard admission
+    // error (a statically-impossible bind), reported alongside the warning.
+    BEZEL_EXPECT_TRUE(hasWrongInstantiationAdmissionError(r));
+}
+
+// (#1912 b) GROUND correct-instantiation cross-declaration ancestor control.
+// `var x: Result<int>` at scrutinee `Wrap<int>` DOES cover every value — an upcast
+// (§5.1) — so the case is exhaustive with no `_` and no warning. Guards the
+// opposite failure mode: the arg-sensitive cross-declaration projection must not
+// regress the legitimate "ancestor binding covers all leaves" idiom.
+BEZEL_TEST(sema_case_exhaust,
+           crossdecl_correct_instantiation_ancestor_ground_covers_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<T> end Result; "
+        "sealed abstract class Wrap<T> : Result<T> end Wrap; "
+        "sealed class Ok<T> : Wrap<T> end Ok; "
+        "sealed class Err<T> : Wrap<T> end Err; "
+        "class Calc "
+        "  public method M(w: Wrap<int>): int "
+        "    var a := case w of "
+        "      var x: Result<int> => 0 "  // CORRECT-inst cross-decl ANCESTOR
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));  // ancestor binding covers all
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (#1912 c) RIGID wrong-instantiation cross-declaration ancestor. Scrutinee
+// `Wrap<T>` (rigid `T`, from the enclosing `Handle<T>`); the arm
+// `var x: Result<string>` names ONE ground instantiation of the ancestor family.
+// `Wrap<T>` reference-converts to `Result<string>` only at `T = string`, not at
+// EVERY instantiation of the enclosing body (§31.2.1), so the binding does NOT
+// universally cover and the case is non-exhaustive — yet admission ACCEPTS it (a
+// type pattern is tested per instantiation, §19.3 v0.182), so NO error is raised.
+// FAILS WITHOUT (the cross-declaration disjunct covered by ancestor-declaration
+// name); PASSES WITH (the projected rigid-mismatch guard).
+BEZEL_TEST(sema_case_exhaust,
+           crossdecl_wrong_instantiation_ancestor_rigid_does_not_cover_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<A> end Result; "
+        "sealed abstract class Wrap<B> : Result<B> end Wrap; "
+        "sealed class Ok<Y> : Wrap<Y> end Ok; "
+        "sealed class Err<Y> : Wrap<Y> end Err; "
+        "class Handle<T> "
+        "  public method h(w: Wrap<T>): int "
+        "    var a := case w of "
+        "      var x: Result<string> => 0 "  // one instantiation — not the family
+        "    end; "
+        "    return a; "
+        "  end h; "
+        "end Handle;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "Ok"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());  // rigid bind is per-instantiation
+}
+
+// (#1912 d) RIGID correct-instantiation cross-declaration ancestor control.
+// `var x: Result<T>` at rigid scrutinee `Wrap<T>` covers every value (projected
+// identity `Result<T>`), so the case is exhaustive — the projected rigid-mismatch
+// guard must accept the SAME rigid parameter.
+BEZEL_TEST(sema_case_exhaust,
+           crossdecl_correct_instantiation_ancestor_rigid_covers_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<A> end Result; "
+        "sealed abstract class Wrap<B> : Result<B> end Wrap; "
+        "sealed class Ok<Y> : Wrap<Y> end Ok; "
+        "sealed class Err<Y> : Wrap<Y> end Err; "
+        "class Handle<T> "
+        "  public method h(w: Wrap<T>): int "
+        "    var a := case w of "
+        "      var x: Result<T> => 0 "  // SAME rigid family — covers all
+        "    end; "
+        "    return a; "
+        "  end h; "
+        "end Handle;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));  // rigid identity covers all
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // --- s5: leaf-chain scalar where-constraint filtering (spec §19.6 v0.196;
 //     clause (b)) --------------------------------------------------------------
 //

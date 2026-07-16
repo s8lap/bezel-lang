@@ -1487,6 +1487,39 @@ static bool armCoversDeterminedLeaf(
 static bool variantGenericAssignable(const TypeRef*, const TypeRef*,
                                      bool (*)(TypeSymbol*, TypeSymbol*));
 
+// §19.6 v0.196 (#1874/#1912): does an unguarded typed binding `var x: bt` cover
+// EVERY non-null value of a scrutinee whose instantiation projected to `bt`'s
+// declaration is `proj`? See the header-comment for the contract. The variance
+// check (variantGenericAssignable) treats a RIGID enclosing-body type parameter
+// as a free variable compatible with any `bt` argument — too lenient for the
+// "covers ALL values" proof, which must hold at EVERY instantiation of the
+// enclosing body (§31.2.1). So after the variance check, reject any position
+// where `proj`'s arg is a rigid parameter and `bt`'s arg is not that SAME rigid
+// parameter; ground args are left to the variance check, so covariant coverage
+// is undisturbed.
+bool ExprTC::typedBindingCoversAllValues(const TypeRef* proj,
+                                         const TypeRef* bt) {
+    if (!proj || !bt) return false;
+    bool covers = variantGenericAssignable(proj, bt, isSubtype);
+    if (covers && proj->genericArgs.size() == bt->genericArgs.size()) {
+        for (std::size_t gi = 0; gi < proj->genericArgs.size(); ++gi) {
+            const TypeRef* sa = proj->genericArgs[gi];
+            const TypeRef* ba = bt->genericArgs[gi];
+            bool saRigid = sa && sa->kind == TypeRef::Kind::Named &&
+                           sa->genericArgs.empty() &&
+                           isInScopeTypeParam(sa->headName());
+            if (!saRigid) continue;  // ground arg — variance ruled it
+            bool baSameRigid = ba && ba->kind == TypeRef::Kind::Named &&
+                               ba->genericArgs.empty() &&
+                               sa->nullable == ba->nullable &&
+                               !ba->headName().empty() &&
+                               ba->headName() == sa->headName();
+            if (!baSameRigid) return false;
+        }
+    }
+    return covers;
+}
+
 // §19.6 v0.196 (#1874): the ANCESTOR/subtype-walk counterpart of
 // armCoversDeterminedLeaf. A pattern naming a proper ancestor `matchTy` of leaf
 // `leaf` covers `leaf` via the subtype walk (§19.3) — but when `leaf` is a
@@ -1608,54 +1641,41 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
                 coversNonNull = bt->primitive == scrutTy->primitive;
             else if (bt->kind == TypeRef::Kind::Named && bt->declaration &&
                      scrutTy->declaration) {
-                // §19.6 v0.196 (#1874): a typed binding `var x: bt` covers all
-                // non-null values of the scrutinee only when the scrutinee
+                // §19.6 v0.196 (#1874/#1912): a typed binding `var x: bt` covers
+                // all non-null values of the scrutinee only when the scrutinee
                 // REFERENCE-CONVERTS to `bt` (§5.1) — which for a generic type is
                 // arg-SENSITIVE. When `bt` names the scrutinee's OWN declaration
-                // (`var x: Result<string>` at scrutinee `Result<int>`, the
-                // ancestor residual of #1862), the args must be compatible under
-                // §12.9 variance: an invariant class requires identity, so a
-                // wrong-instantiation binding does NOT cover, and control falls
-                // through to the arg-sensitive closed-hierarchy leaf analysis
-                // below. The cross-declaration subtype disjunct keeps today's
-                // declaration-level check (consistent with checkAssignable's
-                // conservative treatment of cross-declaration generics, §12.9).
+                // (`var x: Result<string>` at scrutinee `Result<int>`), the args
+                // must be compatible under §12.9 variance (an invariant class
+                // requires identity); when `bt` names a proper ANCESTOR of the
+                // scrutinee's declaration (`var x: Result<string>` at scrutinee
+                // `Ok<int>`/`Ok<T>`, the #1912 cross-declaration residual of
+                // #1874), the scrutinee is PROJECTED up the class chain to `bt`'s
+                // declaration and compared arg-sensitively the same way. A wrong-
+                // instantiation binding does NOT cover, and control falls through
+                // to the arg-sensitive closed-hierarchy leaf analysis below.
                 if (bt->declaration == scrutTy->declaration) {
-                    coversNonNull =
-                        variantGenericAssignable(scrutTy, bt, isSubtype);
-                    // §19.6 v0.196 (#1874, rigid tail): variantGenericAssignable
-                    // treats a RIGID enclosing-body type parameter in `scrutTy`
-                    // as a free variable compatible with any `bt` argument — too
-                    // lenient for the "covers ALL values" proof, which must hold
-                    // at EVERY instantiation of the enclosing body (§31.2.1). So
-                    // a binding `var x: Result<int>` does NOT universally cover a
-                    // rigid scrutinee `Result<T>`: reject any position where
-                    // `scrutTy`'s arg is a rigid parameter and `bt`'s arg is not
-                    // that SAME rigid parameter. Ground args are left to the
-                    // variance check above, so covariant coverage is undisturbed.
-                    if (coversNonNull &&
-                        scrutTy->genericArgs.size() == bt->genericArgs.size()) {
-                        for (std::size_t gi = 0; gi < scrutTy->genericArgs.size();
-                             ++gi) {
-                            const TypeRef* sa = scrutTy->genericArgs[gi];
-                            const TypeRef* ba = bt->genericArgs[gi];
-                            bool saRigid =
-                                sa && sa->kind == TypeRef::Kind::Named &&
-                                sa->genericArgs.empty() &&
-                                isInScopeTypeParam(sa->headName());
-                            if (!saRigid) continue;  // ground arg — variance ruled
-                            bool baSameRigid =
-                                ba && ba->kind == TypeRef::Kind::Named &&
-                                ba->genericArgs.empty() &&
-                                sa->nullable == ba->nullable &&
-                                !ba->headName().empty() &&
-                                ba->headName() == sa->headName();
-                            if (!baSameRigid) { coversNonNull = false; break; }
-                        }
-                    }
-                } else
-                    coversNonNull =
-                        isSubtype(scrutTy->declaration, bt->declaration);
+                    coversNonNull = typedBindingCoversAllValues(scrutTy, bt);
+                } else if (!isSubtype(scrutTy->declaration, bt->declaration)) {
+                    coversNonNull = false;  // not a declaration-level supertype
+                } else if (TypeRef* proj = projectTypeToAncestorDecl(
+                               scrutTy, bt->declaration)) {
+                    // §19.6 v0.196 (#1912): `bt` is a CLASS-chain ancestor
+                    // reachable by projection — compare the projected scrutinee
+                    // instantiation against `bt` arg-sensitively, mirroring the
+                    // same-declaration branch, so an ancestor arm no longer
+                    // discharges coverage by declaration NAME alone (invariant
+                    // class hierarchies, §12.9).
+                    coversNonNull = typedBindingCoversAllValues(proj, bt);
+                } else {
+                    // `bt` is an INTERFACE ancestor / uncomposable chain —
+                    // projection is not provable via the class chain. Keep the
+                    // conservative declaration-level cover (preserves legitimate
+                    // covariant-interface conversions), matching checkAssignable's
+                    // conservative treatment of cross-declaration generics (a
+                    // documented §12.9 residual).
+                    coversNonNull = true;
+                }
             }
             if (!coversNonNull) continue;
             if (!scrutTy->nullable || armsCoverNull(ce)) return;  // exhaustive
