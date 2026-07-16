@@ -483,6 +483,39 @@ private:
     bool typeTestGenericInstantiationImpossible(const TypeRef* scrutTy,
                                                 const TypeRef* patTy);
 
+    // §19.3/§5.1/§12.9 (v0.197, #1920): collect every instantiation of the
+    // interface declaration `ifaceDecl` that the Named type `classTy` (a class
+    // or interface carrying concrete generic args) implements or extends, each
+    // re-expressed in `classTy`'s OWN concrete arguments (`Box<string>` over
+    // `Box<T>: IBox<T>` yields `IBox<string>`). BFS over the ancestor graph
+    // (single class base + interface bases), substituting the carried concrete
+    // args at each level; a declaration reached at TWO distinct instantiations
+    // (`C<T>: I<T>, I<int>` — the implemented-twice shape) contributes BOTH
+    // entries, deduplicated only by structural identity so diamonds are bounded
+    // without merging distinct instantiations. Appends to `out`.
+    void collectAncestorInstantiationsOf(const TypeRef* classTy,
+                                         TypeSymbol* ifaceDecl,
+                                         std::vector<TypeRef*>& out);
+
+    // §19.3/§19.5/§5.1/§12.9 (v0.197, #1920): the INTERFACE-scrutinee
+    // counterpart of typeTestGenericInstantiationImpossible. Is the typed
+    // binding `var x: patTy` (a class pattern) a type-test that NO runtime value
+    // of the generic-interface scrutinee `scrutTy` (`IBox<int>`) could satisfy —
+    // because none of the pattern class's implemented instantiations of that
+    // interface is compatible with the scrutinee (`Box<string>` implements only
+    // `IBox<string>`, disjoint from `IBox<int>` under §12.9)? The erased runtime
+    // type-test checks only the class tag, so such a binding would match and
+    // bind at a wrong static type. Returns true (=> the caller REJECTS) only for
+    // a FINAL pattern class (plain `sealed`, non-abstract — no subclass can add
+    // a compatible implementation, §12.4) whose FULL implemented-interface set
+    // is disjoint from the scrutinee. A non-final class, an interface pattern, a
+    // non-generic or non-interface scrutinee, a class that does not implement
+    // the interface at all, or any compatible (incl. rigid/free-parameter)
+    // instantiation yields a CONSERVATIVE accept (false) — never an
+    // over-rejection.
+    bool typeTestInterfaceInstantiationImpossible(const TypeRef* scrutTy,
+                                                  const TypeRef* patTy);
+
     // §19.6 (v0.196, #1874): does an ANCESTOR arm of type `armTy` (an
     // instantiation of `matchTy`, a strict ancestor of the DETERMINED generic
     // leaf `leaf`) cover `leaf`'s sole inhabiting instantiation `leaf<σ>`? The

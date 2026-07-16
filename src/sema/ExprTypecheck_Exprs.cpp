@@ -5336,6 +5336,23 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             "scrutinee type (class hierarchies are invariant, "
                             "§12.9), so the pattern would bind at a wrong "
                             "static type (§19.3/§5.1)");
+                    // §19.3/§19.5/§5.1/§12.9 (#1920): the interface-scrutinee
+                    // counterpart — a FINAL class pattern (`var x: Box<string>`)
+                    // whose implemented instantiations of the generic-interface
+                    // scrutinee (`IBox<int>`) are all incompatible. Same erased-
+                    // test wrong-bind hole as #1913, one level up through an
+                    // interface.
+                    else if (typeTestInterfaceInstantiationImpossible(
+                                 scrutTy, lsym->declType))
+                        ctx_.diagnostics().report(
+                            Severity::Error, bp->span.begin,
+                            "binding pattern type is incompatible with the "
+                            "scrutinee's static type — its generic "
+                            "instantiation can never match a value of the "
+                            "scrutinee interface type (no implemented "
+                            "instantiation is compatible under §12.9), so the "
+                            "pattern would bind at a wrong static type "
+                            "(§19.3/§5.1)");
                 }
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;

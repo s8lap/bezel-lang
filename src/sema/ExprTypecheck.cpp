@@ -4133,6 +4133,129 @@ bool ExprTC::typeTestGenericInstantiationImpossible(const TypeRef* scrutTy,
     return true;  // provably incompatible instantiation — reject
 }
 
+// §12.4 (#1920): is `d` a FINAL class — plain `sealed`, non-`abstract`? Such a
+// class admits no subclass anywhere (`sealed` prevents inheritance; only the
+// `sealed abstract` combination stays inheritable within its module, §11.7), so
+// its implemented-interface set is exhaustive over all runtime values that pass
+// the erased class-tag type-test.
+static bool isFinalClass(const TypeSymbol* d) {
+    if (!d || d->kind != ast::TypeDeclKind::Class) return false;
+    const auto* td = dynamic_cast<const ast::TypeDecl*>(d->decl);
+    if (!td) return false;
+    bool sealed = false, abstract = false;
+    for (std::string_view m : td->modifiers) {
+        if (m == "sealed") sealed = true;
+        else if (m == "abstract") abstract = true;
+    }
+    return sealed && !abstract;
+}
+
+// §19.3/§5.1/§12.9 (v0.197, #1920): see the header comment. BFS the ancestor
+// graph of `classTy`, substituting the carried concrete args at each level, and
+// collect every instantiation of `ifaceDecl`.
+void ExprTC::collectAncestorInstantiationsOf(const TypeRef* classTy,
+                                             TypeSymbol* ifaceDecl,
+                                             std::vector<TypeRef*>& out) {
+    if (!classTy || classTy->kind != TypeRef::Kind::Named ||
+        !classTy->declaration || !ifaceDecl)
+        return;
+    std::vector<TypeRef*> work{const_cast<TypeRef*>(classTy)};
+    std::unordered_set<const TypeSymbol*> seenNonGeneric;
+    std::vector<TypeRef*> seenGeneric;
+    const std::size_t kMaxWalk = 4096;  // defensive; ancestor sets are shallow
+    std::size_t walked = 0;
+    while (!work.empty()) {
+        if (++walked > kMaxWalk) break;  // malformed cycle must terminate
+        TypeRef* cur = work.back();
+        work.pop_back();
+        if (!cur || cur->kind != TypeRef::Kind::Named || !cur->declaration)
+            continue;
+        TypeSymbol* d = cur->declaration;
+        // Bound diamonds WITHOUT merging distinct instantiations of a repeated
+        // declaration (the implemented-twice shape): a non-generic ancestor
+        // dedups by declaration, a generic one by structural identity.
+        if (cur->genericArgs.empty()) {
+            if (!seenNonGeneric.insert(d).second) continue;
+        } else {
+            bool dup = false;
+            for (TypeRef* s : seenGeneric)
+                if (typeRefEqual(s, cur)) { dup = true; break; }
+            if (dup) continue;
+            seenGeneric.push_back(cur);
+        }
+        if (d == ifaceDecl) out.push_back(cur);
+        // Re-express each declared base (single class base + interfaces) in
+        // `cur`'s concrete args and enqueue it.
+        std::unordered_map<std::string_view, TypeRef*> subst;
+        const auto& params = d->genericParams;
+        if (params.size() == cur->genericArgs.size())
+            for (std::size_t i = 0; i < params.size(); ++i)
+                if (params[i]) subst[params[i]->name] = cur->genericArgs[i];
+        for (TypeRef* br : d->baseTypeRefs)
+            if (br)
+                work.push_back(subst.empty() ? br
+                                             : substituteReturnType(br, subst));
+    }
+}
+
+// §19.3/§19.5/§5.1/§12.9 (v0.197, #1920): see the header comment. The
+// interface-scrutinee counterpart of typeTestGenericInstantiationImpossible,
+// reasoning over the pattern class's conforming interface instantiations rather
+// than a single class-chain projection.
+bool ExprTC::typeTestInterfaceInstantiationImpossible(const TypeRef* scrutTy,
+                                                      const TypeRef* patTy) {
+    if (!scrutTy || !patTy) return false;
+    if (scrutTy->kind != TypeRef::Kind::Named ||
+        patTy->kind != TypeRef::Kind::Named)
+        return false;
+    TypeSymbol* sd = scrutTy->declaration;
+    TypeSymbol* pd = patTy->declaration;
+    if (!sd || !pd) return false;  // builtin/free type — conservative accept
+    // Scrutinee must be a GENERIC INTERFACE — this is the interface counterpart
+    // of the #1913 class check (a class scrutinee is handled there via the
+    // class-chain projection). A non-generic interface carries no instantiation
+    // to mismatch.
+    if (sd->kind != ast::TypeDeclKind::Interface || scrutTy->genericArgs.empty())
+        return false;
+    // Pattern must be a CLASS: the erased type-test binds the value at the
+    // class's static instantiation. (An interface pattern would need the
+    // implemented-twice reasoning on BOTH sides — a residual, conservative
+    // accept here.)
+    if (pd->kind != ast::TypeDeclKind::Class) return false;
+    // SOUND SUBSET (#1920): restrict to a FINAL class — no subclass can exist
+    // (§12.4), so its implemented-interface set is exhaustive over every value
+    // that could pass the erased class-tag test, and no subclass can add a
+    // compatible implementation at a different instantiation (the
+    // implemented-twice hazard). For a non-final pattern class a subclass
+    // deriving from `patTy` could add a compatible `sd` implementation, so we
+    // conservatively ACCEPT (residual — tracked for the clash-reasoning
+    // extension).
+    if (!isFinalClass(pd)) return false;
+
+    // Every instantiation of the scrutinee interface `sd` that the FINAL pattern
+    // class implements, in `patTy`'s own concrete args. The implemented-twice
+    // shape (`C<T>: I<T>, I<int>`) contributes multiple entries — a value that
+    // satisfies ANY compatible one keeps the pattern admissible.
+    std::vector<TypeRef*> impls;
+    collectAncestorInstantiationsOf(patTy, sd, impls);
+    if (impls.empty())
+        return false;  // patTy does not implement `sd` at all — not a
+                       // wrong-INSTANTIATION case; conservative accept.
+
+    // Admissible iff SOME implemented instantiation reference-converts to/from
+    // the scrutinee under §12.9 (variantGenericAssignable in both directions,
+    // matching the #1913 posture — a rigid/free parameter is treated as
+    // compatible, so a rigid scrutinee or pattern arg is never over-rejected).
+    // Provably impossible iff NONE does: a FINAL class means no subclass can
+    // supply another instantiation, so no value of the scrutinee type can be a
+    // `patTy`, and the erased test would bind at a wrong static type.
+    for (TypeRef* impl : impls)
+        if (variantGenericAssignable(impl, scrutTy, isSubtype) ||
+            variantGenericAssignable(scrutTy, impl, isSubtype))
+            return false;  // a compatible implementation exists — admit
+    return true;  // every implemented instantiation is incompatible — reject
+}
+
 // §26.5 (#714/#927): find the ancestor of `recv` (or `recv` itself) that
 // exactly matches `target` under freeVars unification, or return nullptr.
 // Walks user-declared receivers via their TypeDecl::baseTypeRefs chain (§26.5
@@ -8585,6 +8708,23 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             "scrutinee type (class hierarchies are invariant, "
                             "§12.9), so the pattern would bind at a wrong "
                             "static type (§19.3/§5.1)");
+                    // §19.3/§19.5/§5.1/§12.9 (#1920): the interface-scrutinee
+                    // counterpart — a FINAL class pattern (`var x: Box<string>`)
+                    // whose implemented instantiations of the generic-interface
+                    // scrutinee (`IBox<int>`) are all incompatible. Same erased-
+                    // test wrong-bind hole as #1913, one level up through an
+                    // interface.
+                    else if (typeTestInterfaceInstantiationImpossible(
+                                 scrutTy, lsym->declType))
+                        ctx_.diagnostics().report(
+                            Severity::Error, bp->span.begin,
+                            "binding pattern type is incompatible with the "
+                            "scrutinee's static type — its generic "
+                            "instantiation can never match a value of the "
+                            "scrutinee interface type (no implemented "
+                            "instantiation is compatible under §12.9), so the "
+                            "pattern would bind at a wrong static type "
+                            "(§19.3/§5.1)");
                 }
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;
