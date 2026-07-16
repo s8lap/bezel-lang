@@ -1261,6 +1261,16 @@ private:
     // (where this flag is false). Saved/restored false around a specialization.
     bool emittingGenericTemplateBody_ = false;
 
+    // §19.3 (v0.182, #1852): the names of the generic parameters in scope while
+    // emitting the UNSPECIALIZED template body (set alongside
+    // emittingGenericTemplateBody_ in emitFunctionBody). In the dead template the
+    // active `genericSubstSemaTy_` is empty, so a type-parameter pattern
+    // (`case x of T`, `var x: T`) cannot resolve T to a concrete type; this set
+    // lets patternMatches recognize such a name as a parameter and emit a
+    // well-formed never-match (the template verifies but is never called), while
+    // a genuinely-unsupported name still reaches the #1847 diagnostic.
+    std::unordered_set<std::string_view> templateGenericParamNames_;
+
     // #383 / §28.8.1: true while emitting a class's compiler-generated Dispose
     // (a destructor body). A `using var u := move this._f;` inside a destructor
     // is NOT registered for disposal: the destructor's auto field-dispose pass
@@ -3559,6 +3569,24 @@ private:
     // const — the pattern is then a type-test / enum constant handled
     // elsewhere, or deferred.
     llvm::Value* constValueForPatternName(const ast::QualifiedName* name);
+
+    // §19.3 (v0.182, #1852): emit the i1 match condition "scrut is-a `ct`" for a
+    // type-test pattern whose type is a bare **type parameter** resolved, through
+    // the active monomorphization substitution, to the concrete type `ct`. Shared
+    // by the bare pattern `case x of T` and the typed binding `var x: T`, whose
+    // §19.3 rule is identical ("test against the substituted type argument, per
+    // instantiation"): a class/interface → runtime is-a against the PER-
+    // MONOMORPHIZATION descriptor (#1843 perInstDescriptorForTarget, so
+    // `T=Wrap<int>` does not match a `Wrap<string>` scrutinee); a built-in
+    // exception → the btd$ descriptor is-a (like #1854); a value-builtin
+    // (DateTime/Guid/… — no reference descriptor) → a well-formed never-match; a
+    // record/enum → static decidability; a primitive incl. string → the boxed /
+    // same-primitive test. Returns null ONLY for a type-test kind it cannot lower
+    // — the caller then emits a TERMINATED never-match (never falls through to a
+    // return-nullptr, which would leave `case.end` unterminated → malformed IR).
+    llvm::Value* emitTypeParamPatternTest(const sema::TypeRef* ct,
+                                          llvm::Value* scrut,
+                                          const sema::TypeRef* scrutTy);
 
     // §31.4 (v0.162/v0.163) built-in exception object layout. A directly-
     // constructed built-in exception (rt->declaration == null) is a single

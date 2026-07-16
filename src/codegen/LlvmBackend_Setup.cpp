@@ -2668,6 +2668,216 @@ llvm::Value* Emitter::constValueForPatternName(
 }
 
 
+// §19.3 (v0.182, #1852): lower a type-test pattern whose type is a bare type
+// parameter T, resolved to the concrete substituted type `ct` at THIS
+// monomorphized instantiation. `case x of T` and `var x: T` share one §19.3
+// rule — "test against the substituted type argument, per instantiation" — so
+// both route here after resolving T. The emission mirrors the concrete-type
+// handlers in patternMatches: a class/interface → runtime is-a against the
+// PER-MONOMORPHIZATION descriptor (#1843 perInstDescriptorForTarget, so
+// `T=Wrap<int>` does not match a `Wrap<string>` scrutinee — the shared erased
+// descriptor would over-match); a built-in exception → the btd$ descriptor is-a
+// (like #1854); a value-builtin (DateTime/Guid/… — no reference descriptor) → a
+// well-formed never-match; a record/enum → static decidability; a primitive
+// incl. string → the boxed / same-primitive test. Returns null ONLY for a kind
+// it cannot lower; the caller then emits a TERMINATED never-match (never a
+// return-nullptr, which would leave `case.end` unterminated → malformed IR).
+llvm::Value* Emitter::emitTypeParamPatternTest(const sema::TypeRef* ct,
+                                               llvm::Value* scrut,
+                                               const sema::TypeRef* scrutTy) {
+    if (!ct) return nullptr;
+
+    // Is `scrut` a heap object that carries a vtable/descriptor emitIsA can
+    // walk? A runtime is-a only makes sense on a class/interface/Object/built-in-
+    // exception scrutinee; against a value primitive or an unboxed value type the
+    // test can never match (return false, do not fault emitIsA on a non-object).
+    auto scrutObjectLike = [&]() -> bool {
+        return !scrutTy ||
+            (scrutTy->kind == sema::TypeRef::Kind::Named && scrutTy->declaration &&
+             (scrutTy->declaration->kind == ast::TypeDeclKind::Class ||
+              scrutTy->declaration->kind == ast::TypeDeclKind::Interface)) ||
+            (scrutTy->kind == sema::TypeRef::Kind::Primitive &&
+             scrutTy->primitive == sema::PrimitiveType::Object) ||
+            isBuiltinExceptionTypeRef(scrutTy);
+    };
+    // Could the scrutinee's runtime value be a bare bz_string* (a vtable-less
+    // string in an Object or interface)? A string has no leading descriptor word,
+    // so emitIsA would fault walking it — guard on it. Mirrors lowerTypeTest's
+    // `mightHoldString` (Object or interface static type).
+    auto scrutMayBeString = [&]() -> bool {
+        if (!scrutTy) return true;
+        if (scrutTy->kind == sema::TypeRef::Kind::Primitive &&
+            scrutTy->primitive == sema::PrimitiveType::Object)
+            return true;
+        if (scrutTy->kind == sema::TypeRef::Kind::Named && scrutTy->declaration &&
+            scrutTy->declaration->kind == ast::TypeDeclKind::Interface)
+            return true;
+        return false;
+    };
+    // Emit the runtime is-a against `desc`, short-circuiting a runtime string to
+    // false when the scrutinee could hold one (emitIsA would fault walking a
+    // vtable-less bz_string*). Mirrors lowerTypeTest's / patternMatches' guard.
+    auto guardedIsA = [&](llvm::GlobalVariable* desc) -> llvm::Value* {
+        if (!scrutMayBeString()) return emitIsA(scrut, desc);
+        llvm::BasicBlock* preBB = builder_.GetInsertBlock();
+        auto* isStrFn = declareC("bz_obj_is_string", i32(), {ptrTy(), ptrTy()});
+        llvm::Value* isStr = builder_.CreateICmpNE(
+            builder_.CreateCall(isStrFn, {scrut, vtableTablePtr()}),
+            builder_.getInt32(0));
+        auto* doIsaBB = llvm::BasicBlock::Create(llvm_, "tp.isa", currentFn_);
+        auto* joinBB = llvm::BasicBlock::Create(llvm_, "tp.isa.join", currentFn_);
+        builder_.CreateCondBr(isStr, joinBB, doIsaBB);
+        builder_.SetInsertPoint(doIsaBB);
+        llvm::Value* isa = emitIsA(scrut, desc);
+        llvm::BasicBlock* isaEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(joinBB);
+        builder_.SetInsertPoint(joinBB);
+        auto* phi = builder_.CreatePHI(i1(), 2);
+        phi->addIncoming(builder_.getInt1(false), preBB);
+        phi->addIncoming(isa, isaEnd);
+        return phi;
+    };
+
+    // A VALUE-BUILTIN substitution (DateTime/TimeSpan/Guid/… — isValueBuiltin, or
+    // declaration=null with a value-builtin name). Its declaration kind is Class
+    // but it carries NO reference descriptor (descriptorForPatternName /
+    // boxDescriptorFor both miss it), exactly as the CONCRETE `case o of DateTime`
+    // form does; §19.3 makes the type-param form behave identically to that
+    // concrete form. Emit a well-formed never-match (the honest, IR-valid result:
+    // a value-builtin boxed into Object is not yet a walkable box either — a
+    // separate lowering gap, filed as #1945). Checked BEFORE the class/interface
+    // branch so it does not enter emitIsA with a descArray_ miss — the #1852
+    // blocker-1 malformed-IR crash. (If a box descriptor ever exists, is-a it.)
+    bool isValueBuiltin =
+        (ct->declaration && ct->declaration->isValueBuiltin) ||
+        (ct->kind == sema::TypeRef::Kind::Named && !ct->declaration &&
+         sema::isValueBuiltinByName(ct->headName()));
+    if (isValueBuiltin) {
+        if (scrut->getType()->isPointerTy() && scrutObjectLike())
+            if (llvm::GlobalVariable* desc = boxDescriptorFor(ct))
+                return guardedIsA(desc);
+        return builder_.getInt1(false);
+    }
+
+    // A class or interface substitution: runtime is-a. #1843: for a CONSTRUCTED
+    // generic target (`T=Box<int>`) resolve the per-monomorphization descriptor
+    // so it does not match a sibling instantiation (`Box<string>`); a non-generic
+    // or erased target keeps its shared descArray_ descriptor.
+    if (ct->kind == sema::TypeRef::Kind::Named && ct->declaration &&
+        (ct->declaration->kind == ast::TypeDeclKind::Class ||
+         ct->declaration->kind == ast::TypeDeclKind::Interface)) {
+        if (!scrut->getType()->isPointerTy() || !scrutObjectLike())
+            return builder_.getInt1(false);
+        llvm::GlobalVariable* desc = perInstDescriptorForTarget(ct);
+        if (!desc) {
+            auto it = descArray_.find(ct->declaration);
+            if (it == descArray_.end()) return nullptr;
+            desc = it->second;
+        }
+        return guardedIsA(desc);
+    }
+
+    // A built-in exception substitution (`Box<IOException>`): no user TypeSymbol
+    // (ct->declaration null) but a heap object whose vtable[0] is the btd$<name>
+    // descriptor emitIsA walks (#1854). §19.3: "the same rule as catch arms".
+    // The is-a is correct for the descriptor handed to it; note that two distinct
+    // built-in-exception type ARGUMENTS to one generic currently collapse to a
+    // single monomorphization (#1944), so per-instantiation distinctness for
+    // built-in-exception args is limited at the monomorphization layer, not here.
+    if (isBuiltinExceptionTypeRef(ct) && ct->astNode && ct->astNode->name &&
+        !ct->astNode->name->parts.empty()) {
+        auto bit =
+            builtinDesc_.find(std::string(ct->astNode->name->parts.back()));
+        if (bit != builtinDesc_.end()) {
+            if (!scrut->getType()->isPointerTy() || !scrutObjectLike())
+                return builder_.getInt1(false);
+            return guardedIsA(bit->second);
+        }
+    }
+
+    // A record or enum substitution: a sealed value type with no subtyping, so
+    // the test is statically decidable (mirrors the NamedPattern record/enum
+    // branch). A boxed record/enum inside an Object (a pointer scrutinee) is not
+    // matched by a bare value-type name here — the concrete form returns false
+    // for a pointer scrutinee too.
+    if (ct->kind == sema::TypeRef::Kind::Named && ct->declaration &&
+        (ct->declaration->kind == ast::TypeDeclKind::Record ||
+         ct->declaration->kind == ast::TypeDeclKind::Enum)) {
+        if (scrut->getType()->isPointerTy())
+            return builder_.getInt1(false);
+        const sema::TypeRef* rScrutTy = resolveTypeParamRef(scrutTy);
+        bool sameType = rScrutTy && rScrutTy->declaration == ct->declaration;
+        return builder_.getInt1(sameType);
+    }
+
+    // A primitive substitution.
+    if (ct->kind == sema::TypeRef::Kind::Primitive) {
+        const sema::TypeRef* rScrutTy = resolveTypeParamRef(scrutTy);
+        bool scrutSamePrim = rScrutTy &&
+                             rScrutTy->kind == sema::TypeRef::Kind::Primitive &&
+                             rScrutTy->primitive == ct->primitive &&
+                             !rScrutTy->nullable;
+
+        // T = Object: matches any non-null reference (§19.5 — a type pattern
+        // never matches null). A non-pointer scrutinee cannot be an Object.
+        if (ct->primitive == sema::PrimitiveType::Object) {
+            if (scrut->getType()->isPointerTy())
+                return builder_.CreateICmpNE(
+                    scrut, llvm::ConstantPointerNull::get(ptrTy()),
+                    "tp.obj.nonnull");
+            return builder_.getInt1(false);
+        }
+
+        // T = string against a pointer scrutinee (a `string`/`string?` or a
+        // boxed Object): match a non-null string value (mirrors the `var n:
+        // string` branch in patternMatches).
+        if (ct->primitive == sema::PrimitiveType::String &&
+            scrut->getType()->isPointerTy()) {
+            llvm::Value* nonNull = builder_.CreateICmpNE(
+                scrut, llvm::ConstantPointerNull::get(ptrTy()),
+                "tp.str.nonnull");
+            // A statically `string`/`string?` scrutinee: non-null suffices.
+            if (rScrutTy && rScrutTy->kind == sema::TypeRef::Kind::Primitive &&
+                rScrutTy->primitive == sema::PrimitiveType::String)
+                return nonNull;
+            // An Object/interface scrutinee: a runtime is-string test, guarded so
+            // bz_obj_is_string is never called on null.
+            llvm::BasicBlock* preBB = builder_.GetInsertBlock();
+            auto* isStrFn = declareC("bz_obj_is_string", i32(), {ptrTy(), ptrTy()});
+            auto* chkBB = llvm::BasicBlock::Create(llvm_, "tp.str.chk", currentFn_);
+            auto* joinBB =
+                llvm::BasicBlock::Create(llvm_, "tp.str.join", currentFn_);
+            builder_.CreateCondBr(nonNull, chkBB, joinBB);
+            builder_.SetInsertPoint(chkBB);
+            llvm::Value* isStr = builder_.CreateICmpNE(
+                builder_.CreateCall(isStrFn, {scrut, vtableTablePtr()}),
+                builder_.getInt32(0));
+            llvm::BasicBlock* chkEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(joinBB);
+            builder_.SetInsertPoint(joinBB);
+            auto* phi = builder_.CreatePHI(i1(), 2);
+            phi->addIncoming(builder_.getInt1(false), preBB);
+            phi->addIncoming(isStr, chkEnd);
+            return phi;
+        }
+
+        // T = a value primitive (int, bool, …) boxed in an Object (a pointer
+        // scrutinee): a runtime is-a against the boxed primitive's descriptor,
+        // short-circuiting a string. Mirrors the boxed-primitive branch in
+        // patternMatches.
+        if (!scrutSamePrim && scrut->getType()->isPointerTy())
+            if (llvm::GlobalVariable* desc = boxDescriptorFor(ct))
+                return guardedIsA(desc);
+
+        // A non-pointer scrutinee already the same primitive: static match; a
+        // differing value primitive can never match.
+        return builder_.getInt1(scrutSamePrim);
+    }
+
+    return nullptr;  // not a lowerable type-test kind — caller falls back
+}
+
+
 void Emitter::emitThrowBuiltin(const char* name) {
     auto vit = builtinVtable_.find(name);
     if (vit == builtinVtable_.end()) return;
@@ -3572,13 +3782,25 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // return-type mismatch in the (dead) template — see emittingGenericTemplateBody_.
     {
         bool genericTemplate = false;
+        // §19.3 (v0.182, #1852): collect the generic parameter names in scope so
+        // a type-parameter pattern in the (dead) template body is recognizable
+        // even with no active substitution (genericSubstSemaTy_ empty there).
+        templateGenericParamNames_.clear();
         if (ms->parent && ms->parent->decl) {
             if (auto* ptd = dynamic_cast<const ast::TypeDecl*>(ms->parent->decl))
-                if (!ptd->genericParams.empty()) genericTemplate = true;
+                if (!ptd->genericParams.empty()) {
+                    genericTemplate = true;
+                    for (const auto& gp : ptd->genericParams)
+                        templateGenericParamNames_.insert(gp.name);
+                }
         }
-        if (!genericTemplate && ms->decl) {
+        if (ms->decl) {
             if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
-                if (!md->genericParams.empty()) genericTemplate = true;
+                if (!md->genericParams.empty()) {
+                    genericTemplate = true;
+                    for (const auto& gp : md->genericParams)
+                        templateGenericParamNames_.insert(gp.name);
+                }
         }
         emittingGenericTemplateBody_ = genericTemplate;
     }

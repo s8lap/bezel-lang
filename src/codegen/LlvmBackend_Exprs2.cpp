@@ -5814,21 +5814,55 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 }
             }
         }
+        // §19.3 (v0.182, #1852): a bare TYPE-PARAMETER pattern `case x of T`. In
+        // a monomorphized generic body a single-part name that resolves to none
+        // of the handlers above may be a type parameter of the enclosing generic;
+        // it tests the scrutinee against the SUBSTITUTED type argument, per
+        // instantiation (the same §19.3 rule as `var x: T` and catch arms). The
+        // active `genericSubstSemaTy_` maps the parameter name to the concrete
+        // type for THIS instantiation; resolve it and emit the concrete type-test
+        // through the shared helper (routed through #1843's per-monomorphization
+        // descriptor for a constructed generic). Without this the name fell to the
+        // #1847 diagnostic below (a clean but wrong "unsupported" error; a
+        // malformed-IR ICE before #1847's guard landed).
+        if (np->name && np->name->parts.size() == 1) {
+            std::string_view pn = np->name->parts.back();
+            auto sit = genericSubstSemaTy_.find(pn);
+            if (sit != genericSubstSemaTy_.end() && sit->second) {
+                // The substitution is already the concrete type. Emit the test;
+                // if the helper cannot lower it, emit a TERMINATED never-match —
+                // NEVER fall through to the #1847 diagnostic / return-nullptr,
+                // which would leave `case.end` unterminated (#1852 blocker 1).
+                if (llvm::Value* m =
+                        emitTypeParamPatternTest(sit->second, scrut, scrutTy))
+                    return m;
+                return builder_.getInt1(false);
+            }
+            if (emittingGenericTemplateBody_ &&
+                templateGenericParamNames_.count(pn)) {
+                // §19.3 (v0.182, #1852): the UNSPECIALIZED template body has no
+                // active substitution, so T is unresolvable here. The template is
+                // never called — every call binds a substitution and routes to a
+                // specialization (where the real test above is emitted) — but it
+                // must IR-verify. Emit a well-formed never-match so `case.end`
+                // stays terminated (and no spurious #1847 error is reported for
+                // the dead body).
+                return builder_.getInt1(false);
+            }
+        }
         // §19.3 (#1847): a top-level NamedPattern that resolved to none of the
         // handlers above — an enum constant, a named `const`, a class/interface
-        // type descriptor, or a record/enum type name. Sema now rejects the
-        // reported ill-formed forms (a bare identifier naming a runtime VALUE or
-        // an unresolved name — checkTopLevelNamedPattern, ExprTypecheck.cpp), so
-        // the only patterns still reaching here are VALID-per-spec forms the
-        // backend does not yet lower: a `const` LOCAL used as a pattern
-        // (constValueForPatternName searches only const MEMBERS) and a bare
-        // type-parameter pattern (`case x of T`, §19.3 v0.182 — needs the
-        // substituted type argument). Returning nullptr here left `case.end`
-        // unterminated in expression position (a malformed-IR ICE) and silently
-        // truncated the arm chain in statement position (the mandatory `_`
-        // skipped — a silent miscompile). Fail LOUDLY and consistently instead:
-        // emit a diagnostic and a never-match so the block stays terminated.
-        // (Proper lowering of these two forms is tracked separately.)
+        // type descriptor, a record/enum type name, or (above) a type parameter.
+        // Sema now rejects the reported ill-formed forms (a bare identifier naming
+        // a runtime VALUE or an unresolved name — checkTopLevelNamedPattern,
+        // ExprTypecheck.cpp), so the only pattern still reaching here is a valid-
+        // per-spec form the backend does not yet lower: a `const` LOCAL used as a
+        // pattern (constValueForPatternName searches only const MEMBERS).
+        // Returning nullptr here left `case.end` unterminated in expression
+        // position (a malformed-IR ICE) and silently truncated the arm chain in
+        // statement position (the mandatory `_` skipped — a silent miscompile).
+        // Fail LOUDLY and consistently instead: emit a diagnostic and a
+        // never-match so the block stays terminated.
         if (np->name && !np->name->parts.empty())
             ctx_.diagnostics().report(
                 Severity::Error, np->span.begin,
@@ -6018,6 +6052,41 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             // §19.3/§19.5: `var x: T` is a type-test + binding — it matches
             // if the scrutinee is-a T and (§19.5) is non-null.
             if (auto* rt = ctx_.resolvedType(*bp->type)) {
+                // §19.3 (v0.182, #1852): when the annotation is a bare TYPE
+                // PARAMETER (a single-part Named ref with no user declaration),
+                // resolve it through the active monomorphization substitution and
+                // test against the concrete type argument — the same §19.3 rule as
+                // the bare `case x of T` form (routed through the shared helper,
+                // #1843's per-monomorphization descriptor for a constructed
+                // generic). Without this the placeholder ref (null declaration,
+                // non-primitive, so none of the concrete branches below matched)
+                // fell to the `return nullptr` at the end → an unterminated
+                // `case.end` (a malformed-IR ICE). This runs FIRST so a resolvable
+                // T never reaches the concrete branches with the wrong (erased)
+                // pattern name.
+                if (rt->kind == sema::TypeRef::Kind::Named && !rt->declaration) {
+                    const sema::TypeRef* ct = resolveTypeParamRef(rt);
+                    if (ct && ct != rt) {
+                        if (llvm::Value* m =
+                                emitTypeParamPatternTest(ct, scrut, scrutTy))
+                            return m;
+                        // BELT-AND-SUSPENDERS (#1852 blocker 1): the param
+                        // resolved to a concrete type the helper cannot lower —
+                        // emit a TERMINATED never-match rather than fall through
+                        // to the `return nullptr` below (malformed IR). No
+                        // RESOLVED type-param target can ever produce malformed IR.
+                        return builder_.getInt1(false);
+                    } else if (emittingGenericTemplateBody_ && rt->astNode &&
+                               rt->astNode->name &&
+                               rt->astNode->name->parts.size() == 1 &&
+                               templateGenericParamNames_.count(
+                                   rt->astNode->name->parts.back())) {
+                        // §19.3 (v0.182, #1852): unresolvable T in the dead
+                        // template body — never-match keeps it IR-valid (see the
+                        // bare `case x of T` sibling above).
+                        return builder_.getInt1(false);
+                    }
+                }
                 // #1854 / §19.3 + §31: a typed binding whose type is a BUILT-IN
                 // exception (`var x: IOException`) — the built-ins carry no user
                 // TypeSymbol so `rt->declaration` is null and the Named+declaration
