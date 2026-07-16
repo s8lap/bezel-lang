@@ -1190,11 +1190,19 @@ private:
     // erases to `ptr` in IR, so `Maker<A>.Run` and `Maker<B>.Run` would share a
     // key `[ptr]` and the second would reuse the first's body — wrong when the
     // body contains a concrete-class-specific disposer (`using var a := new
-    // T()`). The third element carries a stable per-type identity token (the
-    // sema TypeSymbol* for a Named type, a tagged primitive id otherwise) for
-    // each substituted type parameter, in the SAME deterministic order as the
-    // LLVM type vector, so distinct concrete type args get distinct entries and
+    // T()`). The third element carries a stable per-type identity KEY for each
+    // substituted type parameter, in the SAME deterministic order as the LLVM
+    // type vector, so distinct concrete type args get distinct entries and
     // genuinely-identical instantiations still share one.
+    // fix #1947: the key is the RECURSIVE structural encoding (typeRefIdentityKey
+    // → appendDescKey), NOT the old per-declaration identity token. A single
+    // declaration pointer collapsed a self-nested instantiation onto one entry —
+    // `Foo<int>` and `Foo<Foo<int>>` (top decl `Foo` for both) shared a key AND
+    // the erased `ptr` LLVM type, so the second reused the first's specialized
+    // body (first-seen-wins mis-dispatch: an `is Foo<T>` in the body baked the
+    // FIRST T's descriptor). The recursive key encodes every nested type
+    // argument, so nested instantiations that share a top-level declaration get
+    // DISTINCT specialized bodies (§14.2 monomorphization, §12.9 invariance).
     // fix #1894 #1895: the fourth element is the concrete LLVM PARAMETER type
     // vector. Two call sites can share the same type-argument substitution yet
     // pass arguments at DIFFERENT LLVM widths — e.g. `Make<long,long>(100,200)`
@@ -1208,7 +1216,7 @@ private:
     // widths), so both call sites get a correctly-typed callee.
     std::map<std::tuple<const sema::MethodSymbol*,
                         std::vector<llvm::Type*>,
-                        std::vector<const void*>,
+                        std::vector<std::string>,  // fix #1947: recursive id keys
                         std::vector<llvm::Type*>>,
              llvm::Function*>
         specializedMethods_;
@@ -4237,6 +4245,14 @@ private:
     // uniquifies). Both recurse through the argument list.
     std::string descIdentityKey(const sema::TypeSymbol* ts,
                                 const std::vector<const sema::TypeRef*>& args);
+    // #1947: the structural, RECURSIVE identity key of a single (concrete)
+    // constructed type — the per-argument counterpart of descIdentityKey. Encodes
+    // the top-level declaration AND every nested type argument, so a self-nested
+    // instantiation (`Wrap<int>` vs `Wrap<Wrap<int>>`) yields DISTINCT keys. Used
+    // by buildSpecializedMethodFn's monomorphization cache, where the old
+    // per-declaration `typeRefIdentityToken` collapsed them onto one specialized
+    // body (first-seen-wins mis-dispatch). Delegates to appendDescKey.
+    std::string typeRefIdentityKey(const sema::TypeRef* t);
     std::string descReadableMangle(const sema::TypeRef* t);
     // #1843: are all of `args` concrete (fully-resolved) types — i.e. carry a
     // real identity token, not an unbound generic parameter placeholder?

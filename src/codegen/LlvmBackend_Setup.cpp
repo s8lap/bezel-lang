@@ -3440,6 +3440,17 @@ std::string Emitter::descIdentityKey(
     return key;
 }
 
+// #1947: recursive structural key of one constructed type argument. Mirrors the
+// per-argument encoding descIdentityKey applies to a type's arg list, so it
+// distinguishes a self-nested instantiation (Wrap<int> vs Wrap<Wrap<int>>) —
+// exactly the discrimination the runtime `is`/`as` descriptor honors and the
+// monomorphization cache must too.
+std::string Emitter::typeRefIdentityKey(const sema::TypeRef* t) {
+    std::string key;
+    appendDescKey(t, key);
+    return key;
+}
+
 bool Emitter::descArgsConcrete(const std::vector<const sema::TypeRef*>& args) {
     for (const sema::TypeRef* a : args) {
         // A concrete arg carries a real identity token (a TypeSymbol* or a

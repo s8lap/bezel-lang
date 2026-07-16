@@ -6203,18 +6203,29 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // erases to `ptr`, so `Maker<A>.Run` and `Maker<B>.Run` would collide on
     // `[ptr]` and the second would reuse the first's body (wrong when the body
     // disposes a concrete class via `using var a := new T()`). Pair each LLVM
-    // type with a stable per-type identity token from the parallel
-    // genericSubstSemaTy_ (TypeSymbol* for a Named type, tagged primitive id
-    // otherwise), iterated in lockstep so the two vectors stay order-aligned.
+    // type with a per-type identity KEY from the parallel genericSubstSemaTy_,
+    // iterated in lockstep so the two vectors stay order-aligned.
+    //
+    // fix #1947: the identity key must be the RECURSIVE structural encoding
+    // (typeRefIdentityKey), not a per-declaration token. The old
+    // `typeRefIdentityToken` returned just the top-level declaration pointer, so
+    // a SELF-NESTED instantiation collapsed onto one entry: `Foo<int>` and
+    // `Foo<Foo<int>>` both keyed on `Foo` AND both erase to `ptr`, so the second
+    // reused the first's specialized body — and an `is Foo<T>` / `case o of T`
+    // test inside baked the FIRST T's per-monomorphization descriptor, silently
+    // mis-dispatching (over-match / wrong body, order-dependent). The recursive
+    // key encodes every nested type argument, exactly as the runtime descriptor
+    // identity (§12.9 invariance) does, so distinct nested instantiations that
+    // share a top-level declaration get DISTINCT bodies.
     std::vector<llvm::Type*> substKey;
-    std::vector<const void*> idKey;
+    std::vector<std::string> idKey;
     for (auto& [name, ty] : genericSubst_) {
         substKey.push_back(ty);
         auto sit = genericSubstSemaTy_.find(name);
         idKey.push_back(
             sit != genericSubstSemaTy_.end()
-                ? typeRefIdentityToken(sit->second)
-                : nullptr);
+                ? typeRefIdentityKey(sit->second)
+                : std::string());
     }
 
     // fix #1894 #1895: include the concrete LLVM parameter-type vector in the
