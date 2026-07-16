@@ -400,6 +400,106 @@ BEZEL_TEST(async_own_patternA, task_family_generic_guard_bare_T_not_minted) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// v0.190 SB-01 FUNCTION-VALUE arm (§28.3 "Task-family calls produce owned
+// frames" — "an invocation through a function value"; #1865, the SB01-A
+// residual). A call through a function VALUE whose DECLARED return slot is a
+// plain `Task`-family type mints an OWNED task at the call site, exactly like an
+// instance/interface/static Task-returning call. Pinned through the §28.3
+// deferred-activation escaping-arg reject: an unbound owned task temporary
+// passed as a plain argument to a Task-family callee that binds it (`Chain`) may
+// not escape the full expression. BEFORE the fix, the function-value call was
+// classified Borrowed — no MethodSymbol reaches the SB01-A `calleeMethodDecl`
+// mint, and the name-head fallback carries `OwningTask` but not the plain `Task`
+// head — so `mk()` was not an unbound owned temp, the reject never fired, and
+// the fresh frame leaked silently. WITH the fix it is Owned → the reject fires.
+// FAILS-without / PASSES-with. // per §28.3 (v0.190), #1865
+BEZEL_TEST(async_own_patternA, funcval_task_call_minted_owned_reject_escaping_arg) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public static async method Chain(t: Task): Task<int> "
+        "    await Task.Delay(1); return 0; end Chain; "
+        "  public static async method MakeTask(): Task "
+        "    await Task.Delay(1); end MakeTask; "
+        "  public static async method Main(): Task<int> "
+        "    var mk: () -> Task := MakeTask; "
+        "    using var w := Chain(mk()); "
+        "    return await w; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// v0.190 SB-01 FUNCTION-VALUE arm — OVER-REJECTION GUARD (#1865). The minted
+// owned task from a function-value call is a proper owned value the caller can
+// discharge normally: bind it in its own `using var src` first (naming the
+// source, exactly as the deferred-activation diagnostic instructs), then pass
+// the borrow `src` to `Chain`. No escaping unbound temporary, so the call is
+// accepted — the mint must not turn a properly-discharged task into a spurious
+// reject. Clean. // per §28.3 (v0.190), #1865
+BEZEL_TEST(async_own_patternA, funcval_task_call_bind_first_clean) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public static async method Chain(t: Task): Task<int> "
+        "    await Task.Delay(1); return 0; end Chain; "
+        "  public static async method MakeTask(): Task "
+        "    await Task.Delay(1); end MakeTask; "
+        "  public static async method Main(): Task<int> "
+        "    var mk: () -> Task := MakeTask; "
+        "    using var src := mk(); "
+        "    using var w := Chain(src); "
+        "    return await w; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// v0.190 SB-01 FUNCTION-VALUE arm — CONTROL (#1865). An `OwningTask<T>` function-
+// value call was ALREADY minted owned pre-#1865 (its head is in the producers
+// name-head fallback), so it ALREADY rejected the escaping-arg shape. This pins
+// that the bare-`Task` fix brings the plain-`Task` head to parity with its
+// `OwningTask` sibling, and that the control's behavior is unchanged. Rejected.
+// // per §28.3 (v0.190), #1865
+BEZEL_TEST(async_own_patternA, funcval_owningtask_call_reject_escaping_arg_control) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public static async method Chain(t: Task): Task<int> "
+        "    await Task.Delay(1); return 0; end Chain; "
+        "  public static method MakeOT(): OwningTask<int> "
+        "    return Task.FromResult(0); end MakeOT; "
+        "  public static async method Main(): Task<int> "
+        "    var mk: () -> OwningTask<int> := MakeOT; "
+        "    using var w := Chain(mk()); "
+        "    return await w; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// v0.190 SB-01 FUNCTION-VALUE arm — DECLINED RESIDUAL boundary (§28.3 v0.194
+// recorded decline; #1865). A function value invoked through a BARE-TYPE-
+// PARAMETER slot — `Wrap<T>(f: () -> T): T`, later instantiable at `T =
+// Task<int>` — is NOT minted by the function-value arm: the mint keys PRE-
+// SUBSTITUTION off the callee's declared function-return slot, which inside
+// `Wrap`'s generic body has head `T`, not `Task`, so `f()` stays the bare-type-
+// parameter borrow of its function-value source (#1794/#1801), admissibly
+// returned through the non-`owned` `T` return. Were `f()` wrongly minted owned,
+// `return f();` would be REJECTED (a fresh owned value may not escape through a
+// non-`owned` bare-T return). Clean => not minted — the spec's recorded v0.194
+// decline holds ("pre-substitution keying cannot see through the slot"; a leak,
+// not a double-dispose). Pins that the fix does not over-reach past the
+// declared-`Task`-slot case. // per §28.3 (v0.194 residual note), #1794, #1865
+BEZEL_TEST(async_own_patternA, funcval_bare_type_param_slot_not_minted) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public static method Wrap<T>(f: () -> T): T return f(); end Wrap; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // ---------------------------------------------------------------------------
 // (2b) Pattern B await-site (§30.5 Consumer-side; Appendix C.6).
 // ---------------------------------------------------------------------------

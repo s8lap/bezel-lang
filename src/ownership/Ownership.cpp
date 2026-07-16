@@ -2869,9 +2869,39 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
         // does not set funcReturnOwned, so its result is not owned here.)
         if (ce->callee) {
             if (const sema::TypeRef* calleeTy = ctx_.exprType(*ce->callee)) {
-                if (calleeTy->kind == sema::TypeRef::Kind::Function &&
-                    calleeTy->funcReturnOwned)
-                    return OwnershipState::Owned;
+                if (calleeTy->kind == sema::TypeRef::Kind::Function) {
+                    if (calleeTy->funcReturnOwned)
+                        return OwnershipState::Owned;
+                    // SB01-A residual (§28.3 "Task-family calls produce owned
+                    // frames", v0.190, SB-01, #1865): the FUNCTION-VALUE arm of
+                    // caller-side minting. A call THROUGH a function VALUE whose
+                    // DECLARED return slot is a `Task`-family type (`Task`/
+                    // `Task<T>`/`OwningTask<T>`) mints an OWNED task frame at the
+                    // call site — the spec's "an invocation through a function
+                    // value" clause, on equal footing with the instance / static /
+                    // interface Task-returning calls that reach the SB01-A block
+                    // above through `calleeMethodDecl`. A function value has NO
+                    // MethodSymbol, so that block never fires, and the name-head
+                    // fallback below carries `OwningTask` but NOT the plain `Task`
+                    // head — so a plain-`Task` function-value call was classified
+                    // Borrowed, silently leaking the fresh frame (#1865). Keyed
+                    // PRE-SUBSTITUTION off the callee's DECLARED function-type
+                    // return slot (`funcReturn`), NEVER the resolved result type,
+                    // so the recorded v0.194 decline holds: a function value
+                    // invoked through a BARE-TYPE-PARAMETER slot (`Wrap<T>(f: () ->
+                    // T): T` at `T = Task<int>`) has declared slot head `T`, not
+                    // `Task`, and is NOT minted here — pre-substitution keying
+                    // "cannot see through the slot" (§28.3 v0.194 residual note).
+                    // Only a CALL mints; a READ of a task from function-typed
+                    // STORAGE is not a CallExpr and stays a borrow. // per §28.3
+                    // (v0.190)
+                    if (calleeTy->funcReturn &&
+                        calleeTy->funcReturn->kind ==
+                            sema::TypeRef::Kind::Named &&
+                        common::isTaskFamilyHead(
+                            calleeTy->funcReturn->headName()))
+                        return OwnershipState::Owned;
+                }
             }
         }
         // Slice O13 / §28.13 / §30.14 (#693): builtin owned-returning calls.

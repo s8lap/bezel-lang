@@ -1996,6 +1996,31 @@ BEZEL_TEST(async_30_5_445, v0190_minted_plain_var_task_disposed_exactly_once) {
         42);
 }
 
+// v0.190 SB-01 FUNCTION-VALUE arm (§28.3 "Task-family calls produce owned
+// frames" — "an invocation through a function value"; #1865). A call through a
+// function VALUE whose declared return slot is a plain `Task<T>` type MINTS an
+// OWNED task at the call site (the SB01-A residual this fix closes). Awaited as a
+// borrow (§30.5), the plain-var task auto-drops at scope end. This pins that the
+// function-value mint reaches the SAME single codegen task disposal (#445 `d.task`)
+// as an instance/static Task call — the frame is freed EXACTLY ONCE (LSan/ASan:
+// no leak, no double-free), the Owned+autoDrop flag disposal-inert here. The
+// classification is the ONLY change; the codegen disposal path is untouched
+// (SB01-D1). Result 42. // per §28.3, §30.5 (v0.190 SB-01), #1865
+BEZEL_TEST(async_30_5_445, v0190_minted_funcval_task_disposed_exactly_once) {
+    expectValueLeakFree(
+        "module M; class C "
+        "  public static async method Producer(): Task<int> "
+        "    return 42; "
+        "  end Producer; "
+        "  public static async method Main(): Task<int> "
+        "    var mk: () -> Task<int> := Producer; "
+        "    var t := mk(); "
+        "    var x := await t; "
+        "    return x; "
+        "  end Main; end C;",
+        42);
+}
+
 // ===========================================================================
 // §30.2 / §14.1 (#444 / #509): `await` requires a Task / Task<T> / OwningTask<T>
 // operand.  Before #509, `Task.FromResult<int>(42)` was misparsed (§A.7 had no
