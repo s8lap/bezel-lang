@@ -7047,7 +7047,26 @@ void ExprTC::checkArgsAgainstParams(const std::vector<ast::Param>& params,
         if (ai < 0) continue;  // defaulted parameter — default-value typing
                                // is checked at the declaration, not here.
         const ast::CallArgument& a = args[static_cast<std::size_t>(ai)];
-        if (!a.value || !a.modifier.empty() || a.isDiscard) continue;
+        if (!a.value || a.isDiscard) continue;
+        // per §5.1 / §22.3 (#1974): a modified argument that still passes a
+        // VALUE — an `owned` ownership-transfer argument (§22.3/§28.3) or a
+        // `scoped` borrow argument (§22.3/§28.14) — must run the SAME §5.1
+        // implicit-conversion (interface-conformance) check a plain (bare)
+        // argument runs: transferring/borrowing a source into an interface-
+        // typed parameter requires the source's concrete type to IMPLEMENT
+        // that interface. This was skipped for EVERY modified argument, so an
+        // `owned`/`scoped` transfer of a non-implementing class to an interface
+        // parameter compiled clean and then dispatched through a null vtable →
+        // runtime SEGV; the bare-argument counterpart was already correctly
+        // rejected here. The by-reference family (`ref`, `out`, `out var`,
+        // `out using var`, `out owned var`) binds by reference / declares an
+        // inline out-local and is type-matched by its own (exact-type /
+        // declaration) rules elsewhere — continue to skip those here.
+        const std::string_view am = a.modifier;
+        const bool refOutFamily =
+            am == "ref" || am == "out" || am == "out var" ||
+            am == "out using var" || am == "out owned var";
+        if (refOutFamily) continue;
         const ast::Param& p = params[j];
         if (!p.type) continue;
         TypeRef* paramTy = ctx_.resolvedType(*p.type);
