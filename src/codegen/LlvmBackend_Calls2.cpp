@@ -5497,50 +5497,25 @@ void Emitter::applyMethodGenericSubst(const ast::CallExpr& call,
         genericSubst_;
     std::unordered_map<std::string_view, const sema::TypeRef*> newSema =
         genericSubstSemaTy_;
-    // §14.1 (#785): bind each method type parameter by STRUCTURALLY
-    // unifying every value parameter's declared type against the call
-    // argument's type — so a generic-typed parameter `p: Pair<A, B>`
-    // binds A and B from a `Pair<int, string>` argument, not only a
-    // top-level bare `p: T`. Reuses the same recursive unification the
-    // return-type inference uses (unifyMethodReturnTypeArg); the helper
-    // skips any param already bound (genericSubst_ from the receiver, or
-    // an earlier parameter).
-    for (std::size_t pi = 0; pi < md->params.size() &&
-         pi < call.args.size(); ++pi) {
-        if (!md->params[pi].type || !call.args[pi].value) continue;
-        // §14.1 / #885 #886: a `null` literal carries no concrete type
-        // information — it is typed by sema as Object (the root reference
-        // type) or as the declared param type T?, neither of which reveals
-        // T's concrete binding. Binding T → Object here blocks the correct
-        // binding from a subsequent concrete argument or explicit type arg,
-        // causing nullableTypeParamConcrete to fail → null not wrapped →
-        // PHI/ICmp type-mismatch crash in the specialized body. Skip null
-        // literals during type-param inference. per §14.1/§14.2, #885/#886.
-        if (dynamic_cast<const ast::NullLiteralExpr*>(
-                call.args[pi].value.get()))
-            continue;
-        const sema::TypeRef* declPt =
-            ctx_.resolvedType(*md->params[pi].type);
-        sema::TypeRef* at = ctx_.exprType(*call.args[pi].value);
-        if (!declPt || !at) continue;
-        bool added = false;
-        unifyMethodReturnTypeArg(declPt, at, md->genericParams,
-                                 newSubst, newSema, added);
-    }
-    // per §14.1 (issues #515/#516/#561): a generic method whose type
-    // param appears ONLY in lambda param/return positions (not in any
-    // non-lambda param's declared type) leaves the param unbound by
-    // the arg-inference loop above. When the call site supplies
-    // explicit type arguments (`Transform<int>`), use them to bind
-    // any still-unbound method generic params before the body is
-    // emitted. This complements the pre-pass (which seeds the binding
-    // for lowerLambda) and ensures the MAIN substitution (which drives
-    // emitInlineGenericMethod / emitGenericSpecialization) also has
-    // the correct binding, so that body-level dispatch (v.ToString()
-    // on a U-typed receiver) resolves via genericSubstSemaTy_.
-    // The callee may be a MemberAccessExpr (`obj.Method<T>(...)`), a
+    // fix #1894 #1895 / §14.1: EXPLICIT call-site type arguments
+    // (`Make<long, long>(...)`) are AUTHORITATIVE and must be bound FIRST,
+    // before any argument-driven inference. An argument's own expression type
+    // is often NARROWER than the declared parameter type after an implicit
+    // conversion — e.g. the int literals `100`/`200` passed to `a: A, b: B`
+    // with `A = B = long` are typed `int` by sema, so inferring A/B from the
+    // arguments binds A/B → int (i32). Since unifyMethodReturnTypeArg SKIPS any
+    // already-bound param, binding the explicit `<long, long>` first makes it
+    // win: A/B → long (i64). Previously the explicit block ran AFTER inference
+    // with a `newSubst.count(pname) continue` guard, so the narrow int binding
+    // stuck and the generic method was monomorphized at the i32-placeholder
+    // layout — the returned record's field offsets/size then disagreed with the
+    // caller's concrete `Pair<long,long>` / `Triple<long,long,long>` layout (a
+    // silent wrong-value corruption; ASan stack-buffer-overflow on the return
+    // slot). The callee may be a MemberAccessExpr (`obj.Method<T>(...)`), a
     // NullCondMemberExpr (`obj?.Method<T>(...)` — §7.5/#1278), or a bare
-    // IdentifierExpr (`Id<T>(...)` — in-scope call without dot).
+    // IdentifierExpr (`Id<T>(...)` — in-scope call without dot). This also
+    // covers #515/#516/#561: a method type param appearing ONLY in lambda
+    // param/return positions is bound here from the explicit type args.
     {
     const std::vector<std::unique_ptr<ast::Type>>* callTAs = nullptr;
     if (auto* callMa = dynamic_cast<const ast::MemberAccessExpr*>(
@@ -5566,6 +5541,36 @@ void Emitter::applyMethodGenericSubst(const ast::CallExpr& call,
             newSema[pname] = concreteArg;
         }
     }
+    }
+    // §14.1 (#785): bind each STILL-UNBOUND method type parameter by
+    // STRUCTURALLY unifying every value parameter's declared type against the
+    // call argument's type — so a generic-typed parameter `p: Pair<A, B>`
+    // binds A and B from a `Pair<int, string>` argument, not only a
+    // top-level bare `p: T`. Reuses the same recursive unification the
+    // return-type inference uses (unifyMethodReturnTypeArg); the helper
+    // skips any param already bound (the explicit type args just bound above,
+    // genericSubst_ from the receiver, or an earlier parameter).
+    for (std::size_t pi = 0; pi < md->params.size() &&
+         pi < call.args.size(); ++pi) {
+        if (!md->params[pi].type || !call.args[pi].value) continue;
+        // §14.1 / #885 #886: a `null` literal carries no concrete type
+        // information — it is typed by sema as Object (the root reference
+        // type) or as the declared param type T?, neither of which reveals
+        // T's concrete binding. Binding T → Object here blocks the correct
+        // binding from a subsequent concrete argument or explicit type arg,
+        // causing nullableTypeParamConcrete to fail → null not wrapped →
+        // PHI/ICmp type-mismatch crash in the specialized body. Skip null
+        // literals during type-param inference. per §14.1/§14.2, #885/#886.
+        if (dynamic_cast<const ast::NullLiteralExpr*>(
+                call.args[pi].value.get()))
+            continue;
+        const sema::TypeRef* declPt =
+            ctx_.resolvedType(*md->params[pi].type);
+        sema::TypeRef* at = ctx_.exprType(*call.args[pi].value);
+        if (!declPt || !at) continue;
+        bool added = false;
+        unifyMethodReturnTypeArg(declPt, at, md->genericParams,
+                                 newSubst, newSema, added);
     }
     genericSubst_ = std::move(newSubst);
     genericSubstSemaTy_ = std::move(newSema);
@@ -6126,7 +6131,13 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
                 : nullptr);
     }
 
-    auto cacheKey = std::make_tuple(ms, substKey, idKey);
+    // fix #1894 #1895: include the concrete LLVM parameter-type vector in the
+    // key. Two call sites sharing the same substitution can still pass args at
+    // different widths (`Make<long,long>(100,200)` → i32 literals vs
+    // `Make<long,long>(x,y)` → i64), and the specialized signature is built from
+    // paramTys below — so a shared cache entry would call one signature with the
+    // other's args (IR-verify failure). Distinct paramTys → distinct spec fns.
+    auto cacheKey = std::make_tuple(ms, substKey, idKey, paramTys);
     auto cit = specializedMethods_.find(cacheKey);
     if (cit != specializedMethods_.end()) {
         // Already compiled — share one specialization across identical

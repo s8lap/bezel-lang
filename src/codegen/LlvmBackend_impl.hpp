@@ -1143,7 +1143,8 @@ private:
     std::map<const sema::TypeSymbol*,
              std::map<std::vector<llvm::Type*>, llvm::StructType*>>
         specializedStructs_;
-    // specializedMethods_[(ms, llvm_subst_key, sema_id_key)] = specialized
+    // specializedMethods_[(ms, llvm_subst_key, sema_id_key, param_tys)] =
+    // specialized
     // LLVM function. per §14.2 (generics are monomorphized): the cache key must
     // distinguish instantiations that produce DIFFERENT specialized bodies. The
     // LLVM type vector alone is insufficient because every class/interface type
@@ -1155,9 +1156,21 @@ private:
     // each substituted type parameter, in the SAME deterministic order as the
     // LLVM type vector, so distinct concrete type args get distinct entries and
     // genuinely-identical instantiations still share one.
+    // fix #1894 #1895: the fourth element is the concrete LLVM PARAMETER type
+    // vector. Two call sites can share the same type-argument substitution yet
+    // pass arguments at DIFFERENT LLVM widths — e.g. `Make<long,long>(100,200)`
+    // lowers the int literals as i32 while `Make<long,long>(x,y)` (x,y: long)
+    // passes i64. The specialized function's signature is built from these
+    // argument types (buildSpecializedMethodFn's paramTys), so without this
+    // element the second call reuses the first's `(i32,i32)` function and the
+    // `call` passes i64 args to i32 params — an IR-verification failure. Keying
+    // on the param types mints one specialization per distinct signature (each
+    // internally coerces its narrow params to the substituted field/return
+    // widths), so both call sites get a correctly-typed callee.
     std::map<std::tuple<const sema::MethodSymbol*,
                         std::vector<llvm::Type*>,
-                        std::vector<const void*>>,
+                        std::vector<const void*>,
+                        std::vector<llvm::Type*>>,
              llvm::Function*>
         specializedMethods_;
     // localGenericSubst_[decl] = concrete subst when local was created.
