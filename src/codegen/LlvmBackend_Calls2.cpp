@@ -5356,7 +5356,38 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // target-inferred result type. Factored into applyMethodGenericSubst so
     // lowerNullCondCall (`?.`) shares the exact same trigger.
     applyMethodGenericSubst(call, ms);
+    // #1864 / §27.5 / §29.2 / §28.9: an inline-closure PRODUCER (a lambda or
+    // method reference — isPlusOneClosureProducer) passed DIRECTLY as an
+    // argument to a SYNC ITERATOR method is a +1 TEMPORARY (the producer's
+    // reference). The iterator's state-machine frame RETAINS its OWN +1 on the
+    // closure cell at construction (emitIteratorMethod's capture-store retain)
+    // and drops it at the SOURCE Dispose, so it invokes the closure across every
+    // MoveNext independently of this temporary. The producer's transient
+    // reference must therefore be released once the call returns — otherwise the
+    // cell leaks (LSan: 40 bytes, #1864) after the frame that borrowed-and-
+    // retained it is torn down. This is the closure analogue of the #429 string
+    // ARGUMENT-PASS release below, scoped to sync-iterator callees — the only
+    // closure sink whose frame-capture retain this fix arms (an async iterator
+    // or a closure-returning method is left as-is; its capture/return is not
+    // retained here, so releasing would UAF). Snapshot the closure values BEFORE
+    // emitMethodCall (which may rewrite `args` for nullable widening) and release
+    // AFTER, on the normal path only (an exception path leaks the temporary — the
+    // safe direction, matching the string block's `!diverged_` guard).
+    std::vector<llvm::Value*> syncIterClosureArgs;
+    if (auto* mdIt = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        if (!isAsyncMethod(ms) &&
+                mdIt->bodyKind == ast::MethodBodyKind::Block &&
+                containsYield(mdIt->stmts)) {
+            std::size_t clOffset = isStaticMethod(ms) ? 0 : 1;
+            for (std::size_t ai = clOffset;
+                 ai < args.size() && ai < argExprs.size(); ++ai)
+                if (argExprs[ai] && isPlusOneClosureProducer(argExprs[ai]))
+                    syncIterClosureArgs.push_back(args[ai]);
+        }
+    }
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs);
+    if (!diverged_)
+        for (llvm::Value* cl : syncIterClosureArgs) emitClosureRelease(cl);
     // Record the concrete subst that drives the RESULT local's layout so that
     // lowerLocalDecl can associate it with the result's local variable.
     //

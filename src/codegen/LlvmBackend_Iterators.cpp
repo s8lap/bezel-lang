@@ -673,6 +673,29 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         builder_.CreateStore(builder_.getInt32(0), stateField);
         // Store each capture (this + params) into the frame.
         emitFrameCaptureStores(frame, st);
+        // #1864 / §27.5 / §28.9: a closure (function-typed) parameter captured
+        // into the iterator FRAME is a BORROW the frame must be able to invoke
+        // across every MoveNext, i.e. it must outlive the producing call. Give
+        // the frame its OWN +1 on the closure cell here (parallel to a closure
+        // FIELD-STORE retaining a borrow, lowerClosureFieldStore); the SOURCE
+        // Dispose (disposeOwned=true) drops it (releaseClosureCaptures below).
+        // The caller then releases its transient producer reference at the call
+        // site (the sync-iterator ARGUMENT-PASS release in lowerCall). Without
+        // this retain the cell would be freed while the frame still holds it (a
+        // UAF once the caller-side release lands); without both the cell simply
+        // leaked (LSan: 40 bytes). bz_closure_retain is null-safe.
+        for (std::size_t ci = 0; ci < frame.captures.size(); ++ci) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                frame.captures[ci].first);
+            if (!ps) continue;                       // 'this' capture — skip
+            sema::TypeRef* pt = paramTypeOf(ps);
+            if (!pt || pt->kind != sema::TypeRef::Kind::Function) continue;
+            unsigned fieldIdx = frame.captureStart + (unsigned)ci;
+            llvm::Value* fptr =
+                builder_.CreateStructGEP(frame.structTy, st, fieldIdx);
+            llvm::Value* cl = builder_.CreateLoad(ptrTy(), fptr, "iter.clcap");
+            emitClosureRetain(cl);
+        }
         // Return the state struct (as ptr)
         builder_.CreateRet(st);
     }
@@ -1089,6 +1112,33 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             }
         };
 
+        // #1864 / §27.5 / §28.9: release each closure (function-typed) parameter
+        // the frame RETAINED at construction (emitIteratorMethod's capture-store
+        // retain). The frame held its own +1 so it could invoke the closure
+        // across every MoveNext; that reference is dropped here. Like
+        // disposeOwnedParams, this runs on the SOURCE Dispose ONLY
+        // (disposeOwned=true): the per-loop clone (cloneDisposeFn,
+        // disposeOwned=false) BORROWS the captures from the source — the source
+        // is disposed last (reverse order) and drops the frame's reference
+        // exactly once. bz_closure_release is null-safe and reclaims the cell +
+        // env block at rc 0. Owned-class params (disposeOwnedParams) and closure
+        // params are disjoint sets, so the two loops never touch the same field.
+        auto releaseClosureCaptures = [&]() {
+            if (!disposeOwned) return;
+            for (std::size_t i = frame.captures.size(); i-- > 0;) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    frame.captures[i].first);
+                if (!ps) continue;
+                sema::TypeRef* pt = paramTypeOf(ps);
+                if (!pt || pt->kind != sema::TypeRef::Kind::Function) continue;
+                unsigned fieldIdx = frame.captureStart + (unsigned)i;
+                llvm::Value* fptr =
+                    builder_.CreateStructGEP(stateStructTy, self, fieldIdx);
+                llvm::Value* cl = builder_.CreateLoad(ptrTy(), fptr, "itc.cl");
+                emitClosureRelease(cl);   // null-safe
+            }
+        };
+
         // §29 (#1120): dispose the outstanding yielded owned value stored in the
         // current_val frame field — BUT ONLY if the enumerator actually owns it
         // (current_val_owned == 1, set when the yielded expression was a `new`).
@@ -1181,6 +1231,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             builder_.CreateStore(builder_.getInt32(-2), stateGEP2);
             disposeYieldedVal();       // §29 (#1120): dispose outstanding yield val
             disposeOwnedParams();      // §29.8 (#945)
+            releaseClosureCaptures();  // #1864 §27.5/§28.9: drop frame's +1 on closure captures
             emitFreeSpillArea(self);   // #747: free any spilled for-loop frame
             builder_.CreateCall(freeFn, {self});
             builder_.CreateRetVoid();
@@ -1288,6 +1339,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             builder_.SetInsertPoint(doneBB);
             disposeYieldedVal();       // §29 (#1120): dispose outstanding yield val
             disposeOwnedParams();      // §29.8 (#945): after the finally chains
+            releaseClosureCaptures();  // #1864 §27.5/§28.9: drop frame's +1 on closure captures
             emitFreeSpillArea(self);   // #747: free any spilled for-loop frame
             builder_.CreateCall(freeFn, {self});
             builder_.CreateRetVoid();
