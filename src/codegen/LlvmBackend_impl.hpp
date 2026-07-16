@@ -311,6 +311,11 @@ public:
             auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
             if (ts && initFns_.count(ts)) emitInstanceInitFunction(ts);
         }
+        // #1843 / §8.6 #417: now that every method/ctor/disposer/init body has
+        // been lowered, allVtables_ holds every vtable an object can carry —
+        // including the per-monomorphization vt$C$specN created lazily above.
+        // Materialize the real bz$vtable$table (bz_obj_is_string's whitelist).
+        finalizeVtableTable();
         // FINDING [3]: malformed IR (e.g. a block with two terminators) reached
         // the optimizer as a segfault because nothing checked the IR after
         // emission. The module verifier turns such a defect into a printed
@@ -1464,6 +1469,9 @@ private:
     llvm::GlobalVariable* vtableTableGV_ = nullptr;
     // §8.6 / §12.7 (#417): emit (once) and return the bz$vtable$table global.
     llvm::Value* vtableTablePtr();
+    // #1843 / §8.6 #417: replace the vtableTablePtr placeholder with the real,
+    // complete table once every (incl. lazily-created specialized) vtable exists.
+    void finalizeVtableTable();
     // §33.3 / #1366: null-terminated table of just the BUILT-IN exception
     // vtables. bz_unhandled_exception scans it to decide whether the uncaught
     // object has the §31.4 built-in layout (message@8, CauseChain@24) before
@@ -4138,6 +4146,60 @@ private:
     std::map<const sema::TypeSymbol*,
              std::map<std::vector<llvm::Type*>, llvm::GlobalVariable*>>
         specializedVtables_;
+
+    // #1843 (§12.7/§12.9/§19.6): per-monomorphization runtime type descriptor.
+    // The shared `descArray_[ts]` is keyed by the base declaration, so every
+    // instantiation of a generic type used to share ONE descriptor — making
+    // `x is Box<int>` match a `Box<string>` (type confusion). A constructed
+    // generic type `C<a…>` gets its OWN descriptor global here whose flat array
+    // lists the per-instantiation descriptors of `C<a…>` and every transitive
+    // (substituted) base/interface, so `emitIsA`'s pointer-identity walk
+    // distinguishes instantiations. Keyed by a structural pointer-based string
+    // (declaration identity + recursive type arguments) so `Box<string>` and
+    // `Box<Dog>` — same LLVM layout `ptr` — still map to DISTINCT globals. The
+    // `new` site (specializedVtableFor patches vtable slot 0) and the type-test
+    // site (perInstDescriptorForTarget) both resolve to this same global.
+    std::unordered_map<std::string, llvm::GlobalVariable*> instanceDesc_;
+    // Arena of substituted TypeRefs synthesized while building a base chain
+    // (`Ok<T>: Result<T>` at Ok<int> needs a Result<int> TypeRef); owned by the
+    // Emitter so they outlive descriptor construction.
+    std::vector<std::unique_ptr<sema::TypeRef>> descArena_;
+    // Per-monomorphization vtable, keyed by the instance descriptor global so a
+    // generic instantiation whose only per-instantiation need is its descriptor
+    // (slot 0) still gets a distinct vtable. Finer than the layout key above
+    // (Box<string> vs Box<Dog> share layout but differ in descriptor).
+    std::map<const sema::TypeSymbol*,
+             std::map<llvm::GlobalVariable*, llvm::GlobalVariable*>>
+        specVtablesByDesc_;
+
+    // #1843: the per-monomorphization descriptor factory. Returns a global whose
+    // ADDRESS is `C<args>`'s runtime identity and whose CONTENTS are the flat
+    // ancestor-descriptor array `emitIsA` walks. Falls back to the shared
+    // `descArray_[ts]` for a non-generic type, an arity mismatch, or when any
+    // argument is not a concrete (fully-resolved) type. Memoized.
+    llvm::GlobalVariable* instanceDescriptorFor(
+        const sema::TypeSymbol* ts,
+        const std::vector<const sema::TypeRef*>& args);
+    // #1843: resolve a type-test TARGET (`is`/`as`/case-pattern) to its per-
+    // monomorphization descriptor when it is a constructed generic class or
+    // interface with concrete arguments; nullptr otherwise (caller keeps its
+    // existing shared-descriptor resolution).
+    llvm::GlobalVariable* perInstDescriptorForTarget(const sema::TypeRef* rt);
+    // #1843: substitute `map` (param-name → concrete TypeRef) through `t`,
+    // allocating into descArena_ where substitution changes structure.
+    const sema::TypeRef* substituteTypeRefLocal(
+        const sema::TypeRef* t,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>& map);
+    // #1843: a structural, pointer-based cache key + a readable LLVM global-name
+    // fragment for a constructed generic type. The key disambiguates distinct
+    // declarations that share a name; the name is only cosmetic (LLVM
+    // uniquifies). Both recurse through the argument list.
+    std::string descIdentityKey(const sema::TypeSymbol* ts,
+                                const std::vector<const sema::TypeRef*>& args);
+    std::string descReadableMangle(const sema::TypeRef* t);
+    // #1843: are all of `args` concrete (fully-resolved) types — i.e. carry a
+    // real identity token, not an unbound generic parameter placeholder?
+    bool descArgsConcrete(const std::vector<const sema::TypeRef*>& args);
 
     // #816: per-instantiation CORE disposer (unguarded destructor body + owned-
     // field disposal + base chain) for a class reached as a BASE of a specialized

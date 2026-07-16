@@ -2909,6 +2909,32 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
     llvm::GlobalVariable* shared = vtableOf(ts);
     if (!shared || genericSubst_.empty()) return shared;
 
+    // #1843 (§12.7/§12.9): a constructed generic instantiation needs its OWN
+    // runtime descriptor (vtable slot 0) so `x is Box<int>` distinguishes it
+    // from `Box<string>`.  Derive the concrete type arguments from the active
+    // substitution (genericSubstSemaTy_, set up by lowerNew), mirroring the
+    // static-field per-instantiation Path A (§22.12/#536).  A null/unresolved
+    // arg leaves instDesc == the shared descriptor and no descriptor
+    // specialization is forced.
+    llvm::GlobalVariable* instDesc = nullptr;
+    {
+        std::vector<const sema::TypeRef*> args;
+        args.reserve(ts->genericParams.size());
+        for (const sema::Symbol* gp : ts->genericParams) {
+            auto it = genericSubstSemaTy_.find(gp->name);
+            args.push_back(it != genericSubstSemaTy_.end() ? it->second
+                                                           : nullptr);
+        }
+        if (!args.empty()) {
+            llvm::GlobalVariable* pid = instanceDescriptorFor(ts, args);
+            auto dit = descArray_.find(ts);
+            llvm::GlobalVariable* sharedDesc =
+                dit != descArray_.end() ? dit->second : nullptr;
+            if (pid && pid != sharedDesc) instDesc = pid;
+        }
+    }
+    bool needsSpecDescriptor = instDesc != nullptr;
+
     // #1247 (§28.3/§28.4): a generic class whose user-defined destructor body
     // references instantiation-dependent symbols (e.g. a static field of
     // GBox<T>: `GBox<T>._m := GBox<T>._m - 1`) must also get a specialized
@@ -2963,7 +2989,18 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
         }
     }
 
-    if (!needsSpecDispose && !needsSpecItable) return shared;
+    if (!needsSpecDispose && !needsSpecItable && !needsSpecDescriptor)
+        return shared;
+
+    // #1843: when the instantiation needs a per-monomorphization descriptor,
+    // cache by the descriptor global (unique per type-argument identity) — the
+    // layout key below conflates Box<string> and Box<Dog> (both `ptr`), but they
+    // must carry DISTINCT slot-0 descriptors.  Otherwise keep the layout key.
+    if (needsSpecDescriptor) {
+        auto& m = specVtablesByDesc_[ts];
+        auto it = m.find(instDesc);
+        if (it != m.end()) return it->second;
+    }
 
     // Key by the spec field types so Box<Elem> and Box<int> get distinct vtables.
     std::vector<const sema::Symbol*> storage;
@@ -2975,10 +3012,13 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
         specFieldTys.push_back(storageType(m));
 
     auto& specMap = specializedVtables_[ts];
-    auto sit = specMap.find(specFieldTys);
-    if (sit != specMap.end()) return sit->second;
+    if (!needsSpecDescriptor) {
+        auto sit = specMap.find(specFieldTys);
+        if (sit != specMap.end()) return sit->second;
+    }
 
-    std::string suffix = "$spec" + std::to_string(specMap.size());
+    std::string suffix = "$spec" + std::to_string(
+        specMap.size() + specVtablesByDesc_[ts].size());
 
     // (a) Specialized disposer — only when the class has an owned T field.
     llvm::Function* specDispose = nullptr;
@@ -3072,13 +3112,370 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
         elems[2] = llvm::cast<llvm::Constant>(specDispose);  // slot 2 = Dispose
     if (specItmapGV)
         elems[1] = llvm::ConstantExpr::getPointerCast(specItmapGV, ptrTy());  // slot 1 = itmap
+    if (instDesc)
+        elems[0] = instDesc;  // #1843: slot 0 = per-monomorphization descriptor
     auto* init = llvm::ConstantArray::get(arrTy, elems);
     auto* gv = new llvm::GlobalVariable(
         *module_, arrTy, /*isConstant=*/true,
         llvm::GlobalValue::InternalLinkage, init,
         "vt$" + std::string(ts->name) + suffix);
-    specMap[specFieldTys] = gv;
+    // §8.6 #417: a specialized vtable is a word-0 vtable an object can carry, so
+    // register it in the string discriminator's whitelist (bz$vtable$table) —
+    // otherwise bz_obj_is_string misreads such an instance as a string and
+    // `is`/`as` on it silently fails (#1843). finalizeVtableTable emits the table
+    // after this push.
+    allVtables_.push_back(gv);
+    if (needsSpecDescriptor) specVtablesByDesc_[ts][instDesc] = gv;
+    else specMap[specFieldTys] = gv;
     return gv;
+}
+
+
+// #1843 (§12.7/§12.9/§19.6): per-monomorphization runtime descriptors. See the
+// declaration comment in LlvmBackend_impl.hpp for the rationale; the three
+// helpers below (descReadableMangle, descIdentityKey, descArgsConcrete,
+// substituteTypeRefLocal) support the instanceDescriptorFor factory.
+
+// A readable name fragment for a resolved type — used only for the LLVM global
+// name (`td$Box$int`); LLVM uniquifies on collision, so this is cosmetic. It
+// still recurses through type arguments and marks nullability so a reader can
+// tell instantiations apart at a glance.
+std::string Emitter::descReadableMangle(const sema::TypeRef* t) {
+    if (!t) return "t";
+    std::string s;
+    switch (t->kind) {
+        case sema::TypeRef::Kind::Named:
+            if (t->declaration) {
+                s = std::string(t->declaration->name);
+                for (const sema::TypeRef* a : t->genericArgs)
+                    s += "_" + descReadableMangle(a);
+            } else {
+                s = std::string(t->headName());
+            }
+            break;
+        case sema::TypeRef::Kind::Primitive: {
+            static const char* names[] = {
+                "none", "bool", "char", "string", "byte", "sbyte", "short",
+                "ushort", "int", "uint", "long", "ulong", "float", "double",
+                "decimal", "object"};
+            unsigned i = static_cast<unsigned>(t->primitive);
+            s = i < (sizeof(names) / sizeof(names[0])) ? names[i] : "prim";
+            break;
+        }
+        case sema::TypeRef::Kind::InlineArray:
+            s = "arr_" + descReadableMangle(t->arrayElement);
+            break;
+        case sema::TypeRef::Kind::Function:
+            s = "fn";
+            break;
+        default:
+            s = "t";
+            break;
+    }
+    if (t->nullable) s += "$n";
+    return s;
+}
+
+
+// A structural, pointer-based cache key for a constructed generic type. Unlike
+// the readable name, this disambiguates distinct declarations sharing a name
+// (declaration pointer) and primitives by enum value, and recurses through the
+// argument list — so two type-arg lists produce the same key iff they denote the
+// same type (pointer identity + nullability), which is exactly the runtime
+// identity `is`/`as` must honor.
+static void appendDescKey(const sema::TypeRef* t, std::string& out) {
+    if (!t) { out += "0;"; return; }
+    switch (t->kind) {
+        case sema::TypeRef::Kind::Named:
+            if (t->declaration) {
+                out += 'C';
+                out += std::to_string(reinterpret_cast<std::uintptr_t>(
+                    static_cast<const void*>(t->declaration)));
+                out += '<';
+                for (const sema::TypeRef* a : t->genericArgs) appendDescKey(a, out);
+                out += '>';
+            } else {
+                out += "U";
+                out += std::string(t->headName());
+            }
+            break;
+        case sema::TypeRef::Kind::Primitive:
+            out += "P";
+            out += std::to_string(static_cast<int>(t->primitive));
+            break;
+        case sema::TypeRef::Kind::InlineArray:
+            out += "A";
+            appendDescKey(t->arrayElement, out);
+            break;
+        case sema::TypeRef::Kind::Function:
+            out += "F";
+            break;
+        default:
+            out += "X";
+            break;
+    }
+    if (t->nullable) out += "?";
+    out += ';';
+}
+
+std::string Emitter::descIdentityKey(
+    const sema::TypeSymbol* ts,
+    const std::vector<const sema::TypeRef*>& args) {
+    std::string key = "C";
+    key += std::to_string(
+        reinterpret_cast<std::uintptr_t>(static_cast<const void*>(ts)));
+    key += '<';
+    for (const sema::TypeRef* a : args) appendDescKey(a, key);
+    key += '>';
+    return key;
+}
+
+bool Emitter::descArgsConcrete(const std::vector<const sema::TypeRef*>& args) {
+    for (const sema::TypeRef* a : args) {
+        // A concrete arg carries a real identity token (a TypeSymbol* or a
+        // primitive tag). An unbound generic-parameter placeholder is Named
+        // with declaration == nullptr — typeRefIdentityToken returns null.
+        if (typeRefIdentityToken(a) == nullptr) return false;
+    }
+    return true;
+}
+
+
+// Substitute the param-name → concrete-TypeRef `map` through `t`. A bare
+// generic-parameter reference (Named, declaration == nullptr, single-part name)
+// is replaced by its bound argument; a constructed type recurses through its
+// arguments, allocating a fresh TypeRef into descArena_ only when substitution
+// actually changes something (so the common identity case allocates nothing).
+const sema::TypeRef* Emitter::substituteTypeRefLocal(
+    const sema::TypeRef* t,
+    const std::unordered_map<std::string_view, const sema::TypeRef*>& map) {
+    if (!t || map.empty()) return t;
+    if (t->kind == sema::TypeRef::Kind::Named) {
+        if (!t->declaration) {
+            // A bare parameter placeholder — resolve by head name.
+            std::string_view head = t->headName();
+            if (!head.empty()) {
+                auto it = map.find(head);
+                if (it != map.end() && it->second) {
+                    // Preserve `T?` nullability of the placeholder occurrence.
+                    if (t->nullable && !it->second->nullable) {
+                        auto copy = std::make_unique<sema::TypeRef>(*it->second);
+                        copy->nullable = true;
+                        const sema::TypeRef* raw = copy.get();
+                        descArena_.push_back(std::move(copy));
+                        return raw;
+                    }
+                    return it->second;
+                }
+            }
+            return t;
+        }
+        // A constructed type: substitute inside its arguments.
+        bool changed = false;
+        std::vector<sema::TypeRef*> newArgs;
+        newArgs.reserve(t->genericArgs.size());
+        for (const sema::TypeRef* a : t->genericArgs) {
+            const sema::TypeRef* sub = substituteTypeRefLocal(a, map);
+            if (sub != a) changed = true;
+            newArgs.push_back(const_cast<sema::TypeRef*>(sub));
+        }
+        if (!changed) return t;
+        auto copy = std::make_unique<sema::TypeRef>(*t);
+        copy->genericArgs = std::move(newArgs);
+        const sema::TypeRef* raw = copy.get();
+        descArena_.push_back(std::move(copy));
+        return raw;
+    }
+    if (t->kind == sema::TypeRef::Kind::InlineArray && t->arrayElement) {
+        const sema::TypeRef* sub = substituteTypeRefLocal(t->arrayElement, map);
+        if (sub == t->arrayElement) return t;
+        auto copy = std::make_unique<sema::TypeRef>(*t);
+        copy->arrayElement = const_cast<sema::TypeRef*>(sub);
+        const sema::TypeRef* raw = copy.get();
+        descArena_.push_back(std::move(copy));
+        return raw;
+    }
+    return t;
+}
+
+
+// The per-monomorphization descriptor factory. Returns a global whose ADDRESS is
+// the runtime identity of `ts<args>` and whose CONTENTS are the flat array of
+// ancestor descriptors `emitIsA` walks — each ancestor reified under the
+// substitution `ts<args>` induces, so a generic base (`Ok<int>: Result<int>`)
+// contributes its OWN per-instantiation descriptor, not the shared erased one.
+llvm::GlobalVariable* Emitter::instanceDescriptorFor(
+    const sema::TypeSymbol* ts,
+    const std::vector<const sema::TypeRef*>& args) {
+    // Fallback: a non-generic type, an arity mismatch, or a non-concrete arg
+    // keeps the shared descriptor — correct for non-generics and the only sound
+    // option for a genuinely-unbound template (which never reaches a `new`/`is`
+    // site with concrete operands).
+    auto sharedOf = [&](const sema::TypeSymbol* s) -> llvm::GlobalVariable* {
+        auto it = descArray_.find(s);
+        return it != descArray_.end() ? it->second : nullptr;
+    };
+    if (!ts || ts->genericParams.empty() ||
+        args.size() != ts->genericParams.size() || !descArgsConcrete(args))
+        return sharedOf(ts);
+
+    std::string key = descIdentityKey(ts, args);
+    auto cached = instanceDesc_.find(key);
+    if (cached != instanceDesc_.end()) return cached->second;
+
+    // Phase 1: BFS over the (substituted) super-chain, mirroring
+    // collectTypeAndBases so the flat array lists ts and every transitive
+    // base/interface exactly once. Each node records its own concrete args (for
+    // its own genericParams); this phase mints nothing, so it terminates on the
+    // finite (dedup-by-symbol) super set with no reentrancy.
+    struct Node {
+        const sema::TypeSymbol* sym;
+        std::vector<const sema::TypeRef*> symArgs;  // for sym's own params
+        bool concrete;                              // all symArgs concrete
+    };
+    struct Pending {
+        const sema::TypeSymbol* sym;
+        std::unordered_map<std::string_view, const sema::TypeRef*> subst;
+    };
+    std::vector<Node> nodes;
+    std::vector<Pending> frontier;
+    std::unordered_set<const sema::TypeSymbol*> seen;
+    {
+        std::unordered_map<std::string_view, const sema::TypeRef*> m0;
+        for (std::size_t i = 0; i < ts->genericParams.size(); ++i)
+            m0[ts->genericParams[i]->name] = args[i];
+        frontier.push_back(Pending{ts, std::move(m0)});
+        seen.insert(ts);
+    }
+    for (std::size_t i = 0; i < frontier.size(); ++i) {
+        const sema::TypeSymbol* sym = frontier[i].sym;
+        auto subst = frontier[i].subst;  // copy — frontier may reallocate below
+        std::vector<const sema::TypeRef*> symArgs;
+        bool symConcrete = !sym->genericParams.empty();
+        for (const sema::Symbol* gp : sym->genericParams) {
+            auto it = subst.find(gp->name);
+            const sema::TypeRef* a = it != subst.end() ? it->second : nullptr;
+            symArgs.push_back(a);
+            if (typeRefIdentityToken(a) == nullptr) symConcrete = false;
+        }
+        nodes.push_back(Node{sym, std::move(symArgs), symConcrete});
+        for (std::size_t bi = 0; bi < sym->baseTypes.size(); ++bi) {
+            const sema::TypeSymbol* b = sym->baseTypes[bi];
+            if (!b || !seen.insert(b).second) continue;
+            std::unordered_map<std::string_view, const sema::TypeRef*> bm;
+            const sema::TypeRef* bref =
+                bi < sym->baseTypeRefs.size() ? sym->baseTypeRefs[bi] : nullptr;
+            if (bref && b->genericParams.size() == bref->genericArgs.size()) {
+                for (std::size_t gi = 0; gi < b->genericParams.size(); ++gi)
+                    bm[b->genericParams[gi]->name] =
+                        substituteTypeRefLocal(bref->genericArgs[gi], subst);
+            }
+            frontier.push_back(Pending{b, std::move(bm)});
+        }
+    }
+
+    // Compute the array size (nodes + built-in exception chain + null) and mint
+    // the global with NO initializer, then CACHE it — so the recursive
+    // instanceDescriptorFor calls in phase 2 resolve a self/diamond reference to
+    // this same global instead of re-minting or looping.
+    std::vector<std::string> builtinNames;
+    {
+        std::string bn = directBuiltinExceptionBase(ts);
+        std::unordered_map<std::string, std::string> builtinParent;
+        for (const auto& [name, par] : builtinExceptionHierarchy())
+            builtinParent[name] = par;
+        while (!bn.empty()) {
+            builtinNames.push_back(bn);
+            auto pit = builtinParent.find(bn);
+            bn = pit != builtinParent.end() ? pit->second : std::string{};
+        }
+    }
+    std::size_t size = nodes.size() + builtinNames.size() + 1;
+    auto* arrTy = llvm::ArrayType::get(ptrTy(), size);
+    // Readable (cosmetic) global name from ts + args.
+    std::string readable;
+    {
+        auto tmp = std::make_unique<sema::TypeRef>();
+        tmp->kind = sema::TypeRef::Kind::Named;
+        tmp->declaration = const_cast<sema::TypeSymbol*>(ts);
+        for (const sema::TypeRef* a : args)
+            tmp->genericArgs.push_back(const_cast<sema::TypeRef*>(a));
+        readable = descReadableMangle(tmp.get());
+        descArena_.push_back(std::move(tmp));
+    }
+    auto* gv = new llvm::GlobalVariable(
+        *module_, arrTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage, /*init=*/nullptr, "td$" + readable);
+    instanceDesc_[key] = gv;  // cache BEFORE phase 2 (self / diamond / cycle)
+
+    // Phase 2: fill the elements. Element for ts itself is the global (self);
+    // a generic super with concrete args contributes its per-instantiation
+    // descriptor; every other super its shared descriptor.
+    std::vector<llvm::Constant*> elems;
+    elems.reserve(size);
+    for (const Node& n : nodes) {
+        if (n.sym == ts) {
+            elems.push_back(gv);
+        } else if (n.concrete) {
+            elems.push_back(instanceDescriptorFor(n.sym, n.symArgs));
+        } else {
+            llvm::GlobalVariable* sd = sharedOf(n.sym);
+            elems.push_back(sd ? llvm::cast<llvm::Constant>(sd)
+                               : llvm::ConstantPointerNull::get(ptrTy()));
+        }
+    }
+    for (const std::string& bn : builtinNames) {
+        auto bit = builtinDesc_.find(bn);
+        elems.push_back(bit != builtinDesc_.end()
+                            ? llvm::cast<llvm::Constant>(bit->second)
+                            : llvm::ConstantPointerNull::get(ptrTy()));
+    }
+    elems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
+    gv->setInitializer(llvm::ConstantArray::get(arrTy, elems));
+    return gv;
+}
+
+
+// #1843: resolve an `is`/`as`/case-pattern TARGET to its per-monomorphization
+// descriptor when it is a constructed generic class or interface with concrete
+// arguments (`is Box<int>`). Returns nullptr for a non-generic target, a bare
+// template, or when the descriptor would fall back to the shared one — the
+// caller then keeps its existing shared-descriptor resolution. Type-parameter
+// arguments are resolved through the active substitution first, so `is Box<T>`
+// inside a monomorphized body tests against the concrete instantiation (§19.3
+// v0.182 / §19.6 v0.196).
+llvm::GlobalVariable* Emitter::perInstDescriptorForTarget(
+    const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return nullptr;
+    const sema::TypeSymbol* ts = rt->declaration;
+    if ((ts->kind != ast::TypeDeclKind::Class &&
+         ts->kind != ast::TypeDeclKind::Interface) ||
+        ts->genericParams.empty() ||
+        rt->genericArgs.size() != ts->genericParams.size())
+        return nullptr;
+    // #1843: resolve each argument through the active substitution
+    // RECURSIVELY. `resolveTypeParamRef` only rewrites a TOP-LEVEL bare
+    // parameter, so inside a monomorphized `Checker<int>` body a nested target
+    // `Box<Box<T>>` kept its inner `T` unbound — the resulting descriptor was
+    // keyed on the placeholder and never equalled the object's fully-resolved
+    // `td$Box$Box_int`, making the test constant-false (a correct→wrong
+    // regression on a legal program). substituteTypeRefLocal rewrites the bare
+    // top-level param AND recurses into constructed-type arguments, arena-ing
+    // the rewritten TypeRef into descArena_ (Emitter-lifetime), so `Box<Box<T>>`
+    // with T=int resolves to the same per-instantiation global the `new` site
+    // minted. Outside a generic body genericSubstSemaTy_ is empty and this is a
+    // no-op, so a concrete literal target (`is Box<int>`) is unaffected.
+    std::vector<const sema::TypeRef*> args;
+    args.reserve(rt->genericArgs.size());
+    for (const sema::TypeRef* a : rt->genericArgs)
+        args.push_back(substituteTypeRefLocal(a, genericSubstSemaTy_));
+    if (!descArgsConcrete(args)) return nullptr;
+    llvm::GlobalVariable* pid = instanceDescriptorFor(ts, args);
+    auto dit = descArray_.find(ts);
+    llvm::GlobalVariable* sharedDesc =
+        dit != descArray_.end() ? dit->second : nullptr;
+    return (pid && pid != sharedDesc) ? pid : nullptr;
 }
 
 
@@ -14356,16 +14753,45 @@ llvm::Constant* Emitter::primBoxToStringThunk(sema::PrimitiveType prim,
 // site; all vtable globals already exist by the time any function body emits.
 llvm::Value* Emitter::vtableTablePtr() {
     if (vtableTableGV_) return vtableTableGV_;
+    // #1843 / §8.6 #417: the table must list EVERY vtable an object can carry —
+    // including per-monomorphization specialized vtables (vt$C$specN), which are
+    // created LAZILY during body lowering, AFTER a call site here would freeze an
+    // eagerly-built table. bz_obj_is_string treats an object whose word-0 vtable
+    // is NOT in the table as a string, so a missing specialized vtable makes
+    // `is`/`as` on that instance silently fail (the #1843 first attempt regressed
+    // the matching case this way). Emit a PLACEHOLDER global now (so body lowering
+    // has a stable pointer to pass) and swap in the real, complete array at
+    // finalizeVtableTable() once allVtables_ is fully populated.
+    auto* emptyTy = llvm::ArrayType::get(ptrTy(), 0);
+    vtableTableGV_ = new llvm::GlobalVariable(
+        *module_, emptyTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(emptyTy, {}), "bz$vtable$table$pending");
+    return vtableTableGV_;
+}
+
+
+// #1843 / §8.6 #417: build the real `bz$vtable$table` from the now-complete
+// allVtables_ and redirect every use of the placeholder to it. Called once at
+// the end of run(), after all bodies/ctors/disposers (hence all lazily-created
+// specialized/span/box vtables) exist. A no-op when no discriminator was ever
+// needed (vtableTablePtr never called).
+void Emitter::finalizeVtableTable() {
+    if (!vtableTableGV_) return;
     std::vector<llvm::Constant*> entries;
     for (llvm::GlobalVariable* gv : allVtables_)
         entries.push_back(llvm::ConstantExpr::getPointerCast(gv, ptrTy()));
     entries.push_back(llvm::ConstantPointerNull::get(ptrTy()));  // terminator
     auto* arrTy = llvm::ArrayType::get(ptrTy(), entries.size());
-    vtableTableGV_ = new llvm::GlobalVariable(
+    auto* real = new llvm::GlobalVariable(
         *module_, arrTy, /*isConstant=*/true,
         llvm::GlobalValue::InternalLinkage,
         llvm::ConstantArray::get(arrTy, entries), "bz$vtable$table");
-    return vtableTableGV_;
+    // Both the placeholder and the real global are `ptr`-typed values (only ever
+    // passed as an opaque pointer to bz_obj_is_string), so RAUW is well-typed.
+    vtableTableGV_->replaceAllUsesWith(real);
+    vtableTableGV_->eraseFromParent();
+    vtableTableGV_ = real;
 }
 
 

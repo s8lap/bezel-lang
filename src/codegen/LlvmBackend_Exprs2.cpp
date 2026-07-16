@@ -6056,6 +6056,14 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                             scrutTy && scrutTy->declaration == rt->declaration;
                         return builder_.getInt1(sameType);
                     }
+                    // #1843 (§19.3 v0.182 / §19.6 v0.196): a CONSTRUCTED generic
+                    // class/interface pattern (`var g: Tagged<int>`) tests against
+                    // the per-monomorphization descriptor, so it matches only the
+                    // named instantiation — a `Tagged<string>` value does not match
+                    // the `Tagged<int>` arm.
+                    if (llvm::GlobalVariable* pid =
+                            perInstDescriptorForTarget(rt))
+                        return emitIsA(scrut, pid);
                     auto dit = descArray_.find(rt->declaration);
                     if (dit != descArray_.end())
                         return emitIsA(scrut, dit->second);

@@ -1382,6 +1382,12 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             if (dit != descArray_.end()) targetDesc = dit->second;
         }
     }
+    // #1843 (§12.7/§12.9): for a CONSTRUCTED generic class/interface target
+    // (`is Box<int>`), resolve the per-monomorphization descriptor so the test
+    // honors the type argument — the shared `descArray_[decl]` above is the
+    // erased class tag and would match every instantiation (type confusion).
+    if (llvm::GlobalVariable* pid = perInstDescriptorForTarget(rt))
+        targetDesc = pid;
     // #596 / §21 / §12: built-in exception types (e.g. Exception,
     // ArgumentException) have no user TypeSymbol (declaration == nullptr),
     // so neither boxDescriptorFor nor the descArray_ lookup above resolves
