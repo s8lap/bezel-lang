@@ -4678,12 +4678,24 @@ void MethodOwnership::checkLambdaTaskFamilyBorrowReturns(
 // §28.3 SB01-B (v0.190, #1919): the `=>` expression-body sibling — an
 // expression-bodied method's `=> E` body can embed a lambda just as a block
 // body can (driven from runExprBodyOwningReturnCheck). // per §28.3 SB01-B
+//
+// `topExpected` (v0.190, #1926): the expected function type at this expression's
+// own position, when the caller knows it — a field's declared type, a getter's
+// property type, an operator's return type. It is applied ONLY to the TOP-LEVEL
+// lambda (the case where `e` itself IS the lambda: `f: Fn := (t) => t;`,
+// `property P: Fn => (t) => t;`, `operator +(...): Fn => (t) => t;`), because
+// only that lambda's type is dictated by the declared position. It supplies the
+// return type the type-checker leaves un-inferred in these positions (funcReturn
+// is null off the typed-local path — see checkOneLambdaTaskFamilyBorrowReturn).
+// A nested lambda gets no expected type (nullptr), exactly as before.
 void MethodOwnership::checkLambdaTaskFamilyBorrowReturnsExpr(
-        const ast::Expr& e) {
+        const ast::Expr& e, const sema::TypeRef* topExpected) {
     std::vector<const ast::LambdaExpr*> lambdas;
     collectBodyLambdasExpr(e, lambdas);
+    const auto* topLam = dynamic_cast<const ast::LambdaExpr*>(&e);
     for (const ast::LambdaExpr* lam : lambdas)
-        checkOneLambdaTaskFamilyBorrowReturn(*lam);
+        checkOneLambdaTaskFamilyBorrowReturn(
+            *lam, lam == topLam ? topExpected : nullptr);
 }
 
 // §28.3 SB01-B (v0.190, #1919): collect every LambdaExpr appearing anywhere in a
@@ -4908,22 +4920,39 @@ void MethodOwnership::collectBodyLambdasExpr(
 // `async` lambda auto-satisfies the obligation (its body is the awaited value,
 // not a task) and is exempt, exactly as an `async` method body is. // per §28.3
 void MethodOwnership::checkOneLambdaTaskFamilyBorrowReturn(
-        const ast::LambdaExpr& lam) {
+        const ast::LambdaExpr& lam, const sema::TypeRef* expectedFnType) {
     // An `async` lambda's return IS its own fresh state-machine frame (§30.1);
     // its `=> E` body is the awaited value (type T), not a task. Exempt — the
     // named-method arm gates identically on `!isAsync_`. // per §28.3, §30.1
     if (lam.isAsync) return;
     // The lambda's effective return type is its inferred function `TypeRef`'s
-    // funcReturn (the body's result T for `=> E`, or the first `return E` for a
-    // block body — ExprTypecheck_Exprs.cpp). An explicit `owned` target return
-    // is a different, explicit transfer contract, not this rule's plain-`Task`
-    // case. // per §28.3
+    // funcReturn. But that is populated by the type-checker only when an expected
+    // function type is threaded into the lambda — which today happens for a
+    // typed-local initializer (`var f: Fn := lambda`, the #829 hint) but NOT for
+    // a lambda in a field initializer, a property/operator/method RETURN
+    // position, etc.: there the inferred funcReturn is null (#1926). When the
+    // caller knows the expected function type at the lambda's position (a field's
+    // declared type, a getter's property type, an operator's return type), it
+    // passes it as `expectedFnType`; fall back to its funcReturn so the SB01-B
+    // rule is not inert in those positions. // per §28.3 SB01-B (v0.190, #1926)
     const sema::TypeRef* lamTy = ctx_.exprType(lam);
-    if (!lamTy || lamTy->kind != sema::TypeRef::Kind::Function ||
-        !lamTy->funcReturn)
-        return;
-    if (lamTy->funcReturnOwned) return;
-    std::string_view head = lamTy->funcReturn->headName();
+    const sema::TypeRef* effRet = nullptr;
+    bool effOwned = false;
+    if (lamTy && lamTy->kind == sema::TypeRef::Kind::Function &&
+        lamTy->funcReturn) {
+        effRet = lamTy->funcReturn;
+        effOwned = lamTy->funcReturnOwned;
+    } else if (expectedFnType &&
+               expectedFnType->kind == sema::TypeRef::Kind::Function &&
+               expectedFnType->funcReturn) {
+        effRet = expectedFnType->funcReturn;
+        effOwned = expectedFnType->funcReturnOwned;
+    }
+    if (!effRet) return;
+    // An explicit `owned` target return is a different, explicit transfer
+    // contract, not this rule's plain-`Task` case. // per §28.3
+    if (effOwned) return;
+    std::string_view head = effRet->headName();
     // Plain `Task` / `OwningTask` head only — `isTaskFamilyHead` folds both in
     // (an `async` lambda is already exempted above). A non-`Task`-family return
     // (a plain class/interface, a value type) is governed by the ordinary
@@ -5689,6 +5718,19 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
         if (od->bodyKind == ast::MethodBodyKind::Block) {
             MethodOwnership mo(ctx);
             mo.run(od->stmts);
+        } else if (od->bodyKind == ast::MethodBodyKind::Expression &&
+                   od->exprBody) {
+            // §28.3 SB01-B (v0.190, #1926): an EXPRESSION-bodied operator
+            // (`operator +(...): T => E`) is otherwise not ownership-analysed —
+            // only the Block arm above reaches run(), which carries the lambda
+            // borrow-return pre-pass. Wire the same pre-pass over its `=> E`
+            // body so an identity `Task`-family lambda in an expression-bodied
+            // operator is rejected exactly as one in an expression-bodied
+            // method body. // per §28.3 SB01-B (v0.190)
+            MethodOwnership mo(ctx);
+            mo.checkLambdaTaskFamilyBorrowReturnsExpr(
+                *od->exprBody,
+                od->returnType ? ctx.resolvedType(*od->returnType) : nullptr);
         }
     } else if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
         // #1484 / §28.6: a field INITIALIZER (`f: T := E`) is an ownership-
@@ -5701,6 +5743,19 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
         if (fd->initializer) {
             MethodOwnership mo(ctx);
             mo.checkFieldInitializer(*fd);
+            // §28.3 SB01-B (v0.190, #1926): a field INITIALIZER expression can
+            // embed a lambda (`f: (Task<int>) -> Task<int> := (t) => t;`) that
+            // the block/expr method-body drivers never reach — the initializer
+            // is otherwise ownership-analysed only for the narrow §28.6 leak
+            // rule above. Drive the same lambda borrow-return pre-pass over it.
+            // (Unlike checkFieldInitializer's instance-only §28.6 scope, this
+            // applies to static fields too: the lambda hazard is independent of
+            // static/instance storage.) The field's declared type is the
+            // expected function type for a top-level initializer lambda. // per
+            // §28.3 SB01-B (v0.190)
+            mo.checkLambdaTaskFamilyBorrowReturnsExpr(
+                *fd->initializer,
+                fd->type ? ctx.resolvedType(*fd->type) : nullptr);
         }
     } else if (auto* nt = dynamic_cast<const ast::NestedTypeMember*>(&m)) {
         if (nt->decl) {
@@ -5721,10 +5776,38 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
         if (pd->bodyKind == ast::PropertyBodyKind::Expression && pd->exprBody) {
             MethodOwnership mo(ctx);
             mo.checkGetterFreshOwnedReturn(*pd->exprBody);
+            // §28.3 SB01-B (v0.190, #1926): a lambda embedded in a
+            // property/indexer getter body (`property X: T => … (t) => t …`)
+            // carries the same lambda borrow-return obligation as one in a
+            // method body — the getter body is otherwise analysed only for the
+            // narrow §28.6 getter-fresh-owned rule above. The property's declared
+            // type is the expected function type for a top-level getter lambda.
+            // // per §28.3 SB01-B
+            mo.checkLambdaTaskFamilyBorrowReturnsExpr(
+                *pd->exprBody,
+                pd->type ? ctx.resolvedType(*pd->type) : nullptr);
         } else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
             for (const auto& acc : pd->accessors) {
-                if (acc.isSet) continue;  // getters only
                 MethodOwnership mo(ctx);
+                // §28.3 SB01-B (v0.190, #1926): the lambda borrow-return
+                // pre-pass applies to ANY accessor body — get OR set — because a
+                // lambda's SB01-B obligation is independent of the accessor
+                // role; a Task-family identity lambda in a setter body is the
+                // same hazard. The §28.6 getter-fresh-owned check below stays
+                // getter-only. A GETTER accessor's `get => E` returns the
+                // property value, so the property type is the expected function
+                // type for a top-level lambda there; a setter body is a void
+                // statement context (no such top-level expected). // per §28.3
+                // SB01-B (v0.190)
+                if (acc.bodyKind == ast::PropertyAccessorBodyKind::Expression &&
+                    acc.exprBody)
+                    mo.checkLambdaTaskFamilyBorrowReturnsExpr(
+                        *acc.exprBody,
+                        (!acc.isSet && pd->type) ? ctx.resolvedType(*pd->type)
+                                                 : nullptr);
+                else if (acc.bodyKind == ast::PropertyAccessorBodyKind::Block)
+                    mo.checkLambdaTaskFamilyBorrowReturns(acc.stmts);
+                if (acc.isSet) continue;  // §28.6 getter-fresh-owned: getters only
                 if (acc.bodyKind == ast::PropertyAccessorBodyKind::Expression &&
                     acc.exprBody) {
                     mo.checkGetterFreshOwnedReturn(*acc.exprBody);

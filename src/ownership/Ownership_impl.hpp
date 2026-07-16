@@ -190,6 +190,26 @@ public:
     // initializer stays accepted (§28.5). // per §28.6
     void checkFieldInitializer(const ast::FieldDecl& fd);
 
+    // §28.3 SB01-B (v0.190, #1919/#1926): the callee-side borrow-return
+    // prohibition on a plain (non-`async`) `Task`-family return applies to
+    // LAMBDA / function-value bodies wherever they appear — the spec is explicit
+    // that it governs "a non-`async` method OR lambda". These pre-passes drive
+    // the rejection over every lambda in a body/expression that is not otherwise
+    // ownership-analysed for it. #1919 wired them into run() (block method/ctor/
+    // operator bodies) and runExprBodyOwningReturnCheck (`=>` method bodies);
+    // #1926 additionally wires them into the field-initializer, property/indexer
+    // accessor (get AND set), and expression-bodied-operator entry points in
+    // checkMember, so they are public. The internal collectors and the single-
+    // lambda classifier stay private. // per §28.3 SB01-B (v0.190)
+    void checkLambdaTaskFamilyBorrowReturns(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // `topExpected` (#1926): the expected function type at `e`'s own position
+    // (a field's / getter's / operator's declared type), used as the effective-
+    // return fallback for the TOP-LEVEL lambda when the type-checker left its
+    // funcReturn un-inferred (it is null off the typed-local #829 hint path).
+    void checkLambdaTaskFamilyBorrowReturnsExpr(
+        const ast::Expr& e, const sema::TypeRef* topExpected = nullptr);
+
     // #1066 / §9.7 (v0.153) + §28.3: a borrow-bearing record may not be
     // constructed from a TEMPORARY bound to one of its borrow-carrying fields —
     // the temporary's lifetime ends at the construction expression, so the record
@@ -620,33 +640,24 @@ private:
     // unaffected. Fires from handleReturn; a no-op for non-owning return types.
     void checkBorrowReturnedThroughOwningType(const ast::Expr& e);
 
-    // §28.3 SB01-B (v0.190, #1919): the callee-side borrow-return prohibition
-    // for a plain (non-`async`) `Task`-family return applies to LAMBDA /
-    // function-value bodies exactly as to named-method bodies — the spec is
-    // explicit: "every return path of a non-`async` method OR lambda with such
-    // a return type must supply an owned task ... Returning a borrow — a bare
-    // task field or property read, a plain parameter, a captured binding — is a
-    // compile error." checkBorrowReturnedThroughOwningType enforces this on
-    // method/static bodies (driven from handleReturn /
-    // runExprBodyOwningReturnCheck), but a lambda body is not otherwise
-    // ownership-analysed, so an identity lambda returning a borrowed `Task`
-    // parameter through a plain-`Task` return compiled and hung (double-free /
-    // async-state corruption) while the equivalent method was rejected. These
-    // walk the enclosing method/ctor/operator body for every lambda and apply
-    // the same rejection to each — the effective return type read from the
-    // lambda's inferred function `TypeRef` (`funcReturn->headName()`), the async
-    // exemption from `lam.isAsync`. Runs as a syntactic pre-pass, independent of
-    // the enclosing method's dataflow. // per §28.3 SB01-B (v0.190)
-    void checkLambdaTaskFamilyBorrowReturns(
-        const std::vector<std::unique_ptr<ast::Stmt>>& body);
-    void checkLambdaTaskFamilyBorrowReturnsExpr(const ast::Expr& e);
+    // §28.3 SB01-B (v0.190, #1919): the internal machinery behind the two public
+    // checkLambdaTaskFamilyBorrowReturns* entry points (declared above). The two
+    // collectors walk a body/expression gathering every LambdaExpr (mirroring the
+    // scopedPreScan traversal); checkOneLambdaTaskFamilyBorrowReturn applies the
+    // callee-side plain-`Task` borrow-return rejection to a single lambda — the
+    // effective return type read from the lambda's inferred function `TypeRef`
+    // (`funcReturn->headName()`), the async exemption from `lam.isAsync`. The
+    // whole pass is syntactic, independent of the enclosing method's dataflow.
+    // // per §28.3 SB01-B (v0.190)
     void collectBodyLambdas(
         const ast::Stmt& s,
         std::vector<const ast::LambdaExpr*>& out) const;
     void collectBodyLambdasExpr(
         const ast::Expr& e,
         std::vector<const ast::LambdaExpr*>& out) const;
-    void checkOneLambdaTaskFamilyBorrowReturn(const ast::LambdaExpr& lam);
+    void checkOneLambdaTaskFamilyBorrowReturn(
+        const ast::LambdaExpr& lam,
+        const sema::TypeRef* expectedFnType = nullptr);
 
     // §28.3 (v0.180, #1547): reject a BORROW returned from a STATIC method
     // through a plain (non-owning) class/interface return type declared
