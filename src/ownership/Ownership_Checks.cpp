@@ -6690,8 +6690,25 @@ void MethodOwnership::recordAwaitOperandConsume(
     // movable owned local (`using var` bindings return early above as the
     // borrowed-operand case); the transition to Disposed makes a straight-line
     // second await a moved-from read. // per §30.5
-    if (st->state == OwnershipState::Owned)
+    if (st->state == OwnershipState::Owned) {
         st->state = OwnershipState::Disposed;
+        // §30.5 / §29.2 (#1888): if the awaited operand is a drained for-loop
+        // iteration variable (`for var task in tasks.Drain() do results.Add(await
+        // task); end`), record it so the §29.2 owned-iter-var auto-drop in run()
+        // suppresses the spurious must-use warning. The spec: "task discharged by
+        // the await; no further obligation" — the await IS the discharge, exactly
+        // as for a plain `var t := M(); await t;` (which is warning-free). The
+        // auto-drop FLAG still gets set (codegen frees the bound task's frame via
+        // a body-end fire-and-forget — the await never frees a bound task), but the
+        // lint that implies the user forgot to discharge must not fire. // per §30.5
+        for (auto& [s, stt] : states_)
+            if (s->name == id->name) {
+                if (auto* ls = dynamic_cast<sema::LocalSymbol*>(s))
+                    if (dynamic_cast<const ast::ForStmt*>(ls->decl))
+                        awaitDischargedIterVars_.insert(s);
+                break;
+            }
+    }
 }
 
 void MethodOwnership::annotateSuspendLocals(const flow::CFG& cfg) {

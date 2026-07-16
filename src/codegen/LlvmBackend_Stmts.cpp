@@ -3046,10 +3046,45 @@ bool Emitter::lowerForBody(const ast::ForStmt& fs) {
     }
 
     if (iterVarSlot) {
+        // §30.5 / §29.2 (#1888): a drained `OwningTask<T>`/`Task<T>` iteration
+        // variable (`for var task in tasks.Drain() do results.Add(await task);
+        // end`) is a TASK, not a class object — its frame has no Bezel vtable, so
+        // the class-vtable `dynamicDispose` below (emitDisposeAndReclaim) would
+        // read a bogus vtable slot and crash. A bound task's frame is never freed
+        // by the `await` (freeTaskAfter is only set for an anonymous CallExpr
+        // operand, LlvmBackend_Async.cpp lowerAwait); it is freed at scope/body-end
+        // via `bz_task_fire_and_forget`, EXACTLY as a plain `var t := M(); await t;`
+        // task local is (the by-type `d.task` registration in lowerStmt's LocalDecl
+        // arm above).
+        // Mirror that here for the iter var: dispose it via the task path
+        // (fire-and-forget, idempotent on a spent/complete task), carrying the
+        // per-T owned-result disposer for an `OwningTask<T:class>` so a drained-but-
+        // never-awaited task also reclaims its produced result (a no-op once the
+        // await has taken/nulled it). // per §30.5 / §29.2
+        const sema::TypeRef* iterElemTy = nullptr;
+        if (fs.iterable) {
+            if (const sema::TypeRef* itTy = ctx_.exprType(*fs.iterable))
+                if (!itTy->genericArgs.empty() && itTy->genericArgs[0])
+                    iterElemTy = resolveTypeParamRef(itTy->genericArgs[0]);
+        }
+        bool iterVarIsTask = isTaskTypeName(iterElemTy);
         // Push outermost scope: per-iteration iter-var disposal.
         disposeStack_.emplace_back();
         Disposal id{iterVarSlot, nullptr};
-        id.dynamicDispose = true;
+        if (iterVarIsTask) {
+            id.task = true;
+            if (iterElemTy && !iterElemTy->genericArgs.empty() &&
+                iterElemTy->genericArgs[0]) {
+                ElementPolicy pol =
+                    elementPolicyFor(iterElemTy->genericArgs[0],
+                                     /*owningFamily=*/true);
+                if (pol.cat == ElementPolicy::Category::ClassOwned)
+                    id.taskOwnedResultDisposer =
+                        pol.disposerThunk;
+            }
+        } else {
+            id.dynamicDispose = true;
+        }
         disposeStack_.back().push_back(id);
     }
 
@@ -4690,6 +4725,24 @@ bool Emitter::lowerOwnedSeqDrainFor(const ast::ForStmt& fs) {
 
     // Alloca for the loop variable (holds the popped owned pointer).
     auto* varSlot = entryAlloca(elemLlvm);
+    // §30.7 / §29.2 (#1888): if the drained loop variable is live across an
+    // `await` in the BODY (the canonical Pattern B drain-and-await:
+    // `for var task in tasks.Drain() do results.Add(await task); end`), it is a
+    // suspend-local — frame-back its slot exactly as range-for
+    // (LlvmBackend_Stmts.cpp) and await-for (lowerAwaitFor) already do.
+    // collectSuspendLocals (LlvmBackend_Iterators.cpp) reserves the frame field,
+    // keyed on the ForStmt node. WITHOUT this the slot is a bare stack alloca
+    // that is NOT spilled/restored across the body's await suspend, so on resume
+    // (a fresh Resume invocation with a fresh stack) it holds a stale/garbage
+    // task pointer — the body-end iter-var disposal then dereferences a dangling
+    // (freed) task (`pthread_mutex` ESRCH / SEGV in bz$async$*$Resume). Framing
+    // it makes the slot hold the current iteration's live task at body-end, so
+    // the disposal reclaims it exactly once. // per §30.7, §29.2
+    if (smStateStruct_ && smSelf_) {
+        auto fit = smLocalFields_.find(&fs);
+        if (fit != smLocalFields_.end())
+            smAllocaToField_[varSlot] = fit->second;
+    }
     locals_[&fs] = varSlot;
 
     // Alloca for the raw element output from the drain function.

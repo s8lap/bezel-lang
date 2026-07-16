@@ -373,16 +373,22 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     if (iterableIsOwningEnumerable(*fs)) {
                         const_cast<ast::ForStmt*>(fs)->ownedIterVarAutoDropAtBodyEnd =
                             true;
-                        ctx_.diagnostics().report(
-                            Severity::Warning,
-                            st.obligationOrigin ? st.obligationOrigin->span.begin
-                                                : SourceLocation{},
-                            std::string("owned value in `") +
-                            std::string(sym->name) +
-                            "` is implicitly disposed at the end of each loop "
-                            "iteration (§29.2/§28.3 auto-drop); use `.Dispose()`, "
-                            "`move`, `using var`, or `return` to discharge it "
-                            "explicitly");
+                        // §30.5 / §29.2 (#1888): a drained `OwningTask<T>` iter var
+                        // discharged by a Pattern B `await` ("no further obligation")
+                        // still needs the body-end task disposal (the flag above), but
+                        // NOT the must-use warning — the await IS the discharge, exactly
+                        // as for a warning-free plain-local await. // per §30.5
+                        if (awaitDischargedIterVars_.count(sym) == 0)
+                            ctx_.diagnostics().report(
+                                Severity::Warning,
+                                st.obligationOrigin ? st.obligationOrigin->span.begin
+                                                    : SourceLocation{},
+                                std::string("owned value in `") +
+                                std::string(sym->name) +
+                                "` is implicitly disposed at the end of each loop "
+                                "iteration (§29.2/§28.3 auto-drop); use `.Dispose()`, "
+                                "`move`, `using var`, or `return` to discharge it "
+                                "explicitly");
                         continue;
                     }
                 }
@@ -576,13 +582,21 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
         if (fs->ownedIterVarAutoDropAtBodyEnd) continue; // already set above
         if (everDischarged_.count(sym) != 0) continue;  // discharged on some path
         const_cast<ast::ForStmt*>(fs)->ownedIterVarAutoDropAtBodyEnd = true;
-        ctx_.diagnostics().report(
-            Severity::Warning, fs->span.begin,
-            std::string("owned value in `") + std::string(ls->name) +
-            "` is implicitly disposed at the end of each loop "
-            "iteration (§29.2/§28.3 auto-drop); use `.Dispose()`, "
-            "`move`, `using var`, or `return` to discharge it "
-            "explicitly");
+        // §30.5 / §29.2 (#1888): a drained `OwningTask<T>` iter var whose body
+        // consumes it with a Pattern B `await` (`results.Add(await task)`) leaves
+        // it out of endState and reaches THIS fallback. The await IS the discharge
+        // ("no further obligation", §30.5) — set the body-end task-disposal flag
+        // above (the frame is freed by codegen's body-end fire-and-forget, never by
+        // the await), but suppress the spurious must-use warning, matching the
+        // warning-free plain-local await. // per §30.5
+        if (awaitDischargedIterVars_.count(sym) == 0)
+            ctx_.diagnostics().report(
+                Severity::Warning, fs->span.begin,
+                std::string("owned value in `") + std::string(ls->name) +
+                "` is implicitly disposed at the end of each loop "
+                "iteration (§29.2/§28.3 auto-drop); use `.Dispose()`, "
+                "`move`, `using var`, or `return` to discharge it "
+                "explicitly");
     }
     // §29.8/§30.1 (#1521 addendum): a state-machine method's (`sawYield_ ||
     // isAsync_`) `owned` PARAMETER that reaches the function exit ONLY via an

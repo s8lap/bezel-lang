@@ -307,6 +307,16 @@ private:
     // the break edge is not a loopEdge so item=Owned is not propagated to the
     // after block via unionKeys=true. Monotone (grows only), fixpoint-safe.
     std::unordered_set<sema::Symbol*> seededIterVarSyms_;
+    // §30.5 / §29.2 (#1888): every owned local (in particular a drained
+    // `OwningTask<T>` for-loop iteration variable) that a Pattern B `await`
+    // consumed — recorded by recordAwaitOperandConsume. The await IS the
+    // discharge ("task discharged by the await; no further obligation", §30.5),
+    // so the §29.2 owned-iter-var auto-drop must STILL flag the iter var for a
+    // body-end task disposal (the frame is never freed by the await itself —
+    // codegen frees a bound task via a scope/body-end fire-and-forget, exactly as
+    // a plain `var t := M(); await t;` does) but WITHOUT the spurious must-use
+    // warning, matching the warning-free plain-local await. Monotone, fixpoint-safe.
+    std::unordered_set<sema::Symbol*> awaitDischargedIterVars_;
     // §28.3 / #1387: every `out owned var` INLINE local whose declaring call
     // appears in a WHILE-LOOP CONDITION (block.isLoopHeader == true). While-
     // condition items are potentially overwritten on each iteration (the slot is
