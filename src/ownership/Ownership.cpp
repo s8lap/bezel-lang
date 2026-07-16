@@ -1902,6 +1902,17 @@ sema::LocalSymbol* MethodOwnership::findForLoopVarSymbol(
 }
 
 void MethodOwnership::visitStmt(const ast::Stmt& s) {
+    // §28.3 (v0.184, #1958): a captured owned binding is borrow-state inside any
+    // closure — consuming it (marked transfer `M(owned x)` / `move x`, explicit
+    // `.Dispose()`, discard `_ := x`, reassignment) is a compile error whether
+    // or not the closure escapes. checkClosureEscapesOnReturn only fires on the
+    // return path; this walks EVERY lambda literal in `s` so an in-place-invoked
+    // closure that consumes a captured owned — disposing it in the body and
+    // again at the owner's scope end (double-dispose / UAF) — is rejected. Run
+    // before this statement's own transfer functions, using the binding states
+    // at statement entry (the point the closure is created). Gated on the final
+    // emit pass so the (report-suppressed) fixpoint iterations skip the walk.
+    if (!suppressDiag_) checkCapturedOwnedConsumeInStmt(s);
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         handleLocalDecl(*ld);
         return;

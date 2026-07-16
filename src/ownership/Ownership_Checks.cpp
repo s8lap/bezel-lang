@@ -1420,6 +1420,404 @@ void MethodOwnership::collectLambdaIdentifiers(
     }
 }
 
+// -------------------------------------------------------------------------
+// §28.3 (v0.184, #1958) captured-owned-binding consume inside a closure.
+//
+// A captured owned binding — an owned local or `owned` parameter of the
+// ENCLOSING body — is uniformly in borrow state inside any closure: reading it
+// borrows, but "a marked transfer from it, an explicit `Dispose()` or discard
+// of it, and every other owned-consuming use of it are compile errors — a
+// closure cannot consume, reassign, or dispose a captured owned binding."
+// (spec §28.3 v0.184; Appendix C.: "A closure may read a captured owned binding
+// (as a borrow) but may not assign to it, transfer from it, or dispose it".)
+//
+// checkClosureEscapesOnReturn (above) only fires on the ESCAPE path — a lambda
+// that is RETURNED. A lambda that is invoked IN PLACE never reaches it, so the
+// consume inside its body was never checked: the closure disposed the captured
+// owned once, and the owner's scope end disposed it again — a double-dispose /
+// use-after-free (#1958). This walk closes that gap: it fires whether or not the
+// closure escapes.
+//
+// The walk carries `insideLambda`. At the method top level it is false — the
+// ordinary consuming forms there are handled by the main pass and are untouched.
+// On entering a lambda body it becomes true and a consuming form of a captured
+// owned binding is then diagnosed. A nested closure keeps `insideLambda` true:
+// its consuming form of the same enclosing-method binding is equally illegal.
+// A captured owned binding that is merely READ (a field access, a non-consuming
+// method call) is never a consuming form, so the ordinary borrow-capture case
+// stays accepted.
+bool MethodOwnership::isCapturedOwnedBinding(const ast::Expr& e) {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+    if (!id) return false;
+    if (id->name == "this" || id->name == "base") return false;
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    if (!sym) return false;
+    // Resolve against the dataflow-tracked method-scope bindings — the SAME
+    // states_ key checkClosureEscapesOnReturn uses. A lambda's own `owned`
+    // parameter and a lambda-body-local owned binding are declared inside the
+    // lambda and are NOT in states_, so they are correctly excluded here (a
+    // closure may consume a value it owns itself). Only an enclosing-method
+    // local / `owned` parameter still in the Owned state matches.
+    auto it = states_.find(sym);
+    if (it == states_.end()) return false;
+    return it->second.state == OwnershipState::Owned;
+}
+
+void MethodOwnership::reportCapturedOwnedConsume(std::string_view name,
+                                                 SourceLocation loc,
+                                                 const char* verb) {
+    report(Severity::Error, loc,
+           std::string("cannot ") + verb + " captured owned binding `" +
+               std::string(name) +
+               "` inside a closure — a captured owned binding is borrow-state "
+               "throughout the closure (§28.3, v0.184): the closure may not "
+               "consume, transfer, reassign, or dispose it. The enclosing scope "
+               "keeps the disposal obligation, so consuming it here disposes the "
+               "value twice (double-dispose / use-after-free). Give the closure "
+               "an `owned` parameter and transfer the value in from outside, or "
+               "restructure so the closure only borrows it.");
+}
+
+bool MethodOwnership::calleeArgIsOwnedSink(const ast::Expr* callee,
+                                           std::size_t pos) {
+    // Resolve the callee's declared parameter list — the SAME navigation
+    // recordMovesInArgs uses (MethodSymbol/ConstructorSymbol -> decl -> params).
+    sema::Symbol* sym = callee ? ctx_.exprSymbol(*callee) : nullptr;
+    const std::vector<ast::Param>* params = nullptr;
+    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym)) {
+        if (const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
+            params = &md->params;
+    } else if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym)) {
+        if (const auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
+            params = &cd->params;
+    }
+    // Only a plain `owned` formal CONSUMES the argument (an `out owned` formal
+    // writes it — recordMovesInArgs' twin note). Builtin owned-sink positions
+    // (Domain.Spawn, channel Send, …) have no AST decl and are covered by
+    // builtinOwnedSinkArg, exactly as the main owned-sink classification does.
+    const bool userOwned = params && pos < params->size() &&
+                           (*params)[pos].modifier == "owned";
+    return userOwned || builtinOwnedSinkArg(callee, pos);
+}
+
+void MethodOwnership::reportArgConsumeCapturedOwned(const ast::CallArgument& a,
+                                                    bool ownedSinkParam) {
+    if (!a.value || !isCapturedOwnedBinding(*a.value)) return;
+    // MARKED transfer (`owned r`) OR an UNMARKED bare identifier flowing into an
+    // owned (consuming) parameter. A `ref`/`out`/`scoped`/`out owned` modifier is
+    // NOT an ownership consume of the passed value, and a bare identifier into a
+    // BORROW parameter (ownedSinkParam == false) is a legitimate borrow-in-
+    // closure — both stay accepted.
+    if (a.modifier == "owned" || (a.modifier.empty() && ownedSinkParam)) {
+        const auto* aid =
+            dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
+        reportCapturedOwnedConsume(aid->name, aid->span.begin, "transfer");
+    }
+}
+
+void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
+                                                   bool insideLambda) {
+    // Entering a lambda body: descend with insideLambda = true. Both a
+    // top-level lambda literal and a nested one funnel through here, so every
+    // closure's direct body is scanned exactly once.
+    if (const auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        if (lam->exprBody)
+            scanCapturedOwnedConsumeExpr(*lam->exprBody, /*insideLambda=*/true);
+        for (const auto& st : lam->stmts)
+            if (st) scanCapturedOwnedConsumeStmt(*st, /*insideLambda=*/true);
+        return;
+    }
+    if (const auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (insideLambda && call->callee) {
+            // Explicit `.Dispose()` of a captured owned binding: `r.Dispose()`.
+            // Only a DIRECT identifier receiver matches (`r.Field.Dispose()`
+            // disposes a field, a distinct concern the field rules cover).
+            if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    call->callee.get())) {
+                if (ma->member == "Dispose" && ma->target &&
+                    isCapturedOwnedBinding(*ma->target)) {
+                    const auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
+                        ma->target.get());
+                    reportCapturedOwnedConsume(rid->name, rid->span.begin,
+                                               "dispose");
+                }
+            }
+        }
+        // Transfer of a captured owned binding into a consuming (`owned`)
+        // parameter — the MARKED form `Sink(owned r)` / `Domain.Spawn(owned r)`,
+        // AND the UNMARKED form `Sink(r)` whose callee parameter is `owned`
+        // (§22.3's call-site-marker check fires only at method top level, so the
+        // unmarked spelling reaches the closure body unrejected — #1958). A bare
+        // identifier passed to a BORROW parameter is not an owned sink and stays
+        // an accepted borrow-in-closure.
+        if (insideLambda) {
+            std::size_t pos = 0;
+            for (const auto& a : call->args) {
+                reportArgConsumeCapturedOwned(
+                    a, calleeArgIsOwnedSink(call->callee.get(), pos));
+                ++pos;
+            }
+        }
+        if (call->callee)
+            scanCapturedOwnedConsumeExpr(*call->callee, insideLambda);
+        for (const auto& a : call->args)
+            if (a.value) scanCapturedOwnedConsumeExpr(*a.value, insideLambda);
+        return;
+    }
+    if (const auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        if (insideLambda) {
+            std::size_t pos = 0;
+            for (const auto& a : nc->args) {
+                reportArgConsumeCapturedOwned(
+                    a, calleeArgIsOwnedSink(nc->callee.get(), pos));
+                ++pos;
+            }
+        }
+        if (nc->callee) scanCapturedOwnedConsumeExpr(*nc->callee, insideLambda);
+        for (const auto& a : nc->args)
+            if (a.value) scanCapturedOwnedConsumeExpr(*a.value, insideLambda);
+        return;
+    }
+    if (const auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        // Transfer into a constructor `owned` parameter — MARKED
+        // `new Holder(owned r)` and UNMARKED `new Holder(r)` alike (#1958).
+        if (insideLambda) {
+            const std::vector<ast::Param>* ctorParams =
+                resolveCtorParams(*ne, ctx_);
+            std::size_t pos = 0;
+            for (const auto& a : ne->args) {
+                const bool ownedSink = ctorParams && pos < ctorParams->size() &&
+                                       (*ctorParams)[pos].modifier == "owned";
+                reportArgConsumeCapturedOwned(a, ownedSink);
+                ++pos;
+            }
+        }
+        for (const auto& a : ne->args)
+            if (a.value) scanCapturedOwnedConsumeExpr(*a.value, insideLambda);
+        return;
+    }
+    if (const auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        // Indexer indices: only the MARKED `owned` form is a consume here (an
+        // index argument is never a plain `owned` sink), so pass ownedSinkParam
+        // = false — reportArgConsumeCapturedOwned still fires on `coll[owned r]`.
+        if (insideLambda)
+            for (const auto& a : ix->indices)
+                reportArgConsumeCapturedOwned(a, /*ownedSinkParam=*/false);
+        if (ix->target) scanCapturedOwnedConsumeExpr(*ix->target, insideLambda);
+        for (const auto& a : ix->indices)
+            if (a.value) scanCapturedOwnedConsumeExpr(*a.value, insideLambda);
+        return;
+    }
+    if (const auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        // Marked transfer via `move r`.
+        if (insideLambda && un->op == "move" && un->operand &&
+            isCapturedOwnedBinding(*un->operand)) {
+            const auto* oid =
+                dynamic_cast<const ast::IdentifierExpr*>(un->operand.get());
+            reportCapturedOwnedConsume(oid->name, oid->span.begin, "transfer");
+        }
+        if (un->operand) scanCapturedOwnedConsumeExpr(*un->operand, insideLambda);
+        return;
+    }
+    if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) scanCapturedOwnedConsumeExpr(*ma->target, insideLambda);
+        return;
+    }
+    if (const auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (ncm->target)
+            scanCapturedOwnedConsumeExpr(*ncm->target, insideLambda);
+        return;
+    }
+    if (const auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand) scanCapturedOwnedConsumeExpr(*pb->operand, insideLambda);
+        return;
+    }
+    if (const auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left) scanCapturedOwnedConsumeExpr(*be->left, insideLambda);
+        if (be->right) scanCapturedOwnedConsumeExpr(*be->right, insideLambda);
+        return;
+    }
+    if (const auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->operand) scanCapturedOwnedConsumeExpr(*tt->operand, insideLambda);
+        return;
+    }
+    if (const auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->thenValue)
+            scanCapturedOwnedConsumeExpr(*cd->thenValue, insideLambda);
+        if (cd->condition)
+            scanCapturedOwnedConsumeExpr(*cd->condition, insideLambda);
+        if (cd->elseValue)
+            scanCapturedOwnedConsumeExpr(*cd->elseValue, insideLambda);
+        return;
+    }
+    if (const auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        if (th->operand) scanCapturedOwnedConsumeExpr(*th->operand, insideLambda);
+        return;
+    }
+    if (const auto* isx = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        for (const auto& part : isx->parts)
+            if (part.expr)
+                scanCapturedOwnedConsumeExpr(*part.expr, insideLambda);
+        return;
+    }
+    if (const auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        if (we->source) scanCapturedOwnedConsumeExpr(*we->source, insideLambda);
+        for (const auto& as : we->assigns)
+            if (as.value) scanCapturedOwnedConsumeExpr(*as.value, insideLambda);
+        return;
+    }
+    if (const auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& k : cl->keys)
+            if (k) scanCapturedOwnedConsumeExpr(*k, insideLambda);
+        for (const auto& v : cl->elements)
+            if (v) scanCapturedOwnedConsumeExpr(*v, insideLambda);
+        return;
+    }
+    if (const auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        if (ce->scrutinee)
+            scanCapturedOwnedConsumeExpr(*ce->scrutinee, insideLambda);
+        for (const auto& arm : ce->arms) {
+            if (arm.guard) scanCapturedOwnedConsumeExpr(*arm.guard, insideLambda);
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
+                if (arm.exprBody)
+                    scanCapturedOwnedConsumeExpr(*arm.exprBody, insideLambda);
+            } else {
+                for (const auto& bs : arm.stmts)
+                    if (bs) scanCapturedOwnedConsumeStmt(*bs, insideLambda);
+            }
+        }
+        return;
+    }
+    // Literals, identifiers, default/typeof/nameof, ranges, units: no
+    // sub-expression carries a captured-owned consume.
+}
+
+void MethodOwnership::scanCapturedOwnedConsumeStmt(const ast::Stmt& s,
+                                                   bool insideLambda) {
+    if (const auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer)
+            scanCapturedOwnedConsumeExpr(*ld->initializer, insideLambda);
+        return;
+    }
+    if (const auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        // Reassignment / compound assignment of a captured owned binding: §28.3
+        // "assignment to it … [is a] compile error." (A plain `:=` rebind would
+        // drop the still-owned value while the enclosing scope disposes it.)
+        if (insideLambda && as->target && isCapturedOwnedBinding(*as->target)) {
+            const auto* tid =
+                dynamic_cast<const ast::IdentifierExpr*>(as->target.get());
+            reportCapturedOwnedConsume(tid->name, tid->span.begin, "assign to");
+        }
+        if (as->target) scanCapturedOwnedConsumeExpr(*as->target, insideLambda);
+        if (as->value) scanCapturedOwnedConsumeExpr(*as->value, insideLambda);
+        return;
+    }
+    if (const auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        // Announced discard of a captured owned binding: `_ := r` disposes it.
+        if (insideLambda && ds->value && isCapturedOwnedBinding(*ds->value)) {
+            const auto* vid =
+                dynamic_cast<const ast::IdentifierExpr*>(ds->value.get());
+            reportCapturedOwnedConsume(vid->name, vid->span.begin, "discard");
+        }
+        if (ds->value) scanCapturedOwnedConsumeExpr(*ds->value, insideLambda);
+        return;
+    }
+    if (const auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) scanCapturedOwnedConsumeExpr(*es->expr, insideLambda);
+        return;
+    }
+    if (const auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) scanCapturedOwnedConsumeExpr(*rs->value, insideLambda);
+        return;
+    }
+    if (const auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (th->value) scanCapturedOwnedConsumeExpr(*th->value, insideLambda);
+        return;
+    }
+    if (const auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) scanCapturedOwnedConsumeExpr(*ys->value, insideLambda);
+        return;
+    }
+    if (const auto* incr = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        if (incr->target)
+            scanCapturedOwnedConsumeExpr(*incr->target, insideLambda);
+        return;
+    }
+    // Control-flow statements. At the method top level (insideLambda == false)
+    // the enclosing CFG has already flattened these into straight-line blocks
+    // that visitStmt processes on their own, so descending here would double-
+    // scan; a top-level control-flow statement therefore contributes nothing.
+    // Inside a lambda body the body is opaque to the CFG, so every sub-statement
+    // and controlling expression IS walked here.
+    if (!insideLambda) return;
+    if (const auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition)
+            scanCapturedOwnedConsumeExpr(*ifs->ifBranch.condition, insideLambda);
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) scanCapturedOwnedConsumeStmt(*bs, insideLambda);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition)
+                scanCapturedOwnedConsumeExpr(*el.condition, insideLambda);
+            for (const auto& bs : el.body)
+                if (bs) scanCapturedOwnedConsumeStmt(*bs, insideLambda);
+        }
+        for (const auto& bs : ifs->elseBody)
+            if (bs) scanCapturedOwnedConsumeStmt(*bs, insideLambda);
+        return;
+    }
+    if (const auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition)
+            scanCapturedOwnedConsumeExpr(*ws->condition, insideLambda);
+        for (const auto& bs : ws->body)
+            if (bs) scanCapturedOwnedConsumeStmt(*bs, insideLambda);
+        return;
+    }
+    if (const auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable)
+            scanCapturedOwnedConsumeExpr(*fs->iterable, insideLambda);
+        if (fs->withExpr)
+            scanCapturedOwnedConsumeExpr(*fs->withExpr, insideLambda);
+        for (const auto& bs : fs->body)
+            if (bs) scanCapturedOwnedConsumeStmt(*bs, insideLambda);
+        return;
+    }
+    if (const auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : dob->body)
+            if (bs) scanCapturedOwnedConsumeStmt(*bs, insideLambda);
+        return;
+    }
+    if (const auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : ts->body)
+            if (bs) scanCapturedOwnedConsumeStmt(*bs, insideLambda);
+        for (const auto& arm : ts->catches) {
+            if (arm.guard) scanCapturedOwnedConsumeExpr(*arm.guard, insideLambda);
+            if (arm.body) scanCapturedOwnedConsumeStmt(*arm.body, insideLambda);
+        }
+        for (const auto& bs : ts->finallyBody)
+            if (bs) scanCapturedOwnedConsumeStmt(*bs, insideLambda);
+        return;
+    }
+    if (const auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        if (cs->scrutinee)
+            scanCapturedOwnedConsumeExpr(*cs->scrutinee, insideLambda);
+        for (const auto& arm : cs->arms) {
+            if (arm.guard) scanCapturedOwnedConsumeExpr(*arm.guard, insideLambda);
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
+                if (arm.exprBody)
+                    scanCapturedOwnedConsumeExpr(*arm.exprBody, insideLambda);
+            } else {
+                for (const auto& bs : arm.stmts)
+                    if (bs) scanCapturedOwnedConsumeStmt(*bs, insideLambda);
+            }
+        }
+        return;
+    }
+}
+
+void MethodOwnership::checkCapturedOwnedConsumeInStmt(const ast::Stmt& s) {
+    scanCapturedOwnedConsumeStmt(s, /*insideLambda=*/false);
+}
+
 void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e) {
     // Gather every lambda appearing in the returned expression. The
     // returned expression is most commonly the lambda itself

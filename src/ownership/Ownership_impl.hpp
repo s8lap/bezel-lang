@@ -903,6 +903,52 @@ private:
     // LambdaExpr and diagnoses each offending capture.
     void checkClosureEscapesOnReturn(const ast::Expr& e);
 
+    // §28.3 (v0.184, #1958) "Captured owned bindings": inside a closure a
+    // captured owned binding — an owned local or `owned` parameter of the
+    // enclosing body — is uniformly in BORROW state; a marked transfer
+    // (`M(owned x)` / `move x`), an explicit `.Dispose()`, an announced discard
+    // (`_ := x`), a reassignment, and every other owned-consuming use of it are
+    // compile errors ("a closure cannot consume, reassign, or dispose a
+    // captured owned binding"). checkClosureEscapesOnReturn only fires on the
+    // ESCAPE (return) path; this walk fires regardless of escape, so an
+    // in-place-invoked closure that consumes a captured owned binding — which
+    // would dispose the value once in the closure body and again at the owner's
+    // scope end (double-dispose / use-after-free) — is rejected. Invoked once
+    // per statement from visitStmt (final emit pass only). The `insideLambda`
+    // flag is false at method top level (the ordinary consuming forms handled by
+    // the main pass are untouched) and becomes true on entering any lambda body,
+    // so a consuming form is diagnosed exactly when it is lexically inside at
+    // least one closure (a nested closure counts — the binding is still an
+    // enclosing-method owned binding there). A captured owned binding that is
+    // merely READ (a field access, a non-consuming method call) is never a
+    // consuming form and stays accepted.
+    void checkCapturedOwnedConsumeInStmt(const ast::Stmt& s);
+    void scanCapturedOwnedConsumeStmt(const ast::Stmt& s, bool insideLambda);
+    void scanCapturedOwnedConsumeExpr(const ast::Expr& e, bool insideLambda);
+    // True when `e` is a bare identifier resolving to an enclosing-method owned
+    // binding (a local/`owned` parameter currently in the Owned state — the same
+    // key checkClosureEscapesOnReturn resolves against `states_`). A lambda's own
+    // parameter or a lambda-body-local owned binding is NOT in `states_`, so it
+    // is correctly excluded (a closure may consume what it owns itself).
+    bool isCapturedOwnedBinding(const ast::Expr& e);
+    void reportCapturedOwnedConsume(std::string_view name, SourceLocation loc,
+                                    const char* verb);
+    // True when argument position `pos` of a call whose callee is `callee` is a
+    // CONSUMING owned sink — a user-declared plain `owned` formal, or a builtin
+    // owned-sink position (Domain.Spawn, channel Send, …). Mirrors the owned-sink
+    // half of recordMovesInArgs (an `out owned` / ref / out / scoped / borrow
+    // formal is NOT a consuming sink). Used to reject the UNMARKED consume
+    // `Sink(r)` of a captured owned binding inside a closure — §22.3's call-site
+    // `owned`-marker requirement only fires at method top level, so the (more
+    // natural) unmarked spelling reaches the closure body unrejected (#1958).
+    bool calleeArgIsOwnedSink(const ast::Expr* callee, std::size_t pos);
+    // Reports the §28.3 v0.184 transfer error when call argument `a` consumes a
+    // captured owned binding — either the MARKED form (`owned r`) or the UNMARKED
+    // bare identifier flowing into an owned parameter (`ownedSinkParam`). A bare
+    // identifier passed to a borrow parameter is not a consume and is accepted.
+    void reportArgConsumeCapturedOwned(const ast::CallArgument& a,
+                                       bool ownedSinkParam);
+
     // Free-variable walk of a lambda body. Appends to `out` every
     // IdentifierExpr in the body (and in nested lambdas) — sema has
     // already attached each identifier's resolved Symbol via exprSymbol,
