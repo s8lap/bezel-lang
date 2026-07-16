@@ -812,6 +812,25 @@ private:
     // candidate ancestor?).
     bool hasNamedAncestor(TypeRef* ty, std::string_view ancestorName);
 
+    // §11 / §12.9 / §5.1 (#1935): does the USER-declared type `from` actually
+    // implement (directly or transitively) a BUILTIN interface whose simple name
+    // is `builtinBaseName`? Interface conformance in Bezel is nominal — a type
+    // conforms only by listing the interface among its bases — so a builtin base
+    // absent from `from`'s transitive declared-base closure is PROOF `from` does
+    // not conform. A builtin interface base carries a null declaration and is
+    // therefore dropped from `baseTypeRefs` (TypeResolution records only bases
+    // with a resolved TypeSymbol); it survives only on the SYNTACTIC AST base
+    // list, and its own builtin supers (IList<T> → … → IEnumerable<T>) live only
+    // in the hardcoded builtin interface hierarchy. This walk consults all three
+    // — `baseTypeRefs`, the AST base list, and `builtinInterfaceAncestors` on any
+    // builtin node — so a class implementing a more-derived builtin interface
+    // still counts as implementing its builtin supers. Used by `checkAssignable`
+    // to REJECT a user-declared source assigned to a builtin generic interface it
+    // does not implement, instead of `variantGenericAssignable`'s conservative
+    // user→builtin residual accept.
+    bool userTypeImplementsBuiltinIface(TypeRef* from,
+                                        std::string_view builtinBaseName);
+
     // Slice S7: diagnose assignment to a readonly field outside the
     // declaring class's constructor. Tracks only the `this.<field>`
     // target shape; `other.f := X` would need cross-object readonly

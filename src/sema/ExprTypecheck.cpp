@@ -2713,6 +2713,19 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
     if (from->kind == TypeRef::Kind::Named &&
         to->kind == TypeRef::Kind::Named &&
         !to->genericArgs.empty() && !to->declaration) {
+        // §11 / §12.9 / §5.1 (#1935): a USER-declared `from` (non-null
+        // declaration) reaching a BUILTIN generic interface `to` must actually
+        // implement `to`'s base interface — nominal conformance, verified by
+        // walking `from`'s transitive declared-base closure. Without this,
+        // variantGenericAssignable's user→builtin residual conservatively
+        // ACCEPTS, letting an unrelated `MyBag<Dog>` pass as `IList<Dog>` and a
+        // later interface call dispatch through an itable the object lacks (an
+        // unsound accept — runtime type confusion).
+        if (from->declaration &&
+            !userTypeImplementsBuiltinIface(from, namedTypeSimpleName(to))) {
+            reportNotConvertible();
+            return;
+        }
         if (!variantGenericAssignable(from, to, isSubtype)) {
             reportNotConvertible();
             return;
@@ -3991,6 +4004,91 @@ static bool typeArgCovariantAssignable(
     return false;
 }
 
+// §11 / §12.9 / §5.1 (#1935): see header doc. A user-declared type conforms to
+// a builtin interface only by nominally listing it (directly or transitively)
+// among its bases; walk the full declared-base closure — resolved user bases
+// (`baseTypeRefs`), the syntactic AST base list (recovers builtin bases, which
+// have no TypeSymbol and so are absent from `baseTypeRefs`), and the builtin
+// interface hierarchy on any builtin node (so implementing IList<T> also counts
+// as implementing IEnumerable<T>) — and report whether the builtin base named
+// `builtinBaseName` is reachable. A name-only walk suffices for the base-
+// conformance gate; the type-argument variance on the matched base stays the
+// (conservatively-accepted) residual that #1851 deliberately left.
+bool ExprTC::userTypeImplementsBuiltinIface(TypeRef* from,
+                                            std::string_view builtinBaseName) {
+    if (builtinBaseName.empty() || !from ||
+        from->kind != TypeRef::Kind::Named)
+        return false;
+    // Only a target whose builtin super-hierarchy is COMPLETELY modeled by
+    // builtinInterfaceAncestors (the borrowing collection interfaces) permits a
+    // sound "not reachable ⇒ does not implement" conclusion. For any other
+    // builtin `to`, absence from the walk is not proof — keep the conservative
+    // accept (#1851's discipline: reject only where the model is complete).
+    if (!builtinBorrowingCollectionFullyModeled(builtinBaseName))
+        return true;
+    // Ancestors synthesised by builtinInterfaceAncestors are owned here so their
+    // TypeRefs outlive the walk (the frontier holds raw pointers into them).
+    std::vector<std::unique_ptr<TypeRef>> owned;
+    std::unordered_set<std::string_view> seenName;
+    std::unordered_set<const TypeRef*> seenPtr;  // empty-name nodes
+    std::vector<const TypeRef*> queue{from};
+    // If ANY builtin base encountered lies OUTSIDE the fully-modeled collection
+    // family (e.g. IGrouping<K,T>/IOrderedEnumerable<T>, whose `: IEnumerable<T>`
+    // super is not in builtinInterfaceAncestors, or an arity-2 / owning base),
+    // its builtin super-closure is unknown here — so a not-found result is not
+    // proof of non-conformance and we must conservatively accept.
+    bool sawUnmodeledBuiltinBase = false;
+    const std::size_t kMaxWalk = 8192;  // defensive bound; base sets are shallow
+    std::size_t walked = 0;
+    while (!queue.empty()) {
+        // Defensive: on a malformed base-type cycle that survives error recovery,
+        // do NOT over-reject — bail out to the conservative accept.
+        if (++walked > kMaxWalk) return true;
+        const TypeRef* cur = queue.back();
+        queue.pop_back();
+        if (!cur || cur->kind != TypeRef::Kind::Named) continue;
+        std::string_view curName = namedTypeSimpleName(cur);
+        bool fresh = !curName.empty() ? seenName.insert(curName).second
+                                      : seenPtr.insert(cur).second;
+        if (!fresh) continue;
+        if (curName == builtinBaseName) return true;
+        if (cur->declaration) {
+            // User-declared node: walk resolved user bases plus the AST base
+            // list (the only place a builtin base survives).
+            for (TypeRef* b : cur->declaration->baseTypeRefs)
+                queue.push_back(b);
+            if (const auto* astDecl =
+                    dynamic_cast<const ast::TypeDecl*>(cur->declaration->decl))
+                for (const auto& baseAst : astDecl->baseTypes) {
+                    if (!baseAst) continue;
+                    TypeRef* br = ctx_.resolvedType(*baseAst);
+                    // An UNRESOLVED base — null, or an Error/non-Named TypeRef
+                    // (already reported elsewhere) — leaves the conformance
+                    // closure incomplete: can't prove absence, so mark unknown
+                    // and don't pile a spurious §5.1 error on the real one.
+                    if (!br || br->kind != TypeRef::Kind::Named) {
+                        sawUnmodeledBuiltinBase = true;
+                        continue;
+                    }
+                    queue.push_back(br);
+                }
+        } else if (!curName.empty()) {
+            // Builtin interface base. If it is not in the fully-modeled family,
+            // its super-closure is unknown — record that so a not-found result
+            // stays a conservative accept.
+            if (!builtinBorrowingCollectionFullyModeled(curName))
+                sawUnmodeledBuiltinBase = true;
+            for (const TypeRef* anc : builtinInterfaceAncestors(
+                     curName, const_cast<std::vector<TypeRef*>&>(cur->genericArgs),
+                     owned))
+                queue.push_back(anc);
+        }
+    }
+    // Not reachable. Reject only when every builtin base along the way was fully
+    // modeled (proof of non-conformance); otherwise conservatively accept.
+    return sawUnmodeledBuiltinBase;
+}
+
 // §12.9 (issue #1180): check whether the generic assignment `from → to` is
 // sound under §12.9 variance rules.  Returns true (compatible) or false
 // (unsound — caller should report §5.1 error).
@@ -4001,8 +4099,10 @@ static bool typeArgCovariantAssignable(
 //   B) Different base types where `from` is a builtin subtype of `to`:
 //      walk builtinInterfaceAncestorsOf to find the matching ancestor, then
 //      apply case A on that pair.
-//      User-declared cross-type generics are conservatively accepted
-//      (residual — deferred to the full §12.9 milestone).
+//      User-declared cross-type generics: base conformance is verified by the
+//      caller (checkAssignable, via userTypeImplementsBuiltinIface, #1935) for a
+//      builtin `to`; the type-argument variance on the matched base stays a
+//      conservatively-accepted residual (deferred to the full §12.9 milestone).
 static bool variantGenericAssignable(
     const TypeRef* from, const TypeRef* to,
     bool (*isSubtypeFn)(TypeSymbol*, TypeSymbol*)) {
@@ -4047,8 +4147,13 @@ static bool variantGenericAssignable(
                     return false;
             }
         }
-        // `from` has a user declaration: user-declared → builtin is a residual
-        // (would need baseTypeRefs walk with substitution).  Accept conservatively.
+        // `from` has a user declaration: user-declared → builtin. The BASE
+        // conformance (does `from` implement `to`'s base interface at all) is
+        // verified by the caller for the checkAssignable site
+        // (userTypeImplementsBuiltinIface, #1935) — a non-conforming `from` is
+        // rejected there before reaching here. What remains here is the
+        // type-argument variance on the matched base, a conservatively-accepted
+        // residual (would need a baseTypeRefs walk with substitution).
     } else {
         // `to` is a user-declared generic type (has declaration).
         if (from->declaration == to->declaration) {
