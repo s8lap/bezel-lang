@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.196 — July 2026**
+**Version 0.197 — July 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -7483,9 +7483,13 @@ The factory `Task.FromResult<T>(value: T)` produces a completed task whose resul
 For class T, use `Task.FromOwnedResult<T>(owned value: T): OwningTask<T>` instead. The caller transfers ownership of `value` to the task; the produced task is Pattern B (single-consumer, owned result), and consumers await it under the `using var x := await ...` shape:
 
 ```bezel
-Task.FromResult(42);                               // T = int, value-typed
-Task.FromResult("done");                           // T = string, runtime-managed
-Task.FromOwnedResult<MyClass>(new MyClass());      // T = MyClass, returns OwningTask<MyClass>
+class TaskFactoryDemo
+  async method Consume(): Task
+    var i := await Task.FromResult(42);                                // T = int, value-typed
+    var s := await Task.FromResult("done");                            // T = string, runtime-managed
+    using var m := await Task.FromOwnedResult<MyClass>(new MyClass());  // T = MyClass → OwningTask<MyClass>
+  end Consume;
+end TaskFactoryDemo;
 ```
 
 The same split applies to `TaskCompletionSource<T>`: the standard form is for non-class T (value, string, runtime-managed) and produces `Task<T>`; `OwningTaskCompletionSource<T> where T: class` is the form for class T and produces `OwningTask<T>`. See [§30.10](#sec-standard-library-task-helpers) and [§30.11](#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet).
