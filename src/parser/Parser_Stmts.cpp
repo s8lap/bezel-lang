@@ -285,6 +285,17 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
             decl->type = parseType();
         }
         if (consumePunctuator(":=")) {
+            // §28.3 / §28.10 (v0.180, #1962): the `owned` binding-position
+            // transfer marker — `var y := owned x;` / `using var y := owned x;`.
+            // This parallels the call-site marker (§22.3, `M(owned x)`): the
+            // keyword announces that the initializer MOVES a named owned binding
+            // (leaving it moved-from) rather than borrowing it. `owned` is a
+            // modifier keyword that can never begin an expression, so consuming
+            // it here is unambiguous. The ownership pass validates the source and
+            // records the move; the flag routes the binding to the same
+            // move-transfer handling as an `owned` call argument.
+            if (consumeKeyword("owned"))
+                decl->initializerHasOwnedMarker = true;
             decl->initializer = parseExpression();
         } else if (decl->isUsing) {
             diagnostics_.report(

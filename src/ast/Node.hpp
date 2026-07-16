@@ -203,6 +203,16 @@ struct LocalDecl : Stmt {
     // free. Only set for the discard discharge form (NOT `move`/`.Dispose()`, whose
     // codegen does not null a collection slot), so it can never double a transfer.
     bool dischargedByDiscard = false;
+    // §28.3 / §28.10 (v0.180, #1962): the initializer carries the `owned`
+    // binding-position transfer marker — `var y := owned x;` / `using var y :=
+    // owned x;`. It is the binding-position form of the §22.3 call-site marker
+    // (`M(owned x)`): a MARKED read of a named owned binding is a MOVE (the
+    // source is left moved-from and this binding takes over the disposal
+    // obligation), as opposed to the UNMARKED read `var y := x;`, which is a
+    // borrow. Set by the parser (right after `:=`); consumed by the ownership
+    // pass (handleLocalDecl), which validates the source is a named owned
+    // binding and records the move.
+    bool initializerHasOwnedMarker = false;
     std::string_view name;
     std::unique_ptr<Type> type;        // null when no `: Type`
     std::unique_ptr<Expr> initializer; // null only when plain `var x;`

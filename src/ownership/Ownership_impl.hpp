@@ -1601,6 +1601,22 @@ private:
     // obj.f`); otherwise the non-`owned`-parameter-position wording.
     void reportSpuriousOwnedMarker(SourceLocation loc, bool onFreshProducer);
 
+    // §28.3 / §28.10 (v0.180, #1962): validate and record the binding-position
+    // `owned` transfer marker — `var y := owned x;` / `using var y := owned x;`.
+    // The marked initializer must be a NAMED OWNED BINDING (an owned local or
+    // `owned` parameter currently Owned); when it is, the source is marked
+    // moved-from (the binding takes over the disposal obligation). The marker on a
+    // borrow, a fresh producer, or any other right-hand side is rejected with a
+    // spec-stated diagnostic — mirroring the call-site marker's rules (§22.3).
+    // Called from handleLocalDecl for either `var` or `using var`.
+    void checkAndMoveBindingOwnedMarker(const ast::Expr& init);
+
+    // §28.3 / §28.10 (v0.180, #1962): report a rejected binding-position `owned`
+    // marker. `onFreshProducer` selects the fresh-producer wording (`new`,
+    // owned-returning call, operator, `move obj.f`); otherwise the borrow /
+    // not-a-named-owned-binding wording.
+    void reportBindingOwnedMarkerRejected(SourceLocation loc, bool onFreshProducer);
+
     // §28.8.1 (#897 #898): record a `move this.field` / `move _field` (qualified
     // OR bare owned-field move). This is the field analogue of markMovedByName
     // for locals: BEFORE marking the field moved-from, it CHECKS the current

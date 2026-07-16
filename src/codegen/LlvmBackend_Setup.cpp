@@ -8147,6 +8147,31 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
                 return reinterpret_cast<const sema::TypeSymbol*>(1);
         }
     }
+    // §28.3 / §28.10 (v0.180, #1962): a plain `var y := owned x;` — the binding-
+    // position transfer marker. The initializer is a bare IdentifierExpr (the
+    // named owned source), so the (a)/(b)/(a2) shape checks above miss it, exactly
+    // as they miss `var y := move x;`. When the binding is discharged on some path
+    // (so the ownership pass did NOT flag autoDropAtScopeEnd and the auto-drop
+    // registerUsingDisposal is not used) it must still be disposed on the
+    // exception-unwind edge that PRECEDES the discharge — otherwise the moved-in
+    // value leaks on a throw. The source `x` is left moved-from (marked ineligible
+    // by UnwindIneligibleWalker, which walks `var y := x` as a consume of x), so
+    // `y` is the sole owner: an unwindOnly dynamic dispose here is exactly-once.
+    // Recover the class from the initializer's inferred type (the source's type);
+    // dispatch is dynamic (vtable) and null-guarded regardless. // per §28.3 v0.180
+    if (ld->initializerHasOwnedMarker &&
+        dynamic_cast<const ast::IdentifierExpr*>(ld->initializer.get())) {
+        const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
+        const sema::TypeRef* rInit = resolveTypeParamRef(initTy);
+        if (isClassOrInterfaceRef(initTy) || isClassOrInterfaceRef(rInit)) {
+            if (initTy && initTy->kind == sema::TypeRef::Kind::Named &&
+                initTy->declaration &&
+                initTy->declaration->kind == ast::TypeDeclKind::Class &&
+                disposerFns_.find(initTy->declaration) != disposerFns_.end())
+                return initTy->declaration;
+            return reinterpret_cast<const sema::TypeSymbol*>(1);
+        }
+    }
     return nullptr;
 }
 
@@ -12390,6 +12415,27 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
         const sema::TypeRef* rt = ctx_.resolvedType(*ld->type);
         if (rt && rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
             rt->declaration->kind == ast::TypeDeclKind::Interface)
+            return true;
+    }
+    // (a1) §28.3 / §28.10 (v0.180, #1962): a bare-identifier `owned`-marked binding
+    // whose (possibly INFERRED) type is a class or interface — `var y := owned x;`
+    // / `using var y := owned x;` where the source is interface-typed and the
+    // binding is UNANNOTATED. classOfLocal recovers the interface symbol (which has
+    // no disposerFns_ entry), and the initializer is neither a `new`/call/operator/
+    // `??`/arm-meet shape (a2/b0..b2 below) nor type-annotated (a above), so every
+    // branch missed it and the adopted value LEAKED on the NORMAL path. (The throw
+    // edge is covered by unwindOwnedLocalClass's mirror branch.) The marker MOVED
+    // the sole owner into this binding (the source is left moved-from and marked
+    // unwind-ineligible), so a single dynamic (vtable-slot-2) dispose at scope end
+    // is exactly-once. A CLASS-typed source is already disposed by the classOfLocal
+    // static path (which returns before this function is reached), so this fires
+    // only for the interface / erased-generic case — no double-registration.
+    // // per §28.3 v0.180 #1962
+    if (ld->initializerHasOwnedMarker && ld->initializer &&
+        dynamic_cast<const ast::IdentifierExpr*>(ld->initializer.get())) {
+        const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
+        if (isClassOrInterfaceRef(initTy) ||
+            isClassOrInterfaceRef(resolveTypeParamRef(initTy)))
             return true;
     }
     // (a2) §28.3 arm-meet (v0.184, #1661): an inferred `using var x := new T()

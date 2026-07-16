@@ -3229,11 +3229,31 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
         // Runs for a `using var` binding too (§15.3: copies are forbidden, so the
         // plain binding can only move); a MovedFrom/Poisoned source was already
         // rejected by the checkRead above, so this only ever marks a LIVE source.
-        noteMoveOnlyArrayWholeMoveRead(*ld.initializer);
+        // Skipped when the §28.3 (v0.180) `owned` binding marker is present: the
+        // marker branch below records the single move (markMovedByName), so
+        // running this first would double-mark the source (a spurious "already
+        // moved" on a marked move-only-array transfer). // per §28.3 v0.180 #1962
+        if (!ld.initializerHasOwnedMarker)
+            noteMoveOnlyArrayWholeMoveRead(*ld.initializer);
     }
     LocalOwnership lo;
     lo.obligationOrigin = &ld;
-    if (ld.isUsing) {
+    // §28.3 / §28.10 (v0.180, #1962): the binding-position `owned` transfer
+    // marker — `var y := owned x;` / `using var y := owned x;`. A MARKED read of a
+    // named owned binding is a MOVE: validate the source and record it moved-from,
+    // then the new binding is Owned (and, for `using var`, scope-bound-disposed).
+    // This diverts the whole state-classification below (the unmarked bare-id
+    // borrow-pin / producerState paths do not apply to a marked transfer).
+    if (ld.initializer && ld.initializerHasOwnedMarker) {
+        checkAndMoveBindingOwnedMarker(*ld.initializer);
+        lo.state = OwnershipState::Owned;
+        if (ld.isUsing) {
+            // A `using var` adoption is scope-bound and implicitly discharged; the
+            // moved source is Owned, so this is never a §28.10 borrow-pin (the
+            // usingVarSourceIsBorrow flag stays clear — codegen disposes `y`).
+            lo.implicitDischarge = true;
+        }
+    } else if (ld.isUsing) {
         // `using var` is always Owned and implicitly discharged.
         lo.state = OwnershipState::Owned;
         lo.implicitDischarge = true;
@@ -3411,7 +3431,10 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
         // AFTER recordMovesIn so a `move`d-out source (now MovedFrom, not
         // Owned) is correctly NOT treated as a live borrow source. A `using
         // var` is itself Owned, not a re-borrow, so it never gets a source.
-        if (!ld.isUsing) {
+        // A §28.3 (v0.180) `owned`-marked binding (`var y := owned x;`) MOVED the
+        // source: `y` is a new OWNER, not a borrow of `x`, so it takes no borrow
+        // source (a later `return y;` is an owned return, not a borrow escape).
+        if (!ld.isUsing && !ld.initializerHasOwnedMarker) {
             if (sema::Symbol* src = borrowSourceForExpr(*ld.initializer)) {
                 BorrowSource bs;
                 bs.sym = src;

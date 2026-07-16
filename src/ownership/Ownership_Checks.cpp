@@ -4519,6 +4519,57 @@ void MethodOwnership::reportSpuriousOwnedMarker(SourceLocation loc,
                "ownership — remove `owned` (§22.3, v0.169)");
 }
 
+void MethodOwnership::reportBindingOwnedMarkerRejected(SourceLocation loc,
+                                                       bool onFreshProducer) {
+    if (onFreshProducer)
+        report(Severity::Error, loc,
+               "the `owned` binding-position marker is not written on a fresh "
+               "producer (a `new` expression, a call returning `owned T`, an "
+               "operator result, or `move obj.f`) — no live binding is "
+               "invalidated, so there is nothing to announce; remove `owned` "
+               "(§28.3, v0.180)");
+    else
+        report(Severity::Error, loc,
+               "the `owned` binding-position marker transfers a named owned "
+               "binding (an owned local or `owned` parameter) and leaves it "
+               "moved-from; it may not be written on a borrow or any other "
+               "right-hand side — an unmarked `var y := x;` borrows (§28.3, "
+               "v0.180)");
+}
+
+// §28.3 / §28.10 (v0.180, #1962): the binding-position transfer marker. See the
+// header. The ONLY valid source is a bare identifier resolving to a named owned
+// binding in the Owned state (`isNamedOwnedBinding`) — exactly the argument form
+// the call-site marker (`M(owned x)`) covers. On that form the source is marked
+// moved-from (`markMovedByName`), transferring the disposal obligation to the new
+// binding; every other form is rejected with the spec-stated diagnostic.
+void MethodOwnership::checkAndMoveBindingOwnedMarker(const ast::Expr& init) {
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&init)) {
+        // A borrow flowing where an owned value is required — rejected regardless
+        // of the marker (mirrors the call-site owned-arg source check, §28.8).
+        if (checkOwnedArgSource(init, id->span.begin)) return;
+        // A valid owned source: the named binding is moved-from by this transfer.
+        if (isNamedOwnedBinding(init)) {
+            markMovedByName(id->name, id->span.begin);
+            return;
+        }
+        // A bare id that is not a live owned binding (`this`/`base`, a moved-from
+        // or disposed local, or a plain value) — the marker is spurious.
+        reportBindingOwnedMarkerRejected(init.span.begin,
+                                         /*onFreshProducer=*/false);
+        return;
+    }
+    // A fresh producer (`new`, a call returning `owned T`, an owned operator
+    // result, or `move obj.f`) invalidates no live binding — the marker is
+    // spurious. A non-identifier borrow (`obj.f`, `coll[i]`) is likewise rejected.
+    if (producerState(init) == OwnershipState::Owned)
+        reportBindingOwnedMarkerRejected(init.span.begin,
+                                         /*onFreshProducer=*/true);
+    else
+        reportBindingOwnedMarkerRejected(init.span.begin,
+                                         /*onFreshProducer=*/false);
+}
+
 // §28.8.1, #897 #898: the field analogue of markMovedByName. Mirrors the
 // locals' read/move-after-move diagnostic (markMovedByName above, which reports
 // "was already moved out at this point (§28.3)" when the local is MovedFrom):
