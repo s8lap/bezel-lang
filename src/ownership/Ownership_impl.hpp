@@ -1921,6 +1921,31 @@ private:
                                                bool escaping,
                                                bool forSource = false);
 
+    // §28.3 / stdlib §5 (#1917): a lazy LINQ `Select(selector)` whose inline
+    // lambda selector MINTS a fresh cleanup-bearing value per element — a
+    // freshly-`new`'d owned class (`(x) => new Box(x)`) or a fresh string
+    // (`(w) => w + "!"`, an interpolation) — launders that value out through the
+    // projected sequence's receiver-sourced-borrow classification (stdlib §5
+    // "Ownership at class-typed substitutions"): the pipeline takes no disposal
+    // obligation on the projected elements (they are treated as borrows drawn
+    // from the receiver), so every minted projection leaks and there is no
+    // consumer that can reclaim it (`ToArray` owns only the CONTAINER, borrowing
+    // elements; no lazy materializer takes ELEMENT ownership). This is the same
+    // §28.3 laundering class as the `Aggregate` minted-seed rejection
+    // (checkBareBorrowTempLaunder) and the Min/Max minting-selector case (#1915);
+    // reject the launder at the selector. Called for every CallExpr the
+    // deferred-activation walk visits (position-independent — a minting Select
+    // leaks in for-source, binding, materialization, and terminal positions
+    // alike). // per §28.3 / stdlib §5 (#1917)
+    void checkLazySelectMintingSelector(const ast::CallExpr& ce);
+    // True when `retExpr` — a lazy `Select` selector's return value — mints a
+    // fresh owned/heap value with no borrow source: an owned-class producer
+    // (producerState == Owned), a fresh string (a `+` concatenation or an
+    // interpolation), or a conditional either of whose arms mints. A borrowed
+    // projection (the element itself, a field / index read, a value-typed
+    // projection) is NOT a mint and is admitted. // per §28.3 / stdlib §5 (#1917)
+    bool lazySelectSelectorReturnMints(const ast::Expr& retExpr);
+
     // True when `callResult`'s resolved type is one of the deferred-
     // activation frame shapes above: an iterator/async-iterator interface,
     // the lazy-query sentinel (mirrors DefiniteAssignment's

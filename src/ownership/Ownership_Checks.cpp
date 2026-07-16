@@ -6356,6 +6356,11 @@ void MethodOwnership::checkDeferredActivationTempSitesExpr(const ast::Expr& e,
                                                              bool escaping,
                                                              bool forSource) {
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        // §28.3 / stdlib §5 (#1917): reject a lazy `Select` whose inline lambda
+        // selector mints a fresh cleanup-bearing value per element — the launder
+        // is position-independent (this walk visits every CallExpr, so the check
+        // fires wherever the Select appears). // per §28.3 / stdlib §5 (#1917)
+        checkLazySelectMintingSelector(*ce);
         if (escaping && isDeferredActivationCallResult(*ce)) {
             std::size_t pos = 0;
             for (const auto& a : ce->args) {
@@ -6678,6 +6683,128 @@ void MethodOwnership::checkDeferredActivationTempSitesExpr(const ast::Expr& e,
     }
     // A LambdaExpr is its own scope — its calls are checked when its body is
     // analysed, not here. Other leaf expressions hold no calls.
+}
+
+// §28.3 / stdlib §5 (#1917): reject a lazy `Select(selector)` whose inline
+// lambda selector mints a fresh cleanup-bearing value per element. See the
+// declaration comment for the full contract. // per §28.3 / stdlib §5 (#1917)
+void MethodOwnership::checkLazySelectMintingSelector(const ast::CallExpr& ce) {
+    // A LINQ `Select` is a builtin intrinsic with NO user MethodDecl (mirrors
+    // analyzeBareBorrowCall's gate): a user-defined method also named `Select`
+    // resolves to a MethodDecl and its selector's ownership is governed by its
+    // declared parameter modifier — leave it alone. // per §28.3 (#1917)
+    if (common::calleeMethodDecl(ce, ctx_)) return;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+    if (!ma || ma->member != "Select") return;
+    // Exactly one argument, an INLINE lambda selector, no argument modifier. (A
+    // method-reference selector `Select(Factory.Make)` over an owned-returning
+    // method is the same laundering class but needs the callee's `returnOwned`
+    // navigation — left as a follow-up; the issue's repros are inline lambdas.)
+    // // per §28.3 (#1917)
+    if (ce.args.size() != 1) return;
+    const ast::CallArgument& arg = ce.args[0];
+    if (arg.isDiscard || !arg.value || !arg.name.empty() ||
+        !arg.modifier.empty())
+        return;
+    auto* lam = dynamic_cast<const ast::LambdaExpr*>(arg.value.get());
+    if (!lam) return;
+    // An `async` selector projects a Task frame, a different ownership contract.
+    if (lam->isAsync) return;
+
+    // Does any return path of the selector mint a fresh value? Scan the `=> E`
+    // body or the block body's `return` statements (never crossing a nested
+    // lambda — its returns belong to it), mirroring the SB01-B return walk.
+    const ast::Expr* mintingReturn = nullptr;
+    auto note = [&](const ast::Expr& re) {
+        if (!mintingReturn && lazySelectSelectorReturnMints(re))
+            mintingReturn = &re;
+    };
+    if (lam->exprBody) {
+        note(*lam->exprBody);
+    } else {
+        std::function<void(const ast::Stmt&)> scan = [&](const ast::Stmt& s) {
+            if (mintingReturn) return;
+            if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+                if (rs->value) note(*rs->value);
+                return;
+            }
+            if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+                for (const auto& bs : ifs->ifBranch.body) if (bs) scan(*bs);
+                for (const auto& el : ifs->elifBranches)
+                    for (const auto& bs : el.body) if (bs) scan(*bs);
+                for (const auto& bs : ifs->elseBody) if (bs) scan(*bs);
+                return;
+            }
+            if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+                for (const auto& bs : ws->body) if (bs) scan(*bs);
+                return;
+            }
+            if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+                for (const auto& bs : fs->body) if (bs) scan(*bs);
+                return;
+            }
+            if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+                for (const auto& bs : db->body) if (bs) scan(*bs);
+                return;
+            }
+            if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+                for (const auto& bs : trys->body) if (bs) scan(*bs);
+                for (const auto& c : trys->catches) if (c.body) scan(*c.body);
+                for (const auto& bs : trys->finallyBody) if (bs) scan(*bs);
+                return;
+            }
+            if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+                for (const auto& arm : cs->arms)
+                    for (const auto& bs : arm.stmts) if (bs) scan(*bs);
+                return;
+            }
+        };
+        for (const auto& s : lam->stmts) if (s) scan(*s);
+    }
+    if (!mintingReturn) return;
+    report(
+        Severity::Error, mintingReturn->span.begin,
+        "a lazy `Select` selector that mints a fresh owned value per element "
+        "(a `new` of a class, an `owned`-returning call, or a fresh string "
+        "such as a `+` concatenation or an interpolation) launders that value "
+        "out through the projected sequence — stdlib §5 classifies `Select`'s "
+        "projected element as a receiver-sourced borrow, so the lazy pipeline "
+        "takes no disposal obligation on it and every minted projection leaks "
+        "(no consumer reclaims it: `ToArray` owns only the container, borrowing "
+        "elements, and no lazy materializer takes element ownership) — §28.3 "
+        "*Bare-type-parameter returns* (v0.194), the same launder the "
+        "`Aggregate` minted-seed rejection forbids; project a borrow of the "
+        "element (a field, or the element itself), or build an owning "
+        "collection (`OwningArray<T>`) from the sources directly");
+}
+
+// §28.3 / stdlib §5 (#1917): see the declaration comment. // per §28.3 (#1917)
+bool MethodOwnership::lazySelectSelectorReturnMints(const ast::Expr& retExpr) {
+    // A freshly-produced OWNED value: `new ClassType(...)`, an `owned`-returning
+    // call, a `move` result — producerState's exact §28.3 producer classifier.
+    if (producerState(retExpr) == OwnershipState::Owned) return true;
+    // A fresh STRING with no borrow source: string `+` concatenation or an
+    // interpolation always allocates. (A bare element / field / index read of a
+    // string is a BORROW — not one of these shapes — and stays admitted; a
+    // string-returning method call is the recorded interprocedural gap and is
+    // NOT flagged here.) // per §28.3 (#1917)
+    const sema::TypeRef* rt = ctx_.exprType(retExpr);
+    const bool isString = rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+                          rt->primitive == sema::PrimitiveType::String;
+    if (isString) {
+        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&retExpr))
+            if (be->op == "+") return true;
+        if (dynamic_cast<const ast::InterpolatedStringExpr*>(&retExpr))
+            return true;
+    }
+    // A conditional projects a mint if EITHER arm mints.
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&retExpr)) {
+        if (cd->thenValue && lazySelectSelectorReturnMints(*cd->thenValue))
+            return true;
+        if (cd->elseValue && lazySelectSelectorReturnMints(*cd->elseValue))
+            return true;
+    }
+    return false;
 }
 
 // §30.5 / §30.4 (#834): true when `e`'s static type is an `OwningTask<...>`
