@@ -3249,12 +3249,30 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
             // The discharged (non-Owned) side is the one whose state is the
             // danger signal — capture it BEFORE the reassignment below.
             const OwnershipState dischargedState = stOwned ? o.state : st.state;
+            // #1869: was the discharged side an OwningTask Pattern B await-SPEND
+            // (Disposed + awaitSpent)? Capture before the record is overwritten.
+            const bool dischargedAwaitSpent =
+                stOwned ? o.awaitSpent : st.awaitSpent;
             if (st.state != OwnershipState::Owned) st = o;
             // §28.3 (#1626, reworked): mark maybe-consumed ONLY for the MOVED-
             // FROM split — the ownership-transfer-out use-after-free danger.
             // The DISPOSED split resolves to plain Owned with no marker (the
             // idempotent §28.2 discharge / #601 one-branch pattern).
-            if (dischargedState == OwnershipState::MovedFrom)
+            //
+            // #1869 (§30.5 / Appendix C.6): a Pattern B `await` consume of an
+            // owned task local is a single-consumer SPEND, spelled Disposed +
+            // awaitSpent — NOT an idempotent Dispose. On a BRANCH join
+            // (`!unionKeys`) an await-spend on one arm is a genuine maybe-consume
+            // (some paths spent the task, some did not), so a later await/move is
+            // rejected via the marker exactly as the moved-from split is. Loop
+            // back-edge / zero-trip merges (`unionKeys`) are EXCLUDED: those keep
+            // the pre-existing suspend-local scope-end handling, whose §30.5
+            // frame-teardown / D2 (#1868) treatment of a loop-carried task is a
+            // separate piece — upgrading them here would suppress that reject and
+            // leak the task on the zero-trip path.
+            if (dischargedState == OwnershipState::MovedFrom ||
+                (dischargedState == OwnershipState::Disposed &&
+                 dischargedAwaitSpent && !unionKeys))
                 st.maybeConsumed = true;
             continue;
         }
@@ -3349,6 +3367,11 @@ void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation l
         return;
     }
     st->state = OwnershipState::Disposed;
+    // #1869: an explicit `.Dispose()` is NOT an OwningTask await-spend — it is
+    // the idempotent §28.2 discharge whose one-branch `Owned ⊓ Disposed` join
+    // must stay benign (#601). Clear any stale await-spend marker so this
+    // Disposed is not upgraded to maybe-consumed at a later branch join.
+    st->awaitSpent = false;
     st->explicitlyDisposed = true;
     st->explicitDisposeLoc = loc;
     // §29.8 (#945): record the discharge so the iterator owned-param auto-dispose
@@ -4041,6 +4064,7 @@ void MethodOwnership::markOwnedByName(std::string_view name, SourceLocation loc,
     // §28.3 (#1626): an `out owned` write deposits a fresh owned value, so
     // clear any maybe-consumed marker from a prior mixed join.
     st->maybeConsumed = false;
+    st->awaitSpent = false;  // #1869: fresh owned value — not an await-spend
     (void)loc;
 }
 
@@ -6702,8 +6726,24 @@ void MethodOwnership::recordAwaitOperandConsume(
     // movable owned local (`using var` bindings return early above as the
     // borrowed-operand case); the transition to Disposed makes a straight-line
     // second await a moved-from read. // per §30.5
+    //
+    // #1869: a Pattern B await is a single-consumer SPEND — §30.5 (line ~7399)
+    // and Appendix C.6 (v0.184) call the operand **moved-from per §28.3** after
+    // the await, because the result was moved out (a second await raises IOE, a
+    // `move`/re-await moves out an already-spent task). This is NOT the
+    // idempotent §28.2 `.Dispose()` that makes an `Owned ⊓ Disposed` BRANCH join
+    // benign (joinInto, #601/#1626). So flag the Disposed as an await-spend
+    // (`awaitSpent`): joinInto upgrades a one-branch await-spend to the
+    // maybe-consumed marker so a later await/move of a task awaited on only SOME
+    // branch is rejected (the pre-#1869 hole let a spent task be re-awaited/moved
+    // with no diagnostic). Keeping the state Disposed (not MovedFrom) leaves the
+    // loop back-edge and async suspend-local scope-end handling exactly as before
+    // — the branch-join upgrade is gated to non-loop merges in joinInto. A
+    // straight-line second await stays caught by the Disposed/MovedFrom check
+    // above. // per §30.5, Appendix C.6, §28.3
     if (st->state == OwnershipState::Owned) {
         st->state = OwnershipState::Disposed;
+        st->awaitSpent = true;
         // §30.5 / §29.2 (#1888): if the awaited operand is a drained for-loop
         // iteration variable (`for var task in tasks.Drain() do results.Add(await
         // task); end`), record it so the §29.2 owned-iter-var auto-drop in run()

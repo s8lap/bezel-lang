@@ -132,6 +132,18 @@ struct LocalOwnership {
     // declaration"). Reassignment to a fresh owned value clears the flag
     // (the local is then definitely owned again). // per §28.3, §28.2
     bool maybeConsumed = false;
+
+    // #1869 (§30.5 / Appendix C.6): set on a Disposed record produced by a
+    // Pattern B `await` consume of a plain owned `OwningTask<T>` local
+    // (recordAwaitOperandConsume). Unlike an idempotent `.Dispose()`, a Pattern B
+    // await is a single-consumer SPEND — the result is moved out, a second await
+    // raises InvalidOperationException, and a `move`/re-await moves out an
+    // already-spent task. So the `Owned ⊓ Disposed` BRANCH-join benign rule
+    // (#601 idempotent-Dispose, above) does NOT apply when the Disposed side is
+    // an await-spend: joinInto upgrades that one-branch spend to `maybeConsumed`
+    // (branch merges only — loop back-edges keep the plain-Owned/suspend-local
+    // handling unchanged). // per §30.5, Appendix C.6, §28.3
+    bool awaitSpent = false;
 };
 
 // Spelled state for diagnostics + tests.

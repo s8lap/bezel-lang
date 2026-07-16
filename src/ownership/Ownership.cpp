@@ -3558,6 +3558,7 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // value (owned or borrowed per the RHS producer). Clear it so a
             // later use of the reassigned local is not spuriously rejected.
             st.maybeConsumed = false;
+            st.awaitSpent = false;  // #1869: fresh value — not an await-spend
             // §28.7 / §28.3 (#1625): flag a null-INITIALIZED plain local
             // (`var x: T? := null;`, PolyNull) the first time it ADOPTS Owned
             // state from a non-null RHS, so codegen treats it as an owned class
