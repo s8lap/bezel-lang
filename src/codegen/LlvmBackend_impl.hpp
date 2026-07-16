@@ -5742,6 +5742,15 @@ private:
     // declaration order. Recorded against the innermost open scope.
     void registerUsingDisposal(const ast::LocalDecl* ld);
 
+    // §30.5 / #1258 / #1868: attach the per-T owned-result disposer to a task
+    // Disposal when `taskTy` is an `OwningTask<T:class>` — the produced owned
+    // class result would otherwise leak when the task is dropped without an
+    // intervening await taking it. Shared by BOTH the `using var` task
+    // registration (registerUsingDisposal) and the plain-`var` auto-drop task
+    // registration (lowerStmt LocalDecl) so the two paths cannot drift. No-op for
+    // a channel-receive task, a non-OwningTask, or a value-typed result. // per §30.5
+    void attachOwningTaskResultDisposer(Disposal& d, const sema::TypeRef* taskTy);
+
     // §28.3 (line 4910): register a plain `var` owned local for EXCEPTION-UNWIND
     // disposal only (an `unwindOnly` Disposal). Unlike `using var`, the plain
     // owned local is auto-disposed solely when an exception unwinds out of its

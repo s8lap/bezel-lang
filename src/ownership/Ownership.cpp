@@ -512,21 +512,36 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             // never marks) has no suspend-local signal to gate on, so it keeps the
             // reject. // per §28.12/§30.5
             //
-            // SB01-C1 (§30.5 line 7341/7351, v0.190, #1786): a plain owned TASK
-            // local that is BORROW-AWAITED (borrowAwaitedOwnedTaskDecls_) is
-            // exempted from the suspend-local reject even when it crosses a
-            // suspend point — §30.5 admits it (line 7351) and says it "keeps its
-            // ordinary §28.3 discharge (auto-drop at scope end)" (line 7341),
-            // exactly like an admitted `using var` task suspend-local, which is
-            // disposed at scope end on the normal+unwind edges via codegen's task
-            // path (LlvmBackend_Stmts, #445) — the SAME disposal coverage a
-            // `using var` task gets. The abandonment/cancellation completion-edge
-            // disposal (D2) is a separate, still-unimplemented piece, but it is a
-            // PRE-EXISTING residual shared with the already-admitted `using var`
-            // task suspend-local, not a regression this admission introduces. A
-            // NEVER-awaited plain owned task held live across a suspend point is
-            // NOT in this set and stays the §28.3 reject (its remedy is `await`
-            // it or `using var`). // per §30.5, §28.3 (v0.190)
+            // SB01-C1/D2 (§30.5 line 7341/7351, §28.12, v0.190, #1786/#1868): a
+            // plain owned TASK local is exempted from the suspend-local reject
+            // even when it crosses a suspend point — §30.5 admits it (line 7351)
+            // and says it "keeps its ordinary §28.3 discharge (auto-drop at scope
+            // end)" (line 7341), exactly like an admitted `using var` task
+            // suspend-local. Codegen disposes it at scope end via the task path
+            // (bz_task_fire_and_forget, LlvmBackend_Stmts #445), which fires on
+            // EVERY reachable terminal edge: the normal fall-off/return
+            // (emitDisposals), a synchronous throw or faulted-await re-raise
+            // (emitUnwindDisposals), and cancellation — delivered by the runtime
+            // as a FAULT on the awaited task that resumes the frame and unwinds
+            // through emitUnwindDisposals. The frame is only ever freed from
+            // inside its own resume function (emitAsyncComplete / async.fault),
+            // AFTER those disposals, so an owned task suspend-local never needs a
+            // separate frame-teardown "completion edge" disposal — its await-ness
+            // was never the soundness criterion. Two admitting signals:
+            //   • SB01-C1 (#1786): BORROW-AWAITED (borrowAwaitedOwnedTaskDecls_,
+            //     resolving the #1800 alias chain to the minting root).
+            //   • SB01-D2 (#1868): the minting decl ITSELF is an owned task frame
+            //     (declInitializerIsOwnedTaskMint) — this admits the NEVER-awaited
+            //     case too (a dangling owned task held live across a suspend),
+            //     which C1 alone left rejected. Both auto-drop with the must-use
+            //     nudge to `using var`.
+            // A plain owned CLASS suspend-local matches NEITHER and stays the
+            // §28.3 reject (its only disposal is the normal/unwind scope path,
+            // with the genuine frame-teardown gap; remedy: discharge it, or use a
+            // task/`using var`). The only unaddressed leak is a frame ABANDONED
+            // FOREVER (awaited task never completes → resume never re-enters);
+            // that leaks the whole frame and is a pre-existing gap shared by every
+            // suspend-local kind, not one D2 closes from here. // per §30.5, §28.12, §28.3 (v0.190)
             if (isAsync_ && !sawYield_ && !isDestructor_ &&
                 everDischarged_.count(sym) == 0 &&
                 (reassignedLocals.count(sym) == 0 ||
@@ -535,7 +550,8 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     if (auto* ld =
                             dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
                         if (suspendLocalDecls_.count(ld) == 0 ||
-                            borrowAwaitedOwnedTaskDecls_.count(ld) != 0) {
+                            borrowAwaitedOwnedTaskDecls_.count(ld) != 0 ||
+                            declInitializerIsOwnedTaskMint(ld)) {
                             const_cast<ast::LocalDecl*>(ld)->autoDropAtScopeEnd =
                                 true;
                             ctx_.diagnostics().report(

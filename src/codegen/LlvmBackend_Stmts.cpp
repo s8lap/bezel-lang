@@ -64,7 +64,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // codegen and the ownership pass in agreement — the borrow no longer
         // registers a second `d.task` (a double-free of the real owner's frame).
         // // per §28.3 v0.190 SB-01 (#1872)
-        else if (taskTypeOfLocal(ld) && !disposeStack_.empty() &&
+        else if (const sema::TypeRef* taskTy = taskTypeOfLocal(ld);
+                 taskTy && !disposeStack_.empty() &&
                  !taskLocalInitializerIsBorrowSource(ld) &&
                  !ld->initializerCallIsBorrow) {
             auto it = locals_.find(ld);
@@ -77,6 +78,13 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // disposal (see LlvmBackend_Setup.cpp's using-var registration
                 // for the full rationale).
                 d.channelReceiveTask = isChannelReceiveInitializer(ld);
+                // §30.5 / #1258 / #1868: a plain `var` OwningTask<T:class> local
+                // (SB01-C1/D2 auto-drop, #1786/#1868) owns its produced result;
+                // attach the per-T disposer so it is disposed at scope end, EXACTLY
+                // as the `using var` path does (shared helper — no drift). Without
+                // this, a never-awaited-across-suspend OwningTask<Cell> leaked its
+                // Cell (the pre-existing plain-`var` activation-local leak too).
+                attachOwningTaskResultDisposer(d, taskTy);
                 disposeStack_.back().push_back(d);
             }
             // Still register the unwind-owned path for any non-task cleanup

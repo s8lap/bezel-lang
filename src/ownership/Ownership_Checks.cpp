@@ -7000,6 +7000,67 @@ const ast::LocalDecl* MethodOwnership::awaitedOwnedTaskLocalRoot(
     return nullptr;
 }
 
+bool MethodOwnership::declInitializerIsOwnedTaskMint(const ast::LocalDecl* ld) {
+    // SB01-D2 (§30.5 line 7341/7351, §28.12, v0.190, #1868): true when `ld` is a
+    // plain `var` local whose initializer MINTS an owned task frame — a
+    // Task-family CALL classified Owned by SB01-A (producerState == Owned) whose
+    // static result type is `Task`/`Task<T>`/`OwningTask<T>`.
+    //
+    // Such a local's scope-end discharge is the codegen TASK path
+    // (bz_task_fire_and_forget, LlvmBackend_Stmts.cpp #445 / LlvmBackend_Disposal.cpp
+    // d.task), registered on the disposal stack and fired on EVERY edge on which
+    // the async frame's resume function re-enters and terminates: the normal
+    // fall-off / `return` (emitDisposals), a synchronous throw or a faulted
+    // await's re-raise (emitUnwindDisposals), and cancellation — the runtime
+    // delivers cancellation by FAULTING the awaited task (bz_task_delay_cancelable
+    // → bz_task_complete_error_obj), which resumes the frame at the suspend point
+    // and unwinds through that same emitUnwindDisposals. There is no runtime path
+    // that frees the frame WITHOUT re-entering the resume function (the frame is
+    // freed only by emitAsyncComplete / the async.fault boundary, both inside the
+    // resume function, after the scope/unwind disposals have run). So a
+    // suspend-local owned TASK needs no separate frame-teardown "completion edge"
+    // disposal — its fire-and-forget disposal already covers every reachable
+    // terminal edge, exactly as an admitted `using var` task suspend-local's does.
+    //
+    // This is the property that makes a suspend-local owned task sound to
+    // AUTO-DROP (§28.3 affine discharge, §28.12 "implicit discharge is
+    // synchronous") whether or not it is ever awaited — distinguishing it from a
+    // plain owned CLASS suspend-local, whose only disposal mechanism is the
+    // exception-path unwind / normal scope end and which therefore stays the
+    // §28.3 hard reject when live across a suspend. The genuinely-unaddressed
+    // residual is the whole-frame leak of a frame ABANDONED FOREVER (its awaited
+    // task never completes, so the resume function is never re-entered): that
+    // leaks the entire frame and every suspend-local it holds — params, using-var
+    // tasks, plain tasks alike — and is a pre-existing gap shared by all of them,
+    // not a task-specific one D2 can close from codegen. // per §30.5, §28.12, §28.3 (v0.190)
+    if (!ld || !ld->initializer) return false;
+    if (producerState(*ld->initializer) != OwnershipState::Owned) return false;
+    const sema::TypeRef* rt = ctx_.exprType(*ld->initializer);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->nullable)
+        return false;
+    // Builtin-task IDENTITY, not just a matching name-HEAD (#1868): a builtin
+    // `Task` / `Task<T>` / `OwningTask<T>` has NO user `TypeDecl` — its TypeRef
+    // has `declaration == null` (Path A) or a null-`decl` builtin TypeSymbol
+    // (Path B). A user class literally NAMED `Task`/`OwningTask` (not a reserved
+    // name, §3.4 only reserves primitive aliases) has a declaration WITH a decl;
+    // it is an ordinary owned CLASS local and must keep the §28.3 suspend-local
+    // reject, NOT be admitted here. Mirrors codegen's isTaskTypeName
+    // (LlvmBackend_Setup.cpp) so the ownership admission and the codegen task
+    // disposal agree on exactly which locals are tasks. // per §30.5, §28.3 (v0.190)
+    if (!rt->declaration) {  // Path A: name in astNode->name->parts[0]
+        if (!rt->astNode || !rt->astNode->name ||
+            rt->astNode->name->parts.size() != 1)
+            return false;
+        const std::string_view head = rt->headName();
+        return head == "Task" || head == "OwningTask";
+    }
+    if (!rt->declaration->decl) {  // Path B: builtinClassSym, name on the symbol
+        return rt->declaration->name == "Task" ||
+               rt->declaration->name == "OwningTask";
+    }
+    return false;  // user declaration with a decl — a user class, not a builtin task
+}
+
 void MethodOwnership::collectBorrowAwaitedOwnedTaskLocals(const flow::CFG& cfg) {
     // SB01-C1 (§30.5 line 7341, v0.190, #1786): record every plain `var` owned
     // task local that is BORROW-AWAITED — the operand of a borrow-await (Pattern

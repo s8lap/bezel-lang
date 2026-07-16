@@ -6170,6 +6170,42 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
     return true;
 }
 
+// §30.5 / #1258 / #1868: an OwningTask<T:class> owns its produced result. When
+// the task is dropped at scope end without an intervening await taking the
+// result (bz_task_take_result zeros it on consume), the produced owned class
+// result would leak. Attach the per-T disposer thunk (the caller knows the
+// static OwningTask<T> type) so bz_task_free disposes it — whether bz_task_free
+// runs synchronously (already-done task) or later via the fire-and-forget
+// completion continuation. Shared by BOTH the `using var` task registration and
+// the plain-`var` auto-drop task registration (lowerStmt LocalDecl, SB01-C1/D2
+// #1786/#1868) so the two paths cannot drift — the drift that leaked a plain
+// `var t := Producer()` OwningTask<T:class> auto-dropped across a suspend. The
+// `taskName` builtin-identity check (declaration null, or a null-`decl` builtin
+// TypeSymbol) means a USER class named `OwningTask` — which has a declaration
+// WITH a decl — yields no disposer, exactly as it must. No-op for a
+// channel-receive task (the abandon path disposes no produced item) and for a
+// value-typed / non-OwningTask result. // per §30.5, §28.3 (v0.190)
+void Emitter::attachOwningTaskResultDisposer(Disposal& d,
+                                             const sema::TypeRef* taskTy) {
+    if (d.channelReceiveTask || !taskTy) return;
+    auto taskName = [](const sema::TypeRef* rt) -> std::string_view {
+        if (!rt->declaration) {
+            if (rt->astNode && rt->astNode->name &&
+                !rt->astNode->name->parts.empty())
+                return rt->headName();
+        } else if (!rt->declaration->decl) {
+            return rt->declaration->name;
+        }
+        return {};
+    };
+    if (taskName(taskTy) == "OwningTask" && !taskTy->genericArgs.empty() &&
+        isClassOrInterfaceRef(taskTy->genericArgs[0])) {
+        d.taskOwnedResultDisposer =
+            elementPolicyFor(taskTy->genericArgs[0], /*owningFamily=*/true)
+                .disposerThunk;
+    }
+}
+
 void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     if (disposeStack_.empty()) return;
     auto it = locals_.find(ld);
@@ -6881,25 +6917,9 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         // §30.5 / #1258: an OwningTask<T:class> owns its produced result. If the
         // task is dropped at scope end without an intervening await taking the
         // result (bz_task_take_result zeros it on consume), the produced owned
-        // class result would leak. Capture the per-T disposer here (the caller
-        // knows the static OwningTask<T> type) and dispose it at scope end.
-        auto taskName = [](const sema::TypeRef* rt) -> std::string_view {
-            if (!rt->declaration) {
-                if (rt->astNode && rt->astNode->name &&
-                    !rt->astNode->name->parts.empty())
-                    return rt->headName();
-            } else if (!rt->declaration->decl) {
-                return rt->declaration->name;
-            }
-            return {};
-        };
-        if (!d.channelReceiveTask &&
-            taskName(tt) == "OwningTask" && !tt->genericArgs.empty() &&
-            isClassOrInterfaceRef(tt->genericArgs[0])) {
-            d.taskOwnedResultDisposer =
-                elementPolicyFor(tt->genericArgs[0], /*owningFamily=*/true)
-                    .disposerThunk;
-        }
+        // class result would leak. Attach the per-T disposer (shared with the
+        // plain-`var` auto-drop path so the two cannot drift, #1868).
+        attachOwningTaskResultDisposer(d, tt);
         disposeStack_.back().push_back(d);
         return;
     }

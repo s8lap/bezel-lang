@@ -357,18 +357,73 @@ BEZEL_TEST(async_own_patternA, await_value_typed_task_any_position_clean) {
 // caller-side classification: the flip's boundary cases.
 // ---------------------------------------------------------------------------
 
-// v0.190 SB-01 KEEP-REJECT (the D2 residual boundary): a plain owned task local
-// that is NEVER awaited but held live ACROSS a suspend point stays REJECTED. Its
-// scope-end task disposal covers the normal + unwind edges, but the frame-
-// teardown disposal on the §30.5 abandonment/cancellation completion edges is
-// unimplemented (SB01-D2), so — unlike a BORROW-awaited task, whose await is its
-// use and which §30.5 line 7341 auto-drops — this dangling task is conservatively
-// rejected. Remedy: await it (its use), or `using var` it. Pins that SB01-A/C1
-// does NOT over-admit the genuine across-suspend case. // per §28.3, §30.5 (v0.190)
-BEZEL_TEST(async_own_patternA, plain_owned_task_never_awaited_across_suspend_rejected) {
+// v0.190 SB-01 D2 (#1868): a plain owned task local that is NEVER awaited but
+// held live ACROSS a suspend point is ADMITTED with auto-drop (was rejected
+// pre-D2). §30.5 line 7341 says a plain owned task local "keeps its ordinary
+// §28.3 discharge (auto-drop at scope end)"; that scope-end task disposal
+// (bz_task_fire_and_forget) fires on EVERY reachable terminal edge — the normal
+// fall-off, a synchronous throw / faulted-await re-raise (unwind), AND
+// cancellation, which the runtime delivers as a fault on the awaited task that
+// resumes the frame and unwinds through the same disposal. The frame is only
+// freed from inside its own resume function, after those disposals run, so an
+// owned task suspend-local needs no separate frame-teardown "completion edge"
+// disposal, and its await-ness was never the soundness criterion (SB01-C1's
+// borrow-await was one admitting signal; the minting decl itself is the other).
+// This FLIPS the pre-D2 KEEP-REJECT — verified leak-clean under ASan/LSan on the
+// normal, throw, and cancellation edges (async_own_task_across_suspend_1868
+// codegen suite). A plain owned CLASS local across a suspend stays rejected
+// (activation_local_drop / suspend_local_dropped tests). // per §28.3, §30.5, §28.12 (v0.190)
+BEZEL_TEST(async_own_patternA, plain_owned_task_never_awaited_across_suspend_admitted_1868) {
     auto r = parseAndCheckOwnership(wrap(
         "var t := p.MakeShared(); "
         "await p.MakeUnit(); "));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// SB01-D2 (#1868) companion: a plain owned CLASS local held live across a suspend
+// point is STILL REJECTED — its only disposal is the normal/unwind scope path
+// (the genuine frame-teardown gap a task's fire-and-forget disposal sidesteps),
+// so admitting it would leak on the abandonment edge. Pins that D2 is scoped to
+// TASK-family locals and did not weaken the class-local obligation
+// (declInitializerIsOwnedTaskMint's type gate). // per §28.3, §30.5 (v0.190)
+BEZEL_TEST(async_own_patternA, plain_owned_class_never_used_across_suspend_still_rejected_1868) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var x := new T(); "
+        "await p.MakeUnit(); "));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// SB01-D2 (#1868): a plain owned `OwningTask<T>` (Pattern B) local never awaited
+// and held across a suspend is likewise admitted with auto-drop — its scope-end
+// task disposal (with the per-T owned-result disposer) covers the same reachable
+// edges. Guards that the D2 admission is not narrowed to Pattern A. // per §30.5 (v0.190)
+BEZEL_TEST(async_own_patternA, plain_owned_owningtask_never_awaited_across_suspend_admitted_1868) {
+    auto r = parseAndCheckOwnership(wrap(
+        "var t := p.MakeOwned(); "
+        "await p.MakeUnit(); "));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// SB01-D2 (#1868) IDENTITY GUARD: a USER class literally NAMED `OwningTask` (not
+// a reserved name — §3.4 only reserves primitive aliases) held live across a
+// suspend is STILL REJECTED. The D2 admission keys on builtin-task IDENTITY
+// (declInitializerIsOwnedTaskMint: no user TypeDecl), not on the name-head string
+// alone, so a user type that happens to share the name is an ordinary owned CLASS
+// local and keeps the §28.3 suspend-local reject. Without the identity gate the
+// name-head match would wrongly admit it and leak on the abandonment edge (it has
+// no task fire-and-forget disposal). // per §30.5, §28.3 (v0.190), #1868
+BEZEL_TEST(async_own_patternA, user_class_named_task_across_suspend_still_rejected_1868) {
+    auto r = parseAndCheckOwnership(
+        "module M; import System.Threading; "
+        "class OwningTask public method Ping(): int return 1; end Ping; end OwningTask; "
+        "class C "
+        "  public static method Make(): OwningTask return new OwningTask(); end Make; "
+        "  public static async method Main(): Task<int> "
+        "    var t := C.Make(); "        // user class named OwningTask — NOT a builtin task
+        "    await Task.Delay(5); "       // held live across a suspend
+        "    return 0; "
+        "  end Main; "
+        "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
