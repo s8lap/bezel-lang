@@ -840,6 +840,23 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // it.
         collectClosureReleaseEligible(*ci.stmts);
         closureReleaseEligibleFn_ = resumeFn;
+        // fix #1896 / §28.3 "Exception-path discharge" / §30.1: compute the
+        // unwind-disposal eligibility of the async body's plain owned locals and
+        // key it to the RESUME fn (where the body lowers). registerUnwindOwnedLocal
+        // gates on `currentFn_ == unwindIneligibleFn_` (so a body whose moves/
+        // disposes were not analyzed cannot register a double-dispose); without
+        // this the resume body's currentFn_ (resumeFn) never matched the stale
+        // unwindIneligibleFn_ left by the last synchronous method, so EVERY plain
+        // `owned` local in an async body was silently skipped — never registered
+        // for the exception-path (`unwindOnly`) disposal — and leaked when an
+        // operation threw before the local's normal-path discharge (the #1896
+        // leak). emitThrowValue / emitPendingCheck already emit emitUnwindDisposals
+        // on the throw edge; they simply had nothing registered to dispose. Mirror
+        // the synchronous emitFunctionBody setup (Setup.cpp ~3318). The unwindOnly
+        // disposal is skipped on the normal edge (§28.3: normal-exit discharge is
+        // sema-enforced), so no double-free on the non-throwing path. // per §28.3
+        unwindIneligibleFn_ = resumeFn;
+        collectUnwindIneligible(*ci.stmts);
         // #1416 / #1418 / §27.5 / §28.9: the CAPTURE CELL of a frame-local that a
         // lambda captures (the `calloc` from boxLocalSlot) is freed at scope end by
         // the same boxedCellFree / deferred-cell-free machinery as in a synchronous
@@ -1671,6 +1688,17 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         smIterEnumFrameSlot_.clear();      // §29.7 (#944)
         propagateBB_ = nullptr; unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
+        // fix #1896 / #1897 (async-iterator sibling) / §28.3 "Exception-path
+        // discharge" / §29.2 / §30.1: same exception-path-discharge gap as the
+        // plain-async and sync-iterator state machines — the async-iterator
+        // (async + yield / IAsyncEnumerable) resume body never keyed
+        // unwindIneligibleFn_ to its resume fn, so registerUnwindOwnedLocal's
+        // `currentFn_ == unwindIneligibleFn_` gate never matched and a plain
+        // `owned` local hoisted into this state-machine frame was skipped for the
+        // `unwindOnly` disposal — leaking when the body threw after a suspend.
+        // Mirror the synchronous setup. // per §28.3
+        unwindIneligibleFn_ = resumeFn;
+        collectUnwindIneligible(*ci.stmts);
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", resumeFn);
         builder_.SetInsertPoint(entry);
 

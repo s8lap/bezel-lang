@@ -789,6 +789,24 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         smIterEnumFrameSlot_.clear();      // §29.7 (#944)
         propagateBB_ = nullptr; unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
+        // fix #1897 / §28.3 "Exception-path discharge" / §29.2: compute the
+        // unwind-disposal eligibility of the iterator body's plain owned locals
+        // and key it to the MOVENEXT fn (where the body lowers). registerUnwind-
+        // OwnedLocal gates on `currentFn_ == unwindIneligibleFn_` (so a body whose
+        // moves/disposes were not analyzed cannot register a double-dispose);
+        // without this the MoveNext body's currentFn_ (moveNextFn) never matched
+        // the stale unwindIneligibleFn_ left by the last synchronous method, so
+        // EVERY plain `owned` local hoisted into the iterator state-machine frame
+        // was silently skipped — never registered for the exception-path
+        // (`unwindOnly`) disposal — and leaked when the iterator body threw after a
+        // yield (the #1897 leak). emitThrowValue / emitPendingCheck already emit
+        // emitUnwindDisposals on the throw edge; they simply had nothing registered
+        // to dispose. Mirror the synchronous emitFunctionBody setup (Setup.cpp
+        // ~3318). The unwindOnly disposal is skipped on the normal edge (§28.3:
+        // normal-exit discharge is sema-enforced), so no double-free on the
+        // non-throwing path. // per §28.3
+        unwindIneligibleFn_ = moveNextFn;
+        collectUnwindIneligible(*ci.stmts);
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", moveNextFn);
         builder_.SetInsertPoint(entry);
 
