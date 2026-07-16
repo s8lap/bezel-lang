@@ -3402,6 +3402,26 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // state to match the producer of EXPR.
     if (as.op != ":=") return;
     if (!as.target || !as.value) return;
+    // §15.3 (#1928 half b): a SLOT WRITE `a[i] := …` into a move-only inline
+    // array (§15.1.1 `[N owned]T?`) whose WHOLE value has already been moved out
+    // writes into a moved-from location — §15.3: after the move the source "may
+    // not be read until reassigned", and a slot store is exactly such a use of
+    // the moved-from array. The whole-move marking (#1899 local / #1922 param)
+    // leaves the array MovedFrom in `states_`; consult it by read-checking the
+    // index TARGET (the array identifier) so its moved-from state is reported as
+    // the §28.3 use-after-move — the write-target analogue of #1925's read gate.
+    // Gated to a move-only inline-array target so it fires ONLY there: a live
+    // array (Owned/Borrowed) or one with only an element moved `move a[i]` (which
+    // leaves the ARRAY live, never MovedFrom) is untouched, and every ordinary
+    // indexer-set is unaffected. Runs before the RHS/target handling below so the
+    // diagnostic is not masked, and before handleOwnedFieldAssignment clears the
+    // slot's own moved-from tracking. // per §15.3 (#1928 half b)
+    if (const auto* ix = dynamic_cast<const ast::IndexExpr*>(as.target.get())) {
+        long long moSize = 0;
+        if (ix->target &&
+            isMoveOnlyInlineArrayType(ctx_.exprType(*ix->target), moSize))
+            checkRead(*ix->target, /*selfTarget=*/false);
+    }
     // §28.14 (v0.175): a captured source frozen by a scoped-callback admission
     // may not be REASSIGNED until the bounding scope exits.
     if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(as.target.get()))

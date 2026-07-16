@@ -1076,6 +1076,21 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         if (ix->target &&
             isMoveOnlyInlineArrayType(ctx_.exprType(*ix->target), moSize))
             checkRead(*ix->target, /*selfTarget=*/false);
+        // §15.3 (#1928 half a): every index sub-expression is itself a READ
+        // position, so a moved-from local surfaced through one — e.g.
+        // `a[m.V()]` after `move m`, or `a[b[i]!.V()]` after a whole move of the
+        // move-only array `b` — is a §15.3 read-of-moved-from. #1925 recursed
+        // only into the index TARGET (the array above), never into `ix->indices`,
+        // so a moved-from index went undiagnosed for EVERY array kind (a
+        // copyable value array `[N]int`, an ordinary collection, and a move-only
+        // array alike). checkRead reports only for a local already in an error
+        // state (MovedFrom / Disposed / maybe-consumed / uninitialized), so a
+        // normal live index never triggers it — no over-rejection; this simply
+        // walks a read that was previously skipped. Unconditional (not gated to a
+        // move-only-array target): the index is a read regardless of what is
+        // being indexed. // per §15.3 (#1928 half a)
+        for (const auto& idx : ix->indices)
+            if (idx.value) checkRead(*idx.value, /*selfTarget=*/false);
         return;
     }
     // Other expression forms — not exhaustive; later slices extend.
