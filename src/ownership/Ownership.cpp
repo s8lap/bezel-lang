@@ -785,7 +785,13 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // `Task` parameter through a plain-`Task` return compiled and HUNG at
     // runtime while the equivalent method was rejected; drive the same rejection
     // over every lambda in this body. // per §28.3 SB01-B (v0.190)
-    checkLambdaTaskFamilyBorrowReturns(body);
+    //
+    // (v0.190, #1929): thread this body's declared return type in so a lambda
+    // returned DIRECTLY (`method M(): Fn return (t) => t; end`) is reached too —
+    // the type-checker leaves a return-position lambda's funcReturn un-inferred,
+    // so the classifier was inert there. // per §28.3 SB01-B (v0.190)
+    checkLambdaTaskFamilyBorrowReturns(
+        body, returnType_ ? ctx_.resolvedType(*returnType_) : nullptr);
 }
 
 void MethodOwnership::runExprBodyOwningReturnCheck(
@@ -901,7 +907,14 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // §28.3 SB01-B (v0.190, #1919): the `=>` expression-body sibling of the
     // block-body driver above — a lambda embedded in an expression body carries
     // the same lambda-return obligation. // per §28.3 SB01-B (v0.190)
-    checkLambdaTaskFamilyBorrowReturnsExpr(exprBody);
+    //
+    // (v0.190, #1929): pass this method's declared return type as the top
+    // expected function type, so an expression-bodied METHOD whose body IS the
+    // lambda (`method M(): Fn => (t) => t`) is reached — #1926 wired this for
+    // expression-bodied OPERATORS but not methods, whose funcReturn is likewise
+    // left un-inferred in this position. // per §28.3 SB01-B (v0.190)
+    checkLambdaTaskFamilyBorrowReturnsExpr(
+        exprBody, returnType_ ? ctx_.resolvedType(*returnType_) : nullptr);
 }
 
 namespace {
@@ -4702,13 +4715,92 @@ void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
 // body is not otherwise ownership-analysed, so this is where the callee-side
 // obligation the spec places on "a non-`async` method OR lambda" reaches
 // lambda/function-value bodies. // per §28.3 SB01-B (v0.190)
+//
+// `expectedReturnFnType` (v0.190, #1929): the enclosing DECLARED return
+// function type of this body (the method's return type, a block getter's
+// property type). A lambda that IS the direct value of a `return E;` in this
+// body has its type dictated by that declared position, but the type-checker
+// leaves such a return-position lambda's `funcReturn` un-inferred (it is
+// populated only off the typed-local #829 hint path — see
+// checkOneLambdaTaskFamilyBorrowReturn), so the SB01-B classifier was inert on
+// `return (t) => t;` / `get => do return (t) => t; end`. Thread the declared
+// type in as the effective-return fallback for those return-direct lambdas
+// only — exactly the top-level-expression treatment #1926 gave field/getter/
+// operator positions. Any other (nested) lambda keeps nullptr. // per §28.3
 void MethodOwnership::checkLambdaTaskFamilyBorrowReturns(
-        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        const sema::TypeRef* expectedReturnFnType) {
     std::vector<const ast::LambdaExpr*> lambdas;
     for (const auto& s : body)
         if (s) collectBodyLambdas(*s, lambdas);
+    // Only a lambda returned DIRECTLY (`return <lambda>;`) is dictated by the
+    // enclosing declared return type; collect that set so the fallback reaches
+    // exactly those and no nested lambda. // per §28.3 SB01-B (v0.190, #1929)
+    std::unordered_set<const ast::LambdaExpr*> returnDirect;
+    if (expectedReturnFnType)
+        for (const auto& s : body)
+            if (s) collectReturnDirectLambdas(*s, returnDirect);
     for (const ast::LambdaExpr* lam : lambdas)
-        checkOneLambdaTaskFamilyBorrowReturn(*lam);
+        checkOneLambdaTaskFamilyBorrowReturn(
+            *lam, returnDirect.count(lam) ? expectedReturnFnType : nullptr);
+}
+
+// §28.3 SB01-B (v0.190, #1929): collect every lambda that is the DIRECT value
+// of a `return E;` statement reachable in this body without crossing a nested
+// lambda (a pure statement walk never enters a lambda body, which lives inside
+// a LambdaExpr expression). Mirrors the block driver's own return traversal
+// (`scanReturns` in checkOneLambdaTaskFamilyBorrowReturn) node-for-node, so it
+// reaches exactly the returns that walk classifies. // per §28.3 SB01-B
+void MethodOwnership::collectReturnDirectLambdas(
+        const ast::Stmt& s,
+        std::unordered_set<const ast::LambdaExpr*>& out) const {
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value)
+            if (auto* lam =
+                    dynamic_cast<const ast::LambdaExpr*>(rs->value.get()))
+                out.insert(lam);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) collectReturnDirectLambdas(*bs, out);
+        for (const auto& el : ifs->elifBranches)
+            for (const auto& bs : el.body)
+                if (bs) collectReturnDirectLambdas(*bs, out);
+        for (const auto& bs : ifs->elseBody)
+            if (bs) collectReturnDirectLambdas(*bs, out);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        for (const auto& bs : ws->body)
+            if (bs) collectReturnDirectLambdas(*bs, out);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        for (const auto& bs : fs->body)
+            if (bs) collectReturnDirectLambdas(*bs, out);
+        return;
+    }
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : db->body)
+            if (bs) collectReturnDirectLambdas(*bs, out);
+        return;
+    }
+    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : trys->body)
+            if (bs) collectReturnDirectLambdas(*bs, out);
+        for (const auto& arm : trys->catches)
+            if (arm.body) collectReturnDirectLambdas(*arm.body, out);
+        for (const auto& bs : trys->finallyBody)
+            if (bs) collectReturnDirectLambdas(*bs, out);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        for (const auto& arm : cs->arms)
+            for (const auto& bs : arm.stmts)
+                if (bs) collectReturnDirectLambdas(*bs, out);
+        return;
+    }
 }
 
 // §28.3 SB01-B (v0.190, #1919): the `=>` expression-body sibling — an
@@ -5842,7 +5934,16 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
                         (!acc.isSet && pd->type) ? ctx.resolvedType(*pd->type)
                                                  : nullptr);
                 else if (acc.bodyKind == ast::PropertyAccessorBodyKind::Block)
-                    mo.checkLambdaTaskFamilyBorrowReturns(acc.stmts);
+                    // §28.3 SB01-B (v0.190, #1929): a block getter accessor
+                    // (`get => do return (t) => t; end`) returns the property
+                    // value, so its declared property type is the expected
+                    // function type for a lambda returned DIRECTLY — thread it
+                    // for a getter (a setter body has no return value). // per
+                    // §28.3 SB01-B (v0.190)
+                    mo.checkLambdaTaskFamilyBorrowReturns(
+                        acc.stmts,
+                        (!acc.isSet && pd->type) ? ctx.resolvedType(*pd->type)
+                                                 : nullptr);
                 if (acc.isSet) continue;  // §28.6 getter-fresh-owned: getters only
                 if (acc.bodyKind == ast::PropertyAccessorBodyKind::Expression &&
                     acc.exprBody) {

@@ -201,8 +201,15 @@ public:
     // accessor (get AND set), and expression-bodied-operator entry points in
     // checkMember, so they are public. The internal collectors and the single-
     // lambda classifier stay private. // per §28.3 SB01-B (v0.190)
+    //
+    // `expectedReturnFnType` (#1929): the enclosing DECLARED return function
+    // type of `body` (a method's return type, a block getter's property type),
+    // used as the effective-return fallback for a lambda returned DIRECTLY
+    // (`return <lambda>;`) — its funcReturn is left un-inferred in return
+    // position, so the classifier was inert on it before. // per §28.3 SB01-B
     void checkLambdaTaskFamilyBorrowReturns(
-        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        const sema::TypeRef* expectedReturnFnType = nullptr);
     // `topExpected` (#1926): the expected function type at `e`'s own position
     // (a field's / getter's / operator's declared type), used as the effective-
     // return fallback for the TOP-LEVEL lambda when the type-checker left its
@@ -655,6 +662,12 @@ private:
     void collectBodyLambdasExpr(
         const ast::Expr& e,
         std::vector<const ast::LambdaExpr*>& out) const;
+    // §28.3 SB01-B (#1929): collect the lambdas that are the DIRECT value of a
+    // `return E;` in a block body (mirroring the return traversal), so the block
+    // driver can apply the enclosing declared return type only to those.
+    void collectReturnDirectLambdas(
+        const ast::Stmt& s,
+        std::unordered_set<const ast::LambdaExpr*>& out) const;
     void checkOneLambdaTaskFamilyBorrowReturn(
         const ast::LambdaExpr& lam,
         const sema::TypeRef* expectedFnType = nullptr);
