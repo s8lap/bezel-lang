@@ -1919,6 +1919,29 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                         markDisposedByName(id->name, id->span.begin);
                         const_cast<ast::DiscardStmt*>(ds)->discardOutOwnedVar =
                             true;
+                        // fix #1892 / §17.13 / §28.5: when the discarded named
+                        // binding is a plain (non-`using`) owning-COLLECTION local,
+                        // record that on its LocalDecl so codegen registers the
+                        // collection's scope-end/unwind disposal (registerUsingDisposal)
+                        // — the class-only registerUnwindOwnedLocal (which this
+                        // markDisposedByName otherwise routes it to) does not cover
+                        // collections, so the container leaked on the pre-discard-throw
+                        // exception edge. The discard codegen disposes the container at
+                        // the discard point and nulls the slot, so the both-edges
+                        // registration is null-safe (no double-free). Only the plain
+                        // `var` form carries this obligation (a `using var`
+                        // owning-collection already disposes via registerUsingDisposal;
+                        // an `owned` PARAMETER is not a LocalDecl). // per §17.13, §28.5
+                        if (const sema::TypeRef* rt = ctx_.exprType(*ds->value))
+                            if (rt->kind == sema::TypeRef::Kind::Named &&
+                                isOwningCollectionNameHead(rt->headName()))
+                                if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                                        ctx_.exprSymbol(*id)))
+                                    if (auto* ld = dynamic_cast<
+                                            const ast::LocalDecl*>(loc->decl))
+                                        if (!ld->isUsing)
+                                            const_cast<ast::LocalDecl*>(ld)
+                                                ->dischargedByDiscard = true;
                     }
                 }
             }

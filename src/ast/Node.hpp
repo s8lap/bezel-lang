@@ -184,6 +184,25 @@ struct LocalDecl : Stmt {
     // (a user `async` method, `Task.FromResult`, …) is classified Owned (or
     // stays an unrecognized owner) and is NOT flagged, so it keeps its `d.task`.
     bool initializerCallIsBorrow = false;
+    // fix #1892 / §17.13 / §28.3 / §28.5 (v0.194): set by the ownership pass on a
+    // plain (non-`using`) owning-COLLECTION local (OwningArray/OwningDictionary/
+    // OwningSet/OwningStack/OwningQueue/OwningLinkedList) that is discharged via a
+    // `_ := x;` DISCARD (the "announced consume", spec §17.13). Such a local is
+    // markDisposedByName in the ownership pass, so it is NOT flagged
+    // autoDropAtScopeEnd and would otherwise fall to registerUnwindOwnedLocal —
+    // which covers only class/interface instances (unwindOwnedLocalClass excludes
+    // collections), leaving the container un-disposed on the EXCEPTION edge when an
+    // operation between acquisition and the discard throws (the pre-discard-throw
+    // leak). This flag routes it through registerUsingDisposal instead, registering
+    // the full collection disposal (bz_array_free/bz_dict_free/bz_llist_free with
+    // the element-disposer cascade, §28.5) which fires on BOTH the normal and
+    // unwind edges and is null-safe. The discard codegen disposes the container at
+    // the discard point (§17.13 timing) and NULLS the slot, so the both-edges
+    // registration is a no-op on the normal path (null reload) and the sole
+    // disposer on the pre-discard-throw exception path — exactly once, no double-
+    // free. Only set for the discard discharge form (NOT `move`/`.Dispose()`, whose
+    // codegen does not null a collection slot), so it can never double a transfer.
+    bool dischargedByDiscard = false;
     std::string_view name;
     std::unique_ptr<Type> type;        // null when no `: Type`
     std::unique_ptr<Expr> initializer; // null only when plain `var x;`

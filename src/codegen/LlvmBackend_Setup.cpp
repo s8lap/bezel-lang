@@ -7816,7 +7816,28 @@ struct UnwindIneligibleWalker {
             expr(inc->target.get(), /*consuming=*/false); return;
         }
         if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
-            expr(ds->value.get(), /*consuming=*/true); return;
+            // fix #1893 / §28.3 (v0.184/v0.194): a `_ := x;` DISCARD of a bare-
+            // identifier named owned binding (the "announced consume") must NOT
+            // taint `x` as unwind-ineligible — the exact same reasoning as an
+            // explicit `x.Dispose()` (walked as a borrow above). On the normal
+            // path the discard's announced-consume codegen (discardOutOwnedVar /
+            // the owning-collection discard path) disposes `x` AND nulls its slot,
+            // and every scope-end / exception-path disposal reloads that slot
+            // null-guarded (or via the null-safe collection free) — so a discard
+            // that is UNREACHABLE or PRECEDED BY A THROW keeps a live slot and
+            // must still be unwind-disposed (no leak), while a discard that ran
+            // leaves a null slot and is skipped (no double-free). Marking `x`
+            // ineligible here was a flow-INSENSITIVE over-approximation: it saw
+            // `_ := x` anywhere (even AFTER a throwing operation, as in #1893) and
+            // dropped the unwind disposal for the edge that PRECEDES the discard,
+            // leaking `x` on that throw path. A non-identifier discard value
+            // (`_ := move x`, `_ := producer()`, `_ := x.Field`) is handled by the
+            // expr() walk with its own consuming rules and is unaffected. // per §28.3
+            if (dynamic_cast<const ast::IdentifierExpr*>(ds->value.get()))
+                expr(ds->value.get(), /*consuming=*/false);
+            else
+                expr(ds->value.get(), /*consuming=*/true);
+            return;
         }
         if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
             expr(ys->value.get(), /*consuming=*/true); return;

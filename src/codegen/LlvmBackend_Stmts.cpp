@@ -95,6 +95,25 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // NOT cover collections, hence routing the flagged local through the
         // full using-disposal dispatcher.
         else if (ld->autoDropAtScopeEnd) registerUsingDisposal(ld);
+        // fix #1892 / §17.13 / §28.5: a plain `var` owning-COLLECTION local
+        // discharged via a `_ := x;` DISCARD (announced consume). The ownership
+        // pass markDisposedByName's it (so autoDropAtScopeEnd is false) and set
+        // dischargedByDiscard on the decl. registerUnwindOwnedLocal (the class-
+        // only unwind path below) does NOT cover collections, so the container
+        // leaked when an operation between acquisition and the discard threw.
+        // Route it through the full collection disposal (registerUsingDisposal →
+        // bz_array_free/bz_dict_free/bz_llist_free with the element-disposer
+        // cascade), which fires on BOTH the normal and unwind edges and is
+        // null-safe. The discard codegen (lowerStmt DiscardStmt) disposes the
+        // container at the discard point and nulls the slot, so this registration
+        // is a no-op on the normal path (null reload) and the sole disposer on the
+        // pre-discard-throw exception edge — exactly once, no double-free. The
+        // flag is only set for the discard form (not `move`/`.Dispose()`), so this
+        // never doubles a transfer whose collection slot codegen does not null.
+        else if (ld->dischargedByDiscard &&
+                 (collectionTypeOfLocal(ld) || dictTypeOfLocal(ld) ||
+                  linkedListTypeOfLocal(ld)))
+            registerUsingDisposal(ld);
         // §28.3: a plain `var` owned local NOT flagged for auto-drop (it is
         // discharged on some path) is auto-disposed only on the exception-
         // unwind path (an `unwindOnly` Disposal); its normal-exit discharge is
@@ -1511,35 +1530,86 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
         if (ds->value) {
             if (ds->discardOutOwnedVar) {
-                // §17.13 / §28.3 v0.184 (#1387, generalized by #1651): `_ := x`
-                // where `x` is a named owned binding (a plain owned local of any
-                // decl form, including the `out owned var` inline local, or an
-                // `owned` parameter) recognized as an announced-consume §17.13
-                // discharge by the ownership pass. Emit null-guarded dispose+
-                // reclaim of the local's slot and null it so any other scope-end
-                // / exception-path disposal registered for the same slot
-                // (e.g. ensureOutVarSlots' unwindOnly disposal) is a no-op after
-                // this point. Uses explicitDisposeOwnedReceiverSlot to find the
-                // slot address — the same resolver `x?.Dispose()` / `x.Dispose()`
-                // uses, so it is already general across LocalSymbol (any decl
-                // kind) and `owned` ParameterSymbol receivers.
-                llvm::Type* slotTy = nullptr;
-                llvm::Value* slotAddr =
-                    explicitDisposeOwnedReceiverSlot(*ds->value, slotTy);
-                if (slotAddr && !diverged_) {
-                    llvm::Value* obj = builder_.CreateLoad(ptrTy(), slotAddr);
-                    auto* nullVal = llvm::ConstantPointerNull::get(ptrTy());
-                    auto* isNull  = builder_.CreateICmpEQ(obj, nullVal);
-                    auto* dispBB  = llvm::BasicBlock::Create(
-                        llvm_, "disc.disp", currentFn_);
-                    auto* contBB  = llvm::BasicBlock::Create(
-                        llvm_, "disc.cont", currentFn_);
-                    builder_.CreateCondBr(isNull, contBB, dispBB);
-                    builder_.SetInsertPoint(dispBB);
-                    emitDisposeAndReclaim(obj);
-                    builder_.CreateStore(nullVal, slotAddr);
-                    builder_.CreateBr(contBB);
-                    builder_.SetInsertPoint(contBB);
+                // fix #1892 / §17.13 / §28.5: FIRST, an announced-consume discard
+                // of a named owning-COLLECTION local (OwningArray/OwningDictionary/
+                // OwningSet/OwningStack/OwningQueue/OwningLinkedList), of ANY decl
+                // form (plain `var` OR `using var`). This is handled BEFORE the
+                // class reclaim path below because explicitDisposeOwnedReceiver-
+                // Slot mis-serves a collection: for a plain-`var` collection it
+                // returns null (unwindOwnedLocalClass excludes collections) so the
+                // container was never disposed (the #1892 leak), and for a
+                // `using var` collection it returns the slot, feeding the collection
+                // struct into the CLASS dispatch (emitDisposeAndReclaim reads its
+                // first word as a vtable → SEGV). A collection is neither: it frees
+                // via a runtime call, cascading disposal into each owned element
+                // (§28.5). Dispose the container HERE at the discard point (§17.13:
+                // "disposed at the end of the discard statement") via the shared
+                // collection-disposal machinery — registerUsingDisposal builds the
+                // correct bz_array_free / bz_dict_free / bz_llist_free with the
+                // element-disposer cascade, pushed into a one-shot dispose frame and
+                // emitted now — then NULL the slot so the collection's own scope-end/
+                // unwind disposal (a `using var`'s registerUsingDisposal at its
+                // LocalDecl, or a discard-discharged plain `var`'s dischargedByDiscard
+                // registration — both fire on both edges and are null-safe) reloads
+                // null and no-ops. The container and its elements are disposed
+                // EXACTLY ONCE, no double-free; the pre-discard-throw exception edge
+                // is covered by that both-edges registration. // per §17.13, §28.5
+                const ast::LocalDecl* collLd = nullptr;
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        ds->value.get()))
+                    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                            ctx_.exprSymbol(*id)))
+                        if (auto* ld2 = dynamic_cast<const ast::LocalDecl*>(
+                                loc->decl))
+                            if (collectionTypeOfLocal(ld2) ||
+                                dictTypeOfLocal(ld2) ||
+                                linkedListTypeOfLocal(ld2))
+                                collLd = ld2;
+                if (collLd && !diverged_) {
+                    disposeStack_.emplace_back();
+                    registerUsingDisposal(collLd);
+                    emitDisposals(disposeStack_.back());
+                    disposeStack_.pop_back();
+                    auto lit = locals_.find(collLd);
+                    if (lit != locals_.end() && lit->second) {
+                        llvm::Type* ety = nullptr;
+                        llvm::Value* addr = boxedStorage(lit->second, ety);
+                        if (addr && ety && ety->isPointerTy())
+                            builder_.CreateStore(
+                                llvm::ConstantPointerNull::get(ptrTy()), addr);
+                    }
+                } else if (!diverged_) {
+                    // §17.13 / §28.3 v0.184 (#1387, generalized by #1651): `_ := x`
+                    // where `x` is a named owned CLASS/INTERFACE binding (a plain
+                    // owned local of any decl form, including the `out owned var`
+                    // inline local, or an `owned` parameter) — an announced-consume
+                    // §17.13 discharge. Emit null-guarded dispose+reclaim of the
+                    // local's slot and null it so any other scope-end / exception-
+                    // path disposal registered for the same slot (e.g.
+                    // ensureOutVarSlots' unwindOnly disposal) is a no-op after this
+                    // point. explicitDisposeOwnedReceiverSlot finds the slot address
+                    // — the same resolver `x?.Dispose()` / `x.Dispose()` uses, so it
+                    // is already general across LocalSymbol (any decl kind) and
+                    // `owned` ParameterSymbol receivers.
+                    llvm::Type* slotTy = nullptr;
+                    llvm::Value* slotAddr =
+                        explicitDisposeOwnedReceiverSlot(*ds->value, slotTy);
+                    if (slotAddr) {
+                        llvm::Value* obj =
+                            builder_.CreateLoad(ptrTy(), slotAddr);
+                        auto* nullVal = llvm::ConstantPointerNull::get(ptrTy());
+                        auto* isNull  = builder_.CreateICmpEQ(obj, nullVal);
+                        auto* dispBB  = llvm::BasicBlock::Create(
+                            llvm_, "disc.disp", currentFn_);
+                        auto* contBB  = llvm::BasicBlock::Create(
+                            llvm_, "disc.cont", currentFn_);
+                        builder_.CreateCondBr(isNull, contBB, dispBB);
+                        builder_.SetInsertPoint(dispBB);
+                        emitDisposeAndReclaim(obj);
+                        builder_.CreateStore(nullVal, slotAddr);
+                        builder_.CreateBr(contBB);
+                        builder_.SetInsertPoint(contBB);
+                    }
                 }
             } else if (ds->disposeOwnedValue) {
                 // §17.13 / §28.3 v0.150 (#1009): the ownership pass classified
