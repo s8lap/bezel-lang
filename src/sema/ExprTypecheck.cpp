@@ -1481,6 +1481,48 @@ static bool armCoversDeterminedLeaf(
     return true;
 }
 
+// Forward declaration (defined below): §12.9 variance-aware generic
+// assignability, reused by checkCaseExhaustiveness's #784/#1874 typed-binding
+// coverage check to make a same-declaration generic binding arg-SENSITIVE.
+static bool variantGenericAssignable(const TypeRef*, const TypeRef*,
+                                     bool (*)(TypeSymbol*, TypeSymbol*));
+
+// §19.6 v0.196 (#1874): the ANCESTOR/subtype-walk counterpart of
+// armCoversDeterminedLeaf. A pattern naming a proper ancestor `matchTy` of leaf
+// `leaf` covers `leaf` via the subtype walk (§19.3) — but when `leaf` is a
+// DETERMINED generic leaf, that cover is arg-SENSITIVE exactly as the direct
+// self-match is: the determination rule fixes `leaf`'s obligation to its sole
+// admitted instantiation `leaf<σ>` and requires it "covered … by an unguarded
+// type pattern it is assignable to". `leaf<σ>` is assignable to the ancestor arm
+// `armTy` (an instantiation of `matchTy`) iff `leaf<σ>`'s instantiation projected
+// up to `matchTy` — leafRootInstantiation(leaf, matchTy) substituted by σ — is
+// IDENTICAL to `armTy` (class hierarchies being invariant, §12.9). So a
+// wrong-instantiation ancestor arm (`Result<string>` at scrutinee `Result<int>`)
+// does NOT discharge the determined `Ok<int>`/`Err<int>`, closing the residual
+// the direct-path fix left. A bare NamedPattern ancestor (`armTy == nullptr`)
+// carries no instantiation and never discharges a determined generic leaf,
+// symmetric with armCoversDeterminedLeaf.
+bool ExprTC::ancestorArmCoversDeterminedLeaf(
+    const TypeRef* armTy, TypeSymbol* leaf, TypeSymbol* matchTy,
+    const std::unordered_map<std::string_view, TypeRef*>& solution) {
+    if (!armTy || armTy->kind != TypeRef::Kind::Named) return false;
+    if (armTy->declaration != matchTy) return false;
+    // The leaf's instantiation of the ancestor `matchTy`, in the leaf's own
+    // params (`Ok<Y>: Result<Y>` ⇒ `Result<Y>`), then substituted by the
+    // determined σ so it names `leaf`'s sole obligation at `matchTy`.
+    TypeRef* ancInst = leafRootInstantiation(leaf, matchTy);
+    if (!ancInst || ancInst->kind != TypeRef::Kind::Named ||
+        ancInst->declaration != matchTy)
+        return false;  // uncomposable / mismatched chain — cannot prove cover
+    TypeRef* ancDet = substituteReturnType(ancInst, solution);
+    if (!ancDet || ancDet->genericArgs.size() != armTy->genericArgs.size())
+        return false;
+    for (std::size_t i = 0; i < armTy->genericArgs.size(); ++i)
+        if (!sameInstantiationArg(armTy->genericArgs[i], ancDet->genericArgs[i]))
+            return false;  // any component not provably identical ⇒ no cover
+    return true;
+}
+
 // §19.6: emit a non-exhaustiveness WARNING for an expression-position
 // `case` whose arms the compiler cannot prove cover every possible value.
 // The spec lists the scrutinee shapes for which exhaustiveness IS provable
@@ -1565,9 +1607,56 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
             if (bt->kind == TypeRef::Kind::Primitive)
                 coversNonNull = bt->primitive == scrutTy->primitive;
             else if (bt->kind == TypeRef::Kind::Named && bt->declaration &&
-                     scrutTy->declaration)
-                coversNonNull = bt->declaration == scrutTy->declaration ||
-                                isSubtype(scrutTy->declaration, bt->declaration);
+                     scrutTy->declaration) {
+                // §19.6 v0.196 (#1874): a typed binding `var x: bt` covers all
+                // non-null values of the scrutinee only when the scrutinee
+                // REFERENCE-CONVERTS to `bt` (§5.1) — which for a generic type is
+                // arg-SENSITIVE. When `bt` names the scrutinee's OWN declaration
+                // (`var x: Result<string>` at scrutinee `Result<int>`, the
+                // ancestor residual of #1862), the args must be compatible under
+                // §12.9 variance: an invariant class requires identity, so a
+                // wrong-instantiation binding does NOT cover, and control falls
+                // through to the arg-sensitive closed-hierarchy leaf analysis
+                // below. The cross-declaration subtype disjunct keeps today's
+                // declaration-level check (consistent with checkAssignable's
+                // conservative treatment of cross-declaration generics, §12.9).
+                if (bt->declaration == scrutTy->declaration) {
+                    coversNonNull =
+                        variantGenericAssignable(scrutTy, bt, isSubtype);
+                    // §19.6 v0.196 (#1874, rigid tail): variantGenericAssignable
+                    // treats a RIGID enclosing-body type parameter in `scrutTy`
+                    // as a free variable compatible with any `bt` argument — too
+                    // lenient for the "covers ALL values" proof, which must hold
+                    // at EVERY instantiation of the enclosing body (§31.2.1). So
+                    // a binding `var x: Result<int>` does NOT universally cover a
+                    // rigid scrutinee `Result<T>`: reject any position where
+                    // `scrutTy`'s arg is a rigid parameter and `bt`'s arg is not
+                    // that SAME rigid parameter. Ground args are left to the
+                    // variance check above, so covariant coverage is undisturbed.
+                    if (coversNonNull &&
+                        scrutTy->genericArgs.size() == bt->genericArgs.size()) {
+                        for (std::size_t gi = 0; gi < scrutTy->genericArgs.size();
+                             ++gi) {
+                            const TypeRef* sa = scrutTy->genericArgs[gi];
+                            const TypeRef* ba = bt->genericArgs[gi];
+                            bool saRigid =
+                                sa && sa->kind == TypeRef::Kind::Named &&
+                                sa->genericArgs.empty() &&
+                                isInScopeTypeParam(sa->headName());
+                            if (!saRigid) continue;  // ground arg — variance ruled
+                            bool baSameRigid =
+                                ba && ba->kind == TypeRef::Kind::Named &&
+                                ba->genericArgs.empty() &&
+                                sa->nullable == ba->nullable &&
+                                !ba->headName().empty() &&
+                                ba->headName() == sa->headName();
+                            if (!baSameRigid) { coversNonNull = false; break; }
+                        }
+                    }
+                } else
+                    coversNonNull =
+                        isSubtype(scrutTy->declaration, bt->declaration);
+            }
             if (!coversNonNull) continue;
             if (!scrutTy->nullable || armsCoverNull(ce)) return;  // exhaustive
             // Non-null fully covered, but null is not (§19.6 nullable rule).
@@ -1906,7 +1995,24 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
                         TypeSymbol* b = work.back();
                         work.pop_back();
                         if (!b || !seen.insert(b).second) continue;
-                        if (b == matchTy) { coveredLeaves.insert(lf); break; }
+                        if (b == matchTy) {
+                            // §19.6 v0.196 (#1874): the ANCESTOR/subtype-walk
+                            // cover is arg-SENSITIVE for a DETERMINED generic
+                            // leaf, exactly as the direct self-match above — a
+                            // wrong-instantiation ancestor arm (`Result<string>`
+                            // at scrutinee `Result<int>`) does NOT discharge the
+                            // determined `Ok<int>`/`Err<int>` (residual of #1862).
+                            // Non-generic / undetermined / exempt leaves are not
+                            // in `determined`, so the plain subtype discharge is
+                            // undisturbed.
+                            auto di = determined.find(lf);
+                            if (di != determined.end() &&
+                                !ancestorArmCoversDeterminedLeaf(
+                                    armTy, lf, matchTy, di->second))
+                                break;  // arg mismatch — leaf stays uncovered
+                            coveredLeaves.insert(lf);
+                            break;
+                        }
                         for (TypeSymbol* bb : b->baseTypes)
                             work.push_back(bb);
                     }

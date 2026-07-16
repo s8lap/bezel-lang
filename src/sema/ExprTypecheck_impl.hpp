@@ -443,6 +443,23 @@ private:
     // substituteReturnType as the per-level substitution engine.
     TypeRef* leafRootInstantiation(TypeSymbol* leaf, TypeSymbol* root);
 
+    // §19.6 (v0.196, #1874): does an ANCESTOR arm of type `armTy` (an
+    // instantiation of `matchTy`, a strict ancestor of the DETERMINED generic
+    // leaf `leaf`) cover `leaf`'s sole inhabiting instantiation `leaf<σ>`? The
+    // subtype walk (§19.3) lets a pattern naming an ancestor cover a leaf
+    // descendant, but for a determined generic leaf that cover is arg-SENSITIVE:
+    // the leaf is covered only "by an unguarded type pattern it is assignable to"
+    // (§19.6), so the leaf's determined instantiation projected up to `matchTy`
+    // (leafRootInstantiation(leaf, matchTy) substituted by σ = `solution`) must
+    // be IDENTICAL to `armTy` component-wise. A wrong-instantiation ancestor arm
+    // (`Result<string>` at scrutinee `Result<int>`) does NOT cover the determined
+    // `Ok<int>`/`Err<int>`, closing the residual the direct-path #1862 fix left
+    // in the ancestor branch; a bare NamedPattern ancestor (armTy == nullptr)
+    // carries no instantiation and never discharges a determined generic leaf.
+    bool ancestorArmCoversDeterminedLeaf(
+        const TypeRef* armTy, TypeSymbol* leaf, TypeSymbol* matchTy,
+        const std::unordered_map<std::string_view, TypeRef*>& solution);
+
     // §19.6 (v0.196, #1816 s2): the determination outcome of solving a closed-
     // hierarchy leaf's type parameters against a GROUND scrutinee `S` — the
     // multiplicity of the leaf's inhabiting instantiations at `S`. `NoSolution`

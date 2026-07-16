@@ -803,6 +803,173 @@ BEZEL_TEST(sema_case_exhaust,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// --- #1874: ARG-SENSITIVE coverage via an ANCESTOR arm (spec §19.6 v0.196) ---
+//
+// #1862 made a determined leaf's DIRECT self-match arg-sensitive; this closes the
+// residual it left in the ANCESTOR/subtype-cover path. §19.6 requires a
+// determined leaf `L<σ>` "covered … by an unguarded type pattern it is assignable
+// TO", so an ancestor arm covers `L<σ>` only when `L<σ>` reference-converts to the
+// arm's type (§5.1) — arg-SENSITIVE, class hierarchies being invariant (§12.9). A
+// WRONG-instantiation ancestor arm (`var x: Result<string>` at scrutinee
+// `Result<int>`) does NOT discharge the determined `Ok<int>`/`Err<int>`. The
+// rejected "declaration-coverage" reading (§19.6, unsound) matched the ancestor to
+// the leaf by declaration NAME alone through the subtype walk, wrongly deeming a
+// non-exhaustive match exhaustive (the false-exhaustive hole).
+
+// (a) GROUND wrong-instantiation ROOT ancestor. Scrutinee `Result<int>`; the sole
+// arm `var x: Result<string>` names the root Result with the WRONG argument. At
+// runtime the erased type-test catches every value (§19.5), but STATICALLY
+// `Result<int>` is not assignable to `Result<string>` (invariant), so neither
+// determined leaf `Ok<int>`/`Err<int>` is covered and the case is non-exhaustive.
+// FAILS WITHOUT the fix: the #784 typed-binding-covers-full-type check matched by
+// declaration alone (`Result` == `Result`) and returned "exhaustive" with no
+// warning. PASSES WITH: the arg-sensitive check leaves both leaves uncovered.
+BEZEL_TEST(sema_case_exhaust,
+           wrong_instantiation_ancestor_root_does_not_cover_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<T> end Result; "
+        "sealed class Ok<T> : Result<T> end Ok; "
+        "sealed class Err<T> : Result<T> end Err; "
+        "class Calc "
+        "  public method M(r: Result<int>): int "
+        "    var a := case r of "
+        "      var x: Result<string> => 0 "  // WRONG-inst ANCESTOR — covers nothing
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));            // leaves uncovered
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "Ok"));  // names the leaf
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "Err"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (b) CORRECT-instantiation ROOT ancestor control. `var x: Result<int>` at
+// scrutinee `Result<int>` DOES cover every value — each determined leaf `Ok<int>`
+// / `Err<int>` is assignable to `Result<int>` (an upcast, §5.1) — so the case is
+// exhaustive with no `_` and no warning. Guards the opposite failure mode: the
+// arg-sensitive ancestor check must not regress the legitimate "root binding
+// covers all leaves" idiom.
+BEZEL_TEST(sema_case_exhaust,
+           correct_instantiation_ancestor_root_covers_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<T> end Result; "
+        "sealed class Ok<T> : Result<T> end Ok; "
+        "sealed class Err<T> : Result<T> end Err; "
+        "class Calc "
+        "  public method M(r: Result<int>): int "
+        "    var a := case r of "
+        "      var x: Result<int> => 0 "  // CORRECT-inst ANCESTOR — covers all
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));  // root binding covers all
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (c) GROUND wrong-instantiation INTERMEDIATE-abstract ancestor. Scrutinee
+// `Result<int>`; the arm names an intermediate abstract `Wrap<string>` (leaves
+// `Ok`/`Err` derive `Wrap`). This cover flows through the closed-hierarchy leaf
+// subtype-walk (not the #784 self-declaration check, since `Wrap` != `Result`), so
+// it exercises the SECOND arg-sensitivity site. `Ok<int>`/`Err<int>` project up to
+// `Wrap<int>`, not `Wrap<string>`, so neither is covered → non-exhaustive. FAILS
+// WITHOUT (the subtype walk covered by ancestor-declaration name); PASSES WITH.
+BEZEL_TEST(sema_case_exhaust,
+           wrong_instantiation_ancestor_intermediate_does_not_cover_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<T> end Result; "
+        "sealed abstract class Wrap<T> : Result<T> end Wrap; "
+        "sealed class Ok<T> : Wrap<T> end Ok; "
+        "sealed class Err<T> : Wrap<T> end Err; "
+        "class Calc "
+        "  public method M(r: Result<int>): int "
+        "    var a := case r of "
+        "      var w: Wrap<string> => 0 "  // WRONG-inst INTERMEDIATE — covers nothing
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "Ok"));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "Err"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (d) RIGID wrong-instantiation ROOT ancestor. Scrutinee `Result<T>` (rigid `T`,
+// from the enclosing `Handle<T>`); the arm `var x: Result<int>` names one ground
+// instantiation of the rigid family. `Result<T>` reference-converts to
+// `Result<int>` only at the instantiation `T = int`, not at EVERY instantiation of
+// the enclosing body (§31.2.1), so the binding does NOT universally cover and the
+// case is non-exhaustive. FAILS WITHOUT (variance treated the rigid `T` as a free
+// variable compatible with `int`); PASSES WITH (the rigid-mismatch guard).
+BEZEL_TEST(sema_case_exhaust,
+           wrong_instantiation_ancestor_rigid_does_not_cover_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<A> end Result; "
+        "sealed class Ok<Y> : Result<Y> end Ok; "
+        "sealed class Err<Y> : Result<Y> end Err; "
+        "class Handle<T> "
+        "  public method h(r: Result<T>): int "
+        "    var a := case r of "
+        "      var x: Result<int> => 0 "  // one instantiation — not the rigid family
+        "    end; "
+        "    return a; "
+        "  end h; "
+        "end Handle;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "Ok"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (e) RIGID CORRECT-instantiation ROOT ancestor control. `var x: Result<T>` at
+// rigid scrutinee `Result<T>` covers every value (identity), so the case is
+// exhaustive — the rigid-mismatch guard must accept the SAME rigid parameter.
+BEZEL_TEST(sema_case_exhaust,
+           correct_instantiation_ancestor_rigid_covers_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Result<A> end Result; "
+        "sealed class Ok<Y> : Result<Y> end Ok; "
+        "sealed class Err<Y> : Result<Y> end Err; "
+        "class Handle<T> "
+        "  public method h(r: Result<T>): int "
+        "    var a := case r of "
+        "      var x: Result<T> => 0 "  // SAME rigid family — covers all
+        "    end; "
+        "    return a; "
+        "  end h; "
+        "end Handle;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));  // rigid identity covers all
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (f) NON-GENERIC base-binding control. A `var x: Shape` binding over a non-generic
+// closed hierarchy still covers every leaf (the #784 typed-binding idiom). Guards
+// that the #1874 generic arg-sensitivity did not disturb the non-generic path.
+BEZEL_TEST(sema_case_exhaust,
+           nongeneric_base_binding_still_covers_spec_19_6) {
+    auto r = parseSemaAll(
+        "module M; "
+        "sealed abstract class Shape end Shape; "
+        "sealed class Circle : Shape end Circle; "
+        "sealed class Square : Shape end Square; "
+        "class Calc "
+        "  public method M(s: Shape): int "
+        "    var a := case s of "
+        "      var x: Shape => 0 "  // base binding — covers all non-null values
+        "    end; "
+        "    return a; "
+        "  end M; "
+        "end Calc;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // --- s5: leaf-chain scalar where-constraint filtering (spec §19.6 v0.196;
 //     clause (b)) --------------------------------------------------------------
 //
