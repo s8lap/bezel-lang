@@ -156,18 +156,16 @@ BEZEL_TEST(case_type_test_iface_instantiation_1920,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// (6) IMPLEMENTED-TWICE — now REJECTED by #1927 (this control originally
-// asserted ACCEPT; that was an UNSOUND admission, reproduced as an ASan
-// heap-buffer-overflow). `sealed class C<T>: IMarker<T>, IMarker<int>` at an
-// `IMarker<int>` scrutinee, arm `var x: C<string>`: #1920 admitted it because
-// SOME implemented instantiation (`IMarker<int>` DIRECTLY) is compatible — but
-// that is reachability, not UNIQUENESS. Every `C<Q>` conforms (the ground
-// `IMarker<int>` clause), so a `C<int>` value passes the erased `is C` test and
-// binds at `C<string>` — a wrong-type bind. #1927 rejects it: the `IMarker<T>`
-// clause invariant-matches the scrutinee pinning `T = int ≠ string` (and the
-// ground clause leaves `T` free) — a provable second conformer.
+// (6) IMPLEMENTED-TWICE — a LIVE arm, ACCEPTED (originally asserted ACCEPT under
+// #1920; #1927 flipped it to REJECT on an erasure premise #1843 later falsified;
+// #1946 restores ACCEPT). `sealed class C<T>: IMarker<T>, IMarker<int>` at an
+// `IMarker<int>` scrutinee, arm `var x: C<string>`: `C<string>` conforms to
+// `IMarker<int>` via the GROUND clause, so a `C<string>` value legitimately flows
+// through the scrutinee. Post-#1843 the runtime `is C<string>` test is PRECISE —
+// it matches ONLY genuine `C<string>` values (a `C<int>` value does NOT match) —
+// so no wrong-type bind occurs; the arm is LIVE and sound. Must compile clean.
 BEZEL_TEST(case_type_test_iface_instantiation_1920,
-           implemented_twice_ambiguous_bind_rejected) {
+           implemented_twice_live_bind_accepted) {
     auto r = parseSemaAll(wrap(
         "interface IMarker<T>\nend IMarker;\n"
         "sealed class C<T> : IMarker<T>, IMarker<int>\nend C;\n",
@@ -178,10 +176,8 @@ BEZEL_TEST(case_type_test_iface_instantiation_1920,
         "    end;\n"
         "    return n;\n"
         "  end M;\n"));
-    // The #1927 uniqueness diagnostic ("not determined by the scrutinee
-    // interface type") is also matched by hasIfaceInstantiationError, whose
-    // substring "scrutinee interface type" it contains.
-    BEZEL_EXPECT_TRUE(hasIfaceInstantiationError(r));
+    BEZEL_EXPECT_FALSE(hasIfaceInstantiationError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // (7) COVARIANT interface: `IReadOnly<out T>`, scrutinee `IReadOnly<Animal>`,
@@ -206,18 +202,16 @@ BEZEL_TEST(case_type_test_iface_instantiation_1920,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// (8) NON-FINAL pattern class — now REJECTED by #1927 (this control originally
-// asserted ACCEPT; that was an UNSOUND admission, reproduced as an ASan
-// heap-buffer-overflow). Plain (non-sealed) `class Box<T>: IBox<T>` at scrutinee
-// `IBox<int>`, arm `var x: Box<string>`: #1920 admitted it on the theory that
-// only a subclass of `Box<string>` (adding an `IBox<int>` implementation) could
-// match — but the erased `is Box` test also matches a plain `Box<int>` value
-// (`Box<int>: IBox<int>`, a SAME-class instantiation, no subclass needed), which
-// then binds at `Box<string>` — a wrong-type bind. #1927 rejects it: the
-// `IBox<T>` clause invariant-matches the scrutinee pinning `T = int ≠ string`, a
-// provable second conformer. (The member-clash reasoning #1927(a) proposed for
-// the subclass case is unnecessary here — the same-class `Box<int>` witness
-// settles it, final or not.)
+// (8) NON-FINAL pattern class, a DEAD arm — REJECTED by #1927 (narrowed #1946).
+// Plain (non-sealed) `class Box<T>: IBox<T>` at scrutinee `IBox<int>`, arm
+// `var x: Box<string>`: `Box<string>` implements only `IBox<string>` (invariant,
+// §12.9), never `IBox<int>`, so no value of the scrutinee type is ever a
+// `Box<string>` — the arm is unreachable. #1920 conservatively admits the
+// non-final case (a subclass could in principle add a conforming implementation,
+// the #1939-residual cross-declaration slice); #1927 is the non-final counterpart
+// that rejects this unreachable arm. (Post-#1843 the runtime `is Box<string>`
+// test is precise — a `Box<int>` value does NOT match it — so the rejection now
+// rests on unreachability, not the old erasure wrong-bind framing.)
 BEZEL_TEST(case_type_test_iface_instantiation_1920,
            non_final_ambiguous_bind_rejected) {
     auto r = parseSemaAll(wrap(

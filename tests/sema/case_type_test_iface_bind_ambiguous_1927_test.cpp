@@ -1,37 +1,39 @@
-// Spec-derived tests for §19.3/§19.5/§5.1/§12.9 (#1927): the UNIQUENESS
-// admission of a typed binding pattern `var x: C<A>` (a class pattern) against a
-// generic INTERFACE scrutinee `I<B>`. #1920 (case_type_test_iface_instantiation_
-// 1920_test.cpp) rejects only when NO instantiation of `C` conforms to `I<B>`
-// (the arm is unreachable). #1927 is the DUAL hole: `C<A>` DOES conform, but is
-// NOT the SOLE instantiation of `C` that does, so the erased runtime type-test
-// (which checks only the class tag, §19.3) also matches a `C<Q≠A>` value and
-// binds it at the wrong static type `C<A>`.
+// Spec-derived tests for §19.3/§19.5/§5.1/§12.9 (#1927; narrowed by #1946): the
+// DEAD-ARM admission of a typed binding pattern `var x: C<A>` (a class pattern)
+// against a generic INTERFACE scrutinee `I<B>`. #1920 (case_type_test_iface_
+// instantiation_1920_test.cpp) rejects an unreachable arm only for a FINAL
+// pattern class; #1927 is the NON-FINAL / generic-class counterpart: it rejects
+// `var x: C<A>` when the concrete `C<A>` provably CANNOT conform to `I<B>`, so no
+// value of the scrutinee type is ever a `C<A>` and the arm can never match.
 //
-// Both residuals #1927 records are exploitable erasure holes (each reproduced as
-// an AddressSanitizer heap-buffer-overflow before this fix):
+// #1946 REFINED this check into a THREE-WAY rule. As landed under #1927 it
+// rejected EVERY non-unique conformer, on the premise that the runtime type-test
+// ERASES generic arguments, so a `C<Q≠A>` value would bind at `C<A>`. #1843
+// (per-monomorphization RTTI descriptors) made `is C<A>` PRECISE — BUT ONLY when
+// every type argument of `A` is runtime-REIFIED (a concrete class/record/enum/
+// primitive). For a still-erased #1939 kind (a function type, inline array) the
+// descriptor collapses siblings and the test is NOT precise. So:
 //
-//   (a) Non-final pattern class, `Box<T>: IBox<T>` at scrutinee `IBox<int>`,
-//       pattern `var x: Box<string>`: a runtime `Box<int>` value (implements
-//       `IBox<int>`, so it IS a value of scrutinee type) passes the erased
-//       `is Box` test and binds at `Box<string>` — a wrong-type bind. #1920
-//       admitted this because `Box` is non-final; but the `Box<int>` witness is
-//       a SAME-class instantiation, so no subclass reasoning is needed — the
-//       single implemented instantiation `IBox<T>` invariant-matches `IBox<int>`
-//       pinning `T = int ≠ string`, a PROVABLE second conformer.
+//   DEAD (REJECTED, "unreachable"): non-final `Box<T>: IBox<T>` at scrutinee
+//       `IBox<int>`, pattern `var x: Box<string>`. `Box<string>` implements only
+//       `IBox<string>` (invariant, §12.9), never `IBox<int>` — no value of the
+//       scrutinee type is ever a `Box<string>`.
 //
-//   (b) Implemented-twice, `C<T>: IMarker<T>, IMarker<int>` at scrutinee
-//       `IMarker<int>`, pattern `var x: C<int>`: a runtime `C<string>` value
-//       implements `IMarker<int>` DIRECTLY (the ground clause), so every `C<Q>`
-//       conforms; it passes `is C` and binds at `C<int>`. The ground implemented
-//       instantiation leaves `C`'s parameter FREE — a provable second conformer.
+//   LIVE + REIFIED arg (ACCEPTED, was over-rejected): implemented-twice
+//       `C<T>: IMarker<T>, IMarker<int>` at `IMarker<int>`, pattern `var x:
+//       C<string>` / `C<int>`, and the free-extra-parameter shape with a concrete
+//       argument. #1843 makes `is C<string>` precise, so only genuine `C<string>`
+//       values match — LIVE and sound.
 //
-// The check fires ONLY on a PROVABLE second conformer and stays INVARIANT-only:
-// a variant (`in`/`out`) scrutinee interface admits a subtype range — a distinct
-// erasure slice (a recorded residual, orthogonal to the variance checker) that
-// must stay ACCEPTED here. A conforming unique instantiation, an
-// implemented-twice shape where only ONE branch matches the scrutinee, a rigid
-// scrutinee parameter, and the covariant residual must all stay ACCEPTED (no
-// over-rejection).
+//   LIVE + ERASED arg (REJECTED, "not runtime-distinguishable"): the SAME shapes
+//       but with a function-typed argument (`var x: C<(int)->int>`). #1843 does
+//       NOT reify a function type, so `is C<(int)->int>` degrades and a sibling
+//       `C<(string)->string>` mis-binds — the OLD #1927 rejection must stand.
+//
+// The check stays INVARIANT-only: a variant (`in`/`out`) scrutinee interface
+// admits a subtype range — a distinct slice (a recorded residual, orthogonal to
+// the variance checker) that stays ACCEPTED here. A conforming instantiation, a
+// rigid scrutinee parameter, and the covariant residual all stay ACCEPTED.
 
 #include "support/sema_support.hpp"
 #include "test_harness.hpp"
@@ -50,15 +52,28 @@ bezel::test::SemaResult parseSemaAll(std::string_view src) {
     return r;
 }
 
-// True iff an ERROR diagnostic carries the #1927 uniqueness reason — pins THIS
-// defect: its message names "not determined by the scrutinee", which the #1920
-// reachability diagnostic ("no implemented instantiation is compatible") does
-// NOT carry.
+// True iff an ERROR diagnostic carries the #1927 (narrowed #1946) dead-arm
+// reason — pins THIS check: its message ends "the arm is unreachable", which the
+// #1920 reachability diagnostic ("would bind at a wrong static type") does NOT
+// carry, so the two remain distinguishable.
 bool hasBindAmbiguousError(const bezel::test::SemaResult& r) {
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.severity == bezel::Severity::Error &&
-            d.message.find("not determined by the scrutinee") !=
-                std::string::npos)
+            d.message.find("the arm is unreachable") != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+// True iff an ERROR diagnostic carries the #1946 ERASED-ambiguous reason — a live
+// arm whose differing type argument is a still-erased #1939 kind (function type,
+// inline array) so the runtime test degrades and a sibling would mis-bind. Its
+// message names "not runtime-distinguishable", carried by neither the #1920 nor
+// the dead-arm diagnostic.
+bool hasErasedAmbiguousError(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("not runtime-distinguishable") != std::string::npos)
             return true;
     }
     return false;
@@ -70,12 +85,13 @@ std::string wrap(const std::string& decls, const std::string& body) {
 
 }  // namespace
 
-// ---- FAIL-without / PASS-with: the undetermined-argument bind is REJECTED ----
+// ---- DEAD arms: an unreachable pattern instantiation is REJECTED -------------
 
 // (a) EXPRESSION position: non-final `Box<T>: IBox<T>` at scrutinee `IBox<int>`,
-// arm `var x: Box<string>`. `Box<int>` conforms to `IBox<int>` and int ≠ string,
-// so the erased `is Box` test would bind a `Box<int>` value at `Box<string>`.
-// REJECTED (FAILS WITHOUT the fix — #1920 admits the non-final case).
+// arm `var x: Box<string>`. `Box<string>` implements only `IBox<string>`
+// (invariant, §12.9), never `IBox<int>`, so no value of the scrutinee type is
+// ever a `Box<string>` — the arm is unreachable. REJECTED (FAILS WITHOUT the
+// fix — #1920 admits the non-final case; #1946 keeps this dead-arm rejection).
 BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
            expr_nonfinal_distinct_pin_rejected) {
     auto r = parseSemaAll(wrap(
@@ -108,13 +124,16 @@ BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
     BEZEL_EXPECT_TRUE(hasBindAmbiguousError(r));
 }
 
+// ---- LIVE arms (#1946): the pattern instantiation conforms — ACCEPTED --------
+
 // (b) EXPRESSION position: FINAL `C<T>: IMarker<T>, IMarker<int>` at scrutinee
-// `IMarker<int>`, arm `var x: C<int>`. The ground clause `IMarker<int>` makes
-// EVERY `C<Q>` conform, so a `C<string>` value would bind at `C<int>`. REJECTED
-// (FAILS WITHOUT the fix — #1920 admits it: SOME implemented instantiation is
-// compatible, which is reachability, not uniqueness).
+// `IMarker<int>`, arm `var x: C<int>`. `C<int>` conforms to `IMarker<int>` (via
+// `T=int` AND the ground clause), so a real `C<int>` value flows in and — post-
+// #1843 (precise `is C<int>`) — matches ONLY genuine `C<int>` values; no
+// `C<Q≠int>` value ever binds here. The arm is LIVE and sound. Pre-#1946 #1927
+// over-rejected this on the (now-false) erasure premise; #1946 admits it.
 BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
-           expr_implemented_twice_ground_free_rejected) {
+           expr_implemented_twice_ground_live_accepted) {
     auto r = parseSemaAll(wrap(
         "interface IMarker<T>\nend IMarker;\n"
         "sealed class C<T> : IMarker<T>, IMarker<int>\nend C;\n",
@@ -125,12 +144,13 @@ BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
         "    end;\n"
         "    return n;\n"
         "  end M;\n"));
-    BEZEL_EXPECT_TRUE(hasBindAmbiguousError(r));
+    BEZEL_EXPECT_FALSE(hasBindAmbiguousError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // (b) STATEMENT position.
 BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
-           stmt_implemented_twice_ground_free_rejected) {
+           stmt_implemented_twice_ground_live_accepted) {
     auto r = parseSemaAll(wrap(
         "interface IMarker<T>\nend IMarker;\n"
         "sealed class C<T> : IMarker<T>, IMarker<int>\nend C;\n",
@@ -142,15 +162,38 @@ BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
         "    end;\n"
         "    return n;\n"
         "  end M;\n"));
-    BEZEL_EXPECT_TRUE(hasBindAmbiguousError(r));
+    BEZEL_EXPECT_FALSE(hasBindAmbiguousError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// (b, ground makes a DIFFERENT argument conform too) The #1946 headline case:
+// `C<T>: IMarker<T>, IMarker<int>` at scrutinee `IMarker<int>`, arm
+// `var x: C<string>`. `C<string>` conforms to `IMarker<int>` via the GROUND
+// clause, so a `C<string>` value legitimately flows through the scrutinee and —
+// post-#1843 — precisely matches `is C<string>`. LIVE and sound; ACCEPTED.
+BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
+           expr_implemented_twice_ground_conformer_accepted) {
+    auto r = parseSemaAll(wrap(
+        "interface IMarker<T>\nend IMarker;\n"
+        "sealed class C<T> : IMarker<T>, IMarker<int>\nend C;\n",
+        "  public method M(m: IMarker<int>): int\n"
+        "    var n := case m of\n"
+        "      var x: C<string> => 1,\n"
+        "      _ => 0\n"
+        "    end;\n"
+        "    return n;\n"
+        "  end M;\n"));
+    BEZEL_EXPECT_FALSE(hasBindAmbiguousError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // (b, variant) An EXTRA class parameter the scrutinee does not mention:
 // `Pair<T, U>: IMarker<T>` at scrutinee `IMarker<int>`, arm `var x: Pair<int,
-// string>`. `IMarker<T>` pins `T = int` but leaves `U` FREE — a `Pair<int, bool>`
-// value conforms and would bind at `Pair<int, string>`. REJECTED.
+// string>`. `Pair<int, string>` implements `IMarker<int>` (`T=int`), so it
+// conforms; post-#1843 `is Pair<int, string>` matches ONLY `Pair<int, string>`
+// values (no `Pair<int, bool>` binds here). LIVE and sound; ACCEPTED (#1946).
 BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
-           free_extra_class_parameter_rejected) {
+           free_extra_class_parameter_live_accepted) {
     auto r = parseSemaAll(wrap(
         "interface IMarker<T>\nend IMarker;\n"
         "sealed class Pair<T, U> : IMarker<T>\nend Pair;\n",
@@ -161,7 +204,8 @@ BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
         "    end;\n"
         "    return n;\n"
         "  end M;\n"));
-    BEZEL_EXPECT_TRUE(hasBindAmbiguousError(r));
+    BEZEL_EXPECT_FALSE(hasBindAmbiguousError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // ---- No over-rejection: legitimately-unique / undecidable binds stay ACCEPTED
@@ -250,3 +294,62 @@ BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
     BEZEL_EXPECT_FALSE(hasBindAmbiguousError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ---- ERASED-arg ambiguity (#1946): #1843 does NOT reify these — REJECTED ------
+//
+// #1843 makes `is C<A>` precise ONLY for a runtime-reified argument. A still-
+// erased #1939 kind (a function type; the descriptor key collapses `Kind::Function`
+// to "F" at any depth) makes the test degrade, so a conforming sibling `C<Q≠A>`
+// mis-binds. The uniqueness rejection must STAND for these — this is exactly the
+// blocker the pre-gate review of the first #1946 cut caught (a `C<(string)->string>`
+// value wrongly matched `var x: C<(int)->int>`).
+
+// (E1) IMPLEMENTED-TWICE with a FUNCTION-typed argument: `C<T>: IMarker<T>,
+// IMarker<int>` at scrutinee `IMarker<int>`, arm `var x: C<(int) -> int>`. The
+// ground `IMarker<int>` clause makes every `C<Q>` conform, and `(int)->int` is
+// NOT runtime-reified, so `is C<(int)->int>` degrades and would bind a
+// `C<(string)->string>` value at `C<(int)->int>`. REJECTED (the erased sibling).
+BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
+           implemented_twice_function_arg_erased_rejected) {
+    auto r = parseSemaAll(wrap(
+        "interface IMarker<T>\nend IMarker;\n"
+        "sealed class C<T> : IMarker<T>, IMarker<int>\nend C;\n",
+        "  public method M(m: IMarker<int>): int\n"
+        "    var n := case m of\n"
+        "      var x: C<(int) -> int> => 1,\n"
+        "      _ => 0\n"
+        "    end;\n"
+        "    return n;\n"
+        "  end M;\n"));
+    BEZEL_EXPECT_TRUE(hasErasedAmbiguousError(r));
+    // NOT the dead-arm diagnostic — this arm is LIVE (a `C<(int)->int>` conforms),
+    // just not runtime-distinguishable from its sibling.
+    BEZEL_EXPECT_FALSE(hasBindAmbiguousError(r));
+}
+
+// (E2) FREE extra parameter with a FUNCTION-typed argument: `Pair<T, U>:
+// IMarker<T>` at scrutinee `IMarker<int>`, arm `var x: Pair<int, (int) -> int>`.
+// `T` pins to `int` but `U` is free, and `U`'s pattern argument `(int)->int` is
+// not reified, so a `Pair<int, (string)->string>` value would mis-bind. REJECTED.
+BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
+           free_extra_function_arg_erased_rejected) {
+    auto r = parseSemaAll(wrap(
+        "interface IMarker<T>\nend IMarker;\n"
+        "sealed class Pair<T, U> : IMarker<T>\nend Pair;\n",
+        "  public method M(m: IMarker<int>): int\n"
+        "    var n := case m of\n"
+        "      var x: Pair<int, (int) -> int> => 1,\n"
+        "      _ => 0\n"
+        "    end;\n"
+        "    return n;\n"
+        "  end M;\n"));
+    BEZEL_EXPECT_TRUE(hasErasedAmbiguousError(r));
+}
+
+// NOTE on the erased-UNIQUE-conformer case (`C<T>: IMarker<T>` at scrutinee
+// `IMarker<(int)->int>`, arm `var x: C<(int)->int>`): though a `C<(int)->int>` is
+// the sole conformer and the arm is sound, it is rejected UPSTREAM (by the #1913 /
+// #1920 reachability checks, which run before this one) — `variantGenericAssignable`
+// cannot confirm conformance THROUGH a function-typed argument, a pre-existing
+// conservative limitation orthogonal to #1946. So it never reaches this check and
+// is not a clean ACCEPT to assert here; it is documented rather than tested.

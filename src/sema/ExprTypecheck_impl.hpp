@@ -528,29 +528,37 @@ private:
     bool typeTestInterfaceInstantiationImpossible(const TypeRef* scrutTy,
                                                   const TypeRef* patTy);
 
-    // §19.3/§19.5/§5.1/§12.9 (v0.197, #1927): the erased-type-test UNIQUENESS
-    // counterpart of the interface-scrutinee admission check. A typed binding
-    // `var x: C<A>` against a generic-interface scrutinee `I<B>` binds the value
-    // at the STATIC type `C<A>`, but the runtime type-test erases generic args
-    // (it checks only the class tag). So the bind is sound only when `C<A>` is
-    // the UNIQUE instantiation of `C` whose values can have static type `I<B>` —
-    // otherwise a `C<Q≠A>` value (same erased class tag, also an `I<B>`) matches
-    // and binds at the wrong static type. #1920 rejects only when NO
-    // instantiation of `C` conforms (the arm is unreachable); this catches the
-    // dual hole where `C<A>` DOES conform but is NOT the unique conformer: a
-    // GROUND implemented instantiation of `I` (`C<T>: I<T>, I<int>` at scrutinee
-    // `I<int>` — every `C<Q>` conforms, #1927(b)), a class parameter left FREE by
-    // the scrutinee, or an implemented instantiation whose invariant match pins a
-    // parameter to a value OTHER than `A` (`Box<T>: IBox<T>` at `IBox<int>` with
-    // pattern `Box<string>` — `Box<int>` conforms, #1927(a)). Returns true (=>
-    // the caller REJECTS) only on a PROVABLE second conformer. An INVARIANT
-    // scrutinee interface only (a variant one admits a subtype range — a distinct
-    // erasure slice, a residual); a rigid/free scrutinee or pattern argument, an
-    // imported interface whose variance is unknown, a non-generic pattern class,
-    // or any undecidable match yields a CONSERVATIVE accept (false) — never an
-    // over-rejection.
-    bool typeTestInterfaceBindAmbiguous(const TypeRef* scrutTy,
-                                        const TypeRef* patTy);
+    // §19.3/§19.5/§5.1/§12.9 (v0.197, #1927; narrowed/refined #1946): admission
+    // of a typed binding `var x: C<A>` (a class pattern) against a generic-
+    // interface scrutinee `I<B>`. Returns which rejection (if any) applies:
+    enum class IfaceBindReject {
+        None,          // admit — the arm is live and soundly matched
+        Unreachable,   // C<A> provably cannot conform to I<B> — a DEAD arm (#1920's
+                       // non-final counterpart)
+        ErasedAmbiguous  // C<A> conforms, but its differing type argument is a
+                         // still-ERASED kind (#1939: a function type, inline array,
+                         // …) so the runtime `is C<A>` degrades to the class-tag-only
+                         // test, AND another instantiation of C also conforms — the
+                         // erased test would bind a `C<Q≠A>` value at C<A>.
+    };
+    // Post-#1843 the runtime `is C<A>` test is PRECISE when every type argument of
+    // A carries a runtime identity token (descArgsConcrete / typeRefIdentityToken:
+    // a concrete class/record/enum/primitive, recursively) — it then matches only
+    // genuine C<A> values, so a live conforming arm is admitted even if C
+    // implements I twice (the #1927 over-rejection #1946 removed). It is NOT
+    // precise for a still-erased #1939 arg kind (function type, inline array, …):
+    // the descriptor collapses siblings, so an implemented-twice / free-parameter
+    // sibling would mis-bind — those keep the old uniqueness rejection. An
+    // INVARIANT scrutinee interface only (a variant one admits a subtype range — a
+    // residual); a rigid/free scrutinee or pattern argument, an imported interface
+    // of unknown variance, a non-generic pattern class, or any undecidable match
+    // yields a CONSERVATIVE admit (None) — never an over-rejection.
+    IfaceBindReject typeTestInterfaceBindAmbiguous(const TypeRef* scrutTy,
+                                                   const TypeRef* patTy);
+    // Mirror of codegen typeRefIdentityToken/descArgsConcrete: does `t` carry a
+    // runtime identity token all the way down (concrete Named/primitive only), so
+    // the per-monomorphization descriptor (#1843) distinguishes it from a sibling?
+    static bool typeArgRuntimeReified(const TypeRef* t);
 
     // §19.6 (v0.196, #1874): does an ANCESTOR arm of type `armTy` (an
     // instantiation of `matchTy`, a strict ancestor of the DETERMINED generic

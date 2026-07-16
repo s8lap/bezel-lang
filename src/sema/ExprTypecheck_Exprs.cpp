@@ -5353,21 +5353,35 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             "instantiation is compatible under §12.9), so the "
                             "pattern would bind at a wrong static type "
                             "(§19.3/§5.1)");
-                    // §19.3/§19.5/§5.1/§12.9 (#1927): the erased-test UNIQUENESS
-                    // hole — the pattern class conforms but its generic argument
-                    // is not determined by the scrutinee interface, so a value at
-                    // a DIFFERENT argument (same erased class tag) would bind at a
-                    // wrong static type.
-                    else if (typeTestInterfaceBindAmbiguous(scrutTy,
-                                                            lsym->declType))
-                        ctx_.diagnostics().report(
-                            Severity::Error, bp->span.begin,
-                            "binding pattern type's generic argument is not "
-                            "determined by the scrutinee interface type — "
-                            "another instantiation of the pattern class also "
-                            "implements it, and the runtime type-test erases "
-                            "generic arguments, so the pattern could bind a "
-                            "value at a wrong static type (§19.3/§5.1)");
+                    // §19.3/§19.5/§5.1/§12.9 (#1927; narrowed/refined #1946): a
+                    // generic class pattern against a generic-interface scrutinee.
+                    // Unreachable = DEAD arm (cannot conform — #1920's non-final
+                    // counterpart). ErasedAmbiguous = live but the differing type
+                    // argument is a still-erased #1939 kind so the runtime test
+                    // degrades and a sibling would mis-bind (the OLD #1927
+                    // uniqueness rejection, kept only where #1843 does not reify).
+                    else {
+                        IfaceBindReject rej = typeTestInterfaceBindAmbiguous(
+                            scrutTy, lsym->declType);
+                        if (rej == IfaceBindReject::Unreachable)
+                            ctx_.diagnostics().report(
+                                Severity::Error, bp->span.begin,
+                                "binding pattern type's generic instantiation can "
+                                "never match a value of the scrutinee interface "
+                                "type — no instantiation of the pattern class that "
+                                "implements it is compatible under §12.9, so the "
+                                "arm is unreachable (§19.3/§5.1)");
+                        else if (rej == IfaceBindReject::ErasedAmbiguous)
+                            ctx_.diagnostics().report(
+                                Severity::Error, bp->span.begin,
+                                "binding pattern type's generic argument is not "
+                                "runtime-distinguishable — it is a still-erased "
+                                "type kind (e.g. a function type or inline array), "
+                                "and another instantiation of the pattern class "
+                                "also implements the scrutinee interface type, so "
+                                "the erased runtime type-test could bind a value "
+                                "at a wrong static type (§19.3/§5.1/§12.9)");
+                    }
                 }
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;

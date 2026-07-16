@@ -4487,32 +4487,53 @@ static bool refMentionsTypeVariable(const TypeRef* t) {
     }
 }
 
-// §19.3/§19.5/§5.1/§12.9 (v0.197, #1927): see the header comment. Detect the
-// UNIQUENESS hole the #1920 reachability check leaves open — `var x: C<A>`
-// against a generic-INTERFACE scrutinee `I<B>` where `C<A>` DOES conform to
-// `I<B>` but is not the SOLE instantiation of `C` that does, so the erased
-// class-tag test also matches a `C<Q≠A>` value and binds it at the wrong static
-// type. Returns true (=> the caller REJECTS) only on a PROVABLE second
-// conformer.
-bool ExprTC::typeTestInterfaceBindAmbiguous(const TypeRef* scrutTy,
-                                            const TypeRef* patTy) {
-    if (!scrutTy || !patTy) return false;
+// §19.3/§19.5/§5.1/§12.9 (v0.197, #1927; narrowed/refined #1946): admission of a
+// typed binding `var x: C<A>` (a class pattern) against a generic-INTERFACE
+// scrutinee `I<B>`. Three-way result (see the header):
+//
+//   Unreachable    — `C<A>` provably cannot conform to `I<B>` (`Box<string>` at
+//                    `IBox<int>` where `Box<T>: IBox<T>`): no value of the
+//                    scrutinee type is ever a `C<A>` — a DEAD arm (#1920's
+//                    non-final / generic counterpart).
+//   ErasedAmbiguous— `C<A>` conforms, but its differing type argument is a
+//                    still-ERASED kind (#1939: a function type, inline array, …)
+//                    AND another instantiation of `C` also conforms. Post-#1843
+//                    the runtime `is C<A>` is precise ONLY when every arg carries
+//                    a runtime identity token; an erased arg makes the descriptor
+//                    collapse siblings, so the test would bind a `C<Q≠A>` value at
+//                    `C<A>` — the OLD #1927 uniqueness rejection, still needed here.
+//   None           — admit.
+//
+// HISTORY (#1946): as landed under #1927 this check rejected EVERY non-unique
+// conformer, on the premise that the runtime type-test ERASES generic arguments.
+// #1843 (per-monomorphization RTTI descriptors) made `is C<A>` PRECISE *for a
+// reified type argument* — it then matches only genuine `C<A>` values, so a live
+// implemented-twice / free-parameter arm with a CONCRETE differing argument is
+// sound and must be admitted (the over-rejection #1946 removed). But #1843 does
+// NOT reify a #1939 kind (function type, inline array, …): the descriptor key
+// (appendDescKey) collapses those, so for such a differing argument the sibling
+// still mis-binds and the old uniqueness rejection must stand. Hence the reified-
+// vs-erased split below.
+ExprTC::IfaceBindReject ExprTC::typeTestInterfaceBindAmbiguous(
+    const TypeRef* scrutTy, const TypeRef* patTy) {
+    if (!scrutTy || !patTy) return IfaceBindReject::None;
     if (scrutTy->kind != TypeRef::Kind::Named ||
         patTy->kind != TypeRef::Kind::Named)
-        return false;
+        return IfaceBindReject::None;
     TypeSymbol* sd = scrutTy->declaration;
     TypeSymbol* pd = patTy->declaration;
-    if (!sd || !pd) return false;  // builtin/free type — conservative accept
+    if (!sd || !pd) return IfaceBindReject::None;  // builtin/free — accept
     // Scrutinee: a GENERIC INTERFACE (the interface counterpart of #1913's class
     // check). Pattern: a GENERIC CLASS — a non-generic class pattern has no
     // argument to be left undetermined (any value that passes `is C` IS a `C`),
     // so its only failure mode is unreachability, which the #1920 reachability
     // check already handles.
     if (sd->kind != ast::TypeDeclKind::Interface || scrutTy->genericArgs.empty())
-        return false;
+        return IfaceBindReject::None;
     if (pd->kind != ast::TypeDeclKind::Class || patTy->genericArgs.empty())
-        return false;
-    if (pd->genericParams.size() != patTy->genericArgs.size()) return false;
+        return IfaceBindReject::None;
+    if (pd->genericParams.size() != patTy->genericArgs.size())
+        return IfaceBindReject::None;
 
     // A rigid/free type parameter in either operand makes the per-instantiation
     // match undecidable AT THE DECLARATION (§19.3 v0.182 — a type pattern is
@@ -4520,7 +4541,7 @@ bool ExprTC::typeTestInterfaceBindAmbiguous(const TypeRef* scrutTy,
     // accept — never over-reject a pattern admissible at some instantiation
     // (matches #1920's rigid posture).
     if (refMentionsTypeVariable(scrutTy) || refMentionsTypeVariable(patTy))
-        return false;
+        return IfaceBindReject::None;
 
     // Restrict to an INVARIANT scrutinee interface. A variant (`in`/`out`)
     // parameter admits a subtype/supertype RANGE of conforming class
@@ -4530,46 +4551,74 @@ bool ExprTC::typeTestInterfaceBindAmbiguous(const TypeRef* scrutTy,
     // variantGenericAssignable; when unavailable (an imported interface with no
     // AST), conservatively treat as possibly-variant and accept.
     const auto* itd = dynamic_cast<const ast::TypeDecl*>(sd->decl);
-    if (!itd) return false;
+    if (!itd) return IfaceBindReject::None;
     for (const auto& gp : itd->genericParams)
-        if (gp.variance == "in" || gp.variance == "out") return false;
+        if (gp.variance == "in" || gp.variance == "out")
+            return IfaceBindReject::None;
 
-    // The pattern class's implemented instantiations of `I`, SYMBOLIC in `C`'s
-    // own parameters: pass a `C` head carrying NO generic args so
-    // collectAncestorInstantiationsOf substitutes nothing and returns the base
-    // clauses as declared (`IBox<T>`, the ground `IMarker<int>`, …).
+    // Split on runtime PRECISION (post-#1843). `is C<A>` is precise iff EVERY type
+    // argument of `A` is runtime-reified (a concrete class/record/enum/primitive
+    // all the way down — descArgsConcrete / typeRefIdentityToken). The two regimes
+    // need DIFFERENT reasoning, and — importantly — `variantGenericAssignable`
+    // cannot reliably compare a still-erased kind (a function type), so the
+    // concrete-conformance path below is used ONLY for the reified regime.
+    bool allReified = true;
+    for (const TypeRef* a : patTy->genericArgs)
+        if (!typeArgRuntimeReified(a)) { allReified = false; break; }
+
+    if (allReified) {
+        // (A) REIFIED. The runtime test is PRECISE: it matches only genuine `C<A>`
+        // values, so an implemented-twice / free-parameter sibling `C<Q≠A>` is
+        // distinguished and never mis-binds. So the ONLY unsound case is a DEAD
+        // arm — `C<A>` cannot conform to `I<B>`, unreachable. Reason over the
+        // CONCRETE `patTy`: its implemented instantiations of `I` are exactly the
+        // interface instantiations a `C<A>` value carries; if NONE reference-
+        // converts to/from the scrutinee (§12.9) the arm is unreachable.
+        // (`Box<string>` at `IBox<int>` — implements only `IBox<string>`.) A
+        // conforming instantiation (incl. the implemented-twice `C<string>` via a
+        // ground `IMarker<int>`, and `Pair<int, string>`) is ADMITTED.
+        std::vector<TypeRef*> concImpls;
+        collectAncestorInstantiationsOf(patTy, sd, concImpls);
+        if (concImpls.empty())
+            return IfaceBindReject::None;  // doesn't implement `I` — #1920's job.
+        for (TypeRef* impl : concImpls)
+            if (variantGenericAssignable(impl, scrutTy, isSubtype) ||
+                variantGenericAssignable(scrutTy, impl, isSubtype))
+                return IfaceBindReject::None;  // conforms — LIVE + precise, admit.
+        return IfaceBindReject::Unreachable;   // DEAD arm.
+    }
+
+    // (B) ERASED. Some type argument of `A` is a still-erased #1939 kind (function
+    // type, inline array, …): the descriptor collapses it, so `is C<A>` degrades
+    // to a test that also matches a sibling `C<Q≠A>`. Keep EXACTLY the OLD #1927
+    // uniqueness rejection here (variantGenericAssignable is unreliable through an
+    // erased arg, so do NOT use the concrete-conformance path) — reject iff a
+    // PROVABLE second conformer exists (a GROUND/free implemented instantiation,
+    // or one whose invariant match pins a parameter to a value other than `A`),
+    // else admit (the unique conformer, or a harmless unreachable arm — as base
+    // did). Reason over the SYMBOLIC impls (in `C`'s own parameters) so an
+    // unmentioned/ground parameter shows as free.
     TypeRef symbolicSelf;
     symbolicSelf.kind = TypeRef::Kind::Named;
     symbolicSelf.declaration = pd;
     std::vector<TypeRef*> symImpls;
     collectAncestorInstantiationsOf(&symbolicSelf, sd, symImpls);
-    if (symImpls.empty())
-        return false;  // does not implement `I` — the reachability check's job
-
     std::unordered_set<std::string_view> cParams;
     for (const Symbol* gp : pd->genericParams)
         if (gp) cParams.insert(gp->name);
-
-    // For each symbolic implemented instantiation, invariant-match it against the
-    // ground scrutinee `I<B>`. A matching impl (Ok) fixes exactly which of `C`'s
-    // parameters the scrutinee determines. The bind is AMBIGUOUS (⇒ reject) when
-    // ANY matching impl (a) leaves a parameter FREE — a value with any binding of
-    // it conforms, so a `C<Q≠A>` conformer exists (the ground implemented-twice
-    // shape, #1927(b), and the extra-parameter shape), or (b) pins a parameter to
-    // a value OTHER than the pattern's argument — a `C<Q≠A>` conforms and the
-    // erased test binds it at `C<A>` (`Box<T>: IBox<T>` at `IBox<int>` with
-    // pattern `Box<string>`, #1927(a)).
     for (TypeRef* impl : symImpls) {
         std::unordered_map<std::string_view, TypeRef*> solved;
         std::unordered_set<std::string_view> splitParams;
         InvMatch m =
             matchLeafInvariant(impl, scrutTy, cParams, solved, ctx_, splitParams);
         if (m != InvMatch::Ok)
-            continue;  // Fail: this impl never matches `I<B>`; Unknown: undecidable
-        // (a) FREE parameter — undetermined by the scrutinee.
+            continue;  // Fail: never matches `I<B>`; Unknown: undecidable.
+        // (a) FREE parameter — a sibling varying it also conforms.
         for (const Symbol* gp : pd->genericParams)
-            if (gp && !solved.count(gp->name)) return true;
-        // (b) DISTINCT PIN — the impl matches `I<B>` only at a different argument.
+            if (gp && !solved.count(gp->name))
+                return IfaceBindReject::ErasedAmbiguous;
+        // (b) DISTINCT PIN — the impl conforms only at a different argument, i.e.
+        // a `C<Q≠A>` sibling conforms via it.
         for (std::size_t i = 0; i < pd->genericParams.size(); ++i) {
             const Symbol* gp = pd->genericParams[i];
             if (!gp) continue;
@@ -4578,10 +4627,36 @@ bool ExprTC::typeTestInterfaceBindAmbiguous(const TypeRef* scrutTy,
             TypeRef* arg = patTy->genericArgs[i];
             if (pinned && arg && isFullyGroundTypeRef(pinned) &&
                 isFullyGroundTypeRef(arg) && !typeRefEqual(pinned, arg))
-                return true;
+                return IfaceBindReject::ErasedAmbiguous;
         }
     }
-    return false;  // every matching impl determines exactly `A` — bind is unique
+    return IfaceBindReject::None;  // erased but the UNIQUE conformer — sound.
+}
+
+// §19.3/§14.1 (#1946): mirror of codegen typeRefIdentityToken/descArgsConcrete
+// (LlvmBackend_impl.hpp / LlvmBackend_Setup.cpp). A type argument is runtime-
+// reified — the per-monomorphization descriptor (#1843) distinguishes it from a
+// sibling — iff it is a concrete Named type (with a resolved declaration) or a
+// primitive, RECURSIVELY through its own generic arguments. A function type, an
+// inline array, Unit/Error, or an unresolved bare parameter carries no identity
+// token, so the descriptor key (appendDescKey) collapses it (`Kind::Function`
+// →"F" at any depth): NOT distinguishable. Conservative (⊆ codegen precision):
+// an inline-array arg is treated as non-reified even though codegen would key its
+// element, so a nested-array pattern is admitted through the erased path, never
+// under-rejected.
+bool ExprTC::typeArgRuntimeReified(const TypeRef* t) {
+    if (!t) return false;
+    switch (t->kind) {
+        case TypeRef::Kind::Named:
+            if (!t->declaration) return false;  // unresolved param — no token.
+            for (const TypeRef* a : t->genericArgs)
+                if (!typeArgRuntimeReified(a)) return false;
+            return true;
+        case TypeRef::Kind::Primitive:
+            return true;
+        default:
+            return false;  // Function / InlineArray / Unit / Error — erased.
+    }
 }
 
 // §26.5 (#714/#927): find the ancestor of `recv` (or `recv` itself) that
@@ -9053,21 +9128,35 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             "instantiation is compatible under §12.9), so the "
                             "pattern would bind at a wrong static type "
                             "(§19.3/§5.1)");
-                    // §19.3/§19.5/§5.1/§12.9 (#1927): the erased-test UNIQUENESS
-                    // hole — the pattern class conforms but its generic argument
-                    // is not determined by the scrutinee interface, so a value at
-                    // a DIFFERENT argument (same erased class tag) would bind at a
-                    // wrong static type.
-                    else if (typeTestInterfaceBindAmbiguous(scrutTy,
-                                                            lsym->declType))
-                        ctx_.diagnostics().report(
-                            Severity::Error, bp->span.begin,
-                            "binding pattern type's generic argument is not "
-                            "determined by the scrutinee interface type — "
-                            "another instantiation of the pattern class also "
-                            "implements it, and the runtime type-test erases "
-                            "generic arguments, so the pattern could bind a "
-                            "value at a wrong static type (§19.3/§5.1)");
+                    // §19.3/§19.5/§5.1/§12.9 (#1927; narrowed/refined #1946): a
+                    // generic class pattern against a generic-interface scrutinee.
+                    // Unreachable = DEAD arm (cannot conform — #1920's non-final
+                    // counterpart). ErasedAmbiguous = live but the differing type
+                    // argument is a still-erased #1939 kind so the runtime test
+                    // degrades and a sibling would mis-bind (the OLD #1927
+                    // uniqueness rejection, kept only where #1843 does not reify).
+                    else {
+                        IfaceBindReject rej = typeTestInterfaceBindAmbiguous(
+                            scrutTy, lsym->declType);
+                        if (rej == IfaceBindReject::Unreachable)
+                            ctx_.diagnostics().report(
+                                Severity::Error, bp->span.begin,
+                                "binding pattern type's generic instantiation can "
+                                "never match a value of the scrutinee interface "
+                                "type — no instantiation of the pattern class that "
+                                "implements it is compatible under §12.9, so the "
+                                "arm is unreachable (§19.3/§5.1)");
+                        else if (rej == IfaceBindReject::ErasedAmbiguous)
+                            ctx_.diagnostics().report(
+                                Severity::Error, bp->span.begin,
+                                "binding pattern type's generic argument is not "
+                                "runtime-distinguishable — it is a still-erased "
+                                "type kind (e.g. a function type or inline array), "
+                                "and another instantiation of the pattern class "
+                                "also implements the scrutinee interface type, so "
+                                "the erased runtime type-test could bind a value "
+                                "at a wrong static type (§19.3/§5.1/§12.9)");
+                    }
                 }
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;
