@@ -7043,17 +7043,105 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             return nullptr;
         };
         auto emitCompareToCmp = [&](sema::MethodSymbol* cmpMs, llvm::Value* a,
-                                    llvm::Value* b) -> llvm::Value* {
+                                    llvm::Value* b,
+                                    const ast::Expr* recvExpr) -> llvm::Value* {
+            // fix #1858 / §5 / §11 / §14.2: for a GENERIC-record IComparable
+            // instantiation (`Box<string>`), install the per-instantiation
+            // generic substitution from the receiver's concrete type arguments
+            // BEFORE the emitMethodCall — exactly as a normal `x.CompareTo(y)`
+            // method call does in lowerMethodCall. Without it, genericSubst_ is
+            // empty at this intrinsic call site, so emitMethodCall falls through
+            // to a DIRECT call of the UNSPECIALIZED template `bz$Box$CompareTo`
+            // (param `%record.Box` = {i32,i32}) while passing the SPECIALIZED
+            // `%record.Box$spec0` receiver/argument — a "Call parameter type
+            // does not match function signature" IR-verification failure. With
+            // the substitution active, emitMethodCall routes through the
+            // parentIsGeneric block → emitInlineGenericMethod, which
+            // monomorphizes CompareTo for the concrete instantiation. A no-op
+            // for a non-generic record (no type params to bind).
+            auto savedSubst = genericSubst_;
+            auto savedSubstSema = genericSubstSemaTy_;
+            bool substInstalled = false;
+            if (recvExpr && cmpMs->parent &&
+                !cmpMs->parent->genericParams.empty()) {
+                sema::TypeRef* recvTy = ctx_.exprType(*recvExpr);
+                if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                    recvTy->declaration == cmpMs->parent &&
+                    !recvTy->genericArgs.empty()) {
+                    // §14.1 / #783: take the type-parameter NAMES from the AST
+                    // decl when present (local generic), else from the imported
+                    // TypeSymbol's genericParams (cross-module).
+                    auto* td = dynamic_cast<const ast::TypeDecl*>(
+                        cmpMs->parent->decl);
+                    std::vector<std::string_view> gpNames;
+                    if (td)
+                        for (const auto& gp : td->genericParams)
+                            gpNames.push_back(gp.name);
+                    else
+                        for (sema::Symbol* gp : cmpMs->parent->genericParams)
+                            if (gp) gpNames.push_back(gp->name);
+                    if (gpNames.size() == recvTy->genericArgs.size() &&
+                        !gpNames.empty()) {
+                        // Resolve the args under the OUTER substitution (still
+                        // active here) so a `Box<U>` receiver inside a generic
+                        // body binds T→U's concrete type.
+                        std::unordered_map<std::string_view, llvm::Type*>
+                            newSubst;
+                        std::unordered_map<std::string_view,
+                                           const sema::TypeRef*> newSema;
+                        for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
+                            newSubst[gpNames[gi]] =
+                                lowerTypeRef(recvTy->genericArgs[gi]);
+                            newSema[gpNames[gi]] = recvTy->genericArgs[gi];
+                        }
+                        // If any resolved arg is still the i32 fallback (an
+                        // unresolved enclosing param), prefer the receiver
+                        // local's stored concrete substitution.
+                        bool hasUnresolved = false;
+                        for (auto& [name, ty] : newSubst)
+                            if (ty == i32()) { hasUnresolved = true; break; }
+                        if (hasUnresolved) {
+                            sema::Symbol* recvSym = ctx_.exprSymbol(*recvExpr);
+                            const ast::Node* recvDecl = nullptr;
+                            if (auto* loc =
+                                    dynamic_cast<sema::LocalSymbol*>(recvSym))
+                                recvDecl = loc->decl;
+                            if (recvDecl) {
+                                auto lit = localGenericSubst_.find(recvDecl);
+                                if (lit != localGenericSubst_.end())
+                                    newSubst = lit->second;
+                            }
+                        }
+                        genericSubst_ = std::move(newSubst);
+                        genericSubstSemaTy_ = std::move(newSema);
+                        substInstalled = true;
+                    }
+                }
+            }
             llvm::Value* recv = a;
             if (cmpMs->parent &&
                 cmpMs->parent->kind == ast::TypeDeclKind::Record &&
                 !recv->getType()->isPointerTy()) {
-                llvm::Value* tmp = entryAlloca(recordStruct(cmpMs->parent));
+                // fix #1858 (latent #1855 sibling) / §14.2: size the spill slot
+                // to the RECEIVER VALUE's own (monomorphized) type, not the
+                // unspecialized `recordStruct(cmpMs->parent)` placeholder —
+                // storing an 8-byte specialized value into the 4-byte
+                // i32-placeholder slot is a stack-buffer-overflow WRITE (the
+                // masked sibling of #1855, LlvmBackend_Calls2.cpp:4915). A no-op
+                // for a non-generic record (recv->getType() ==
+                // recordStruct(cmpMs->parent)).
+                llvm::Value* tmp = entryAlloca(recv->getType());
                 builder_.CreateStore(recv, tmp);
                 recv = tmp;
             }
             std::vector<llvm::Value*> cargs{recv, b};
-            return emitMethodCall(cmpMs, cargs, /*baseQualified=*/false);
+            llvm::Value* r =
+                emitMethodCall(cmpMs, cargs, /*baseQualified=*/false);
+            if (substInstalled) {
+                genericSubst_ = std::move(savedSubst);
+                genericSubstSemaTy_ = std::move(savedSubstSema);
+            }
+            return r;
         };
         if (call.args.size() == 1 && call.args[0].value) {
             llvm::Value* arg = lowerExpr(*call.args[0].value);
@@ -7187,7 +7275,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 } else if (sema::MethodSymbol* cmpMs =
                                comparableCompareTo(call.args[0].value.get())) {
                     // #1141: non-numeric IComparable<T> → a if a.CompareTo(b) <= 0.
-                    llvm::Value* cmp = emitCompareToCmp(cmpMs, a, b);
+                    llvm::Value* cmp =
+                        emitCompareToCmp(cmpMs, a, b, call.args[0].value.get());
                     if (!cmp) return nullptr;
                     llvm::Value* le = builder_.CreateICmpSLE(
                         cmp, llvm::ConstantInt::get(cmp->getType(), 0));
@@ -7208,7 +7297,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 } else if (sema::MethodSymbol* cmpMs =
                                comparableCompareTo(call.args[0].value.get())) {
                     // #1141: non-numeric IComparable<T> → a if a.CompareTo(b) >= 0.
-                    llvm::Value* cmp = emitCompareToCmp(cmpMs, a, b);
+                    llvm::Value* cmp =
+                        emitCompareToCmp(cmpMs, a, b, call.args[0].value.get());
                     if (!cmp) return nullptr;
                     llvm::Value* ge = builder_.CreateICmpSGE(
                         cmp, llvm::ConstantInt::get(cmp->getType(), 0));
@@ -7283,8 +7373,10 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                            comparableCompareTo(call.args[0].value.get())) {
                 // #1141: non-numeric IComparable<T> → value.CompareTo(lo) < 0 ?
                 // lo : (value.CompareTo(hi) > 0 ? hi : value).
-                llvm::Value* cmpLo = emitCompareToCmp(cmpMs, val, lo);
-                llvm::Value* cmpHi = emitCompareToCmp(cmpMs, val, hi);
+                llvm::Value* cmpLo =
+                    emitCompareToCmp(cmpMs, val, lo, call.args[0].value.get());
+                llvm::Value* cmpHi =
+                    emitCompareToCmp(cmpMs, val, hi, call.args[0].value.get());
                 if (!cmpLo || !cmpHi) return nullptr;
                 llvm::Value* ltLo = builder_.CreateICmpSLT(
                     cmpLo, llvm::ConstantInt::get(cmpLo->getType(), 0));

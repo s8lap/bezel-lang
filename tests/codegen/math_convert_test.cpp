@@ -34,6 +34,7 @@
 
 using bezel::test::runAot;
 using bezel::test::runAotOut;
+using bezel::test::runAotChecked;
 
 namespace {
 
@@ -525,6 +526,125 @@ BEZEL_TEST(math_comparable_1875, conforming_class_still_runs) {
     BEZEL_EXPECT_EQ(run(boxMain(
         "  using var a := new Box(150); using var b := new Box(99); "
         "  return Math.Max(a, b).v;")), 150);
+}
+
+// ── #1858 / §5 (Math.Min/Max/Clamp) / §11 (IComparable) / §14.2 ──────────────
+// Math.Min/Max/Clamp over a GENERIC-record IComparable. The #1141 path handled
+// only a NON-generic record; a generic instantiation (`Box<string>`) reached
+// emitMethodCall with `genericSubst_` EMPTY at this intrinsic call site, so it
+// fell through to a DIRECT call of the UNSPECIALIZED template `bz$Box$CompareTo`
+// (param `%record.Box` = {i32,i32}) while passing the SPECIALIZED
+// `%record.Box$spec0` receiver/argument — a "Call parameter type does not match
+// function signature" IR-VERIFICATION FAILURE (the valid program was rejected at
+// compile). The fix installs the per-instantiation generic substitution from
+// the receiver's concrete type arguments BEFORE the call (so emitMethodCall
+// routes through emitInlineGenericMethod and monomorphizes CompareTo), AND sizes
+// the receiver spill slot to the monomorphized layout (`recv->getType()`) rather
+// than the 4-byte i32-placeholder — the latent stack-buffer-overflow sibling of
+// #1855 (an 8-byte specialized `string` pointer stored into a 4-byte slot).
+//
+// runAotChecked compiles + links + RUNS under generated-code AddressSanitizer:
+// WITHOUT the fix `r.ran` is false (the module fails IR verification, so the
+// program never links/runs); WITH it the program is ASan-clean AND value-
+// correct. So each test both fails-without and passes-with.
+namespace {
+// A generic record with a REFERENCE-typed field (`value: T`) plus an int `key`;
+// CompareTo orders by key (§11, IComparable<Box<T>>). This is the issue repro.
+const char* kGenBox =
+    "module M; import System; "
+    "record Box<T>(value: T, key: int): IComparable<Box<T>> "
+    "  public method CompareTo(other: Box<T>): int => this.key - other.key; "
+    "end Box; ";
+std::string genBoxMain(const std::string& body) {
+    return std::string(kGenBox) +
+           "class App public static method Main(): int " + body +
+           " end Main; end App;";
+}
+}  // namespace
+
+// #1858: Math.Min<Box<string>> (inferred) returns the lesser-by-key operand
+// (key 1 < 2 → `a` = "aaa"), so .value.Length = 3. ASan-clean + value-correct.
+BEZEL_TEST(math_comparable_1858, min_generic_record_string_inferred) {
+    auto r = runAotChecked(genBoxMain(
+        "  var a := new Box<string>(\"aaa\", 1); "
+        "  var b := new Box<string>(\"bb\", 2); "
+        "  return Math.Min(a, b).value.Length;"));
+    BEZEL_EXPECT_TRUE(r.ran);         // WITHOUT fix: IR verification rejects → false
+    BEZEL_EXPECT_EQ(r.exitCode, 3);   // "aaa".Length
+}
+
+// #1858: Math.Max<Box<string>> returns the greater-by-key operand (key 2 → `b`
+// = "bb"), so .value.Length = 2.
+BEZEL_TEST(math_comparable_1858, max_generic_record_string) {
+    auto r = runAotChecked(genBoxMain(
+        "  var a := new Box<string>(\"aaa\", 1); "
+        "  var b := new Box<string>(\"bb\", 2); "
+        "  return Math.Max(a, b).value.Length;"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 2);   // "bb".Length
+}
+
+// #1858: the EXPLICIT nested-generic type argument `Math.Max<Box<string>>` is
+// monomorphized the same way (the substitution keys on the operand type).
+BEZEL_TEST(math_comparable_1858, max_generic_record_string_explicit_type_arg) {
+    auto r = runAotChecked(genBoxMain(
+        "  var a := new Box<string>(\"aaa\", 1); "
+        "  var b := new Box<string>(\"bb\", 2); "
+        "  return Math.Max<Box<string>>(a, b).value.Length;"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 2);
+}
+
+// #1858: Math.Clamp<Box<string>> — value key 5 is ABOVE hi key 3, so it clamps
+// to hi ("hhh"), .value.Length = 3. Exercises the two-CompareTo Clamp path.
+BEZEL_TEST(math_comparable_1858, clamp_generic_record_string_above_range) {
+    auto r = runAotChecked(genBoxMain(
+        "  var v  := new Box<string>(\"vvvv\", 5); "
+        "  var lo := new Box<string>(\"l\", 2); "
+        "  var hi := new Box<string>(\"hhh\", 3); "
+        "  return Math.Clamp(v, lo, hi).value.Length;"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 3);   // clamped to hi = "hhh"
+}
+
+// #1858: a VALUE-typed generic field (`Box<int>`) monomorphizes correctly too —
+// Min by key (3 vs 1 → `b`, key 1), then read `b.value` = 200.
+BEZEL_TEST(math_comparable_1858, min_generic_record_int_value_field) {
+    auto r = runAotChecked(genBoxMain(
+        "  var a := new Box<int>(100, 3); "
+        "  var b := new Box<int>(200, 1); "
+        "  return Math.Min(a, b).value;"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 200);
+}
+
+// #1858: a TWO-type-parameter generic record with a mixed value+reference field
+// pair (`Pair<int, string>`) — Max by key (9 vs 4 → `x`), then a=7 + "hello"
+// Length 5 = 12. Confirms the substitution binds all type params positionally.
+BEZEL_TEST(math_comparable_1858, max_generic_record_two_type_params) {
+    auto r = runAotChecked(
+        "module M; import System; "
+        "record Pair<A, B>(a: A, b: B, key: int): IComparable<Pair<A, B>> "
+        "  public method CompareTo(other: Pair<A, B>): int => "
+        "    this.key - other.key; "
+        "end Pair; "
+        "class App public static method Main(): int "
+        "  var x := new Pair<int, string>(7, \"hello\", 9); "
+        "  var y := new Pair<int, string>(3, \"hi\", 4); "
+        "  return Math.Max(x, y).a + Math.Max(x, y).b.Length;"
+        " end Main; end App;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 12);  // 7 + "hello".Length(5)
+}
+
+// #1858 regression control: the NON-generic record path (#1141) is unchanged —
+// the substitution install is a no-op when the record has no type parameters.
+BEZEL_TEST(math_comparable_1858, non_generic_record_unaffected) {
+    auto r = runAotChecked(moneyMain(
+        "  var a := new Money(150); var b := new Money(99); "
+        "  return Math.Min(a, b).cents;"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 99);
 }
 
 // ===========================================================================
