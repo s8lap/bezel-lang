@@ -2661,7 +2661,31 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
                 if (from->nullable && !to->nullable) { reportNullable(); return; }
                 return;
             }
-            // Cross-declaration or arity mismatch: conservative skip.
+            // §11 / §12.9 / §5.1 (#1940): cross-declaration or arity mismatch.
+            // The base conformance must still hold nominally — `from`'s
+            // declaration must BE `to`'s declaration or a subtype of it (§11:
+            // conformance is by nominally listing the interface among the
+            // bases). Without this gate a user class assigned to an unrelated
+            // *generic declared* interface it does not implement (e.g. a bare
+            // `Box` to `IComparable<Box>`) was ACCEPTED — the DECLARED-interface
+            // analogue of #1935's builtin residual — and a later interface call
+            // would dispatch through an itable the object lacks (unsound accept,
+            // runtime type confusion). `isSubtype` is reflexive, so the
+            // same-declaration arity-mismatch case stays accepted; a genuine
+            // subtype (incl. a covariant/contravariant generic, whose
+            // declaration relationship must hold regardless of the type
+            // arguments) stays accepted with the per-argument variance the
+            // conservatively-accepted residual (deferred to the full §12.9
+            // milestone), exactly as before. Only a PROVEN non-conformance — no
+            // nominal path at all — is now rejected. This mirrors the non-
+            // generic Named-Named path just below (which already gates on the
+            // same `isSubtype`).
+            if (!isSubtype(from->declaration, to->declaration)) {
+                reportNotConvertible();
+                return;
+            }
+            // Base conformance established: conservative skip (the per-argument
+            // variance is the residual).
             return;
         }
         if (from->nullable && !to->nullable) { reportNullable(); return; }
