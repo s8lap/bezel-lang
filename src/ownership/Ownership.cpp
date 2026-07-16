@@ -3167,6 +3167,16 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
         // out through the borrow result — rejected (the temporary bounds the
         // result to the full expression). // per §28.3 v0.194
         checkBareBorrowTempLaunder(*ld.initializer);
+        // §15.3 (#1899) bullet 1 "Local-to-local assignment": `var b := a;` where
+        // the initializer is a bare read of a move-only inline-array local MOVES
+        // the whole array out of `a`, leaving `a` moved-from. Mark the source so a
+        // later read/move/dispose of `a` is the use-after-move error §15.3 mandates
+        // — without this the untracked move let `a` and `b` (and any further read)
+        // alias one heap cell, each disposed at scope end (a double-free, #1899).
+        // Runs for a `using var` binding too (§15.3: copies are forbidden, so the
+        // plain binding can only move); a MovedFrom/Poisoned source was already
+        // rejected by the checkRead above, so this only ever marks a LIVE source.
+        noteMoveOnlyArrayWholeMoveRead(*ld.initializer);
     }
     LocalOwnership lo;
     lo.obligationOrigin = &ld;
@@ -3637,6 +3647,26 @@ bool MethodOwnership::isMoveOnlyInlineArrayType(const sema::TypeRef* rt,
 
 void MethodOwnership::moveOnlyArrayNoteWholeTransfer(std::string_view name) {
     moveOnlyArrayLive_.erase(std::string(name));
+}
+
+// §15.3 (#1899) bullet 1: mark the move-only inline-array local read by a bare
+// identifier at a transfer position as moved-from. See the header comment.
+void MethodOwnership::noteMoveOnlyArrayWholeMoveRead(const ast::Expr& src) {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&src);
+    if (!id) return;  // only a WHOLE-array read (a[i]/a.f/a.M() are borrows)
+    long long size = 0;
+    if (!isMoveOnlyInlineArrayType(ctx_.exprType(src), size)) return;
+    auto* st = lookupState(id->name);
+    if (!st) return;  // not a tracked local (e.g. a field/parameter)
+    // A live source (Owned when a `using var`, Borrowed when a plain `var` — the
+    // collection-literal producer state) is the genuine move. A MovedFrom /
+    // Disposed / Poisoned source was already diagnosed by the checkRead that
+    // precedes this call; re-marking would either duplicate that diagnostic or
+    // (via markMovedByName) resurrect a poisoned local. // per §15.3 bullet 1
+    if (st->state != OwnershipState::Owned &&
+        st->state != OwnershipState::Borrowed)
+        return;
+    markMovedByName(id->name, id->span.begin);
 }
 
 void MethodOwnership::moveOnlyArrayNoteSlotMoved(const ast::IndexExpr& ix) {

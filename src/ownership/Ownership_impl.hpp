@@ -584,6 +584,18 @@ private:
     void moveOnlyArrayCheckReassignment(const ast::AssignmentStmt& as);
     bool isMoveOnlyInlineArrayType(const sema::TypeRef* rt,
                                    long long& sizeOut) const;
+    // §15.3 (#1899) bullet 1 "Local-to-local assignment": a bare-identifier read
+    // of a move-only inline-array LOCAL in a transfer (non-borrow) position —
+    // e.g. the initializer of `var b := a;` — MOVES the whole array: "After the
+    // move, `x` is in moved-from state and may not be read until reassigned."
+    // Mark the source local moved-from in the flow state (`states_`) so a later
+    // read/move/dispose of it is the use-after-move compile error §15.3 mandates.
+    // A move-only value has no borrow reading, so an unmarked bare-id read at a
+    // value position can only be this move (copies are forbidden). A no-op when
+    // `src` is not such an identifier or its source is not a tracked live local
+    // (a MovedFrom/Disposed/Poisoned source was already diagnosed by the
+    // preceding checkRead). // per §15.3 bullet 1
+    void noteMoveOnlyArrayWholeMoveRead(const ast::Expr& src);
     struct MoveOnlyArraySlots {
         long long size = 0;
         std::unordered_set<long long> movedSlots;  // provably moved-from
