@@ -819,8 +819,53 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // The materialized-array temp to free before the terminal returns its
     // result (null unless we materialized a lazy receiver above).
     llvm::Value* lazyTempArr = nullptr;
+    // #1924: set when lazyTempArr is the CONCRETE fresh groups array
+    // (Array<IGrouping>) from a bare-GroupBy scalar terminal — freeLazyTemp then
+    // also frees every grouping (bz_groupby_free_groups) before the outer array.
+    bool lazyTempIsGroupings = false;
     llvm::Value* recv = nullptr;
-    if (lazyTerminal) {
+    // #1924 / stdlib §5 / §28.9: a bare `GroupBy(sel)` consumed by a SCALAR
+    // terminal leaked the materialized groups — the outer Array<IGrouping> plus
+    // every grouping's element array, key buffer, and group object. The #1914
+    // for-in fix (bz_lazy_from_owned_grouping_array) could not be reused here: the
+    // snapshot path (bz_lazy_to_array) drains-and-disposes the lazy BEFORE the
+    // terminal reads it, so owning at the lazy would UAF a grouping pointer the
+    // terminal returns. Fix: when the receiver is a bare GroupBy and the terminal
+    // result is NOT itself a grouping pointer (Count/Any/All/Sum/Aggregate-with-
+    // seed/ForEach/… — the fold reads each grouping DURING and returns a scalar),
+    // materialize the groups CONCRETELY (they are already a bz_array_t* of
+    // grouping pointers — no snapshot needed), run the array terminal over them,
+    // then free the groupings + outer array AFTER the result is computed (each
+    // freed exactly once, no UAF). An element-RETURNING terminal (result type
+    // IGrouping: First/Single/Last/ElementAt/*OrNull/no-seed Aggregate) is
+    // EXCLUDED — its result aliases a live grouping pointer, so freeing here would
+    // dangle it; those keep the borrowing snapshot path (leak deferred, #1930).
+    bool ownGroupByGroups = false;
+    if (lazyTerminal && isGroupByCall(ma->target.get())) {
+        // Gate on the TERMINAL's result type, not the method name: any terminal
+        // whose result is not an IGrouping<…> pointer is safe to free-after.
+        auto isGroupingRef = [](const sema::TypeRef* t) {
+            return t && t->kind == sema::TypeRef::Kind::Named && !t->declaration &&
+                   t->astNode && t->astNode->name &&
+                   !t->astNode->name->parts.empty() &&
+                   t->headName() == "IGrouping";
+        };
+        ownGroupByGroups = !isGroupingRef(ctx_.exprType(call));
+    }
+    if (ownGroupByGroups) {
+        auto* gbCall = dynamic_cast<const ast::CallExpr*>(ma->target.get());
+        // Materialize directly to the concrete groups Array<IGrouping> (bypasses
+        // the borrowing bz_lazy_from_array + bz_lazy_to_array snapshot the other
+        // lazy terminals use). lowerGroupByMaterialize already drains+disposes the
+        // GroupBy's own inner source (bz_groupby_to_array) and releases the key
+        // closure — so only the fresh groups temporary is left for us to reclaim.
+        llvm::Value* groups = lowerGroupByMaterialize(*gbCall);
+        if (!groups) return nullptr;
+        recv = groups;
+        lazyTempArr = groups;
+        lazyTempIsGroupings = true;
+        isArr = true;  // route through the concrete-array terminal lowerings
+    } else if (lazyTerminal) {
         sema::TypeRef* elemRef = nullptr;
         llvm::Value* lazy = lowerToLazyEnumerator(*ma->target, elemRef);
         if (!lazy) return nullptr;
@@ -876,6 +921,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // the array BEFORE the backing buffer is released.
     auto freeLazyTemp = [&]() {
         if (!lazyTempArr) return;
+        // #1924: a bare-GroupBy scalar-terminal temp is the CONCRETE groups array
+        // (Array<IGrouping>) this call owns. Free every grouping (element array +
+        // key data + group object) BEFORE the outer array — this runs AFTER the
+        // terminal computed its non-grouping result (the fold read each grouping
+        // during), so each grouping is freed exactly once and never after a use.
+        if (lazyTempIsGroupings) {
+            auto* gfree = declareC("bz_groupby_free_groups",
+                                   llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(gfree, {lazyTempArr});
+        }
         auto* fn = declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
                             {ptrTy(), ptrTy()});
         builder_.CreateCall(fn,

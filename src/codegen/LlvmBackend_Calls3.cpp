@@ -687,7 +687,7 @@ llvm::Function* Emitter::buildZipTrampoline(llvm::Type* aTy, llvm::Type* bTy,
 
 // stdlib §5 (#651/#752): is `e` a `GroupBy(keySelector)` call — a CallExpr whose
 // callee is a MemberAccessExpr with member "GroupBy" and exactly one argument?
-static bool isGroupByCall(const ast::Expr* e) {
+bool Emitter::isGroupByCall(const ast::Expr* e) {
     auto* call = dynamic_cast<const ast::CallExpr*>(e);
     if (!call || !call->callee || call->args.size() != 1 || !call->args[0].value)
         return false;
