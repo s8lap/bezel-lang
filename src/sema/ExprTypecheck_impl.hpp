@@ -150,6 +150,15 @@ private:
     // identifier". A bare `T` in any other expression position keeps today's
     // error. Saved/restored around each target visit.
     const ast::Expr* maTargetHint_ = nullptr;
+    // §27.6 (v0.184): while visiting a CallExpr's *callee* child, this points at
+    // that callee node. resolveMemberAccess consults it to tell a primitive-
+    // intrinsic static member that is the DIRECT callee of a call (`int.Parse(s)`
+    // — typed as its scalar result, dispatched by member/receiver in typeCall)
+    // from one used as a BARE method reference (`strings.Select(int.Parse)` —
+    // typed as the function value `(string) -> int` per §27.6). Identity-based
+    // (the specific callee node), so a stale value never yields a false positive.
+    // Saved/restored around each callee visit.
+    const ast::Expr* calleeOfCallCtx_ = nullptr;
     // §11.8: one synthesized GenericParamSymbol marker per type-parameter
     // name, attached as the exprSymbol of a `T` member-access receiver so
     // resolveMemberAccess (and codegen) can identify the receiver kind.

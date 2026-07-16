@@ -727,9 +727,12 @@ llvm::Value* Emitter::lowerGroupByMaterialize(const ast::CallExpr& srcCall) {
     if (!srcLazy) return nullptr;
     // Lower the key lambda to a closure. Use selector trampoline (kind 1):
     // void(cl, elem, out) so the key is written as bytes into the output slot.
+    // §27.6 (#1758): own+release the key closure when it is an inline +1 producer
+    // — a lambda literal OR a primitive-intrinsic method reference.
     const bool relCl =
         srcCall.args[0].value &&
-        dynamic_cast<const ast::LambdaExpr*>(srcCall.args[0].value.get()) != nullptr;
+        (dynamic_cast<const ast::LambdaExpr*>(srcCall.args[0].value.get()) != nullptr ||
+         isPrimIntrinsicMethodRef(srcCall.args[0].value.get()));
     llvm::Value* closure = nullptr;
     {
         auto* funcRef = ctx_.makeTypeRef();
@@ -1518,14 +1521,18 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
              builder_.getInt64(valInline ? 1 : 0), valTramp, valClosure,
              builder_.getInt64(keyIsString ? 1 : 0)},
             "linq.todict");
-        // Release the inline-lambda key/value closures if we own them (eager
-        // materialization — the closures are fully consumed during
-        // bz_lazy_to_dict, same as eager LINQ terminals like Count/Sum).
+        // Release the inline-lambda / primitive-intrinsic-method-ref key/value
+        // closures if we own them (eager materialization — the closures are
+        // fully consumed during bz_lazy_to_dict, same as eager LINQ terminals
+        // like Count/Sum). §27.6 (#1758): a `Type.Member` intrinsic reference is
+        // also a fresh +1 cell (isPrimIntrinsicMethodRef) we must release.
         if (call.args[0].value &&
-            dynamic_cast<const ast::LambdaExpr*>(call.args[0].value.get()))
+            (dynamic_cast<const ast::LambdaExpr*>(call.args[0].value.get()) ||
+             isPrimIntrinsicMethodRef(call.args[0].value.get())))
             emitClosureRelease(keyClosure);
-        if (hasValueSel &&
-            dynamic_cast<const ast::LambdaExpr*>(call.args[1].value.get()))
+        if (hasValueSel && call.args[1].value &&
+            (dynamic_cast<const ast::LambdaExpr*>(call.args[1].value.get()) ||
+             isPrimIntrinsicMethodRef(call.args[1].value.get())))
             emitClosureRelease(valClosure);
         return result;
     }
@@ -1568,9 +1575,17 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     // arriving via a variable/field is a BORROW and is left untouched. Mirrors
     // the GetOrAdd/eager factoryIsInlineLambda guard.
     auto argIsInlineLambda = [&](size_t i) -> bool {
-        return i < call.args.size() && call.args[i].value &&
-               dynamic_cast<const ast::LambdaExpr*>(call.args[i].value.get())
-                   != nullptr;
+        if (i >= call.args.size() || !call.args[i].value) return false;
+        const ast::Expr* a = call.args[i].value.get();
+        if (dynamic_cast<const ast::LambdaExpr*>(a)) return true;
+        // §27.6 (v0.184, #1758): a bare primitive-intrinsic method reference
+        // (`Select(int.Parse)`, `Where(char.IsDigit)`) is ALSO a fresh +1
+        // closure cell (makePrimIntrinsicThunk) the enumerator must own and
+        // release on dispose — the same inline-producer shape isPlusOne-
+        // ClosureProducer recognizes for the bound-local path. Without this the
+        // cell leaked (40 bytes; #1758 pre-gate review). Keyed off the shared
+        // predicate so the owned set matches the produced set exactly.
+        return isPrimIntrinsicMethodRef(a);
     };
     // Thread the enumerator pointer through bz_lazy_own_closure(e) iff the
     // operator's closure arg was an inline lambda; otherwise return it unchanged.

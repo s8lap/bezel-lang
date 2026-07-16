@@ -2440,6 +2440,149 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     return buildMethodClosureCell(thunk, instMethod, receiverVal, kind);
 }
 
+// §27.6 (v0.184, #1758): back a bare reference to a primitive-intrinsic static
+// method (`int.Parse`, `char.IsDigit`, `double.IsNaN`, …) with a thunk closure.
+// See the header declaration for the full contract. A primitive intrinsic has no
+// MethodSymbol (it is name-recognized in sema/codegen), so makeMethodThunk cannot
+// back it; the SIGSEGV of #1758 was the CG60 method-ref path returning nullptr
+// for such a reference — a null fn pointer the lazy pipeline then invoked.
+llvm::Value* Emitter::makePrimIntrinsicThunk(const ast::MemberAccessExpr& ma,
+                                             const sema::TypeRef* fnTy) {
+    if (!fnTy || fnTy->kind != sema::TypeRef::Kind::Function) return nullptr;
+    auto* id = ma.target
+        ? dynamic_cast<const ast::IdentifierExpr*>(ma.target.get()) : nullptr;
+    if (!id) return nullptr;
+    sema::PrimitiveType pt = sema::primitiveFromName(id->name);
+    if (pt == sema::PrimitiveType::None) return nullptr;
+
+    // Thunk signature: ret (ptr env, params…) — the closure ABI the LINQ
+    // trampolines and the general function-value call site expect (fn(env, args)).
+    // env is null for this static reference (no captures); the thunk ignores it.
+    llvm::Type* retTy = fnTy->funcReturn ? lowerTypeRef(fnTy->funcReturn)
+                                         : llvm::Type::getVoidTy(llvm_);
+    std::vector<llvm::Type*> thunkParamTys;
+    thunkParamTys.push_back(ptrTy());  // env (ignored)
+    for (const auto& fp : fnTy->funcParams)
+        thunkParamTys.push_back(fp.type ? lowerTypeRef(fp.type) : ptrTy());
+    auto* thunkFnTy = llvm::FunctionType::get(retTy, thunkParamTys, false);
+
+    // Reuse a cached thunk per (kind, member) so repeated references share ONE fn
+    // pointer — a static reference is FVK_FN_ONLY, so §27.7.1 equality is by fn
+    // alone (the #1170 stability reasoning applied to primitive intrinsics).
+    std::pair<int, std::string> key{static_cast<int>(pt), std::string(ma.member)};
+    if (auto cit = primIntrinsicThunks_.find(key);
+        cit != primIntrinsicThunks_.end())
+        return buildMethodClosureCell(cit->second, /*instMethod=*/false,
+                                      /*receiverVal=*/nullptr, FVK_FN_ONLY);
+
+    static std::atomic<unsigned> primThunkCtr{0};
+    std::string thunkName = "primthunk$" + std::string(id->name) + "$" +
+                            std::string(ma.member) + "$" +
+                            std::to_string(primThunkCtr.fetch_add(1));
+    auto* thunk = llvm::Function::Create(
+        thunkFnTy, llvm::Function::InternalLinkage, thunkName, module_.get());
+
+    // Save emitter state (mirror makeMethodThunk; also snapshot finallyStack_).
+    llvm::Function* savedFn = currentFn_;
+    llvm::Value* savedThis = currentThis_;
+    llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
+    auto savedLocals = locals_;
+    auto savedParams = paramSlots_;
+    auto savedRefParams = refParams_;
+    auto savedDisposeStack = disposeStack_;
+    auto savedLoopStack = loopStack_;
+    auto savedFinallyStack = finallyStack_;
+    llvm::BasicBlock* savedUnwind = unwindTarget_;
+    llvm::BasicBlock* savedProp = propagateBB_;
+    llvm::Value* savedCaught = currentCaughtExc_;
+    std::size_t savedUnwindDepth = unwindScopeDepth_;
+    bool savedDiverged = diverged_;
+
+    currentFn_ = thunk;
+    currentThis_ = nullptr;
+    locals_.clear(); paramSlots_.clear(); refParams_.clear();
+    disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+    unwindTarget_ = nullptr; propagateBB_ = nullptr;
+    currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0; diverged_ = false;
+    builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", thunk));
+
+    // Build a synthetic `Type.Member(args…)` call whose arguments lower to the
+    // thunk's incoming parameters, then lower it through the SAME intrinsic path a
+    // direct call uses (tryLowerPrimitiveStaticCall). This reuses every primitive-
+    // static member's existing lowering — no per-member thunk emitter. The
+    // synthetic nodes reuse the original source-backed string_views (id->name,
+    // ma.member); the tree is owned by primIntrinsicSynthCalls_ so the exprType
+    // set on each arg node below never outlives its key.
+    auto synthCall = std::make_unique<ast::CallExpr>();
+    {
+        auto synthTargetId = std::make_unique<ast::IdentifierExpr>();
+        synthTargetId->name = id->name;
+        auto synthCallee = std::make_unique<ast::MemberAccessExpr>();
+        synthCallee->target = std::move(synthTargetId);
+        synthCallee->member = ma.member;
+        synthCall->callee = std::move(synthCallee);
+    }
+    std::vector<const ast::Expr*> synthArgs;
+    for (std::size_t i = 0; i < fnTy->funcParams.size(); ++i) {
+        ast::CallArgument arg;
+        auto argExpr = std::make_unique<ast::IdentifierExpr>();
+        argExpr->name = ma.member;  // unused; the value comes from the override
+        // Thunk arg 0 is env; user params start at 1.
+        exprValueOverride_[argExpr.get()] = thunk->getArg(static_cast<unsigned>(i) + 1);
+        // Some intrinsic handlers (numeric Parse) inspect the arg's exprType to
+        // select the string-parse branch — give the synthetic arg its param type.
+        if (fnTy->funcParams[i].type)
+            ctx_.setExprType(
+                argExpr.get(),
+                const_cast<sema::TypeRef*>(fnTy->funcParams[i].type));
+        synthArgs.push_back(argExpr.get());
+        arg.value = std::move(argExpr);
+        synthCall->args.push_back(std::move(arg));
+    }
+
+    llvm::Value* result = tryLowerPrimitiveStaticCall(*synthCall);
+
+    // Drop the per-arg value overrides now that the body is emitted; keep the
+    // tree (and its exprType keys) alive by parking it in the owner vector.
+    for (const ast::Expr* a : synthArgs) exprValueOverride_.erase(a);
+    primIntrinsicSynthCalls_.push_back(std::move(synthCall));
+
+    if (!result && !retTy->isVoidTy()) result = llvm::PoisonValue::get(retTy);
+    if (retTy->isVoidTy()) builder_.CreateRetVoid();
+    else builder_.CreateRet(result);
+
+    // Restore emitter state.
+    currentFn_ = savedFn;
+    currentThis_ = savedThis;
+    locals_ = std::move(savedLocals); paramSlots_ = std::move(savedParams);
+    refParams_ = std::move(savedRefParams);
+    disposeStack_ = std::move(savedDisposeStack);
+    loopStack_ = std::move(savedLoopStack);
+    finallyStack_ = std::move(savedFinallyStack);
+    unwindTarget_ = savedUnwind; propagateBB_ = savedProp;
+    currentCaughtExc_ = savedCaught; unwindScopeDepth_ = savedUnwindDepth;
+    diverged_ = savedDiverged;
+    if (savedBB) builder_.SetInsertPoint(savedBB);
+
+    primIntrinsicThunks_[key] = thunk;
+    return buildMethodClosureCell(thunk, /*instMethod=*/false,
+                                  /*receiverVal=*/nullptr, FVK_FN_ONLY);
+}
+
+// §27.6 (v0.184, #1758): see the header declaration. Recognizes the bare
+// primitive-intrinsic method-reference VALUE shape that makePrimIntrinsicThunk
+// backs with a fresh +1 closure cell — kept in one place so every producer/
+// consumer site agrees on the recognized set.
+bool Emitter::isPrimIntrinsicMethodRef(const ast::Expr* e) const {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e);
+    if (!ma || !ma->target) return false;
+    if (ctx_.exprSymbol(*e)) return false;          // a real MethodSymbol ref
+    const sema::TypeRef* t = ctx_.exprType(*e);      // sema typed it as a value
+    if (!t || t->kind != sema::TypeRef::Kind::Function) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+    return id && sema::primitiveFromName(id->name) != sema::PrimitiveType::None;
+}
+
 // §27.7.1 (#1544): classify the equality kind of a method-reference function
 // value. The runtime cannot tell a class receiver (which must match by fn +
 // receiver across separate evaluations) from a record receiver (which must NOT,

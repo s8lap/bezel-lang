@@ -3849,7 +3849,15 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                    dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
         if (nm->target) visitExpr(*nm->target);
     } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        // §27.6 (v0.184): mark the callee node while visiting it so
+        // resolveMemberAccess types a primitive-intrinsic static member that is
+        // the DIRECT callee (`int.Parse(s)`) as its scalar result, but the same
+        // member used as a bare method reference (`.Select(int.Parse)`) as a
+        // function value. Saved/restored so a nested call's callee does not leak.
+        const ast::Expr* savedCallee = calleeOfCallCtx_;
+        calleeOfCallCtx_ = ce->callee.get();
         if (ce->callee) visitExpr(*ce->callee);
+        calleeOfCallCtx_ = savedCallee;
         // per §24.3: an event-handler argument (`<event>.Subscribe(h)` / .Add /
         // .Remove) — push the event payload type so an untyped handler lambda's
         // parameter is typed as `T`, letting its body resolve `e.Field`.

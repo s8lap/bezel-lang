@@ -8810,6 +8810,37 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             PrimitiveType pt = primitiveFromName(id2->name);
             if (pt != PrimitiveType::None) {
                 const auto& mbr = ma.member;
+                // §27.6 (v0.184, #1758): a primitive-intrinsic static METHOD used
+                // as a bare method reference — NOT the direct callee of a call —
+                // is a function value `(paramTypes) -> returnType`, not its scalar
+                // result. `int.Parse` in `strings.Select(int.Parse)` is the spec's
+                // own §27.6 example. `methodRef` sets the function type in that
+                // case; when the access IS the callee (`int.Parse(s)`) it keeps
+                // the scalar result — typeCall dispatches on member + receiver,
+                // and the scalar keeps the #1093 delegate arity-check from
+                // misfiring on the intrinsic call (its callee is not Function-
+                // typed and has no MethodSymbol). Static PROPERTIES (MaxValue,
+                // NaN, Zero, …) are values, not functions, and stay scalar.
+                //
+                // Overloaded intrinsics (`int.Parse(s)` vs `int.Parse(s, radix)`)
+                // form the single-argument `(string) -> T` reference — the form
+                // the spec example and every LINQ selector want; the two-argument
+                // overload is not reachable as a bare reference here (a scoped,
+                // documented choice — the general overloaded-reference target-type
+                // resolution of §27.6 is not applied to primitive intrinsics).
+                const bool bareRef = (&ma != calleeOfCallCtx_);
+                auto methodRef = [&](std::vector<TypeRef*> params, TypeRef* ret) {
+                    if (!bareRef) { ctx_.setExprType(&ma, ret); return; }
+                    auto* ft = ctx_.makeTypeRef();
+                    ft->kind = TypeRef::Kind::Function;
+                    for (TypeRef* p : params) {
+                        TypeRef::FuncParam fp;
+                        fp.type = p;
+                        ft->funcParams.push_back(fp);
+                    }
+                    ft->funcReturn = ret;
+                    ctx_.setExprType(&ma, ft);
+                };
                 // Numeric properties: MaxValue/MinValue → same type.
                 if (mbr == "MaxValue" || mbr == "MinValue") {
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(pt));
@@ -8833,23 +8864,30 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(pt));
                         return;
                     }
-                    // stdlib §9.2: all five FP predicates return bool.
+                    // stdlib §9.2: all five FP predicates return bool. §27.6:
+                    // `double.IsNaN` as a reference is `(double) -> bool`.
                     if (mbr == "IsNaN" || mbr == "IsInfinity" ||
                         mbr == "IsPositiveInfinity" ||
                         mbr == "IsNegativeInfinity" || mbr == "IsFinite") {
-                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                        methodRef({ctx_.primitiveTypeRef(pt)},
+                                  ctx_.primitiveTypeRef(PrimitiveType::Bool));
                         return;
                     }
                     // stdlib §9.2 (#519): IeeeEquals / BitwiseEquals — two-arg
-                    // static equality variants; both return bool.
+                    // static equality variants; both return bool. §27.6:
+                    // `(double, double) -> bool` as a reference.
                     if (mbr == "IeeeEquals" || mbr == "BitwiseEquals") {
-                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                        methodRef({ctx_.primitiveTypeRef(pt),
+                                   ctx_.primitiveTypeRef(pt)},
+                                  ctx_.primitiveTypeRef(PrimitiveType::Bool));
                         return;
                     }
                 }
-                // int.Parse(s) → int.
+                // int.Parse(s) → int. §27.6: `int.Parse` as a reference is
+                // `(string) -> int` — the spec's own method-reference example.
                 if (mbr == "Parse") {
-                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(pt));
+                    methodRef({ctx_.primitiveTypeRef(PrimitiveType::String)},
+                              ctx_.primitiveTypeRef(pt));
                     return;
                 }
                 // char static classification methods → bool.
@@ -8863,28 +8901,36 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // Dropped from the set so it falls through to the §3.4 "char has
                 // no static method 'IsSymbol'" reject, like any other unknown.
                 if (pt == PrimitiveType::Char) {
+                    // §27.6: a char classification method as a reference is
+                    // `(char) -> bool`.
                     if (mbr == "IsDigit" || mbr == "IsLetter" ||
                         mbr == "IsLetterOrDigit" || mbr == "IsWhiteSpace" ||
                         mbr == "IsUpper" || mbr == "IsLower" ||
                         mbr == "IsControl" ||
                         mbr == "IsPunctuation") {
-                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                        methodRef({ctx_.primitiveTypeRef(PrimitiveType::Char)},
+                                  ctx_.primitiveTypeRef(PrimitiveType::Bool));
                         return;
                     }
                     if (mbr == "ToUpper" || mbr == "ToLower") {
-                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Char));
+                        methodRef({ctx_.primitiveTypeRef(PrimitiveType::Char)},
+                                  ctx_.primitiveTypeRef(PrimitiveType::Char));
                         return;
                     }
                     // char.ToString(c) → string.
                     if (mbr == "ToString") {
-                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                        methodRef({ctx_.primitiveTypeRef(PrimitiveType::Char)},
+                                  ctx_.primitiveTypeRef(PrimitiveType::String));
                         return;
                     }
                 }
                 // string static methods → bool or string or int.
                 if (pt == PrimitiveType::String) {
                     if (mbr == "IsNullOrEmpty" || mbr == "IsNullOrWhiteSpace") {
-                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                        // §27.6: `string.IsNullOrEmpty` as a reference is
+                        // `(string) -> bool`.
+                        methodRef({ctx_.primitiveTypeRef(PrimitiveType::String)},
+                                  ctx_.primitiveTypeRef(PrimitiveType::Bool));
                         return;
                     }
                     // #1034: `string.Format` and `string.Concat` are NOT provided
@@ -8901,9 +8947,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                         return;
                     }
-                    // string.Compare → int (ordinal comparison result).
+                    // string.Compare → int (ordinal comparison result). §27.6:
+                    // `(string, string) -> int` as a reference.
                     if (mbr == "Compare") {
-                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                        methodRef({ctx_.primitiveTypeRef(PrimitiveType::String),
+                                   ctx_.primitiveTypeRef(PrimitiveType::String)},
+                                  ctx_.primitiveTypeRef(PrimitiveType::Int));
                         return;
                     }
                 }
@@ -8964,7 +9013,11 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // arguments always returns false — each boxing creates a fresh
                 // object — which the pointer compare yields naturally.)
                 if (pt == PrimitiveType::Object && mbr == "ReferenceEquals") {
-                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                    // §27.6: `Object.ReferenceEquals` as a reference is
+                    // `(object, object) -> bool`.
+                    methodRef({ctx_.primitiveTypeRef(PrimitiveType::Object),
+                               ctx_.primitiveTypeRef(PrimitiveType::Object)},
+                              ctx_.primitiveTypeRef(PrimitiveType::Bool));
                     return;
                 }
                 // fix #1633 / §26.5 / §27.6: before reporting "no static

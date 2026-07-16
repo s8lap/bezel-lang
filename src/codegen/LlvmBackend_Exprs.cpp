@@ -15,6 +15,13 @@ namespace bezel::codegen {
 
 llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     diverged_ = false;  // CG40: cleared per expression; a `throw` sets it
+    // §27.6 (v0.184, #1758): inside a primitive-intrinsic thunk body, a synthetic
+    // argument node lowers to the thunk's incoming parameter (see
+    // makePrimIntrinsicThunk). Checked only when the override map is non-empty.
+    if (!exprValueOverride_.empty()) {
+        if (auto it = exprValueOverride_.find(&e); it != exprValueOverride_.end())
+            return it->second;
+    }
     // CG30: an enum constant (`Color.Green`) is its integer value.
     if (llvm::Value* ev = enumConstant(e)) return ev;
     if (llvm::Value* cv = constMemberValue(e)) return cv;
@@ -4450,6 +4457,14 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 recv = lowerExpr(*ma->target);
             return makeMethodThunk(ms, recv);
         }
+        // §27.6 (v0.184, #1758): a bare reference to a primitive-intrinsic static
+        // method (`int.Parse`, `char.IsDigit`, …) — no MethodSymbol (intrinsics
+        // are name-recognized) — that sema typed as a function value. Back it with
+        // a synthesized thunk closure instead of falling through to `ret nullptr`
+        // (which produced a null fn pointer → SIGSEGV when the pipeline invoked
+        // it). isPrimIntrinsicMethodRef keys the disposal sites to this same set.
+        if (isPrimIntrinsicMethodRef(&e))
+            return makePrimIntrinsicThunk(*ma, ctx_.exprType(e));
     }
     return nullptr;
 }

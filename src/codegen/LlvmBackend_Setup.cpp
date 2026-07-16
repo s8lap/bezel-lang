@@ -8955,6 +8955,16 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
         if (dynamic_cast<const ast::IdentifierExpr*>(init) && isStaticMethod(ms))
             return true;
     }
+    // §27.6 (v0.184, #1758): a bare reference to a primitive-intrinsic static
+    // method (`int.Parse`, `char.IsDigit`, …) ALSO lowers to a fresh calloc'd
+    // rc=1 closure cell — via makePrimIntrinsicThunk (the CG60 path,
+    // LlvmBackend_Exprs.cpp) — but has NO MethodSymbol (intrinsics are
+    // name-recognized), so the MethodSymbol branch above misses it and the cell
+    // leaked (40 bytes/reference). The shared predicate keys eligibility EXACTLY
+    // to the CG60 gate that produced the cell, so binding the reference to a
+    // local releases its single reference at scope end. A call is a CallExpr
+    // node, never this shape, so this cannot misfire.
+    if (isPrimIntrinsicMethodRef(init)) return true;
     return false;
 }
 

@@ -1205,9 +1205,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // the GetOrAdd factoryIsInlineLambda guard. (Null-safe; LAZY ops differ —
         // they store the closure and release at enumerator dispose, see below.)
         auto argIsInlineLambda = [&](size_t i) -> bool {
-            return i < call.args.size() && call.args[i].value &&
-                   dynamic_cast<const ast::LambdaExpr*>(call.args[i].value.get())
-                       != nullptr;
+            if (i >= call.args.size() || !call.args[i].value) return false;
+            const ast::Expr* a = call.args[i].value.get();
+            if (dynamic_cast<const ast::LambdaExpr*>(a)) return true;
+            // §27.6 (v0.184, #1758): a bare primitive-intrinsic method reference
+            // (`arr.Any(char.IsDigit)`) is likewise a fresh +1 closure the eager
+            // op fully consumes and must release at loop-end — same inline-
+            // producer shape as a lambda literal (#1758 pre-gate review).
+            return isPrimIntrinsicMethodRef(a);
         };
 
         // per §5 LINQ: .Any(pred: (T)->bool): bool

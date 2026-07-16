@@ -461,6 +461,26 @@ private:
     // parameter) reference to the same extension method cache DISTINCT thunks
     // (they have different signatures).
     std::map<std::pair<sema::MethodSymbol*, bool>, llvm::Function*> methodThunks_;
+    // §27.6 (v0.184, #1758): cached thunk per primitive-intrinsic static method
+    // reference, keyed by (primitive kind, member name). A primitive intrinsic
+    // (`int.Parse`, `char.IsDigit`, …) has no MethodSymbol — it is recognized by
+    // name in sema/codegen — so makeMethodThunk cannot back a bare method
+    // reference to it. makePrimIntrinsicThunk emits a `ret (ptr env, params…)`
+    // thunk that internally re-lowers the intrinsic call, and this cache gives
+    // repeated references to the same intrinsic a STABLE fn pointer (the same
+    // #1170 reasoning methodThunks_ uses for §27.7.1 equality).
+    std::map<std::pair<int, std::string>, llvm::Function*> primIntrinsicThunks_;
+    // §27.6 (v0.184, #1758): while emitting a primitive-intrinsic thunk body,
+    // maps each synthetic argument node to the thunk's corresponding LLVM
+    // parameter so the reused intrinsic-call lowering (`lowerExpr` on the
+    // synthetic arg) yields the thunk's incoming value. Empty outside thunk
+    // emission; checked at the top of lowerExpr only when non-empty.
+    std::unordered_map<const ast::Expr*, llvm::Value*> exprValueOverride_;
+    // §27.6 (v0.184, #1758): owns the synthetic `Type.Member(args…)` call trees
+    // built for primitive-intrinsic thunk bodies. Kept alive for the whole
+    // compilation so the exprType entries set on their argument nodes never
+    // outlive their key (one small tree per cached thunk).
+    std::vector<std::unique_ptr<ast::CallExpr>> primIntrinsicSynthCalls_;
     // §27.7.1 (v0.180, #1544): cached property-getter-reference thunk per
     // property symbol — the SAME #1170 stability reasoning as methodThunks_
     // above, applied to a property used as a function value (§27.6, `var f:
@@ -6670,6 +6690,28 @@ private:
     // The thunk has calling convention (ptr env, params...) -> ret.
     llvm::Value* makeMethodThunk(sema::MethodSymbol* ms,
                                  llvm::Value* receiverVal);
+
+    // §27.6 (v0.184, #1758): produce a closure { thunk, null-env } for a bare
+    // reference to a primitive-intrinsic static method (`int.Parse`,
+    // `char.IsDigit`, `double.IsNaN`, …), which has no MethodSymbol. `ma` is the
+    // `Type.Member` access node; `fnTy` is the function type sema gave the bare
+    // reference (`(paramTypes) -> returnType`, §27.6). The thunk `(ptr env,
+    // params…) -> ret` re-lowers the intrinsic through tryLowerPrimitiveStaticCall
+    // over a synthetic call, so every primitive-static member reachable as a
+    // direct call is reachable as a reference with no per-member codegen.
+    llvm::Value* makePrimIntrinsicThunk(const ast::MemberAccessExpr& ma,
+                                        const sema::TypeRef* fnTy);
+
+    // §27.6 (v0.184, #1758): is `e` a bare reference to a primitive-intrinsic
+    // static method (`int.Parse`, `char.IsDigit`, …) used as a function VALUE —
+    // the exact shape makePrimIntrinsicThunk mints a fresh +1 closure cell for
+    // (no exprSymbol, Function-typed, primitive-keyword `Type.Member` target)?
+    // Shared by the CG60 value-lowering gate, isPlusOneClosureProducer (so a
+    // bound local releases the cell at scope end), and the LINQ inline-closure
+    // ownership check (so a `Select(int.Parse)` temporary is released on
+    // enumerator dispose) — one predicate keeps all three recognizing exactly
+    // the same set, which is what makes the producer/consumer balance sound.
+    bool isPrimIntrinsicMethodRef(const ast::Expr* e) const;
 
     // #1170: build a fresh closure cell { thunk, env, rc, envdtor, kind }
     // wrapping a (possibly cached) method thunk and the current receiver. Shared
