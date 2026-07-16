@@ -2,6 +2,7 @@
 #include "ownership/Ownership_impl.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -761,6 +762,14 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // Task returned by an async method) just as readily as an async one.
     // // per §28.3
     checkDeferredActivationTempSites(body);
+    // §28.3 SB01-B (v0.190, #1919): a lambda / function-value body carries the
+    // same callee-side borrow-return obligation as a named method — the spec's
+    // own wording is "a non-`async` method OR lambda". A lambda body is not
+    // otherwise ownership-analysed, so an identity lambda returning a borrowed
+    // `Task` parameter through a plain-`Task` return compiled and HUNG at
+    // runtime while the equivalent method was rejected; drive the same rejection
+    // over every lambda in this body. // per §28.3 SB01-B (v0.190)
+    checkLambdaTaskFamilyBorrowReturns(body);
 }
 
 void MethodOwnership::runExprBodyOwningReturnCheck(
@@ -873,6 +882,10 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
                 reportCallBounded(exprBody.span.begin, src->name, "returned");
         }
     }
+    // §28.3 SB01-B (v0.190, #1919): the `=>` expression-body sibling of the
+    // block-body driver above — a lambda embedded in an expression body carries
+    // the same lambda-return obligation. // per §28.3 SB01-B (v0.190)
+    checkLambdaTaskFamilyBorrowReturnsExpr(exprBody);
 }
 
 namespace {
@@ -4646,6 +4659,378 @@ void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
         "owned " + head +
         "<…>`); a non-`owned` owning-collection return is a borrow of a field, "
         "which the caller may not dispose (§28.6 / §5.11)");
+}
+
+// §28.3 SB01-B (v0.190, #1919): drive the plain-`Task`-family borrow-return
+// prohibition over every lambda in a method/ctor/operator BLOCK body. A lambda
+// body is not otherwise ownership-analysed, so this is where the callee-side
+// obligation the spec places on "a non-`async` method OR lambda" reaches
+// lambda/function-value bodies. // per §28.3 SB01-B (v0.190)
+void MethodOwnership::checkLambdaTaskFamilyBorrowReturns(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    std::vector<const ast::LambdaExpr*> lambdas;
+    for (const auto& s : body)
+        if (s) collectBodyLambdas(*s, lambdas);
+    for (const ast::LambdaExpr* lam : lambdas)
+        checkOneLambdaTaskFamilyBorrowReturn(*lam);
+}
+
+// §28.3 SB01-B (v0.190, #1919): the `=>` expression-body sibling — an
+// expression-bodied method's `=> E` body can embed a lambda just as a block
+// body can (driven from runExprBodyOwningReturnCheck). // per §28.3 SB01-B
+void MethodOwnership::checkLambdaTaskFamilyBorrowReturnsExpr(
+        const ast::Expr& e) {
+    std::vector<const ast::LambdaExpr*> lambdas;
+    collectBodyLambdasExpr(e, lambdas);
+    for (const ast::LambdaExpr* lam : lambdas)
+        checkOneLambdaTaskFamilyBorrowReturn(*lam);
+}
+
+// §28.3 SB01-B (v0.190, #1919): collect every LambdaExpr appearing anywhere in a
+// statement (including nested lambdas — collectBodyLambdasExpr descends into a
+// lambda's own body). Structural recursion mirroring scopedPreScanStmt; a form
+// this walker does not descend into merely under-collects (misses a lambda),
+// never over-rejects. // per §28.3 SB01-B (v0.190)
+void MethodOwnership::collectBodyLambdas(
+        const ast::Stmt& s,
+        std::vector<const ast::LambdaExpr*>& out) const {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer) collectBodyLambdasExpr(*ld->initializer, out);
+        return;
+    }
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lc->value) collectBodyLambdasExpr(*lc->value, out);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) collectBodyLambdasExpr(*rs->value, out);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) collectBodyLambdasExpr(*es->expr, out);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->target) collectBodyLambdasExpr(*as->target, out);
+        if (as->value) collectBodyLambdasExpr(*as->value, out);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (ts->value) collectBodyLambdasExpr(*ts->value, out);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition)
+            collectBodyLambdasExpr(*ifs->ifBranch.condition, out);
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) collectBodyLambdas(*bs, out);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition) collectBodyLambdasExpr(*el.condition, out);
+            for (const auto& bs : el.body)
+                if (bs) collectBodyLambdas(*bs, out);
+        }
+        for (const auto& bs : ifs->elseBody)
+            if (bs) collectBodyLambdas(*bs, out);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition) collectBodyLambdasExpr(*ws->condition, out);
+        for (const auto& bs : ws->body)
+            if (bs) collectBodyLambdas(*bs, out);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable) collectBodyLambdasExpr(*fs->iterable, out);
+        if (fs->withExpr) collectBodyLambdasExpr(*fs->withExpr, out);
+        for (const auto& bs : fs->body)
+            if (bs) collectBodyLambdas(*bs, out);
+        return;
+    }
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : db->body)
+            if (bs) collectBodyLambdas(*bs, out);
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        if (is->target) collectBodyLambdasExpr(*is->target, out);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) collectBodyLambdasExpr(*ds->value, out);
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) collectBodyLambdasExpr(*ys->value, out);
+        return;
+    }
+    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : trys->body)
+            if (bs) collectBodyLambdas(*bs, out);
+        for (const auto& arm : trys->catches) {
+            if (arm.guard) collectBodyLambdasExpr(*arm.guard, out);
+            if (arm.body) collectBodyLambdas(*arm.body, out);
+        }
+        for (const auto& bs : trys->finallyBody)
+            if (bs) collectBodyLambdas(*bs, out);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        if (cs->scrutinee) collectBodyLambdasExpr(*cs->scrutinee, out);
+        for (const auto& arm : cs->arms) {
+            if (arm.guard) collectBodyLambdasExpr(*arm.guard, out);
+            if (arm.exprBody) collectBodyLambdasExpr(*arm.exprBody, out);
+            for (const auto& bs : arm.stmts)
+                if (bs) collectBodyLambdas(*bs, out);
+        }
+        return;
+    }
+    // Break / Continue: no child expressions.
+}
+
+// §28.3 SB01-B (v0.190, #1919): the expression half of the lambda collector.
+// Mirrors scopedPreScanExpr; on a LambdaExpr it records the lambda AND descends
+// into its body so nested lambdas are collected too. // per §28.3 SB01-B
+void MethodOwnership::collectBodyLambdasExpr(
+        const ast::Expr& e,
+        std::vector<const ast::LambdaExpr*>& out) const {
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        out.push_back(lam);
+        if (lam->exprBody) collectBodyLambdasExpr(*lam->exprBody, out);
+        for (const auto& bs : lam->stmts)
+            if (bs) collectBodyLambdas(*bs, out);
+        return;
+    }
+    // Call-like nodes (CallExpr / NullCondCallExpr / NewExpr): descend into
+    // every argument value and the callee.
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (ce->callee) collectBodyLambdasExpr(*ce->callee, out);
+        for (const auto& a : ce->args)
+            if (a.value) collectBodyLambdasExpr(*a.value, out);
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        if (nc->callee) collectBodyLambdasExpr(*nc->callee, out);
+        for (const auto& a : nc->args)
+            if (a.value) collectBodyLambdasExpr(*a.value, out);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        for (const auto& a : ne->args)
+            if (a.value) collectBodyLambdasExpr(*a.value, out);
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) collectBodyLambdasExpr(*ma->target, out);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->target) collectBodyLambdasExpr(*nm->target, out);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) collectBodyLambdasExpr(*ix->target, out);
+        for (const auto& a : ix->indices)
+            if (a.value) collectBodyLambdasExpr(*a.value, out);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left) collectBodyLambdasExpr(*be->left, out);
+        if (be->right) collectBodyLambdasExpr(*be->right, out);
+        return;
+    }
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (un->operand) collectBodyLambdasExpr(*un->operand, out);
+        return;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand) collectBodyLambdasExpr(*pb->operand, out);
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->operand) collectBodyLambdasExpr(*tt->operand, out);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->condition) collectBodyLambdasExpr(*cd->condition, out);
+        if (cd->thenValue) collectBodyLambdasExpr(*cd->thenValue, out);
+        if (cd->elseValue) collectBodyLambdasExpr(*cd->elseValue, out);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        if (th->operand) collectBodyLambdasExpr(*th->operand, out);
+        return;
+    }
+    if (auto* rg = dynamic_cast<const ast::RangeExpr*>(&e)) {
+        if (rg->lo) collectBodyLambdasExpr(*rg->lo, out);
+        if (rg->hi) collectBodyLambdasExpr(*rg->hi, out);
+        if (rg->step) collectBodyLambdasExpr(*rg->step, out);
+        return;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        if (we->source) collectBodyLambdasExpr(*we->source, out);
+        for (const auto& ia : we->assigns)
+            if (ia.value) collectBodyLambdasExpr(*ia.value, out);
+        return;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& k : cl->keys)
+            if (k) collectBodyLambdasExpr(*k, out);
+        for (const auto& el : cl->elements)
+            if (el) collectBodyLambdasExpr(*el, out);
+        return;
+    }
+    if (auto* isx = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        for (const auto& part : isx->parts)
+            if (part.expr) collectBodyLambdasExpr(*part.expr, out);
+        return;
+    }
+    if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        if (cx->scrutinee) collectBodyLambdasExpr(*cx->scrutinee, out);
+        for (const auto& arm : cx->arms) {
+            if (arm.guard) collectBodyLambdasExpr(*arm.guard, out);
+            if (arm.exprBody) collectBodyLambdasExpr(*arm.exprBody, out);
+            for (const auto& bs : arm.stmts)
+                if (bs) collectBodyLambdas(*bs, out);
+        }
+        return;
+    }
+    // Literals / identifiers / typeof / nameof / default / unit: no children.
+}
+
+// §28.3 SB01-B (v0.190, #1919): apply the plain-`Task`-family borrow-return
+// prohibition to a single lambda / function-value body, mirroring
+// checkBorrowReturnedThroughOwningType's `plainTaskInSyncBody` arm on named
+// methods. The lambda's effective (inferred) return type is read from its
+// function `TypeRef`'s funcReturn head; a borrow returned through it — a plain
+// lambda parameter, a bare task field / property read, an index / slot read — is
+// laundered into a caller-owned frame the callee still owns: a double-free /
+// async-state corruption at runtime (the identity lambda `(t) => t` hang). An
+// `async` lambda auto-satisfies the obligation (its body is the awaited value,
+// not a task) and is exempt, exactly as an `async` method body is. // per §28.3
+void MethodOwnership::checkOneLambdaTaskFamilyBorrowReturn(
+        const ast::LambdaExpr& lam) {
+    // An `async` lambda's return IS its own fresh state-machine frame (§30.1);
+    // its `=> E` body is the awaited value (type T), not a task. Exempt — the
+    // named-method arm gates identically on `!isAsync_`. // per §28.3, §30.1
+    if (lam.isAsync) return;
+    // The lambda's effective return type is its inferred function `TypeRef`'s
+    // funcReturn (the body's result T for `=> E`, or the first `return E` for a
+    // block body — ExprTypecheck_Exprs.cpp). An explicit `owned` target return
+    // is a different, explicit transfer contract, not this rule's plain-`Task`
+    // case. // per §28.3
+    const sema::TypeRef* lamTy = ctx_.exprType(lam);
+    if (!lamTy || lamTy->kind != sema::TypeRef::Kind::Function ||
+        !lamTy->funcReturn)
+        return;
+    if (lamTy->funcReturnOwned) return;
+    std::string_view head = lamTy->funcReturn->headName();
+    // Plain `Task` / `OwningTask` head only — `isTaskFamilyHead` folds both in
+    // (an `async` lambda is already exempted above). A non-`Task`-family return
+    // (a plain class/interface, a value type) is governed by the ordinary
+    // borrow-lifetime rules elsewhere and is untouched here, so a lambda
+    // returning a borrow of a NON-`Task` type is unaffected. // per §28.3
+    if (!common::isTaskFamilyHead(head)) return;
+    // Classify each return expression with a FRESH MethodOwnership so the borrow
+    // classifier's by-name state lookup (lookupState) cannot collide with an
+    // enclosing-method local of the same name — the lambda's own parameters
+    // resolve through ctx_.exprSymbol to their ParameterSymbols (a plain,
+    // non-`owned` param is a borrow) regardless of the enclosing dataflow.
+    MethodOwnership sub(ctx_);
+    auto classifyReturn = [&](const ast::Expr& re) {
+        // `move field` is the field-TRANSFER form (an owned producer), never a
+        // borrow — skip it. A bare param / field / index read IS a borrow.
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&re))
+            if (un->op == "move") return;
+        bool isBorrow = sub.ownedArgSourceIsBorrow(re);
+        if (!isBorrow) {
+            // Task-typed field / index reads the classifier did not already flag
+            // (mirrors checkBorrowReturnedThroughOwningType's owning-wrapper
+            // fallback: a stored task re-exposed through a property / field /
+            // slot read is a borrow of its storage). // per §28.3
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&re)) {
+                if (dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*ma)))
+                    isBorrow = true;
+            } else if (auto* id =
+                           dynamic_cast<const ast::IdentifierExpr*>(&re)) {
+                if (dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*id)))
+                    isBorrow = true;
+            } else if (dynamic_cast<const ast::IndexExpr*>(&re)) {
+                isBorrow = true;
+            }
+        }
+        if (!isBorrow) return;
+        report(
+            Severity::Error, re.span.begin,
+            "a borrow may not be returned through the non-`async` "
+            "`Task`-family return of a lambda: an unmarked `Task` return is "
+            "container-ownership-transferring — the caller owns and disposes "
+            "the task frame — so every return path must supply an OWNED task "
+            "(§28.3 \"Task-family calls produce owned frames\", v0.190, "
+            "SB-01); return a fresh or forwarded task-returning call, a "
+            "completed-task factory (§30.10), an `owned` task local or "
+            "parameter, or a `move`d owned task field. A stored task is "
+            "re-exposed through a property, field, or collection slot (whose "
+            "reads are borrows of their storage), never through a non-`owned` "
+            "lambda return; or make the lambda `async`");
+    };
+    if (lam.exprBody) {
+        classifyReturn(*lam.exprBody);
+        return;
+    }
+    // Block body: check every `return EXPR` reachable without crossing a nested
+    // lambda. A nested lambda's returns belong to it and are checked when the
+    // collector reaches it separately; a pure statement walk never enters a
+    // nested lambda body (those live inside a LambdaExpr, an expression).
+    // // per §28.3
+    std::function<void(const ast::Stmt&)> scanReturns =
+        [&](const ast::Stmt& s) {
+            if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+                if (rs->value) classifyReturn(*rs->value);
+                return;
+            }
+            if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+                for (const auto& bs : ifs->ifBranch.body)
+                    if (bs) scanReturns(*bs);
+                for (const auto& el : ifs->elifBranches)
+                    for (const auto& bs : el.body)
+                        if (bs) scanReturns(*bs);
+                for (const auto& bs : ifs->elseBody)
+                    if (bs) scanReturns(*bs);
+                return;
+            }
+            if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+                for (const auto& bs : ws->body)
+                    if (bs) scanReturns(*bs);
+                return;
+            }
+            if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+                for (const auto& bs : fs->body)
+                    if (bs) scanReturns(*bs);
+                return;
+            }
+            if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+                for (const auto& bs : db->body)
+                    if (bs) scanReturns(*bs);
+                return;
+            }
+            if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+                for (const auto& bs : trys->body)
+                    if (bs) scanReturns(*bs);
+                for (const auto& arm : trys->catches)
+                    if (arm.body) scanReturns(*arm.body);
+                for (const auto& bs : trys->finallyBody)
+                    if (bs) scanReturns(*bs);
+                return;
+            }
+            if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+                for (const auto& arm : cs->arms)
+                    for (const auto& bs : arm.stmts)
+                        if (bs) scanReturns(*bs);
+                return;
+            }
+        };
+    for (const auto& s : lam.stmts)
+        if (s) scanReturns(*s);
 }
 
 // §28.3 (v0.180, #1547): a STATIC method has no receiver, so the borrow-

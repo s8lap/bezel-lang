@@ -620,6 +620,34 @@ private:
     // unaffected. Fires from handleReturn; a no-op for non-owning return types.
     void checkBorrowReturnedThroughOwningType(const ast::Expr& e);
 
+    // §28.3 SB01-B (v0.190, #1919): the callee-side borrow-return prohibition
+    // for a plain (non-`async`) `Task`-family return applies to LAMBDA /
+    // function-value bodies exactly as to named-method bodies — the spec is
+    // explicit: "every return path of a non-`async` method OR lambda with such
+    // a return type must supply an owned task ... Returning a borrow — a bare
+    // task field or property read, a plain parameter, a captured binding — is a
+    // compile error." checkBorrowReturnedThroughOwningType enforces this on
+    // method/static bodies (driven from handleReturn /
+    // runExprBodyOwningReturnCheck), but a lambda body is not otherwise
+    // ownership-analysed, so an identity lambda returning a borrowed `Task`
+    // parameter through a plain-`Task` return compiled and hung (double-free /
+    // async-state corruption) while the equivalent method was rejected. These
+    // walk the enclosing method/ctor/operator body for every lambda and apply
+    // the same rejection to each — the effective return type read from the
+    // lambda's inferred function `TypeRef` (`funcReturn->headName()`), the async
+    // exemption from `lam.isAsync`. Runs as a syntactic pre-pass, independent of
+    // the enclosing method's dataflow. // per §28.3 SB01-B (v0.190)
+    void checkLambdaTaskFamilyBorrowReturns(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void checkLambdaTaskFamilyBorrowReturnsExpr(const ast::Expr& e);
+    void collectBodyLambdas(
+        const ast::Stmt& s,
+        std::vector<const ast::LambdaExpr*>& out) const;
+    void collectBodyLambdasExpr(
+        const ast::Expr& e,
+        std::vector<const ast::LambdaExpr*>& out) const;
+    void checkOneLambdaTaskFamilyBorrowReturn(const ast::LambdaExpr& lam);
+
     // §28.3 (v0.180, #1547): reject a BORROW returned from a STATIC method
     // through a plain (non-owning) class/interface return type declared
     // WITHOUT `owned`. The borrow-lifetime rule admits only two forms of
