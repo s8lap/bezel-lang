@@ -316,6 +316,78 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
 }
 
 namespace {
+// #1937 / §14.1 / §2.5: does `rt` structurally reference any of the
+// type-parameter names in `paramNames` — as a bare parameter reference, or
+// nested inside a generic argument (`Pair<A, B>`), an inline-array element
+// (`[N]T`), or a function type (`(A) -> B`)? An imported bare parameter
+// reference carries its name on `importedName` (declaration/astNode are null for
+// reconstructed types), which `headName()` returns.
+bool typeRefMentionsAnyParamName(
+    const TypeRef* rt,
+    const std::unordered_set<std::string_view>& paramNames) {
+    if (!rt) return false;
+    switch (rt->kind) {
+        case TypeRef::Kind::Named: {
+            // A bare generic-parameter reference: no concrete declaration and no
+            // generic arguments of its own — its name rides headName().
+            if (!rt->declaration && rt->genericArgs.empty() &&
+                paramNames.count(rt->headName()))
+                return true;
+            for (const TypeRef* ga : rt->genericArgs)
+                if (typeRefMentionsAnyParamName(ga, paramNames)) return true;
+            return false;
+        }
+        case TypeRef::Kind::InlineArray:
+            return typeRefMentionsAnyParamName(rt->arrayElement, paramNames);
+        case TypeRef::Kind::Function: {
+            for (const auto& fp : rt->funcParams)
+                if (typeRefMentionsAnyParamName(fp.type, paramNames)) return true;
+            return typeRefMentionsAnyParamName(rt->funcReturn, paramNames);
+        }
+        default:
+            return false;
+    }
+}
+
+// #1937 / §14.1 / §9: does `rt` — the declared return type of an IMPORTED generic
+// METHOD — carry a generic RECORD parameterized by one of the method's own type
+// parameters (`Pair<A, B>`; or such a record nested inside a generic argument /
+// inline-array element)? A by-value parametric-record return is the proven #1937
+// miscompile: the defining module compiled the method body against the i32
+// placeholder, so the returned record crosses the module boundary with the
+// placeholder LAYOUT — the value is silently dropped (register-return ABI) or a
+// layout touch segfaults (sret ABI), for EVERY instantiation (sema even mis-types
+// the record's fields as `?`, so even the i32-matching `<int,int>` case drops the
+// value). This is deliberately NARROWER than "return references a type
+// parameter": a bare-`T` scalar/reference return (`Echo<T>(x:T):T` called
+// `Echo(42)`) round-trips correctly for a placeholder-matching (i32)
+// instantiation and is an existing, tested, working shape — so it is NOT flagged.
+bool returnCarriesParametricRecord(
+    const TypeRef* rt,
+    const std::unordered_set<std::string_view>& paramNames) {
+    if (!rt) return false;
+    switch (rt->kind) {
+        case TypeRef::Kind::Named: {
+            // A generic RECORD (declared or imported-reconstructed, kind Record)
+            // whose own generic arguments reference a method type parameter.
+            if (rt->declaration &&
+                rt->declaration->kind == ast::TypeDeclKind::Record) {
+                for (const TypeRef* ga : rt->genericArgs)
+                    if (typeRefMentionsAnyParamName(ga, paramNames)) return true;
+            }
+            // Recurse into generic args so a by-value record nested inside
+            // another generic (e.g. `Box<Pair<A, B>>`) is still caught.
+            for (const TypeRef* ga : rt->genericArgs)
+                if (returnCarriesParametricRecord(ga, paramNames)) return true;
+            return false;
+        }
+        case TypeRef::Kind::InlineArray:
+            return returnCarriesParametricRecord(rt->arrayElement, paramNames);
+        default:
+            return false;
+    }
+}
+
 // §14.1 (#785, #850): structurally unify a value parameter's declared type
 // (`pt`, AST) against the call argument's resolved type (`argTy`), binding each
 // method type parameter named in `paramNames` to the matching component of the
@@ -2284,6 +2356,60 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     "an `int` instantiation, until importer-side "
                                     "method monomorphization lands");
                         }
+                    }
+                }
+                // #1937 / §14.1 / §2.5 / §2.8.3 rule 2 (decline-with-reasons):
+                // an IMPORTED GENERIC METHOD — one with its OWN `<T>` type
+                // parameters (`Maker.Make<A, B>(...): Pair<A, B>`), distinct
+                // from the #783 generic-CLASS-method gate above — is NOT
+                // monomorphized importer-side. Its body was compiled in the
+                // defining module against the i32 placeholder, and (unlike a
+                // generic class's methods) its body is not reconstructed here:
+                // methodBodyText is exported only for generic classes, and a
+                // body that constructs/returns a SIBLING generic record cannot
+                // be reconstructed from the single-class synthetic source
+                // anyway. When the method's declared RETURN type carries a
+                // generic RECORD parameterized by one of its type parameters,
+                // the placeholder-compiled body returns the i32-erased record
+                // layout — a silently-DROPPED value (register-return ABI, e.g.
+                // `Pair<long,long>`) or a SEGFAULT on a layout touch (sret ABI,
+                // e.g. `Triple<long,long,long>`), for EVERY instantiation
+                // including the i32-matching `<int,int>` one (so this is NOT the
+                // #1894/#1895 return-ABI-width bug). Same-module this shape is
+                // monomorphized correctly, and a non-generic cross-module method
+                // is correct; only the cross-module + generic-record-return
+                // combination miscompiles. Reject exactly this proven-
+                // miscompiling shape with a clean diagnostic rather than emitting
+                // bad code — a clean compile-error is strictly better than a
+                // silent wrong value / crash. Importer-side generic-method
+                // monomorphization is the full fix (#1937, #428 family). The
+                // check is deliberately narrow: a bare-`T` scalar/reference
+                // return (`Echo<T>(x:T):T` called `Echo(42)`) round-trips for a
+                // placeholder-matching instantiation and is left alone; a method
+                // whose return does not use a type parameter (`Count<T>(x:T):
+                // int`) is unaffected; an imported non-generic method (empty
+                // genericParams) never reaches this check.
+                if (!ms->genericParams.empty()) {
+                    std::unordered_set<std::string_view> mparams;
+                    for (const Symbol* gp : ms->genericParams)
+                        if (gp && !gp->name.empty()) mparams.insert(gp->name);
+                    if (!mparams.empty() &&
+                        returnCarriesParametricRecord(rt, mparams)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            "calling imported generic method `" +
+                            std::string(ms->name) +
+                            "`, which returns a generic record parameterized by "
+                            "its own type parameter(s), is not yet monomorphized "
+                            "across the module boundary (\xC2\xA7""14.1 / "
+                            "\xC2\xA7""2.8.3 / #1937, #428 family): the method's "
+                            "body was compiled in its defining module against the "
+                            "placeholder layout, so the returned record would be "
+                            "silently dropped (a register-returned record) or "
+                            "crash (an sret record). Call it within the module "
+                            "that defines it, or have it return a non-generic "
+                            "type, until importer-side generic-method "
+                            "monomorphization lands");
                     }
                 }
             }
