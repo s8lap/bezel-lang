@@ -6079,6 +6079,55 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             args[ai] = coerceNumericToType(args[ai], callFnTy->getParamType(ai),
                                            argUnsigned(ai));
     }
+    // #1943 / §14.1 / §2.8.3 / §2.5 (decline-with-reasons, ARGUMENT side; the
+    // sibling of the #1937 return-side sema gate): an IMPORTED GENERIC METHOD —
+    // one with its OWN `<T>` type parameters on a NON-generic class
+    // (`Util.Count<T>(x: T): int`) — has no reconstructed body importer-side
+    // (methodBodyText is exported only for generic CLASSES, #783/#1937), so the
+    // only entry in methodFns_ is the defining module's i32-PLACEHOLDER external
+    // template `bz$<Class>$<M>(i32, …)`. When it is instantiated at a type whose
+    // ABI is not that i32 placeholder — `long` (i64), `double`, `bool` (i1), a
+    // record struct, … — a type-param-typed argument reaches the placeholder
+    // parameter at a DIFFERENT LLVM width, so the emitted `call`'s parameter type
+    // does not match the callee signature and LLVM's module verifier aborts the
+    // compile with a raw "Call parameter type does not match function signature"
+    // report (an ICE-like abort with no source location). The importer-side
+    // generic-method monomorphization that would make this call CORRECT is the
+    // #428 core (the same blocker as #1937). Until it lands, fail-closed with a
+    // clean, LOCATED §-cited diagnostic at the offending argument instead of
+    // letting verifyModule abort. This is reached ONLY by a generic method on a
+    // non-generic class: an imported generic-CLASS method (parent generic) is
+    // fully handled by the HARD route above (returns before here), and a
+    // non-generic imported method has empty genericParams. The i32-matching
+    // instantiations (`Count<int>`, and an int LITERAL narrowed to i32 as in a
+    // `Count<long>(99)` call) leave arg and param types EQUAL, so the loop does
+    // not fire and they keep compiling & running. Return a poison of the callee's
+    // return type so no malformed `call` is emitted: the reported Error makes
+    // Emitter::run() return nullptr (#628 part 1), so the compile fails cleanly.
+    if (ctx_.isImported(ms) && !ms->genericParams.empty()) {
+        auto* cft = callee->getFunctionType();
+        for (std::size_t ai = 0;
+             ai < args.size() && ai < cft->getNumParams(); ++ai) {
+            if (args[ai]->getType() == cft->getParamType(ai)) continue;
+            SourceLocation loc{};
+            if (argExprs && ai < argExprs->size() && (*argExprs)[ai])
+                loc = (*argExprs)[ai]->span.begin;
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "calling imported generic method `" + std::string(ms->name) +
+                "` with a type argument whose representation is not the "
+                "compiled `int` (i32) placeholder — e.g. `long`, `double`, "
+                "`bool`, or a record — is not yet monomorphized across the "
+                "module boundary (\xC2\xA7""14.1 / \xC2\xA7""2.8.3 / #1943, #428 "
+                "family): the method's body was compiled in its defining module "
+                "against the placeholder layout, so the argument would cross the "
+                "boundary at the wrong width. Call it within the module that "
+                "defines it, use an `int` instantiation, or have it take a "
+                "non-generic parameter, until importer-side generic-method "
+                "monomorphization lands");
+            return llvm::PoisonValue::get(callee->getReturnType());
+        }
+    }
     llvm::Value* r = builder_.CreateCall(callee, args);
     emitPendingCheck();  // CG20: a callee may have thrown
     return r;
