@@ -5421,6 +5421,28 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     llvm::AllocaInst* slot = entryAlloca(ptrTy());
                     locals_[declNode] = slot;
                     builder_.CreateStore(arr, slot);
+                    // #1871 / §28.9 / §28.11: reclaim the backing of an eligible
+                    // borrowing-`Array<T>` LITERAL local at scope end
+                    // (bz_array_free(backing, null)). `Array<T>` is trivial-dispose
+                    // (no-op Dispose) but its backing storage is "reclaimed with the
+                    // instance" (§28.9/§28.11) — here a compiler-emitted scope-end
+                    // free. This literal path early-returns, bypassing the shared
+                    // #1003 reclaim block at the end of lowerLocalDecl, so register
+                    // it directly. Gated on borrowingArrayFreeEligible_
+                    // (collectBorrowingArrayFreeEligible proved the local never
+                    // escapes AND its element policy is backing-only — a null
+                    // per-element disposer), so the free is exactly-once (no UAF, no
+                    // double-free). OwningArray/Stack/Queue literals are NOT in the
+                    // set (only name-head "Array" with a null element disposer is
+                    // collected), so their owned disposal path is untouched.
+                    if (currentFn_ == borrowingArrayFreeEligibleFn_ &&
+                        borrowingArrayFreeEligible_.count(
+                            static_cast<const void*>(declNode)) &&
+                        !disposeStack_.empty()) {
+                        Disposal d{slot, nullptr};
+                        d.collection = true;  // per-element disposer null
+                        disposeStack_.back().push_back(d);
+                    }
                     return;
                 }
             }
@@ -8622,6 +8644,21 @@ struct StringEscapeWalker {
     // and never match `target`, so they are unaffected.
     bool inLambda = false;
 
+    // #1871 / §28.9 / §28.11: enable the borrowing-`Array<T>`-ONLY safe-read
+    // relaxations below (a for-in over the target array, and a binding of the
+    // target into a proven-non-escaping pure-`IEnumerable<T>` VIEW local, are
+    // borrows — not escapes). Off by default so the string-release reuse of this
+    // walk keeps its stricter conservative treatment. Only the borrowing-array
+    // eligibility analysis (collectBorrowingArrayFreeEligible) sets it.
+    bool borrowingArrayMode = false;
+    // #1871: the set of `var v: IEnumerable<T> := <target-array>` VIEW LocalDecls
+    // that were independently proven never to escape. A binding of the target into
+    // one of these is a borrow (the view wrapper borrows the array's backing; its
+    // Dispose frees only the wrapper struct), so it does NOT taint the array.
+    // Non-null only in borrowingArrayMode; when null every into-local binding stays
+    // an escape.
+    const std::unordered_set<const void*>* safeViewAliases = nullptr;
+
     bool isTargetIdent(const ast::Expr* e) {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
         if (!id) return false;
@@ -8827,9 +8864,24 @@ struct StringEscapeWalker {
     void stmt(const ast::Stmt* s) {
         if (!s || escaped) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-            // Binding the target into ANOTHER local escapes it (the new local
-            // may itself be returned/stored). Walk the initializer as an escape
-            // position — but its sub-reads (e.g. `s.ToUpper()` receiver) are
+            // #1871 / §28.9 / §28.11: binding the target array directly into a
+            // pure-`IEnumerable<T>` VIEW local that was independently proven never
+            // to escape (safeViewAliases) is a BORROW: the view wrapper borrows the
+            // array's backing (wrapArrayAsIEnumerable) and its scope-end Dispose
+            // frees only the wrapper struct — never the backing (§28.11). So the
+            // binding does NOT taint the array; the array remains the sole owner of
+            // its backing and reclaims it at ITS OWN scope end (which the ownership
+            // pass proves outlives the view — the array is usable after the view's
+            // scope). Only in borrowingArrayMode, and only for the exact
+            // `var v := <array-identifier>` shape (isTargetIdent of the whole
+            // initializer); a sub-expression use falls through to the escape walk.
+            if (borrowingArrayMode && safeViewAliases &&
+                safeViewAliases->count(static_cast<const void*>(ld)) &&
+                isTargetIdent(ld->initializer.get()))
+                return;
+            // Otherwise: binding the target into ANOTHER local escapes it (the new
+            // local may itself be returned/stored). Walk the initializer as an
+            // escape position — but its sub-reads (e.g. `s.ToUpper()` receiver) are
             // still recognized as safe by expr().
             expr(ld->initializer.get(), /*safeRead=*/false);
             return;
@@ -8912,7 +8964,17 @@ struct StringEscapeWalker {
         if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
             // `for var x in s do ... end` — iterating the local. Conservatively
             // an escape (the enumerator may retain the source). expr(false).
-            expr(fs->iterable.get(), /*safeRead=*/false);
+            // #1871 / §28.9 / §28.11: EXCEPT in borrowingArrayMode, where the
+            // target is a borrowing `Array<T>`: a `for var x in a` clones a
+            // per-loop enumerator that BORROWS the backing (bz_array_ptr_at) and
+            // whose Dispose frees only its own struct — it never retains or frees
+            // the backing. So iterating the array is a borrow-read, not an escape,
+            // and the array stays reclaim-eligible. (A read inside a lambda body
+            // still escapes: expr() forces it via inLambda regardless of safeRead.)
+            if (borrowingArrayMode && isTargetIdent(fs->iterable.get()))
+                expr(fs->iterable.get(), /*safeRead=*/true);
+            else
+                expr(fs->iterable.get(), /*safeRead=*/false);
             expr(fs->withExpr.get(), /*safeRead=*/false);
             for (auto& b : fs->body) stmt(b.get());
             return;
@@ -10119,6 +10181,17 @@ void Emitter::collectBorrowingArrayFreeEligible(
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
             if (isFreshBorrowingArrayMaterializerLocal(ld))
                 candidates.push_back(ld);
+            // #1871 / §28.9 / §28.11: a plain `var xs: Array<T> := [ ... ]` — a
+            // collection literal whose backing the local solely owns. `Array<T>`
+            // is trivial-dispose (its Dispose is a no-op) but its backing storage
+            // is "reclaimed with the instance" by an implementation-defined
+            // mechanism (§28.9/§28.11) — here, a compiler-emitted scope-end
+            // bz_array_free. Without it the backing (spine + data) leaks. Scoped to
+            // backing-only element policies (value / class-or-interface borrows,
+            // null disposer) via isBorrowingArrayLiteralLocal; string/fn-element
+            // literals (their +1/element release differs) are excluded.
+            else if (isBorrowingArrayLiteralLocal(ld))
+                candidates.push_back(ld);
             // #1028: a plain `var d := src.ToDictionary(...)` — a fresh
             // `owned Dictionary<K,V>` materializer the local solely owns. Excluded:
             // a `using var` (disposed via registerUsingDisposal → would double-free).
@@ -10150,7 +10223,16 @@ void Emitter::collectBorrowingArrayFreeEligible(
     for (auto& s : body) scan(s.get());
 
     for (const ast::LocalDecl* ld : candidates) {
+        // #1871: gather this array's pure-`IEnumerable<T>` VIEW aliases that are
+        // themselves proven non-escaping — a binding into such a view is a borrow,
+        // not an escape (the view wrapper borrows the backing; its Dispose frees
+        // only the wrapper struct). Then run the escape walk in borrowingArrayMode
+        // so a for-in over the array and a binding into a safe view are borrows.
+        std::unordered_set<const void*> safeViews;
+        collectSafeViewAliases(body, ld, safeViews);
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        w.borrowingArrayMode = true;
+        w.safeViewAliases = &safeViews;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             borrowingArrayFreeEligible_.insert(static_cast<const void*>(ld));
@@ -10163,6 +10245,114 @@ void Emitter::collectBorrowingArrayFreeEligible(
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             dictMaterializerFreeEligible_.insert(static_cast<const void*>(ld));
+    }
+}
+
+
+// #1871 / §28.9 / §28.11: is `ld` a plain `var xs: Array<T> := [ ... ]` whose
+// backing the local solely owns — a borrowing `Array<T>` (name-head exactly
+// "Array") initialised by a COLLECTION LITERAL, whose element policy is
+// backing-only (a null per-element disposer: value types, and class/interface
+// BORROWS)? Those are exactly the literals codegen lowers to a fresh bz_array_t
+// the local owns and whose scope-end reclaim is a single bz_array_free(backing,
+// null) — no element +1 to release, so no double-free. `Array<string>` and other
+// runtime-managed-element literals (retain/release-per-element) are excluded here
+// (their +1/element semantics differ from the materializer path; left to a
+// separate rule). A `new Array<T>(...)` / alias / materializer initializer is not
+// a CollectionLiteralExpr, so it is not matched (those are handled elsewhere, or
+// carry their own disposal obligation).
+bool Emitter::isBorrowingArrayLiteralLocal(const ast::LocalDecl* ld) {
+    if (!ld || ld->isUsing || !ld->initializer) return false;
+    const sema::TypeRef* rt = nullptr;
+    if (ld->type) rt = ctx_.resolvedType(*ld->type);
+    if (!rt) rt = ctx_.exprType(*ld->initializer);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (builtinTypeName(rt) != "Array") return false;
+    auto* lit = dynamic_cast<const ast::CollectionLiteralExpr*>(
+        ld->initializer.get());
+    if (!lit || lit->isDict) return false;
+    // Backing-only element policy gate (same disposer the reclaim block derives):
+    // a null per-element disposer AND not a runtime-managed (string/fn) element.
+    const sema::TypeRef* el =
+        (!rt->genericArgs.empty()) ? rt->genericArgs[0] : nullptr;
+    ElementPolicy ep = elementPolicyFor(el, /*owningFamily=*/false);
+    if (ep.disposerThunk != nullptr) return false;
+    if (ep.cat == ElementPolicy::Category::RuntimeManaged) return false;
+    return true;
+}
+
+
+// #1871 / §28.9 / §28.11: collect, into `out`, every `var v: IEnumerable<T> :=
+// <arrLd>` VIEW LocalDecl in `body` — a pure declaration-less IEnumerable /
+// IOwningEnumerable local whose initializer is EXACTLY the array identifier
+// `arrLd` — that is itself proven NEVER to escape. Such a view borrows the
+// array's backing (wrapArrayAsIEnumerable) and its scope-end Dispose frees only
+// the wrapper struct (§28.11), so binding the array into it does not extend the
+// backing's lifetime past the view's scope. The array remains the sole owner of
+// its backing and reclaims it at ITS scope end (the ownership pass permits the
+// array to be used after the view's scope — it is a borrow). A view that ESCAPES
+// (returned / stored / captured / passed to an owned sink) could outlive the
+// array, so it is excluded — the binding then stays an escape and the array is
+// not reclaimed (the safe direction, a leak not a UAF).
+void Emitter::collectSafeViewAliases(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        const ast::LocalDecl* arrLd,
+        std::unordered_set<const void*>& out) {
+    std::vector<const ast::LocalDecl*> views;
+    std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            if (!ld->isUsing && ld->initializer && ld->type) {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        ld->initializer.get())) {
+                    auto* loc =
+                        dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+                    if (loc && loc->decl &&
+                        static_cast<const void*>(loc->decl) ==
+                            static_cast<const void*>(arrLd)) {
+                        const sema::TypeRef* dt = ctx_.resolvedType(*ld->type);
+                        if (dt && dt->kind == sema::TypeRef::Kind::Named &&
+                            !dt->declaration && dt->astNode && dt->astNode->name &&
+                            !dt->astNode->name->parts.empty() &&
+                            (dt->headName() == "IEnumerable" ||
+                             dt->headName() == "IOwningEnumerable"))
+                            views.push_back(ld);
+                    }
+                }
+            }
+        }
+        // Recurse into nested blocks (mirrors the collect scan above).
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scan(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scan(b.get());
+            for (auto& b : is->elseBody) scan(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scan(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scan(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scan(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scan(b.get());
+            for (auto& c : ts->catches) scan(c.body.get());
+            for (auto& b : ts->finallyBody) scan(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scan(a.get());
+        }
+    };
+    for (auto& s : body) scan(s.get());
+
+    // A view qualifies only if it never escapes. Run the escape walk in
+    // borrowingArrayMode so a for-in over the view (the common consumer) is a
+    // borrow-read; everything else (return/store/capture/owned-arg) still escapes.
+    for (const ast::LocalDecl* v : views) {
+        StringEscapeWalker w{ctx_, static_cast<const void*>(v)};
+        w.borrowingArrayMode = true;
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped) out.insert(static_cast<const void*>(v));
     }
 }
 

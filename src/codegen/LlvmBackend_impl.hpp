@@ -5862,6 +5862,21 @@ private:
     // Compute borrowingArrayFreeEligible_ for a block body (see the .cpp).
     void collectBorrowingArrayFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // #1871 / §28.9 / §28.11: true if `ld` is a plain `var xs: Array<T> := [ ... ]`
+    // (a borrowing `Array<T>` local initialised by a collection literal) whose
+    // element policy is backing-only (null per-element disposer; value or
+    // class/interface borrows). Such a literal's backing is reclaimed at scope end
+    // via a single bz_array_free(backing, null) — the §28.9 "reclaimed with the
+    // instance" mechanism. Non-const: calls elementPolicyFor.
+    bool isBorrowingArrayLiteralLocal(const ast::LocalDecl* ld);
+    // #1871 / §28.9 / §28.11: collect the `var v: IEnumerable<T> := <arrLd>` VIEW
+    // locals in `body` that are proven never to escape — a binding of the array
+    // into such a borrowing view does not extend the backing's lifetime, so it
+    // does not disqualify the array from scope-end reclaim.
+    void collectSafeViewAliases(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        const ast::LocalDecl* arrLd,
+        std::unordered_set<const void*>& out);
     // #1003: true if `ld` binds a plain `var` whose resolved type is a borrowing
     // bz_array_t-backed collection (`Array`/`Stack`/`Queue`, NOT an `Owned*`
     // family, NOT dict-backed Dictionary/Set/LinkedList) AND whose initializer is
