@@ -4003,9 +4003,12 @@ private:
     // local-decl case. It is gated on the flag because the disposal contract
     // differs by position: a RETURN value is OWNED by the caller (an owning
     // wrapper is leak-free — the four RETURN call sites pass true), whereas a
-    // callee `IEnumerable<T>` PARAMETER is BORROWED (an owning wrapper as the arg
-    // temporary would leak the drained array — the ARGUMENT site keeps the
-    // default false; the argument variant is deferred in #1916).
+    // callee `IEnumerable<T>` PARAMETER is BORROWED. #1923 handles that ARGUMENT
+    // position too: buildOrderedArgs passes true AND registers a scope-end
+    // iterEnumDispose of the owning-enumerator arg temporary (the caller disposes
+    // it exactly once, after the call, on both the normal and unwind edges — the
+    // callee never disposes a borrowed arg), so the drained array is leak-free
+    // and never double-freed.
     llvm::Value* wrapAsIEnumerableForTarget(llvm::Value* v,
                                             const sema::TypeRef* targetTy,
                                             const ast::Expr* srcExpr,

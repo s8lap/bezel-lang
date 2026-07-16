@@ -4366,7 +4366,54 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             // pure `IEnumerable<T>` is wrapped — richer interfaces keep the
             // array-backed protocol. Shared with the local-decl init and the
             // method-RETURN coercion (#1310).
-            v = wrapAsIEnumerableForTarget(v, formalTy, a.value.get());
+            //
+            // #1923 / stdlib §5 / §29.11 / §28.3: a lazy LINQ pipeline
+            // (Select/Where/… → a bz_lazy_t* sentinel, isLazyEnumerableType)
+            // passed as a pure `IEnumerable<T>` ARGUMENT — the sibling of #1911
+            // (local) and the #1916 RETURN half. The lazy vtable has only 4 slots
+            // (td/Dispose/MoveNext/Current, Current-by-pointer); the callee's
+            // for-in over the `IEnumerable<T>` param drives the §29.11 vtable and
+            // reads slot 4 (GetEnumerator) out of bounds → a garbage
+            // function-pointer call → SIGSEGV. So drain the pipeline once into a
+            // fresh owned Array<T> and wrap it in the OWNING vtable-backed
+            // enumerator (wrapAsIEnumerableForTarget with ownLazyPipeline=true).
+            //
+            // DISPOSAL CONTRACT (why this differs from the RETURN half, #1916): a
+            // callee `IEnumerable<T>` parameter is BORROWED — the callee's for-in
+            // takes the no-dispose sourceIsNamedLocal path and never disposes it,
+            // and borrow-checking (§28.3) forbids the callee from retaining it
+            // past the call. So the owning enumerator is a CALLER temporary the
+            // CALLER must dispose exactly once, after the call, on BOTH the
+            // normal-return and the exception-unwind edges — else the drained
+            // array leaks. Register it as a scope-end iterEnumDispose (the same
+            // slot-1 Dispose the local-decl #1911 source uses via
+            // registerIterableSourceDisposal): its slot-1 Dispose frees the
+            // drained array AND the enumerator frame, null-guarded, once. It is
+            // NOT unwindOnly and NOT in argTempSlots, so the pre-call discharge
+            // leaves it intact and it fires at scope end on the normal edge; a
+            // LATER argument (or the callee) that throws unwinds through this
+            // scope and fires it on the exception edge. Either way: exactly once,
+            // no double-free (the callee never disposes a borrowed arg), no leak.
+            // Mirrors the #1019 borrow-parameter `new T(...)` arg-temporary
+            // disposal already registered below.
+            bool lazyArgWrapped =
+                formalTy &&
+                formalTy->kind == sema::TypeRef::Kind::Named &&
+                !formalTy->declaration && formalTy->astNode &&
+                formalTy->astNode->name &&
+                !formalTy->astNode->name->parts.empty() &&
+                formalTy->headName() == "IEnumerable" &&
+                isLazyEnumerableType(ctx_.exprType(*a.value));
+            v = wrapAsIEnumerableForTarget(v, formalTy, a.value.get(),
+                                           /*ownLazyPipeline=*/lazyArgWrapped);
+            if (lazyArgWrapped && v && v->getType()->isPointerTy() &&
+                !disposeStack_.empty()) {
+                llvm::AllocaInst* eslot = entryAlloca(v->getType());
+                builder_.CreateStore(v, eslot);
+                Disposal d{eslot, nullptr};
+                d.iterEnumDispose = true;  // slot-1 Dispose: free drained array + frame
+                disposeStack_.back().push_back(d);
+            }
             // §9 / §9.1 (#1759): passing `this` of a record method by value —
             // `this` lowered to the receiver POINTER (CG29 / §9.2), but a
             // by-value record parameter expects the record STRUCT. Load the
