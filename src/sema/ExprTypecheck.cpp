@@ -3688,10 +3688,14 @@ static bool extensionTargetMatchesReceiver(
 // This lets extensionTargetMatchesReceiverOrBase BFS the conceptual interface
 // hierarchy without requiring real TypeDecl nodes.
 //
-// The hierarchy (per stdlib §4.4/§4.5):
+// The hierarchy (per stdlib §4.1–§4.12):
 //   Array<T>      : IList<T>
 //   OwningArray<T> : IOwningList<T>
-//   Stack<T>      : IReadOnlyCollection<T> (conservative; full chain when needed)
+//   Set<T>        : ICollection<T>            // mutating borrowing collection
+//   LinkedList<T> : ICollection<T>            // mutating borrowing collection
+//   Stack<T>      : IReadOnlyCollection<T>    // read-only chain only (v0.165)
+//   Queue<T>      : IReadOnlyCollection<T>
+//   SortedSet<T>  : IReadOnlyCollection<T>
 //   IList<T>      : IReadOnlyList<T>, ICollection<T>
 //   IOwningList<T> : IReadOnlyList<T>, IOwningCollection<T>
 //   IReadOnlyList<T>       : IReadOnlyCollection<T>
@@ -3699,6 +3703,14 @@ static bool extensionTargetMatchesReceiver(
 //   IOwningCollection<T>    : IReadOnlyCollection<T>
 //   IReadOnlyCollection<T> : IEnumerable<T>
 //   IEnumerable<T>         : (root)
+// The concrete borrowing collections above each implement exactly one collection
+// interface (transitively closed here to the full read-only chain), so their
+// complete generic-interface set is captured — this is what
+// builtinBorrowingCollectionFullyModeled relies on to let the top-level variance
+// check REJECT a proven non-subtype instead of conservatively accepting (#1851).
+// The owning concretes (Owning*) map to IReadOnlyCollection conservatively (their
+// owning graph — IOwningEnumerable etc. — is not modeled), so they are NOT
+// treated as fully modeled and retain conservative-accept.
 //
 // Only arity-1 types are covered here; types without standard covariant element
 // chains (e.g. Dictionary<K,V>) are not in scope for this helper.
@@ -3732,10 +3744,18 @@ static std::vector<const TypeRef*> builtinInterfaceAncestors(
         ancestors.push_back(makeBuiltin("IList", {T}));
     else if (name == "OwningArray")
         ancestors.push_back(makeBuiltin("IOwningList", {T}));
+    else if (name == "Set" || name == "LinkedList")
+        // #1851: Set<T> and LinkedList<T> implement ICollection<T> (mutating
+        // borrowing collections, stdlib §4.6/§4.9), not merely
+        // IReadOnlyCollection<T>. The read-only chain stays reachable
+        // transitively (ICollection → IReadOnlyCollection → IEnumerable).
+        ancestors.push_back(makeBuiltin("ICollection", {T}));
     else if (name == "Stack" || name == "OwningStack" ||
              name == "Queue" || name == "OwningQueue" ||
-             name == "Set"   || name == "OwningSet" ||
-             name == "LinkedList" || name == "OwningLinkedList")
+             name == "OwningSet" || name == "SortedSet" ||
+             name == "OwningLinkedList")
+        // Stack/Queue/SortedSet conform only to the read-only chain (v0.165,
+        // #1354). The Owning* concretes map here conservatively (see header).
         ancestors.push_back(makeBuiltin("IReadOnlyCollection", {T}));
     else if (name == "IList")
         ancestors.push_back(makeBuiltin("IReadOnlyList", {T})),
@@ -3785,6 +3805,29 @@ static std::vector<const TypeRef*> builtinInterfaceAncestorsOf(
     if (name.empty()) return {};
     return builtinInterfaceAncestors(name,
         const_cast<std::vector<TypeRef*>&>(recv->genericArgs), owned);
+}
+
+// §5.1/§12.9 (#1851): the arity-1 BORROWING-collection builtin generics whose
+// COMPLETE generic-interface set is captured by builtinInterfaceAncestors above
+// — the concrete borrowing collections (each implements exactly one collection
+// interface, transitively closed to the read-only chain) and the borrowing
+// collection interfaces themselves. For a `from` in this set, the both-builtin
+// variance search finding no candidate for `to` is PROOF that `from` does not
+// conform to `to` (not merely an unmodeled gap), so the top-level assignability
+// check may soundly REJECT rather than conservatively accept — e.g. `Stack<Dog>`
+// is not assignable to the unrelated sibling `IList<Dog>`.
+//
+// Deliberately EXCLUDED (retain conservative-accept): the owning family
+// (Owning*, IOwning*) whose owning graph — IOwningEnumerable, IOwningEnumerator
+// — is not modeled here, and the arity-2 maps (Dictionary, SortedDictionary)
+// whose element interface carries DictionaryEntry rather than the receiver's own
+// arg. Those non-conformances remain a residual (tracked separately).
+static bool builtinBorrowingCollectionFullyModeled(std::string_view name) {
+    return name == "Array" || name == "LinkedList" || name == "Set" ||
+           name == "Stack" || name == "Queue" || name == "SortedSet" ||
+           name == "IList" || name == "ICollection" ||
+           name == "IReadOnlyList" || name == "IReadOnlyCollection" ||
+           name == "IEnumerable";
 }
 
 // ---------------------------------------------------------------------------
@@ -3970,6 +4013,18 @@ static bool variantGenericAssignable(
                         break;
                     }
                 }
+                // §5.1/§12.9 (#1851): both `from` and `to` are builtin generics.
+                // When `from` is a fully-modeled borrowing collection, a null
+                // candidate is PROOF `to`'s base is not an ancestor of `from` —
+                // `from` does not conform to `to` — so REJECT. The prior
+                // fall-through to conservative-accept below was unsound at this
+                // top level (no separate base relation is established for two
+                // builtins), letting `Stack<Dog>` pass as `IList<Dog>`. Types
+                // outside the modeled family (owning collections, arity-2 maps)
+                // are not proven non-conforming here and keep conservative-accept.
+                if (!candidate &&
+                    builtinBorrowingCollectionFullyModeled(fromName))
+                    return false;
             }
         }
         // `from` has a user declaration: user-declared → builtin is a residual
