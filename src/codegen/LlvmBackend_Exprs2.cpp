@@ -6445,11 +6445,41 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         if (scrut->getType()->isPointerTy()) {
             auto dit = descArray_.find(recTy);
             if (dit == descArray_.end()) return builder_.getInt1(false);
+            // #1949 / §19.3/§19.5: gate the is-a on the scrutinee being
+            // OBJECT-LIKE, mirroring the bare-type-name NamedPattern path above
+            // (see the `objectLike` gate before its emitStringGuardedIsA). A
+            // record destructuring can only match a boxed record inside a
+            // reference — an `Object`/interface (or a class instance, which is-a
+            // then correctly rejects). A scrutinee whose STATIC type is a
+            // vtable-less runtime reference like `string` reaches this branch as
+            // a pointer (a `bz_string*`) too, but is never a record: with only
+            // the #1938 `mayBeString` guard (false for a statically string-typed
+            // scrutinee) it fell through to a plain emitIsA that walked the
+            // string's `char* data` as a descriptor and FAULTED (SIGSEGV). A
+            // string (or any non-object-like reference) can never be a record —
+            // decide it statically. Cannot early-return getInt1(false) as the
+            // NamedPattern path does: a destructuring arm body (`Pt(a,b) => a+b`)
+            // references the bound names, which are registered as local slots by
+            // the unbox block below; skipping it leaves `a`/`b` unresolved and
+            // `case.end` without a terminator. Instead force the is-a to a
+            // compile-time false so the unbox block is emitted (binding the
+            // slots so the arm body still lowers) but is statically dead — the
+            // faulting GEP/load is never reached at run time.
+            bool objectLike = !scrutTy ||
+                (scrutTy->kind == sema::TypeRef::Kind::Named &&
+                 scrutTy->declaration &&
+                 (scrutTy->declaration->kind == ast::TypeDeclKind::Class ||
+                  scrutTy->declaration->kind == ast::TypeDeclKind::Interface)) ||
+                (scrutTy->kind == sema::TypeRef::Kind::Primitive &&
+                 scrutTy->primitive == sema::PrimitiveType::Object) ||
+                isBuiltinExceptionTypeRef(scrutTy);
             // isA check — the guarded is-a leaves the builder at its join block,
             // like emitIsA leaves it at isa.end. #1938 / §19.3: an `Object`
             // holding a string would fault emitIsA walking the box descriptor;
             // guard it so `case o of Rec(...)` over a string cleanly no-matches.
-            llvm::Value* isA = emitStringGuardedIsA(scrut, dit->second, scrutTy);
+            llvm::Value* isA = objectLike
+                ? emitStringGuardedIsA(scrut, dit->second, scrutTy)
+                : builder_.getInt1(false);
             llvm::BasicBlock* afterIsaBB = builder_.GetInsertBlock();
             auto* unboxBB =
                 llvm::BasicBlock::Create(llvm_, "destr.unbox", currentFn_);
