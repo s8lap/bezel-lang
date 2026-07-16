@@ -5285,6 +5285,47 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
 }
 
 
+// §19.3/§19.5 (#1938): a class/interface/exception type-test lowers to emitIsA,
+// which loads obj[0] and dereferences it as a type descriptor. When an `Object`
+// (or interface reference) scrutinee actually holds a vtable-less `bz_string*`,
+// obj[0] is the string's `char* data`, not a descriptor — walking it faults
+// (SIGSEGV). Guard the is-a: when the static scrutinee type COULD hold a runtime
+// string (`Object` or an interface), first ask bz_obj_is_string and short-
+// circuit a string to a clean never-match (a string is never a class/interface/
+// exception); otherwise emit the plain is-a. This mirrors the guard
+// emitTypeParamPatternTest::guardedIsA already applies for the type-PARAMETER
+// pattern form (#1852) — the concrete and type-parameter paths stay consistent.
+// The guard is a no-op for a statically class/interface/exception-typed
+// scrutinee (mayBeString false), so it never disturbs class/exception dispatch.
+llvm::Value* Emitter::emitStringGuardedIsA(llvm::Value* scrut,
+                                           llvm::GlobalVariable* desc,
+                                           const sema::TypeRef* scrutTy) {
+    bool mayBeString =
+        !scrutTy ||
+        (scrutTy->kind == sema::TypeRef::Kind::Primitive &&
+         scrutTy->primitive == sema::PrimitiveType::Object) ||
+        (scrutTy->kind == sema::TypeRef::Kind::Named && scrutTy->declaration &&
+         scrutTy->declaration->kind == ast::TypeDeclKind::Interface);
+    if (!mayBeString) return emitIsA(scrut, desc);
+    llvm::BasicBlock* preBB = builder_.GetInsertBlock();
+    auto* isStrFn = declareC("bz_obj_is_string", i32(), {ptrTy(), ptrTy()});
+    llvm::Value* isStr = builder_.CreateICmpNE(
+        builder_.CreateCall(isStrFn, {scrut, vtableTablePtr()}),
+        builder_.getInt32(0));
+    auto* doIsaBB = llvm::BasicBlock::Create(llvm_, "pm.isa", currentFn_);
+    auto* joinBB = llvm::BasicBlock::Create(llvm_, "pm.isa.join", currentFn_);
+    builder_.CreateCondBr(isStr, joinBB, doIsaBB);
+    builder_.SetInsertPoint(doIsaBB);
+    llvm::Value* isa = emitIsA(scrut, desc);
+    llvm::BasicBlock* isaEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(joinBB);
+    builder_.SetInsertPoint(joinBB);
+    auto* phi = builder_.CreatePHI(i1(), 2);
+    phi->addIncoming(builder_.getInt1(false), preBB);
+    phi->addIncoming(isa, isaEnd);
+    return phi;
+}
+
 llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut,
                             const sema::TypeSymbol* enumTy,
                             bool isStr,
@@ -5786,7 +5827,11 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 isBuiltinExceptionTypeRef(scrutTy);
             if (!scrut->getType()->isPointerTy() || !objectLike)
                 return builder_.getInt1(false);
-            return emitIsA(scrut, desc);
+            // #1938 / §19.3: an `Object`/interface scrutinee holding a string
+            // would fault emitIsA (a string is a vtable-less bz_string*); guard
+            // it to a clean never-match. No-op for a class/interface-typed
+            // scrutinee. Consistent with the type-parameter path (#1852).
+            return emitStringGuardedIsA(scrut, desc, scrutTy);
         }
         // §19.5 (#1206): a bare type-name pattern whose name resolves to a
         // RECORD or ENUM — a sealed value type with no subtyping — is
@@ -6102,7 +6147,8 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                     scrut->getType()->isPointerTy()) {
                     if (llvm::GlobalVariable* desc =
                             descriptorForPatternName(bp->type->name.get()))
-                        return emitIsA(scrut, desc);
+                        // #1938: string-in-Object guard (see emitStringGuardedIsA)
+                        return emitStringGuardedIsA(scrut, desc, scrutTy);
                 }
                 if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration) {
                     // §9.6 / §10: a RECORD or ENUM is a sealed VALUE type with no
@@ -6130,17 +6176,21 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                     // the per-monomorphization descriptor, so it matches only the
                     // named instantiation — a `Tagged<string>` value does not match
                     // the `Tagged<int>` arm.
+                    // #1938: each class/interface is-a below guards a string-in-
+                    // Object scrutinee (see emitStringGuardedIsA) — a `var x: C`
+                    // typed binding shares the concrete-name fault the bare
+                    // `case o of C` NamedPattern above had.
                     if (llvm::GlobalVariable* pid =
                             perInstDescriptorForTarget(rt))
-                        return emitIsA(scrut, pid);
+                        return emitStringGuardedIsA(scrut, pid, scrutTy);
                     auto dit = descArray_.find(rt->declaration);
                     if (dit != descArray_.end())
-                        return emitIsA(scrut, dit->second);
+                        return emitStringGuardedIsA(scrut, dit->second, scrutTy);
                     // #473: a named class with no descArray_ entry can still
                     // be resolved by name (mirrors the bare-NamedPattern path).
                     if (llvm::GlobalVariable* desc =
                             descriptorForPatternName(bp->type->name.get()))
-                        return emitIsA(scrut, desc);
+                        return emitStringGuardedIsA(scrut, desc, scrutTy);
                 }
                 // #473 / §19.3: `var v: P` where P is a primitive type. When
                 // the scrutinee's static type already IS that primitive (the
@@ -6328,8 +6378,11 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         if (scrut->getType()->isPointerTy()) {
             auto dit = descArray_.find(recTy);
             if (dit == descArray_.end()) return builder_.getInt1(false);
-            // isA check — emitIsA leaves builder insert point at isa.end.
-            llvm::Value* isA = emitIsA(scrut, dit->second);
+            // isA check — the guarded is-a leaves the builder at its join block,
+            // like emitIsA leaves it at isa.end. #1938 / §19.3: an `Object`
+            // holding a string would fault emitIsA walking the box descriptor;
+            // guard it so `case o of Rec(...)` over a string cleanly no-matches.
+            llvm::Value* isA = emitStringGuardedIsA(scrut, dit->second, scrutTy);
             llvm::BasicBlock* afterIsaBB = builder_.GetInsertBlock();
             auto* unboxBB =
                 llvm::BasicBlock::Create(llvm_, "destr.unbox", currentFn_);

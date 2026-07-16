@@ -3588,6 +3588,19 @@ private:
                                           llvm::Value* scrut,
                                           const sema::TypeRef* scrutTy);
 
+    // §19.3/§19.5 (#1938): emit a runtime is-a of `scrut` against `desc`, but
+    // short-circuit a runtime bz_string* scrutinee to a clean never-match BEFORE
+    // emitIsA when the scrutinee's static type could hold one (`Object` or an
+    // interface). emitIsA loads obj[0] as a descriptor and dereferences it; a
+    // string's word 0 is `char* data`, not a descriptor, so the walk faults
+    // (SIGSEGV). A string is never a class/interface/exception, so no-match is
+    // the correct result. This is the concrete-type-name analogue of the guard
+    // emitTypeParamPatternTest::guardedIsA applies for the type-PARAMETER form
+    // (#1852) — the two paths must stay consistent.
+    llvm::Value* emitStringGuardedIsA(llvm::Value* scrut,
+                                      llvm::GlobalVariable* desc,
+                                      const sema::TypeRef* scrutTy);
+
     // §31.4 (v0.162/v0.163) built-in exception object layout. A directly-
     // constructed built-in exception (rt->declaration == null) is a single
     // calloc'd block whose slots are, at these fixed byte offsets:
