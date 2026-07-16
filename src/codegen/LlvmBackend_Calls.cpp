@@ -7672,6 +7672,33 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             auto* fafFn = declareC("bz_task_fire_and_forget",
                                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(fafFn, {task});
+            // §30.10 / §28.3 (#1890): the `owned` parameter transfers ownership
+            // of the task to the runtime, which fires-and-forgets it here. When
+            // the argument is a NAMED owned task local (`Task.FireAndForget(owned
+            // t)` — the §22.3 spelling — or the `move t` form), that local also
+            // carries a scope-end `d.task` fire-and-forget (#445: a plain `var t
+            // := M();` task local is freed at scope end). Leaving the slot
+            // non-null would fire-and-forget the SAME task twice — a double
+            // completion-continuation registration / double bz_task_free that
+            // corrupts async state and hangs. Null the source slot now (mirroring
+            // the `move`-of-using-var nulling in lowerUnary and the async-return
+            // task-transfer nulling in lowerReturn) so the null-guarded scope-end
+            // disposal reloads null and skips. The fresh-producer form
+            // (`Task.FireAndForget(M())`) has no named slot and is unaffected.
+            const ast::Expr* av = call.args[0].value.get();
+            if (auto* un = dynamic_cast<const ast::UnaryExpr*>(av))
+                if (un->op == "move" && un->operand) av = un->operand.get();
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(av)) {
+                if (dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id))) {
+                    if (llvm::AllocaInst* slotAI = localSlot(*id)) {
+                        llvm::Type* ety = nullptr;
+                        llvm::Value* addr = boxedStorage(slotAI, ety);
+                        if (ety && ety->isPointerTy())
+                            builder_.CreateStore(
+                                llvm::ConstantPointerNull::get(ptrTy()), addr);
+                    }
+                }
+            }
             return nullptr;  // unit
         }
     }

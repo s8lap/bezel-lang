@@ -602,6 +602,58 @@ BEZEL_TEST(task_combinators_6_7, fire_and_forget_delay_task_cross_thread) {
     if (lsan != -1) BEZEL_EXPECT_EQ(lsan, 0);
 }
 
+// §30.10 / §22.3 / §28.3 (#1890): Task.FireAndForget(owned t) on a NAMED owned
+// task local. stdlib §6.7 declares `FireAndForget(owned task: Task)` and §22.3
+// (v0.169) requires the `owned` call-site marker when a named owned binding is
+// passed to an `owned` parameter — so `Task.FireAndForget(owned t)` is the
+// mandated spelling for supervised fire-and-forget of a HELD task. Before the
+// fix the owned parameter was not modeled as an owned sink, so the marker was
+// spuriously rejected AND (unmarked) the task was left undischarged; even once
+// the ownership pass accepted it, codegen fire-and-forgot the same task twice
+// (the call here + the plain-`var` task local's scope-end #445 d.task disposal),
+// a double bz_task_free that corrupts async state and hangs. This test fails
+// without BOTH fixes (compile error → compileAndRun returns -1; or a hang) and
+// passes with them: the task is fired-and-forgotten exactly once, LSan-clean.
+BEZEL_TEST(task_combinators_6_7, fire_and_forget_owned_named_task_local_1890) {
+    const std::string src =
+        "module M; class C "
+        "  public static async method Ping(): Task "
+        "    await Task.Delay(1); "
+        "  end Ping; "
+        "  public static async method Main(): Task<int> "
+        "    var t := Ping(); "
+        "    Task.FireAndForget(owned t); "
+        "    return 7; "
+        "  end Main; end C;";
+    for (int i = 0; i < 3; ++i)
+        BEZEL_EXPECT_EQ(compileAndRun(src), 7);
+    int lsan = runUnderLeakSanitizer(src);
+    if (lsan != -1) BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// §30.10 / §28.3 (#1890): the same held-task fire-and-forget with a subsequent
+// suspension point (`await Task.Delay` after the FireAndForget). Exercises the
+// double-fire hang directly: the nulled `t` slot lives in the async frame and
+// its scope-end d.task disposal (which runs after the resume) must reload null
+// and skip. Before the codegen fix this hung at scheduler shutdown.
+BEZEL_TEST(task_combinators_6_7, fire_and_forget_owned_named_task_then_await_1890) {
+    const std::string src =
+        "module M; class C "
+        "  public static async method Ping(): Task "
+        "    await Task.Delay(1); "
+        "  end Ping; "
+        "  public static async method Main(): Task<int> "
+        "    var t := Ping(); "
+        "    Task.FireAndForget(owned t); "
+        "    await Task.Delay(2); "
+        "    return 8; "
+        "  end Main; end C;";
+    for (int i = 0; i < 3; ++i)
+        BEZEL_EXPECT_EQ(compileAndRun(src), 8);
+    int lsan = runUnderLeakSanitizer(src);
+    if (lsan != -1) BEZEL_EXPECT_EQ(lsan, 0);
+}
+
 // ============================================================
 // §30.5 / stdlib §6.7: using-var Task disposal
 // ============================================================

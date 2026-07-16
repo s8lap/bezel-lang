@@ -294,3 +294,74 @@ BEZEL_TEST(owned_marker, marked_transfer_disposes_once_value) {
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
+
+// ---------------------------------------------------------------------------
+// §30.10 / §22.3 (#1890): Task.FireAndForget(owned task: Task) is a builtin
+// owned sink. A NAMED owned task local passed as `owned t` is the mandated
+// §22.3 spelling; the unmarked form is a missing-marker error, not the pre-fix
+// "would be dropped without disposal" one. A common async-producer helper.
+// ---------------------------------------------------------------------------
+
+// A module whose Main holds a named owned task local `t := Ping()` (an async
+// call produces an owned Task, spec §5840). `body` is the FireAndForget call.
+static std::string fafMod(const std::string& call) {
+    return std::string(
+        "module M; class C "
+        "  public static async method Ping(): Task "
+        "    await Task.Delay(1); "
+        "  end Ping; "
+        "  public static async method Main(): Task<int> "
+        "    var t := Ping(); ") + call + " "
+        "    return 0; "
+        "  end Main; end C;";
+}
+
+// ACCEPT: `Task.FireAndForget(owned t)` on a named owned task local — the §22.3
+// mandated spelling. Before the fix the `owned` marker was spuriously rejected
+// ("only valid on an argument to an `owned` parameter") because FireAndForget's
+// owned parameter was not modeled as an owned sink.
+BEZEL_TEST(owned_marker, fire_and_forget_owned_named_task_accepted_1890) {
+    auto r = parseAndCheckOwnership(fafMod("Task.FireAndForget(owned t);"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// REJECT: `Task.FireAndForget(t)` unmarked — a named owned binding to an owned
+// parameter REQUIRES the marker (§22.3). The error must be the missing-marker
+// one naming the fix, not the pre-fix undischarged "would be dropped" error.
+BEZEL_TEST(owned_marker, fire_and_forget_unmarked_named_task_missing_marker_1890) {
+    auto r = parseAndCheckOwnership(fafMod("Task.FireAndForget(t);"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(errorSays(r, "this call consumes `t`"));
+    BEZEL_EXPECT_TRUE(errorSays(r, "write `M(owned t)`"));
+}
+
+// ACCEPT: the fresh-producer form `Task.FireAndForget(Ping())` stays UNMARKED —
+// no live binding is invalidated, so the marker must not be required (§22.3).
+BEZEL_TEST(owned_marker, fire_and_forget_fresh_producer_unmarked_accepted_1890) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public static async method Ping(): Task "
+        "    await Task.Delay(1); "
+        "  end Ping; "
+        "  public static async method Main(): Task<int> "
+        "    Task.FireAndForget(Ping()); "
+        "    return 0; "
+        "  end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// REJECT: the marker on the fresh-producer form `Task.FireAndForget(owned
+// Ping())` is spurious — no named binding is left moved-from (§22.3).
+BEZEL_TEST(owned_marker, fire_and_forget_marker_on_fresh_producer_rejected_1890) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public static async method Ping(): Task "
+        "    await Task.Delay(1); "
+        "  end Ping; "
+        "  public static async method Main(): Task<int> "
+        "    Task.FireAndForget(owned Ping()); "
+        "    return 0; "
+        "  end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(errorSays(r, "fresh producer"));
+}

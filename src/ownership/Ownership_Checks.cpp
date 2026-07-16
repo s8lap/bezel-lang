@@ -4210,6 +4210,18 @@ bool MethodOwnership::builtinOwnedSinkArg(const ast::Expr* callee,
         // whose identifier carries no exprType, so match it syntactically.
         if (tid->name == "Task" && ma->member == "WhenAllOwned")
             return argPos == 0;
+        // stdlib §6.7 / §30.10 (#1890): Task.FireAndForget(owned task: Task)
+        // relinquishes ownership of the task to the runtime, which supervises it
+        // and disposes it on completion. The owned-arg position (0) is an owned
+        // sink: passing a NAMED owned task binding (`Task.FireAndForget(owned t)`)
+        // discharges its §28.3 disposal obligation and leaves it moved-from,
+        // exactly as the fresh-producer form `Task.FireAndForget(Ping())` already
+        // consumes its temporary. Without this, the §22.3 (v0.169) marker check
+        // saw a non-owned position and spuriously rejected `owned t`, while the
+        // unmarked form left `t` undischarged. `Task` is a static builtin whose
+        // identifier carries no exprType, so match it syntactically.
+        if (tid->name == "Task" && ma->member == "FireAndForget")
+            return argPos == 0;
     }
     const sema::TypeRef* tt = ctx_.exprType(*ma->target);
     // Built-in collections resolve to a Named TypeRef with a null declaration
