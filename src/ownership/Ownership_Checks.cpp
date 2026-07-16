@@ -2793,7 +2793,17 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
                           m == "AddFirst" || m == "AddLast" ||
                           m == "AddBefore" || m == "AddAfter" ||
                           m == "Push" || m == "Enqueue";
-    if (!storing) return;
+    // §28.11 (#1886): `AddRange` is a BULK store — it copies every element of
+    // its argument collection into the receiver, so an element borrow whose
+    // source does not outlive the receiver escapes exactly as a single `.Add`
+    // of that borrow would. It was absent from the `storing` set above, so the
+    // borrow of a scope-bound local collection entering an escaping collection
+    // through it was never checked. Distinguished from the element-store
+    // methods because its argument is a COLLECTION, not a single element: the
+    // element-type gate below applies only to it (a value-typed element carries
+    // no borrow, so copying it out is not an escape). // per §28.11
+    const bool bulkStoring = m == "AddRange";
+    if (!storing && !bulkStoring) return;
 
     // Built-in collections resolve to a Named TypeRef with a NULL declaration
     // carrying the class name on the AST node / import metadata (cf.
@@ -2810,6 +2820,21 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
         cn == "Array" || cn == "Dictionary" || cn == "SortedDictionary" ||
         cn == "Set" || cn == "Stack" || cn == "Queue" || cn == "LinkedList";
     if (!borrowingFamily) return;
+
+    // §28.11 (#1886): the bulk `AddRange` argument is an IEnumerable<T>, not a
+    // single element, so its scope-bound-local nature is only an escape when the
+    // element type T is borrow-bearing (a class/interface reference). A value-,
+    // string-, or record-typed element is COPIED into the receiver (no borrow),
+    // so `field.AddRange(localValueArray)` is legal and must not be flagged. The
+    // element type is the receiver's first generic argument (`Array<T>` /
+    // `LinkedList<T>` are the borrowing families defining AddRange, stdlib §4).
+    // isBorrowableType is conservative (unknown → borrowable), so an unresolved
+    // element type still fires — a sound over-approximation. // per §28.11
+    if (bulkStoring) {
+        const sema::TypeRef* elemT =
+            !tt->genericArgs.empty() ? tt->genericArgs[0] : nullptr;
+        if (!isBorrowableType(elemT)) return;
+    }
 
     enum class RecvKind { Unknown, Escapes, Local };
     RecvKind kind = RecvKind::Unknown;
@@ -2881,11 +2906,41 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
             }
         }
 
-        // ownedLocalBorrowSource restricts to a scope-bound owned LOCAL
-        // source, excluding parameters — a plain borrow read of `src` here
-        // (not a `move`d/owned transfer, which recordMovesIn has already
-        // resolved to MovedFrom before this pass runs).
-        sema::Symbol* src = ownedLocalBorrowSource(*a.value);
+        // For an ELEMENT store (`Add`/`Insert`/…), the argument IS the borrow:
+        // ownedLocalBorrowSource restricts to a scope-bound owned LOCAL source,
+        // excluding parameters — a plain borrow read of `src` here (not a
+        // `move`d/owned transfer, which recordMovesIn has already resolved to
+        // MovedFrom before this pass runs).
+        //
+        // §28.11 (#1886): for the BULK `AddRange`, the argument is a COLLECTION,
+        // not a single element. A built-in collection type is not "borrowable"
+        // per borrowSourceForExpr's borrow-vs-copy gate, so ownedLocalBorrowSource
+        // never sees it — detect the owned scope-bound LOCAL collection directly:
+        // its element borrows are copied into the escaping receiver and outlive
+        // its scope, the same escape as an `.Add` of one of them.
+        //
+        // Restricted to a LocalSymbol, EXCLUDING parameters — the exact same
+        // distinction ownedLocalBorrowSource draws (it rejects any non-LocalSymbol
+        // source). `isOwnedTrackedLocal` alone is NOT enough: run() seeds
+        // `owned`/`out owned` PARAMETERS into `states_` as Owned, so it is true
+        // for them too. An owned parameter's source outlives the method (the
+        // caller supplied it), so `_all.AddRange(items)` with `items: owned
+        // Array<Res>` is admitted, exactly as the plain-parameter and field cases
+        // are (§28.11: parameter-, receiver-, and field-sourced borrows are
+        // admitted) and exactly as the `.Add` element-store path (ownedLocalBorrow-
+        // Source) admits every parameter. The element-type gate above already
+        // excluded a value-typed (borrow-free) element collection. // per §28.11
+        sema::Symbol* src = nullptr;
+        if (bulkStoring) {
+            if (const auto* aid =
+                    dynamic_cast<const ast::IdentifierExpr*>(a.value.get()))
+                if (sema::Symbol* asym = ctx_.exprSymbol(*aid))
+                    if (isOwnedTrackedLocal(asym) &&
+                        dynamic_cast<sema::LocalSymbol*>(asym))
+                        src = asym;
+        } else {
+            src = ownedLocalBorrowSource(*a.value);
+        }
         if (!src) continue;
         bool reject = false;
         if (kind == RecvKind::Escapes) {
@@ -2915,6 +2970,109 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
             "collection and transfer ownership with `Add(owned item)` "
             "instead)");
     }
+}
+
+// §28.11 "Storing a borrow" (v0.180; hole closed #1884). §28.11 lists the store
+// operations of a borrowing collection together — "store (`Add`, `Insert`,
+// indexer-set)" — so the indexer-set sink `coll[i] := value` is a borrow store
+// exactly like `.Add(value)`. checkBorrowStoreEscape's Dest classification only
+// recognises MemberAccess/bare-field/out-param/outer-local ASSIGNMENT targets,
+// and checkCollectionBorrowStoreEscape only recognises the storing-method CALLS
+// — neither classified the `coll[i] := local` IndexExpr assignment target, so a
+// borrow of a scope-bound owned local stored through it into an escaping
+// collection was silently accepted (use-after-free). This mirrors
+// checkCollectionBorrowStoreEscape's receiver classification, applied to the
+// indexer target's collection. Owning-collection / inline-array indexer sets
+// TAKE owned (the §28.11 owning-slot path in handleAssignment) — a transfer, not
+// a borrow store — and are excluded. Returns true when it reported. // per §28.11
+bool MethodOwnership::checkIndexerSetBorrowStoreEscape(
+    const ast::AssignmentStmt& as) {
+    if (as.op != ":=" || !as.target || !as.value) return false;
+    const auto* ix = dynamic_cast<const ast::IndexExpr*>(as.target.get());
+    if (!ix || !ix->target) return false;
+    // Owning-collection / inline-array slot: indexer-set takes owned (handled by
+    // handleAssignment's owning-slot path) — a transfer, not a borrow store.
+    if (indexerSetterTakesOwned(*as.target) ||
+        targetIsOwningInlineArraySlot(*as.target))
+        return false;
+    // Built-in borrowing collections resolve to a Named TypeRef with a NULL
+    // declaration (a user type's own indexer carries its own §28.14 rules, not
+    // this collection-specific one); owning collections are excluded above.
+    const sema::TypeRef* tt = ctx_.exprType(*ix->target);
+    if (!tt || tt->kind != sema::TypeRef::Kind::Named || tt->declaration)
+        return false;
+    const std::string_view cn = tt->headName();
+    const bool borrowingFamily =
+        cn == "Array" || cn == "Dictionary" || cn == "SortedDictionary" ||
+        cn == "Set" || cn == "Stack" || cn == "Queue" || cn == "LinkedList";
+    if (!borrowingFamily) return false;
+
+    // Classify the collection root exactly as checkCollectionBorrowStoreEscape
+    // classifies a storing-method receiver: `Escapes` = every root that provably
+    // outlives this method (`this`/`base`, a field, a parameter, or a chain
+    // reachable through a field); `Local` defers to the declaring-block depth
+    // comparison. An unrooted/complex root is conservatively left unclassified.
+    enum class RecvKind { Unknown, Escapes, Local };
+    RecvKind kind = RecvKind::Unknown;
+    sema::LocalSymbol* recvLocal = nullptr;
+    const ast::IdentifierExpr* recvRoot = identifierRoot(*ix->target);
+    if (const auto* rid =
+            dynamic_cast<const ast::IdentifierExpr*>(ix->target.get())) {
+        if (rid->name == "this" || rid->name == "base") {
+            kind = RecvKind::Escapes;
+        } else if (sema::Symbol* sym = ctx_.exprSymbol(*rid)) {
+            if (dynamic_cast<sema::FieldSymbol*>(sym) ||
+                dynamic_cast<sema::ParameterSymbol*>(sym)) {
+                kind = RecvKind::Escapes;
+            } else if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                kind = RecvKind::Local;
+                recvLocal = ls;
+            }
+        }
+    } else if (dynamic_cast<const ast::MemberAccessExpr*>(ix->target.get()) ||
+               dynamic_cast<const ast::NullCondMemberExpr*>(ix->target.get())) {
+        kind = RecvKind::Escapes;
+    }
+    if (kind == RecvKind::Unknown) return false;
+
+    // ownedLocalBorrowSource restricts to a scope-bound owned LOCAL source
+    // (excluding parameters, which outlive the method — the admitted "borrow in,
+    // borrow out" pattern); a `move`d source is already MovedFrom before this
+    // pass runs and so is correctly not seen as a live borrow.
+    sema::Symbol* src = ownedLocalBorrowSource(*as.value);
+    if (!src) return false;
+    bool reject = false;
+    if (kind == RecvKind::Escapes) {
+        reject = true;
+    } else if (recvLocal) {
+        auto depthOf = [&](const ast::Node* declNode) -> int {
+            auto it = localDepth_.find(declNode);
+            return it == localDepth_.end() ? -1 : it->second;
+        };
+        int cd = recvLocal->decl ? depthOf(recvLocal->decl) : -1;
+        int sd = src->decl ? depthOf(src->decl) : -1;
+        reject = (cd >= 0 && sd >= 0 && cd < sd);
+    }
+    if (!reject) return false;
+    const std::string recvName =
+        recvRoot ? std::string(recvRoot->name) : std::string("it");
+    report(
+        Severity::Error, as.value->span.begin,
+        std::string("borrow of `") + std::string(src->name) +
+        "` stored into `" + recvName +
+        "[...]` would outlive its source — `" + std::string(src->name) +
+        "` is an owned scope-bound local disposed at the end of its block, "
+        "and `" + recvName +
+        (kind == RecvKind::Escapes
+             ? "` is reachable beyond this method's scope (the receiver, a "
+               "field, or a parameter)"
+             : "` lives in an enclosing scope") +
+        ", which outlives it (§28.11 borrowing-collection store rule — the "
+        "indexer-set `coll[i] := value` is a store operation exactly like "
+        "`.Add`; keep `" + std::string(src->name) + "` alive at least as long "
+        "as `" + recvName + "`, or store into an owning-family collection and "
+        "transfer ownership with `coll[i] := move item` instead)");
+    return true;
 }
 
 const ast::IdentifierExpr* MethodOwnership::identifierRoot(const ast::Expr& e) {

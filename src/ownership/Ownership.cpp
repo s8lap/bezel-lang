@@ -799,6 +799,11 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // a;` exactly as the block-body `return a;` form is rejected. A no-op
     // when `isStatic` is false. // per §28.3
     checkStaticBorrowReturn(exprBody);
+    // §28.3 (v0.196, #1885): the `=>` sibling of the handleReturn call — rejects
+    // `method Extract(h: Holder): Inner => h._inner;` (a parameter-sourced borrow
+    // returned from an instance method). A no-op for static / receiver-sourced /
+    // bare-T returns. // per §28.3
+    checkInstanceBorrowReturn(exprBody);
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): the `=>` sibling of
     // the handleReturn call — the callee-side per-instantiation admission for a
     // bare-type-parameter return (`Sel<T>(a: T, owned b: T): T => b;` is rejected;
@@ -2301,6 +2306,38 @@ const ast::MethodDecl* MethodOwnership::findInheritedBareReturnDecl(
     return nullptr;
 }
 
+// §28.3 (v0.194 S10; #1885): the CALLEE-side dual of findInheritedBareReturnDecl.
+// True when `md` (whose method symbol is `ms`) implements/overrides a generic
+// declaration — reachable through the declaring type's base types/interfaces,
+// transitively — whose declared return type is a bare type parameter. Such a
+// body inherits the bare-T return classification (callers dispatch through the
+// generic signature and re-establish borrows against their own arguments), so
+// the instance parameter-borrow-return prohibition must not fire on it. Mirrors
+// findInheritedBareReturnDecl's base-type walk but keyed off the method symbol
+// directly (no call site). // per §28.3 v0.194
+static bool methodInheritsBareTypeParamReturn(const ast::MethodDecl& md,
+                                              const sema::MethodSymbol* ms,
+                                              const sema::SemaContext& ctx) {
+    if (!ms || !ms->parent) return false;
+    std::vector<sema::TypeSymbol*> work(ms->parent->baseTypes.begin(),
+                                        ms->parent->baseTypes.end());
+    std::unordered_set<const sema::TypeSymbol*> seen;
+    while (!work.empty()) {
+        sema::TypeSymbol* base = work.back();
+        work.pop_back();
+        if (!base || !seen.insert(base).second) continue;
+        for (const sema::Symbol* mem : base->members) {
+            auto* bms = dynamic_cast<const sema::MethodSymbol*>(mem);
+            if (!bms || bms->name != md.name) continue;
+            const auto* bmd = dynamic_cast<const ast::MethodDecl*>(bms->decl);
+            if (!bmd || bmd->params.size() != md.params.size()) continue;
+            if (baseReturnIsBareTypeParam(*bmd, *base, ctx)) return true;
+        }
+        for (sema::TypeSymbol* b2 : base->baseTypes) work.push_back(b2);
+    }
+    return false;
+}
+
 MethodOwnership::BareBorrowCallInfo
 MethodOwnership::analyzeBareBorrowCall(const ast::CallExpr& ce) {
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S3/S10/S11/S13). See the
@@ -3282,6 +3319,17 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // feeds the #402 owned-field check below so the same store is not reported
     // by both. // per §28.3, §31.1
     bool flagged386 = checkBorrowStoreEscape(as);
+    // §28.11 (#1884): the indexer-set sink `coll[i] := local` on a borrowing
+    // collection is a borrow store exactly like `.Add(local)` — §28.11 lists
+    // "Add, Insert, indexer-set" together — but its IndexExpr assignment target
+    // was classified by neither checkBorrowStoreEscape (which handles member/
+    // field/out-param/outer-local targets) nor checkCollectionBorrowStoreEscape
+    // (which handles the storing-method CALLS), so a borrow of a scope-bound
+    // owned local stored through it into an escaping collection was silently
+    // accepted. Runs after checkBorrowStoreEscape; the two are mutually
+    // exclusive by target shape (IndexExpr vs member/identifier), so no
+    // diagnostic is duplicated. // per §28.11
+    checkIndexerSetBorrowStoreEscape(as);
     // §27.5 / §28.6 (#1217): a lambda stored into a field or written through an
     // out/ref parameter that captures a ref/out parameter — the captured pointer
     // is to the caller's stack frame and is valid only for the duration of the
@@ -3865,6 +3913,13 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // must not silently fall into the discharge fast-path first. A no-op for
     // instance/extension methods (isStatic_ false). // per §28.3
     checkStaticBorrowReturn(e);
+    // §28.3 (v0.196, #1885): the instance-method sibling of the static check —
+    // reject a borrow returned from an INSTANCE method whose source is a plain
+    // parameter (`return a;` / `return h._inner;`), which the caller mis-
+    // attributes to the receiver. Run BEFORE the bare-identifier discharge fast-
+    // path below (same reason as the static/owning checks above). A no-op for
+    // static methods, receiver-sourced returns, and bare-T returns. // per §28.3
+    checkInstanceBorrowReturn(e);
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): the callee-side,
     // per-instantiation-category admission for a bare-type-parameter return. Runs
     // BEFORE the bare-identifier discharge fast-path below (which returns early
@@ -4566,6 +4621,73 @@ void MethodOwnership::checkStaticBorrowReturn(const ast::Expr& e) {
         "transfer ownership");
 }
 
+// §28.3 (v0.196, #1885): an INSTANCE method's borrow-return options are narrow.
+// The borrow-lifetime rule admits, through a plain (non-`owned`) class/interface
+// return type, only a *receiver-sourced* borrow (`this`, a bare owned-field read
+// — an implicit `this.f` — or a borrow reached through the receiver's fields and
+// indexers; §26.7 accesses an extension method's receiver as `this` too, so this
+// covers the extension receiver-parameter case). A borrow whose source is a
+// *plain parameter* — a bare `return a;`, or a field/indexer reached through a
+// parameter (`return h._inner;`) — is NOT receiver-sourced and must be rejected:
+// the caller-side producer rule classifies an instance non-`owned` return as a
+// borrow OF THE RECEIVER (§28.3 producers table), which outlives it, while the
+// borrow actually aliases the parameter's object, which the caller may dispose
+// while the return still aliases it — a use-after-free. This callee-side
+// prohibition is what makes the caller-side receiver-attribution sound (#1499).
+//
+// The check fires only when the return is a borrow (ownedArgSourceIsBorrow) whose
+// ROOT identifier resolves to a plain non-`owned` parameter. `this`/`base` carry
+// no resolved Symbol and a bare owned-field read roots at a FieldSymbol, so
+// receiver-sourced returns never reach the rejection — traced against the accept
+// controls (`return this;`, `return _inner;`, `return this._cache[k];`). A
+// borrow rooted at a LOCAL is left to checkBorrowEscapesOnReturn / the recorded
+// borrowed-local gap; a static method is checkStaticBorrowReturn's job. A
+// bare-type-parameter return admits plain-parameter-sourced borrows (§28.3
+// v0.194) and is governed by checkBareTypeParamReturn — skipped here. Owning-
+// type returns are checkBorrowReturnedThroughOwningType's; value/record/runtime-
+// managed returns are not borrows (isBorrowableType). Fires from handleReturn
+// (block bodies) and runExprBodyOwningReturnCheck (`=>` bodies). // per §28.3, §26.7
+void MethodOwnership::checkInstanceBorrowReturn(const ast::Expr& e) {
+    if (isStatic_) return;              // static: checkStaticBorrowReturn's job
+    if (returnOwned_) return;           // `owned` return transfers ownership
+    if (returnIsBareTypeParam_) return; // bare-T: checkBareTypeParamReturn's job
+    // §28.3 (v0.194 S10; #1885): a body implementing/overriding a bare-T-returning
+    // generic declaration inherits that classification — callers dispatch through
+    // the generic signature and re-establish borrows against their own arguments,
+    // so a parameter-sourced borrow return here is admitted (the caller-side dual
+    // is findInheritedBareReturnDecl). Without this, `class VChooser: IChooser<C>
+    // ... method Pick(a: C, b: C): C return a;` would be over-rejected.
+    if (returnInheritsBareTypeParam_) return;
+    if (!returnType_) return;
+    if (returnType_->kind == ast::TypeKind::Named && returnType_->name &&
+        !returnType_->name->parts.empty() &&
+        isOwningTypeNameHead(returnType_->name->parts.front()))
+        return;  // owning-type return: checkBorrowReturnedThroughOwningType
+    if (!isBorrowableType(ctx_.resolvedType(*returnType_))) return;
+    if (!ownedArgSourceIsBorrow(e)) return;
+    // Is the borrow's root a plain (non-`owned`) parameter? Only then is the
+    // return non-receiver-sourced. `this`/`base` and receiver field reads are
+    // admitted (their root is not a ParameterSymbol).
+    const ast::IdentifierExpr* root = identifierRoot(e);
+    if (!root) return;
+    auto* ps = dynamic_cast<sema::ParameterSymbol*>(ctx_.exprSymbol(*root));
+    if (!ps) return;
+    if (ps->modifier == "owned" || ps->modifier == "out owned") return;
+    report(
+        Severity::Error, e.span.begin,
+        std::string("a borrow reached through parameter `") +
+        std::string(root->name) +
+        "` may not be returned from an instance method — the borrow-lifetime "
+        "rule (§28.3) admits only a receiver-sourced borrow (`this`, an owned-"
+        "field read, or a borrow reached through the receiver's fields and "
+        "indexers), but every caller attributes an instance method's non-"
+        "`owned` return to the RECEIVER, which outlives the call, while this "
+        "borrow's source is the parameter `" + std::string(root->name) +
+        "` — an object the caller may dispose while the returned borrow still "
+        "aliases it (a use-after-free); return a receiver-sourced borrow, or "
+        "declare the return type `owned` to transfer ownership");
+}
+
 // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6). Does the declared
 // type `t` MENTION the generic parameter `name`? A bare `T`, and any nesting
 // that reaches it (`List<T>`, `[N]T`, `(T) -> ()`), qualifies — an argument
@@ -4616,6 +4738,12 @@ void MethodOwnership::computeBareReturnContext(
         const GenericReturnContext* genericCtx) {
     returnIsBareTypeParam_ = false;
     bareReturnSourceSetEmpty_ = true;
+    // §28.3 (v0.194 S10; #1885): carry the inherited-bare-T fact computed in
+    // checkMember (where the enclosing type's base types are reachable) onto the
+    // pass, so checkInstanceBorrowReturn admits a parameter-sourced borrow return
+    // from a body implementing/overriding a bare-T-returning generic declaration.
+    returnInheritsBareTypeParam_ =
+        genericCtx && genericCtx->returnInheritsBareTypeParam;
     // `owned T` is the ordinary ownership-transferring return (§28.8), outside
     // this rule; and a bare parameter is a single-part Named head.
     if (returnOwned_ || !genericCtx || !returnType_ ||
@@ -4990,6 +5118,22 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
         if (enclosingType) {
             genericCtx.enclosingParams = &enclosingType->genericParams;
             genericCtx.enclosingConstraints = &enclosingType->genericConstraints;
+        }
+        // §28.3 (v0.194 S10; #1885): does this INSTANCE method implement/override
+        // a bare-T-returning generic declaration? If so, its return classification
+        // is inherited and checkInstanceBorrowReturn must admit a parameter-sourced
+        // borrow return (the caller dispatches through the generic signature). Only
+        // meaningful for a method with a receiver — a static method has no receiver
+        // attribution to unsettle, and checkInstanceBorrowReturn no-ops for it.
+        if (!methodIsStatic(*md)) {
+            const sema::MethodSymbol* selfMs = nullptr;
+            for (const auto& s : ctx.symbols())
+                if (s->decl == &m) {
+                    selfMs = dynamic_cast<sema::MethodSymbol*>(s.get());
+                    break;
+                }
+            genericCtx.returnInheritsBareTypeParam =
+                methodInheritsBareTypeParamReturn(*md, selfMs, ctx);
         }
         if (md->bodyKind == ast::MethodBodyKind::Block) {
             MethodOwnership mo(ctx);

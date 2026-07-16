@@ -92,6 +92,17 @@ struct GenericReturnContext {
     const std::vector<ast::GenericParam>* enclosingParams = nullptr;
     const std::vector<ast::GenericConstraint>* methodConstraints = nullptr;
     const std::vector<ast::GenericConstraint>* enclosingConstraints = nullptr;
+    // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S10; #1885): true when
+    // this method IMPLEMENTS or OVERRIDES a generic declaration whose declared
+    // return type is a bare type parameter (`class VChooser: IChooser<C> ...
+    // method Pick(a: C, b: C): C`), so the classification is inherited even
+    // though this method's own signature names concrete types. Callers dispatch
+    // through the generic signature and re-establish the borrow against their
+    // own arguments (the caller-side dual is findInheritedBareReturnDecl), so
+    // the instance parameter-borrow-return prohibition (checkInstanceBorrowReturn)
+    // must NOT fire on such a body. Computed in checkMember, where the enclosing
+    // type's base types are reachable. // per §28.3 v0.194
+    bool returnInheritsBareTypeParam = false;
 };
 
 // §28.1 (v0.196, #1817/#1860): true when a bare-type-parameter `owned` slot's
@@ -243,6 +254,14 @@ private:
     // Gates checkBareTypeParamReturn's callee-side admission. Computed once by
     // computeBareReturnContext. // per §28.3 v0.194
     bool returnIsBareTypeParam_ = false;
+    // §28.3 (v0.194 S10; #1885): true when this method implements/overrides a
+    // generic declaration whose return type is a bare type parameter, so its
+    // return classification is inherited (callers dispatch through the generic
+    // signature and re-establish borrows against their own arguments). Gates OFF
+    // checkInstanceBorrowReturn — a parameter-sourced borrow return from such a
+    // body is admitted, exactly as the bare-T rule admits it. Set from the
+    // GenericReturnContext computed in checkMember. // per §28.3 v0.194
+    bool returnInheritsBareTypeParam_ = false;
     // §28.3 (v0.194, #1801 S6): true when the bare-type-parameter return's
     // POTENTIAL SOURCE SET is structurally empty — a static method with no plain
     // (non-`owned`) parameter whose declared type mentions the returned parameter.
@@ -617,6 +636,25 @@ private:
     // (`=>` expression bodies). // per §28.3, §28.6
     void checkStaticBorrowReturn(const ast::Expr& e);
 
+    // §28.3 (v0.196, #1885) — the INSTANCE-method sibling of
+    // checkStaticBorrowReturn. Through a plain (non-`owned`) class/interface
+    // return type, an instance method may return only a *receiver-sourced*
+    // borrow (`this`, a bare owned-field read, or a borrow reached through the
+    // receiver's fields/indexers — §26.7 accesses an extension receiver as
+    // `this`, so extension methods are covered). A borrow whose root is a plain
+    // parameter (`return a;` / `return h._inner;`) is rejected: every caller
+    // attributes an instance non-`owned` return to the RECEIVER (§28.3 producers
+    // table), which outlives it, while the borrow aliases the parameter's object
+    // — an object the caller may dispose while the return still aliases it
+    // (use-after-free). This callee-side prohibition is what makes the caller-
+    // side receiver-attribution sound (#1499). A no-op for static methods
+    // (checkStaticBorrowReturn), owning-type returns
+    // (checkBorrowReturnedThroughOwningType), bare-T returns
+    // (checkBareTypeParamReturn admits parameter-sourced borrows, §28.3 v0.194),
+    // and receiver-sourced returns. Fires from handleReturn and
+    // runExprBodyOwningReturnCheck. // per §28.3, §26.7
+    void checkInstanceBorrowReturn(const ast::Expr& e);
+
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6) — the CALLEE-side,
     // per-instantiation-category admission that SUPERSEDES checkStaticBorrowReturn's
     // vacuous bare-T behaviour (isBorrowableType is false for an abstract bare
@@ -937,6 +975,20 @@ private:
     // (Add/Insert/TryAdd/AddFirst/AddLast/AddBefore/AddAfter/Push/Enqueue)
     // whose receiver is a borrowing collection. // per §28.11
     void checkCollectionBorrowStoreEscape(const ast::CallExpr& call);
+
+    // §28.11 "Storing a borrow" (hole closed #1884) — the indexer-set sibling of
+    // checkCollectionBorrowStoreEscape. §28.11 lists "Add, Insert, indexer-set"
+    // as the store operations of a borrowing collection, so `coll[i] := value`
+    // is a borrow store exactly like `.Add(value)`: a borrow of a scope-bound
+    // owned local stored through it into a collection that provably outlives
+    // that scope (a field, reachable from one, escaping the method, or an outer
+    // local) is rejected. The IndexExpr assignment target was classified by
+    // neither checkBorrowStoreEscape (member/field/out-param/outer-local
+    // targets) nor checkCollectionBorrowStoreEscape (storing-method calls).
+    // Owning-collection / inline-array indexer sets TAKE owned (a §28.8 transfer)
+    // and are excluded. Called from handleAssignment; returns true when it
+    // reported a diagnostic. // per §28.11
+    bool checkIndexerSetBorrowStoreEscape(const ast::AssignmentStmt& as);
 
     // §28.3 / §28.5 / §28.8 (issue #402): true when `target` resolves to an
     // `owned` field — an owned storage location. Reuses the owned-field
