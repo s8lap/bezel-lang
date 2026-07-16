@@ -4436,6 +4436,130 @@ bool ExprTC::typeTestInterfaceInstantiationImpossible(const TypeRef* scrutTy,
     return true;  // every implemented instantiation is incompatible — reject
 }
 
+// §14.1 (#1927): does `t` mention a free/rigid type variable anywhere — a Named
+// TypeRef with no declaration and a non-empty head (a generic type or method
+// parameter, the same shape variantGenericAssignable and matchLeafInvariant
+// treat as a solve/free variable)? Used to hold #1927's uniqueness check off any
+// scrutinee or pattern carrying a rigid parameter, whose per-instantiation match
+// is undecidable at the declaration (§19.3 v0.182 / §19.6 rigid identity).
+static bool refMentionsTypeVariable(const TypeRef* t) {
+    if (!t) return false;
+    switch (t->kind) {
+        case TypeRef::Kind::Named:
+            if (!t->declaration && t->genericArgs.empty() &&
+                !namedTypeSimpleName(t).empty())
+                return true;
+            for (const TypeRef* a : t->genericArgs)
+                if (refMentionsTypeVariable(a)) return true;
+            return false;
+        case TypeRef::Kind::InlineArray:
+            return refMentionsTypeVariable(t->arrayElement);
+        case TypeRef::Kind::Function:
+            for (const auto& p : t->funcParams)
+                if (refMentionsTypeVariable(p.type)) return true;
+            return refMentionsTypeVariable(t->funcReturn);
+        default:
+            return false;
+    }
+}
+
+// §19.3/§19.5/§5.1/§12.9 (v0.197, #1927): see the header comment. Detect the
+// UNIQUENESS hole the #1920 reachability check leaves open — `var x: C<A>`
+// against a generic-INTERFACE scrutinee `I<B>` where `C<A>` DOES conform to
+// `I<B>` but is not the SOLE instantiation of `C` that does, so the erased
+// class-tag test also matches a `C<Q≠A>` value and binds it at the wrong static
+// type. Returns true (=> the caller REJECTS) only on a PROVABLE second
+// conformer.
+bool ExprTC::typeTestInterfaceBindAmbiguous(const TypeRef* scrutTy,
+                                            const TypeRef* patTy) {
+    if (!scrutTy || !patTy) return false;
+    if (scrutTy->kind != TypeRef::Kind::Named ||
+        patTy->kind != TypeRef::Kind::Named)
+        return false;
+    TypeSymbol* sd = scrutTy->declaration;
+    TypeSymbol* pd = patTy->declaration;
+    if (!sd || !pd) return false;  // builtin/free type — conservative accept
+    // Scrutinee: a GENERIC INTERFACE (the interface counterpart of #1913's class
+    // check). Pattern: a GENERIC CLASS — a non-generic class pattern has no
+    // argument to be left undetermined (any value that passes `is C` IS a `C`),
+    // so its only failure mode is unreachability, which the #1920 reachability
+    // check already handles.
+    if (sd->kind != ast::TypeDeclKind::Interface || scrutTy->genericArgs.empty())
+        return false;
+    if (pd->kind != ast::TypeDeclKind::Class || patTy->genericArgs.empty())
+        return false;
+    if (pd->genericParams.size() != patTy->genericArgs.size()) return false;
+
+    // A rigid/free type parameter in either operand makes the per-instantiation
+    // match undecidable AT THE DECLARATION (§19.3 v0.182 — a type pattern is
+    // tested per instantiation; §19.6's rigid three-valued identity). Conservative
+    // accept — never over-reject a pattern admissible at some instantiation
+    // (matches #1920's rigid posture).
+    if (refMentionsTypeVariable(scrutTy) || refMentionsTypeVariable(patTy))
+        return false;
+
+    // Restrict to an INVARIANT scrutinee interface. A variant (`in`/`out`)
+    // parameter admits a subtype/supertype RANGE of conforming class
+    // instantiations — a distinct erasure slice needing variance reasoning (a
+    // recorded residual, orthogonal to #1935's variance checker). Variance is
+    // read from the interface declaration's GenericParam annotations, mirroring
+    // variantGenericAssignable; when unavailable (an imported interface with no
+    // AST), conservatively treat as possibly-variant and accept.
+    const auto* itd = dynamic_cast<const ast::TypeDecl*>(sd->decl);
+    if (!itd) return false;
+    for (const auto& gp : itd->genericParams)
+        if (gp.variance == "in" || gp.variance == "out") return false;
+
+    // The pattern class's implemented instantiations of `I`, SYMBOLIC in `C`'s
+    // own parameters: pass a `C` head carrying NO generic args so
+    // collectAncestorInstantiationsOf substitutes nothing and returns the base
+    // clauses as declared (`IBox<T>`, the ground `IMarker<int>`, …).
+    TypeRef symbolicSelf;
+    symbolicSelf.kind = TypeRef::Kind::Named;
+    symbolicSelf.declaration = pd;
+    std::vector<TypeRef*> symImpls;
+    collectAncestorInstantiationsOf(&symbolicSelf, sd, symImpls);
+    if (symImpls.empty())
+        return false;  // does not implement `I` — the reachability check's job
+
+    std::unordered_set<std::string_view> cParams;
+    for (const Symbol* gp : pd->genericParams)
+        if (gp) cParams.insert(gp->name);
+
+    // For each symbolic implemented instantiation, invariant-match it against the
+    // ground scrutinee `I<B>`. A matching impl (Ok) fixes exactly which of `C`'s
+    // parameters the scrutinee determines. The bind is AMBIGUOUS (⇒ reject) when
+    // ANY matching impl (a) leaves a parameter FREE — a value with any binding of
+    // it conforms, so a `C<Q≠A>` conformer exists (the ground implemented-twice
+    // shape, #1927(b), and the extra-parameter shape), or (b) pins a parameter to
+    // a value OTHER than the pattern's argument — a `C<Q≠A>` conforms and the
+    // erased test binds it at `C<A>` (`Box<T>: IBox<T>` at `IBox<int>` with
+    // pattern `Box<string>`, #1927(a)).
+    for (TypeRef* impl : symImpls) {
+        std::unordered_map<std::string_view, TypeRef*> solved;
+        std::unordered_set<std::string_view> splitParams;
+        InvMatch m =
+            matchLeafInvariant(impl, scrutTy, cParams, solved, ctx_, splitParams);
+        if (m != InvMatch::Ok)
+            continue;  // Fail: this impl never matches `I<B>`; Unknown: undecidable
+        // (a) FREE parameter — undetermined by the scrutinee.
+        for (const Symbol* gp : pd->genericParams)
+            if (gp && !solved.count(gp->name)) return true;
+        // (b) DISTINCT PIN — the impl matches `I<B>` only at a different argument.
+        for (std::size_t i = 0; i < pd->genericParams.size(); ++i) {
+            const Symbol* gp = pd->genericParams[i];
+            if (!gp) continue;
+            auto it = solved.find(gp->name);
+            TypeRef* pinned = (it == solved.end()) ? nullptr : it->second;
+            TypeRef* arg = patTy->genericArgs[i];
+            if (pinned && arg && isFullyGroundTypeRef(pinned) &&
+                isFullyGroundTypeRef(arg) && !typeRefEqual(pinned, arg))
+                return true;
+        }
+    }
+    return false;  // every matching impl determines exactly `A` — bind is unique
+}
+
 // §26.5 (#714/#927): find the ancestor of `recv` (or `recv` itself) that
 // exactly matches `target` under freeVars unification, or return nullptr.
 // Walks user-declared receivers via their TypeDecl::baseTypeRefs chain (§26.5
@@ -8905,6 +9029,21 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             "instantiation is compatible under §12.9), so the "
                             "pattern would bind at a wrong static type "
                             "(§19.3/§5.1)");
+                    // §19.3/§19.5/§5.1/§12.9 (#1927): the erased-test UNIQUENESS
+                    // hole — the pattern class conforms but its generic argument
+                    // is not determined by the scrutinee interface, so a value at
+                    // a DIFFERENT argument (same erased class tag) would bind at a
+                    // wrong static type.
+                    else if (typeTestInterfaceBindAmbiguous(scrutTy,
+                                                            lsym->declType))
+                        ctx_.diagnostics().report(
+                            Severity::Error, bp->span.begin,
+                            "binding pattern type's generic argument is not "
+                            "determined by the scrutinee interface type — "
+                            "another instantiation of the pattern class also "
+                            "implements it, and the runtime type-test erases "
+                            "generic arguments, so the pattern could bind a "
+                            "value at a wrong static type (§19.3/§5.1)");
                 }
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;

@@ -528,6 +528,30 @@ private:
     bool typeTestInterfaceInstantiationImpossible(const TypeRef* scrutTy,
                                                   const TypeRef* patTy);
 
+    // §19.3/§19.5/§5.1/§12.9 (v0.197, #1927): the erased-type-test UNIQUENESS
+    // counterpart of the interface-scrutinee admission check. A typed binding
+    // `var x: C<A>` against a generic-interface scrutinee `I<B>` binds the value
+    // at the STATIC type `C<A>`, but the runtime type-test erases generic args
+    // (it checks only the class tag). So the bind is sound only when `C<A>` is
+    // the UNIQUE instantiation of `C` whose values can have static type `I<B>` —
+    // otherwise a `C<Q≠A>` value (same erased class tag, also an `I<B>`) matches
+    // and binds at the wrong static type. #1920 rejects only when NO
+    // instantiation of `C` conforms (the arm is unreachable); this catches the
+    // dual hole where `C<A>` DOES conform but is NOT the unique conformer: a
+    // GROUND implemented instantiation of `I` (`C<T>: I<T>, I<int>` at scrutinee
+    // `I<int>` — every `C<Q>` conforms, #1927(b)), a class parameter left FREE by
+    // the scrutinee, or an implemented instantiation whose invariant match pins a
+    // parameter to a value OTHER than `A` (`Box<T>: IBox<T>` at `IBox<int>` with
+    // pattern `Box<string>` — `Box<int>` conforms, #1927(a)). Returns true (=>
+    // the caller REJECTS) only on a PROVABLE second conformer. An INVARIANT
+    // scrutinee interface only (a variant one admits a subtype range — a distinct
+    // erasure slice, a residual); a rigid/free scrutinee or pattern argument, an
+    // imported interface whose variance is unknown, a non-generic pattern class,
+    // or any undecidable match yields a CONSERVATIVE accept (false) — never an
+    // over-rejection.
+    bool typeTestInterfaceBindAmbiguous(const TypeRef* scrutTy,
+                                        const TypeRef* patTy);
+
     // §19.6 (v0.196, #1874): does an ANCESTOR arm of type `armTy` (an
     // instantiation of `matchTy`, a strict ancestor of the DETERMINED generic
     // leaf `leaf`) cover `leaf`'s sole inhabiting instantiation `leaf<σ>`? The

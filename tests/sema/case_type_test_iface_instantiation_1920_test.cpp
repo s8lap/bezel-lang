@@ -156,14 +156,18 @@ BEZEL_TEST(case_type_test_iface_instantiation_1920,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// (6) IMPLEMENTED-TWICE (the hazard the class-case check deliberately avoids):
-// `sealed class C<T>: IMarker<T>, IMarker<int>` implements the interface at TWO
-// instantiations. Against an `IMarker<int>` scrutinee, arm `var x: C<string>`
-// is admissible — `C<string>` implements `IMarker<int>` DIRECTLY, so a value of
-// scrutinee type can be a `C<string>` and the bind is sound. Must stay ACCEPTED
-// (the full implemented-set must be considered, not a single projection).
+// (6) IMPLEMENTED-TWICE — now REJECTED by #1927 (this control originally
+// asserted ACCEPT; that was an UNSOUND admission, reproduced as an ASan
+// heap-buffer-overflow). `sealed class C<T>: IMarker<T>, IMarker<int>` at an
+// `IMarker<int>` scrutinee, arm `var x: C<string>`: #1920 admitted it because
+// SOME implemented instantiation (`IMarker<int>` DIRECTLY) is compatible — but
+// that is reachability, not UNIQUENESS. Every `C<Q>` conforms (the ground
+// `IMarker<int>` clause), so a `C<int>` value passes the erased `is C` test and
+// binds at `C<string>` — a wrong-type bind. #1927 rejects it: the `IMarker<T>`
+// clause invariant-matches the scrutinee pinning `T = int ≠ string` (and the
+// ground clause leaves `T` free) — a provable second conformer.
 BEZEL_TEST(case_type_test_iface_instantiation_1920,
-           implemented_twice_reachable_instantiation_accepted) {
+           implemented_twice_ambiguous_bind_rejected) {
     auto r = parseSemaAll(wrap(
         "interface IMarker<T>\nend IMarker;\n"
         "sealed class C<T> : IMarker<T>, IMarker<int>\nend C;\n",
@@ -174,8 +178,10 @@ BEZEL_TEST(case_type_test_iface_instantiation_1920,
         "    end;\n"
         "    return n;\n"
         "  end M;\n"));
-    BEZEL_EXPECT_FALSE(hasIfaceInstantiationError(r));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // The #1927 uniqueness diagnostic ("not determined by the scrutinee
+    // interface type") is also matched by hasIfaceInstantiationError, whose
+    // substring "scrutinee interface type" it contains.
+    BEZEL_EXPECT_TRUE(hasIfaceInstantiationError(r));
 }
 
 // (7) COVARIANT interface: `IReadOnly<out T>`, scrutinee `IReadOnly<Animal>`,
@@ -200,13 +206,20 @@ BEZEL_TEST(case_type_test_iface_instantiation_1920,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// (8) NON-FINAL pattern class: a plain (non-sealed) `class Box<T>: IBox<T>`.
-// Even at the disjoint instantiation `var x: Box<string>` @ `IBox<int>`, a
-// subclass of `Box<string>` could add an `IBox<int>` implementation, so the
-// pattern is NOT provably impossible. Conservative ACCEPT (the sound-subset
-// boundary — the residual for the clash-reasoning extension).
+// (8) NON-FINAL pattern class — now REJECTED by #1927 (this control originally
+// asserted ACCEPT; that was an UNSOUND admission, reproduced as an ASan
+// heap-buffer-overflow). Plain (non-sealed) `class Box<T>: IBox<T>` at scrutinee
+// `IBox<int>`, arm `var x: Box<string>`: #1920 admitted it on the theory that
+// only a subclass of `Box<string>` (adding an `IBox<int>` implementation) could
+// match — but the erased `is Box` test also matches a plain `Box<int>` value
+// (`Box<int>: IBox<int>`, a SAME-class instantiation, no subclass needed), which
+// then binds at `Box<string>` — a wrong-type bind. #1927 rejects it: the
+// `IBox<T>` clause invariant-matches the scrutinee pinning `T = int ≠ string`, a
+// provable second conformer. (The member-clash reasoning #1927(a) proposed for
+// the subclass case is unnecessary here — the same-class `Box<int>` witness
+// settles it, final or not.)
 BEZEL_TEST(case_type_test_iface_instantiation_1920,
-           non_final_pattern_class_not_over_rejected) {
+           non_final_ambiguous_bind_rejected) {
     auto r = parseSemaAll(wrap(
         "interface IBox<T>\nend IBox;\n"
         "class Box<T> : IBox<T>\nend Box;\n",
@@ -217,8 +230,7 @@ BEZEL_TEST(case_type_test_iface_instantiation_1920,
         "    end;\n"
         "    return n;\n"
         "  end M;\n"));
-    BEZEL_EXPECT_FALSE(hasIfaceInstantiationError(r));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasIfaceInstantiationError(r));
 }
 
 // (9) RIGID scrutinee parameter: in a generic method the scrutinee is

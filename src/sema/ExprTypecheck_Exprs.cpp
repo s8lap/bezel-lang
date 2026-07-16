@@ -5353,6 +5353,21 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             "instantiation is compatible under §12.9), so the "
                             "pattern would bind at a wrong static type "
                             "(§19.3/§5.1)");
+                    // §19.3/§19.5/§5.1/§12.9 (#1927): the erased-test UNIQUENESS
+                    // hole — the pattern class conforms but its generic argument
+                    // is not determined by the scrutinee interface, so a value at
+                    // a DIFFERENT argument (same erased class tag) would bind at a
+                    // wrong static type.
+                    else if (typeTestInterfaceBindAmbiguous(scrutTy,
+                                                            lsym->declType))
+                        ctx_.diagnostics().report(
+                            Severity::Error, bp->span.begin,
+                            "binding pattern type's generic argument is not "
+                            "determined by the scrutinee interface type — "
+                            "another instantiation of the pattern class also "
+                            "implements it, and the runtime type-test erases "
+                            "generic arguments, so the pattern could bind a "
+                            "value at a wrong static type (§19.3/§5.1)");
                 }
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;
