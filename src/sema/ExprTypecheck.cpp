@@ -4048,6 +4048,91 @@ static bool variantGenericAssignable(
     return true;
 }
 
+// §19.3/§5.1/§12.9 (v0.196, #1913): see the header comment. Project `sub` up to
+// its instantiation of the class-chain ancestor `ancDecl`, in `sub`'s own
+// concrete generic arguments.
+TypeRef* ExprTC::projectTypeToAncestorDecl(const TypeRef* sub,
+                                           TypeSymbol* ancDecl) {
+    if (!sub || sub->kind != TypeRef::Kind::Named || !sub->declaration ||
+        !ancDecl)
+        return nullptr;
+    if (sub->declaration == ancDecl) return const_cast<TypeRef*>(sub);
+    // `ancDecl`'s instantiation expressed in `sub`'s declaration's params — null
+    // when `ancDecl` is not a class ancestor reachable on the class chain (an
+    // interface ancestor, an uncomposable/arity-mismatched link).
+    TypeRef* inst = leafRootInstantiation(sub->declaration, ancDecl);
+    if (!inst) return nullptr;
+    // Substitute `sub`'s actual generic args for its declaration's params.
+    const auto& params = sub->declaration->genericParams;
+    if (params.size() != sub->genericArgs.size()) return nullptr;
+    std::unordered_map<std::string_view, TypeRef*> solution;
+    for (std::size_t i = 0; i < params.size(); ++i)
+        if (params[i]) solution[params[i]->name] = sub->genericArgs[i];
+    return substituteReturnType(inst, solution);
+}
+
+// §19.3/§19.5/§5.1/§12.9 (v0.196, #1913): see the header comment. Reject a typed
+// binding pattern `var x: patTy` only when NO runtime value of scrutinee type
+// `scrutTy` could satisfy it — provable on ground structure via a common CLASS
+// declaration whose invariant args are disjoint under §12.9.
+bool ExprTC::typeTestGenericInstantiationImpossible(const TypeRef* scrutTy,
+                                                    const TypeRef* patTy) {
+    if (!scrutTy || !patTy) return false;
+    if (scrutTy->kind != TypeRef::Kind::Named ||
+        patTy->kind != TypeRef::Kind::Named)
+        return false;
+    TypeSymbol* sd = scrutTy->declaration;
+    TypeSymbol* pd = patTy->declaration;
+    if (!sd || !pd) return false;  // builtin/free type — conservative accept
+    auto isClassOrIface = [](TypeSymbol* d) {
+        return d->kind == ast::TypeDeclKind::Class ||
+               d->kind == ast::TypeDeclKind::Interface;
+    };
+    if (!isClassOrIface(sd) || !isClassOrIface(pd)) return false;
+    // Only a generic instantiation can be incompatible while the class tag still
+    // matches; a bare (non-generic) type test is already handled elsewhere.
+    if (scrutTy->genericArgs.empty() && patTy->genericArgs.empty()) return false;
+
+    // Project the descendant side up to the common declaration so both operands
+    // name the SAME declaration; then compare under §12.9 variance. The
+    // projection is non-null only when the common declaration is a CLASS reached
+    // on the class chain (leafRootInstantiation walks class bases), so an
+    // interface common ancestor / cross-interface arg reasoning — where a value
+    // could conceivably satisfy both via distinct implementations — never
+    // produces a rejection.
+    const TypeRef* a = nullptr;  // scrutinee side, at the common declaration
+    const TypeRef* b = nullptr;  // pattern side, at the common declaration
+    if (sd == pd) {
+        // Same declaration: a value's runtime class carries exactly one
+        // instantiation of a CLASS (single inheritance), so disjoint invariant
+        // args are provably impossible. Restrict to a class base to avoid the
+        // (unsettled) interface-implemented-twice hazard — conservative accept
+        // for a same-interface pair.
+        if (sd->kind != ast::TypeDeclKind::Class) return false;
+        a = scrutTy;
+        b = patTy;
+    } else if (isSubtype(pd, sd)) {  // pattern's decl is a CLASS-chain subtype
+        a = scrutTy;
+        b = projectTypeToAncestorDecl(patTy, sd);
+    } else if (isSubtype(sd, pd)) {  // scrutinee's decl is a CLASS-chain subtype
+        a = projectTypeToAncestorDecl(scrutTy, pd);
+        b = patTy;
+    } else {
+        return false;  // unrelated declarations — out of scope, no new rejection
+    }
+    if (!a || !b) return false;  // uncomposable projection — conservative accept
+
+    // Admissible iff some value common to both static types could exist: `a`
+    // reference-converts to `b`, or `b` to `a`, under §12.9 (covariance/
+    // contravariance handled by variantGenericAssignable; a rigid/free type
+    // parameter is treated as compatible, so a rigid scrutinee is never
+    // over-rejected — a type pattern is tested per instantiation, §19.3 v0.182).
+    if (variantGenericAssignable(a, b, isSubtype) ||
+        variantGenericAssignable(b, a, isSubtype))
+        return false;
+    return true;  // provably incompatible instantiation — reject
+}
+
 // §26.5 (#714/#927): find the ancestor of `recv` (or `recv` itself) that
 // exactly matches `target` under freeVars unification, or return nullptr.
 // Walks user-declared receivers via their TypeDecl::baseTypeRefs chain (§26.5
@@ -8484,6 +8569,22 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 "scrutinee can never match a reference-typed "
                                 "binding (§19.5)");
                     }
+                    // §19.3/§19.5/§5.1/§12.9 (#1913): a typed binding whose
+                    // generic INSTANTIATION is incompatible with the scrutinee
+                    // (`var x: Ok<string>` at `Result<int>`) — the erased
+                    // runtime test would match and bind at the wrong static
+                    // type. Reject it, the admission counterpart of #1874's
+                    // arg-sensitive §19.6 coverage.
+                    else if (typeTestGenericInstantiationImpossible(
+                                 scrutTy, lsym->declType))
+                        ctx_.diagnostics().report(
+                            Severity::Error, bp->span.begin,
+                            "binding pattern type is incompatible with the "
+                            "scrutinee's static type — its generic "
+                            "instantiation can never match a value of the "
+                            "scrutinee type (class hierarchies are invariant, "
+                            "§12.9), so the pattern would bind at a wrong "
+                            "static type (§19.3/§5.1)");
                 }
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;

@@ -5320,6 +5320,22 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 "scrutinee can never match a reference-typed "
                                 "binding (§19.5)");
                     }
+                    // §19.3/§19.5/§5.1/§12.9 (#1913): a typed binding whose
+                    // generic INSTANTIATION is incompatible with the scrutinee
+                    // (`var x: Ok<string>` at `Result<int>`) — the erased
+                    // runtime test would match and bind at the wrong static
+                    // type. Reject it, the admission counterpart of #1874's
+                    // arg-sensitive §19.6 coverage.
+                    else if (typeTestGenericInstantiationImpossible(
+                                 scrutTy, lsym->declType))
+                        ctx_.diagnostics().report(
+                            Severity::Error, bp->span.begin,
+                            "binding pattern type is incompatible with the "
+                            "scrutinee's static type — its generic "
+                            "instantiation can never match a value of the "
+                            "scrutinee type (class hierarchies are invariant, "
+                            "§12.9), so the pattern would bind at a wrong "
+                            "static type (§19.3/§5.1)");
                 }
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;

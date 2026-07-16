@@ -452,6 +452,37 @@ private:
     // substituteReturnType as the per-level substitution engine.
     TypeRef* leafRootInstantiation(TypeSymbol* leaf, TypeSymbol* root);
 
+    // §19.3/§5.1/§12.9 (v0.196, #1913): project the Named type `sub` — whose
+    // declaration is `ancDecl` or a CLASS-chain subtype of it — up to its
+    // instantiation of `ancDecl`, expressed in `sub`'s own concrete generic
+    // arguments (`Ok<string>` up to `Result` is `Result<string>`). Composes
+    // leafRootInstantiation (which walks the class chain) and substitutes
+    // `sub`'s actual args. Returns null when the chain cannot be composed or
+    // `ancDecl` is not reached as a class ancestor (an interface ancestor, an
+    // arity mismatch) — the caller then conservatively admits the pattern.
+    TypeRef* projectTypeToAncestorDecl(const TypeRef* sub, TypeSymbol* ancDecl);
+
+    // §19.3/§19.5/§5.1/§12.9 (v0.196, #1913): is the typed binding pattern
+    // `var x: patTy` a type-test that NO runtime value of scrutinee type
+    // `scrutTy` could ever satisfy — because its generic INSTANTIATION is
+    // incompatible with the scrutinee? A typed binding binds the matched value
+    // at the STATIC type `patTy`, but the runtime type-test erases generic
+    // arguments (checks only the class tag), so a wrong instantiation
+    // (`var x: Ok<string>` at scrutinee `Result<int>`) would match at runtime and
+    // bind `Ok<int>` as `Ok<string>` — a type-safety hole (§5.1: `Result<int>`
+    // is not assignable to `Result<string>`; class hierarchies are invariant,
+    // §12.9). This is the ADMISSION counterpart of the arg-SENSITIVE §19.6
+    // coverage the #1874 exhaustiveness fix installed. Returns true (=> the
+    // caller REJECTS) only when incompatibility is PROVABLE on ground structure:
+    // `scrutTy` and `patTy` project (through the class chain) to a common CLASS
+    // declaration whose invariant arguments are disjoint and neither
+    // reference-converts to the other under §12.9. A rigid/free type parameter,
+    // an uncomposable chain, an interface common declaration, an unrelated
+    // declaration, or any non-class/interface shape yields a CONSERVATIVE accept
+    // (false) — never an over-rejection.
+    bool typeTestGenericInstantiationImpossible(const TypeRef* scrutTy,
+                                                const TypeRef* patTy);
+
     // §19.6 (v0.196, #1874): does an ANCESTOR arm of type `armTy` (an
     // instantiation of `matchTy`, a strict ancestor of the DETERMINED generic
     // leaf `leaf`) cover `leaf`'s sole inhabiting instantiation `leaf<σ>`? The

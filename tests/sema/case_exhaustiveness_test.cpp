@@ -67,6 +67,24 @@ bool nonExhaustiveWarningMentions(const bezel::test::SemaResult& r,
     return false;
 }
 
+// §19.3/§5.1/§12.9 (#1913): true iff an ERROR reports the ADMISSION rejection of
+// a wrong-instantiation type-test binding. A GROUND wrong-instantiation arm
+// (`var x: Ok<string>` at `Result<int>`) is not merely non-covering (#1874, the
+// WARNING below) — it is a statically-impossible bind that #1913 rejects at
+// admission. The two diagnostics co-occur on such a program: the warning still
+// fires (proving #1874's arg-sensitive coverage is unchanged and NAMES the
+// uncovered leaf), and the error additionally rejects the impossible bind. A
+// RIGID wrong-instantiation arm draws only the warning — admission accepts it
+// (a type pattern is tested per instantiation, §19.3 v0.182).
+bool hasWrongInstantiationAdmissionError(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("generic instantiation can never match") !=
+                std::string::npos)
+            return true;
+    return false;
+}
+
 } // namespace
 
 // --- Enum scrutinee (§19.6: "every declared constant has a matching
@@ -747,7 +765,11 @@ BEZEL_TEST(sema_case_exhaust,
         "end Calc;");
     BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));            // Ok<int> uncovered
     BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "Ok"));  // names the leaf
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // #1913: the GROUND wrong-instantiation arm `var a2: Ok<string>` is ALSO a
+    // hard admission error now (a statically-impossible bind), reported
+    // alongside the coverage warning above. #1874's arg-sensitive coverage is
+    // unchanged — the warning still fires and names the leaf.
+    BEZEL_EXPECT_TRUE(hasWrongInstantiationAdmissionError(r));
 }
 
 // (b) RIGID wrong-instantiation. Scrutinee `Result<T>` (rigid `T`, from the
@@ -842,7 +864,10 @@ BEZEL_TEST(sema_case_exhaust,
     BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));            // leaves uncovered
     BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "Ok"));  // names the leaf
     BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "Err"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // #1913: the GROUND wrong-instantiation ROOT ancestor `var x: Result<string>`
+    // is ALSO a hard admission error (a statically-impossible bind), reported
+    // alongside the coverage warning above.
+    BEZEL_EXPECT_TRUE(hasWrongInstantiationAdmissionError(r));
 }
 
 // (b) CORRECT-instantiation ROOT ancestor control. `var x: Result<int>` at
@@ -896,7 +921,10 @@ BEZEL_TEST(sema_case_exhaust,
     BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
     BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "Ok"));
     BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "Err"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // #1913: the GROUND wrong-instantiation INTERMEDIATE ancestor
+    // `var w: Wrap<string>` is ALSO a hard admission error (a statically-
+    // impossible bind), reported alongside the coverage warning above.
+    BEZEL_EXPECT_TRUE(hasWrongInstantiationAdmissionError(r));
 }
 
 // (d) RIGID wrong-instantiation ROOT ancestor. Scrutinee `Result<T>` (rigid `T`,
