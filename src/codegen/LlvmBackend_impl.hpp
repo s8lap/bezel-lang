@@ -7382,8 +7382,20 @@ private:
     // bz_lazy_from_array(esz); if it is already a lazy enumerator
     // (IEnumerable<T>), returns the lowered value unchanged. `elemRef` receives
     // the element TypeRef.
+    //
+    // #1914: `ownFreshGroupings` — when the receiver is a bare `GroupBy(sel)`
+    // whose fresh groups temporary is consumed by a DRAIN-then-DISPOSE consumer
+    // that reads each grouping only DURING iteration (the for-in loop), pass true
+    // so the lazy source OWNS and disposes the groupings + array
+    // (bz_lazy_from_owned_grouping_array). Default false (the borrowing
+    // bz_lazy_from_array) is required for consumers that either re-own the
+    // groupings via a produced `Array<IGrouping>` local (ToArray) or read an
+    // element pointer AFTER the materialize-and-dispose (First/Aggregate over a
+    // snapshot) — owning there would double-free / UAF respectively. Ignored for
+    // non-GroupBy receivers.
     llvm::Value* lowerToLazyEnumerator(const ast::Expr& recvExpr,
-                                       sema::TypeRef*& elemRef);
+                                       sema::TypeRef*& elemRef,
+                                       bool ownFreshGroupings = false);
 
     // stdlib §5 (#651/#752): materialize a `GroupBy(keySelector)` call into an
     // owned `Array<IGrouping<TKey, T>>` (a bz_array_t* of bz_grouping_t*

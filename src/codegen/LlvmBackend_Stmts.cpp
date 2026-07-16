@@ -5809,7 +5809,13 @@ bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
     // For an ordinary lazy pipeline (Where/Select/…) lowerToLazyEnumerator
     // returns lowerExpr(iterable) unchanged, so this is behaviour-preserving.
     sema::TypeRef* lazyElemRef = nullptr;
-    llvm::Value* lazy = lowerToLazyEnumerator(*fs.iterable, lazyElemRef);
+    // #1914: a bare `for var g in seq.GroupBy(sel)` drains the fresh groups and
+    // disposes the enumerator at loop end — so it OWNS the groups temporary (each
+    // grouping consumed inside the loop, freed only after). Pass ownFreshGroupings
+    // so the lazy source frees the groupings + array on dispose (no leak); the
+    // borrowing default is kept for every re-owning / snapshot-reading consumer.
+    llvm::Value* lazy = lowerToLazyEnumerator(*fs.iterable, lazyElemRef,
+                                              /*ownFreshGroupings=*/true);
     if (!lazy) return false;
     llvm::Type* elemTy = lowerTypeRef(iterTy->genericArgs[0]);
     if (!elemTy) elemTy = i32();

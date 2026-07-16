@@ -1833,6 +1833,14 @@ struct bz_lazy_t {
     // makes the materialize-then-enumerate bridge leak-free for both the terminal
     // (bz_lazy_to_array) and the operator-chain (Where/Select/…) consumers.
     int32_t own_arr;
+    // stdlib §5 (#1914): when the owned ARRAY (own_arr == 1) is a fresh
+    // `Array<IGrouping>` from bz_groupby_to_array, its SLOTS are bz_grouping_t*
+    // pointers this lazy source also owns — bz_lazy_dispose must free each
+    // grouping (bz_groupby_free_groups) BEFORE freeing the outer array. Set only
+    // by bz_lazy_from_owned_grouping_array (the bare for-in GroupBy path); 0 (the
+    // borrowing bz_lazy_from_array / element-borrowing bz_lazy_from_owned_array
+    // paths) leaves the slots untouched. Disjoint from own_closure/seen/sorted.
+    int32_t arr_is_groupings;
 };
 
 // Advance the upstream enumerator and return a pointer to its current element,
@@ -1846,6 +1854,7 @@ static const void* bz_lazy_up_next(bz_lazy_t* up) {
 }
 
 extern "C" void bz_closure_release(void* c);  // defined below; released on dispose
+extern "C" void bz_groupby_free_groups(void* groups_arr);  // defined below (#1914)
 
 static int32_t bz_lazy_movenext(bz_lazy_t* e);
 static void*   bz_lazy_current(bz_lazy_t* e) { return e->cur; }
@@ -1884,7 +1893,14 @@ static void    bz_lazy_dispose(bz_lazy_t* e) {
     // a vtable-backed IEnumerable<T>). A borrowed array (own_arr == 0, the normal
     // bz_lazy_from_array path) is left untouched. The snapshot owns no elements, so
     // the disposer is null (no element disposal) — sound, no double-free.
-    if (e->own_arr && e->arr) bz_array_free(e->arr, nullptr);
+    // #1914: when the owned array is a fresh Array<IGrouping> (arr_is_groupings),
+    // this lazy source also owns each grouping — free them (element array + key
+    // data + group object) BEFORE the outer array. bz_groupby_free_groups runs
+    // exactly once (dispose is once per enumerator), so no double-free.
+    if (e->own_arr && e->arr) {
+        if (e->arr_is_groupings) bz_groupby_free_groups(e->arr);
+        bz_array_free(e->arr, nullptr);
+    }
     // #422 / §28.9 / §28.3: release the operator's closure ONLY when it was an
     // inline lambda we own (own_closure set by codegen). The closure BORROWS its
     // captures, so this frees only the cell + env, never a capture — sound, no
@@ -1932,6 +1948,22 @@ extern "C" void* bz_lazy_from_owned_array(void* arr, int64_t esz) {
     auto* e = bz_lazy_new(BZ_LAZY_ARRAY, esz);
     e->arr = arr;
     e->own_arr = 1;
+    return e;
+}
+
+// stdlib §5 (#1914): wrap a FRESH `Array<IGrouping>` (bz_array_t* of
+// bz_grouping_t* pointers, from bz_groupby_to_array) as a lazy ARRAY source that
+// OWNS the array AND every grouping inside it (own_arr := 1, arr_is_groupings :=
+// 1 → bz_lazy_dispose runs bz_groupby_free_groups then frees the outer array).
+// Used by the bare `for var g in seq.GroupBy(sel)` path: the groups temporary
+// has no other owner, the loop consumes each grouping during iteration, and the
+// lazy is disposed only after the loop drains — so freeing the groups at dispose
+// is exactly-once and never a use-after-free.
+extern "C" void* bz_lazy_from_owned_grouping_array(void* arr, int64_t esz) {
+    auto* e = bz_lazy_new(BZ_LAZY_ARRAY, esz);
+    e->arr = arr;
+    e->own_arr = 1;
+    e->arr_is_groupings = 1;
     return e;
 }
 

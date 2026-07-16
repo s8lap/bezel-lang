@@ -916,6 +916,15 @@ void* bz_array_enum_alloc(void* arr, int64_t elem_size);
 // are invoked through codegen trampolines (fixed C signatures, see .cpp).
 // ---------------------------------------------------------------------------
 void* bz_lazy_from_array(void* arr, int64_t elem_size);
+// stdlib §5 (#1914): wrap a FRESH `Array<IGrouping>` (a bz_array_t* of
+// bz_grouping_t* pointers, produced by bz_groupby_to_array) as a lazy source
+// that OWNS both the array AND every grouping inside it. bz_lazy_dispose frees
+// each grouping (bz_groupby_free_groups) then the outer array. Used by the bare
+// `for var g in seq.GroupBy(sel)` path, whose fresh groups temporary no name
+// owns; the loop consumes each grouping during iteration and disposes the lazy
+// (freeing the groups) only at loop end — so there is no other owner (no
+// double-free) and no post-free element read (no UAF).
+void* bz_lazy_from_owned_grouping_array(void* arr, int64_t elem_size);
 // per §4.6/§4.7 + §5: wrap a bz_llist_t* (LinkedList<T>/OwningLinkedList<T>) as a
 // lazy source so LINQ aggregate/terminal operators can enumerate it. Walks nodes
 // head-to-tail; does not own the list (caller still responsible for disposal).

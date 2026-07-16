@@ -894,7 +894,8 @@ llvm::Value* Emitter::materializeVtableIEnumerableToArray(
 }
 
 llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
-                                            sema::TypeRef*& elemRef) {
+                                            sema::TypeRef*& elemRef,
+                                            bool ownFreshGroupings) {
     auto* recvTy = ctx_.exprType(recvExpr);
     // stdlib §5 (#752): a bare `GroupBy(...)` is IEnumerable<IGrouping<TKey,T>>
     // (so isLazyEnumerableType below is true), but lowerExpr cannot lower it to
@@ -910,7 +911,19 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
         elemRef = (recvTy && !recvTy->genericArgs.empty())
                   ? recvTy->genericArgs[0] : nullptr;
         int64_t esz = lazyElemSize(ptrTy(), module_->getDataLayout());
-        auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
+        // #1914: the groups array + groupings are a fresh temporary no name owns.
+        // A DRAIN-then-DISPOSE consumer that reads each grouping only during
+        // iteration (the for-in loop, ownFreshGroupings=true) owns and disposes
+        // them via bz_lazy_from_owned_grouping_array — fixing the leak (selector
+        // closure is already released in lowerGroupByMaterialize; this reclaims
+        // the array + every grouping's element array/key/object). All other
+        // consumers keep the borrowing bz_lazy_from_array: ToArray re-owns the
+        // groupings through its produced Array<IGrouping> local (owning here would
+        // double-free), and a scalar terminal (First/Aggregate) may read a
+        // grouping pointer from the post-dispose snapshot (owning here would UAF).
+        const char* wrapName = ownFreshGroupings
+            ? "bz_lazy_from_owned_grouping_array" : "bz_lazy_from_array";
+        auto* wrapFn = declareC(wrapName, ptrTy(), {ptrTy(), i64()});
         return builder_.CreateCall(wrapFn, {groups, builder_.getInt64(esz)},
                                    "lazy.groupby");
     }
