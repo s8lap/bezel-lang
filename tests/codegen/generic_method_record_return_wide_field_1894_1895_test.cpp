@@ -102,6 +102,77 @@ BEZEL_TEST(generic_method_record_return_wide_field_1894_1895,
     BEZEL_EXPECT_EQ(r.exitCode, 60);
 }
 
+// #1895 — mixed-width sret arrangement: `Maker.Make<long, int, long>(10,20,30)`
+// returns a Tri<long,int,long> whose concrete layout is {i64,i32,i64} with tail
+// padding = 24 bytes (> 16 → sret). Without the fix the int literals infer
+// A/B/C → int, so the callee is monomorphized at the {i32,i32,i32} = 12-byte
+// placeholder layout (≤ 16, a DIFFERENT return-ABI class from the caller's 24-
+// byte sret expectation) — the returned bytes and the return-slot size both
+// disagree, and an i64 field read overruns the 12-byte slot (ASan stack-buffer-
+// overflow). This pins the heterogeneous-width case across the register/sret
+// boundary, which the all-`long` Triple above does not exercise. Per §14.1 /
+// §2.8.3 rule 2 / §9.4 fields must read X=10, Y=20, Z=30; exit int(10+20+30)=60.
+BEZEL_TEST(generic_method_record_return_wide_field_1894_1895,
+           tri_long_int_long_mixed_width_sret_return_1895) {
+    auto r = runAotChecked(
+        "module M; "
+        "record Tri<A, B, C>(X: A, Y: B, Z: C); "
+        "class Maker "
+        "  public static method Make<A, B, C>(a: A, b: B, c: C): Tri<A, B, C> "
+        "      where A: value where B: value where C: value "
+        "    return new Tri<A, B, C>(a, b, c); "
+        "  end Make; "
+        "end Maker; "
+        "class Program "
+        "  public static method Main(): int "
+        "    var t := Maker.Make<long, int, long>(10, 20, 30); "
+        "    Console.WriteLine(t.X.ToString()); "
+        "    Console.WriteLine(t.Y.ToString()); "
+        "    Console.WriteLine(t.Z.ToString()); "
+        "    return int(t.X + t.Y + t.Z); "  // 60 → exit 60
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);            // no ASan stack-buffer-overflow
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("10\n20\n30\n"));
+    BEZEL_EXPECT_EQ(r.exitCode, 60);
+}
+
+// #1895 — larger sret record (5 `long` fields = 40 bytes, well past the 16-byte
+// register cutoff): `Maker.Make<long,long,long,long,long>(1,2,3,4,5)`. Without
+// the fix the callee is monomorphized at {i32×5} = 20 bytes while the caller
+// reads the concrete {i64×5} = 40-byte layout — both sret, but the 20-byte
+// callee slot is half the size the caller reads, so a field read runs off it
+// (ASan stack-buffer-overflow). Confirms the fix scales past the smallest sret
+// record. Per §14.1 / §9.4 fields read 1..5; exit int(1+2+3+4+5)=15.
+BEZEL_TEST(generic_method_record_return_wide_field_1894_1895,
+           five_long_fields_sret_return_1895) {
+    auto r = runAotChecked(
+        "module M; "
+        "record Five<A, B, C, D, E>(V: A, W: B, X: C, Y: D, Z: E); "
+        "class Maker "
+        "  public static method Make<A, B, C, D, E>"
+        "(a: A, b: B, c: C, d: D, e: E): Five<A, B, C, D, E> "
+        "      where A: value where B: value where C: value "
+        "      where D: value where E: value "
+        "    return new Five<A, B, C, D, E>(a, b, c, d, e); "
+        "  end Make; "
+        "end Maker; "
+        "class Program "
+        "  public static method Main(): int "
+        "    var t := Maker.Make<long, long, long, long, long>(1, 2, 3, 4, 5); "
+        "    Console.WriteLine(t.V.ToString()); "
+        "    Console.WriteLine(t.W.ToString()); "
+        "    Console.WriteLine(t.X.ToString()); "
+        "    Console.WriteLine(t.Y.ToString()); "
+        "    Console.WriteLine(t.Z.ToString()); "
+        "    return int(t.V + t.W + t.X + t.Y + t.Z); "  // 15 → exit 15
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);            // no ASan stack-buffer-overflow
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("1\n2\n3\n4\n5\n"));
+    BEZEL_EXPECT_EQ(r.exitCode, 15);
+}
+
 // Cache-collision regression (the second, latent defect the primary fix
 // exposed): the SAME generic instantiation `Make<long,long>` reached from two
 // call sites — one with int-literal args (lowered i32), one with `long`-variable
