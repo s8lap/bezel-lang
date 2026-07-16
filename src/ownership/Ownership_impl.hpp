@@ -575,6 +575,16 @@ private:
 
     void handleAssignment(const ast::AssignmentStmt& as);
 
+    // §28.3 / §28.7 / §28.10 (v0.180, #1965): handle an assignment-position
+    // `owned` transfer marker `y := owned x;` (as.valueHasOwnedMarker). The
+    // assignment analog of the binding marker (#1962): the source must be a
+    // named owned binding (validated + moved-from by checkAndMoveBindingOwnedMarker),
+    // the target must be an owned-state or polymorphic-null local (the state-match
+    // rule — a borrowed-state target is rejected), the displaced owned value is
+    // dropped-on-overwrite (§28.7 — the consume-site "Overwrite while borrowed"
+    // freeze applies), and the target adopts Owned. Called from handleAssignment.
+    void handleMarkedOwnedAssignment(const ast::AssignmentStmt& as);
+
     // §15.3 (#1549): a straight-line, program-order pre-pass (mirrors codegen's
     // MoveOnlyArrayTransferWalker's borrow/transfer classification of an
     // identifier occurrence, but for diagnostic purposes rather than

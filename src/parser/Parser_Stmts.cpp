@@ -133,6 +133,11 @@ ast::CaseArm Parser::parseCaseStmtArm(bool scrutineeLess) {
                 a->op = current_.text;
                 a->span.begin = start;
                 advance();
+                // §28.3 / §28.7 / §28.10 (v0.180, #1965): the `owned`
+                // assignment-position transfer marker — `y := owned x;` — in a
+                // case/when arm body. See parseStatementImpl for the rationale.
+                if (a->op == ":=" && consumeKeyword("owned"))
+                    a->valueHasOwnedMarker = true;
                 a->value = parseExpression();
                 consumePunctuator(";");
                 arm.stmts.push_back(std::move(a));
@@ -570,6 +575,11 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                             a->target = std::move(lhs);
                             a->op = current_.text;
                             advance();
+                            // §28.3 / §28.7 / §28.10 (v0.180, #1965): the `owned`
+                            // assignment-position transfer marker `y := owned x;`
+                            // in a catch-arm body. See parseStatementImpl.
+                            if (a->op == ":=" && consumeKeyword("owned"))
+                                a->valueHasOwnedMarker = true;
                             a->value = parseExpression();
                             if (!consumePunctuator(";")) {
                                 diagnostics_.report(
@@ -860,6 +870,16 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
         a->target = std::move(lhs);
         a->op = current_.text;
         advance();
+        // §28.3 / §28.7 / §28.10 (v0.180, #1965): the `owned` assignment-position
+        // transfer marker — `y := owned x;`. The assignment-position analog of
+        // the binding marker (`var y := owned x;`, #1962) and the call-site
+        // marker (`M(owned x)`, §22.3): the keyword announces that the value
+        // MOVES a named owned binding (leaving it moved-from) rather than
+        // borrowing it. Only for a plain `:=` (a compound assign never takes an
+        // ownership transfer). `owned` is a modifier keyword that can never begin
+        // an expression, so consuming it here is unambiguous.
+        if (a->op == ":=" && consumeKeyword("owned"))
+            a->valueHasOwnedMarker = true;
         a->value = parseExpression();
         if (!consumePunctuator(";")) {
             diagnostics_.report(Severity::Error, current_.location,

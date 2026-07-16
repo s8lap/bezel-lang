@@ -245,6 +245,18 @@ struct AssignmentStmt : Stmt {
     std::unique_ptr<Expr> target;
     std::string_view op;               // ":=", "+=", "-=", "*=", …
     std::unique_ptr<Expr> value;
+    // §28.3 / §28.7 / §28.10 (v0.180, #1965): the value carries the `owned`
+    // assignment-position transfer marker — `y := owned x;`. It is the
+    // assignment-position analog of the binding marker
+    // (LocalDecl::initializerHasOwnedMarker, #1962) and the call-site marker
+    // (`M(owned x)`, §22.3): a MARKED read of a named owned binding on the
+    // right-hand side is a MOVE (the source is left moved-from and the target
+    // takes over the disposal obligation, disposing its own displaced value by
+    // drop-on-overwrite, §28.7), as opposed to the UNMARKED read `y := x;`,
+    // which is a borrow. Set by the parser (right after `:=`); consumed by the
+    // ownership pass (handleAssignment → handleMarkedOwnedAssignment). Only
+    // meaningful when `op == ":="`.
+    bool valueHasOwnedMarker = false;
 };
 
 // A.6: `ThrowStmt ::= "throw" Expression? ";"`.

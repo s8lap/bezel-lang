@@ -3487,6 +3487,28 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // may not be REASSIGNED until the bounding scope exits.
     if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(as.target.get()))
         checkScopedFreeze(tid->name, as.target->span.begin, "reassign");
+    // §28.3 / §28.7 / §28.10 (v0.180, #1965): the assignment-position `owned`
+    // transfer marker — `y := owned x;`. A MARKED read of a named owned binding
+    // is a MOVE (the source is left moved-from; the target adopts owned and
+    // disposes its displaced value by drop-on-overwrite), diverting the general
+    // RHS-producer classification below. Handled specially — the source must be
+    // a named owned binding, the target must be an owned-state or polymorphic-
+    // null local (the state-match rule), and the displaced value is dropped.
+    // Scoped to a bare-identifier TRACKED LOCAL target — the §28.3/§28.7
+    // reassignment the marker names. A store into an `owned` field / owning slot
+    // (a MemberAccess / IndexExpr target, or a bare owned-field name via implicit
+    // `this` that is not a tracked local) is self-announcing (§28.3): the general
+    // path below consumes the named owned source without a marker, so it falls
+    // through with the redundant marker harmlessly ignored, rather than being
+    // over-rejected.
+    if (as.valueHasOwnedMarker) {
+        const auto* tid =
+            dynamic_cast<const ast::IdentifierExpr*>(as.target.get());
+        if (tid && lookupState(tid->name)) {
+            handleMarkedOwnedAssignment(as);
+            return;
+        }
+    }
     // Slice O15: side-effects in the RHS — `x := move y` should
     // transition y to MovedFrom. recordMovesIn handles `move local`,
     // `move this.field`, and `f(owned z)` in any position.
@@ -3741,6 +3763,101 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
                 fieldMovedFrom_[ma->member] = false;
             }
         }
+    }
+}
+
+// §28.3 / §28.7 / §28.10 (v0.180, #1965): the assignment-position `owned`
+// transfer marker — `y := owned x;`. The assignment-position analog of the
+// binding marker (`var y := owned x;`, #1962, handleLocalDecl +
+// checkAndMoveBindingOwnedMarker) with the extra §28.7 delicacy the binding form
+// does not have: the TARGET may already hold an owned value that must be DROPPED
+// (disposed) before the overwrite.
+//
+// Semantics (spec §28.3 line ~5738 restated at v0.180): reassignment is
+// permitted only when the RHS's ownership state matches the LHS's current state.
+// A MARKED transfer supplies an OWNED value (a named owned binding moved into the
+// target), so the target must currently be OWNED (drop-on-overwrite disposes the
+// displaced value) or in the POLYMORPHIC-NULL state (`var y: T? := null;`, which
+// adopts owned state from the marked transfer — the null-literal producers row);
+// a BORROWED-state target is rejected (the mismatch would silently drop the
+// borrow or double-hold an obligation). The source is validated + moved by the
+// shared checkAndMoveBindingOwnedMarker (rejecting a borrow / fresh producer /
+// non-owned-binding RHS exactly as the call-site and binding markers do).
+void MethodOwnership::handleMarkedOwnedAssignment(const ast::AssignmentStmt& as) {
+    // The caller (handleAssignment) routes here only for a bare-identifier
+    // TRACKED-LOCAL target — the §28.3/§28.7 reassignment the marker names.
+    // Locate that local's state by name, mirroring the reassignment loop in
+    // handleAssignment (a defensive guard covers the can't-happen no-local case).
+    const auto* tid = dynamic_cast<const ast::IdentifierExpr*>(as.target.get());
+    LocalOwnership* tst = nullptr;
+    sema::Symbol* tsym = nullptr;
+    if (tid) {
+        for (auto& [sym, st] : states_) {
+            if (sym->name != tid->name) continue;
+            tst = &st;
+            tsym = sym;
+            break;
+        }
+    }
+    if (!tst) {
+        reportBindingOwnedMarkerRejected(as.value->span.begin,
+                                         /*onFreshProducer=*/false);
+        return;
+    }
+    // State-match (§28.3): a marked (owned) transfer may not target a
+    // BORROWED-state local — an owned value handed to a borrow slot would either
+    // leak (the slot never disposes) or, once the target is treated as owned,
+    // double-dispose a value owned elsewhere. Rejected before the source is
+    // consumed, so a later use of the source stays valid.
+    if (tst->state == OwnershipState::Borrowed) {
+        report(Severity::Error, as.target->span.begin,
+               std::string("cannot transfer an owned value into `") +
+                   std::string(tid->name) +
+                   "` with the `owned` marker: it currently holds a BORROW, and "
+                   "a marked transfer requires an owned-state or polymorphic-null "
+                   "target (the state-match rule, §28.3, v0.180)");
+        return;
+    }
+    // Validate + move the source: marks the named owned binding moved-from, and
+    // rejects a borrow / fresh producer / non-owned-binding RHS with the
+    // spec-stated diagnostic (mirrors the call-site + binding markers, §22.3 /
+    // §28.3). Runs the central consume-site freeze on the source (markMovedByName).
+    checkAndMoveBindingOwnedMarker(*as.value);
+    // Drop-on-overwrite (§28.7): if the target currently holds a LIVE owned
+    // value, its reassignment silently disposes the displaced value — reject if a
+    // live local borrow of that value exists (the consume-site freeze's
+    // "Overwrite while borrowed" case, §28.3). Checked BEFORE the state is
+    // overwritten and only when the displaced value is Owned (a poly-null /
+    // moved-from / disposed target holds nothing to drop, so nothing is silently
+    // killed). Codegen disposes the displaced value exactly once
+    // (disposeDisplacedOwnedClassLocal) — this is the accept side (#1465).
+    if (tst->state == OwnershipState::Owned)
+        checkConsumeFreeze(tid->name, as.target->span.begin);
+    // The target adopts owned state and takes NO borrow source: it is a new
+    // OWNER of the moved-in value, not a borrow of the source (a later `return y;`
+    // is an owned return, not a borrow escape) — mirroring the binding marker.
+    tst->state = OwnershipState::Owned;
+    tst->obligationOrigin = &as;
+    tst->maybeConsumed = false;
+    tst->awaitSpent = false;
+    tst->source.reset();
+    // §28.7 / §28.3 (#1625): a polymorphic-null target (`var y: T? := null;`) that
+    // adopts owned state via the marked transfer is flagged for codegen so its
+    // drop-on-overwrite (§28.7) and scope-end disposal (§28.3) treat it as an
+    // owned class/interface local — exactly as a fresh-producer reassignment does
+    // (`y := new C();`). Its `null` initializer is not itself an owned producer,
+    // so without the flag codegen's unwindOwnedLocalClass (which keys on the
+    // initializer form) would never classify it as owned and every displaced
+    // value would leak. Idempotent; the class/interface gating lives in the
+    // consumers (unwindOwnedLocalClass / localDropOnOverwriteCovered), which
+    // exclude collection/wrapper/task types. Set only for the NULL-initialized
+    // local — a moved-from / disposed re-adoption of an owned-initialized local
+    // already carries the correct disposal classification from its initializer.
+    if (auto* lsym = dynamic_cast<sema::LocalSymbol*>(tsym)) {
+        if (auto* ld2 = dynamic_cast<const ast::LocalDecl*>(lsym->decl))
+            if (ld2->initializer &&
+                dynamic_cast<const ast::NullLiteralExpr*>(ld2->initializer.get()))
+                const_cast<ast::LocalDecl*>(ld2)->becomesOwnedViaReassign = true;
     }
 }
 
