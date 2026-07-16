@@ -5773,7 +5773,17 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                  (scrutTy->declaration->kind == ast::TypeDeclKind::Class ||
                   scrutTy->declaration->kind == ast::TypeDeclKind::Interface)) ||
                 (scrutTy->kind == sema::TypeRef::Kind::Primitive &&
-                 scrutTy->primitive == sema::PrimitiveType::Object);
+                 scrutTy->primitive == sema::PrimitiveType::Object) ||
+                // #1854 / §19.3 + §31: a BUILT-IN exception scrutinee (e.g. a
+                // `catch e: Exception` binding) is a heap object carrying a
+                // built-in vtable (setupBuiltinExceptions) whose vtable[0] is the
+                // `btd$<name>` descriptor emitIsA walks — object-like exactly like
+                // a class instance. It has a Named TypeRef with a NULL declaration
+                // (built-ins have no user TypeSymbol), so the declaration-gated
+                // class/interface disjunct above misses it. Without this, `case e
+                // of InvalidOperationException => …` always emitted false and
+                // silently fell through to `_` — a wrong-branch miscompile.
+                isBuiltinExceptionTypeRef(scrutTy);
             if (!scrut->getType()->isPointerTy() || !objectLike)
                 return builder_.getInt1(false);
             return emitIsA(scrut, desc);
@@ -6008,6 +6018,23 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             // §19.3/§19.5: `var x: T` is a type-test + binding — it matches
             // if the scrutinee is-a T and (§19.5) is non-null.
             if (auto* rt = ctx_.resolvedType(*bp->type)) {
+                // #1854 / §19.3 + §31: a typed binding whose type is a BUILT-IN
+                // exception (`var x: IOException`) — the built-ins carry no user
+                // TypeSymbol so `rt->declaration` is null and the Named+declaration
+                // block below misses them. Resolve the pattern type's descriptor
+                // by name (builtinDesc_ via descriptorForPatternName) and emit the
+                // runtime is-a test, exactly as the bare-name form does. The
+                // scrutinee is a heap exception object (object-like); guard on a
+                // pointer scrutinee so a non-reference scrutinee never faults in
+                // emitIsA. Without this the pattern returned nullptr and left
+                // `case.end` unterminated → malformed IR (a hard codegen abort).
+                if (rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
+                    isBuiltinExceptionTypeRef(rt) &&
+                    scrut->getType()->isPointerTy()) {
+                    if (llvm::GlobalVariable* desc =
+                            descriptorForPatternName(bp->type->name.get()))
+                        return emitIsA(scrut, desc);
+                }
                 if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration) {
                     // §9.6 / §10: a RECORD or ENUM is a sealed VALUE type with no
                     // subtyping, so a typed binding `var q: R` over an UNBOXED
