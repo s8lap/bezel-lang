@@ -1252,16 +1252,41 @@ void MethodOwnership::checkBorrowEscapesOnReturn(const ast::Expr& e) {
     if (!returnedExprMayBorrow(e)) return;
     for (const auto& [sym, st] : states_) {
         if (sym->name != root->name) continue;
-        if (!st.implicitDischarge) continue;  // only `using var`
+        // §28.3 borrow-lifetime rule (#1960): a borrow whose source is a scope-
+        // bound owned local may not be returned — the source is disposed before
+        // control returns to the caller, so the returned borrow dangles (UAF).
+        // BOTH a `using var` (implicitDischarge) AND a plain `var` owned local
+        // (state Owned, recorded in everOwnedPlainLocals_ and auto-dropped at
+        // scope end by the §28.3 affine auto-drop) are disposed at this method's
+        // exit, so a borrow DERIVED from either is an escape. Previously the gate
+        // was `implicitDischarge` only, so a plain-`var`-owned-local-derived
+        // borrow (`return c.M()` / `c.Field` / `c[i]`) was silently accepted
+        // (#1960). A bare-identifier move-out (`return c;`) is a discharge, not a
+        // borrow escape — it is handled by handleReturn's earlier bare-identifier
+        // fast-path and never reaches this function, so relaxing the gate does
+        // not over-reject it. An owned PARAMETER is also Owned in states_ but is
+        // NOT in everOwnedPlainLocals_ (only plain owned LOCALS are) — its
+        // borrow-return is handled by checkInstanceBorrowReturn /
+        // checkStaticBorrowReturn, so it stays excluded here. // per §28.3
+        const bool usingVar = st.implicitDischarge;
+        const bool plainOwnedLocal = st.state == OwnershipState::Owned &&
+                                     everOwnedPlainLocals_.count(sym) != 0;
+        if (!usingVar && !plainOwnedLocal) continue;
         report(
             Severity::Error, root->span.begin,
             std::string("borrow returned from `") +
             std::string(root->name) +
-            "` would outlive its source — `using var` `" +
+            (usingVar
+                 ? "` would outlive its source — `using var` `"
+                 : "` would outlive its source — owned local `") +
             std::string(root->name) +
-            "` is disposed at scope end (§28.3 borrow-lifetime "
-            "rule; bind the source in the caller's scope and "
-            "return the borrow from there instead)");
+            (usingVar
+                 ? "` is disposed at scope end (§28.3 borrow-lifetime "
+                   "rule; bind the source in the caller's scope and "
+                   "return the borrow from there instead)"
+                 : "` is auto-dropped at scope end (§28.3 borrow-lifetime "
+                   "rule; bind the source in the caller's scope and "
+                   "return the borrow from there instead)"));
         return;
     }
 }
@@ -1686,21 +1711,30 @@ bool MethodOwnership::isNullSourceRecordExpr(const ast::Expr& e) const {
 }
 
 void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
-    // Direct form: `return new Rec(...);` where Rec is a borrow-bearing
-    // record (§9.7). The static type of the returned expression must be a
-    // borrow-bearing record, and at least one constructor argument must
-    // alias a scope-bound (`using var` / owned) local — the borrow whose
-    // source is disposed at this method's exit.
+    // §9.7 / §4.14 / §4.15: a borrow-bearing record — OR a builtin span VIEW
+    // (Span / ReadOnlySpan / ArraySpan / ReadOnlyArraySpan), which carries a
+    // borrow of its backing Array / OwningBuffer even though it has no user
+    // Record TypeDecl (§4.14/§4.15) — may not outlive the source of any borrow
+    // it carries. Returning one whose borrow is rooted at a scope-bound owned
+    // local (disposed at this method's exit) dangles the returned view → UAF.
     const auto* ne = dynamic_cast<const ast::NewExpr*>(&e);
-    if (!ne) return;
     const sema::TypeRef* rt =
-        ne->type ? ctx_.resolvedType(*ne->type) : ctx_.exprType(e);
-    if (!isBorrowBearingRecord(rt)) return;
+        ne && ne->type ? ctx_.resolvedType(*ne->type) : ctx_.exprType(e);
+    if (!isBorrowBearingRecordOrSpan(rt)) return;
+    // A builtin span view (no user Record decl) vs a user borrow-bearing
+    // record — selects the diagnostic wording and the projection-branch gate.
+    const bool typeIsSpan = !isBorrowBearingRecord(rt);
 
-    for (const ast::CallArgument& a : ne->args) {
-        if (!a.value) continue;
-        const ast::IdentifierExpr* root = identifierRoot(*a.value);
-        if (!root) continue;
+    // Shared: if `root` names a tracked scope-bound OWNED local (a `using var`
+    // or a plain `var` owned local — both Owned in `states_`), report the
+    // escape at `loc` and return true. A `this`- / param- / static-rooted
+    // borrow source (which outlives the frame) is never a tracked owned local,
+    // so it is left to pass. Mirrors the by-name unbound-identifier fallback of
+    // checkBorrowEscapesOnReturn.
+    auto reportIfScopeBoundOwned =
+        [&](const ast::IdentifierExpr* root, SourceLocation loc,
+            bool spanForm) -> bool {
+        if (!root) return false;
         sema::Symbol* sym = ctx_.exprSymbol(*root);
         const LocalOwnership* st = nullptr;
         if (sym) {
@@ -1708,26 +1742,59 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
             if (it != states_.end()) st = &it->second;
         }
         if (!st) {
-            // Fallback for an argument identifier sema left unbound: match
-            // by name against a tracked owned local (parallels the
-            // by-name match in checkBorrowEscapesOnReturn).
-            for (const auto& [s, lo] : states_) {
+            for (const auto& [s, lo] : states_)
                 if (s->name == root->name) { st = &lo; break; }
-            }
         }
-        if (!st || st->state != OwnershipState::Owned) continue;
+        if (!st || st->state != OwnershipState::Owned) return false;
         report(
-            Severity::Error, ne->span.begin,
-            std::string("returned borrow-bearing record carries a borrow of "
-                        "`") +
-            std::string(root->name) +
-            "` whose source is disposed at scope end — a borrow-bearing "
-            "record may not outlive the source of any borrow it carries, "
-            "and returning it from this method does (§9.7 record borrow-"
-            "lifetime rule; bind the source in the caller's scope and build "
-            "the record there instead)");
-        return;  // one diagnostic per return is enough
+            Severity::Error, loc,
+            spanForm
+                ? (std::string("returned span views `") +
+                   std::string(root->name) +
+                   "` whose backing storage is disposed at scope end — a span "
+                   "(§4.14/§4.15) is a borrow of its backing Array / "
+                   "OwningBuffer and may not outlive it, but returning it from "
+                   "this method does (§9.7 borrow-lifetime rule; bind the "
+                   "source in the caller's scope and return the span from there "
+                   "instead)")
+                : (std::string("returned borrow-bearing record carries a "
+                   "borrow of `") +
+                   std::string(root->name) +
+                   "` whose source is disposed at scope end — a borrow-bearing "
+                   "record may not outlive the source of any borrow it carries, "
+                   "and returning it from this method does (§9.7 record borrow-"
+                   "lifetime rule; bind the source in the caller's scope and "
+                   "build the record there instead)"));
+        return true;
+    };
+
+    if (ne) {
+        // Direct construction form: `return new Rec(...);` / `return new
+        // ArraySpan<int>(local, …);` — at least one constructor argument must
+        // alias a scope-bound owned local (the borrow whose source is disposed
+        // at this method's exit).
+        for (const ast::CallArgument& a : ne->args) {
+            if (!a.value) continue;
+            if (reportIfScopeBoundOwned(identifierRoot(*a.value), ne->span.begin,
+                                        /*spanForm=*/typeIsSpan))
+                return;  // one diagnostic per return is enough
+        }
+        return;
     }
+
+    // §4.14 / §4.15 (#1959) projection form: `return local.AsSpan();` /
+    // `return local.AsSpan(2..5)` / `return local[i]` — a builtin span VIEW
+    // read off a scope-bound owned receiver. This function formerly bailed on
+    // any non-`new` expression, and checkBorrowEscapesOnReturn never fires for a
+    // span (a span is a value-builtin, so returnedExprMayBorrow treats it as a
+    // copy), so this UAF went unchecked. Restrict the projection branch to the
+    // builtin span types — `isBorrowBearingRecordOrSpan(rt)` already held above,
+    // and a user Record is excluded here so a user-record projection (which
+    // might borrow a source that DOES outlive the frame) is not newly rejected —
+    // and require the receiver ROOT (`identifierRoot` peels the member/call/
+    // index chain) to be a tracked owned local. // per §9.7, §4.14, §4.15
+    if (!typeIsSpan) return;  // a user record → not the span gap
+    reportIfScopeBoundOwned(identifierRoot(e), e.span.begin, /*spanForm=*/true);
 }
 
 bool MethodOwnership::isOwnedTrackedLocal(sema::Symbol* sym) const {

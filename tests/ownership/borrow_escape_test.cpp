@@ -438,3 +438,120 @@ BEZEL_TEST(own_escape, return_using_var_itself_still_diagnosed_1136) {
         "public static method Main(): int return 0; end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
+
+// ===========================================================================
+// §28.3 (issue #1960): a borrow derived from a plain `var` owned local (not
+// `using var`) and returned is a borrow escape too.
+//
+// A plain `var` owned local is auto-dropped at scope end by the §28.3 affine
+// auto-drop, exactly as a `using var` is disposed at scope end. So a borrow
+// DERIVED from either — `return c.M()` / `c.Field` / `c[i]` — outlives its
+// source and dangles (use-after-free). The escape check was gated on
+// `implicitDischarge` (the `using var` marker) only, so the plain-`var` form
+// was silently accepted. These are the A/B twins of the `using var` cases
+// above: the only difference is `var` vs `using var`.
+// ===========================================================================
+
+// §28.3 (#1960 NEGATIVE, the exact repro): the A/B twin of
+// return_member_call_on_using_var_diagnosed — a member-call borrow returned
+// from a plain `var` owned local is now rejected.
+BEZEL_TEST(own_escape, return_member_call_on_plain_var_diagnosed) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Leak(): View "
+        "  var c := new Connection(); "
+        "  return c.View(); "
+        "end Leak;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §28.3 (#1960 NEGATIVE): the field-access twin of
+// return_reference_field_on_using_var_still_diagnosed for a plain `var`.
+BEZEL_TEST(own_escape, return_reference_field_on_plain_var_diagnosed) {
+    auto r = parseAndCheckOwnership(
+        "module M; class View end View; "
+        "class Connection public Inner: View := null; end Connection; "
+        "class C public method Leak(): View "
+        "  var c := new Connection(); "
+        "  return c.Inner; "
+        "end Leak; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §28.3 (#1960 POSITIVE control — must NOT be over-rejected): a bare-identifier
+// return of a plain `var` owned local is a MOVE-OUT (the ownership transfers to
+// the caller), not a borrow escape. Duplicates return_bare_local_not_borrow_
+// escape's intent to pin that the relaxed gate did not perturb the move-out
+// path (handleReturn's earlier bare-identifier fast-path handles it before this
+// check ever runs).
+BEZEL_TEST(own_escape, return_bare_plain_var_still_moveout_1960) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Take(): Connection "
+        "  var c := new Connection(); "
+        "  return c; "
+        "end Take;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ===========================================================================
+// §9.7 / §4.14 / §4.15 (issue #1959): returning a builtin span VIEW
+// (Span / ReadOnlySpan / ArraySpan / ReadOnlyArraySpan) that views a scope-
+// bound local Array / OwningBuffer is a borrow escape.
+//
+// A span is a borrow-bearing record (§9.7) — it carries a borrow of its
+// backing store — but has no user Record TypeDecl, so isBorrowBearingRecord
+// missed it; and checkBorrowEscapesOnReturn never fires for a span (a span is
+// a value-builtin, so returnedExprMayBorrow treats it as a copy). So the span
+// return `return local.AsSpan();` was accepted and dangled at runtime (UAF in
+// the array accessor). The projection form of checkRecordBorrowEscapesOnReturn
+// now catches it, for both `var` and `using var` sources.
+// ===========================================================================
+
+// §9.7 / §4.14 (#1959 NEGATIVE, the exact repro): a span viewing a plain `var`
+// local Array, returned, is rejected.
+BEZEL_TEST(own_escape, return_span_of_plain_var_array_diagnosed) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public static method Leak(): ArraySpan<int> "
+        "    var local := new Array<int>(); local.Add(7); "
+        "    return local.AsSpan(); "
+        "  end Leak; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §9.7 / §4.14 (#1959 NEGATIVE): the `using var` source is likewise rejected
+// (checkBorrowEscapesOnReturn missed it because a span is value-typed).
+BEZEL_TEST(own_escape, return_span_of_using_var_array_diagnosed) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public static method Leak(): ArraySpan<int> "
+        "    using var local := new Array<int>(); local.Add(7); "
+        "    return local.AsSpan(); "
+        "  end Leak; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// §9.7 / §4.14 (#1959 POSITIVE control — must NOT be over-rejected): a span
+// viewing a PARAM Array outlives the caller's frame (the caller's array
+// persists past this method's exit), so returning it is sound.
+BEZEL_TEST(own_escape, return_span_of_param_array_clean) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public static method View(a: Array<int>): ArraySpan<int> "
+        "    return a.AsSpan(); "
+        "  end View; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §9.7 / §4.14 (#1959 POSITIVE control): a span viewing an owned FIELD of
+// `this` is sound — the field's storage outlives the call (the receiver
+// persists past this instance method's exit). The receiver root `this` is not
+// a tracked scope-bound local, so it is left to pass.
+BEZEL_TEST(own_escape, return_span_of_owned_field_clean) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public owned _buf: Array<int> := new Array<int>(); "
+        "  public method View(): ArraySpan<int> "
+        "    return this._buf.AsSpan(); "
+        "  end View; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
