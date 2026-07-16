@@ -1656,7 +1656,8 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
     if (!op.empty() && op.back() == '=') op.pop_back();
     llvm::Value* newVal = emitCompoundOp(
         op, cur, rhs, cur->getType()->isFloatingPointTy(),
-        isUnsignedTargetExpr(*as.target));
+        isUnsignedTargetExpr(*as.target),
+        isCharTargetExpr(*as.target));  // §6.6/§5.2 #1961
     if (!newVal) return false;
 
     // --- Call setter with the new value and the pre-computed receiver/params. ---
@@ -1800,7 +1801,8 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
             rhs = builder_.CreateSExt(rhs, valLlvm);
         llvm::Value* newVal = emitCompoundOp(
             op, cur, rhs, valLlvm->isFloatingPointTy(),
-            isUnsignedTargetExpr(*as.target));
+            isUnsignedTargetExpr(*as.target),
+            isCharTargetExpr(*as.target));  // §6.6/§5.2 #1961
         if (!newVal) return false;
         // Write back via lowerCollectionIndexerSet (encodes and dispatches to
         // bz_dict_set_str / bz_dict_set_gen, handling disposing variants).
@@ -1890,7 +1892,8 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
     if (!newVal) {
         newVal = emitCompoundOp(
             op, cur, rhs, elemTy->isFloatingPointTy(),
-            isUnsignedTargetExpr(*as.target));
+            isUnsignedTargetExpr(*as.target),
+            isCharTargetExpr(*as.target));  // §6.6/§5.2 #1961
         if (!newVal) return false;
     }
 
@@ -2015,7 +2018,8 @@ bool Emitter::lowerCollectionIndexerIncrDecr(
             ? llvm::cast<llvm::Value>(llvm::ConstantFP::get(cur->getType(), 1.0))
             : llvm::cast<llvm::Value>(llvm::ConstantInt::get(cur->getType(), 1));
         llvm::Value* newVal = emitCompoundOp(
-            binOp, cur, one, fp, isUnsignedTargetExpr(*inc.target));
+            binOp, cur, one, fp, isUnsignedTargetExpr(*inc.target),
+            isCharTargetExpr(*inc.target));  // §6.6/§5.2 #1961
         if (!newVal) return false;
 
         llvm::AllocaInst* setSlot = entryAlloca(newVal->getType());
@@ -2053,7 +2057,8 @@ bool Emitter::lowerCollectionIndexerIncrDecr(
         ? llvm::cast<llvm::Value>(llvm::ConstantFP::get(cur->getType(), 1.0))
         : llvm::cast<llvm::Value>(llvm::ConstantInt::get(cur->getType(), 1));
     llvm::Value* newVal = emitCompoundOp(
-        binOp, cur, one, fp, isUnsignedTargetExpr(*inc.target));
+        binOp, cur, one, fp, isUnsignedTargetExpr(*inc.target),
+        isCharTargetExpr(*inc.target));  // §6.6/§5.2 #1961
     if (!newVal) return false;
     return lowerCollectionIndexerSet(*ix, newVal, /*valueExpr=*/nullptr);
 }
@@ -2849,7 +2854,8 @@ bool Emitter::lowerPropertyCompound(const ast::AssignmentStmt& as) {
     if (!op.empty() && op.back() == '=') op.pop_back();
     llvm::Value* res = emitCompoundOp(
         op, cur, rhs, cur->getType()->isFloatingPointTy(),
-        isUnsignedTargetExpr(*as.target));
+        isUnsignedTargetExpr(*as.target),
+        isCharTargetExpr(*as.target));  // §6.6/§5.2 #1961
     return res ? lowerPropertySetValue(*as.target, res) : false;
 }
 

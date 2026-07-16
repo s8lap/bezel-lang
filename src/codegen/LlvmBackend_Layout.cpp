@@ -77,6 +77,20 @@ bool Emitter::isUnsignedTargetExpr(const ast::Expr& e) {
 }
 
 
+bool Emitter::isCharTargetExpr(const ast::Expr& e) {
+    // §6.6/§5.2 (#1961): the compound/increment write-back applies the §5.2
+    // code-point narrowing only for a `char` target. Resolve a T-typed target
+    // through the active substitution first (a generic body specialized on
+    // T = char), mirroring isUnsignedTargetExpr. A `char?` target does not
+    // reach the built-in emitCompoundOp path (it is a nullable-value struct),
+    // so only the non-nullable primitive is treated as char here.
+    const sema::TypeRef* rt = resolveTypeParamRef(ctx_.exprType(e));
+    return rt && !rt->nullable &&
+           rt->kind == sema::TypeRef::Kind::Primitive &&
+           rt->primitive == sema::PrimitiveType::Char;
+}
+
+
 llvm::Value* Emitter::lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy) {
     // CG50: a ref/out parameter — its address is the incoming pointer.
     if (llvm::Value* a = refParamAddr(target, elemTy)) return a;
@@ -125,7 +139,24 @@ llvm::Value* Emitter::lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy) {
 
 
 llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
-                            llvm::Value* r, bool fp, bool uns) {
+                            llvm::Value* r, bool fp, bool uns, bool charTarget) {
+    // §6.6/§5.2 (#1961): a `char` LHS compound assignment/increment desugars to
+    // `c := char(c OP e)` — the arithmetic runs at int width with the §6.1/§6.2
+    // checked posture (as for any integer), and the result is narrowed back to
+    // char by the §5.2 code-point check: a value outside U+0000–U+10FFFF or in
+    // the surrogate range U+D800–U+DFFF raises OverflowException rather than
+    // storing an invalid char. `char` lowers to i32 exactly like int/uint, so
+    // emitCompoundOp cannot see the char-ness from the operands — the caller
+    // flags it. Recurse for the arithmetic (charTarget=false) and route the
+    // result through the same §5.2 helper the explicit `char(n)` cast uses, so
+    // the write-back and the cast enforce the identical contract. Before this
+    // fix the compound/increment path skipped the check and produced an invalid
+    // char (a type-invariant violation).
+    if (charTarget) {
+        llvm::Value* res = emitCompoundOp(op, l, r, /*fp=*/false, uns);
+        if (!res) return nullptr;
+        return emitCharRangeCheck(res);
+    }
     // §4.6 (#857): string compound concatenation when BOTH operands are string
     // pointers (e.g. an indexer/property `s[i] += t`). A string is a pointer, not
     // a number, so the integer checked-add intrinsic below emits malformed IR.

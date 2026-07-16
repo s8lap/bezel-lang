@@ -2480,6 +2480,13 @@ private:
     // CG31: is the assignment/increment target an unsigned-typed lvalue?
     bool isUnsignedTargetExpr(const ast::Expr& e);
 
+    // §6.6/§5.2 (#1961): is the compound-assignment/increment target a
+    // (non-nullable) `char` lvalue? A `char` LHS desugars `c OP= e` to
+    // `c := char(c OP e)`, so the write-back must apply the §5.2 code-point
+    // narrowing — emitCompoundOp cannot see the char-ness (char lowers to i32
+    // exactly like int/uint), so the caller supplies this flag.
+    bool isCharTargetExpr(const ast::Expr& e);
+
     // CG31: the address (and element type) of an assignable target — a
     // local/parameter slot, a static-field global, a `this.f`/`obj.f`
     // field, or a bare implicit-`this` field. Null if not assignable.
@@ -2490,7 +2497,16 @@ private:
     // are overflow/zero-checked exactly as in lowerBinary; bitwise/shift
     // are exact; floats use IEEE ops.
     llvm::Value* emitCompoundOp(const std::string& op, llvm::Value* l,
-                                llvm::Value* r, bool fp, bool uns);
+                                llvm::Value* r, bool fp, bool uns,
+                                bool charTarget = false);
+
+    // §5.2 (#1961): apply the char code-point narrowing check to an integer
+    // value — valid U+0000–U+10FFFF excluding the surrogate range
+    // U+D800–U+DFFF, otherwise OverflowException — and return the value as the
+    // `char` (i32) type. Shared by the explicit `char(n)` cast
+    // (lowerPrimCastScalar) and the §6.6 char compound-assignment/increment
+    // write-back (emitCompoundOp) so both enforce the identical §5.2 contract.
+    llvm::Value* emitCharRangeCheck(llvm::Value* payload);
 
     // Lower a Bezel type (AST node) to its LLVM representation.
     llvm::Type* lowerType(const ast::Type* t);

@@ -218,7 +218,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         if (!op.empty() && op.back() == '=') op.pop_back();
                         llvm::Value* res = emitCompoundOp(
                             op, cur, rhs, cur->getType()->isFloatingPointTy(),
-                            isUnsignedTargetExpr(*as->target));
+                            isUnsignedTargetExpr(*as->target),
+                            isCharTargetExpr(*as->target));  // §6.6/§5.2 #1961
                         if (res && lowerVirtualPropertySet(*as->target, res))
                             return false;
                     }
@@ -725,7 +726,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
                 llvm::Value* res = emitCompoundOp(
                     op, cur, rhs, elemTy->isFloatingPointTy(),
-                    isUnsignedTargetExpr(*as->target));
+                    isUnsignedTargetExpr(*as->target),
+                    isCharTargetExpr(*as->target));  // §6.6/§5.2 #1961
                 if (res) {
                     builder_.CreateStore(res, addr);
                     // §27.5 / #673: sync back to original alloca.
@@ -877,7 +879,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                  llvm::ConstantInt::get(elemTy, 1));
                     llvm::Value* res = emitCompoundOp(
                         inc->op == "++" ? "+" : "-", cur, one, fp,
-                        isUnsignedTargetExpr(*inc->target));
+                        isUnsignedTargetExpr(*inc->target),
+                        isCharTargetExpr(*inc->target));  // §6.6/§5.2 #1961
                     if (res) {
                         builder_.CreateStore(res, addr);
                         // §27.5 / #673: sync to original alloca.
@@ -915,7 +918,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                      llvm::ConstantInt::get(cur->getType(), 1));
                         llvm::Value* res = emitCompoundOp(
                             binOp, cur, one, fp,
-                            isUnsignedTargetExpr(*inc->target));
+                            isUnsignedTargetExpr(*inc->target),
+                            isCharTargetExpr(*inc->target));  // §6.6/§5.2 #1961
                         if (res) lowerPropertySetValue(*inc->target, res);
                     }
                 // --- (b) User-defined indexer: `v[i]++` / `v[i]--` ---
@@ -1066,7 +1070,10 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                                     emitCompoundOp(
                                                         binOp, cur, one, fp,
                                                         isUnsignedTargetExpr(
+                                                            *inc->target),
+                                                        isCharTargetExpr(
                                                             *inc->target));
+                                                        // §6.6/§5.2 #1961
                                                 if (newVal) {
                                                     // --- Call setter ---
                                                     llvm::Value* savedThis =

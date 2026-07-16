@@ -4112,6 +4112,37 @@ llvm::Value* Emitter::coerceNumericToType(llvm::Value* v,
 }
 
 
+// §5.2 (L679, #1961): the char code-point narrowing check. Casting an integer
+// to `char` requires the value to fall in U+0000–U+10FFFF excluding the
+// surrogate range U+D800–U+DFFF; otherwise OverflowException. Returns the value
+// as the `char` (i32) LLVM type. Shared by the explicit `char(n)` cast
+// (lowerPrimCastScalar) and the §6.6 char compound-assignment/increment
+// write-back (emitCompoundOp), so both enforce the identical §5.2 contract —
+// the fix for #1961, where the compound/increment path skipped this check and
+// stored an invalid char (a type-invariant violation).
+llvm::Value* Emitter::emitCharRangeCheck(llvm::Value* payload) {
+    using P = sema::PrimitiveType;
+    llvm::Type* i64ty = llvm::Type::getInt64Ty(llvm_);
+    llvm::Value* v64  = builder_.CreateSExt(payload, i64ty, "ctoi64");
+    llvm::Value* neg  = builder_.CreateICmpSLT(
+        v64, llvm::ConstantInt::get(i64ty, 0), "cneg");
+    llvm::Value* hi   = builder_.CreateICmpSGT(
+        v64, llvm::ConstantInt::get(i64ty, 0x10FFFF), "chi");
+    llvm::Value* sg_lo = builder_.CreateICmpSGE(
+        v64, llvm::ConstantInt::get(i64ty, 0xD800), "csglo");
+    llvm::Value* sg_hi = builder_.CreateICmpSLE(
+        v64, llvm::ConstantInt::get(i64ty, 0xDFFF), "csghi");
+    llvm::Value* surr  = builder_.CreateAnd(sg_lo, sg_hi, "csurr");
+    llvm::Value* bad   = builder_.CreateOr(
+        builder_.CreateOr(neg, hi, "coor"), surr, "cbad");
+    emitGuardThrow(bad, "OverflowException");
+    llvm::Type* dstCharTy = lowerPrimitive(P::Char);  // i32
+    if (payload->getType() != dstCharTy)
+        return builder_.CreateTrunc(payload, dstCharTy);
+    return payload;
+}
+
+
 // §5.3 (#839): scalar-level primitive conversion shared by lowerConversion
 // (non-nullable target) and the NullCondCallExpr nullable-cast path. Takes
 // the ALREADY-UNWRAPPED `payload` value (of source primitive `srcPt`) and
@@ -4121,35 +4152,17 @@ llvm::Value* Emitter::coerceNumericToType(llvm::Value* v,
 //   • FP → int  → range-checked FPToSI/FPToUI (OverflowException)
 //   • int → FP  → SIToFP / UIToFP (lossless for all supported widths)
 //   • int → int → widening SExt/ZExt or narrowing Trunc with range check
-//   • int → char → §5.2 L421 Unicode range check + Trunc
+//   • int → char → §5.2 L679 Unicode range check + Trunc
 // `srcUns` is isUnsignedPrim(srcPt), pre-computed by the caller.
 llvm::Value* Emitter::lowerPrimCastScalar(sema::PrimitiveType targetPt,
                                           sema::PrimitiveType srcPt,
                                           llvm::Value* payload,
                                           bool srcUns) {
     using P = sema::PrimitiveType;
-    // §5.2 (L421): casting an integer to char requires the value to be in
+    // §5.2 (L679): casting an integer to char requires the value to be in
     // U+0000–U+10FFFF excluding the surrogate range U+D800–U+DFFF.
-    if (targetPt == P::Char && payload->getType()->isIntegerTy()) {
-        llvm::Type* i64ty = llvm::Type::getInt64Ty(llvm_);
-        llvm::Value* v64  = builder_.CreateSExt(payload, i64ty, "ctoi64");
-        llvm::Value* neg  = builder_.CreateICmpSLT(
-            v64, llvm::ConstantInt::get(i64ty, 0), "cneg");
-        llvm::Value* hi   = builder_.CreateICmpSGT(
-            v64, llvm::ConstantInt::get(i64ty, 0x10FFFF), "chi");
-        llvm::Value* sg_lo = builder_.CreateICmpSGE(
-            v64, llvm::ConstantInt::get(i64ty, 0xD800), "csglo");
-        llvm::Value* sg_hi = builder_.CreateICmpSLE(
-            v64, llvm::ConstantInt::get(i64ty, 0xDFFF), "csghi");
-        llvm::Value* surr  = builder_.CreateAnd(sg_lo, sg_hi, "csurr");
-        llvm::Value* bad   = builder_.CreateOr(
-            builder_.CreateOr(neg, hi, "coor"), surr, "cbad");
-        emitGuardThrow(bad, "OverflowException");
-        llvm::Type* dstCharTy = lowerPrimitive(P::Char);  // i32
-        if (payload->getType() != dstCharTy)
-            return builder_.CreateTrunc(payload, dstCharTy);
-        return payload;
-    }
+    if (targetPt == P::Char && payload->getType()->isIntegerTy())
+        return emitCharRangeCheck(payload);
     llvm::Type* dstTy = lowerPrimitive(targetPt);
     llvm::Type* srcTy = payload->getType();
     bool dstFP  = dstTy->isFloatingPointTy();
