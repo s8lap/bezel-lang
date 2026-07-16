@@ -1049,6 +1049,35 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         if (un->operand) checkRead(*un->operand, false);
         return;
     }
+    // §15.3 (#1925): the null-forgiving `x!` reads its operand, so recurse — a
+    // move-only inline-array slot read is spelled `a[i]!` (the element type is
+    // nullable, `[N owned]T?`), so the read-of-moved-from check below is only
+    // reachable through this. Mirrors the UnaryExpr recursion above; checkRead
+    // reports only for a local already in an error state (MovedFrom/Disposed/…),
+    // so reading such a local via `!` is a genuine read-of-moved-from, not an
+    // over-rejection. // per §15.3
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand) checkRead(*pb->operand, /*selfTarget=*/false);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        // §15.3 (#1925): a SLOT read `a[i]` of a move-only inline array
+        // (§15.1.1 `[N owned]T?`) whose WHOLE value has been moved out reads
+        // from a moved-from location — "Reading from a moved-from location is a
+        // compile error." The whole-move marking (#1899 local / #1922 param)
+        // leaves the array local/parameter in MovedFrom state in `states_`;
+        // recurse the read check into the index TARGET so the IdentifierExpr
+        // branch above consults that state and reports the §28.3 use-after-move.
+        // Gated to a move-only inline-array target so this fires ONLY there: a
+        // partial slot move `move a[i]` leaves the ARRAY live (Owned/Borrowed),
+        // not MovedFrom, so the other slots stay readable, and every ordinary
+        // collection index read is untouched. // per §15.3 (#1925)
+        long long moSize = 0;
+        if (ix->target &&
+            isMoveOnlyInlineArrayType(ctx_.exprType(*ix->target), moSize))
+            checkRead(*ix->target, /*selfTarget=*/false);
+        return;
+    }
     // Other expression forms — not exhaustive; later slices extend.
 }
 
