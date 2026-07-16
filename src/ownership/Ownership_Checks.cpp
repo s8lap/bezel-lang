@@ -6376,6 +6376,12 @@ void MethodOwnership::checkDeferredActivationTempSitesExpr(const ast::Expr& e,
         // is position-independent (this walk visits every CallExpr, so the check
         // fires wherever the Select appears). // per §28.3 / stdlib §5 (#1917)
         checkLazySelectMintingSelector(*ce);
+        // §28.3 / stdlib §5 (#1915): same laundering class, a separate call site —
+        // a `Min<U>/Max<U>(selector)` whose inline lambda selector mints a fresh
+        // cleanup-bearing value per element leaks every projection (winner and
+        // losers) through the receiver-sourced-borrow result classification.
+        // // per §28.3 / stdlib §5 (#1915)
+        checkMinMaxMintingSelector(*ce);
         if (escaping && isDeferredActivationCallResult(*ce)) {
             std::size_t pos = 0;
             for (const auto& a : ce->args) {
@@ -6723,9 +6729,74 @@ void MethodOwnership::checkLazySelectMintingSelector(const ast::CallExpr& ce) {
         return;
     auto* lam = dynamic_cast<const ast::LambdaExpr*>(arg.value.get());
     if (!lam) return;
-    // An `async` selector projects a Task frame, a different ownership contract.
-    if (lam->isAsync) return;
+    const ast::Expr* mintingReturn = selectorLambdaMintingReturn(*lam);
+    if (!mintingReturn) return;
+    report(
+        Severity::Error, mintingReturn->span.begin,
+        "a lazy `Select` selector that mints a fresh owned value per element "
+        "(a `new` of a class, an `owned`-returning call, or a fresh string "
+        "such as a `+` concatenation or an interpolation) launders that value "
+        "out through the projected sequence — stdlib §5 classifies `Select`'s "
+        "projected element as a receiver-sourced borrow, so the lazy pipeline "
+        "takes no disposal obligation on it and every minted projection leaks "
+        "(no consumer reclaims it: `ToArray` owns only the container, borrowing "
+        "elements, and no lazy materializer takes element ownership) — §28.3 "
+        "*Bare-type-parameter returns* (v0.194), the same launder the "
+        "`Aggregate` minted-seed rejection forbids; project a borrow of the "
+        "element (a field, or the element itself), or build an owning "
+        "collection (`OwningArray<T>`) from the sources directly");
+}
 
+// §28.3 / stdlib §5 (#1915): reject a LINQ `Min<U>/Max<U>(selector)` whose inline
+// lambda selector mints a fresh cleanup-bearing value per element. See the
+// declaration comment for the full contract. // per §28.3 / stdlib §5 (#1915)
+void MethodOwnership::checkMinMaxMintingSelector(const ast::CallExpr& ce) {
+    // A LINQ `Min`/`Max` is a builtin intrinsic with NO user MethodDecl (mirrors
+    // analyzeBareBorrowCall's gate): a user-defined method also named `Min`/`Max`
+    // resolves to a MethodDecl and its selector's ownership is governed by its
+    // declared parameter modifier — leave it alone. // per §28.3 (#1915)
+    if (common::calleeMethodDecl(ce, ctx_)) return;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+    if (!ma || (ma->member != "Min" && ma->member != "Max")) return;
+    // The selector overload `Min<U>/Max<U>(selector: (T) -> U): U` (stdlib §5) is
+    // the SINGLE-argument form; the no-selector `Min()`/`Max()` (§5.1) and
+    // `Math.Min`/`Max`/`Clamp` (value args, no lambda) are excluded by the arg
+    // count and the inline-lambda requirement below. (A method-reference selector
+    // `Max(Factory.Make)` over an owned-returning method is the same laundering
+    // class but needs the callee's `returnOwned` navigation — left as a follow-up,
+    // shared with the `Select` case; the issue's repros are inline lambdas.)
+    // // per §28.3 (#1915)
+    if (ce.args.size() != 1) return;
+    const ast::CallArgument& arg = ce.args[0];
+    if (arg.isDiscard || !arg.value || !arg.name.empty() ||
+        !arg.modifier.empty())
+        return;
+    auto* lam = dynamic_cast<const ast::LambdaExpr*>(arg.value.get());
+    if (!lam) return;
+    const ast::Expr* mintingReturn = selectorLambdaMintingReturn(*lam);
+    if (!mintingReturn) return;
+    report(
+        Severity::Error, mintingReturn->span.begin,
+        "a `Min`/`Max` selector that mints a fresh owned value per element "
+        "(a `new` of a class, an `owned`-returning call, or a fresh string "
+        "such as a `+` concatenation or an interpolation) launders that value "
+        "out through the aggregation result — stdlib §5 classifies the selector "
+        "`Min<U>`/`Max<U>`'s result `U` as a receiver-sourced borrow, so the "
+        "aggregation takes no disposal obligation on any projected value and "
+        "every minted projection leaks (the selector runs on every element to "
+        "find the extremum — winner and losers alike — and nothing reclaims the "
+        "minted values) — §28.3 *Bare-type-parameter returns* (v0.194), the same "
+        "launder the `Aggregate` minted-seed rejection forbids; project a borrow "
+        "of the element (a field, or the element itself), or compute the extremum "
+        "over a borrowed key and pick the owning element separately");
+}
+
+// §28.3 / stdlib §5 (#1917, #1915): see the declaration comment. Shared by the
+// `Select` and `Min`/`Max` minting-selector rejects. // per §28.3 / stdlib §5
+const ast::Expr* MethodOwnership::selectorLambdaMintingReturn(
+        const ast::LambdaExpr& lam) {
+    // An `async` selector projects a Task frame, a different ownership contract.
+    if (lam.isAsync) return nullptr;
     // Does any return path of the selector mint a fresh value? Scan the `=> E`
     // body or the block body's `return` statements (never crossing a nested
     // lambda — its returns belong to it), mirroring the SB01-B return walk.
@@ -6734,8 +6805,8 @@ void MethodOwnership::checkLazySelectMintingSelector(const ast::CallExpr& ce) {
         if (!mintingReturn && lazySelectSelectorReturnMints(re))
             mintingReturn = &re;
     };
-    if (lam->exprBody) {
-        note(*lam->exprBody);
+    if (lam.exprBody) {
+        note(*lam.exprBody);
     } else {
         std::function<void(const ast::Stmt&)> scan = [&](const ast::Stmt& s) {
             if (mintingReturn) return;
@@ -6774,23 +6845,9 @@ void MethodOwnership::checkLazySelectMintingSelector(const ast::CallExpr& ce) {
                 return;
             }
         };
-        for (const auto& s : lam->stmts) if (s) scan(*s);
+        for (const auto& s : lam.stmts) if (s) scan(*s);
     }
-    if (!mintingReturn) return;
-    report(
-        Severity::Error, mintingReturn->span.begin,
-        "a lazy `Select` selector that mints a fresh owned value per element "
-        "(a `new` of a class, an `owned`-returning call, or a fresh string "
-        "such as a `+` concatenation or an interpolation) launders that value "
-        "out through the projected sequence — stdlib §5 classifies `Select`'s "
-        "projected element as a receiver-sourced borrow, so the lazy pipeline "
-        "takes no disposal obligation on it and every minted projection leaks "
-        "(no consumer reclaims it: `ToArray` owns only the container, borrowing "
-        "elements, and no lazy materializer takes element ownership) — §28.3 "
-        "*Bare-type-parameter returns* (v0.194), the same launder the "
-        "`Aggregate` minted-seed rejection forbids; project a borrow of the "
-        "element (a field, or the element itself), or build an owning "
-        "collection (`OwningArray<T>`) from the sources directly");
+    return mintingReturn;
 }
 
 // §28.3 / stdlib §5 (#1917): see the declaration comment. // per §28.3 (#1917)

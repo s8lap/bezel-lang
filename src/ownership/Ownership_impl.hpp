@@ -1951,6 +1951,31 @@ private:
     // leaks in for-source, binding, materialization, and terminal positions
     // alike). // per §28.3 / stdlib §5 (#1917)
     void checkLazySelectMintingSelector(const ast::CallExpr& ce);
+    // §28.3 / stdlib §5 (#1915): a LINQ selector `Min<U>(selector)` /
+    // `Max<U>(selector)` whose inline lambda selector MINTS a fresh
+    // cleanup-bearing value per element — a freshly-`new`'d owned class
+    // (`(o) => new Box(o)`) or a fresh string (`(s) => s + "!"`, an
+    // interpolation). Stdlib §5 ("Ownership at class-typed substitutions",
+    // v0.194) classifies the selector `Min<U>/Max<U>`'s result `U` as a
+    // RECEIVER-SOURCED BORROW (the #1876 carve, re-enabled with the #1901 result
+    // type fix), so the pointer-U aggregation path takes NO disposal obligation on
+    // ANY projected value — correct for a receiver-sourced projection (identity /
+    // field-borrow), but a minting selector's projections are freshly owned and
+    // leak (winner AND losers: the selector runs on every element to find the
+    // extremum, and nothing reclaims any of the minted values). This is the same
+    // §28.3 laundering class as the `Aggregate` minted-seed rejection
+    // (checkBareBorrowTempLaunder) and the lazy `Select` minting selector (#1917);
+    // reject the launder at the selector. Called for every CallExpr the
+    // deferred-activation walk visits (position-independent). // per §28.3 /
+    // stdlib §5 (#1915)
+    void checkMinMaxMintingSelector(const ast::CallExpr& ce);
+    // The first return-path expression of `lam` (an inline lambda selector) that
+    // MINTS a fresh cleanup-bearing value (lazySelectSelectorReturnMints), or
+    // nullptr if none does. Scans the `=> E` body or the block body's `return`
+    // statements, never crossing a nested lambda (its returns belong to it) —
+    // mirrors the SB01-B return walk. Shared by the `Select` (#1917) and `Min`/
+    // `Max` (#1915) minting-selector rejects. // per §28.3 / stdlib §5
+    const ast::Expr* selectorLambdaMintingReturn(const ast::LambdaExpr& lam);
     // True when `retExpr` — a lazy `Select` selector's return value — mints a
     // fresh owned/heap value with no borrow source: an owned-class producer
     // (producerState == Owned), a fresh string (a `+` concatenation or an
