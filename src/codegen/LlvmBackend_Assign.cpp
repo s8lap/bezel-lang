@@ -2996,6 +2996,128 @@ llvm::Value* Emitter::wrapArrayAsIEnumerable(llvm::Value* arr,
     return en;
 }
 
+// #1911 / stdlib §5 / §29.11: wrap a FRESH temporary array (no other owner) as a
+// vtable-backed IEnumerable<T> enumerator that OWNS the array. Reuses the plain
+// array-enum struct/MoveNext/Current machinery (identical layout + iteration),
+// but installs a distinct vtable whose:
+//   * Dispose (slot 1) frees the backing array (null element disposer — the
+//     snapshot borrows its elements, owning none) AND the enumerator struct; and
+//   * GetEnumerator (slot 4) stamps each clone with the NON-owning vtable, so a
+//     per-loop enumerator (the for-in clone) borrows the shared array and frees
+//     only its own struct. The owning SOURCE (this value, held by the local) is
+//     the sole array owner and frees it exactly once at scope end
+//     (registerIterableSourceDisposal / registerUsingDisposal → slot-1 Dispose).
+// This is the lazy-pipeline analogue of the borrow/own split the plain wrapper
+// relies on when the Array<T> has a separate owning local.
+llvm::Value* Emitter::wrapOwnedArrayAsIEnumerable(llvm::Value* arr,
+                                                  const sema::TypeRef* iEnumTy) {
+    llvm::Type* elemTy = i32();
+    if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
+        elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);
+    // Ensure the plain (non-owning) machinery exists: shared struct type, the
+    // non-owning vtable (for clones), the shared MoveNext/Current, and esz.
+    ArrEnumMachinery m = ensureArrayEnumMachinery(elemTy);
+    llvm::StructType* stTy = m.stTy;
+    // Element-name key (same scheme as ensureArrayEnumMachinery) so the owning
+    // Dispose / GetEnumerator / vtable are created once per element type.
+    std::string elemName = elemTy->isIntegerTy() ?
+        ("i" + std::to_string(elemTy->getIntegerBitWidth())) :
+        (elemTy->isPointerTy() ? "ptr" : "f");
+    std::string plainPrefix = "bz$arrenum$" + elemName + "$";
+    std::string prefix = "bz$arrenumown$" + elemName + "$";
+
+    // Owning Dispose: bz_array_free(self->arr, null); free(self).
+    auto* dispFn = module_->getFunction(prefix + "Dispose");
+    if (!dispFn) {
+        dispFn = llvm::Function::Create(
+            llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+            llvm::Function::InternalLinkage, prefix + "Dispose", module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", dispFn);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value* self = dispFn->arg_begin();
+        llvm::Value* arrPtr =
+            b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 1));
+        auto* freeArrFn = module_->getOrInsertFunction(
+            "bz_array_free", llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false))
+            .getCallee();
+        b.CreateCall(
+            llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false),
+            freeArrFn, {arrPtr, llvm::ConstantPointerNull::get(ptrTy())});
+        auto* freeFn = module_->getOrInsertFunction(
+            "free", llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false)).getCallee();
+        b.CreateCall(llvm::FunctionType::get(
+            llvm::Type::getVoidTy(llvm_), {ptrTy()}, false), freeFn, {self});
+        b.CreateRetVoid();
+    }
+
+    // Owning GetEnumerator: a fresh NON-owning clone over the same borrowed array,
+    // positioned before the first element (idx = -1). Stamping the clone with the
+    // NON-owning vtable (m.vtGV) — not this owning one — is what keeps a per-loop
+    // enumerator from freeing the shared array (only the source owns it).
+    auto* geFn = module_->getFunction(prefix + "GetEnumerator");
+    if (!geFn) {
+        geFn = llvm::Function::Create(
+            llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
+            llvm::Function::InternalLinkage, prefix + "GetEnumerator",
+            module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", geFn);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value* self = geFn->arg_begin();
+        uint64_t cloneSz = module_->getDataLayout().getTypeAllocSize(stTy);
+        auto* callocFT = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+        auto* callocC = module_->getOrInsertFunction("calloc", callocFT).getCallee();
+        llvm::Value* clone = b.CreateCall(callocFT, callocC,
+            {llvm::ConstantInt::get(i64(), 1),
+             llvm::ConstantInt::get(i64(), (int64_t)cloneSz)});
+        // Clone gets the NON-owning vtable (borrows the array).
+        b.CreateStore(m.vtGV, b.CreateStructGEP(stTy, clone, 0));
+        llvm::Value* arrCp = b.CreateLoad(ptrTy(),
+            b.CreateStructGEP(stTy, self, 1));
+        b.CreateStore(arrCp, b.CreateStructGEP(stTy, clone, 1));
+        llvm::Value* eszCp = b.CreateLoad(i64(),
+            b.CreateStructGEP(stTy, self, 3));
+        b.CreateStore(eszCp, b.CreateStructGEP(stTy, clone, 3));
+        b.CreateStore(llvm::ConstantInt::get(i64(), -1),
+            b.CreateStructGEP(stTy, clone, 2));
+        b.CreateRet(clone);
+    }
+
+    // Owning vtable: [0]=self, [1]=owning Dispose, [2]=MoveNext, [3]=Current,
+    // [4]=owning GetEnumerator. Slots 2/3 reuse the plain machinery's functions.
+    auto* mnFn = module_->getFunction(plainPrefix + "MoveNext");
+    auto* curFn = module_->getFunction(plainPrefix + "Current");
+    std::string vtName = prefix + "vtable";
+    auto* vtGV = module_->getGlobalVariable(vtName);
+    if (!vtGV) {
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
+        std::vector<llvm::Constant*> elems = {
+            llvm::ConstantPointerNull::get(ptrTy()),  // slot 0: self-ptr (below)
+            dispFn, mnFn, curFn, geFn
+        };
+        vtGV = new llvm::GlobalVariable(*module_, vtTy, /*isConst=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(vtTy, elems), vtName);
+        elems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy());
+        vtGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
+    }
+
+    // Allocate + fill the OWNING enumerator instance { owningVt, arr, idx=-1, esz }.
+    uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stTy);
+    auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
+    llvm::Value* en = builder_.CreateCall(callocFn2,
+        {builder_.getInt64(1), builder_.getInt64(stSz)}, "arrenumown");
+    builder_.CreateStore(vtGV, builder_.CreateStructGEP(stTy, en, 0));
+    builder_.CreateStore(arr, builder_.CreateStructGEP(stTy, en, 1));
+    builder_.CreateStore(builder_.getInt64(-1),
+        builder_.CreateStructGEP(stTy, en, 2));
+    builder_.CreateStore(builder_.getInt64(m.esz),
+        builder_.CreateStructGEP(stTy, en, 3));
+    return en;
+}
+
 // §29.2 (#437 / #1850): create-or-reuse the array-enumerator machinery (struct
 // type, method functions, vtable) keyed on the lowered element type. Factored
 // out of wrapArrayAsIEnumerable so the nested covariant-view factory

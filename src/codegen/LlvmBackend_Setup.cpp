@@ -5604,6 +5604,37 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 // #1177: (Owned)LinkedList<T> is node-based (bz_llist) — wrap
                 // with the node-walking enumerator, mirroring buildOrderedArgs.
                 v = wrapLinkedListAsIEnumerable(v, declTR);
+            } else if (initTR && isLazyEnumerableType(initTR)) {
+                // #1911 / stdlib §5 / §29.11: a lazy LINQ pipeline (Select/Where/…
+                // → a bz_lazy_t*) bound to an EXPLICIT `IEnumerable<T>` local. The
+                // lazy vtable has only 4 slots (td/Dispose/MoveNext/Current) and
+                // its Current returns a POINTER to the element, whereas the for-in
+                // over an IEnumerable<T> local drives the §29.11 iterator vtable —
+                // it reads slot 4 (GetEnumerator, OUT OF BOUNDS for the 4-slot lazy
+                // vtable → a garbage function-pointer call → SIGSEGV) and expects
+                // Current BY VALUE. Drain the pipeline once into a fresh owned
+                // Array<T> (bz_lazy_to_array also disposes the pipeline, releasing
+                // its inline-lambda closures) and wrap that array in an OWNING
+                // vtable-backed enumerator: the for-in's slot-4/Current protocol is
+                // then satisfied, and scope-end iterEnumDispose
+                // (registerIterableSourceDisposal) frees the drained array exactly
+                // once (leak-free). An INFERRED local (`var xs := xs.Select(…)`)
+                // keeps its concrete lazy type and iterates via lowerLazyLinqFor —
+                // only the interface-widened binding needs this bridge.
+                llvm::Type* et =
+                    (declTR->genericArgs.empty() || !declTR->genericArgs[0])
+                        ? i32() : lowerTypeRef(declTR->genericArgs[0]);
+                int64_t esz = 8;
+                if (et->isIntegerTy(32) || et->isFloatTy()) esz = 4;
+                else if (et->isIntegerTy(1) || et->isIntegerTy(8)) esz = 1;
+                else if (et->isIntegerTy(16)) esz = 2;
+                else if (et->isStructTy())
+                    esz = (int64_t)module_->getDataLayout().getTypeAllocSize(et);
+                auto* toArrFn =
+                    declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
+                llvm::Value* arr = builder_.CreateCall(
+                    toArrFn, {v, builder_.getInt64(esz)}, "lazy.mat");
+                v = wrapOwnedArrayAsIEnumerable(arr, declTR);
             } else if (initTR && initTR->kind == sema::TypeRef::Kind::Named &&
                        initTR->declaration) {
                 v = wrapUserClassAsIEnumerable(v, initTR->declaration, declTR);

@@ -3933,6 +3933,17 @@ private:
     llvm::Value* wrapArrayAsIEnumerable(llvm::Value* arr,
                                         const sema::TypeRef* iEnumTy);
 
+    // #1911 / stdlib §5 / §29.11: like wrapArrayAsIEnumerable, but the resulting
+    // enumerator OWNS its backing `arr` — its slot-1 Dispose frees the array (a
+    // fresh temporary with no other owner, e.g. a lazy LINQ pipeline drained via
+    // bz_lazy_to_array). Its GetEnumerator (slot 4) hands out NON-owning clones
+    // that borrow the shared array, so a per-loop enumerator disposes only its
+    // own struct while the owning source frees the array exactly once at scope
+    // end (leak-free, no double-free — mirrors the borrow/own split the plain
+    // array wrapper relies on for a separately-owned Array<T> source).
+    llvm::Value* wrapOwnedArrayAsIEnumerable(llvm::Value* arr,
+                                             const sema::TypeRef* iEnumTy);
+
     // §29.2 (#437 / #1850): the cached machinery (struct type, vtable global,
     // element stride) for the array enumerator over a given lowered element type.
     // Extracted from wrapArrayAsIEnumerable so both the top-level wrap and the
