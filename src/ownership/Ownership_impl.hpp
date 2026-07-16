@@ -591,10 +591,15 @@ private:
     // Mark the source local moved-from in the flow state (`states_`) so a later
     // read/move/dispose of it is the use-after-move compile error §15.3 mandates.
     // A move-only value has no borrow reading, so an unmarked bare-id read at a
-    // value position can only be this move (copies are forbidden). A no-op when
-    // `src` is not such an identifier or its source is not a tracked live local
-    // (a MovedFrom/Disposed/Poisoned source was already diagnosed by the
-    // preceding checkRead). // per §15.3 bullet 1
+    // value position can only be this move (copies are forbidden). The same
+    // applies to a move-only-array PARAMETER source (§15.3 "Parameter passing",
+    // #1922): a plain move-only-array parameter is not seeded into `states_` at
+    // method entry, so it is seeded lazily at the move site (as a live Borrowed
+    // binding) before marking, giving a parameter the identical use-after-move
+    // rejection a local gets. A no-op when `src` is not such an identifier or its
+    // source is neither a tracked live local nor a move-only-array parameter (a
+    // MovedFrom/Disposed/Poisoned source was already diagnosed by the preceding
+    // checkRead). // per §15.3 bullet 1
     void noteMoveOnlyArrayWholeMoveRead(const ast::Expr& src);
     struct MoveOnlyArraySlots {
         long long size = 0;

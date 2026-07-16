@@ -3658,12 +3658,40 @@ void MethodOwnership::noteMoveOnlyArrayWholeMoveRead(const ast::Expr& src) {
     long long size = 0;
     if (!isMoveOnlyInlineArrayType(ctx_.exprType(src), size)) return;
     auto* st = lookupState(id->name);
-    if (!st) return;  // not a tracked local (e.g. a field/parameter)
+    if (!st) {
+        // §15.3 (#1922) "Parameter passing": a move-only inline-array PARAMETER is
+        // passed by value-MOVE and — unlike an `owned` local/parameter — carries
+        // no discharge obligation, so it is NOT seeded into `states_` at method
+        // entry (an `owned`-modified move-only array IS seeded Owned and takes the
+        // tracked-local path above; the `owned` modifier is redundant here per
+        // §15.3). A bare-identifier whole read of a plain move-only-array parameter
+        // in a transfer position is the same move #1899 tracks for a local —
+        // "Local-to-local assignment" (bullet 1) applies to any move-only lvalue,
+        // including a parameter. Seed the parameter into the flow state lazily AT
+        // THIS move site as a LIVE (Borrowed) binding so the shared markMovedByName
+        // below leaves it moved-from and the standard read/move/dispose checks
+        // reject a later whole read/move/return of it — the §15.3 use-after-move
+        // error the local form already gives (#1899). Purely a diagnostic: the
+        // array stays memory-safe (the transfer target keeps the storage alive, no
+        // double-free) and codegen's whole-body transfer walk already skips
+        // disposing the moved-from source; this only adds the missing rejection.
+        // Tight guards mirror the local path: bare-identifier whole read only
+        // (index/member/call borrows are filtered above), move-only inline-array
+        // type only (filtered above). // per §15.3 (#1922)
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(ctx_.exprSymbol(*id));
+        if (!ps) return;  // not a tracked local and not a parameter source
+        LocalOwnership lo;
+        lo.state = OwnershipState::Borrowed;
+        states_[ps] = lo;
+        st = lookupState(id->name);
+        if (!st) return;  // defensive — the insertion above always succeeds
+    }
     // A live source (Owned when a `using var`, Borrowed when a plain `var` — the
-    // collection-literal producer state) is the genuine move. A MovedFrom /
-    // Disposed / Poisoned source was already diagnosed by the checkRead that
-    // precedes this call; re-marking would either duplicate that diagnostic or
-    // (via markMovedByName) resurrect a poisoned local. // per §15.3 bullet 1
+    // collection-literal producer state, or a freshly-seeded move-only-array
+    // parameter, #1922) is the genuine move. A MovedFrom / Disposed / Poisoned
+    // source was already diagnosed by the checkRead that precedes this call;
+    // re-marking would either duplicate that diagnostic or (via markMovedByName)
+    // resurrect a poisoned local. // per §15.3 bullet 1
     if (st->state != OwnershipState::Owned &&
         st->state != OwnershipState::Borrowed)
         return;
