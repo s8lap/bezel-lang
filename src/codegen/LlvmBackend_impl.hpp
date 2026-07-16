@@ -3904,6 +3904,13 @@ private:
     llvm::Constant* boxDefaultEqualsThunk();
     llvm::Constant* boxDefaultHashCodeThunk();
 
+    // §8.6 / §2.5 (#1945): the ToString thunk `ptr(ptr this)` for a boxed VALUE-
+    // BUILTIN (DateTime/…) — returns the type name (the class-default form), so
+    // the box vtable's slot 3 is a valid function rather than a null that would
+    // fault on an `Object.ToString()` dispatch. Per-type value formatting is out
+    // of scope (it belongs to the value-type's own methods).
+    llvm::Constant* valueBuiltinBoxToStringThunk(const char* name);
+
     // §9.1 / §9.6 (#961): per-type structural Equals `i1(ptr this, ptr other)`
     // and GetHashCode `i32(ptr this)` thunks for boxed RECORDS and ENUMS.
     // Equals guards `other` is a box of the same type (matching vtable[0]
@@ -3978,6 +3985,15 @@ private:
     // (record, enum, value primitive, or inline array)? Reference types
     // (class, interface, string, Object, function, heap collections) do not.
     bool isBoxableValueType(const sema::TypeRef* rt);
+
+    // §8.6 / §2.5–§2.6 (#1945): the stable box-key name for a boxable VALUE-
+    // BUILTIN (DateTime/TimeSpan/DateOnly/TimeOnly/Guid — scalar/struct value
+    // types), across the three TypeRef shapes (builtinClassSym decl, declaration-
+    // less annotation, imported). Keyed into primBoxDesc_/primBoxVtable_ so a
+    // boxed value-builtin carries a walkable type descriptor (emitIsA) and
+    // boxValue can wrap it. Returns nullptr for any other type (and for a nullable
+    // form — a `DateTime?` → Object box is a distinct, unhandled shape).
+    const char* valueBuiltinBoxName(const sema::TypeRef* rt);
 
     // §8.6: is `target` a reference type (Object / interface / Object?) — the
     // kind of declared location that triggers boxing of a value-typed source?

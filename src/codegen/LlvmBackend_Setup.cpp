@@ -13,6 +13,11 @@ namespace bezel::codegen {
 // unwind-disposal eligibility helpers above its definition.
 static bool isClassOrInterfaceRef(const sema::TypeRef* rt);
 
+// #1945 / §8.6: forward declaration — defined later in this file. The box-key
+// name for a boxable value-builtin (DateTime/…) by spelling; used by
+// descriptorForPatternName above its definition.
+static const char* valueBuiltinBoxNameStr(std::string_view n);
+
 // #1309 / §22.13: the constant-literal initializer shapes that constInitForExpr
 // can fold into an LLVM Constant for a static field's backing global. Factored
 // out of the (previously triplicated) inline dynamic_cast checklist so the
@@ -2614,6 +2619,15 @@ llvm::GlobalVariable* Emitter::descriptorForPatternName(
     }
     auto bit = builtinDesc_.find(std::string(last));
     if (bit != builtinDesc_.end()) return bit->second;
+    // §19.3 / §8.6 (#1945): a value-builtin type-test target (DateTime/TimeSpan/
+    // DateOnly/TimeOnly/Guid) resolves to its box descriptor (primBoxDesc_), so a
+    // concrete `case o of DateTime` / `o is DateTime` runs a real is-a against a
+    // boxed value-builtin. Value-builtin names are reserved, so no user type name
+    // collides; checked after the user-symbol / builtinDesc_ lookups above.
+    if (const char* vb = valueBuiltinBoxNameStr(last)) {
+        auto vit = primBoxDesc_.find(vb);
+        if (vit != primBoxDesc_.end()) return vit->second;
+    }
     return nullptr;
 }
 
@@ -13756,6 +13770,43 @@ static const char* primBoxName(sema::PrimitiveType p) {
 }
 
 
+// §8.6 / §2.5–§2.6 (#1945): the box-key name for a boxable VALUE-BUILTIN by its
+// spelling. The scalar/struct value builtins (DateTime/TimeSpan → i64,
+// DateOnly/TimeOnly → i32, Guid → {i64,i64}) box into Object like a record; a
+// CancellationToken lowers to a pointer (reference-like) and Range/spans are
+// separate value shapes, so none of those are boxed here (not the #1945 defect).
+static const char* valueBuiltinBoxNameStr(std::string_view n) {
+    if (n == "DateTime")  return "DateTime";
+    if (n == "TimeSpan")  return "TimeSpan";
+    if (n == "DateOnly")  return "DateOnly";
+    if (n == "TimeOnly")  return "TimeOnly";
+    if (n == "Guid")      return "Guid";
+    return nullptr;
+}
+
+
+// §8.6 / §2.5–§2.6 (#1945): the box-key name for a boxable value-builtin TypeRef,
+// resolved across the three shapes value-builtins take (builtinClassSym decl with
+// decl==nullptr; declaration-less annotation via astNode headName; imported via
+// importedName). Nullable is excluded — a `DateTime?` → Object box is a separate,
+// unhandled shape (isNullableValueTy does not recognise value-builtins either).
+const char* Emitter::valueBuiltinBoxName(const sema::TypeRef* rt) {
+    using K = sema::TypeRef::Kind;
+    if (!rt || rt->nullable || rt->kind != K::Named) return nullptr;
+    // (a) builtinClassSym form: a compiler-intrinsic TypeSymbol (decl==nullptr).
+    if (rt->declaration)
+        return rt->declaration->decl ? nullptr
+                                     : valueBuiltinBoxNameStr(rt->declaration->name);
+    // (b) annotation form: declaration null, name via astNode headName.
+    if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty())
+        return valueBuiltinBoxNameStr(rt->headName());
+    // (c) imported form: declaration null, no astNode, importedName set.
+    if (!rt->importedName.empty())
+        return valueBuiltinBoxNameStr(rt->importedName);
+    return nullptr;
+}
+
+
 // §8.6: build the box descriptor (vtable[0] type-tag array) + box vtable globals
 // for boxable value types — user records and enums, and the built-in primitives
 // + string. A boxed value is `{ vtable*, value-bytes }`; its first word points
@@ -14201,6 +14252,82 @@ void Emitter::setupBoxDescriptors() {
             std::string("pvt$") + nm);
         allVtables_.push_back(primBoxVtable_[nm]);  // §8.6 #417
     }
+
+    // --- Value-builtins: descriptor + box vtable (#1945) ------------------
+    // §8.6 / §2.5–§2.6: DateTime/TimeSpan/DateOnly/TimeOnly/Guid are scalar/struct
+    // value types (i64 / i32 / {i64,i64}) that box into Object exactly like a
+    // record. Without a box descriptor a boxed value-builtin carried no walkable
+    // type tag, so `case o of DateTime` / `o is DateTime` never matched (and the
+    // §19.3 type-parameter form was a documented never-match, #1852); and because
+    // isBoxableValueType missed them, boxValue was a no-op, leaving the raw scalar
+    // in an Object slot → a malformed-IR call in some shapes. Give each a box
+    // vtable (keyed into primBoxDesc_/primBoxVtable_ by name — the keys never
+    // collide with the primitive spellings). CRITICALLY, the box's type tag
+    // (vtable[0]) must be the value-builtin's EXISTING class descriptor (`td$<nm>`
+    // — every value-builtin has a compiler class TypeSymbol in descArray_ from
+    // declareVtables) so it compares equal in emitIsA to the descriptor that
+    // descriptorForPatternName / boxDescriptorFor resolve by NAME for the type-test
+    // target; a freshly-minted descriptor would be a distinct global and never
+    // match. A `[self, null]` descriptor is minted only as a fallback if the
+    // builtin somehow lacks a class descriptor. The vtable interface slot points at
+    // a shared empty (null-terminated) itmap so a stray itable lookup finds nothing
+    // rather than dereferencing a null itmap (§26.5 crash the primitive block warns
+    // about).
+    static const char* const kValueBuiltins[] = {
+        "DateTime", "TimeSpan", "DateOnly", "TimeOnly", "Guid"};
+    // One shared empty itmap `[null]` for every value-builtin box vtable.
+    llvm::GlobalVariable* vbEmptyItmap = nullptr;
+    for (const char* nm : kValueBuiltins) {
+        if (primBoxDesc_.count(nm)) continue;
+        // Reuse the value-builtin's class descriptor (td$<nm>) so box and type-test
+        // agree; fall back to a minted [self, null] descriptor only if absent.
+        llvm::GlobalVariable* desc = nullptr;
+        for (const auto& sym : ctx_.symbols()) {
+            auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+            if (ts && ts->name == nm &&
+                (ts->kind == ast::TypeDeclKind::Class ||
+                 ts->kind == ast::TypeDeclKind::Interface)) {
+                auto dit = descArray_.find(ts);
+                if (dit != descArray_.end()) { desc = dit->second; break; }
+            }
+        }
+        if (!desc) {
+            auto* descTy = llvm::ArrayType::get(ptrTy(), 2);
+            auto* minted = new llvm::GlobalVariable(
+                *module_, descTy, /*isConstant=*/true,
+                llvm::GlobalValue::InternalLinkage, nullptr,
+                std::string("ptd$") + nm);
+            minted->setInitializer(llvm::ConstantArray::get(
+                descTy, {minted, llvm::ConstantPointerNull::get(ptrTy())}));
+            desc = minted;
+        }
+        primBoxDesc_[nm] = desc;
+        if (!vbEmptyItmap) {
+            auto* itmapTy = llvm::ArrayType::get(ptrTy(), 1);
+            vbEmptyItmap = new llvm::GlobalVariable(
+                *module_, itmapTy, /*isConstant=*/true,
+                llvm::GlobalValue::InternalLinkage,
+                llvm::ConstantArray::get(
+                    itmapTy, {llvm::ConstantPointerNull::get(ptrTy())}),
+                "itmap$box$valuebuiltin");
+        }
+        std::vector<llvm::Constant*> vtElems(
+            kVirtualMethodsBase, llvm::ConstantPointerNull::get(ptrTy()));
+        vtElems[0] = desc;                                        // type descriptor
+        vtElems[1] = llvm::ConstantExpr::getPointerCast(vbEmptyItmap, ptrTy());
+        if (builtinDisposeFn_)
+            vtElems[2] = llvm::cast<llvm::Constant>(builtinDisposeFn_);  // Dispose
+        vtElems[kToStringSlot]    = valueBuiltinBoxToStringThunk(nm);
+        vtElems[kEqualsSlot]      = boxDefaultEqualsThunk();
+        vtElems[kGetHashCodeSlot] = boxDefaultHashCodeThunk();
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), kVirtualMethodsBase);
+        primBoxVtable_[nm] = new llvm::GlobalVariable(
+            *module_, vtTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(vtTy, vtElems),
+            std::string("pvt$") + nm);
+        allVtables_.push_back(primBoxVtable_[nm]);  // §8.6 #417
+    }
 }
 
 
@@ -14231,6 +14358,28 @@ struct ThunkScope {
     }
 };
 }  // namespace
+
+
+// §8.6 / §2.5 (#1945): the ToString thunk for a boxed VALUE-BUILTIN. A boxed
+// DateTime/Guid/… has no user ToString and no per-type formatter here (formatting
+// belongs to the value-type's own methods, out of scope for the box-descriptor
+// fix), so the box-vtable slot returns the type's name — mirroring the class
+// default (§8.5 "the type's qualified name"). This exists so vtable slot 3 is a
+// valid function (a null slot would fault if `Object.ToString()` is dispatched on
+// a boxed value-builtin). Signature is the vtable-uniform `ptr(ptr this)`.
+llvm::Constant* Emitter::valueBuiltinBoxToStringThunk(const char* name) {
+    auto* fnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, /*isVarArg=*/false);
+    auto* thunk = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage,
+        std::string("bz$vbtostr$") + name, module_.get());
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    {
+        ThunkScope scope(currentFn_, builder_, thunk, entry);
+        builder_.CreateRet(
+            lowerStringLiteral(std::string("\"") + name + "\"", false));
+    }
+    return thunk;
+}
 
 
 // §8.5 / §8.6 (#417): the uniform ToString thunk for a CLASS. Returns the user
@@ -15365,6 +15514,13 @@ bool Emitter::isBoxableValueType(const sema::TypeRef* rt) {
         return rt->primitive != P::String && rt->primitive != P::Object &&
                rt->primitive != P::None && rt->primitive != P::Decimal;
     }
+    // §8.6 / §2.5–§2.6 (#1945): value-builtins (DateTime/TimeSpan/Guid/DateOnly/
+    // TimeOnly) are scalar/struct value types that box into Object like a record.
+    // Handled in BOTH TypeRef shapes (builtinClassSym decl and declaration-less
+    // annotation/imported) before the record/enum decl gate — without this the
+    // raw scalar was left in an Object slot (no box → malformed-IR call in some
+    // shapes) and carried no box descriptor (`case o of DateTime` never matched).
+    if (valueBuiltinBoxName(rt)) return true;
     if (rt->kind == K::Named && rt->declaration)
         return rt->declaration->kind == ast::TypeDeclKind::Record ||
                rt->declaration->kind == ast::TypeDeclKind::Enum;
@@ -15390,6 +15546,14 @@ bool Emitter::isObjectOrInterfaceTarget(const sema::TypeRef* target) {
 llvm::GlobalVariable* Emitter::boxDescriptorFor(const sema::TypeRef* rt) {
     if (!rt) return nullptr;
     using K = sema::TypeRef::Kind;
+    // §8.6 / §2.5 (#1945): a value-builtin's box descriptor (primBoxDesc_, keyed
+    // by the builtin name). Checked FIRST so a builtinClassSym-shaped value-
+    // builtin (declaration set but no descArray_ entry) resolves to its box
+    // descriptor rather than the `Named && declaration` miss below.
+    if (const char* vb = valueBuiltinBoxName(rt)) {
+        auto it = primBoxDesc_.find(vb);
+        return it != primBoxDesc_.end() ? it->second : nullptr;
+    }
     if (rt->kind == K::Named && rt->declaration) {
         auto it = descArray_.find(rt->declaration);
         return it != descArray_.end() ? it->second : nullptr;
@@ -15408,6 +15572,14 @@ llvm::GlobalVariable* Emitter::boxDescriptorFor(const sema::TypeRef* rt) {
 llvm::GlobalVariable* Emitter::boxVtableFor(const sema::TypeRef* rt) {
     if (!rt) return nullptr;
     using K = sema::TypeRef::Kind;
+    // §8.6 / §2.5 (#1945): a value-builtin's box vtable (primBoxVtable_, keyed by
+    // the builtin name). Checked FIRST so boxValue finds a vtable for a value-
+    // builtin source and produces a proper box (rather than the no-op that left
+    // the raw scalar in an Object slot).
+    if (const char* vb = valueBuiltinBoxName(rt)) {
+        auto it = primBoxVtable_.find(vb);
+        return it != primBoxVtable_.end() ? it->second : nullptr;
+    }
     if (rt->kind == K::Named && rt->declaration) {
         auto it = boxVtable_.find(rt->declaration);
         return it != boxVtable_.end() ? it->second : nullptr;
