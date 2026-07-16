@@ -922,6 +922,20 @@ private:
         // disposed exactly once (no double-free). bz_box-style no GEP on the
         // ptr-holder: the cell pointer is loaded first.
         bool inlineOwnedArrayCell = false;
+        // #1930 / stdlib §5 / §28.9: a plain `var g := <src>.GroupBy(sel).First()`
+        // (or .Single()/.Last()/.ElementAt(i)/.*OrNull()/no-seed .Aggregate(...)) —
+        // a local bound to a bare-GroupBy element-RETURNING terminal, whose result
+        // is the returned IGrouping pointer. The terminal already freed the SIBLING
+        // groups + the outer array spine (bz_groupby_free_groups_except), keeping
+        // ONLY the returned grouping alive; this disposes THAT grouping (its element
+        // array + key buffer + object) at scope end via bz_grouping_free. Fires on
+        // BOTH the normal and unwind exit (the reference dies either way; a given
+        // exit goes one way only → exactly once per exit). Registered ONLY for a
+        // local the StringEscapeWalker proved never escapes (groupingFreeEligible_):
+        // nothing else holds the pointer, so no UAF and no double-free. `slot` holds
+        // the grouping pointer; bz_grouping_free is null-safe (an *OrNull empty
+        // result is null). The class/collection/dict fields are unused.
+        bool grouping = false;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // §28.3 (line 4910): owned parameters of the current function awaiting
@@ -5893,9 +5907,30 @@ private:
     // bz_array_free).
     std::unordered_set<const void*> dictMaterializerFreeEligible_;
     llvm::Function* dictMaterializerFreeEligibleFn_ = nullptr;
-    // Compute borrowingArrayFreeEligible_ for a block body (see the .cpp).
+    // #1930 / stdlib §5 / §28.9: the grouping analog of borrowingArrayFreeEligible_
+    // — plain `var g := <src>.GroupBy(sel).First()` (or .Single()/.Last()/
+    // .ElementAt(i)/.*OrNull()/no-seed .Aggregate(...)) locals bound to a bare-
+    // GroupBy element-RETURNING terminal, whose returned IGrouping the type-agnostic
+    // escape walk (StringEscapeWalker) proves never escapes. Membership arms a
+    // scope-end bz_grouping_free of that single returned grouping (the terminal
+    // already reclaimed its sibling groups + the outer array). An escaping local
+    // (returned — statically rejected as a borrow —, captured by a closure, added
+    // to an Array<IGrouping>, or aliased) is excluded → the returned grouping just
+    // leaks (the safe direction: never a UAF, never a double-free with an owner
+    // that took it). Populated alongside borrowingArrayFreeEligible_ (same escape
+    // walk, separate set because groupings free via bz_grouping_free).
+    std::unordered_set<const void*> groupingFreeEligible_;
+    llvm::Function* groupingFreeEligibleFn_ = nullptr;
+    // Compute borrowingArrayFreeEligible_ (and #1930 groupingFreeEligible_) for a
+    // block body (see the .cpp).
     void collectBorrowingArrayFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // #1930 / stdlib §5 / §28.9: true if `ld` is a plain `var g := <expr>` whose
+    // initializer is a bare-GroupBy element-RETURNING terminal (result type
+    // IGrouping<…>): `<src>.GroupBy(sel).First()/.Single()/.Last()/.ElementAt(i)/
+    // .FirstOrNull()/.LastOrNull()/.SingleOrNull()/no-seed .Aggregate(...)`. Such a
+    // local binds the returned grouping (freed at scope end when non-escaping).
+    bool isFreshGroupingTerminalLocal(const ast::LocalDecl* ld) const;
     // #1871 / §28.9 / §28.11: true if `ld` is a plain `var xs: Array<T> := [ ... ]`
     // (a borrowing `Array<T>` local initialised by a collection literal) whose
     // element policy is backing-only (null per-element disposer; value or

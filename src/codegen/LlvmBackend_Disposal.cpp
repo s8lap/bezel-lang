@@ -1683,6 +1683,24 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             emitClosureRelease(c);
             continue;
         }
+        // #1930 / stdlib §5 / §28.9: a provably-non-escaping `var g :=
+        // <src>.GroupBy(sel).First()/…` local — the returned IGrouping of a bare-
+        // GroupBy element-returning terminal. Its SIBLING groups + the outer array
+        // were already reclaimed by the terminal (bz_groupby_free_groups_except),
+        // keeping only this returned grouping; free it here (element array + key
+        // buffer + group object) at scope end — on BOTH the normal and unwind exit
+        // (the reference dies either way; a given exit goes one way only, so exactly
+        // once per exit). The local was proven non-escaping, so nothing else holds
+        // the pointer: bz_grouping_free frees the grouping exactly once (no UAF, no
+        // double-free). bz_grouping_free is null-safe (an *OrNull empty result is
+        // null → a no-op).
+        if (it->grouping) {
+            llvm::Value* g = builder_.CreateLoad(ptrTy(), it->slot, "grp.free");
+            auto* gfree = declareC("bz_grouping_free",
+                                   llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(gfree, {g});
+            continue;
+        }
         // #422 / §8.6 / §28.9: a provably-non-escaping `var` Object/interface
         // local holding a BOXED VALUE. Release its single (producer) reference at
         // scope end — on BOTH the normal and unwind exit (the reference dies

@@ -2146,6 +2146,26 @@ extern "C" void bz_groupby_free_groups(void* groups_arr) {
     }
 }
 
+// #1930 / stdlib §5 / §28.9: release every grouping inside a groups array EXCEPT
+// the one whose pointer equals `keep` — used when a bare `GroupBy(sel)` is drained
+// by an element-RETURNING terminal (First/Single/Last/ElementAt/*OrNull/no-seed
+// Aggregate) whose result IS one of the grouping pointers. The returned grouping
+// (`keep`) must stay live (the caller now holds it — freeing it would dangle the
+// result: use-after-free); its SIBLING groups are unreachable and are reclaimed
+// here. After this call the outer array spine must be freed with
+// bz_array_free(..., null) — the spine holds only the pointers, not the grouping
+// objects, so freeing it does not touch the surviving `keep`. `keep` may be null
+// (an *OrNull empty result): no grouping matches, so every grouping is freed
+// (correct — nothing is returned to keep alive).
+extern "C" void bz_groupby_free_groups_except(void* groups_arr, void* keep) {
+    auto* garr = (bz_array_t*)groups_arr;
+    if (!garr) return;
+    for (int64_t i = 0; i < garr->count; ++i) {
+        void** slot = (void**)((char*)garr->data + i * sizeof(void*));
+        if (*slot != keep) bz_grouping_free(*slot);
+    }
+}
+
 extern "C" void* bz_lazy_where(void* up, void* closure, void* pred) {
     auto* u = (bz_lazy_t*)up;
     auto* e = bz_lazy_new(BZ_LAZY_WHERE, u->esz);

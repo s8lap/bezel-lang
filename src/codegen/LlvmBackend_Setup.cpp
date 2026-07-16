@@ -3295,6 +3295,12 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // #1028: dict-materializer eligibility, populated by the same pass.
     dictMaterializerFreeEligible_.clear();
     dictMaterializerFreeEligibleFn_ = fn;
+    // #1930: which plain `var g := <src>.GroupBy(sel).First()/…` locals (a bare-
+    // GroupBy element-returning terminal) may have the returned grouping freed at
+    // scope end. Populated by collectBorrowingArrayFreeEligible; consulted in
+    // lowerLocalDecl (mirrors borrowingArrayFreeEligible_).
+    groupingFreeEligible_.clear();
+    groupingFreeEligibleFn_ = fn;
     // #422 / §27.5 / §28.9: which `var` closure (function-typed) locals may be
     // released at scope end (mirrors stringReleaseEligible_).
     closureReleaseEligible_.clear();
@@ -6094,6 +6100,24 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         !disposeStack_.empty()) {
         Disposal d{slot, nullptr};
         d.dict = true;
+        disposeStack_.back().push_back(d);
+    }
+    // #1930 / stdlib §5 / §28.9: a plain `var g := <src>.GroupBy(sel).First()/…`
+    // (a bare-GroupBy element-returning terminal) proven non-escaping holds the SOLE
+    // reference to the returned grouping — the terminal already reclaimed the sibling
+    // groups + the outer array (bz_groupby_free_groups_except), keeping only this
+    // one. Reclaim it at scope end via bz_grouping_free (the grouping analog of the
+    // #1003 array reclaim / #1028 dict reclaim above). The escape walk excludes any
+    // returned (statically a borrow → rejected)/captured/added-to-collection/aliased
+    // local, so the free is exactly-once (no UAF, no double-free with an owner that
+    // took the grouping). bz_grouping_free is null-safe (an *OrNull empty result is
+    // null). Gated on currentFn_ matching the analyzed function (a lambda/thunk body
+    // inherits no eligibility → the grouping just leaks, never double-freed).
+    if (v && currentFn_ == groupingFreeEligibleFn_ &&
+        groupingFreeEligible_.count(static_cast<const void*>(declNode)) &&
+        !disposeStack_.empty()) {
+        Disposal d{slot, nullptr};
+        d.grouping = true;
         disposeStack_.back().push_back(d);
     }
 }
@@ -10043,6 +10067,34 @@ bool Emitter::isFreshBorrowingArrayMaterializerLocal(
 }
 
 
+// #1930 / stdlib §5 / §28.9: is `ld` a plain `var g := <expr>` whose initializer is
+// a bare-GroupBy element-RETURNING terminal — a call `<src>.GroupBy(sel).<Term>(…)`
+// (Term ∈ First/Single/Last/ElementAt/*OrNull/no-seed Aggregate) whose result type
+// is an IGrouping<TKey,T> pointer? The terminal returns one of the freshly-
+// materialized groups; when the local never escapes (proven separately by the
+// escape walk) the returned grouping is freed at scope end (bz_grouping_free). The
+// gate is the RESULT TYPE (IGrouping, possibly nullable for the *OrNull forms) plus
+// the receiver being a bare GroupBy — matching exactly the terminals the codegen
+// keep-path (LlvmBackend_Calls.cpp) reclaims siblings for.
+bool Emitter::isFreshGroupingTerminalLocal(const ast::LocalDecl* ld) const {
+    if (!ld || ld->isUsing || !ld->initializer) return false;
+    // Result type must be a synthetic declaration-less IGrouping<…> (the element a
+    // bare-GroupBy element-returning terminal yields; nullable for *OrNull).
+    const sema::TypeRef* rt = ctx_.exprType(*ld->initializer);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+        return false;
+    if (rt->headName() != "IGrouping") return false;
+    // The initializer must be a terminal CALL whose RECEIVER is a bare `GroupBy(sel)`.
+    auto* call = dynamic_cast<const ast::CallExpr*>(ld->initializer.get());
+    if (!call || !call->callee) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma || !ma->target) return false;
+    return isGroupByCall(ma->target.get());
+}
+
+
 // #1004 / stdlib §5 / §3 / §28: is `e` an EXPRESSION codegen lowers to a FRESH,
 // OWNERLESS `Array<T>` temporary — i.e. a fresh-array materializer call
 // (`recv.ToArray()`, `recv.Sorted(...)`, or `recv.Reversed()`) whose result is
@@ -10238,11 +10290,18 @@ void Emitter::collectBorrowingArrayFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     borrowingArrayFreeEligible_.clear();
     dictMaterializerFreeEligible_.clear();  // #1028
+    groupingFreeEligible_.clear();          // #1930
     std::vector<const ast::LocalDecl*> candidates;
     std::vector<const ast::LocalDecl*> dictCandidates;  // #1028
+    std::vector<const ast::LocalDecl*> groupingCandidates;  // #1930
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            // #1930: a plain `var g := <src>.GroupBy(sel).First()/…` — a bare-GroupBy
+            // element-returning terminal binding the returned IGrouping. A `using var`
+            // never reaches here (IGrouping has no user Dispose; it is a plain `var`).
+            if (isFreshGroupingTerminalLocal(ld))
+                groupingCandidates.push_back(ld);
             if (isFreshBorrowingArrayMaterializerLocal(ld))
                 candidates.push_back(ld);
             // #1871 / §28.9 / §28.11: a plain `var xs: Array<T> := [ ... ]` — a
@@ -10309,6 +10368,24 @@ void Emitter::collectBorrowingArrayFreeEligible(
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             dictMaterializerFreeEligible_.insert(static_cast<const void*>(ld));
+    }
+    // #1930 / stdlib §5 / §28.9: the same conservative type-agnostic escape walk
+    // for bare-GroupBy element-returning-terminal locals. A local proven never to
+    // escape holds the SOLE reference to the returned grouping (the terminal freed
+    // its siblings + the array), so a scope-end bz_grouping_free runs exactly once
+    // (no UAF, no double-free). The walk runs in the STRICT (non-borrowingArray)
+    // mode: a `for var x in g` iteration or any binding/capture/argument use of the
+    // grouping is treated as an escape — the returned grouping then just leaks (the
+    // safe direction), never dangles. CRITICALLY this excludes the two escape routes
+    // that would otherwise turn the free into a fault: capture by a closure that
+    // outlives the scope (UAF), and `arr.Add(g)` into an owning Array<IGrouping>
+    // that also frees it (double-free) — both surface as a non-safe-read occurrence
+    // and taint the local out of eligibility.
+    for (const ast::LocalDecl* ld : groupingCandidates) {
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            groupingFreeEligible_.insert(static_cast<const void*>(ld));
     }
 }
 
