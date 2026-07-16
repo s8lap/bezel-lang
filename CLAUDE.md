@@ -125,14 +125,20 @@ serial gtest (several minutes). Use `tests/run_parallel.sh 16` (or `cmake --buil
 build --target check`): it shards `bezel_tests` across cores (each shard a
 separate process via `BEZEL_SHARD_*`), running the whole suite in ~2 min. Tests
 drive the *real* `bezelc` AOT path (fork-isolated `Driver::compileFile` + clang
-link + native exec) — the strict oracle. **Serial is authoritative**: the
-sharded runner can over-report under fork/link contention, so a real failure
-must reproduce under the serial `build/tests/bezel_tests`. See `tests/README.md`
-for the harness (`runAot` / `runAotChecked` / lit+FileCheck) and how to write a
-test; `BEZEL_AOT_LINK_TOKENS` caps concurrent compiles when several agents run
-the suite at once. (The older in-process JIT harness — a *lenient* oracle that
-skipped the ownership and definite-assignment passes and `verifyModule` — is
-being retired.)
+link + native exec) — the strict oracle. The sharded `--full` run (`scripts/gate.sh`)
+is **authoritative** (#1861): every test is process-isolated (a fork'd compile +
+a separate native exec), so the old serial-order heap-corruption class is
+structurally impossible and the always-on serial pass was retired. The sharded
+runner *can* over-report under fork/link contention — but that shows up as a
+whole-suite timeout, not a real failure; to disambiguate, re-run the specific
+suspect test(s) in isolation with `BEZEL_TEST_FILTER=<name>` (a single-process
+run), NOT a full serial pass. (The binary silently ignores `--gtest_filter`;
+`BEZEL_TEST_FILTER` is the substring selector.) See `tests/README.md` for the
+harness (`runAot` / `runAotChecked` / lit+FileCheck) and how to write a test;
+`BEZEL_AOT_LINK_TOKENS` caps concurrent compiles when several agents run the
+suite at once. (The former in-process JIT harness — a *lenient* oracle that
+skipped the ownership/definite-assignment passes and `verifyModule` — has been
+retired.)
 
 One machine-local, not-tracked step is required for ccache to cache the PCH'd
 compiles: `~/.config/ccache/ccache.conf` must contain
@@ -185,12 +191,13 @@ preview, `--apply` to act; `scripts/reap_orphans.sh` clears processes a dead
 agent orphaned. Per-worktree build dirs live *inside* the worktree, so reaping
 the worktree reclaims them too.
 
-**Extra gates for delicate merges.** Merges touching object layout, disposal
-machinery, or the runtime additionally run (a) one full **serial** suite pass
-(`build/tests/bezel_tests` directly — twice this project, sharded-green runs
-masked heap corruption the serial order exposed) and (b)
-`scripts/asan_sweep.sh` — a whole-suite ASan shard sweep (caught the v0.175
-exception-layout corruption and #1390).
+**Delicate merges (object layout, disposal machinery, runtime).** Gate these
+with `scripts/gate_and_push.sh --full` (or `gate.sh --full`): `--full` runs the
+whole suite with generated-code AddressSanitizer forced on
+(`BEZEL_AOT_FORCE_SANITIZE=address`) — the former standalone whole-suite ASan
+sweep is folded into that one sharded pass (#1861). No separate serial pass or
+`asan_sweep.sh` is needed: AOT process-isolation makes serial-order corruption
+structurally impossible, so the sharded `--full` run is the whole oracle.
 
 ## When in doubt
 

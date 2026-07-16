@@ -241,7 +241,7 @@ spec_0238	spec	Consumer-side-rules	skip	n/a	skip:syntax-snippet
 spec_0239	spec	Consumer-side-rules	skip	n/a	skip:syntax-snippet
 spec_0240	spec	Consumer-side-rules	skip	n/a	skip:syntax-snippet
 spec_0241	spec	Disposing-an-unconsumed-OwnedTaskT	skip	n/a	skip:syntax-snippet
-spec_0242	spec	Constructing-a-completed-task-with-a-class-typed-result	fragment	compiles	preamble
+spec_0242	spec	Constructing-a-completed-task-with-a-class-typed-result	skip	n/a	skip:stale-unawaited-task-1903
 spec_0243	spec	Idiom-async-resource-acquisition	skip	n/a	skip:syntax-snippet
 spec_0244	spec	306-Async-lambdas	skip	n/a	blocked-on-#980
 spec_0245	spec	307-Async-iterators	skip	n/a	skip:syntax-snippet
