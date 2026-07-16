@@ -3465,9 +3465,12 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
             // returned as IEnumerable<T> into the vtable-backed enumerator (a raw
             // array/instance returned as IEnumerable → SIGSEGV on the caller's
             // for-in / scope-end iterEnumDispose). Mirrors the ReturnStmt path.
+            // #1916: ownLazyPipeline=true — a lazy pipeline `=> xs.Select(…)` is
+            // drained into an OWNING enumerator the caller disposes (leak-free).
             if (v && currentReturnTypeNode_)
                 v = wrapAsIEnumerableForTarget(
-                    v, ctx_.resolvedType(*currentReturnTypeNode_), ci.exprBody);
+                    v, ctx_.resolvedType(*currentReturnTypeNode_), ci.exprBody,
+                    /*ownLazyPipeline=*/true);
             // #694 residue-1 / §4.6 / §28.9 / §28.3: an arrow-body (`=> expr`)
             // string-returning method must mint EXACTLY +1 just like the explicit
             // ReturnStmt path (LlvmBackend_Stmts.cpp line ~750). Without this,
@@ -5642,21 +5645,9 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 // (registerIterableSourceDisposal) frees the drained array exactly
                 // once (leak-free). An INFERRED local (`var xs := xs.Select(…)`)
                 // keeps its concrete lazy type and iterates via lowerLazyLinqFor —
-                // only the interface-widened binding needs this bridge.
-                llvm::Type* et =
-                    (declTR->genericArgs.empty() || !declTR->genericArgs[0])
-                        ? i32() : lowerTypeRef(declTR->genericArgs[0]);
-                int64_t esz = 8;
-                if (et->isIntegerTy(32) || et->isFloatTy()) esz = 4;
-                else if (et->isIntegerTy(1) || et->isIntegerTy(8)) esz = 1;
-                else if (et->isIntegerTy(16)) esz = 2;
-                else if (et->isStructTy())
-                    esz = (int64_t)module_->getDataLayout().getTypeAllocSize(et);
-                auto* toArrFn =
-                    declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
-                llvm::Value* arr = builder_.CreateCall(
-                    toArrFn, {v, builder_.getInt64(esz)}, "lazy.mat");
-                v = wrapOwnedArrayAsIEnumerable(arr, declTR);
+                // only the interface-widened binding needs this bridge. The
+                // drain+owning-wrap is shared with the RETURN variant (#1916).
+                v = drainLazyPipelineToOwnedIEnumerable(v, declTR);
             } else if (initTR && initTR->kind == sema::TypeRef::Kind::Named &&
                        initTR->declaration) {
                 v = wrapUserClassAsIEnumerable(v, initTR->declaration, declTR);

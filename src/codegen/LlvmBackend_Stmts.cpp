@@ -1343,10 +1343,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // vtable-backed enumerator, not a raw bz_array_t* / class instance — the
         // caller's for-in and its scope-end iterEnumDispose both dispatch through
         // the value's vtable (a raw array → SIGSEGV). Wrap it here as the
-        // call-argument and local-decl init paths already do.
+        // call-argument and local-decl init paths already do. #1916: pass
+        // ownLazyPipeline=true — a lazy LINQ pipeline returned as IEnumerable<T>
+        // is drained into an OWNING enumerator (the caller owns and disposes the
+        // returned value, so an owning wrapper is leak-free).
         if (v && rs->value && currentReturnTypeNode_)
             v = wrapAsIEnumerableForTarget(
-                v, ctx_.resolvedType(*currentReturnTypeNode_), rs->value.get());
+                v, ctx_.resolvedType(*currentReturnTypeNode_), rs->value.get(),
+                /*ownLazyPipeline=*/true);
         // #429 (RETURN-escape category) / §4.6 / §28.9 / §28.3: a method whose
         // declared return type is (non-nullable) `string` mints EXACTLY +1 for
         // the returned value, transferring ownership of one reference to the

@@ -2930,7 +2930,7 @@ bool Emitter::argsCanFill(const std::vector<ast::Param>& params,
 // path (#1067/#1068/#552).
 llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         llvm::Value* v, const sema::TypeRef* targetTy,
-        const ast::Expr* srcExpr) {
+        const ast::Expr* srcExpr, bool ownLazyPipeline) {
     if (!v || !targetTy || !srcExpr) return v;
     if (!(targetTy->kind == sema::TypeRef::Kind::Named &&
           !targetTy->declaration && targetTy->astNode &&
@@ -2938,6 +2938,23 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
           targetTy->headName() == "IEnumerable"))
         return v;
     sema::TypeRef* actualTy = ctx_.exprType(*srcExpr);
+    // #1916 / stdlib §5 / §29.11: a lazy LINQ pipeline (Select/Where/… → a
+    // bz_lazy_t* sentinel) widened to a pure `IEnumerable<T>` in a RETURN
+    // position. The lazy vtable has only 4 slots (td/Dispose/MoveNext/Current)
+    // and its Current returns a POINTER; the caller's for-in over the returned
+    // IEnumerable<T> drives the §29.11 iterator vtable — it reads slot 4
+    // (GetEnumerator, OUT OF BOUNDS for the 4-slot lazy vtable → a garbage
+    // function-pointer call → SIGSEGV) and expects Current BY VALUE. Drain the
+    // pipeline once into a fresh owned Array<T> and wrap it in an OWNING
+    // vtable-backed enumerator (mirrors #1911's local-decl fix): the caller owns
+    // the returned IEnumerable and disposes it exactly once — a for-in over a
+    // CallExpr temporary takes the loop-owned (!sourceIsNamedLocal) slot-1
+    // Dispose path, freeing the drained array leak-free. Gated on
+    // ownLazyPipeline: only RETURN sites (the caller owns the result) pass true;
+    // the ARGUMENT position (a BORROWED callee param) needs a call-site
+    // temporary-disposal contract and is deferred (#1916).
+    if (ownLazyPipeline && isLazyEnumerableType(actualTy))
+        return drainLazyPipelineToOwnedIEnumerable(v, targetTy);
     std::string_view an;
     if (actualTy && actualTy->kind == sema::TypeRef::Kind::Named &&
         actualTy->astNode && actualTy->astNode->name &&
@@ -3116,6 +3133,33 @@ llvm::Value* Emitter::wrapOwnedArrayAsIEnumerable(llvm::Value* arr,
     builder_.CreateStore(builder_.getInt64(m.esz),
         builder_.CreateStructGEP(stTy, en, 3));
     return en;
+}
+
+// #1916 / #1911 / stdlib §5 / §29.11: drain a lazy LINQ pipeline (bz_lazy_t*)
+// once into a fresh owned Array<T> and wrap that array in an OWNING vtable-backed
+// enumerator. bz_lazy_to_array walks the pipeline to completion, materialising a
+// fresh bz_array_t* AND disposing the pipeline (releasing its inline-lambda
+// closures), so the resulting enumerator is the SOLE owner of independent data —
+// its slot-1 Dispose frees the array exactly once at the consumer's scope end.
+// `iEnumTy` is the target `IEnumerable<T>`; genericArgs[0] gives the element
+// stride (matching lowerLocalDecl's #1911 esz computation). Shared by
+// lowerLocalDecl (local-decl variant) and wrapAsIEnumerableForTarget (RETURN
+// variant).
+llvm::Value* Emitter::drainLazyPipelineToOwnedIEnumerable(
+        llvm::Value* lazyVal, const sema::TypeRef* iEnumTy) {
+    llvm::Type* et =
+        (!iEnumTy || iEnumTy->genericArgs.empty() || !iEnumTy->genericArgs[0])
+            ? i32() : lowerTypeRef(iEnumTy->genericArgs[0]);
+    int64_t esz = 8;
+    if (et->isIntegerTy(32) || et->isFloatTy()) esz = 4;
+    else if (et->isIntegerTy(1) || et->isIntegerTy(8)) esz = 1;
+    else if (et->isIntegerTy(16)) esz = 2;
+    else if (et->isStructTy())
+        esz = (int64_t)module_->getDataLayout().getTypeAllocSize(et);
+    auto* toArrFn = declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
+    llvm::Value* arr = builder_.CreateCall(
+        toArrFn, {lazyVal, builder_.getInt64(esz)}, "lazy.mat");
+    return wrapOwnedArrayAsIEnumerable(arr, iEnumTy);
 }
 
 // §29.2 (#437 / #1850): create-or-reuse the array-enumerator machinery (struct

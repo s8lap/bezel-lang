@@ -6465,10 +6465,13 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
             // §29.2 / §4.3 (#1310): wrap an array/user-class result returned as
             // IEnumerable<T> into the vtable-backed enumerator (raw array → the
             // caller's for-in / iterEnumDispose SIGSEGVs). Mirrors the other
-            // return-coercion sites.
+            // return-coercion sites. #1916: ownLazyPipeline=true — a lazy pipeline
+            // returned as IEnumerable<T> becomes an OWNING enumerator (leak-free;
+            // the caller owns the returned value).
             if (rv && ci.returnType)
                 rv = wrapAsIEnumerableForTarget(
-                    rv, ctx_.resolvedType(*ci.returnType), ci.exprBody);
+                    rv, ctx_.resolvedType(*ci.returnType), ci.exprBody,
+                    /*ownLazyPipeline=*/true);
             if (!emitReturn(specFn, rv)) emitImplicitReturn(specFn);
         }
     } else {
@@ -6802,8 +6805,12 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
         if (result && ci.returnType && !diverged_) {
             result = boxForTarget(result,
                 ctx_.resolvedType(*ci.returnType), ci.exprBody);
+            // #1916: ownLazyPipeline=true — this is a RETURN position (the caller
+            // owns the inlined result), so a lazy pipeline returned as
+            // IEnumerable<T> is drained into an OWNING enumerator (leak-free).
             result = wrapAsIEnumerableForTarget(
-                result, ctx_.resolvedType(*ci.returnType), ci.exprBody);
+                result, ctx_.resolvedType(*ci.returnType), ci.exprBody,
+                /*ownLazyPipeline=*/true);
         }
     } else if (ci.bodyKind == ast::MethodBodyKind::Block) {
         // Block body: compile a specialized function and call it.

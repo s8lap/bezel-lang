@@ -3996,9 +3996,31 @@ private:
     // the local-decl init path, and the method-RETURN coercion so a value
     // coerced to IEnumerable<T> is ALWAYS a real vtable object (a raw
     // bz_array_t* returned as IEnumerable would SIGSEGV on iteration/disposal).
+    //
+    // #1916 / stdlib §5 / §29.11: `ownLazyPipeline` additionally handles a lazy
+    // LINQ pipeline (a bz_lazy_t* sentinel, isLazyEnumerableType) widened to a
+    // pure `IEnumerable<T>` — the same 4-slot-vs-5-slot crash #1911 fixed for the
+    // local-decl case. It is gated on the flag because the disposal contract
+    // differs by position: a RETURN value is OWNED by the caller (an owning
+    // wrapper is leak-free — the four RETURN call sites pass true), whereas a
+    // callee `IEnumerable<T>` PARAMETER is BORROWED (an owning wrapper as the arg
+    // temporary would leak the drained array — the ARGUMENT site keeps the
+    // default false; the argument variant is deferred in #1916).
     llvm::Value* wrapAsIEnumerableForTarget(llvm::Value* v,
                                             const sema::TypeRef* targetTy,
-                                            const ast::Expr* srcExpr);
+                                            const ast::Expr* srcExpr,
+                                            bool ownLazyPipeline = false);
+
+    // #1916 / #1911 / stdlib §5 / §29.11: drain a lazy LINQ pipeline (bz_lazy_t*)
+    // once into a fresh owned Array<T> (bz_lazy_to_array also disposes the
+    // pipeline, releasing its inline-lambda closures) and wrap that array in an
+    // OWNING vtable-backed enumerator (wrapOwnedArrayAsIEnumerable), suitable for
+    // an `IEnumerable<T>` binding whose consumer disposes it exactly once — a
+    // local (#1911) or a returned value the caller owns (#1916). `iEnumTy` is the
+    // target `IEnumerable<T>` type; its genericArgs[0] supplies the element
+    // stride. Shared by lowerLocalDecl and wrapAsIEnumerableForTarget.
+    llvm::Value* drainLazyPipelineToOwnedIEnumerable(
+        llvm::Value* lazyVal, const sema::TypeRef* iEnumTy);
 
     // #1069: wrap a (Owned)LinkedList<T> — node-based bz_llist, NOT array-backed —
     // in the same vtable-backed enumerator the array wrapper produces, but walking
