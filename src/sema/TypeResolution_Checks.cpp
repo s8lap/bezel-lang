@@ -3316,6 +3316,18 @@ void Resolver::checkOneConstraint(const ast::Type& t,
             bound = resolveType(*item.typeArg, boundScope);
         }
         if (!bound || bound->kind == TypeRef::Kind::Error) return;  // defer
+        // #1867 / §14.2 clause 5 + §28.2/§9.7: a PRIMITIVE argument against
+        // `IDisposable`/`IAsyncDisposable` — which only classes implement — can
+        // never conform. These auto-imported builtin interfaces resolve to a
+        // Named TypeRef WITHOUT a synthesized declaration, so without this they
+        // would fall through the decl-null defer below. Mirrors the method-call-
+        // site check in ExprTypecheck_Calls.cpp.
+        if (arg->kind == TypeRef::Kind::Primitive &&
+            bound->kind == TypeRef::Kind::Named && !bound->declaration &&
+            primitiveNeverConformsToBuiltinIface(bound->headName())) {
+            report(std::string(bound->headName()));
+            return;
+        }
         // We can only verify a type-bound when both sides are user-declared
         // named types (BFS over baseTypes). Built-in bounds/args carry no
         // base-type chain here; defer to avoid false positives.
@@ -3345,9 +3357,22 @@ void Resolver::checkOneConstraint(const ast::Type& t,
             // a USER-declared interface or class, or a builtin class — is one a
             // primitive can never conform to (primitives cannot declare
             // conformances); reject rather than defer. Mirrors the method-call-
-            // site check in ExprTypecheck_Calls.cpp. The synthesized builtin
-            // interfaces keep the historical conservative accept.
-            if (bound->declaration != ctx_.builtinInterfaceSym(bn))
+            // site check in ExprTypecheck_Calls.cpp.
+            if (bound->declaration != ctx_.builtinInterfaceSym(bn)) {
+                report(std::string(bn));
+                return;
+            }
+            // #1867: the bound IS a synthesized builtin interface. Blanket-
+            // accepting by decl/name was too lenient — it admitted a WRONG
+            // generic argument (`int` vs `IComparable<long>`) and interfaces no
+            // primitive implements (`int` vs `IEqualityComparer<int>` /
+            // `IReadOnlySpan<int>`). Verify the exact §14.2-clause-5 conformance
+            // (correct head + generic arg); Defer keeps the historical
+            // conservative accept when the arg is not a decided concrete
+            // primitive. Mirrors the method-call-site check.
+            if (primitiveConformsToBuiltinInstanceIface(
+                    arg->primitive, bn, bound->genericArgs) ==
+                PrimBuiltinIfaceConformance::Rejects)
                 report(std::string(bn));
             return;
         }

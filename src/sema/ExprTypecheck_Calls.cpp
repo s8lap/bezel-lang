@@ -1742,6 +1742,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 if (item.kind == "type" && item.typeArg) {
                                     TypeRef* bound =
                                         ctx_.resolvedType(*item.typeArg);
+                                    // #1867 / §14.2 clause 5 + §28.2/§9.7: a
+                                    // PRIMITIVE argument against `IDisposable`/
+                                    // `IAsyncDisposable` — which only classes
+                                    // implement — can never conform. These
+                                    // resolve to a Named TypeRef WITHOUT a
+                                    // synthesized declaration, so without this
+                                    // they would fall through the type-parameter-
+                                    // bound branch below to a silent defer.
+                                    if (argRef->kind ==
+                                            TypeRef::Kind::Primitive &&
+                                        bound && !bound->declaration &&
+                                        primitiveNeverConformsToBuiltinIface(
+                                            bound->headName())) {
+                                        report(std::string(bound->headName()));
+                                        continue;
+                                    }
                                     // §14.2 type-parameter bound (`where T: U`):
                                     // the bound is another type parameter of this
                                     // method, so it carries no declaration of its
@@ -1823,11 +1839,28 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         // defer (closes the soundness hole where
                                         // `M<int>()` under `where T: IShape` was
                                         // silently accepted and then dispatched a
-                                        // bad itable slot). The synthesized
-                                        // builtin interfaces keep the historical
-                                        // conservative accept.
+                                        // bad itable slot).
                                         if (bound->declaration !=
-                                            ctx_.builtinInterfaceSym(bn))
+                                            ctx_.builtinInterfaceSym(bn)) {
+                                            report(std::string(bn));
+                                            continue;
+                                        }
+                                        // #1867: the bound IS a synthesized builtin
+                                        // interface. Blanket-accepting by decl/name
+                                        // was too lenient — it admitted a WRONG
+                                        // generic argument (`int` vs
+                                        // `IComparable<long>`) and interfaces no
+                                        // primitive implements (`int` vs
+                                        // `IEqualityComparer<int>`/`IReadOnlySpan<int>`).
+                                        // Verify the exact §14.2-clause-5
+                                        // conformance (correct head + generic arg);
+                                        // Defer keeps the historical conservative
+                                        // accept when the arg is not a decided
+                                        // concrete primitive.
+                                        if (primitiveConformsToBuiltinInstanceIface(
+                                                argRef->primitive, bn,
+                                                bound->genericArgs) ==
+                                            PrimBuiltinIfaceConformance::Rejects)
                                             report(std::string(bn));
                                         continue;
                                     }

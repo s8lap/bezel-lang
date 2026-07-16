@@ -145,4 +145,56 @@ inline bool primitiveConformsToStaticIface(PrimitiveType p,
     }
 }
 
+// spec §14.2 clause 5 (v0.196) + stdlib §9: the verdict of testing a PRIMITIVE
+// against one of the four synthesized-declaration *instance* builtin interfaces
+// (IComparable<T> / IEquatable<T> / IEqualityComparer<T> / IReadOnlySpan<T>).
+// A primitive conforms to these ONLY as its stdlib record declaration lists
+// them, and with the generic argument being the primitive itself:
+//   • IComparable<P> — every primitive EXCEPT `bool` (stdlib §9.4 `Boolean`
+//     lists `IEquatable<bool>` only, no `IComparable`).
+//   • IEquatable<P>  — every primitive (stdlib §9.1–§9.6).
+//   • IEqualityComparer<…> / IReadOnlySpan<…> — NO primitive conforms: these are
+//     an equality-comparer *agent* (stdlib §2.18) and a span view (stdlib §4.16),
+//     which no primitive's declaration lists.
+// The result is three-valued so the constraint checker never invents a false
+// positive: Rejects only when the primitive PROVABLY does not conform (a
+// non-conforming interface head, or a decided-concrete WRONG generic argument);
+// Defer when the generic argument is not a decided concrete primitive (a type
+// parameter, a user/builtin Named type such as the PascalCase `Int32`, a
+// nullable or missing argument) so an outer substitution or the recheck pass
+// can still decide it. Callers pass the head name (the interface's declared
+// name) and the resolved bound's generic arguments.
+enum class PrimBuiltinIfaceConformance { Conforms, Rejects, Defer };
+
+inline PrimBuiltinIfaceConformance primitiveConformsToBuiltinInstanceIface(
+    PrimitiveType p, std::string_view ifaceHead,
+    const std::vector<TypeRef*>& boundArgs) {
+    // IEqualityComparer / IReadOnlySpan: no primitive conforms, any argument.
+    if (ifaceHead == "IEqualityComparer" || ifaceHead == "IReadOnlySpan")
+        return PrimBuiltinIfaceConformance::Rejects;
+    if (ifaceHead != "IComparable" && ifaceHead != "IEquatable")
+        return PrimBuiltinIfaceConformance::Defer;  // not a decided head
+    // IComparable: `bool` declares no `IComparable` conformance (stdlib §9.4).
+    if (ifaceHead == "IComparable" && p == PrimitiveType::Bool)
+        return PrimBuiltinIfaceConformance::Rejects;
+    // The single generic argument must be exactly the primitive itself.
+    if (boundArgs.size() != 1 || !boundArgs[0])
+        return PrimBuiltinIfaceConformance::Defer;
+    const TypeRef* a = boundArgs[0];
+    if (a->kind != TypeRef::Kind::Primitive || a->nullable)
+        return PrimBuiltinIfaceConformance::Defer;  // type-param / Named / nullable
+    return a->primitive == p ? PrimBuiltinIfaceConformance::Conforms
+                             : PrimBuiltinIfaceConformance::Rejects;
+}
+
+// spec §14.2 clause 5 + §28.2/§9.7: `IDisposable`/`IAsyncDisposable` are
+// implemented only by classes (implicitly, §28.2); records, enums, and
+// primitives can NEVER implement them (§9.7). These auto-imported builtin
+// interfaces resolve to a Named TypeRef WITHOUT a synthesized declaration, so a
+// primitive tested against such a bound would otherwise fall through to a silent
+// defer. True when a primitive against `head` provably cannot conform.
+inline bool primitiveNeverConformsToBuiltinIface(std::string_view head) {
+    return head == "IDisposable" || head == "IAsyncDisposable";
+}
+
 } // namespace bezel::sema
