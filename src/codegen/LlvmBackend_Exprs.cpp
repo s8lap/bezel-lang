@@ -6016,8 +6016,22 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     // CG24 (§6.3): floating-point arithmetic and comparisons (IEEE 754,
     // no overflow/div0 checks). If one operand is FP and the other an
     // integer, promote the integer (§6.2 mixed-type promotion).
-    if (l->getType()->isFloatingPointTy() ||
-        r->getType()->isFloatingPointTy()) {
+    // #1981 / §7.11 / §8.4: EXCLUDE a `=`/`<>` where one operand is a nullable-
+    // value STRUCT ({i8 hasValue, T}) and the other is a bare FP scalar — e.g.
+    // `double? = 3.14` (or `float? = 1.5f`). Nullable arithmetic/relational is
+    // already intercepted by the lifted §7.11 block above; equality is NOT
+    // lifted there, so such a comparison reaches here with the FP scalar operand
+    // tripping this block's `isFloatingPointTy` guard. Without the exclusion,
+    // `toFP()` below emitted `sitofp {i8,double} to double` on the whole wrapper
+    // struct (malformed IR → verifier failure). Fall through to the null-safe
+    // nullable-value equality path below, which unwraps the payload before
+    // comparing.
+    bool eqWithNullableStruct =
+        (op == "=" || op == "<>") &&
+        (l->getType()->isStructTy() || r->getType()->isStructTy());
+    if ((l->getType()->isFloatingPointTy() ||
+         r->getType()->isFloatingPointTy()) &&
+        !eqWithNullableStruct) {
         bool lFP = l->getType()->isFloatingPointTy();
         bool rFP = r->getType()->isFloatingPointTy();
         // The result FP type is the wider of two FP operands (so `float`
@@ -6236,6 +6250,49 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 else
                     plainSide = builder_.CreateIntCast(
                         plainSide, eqPayload->getType(), /*isSigned=*/!plainUns);
+            }
+            // #1981 / §6.2 / §7.11: an FP nullable payload (`double?`/`float?`)
+            // compared to a differently-typed SCALAR plain operand needs the same
+            // §6.2 numeric promotion the non-nullable path applies — on the
+            // UNWRAPPED payload/plain scalars, never the wrapper struct. Promote
+            // an integer operand to the FP type (SIToFP/UIToFP) and widen a
+            // narrower float to the wider FP type (FPExt), so the value-equality
+            // below sees matching scalar types. Excludes a struct operand (a
+            // both-nullable `double? = double?` keeps plainSide as its own
+            // {i8,T} struct — handled by the struct-equality fall-through, not
+            // here) and decimal? (payload is a %bz.decimal struct, not FP).
+            if (structSide && plainSide && nvTy && eqPayload &&
+                eqPayload->getType() != plainSide->getType() &&
+                !eqPayload->getType()->isStructTy() &&
+                !plainSide->getType()->isStructTy() &&
+                (eqPayload->getType()->isFloatingPointTy() ||
+                 plainSide->getType()->isFloatingPointTy())) {
+                bool payFP   = eqPayload->getType()->isFloatingPointTy();
+                bool plainFP = plainSide->getType()->isFloatingPointTy();
+                // Common FP type: the wider of two FP operands, else the lone FP.
+                llvm::Type* fty =
+                    (payFP && plainFP)
+                        ? (eqPayload->getType()->getPrimitiveSizeInBits() >=
+                                   plainSide->getType()->getPrimitiveSizeInBits()
+                               ? eqPayload->getType()
+                               : plainSide->getType())
+                        : (payFP ? eqPayload->getType() : plainSide->getType());
+                const ast::Expr* structExpr =
+                    (structSide == l) ? bin.left.get() : bin.right.get();
+                const ast::Expr* plainExpr =
+                    (plainSide == l) ? bin.left.get() : bin.right.get();
+                bool payUns   = structExpr && isUnsignedTargetExpr(*structExpr);
+                bool plainUns = plainExpr && isUnsignedTargetExpr(*plainExpr);
+                auto toFP = [&](llvm::Value* v, bool uns) -> llvm::Value* {
+                    if (!v->getType()->isFloatingPointTy())
+                        return uns ? builder_.CreateUIToFP(v, fty)
+                                   : builder_.CreateSIToFP(v, fty);
+                    if (v->getType() != fty)
+                        return builder_.CreateFPExt(v, fty);
+                    return v;
+                };
+                eqPayload = toFP(eqPayload, payUns);
+                plainSide = toFP(plainSide, plainUns);
             }
             if (structSide && plainSide && nvTy && eqPayload &&
                 plainSide->getType() == eqPayload->getType()) {
