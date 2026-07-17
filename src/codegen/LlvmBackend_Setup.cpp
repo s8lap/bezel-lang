@@ -3637,7 +3637,16 @@ llvm::GlobalVariable* Emitter::instanceDescriptorFor(
             auto it = subst.find(gp->name);
             const sema::TypeRef* a = it != subst.end() ? it->second : nullptr;
             symArgs.push_back(a);
-            if (typeRefIdentityToken(a) == nullptr) symConcrete = false;
+            // #2008 (§12.9 type-test invariance, §14.2 monomorphization, §15.1):
+            // use the SAME concreteness predicate as the top-level gate
+            // (descArgsConcrete) so a folded-size inline-array base arg counts as
+            // concrete. Using typeRefIdentityToken here (nullptr for InlineArray)
+            // marked `D<[3]int>`'s base `B<[3]int>` non-concrete → recorded
+            // sharedOf(B), while the target `is B<[3]int>` resolves the
+            // per-instantiation global → the super-chain scan missed it (a SAFE
+            // false-negative: #2001's memory-unsafe `is B<[4]int>` cases stay
+            // FALSE because the descriptor keys still differ by N).
+            if (!descTypeArgConcrete(a)) symConcrete = false;
         }
         nodes.push_back(Node{sym, std::move(symArgs), symConcrete});
         for (std::size_t bi = 0; bi < sym->baseTypes.size(); ++bi) {
