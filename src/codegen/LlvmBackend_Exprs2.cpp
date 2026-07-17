@@ -2307,9 +2307,26 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         !genericSubstSemaTy_.empty()) {
         auto sit = genericSubstSemaTy_.find(rt->headName());
         if (sit != genericSubstSemaTy_.end() && sit->second &&
-            sit->second->kind == sema::TypeRef::Kind::Named &&
-            sit->second->declaration) {
+            sit->second->kind == sema::TypeRef::Kind::Named) {
             rt = const_cast<sema::TypeRef*>(sit->second);
+            // #2017 / §14.2 (v0.197): a builtin-collection substitution
+            // (`T = Array<int>`) satisfies `where T: new()` — it is a `public
+            // class` with a public parameterless constructor (stdlib §4.4), and
+            // §14.2 lists `Array<T>` among the class types — but it carries NO
+            // user TypeSymbol (rt->declaration == null). The stdlib-collection /
+            // builtin construction dispatch in the `!rt->declaration` block below
+            // keys off `tnode`'s name; while `tnode` still named the bare
+            // parameter `T`, `colName` was "T", every branch fell through, and
+            // lowerNew returned nullptr — the local slot was never initialized,
+            // so a later use dereferenced garbage (SIGSEGV). Redirect `tnode` to
+            // the resolved substitution's node so `new T()` dispatches to the
+            // real backing (bz_array_alloc, bz_dict_alloc, …). A class/record
+            // substitution (declaration != null) skips the whole
+            // `!rt->declaration` block, so `tnode` is unused there and left
+            // untouched — that path is byte-identical to before.
+            if (!rt->declaration && rt->astNode &&
+                rt->astNode->name && !rt->astNode->name->parts.empty())
+                tnode = rt->astNode;
         }
     }
     // §22.4 (#968): pre-create the `out var x` slot(s) for `new T(out var x)` so
