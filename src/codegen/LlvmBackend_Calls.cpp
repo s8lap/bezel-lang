@@ -8237,22 +8237,26 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             return builder_.CreateLoad(gst, slot, "guid.new");
         }
 
-        // Guid.Parse(s: string): Guid — parse canonical form; trap on failure.
+        // Guid.Parse(s: string): Guid — accepts the "D" and "N" renderings
+        // (§2.18); a malformed string raises a catchable FormatException
+        // (stdlib §2.6, v0.197). bz_guid_parse returns 0 on failure; guard on
+        // that and throw via the standard builtin-throw path.
+        //
+        // Before #2004 the failure edge emitted CreateUnreachable — an
+        // uncatchable trap where the spec promises a catchable exception, so a
+        // `catch FormatException` never fired and execution fell into undefined
+        // code (the zeroed/garbage Guid bytes were misread as a pointer →
+        // wild read / SIGSEGV). Routing through emitGuardThrow makes the fault
+        // a first-class, catchable throw like every other builtin guard.
         if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             llvm::AllocaInst* slot = makeGuidSlot();
             auto* fn = declareC("bz_guid_parse", i32(), {ptrTy(), ptrTy()});
             llvm::Value* ok = builder_.CreateCall(fn, {strVal, slot}, "guid.parse.ok");
-            // Trap (unreachable) on parse failure — the spec makes Parse throw;
-            // until exception support for this path is in, trap is the safe choice.
-            llvm::Value* isOk = builder_.CreateICmpNE(ok, builder_.getInt32(0), "guid.parse.chk");
-            auto* okBB   = llvm::BasicBlock::Create(llvm_, "guid.parse.ok", currentFn_);
-            auto* badBB  = llvm::BasicBlock::Create(llvm_, "guid.parse.bad", currentFn_);
-            builder_.CreateCondBr(isOk, okBB, badBB);
-            builder_.SetInsertPoint(badBB);
-            builder_.CreateUnreachable();
-            builder_.SetInsertPoint(okBB);
+            llvm::Value* failed =
+                builder_.CreateICmpEQ(ok, builder_.getInt32(0), "guid.parse.bad");
+            emitGuardThrow(failed, "FormatException");  // §2.6 / §2.18, #2004
             return builder_.CreateLoad(gst, slot, "guid.parsed");
         }
 
