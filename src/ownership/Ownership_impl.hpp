@@ -1645,6 +1645,36 @@ private:
     // move sequence and a loop with unconditional restore are accepted.
     void recordFieldMove(std::string_view name, SourceLocation loc);
 
+    // §28.8.1 / §28.8 (issue #1999): in the bare-statement discharge walk
+    // (handleDischarge), reject `M(move recv.f!)` / `new T(move recv.f)` where
+    // the move source is an owned field `f` of a NON-`this` IDENTIFIER receiver
+    // `recv` (an owned local / `using var` / owned parameter, or a borrow of a
+    // class instance). `ma` is the peeled owned-field read `recv.f`; `loc` is the
+    // move site. Returns true (arg now handled — the caller sets `consumed`) if a
+    // diagnostic fired, false if the shape is not a non-`this` owned-field move
+    // (the caller falls through to its normal handling).
+    //
+    // Why reject rather than consume: the SOLE runtime null-after-move of the
+    // field slot (LlvmBackend lowerUnary) and the field-restoration tracking
+    // (`fieldMovedFrom_`, keyed by field name) are BOTH `this`-only. For a
+    // non-`this` receiver the field is left populated at runtime and never
+    // tracked, so after the move the sink adopts and disposes the value AND
+    // `recv`'s own disposal (scope-end for a `using var`/owned local, the
+    // constructed owner for a moved-out owned local, the true owner for a borrow)
+    // disposes it again — a double-free / heap-use-after-free. This mirrors the
+    // `this` arm's net effect through a different mechanism: `move this.f!` in
+    // this same argument position is ALSO rejected — `recordFieldMove` marks the
+    // field moved-from and the method-exit field-restoration check (§28.8.1)
+    // rejects, because an argument-position move cannot restore the field before
+    // the (throwable) call returns (§28.8.1 "WrongOrder"). The sound form is the
+    // spec's "build then take then restore": `var t := move recv.f!; recv.f := …;
+    // M(owned t)`, which routes through recordMovesIn, not this walk. Scoped to a
+    // STABLE identifier receiver: an arbitrary temporary (`getBox().f`) has no
+    // place to restore and is a separate, harder case — left to fall through here.
+    // // per §28.8.1, §28.8
+    bool rejectNonThisOwnedFieldMoveDischarge(const ast::MemberAccessExpr& ma,
+                                              SourceLocation loc);
+
     // §28.3 / §28.11 (issue #860): mark a tracked local Owned because it
     // received ownership through an `out owned` argument. `origin` is the
     // AST node the dropped-without-disposal diagnostic points at. // per §28.3

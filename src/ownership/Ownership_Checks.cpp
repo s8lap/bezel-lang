@@ -705,6 +705,15 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                                     // `M(move this.field!)` — field-move.
                                     recordFieldMove(ma->member, un->span.begin);
                                     consumed = true;
+                                } else if (rejectNonThisOwnedFieldMoveDischarge(
+                                               *ma, un->span.begin)) {
+                                    // §28.8.1 / §28.8 (#1999): `M(move recv.f!)`
+                                    // for a NON-`this` owned-field receiver double-
+                                    // frees (the field slot is not nulled and the
+                                    // move is untracked for a non-`this` owner) —
+                                    // reject, mirroring the `this` arm's net
+                                    // rejection via the restoration check.
+                                    consumed = true;
                                 }
                             }
                         }
@@ -726,6 +735,11 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                             if (tid->name == "this") {
                                 // §28.8.1, #897 #898: `M(move this.field)`.
                                 recordFieldMove(ma->member, un->span.begin);
+                                consumed = true;
+                            } else if (rejectNonThisOwnedFieldMoveDischarge(
+                                           *ma, un->span.begin)) {
+                                // §28.8.1 / §28.8 (#1999): non-`this` owned-field
+                                // move into an owned sink — reject (double-free).
                                 consumed = true;
                             }
                         }
@@ -1003,6 +1017,13 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                                         ma->target.get())) {
                                 if (tid->name == "this") {
                                     recordFieldMove(ma->member, un->span.begin);
+                                    consumed = true;
+                                } else if (rejectNonThisOwnedFieldMoveDischarge(
+                                               *ma, un->span.begin)) {
+                                    // §28.8.1 / §28.8 (#1999): `new T(move recv.f!)`
+                                    // for a NON-`this` owned-field receiver double-
+                                    // frees — reject (same rule as the CallExpr sink
+                                    // twin above).
                                     consumed = true;
                                 }
                             }
@@ -5252,6 +5273,57 @@ bool MethodOwnership::exprIsOwnedFieldRead(const ast::Expr& e) const {
     if (dynamic_cast<const ast::IdentifierExpr*>(&e))
         return isOwnedField(ctx_.exprSymbol(e));
     return false;
+}
+
+// §28.8.1 / §28.8 (issue #1999): reject a NON-`this` owned-field move in the
+// bare-statement discharge walk. See the header for the full rationale (the
+// runtime null-after-move and the `fieldMovedFrom_` restoration tracking are both
+// `this`-only, so a non-`this` `move recv.f!` into an owned sink double-frees —
+// `recv`'s own disposal frees the value the sink also disposes). The `this` form
+// is rejected too, via the restoration check; this reproduces that rejection for
+// a stable non-`this` receiver.
+bool MethodOwnership::rejectNonThisOwnedFieldMoveDischarge(
+        const ast::MemberAccessExpr& ma, SourceLocation loc) {
+    // Only a STABLE identifier receiver (`recv.f`), never `this` (the caller's
+    // own branch handles that) and never an arbitrary temporary (`getBox().f`,
+    // whose receiver is not an IdentifierExpr — left to fall through, #1999).
+    const auto* recv = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get());
+    if (!recv || recv->name == "this") return false;
+    // Only an OWNED field is a transfer whose double-disposal is the hazard; a
+    // non-owned field read `recv.f` carries no ownership and is not a `move`
+    // source (handled elsewhere as a borrow).
+    if (!exprIsOwnedFieldRead(ma)) return false;
+    const std::string recvName(recv->name);
+    const std::string member(ma.member);
+    // Tailor the diagnostic: a BORROW receiver never owned the object, so the
+    // fix is structural (§28.6/§28.8); an OWNED receiver is the §28.8.1 argument-
+    // position field-move-without-restoration case, whose sound form is a take-
+    // method that transfers the field out through `move this.f` (§28.6/§23 — the
+    // only field-move the runtime nulls). (A local-bound `var t := move recv.f!;
+    // recv.f := …` does NOT work for a non-`this` recv: the field slot is not
+    // nulled, so the §28.7 reassign disposes the moved-out value — a separate
+    // CODEGEN defect, out of this ownership-check's scope.)
+    if (ownedArgSourceIsBorrow(*ma.target)) {
+        report(Severity::Error, loc,
+               "cannot move owned field `" + member + "` out of `" + recvName +
+                   "`: `" + recvName +
+                   "` is a borrow — a borrower does not own the object and cannot "
+                   "transfer its owned fields out; the field's real owner disposes "
+                   "it, so the owned sink would dispose it a second time — a "
+                   "double-free (§28.8, §28.6)");
+    } else {
+        report(Severity::Error, loc,
+               "cannot move owned field `" + member + "` out of `" + recvName +
+                   "` in this argument position: `move " + recvName + "." + member +
+                   "` leaves the field moved-from with no way to restore it before "
+                   "the (throwable) call returns, so `" + recvName +
+                   "`'s disposal frees the already-transferred value a second time "
+                   "— a double-free (§28.8.1, §28.8). To hand another object's "
+                   "owned field to a sink, give its type a take-method that "
+                   "transfers the field out through `move this." + member +
+                   "` and returns it (§28.6, §23), then pass that method's result");
+    }
+    return true;
 }
 
 // §28.6 / §5.11 (#1493). See the header for the full contract: an owned-field
