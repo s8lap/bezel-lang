@@ -240,6 +240,25 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                     // §28.3 / §28.11 (#407): a bare `coll[i]` / `obj.f` borrow.
                     ++pos; continue;
                 }
+                // §28.8 / §28.8.1 / §28.6 (#2010/#2016): a `move <place>` into the
+                // ctor's owned formal whose place is a BORROW (`move b`) or an
+                // owned field of a BORROW receiver (`move recv.f!`) is not an owned
+                // value — reject (a double-free: the sink adopts it AND the
+                // borrow's real owner disposes it). This was the local-decl
+                // `var h := new Holder(move b)` gap: unlike recordMovesInArgs, the
+                // ctor path ran NO borrow check on a `move` argument, so it fell to
+                // recordMovesIn and marked the source moved-from silently. Mirrors
+                // handleDischarge's NewExpr `move` arms (#1993/#1999). A legal owned
+                // source — an owned local, an owned producer, or a `move` of an
+                // owned field off an owned receiver (`move this.f` / `move _f` /
+                // `move ownedBox.f!`) — is accepted and falls through to
+                // recordMovesIn below. // per §28.8, §28.8.1, §28.6
+                if (auto* un = dynamic_cast<const ast::UnaryExpr*>(a.value.get())) {
+                    if (un->op == "move" &&
+                        checkOwnedArgMoveSource(*un, un->span.begin)) {
+                        ++pos; continue;  // reported; skip the bogus move
+                    }
+                }
                 // Fresh producer (`new`, a call returning `owned T`, an operator
                 // result, `move obj.f`). §22.3 (v0.169): the marker is REJECTED
                 // here — no live binding is invalidated.
@@ -336,16 +355,30 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
                 // §28.3 / §28.11 (#407): a bare `coll[i]` / `obj.f` borrow.
                 ++pos; continue;
             }
-            // `move id` to an owned formal: `move b` of a borrow is not an
+            // `move <place>` to an owned formal: `move b` of a borrow is not an
             // owned value (§28.8/#395). A legitimate `move` of an owned value
             // falls through to recordMovesIn, which records the move.
             if (auto* un = dynamic_cast<const ast::UnaryExpr*>(
                     a.value.get())) {
-                if (un->op == "move" &&
-                    dynamic_cast<const ast::IdentifierExpr*>(
-                        un->operand.get()) &&
-                    checkOwnedArgSource(*a.value, un->span.begin)) {
-                    ++pos; continue;  // reported; skip the bogus move
+                if (un->op == "move") {
+                    if (dynamic_cast<const ast::IdentifierExpr*>(
+                            un->operand.get())) {
+                        // Bare `move id` — the existing §28.8 source check.
+                        if (checkOwnedArgSource(*a.value, un->span.begin)) {
+                            ++pos; continue;  // reported; skip the bogus move
+                        }
+                    } else if (checkOwnedArgMoveSource(*un, un->span.begin)) {
+                        // §28.8 / §28.8.1 / §28.6 (#2010/#2016): the `move X!` /
+                        // `move recv.f` PLACE forms the bare-identifier check above
+                        // misses — a borrow source `move b!` or an owned field of a
+                        // BORROW receiver `move recv.f!`. handleDischarge guards
+                        // these at the discharge position (#1993/#1999); this is
+                        // the local-decl-initializer / assignment-RHS twin. A legal
+                        // owned source (owned local, `move` of an owned field off an
+                        // owned receiver, an owned producer) is accepted and falls
+                        // through to recordMovesIn. // per §28.8, §28.8.1, §28.6
+                        ++pos; continue;  // reported; skip the bogus move
+                    }
                 }
             }
             // Fresh producer (`new`, a call returning `owned T`, an operator
@@ -5696,6 +5729,49 @@ bool MethodOwnership::checkOwnedReturnBorrowSource(const ast::Expr& e) {
         "call returning `owned T`, or `move` of an owned local or an owned field "
         "of `this` or an owned place)");
     return true;
+}
+
+// §28.8 / §28.8.1 / §28.6 (issues #2010, #2016): the LOCAL-DECL-initializer /
+// assignment-RHS arg-move twin of the discharge (#1993/#1999) and return
+// (#1995/#2011) owned-source guards. See the header for the full contract.
+bool MethodOwnership::checkOwnedArgMoveSource(const ast::UnaryExpr& moveExpr,
+                                              SourceLocation loc) {
+    const ast::Expr* place =
+        moveExpr.operand ? lookThroughForceUnwrap(moveExpr.operand.get()) : nullptr;
+    if (place && exprIsOwnedFieldRead(*place)) {
+        // §28.6 / §28.8.1 (#2011/#2016): a `move` of an owned field is an owned
+        // transfer ONLY off an owned-place receiver (`this`, which owns its
+        // fields, or an owned local/using-var/`owned` parameter this scope owns —
+        // ownedFieldMoveReceiverIsBorrow returns false). Off a BORROW receiver a
+        // borrower does not own the object and cannot move its owned fields out:
+        // the field's real owner disposes the value and the owned sink disposes it
+        // a second time — a double-free (§28.6). Reject with the §28.8 borrow
+        // diagnostic (a field-tailored variant so the fix is actionable). This
+        // classifies BOTH the `move recv.f!` and non-`!` `move recv.f` spellings:
+        // ownedArgSourceIsBorrow's owned-field branch is `move`-gated and reaches
+        // the receiver test only through the `!` postfix form, so the direct
+        // ownedFieldMoveReceiverIsBorrow call here is what covers the non-`!`
+        // member-access form too. // per §28.6, §28.8, §28.8.1
+        if (ownedFieldMoveReceiverIsBorrow(*place)) {
+            report(Severity::Error, loc,
+                   "a borrow cannot be passed where an `owned` value is required: "
+                   "an owned field moved out of a BORROW receiver is owned by the "
+                   "receiver's real owner, which disposes it too — so the owned "
+                   "sink would dispose it a second time, a double-free (§28.6, "
+                   "§28.8, §28.8.1 — a borrower does not own the object and cannot "
+                   "transfer its owned fields out)");
+            return true;
+        }
+        // Owned-place receiver: the legal owned-field transfer (§28.8.1). Accept
+        // (the caller records the move); the field-restoration obligation is
+        // enforced separately. Excluded here because ownedArgSourceIsBorrow's
+        // FieldSymbol tail spuriously flags a BARE `move _f`. // per §28.8.1
+        return false;
+    }
+    // §28.8 (#2010/#1993): a `move b` / `move b!` of a BORROW local/parameter (or
+    // a catch binding / Borrowed-state local) is not an owned value — reject; an
+    // owned local / owned producer is accepted (ownedArgSourceIsBorrow → false).
+    return checkOwnedArgSource(moveExpr, loc);
 }
 
 // §28.3 / §28.8 (issue #407): owned-sink catch-all. See the header.

@@ -1800,6 +1800,36 @@ private:
     // is enforced separately). Returns true when it reported. // per §28.6, §28.8, §28.8.1
     bool checkOwnedReturnBorrowSource(const ast::Expr& e);
 
+    // §28.8 / §28.8.1 / §28.6 (issues #2010, #2016): the owned-sink borrow-source
+    // guard for a `move <place>` ARGUMENT to a ctor/call `owned` formal in the
+    // LOCAL-DECL-initializer / assignment-RHS arg-move path (recordMovesIn /
+    // recordMovesInArgs). This is the last owned-sink position that never ran the
+    // §28.8 owned-source classifier: handleDischarge (the bare-statement discharge
+    // walk, #1993/#1999) and checkOwnedReturnBorrowSource (the return position,
+    // #1995/#2011) both guard it, but `var h := new Holder(move b)` / `var r :=
+    // C.Sink(move recv.f!)` routed only through recordMovesIn, which marked the
+    // source moved-from with no borrow check — so a `move` of a borrow flowed
+    // silently into the owned sink and the value was disposed twice.
+    //
+    // Returns true — and reports (the §28.8 "borrow cannot be passed" diagnostic)
+    // — when the moved place is NOT an owned value:
+    //   * a BORROW source (`move b` / `move b!` of a borrowed local/parameter, a
+    //     catch binding, or a Borrowed-state local — #2010), or
+    //   * an owned field of a BORROW RECEIVER (`move recv.f` / `move recv.f!`
+    //     where `recv` is a borrow — a borrower does not own the object and cannot
+    //     move its owned fields out; the field's real owner disposes the value and
+    //     the owned sink disposes it a second time, §28.6 — #2016).
+    // Returns false — the caller records the move — for every legal owned source:
+    // an owned local, an owned producer, or a `move` of an owned field whose
+    // RECEIVER is an owned place (`move this.f` / `move _f` / `move ownedBox.f!`).
+    // The owned-field-of-owned-receiver acceptance is checked directly via
+    // `ownedFieldMoveReceiverIsBorrow` (peeling a single `!`) so BOTH the `!` and
+    // non-`!` member-access spellings are classified — `ownedArgSourceIsBorrow`'s
+    // owned-field branch is `move`-gated and reaches the receiver test only through
+    // the `!` postfix form. // per §28.8, §28.8.1, §28.6
+    bool checkOwnedArgMoveSource(const ast::UnaryExpr& moveExpr,
+                                 SourceLocation loc);
+
     // §28.3 / §28.8 (issue #407): an owned-sink argument that is NOT a bare
     // identifier and NOT a bare owned-field read — those two forms have
     // dedicated handling at each call site that also records the move when the
