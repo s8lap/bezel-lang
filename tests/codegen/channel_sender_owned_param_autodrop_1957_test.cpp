@@ -237,3 +237,128 @@ BEZEL_TEST(channel_sender_owned_param_autodrop_1957,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
+
+// =====================================================================
+// #1957 BLOCKER regression — the DOUBLE-FREE the fix must NOT introduce. An
+// `owned Shared<T>` param is explicitly Dispose()'d, then a throw unwinds. The
+// §28.3 unwind disposal (releaseOnUnwindOnly) reloads the receiver slot — so
+// Shared<T>.Dispose() MUST null that slot (as ChannelSender/Channel do), or the
+// null-guarded unwind reload re-runs bz_shared_release on an already-freed
+// control block (free(cb) is NOT idempotent → genuine double-free). A surviving
+// Clone() strong handle makes it observable: a premature free would leave
+// `a.Get()` reading freed memory. WITHOUT the slot-null fix this SEGVs under
+// ASan (r.ran false); WITH it the release runs exactly once and V == 7.
+// =====================================================================
+BEZEL_TEST(channel_sender_owned_param_autodrop_1957,
+           shared_owned_param_dispose_then_throw_single_release_spec_28_13_28_3) {
+    JitResult r = runAotChecked(
+        std::string("module M; import System.Threading; ") + kR +
+        "class E: Exception "
+        "  public constructor() base(\"boom\"); end constructor; "
+        "end E; "
+        "class C "
+        "  public static method Take(owned sm: Shared<R>) "
+        "    sm.Dispose(); "             // release; MUST null the slot
+        "    throw new E(); "            // unwind must NOT re-release
+        "  end Take; "
+        "  public static method Main(): int "
+        "    using var a := new Shared<R>(new R(7)); "
+        "    var b := a.Clone(); "       // surviving strong handle keeps R alive
+        "    try "
+        "      Take(move b); "
+        "    catch E => do end "
+        "    end try; "
+        "    return a.Get().V; "         // 7 (a double-free would SEGV here)
+        "  end Main; "
+        "end C;");
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);            // single release — no double-free / SEGV
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+}
+
+// =====================================================================
+// #1957 BLOCKER — the PRE-EXISTING double-free the same slot-null fix resolves
+// (present on base, independent of the #1957 registration). A `using var` Shared
+// clone is explicitly Dispose()'d, then its scope-end disposal ALSO releases →
+// two bz_shared_release on one handle → free(cb) twice. With the slot-null fix
+// the scope-end reload sees null and skips → single release. `a` still holds a
+// strong handle, so the value is alive; V == 5. (SEGV without the fix.)
+// =====================================================================
+BEZEL_TEST(channel_sender_owned_param_autodrop_1957,
+           shared_usingvar_clone_dispose_scope_end_single_release_spec_28_13) {
+    JitResult r = runAotChecked(
+        std::string("module M; import System.Threading; ") + kR +
+        "class C "
+        "  public static method Main(): int "
+        "    using var a := new Shared<R>(new R(5)); "
+        "    do "
+        "      using var s := a.Clone(); "
+        "      s.Dispose(); "            // release the clone...
+        "    end; "                       // ...scope-end must see null and skip
+        "    return a.Get().V; "         // 5
+        "  end Main; "
+        "end C;");
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);            // single release — no double-free
+    BEZEL_EXPECT_EQ(r.exitCode, 5);
+}
+
+// =====================================================================
+// #1957 guard: an `owned Shared<T>` param explicitly Dispose()'d then RETURNed
+// (normal-path discharge, no throw). autoDropAtScopeEnd is false, so the param
+// carries releaseOnUnwindOnly — which fires ONLY on the unwind exit; the normal
+// return path leaves the release to the explicit Dispose alone. Single release,
+// clean; the surviving Clone() handle keeps the value alive (V == 9).
+// =====================================================================
+BEZEL_TEST(channel_sender_owned_param_autodrop_1957,
+           shared_owned_param_dispose_then_return_single_release_spec_28_13) {
+    JitResult r = runAotChecked(
+        std::string("module M; import System.Threading; ") + kR +
+        "class C "
+        "  public static method Take(owned sm: Shared<R>) "
+        "    sm.Dispose(); "             // sole release on the normal path
+        "  end Take; "
+        "  public static method Main(): int "
+        "    using var a := new Shared<R>(new R(9)); "
+        "    Take(a.Clone()); "          // pass an owned clone; Take disposes it
+        "    return a.Get().V; "         // 9 (a still holds its own handle)
+        "  end Main; "
+        "end C;");
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);            // single release, no double-free
+    BEZEL_EXPECT_EQ(r.exitCode, 9);
+}
+
+// =====================================================================
+// #1957 sibling guard: the ChannelSender invariant the fix now also relies on.
+// An `owned ChannelSender<T>` param explicitly Dispose()'d then a throw unwinds.
+// ChannelSender<T>.Dispose() already nulls its slot, so the releaseOnUnwindOnly
+// unwind reload skips → the sender is released exactly once (closing the channel,
+// §30.15) with no double-release / UAF of the sender. The channel is observed
+// closed after the caught throw (IsClosed == true → 1); ASan-clean.
+// =====================================================================
+BEZEL_TEST(channel_sender_owned_param_autodrop_1957,
+           sender_owned_param_dispose_then_throw_single_release_spec_30_15) {
+    JitResult r = runAotChecked(
+        std::string("module M; import System.Threading; ") + kR +
+        "class E: Exception "
+        "  public constructor() base(\"boom\"); end constructor; "
+        "end E; "
+        "class C "
+        "  public static method Emit(owned tx: ChannelSender<R>) "
+        "    tx.Dispose(); "             // release (last sender -> closes)
+        "    throw new E(); "            // unwind must NOT re-release
+        "  end Emit; "
+        "  public static async method Main(): Task<int> "
+        "    using var inbox := new Channel<R>(); "
+        "    try "
+        "      Emit(inbox.NewSender()); "
+        "    catch E => do end "
+        "    end try; "
+        "    if inbox.IsClosed then return 1; else return 0; end; "
+        "  end Main; "
+        "end C;");
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);            // single release, no double-free / UAF
+    BEZEL_EXPECT_EQ(r.exitCode, 1);      // dispose closed the channel
+}

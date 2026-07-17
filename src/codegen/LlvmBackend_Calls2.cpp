@@ -4448,6 +4448,27 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             auto* fn = declareC(relName,
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
                             builder_.CreateCall(fn, {recv2});
+                            // #1957 / §28.2: null the slot so any later reload —
+                            // a using-var scope-exit OR the null-guarded unwind
+                            // disposal of an `owned` Shared<T> param/local — sees
+                            // null and skips. bz_shared_release does free(cb) (NOT
+                            // idempotent), so a second release through a non-nulled
+                            // slot is a genuine double-free. Mirrors the
+                            // ChannelSender/Channel branches above and restores the
+                            // unwind-ineligible walker's invariant (Setup.cpp
+                            // ~§28.3: a `.Dispose()`'d receiver is left eligible
+                            // BECAUSE Dispose nulls the slot). Only in UNCHECKED
+                            // mode — checked mode (bz_shared_mark_disposed)
+                            // deliberately keeps the block alive for guard reads
+                            // through the slot, so it must NOT be nulled.
+                            if (!checkedDisposal_) {
+                                llvm::Type* slotTy = nullptr;
+                                if (llvm::Value* slot =
+                                        lvalueAddr(*ma->target, slotTy))
+                                    builder_.CreateStore(
+                                        llvm::ConstantPointerNull::get(ptrTy()),
+                                        slot);
+                            }
                         }
                         return nullptr;
                     }
