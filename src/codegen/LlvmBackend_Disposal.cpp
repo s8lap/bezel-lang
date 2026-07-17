@@ -1590,19 +1590,33 @@ void Emitter::emitBaseDisposeChain(const sema::TypeSymbol* ts) {
     for (std::size_t bi = 0; bi < ts->baseTypes.size(); ++bi) {
         const sema::TypeSymbol* base = ts->baseTypes[bi];
         if (!base || base->kind != ast::TypeDeclKind::Class) continue;
-        // #816: if the base (transitively) has an owned type-parameter field, the
-        // shared, type-erased base core disposer skips it (the concrete T is
-        // unknown there) → leak. Bind the base's concrete type arguments — from
+        // §14 / §28.4 / §11.7: the shared, type-erased base core disposer
+        // (disposerCoreFns_[base]) is emitted ONCE against the base template's
+        // erased layout (each of its type parameters lowered as the i32
+        // placeholder). That template disposer is WRONG for a concrete
+        // instantiation of the base whenever either:
+        //   (a) #816: the base (transitively) has an owned type-PARAMETER field
+        //       (`owned _f: T`) — the erased disposer cannot classify the erased T
+        //       as an owned class, so it SKIPS disposing that field entirely
+        //       (→ leak), OR
+        //   (b) #2019: the base's instantiated field layout DIFFERS from the erased
+        //       template layout — e.g. a width-varying value field (`bval: T`, i64
+        //       for T=long) that precedes an owned CONCRETE field (`owned bf: Cell`)
+        //       shifts that owned field's offset, so the template disposer frees/
+        //       reads the WRONG offset (→ SEGV on a plain `D<long> : B<T>`). Note
+        //       (a) is NOT subsumed by (b): a `T`=int owned type-param field leaves
+        //       the layout identical to the i32 template yet is still skipped.
+        // In either case, bind the base's concrete type arguments — from
         // ts->baseTypeRefs[bi], resolved under any active OUTER substitution — and
-        // call a SPECIALIZED base core emitted with that substitution active. The
-        // baseTypeRefs derivation covers BOTH `class Child<T> : Base<T>` (T already
-        // bound to e.g. Cell in the active subst) and the non-generic
+        // call a SPECIALIZED base core emitted with that substitution active, so
+        // every owned base field is disposed exactly once at its CORRECT offset.
+        // The baseTypeRefs derivation covers BOTH `class Child<T> : Base<T>` (T
+        // already bound to e.g. Cell in the active subst) and the non-generic
         // `class ConcreteChild : Base<Cell>` (Cell is concrete in baseTypeRefs) —
         // the same per-base-arg map classStruct builds for inherited fields.
         const ast::TypeDecl* btd =
             base->decl ? dynamic_cast<const ast::TypeDecl*>(base->decl) : nullptr;
-        if (classHasOwnedTypeParamField(base) && btd &&
-            !btd->genericParams.empty() && bi < ts->baseTypeRefs.size() &&
+        if (btd && !btd->genericParams.empty() && bi < ts->baseTypeRefs.size() &&
             ts->baseTypeRefs[bi] &&
             btd->genericParams.size() == ts->baseTypeRefs[bi]->genericArgs.size()) {
             const sema::TypeRef* baseRef = ts->baseTypeRefs[bi];
@@ -1616,11 +1630,35 @@ void Emitter::emitBaseDisposeChain(const sema::TypeSymbol* ts) {
                 newSema[btd->genericParams[gi].name] =
                     resolveTypeParamRef(baseRef->genericArgs[gi]);
             }
+            // #2019: compute the base's instance-field storage-type sequence under
+            // BOTH the erased template layout (empty subst → i32 placeholders, what
+            // disposerCoreFns_[base] was emitted with) and the concrete base subst.
+            // If the two sequences differ, the template disposer's field offsets
+            // are wrong for this instantiation and we MUST use a specialized core.
+            // (Comparing the storageType sequence is exact: identical field types ⇒
+            // identical offsets; llvm::Type* are context-unique so `==` is
+            // structural.) collectInstanceStorage/storageType only read the subst —
+            // no fieldIndex_ / classStruct side effects here.
+            auto baseFieldLayout = [&]() {
+                std::vector<const sema::Symbol*> storage;
+                collectInstanceStorage(base, storage);
+                std::vector<llvm::Type*> tys;
+                tys.reserve(storage.size());
+                for (const sema::Symbol* m : storage) tys.push_back(storageType(m));
+                return tys;
+            };
             auto savedSubst = genericSubst_;
             auto savedSema = genericSubstSemaTy_;
+            genericSubst_.clear();
+            genericSubstSemaTy_.clear();
+            std::vector<llvm::Type*> tmplLayout = baseFieldLayout();
             genericSubst_ = std::move(newSubst);
             genericSubstSemaTy_ = std::move(newSema);
-            llvm::Function* specCore = specializedDisposerCoreFor(base);
+            std::vector<llvm::Type*> specLayout = baseFieldLayout();
+            bool needSpec =
+                classHasOwnedTypeParamField(base) || (tmplLayout != specLayout);
+            llvm::Function* specCore =
+                needSpec ? specializedDisposerCoreFor(base) : nullptr;
             genericSubst_ = std::move(savedSubst);
             genericSubstSemaTy_ = std::move(savedSema);
             if (specCore) {
