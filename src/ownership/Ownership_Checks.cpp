@@ -5239,6 +5239,32 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
             unwrappedMove = true;
         }
     }
+    // §17.4 / §7.8 / §28.8.1 (issue #1975 discovery): a *bare* postfix
+    // null-forgiving `E!` on a PLACE — a named local/parameter/field or index
+    // slot, no enclosing `move` — is a BORROW of `E`'s value. A null-aware
+    // operator "neither transfers ownership out of `x` nor disposes `x`'s value"
+    // and its result is borrowed even when the operand is owned — §17.4 states
+    // this for `as`, and it applies to every null-aware operator (`!`, `??`,
+    // `?.`, `?(`); §28.8.1 makes `move E!` the ONLY way to read a place's value
+    // as an owned value. Flowing a bare `E!` into an owned sink (an `owned`
+    // field/slot store, an `owned` parameter/constructor argument, an `owned`
+    // return, a `throw` operand) is the double-dispose hazard the un-`!` place
+    // reads below already guard: `E!` neither moves `E` (so `E`'s real owner
+    // still disposes it) nor is a fresh producer (so the sink disposes it too)
+    // — a use-after-free / double-free. `move E!` IS the legal owned transfer
+    // (it arrives wrapped in `move`, unwrapped above → `unwrappedMove`, so this
+    // branch is skipped); a TEMPORARY/producer operand (`f()!`, `new T()!`)
+    // carries its own sole ownership through the `!` and is not a place, so it
+    // is not flagged. Checked before the place-read branches below because the
+    // `!` wrapper is not a bare identifier — without this it slips past every
+    // owned-sink handler's bare-identifier move-on-read, so `E` is neither moved
+    // nor rejected and the value is disposed twice. // per §17.4, §28.8.1
+    if (!unwrappedMove) {
+        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            return pb->operand && !exprIsTemporary(*pb->operand) &&
+                   isBorrowableType(ctx_.exprType(*e));
+        }
+    }
     // §28.3 / §28.8.1 (issue #398): a *bare* read of an `owned` field — no
     // enclosing `move` — is Borrowed ("Field access `obj.f` where `f` is
     // `owned` | Borrowed (source: `obj`)"), so flowing it into an owned sink is
@@ -5371,17 +5397,23 @@ bool MethodOwnership::checkOwnedArgSource(const ast::Expr& argValue,
 bool MethodOwnership::checkOwnedArgOtherBorrow(const ast::Expr& argValue) {
     // A bare identifier (including bare `this`) and a bare owned-field read are
     // handled by the caller's dedicated branches; only the *other* class-typed
-    // borrow forms — `coll[i]` (§28.3 / §28.11) and a field read `obj.f`
-    // (§28.3) — are routed here. Restrict to those two AST shapes so a `move`-
+    // borrow forms — `coll[i]` (§28.3 / §28.11), a field read `obj.f` (§28.3),
+    // and a postfix null-forgiving `E!` on a place (§17.4 / §28.8.1, #1975
+    // discovery) — are routed here. Restrict to those AST shapes so a `move`-
     // wrapped or owned-producer argument the caller already handled is never
     // re-examined; `checkOwnedArgSource` then applies the full classifier
-    // (which also re-checks the type gate and the move-unwrap). // per §28.3
+    // (which also re-checks the type gate, the move-unwrap, and the place-vs-
+    // producer test for `E!`). Without the `PostfixBangExpr` shape here, a bare
+    // `M(owned x!)` slips past every branch to the caller's fresh-producer tail
+    // — the source is never moved and the callee disposes a value its real owner
+    // also disposes (a use-after-free). // per §28.3, §17.4, §28.8.1
     const ast::Expr* e = &argValue;
     if (auto* un = dynamic_cast<const ast::UnaryExpr*>(e)) {
         if (un->op == "move") return false;  // legal owned producer (§28.8.1)
     }
     if (!dynamic_cast<const ast::IndexExpr*>(e) &&
-        !dynamic_cast<const ast::MemberAccessExpr*>(e))
+        !dynamic_cast<const ast::MemberAccessExpr*>(e) &&
+        !dynamic_cast<const ast::PostfixBangExpr*>(e))
         return false;
     return checkOwnedArgSource(argValue, argValue.span.begin);
 }
