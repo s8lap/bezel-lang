@@ -5888,6 +5888,28 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 return builder_.CreateCall(fn, {slot}, "guid.tostr");
             }
 
+            // stdlib §2.6 / §2.18 (#1989): ToString(format): string — the format
+            // overload. "D" (dashed) / "N" (no hyphens) per the §2.18 Guid
+            // vocabulary; any other specifier raises FormatException (§2.18
+            // strict-fault, v0.197). bz_guid_to_string_fmt returns nullptr for an
+            // unrecognized specifier — we then emitGuardThrow. This handles a
+            // compile-time-literal AND a runtime format string uniformly, and mints
+            // the same fresh rc=1 heap string the no-arg form does (so the result is
+            // a +1 producer — see isPlusOneStringProducer). Mirrors the decimal
+            // ToString(format) path above (bz_decimal_to_string_fmt) exactly.
+            if (mname == "ToString" && call.args.size() == 1 && call.args[0].value) {
+                llvm::Value* fmtVal = lowerExpr(*call.args[0].value);
+                if (!fmtVal) return nullptr;
+                auto* fn = declareC("bz_guid_to_string_fmt", ptrTy(),
+                                    {ptrTy(), ptrTy()});
+                llvm::Value* res =
+                    builder_.CreateCall(fn, {slot, fmtVal}, "guid.tostr.fmt");
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    res, llvm::Constant::getNullValue(ptrTy()), "guid.fmt.null");
+                emitGuardThrow(isNull, "FormatException");
+                return res;
+            }
+
             // stdlib §2.6: Equals(other: Guid): bool — bytewise compare.
             if (mname == "Equals" && call.args.size() == 1 && call.args[0].value) {
                 llvm::Value* otherVal = lowerExpr(*call.args[0].value);

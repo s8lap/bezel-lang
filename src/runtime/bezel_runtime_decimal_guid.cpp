@@ -802,6 +802,27 @@ void* bz_guid_to_string(const bz_guid_t* g) {
     return s;
 }
 
+// stdlib §2.6 / §2.18 (v0.197, #1989): Guid.ToString(format) — the format
+// overload. The §2.18 Guid vocabulary is exactly "D" (canonical 36-char dashed,
+// = the no-format rendering) and "N" (32 lowercase hex, no hyphens); any other
+// specifier raises FormatException (§2.18 strict-fault). This mints the SAME
+// fresh rc=1 heap string that bz_guid_to_string / bz_guid_to_string_n produce,
+// so the result is a +1 producer (recognized in isPlusOneStringProducer). We
+// return nullptr for an unrecognized/malformed specifier; the codegen caller
+// then emitGuardThrow("FormatException"). Case-sensitive: lowercase "d"/"n"
+// fault, matching the interpolation format path (LlvmBackend_String.cpp).
+// `fmt_p` is a bz_string* (the non-nullable `format: string` parameter),
+// guarded defensively.
+void* bz_guid_to_string_fmt(const bz_guid_t* g, const void* fmt_p) {
+    const bz_string_hdr* fh = (const bz_string_hdr*)fmt_p;
+    if (fh && fh->data && fh->width == 1 && fh->len == 1) {
+        char c = fh->data[0];
+        if (c == 'D') return bz_guid_to_string(g);
+        if (c == 'N') return bz_guid_to_string_n(g);
+    }
+    return nullptr;  // unrecognized specifier → FormatException (§2.18)
+}
+
 // Helper: decode two lowercase hex chars at pos, return the byte value
 // or -1 on non-hex input.
 static int guid_parse_hex_byte(const char* s) {
@@ -816,27 +837,50 @@ static int guid_parse_hex_byte(const char* s) {
     return (hi << 4) | lo;
 }
 
-// Parse "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" (exactly 36 chars, dashes at
-// positions 8, 13, 18, 23).  Returns 1 on success, 0 on format error.
+// stdlib §2.6 (v0.195): Guid.Parse "accepts the D and N renderings (§2.18);
+// FormatException otherwise". Both must parse (round-trip with the two
+// ToString forms):
+//   "D" — "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" (exactly 36 chars, dashes at
+//         positions 8, 13, 18, 23).
+//   "N" — 32 hex chars, no hyphens.
+// Returns 1 on success, 0 on format error. Before v0.197 (#1989) only the
+// 36-char "D" form was accepted; a 32-char "N" string (as produced by
+// ToString("N")) failed here, and the codegen Parse path traps (unreachable)
+// on failure — so `Guid.Parse(g.ToString("N"))` crashed instead of round-
+// tripping. Accepting the "N" form closes that §2.6 conformance gap.
 static int32_t guid_parse_str(const char* s, int64_t len, bz_guid_t* out) {
-    if (len != 36) return 0;
-    if (s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-') return 0;
     uint8_t bytes[16];
-    // group 1: 8 hex chars → bytes 0-3
-    const int offsets[16][2] = {
-        {0,2},{2,2},{4,2},{6,2},
-        {9,2},{11,2},
-        {14,2},{16,2},
-        {19,2},{21,2},
-        {24,2},{26,2},{28,2},{30,2},{32,2},{34,2}
-    };
-    for (int i = 0; i < 16; i++) {
-        int v = guid_parse_hex_byte(s + offsets[i][0]);
-        if (v < 0) return 0;
-        bytes[i] = (uint8_t)v;
+    if (len == 36) {
+        // "D" (dashed) form.
+        if (s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-')
+            return 0;
+        // Hex-pair start offset of each of the 16 bytes (dashes skipped).
+        const int offsets[16] = {
+            0, 2, 4, 6,
+            9, 11,
+            14, 16,
+            19, 21,
+            24, 26, 28, 30, 32, 34
+        };
+        for (int i = 0; i < 16; i++) {
+            int v = guid_parse_hex_byte(s + offsets[i]);
+            if (v < 0) return 0;
+            bytes[i] = (uint8_t)v;
+        }
+        memcpy(out, bytes, 16);
+        return 1;
     }
-    memcpy(out, bytes, 16);
-    return 1;
+    if (len == 32) {
+        // "N" (no-hyphens) form — 16 contiguous hex pairs.
+        for (int i = 0; i < 16; i++) {
+            int v = guid_parse_hex_byte(s + i * 2);
+            if (v < 0) return 0;
+            bytes[i] = (uint8_t)v;
+        }
+        memcpy(out, bytes, 16);
+        return 1;
+    }
+    return 0;  // §2.6: any other length → FormatException
 }
 
 int32_t bz_guid_try_parse(const void* str, bz_guid_t* out) {

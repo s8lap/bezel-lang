@@ -9391,6 +9391,18 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                         // TimeOnly have no format overload.
                         if (call->args.size() == 1 && bn == "DateTime")
                             return true;
+                        // #1989 / stdlib §2.6/§2.18: Guid.ToString(format) — the
+                        // format overload lowers (LlvmBackend_Calls.cpp Guid block)
+                        // to bz_guid_to_string_fmt, which mints the SAME fresh rc=1
+                        // heap `bz.string` as the no-arg form (bz_guid_to_string) for
+                        // a valid "D"/"N" specifier. It is thus a +1 producer exactly
+                        // like #1982's no-arg Guid.ToString() (recognized above) —
+                        // without recognizing it, `var s := g.ToString("N")` would
+                        // leak (borrow-retained at bind, released at scope end, never
+                        // dropping the producer's +1). (`Equals`/`CompareTo` also take
+                        // one arg but are excluded by the `ToString` member check.)
+                        if (call->args.size() == 1 && bn == "Guid")
+                            return true;
                     }
                 }
             }

@@ -551,6 +551,11 @@ void* bz_guid_to_string(const bz_guid_t* g);
 // v0.172 (stdlib §2.18): Guid "N" — 32 lowercase hex digits, no hyphens.
 void* bz_guid_to_string_n(const bz_guid_t* g);
 
+// v0.197 (#1989, stdlib §2.6/§2.18): Guid.ToString(format) format overload —
+// "D" (dashed) / "N" (no hyphens); returns nullptr for any other specifier
+// (caller raises FormatException). `fmt_p` is a bz_string*.
+void* bz_guid_to_string_fmt(const bz_guid_t* g, const void* fmt_p);
+
 // v0.172 (#812/#1339, stdlib §2.18): floating shortest-round-trip renderers —
 // the value used by no-format ToString() and the "R" specifier.
 void* bz_double_to_string_r(double v);
