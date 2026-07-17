@@ -9202,6 +9202,50 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 "also implements the scrutinee interface type, so "
                                 "the erased runtime type-test could bind a value "
                                 "at a wrong static type (§19.3/§5.1/§12.9)");
+                        // §12.9/§14.2/§17.4 (v0.197, #2012): the PLAIN-scrutinee
+                        // analog of #2006's `is`/`as` erasure guard.
+                        // typeTestInterfaceBindAmbiguous only reasons about a
+                        // generic-INTERFACE scrutinee (its `None` there means
+                        // "soundly admitted" — the unique conformer — so respect
+                        // it and skip that domain below). But for a PLAIN
+                        // scrutinee (Object, a class, a NON-generic interface) a
+                        // `var x: T<erased-args>` reaches the COLLAPSED per-
+                        // monomorphization descriptor with no guard at all:
+                        // appendDescKey does not encode a function type's identity
+                        // (Kind::Function → "F" at any depth), so
+                        // `case o of var x: Wrap<(string)->string>` false-positive-
+                        // MATCHES a `Wrap<(int)->int>` value and binds it at a wrong
+                        // static type — the same memory-unsafe type confusion
+                        // #2001/#2006 fixed. Bring this path to parity with #2006:
+                        // reject a CONSTRUCTED generic target whose type argument is
+                        // not runtime-reified (`typeArgRuntimeReified` is the
+                        // oracle) and that carries no type variable (a bare
+                        // parameter resolves to a concrete arg at monomorphization,
+                        // #1843 — admit it, matching the conservative-accept posture
+                        // above). Hold off a generic-INTERFACE scrutinee — that is
+                        // typeTestInterfaceBindAmbiguous's domain (and any erased
+                        // case there is already rejected by it or upstream by
+                        // #1913/#1920), so re-deciding here would double-report or
+                        // override its sound unique-conformer admission.
+                        else if (lsym->declType->kind ==
+                                     TypeRef::Kind::Named &&
+                                 !lsym->declType->genericArgs.empty() &&
+                                 !refMentionsTypeVariable(lsym->declType) &&
+                                 !typeArgRuntimeReified(lsym->declType) &&
+                                 !(scrutTy->kind == TypeRef::Kind::Named &&
+                                   scrutTy->declaration &&
+                                   scrutTy->declaration->kind ==
+                                       ast::TypeDeclKind::Interface &&
+                                   !scrutTy->genericArgs.empty()))
+                            ctx_.diagnostics().report(
+                                Severity::Error, bp->span.begin,
+                                "binding pattern type's generic argument is not "
+                                "runtime-distinguishable — it is a still-erased "
+                                "type kind (e.g. a function type), which the "
+                                "runtime type descriptor collapses, so the type-"
+                                "test could match a different instantiation and "
+                                "bind the value at a wrong static type "
+                                "(§19.3/§12.9/§14.2/§17.4)");
                     }
                 }
                 Scope* saveScope = currentScope_;
