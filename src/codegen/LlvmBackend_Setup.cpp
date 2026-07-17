@@ -9317,6 +9317,36 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // #1982 / stdlib §2.6 / §4.6 / §28.9: the no-arg `guid.ToString()` is a BUILTIN
+    // lowered in lowerCall's Guid block (LlvmBackend_Calls.cpp) to bz_guid_to_string,
+    // which mints a fresh heap `bz.string` at rc := 1 (BZ_GUID_STRING_RC_INIT) —
+    // exactly the +1 single-reference shape of `+`/interpolation/primitive-ToString/
+    // StringBuilder.ToString. Guid is a Named value type, NOT a Primitive, so the
+    // numeric-ToString block above returns false for it; without this recognition the
+    // result was treated as a borrow, so `var s := g.ToString()` retained it (rc
+    // 1->2) at bind and released it (rc 2->1) at scope end, never dropping the
+    // producer's original +1 — leaking the 32-byte header + the data buffer (#1982).
+    // Recognize the no-arg form structurally (CallExpr, empty args, member "ToString",
+    // Guid-typed receiver — the SAME shape lowerCall's Guid dispatch keys on, so the
+    // two decisions stay in lockstep) so the bind TRANSFERS the +1 into the slot and
+    // the scope-end release (when the escape walk proves the local non-escaping) drops
+    // it exactly once. No double-free: no extra retain is emitted and an escaping local
+    // is excluded from the scope-end release (its +1 then leaks — the safe direction).
+    // Only the no-arg overload is recognized: the ToString(format) method-call overload
+    // is a distinct (non-leak) defect and is NOT treated as a producer here.
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (call->args.empty() && call->callee) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+                if (ma->member == "ToString" && ma->target) {
+                    auto* tt = ctx_.exprType(*ma->target);
+                    if (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                        builtinTypeName(tt) == "Guid")
+                        return true;  // bz_guid_to_string → rc=1 heap string
+                }
+            }
+        }
+    }
     // §3.1 / §28.3 / §28.9 (#1637): StringBuilder.ToString() is a BUILTIN lowered
     // in tryLowerCollectionInstanceCall (no resolved MethodSymbol, so
     // isUserMethodStringReturnCall below never sees it). Its lowering concatenates
