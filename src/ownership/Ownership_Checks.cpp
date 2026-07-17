@@ -680,7 +680,19 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                             // `move local!` moves the local out.
                             if (exprIsOwnedFieldRead(*mop))
                                 recordFieldMove(id->name, un->span.begin);
-                            else
+                            // §28.8 (#1993): `move b!` where the peeled place `b`
+                            // is a BORROW (a non-`owned` parameter, a catch
+                            // binding, a Borrowed-state local, a non-`owned`
+                            // field) is not an owned value — reject it exactly as
+                            // the plain `move b` branch below does. Without this,
+                            // the `!` form slipped past the borrow check (only the
+                            // un-`!` `move id` branch ran checkOwnedArgSource), so
+                            // the owned parameter sink AND b's real owner both
+                            // disposed the value — a double-free. checkOwnedArg-
+                            // Source classifies the BARE peeled place (no `move`
+                            // wrapper): an owned local is moved out, a borrow is
+                            // reported and NOT marked. // per §28.8
+                            else if (!checkOwnedArgSource(*mop, id->span.begin))
                                 markMovedByName(id->name, id->span.begin);
                             consumed = true;
                         } else if (auto* ma =
@@ -974,7 +986,13 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                                 dynamic_cast<const ast::IdentifierExpr*>(mop)) {
                             if (exprIsOwnedFieldRead(*mop))
                                 recordFieldMove(id->name, un->span.begin);
-                            else
+                            // §28.8 (#1993): `move b!` where the peeled place `b`
+                            // is a BORROW is not an owned value — reject it as the
+                            // plain `move b` ctor-arg branch below does; otherwise
+                            // the constructed object's owned parameter AND b's real
+                            // owner both dispose the value (a double-free). See the
+                            // CallExpr twin above for the full rationale. // per §28.8
+                            else if (!checkOwnedArgSource(*mop, id->span.begin))
                                 markMovedByName(id->name, id->span.begin);
                             consumed = true;
                         } else if (auto* ma =
@@ -5350,19 +5368,42 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     // return, a `throw` operand) is the double-dispose hazard the un-`!` place
     // reads below already guard: `E!` neither moves `E` (so `E`'s real owner
     // still disposes it) nor is a fresh producer (so the sink disposes it too)
-    // — a use-after-free / double-free. `move E!` IS the legal owned transfer
-    // (it arrives wrapped in `move`, unwrapped above → `unwrappedMove`, so this
-    // branch is skipped); a TEMPORARY/producer operand (`f()!`, `new T()!`)
-    // carries its own sole ownership through the `!` and is not a place, so it
-    // is not flagged. Checked before the place-read branches below because the
-    // `!` wrapper is not a bare identifier — without this it slips past every
-    // owned-sink handler's bare-identifier move-on-read, so `E` is neither moved
-    // nor rejected and the value is disposed twice. // per §17.4, §28.8.1
-    if (!unwrappedMove) {
-        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+    // — a use-after-free / double-free. A TEMPORARY/producer operand (`f()!`,
+    // `new T()!`) carries its own sole ownership through the `!` and is not a
+    // place, so it is not flagged. Checked before the place-read branches below
+    // because the `!` wrapper is not a bare identifier — without this it slips
+    // past every owned-sink handler's bare-identifier move-on-read, so `E` is
+    // neither moved nor rejected and the value is disposed twice. // per §17.4, §28.8.1
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+        if (!unwrappedMove) {
             return pb->operand && !exprIsTemporary(*pb->operand) &&
                    isBorrowableType(ctx_.exprType(*e));
         }
+        // §28.8.1 / §17.4 (issue #1993): `move E!`. `move` reads the underlying
+        // PLACE as owned ONLY when that place is itself owned — an owned local or
+        // a `move`d owned field (§28.8.1: `move` is the owned read of a place).
+        // When the underlying place is a BORROW (a non-`owned` parameter, a catch
+        // binding, a Borrowed-state local, a non-`owned` field), `move E!` is no
+        // more an owned value than `move E` is; it must be REJECTED, not silently
+        // consumed, or the owned sink AND the borrow's real owner both dispose the
+        // value (a double-free). Earlier reasoning wrongly assumed `move E!` is
+        // ALWAYS the legal owned transfer — so the `move` unwrap above set
+        // `unwrappedMove` and this branch was skipped entirely, letting a `move
+        // b!` of a BORROW slip past the classifier for every owned sink that
+        // routes through it (an `owned` field store §28.5 via handleOwnedField-
+        // Assignment, a `throw` operand §31.1 via checkThrowOperandNotBorrowed, an
+        // owning-array slot §28.11, and the recordMovesIn owned-sink discharge).
+        // Peel the `!` to the underlying place and classify it exactly as `move E`
+        // via the place-read branches below (all `!unwrappedMove`-gated, so an
+        // owned field/local/index under `move` is a legal owned source and is not
+        // flagged; a producer/temporary erases to `return false` at the tail; a
+        // BORROW place is caught by the identifier classification). An owned FIELD
+        // read (`move obj.f!` / `move _field!`) is the one place-form the gated
+        // branches skip but that reaches the un-gated FieldSymbol tail — it is a
+        // legal owned read of the field (§28.8.1), so exclude it here explicitly.
+        // // per §28.8.1, §17.4
+        e = lookThroughForceUnwrap(e);
+        if (exprIsOwnedFieldRead(*e)) return false;
     }
     // §28.3 / §28.8.1 (issue #398): a *bare* read of an `owned` field — no
     // enclosing `move` — is Borrowed ("Field access `obj.f` where `f` is
