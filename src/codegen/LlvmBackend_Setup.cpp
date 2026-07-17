@@ -9876,6 +9876,49 @@ struct StringEscapeWalker {
                rt->headName() == "StringBuilder";
     }
 
+    // #1994 / stdlib §2.1 / §7.4 / §4.6 / §28.3 / §28.9 (v0.197):
+    // `Console.Write`/`Console.WriteLine(value: string)` — and the
+    // `Console.Out`/`Console.Error` TextWriter facets that route through the SAME
+    // tryLowerConsoleCall lowering — are NON-RETAINING string consumers.
+    // emitConsoleWrite reads the string's bytes into the write(2) syscall and
+    // returns; it never stores, retains, or otherwise extends the argument's
+    // lifetime (the #1031 direct-producer path RELEASES a fresh +1 argument right
+    // after the write, which is only sound because the call holds no onward
+    // reference). So a string LOCAL passed in the value position is a
+    // CALL-BOUNDED borrow, not an escape — a scope-end release of the caller's +1
+    // is UAF-free (the builtin does not outlive the call). This mirrors the #1185
+    // StringBuilder.Append relaxation and the #1430 plain-method relaxation, but
+    // for an INTRINSIC callee (Console is a §2.3 built-in class matched
+    // structurally by name — it has no resolved user MethodSymbol, so walkCallArgs'
+    // #1430 `ms` path is null and never fires here). Recognized structurally by
+    // the SAME callee shapes tryLowerConsoleCall keys on (name "Console", member
+    // "Write"/"WriteLine", or the "Console.Out"/"Console.Error" facet), so the
+    // escape decision and the lowering stay in lockstep. Only the single string
+    // arg (index 0) qualifies; everything else stays ESCAPED (leak over UAF). The
+    // caller gates this on stringReleaseMode (the #1997 narrowing) so the shared
+    // dict/grouping/borrowing-Array walks — which have no release-old machinery —
+    // keep their conservative ESCAPE for any collection passed to the WriteLine
+    // Object overload.
+    bool isConsoleNonRetainingStringArg(const ast::Expr* callee, size_t i) {
+        if (i != 0) return false;
+        auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+        if (!ma || !ma->target) return false;
+        if (ma->member != "Write" && ma->member != "WriteLine") return false;
+        // Direct `Console.Write`/`Console.WriteLine`.
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
+            return id->name == "Console";
+        // `Console.Out.<m>` / `Console.Error.<m>` — the stdout/stderr TextWriter
+        // facets that lower through the same tryLowerConsoleCall stdfd path.
+        if (auto* inner =
+                dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get())) {
+            if (inner->member != "Out" && inner->member != "Error") return false;
+            if (auto* iid =
+                    dynamic_cast<const ast::IdentifierExpr*>(inner->target.get()))
+                return iid->name == "Console";
+        }
+        return false;
+    }
+
     // Call arguments (#1430): a bare read of the target passed in a PLAIN
     // (no-modifier) parameter position of a resolved user/imported method is a
     // CALL-BOUNDED read, not an escape (§28.3 borrow-for-the-call / §28.9).
@@ -9914,6 +9957,15 @@ struct StringEscapeWalker {
             // string slot is non-escaping (the retaining builder owns a +1).
             if (!safeArg && a.modifier.empty() && a.name.empty() &&
                 isStringBuilderRetainingStringArg(callee, i) &&
+                isTargetIdent(a.value.get()))
+                safeArg = true;
+            // #1994: a string local passed to Console.Write/WriteLine (or the
+            // Console.Out/Console.Error facets) is a CALL-BOUNDED borrow — the
+            // builtin does not retain it. String-release analysis ONLY
+            // (stringReleaseMode) so the shared dict/grouping/borrowing-Array walks
+            // keep their conservative ESCAPE (#1997 narrowing).
+            if (!safeArg && stringReleaseMode && a.modifier.empty() &&
+                a.name.empty() && isConsoleNonRetainingStringArg(callee, i) &&
                 isTargetIdent(a.value.get()))
                 safeArg = true;
             expr(a.value.get(), safeArg);
