@@ -859,6 +859,11 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // rejects `Take(): Cell? => move v;` (the bare-read `=> v;` borrow is
     // legal). // per §28.6
     checkOwnedFieldReturn(exprBody);
+    // §28.6 / §28.8 / §28.8.1 (#1995): the `=>` expression-body sibling of the
+    // handleReturn call — rejects `Take(b: Cell): owned Cell => move b;` where
+    // `b` is a BORROW returned as owned (double-free). A no-op unless the return
+    // type is `owned` and the body is `move <borrow>`. // per §28.6, §28.8
+    checkOwnedReturnBorrowSource(exprBody);
     // #1530 (§30.3 / §30.5): the expression-body sibling of `checkResultSites`
     // — an expression-bodied method's `=>` body can read `.Result` on a
     // class-typed `Task<T>` (`M(): Conn => t.Result;`) just as a block body
@@ -4323,6 +4328,12 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // local. If the local is a `using var` (scope-bound), the
     // borrow outlives its source — error per §28.3.
     checkBorrowEscapesOnReturn(e);
+    // §28.6 / §28.8 / §28.8.1 (#1995): reject `return move b` / `return move b!`
+    // of a BORROW through an `owned` return type (double-free). Runs BEFORE the
+    // discharge below and returns early on rejection, so a rejected borrow is not
+    // silently marked moved-from by handleDischarge's `move` arm. A no-op unless
+    // the return type is `owned` and the expression is `move <borrow>`. // per §28.6
+    if (checkOwnedReturnBorrowSource(e)) return;
     // For `move x` return arm: covered by handleDischarge inside
     // the expression — but we also call it here.
     handleDischarge(e);

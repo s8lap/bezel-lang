@@ -5605,6 +5605,54 @@ bool MethodOwnership::checkOwnedArgSource(const ast::Expr& argValue,
     return true;
 }
 
+// §28.6 / §28.8 / §28.8.1 (issue #1995): the RETURN-position twin of the
+// argument-sink owned-source guard. `return move b` / `return move b!` (and the
+// `=>` expression-body form) where `b` is a BORROW, returned through an `owned`
+// return type, double-frees: the caller takes the returned value as owned and
+// disposes it, while the borrow's real owner disposes it too. `move`-wrapping a
+// borrow does NOT make it owned — §28.8.1 makes `move` the owned read of a place
+// ONLY when the place is itself owned (an owned local, or a `move`d owned field).
+// The return position never ran this classifier (only the borrow-of-scope-local
+// lifetime checks lived here — checkBorrowEscapesOnReturn/checkStaticBorrowReturn/
+// …), so a `move`d borrow slipped through; the ARGUMENT-sink path (a CALL param,
+// a ctor arg, an owned-field store, a `throw` operand) rejects it via
+// checkOwnedArgSource / ownedArgSourceIsBorrow (#1993). Reuse that exact predicate
+// here. // per §28.6, §28.8, §28.8.1
+bool MethodOwnership::checkOwnedReturnBorrowSource(const ast::Expr& e) {
+    // Only an `owned` return sink is the double-dispose hazard: a plain/borrow
+    // return type does not make the caller dispose the returned value.
+    if (!returnOwned_) return false;
+    // Only the `move E` / `move E!` shapes carry a place read that could be a
+    // borrow. A fresh producer (`new`, a call returning `owned T`) and a bare-
+    // identifier return (handled by handleReturn's discharge fast-path) are not
+    // examined here.
+    const auto* un = dynamic_cast<const ast::UnaryExpr*>(&e);
+    if (!un || un->op != "move" || !un->operand) return false;
+    // `move this.f` / `move _f` / `move recv.f!` of an OWNED field is the LEGAL
+    // owned-field transfer (§28.8.1), NOT a borrow — peel a single `!` to the
+    // underlying place and exclude it. (ownedArgSourceIsBorrow classifies a BARE
+    // `move _field` of an owned field as a borrow — its FieldSymbol branch is not
+    // `move`-gated — so without this exclusion a legal `return move _f;` would be
+    // spuriously rejected. The field-restoration obligation of such a move is
+    // enforced separately by the moved-from-field check, §28.8.1.) // per §28.8.1
+    const ast::Expr* place = lookThroughForceUnwrap(un->operand.get());
+    if (exprIsOwnedFieldRead(*place)) return false;
+    // Everything else classifies exactly as the argument-sink path: a borrowed
+    // local/parameter, a catch-bound exception (§31.1), a Borrowed-state local,
+    // or a non-`owned` field is REJECTED; an owned local or an owned producer is
+    // accepted (ownedArgSourceIsBorrow returns false).
+    if (!ownedArgSourceIsBorrow(e)) return false;
+    report(
+        Severity::Error, un->span.begin,
+        "cannot return a borrow as an `owned` value: `move` of a borrow (a "
+        "borrowed local/parameter, a catch-bound exception, or a non-`owned` "
+        "field) does not transfer ownership — the value is owned elsewhere and "
+        "the caller would dispose it a second time (§28.6 / §28.8 — return an "
+        "owned value produced by `new`, a call returning `owned T`, or `move` of "
+        "an owned local or owned field)");
+    return true;
+}
+
 // §28.3 / §28.8 (issue #407): owned-sink catch-all. See the header.
 bool MethodOwnership::checkOwnedArgOtherBorrow(const ast::Expr& argValue) {
     // A bare identifier (including bare `this`) and a bare owned-field read are

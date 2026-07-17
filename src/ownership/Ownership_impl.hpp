@@ -1763,6 +1763,24 @@ private:
     // the borrow as consumed). // per §28.8
     bool checkOwnedArgSource(const ast::Expr& argValue, SourceLocation loc);
 
+    // §28.6 / §28.8 / §28.8.1 (issue #1995): reject `return move b` / `return
+    // move b!` (and the `=>` expression-body form) of a BORROW returned through
+    // an `owned` return type. The return position never ran the §28.8 owned-
+    // source classifier — only the borrow-of-scope-local lifetime checks lived
+    // there — so a `move`d borrow (a borrowed local/parameter, a catch-bound
+    // exception §31.1, a Borrowed-state local, a non-`owned` field) was returned
+    // as if owned: the caller disposes it while the borrow's real owner disposes
+    // it too (a double-free). Reuses the exact ARGUMENT-sink predicate
+    // (checkOwnedArgSource / ownedArgSourceIsBorrow, #1993). A no-op unless the
+    // enclosing method's return type is `owned` (returnOwned_) and `e` is `move
+    // <place>` — a plain/borrow return type is not the double-dispose hazard (the
+    // caller does not dispose a returned borrow), and a non-`move` owned return (a
+    // fresh producer, a bare-identifier discharge) is untouched. A `move`d owned-
+    // FIELD read (`move this.f` / `move _f` / `move recv.f!`) is the legal owned-
+    // field transfer (§28.8.1) and is excluded (its field-restoration obligation
+    // is enforced separately). Returns true when it reported. // per §28.6, §28.8, §28.8.1
+    bool checkOwnedReturnBorrowSource(const ast::Expr& e);
+
     // §28.3 / §28.8 (issue #407): an owned-sink argument that is NOT a bare
     // identifier and NOT a bare owned-field read — those two forms have
     // dedicated handling at each call site that also records the move when the
