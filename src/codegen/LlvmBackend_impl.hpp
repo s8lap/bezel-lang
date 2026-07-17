@@ -2572,14 +2572,28 @@ private:
     // unified by isNullableValueTy below. Defined in LlvmBackend_Layout.cpp
     // (needs the record-declaration kind check, like isNullableEnumTy).
     bool isNullableRecordTy(const sema::TypeRef* rt);
+    // per §2.5–§2.6 / issue #1954: is rt a NULLABLE VALUE-BUILTIN (a nullable
+    // Named TypeRef naming DateTime/TimeSpan/DateOnly/TimeOnly/Guid)? These are
+    // scalar/struct value types whose decl kind is Class (or declaration-less), so
+    // none of isNullablePrimTy/isNullableEnumTy/isNullableRecordTy recognise them —
+    // a `Guid?` therefore fell through to the bare {i64,i64} lowering with NO null
+    // representation, and the nullable-wrapper GEP over it was malformed (LLVM
+    // checkGEPType abort). It now lowers, like records, to the tagged
+    // {i8 hasValue; <builtin payload>} struct (nullableValueStructTy), so `null` is
+    // representable and distinct from every value — critically for the MULTI-FIELD
+    // Guid {i64,i64}. Defined in LlvmBackend_Layout.cpp (delegates to
+    // valueBuiltinName); the four unify under isNullableValueTy below.
+    bool isNullableValueBuiltinTy(const sema::TypeRef* rt);
     // A nullable VALUE type — a value primitive (isNullablePrimTy), an enum
-    // (isNullableEnumTy), or a record (isNullableRecordTy). All lower to the
-    // tagged {i8 hasValue; T value} struct; the only difference is T (the
-    // primitive's LLVM type, i32 for an enum, or the bare record struct). All
+    // (isNullableEnumTy), a record (isNullableRecordTy), or a value-builtin
+    // (isNullableValueBuiltinTy, #1954). All lower to the tagged {i8 hasValue; T
+    // value} struct; the only difference is T (the primitive's LLVM type, i32 for
+    // an enum, the bare record struct, or the value-builtin's lowering — i64 for
+    // DateTime/TimeSpan, i32 for DateOnly/TimeOnly, {i64,i64} for Guid). All
     // null/wrap/value-semantics sites key off this combined predicate.
     bool isNullableValueTy(const sema::TypeRef* rt) {
         return isNullablePrimTy(rt) || isNullableEnumTy(rt) ||
-               isNullableRecordTy(rt);
+               isNullableRecordTy(rt) || isNullableValueBuiltinTy(rt);
     }
     // The tagged struct for a nullable value type (prim, enum, or record). For
     // an enum the value slot is the underlying integer (i32 — CG44); for a record
@@ -4016,13 +4030,19 @@ private:
     // (class, interface, string, Object, function, heap collections) do not.
     bool isBoxableValueType(const sema::TypeRef* rt);
 
+    // §2.5–§2.6 (#1945/#1954): the value-builtin name (DateTime/TimeSpan/DateOnly/
+    // TimeOnly/Guid — scalar/struct value types) a TypeRef denotes, across the three
+    // TypeRef shapes (builtinClassSym decl, declaration-less annotation, imported),
+    // IGNORING nullability. The single home for the value-builtin name set; both
+    // valueBuiltinBoxName and isNullableValueBuiltinTy delegate here.
+    const char* valueBuiltinName(const sema::TypeRef* rt);
+
     // §8.6 / §2.5–§2.6 (#1945): the stable box-key name for a boxable VALUE-
-    // BUILTIN (DateTime/TimeSpan/DateOnly/TimeOnly/Guid — scalar/struct value
-    // types), across the three TypeRef shapes (builtinClassSym decl, declaration-
-    // less annotation, imported). Keyed into primBoxDesc_/primBoxVtable_ so a
-    // boxed value-builtin carries a walkable type descriptor (emitIsA) and
-    // boxValue can wrap it. Returns nullptr for any other type (and for a nullable
-    // form — a `DateTime?` → Object box is a distinct, unhandled shape).
+    // BUILTIN, keyed into primBoxDesc_/primBoxVtable_ so a boxed value-builtin
+    // carries a walkable type descriptor (emitIsA) and boxValue can wrap it. Returns
+    // nullptr for any other type and for a nullable form — a `DateTime?` → Object
+    // box is a distinct shape, and a nullable value-builtin's tagged-struct layout
+    // is keyed by isNullableValueBuiltinTy instead.
     const char* valueBuiltinBoxName(const sema::TypeRef* rt);
 
     // §8.6: is `target` a reference type (Object / interface / Object?) — the

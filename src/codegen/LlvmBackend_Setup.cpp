@@ -14014,14 +14014,16 @@ static const char* valueBuiltinBoxNameStr(std::string_view n) {
 }
 
 
-// §8.6 / §2.5–§2.6 (#1945): the box-key name for a boxable value-builtin TypeRef,
-// resolved across the three shapes value-builtins take (builtinClassSym decl with
-// decl==nullptr; declaration-less annotation via astNode headName; imported via
-// importedName). Nullable is excluded — a `DateTime?` → Object box is a separate,
-// unhandled shape (isNullableValueTy does not recognise value-builtins either).
-const char* Emitter::valueBuiltinBoxName(const sema::TypeRef* rt) {
+// §2.5–§2.6 (#1945/#1954): the value-builtin name (DateTime/TimeSpan/DateOnly/
+// TimeOnly/Guid) a TypeRef denotes, resolved across the three shapes value-builtins
+// take (builtinClassSym decl with decl==nullptr; declaration-less annotation via
+// astNode headName; imported via importedName), IGNORING nullability. Shared by
+// valueBuiltinBoxName (which additionally excludes nullable) and
+// isNullableValueBuiltinTy (which requires nullable), so the value-builtin name set
+// lives in ONE place.
+const char* Emitter::valueBuiltinName(const sema::TypeRef* rt) {
     using K = sema::TypeRef::Kind;
-    if (!rt || rt->nullable || rt->kind != K::Named) return nullptr;
+    if (!rt || rt->kind != K::Named) return nullptr;
     // (a) builtinClassSym form: a compiler-intrinsic TypeSymbol (decl==nullptr).
     if (rt->declaration)
         return rt->declaration->decl ? nullptr
@@ -14033,6 +14035,15 @@ const char* Emitter::valueBuiltinBoxName(const sema::TypeRef* rt) {
     if (!rt->importedName.empty())
         return valueBuiltinBoxNameStr(rt->importedName);
     return nullptr;
+}
+
+
+// §8.6 / §2.5–§2.6 (#1945): the box-key name for a boxable value-builtin TypeRef.
+// Nullable is excluded — a `DateTime?` → Object box is a separate shape; a nullable
+// value-builtin's tagged-struct layout is keyed by isNullableValueBuiltinTy instead.
+const char* Emitter::valueBuiltinBoxName(const sema::TypeRef* rt) {
+    if (!rt || rt->nullable) return nullptr;
+    return valueBuiltinName(rt);
 }
 
 

@@ -341,6 +341,17 @@ bool Emitter::isNullableRecordTy(const sema::TypeRef* rt) {
 }
 
 
+// per §2.5–§2.6 / issue #1954: is rt a NULLABLE VALUE-BUILTIN (DateTime/TimeSpan/
+// DateOnly/TimeOnly/Guid)? See the declaration comment in LlvmBackend_impl.hpp for
+// why these need the tagged-struct nullable lowering (esp. the multi-field Guid
+// {i64,i64}, whose bare lowering has no null representation → the malformed
+// nullable-wrapper GEP crash). valueBuiltinName resolves the name across all three
+// TypeRef shapes ignoring nullability, so gate on rt->nullable here.
+bool Emitter::isNullableValueBuiltinTy(const sema::TypeRef* rt) {
+    return rt && rt->nullable && valueBuiltinName(rt) != nullptr;
+}
+
+
 // per §8.3/§9.1: a nullable reference type lowers to a plain `ptr` whose null
 // is a real null pointer (no hasValue tag). The synthesized value-semantics
 // members must null-guard a field of such a type before dereferencing it.
@@ -1280,6 +1291,19 @@ llvm::StructType* Emitter::nullableValueStructTy(const sema::TypeRef* rt) {
         return llvm::StructType::get(
             llvm_, {nullablePrimHasValTy(), recordStruct(rt->declaration)});
     }
+    // per §2.5–§2.6 / issue #1954: a nullable value-builtin's payload is the
+    // NON-nullable builtin's lowering (DateTime/TimeSpan → i64, DateOnly/TimeOnly →
+    // i32, Guid → {i64,i64}), so the leading hasValue tag distinguishes null from
+    // every value. Lower a non-nullable copy (lowerTypeRef falls through to the
+    // Named/value-builtin branch → guidStructType()/i64()/i32()) rather than the
+    // Primitive slot below (rt->kind is Named, not Primitive — its `primitive`
+    // field is unset, which is exactly what produced the malformed layout/GEP).
+    if (isNullableValueBuiltinTy(rt)) {
+        sema::TypeRef nn = *rt;
+        nn.nullable = false;
+        return llvm::StructType::get(
+            llvm_, {nullablePrimHasValTy(), lowerTypeRef(&nn)});
+    }
     return nullablePrimStructTy(rt->primitive);
 }
 
@@ -1536,20 +1560,23 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             builder_.SetInsertPoint(contBB);
             if (rt->kind == sema::TypeRef::Kind::Primitive ||
                 isNullableRecordTy(rt) ||
+                valueBuiltinName(rt) != nullptr ||
                 (rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
                  (rt->declaration->kind == ast::TypeDeclKind::Record ||
                   rt->declaration->kind == ast::TypeDeclKind::Enum))) {
-                // §8.6 / §17.4 (issue #416, enum #1072): a value primitive,
-                // record, or ENUM unboxes to a non-null T? on a compatible cast,
-                // a null T? otherwise. The result is the tagged {hasValue,
-                // payload} struct: hasValue=1 + the loaded payload on success, the
-                // zero struct on failure. For a record the payload is the bare
-                // record struct; for a primitive/enum it is the scalar (the enum's
-                // underlying integer, §10.3). `rt` is the (non-nullable) target
-                // type, so build the nullable form's tagged struct — without this
-                // an `enum?` from `as` was a bare value, and the downstream
-                // `int(enum?)` / `<> null` / `!` GEP'd its tag on a non-struct
-                // (#1072 LLVM checkGEPType assertion).
+                // §8.6 / §17.4 (issue #416, enum #1072, value-builtin #1953): a
+                // value primitive, record, ENUM, or VALUE-BUILTIN (DateTime/…/Guid)
+                // unboxes to a non-null T? on a compatible cast, a null T?
+                // otherwise. The result is the tagged {hasValue, payload} struct:
+                // hasValue=1 + the loaded payload on success, the zero struct on
+                // failure. For a record/Guid the payload is the bare struct; for a
+                // primitive/enum/DateTime it is the scalar (the enum's underlying
+                // integer, §10.3). `rt` is the (non-nullable) target type, so build
+                // the nullable form's tagged struct — without this an `enum?` from
+                // `as` was a bare value, and the downstream `int(enum?)` / `<> null`
+                // / `!` GEP'd its tag on a non-struct (#1072 LLVM checkGEPType
+                // assertion). For a value-builtin, a FAILED cast now yields null
+                // rather than the zero value / MinValue (#1953).
                 sema::TypeRef tmp = *rt;
                 tmp.nullable = true;
                 auto* nst = nullableValueStructTy(&tmp);
