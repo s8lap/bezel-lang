@@ -1012,8 +1012,21 @@ bool Resolver::typeRefEqual(const TypeRef* a, const TypeRef* b) {
             return true;
         }
         case TypeRef::Kind::InlineArray:
-            return a->arrayOwned == b->arrayOwned &&
-                   typeRefEqual(a->arrayElement, b->arrayElement);
+            // #2001: `[3]T` and `[4]T` are DISTINCT types — the size N is part
+            // of the type identity (§14.2 / §15.1). Comparing only element +
+            // ownedness collapsed them, mirroring (and feeding) the runtime
+            // descriptor collision. Distinguish ONLY when both sizes are FOLDED
+            // (arraySizeValue >= 0, the folded compile-time size): if either is
+            // still unfolded (-1) fall back to the pre-existing size-blind
+            // behavior — the size is not statically known here, so a fold-state
+            // mismatch between two otherwise-identical `[N]T` refs must not be
+            // read as a type difference. Two folded, differing sizes ARE distinct
+            // (the case the descriptor collision and the memory-unsafety needed).
+            if (a->arrayOwned != b->arrayOwned) return false;
+            if (a->arraySizeValue >= 0 && b->arraySizeValue >= 0 &&
+                a->arraySizeValue != b->arraySizeValue)
+                return false;
+            return typeRefEqual(a->arrayElement, b->arrayElement);
         case TypeRef::Kind::Function: {
             if (a->funcParams.size() != b->funcParams.size())
                 return false;

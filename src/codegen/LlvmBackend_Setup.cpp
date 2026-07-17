@@ -3428,7 +3428,21 @@ static void appendDescKey(const sema::TypeRef* t, std::string& out) {
             out += std::to_string(static_cast<int>(t->primitive));
             break;
         case sema::TypeRef::Kind::InlineArray:
+            // #2001 (§14.2 value/inline-array type args, §12.9 type-test
+            // invariance): the key MUST encode the inline-array size N (and
+            // ownedness) — otherwise `C<Box<[3]int>>` and `C<Box<[4]int>>`
+            // produce the SAME key, collapse onto ONE runtime descriptor, and a
+            // runtime `is`/`as` cannot tell them apart (a memory-unsafe type
+            // confusion: the object has the small layout, the cast admits the
+            // large layout → OOB heap access). arraySizeValue is the folded
+            // compile-time size (TypeRef.hpp; -1 when unfolded, which keeps the
+            // conservative collapse for a not-statically-known size). The ':'
+            // terminates the size digits so they cannot bleed into the element
+            // key that follows.
             out += "A";
+            out += (t->arrayOwned ? "o" : "");
+            out += std::to_string(t->arraySizeValue);
+            out += ':';
             appendDescKey(t->arrayElement, out);
             break;
         case sema::TypeRef::Kind::Function:
@@ -3465,13 +3479,26 @@ std::string Emitter::typeRefIdentityKey(const sema::TypeRef* t) {
     return key;
 }
 
+// Is ONE type argument concrete enough to key a per-monomorphization descriptor?
+// Mirrors typeRefIdentityToken's non-null set (a resolved Named declaration or a
+// primitive tag; an unbound generic-parameter placeholder is Named with
+// declaration == nullptr → not concrete). #2001 (§14.2 / §12.9): a FOLDED-size
+// inline array (`[N]T`, N known) whose element is itself concrete is ALSO
+// distinguishable — appendDescKey now encodes its N (and ownedness), so
+// `Box<[3]int>` and `Box<[4]int>` mint DISTINCT descriptors. An UNFOLDED size
+// (< 0) stays conservatively non-concrete (its key still collapses). (Inlined
+// rather than calling typeRefIdentityToken, which is a private Emitter member.)
+static bool descTypeArgConcrete(const sema::TypeRef* a) {
+    if (!a) return false;
+    if (a->kind == sema::TypeRef::Kind::InlineArray)
+        return a->arraySizeValue >= 0 && descTypeArgConcrete(a->arrayElement);
+    if (a->kind == sema::TypeRef::Kind::Named) return a->declaration != nullptr;
+    return a->kind == sema::TypeRef::Kind::Primitive;
+}
+
 bool Emitter::descArgsConcrete(const std::vector<const sema::TypeRef*>& args) {
-    for (const sema::TypeRef* a : args) {
-        // A concrete arg carries a real identity token (a TypeSymbol* or a
-        // primitive tag). An unbound generic-parameter placeholder is Named
-        // with declaration == nullptr — typeRefIdentityToken returns null.
-        if (typeRefIdentityToken(a) == nullptr) return false;
-    }
+    for (const sema::TypeRef* a : args)
+        if (!descTypeArgConcrete(a)) return false;
     return true;
 }
 

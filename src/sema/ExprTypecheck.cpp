@@ -4636,14 +4636,20 @@ ExprTC::IfaceBindReject ExprTC::typeTestInterfaceBindAmbiguous(
 // §19.3/§14.1 (#1946): mirror of codegen typeRefIdentityToken/descArgsConcrete
 // (LlvmBackend_impl.hpp / LlvmBackend_Setup.cpp). A type argument is runtime-
 // reified — the per-monomorphization descriptor (#1843) distinguishes it from a
-// sibling — iff it is a concrete Named type (with a resolved declaration) or a
-// primitive, RECURSIVELY through its own generic arguments. A function type, an
-// inline array, Unit/Error, or an unresolved bare parameter carries no identity
-// token, so the descriptor key (appendDescKey) collapses it (`Kind::Function`
-// →"F" at any depth): NOT distinguishable. Conservative (⊆ codegen precision):
-// an inline-array arg is treated as non-reified even though codegen would key its
-// element, so a nested-array pattern is admitted through the erased path, never
-// under-rejected.
+// sibling — iff it is a concrete Named type (with a resolved declaration), a
+// primitive, or a FOLDED-size inline array whose element is itself reified,
+// RECURSIVELY through generic/element arguments. A function type, an
+// unfolded-size inline array, Unit/Error, or an unresolved bare parameter
+// carries no identity token, so the descriptor key (appendDescKey) collapses it
+// (`Kind::Function` →"F" at any depth): NOT distinguishable.
+//
+// #2001/#1971: the inline-array case was formerly a blanket non-reified (erased)
+// — necessary ONLY while appendDescKey omitted the size N, which made every
+// `[N]T` share one descriptor (a memory-unsafe collision). Now that the key
+// encodes N (arraySizeValue), a folded inline array IS runtime-distinguishable,
+// so admitting the now-sound type-tests here resolves #1971's over-reject. An
+// UNFOLDED size (arraySizeValue < 0) stays conservative: its key still collapses,
+// so it must be treated as erased (never under-rejected).
 bool ExprTC::typeArgRuntimeReified(const TypeRef* t) {
     if (!t) return false;
     switch (t->kind) {
@@ -4654,8 +4660,13 @@ bool ExprTC::typeArgRuntimeReified(const TypeRef* t) {
             return true;
         case TypeRef::Kind::Primitive:
             return true;
+        case TypeRef::Kind::InlineArray:
+            // #2001/#1971: reified iff the size is folded (encoded in the key)
+            // AND the element is itself reified; an unfolded size stays erased.
+            if (t->arraySizeValue < 0) return false;
+            return typeArgRuntimeReified(t->arrayElement);
         default:
-            return false;  // Function / InlineArray / Unit / Error — erased.
+            return false;  // Function / Unit / Error — erased.
     }
 }
 
