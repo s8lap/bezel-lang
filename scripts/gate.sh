@@ -86,6 +86,20 @@ if [ "$ASAN" -eq 1 ]; then
   ARB_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address)
   SHARD_NOTE="asan-instrumented"
   SHARD_LABEL="crash/undercount + generated-code ASan"
+  # 2026-07-17: 16 concurrent ASan shards OOM-kill workers under the dev_heavy
+  # memory-capped slice (~24G soft / 28G hard) — each ASan compile+exec peaks
+  # ~2.5-3G RSS, so 16x exceeds the budget once the box is under pressure and a
+  # worker gets OOM-killed => a spurious "shard crash / undercount" FAIL (with a
+  # DIFFERENT random set of tests each run). ASan is memory-bound, not CPU-bound,
+  # and fewer shards measured FASTER here (8 shards ~270-320s vs 16 shards
+  # ~360-965s). So the ASan pass DEFAULTS to a memory-safe shard count (cap 8,
+  # tuned to the ~24-28G slice); an explicit GATE_SHARDS overrides it (raise on a
+  # larger-memory host, lower on a smaller one). The plain (non-ASan) pass is not
+  # memory-bound and keeps run_parallel's nproc default.
+  if [ -z "${GATE_SHARDS:-}" ]; then
+    _ncpu=$(nproc 2>/dev/null || echo 8)
+    GATE_SHARDS=$(( _ncpu < 8 ? _ncpu : 8 ))
+  fi
 fi
 
 # ---------------------------------------------------------------------------
