@@ -5275,6 +5275,33 @@ bool MethodOwnership::exprIsOwnedFieldRead(const ast::Expr& e) const {
     return false;
 }
 
+// §28.6 / §28.8.1 (issue #2011): is the RECEIVER of an owned-field read a BORROW?
+// `move recv.f` is a legal owned-field transfer ONLY when `recv` is an owned
+// place; a borrower does not own the object and cannot move its owned fields out
+// (§28.6). Positive-rejection only — see the header for the full contract.
+bool MethodOwnership::ownedFieldMoveReceiverIsBorrow(const ast::Expr& fieldRead) {
+    // A bare-identifier owned-field read is an implicit `this.f`; `this` owns its
+    // own fields, so its receiver is never a borrow. (`move _f` / `move _f!` —
+    // the legal unqualified field transfer, §28.8.1.) // per §28.8.1
+    if (dynamic_cast<const ast::IdentifierExpr*>(&fieldRead)) return false;
+    const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&fieldRead);
+    if (!ma || !ma->target) return false;
+    // `this.f` — `this` owns its fields (the §28.8.1 explicit owned-field
+    // transfer). Recognize it directly: `this` carries no resolved Symbol, so the
+    // classifier below would treat it as unclassifiable (not a borrow) anyway, but
+    // spelling it out keeps the intent explicit. // per §28.8.1
+    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
+        if (tid->name == "this") return false;
+    // `recv.f` — classify the receiver `recv` exactly as any other owned source:
+    // a borrow (a borrowed parameter, a catch binding §31.1, a Borrowed-state
+    // local, a record-binding local, or a nested field read — itself a borrow,
+    // §28.3) is positively flagged and its owned-field move REJECTED; an owned
+    // local / using-var / `owned` parameter — or an unclassifiable temporary
+    // receiver (a separate deferred case, #2002) — is NOT flagged, so a legal
+    // `move ownedBox.f!` is not over-rejected. // per §28.6, §28.3, §28.8.1
+    return ownedArgSourceIsBorrow(*ma->target);
+}
+
 // §28.8.1 / §28.8 (issue #1999): reject a NON-`this` owned-field move in the
 // bare-statement discharge walk. See the header for the full rationale (the
 // runtime null-after-move and the `fieldMovedFrom_` restoration tracking are both
@@ -5472,10 +5499,17 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
         // BORROW place is caught by the identifier classification). An owned FIELD
         // read (`move obj.f!` / `move _field!`) is the one place-form the gated
         // branches skip but that reaches the un-gated FieldSymbol tail — it is a
-        // legal owned read of the field (§28.8.1), so exclude it here explicitly.
-        // // per §28.8.1, §17.4
+        // legal owned read of the field (§28.8.1) ONLY when the field's RECEIVER
+        // is an owned place. An owned-field read off a BORROW receiver (`move
+        // b.f!` where `b` is a borrowed parameter / catch binding / Borrowed-state
+        // local / nested field read) is NOT an owned transfer — a borrower does
+        // not own the object and cannot move its owned fields out; the field's
+        // real owner disposes the value, so the owned sink double-frees it (#2011,
+        // §28.6). Classify by the receiver: `this`/owned-place receiver → accept
+        // (return false); provably-borrow receiver → reject (return true).
+        // // per §28.8.1, §28.6, §17.4
         e = lookThroughForceUnwrap(e);
-        if (exprIsOwnedFieldRead(*e)) return false;
+        if (exprIsOwnedFieldRead(*e)) return ownedFieldMoveReceiverIsBorrow(*e);
     }
     // §28.3 / §28.8.1 (issue #398): a *bare* read of an `owned` field — no
     // enclosing `move` — is Borrowed ("Field access `obj.f` where `f` is
@@ -5628,15 +5662,24 @@ bool MethodOwnership::checkOwnedReturnBorrowSource(const ast::Expr& e) {
     // examined here.
     const auto* un = dynamic_cast<const ast::UnaryExpr*>(&e);
     if (!un || un->op != "move" || !un->operand) return false;
-    // `move this.f` / `move _f` / `move recv.f!` of an OWNED field is the LEGAL
-    // owned-field transfer (§28.8.1), NOT a borrow — peel a single `!` to the
-    // underlying place and exclude it. (ownedArgSourceIsBorrow classifies a BARE
-    // `move _field` of an owned field as a borrow — its FieldSymbol branch is not
-    // `move`-gated — so without this exclusion a legal `return move _f;` would be
-    // spuriously rejected. The field-restoration obligation of such a move is
-    // enforced separately by the moved-from-field check, §28.8.1.) // per §28.8.1
+    // `move this.f` / `move _f` / `move ownedBox.f!` of an OWNED field whose
+    // RECEIVER is an owned place is the LEGAL owned-field transfer (§28.8.1), NOT
+    // a borrow — peel a single `!` to the underlying place and exclude it.
+    // (ownedArgSourceIsBorrow classifies a BARE `move _field` of an owned field as
+    // a borrow — its FieldSymbol branch is not `move`-gated — so without this
+    // exclusion a legal `return move _f;` would be spuriously rejected. The field-
+    // restoration obligation of such a move is enforced separately by the moved-
+    // from-field check, §28.8.1.) But an owned-field read off a BORROW receiver
+    // (`return move b.f!` where `b` is a borrowed parameter / catch binding /
+    // Borrowed-state local / nested field read) is the #2011 double-free: a
+    // borrower does not own the object, so moving its owned field out and
+    // returning it as `owned` lets the caller dispose a value the field's real
+    // owner also disposes. Only exclude (accept) the OWNED-receiver form; a
+    // borrow-receiver field move falls through to the borrow rejection below.
+    // // per §28.8.1, §28.6
     const ast::Expr* place = lookThroughForceUnwrap(un->operand.get());
-    if (exprIsOwnedFieldRead(*place)) return false;
+    if (exprIsOwnedFieldRead(*place) && !ownedFieldMoveReceiverIsBorrow(*place))
+        return false;
     // Everything else classifies exactly as the argument-sink path: a borrowed
     // local/parameter, a catch-bound exception (§31.1), a Borrowed-state local,
     // or a non-`owned` field is REJECTED; an owned local or an owned producer is
@@ -5645,11 +5688,13 @@ bool MethodOwnership::checkOwnedReturnBorrowSource(const ast::Expr& e) {
     report(
         Severity::Error, un->span.begin,
         "cannot return a borrow as an `owned` value: `move` of a borrow (a "
-        "borrowed local/parameter, a catch-bound exception, or a non-`owned` "
-        "field) does not transfer ownership — the value is owned elsewhere and "
-        "the caller would dispose it a second time (§28.6 / §28.8 — return an "
-        "owned value produced by `new`, a call returning `owned T`, or `move` of "
-        "an owned local or owned field)");
+        "borrowed local/parameter, a catch-bound exception, a non-`owned` field, "
+        "or an owned field of a BORROW receiver — a borrower does not own the "
+        "object and cannot move its owned fields out, §28.6) does not transfer "
+        "ownership — the value is owned elsewhere and the caller would dispose it "
+        "a second time (§28.6 / §28.8 — return an owned value produced by `new`, a "
+        "call returning `owned T`, or `move` of an owned local or an owned field "
+        "of `this` or an owned place)");
     return true;
 }
 

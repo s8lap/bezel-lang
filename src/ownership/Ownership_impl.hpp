@@ -1716,6 +1716,25 @@ private:
     // read flowing into an owned sink. // per §28.3, §28.8.1
     bool exprIsOwnedFieldRead(const ast::Expr& e) const;
 
+    // §28.6 / §28.8.1 (issue #2011): does the RECEIVER of an owned-field read
+    // `recv.f` (given an `e` that `exprIsOwnedFieldRead` already accepted) denote
+    // a BORROW rather than an owned place? `move recv.f` reads an owned field as
+    // an owned value ONLY when `recv` is an owned place — the class instance
+    // itself (`this`, which owns its fields) or an owned local / using-var /
+    // `owned` parameter this scope owns (§28.8.1). A BORROW receiver (a non-
+    // `owned` parameter, a catch-bound exception §31.1, a Borrowed-state local, a
+    // record-binding local, or another field read — field reads are borrows §28.3)
+    // does NOT own the object, so it cannot transfer the object's owned fields
+    // out: the field's real owner disposes the value and the owned sink would
+    // dispose it a second time — a double-free (§28.6 "a borrow does not own the
+    // object"; §28.8.1 owned-field move). Positive-rejection only (the discipline
+    // of `ownedArgSourceIsBorrow`): returns true ONLY when the receiver is
+    // provably a borrow — `this`, an owned place, or an unclassifiable receiver
+    // (a temporary — a separate deferred case) returns false so a legal `move
+    // this.f` / `move _f` / `move ownedBox.f!` is never over-rejected.
+    // // per §28.6, §28.8.1
+    bool ownedFieldMoveReceiverIsBorrow(const ast::Expr& fieldRead);
+
     // §28.6 / §5.11 (#1493): true when `e` is an `owned`-field read AND the
     // receiver is `this` — a bare identifier (implicit `this.f`) or an
     // explicit `this.f`, never another object's field. This is the exact
