@@ -2103,6 +2103,11 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // Null-guarded: bz_shared_release handles null gracefully, but we load
         // and call only when non-null for consistency with other disposal sites.
         if (it->sharedHandle) {
+            // #1957: an `owned` Shared<T> PARAMETER discharged on the normal path
+            // releases here only on unwind (the discharge site owns the normal
+            // exit). A `using var` / auto-dropped owner leaves the flag false and
+            // releases on both exits.
+            if (it->releaseOnUnwindOnly && !isUnwind) continue;
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* h = builder_.CreateLoad(ptrTy(), addr);
@@ -2576,6 +2581,10 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // per §28.11, frees the struct). The ChannelClosedException vtable is
         // retrieved from builtinVtable_ (set up by setupBuiltinExceptions).
         if (it->channel) {
+            // #1957: an `owned` Channel<T> PARAMETER discharged on the normal
+            // path disposes here only on unwind; a `using var` / auto-dropped
+            // owner leaves the flag false and disposes on both exits.
+            if (it->releaseOnUnwindOnly && !isUnwind) continue;
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* ch = builder_.CreateLoad(ptrTy(), addr);
@@ -2659,6 +2668,13 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // bz_channel_sender_release (decrements sender count; may close the
         // channel if this was the last sender).
         if (it->channelSender) {
+            // #1957: an `owned` ChannelSender<T> PARAMETER discharged on the
+            // normal path releases here only on unwind (the discharge site — a
+            // move/return/.Dispose() — owns the normal exit); a `using var` or an
+            // AUTO-DROPPED owned sender (§28.3, the never-discharged owner) leaves
+            // the flag false and releases on both exits. As the last sender this
+            // release closes the channel (§30.15).
+            if (it->releaseOnUnwindOnly && !isUnwind) continue;
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* tx = builder_.CreateLoad(ptrTy(), addr);

@@ -8263,6 +8263,44 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
     // no further plumbing of the resolved type is needed here.
     const sema::TypeRef* rt =
         ps->declType ? ctx_.resolvedType(*ps->declType) : ps->resolvedDeclType;
+    // §30.15 / §28.13 (#1957): a builtin ChannelSender<T> / Channel<T> /
+    // Shared<T> owned parameter has NO user TypeSymbol (rt->declaration == null),
+    // so isClassOrInterfaceRef below rejects it and the disposal registration is
+    // skipped entirely — the auto-dropped owned sender is never released, its
+    // channel stays open (it was the last sender, §30.15), the graph leaks, and a
+    // cross-domain producer deadlocks. Detect these compiler-known builtins by
+    // head name — exactly the using-var path (usingVarOwns…) — and register their
+    // TYPE-SPECIFIC runtime release (bz_channel_sender_release / bz_channel_dispose
+    // / bz_shared_release) instead of the generic vtable dispatch, which does not
+    // touch the sender/channel/handle refcount and cannot close the channel. This
+    // must run BEFORE the class/interface gate. The auto-drop case (§28.3, a
+    // never-discharged owner) releases on BOTH exits (the sole release); a
+    // discharged owned param (moved/returned/disposed on the normal path)
+    // releases only on unwind (releaseOnUnwindOnly), mirroring the generic
+    // unwindOnly owned-param path — the discharge site owns the normal exit.
+    {
+        auto builtinHead = [](const sema::TypeRef* r) -> std::string_view {
+            if (!r || r->kind != sema::TypeRef::Kind::Named || r->declaration ||
+                !r->astNode || !r->astNode->name || r->astNode->name->parts.empty())
+                return std::string_view{};
+            return r->headName();
+        };
+        std::string_view bhead = builtinHead(rt);
+        bool isTx = bhead == "ChannelSender";
+        bool isCh = bhead == "Channel";
+        bool isSh = bhead == "Shared";
+        if (isTx || isCh || isSh) {
+            Disposal d{slot, nullptr};
+            d.channelSender = isTx;
+            d.channel       = isCh;
+            d.sharedHandle  = isSh;
+            // Never-discharged owner (auto-drop) → release on both exits; a
+            // discharged owned param → release only on the unwind exit.
+            d.releaseOnUnwindOnly = !ps->autoDropAtScopeEnd;
+            disposeStack_.front().push_back(d);
+            return;
+        }
+    }
     if (!isClassOrInterfaceRef(rt) && !isClassOrInterfaceRef(resolveTypeParamRef(rt)))
         return;
     Disposal d{slot, nullptr};

@@ -642,6 +642,20 @@ private:
         // holds the object pointer (via its alloca); `cls` is the static class
         // when known (dispatch is dynamic regardless).
         bool unwindOnly = false;
+        // §30.15 / §28.13 / §28.3 (#1957): like `unwindOnly`, but for a
+        // TYPE-SPECIFIC builtin disposal (channelSender / channel / sharedHandle)
+        // rather than the generic vtable dispatch. Set for an `owned`
+        // ChannelSender<T>/Channel<T>/Shared<T> PARAMETER that is discharged on
+        // the normal path (moved/returned/disposed) and so must run its
+        // type-specific runtime release (bz_channel_sender_release, etc.) ONLY on
+        // the exception-unwind exit — never on normal exit, where the discharge
+        // site already released it (a normal-exit release would double-release /
+        // underflow the refcount). The auto-drop case (a never-discharged owner)
+        // instead leaves this false so the type-specific branch runs on BOTH
+        // exits (the sole release). The channelSender/channel/sharedHandle
+        // disposal branches gate on this flag; it is unset (false) for every
+        // `using var` registration, so those are unaffected.
+        bool releaseOnUnwindOnly = false;
         // #422 / §4.6 / §28.9: a `var` string local that PROVABLY does not
         // escape its scope (a non-escape walk found every use is a
         // non-consuming read) and was initialized once by a codegen-internal
