@@ -312,6 +312,36 @@ static bool inheritsBuiltinException(const TypeSymbol* ts) {
     return false;
 }
 
+// §14.1 (#2006): does `t` mention a free/rigid type variable anywhere — a Named
+// TypeRef with no declaration, no generic arguments, and a non-empty head (a
+// generic type or method parameter)? A local mirror of ExprTypecheck.cpp's
+// file-local `refMentionsTypeVariable` (the two TUs cannot share the static),
+// used by the plain `is`/`as` erasure guard to hold OFF a target that carries a
+// bare parameter (`o is Box<Box<T>>` in a generic body, #1843): T resolves to a
+// concrete argument at monomorphization, so it is not statically erased — the
+// same conservative-accept posture typeTestInterfaceBindAmbiguous takes on the
+// case-binding path.
+bool typeTestTargetMentionsTypeVariable(const TypeRef* t) {
+    if (!t) return false;
+    switch (t->kind) {
+        case TypeRef::Kind::Named:
+            if (!t->declaration && t->genericArgs.empty() &&
+                !t->headName().empty())
+                return true;
+            for (const TypeRef* a : t->genericArgs)
+                if (typeTestTargetMentionsTypeVariable(a)) return true;
+            return false;
+        case TypeRef::Kind::InlineArray:
+            return typeTestTargetMentionsTypeVariable(t->arrayElement);
+        case TypeRef::Kind::Function:
+            for (const auto& p : t->funcParams)
+                if (typeTestTargetMentionsTypeVariable(p.type)) return true;
+            return typeTestTargetMentionsTypeVariable(t->funcReturn);
+        default:
+            return false;
+    }
+}
+
 }  // namespace
 
 // §17.11 (#951): does `default(T)` have no well-defined zero value? See the
@@ -1128,6 +1158,36 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     // of the target type (a failed cast is null). Recording it lets
     // `(x as T)` — and member access on its result — resolve.
     if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        // §12.9/§14.2/§17.4 (v0.197, #2006): erasure guard for the plain
+        // `is`/`as` expression path — parity with the case-binding path
+        // (#1927/#1946). A runtime type-test against a CONSTRUCTED generic
+        // whose type argument is a runtime-ERASED kind reaches a COLLAPSED
+        // per-monomorphization descriptor: appendDescKey does not encode a
+        // function type's identity (Kind::Function → "F" at any depth), so
+        // `Wrap<(int)->int> is Wrap<(string)->string>` returns a false-positive
+        // TRUE and the follow-on `as` reinterprets one signature as another —
+        // the same memory-unsafe type confusion #2001 fixed for inline-array
+        // sizes. Reject such a test at compile time. `typeArgRuntimeReified`
+        // (the codegen descArgsConcrete mirror) is the oracle: reject iff the
+        // target is a constructed generic that carries no type variable (a bare
+        // parameter resolves to a concrete arg at monomorphization — admit it,
+        // #1843's `o is Box<Box<T>>`) yet is NOT runtime-reified. Post-#2001 a
+        // folded inline-array arg IS reified, so `o is Wrap<[3]int>` is admitted.
+        if (te->testType) {
+            if (TypeRef* tt = ctx_.resolvedType(*te->testType)) {
+                if (tt->kind == TypeRef::Kind::Named && !tt->genericArgs.empty() &&
+                    !typeTestTargetMentionsTypeVariable(tt) &&
+                    !typeArgRuntimeReified(tt))
+                    ctx_.diagnostics().report(
+                        Severity::Error, e.span.begin,
+                        "the type argument of this `is`/`as` target is not "
+                        "runtime-distinguishable — it is a still-erased type "
+                        "kind (e.g. a function type), which the runtime type "
+                        "descriptor collapses, so the test would confuse "
+                        "distinct instantiations and bind a value at a wrong "
+                        "static type (§12.9/§14.2/§17.4)");
+            }
+        }
         if (te->op == "is" || te->op == "is not") {
             ctx_.setExprType(&e,
                              ctx_.primitiveTypeRef(PrimitiveType::Bool));
