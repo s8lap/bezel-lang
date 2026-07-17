@@ -489,7 +489,7 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
             }
         } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                        moveSrc)) {
-            // §28.8.1, #897 #898 (Part B): the QUALIFIED `move this._field`
+            // §28.8.1, #897 #898 (Part B): the QUALIFIED `move recv._field`
             // form. Part A (ownership pass) now rejects a SECOND move of an
             // already-moved-from field, so a sound program never double-owns;
             // but to make the qualified move consistent with the bare `move
@@ -500,14 +500,6 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
             // guarded (emitOwnedFieldDisposals), so nulling here makes it skip
             // the already-transferred object instead of double-freeing it.
             //
-            // Only the `this._field` form is nulled. Compute the slot via
-            // currentThis_ + the field index — the same lightweight StructGEP
-            // implicitFieldAddr uses for the bare form — NOT lvalueAddr/
-            // fieldAddr, whose re-lowering of the `this` receiver and generic-
-            // substitution side effects produced malformed IR for the canonical
-            // destructor `using var u := move this._inner;` case (it re-emitted
-            // the receiver after the field value `v` had already been read).
-            //
             // NOT inside a destructor body (emittingDisposerBody_): per the
             // #383/#763 design, a `move this._f` in a destructor does NOT get its
             // own scope-end disposal — emitDispose suppresses it — and the
@@ -517,17 +509,44 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
             // object → a LEAK (destructor_field_move_runtime_763). The Part A
             // sema check already rejects a double-move in a destructor (so the
             // UAF this null guards against cannot occur there), so skipping the
-            // null in the disposer body is both necessary and sound.
-            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
-                    ma->target.get());
-                tid && tid->name == "this" && currentThis_ &&
+            // null in the disposer body is both necessary and sound. This gate
+            // is common to both the `this` and non-`this` receiver arms below.
+            if (auto* fs = dynamic_cast<sema::FieldSymbol*>(
+                    ctx_.exprSymbol(*ma));
+                fs && (isOwnedReferenceField(fs) ||
+                       isOwnedIteratorInterfaceField(fs)) && fs->parent &&
                 !emittingDisposerBody_) {
-                if (auto* fs = dynamic_cast<sema::FieldSymbol*>(
-                        ctx_.exprSymbol(*ma))) {
+                auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    ma->target.get());
+                // A NON-`this` receiver is nulled only when it is an OWNED place
+                // with a stable, side-effect-free slot: an identifier resolving
+                // to a local / using-var / `owned` param. fieldAddr re-lowers the
+                // receiver to re-locate the field slot — an idempotent pointer
+                // load for such an identifier. A receiver denoting a temporary
+                // (`getBox().f`) has no stable slot and re-lowering would re-run
+                // its side effects, so it is NOT handled here (a separate case,
+                // #2002 deferred). Ownership is guaranteed by sema: a borrowed
+                // receiver's owned field cannot be moved out at all (rejected
+                // before codegen — #1999), so any `move recv.f` reaching here is
+                // on a receiver this scope owns.
+                bool nonThisStableOwned = false;
+                if (tid && tid->name != "this") {
+                    sema::Symbol* rsym = ctx_.exprSymbol(*tid);
+                    nonThisStableOwned =
+                        dynamic_cast<sema::LocalSymbol*>(rsym) != nullptr ||
+                        dynamic_cast<sema::ParameterSymbol*>(rsym) != nullptr;
+                }
+                if (tid && tid->name == "this" && currentThis_) {
+                    // §28.8.1: the `this._field` fast-path. Compute the slot via
+                    // currentThis_ + the field index — the same lightweight
+                    // StructGEP implicitFieldAddr uses for the bare form — NOT
+                    // fieldAddr, whose re-lowering of the `this` receiver and
+                    // generic-substitution side effects produced malformed IR
+                    // for the canonical destructor `using var u := move
+                    // this._inner;` case (it re-emitted the receiver after the
+                    // field value `v` had already been read).
                     auto idxIt = fieldIndex_.find(fs);
-                    if ((isOwnedReferenceField(fs) ||
-                         isOwnedIteratorInterfaceField(fs)) && fs->parent &&
-                        idxIt != fieldIndex_.end()) {
+                    if (idxIt != fieldIndex_.end()) {
                         llvm::StructType* st = classStruct(fs->parent);
                         if (st && st->getElementType(idxIt->second)
                                       ->isPointerTy()) {
@@ -536,6 +555,33 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                             builder_.CreateStore(
                                 llvm::ConstantPointerNull::get(ptrTy()), addr);
                         }
+                    }
+                } else if (nonThisStableOwned) {
+                    // #2002 / §28.7 / §28.8/§28.8.1 (v0.197): the QUALIFIED move
+                    // out of a NON-`this` owned receiver's field. Before this,
+                    // ONLY `this`-field moves nulled their slot, so even the
+                    // otherwise-sound "build then take then restore" form —
+                    // `var t := move box.f!; box.f := null; C.Sink(move t!)` —
+                    // double-freed: `box.f` kept the moved-out pointer, so the
+                    // §28.7 drop-on-overwrite `box.f := null` disposed the value
+                    // `t` already owns (and a scope-end disposal of `box` would
+                    // do the same). Null the source field slot so a subsequent
+                    // read / `:= null` / owner disposal sees null and skips.
+                    //
+                    // Use fieldAddr (not a hand-rolled StructGEP on the lowered
+                    // receiver pointer): it installs the receiver's generic
+                    // substitution from ma->target's exprType, so a field of a
+                    // DIFFERENTLY instantiated generic receiver (`Box<int>` vs
+                    // the enclosing method's `T`) GEPs the correct specialized
+                    // layout. A raw StructGEP under the enclosing method's
+                    // (possibly different) substitution could compute a wrong
+                    // byte offset and corrupt memory. Re-lowering the identifier
+                    // receiver inside fieldAddr is an idempotent pointer load.
+                    llvm::Type* fty = nullptr;
+                    if (llvm::Value* addr = fieldAddr(*ma, fty)) {
+                        if (fty && fty->isPointerTy())
+                            builder_.CreateStore(
+                                llvm::ConstantPointerNull::get(ptrTy()), addr);
                     }
                 }
             }
