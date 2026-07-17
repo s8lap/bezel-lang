@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/BuiltinRegistry.hpp"  // #1985: isBuiltinExceptionName
 #include "common/OwnershipFacts.hpp"  // #1801: bare-type-parameter source set
 
 namespace bezel::ownership {
@@ -657,8 +658,47 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(
                            a.value.get())) {
                 if (un->op == "move") {
-                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                    // §28.8.1 / §17.4 (#1986): `move x!` — a `move` of a PLACE
+                    // force-unwrap — consumes the underlying place, exactly as
+                    // `move x` does. Its operand is a `PostfixBangExpr`, not a
+                    // bare identifier, so the `move id` / `move this.field`
+                    // branches below miss it; without this peel the source is
+                    // never marked moved-from, so the owned sink (this bare-
+                    // statement call's `owned` parameter) AND x's real owner both
+                    // dispose the value — a double-free / UAF. Mirrors
+                    // recordMovesIn — the LocalDecl-initializer / assignment-RHS
+                    // twin, which already looks through the force-unwrap (#1125);
+                    // this bare-statement discharge path (handleDischarge) was the
+                    // one that missed it. // per §28.8.1, §17.4
+                    if (dynamic_cast<const ast::PostfixBangExpr*>(
                             un->operand.get())) {
+                        const ast::Expr* mop =
+                            lookThroughForceUnwrap(un->operand.get());
+                        if (auto* id =
+                                dynamic_cast<const ast::IdentifierExpr*>(mop)) {
+                            // `move _field!` reads the owned field as owned;
+                            // `move local!` moves the local out.
+                            if (exprIsOwnedFieldRead(*mop))
+                                recordFieldMove(id->name, un->span.begin);
+                            else
+                                markMovedByName(id->name, id->span.begin);
+                            consumed = true;
+                        } else if (auto* ma =
+                                       dynamic_cast<const ast::MemberAccessExpr*>(
+                                           mop)) {
+                            if (auto* tid =
+                                    dynamic_cast<const ast::IdentifierExpr*>(
+                                        ma->target.get())) {
+                                if (tid->name == "this") {
+                                    // `M(move this.field!)` — field-move.
+                                    recordFieldMove(ma->member, un->span.begin);
+                                    consumed = true;
+                                }
+                            }
+                        }
+                    } else if (auto* id =
+                                   dynamic_cast<const ast::IdentifierExpr*>(
+                                       un->operand.get())) {
                         // §28.8 (#395): `move b` of a borrow is not an owned
                         // value — reject rather than silently consuming it.
                         if (!checkOwnedArgSource(*a.value, id->span.begin))
@@ -918,7 +958,38 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 }
             } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(a.value.get())) {
                 if (un->op == "move") {
-                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(un->operand.get())) {
+                    // §28.8.1 / §17.4 (#1986): `move x!` into an owned ctor
+                    // argument — a `move` of a PLACE force-unwrap consumes the
+                    // underlying place. Its operand is a `PostfixBangExpr`, not a
+                    // bare identifier, so the `move id` branch below misses it;
+                    // without this peel x is never marked moved-from and the
+                    // constructed object's owned parameter AND x's real owner both
+                    // dispose the value (a double-free / UAF). Mirrors
+                    // recordMovesIn's force-unwrap handling. // per §28.8.1, §17.4
+                    if (dynamic_cast<const ast::PostfixBangExpr*>(
+                            un->operand.get())) {
+                        const ast::Expr* mop =
+                            lookThroughForceUnwrap(un->operand.get());
+                        if (auto* id =
+                                dynamic_cast<const ast::IdentifierExpr*>(mop)) {
+                            if (exprIsOwnedFieldRead(*mop))
+                                recordFieldMove(id->name, un->span.begin);
+                            else
+                                markMovedByName(id->name, id->span.begin);
+                            consumed = true;
+                        } else if (auto* ma =
+                                       dynamic_cast<const ast::MemberAccessExpr*>(
+                                           mop)) {
+                            if (auto* tid =
+                                    dynamic_cast<const ast::IdentifierExpr*>(
+                                        ma->target.get())) {
+                                if (tid->name == "this") {
+                                    recordFieldMove(ma->member, un->span.begin);
+                                    consumed = true;
+                                }
+                            }
+                        }
+                    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(un->operand.get())) {
                         // §28.8 (#395): `move b` of a borrow is not an owned value.
                         if (!checkOwnedArgSource(*a.value, id->span.begin))
                             markMovedByName(id->name, id->span.begin);
@@ -1163,7 +1234,35 @@ bool MethodOwnership::isBorrowableType(const sema::TypeRef* rt) {
             // runtime, not by the caller's scope. Not a borrow.
             return false;
         case sema::TypeRef::Kind::Named:
-            if (!rt->declaration) return false;  // generic param → not conservative
+            if (!rt->declaration) {
+                // §31.1 / §28.3 (issue #1985): a Named TypeRef with no
+                // declaration is a builtin type with no user `TypeDecl` OR a bare
+                // GENERIC PARAMETER. A builtin EXCEPTION is an ordinary owned heap
+                // CLASS instance (§31.1: `new SomeException(...)` produces an owned
+                // class reference), so it is borrow-bearing exactly like a user
+                // class — a bare place read of one flowing into an owned sink is
+                // the same double-dispose hazard the #1983 place-`E!` case guards
+                // (`throw x!`, an owned-`Exception?` field store, an owned-
+                // `Exception` parameter/ctor argument). It was lumped with generic
+                // parameters — which erase to a by-value boundary and are NOT
+                // borrowable — and with value builtins (DateTime/Guid/
+                // ExceptionInfo/… value types, also not borrowable), all returning
+                // false, so an un-`move`d builtin-exception `E!` slipped past the
+                // borrow check and double-freed (the #1983 remedy rejects only the
+                // user-declared case). Recognize the builtin exception hierarchy
+                // positively; every OTHER null-declaration Named type (a generic
+                // param, a value builtin, an imported collection wrapper) keeps its
+                // prior (non-borrowable) classification. The name comes from the
+                // AST node's last part — a TypeRef carries none of its own —
+                // matching codegen's `isBuiltinExceptionTypeRef`. // per §31.1, §28.3
+                std::string_view exName;
+                if (rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty())
+                    exName = rt->astNode->name->parts.back();
+                else
+                    exName = rt->importedName;
+                return common::isBuiltinExceptionName(exName);
+            }
             // §2.5 / §2.6 / §6.1 / §28 (issue #434): value-type builtins are
             // scalars/structs — they are not reference types and not borrowable.
             if (rt->declaration->isValueBuiltin) return false;
