@@ -4166,8 +4166,61 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 else if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(asym))
                     eligible = (ps->modifier == "owned");
                 if (eligible)
-                    if (llvm::AllocaInst* s = localSlot(*id))
+                    if (llvm::AllocaInst* s = localSlot(*id)) {
                         transferredOwnedArgSlots.push_back(s);
+                        // #1990 / #1992 / §28.3: a bare owned local/param whose
+                        // ownership transfers into an `owned` argument has its
+                        // auto-dispose registered by registerUnwindOwnedLocal /
+                        // registerUnwindOwnedParam in the scope where it was
+                        // DECLARED (the whole-method / enclosing block). #1918
+                        // relies on that registration firing on a later-arg throw.
+                        // But when the transfer site sits inside a `try` whose
+                        // `catch` is in that SAME enclosing scope, a throw from a
+                        // LATER argument unwinds only to the in-method handler —
+                        // it does NOT exit the declaring scope — so that
+                        // registration never fires, and (because sema treats the
+                        // local as moved past the `owned` transfer) neither does
+                        // its normal-exit discharge: the still-owned value leaks on
+                        // the caught path (#1990: one owned arg; #1992: all but the
+                        // last of several). Mirror the #993 owned-TEMP handling:
+                        // register a TRANSIENT unwind-only disposal for this local
+                        // in the CURRENT scope (disposeStack_.back(), the scope the
+                        // later argument's emitPendingCheck unwinds through on BOTH
+                        // the caught and propagate edges), on the local's OWN slot.
+                        // On the caught arg-throw it disposes the value exactly
+                        // once; on a propagate throw it disposes + NULLS the slot,
+                        // so the outer declaring-scope disposal (null-guarded) then
+                        // skips — no double-free. On the normal (transfer-completes)
+                        // path it is unwind-only (never fires on normal exit) and
+                        // the slot is nulled below, so a subsequent unwind through
+                        // this scope reloads null and skips too. Not discharged
+                        // here (unlike the #993 temp): the entry must be left in
+                        // place null-guarded so a SIBLING branch that did NOT
+                        // transfer keeps a live disposal (mirrors why #1918 nulls
+                        // at runtime instead of erasing the registration).
+                        // Restricted to a vtable-dispatchable user class/interface
+                        // instance — exactly what registerUnwindOwnedLocal/Param
+                        // and the plain unwindOnly dispatch cover; a builtin owned
+                        // handle (Channel/Shared/…, released by a type-specific
+                        // runtime call, not vtable slot 2) or an erased generic is
+                        // left to its declaring-scope registration. // per §28.3
+                        if (!disposeStack_.empty()) {
+                            const sema::TypeRef* at = ctx_.exprType(*id);
+                            bool dispatchable =
+                                at &&
+                                at->kind == sema::TypeRef::Kind::Named &&
+                                at->declaration &&
+                                (at->declaration->kind ==
+                                     ast::TypeDeclKind::Class ||
+                                 at->declaration->kind ==
+                                     ast::TypeDeclKind::Interface);
+                            if (dispatchable) {
+                                Disposal d{s, nullptr};
+                                d.unwindOnly = true;
+                                disposeStack_.back().push_back(d);
+                            }
+                        }
+                    }
             }
         }
         // §22.4 (#1301): an `out _` / `ref _` discard has no destination lvalue —
