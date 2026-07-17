@@ -8331,10 +8331,21 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (m == "FromTicks" && call.args.size() == 1 && call.args[0].value) {
             return lowerExpr(*call.args[0].value);
         }
-        // per §2.5 / #648: DateTime.Parse(s: string): DateTime
-        // Calls bz_datetime_parse(str_p) → i64 ticks.  The codegen emits a
-        // guard that traps (unreachable) on parse failure — same pattern as
-        // Guid.Parse.  bz_datetime_try_parse returns 1 on success, 0 on failure.
+        // per §2.5 / #648: DateTime.Parse(s: string): DateTime — accepts the
+        // type's own rendered forms (round-trip `yyyy-MM-ddTHH:mm:ss`, an
+        // optional `.fff` fractional-seconds tail, and the date-only form
+        // `yyyy-MM-dd`); any other input raises a catchable FormatException
+        // (stdlib §2.5, v0.197). bz_datetime_try_parse returns 1 on success, 0
+        // on failure; guard on that and throw via the standard builtin-throw
+        // path.
+        //
+        // Before #2009 the failure edge emitted CreateUnreachable — an
+        // uncatchable trap where the spec promises a catchable exception, so a
+        // `catch FormatException` never fired and control flowed past the
+        // `unreachable` block into undefined code → wild read / SIGSEGV (ASan
+        // "unknown-crash"). Routing through emitGuardThrow makes the fault a
+        // first-class, catchable throw like every other builtin guard (mirrors
+        // #2004 Guid.Parse).
         if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
@@ -8344,13 +8355,9 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                                    {ptrTy(), ptrTy()});
             llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, ticksSlot},
                                                   "dt.parse.ok");
-            llvm::Value* isOk = builder_.CreateICmpNE(ok, builder_.getInt32(0));
-            auto* okBB  = llvm::BasicBlock::Create(llvm_, "dt.parse.ok", currentFn_);
-            auto* badBB = llvm::BasicBlock::Create(llvm_, "dt.parse.bad", currentFn_);
-            builder_.CreateCondBr(isOk, okBB, badBB);
-            builder_.SetInsertPoint(badBB);
-            builder_.CreateUnreachable();
-            builder_.SetInsertPoint(okBB);
+            llvm::Value* failed =
+                builder_.CreateICmpEQ(ok, builder_.getInt32(0), "dt.parse.bad");
+            emitGuardThrow(failed, "FormatException");  // §2.5, v0.197, #2009
             return builder_.CreateLoad(i64(), ticksSlot, "dt.parsed");
         }
         // per §2.5 / #648: DateTime.TryParse(s: string, out result: DateTime): bool
