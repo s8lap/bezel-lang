@@ -9112,7 +9112,20 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // per §2.5 / #1357: DateOnly static methods.
     // ---------------------------------------------------------------------------
     if (cls == "DateOnly") {
-        // DateOnly.Parse(s: string): DateOnly
+        // DateOnly.Parse(s: string): DateOnly — accepts the type's own rendered
+        // form `yyyy-MM-dd` (and the datetime forms bz_datetime_try_parse
+        // recognises, whose time-of-day is then truncated by the /TICKS_PER_DAY
+        // below); any other input raises a catchable FormatException (stdlib
+        // §2.5, v0.197). bz_datetime_try_parse returns 1 on success, 0 on
+        // failure; guard on that and throw via the standard builtin-throw path.
+        //
+        // Before #2015 the failure edge emitted CreateUnreachable — an
+        // uncatchable trap where the spec promises a catchable exception, so a
+        // `catch FormatException` never fired and control flowed past the
+        // `unreachable` block into undefined code → wild read / SIGSEGV (ASan
+        // "unknown-crash"). Routing through emitGuardThrow makes the fault a
+        // first-class, catchable throw (mirrors #2009 DateTime.Parse / #2004
+        // Guid.Parse).
         if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
@@ -9120,13 +9133,9 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             auto* ticksSlot = entryAlloca(i64());
             auto* tryFn = declareC("bz_datetime_try_parse", i32(), {ptrTy(), ptrTy()});
             llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, ticksSlot}, "do.parse.ok");
-            llvm::Value* isOk = builder_.CreateICmpNE(ok, builder_.getInt32(0));
-            auto* okBB2  = llvm::BasicBlock::Create(llvm_, "do.parse.ok", currentFn_);
-            auto* badBB2 = llvm::BasicBlock::Create(llvm_, "do.parse.bad", currentFn_);
-            builder_.CreateCondBr(isOk, okBB2, badBB2);
-            builder_.SetInsertPoint(badBB2);
-            builder_.CreateUnreachable();
-            builder_.SetInsertPoint(okBB2);
+            llvm::Value* failed =
+                builder_.CreateICmpEQ(ok, builder_.getInt32(0), "do.parse.bad");
+            emitGuardThrow(failed, "FormatException");  // §2.5, v0.197, #2015
             llvm::Value* ticks = builder_.CreateLoad(i64(), ticksSlot, "do.parsed");
             llvm::Value* tpd = builder_.getInt64(864000000000LL);
             return builder_.CreateTrunc(builder_.CreateSDiv(ticks, tpd), i32(), "do.dn");
@@ -9194,20 +9203,28 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // per §2.5 / #1357: TimeOnly static methods.
     // ---------------------------------------------------------------------------
     if (cls == "TimeOnly") {
-        // TimeOnly.Parse(s: string): TimeOnly
+        // TimeOnly.Parse(s: string): TimeOnly — accepts the type's own rendered
+        // form `HH:mm:ss` with an optional `.fff` tail; any other input raises a
+        // catchable FormatException (stdlib §2.5, v0.197). bz_timeonly_try_parse
+        // returns 1 on success, 0 on failure; guard on that and throw via the
+        // standard builtin-throw path.
+        //
+        // Before #2015 the failure edge emitted CreateUnreachable — an
+        // uncatchable trap where the spec promises a catchable exception, so a
+        // `catch FormatException` never fired and control flowed past the
+        // `unreachable` block into undefined code → wild read / SIGSEGV (ASan
+        // "unknown-crash"). Routing through emitGuardThrow makes the fault a
+        // first-class, catchable throw (mirrors #2009 DateTime.Parse / #2004
+        // Guid.Parse).
         if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             auto* msSlot = entryAlloca(i32());
             auto* tryFn = declareC("bz_timeonly_try_parse", i32(), {ptrTy(), ptrTy()});
             llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, msSlot}, "to.parse.ok");
-            llvm::Value* isOk = builder_.CreateICmpNE(ok, builder_.getInt32(0));
-            auto* tokBB  = llvm::BasicBlock::Create(llvm_, "to.parse.ok", currentFn_);
-            auto* tbadBB = llvm::BasicBlock::Create(llvm_, "to.parse.bad", currentFn_);
-            builder_.CreateCondBr(isOk, tokBB, tbadBB);
-            builder_.SetInsertPoint(tbadBB);
-            builder_.CreateUnreachable();
-            builder_.SetInsertPoint(tokBB);
+            llvm::Value* failed =
+                builder_.CreateICmpEQ(ok, builder_.getInt32(0), "to.parse.bad");
+            emitGuardThrow(failed, "FormatException");  // §2.5, v0.197, #2015
             return builder_.CreateLoad(i32(), msSlot, "to.parsed");
         }
         // TimeOnly.TryParse(s: string, out result: TimeOnly): bool
