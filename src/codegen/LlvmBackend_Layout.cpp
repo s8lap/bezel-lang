@@ -152,8 +152,21 @@ llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
     // the write-back and the cast enforce the identical contract. Before this
     // fix the compound/increment path skipped the check and produced an invalid
     // char (a type-invariant violation).
+    //
+    // §6.2 (#1963): the arithmetic itself runs SIGNED. `char` implicitly
+    // converts to `int` (§5.1), a signed type, so in `c OP e` the char promotes
+    // to `int` and the operation is signed — exactly what the explicit
+    // `char(c OP e)` cast computes (an `int` add/sub/mul, then the range check).
+    // The caller's `uns` is `isUnsignedPrim(char) == true` (char is unsigned for
+    // the sub-i32 widening / right-shift / cast paths), but for the char
+    // compound ARITHMETIC it must NOT select the unsigned overflow intrinsic:
+    // `char(5) += -1` under `uadd.with.overflow(5, 0xFFFFFFFF)` reports overflow
+    // and raises, when §6.6/§6.2 give `char(5 + (-1)) = char(4)`. Force signed
+    // arithmetic; the §5.2 code-point range is 0–U+10FFFF, well within `int`'s
+    // range, so signed i32 arithmetic never spuriously overflows before the
+    // §5.2 range check (which still fires for a genuinely out-of-range result).
     if (charTarget) {
-        llvm::Value* res = emitCompoundOp(op, l, r, /*fp=*/false, uns);
+        llvm::Value* res = emitCompoundOp(op, l, r, /*fp=*/false, /*uns=*/false);
         if (!res) return nullptr;
         return emitCharRangeCheck(res);
     }
