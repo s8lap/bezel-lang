@@ -220,7 +220,7 @@ fi
 
 echo "== gate[5/5]: sharded suite ($SHARD_LABEL) — the authoritative oracle =="
 PHASE_T0=$(now)
-"$DH" suite "${SHARD_ENV[@]}" tests/run_parallel.sh >"$S/gate_shard.log" 2>&1; rc=$?
+"$DH" suite "${SHARD_ENV[@]}" tests/run_parallel.sh ${GATE_SHARDS:-} >"$S/gate_shard.log" 2>&1; rc=$?
 # When ASan is on (--full), the shard phase's recorded duration INCLUDES the
 # ASan compile+run (SHARD_NOTE marks it), so the ASan cost is captured in the
 # phases array here — there is no separate asan phase.
