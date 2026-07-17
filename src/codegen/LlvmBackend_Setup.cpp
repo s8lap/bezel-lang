@@ -9347,6 +9347,55 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // #1988 / stdlib §2.5–§2.6 / §4.6 / §28.9: the rest of the Named value-builtin
+    // ToString() family — DateTime/TimeSpan/DateOnly/TimeOnly — is the SAME
+    // +1-producer gap as #1982's Guid, family-wide. Each lowers (in lowerCall's
+    // per-type dispatch, LlvmBackend_Calls.cpp) to a runtime that mints a fresh
+    // heap `bz.string` at rc := 1:
+    //   DateTime.ToString()       / .ToString(format) → bz_datetime_to_string_fmt
+    //   TimeSpan.ToString()                           → inline malloc + initStringRc
+    //   DateOnly.ToString()                           → bz_datetime_to_string_fmt
+    //   TimeOnly.ToString()                           → bz_timeonly_to_string
+    // all rc = 1. These are Named value types, NOT Primitives, so the numeric-
+    // ToString block above returns false for them; without this recognition the
+    // result was treated as a borrow, so `var s := d.ToString()` retained it (rc
+    // 1->2) at bind and released it (rc 2->1) at scope end, never dropping the
+    // producer's original +1 — leaking the 32-byte header + the data buffer (#1988;
+    // DateTime confirmed 112 bytes). Recognize the no-arg form for all four (and
+    // DateTime's ToString(format) overload, which routes through the SAME rc=1
+    // runtime) structurally — the SAME shape lowerCall's dispatch keys on (member
+    // "ToString", receiver builtinTypeName in the family, matching arg count) — so
+    // the two decisions stay in lockstep: the bind TRANSFERS the +1 into the slot
+    // and the scope-end release (when the escape walk proves the local
+    // non-escaping) drops it exactly once. No double-free: each runtime mints
+    // exactly rc = 1, no extra retain is emitted, and an escaping local is excluded
+    // from the scope-end release (its +1 then leaks — the safe direction). Only the
+    // no-arg overload (all four) and DateTime's ToString(format) are recognized:
+    // those are the ONLY ToString forms lowerCall lowers to a +1 producer for these
+    // types (TimeSpan/DateOnly/TimeOnly have no format overload).
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (call->callee) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+                if (ma->member == "ToString" && ma->target) {
+                    auto* tt = ctx_.exprType(*ma->target);
+                    if (tt && tt->kind == sema::TypeRef::Kind::Named) {
+                        std::string_view bn = builtinTypeName(tt);
+                        // No-arg ToString() on any of the four → rc=1 producer.
+                        if (call->args.empty() &&
+                            (bn == "DateTime" || bn == "TimeSpan" ||
+                             bn == "DateOnly" || bn == "TimeOnly"))
+                            return true;
+                        // DateTime.ToString(format): the SAME rc=1
+                        // bz_datetime_to_string_fmt runtime; TimeSpan/DateOnly/
+                        // TimeOnly have no format overload.
+                        if (call->args.size() == 1 && bn == "DateTime")
+                            return true;
+                    }
+                }
+            }
+        }
+    }
     // §3.1 / §28.3 / §28.9 (#1637): StringBuilder.ToString() is a BUILTIN lowered
     // in tryLowerCollectionInstanceCall (no resolved MethodSymbol, so
     // isUserMethodStringReturnCall below never sees it). Its lowering concatenates
