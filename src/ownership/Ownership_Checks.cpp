@@ -5312,7 +5312,29 @@ bool MethodOwnership::exprIsOwnedFieldRead(const ast::Expr& e) const {
 // `move recv.f` is a legal owned-field transfer ONLY when `recv` is an owned
 // place; a borrower does not own the object and cannot move its owned fields out
 // (§28.6). Positive-rejection only — see the header for the full contract.
+// §22.12/§22.13 (issue #2021): a STATIC owned field is also positively flagged —
+// see the branch below.
 bool MethodOwnership::ownedFieldMoveReceiverIsBorrow(const ast::Expr& fieldRead) {
+    // §22.12/§22.13 (issue #2021): a STATIC `owned` field is owned by the PROGRAM
+    // — enrolled in §22.13's program-exit disposal (`bz_dispose_static_owned`),
+    // NOT owned by any instance (`this` does not own it) and NOT reassignable (a
+    // static owned field is always `readonly`, §22.12 / grammar A.4). A bare
+    // `move` of one into an owned sink is therefore NOT the legal owned-field
+    // transfer the bare-identifier `this.f` case below treats it as: the null-
+    // after-move slot machinery is instance-slot-only (`implicitFieldAddr`,
+    // LlvmBackend_Exprs2), so the moved-out static slot is never nulled and the
+    // program's exit-disposal frees the value a SECOND time — a double-free.
+    // Positive-rejection: classify it like a borrow so every owned-sink / owned-
+    // return classifier path (this helper backs `ownedArgSourceIsBorrow`'s
+    // FieldSymbol tail, the `move E!` place branch, `checkOwnedArgMoveSource`, and
+    // `checkOwnedReturnBorrowSource`) REJECTS it — restoring the pre-#2021 §28.8
+    // behavior for the static case. Only an INSTANCE owned field of `this`
+    // (including an inherited one) is the legal accept. The `!` spelling `move
+    // Slot!` is additionally caught by the §28.8.1 restoration check (a readonly
+    // static cannot be reassigned before method exit). // per §22.13, §28.6, §28.8.1
+    if (auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(fieldRead)))
+        for (std::string_view m : fs->modifiers)
+            if (m == "static") return true;
     // A bare-identifier owned-field read is an implicit `this.f`; `this` owns its
     // own fields, so its receiver is never a borrow. (`move _f` / `move _f!` —
     // the legal unqualified field transfer, §28.8.1.) // per §28.8.1
@@ -5638,6 +5660,27 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     // Same hazard as the explicit `obj.f` MemberAccessExpr form. The type gate
     // excludes value-typed fields. // per §28.3, §28.8
     if (dynamic_cast<sema::FieldSymbol*>(sym)) {
+        // §28.8.1 / §28.6 (issue #2021): `move f` — a `move` of an owned field
+        // read through its bare (implicit-`this`) identifier — is the LEGAL
+        // owned-field transfer, NOT a borrow, when the field's RECEIVER is an
+        // owned place. A bare-identifier owned-field read is an implicit `this.f`,
+        // and `this` owns its fields (ownedFieldMoveReceiverIsBorrow → false), so
+        // accept it — mirroring `checkOwnedArgMoveSource` for the `move f!` form
+        // (#2010/#2016) and the `move E!` place-classifier above. The FieldSymbol
+        // tail is not `move`-gated, so without this a bare `move f` reached here
+        // and was spuriously flagged as a borrow (§28.8) even though `move f!`
+        // was accepted. (Without the enclosing `move`, a bare owned-field read is
+        // Borrowed and was already flagged at the `!unwrappedMove &&
+        // exprIsOwnedFieldRead` branch above — so this only fires for the `move f`
+        // shape.) A NON-owned field — which has no `move` form — falls through to
+        // the borrow rejection below; a borrow-receiver `move b.f` is a
+        // MemberAccessExpr, not this bare identifier, and is classified by its own
+        // paths. A bare `move` of a STATIC owned field is REJECTED here too:
+        // ownedFieldMoveReceiverIsBorrow positively flags it (a static owned field
+        // is program-owned, §22.13 — the null-after-move slot machinery is
+        // instance-only, so accepting it double-frees, #2021). // per §28.8.1, §28.6, §28.3, §22.13
+        if (unwrappedMove && exprIsOwnedFieldRead(*id))
+            return ownedFieldMoveReceiverIsBorrow(*id);
         return isBorrowableType(ctx_.exprType(*id));
     }
     // §19.3 / §28.8 (#1280): a record-DESTRUCTURING pattern binding (`case b
