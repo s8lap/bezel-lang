@@ -3348,8 +3348,28 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
                         !arg->declaration && arg->astNode &&
                         arg->astNode->name &&
                         arg->astNode->name->parts.size() == 1) {
-                        hasUnresolved = true;
-                        break;
+                        // #2014 / §14: a bare-param arg (`Box<U>`) is only
+                        // GENUINELY unresolved when the ACTIVE substitution does
+                        // not already bind it. In a MONOMORPHIZED enclosing body
+                        // (e.g. `Run<U>` specialized to U=long) the active subst
+                        // resolves `U` to its concrete type, so `newSubst[param]`
+                        // above is ALREADY the correct concrete layout type
+                        // (lowerTypeRef(arg) honored genericSubst_). Overriding it
+                        // with localGenericSubst_ is wrong here: that map is keyed
+                        // on the ENCLOSING method's param name (`U`), NOT this
+                        // record's param (`T`), so classStruct(ms->parent) cannot
+                        // find `T`, falls back to the i32 template layout, and GEPs
+                        // the wrong specialized-struct offset — a garbage owned-
+                        // field read → SEGV (`move box.f!`, #2014). Only when the
+                        // param stays a bare param after resolution (the #828 case:
+                        // no active binding, so we need the local's stored subst)
+                        // do we fall through to the localGenericSubst_ lookup.
+                        const sema::TypeRef* argR = resolveTypeParamRef(arg);
+                        if (argR && argR->kind == sema::TypeRef::Kind::Named &&
+                            !argR->declaration) {
+                            hasUnresolved = true;
+                            break;
+                        }
                     }
                 }
                 if (hasUnresolved) {
