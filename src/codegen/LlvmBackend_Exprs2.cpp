@@ -6204,14 +6204,27 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 // TypeSymbol so `rt->declaration` is null and the Named+declaration
                 // block below misses them. Resolve the pattern type's descriptor
                 // by name (builtinDesc_ via descriptorForPatternName) and emit the
-                // runtime is-a test, exactly as the bare-name form does. The
-                // scrutinee is a heap exception object (object-like); guard on a
-                // pointer scrutinee so a non-reference scrutinee never faults in
-                // emitIsA. Without this the pattern returned nullptr and left
-                // `case.end` unterminated → malformed IR (a hard codegen abort).
+                // runtime is-a test, exactly as the bare-name form does.
                 if (rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
-                    isBuiltinExceptionTypeRef(rt) &&
-                    scrut->getType()->isPointerTy()) {
+                    isBuiltinExceptionTypeRef(rt)) {
+                    // #1936 / §19.3: a VALUE-typed scrutinee (a non-pointer
+                    // primitive/record/enum — e.g. `case 5 of var x:
+                    // IOException`) can NEVER be a reference exception object, so
+                    // the type-test is statically FALSE. Without this the
+                    // pointer-only guard fell through to `return nullptr` below,
+                    // leaving `case.end` unterminated → malformed IR (a hard
+                    // codegen abort on a nonsensical program). This mirrors the
+                    // bare-name NamedPattern path's `!isPointerTy() → false` gate
+                    // (#1854, L5895). The typed-binding name slot is allocated in
+                    // lowerCaseExpr independently of this result, so a
+                    // compile-time false leaves the (statically dead) arm body
+                    // well-formed — no unbound-slot pitfall (contrast #1949's
+                    // destructuring branch, whose slots are bound inside the is-a
+                    // block).
+                    if (!scrut->getType()->isPointerTy())
+                        return builder_.getInt1(false);
+                    // The scrutinee is a heap exception object (object-like);
+                    // emit the runtime is-a test.
                     if (llvm::GlobalVariable* desc =
                             descriptorForPatternName(bp->type->name.get()))
                         // #1938: string-in-Object guard (see emitStringGuardedIsA)
@@ -6238,6 +6251,21 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                             scrutTy && scrutTy->declaration == rt->declaration;
                         return builder_.getInt1(sameType);
                     }
+                    // #1936 / §19.3/§19.5: a CLASS or INTERFACE typed binding
+                    // `var x: C` against a VALUE-typed (non-pointer) scrutinee can
+                    // never match — a primitive/record/enum value is never a
+                    // reference. The is-a paths below (emitStringGuardedIsA →
+                    // emitIsA) would ICmp the non-pointer scrutinee against a null
+                    // pointer and ABORT the backend (ICmpInst assertion / malformed
+                    // IR). Sema rejects a CONCRETE value-scrutinee case up front
+                    // (#1203/#1936), but a MONOMORPHIZED type-parameter scrutinee
+                    // (`case t of var x: C` at T=int) is only decidable here, so a
+                    // sema-only fix would still crash on it. Decide it statically
+                    // false, mirroring the bare-name NamedPattern gate (its
+                    // `!isPointerTy() → getInt1(false)` above) and the builtin-
+                    // exception typed-binding gate just above.
+                    if (!scrut->getType()->isPointerTy())
+                        return builder_.getInt1(false);
                     // #1843 (§19.3 v0.182 / §19.6 v0.196): a CONSTRUCTED generic
                     // class/interface pattern (`var g: Tagged<int>`) tests against
                     // the per-monomorphization descriptor, so it matches only the

@@ -98,4 +98,13 @@ bool isHeapPointerReferenceBuiltin(std::string_view n);
 // cross-references the other's file/function).
 std::string_view builtinExceptionParentOf(std::string_view name);
 
+// #1936 / §19.5 / §31: true when `name` is the simple name of a recognized
+// built-in exception type (including the hierarchy root `Exception`). Backed by
+// the same `kBuiltinExceptionHierarchy` table as `builtinExceptionParentOf`, so
+// it is sema's single authoritative "is this a built-in exception?" predicate —
+// used to reject a value-typed scrutinee against a reference-typed (built-in
+// exception) `var x: T` binding, where the built-in carries no user TypeSymbol
+// and so is not caught by a `declaration`-gated class/interface test (§19.5).
+bool isBuiltinExceptionName(std::string_view name);
+
 }  // namespace bezel::common

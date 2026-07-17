@@ -189,4 +189,12 @@ std::string_view builtinExceptionParentOf(std::string_view name) {
     return {};
 }
 
+// #1936 / §19.5 / §31: membership test over the same hierarchy table (the root
+// `Exception` is present as an edge with an empty parent, so it is recognized).
+bool isBuiltinExceptionName(std::string_view name) {
+    for (const auto& edge : kBuiltinExceptionHierarchy)
+        if (edge.name == name) return true;
+    return false;
+}
+
 }  // namespace bezel::common

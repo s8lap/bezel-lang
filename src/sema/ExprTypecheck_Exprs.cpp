@@ -1,5 +1,7 @@
 #include "sema/ExprTypecheck_impl.hpp"
 
+#include "common/BuiltinRegistry.hpp"
+
 #include <cmath>
 #include <unordered_set>
 
@@ -5286,32 +5288,56 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 lsym->declType = bp->type ? ctx_.resolvedType(*bp->type)
                                           : scrutTy;
                 armScope.names[bp->name] = lsym;
-                // §19.5 (#1203): a typed binding pattern `var n: T` is a
+                // §19.5 (#1203, #1936): a typed binding pattern `var n: T` is a
                 // type-test + binding. If T is a reference type (class,
-                // interface, or string) but the scrutinee's static type is a
-                // primitive value type (non-nullable, not string, not Object),
-                // the test can NEVER match — a value-type primitive is never
-                // a reference type. Reject it here rather than miscompiling
-                // (an unconditional wrong-value match for string-typed binding,
-                // or SIGABRT in emitIsA for a class-typed binding on an i32).
-                // per §19.5 (#1203)
+                // interface, string, or a BUILT-IN exception) but the scrutinee's
+                // static type is a VALUE type (a primitive — non-nullable, not
+                // string, not Object — or a record/enum), the test can NEVER
+                // match: a value type is never a reference type. Reject it here
+                // rather than miscompiling (an unconditional wrong-value match for
+                // a string-typed binding, or — in codegen's emitIsA over a
+                // non-pointer scrutinee — an ICmpInst assertion / malformed IR).
+                // #1936 broadened #1203 two ways: (a) a BUILT-IN exception pattern
+                // (`var x: IOException`) carries no user TypeSymbol so its bndTy
+                // has a null `declaration` — the declaration-gated class/interface
+                // test below missed it, and the arm reached codegen and emitted
+                // malformed IR; (b) a RECORD or ENUM scrutinee is likewise a
+                // sealed value type (§9/§10) — `case p of var q: C` over a record
+                // `p` hit the same emitIsA crash. per §19.5 (#1203/#1936)
                 if (bp->type && scrutTy && lsym->declType) {
+                    TypeRef* bndTy = lsym->declType;
+                    bool bndIsRefType =
+                        (bndTy->kind == TypeRef::Kind::Primitive &&
+                         bndTy->primitive == PrimitiveType::String) ||
+                        (bndTy->kind == TypeRef::Kind::Named &&
+                         bndTy->declaration &&
+                         (bndTy->declaration->kind ==
+                              ast::TypeDeclKind::Class ||
+                          bndTy->declaration->kind ==
+                              ast::TypeDeclKind::Interface)) ||
+                        // #1936 / §31: a built-in exception (declaration-less
+                        // Named), recognized by name via the shared registry —
+                        // the sema counterpart of codegen isBuiltinExceptionTypeRef.
+                        (bndTy->kind == TypeRef::Kind::Named &&
+                         !bndTy->declaration && bp->type->name &&
+                         !bp->type->name->parts.empty() &&
+                         common::isBuiltinExceptionName(
+                             bp->type->name->parts.back()));
                     bool scrutIsValuePrim =
                         scrutTy->kind == TypeRef::Kind::Primitive &&
                         !scrutTy->nullable &&
                         scrutTy->primitive != PrimitiveType::String &&
                         scrutTy->primitive != PrimitiveType::Object;
+                    // #1936 / §9/§10: a record/enum scrutinee is a sealed value
+                    // type — never a reference.
+                    bool scrutIsValueRecEnum =
+                        scrutTy->kind == TypeRef::Kind::Named &&
+                        scrutTy->declaration && !scrutTy->nullable &&
+                        (scrutTy->declaration->kind ==
+                             ast::TypeDeclKind::Record ||
+                         scrutTy->declaration->kind ==
+                             ast::TypeDeclKind::Enum);
                     if (scrutIsValuePrim) {
-                        TypeRef* bndTy = lsym->declType;
-                        bool bndIsRefType =
-                            (bndTy->kind == TypeRef::Kind::Primitive &&
-                             bndTy->primitive == PrimitiveType::String) ||
-                            (bndTy->kind == TypeRef::Kind::Named &&
-                             bndTy->declaration &&
-                             (bndTy->declaration->kind ==
-                                  ast::TypeDeclKind::Class ||
-                              bndTy->declaration->kind ==
-                                  ast::TypeDeclKind::Interface));
                         if (bndIsRefType)
                             ctx_.diagnostics().report(
                                 Severity::Error, bp->span.begin,
@@ -5320,6 +5346,17 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 "scrutinee can never match a reference-typed "
                                 "binding (§19.5)");
                     }
+                    // #1936: a record/enum value scrutinee against a reference
+                    // pattern — inserted as an else-if so a record scrutinee vs a
+                    // non-reference (record/enum) pattern still falls through to
+                    // the generic-instantiation checks below, unchanged.
+                    else if (scrutIsValueRecEnum && bndIsRefType)
+                        ctx_.diagnostics().report(
+                            Severity::Error, bp->span.begin,
+                            "binding pattern type is incompatible with "
+                            "the scrutinee's static type — a value-type "
+                            "scrutinee can never match a reference-typed "
+                            "binding (§19.5)");
                     // §19.3/§19.5/§5.1/§12.9 (#1913): a typed binding whose
                     // generic INSTANTIATION is incompatible with the scrutinee
                     // (`var x: Ok<string>` at `Result<int>`) — the erased
