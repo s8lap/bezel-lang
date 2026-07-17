@@ -9796,6 +9796,19 @@ struct StringEscapeWalker {
     // walk keeps its stricter conservative treatment. Only the borrowing-array
     // eligibility analysis (collectBorrowingArrayFreeEligible) sets it.
     bool borrowingArrayMode = false;
+    // #1997 / §4.6 / §28.9 / §28.3 (v0.197): OPT-IN gate for the plain-`:=`
+    // reassignment relaxation below (treat a reassignment of the tracked local as
+    // NOT an escape, so the local stays scope-end-release eligible). Sound ONLY for
+    // the STRING-release analysis, where every plain `:=` to the local routes
+    // through lowerStringLocalReassign (release-displaced-old + retain-new keeps the
+    // slot at exactly +1 on its FINAL value, so one scope-end release balances it).
+    // The dict-materializer (#1028), grouping (#1930), and borrowing-`Array` walks
+    // reuse this SAME shared walker but have NO release-old-on-reassign step: for
+    // them a reassignment aliases the value while the original binding still owns it,
+    // so a reassignment MUST stay a conservative escape (else scope-end free + the
+    // reassigned alias ⇒ reachable double-free). They leave this false; only the two
+    // string call sites in collectStringReleaseEligible set it true.
+    bool stringReleaseMode = false;
     // #1871: the set of `var v: IEnumerable<T> := <target-array>` VIEW LocalDecls
     // that were independently proven never to escape. A binding of the target into
     // one of these is a borrow (the view wrapper borrows the array's backing; its
@@ -10072,10 +10085,46 @@ struct StringEscapeWalker {
                 expr(as->value.get(), /*safeRead=*/true);
                 return;
             }
-            // Plain `:=` (or any other assignment): the target being the local
-            // itself is a reassignment → escape (overwrite handling for `:=` is
-            // out of this fix). The RHS escapes.
-            if (isTargetIdent(as->target.get())) { escaped = true; return; }
+            // Plain `:=` reassignment.
+            if (isTargetIdent(as->target.get())) {
+                // #1997 / §4.6 / §28.9 / §28.3 (v0.197): for the STRING-release
+                // analysis a plain `:=` reassignment of the tracked local is NOT
+                // an escape — the separate soundness argument the `+=` fix
+                // (#1486) deferred is now discharged: every plain `:=` to a
+                // non-nullable string local routes through
+                // lowerStringLocalReassign, which keeps the slot at exactly one
+                // reference (transfer a +1 producer / retain a borrow, releasing
+                // the displaced old value, retain-before-release so a self-assign
+                // never dips rc to 0). So after any run of reassignments the slot
+                // owns exactly +1 on its FINAL value, which the scope-end release
+                // drops once — provided no OTHER use aliases it, which the rest of
+                // this walk still checks. Without this the final value leaked
+                // (bounded, one per reassigned local — the safe direction, now
+                // closed). The RHS is walked as a safe-read ROOT so a self-assign
+                // `a := a` / `a := a + x` / `a := a.ToUpper()` stays eligible (the
+                // slot's +1 is maintained), while an occurrence of the target in
+                // an escaping RHS sub-position — a call arg, a `new`, a lambda
+                // capture — still taints it via the sub-walk. Mirrors the `+=`
+                // accumulator case above.
+                //
+                // OPT-IN via stringReleaseMode: this relaxation is sound ONLY for
+                // the string-release walks, whose lowerStringLocalReassign keeps the
+                // slot at exactly +1 on reassign. The dict-materializer (#1028),
+                // grouping (#1930), and borrowing-`Array` (borrowingArrayMode) walks
+                // share this SAME walker but have NO release-old-on-reassign step —
+                // for them a reassigned local aliases the value while the original
+                // binding still owns it, so a reassignment MUST stay a conservative
+                // escape (else scope-end free + the reassigned alias ⇒ reachable
+                // double-free, e.g. `d := u;` where both are dict-materializer
+                // locals). Those walks leave stringReleaseMode false and fall to the
+                // `escaped = true` below.
+                if (stringReleaseMode) {
+                    expr(as->value.get(), /*safeRead=*/true);
+                    return;
+                }
+                escaped = true;
+                return;
+            }
             expr(as->target.get(), /*safeRead=*/false);
             expr(as->value.get(), /*safeRead=*/false);
             return;
@@ -11047,6 +11096,7 @@ void Emitter::collectStringReleaseEligible(
 
     for (const ast::LocalDecl* ld : producerCandidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        w.stringReleaseMode = true;  // #1997: OPT-IN the plain-`:=` relaxation
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             stringReleaseEligible_.insert(static_cast<const void*>(ld));
@@ -11061,6 +11111,7 @@ void Emitter::collectStringReleaseEligible(
     // but NOT released — its +1 leaks, which is safe.
     for (const ast::LocalDecl* ld : borrowCandidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        w.stringReleaseMode = true;  // #1997: OPT-IN the plain-`:=` relaxation
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             stringBorrowRetainEligible_.insert(static_cast<const void*>(ld));
