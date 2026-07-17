@@ -3658,9 +3658,16 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     // parameter, so the caller's null-guarded unwindOnly disposal
                     // (which UnwindIneligibleWalker now leaves eligible for this
                     // shape) stays exactly-once across the transfer.
+                    // #1968 / §28.3: reclaim the uninitialized `obj` if a ctor
+                    // ARGUMENT throws during evaluation (obj is calloc'd here but
+                    // the ctor has not run). Route arg-eval throws through a raw-
+                    // free cleanup, restoring the enclosing target before the ctor.
+                    llvm::BasicBlock* savedArgUT = unwindTarget_;
+                    if (!ne.args.empty()) unwindTarget_ = newArgUnwindCleanup(obj);
                     bool ok = buildOrderedArgs(earlyCd->params, ne.args, eArgs,
                                               &eArgExprs,
                                               /*nullTransferredOwned=*/true);
+                    unwindTarget_ = savedArgUT;
                     currentThis_ = savedThisForArgs;
                     if (ok) {
                         // Store for the ctor-call section below to reuse.
@@ -3744,9 +3751,16 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // #1955 / §28.3: null the caller's slot for a bare owned local/param
             // transferred via `owned x` into an `owned` ctor parameter (see the
             // early-ctor path above and buildOrderedArgs).
+            // #1968 / §28.3: reclaim the uninitialized `obj` if a ctor argument
+            // throws during evaluation (obj is calloc'd + vtable-installed but the
+            // ctor body has not run — every field is zero). Restored before the
+            // inlined ctor body, whose own cleanup then owns the block.
+            llvm::BasicBlock* savedArgUT = unwindTarget_;
+            if (!ne.args.empty()) unwindTarget_ = newArgUnwindCleanup(obj);
             bool builtArgs = buildOrderedArgs(cd->params, ne.args, args,
                                               &ctorArgExprs,
                                               /*nullTransferredOwned=*/true);
+            unwindTarget_ = savedArgUT;
             genericSubst_ = std::move(ctorArgSubst);
             genericSubstSemaTy_ = std::move(ctorArgSemaTy);
             if (builtArgs && args.size() == cs->params.size() + 1) {
@@ -3799,6 +3813,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             args.push_back(obj);
             bool ok = true;
             auto* fnTy = ctorFn->getFunctionType();
+            // #1968 / §28.3: reclaim the uninitialized `obj` if an argument throws
+            // during evaluation (bz$init installed only the vtable for an imported
+            // type WITH a ctor — every field is zero until the imported ctor runs).
+            // Restored before the imported ctor call, whose throw edge is handled
+            // by emitNewPendingCheck below.
+            llvm::BasicBlock* savedArgUT = unwindTarget_;
+            if (!ne.args.empty()) unwindTarget_ = newArgUnwindCleanup(obj);
             for (std::size_t ai = 0; ai < ne.args.size(); ++ai) {
                 if (!ne.args[ai].value) { ok = false; break; }
                 llvm::Value* v = lowerExpr(*ne.args[ai].value);
@@ -3811,6 +3832,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         isUnsignedTargetExpr(*ne.args[ai].value));
                 args.push_back(v);
             }
+            unwindTarget_ = savedArgUT;
             if (ok && args.size() == ctorFn->arg_size())
                 builder_.CreateCall(ctorFn, args);
         }
@@ -3871,9 +3893,16 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // transferred via `owned x` into an `owned` ctor parameter, so the
             // caller's null-guarded unwindOnly disposal (left eligible by
             // UnwindIneligibleWalker for this shape) stays exactly-once.
+            // #1968 / §28.3: reclaim the uninitialized `obj` if a ctor argument
+            // throws during evaluation (obj is calloc'd + vtable-installed but the
+            // ctor body has not run — every field is zero). Restored before the
+            // ctor call / inline body, whose own cleanup then owns the block.
+            llvm::BasicBlock* savedArgUT = unwindTarget_;
+            if (!ne.args.empty()) unwindTarget_ = newArgUnwindCleanup(obj);
             builtArgs = buildOrderedArgs(cd->params, ne.args, args,
                                               &ctorArgExprs,
                                               /*nullTransferredOwned=*/true);
+            unwindTarget_ = savedArgUT;
             genericSubst_ = std::move(ctorArgSubst);
             genericSubstSemaTy_ = std::move(ctorArgSemaTy);
             }

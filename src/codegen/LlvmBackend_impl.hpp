@@ -4418,6 +4418,26 @@ private:
     // `obj` flows out as a normal owned value disposed later by its owning slot.
     void emitNewPendingCheck(llvm::Value* obj);
 
+    // §28.3 (#1968): the CONSTRUCTOR-ARGUMENT variant of emitNewPendingCheck.
+    // `lowerNew` calloc's the instance BEFORE it evaluates the constructor
+    // arguments; when a LATER argument's evaluation throws, `obj` is already
+    // allocated but NOT yet constructed (every field is calloc-zeroed — the ctor
+    // never ran), and it is bound to no `using var`/scope, so the ordinary
+    // scope-end / owned-local unwind disposal never reclaims it → leak. Return a
+    // cleanup block that RAW-frees the uninitialized instance block (a plain
+    // `free` — NOT a dispose: no destructor, no owned-field disposal, because no
+    // field is initialized) and then continues to the CURRENT enclosing unwind
+    // (`unwindBB()`, captured before the caller overrides `unwindTarget_`). The
+    // caller installs this as `unwindTarget_` ONLY while the constructor
+    // arguments are evaluated and restores the previous target before the ctor
+    // body/call runs — whose own cleanup (inlineCtorBody / emitNewPendingCheck)
+    // then owns the block's disposal, so the two edges are disjoint and never
+    // double-free. `unwindScopeDepth_` is left unchanged, so the pending-check at
+    // the arg site still disposes the same enclosing scopes (including any
+    // already-evaluated owned-temp / transferred-owned-arg registered by
+    // buildOrderedArgs, #993/#1918) BEFORE branching here to free `obj`.
+    llvm::BasicBlock* newArgUnwindCleanup(llvm::Value* obj);
+
     // §28.2 / §28.4: dispatch an object's PUBLIC idempotent Dispose through its
     // vtable (slot 1) — runs the destructor + owned fields + base chain at most
     // once. Does NOT free the block. `obj` must be non-null. Used as the dispatch

@@ -1008,6 +1008,30 @@ void Emitter::emitNewPendingCheck(llvm::Value* obj) {
 }
 
 
+llvm::BasicBlock* Emitter::newArgUnwindCleanup(llvm::Value* obj) {
+    // §28.3 (#1968): build the unwind cleanup for an in-flight `new T(...)` whose
+    // CONSTRUCTOR ARGUMENT throws DURING evaluation — before the constructor
+    // runs. `obj` is calloc'd but uninitialized (every field zero, the ctor never
+    // ran) and bound to no scope, so the ordinary unwind disposal never reclaims
+    // it. RAW-free it here (a plain `free`, NOT a dispose — no destructor / owned-
+    // field disposal, because no field is initialized), then continue to the
+    // enclosing unwind exactly as the arg-throw would have without this cleanup.
+    // Capturing `unwindBB()` BEFORE the caller overrides `unwindTarget_` preserves
+    // the enclosing catch/propagate boundary; the pending-check at the arg site
+    // has already run emitUnwindDisposals() for the enclosing scopes (this cleanup
+    // does not repeat them), so a branch here simply adds the missing `obj` free.
+    auto* savedInsert = builder_.GetInsertBlock();
+    llvm::BasicBlock* enclosingUnwind = unwindBB();
+    auto* cleanupBB =
+        llvm::BasicBlock::Create(llvm_, "new.argthrow.cleanup", currentFn_);
+    builder_.SetInsertPoint(cleanupBB);
+    builder_.CreateCall(freeFn(), {obj});  // reclaim the uninitialized block once
+    builder_.CreateBr(enclosingUnwind);
+    if (savedInsert) builder_.SetInsertPoint(savedInsert);
+    return cleanupBB;
+}
+
+
 void Emitter::emitDynamicDispose(llvm::Value* obj) {
     // §28.2 / §28.4: dispatch the object's PUBLIC, idempotent Dispose through
     // its vtable (slot 2, CG35-itable) — which runs the destructor body, owned-field
