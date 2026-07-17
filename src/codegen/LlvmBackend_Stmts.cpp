@@ -602,6 +602,29 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // loads from it (e.g. a while-loop condition) sees the update.
                     if (llvm::AllocaInst* ns = localSlot(*as->target))
                         syncCellToOrigSlot(ns, rhs);
+                    // §28.3 / §28.10 (v0.180, #1978): a bare-identifier-target
+                    // `y := owned x;` assignment marker (#1965) MOVES the named
+                    // owned source `x` into `y`. NULL the source slot at the
+                    // transfer so the source's now-ELIGIBLE (UnwindIneligibleWalker
+                    // no longer taints it, #1978) null-guarded unwindOnly disposal
+                    // is exactly-once — a throw AFTER this store finds the null
+                    // source slot and skips it (no double-free with `y`'s own
+                    // unwind disposal), while a throw that PRECEDES the transfer
+                    // still finds `x` live and disposes it once (fixes the #1978
+                    // leak). handleMarkedOwnedAssignment routes only a bare-id
+                    // tracked-local target (a member/index target keeps the marker
+                    // inert — NOT nulled here, so the walker keeps it tainted); a
+                    // self-transfer `x := owned x` is rejected earlier, but the
+                    // symbol-identity guard makes doubly sure a just-stored live
+                    // value is never nulled. nullTransferredOwnedLocalSlot self-
+                    // gates to the owned local/param slots the walker keeps
+                    // eligible, so `eligible ⟹ nulled` stays EXACT. // per §28.3
+                    if (as->valueHasOwnedMarker &&
+                        dynamic_cast<const ast::IdentifierExpr*>(
+                            as->target.get()) &&
+                        ctx_.exprSymbol(*as->target) !=
+                            ctx_.exprSymbol(*as->value))
+                        nullTransferredOwnedLocalSlot(as->value.get());
                 }
             } else {
                 // fix #610 / §25.1 / §6.6: compound assignment `target OP= value`

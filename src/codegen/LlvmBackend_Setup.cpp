@@ -6493,6 +6493,23 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         builder_.CreateStore(llvm::ConstantAggregateZero::get(slotTy),
                              slot);
     }
+    // §28.3 / §28.10 (v0.180, #1978): a `var y := owned x;` / `using var y :=
+    // owned x;` binding marker (#1962) MOVES a named owned source into this new
+    // binding. NULL the source slot at the transfer — exactly as the #1918
+    // user-method / #1955 ctor arg-lowering transfers do — so the null-guarded
+    // unwindOnly disposal is exactly-once for the source `x` (which
+    // UnwindIneligibleWalker now leaves ELIGIBLE, #1978): a throw that PRECEDES
+    // this binding still finds `x` live and disposes it once (fixes the #1978
+    // leak), while a throw AFTER the transfer finds the null source slot and
+    // skips it (no double-free with the new binding's own unwind disposal).
+    // nullTransferredOwnedLocalSlot self-gates to exactly the slots the walker
+    // keeps eligible (a plain `var` owned local or an `owned` parameter), so the
+    // `eligible ⟹ nulled` invariant stays EXACT; every other initializer is a
+    // no-op here. // per §28.3 v0.180 #1978
+    if (v && init)
+        if (auto* ldNode = dynamic_cast<const ast::LocalDecl*>(declNode))
+            if (ldNode->initializerHasOwnedMarker)
+                nullTransferredOwnedLocalSlot(init);
     // #422 / #429 / §4.6 / §28.9: reference-count this `var` string local. A +1
     // PRODUCER (string `+` / interpolation / range-slice) transfers its single
     // reference into the slot; a BORROW (any other string initializer) is
@@ -8452,6 +8469,32 @@ inline bool newExprRoutesThroughNullingCtor(const sema::SemaContext& ctx,
     return false;
 }
 
+// §28.3 / §28.10 (v0.180, #1978): does the bare-identifier SOURCE of an
+// `owned`-marked transfer — `var y := owned x;` / `using var y := owned x;`
+// (#1962) and `y := owned x;` (#1965) — name a slot the transfer codegen NULLS
+// (nullTransferredOwnedLocalSlot)? True iff the source is a plain `var` owned
+// LOCAL (non-`using`) or an `owned` PARAMETER — the EXACT slots that helper
+// nulls. When true, UnwindIneligibleWalker leaves the source unwind-ELIGIBLE
+// (mirroring the #1918 user-method / #1955 ctor / #1956 reassignment transfers):
+// the null-guarded unwindOnly disposal is exactly-once — it disposes the source
+// on a throw edge that PRECEDES the transfer (fixes the #1978 leak) and is
+// skipped (null slot) on the transfer / post-transfer edge (no double-free with
+// the target's own disposal). Any OTHER source shape (a borrow, a `using` local,
+// a fresh producer, a non-identifier) stays TAINTED — a safe residual leak, never
+// a double-free. This predicate keeps the walker's `eligible ⟹ nulled` invariant
+// EXACT (it mirrors nullTransferredOwnedLocalSlot's own eligibility test).
+inline bool markedOwnedSourceEligible(const sema::SemaContext& ctx,
+                                      const ast::Expr* src) {
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(src);
+    if (!id) return false;
+    sema::Symbol* asym = ctx.exprSymbol(*id);
+    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(asym))
+        return loc->decl && !loc->isUsing;
+    if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(asym))
+        return ps->modifier == "owned";
+    return false;
+}
+
 struct UnwindIneligibleWalker {
     const sema::SemaContext& ctx;
     std::unordered_set<const void*>& out;
@@ -8755,6 +8798,21 @@ struct UnwindIneligibleWalker {
     void stmt(const ast::Stmt* s) {
         if (!s) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            // §28.3 / §28.10 (v0.180, #1978): a `var y := owned x;` / `using var
+            // y := owned x;` binding marker (#1962) MOVES a named owned source.
+            // The transfer codegen (lowerLocalDecl) NULLS the source slot, so —
+            // exactly like the #1918 user-method / #1955 ctor / #1956
+            // reassignment transfers — leave the source unwind-ELIGIBLE: disposed
+            // once on a throw that PRECEDES the binding (fixes the #1978 leak),
+            // skipped (null slot) on the post-transfer edge (no double-free with
+            // the new binding's own disposal). Restricted to the slots codegen
+            // nulls (markedOwnedSourceEligible), keeping `eligible ⟹ nulled`
+            // exact. // per §28.3 v0.180 #1978
+            if (ld->initializerHasOwnedMarker &&
+                markedOwnedSourceEligible(ctx, ld->initializer.get())) {
+                expr(ld->initializer.get(), /*consuming=*/false);
+                return;
+            }
             // `var s := x;` moves x (owned local read in an owning init); a
             // `move`/call/new RHS is handled by expr(consuming). Treat the whole
             // initializer as a consuming position.
@@ -8802,7 +8860,20 @@ struct UnwindIneligibleWalker {
             // per §28.3
             if (!dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
                 markIdent(as->target.get());
-            expr(as->value.get(), /*consuming=*/true);
+            // §28.3 / §28.10 (v0.180, #1978): a bare-identifier-target
+            // `y := owned x;` assignment marker (#1965) MOVES a named owned
+            // source. handleMarkedOwnedAssignment routes ONLY a bare-id tracked-
+            // local target (a member/index target is self-announcing — the marker
+            // is ignored and the general path consumes the source WITHOUT nulling,
+            // so it must stay tainted); for the routed shape the assignment
+            // codegen NULLS the source slot, so leave the source unwind-ELIGIBLE
+            // — same reasoning as the binding marker above and #1918/#1955/#1956.
+            // per §28.3 v0.180 #1978
+            bool markedEligibleSource =
+                as->valueHasOwnedMarker &&
+                dynamic_cast<const ast::IdentifierExpr*>(as->target.get()) &&
+                markedOwnedSourceEligible(ctx, as->value.get());
+            expr(as->value.get(), /*consuming=*/!markedEligibleSource);
             return;
         }
         if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
