@@ -74,6 +74,43 @@ const std::vector<ast::Param>* resolveCtorParams(const ast::NewExpr& ne,
     }
     return nullptr;
 }
+
+// §22.5 (v0.184, #1973): the parameter index the argument at source position
+// `argIdx` binds to — the SAME §22.5 binding sema itself performs
+// (bindArgsToParams). The owned-sink classification below must key off the
+// BOUND parameter's `owned` modifier, not the argument's source position: a
+// named argument `name := value` binds the parameter NAMED `name` regardless of
+// where it sits, so a call that REORDERS an owned/borrow pair by name
+// (`Sink(b := r, a := new R())`) otherwise mis-maps `params[pos]`. Mapping by
+// source position both OVER-REJECTS a sound borrow (a borrow at the owned slot's
+// source index wrongly reported as consuming) AND MISSES a consume (an owned
+// binding at a borrow slot's source index never marked moved-from → the callee
+// disposes it while the caller still believes it owns it → double-free / UAF).
+//
+// The §22.5 binding rule (bindArgsToParams): positional arguments (empty
+// `.name`) precede named ones and fill parameters left-to-right — the Nth
+// positional fills parameter N; a named argument fills the parameter whose name
+// matches. Returns `params.size()` when a named argument matches no parameter
+// (an already-diagnosed §22.5 error) — every caller treats an out-of-range
+// index exactly as it treats a positional overflow (not an owned sink).
+std::size_t boundParamIndex(const std::vector<ast::CallArgument>& args,
+                            std::size_t argIdx,
+                            const std::vector<ast::Param>& params) {
+    const ast::CallArgument& a = args[argIdx];
+    if (a.name.empty()) {
+        // Positional: its parameter slot is the count of positional arguments
+        // before it (for a well-formed call — positionals precede named args —
+        // this equals argIdx; counting stays correct even for an already-
+        // diagnosed positional-after-named ordering).
+        std::size_t slot = 0;
+        for (std::size_t k = 0; k < argIdx; ++k)
+            if (args[k].name.empty()) ++slot;
+        return slot;
+    }
+    for (std::size_t j = 0; j < params.size(); ++j)
+        if (params[j].name == a.name) return j;
+    return params.size();
+}
 } // namespace
 
 void MethodOwnership::recordMovesIn(const ast::Expr& e) {
@@ -156,10 +193,14 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
             // classification below is identical to the method-call path
             // (recordMovesInArgs); the call-site `owned` marker (§22.3, v0.169)
             // is layered on top of the SAME classification.
+            // §22.5 (v0.184, #1973): key off the BOUND ctor parameter (named-arg
+            // binding), not the source position — see boundParamIndex.
+            const std::size_t boundPos =
+                ctorParams ? boundParamIndex(ne->args, pos, *ctorParams) : pos;
             const bool ctorOwnedSink =
-                ctorParams && pos < ctorParams->size() &&
-                ((*ctorParams)[pos].modifier == "owned" ||
-                 (*ctorParams)[pos].modifier == "out owned");
+                ctorParams && boundPos < ctorParams->size() &&
+                ((*ctorParams)[boundPos].modifier == "owned" ||
+                 (*ctorParams)[boundPos].modifier == "out owned");
             const bool ownedSink =
                 ctorOwnedSink || (isSharedNew && pos == 0);
             // §22.3 (v0.169, #1348): the `owned` marker is only valid on an
@@ -245,9 +286,14 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
         const std::vector<ast::Param>* params = nullptr;
         if (calleeMethod)  params = &calleeMethod->params;
         if (calleeCtor)    params = &calleeCtor->params;
+        // §22.5 (v0.184, #1973): classify by the BOUND parameter's modifier, not
+        // the source position — a named argument `name := value` binds the
+        // parameter NAMED `name`, so a reordered owned/borrow call maps correctly.
+        const std::size_t boundPos =
+            params ? boundParamIndex(args, pos, *params) : pos;
         const bool userOwned =
-            params && pos < params->size() &&
-            (*params)[pos].modifier == "owned";
+            params && boundPos < params->size() &&
+            (*params)[boundPos].modifier == "owned";
         const bool ownedSink = userOwned || builtinOwnedSinkArg(callee, pos);
 
         // §22.3 (v0.169, #1348): the `owned` call-site marker is valid ONLY on
@@ -334,8 +380,13 @@ bool MethodOwnership::isImplicitOwned(const std::vector<ast::CallArgument>& args
         cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
     const std::vector<ast::Param>* params =
         md ? &md->params : (cd ? &cd->params : nullptr);
-    if (!params || pos >= params->size()) return false;
-    const std::string_view mod = (*params)[pos].modifier;
+    if (!params) return false;
+    // §22.5 (v0.184, #1973): resolve the BOUND parameter (named-arg binding),
+    // not the source position — a reordered `owned`/borrow named-arg call
+    // otherwise mis-classifies the consume. See boundParamIndex.
+    const std::size_t boundPos = boundParamIndex(args, pos, *params);
+    if (boundPos >= params->size()) return false;
+    const std::string_view mod = (*params)[boundPos].modifier;
     // §28.3 / §28.11 (#860): only a plain `owned` formal is an owned-IN
     // consuming sink (the argument is consumed by the call). An `out owned`
     // formal is the owned-OUT direction — the argument local RECEIVES
@@ -1478,8 +1529,9 @@ void MethodOwnership::reportCapturedOwnedConsume(std::string_view name,
                "restructure so the closure only borrows it.");
 }
 
-bool MethodOwnership::calleeArgIsOwnedSink(const ast::Expr* callee,
-                                           std::size_t pos) {
+bool MethodOwnership::calleeArgIsOwnedSink(
+        const ast::Expr* callee, const std::vector<ast::CallArgument>& args,
+        std::size_t argIdx) {
     // Resolve the callee's declared parameter list — the SAME navigation
     // recordMovesInArgs uses (MethodSymbol/ConstructorSymbol -> decl -> params).
     sema::Symbol* sym = callee ? ctx_.exprSymbol(*callee) : nullptr;
@@ -1491,13 +1543,21 @@ bool MethodOwnership::calleeArgIsOwnedSink(const ast::Expr* callee,
         if (const auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
             params = &cd->params;
     }
+    // §22.5 (v0.184, #1973): classify by the BOUND parameter (named-arg
+    // binding), not the source position — a reordered `owned`/borrow named-arg
+    // call inside a closure must map to the same parameter recordMovesInArgs
+    // maps it to, or the closure check diverges from the top-level one (both
+    // directions: over-reject a sound borrow, miss a consume → UAF). See
+    // boundParamIndex.
+    const std::size_t boundPos =
+        params ? boundParamIndex(args, argIdx, *params) : argIdx;
     // Only a plain `owned` formal CONSUMES the argument (an `out owned` formal
     // writes it — recordMovesInArgs' twin note). Builtin owned-sink positions
     // (Domain.Spawn, channel Send, …) have no AST decl and are covered by
     // builtinOwnedSinkArg, exactly as the main owned-sink classification does.
-    const bool userOwned = params && pos < params->size() &&
-                           (*params)[pos].modifier == "owned";
-    return userOwned || builtinOwnedSinkArg(callee, pos);
+    const bool userOwned = params && boundPos < params->size() &&
+                           (*params)[boundPos].modifier == "owned";
+    return userOwned || builtinOwnedSinkArg(callee, argIdx);
 }
 
 void MethodOwnership::reportArgConsumeCapturedOwned(const ast::CallArgument& a,
@@ -1554,7 +1614,7 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
             std::size_t pos = 0;
             for (const auto& a : call->args) {
                 reportArgConsumeCapturedOwned(
-                    a, calleeArgIsOwnedSink(call->callee.get(), pos));
+                    a, calleeArgIsOwnedSink(call->callee.get(), call->args, pos));
                 ++pos;
             }
         }
@@ -1569,7 +1629,7 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
             std::size_t pos = 0;
             for (const auto& a : nc->args) {
                 reportArgConsumeCapturedOwned(
-                    a, calleeArgIsOwnedSink(nc->callee.get(), pos));
+                    a, calleeArgIsOwnedSink(nc->callee.get(), nc->args, pos));
                 ++pos;
             }
         }
@@ -1586,8 +1646,14 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
                 resolveCtorParams(*ne, ctx_);
             std::size_t pos = 0;
             for (const auto& a : ne->args) {
-                const bool ownedSink = ctorParams && pos < ctorParams->size() &&
-                                       (*ctorParams)[pos].modifier == "owned";
+                // §22.5 (v0.184, #1973): the BOUND ctor parameter (named-arg
+                // binding), not the source position. See boundParamIndex.
+                const std::size_t boundPos =
+                    ctorParams ? boundParamIndex(ne->args, pos, *ctorParams)
+                               : pos;
+                const bool ownedSink =
+                    ctorParams && boundPos < ctorParams->size() &&
+                    (*ctorParams)[boundPos].modifier == "owned";
                 reportArgConsumeCapturedOwned(a, ownedSink);
                 ++pos;
             }

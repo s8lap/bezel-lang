@@ -933,15 +933,19 @@ private:
     bool isCapturedOwnedBinding(const ast::Expr& e);
     void reportCapturedOwnedConsume(std::string_view name, SourceLocation loc,
                                     const char* verb);
-    // True when argument position `pos` of a call whose callee is `callee` is a
-    // CONSUMING owned sink — a user-declared plain `owned` formal, or a builtin
-    // owned-sink position (Domain.Spawn, channel Send, …). Mirrors the owned-sink
-    // half of recordMovesInArgs (an `out owned` / ref / out / scoped / borrow
-    // formal is NOT a consuming sink). Used to reject the UNMARKED consume
-    // `Sink(r)` of a captured owned binding inside a closure — §22.3's call-site
-    // `owned`-marker requirement only fires at method top level, so the (more
-    // natural) unmarked spelling reaches the closure body unrejected (#1958).
-    bool calleeArgIsOwnedSink(const ast::Expr* callee, std::size_t pos);
+    // True when the argument at source index `argIdx` of a call whose callee is
+    // `callee` is a CONSUMING owned sink — a user-declared plain `owned` formal,
+    // or a builtin owned-sink position (Domain.Spawn, channel Send, …). Mirrors
+    // the owned-sink half of recordMovesInArgs (an `out owned` / ref / out /
+    // scoped / borrow formal is NOT a consuming sink). Used to reject the
+    // UNMARKED consume `Sink(r)` of a captured owned binding inside a closure —
+    // §22.3's call-site `owned`-marker requirement only fires at method top
+    // level, so the (more natural) unmarked spelling reaches the closure body
+    // unrejected (#1958). §22.5 (#1973): `args` is threaded so the classification
+    // keys off the BOUND parameter (named-arg binding), not the source position.
+    bool calleeArgIsOwnedSink(const ast::Expr* callee,
+                              const std::vector<ast::CallArgument>& args,
+                              std::size_t argIdx);
     // Reports the §28.3 v0.184 transfer error when call argument `a` consumes a
     // captured owned binding — either the MARKED form (`owned r`) or the UNMARKED
     // bare identifier flowing into an owned parameter (`ownedSinkParam`). A bare
