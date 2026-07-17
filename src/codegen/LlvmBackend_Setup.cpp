@@ -3419,8 +3419,27 @@ static void appendDescKey(const sema::TypeRef* t, std::string& out) {
                 for (const sema::TypeRef* a : t->genericArgs) appendDescKey(a, out);
                 out += '>';
             } else {
+                // #2013 (§12.9 type-test invariance, §14.2 monomorphization,
+                // §17.4): a null-DECLARATION builtin generic type (Array<T>,
+                // Dictionary<K,V>, Task<T>, … — declaration intentionally null, per
+                // TypeResolution_Names §2.5/§29.3) MUST recurse into its generic
+                // arguments, exactly as the resolved-Named branch above does.
+                // Emitting only "U"+headName made `Array<int>` and
+                // `Array<string>` share ONE key ("UArray") — collapsing them
+                // onto one runtime descriptor (descIdentityKey) and one
+                // method-specialization body (typeRefIdentityKey /
+                // buildSpecializedMethodFn), so the second instantiation reused
+                // the first's — the descriptor-identity / monomorphization
+                // collision this key must honor (the null-decl-NO-arg case,
+                // e.g. IOException vs ArgumentException, was already fixed by
+                // #1944 via headName; this is its generic-ARG counterpart). The
+                // '<' '>' delimit the arg keys so they cannot bleed into a
+                // following sibling key, mirroring the declaration branch.
                 out += "U";
                 out += std::string(t->headName());
+                out += '<';
+                for (const sema::TypeRef* a : t->genericArgs) appendDescKey(a, out);
+                out += '>';
             }
             break;
         case sema::TypeRef::Kind::Primitive:
