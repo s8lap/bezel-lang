@@ -154,6 +154,7 @@ The paired records that support the queue:
 For a **ruling** or a **design-change graduation** (the full path):
 
 - [ ] Classify the change (§2). Design change → it must already be an accepted proposal (§6).
+- [ ] If the change touches §28/§30.5: state its kernel classification — derivation (name the K's), axiom extension (name the axiom), or new axiom (add the register row with its recorded reason) (v0.198).
 - [ ] Author the ruling with exact `old→new` edits; cite every `§` against the current heading.
 - [ ] Adversarial critique; resolve every blocking finding (no silent drops) (§4).
 - [ ] If multiple trains in one revision: run the composition gate over the union (§4).

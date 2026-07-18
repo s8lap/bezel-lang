@@ -1,6 +1,6 @@
 # 0046 - The ownership-kernel consolidation revision
 
-**Status:** draft
+**Status:** accepted (2026-07-18, owner-directed); graduating — T1 landed v0.198, T2–T6 in progress
 **Tracking issue:** [#2033](https://github.com/s8lap/bezel-lang/issues/2033)
 **Target:** Docs-only. Spec [§28](../Bezel_Language_Spec.md#sec-resource-management) (a new kernel subsection at the head of [§28.3](../Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows) plus derivation tags through §28.3–§28.14), spec [§30.5](../Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal) and the five ownership paragraphs of [§30.1](../Bezel_Language_Spec.md#sec-async-methods) (tag pass), Appendix [C.3](../Bezel_Language_Spec.md#sec-appendix-c)/C.6 (re-audit, no semantic edits), rationale (one new section recording the kernel's reasons and the axiom-budget discipline; small amendments to [§5.1](../Bezel_Design_Rationale.md#sec-owned-not-borrows)/[§5.6](../Bezel_Design_Rationale.md#sec-the-lattice-direction-at-control-flow-joins)), Guide 01 revalidation pin. **No grammar change** (Appendix A untouched — the revision adds and reorganizes prose, no syntax). **No stdlib change. No compiler work** (the compiler already implements the rules being restated; every discovered text/compiler divergence files its own issue rather than riding this revision).
 **Written against:** spec v0.197 (stdlib/rationale at the same revision)
