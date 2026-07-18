@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.199 — July 2026**
+**Version 0.200 — July 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -45,10 +45,11 @@ If this is your first encounter with Bezel, the rationale's opening section is a
 32. [Foreign Function Interface](#32-foreign-function-interface)
 33. [Program Entry Point](#33-program-entry-point)
 34. [Comments and Documentation](#34-comments-and-documentation)
-35. [Appendix A: Grammar](#appendix-a-grammar)
-36. [Appendix B: Reserved Words](#appendix-b-reserved-words)
-37. [Appendix C: Compiler-Enforced Invariants](#appendix-c-compiler-enforced-invariants)
-38. [Appendix D: Conformance Levels](#appendix-d-conformance-levels)
+35. [Choices](#35-choices)
+36. [Appendix A: Grammar](#appendix-a-grammar)
+37. [Appendix B: Reserved Words](#appendix-b-reserved-words)
+38. [Appendix C: Compiler-Enforced Invariants](#appendix-c-compiler-enforced-invariants)
+39. [Appendix D: Conformance Levels](#appendix-d-conformance-levels)
 
 ---
 
@@ -348,6 +349,7 @@ Bezel types fall into these kinds:
 - **`string`** — a reference type with content equality and runtime-managed lifetime. ([§4.6](#sec-string))
 - **Records** — user-defined value types with positional or body declarations. ([§9](#sec-records))
 - **Enums** — user-defined value types backed by an integer constant. ([§10](#sec-enums))
+- **Choices** — user-defined value types whose values carry one of a fixed set of named cases, each with optional payloads. ([§35](#sec-choices))
 - **Classes** — user-defined reference types with inheritance and disposal. ([§11](#sec-classes-and-interfaces)–[§12](#sec-inheritance-and-dispatch))
 - **Interfaces** — user-defined contracts. An interface variable is a reference; its underlying value may be a class instance, a boxed record, a boxed enum, or a boxed primitive ([§3.2](#sec-reference-vs-value-types), [§8.6](#sec-boxing)). ([§11](#sec-classes-and-interfaces))
 - **Arrays** — `[N]T` (inline, value-typed, fixed compile-time size) and `Array<T>` / `OwningArray<T>` (heap-allocated, class types, may be used resizably or fixed). ([§15](#sec-arrays))
@@ -363,7 +365,7 @@ Every type derives from `Object`. Primitives, records, enums, inline arrays, the
 
 Every type is exactly one of two storage classes. The classification is total and disjoint.
 
-A **value type** is copied on assignment; each variable holds an independent value. Records, enums, primitives, inline arrays (`[N]T`, including `[N]T?` and `[N owned]T?`/`[N owned]T`), and the unit type are value types. (Owning inline arrays are a special sub-category — *move-only value types* — that transfer rather than copy on assignment; see [§15.3](#sec-move-only-value-types).)
+A **value type** is copied on assignment; each variable holds an independent value. Records, enums, choices ([§35](#sec-choices)), primitives, inline arrays (`[N]T`, including `[N]T?` and `[N owned]T?`/`[N owned]T`), and the unit type are value types. (Owning inline arrays and owning-classified choices are a special sub-category — *move-only value types* — that transfer rather than copy on assignment; see [§15.3](#sec-move-only-value-types).)
 
 A **reference type** is shared on assignment; multiple variables may refer to the same heap-allocated object. Classes (including heap-array classes `Array<T>` and `OwningArray<T>`), interfaces, `string`, and function types are reference types.
 
@@ -439,7 +441,8 @@ The derived type properties of this revision:
 | Property | Defined in | Classifies |
 |---|---|---|
 | **trivial-dispose** | [§28](#sec-resource-management) intro, [§28.9](#sec-runtime-managed-types) | classes whose `Dispose()` does nothing: no destructor, no `owned` fields, no owning-inline-array fields, trivial-dispose base |
-| **borrow-bearing** | [§9.7](#sec-records-and-disposal) | records (and inline arrays, [§15.1](#sec-inline-arrays)) carrying at least one borrow of a non-runtime-managed reference type |
+| **borrow-bearing** | [§9.7](#sec-records-and-disposal) | records (and inline arrays, [§15.1](#sec-inline-arrays); choices, [§35.4](#sec-choice-classification)) carrying at least one borrow of a non-runtime-managed reference type |
+| **choice classification** | [§35.4](#sec-choice-classification) | every choice type, as value-like, borrow-bearing, or owning — the classification on which a choice's copyability, lifetime tracking, and disposal obligation depend |
 | **auto-equality-bearing** | [§9.2](#sec-body-records) | records for which `=`, `GetHashCode`, and `ToString` are synthesized |
 | **serialization-eligible** | [§9.8](#sec-serialization-synthesis) | records and enums for which `Serialize`/`Deserialize` are synthesized |
 | **equality-bearing** | [§8.3](#sec-equals-and-gethashcode), [§9.2](#sec-body-records) | types usable where consistent `Equals`/`GetHashCode` are required (hash-container keys/elements): every type except a record that is neither auto-equality-bearing nor declares user equality (`operator =`/`<>` with `Equals(T)`/`GetHashCode` per the [§25.2](#sec-operator-overloading-restrictions) co-declaration rule) |
@@ -454,7 +457,7 @@ Common rules, normative for every derived type property:
 3. **Part of the public contract.** A declaration change that flips a derived type property of a public type — adding a destructor flips trivial-dispose; adding a computed property in the wrong form flips auto-equality-bearing — is a breaking change for clients relying on it, exactly as a signature change is. Library documentation should state the properties a type's clients are expected to rely on.
 4. **Named in diagnostics.** A diagnostic produced by a property-dependent rule names the property in the words of the table above, so the reader can find the defining section.
 
-Dispatch of *behavior* (not merely admissibility) on a derived type property — as the element category does for buffer and collection slot semantics ([§28.11](#sec-collection-element-ownership), stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)) — is reserved to compiler-known standard-library types; it is not a user-available mechanism in this revision; the one exception is the **C-compatible** classification ([§32.13](#sec-c-compatible-records)), whose consequence is a static representation guarantee — compile-time-visible and constant, never behavior dispatch — a deliberate, scoped extension ratified with the FFI's structured-data design (v0.186; rationale §16.5).
+Dispatch of *behavior* (not merely admissibility) on a derived type property — as the element category does for buffer and collection slot semantics ([§28.11](#sec-collection-element-ownership), stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)) — is reserved to compiler-known standard-library types; it is not a user-available mechanism in this revision; two scoped exceptions are recorded. The **C-compatible** classification ([§32.13](#sec-c-compatible-records)) — whose consequence is a static representation guarantee, compile-time-visible and constant, never behavior dispatch — was ratified with the FFI's structured-data design (v0.186; rationale §16.5). The **choice classification** ([§35.4](#sec-choice-classification), v0.200) does flip per-instantiation behavior (copy vs. move on assignment, disposal vs. none at scope end), and is admitted because the dispatch is performed by the language on a language construct — derived from structure, identical for every user, with no user-programmable hook — the recorded generalization path of the compiler-known specializations (rationale §5.15); users still cannot write code conditioned on a type parameter's category.
 
 New rules added to this specification that need a structural classification of types must define it as a derived type property under the rules of this section, rather than introducing a parallel mechanism.
 
@@ -1013,7 +1016,7 @@ Inside an unconstrained generic body, `T` is treated conservatively as possibly 
 
 `where T: class` restricts T to non-nullable reference types — classes (including `Array<T>`, `OwningArray<T>`), interfaces, `string`, function types.
 
-`where T: value` restricts T to non-nullable value types — records, enums, primitives, inline arrays (all forms, including `[N owned]…` owning forms), and the unit type. A nullable value type (e.g. `int?`) does not satisfy the constraint ([§14.2](#sec-constraints)); inside the body, T is the non-nullable value type and `T?` is its nullable companion. Inside the body, operations that copy T (assignment, parameter passing by value, returning by value) are checked at instantiation: for move-only inline arrays ([§15.3](#sec-move-only-value-types)), copy operations are replaced by moves, and any operation the generic body uses that requires copy semantics (e.g., reading T twice without an intervening assignment) is rejected at instantiation with a message naming the move-only type.
+`where T: value` restricts T to non-nullable value types — records, enums, choices ([§35](#sec-choices)), primitives, inline arrays (all forms, including `[N owned]…` owning forms), and the unit type. A nullable value type (e.g. `int?`) does not satisfy the constraint ([§14.2](#sec-constraints)); inside the body, T is the non-nullable value type and `T?` is its nullable companion. Inside the body, operations that copy T (assignment, parameter passing by value, returning by value) are checked at instantiation: for move-only inline arrays ([§15.3](#sec-move-only-value-types)), copy operations are replaced by moves, and any operation the generic body uses that requires copy semantics (e.g., reading T twice without an intervening assignment) is rejected at instantiation with a message naming the move-only type.
 
 `where T: SomeClass` and `where T: IFoo` are *type-bound* constraints. They restrict T to non-nullable types conforming to the named type:
 - `where T: SomeClass` admits SomeClass and its subclasses. Interfaces do not extend classes in Bezel, so this constraint admits class types only.
@@ -1133,19 +1136,19 @@ Unboxing reverses the process: a null `Object` reference unboxes to `null` of th
 <a id="sec-boxing-of-borrow-bearing-records"></a>
 #### Boxing of borrow-bearing records
 
-Boxing a borrow-bearing record ([§9.7](#sec-records-and-disposal)) is subject to the same borrow-lifetime constraints as any other operation on a borrow-bearing value. The boxed copy on the heap holds the same borrowed references as the source record; it does not extend their lifetimes. The compiler enforces: a boxed borrow-bearing record value may not be stored in a location that could outlive the source of any borrow the record contains. In practice, this means a borrow-bearing record may be boxed for a short-lived interface call (e.g. passing to a method accepting `Object`) provided the boxed value does not escape the borrow's source scope. Storing a boxed borrow-bearing record in a field, returning it from a method, or capturing it in a closure that escapes the source scope is rejected by the same rules as the unboxed form ([§9.7](#sec-records-and-disposal), [§28.3](#sec-local-variables-ownership-and-borrows)). The canonical sanctioned use is passing a span to a parameter of type `IReadOnlySpan<TElement>` (stdlib [§4.16](Bezel_Standard_Library.md#sec-ireadonlyspan)): the box is bounded by the call frame, the interface surface is escape-free by construction (no `GetEnumerator`, no `Slice`, no operation returning a borrow-retaining handle), and the source outlives the call in the common synchronous case. The contrasting *forbidden* case is the `IEnumerable<T>` enumerator path: `GetEnumerator()` returns a heap object that would hold the span's borrow across its own, unbounded lifetime, which the borrow tracker cannot bound — which is why spans do not implement `IEnumerable<T?>` ([§29.2](#sec-desugaring-of-for)). The distinction is escaping (an enumerator/field/return/escaping-closure) versus call-bounded, not boxing per se.
+Boxing a borrow-bearing record ([§9.7](#sec-records-and-disposal)) is subject to the same borrow-lifetime constraints as any other operation on a borrow-bearing value. The boxed copy on the heap holds the same borrowed references as the source record; it does not extend their lifetimes. The compiler enforces: a boxed borrow-bearing record value may not be stored in a location that could outlive the source of any borrow the record contains. In practice, this means a borrow-bearing record may be boxed for a short-lived interface call (e.g. passing to a method accepting `Object`) provided the boxed value does not escape the borrow's source scope. Storing a boxed borrow-bearing record in a field, returning it from a method, or capturing it in a closure that escapes the source scope is rejected by the same rules as the unboxed form ([§9.7](#sec-records-and-disposal), [§28.3](#sec-local-variables-ownership-and-borrows)). The canonical sanctioned use is passing a span to a parameter of type `IReadOnlySpan<TElement>` (stdlib [§4.16](Bezel_Standard_Library.md#sec-ireadonlyspan)): the box is bounded by the call frame, the interface surface is escape-free by construction (no `GetEnumerator`, no `Slice`, no operation returning a borrow-retaining handle), and the source outlives the call in the common synchronous case. The contrasting *forbidden* case is the `IEnumerable<T>` enumerator path: `GetEnumerator()` returns a heap object that would hold the span's borrow across its own, unbounded lifetime, which the borrow tracker cannot bound — which is why spans do not implement `IEnumerable<T?>` ([§29.2](#sec-desugaring-of-for)). The distinction is escaping (an enumerator/field/return/escaping-closure) versus call-bounded, not boxing per se. A borrow-bearing **choice** ([§35.4](#sec-choice-classification)) boxes under exactly these rules.
 
 <a id="sec-boxing-of-inline-arrays"></a>
 #### Boxing of inline arrays
 
 Non-owning inline arrays (`[N]T` and `[N]T?`) are ordinary value types and box per the general rule. When the element type is a reference type, the boxed array carries borrows; the same borrow-lifetime constraints apply as for boxed borrow-bearing records (above).
 
-Move-only inline arrays (`[N owned]T` and `[N owned]T?`) cannot be boxed. Boxing a value type copies the value into a heap wrapper, but move-only types forbid copying ([§15.3](#sec-move-only-value-types)). A program that needs the contents of an owning inline array to cross a boxed-value boundary must explicitly transfer ownership — typically by draining the inline array into a heap collection (`OwningArray<T>`), which is itself a class type and is passed by reference rather than boxed.
+Move-only value types — owning inline arrays (`[N owned]T` and `[N owned]T?`) and owning-classified choices ([§35.4](#sec-choice-classification)) — cannot be boxed. Boxing a value type copies the value into a heap wrapper, but move-only types forbid copying ([§15.3](#sec-move-only-value-types)). A program that needs the contents of an owning inline array to cross a boxed-value boundary must explicitly transfer ownership — typically by draining the inline array into a heap collection (`OwningArray<T>`), which is itself a class type and is passed by reference rather than boxed.
 
 <a id="sec-dispose-is-not-on-object"></a>
 ### 8.7 `Dispose` is not on `Object`
 
-`Dispose()` is class-only. The compiler generates `IDisposable` on every non-static class. Static classes, records, enums, primitives, and inline arrays do not implement `IDisposable`.
+`Dispose()` is class-only. The compiler generates `IDisposable` on every non-static class. Static classes, records, enums, choices, primitives, and inline arrays do not implement `IDisposable`.
 
 
 ---
@@ -1320,9 +1323,9 @@ A record type is a **borrow-bearing record** — a derived type property ([§3.6
 
 - Its type is a reference type (class or interface, nullable or not, including the `T?` forms).
 - Its type is an inline array whose element type is a reference type (`[N]C`, `[N]C?` for class-or-interface C).
-- Its type is another borrow-bearing record (transitivity).
+- Its type is another borrow-bearing record, or a borrow-bearing choice ([§35.4](#sec-choice-classification)) (transitivity).
 
-Reference-typed fields whose types are runtime-managed (`string`, function types, boxed value types) do not make the record borrow-bearing because runtime-managed values have unbounded lifetime by construction; the same is true of inline-array fields whose element type is a runtime-managed reference type. Values of a borrow-bearing record are subject to the borrow lifetime rules of [§28.3](#sec-local-variables-ownership-and-borrows). In particular:
+Reference-typed fields whose types are runtime-managed (`string`, function types, boxed value types) do not make the record borrow-bearing because runtime-managed values have unbounded lifetime by construction; the same is true of inline-array fields whose element type is a runtime-managed reference type. Borrow-bearing **choices** ([§35.4](#sec-choice-classification)) are subject to every rule of this section, with "record" read as "record or choice" throughout. Values of a borrow-bearing record are subject to the borrow lifetime rules of [§28.3](#sec-local-variables-ownership-and-borrows). In particular:
 
 - A borrow-bearing record value may not outlive the source of any borrow it contains. For inline-array-field borrows, this applies element-wise: every slot's source must outlive the record.
 - A borrow-bearing record may not be **constructed from a temporary** bound to one of its borrow-carrying fields. A construction argument that is a temporary — a collection or array literal, or a fresh call result that is not bound to a named location — has a lifetime that ends at the construction expression, so the record would immediately outlive that borrow's source (a dangling borrow). For example, `new Bag([10, 20, 30])` where `record Bag(Items: Array<int>)` borrows the array literal is rejected; bind the source to a named local (`var xs := [10, 20, 30]; var b := new Bag(xs);`) whose scope outlives `b`, and pass that. The same no-temporary-source rejection applies to a fresh producer passed to a class- or interface-typed `scoped` parameter ([§28.14](#sec-scoped-callback-parameters), v0.180 — `new StreamReader(scoped new FileStream(...))` is rejected; bind the stream first).
@@ -1441,6 +1444,13 @@ By default the synthesized form uses each component's declared name as its seria
 The clause attaches to the member it affects and is total: a component with no `serialized` clause is coded under its own name, always. There is no separate exhaustive key list to keep synchronized, so adding a component never silently drops it from serialization — the failure mode of an all-or-nothing customization list (rationale [§5.19](Bezel_Design_Rationale.md#sec-serialization-without-reflection)) does not arise. A `serialized` clause on a member of a type that declares no serialization conformance, or on a member of a type whose serialization is hand-written (synthesis suppressed — see below), is a compile error: the clause only has meaning as an input to synthesis, and silently ignoring it would be the kind of inert-looking-but-load-bearing annotation [§18](Bezel_Design_Rationale.md#sec-things-deferred) warns against.
 
 `serialized skip` interacts with the eligibility rule by *removing* its component from consideration: a field that would otherwise make the type ineligible (a non-serializable component type) but is marked `serialized skip` does not disqualify the type, because it is no longer a serialized component. This is the supported way to make an otherwise-eligible record serializable when one field is of a non-serializable type and is not needed in the encoded form.
+
+<a id="sec-choice-serialization"></a>
+#### Choice serialization (v0.200)
+
+A choice ([§35](#sec-choices)) opts in by declaring `: ISerializable` / `: IDeserializable`, exactly as records and enums do. A choice is **serialization-eligible** when it is value-like ([§35.4](#sec-choice-classification)) and every payload field's type is serialization-eligible and record-admissible (value-shaped storage throughout; the borrow-bearing and owning classifications are never eligible — the same `Deserialize`-has-no-owner argument as for class-typed record fields). An ineligible conformance declaration is the compile error above, naming the first offending payload.
+
+**Wire shape.** The synthesized `Serialize` writes an object whose distinguished leading field is the **case discriminator** `"$case"` — the case's declared name, or its `serialized "<name>"` rename — followed by the active case's payload fields by name, in declaration order, each encoded per its component rule; a payload-free case writes the object with only the discriminator. The `$case` field name joins the `$`-reserved set of stdlib [§2.15](Bezel_Standard_Library.md#sec-concrete-serialization-formats)'s JSON mapping; a payload rename beginning with `$` is a compile error. The synthesized `Deserialize` reads the discriminator **first**, consumed by case dispatch before any component binding — it is structural, not a data field, and is never subject to `serialized optional` or the unknown-field policy, exactly the polymorphic-registry discipline above; an undeclared discriminator string raises `SerializationException`, as does an object that does not lead with the discriminator (dispatch must select the case before component binding can begin); the selected case's payloads then read under the standard missing/duplicate/unknown rules, and the value is constructed by the case's own construction form. The `serialized` clause on a **case** admits the rename form only (a case is not omittable — the enum-constant rule); on a **payload field** the full vocabulary applies (`skip` requiring a defaultable payload type). A choice all of whose cases are payload-free still writes the object form (uniformity; such a type should usually be an enum).
 
 <a id="sec-suppression-and-interaction"></a>
 #### Suppression and interaction
@@ -2185,7 +2195,7 @@ The `where` clause restricts the substitutions a type parameter accepts:
 | *(none)* | Any type, nullable or not. T is treated conservatively as possibly nullable. |
 | `where T: notnull` | Non-nullable types only (value or reference). A nullable type, value or reference, is excluded. |
 | `where T: class` | Non-nullable reference types only — classes (including `Array<T>`, `OwningArray<T>`, and other heap collection types), interfaces, `string`, function types. |
-| `where T: value` | Non-nullable value types — records, enums, primitives, inline arrays (all forms), the unit type. A nullable value type (e.g. `int?`) does **not** satisfy `value`. Generic body must use only move-compatible operations on T if T may be a move-only inline array ([§15.3](#sec-move-only-value-types)). |
+| `where T: value` | Non-nullable value types — records, enums, choices ([§35](#sec-choices)), primitives, inline arrays (all forms), the unit type. A nullable value type (e.g. `int?`) does **not** satisfy `value`. Generic body must use only move-compatible operations on T if T may be a move-only value — a move-only inline array or an owning-classified choice instantiation ([§15.3](#sec-move-only-value-types), [§35.4](#sec-choice-classification)). |
 | `where T: SomeClass` | Non-nullable subtypes of `SomeClass` (the class itself and its descendants). Class types only; interfaces do not extend classes in Bezel. |
 | `where T: IFoo` | Non-nullable types conforming to `IFoo`: classes implementing it, records and enums implementing it, interfaces extending it, and primitives conforming through their standard-library declarations or the compiler-provided conformances of [§11.8](#sec-static-interface-members) (clause 5 below). See "Interface conformance" below. |
 | `where T: U` (U a type parameter) | Non-nullable types assignable to the substitution for `U`. See "Type-parameter bounds" below. |
@@ -2193,7 +2203,7 @@ The `where` clause restricts the substitutions a type parameter accepts:
 
 Constraints may be combined: `where T: class, IDisposable, new()` requires a non-nullable reference type that implements `IDisposable` and has a public parameterless constructor.
 
-For `where T: new()` (v0.181): a **class** substitution satisfies the constraint exactly when the class declares a parameterless constructor that is `public` — not merely accessible from some scope. Constraint satisfaction is a property of the type alone, checked wherever an instantiation occurs; keying it to accessibility would let the same substitution satisfy the constraint in one module and fail it in another. A **value-type** substitution — record (positional or body), enum, primitive, inline array, the unit type — satisfies the constraint exactly when `default(T)` is well-defined per [§17.11](#sec-the-default-operator). Inside the generic body, `new T()` for a value substitution is equivalent to `default(T)`: for records this is the zero-valued record (admitting `record Point(X: int, Y: int)` while rejecting records with non-nullable reference fields); for enums it is the zero value, with [§17.11](#sec-the-default-operator)'s no-zero-constant warning applying. For a class substitution, `new T()` produces an owned reference via the class's parameterless constructor under the standard ownership-discharge rules of [§28.3](#sec-local-variables-ownership-and-borrows). Interface substitutions never satisfy `new()` — no constructor exists.
+For `where T: new()` (v0.181): a **class** substitution satisfies the constraint exactly when the class declares a parameterless constructor that is `public` — not merely accessible from some scope. Constraint satisfaction is a property of the type alone, checked wherever an instantiation occurs; keying it to accessibility would let the same substitution satisfy the constraint in one module and fail it in another. A **value-type** substitution — record (positional or body), enum, primitive, inline array, the unit type — satisfies the constraint exactly when `default(T)` is well-defined per [§17.11](#sec-the-default-operator). Inside the generic body, `new T()` for a value substitution is equivalent to `default(T)`: for records this is the zero-valued record (admitting `record Point(X: int, Y: int)` while rejecting records with non-nullable reference fields); for enums it is the zero value, with [§17.11](#sec-the-default-operator)'s no-zero-constant warning applying. For a class substitution, `new T()` produces an owned reference via the class's parameterless constructor under the standard ownership-discharge rules of [§28.3](#sec-local-variables-ownership-and-borrows). Interface substitutions never satisfy `new()` — no constructor exists. **Choices never satisfy the value-type arm**: `default(C)` is undefined for every choice type ([§17.11](#sec-the-default-operator), [§35.10](#sec-choice-default-with)).
 
 A type-bound constraint — naming a class or interface — implies non-null T. The reasoning is that nullable types `MyClass?` and `IFoo?` are distinct from their non-nullable forms ([§7.1](#sec-non-nullable-and-nullable-types)) and do not themselves implement the interfaces of their non-nullable counterparts: a `null` value satisfies no interface contract. Constraining on a class or interface name therefore admits only non-nullable substitutions, the same way `where T: class` does. Inside the generic body, T is non-nullable; `T?` is its nullable companion.
 
@@ -2216,6 +2226,7 @@ For an interface I and a candidate type T, T **conforms to** I exactly when one 
 4. **T is an enum** that lists I (or any interface extending I) in its inheritance clause and declares the matching public members ([§10.5](#sec-restrictions)): `enum Priority: IComparable<Priority>` satisfies `where T: IComparable<T>` exactly as a record would — enum interface conformance exists precisely to make enums visible to interface-constrained generics (rationale §9.4, v0.61).
 5. **T is a primitive.** A primitive conforms to the interfaces its standard-library declaration lists: the keyword and PascalCase forms name one type ([§3.4](#sec-keyword-aliases-for-built-in-types)), and stdlib §9 declares that type in record syntax, so `int` conforms to `IComparable<int>`/`IEquatable<int>` through the `Int32` declaration exactly as clause 2 reads for records. A primitive additionally carries the **compiler-provided conformances** of [§11.8](#sec-static-interface-members) (v0.176): the numeric tower conforms to the stdlib §2.19 `INumber<T>`/`ISteppable<T>`/`IParsable<T>` interfaces, and `char` to `ISteppable<char>`/`IParsable<char>`, with no declaration listing them — the intrinsic operations serve as the member witnesses. (The primitive kind remains distinct from the record kind, [§3.1](#sec-type-kinds); this clause, not clause 2, is a primitive's conformance source.)
 6. **T is a type parameter** whose constraints guarantee conformance to I ("Type-parameter bounds" above): a type-bound constraint naming I or an interface extending I, directly or through a `where T: U` chain.
+7. **T is a choice** ([§35](#sec-choices)) that lists I (or any interface extending I) in its inheritance clause and declares the matching public members ([§35.8](#sec-choice-boxing)) — the enum model. Choices are sealed, so conformance is always direct. For an owning-classified instantiation, conformance admits constraint satisfaction and generic dispatch but not the boxing *conversion* ([§35.8](#sec-choice-boxing)).
 
 `where T: IFoo` admits exactly the substitutions for which T conforms to `IFoo` per the rule above. Inside the generic body, T's surface includes IFoo's members, regardless of which conformance category T belongs to; the body cannot tell whether T was satisfied by a class, a record, an enum, an interface, a primitive, or another type parameter, and does not need to.
 
@@ -2603,12 +2614,12 @@ using var pool: OwningArray<Connection> := [
 
 A move-only value type is a value type whose instances cannot be duplicated. Assignment transfers the value from source to destination, leaving the source in moved-from state. Reading from a moved-from location is a compile error.
 
-The single move-only value type kind in this specification is the owning inline array (`[N owned]T` or `[N owned]T?`, see [§15.1.1](#sec-owning-inline-arrays)). Other value types — primitives, records, and inline arrays without the `owned` modifier — remain copyable.
+The move-only value type kinds in this specification are two: the owning inline array (`[N owned]T` or `[N owned]T?`, see [§15.1.1](#sec-owning-inline-arrays)) and the owning-classified choice ([§35.4](#sec-choice-classification), v0.200). Other value types — primitives, records, value-like and borrow-bearing choices, and inline arrays without the `owned` modifier — remain copyable. Move-only membership follows from *structure*, never from a declaration form: an inline array is move-only exactly when its slots carry the `owned` marker, and a choice exactly when its classification is owning. One recorded asymmetry between the two kinds: whole-value reassignment of an owning *choice* disposes the displaced value automatically ([§35.4](#sec-choice-classification), [§28.7](#sec-reassigning-owned-fields)), where the owning inline array keeps this section's warning-backed manual discipline below.
 
 **Rules.** Where an ordinary value type V supports an operation, a move-only V substitutes a moved variant or rejects the operation:
 
 - **Local-to-local assignment** `var y := x;`: copies for an ordinary value type; moves for a move-only value type. After the move, `x` is in moved-from state and may not be read until reassigned. *(v0.180 scope note: the binding/assignment transfer marker of [§28.3](#sec-local-variables-ownership-and-borrows) applies to **class-typed** owned bindings, where an unmarked binding is ambiguous between borrow and transfer and defaults to borrow. A move-only value binding has no borrow reading to disambiguate — copies are forbidden, so the plain binding can only move — and therefore stays unmarked, as this rule has always defined. The consume-site freeze applies regardless: moving a move-only local while a live borrow of it exists — e.g. a closure capture, [§28.9](#sec-runtime-managed-types) — is a compile error.)*
-- **Whole-value reassignment** `arr := newValue;` on a move-only local or field: the assignment is plain — the compiler does not insert automatic cleanup of the previous slots. If the LHS holds any slot that is not in moved-from state at the assignment site, those slots leak. The programmer satisfies the discipline by first emptying every owned slot of the LHS (via `move arr[i]` followed by `using var` or explicit Dispose on each taken value, or by passing the whole array to a method declared `(owned V)` that consumes it). This rule parallels [§28.7](#sec-reassigning-owned-fields) for owned class fields. A move-only field of a class is subject to the same rule. The compiler emits a warning when reassignment is reachable from a state where some slot is provably non-moved-from; the warning identifies the slots at risk and points at the standard discharge mechanisms.
+- **Whole-value reassignment** `arr := newValue;` on a move-only local or field: the assignment is plain — the compiler does not insert automatic cleanup of the previous slots. If the LHS holds any slot that is not in moved-from state at the assignment site, those slots leak. The programmer satisfies the discipline by first emptying every owned slot of the LHS (via `move arr[i]` followed by `using var` or explicit Dispose on each taken value, or by passing the whole array to a method declared `(owned V)` that consumes it). This rule parallels [§28.7](#sec-reassigning-owned-fields) for owned class fields. A move-only field of a class is subject to the same rule. (This bullet is the owning-inline-array discipline only: owning-classified *choices* dispose the displaced value automatically on reassignment — [§35.4](#sec-choice-classification).) The compiler emits a warning when reassignment is reachable from a state where some slot is provably non-moved-from; the warning identifies the slots at risk and points at the standard discharge mechanisms.
 - **Parameter passing**: a parameter declared `(x: V)` for an ordinary V is by value (copy); for a move-only V, it is by value-move (transfer ownership). The caller's argument expression is in moved-from state after the call. A parameter declared `(x: owned V)` is identical to plain `(x: V)` for a move-only V; the modifier is admitted for documentation but is redundant.
 - **Return**: returning a move-only value transfers it to the caller. The callee's local is moved-from after the return.
 - **Field placement**: a move-only value may be a field of a class. The class's destructor disposes the field's owned slots. A move-only value may not be a field of a record (records support only copy semantics, not move semantics).
@@ -3275,6 +3286,7 @@ The runtime guarantees a single `Type` instance per type, so `=` and `Object.Ref
 - Reference types: `null` if the location is nullable.
 - Records whose fields all have well-defined zero values: the record value with each field at its zero value. For positional records, the positional fields are considered. For body-only records, the backing storage of all auto-properties is considered. Expression-bodied (computed) properties have no backing storage and do not affect `default` eligibility.
 - Inline arrays whose element type has a well-defined zero value: the array with each slot at the element's zero value. `default([3]int)` is `[0, 0, 0]`; `default([5]Connection?)` is five `null`s. Owning inline-array forms (`[N owned]T?`) are admitted: `default([16 owned]Connection?)` produces 16 null slots and is a valid (move-only) value.
+- **Choices: `default(C)` is a compile error for every choice type** ([§35.10](#sec-choice-default-with)) — a sum has no principled zero, and electing a case would make program meaning depend on declaration order. `default(C?)` is the valid null (for an owning `C`, move-only) value, as for owning inline arrays.
 - The unit type: `()`.
 
 `default(T)` is a compile error for:
@@ -3363,7 +3375,7 @@ The discard statement's legality depends on the static type of `expression`:
 
   Inline arrays without owned slots (`[N]T`, `[N]T?`) are ordinary value types and follow this rule.
 
-- **Move-only inline arrays:** `_ := expression;` where `expression` produces a move-only value (an owning inline array, `[N owned]T?` or `[N owned]T`, [§15.3](#sec-move-only-value-types)) is **permitted** and disposes the value at the end of the discard statement — the discard is an *unbound owned temporary* ([§28.3](#sec-unbound-owned-temporaries)), reclaimed once the statement completes. Its owned slots are disposed in the usual order. (This is the explicit "dispose this owned result now" form, parallel to the non-trivial-dispose class case below.)
+- **Move-only values:** `_ := expression;` where `expression` produces a move-only value (an owning inline array `[N owned]T?`/`[N owned]T`, or an owning-classified choice — [§15.3](#sec-move-only-value-types), [§35.4](#sec-choice-classification)) is **permitted** and disposes the value at the end of the discard statement — the discard is an *unbound owned temporary* ([§28.3](#sec-unbound-owned-temporaries)), reclaimed once the statement completes. Its owned slots — for a choice, the active case's owned payloads — are disposed in the usual order. (This is the explicit "dispose this owned result now" form, parallel to the non-trivial-dispose class case below.)
 
 - **Trivial-dispose class types ([§28.9](#sec-runtime-managed-types)):** discard is permitted. The class has a no-op `Dispose()` by definition, so abandoning the value cannot leak a destructor invocation. Memory is reclaimed by an implementation-defined mechanism (see [§28](#sec-resource-management)'s preamble).
 
@@ -3766,7 +3778,7 @@ Arms are comma-separated. A trailing comma after the last arm is optional. In ex
 
 **Alternatives (v0.167, #1371):** `2 | 3 | 4 | 5` matches any of these. The alternative separator is `|` (grammar: `AltPattern`); the comma means exactly one thing in pattern context — the separator of arms and of positional slots — so no `=>` lookahead is needed to tell them apart. In `1 | 2 => "low", 3 => "high"`, the first arm matches 1 or 2; the second arm matches 3.
 
-In an alternative list, every member must be **binding-free**: a constant (a literal, an enum constant, or a named `const`), a **range pattern**, or a **relational pattern** — ranges and relationals admitted in v0.183; like constants they bind nothing and contribute pure membership tests, so `1..5 | 10 => …` and `< 0 | > 100 => …` are single arms. A member that resolves to a *type* is a compile error in a `case` pattern — grouped type tests are written as separate arms; types alter exhaustiveness and binding analysis, which is exactly what the recorded constants-only reasoning targeted (rationale §3.8). Range and relational alternative members do not contribute to static exhaustiveness proofs ([§19.6](#sec-exhaustiveness) counts declared constants, not extents), and an alternative list binds nothing regardless of member kind. (`catch` arms, whose members are exclusively types, use the same `|` spelling for their multi-type alternatives — [§31.2](#sec-try-catch-finally).)
+In an alternative list, every member must be **binding-free**: a constant (a literal, an enum constant, or a named `const`), a **payload-free choice case name** ([§35.5](#sec-choice-matching), v0.200 — nullary, binding-free, and countable toward exhaustiveness like an enum constant), a **range pattern**, or a **relational pattern** — ranges and relationals admitted in v0.183; like constants they bind nothing and contribute pure membership tests, so `1..5 | 10 => …` and `< 0 | > 100 => …` are single arms. A member that resolves to a *type* is a compile error in a `case` pattern — grouped type tests are written as separate arms; types alter exhaustiveness and binding analysis, which is exactly what the recorded constants-only reasoning targeted (rationale §3.8). Range and relational alternative members do not contribute to static exhaustiveness proofs ([§19.6](#sec-exhaustiveness) counts declared constants, not extents), and an alternative list binds nothing regardless of member kind. (`catch` arms, whose members are exclusively types, use the same `|` spelling for their multi-type alternatives — [§31.2](#sec-try-catch-finally).)
 
 Because the alternative separator `|` is distinct from the slot separator `,`, alternatives are available **per slot** inside a positional destructuring pattern: `TwoColor(Color.Red | Color.Blue, var x)` is a two-slot pattern whose first position matches either color. Alternative members are binding-free per the rule above, so a binding (`var c`) cannot appear inside an alternative list (constants, ranges, and relationals can — v0.183).
 
@@ -3784,7 +3796,7 @@ Because the alternative separator `|` is distinct from the slot separator `,`, a
 
 **Record destructuring:** `Point(x, y)`, `MyRecord(a, b, c)`. The type name followed by parenthesized bindings matches the type and binds positional fields by position. The number of bindings must match the record's positional-field count. Individual positions may be discarded with `_`: `Point(_, y)`. Destructuring patterns compose with `when` guards and with subtype matching.
 
-Destructuring applies to records only — the positional binding is over a record's positional fields ([§9.1](#sec-positional-records)). Classes do not have a positional-destructuring surface, even when they declare a primary constructor ([§22.10](#sec-methods-and-constructors-primary-constructors)): primary-constructor parameters are not auto-promoted to public properties, and the positional shape is not part of the class's pattern-match surface. To match a class hierarchy, use a type-test pattern (`Dog`, `var d: Dog`) and access fields through the bound name. The [§19.6](#sec-exhaustiveness) exhaustive-match example over a `sealed abstract` class hierarchy uses this form.
+Destructuring applies to records and choice cases ([§35.5](#sec-choice-matching)) — the positional binding is over a record's positional fields ([§9.1](#sec-positional-records)) or a choice case's payload fields. Classes do not have a positional-destructuring surface, even when they declare a primary constructor ([§22.10](#sec-methods-and-constructors-primary-constructors)): primary-constructor parameters are not auto-promoted to public properties, and the positional shape is not part of the class's pattern-match surface. To match a class hierarchy, use a type-test pattern (`Dog`, `var d: Dog`) and access fields through the bound name. The [§19.6](#sec-exhaustiveness) exhaustive-match example over a `sealed abstract` class hierarchy uses this form.
 
 Inside a positional destructuring pattern, a naked identifier is interpreted as a binding for that position — `Point(x, y)` binds `x` and `y` (it does not type-test the positions against types named `x` and `y`). The naked-identifier form is the common shorthand; the explicit `Point(var x, var y)` is also accepted and means the same thing. The naked-identifier form is *not* available outside positional destructuring: at the top level of a pattern, an identifier alone is parsed as a type test, so a binding requires the explicit `var` form (`var x` or `var x: T`). Nested patterns inside a destructuring (e.g. `Outer(Inner(x))`) follow the same rule recursively.
 
@@ -3792,7 +3804,7 @@ Inside a positional destructuring pattern, a naked identifier is interpreted as 
 
 **Discard `_`:** Matches any value, binds nothing. When used as a top-level pattern (a catch-all arm), it must be the last arm (see [§19.6](#sec-exhaustiveness)); inside destructuring patterns (`Point(_, y)`), `_` may appear in any position with no last-arm restriction.
 
-**Pattern binding and ownership.** A pattern binding (`var d: Dog`, the naked identifier `x` in `Point(x, y)`, or the unconstrained `var t`) is **non-destructive on the scrutinee**: the scrutinee retains whatever ownership state it had, and the bound name is a borrow whose source is the scrutinee's source. This matches the `as` operator's behavior ([§17.4](#sec-the-is-is-not-and-as-operators)). When the scrutinee is an owned local of class type and the user wants to transfer ownership through a pattern match, the user moves from the original scrutinee variable after the case construct selects an arm — the case construct itself never moves from the scrutinee. For value-type scrutinees, the binding is a copy by the standard value-type rules; for runtime-managed scrutinees (`string`, function values), the binding is a shared reference. For a scrutinee of **move-only value type** ([§15.3](#sec-move-only-value-types) — an owning inline array), the binding is a **borrow** of the value: a copy is forbidden and the case construct never moves from the scrutinee, so the borrow form is the only consistent option — the same reasoning as closure capture of a move-only local ([§28.9](#sec-runtime-managed-types)). Slot reads through the binding are admitted; `move s[i]` through the binding is rejected (the binding does not own the array). The narrowing produced by the case arm is purely informational about the type tag; it does not change the ownership state of the scrutinee.
+**Pattern binding and ownership.** A pattern binding (`var d: Dog`, the naked identifier `x` in `Point(x, y)`, or the unconstrained `var t`) is **non-destructive on the scrutinee**: the scrutinee retains whatever ownership state it had, and the bound name is a borrow whose source is the scrutinee's source. This matches the `as` operator's behavior ([§17.4](#sec-the-is-is-not-and-as-operators)). When the scrutinee is an owned local of class type and the user wants to transfer ownership through a pattern match, the user moves from the original scrutinee variable after the case construct selects an arm — the case construct itself never moves from the scrutinee. For value-type scrutinees, the binding is a copy by the standard value-type rules; for runtime-managed scrutinees (`string`, function values), the binding is a shared reference. For a scrutinee of **move-only value type** ([§15.3](#sec-move-only-value-types) — an owning inline array; for an owning *choice* scrutinee, the borrowing/owning match split of [§35.5](#sec-choice-matching) governs), the binding is a **borrow** of the value: a copy is forbidden and the case construct never moves from the scrutinee, so the borrow form is the only consistent option — the same reasoning as closure capture of a move-only local ([§28.9](#sec-runtime-managed-types)). Slot reads through the binding are admitted; `move s[i]` through the binding is rejected (the binding does not own the array). The narrowing produced by the case arm is purely informational about the type tag; it does not change the ownership state of the scrutinee.
 
 <a id="sec-guards"></a>
 ### 19.4 Guards
@@ -3829,6 +3841,7 @@ The compiler proves exhaustiveness statically in the following cases:
 
 - **Any scrutinee — irrefutable arm (v0.182):** some arm is irrefutable — an unguarded `_`, or an unguarded untyped `var x` pattern (which binds any value, including `null`, [§19.5](#sec-type-pattern-matching-never-matches-null)).
 - **Enum scrutinee:** every declared constant has a matching pattern — a constant pattern naming it directly or as a member of a `|` alternative list (v0.182 wording fix: these are *constant* patterns, [§19.3](#sec-patterns), not literals), a `var` binding, or `_`. Coverage is by **value**: under duplicate constant values ([§10.2](#sec-explicit-values)), an arm naming either alias covers both.
+- **Choice scrutinee (v0.200):** every declared case is covered by an unguarded arm — a payload-free case by a constant-style pattern naming it, directly or as a member of a `|` alternative list; a payload-carrying case by a positional destructuring pattern for it whose every slot is **irrefutable** (a binding or `_`). Guarded arms contribute nothing (the v0.182 rule), and an arm whose slot patterns are refutable (a constant, range, relational, alternative, or nested destructuring slot) covers only part of its case's value space and likewise contributes nothing; coverage is counted per case name, one level deep ([§35.6](#sec-choice-exhaustiveness)). When every case is covered, no `_` arm is required — including across module boundaries: the case set is closed by the declaration, so the cross-module rule below applies with "leaf type" read as "declared case", and adding a case to a published choice is a source-breaking change for consumers exactly as adding a sealed leaf is. Generic choice scrutinees need no determination rule: coverage is by case name, not by type.
 - **Bool scrutinee:** both `true` and `false` are covered.
 - **Sealed class hierarchy scrutinee:** when the scrutinee's static type is a `sealed abstract` class, or an `abstract` class whose only direct subclasses are themselves `sealed` or recursively form a closed set, and every leaf type in the closed hierarchy is matched by a type pattern (with or without binding), no `_` arm is required. The leaves may be matched in any order; the analysis is purely on type coverage. When the root or any leaf is generic, *leaf type* means the leaf **instantiation** admitted at the scrutinee's static type, computed per leaf by the determination rule below (v0.196): an uninhabited leaf is exempt, a determined leaf's obligation is its single admitted instantiation, and a leaf left undetermined — or undecidable at the enclosing declaration — makes leaf coverage statically unattainable. Class leaves are matched by type-test patterns (`var c: Circle => ...`); positional destructuring ([§19.3](#sec-patterns)) applies to record leaves, not to class leaves. A `sealed abstract` class ([§11.7](#sec-static-classes)) provides the strongest guarantee: no subclass outside the declaring module can exist, so exhaustiveness holds across module boundaries.
 - **Nullable scrutinee:** under the rules above plus an explicit `null` pattern.
@@ -3925,7 +3938,7 @@ Because `case ... end` is self-delimited, it composes inside any expression posi
 <a id="sec-inside-enum-scrutinees"></a>
 ### 19.8 Inside enum scrutinees
 
-When the scrutinee has an enum type, the enum prefix may be omitted in patterns. See [§10.6](#sec-case-matching) for details and examples.
+When the scrutinee has an enum type, the enum prefix may be omitted in patterns. See [§10.6](#sec-case-matching) for details and examples. The same omission applies within a `case` over a choice scrutinee ([§35.5](#sec-choice-matching)): a case name resolves to a case pattern, never a type test.
 
 ---
 
@@ -5666,6 +5679,7 @@ The `owned` modifier appears in specific declaration positions. It is **admissib
 - **Function-type parameter slots.** `(owned T) -> ()` — the parameter slot of a function type may carry `owned`. The modifier is part of the function type's identity (see [§27.1](#sec-function-types)); `(T) -> ()` and `(owned T) -> ()` are distinct types.
 - **Function-type return slots.** `() -> owned Connection` — the return slot of a function type may carry `owned`. The same identity rule applies.
 - **Lambda parameters.** `(owned x) => ...` or `(owned x: T) => ...` — a lambda's parameter list carries the same modifiers as the target function type expects.
+- **Choice payload fields.** `Fetched(owned response: Response)` — the payload slot takes ownership at construction and the active case's owned payloads are disposed with the value ([§35.1](#sec-choice-declaration), [§35.4](#sec-choice-classification)); admissibility and the bare-type-parameter erasure follow the type requirement below.
 - **Inline-array slot marker.** `[N owned]T` and `[N owned]T?` — the `owned` keyword placed between the size and the closing bracket marks the inline array's slots as owned (see [§15.1.1](#sec-owning-inline-arrays)). The array becomes a move-only value type ([§15.3](#sec-move-only-value-types)). This is the type-level position for owning inline arrays; an owning-inline-array field on a class does **not** additionally carry the `owned` field modifier (the slot marker already conveys the obligation).
 
 The modifier is **not admissible** in the following positions:
@@ -5676,7 +5690,7 @@ The modifier is **not admissible** in the following positions:
 
 Function-type parameters and return types *do* admit `owned` — `(owned T) -> ()` is the function-type form of `method M(owned t: T)`, and is a distinct type from `(T) -> ()` per [§27.1](#sec-function-types). The modifier is part of the function type's identity.
 
-**Type requirement (v0.193; bare-type-parameter arm revised v0.196).** In the method-parameter, return-type, `out`-parameter, lambda-parameter, and function-type parameter/return slot positions above, `owned` requires the declared type — nullability stripped — to be a **class type, an interface type, or a bare type parameter**; for a **move-only value type** ([§15.3](#sec-move-only-value-types)) the modifier is admitted-but-redundant (the type's own move semantics already transfer the obligation). On any other type — a primitive, `string`, a function type, an ordinary record, an enum, a non-owning inline array, or the unit type — `owned` is a **compile error**: such values carry no disposal obligation to transfer ([§28.9](#sec-runtime-managed-types)), the same reasoning as [§28.5](#sec-owned-fields)'s field restriction and [§30.5](#sec-result-lifetime-and-task-disposal)'s rejection of `OwningTask<T>` at non-class T. For a **bare type parameter** the marker's meaning is fixed **per instantiation** (v0.196, superseding the v0.193 instantiation-site rejection — the [§3.6](#sec-derived-type-properties) rule 2 pattern, the same pre-substitution-keying/per-instantiation-enforcement split as [§28.3](#sec-bare-type-parameter-returns)'s bare-type-parameter rule): the generic body type-checks under the class-or-interface assumption; at a **class or interface** substitution the marker has its ordinary transfer meaning; at a **move-only value** substitution it is admitted-but-redundant, as for the concrete type; and at every **other value or runtime-managed** substitution it is **erased by the substitution** — the substituted signature is the unmarked one: no obligation exists to transfer ([§28.9](#sec-runtime-managed-types)), parameters and returns pass by value, an `out owned` slot delivers a plain value, marker-keyed call-site and binding forms written under the class assumption remain admissible with no-op effect ([§28.10](#sec-using-var)'s uniform admissibility), the marker does not survive into a substituted function type's identity (`(owned T) -> ()` at `T = int` *is* `(int) -> ()`, [§27.1](#sec-function-types)), and every rule keyed on the marker — [§11.2](#sec-interface-declaration)/[§12.1](#sec-members-are-non-virtual-by-default) signature matching, [§22.3](#sec-parameter-modifiers)'s call-site marker — reads the erased substituted form. Erasure changes substituted signatures, never classification keys: a declared `owned T` return remains outside [§28.3](#sec-bare-type-parameter-returns)'s bare-type-parameter rule at every instantiation. Rejecting these instantiations instead — the v0.193 rule — made the `owned` spelling unusable for any fresh-producing generic whose domain admits value substitutions: precisely the signatures the factory warning directs at the spelling ([§28.3](#sec-factory-methods-and-sourceless-returns)) and the static-interface producer members of stdlib §2.19 (v0.196). Two rejections remain. A declaration whose constraints exclude class and interface substitutions outright (`where T: value`) rejects the marker **at the declaration** — it could never be more than redundant, the concrete-type reasoning above applied at the only point it is decidable. And [§28.5](#sec-owned-fields)'s generic **field** rule is deliberately unchanged — an `owned` field at an inadmissible substitution stays an instantiation-site error, because a field marker commits the containing type's shape (destructor synthesis, the [§3.6](#sec-derived-type-properties) derived properties) in a way a call-boundary marker does not; the asymmetry is recorded, liftable if a mixed-domain owning-slot case arrives. Authors who intend the marker to be meaningful at every instantiation still constrain the domain (`where T: IDisposable` excludes the runtime-managed reference types at the declaration, [§14.2](#sec-constraints)).
+**Type requirement (v0.193; bare-type-parameter arm revised v0.196).** In the method-parameter, return-type, `out`-parameter, lambda-parameter, choice-payload ([§35.1](#sec-choice-declaration), v0.200), and function-type parameter/return slot positions above, `owned` requires the declared type — nullability stripped — to be a **class type, an interface type, or a bare type parameter**; for a **move-only value type** ([§15.3](#sec-move-only-value-types)) the modifier is admitted-but-redundant (the type's own move semantics already transfer the obligation). On any other type — a primitive, `string`, a function type, an ordinary record, an enum, a non-owning inline array, or the unit type — `owned` is a **compile error**: such values carry no disposal obligation to transfer ([§28.9](#sec-runtime-managed-types)), the same reasoning as [§28.5](#sec-owned-fields)'s field restriction and [§30.5](#sec-result-lifetime-and-task-disposal)'s rejection of `OwningTask<T>` at non-class T. For a **bare type parameter** the marker's meaning is fixed **per instantiation** (v0.196, superseding the v0.193 instantiation-site rejection — the [§3.6](#sec-derived-type-properties) rule 2 pattern, the same pre-substitution-keying/per-instantiation-enforcement split as [§28.3](#sec-bare-type-parameter-returns)'s bare-type-parameter rule): the generic body type-checks under the class-or-interface assumption; at a **class or interface** substitution the marker has its ordinary transfer meaning; at a **move-only value** substitution it is admitted-but-redundant, as for the concrete type; and at every **other value or runtime-managed** substitution it is **erased by the substitution** — the substituted signature is the unmarked one: no obligation exists to transfer ([§28.9](#sec-runtime-managed-types)), parameters and returns pass by value, an `out owned` slot delivers a plain value, marker-keyed call-site and binding forms written under the class assumption remain admissible with no-op effect ([§28.10](#sec-using-var)'s uniform admissibility), the marker does not survive into a substituted function type's identity (`(owned T) -> ()` at `T = int` *is* `(int) -> ()`, [§27.1](#sec-function-types)), and every rule keyed on the marker — [§11.2](#sec-interface-declaration)/[§12.1](#sec-members-are-non-virtual-by-default) signature matching, [§22.3](#sec-parameter-modifiers)'s call-site marker — reads the erased substituted form. Erasure changes substituted signatures, never classification keys: a declared `owned T` return remains outside [§28.3](#sec-bare-type-parameter-returns)'s bare-type-parameter rule at every instantiation. Rejecting these instantiations instead — the v0.193 rule — made the `owned` spelling unusable for any fresh-producing generic whose domain admits value substitutions: precisely the signatures the factory warning directs at the spelling ([§28.3](#sec-factory-methods-and-sourceless-returns)) and the static-interface producer members of stdlib §2.19 (v0.196). Two rejections remain. A declaration whose constraints exclude class and interface substitutions outright (`where T: value`) rejects the marker **at the declaration** — it could never be more than redundant, the concrete-type reasoning above applied at the only point it is decidable. And [§28.5](#sec-owned-fields)'s generic **field** rule is deliberately unchanged — an `owned` field at an inadmissible substitution stays an instantiation-site error, because a field marker commits the containing type's shape (destructor synthesis, the [§3.6](#sec-derived-type-properties) derived properties) in a way a call-boundary marker does not; the asymmetry is recorded, liftable if a mixed-domain owning-slot case arrives. Authors who intend the marker to be meaningful at every instantiation still constrain the domain (`where T: IDisposable` excludes the runtime-managed reference types at the declaration, [§14.2](#sec-constraints)).
 
 The rules for how `owned` interacts with method bodies, control flow, and disposal are in the subsections that follow.
 
@@ -5765,7 +5779,7 @@ The taxonomy defines what a source *is* and how it bounds a borrow; which source
 1. store into an `owned` field or owning-collection slot, including through a `set(owned)` accessor ([§23.3](#sec-block-form-properties));
 2. `return` under an `owned` return type, or — non-`async` bodies — under an unmarked `Task`-family return type (v0.190);
 3. an `owned` argument under the call-site marker ([§22.3](#sec-parameter-modifiers));
-4. a marked binding or assignment transfer — `var y := owned x;`, `y := owned x;`, `using var y := owned x;` (v0.180);
+4. a marked binding or assignment transfer — `var y := owned x;`, `y := owned x;`, `using var y := owned x;` (v0.180) — and (v0.200) the marked owning-match scrutinee `case owned x of …` ([§35.5](#sec-owning-match));
 5. the operand of a Pattern B `await` ([§30.5](#sec-result-lifetime-and-task-disposal));
 6. the owned parameter-or-plain-local source of a Pattern A chaining `return await` ([§30.5](#sec-result-lifetime-and-task-disposal), v0.184);
 7. the operand of `yield return` in an owning iterator ([§29.2](#sec-iterator-yield-ownership), v0.184);
@@ -5937,7 +5951,7 @@ The ownership state of an expression is determined by the expression form — th
 | Parameter `p` (no modifier) | Borrowed (source: caller) |
 | `this` | Borrowed (source: caller) |
 | Function call producing an ordinary value type, `string`, or runtime-managed type | Not applicable ([§28.9](#sec-runtime-managed-types)) |
-| Function call producing a move-only value type (an owning inline array `[N owned]T?` or `[N owned]T`) | Owned. The result is a move-only value ([§15.3](#sec-move-only-value-types)); the caller takes ownership and must discharge by binding into a local (auto-disposed at scope end via the move-only-local rule), into an owning-inline-array slot, or into a class field of move-only type. |
+| Function call producing a move-only value type (an owning inline array `[N owned]T?` or `[N owned]T`, or an owning-classified choice — [§35.4](#sec-choice-classification), including a case construction) | Owned. The result is a move-only value ([§15.3](#sec-move-only-value-types)); the caller takes ownership and must discharge by binding into a local (auto-disposed at scope end via the move-only-local rule), into an owning-inline-array slot, into a class field of move-only type, or — for a choice — by a consuming match ([§35.5](#sec-owning-match)). |
 | `x as T` | Borrowed (source: same as `x`'s source if `x` is borrowed; `x` itself if `x` is owned). The cast does not move from `x`; `x` retains its ownership state. The result is nullable. See [§17.4](#sec-the-is-is-not-and-as-operators) for the rationale. |
 | `a ?? b` (null-coalescing, [§7.7](#sec-null-coalescing-and-=)) | The **meet** of the ownership states of `a` and `b` per [K7](#sec-kernel-k7) — the same two-branch merge as the control-flow join above (v0.180): owned ⊓ owned = **owned** (exactly one of the two owned values is produced at runtime and is discharged once — no leak, no double-free), borrowed ⊓ borrowed = **borrowed** carrying the union of both arms' source sets, and a mixed owned/borrowed arm pair is **rejected** — equalize the arms first ([§28.3](#sec-local-variables-ownership-and-borrows) two-branch patterns). A **named owned binding** written as an arm is an *unmarked read* and therefore a **borrow** arm, per the local-variable-read row above (axiom A7 — there is no arm-position transfer marker in this revision; recorded, liftable): `a ?? b` over two named owned locals is a borrowed ⊓ borrowed merge and consumes neither binding; to coalesce two named owned bindings into one owned result, equalize explicitly — `if a <> null then r := owned a; else r := owned b; end;` — which keeps the no-silent-consume rule of *Move semantics* uniform. A `null`-literal or bottom-typed (`throw`) arm absorbs to the other arm's state (K7.5), legitimizing the `x ?? throw …` shape ([§17.12](#sec-the-throw-expression)). The compound form `a ??= b` assigns into `a` and follows the same meet rule for the assigned-into location. |
 | `v1 if c else v2` ([§20](#sec-the-if-expression)); the result of an expression-position `case`/`when` ([§19.1](#sec-forms), [§19.2](#sec-arms)) | The **meet** of the arms' ownership states, identically to the `a ?? b` row above ([K7](#sec-kernel-k7) at expression joins; v0.184): owned ⊓ owned = **owned** — exactly one arm's value is produced at runtime and is discharged once; borrowed ⊓ borrowed = **borrowed**, carrying the union of the arms' source sets; a mixed owned/borrowed arm set is **rejected** — equalize the arms. A **named owned binding** written as an arm is an unmarked read and therefore a **borrow** arm (axiom A7 — the same recorded, liftable bound as `??`); a `throw` arm is bottom-typed and a `null`-literal arm absorbs to the other arms' state (K7.5; [§17.12](#sec-the-throw-expression)). For `case`/`when` the meet ranges over every arm's result expression. |
@@ -6273,7 +6287,7 @@ When a chain originates from a `new` expression — `new StringBuilder().Append(
 <a id="sec-reassigning-owned-fields"></a>
 ### 28.7 Reassigning owned fields and locals — drop-on-overwrite
 
-**Assignment to an owned field or owned local disposes the displaced value (v0.161; derives: [K3.11](#sec-kernel-k3)).** The right-hand side is evaluated first; then, if the previous value is live (non-null and not moved-from — the per-slot tracking [§28.11](#sec-collection-element-ownership)'s indexer-set rule already defines), it is disposed; then the new value is stored. The disposal is null-guarded and dynamic-dispatched, exactly the machinery scope-end disposal already uses. With overwrite covered, the §28.3 claim — *every owned value is disposed exactly once on every path* — holds with a single recorded carve-out (axiom [A13](#sec-axiom-register)): move-only inline-array *whole-value* reassignment ([§15.3](#sec-move-only-value-types)) remains a plain store whose non-empty slots leak with a warning, keeping §15.3's manual discipline for this revision; the slot-wise disposal interacts with the open #747 design and is deferred with tracking issue #1385.
+**Assignment to an owned field or owned local disposes the displaced value (v0.161; derives: [K3.11](#sec-kernel-k3)).** The right-hand side is evaluated first; then, if the previous value is live (non-null and not moved-from — the per-slot tracking [§28.11](#sec-collection-element-ownership)'s indexer-set rule already defines), it is disposed; then the new value is stored. The disposal is null-guarded and dynamic-dispatched, exactly the machinery scope-end disposal already uses. With overwrite covered, the §28.3 claim — *every owned value is disposed exactly once on every path* — holds with a single recorded carve-out (axiom [A13](#sec-axiom-register)): move-only inline-array *whole-value* reassignment ([§15.3](#sec-move-only-value-types)) remains a plain store whose non-empty slots leak with a warning, keeping §15.3's manual discipline for this revision; the slot-wise disposal interacts with the open #747 design and is deferred with tracking issue #1385. Owning-classified **choices** ([§35.4](#sec-choice-classification), v0.200) deliberately do *not* share the carve-out: a choice has no partial states, so its whole-value reassignment takes this rule's automatic drop-on-overwrite.
 
 ```bezel
 public method Resize(newSize: int)
@@ -6670,7 +6684,7 @@ Every standard collection's element semantics follow from one classification, no
 | value type (non-move-only) | copies | *(rejected at instantiation)* |
 | runtime-managed reference (`string`, function types, boxed values; [§28.9](#sec-runtime-managed-types)) | shared references | *(rejected at instantiation)* |
 | class / interface type | borrows | owned |
-| move-only value type ([§15.3](#sec-move-only-value-types)) | *(rejected at instantiation)* | *(rejected at instantiation)* |
+| move-only value type ([§15.3](#sec-move-only-value-types) — owning inline arrays and owning-classified choices, [§35.4](#sec-choice-classification)) | *(rejected at instantiation)* | *(rejected at instantiation)* |
 
 (The owning family admits only class/interface element types; see the instantiation-site restriction in [§14.4](#sec-owned-as-a-generic-argument). Move-only element types are deferred for both families — see stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans) and the rationale.) For dictionaries the classification applies independently to the key slots and the value slots: an owning dictionary owns its *values*; its keys are value-like and classified per the borrowing column (stdlib [§4.9](Bezel_Standard_Library.md#sec-owneddictionaryk-v)).
 
@@ -8076,11 +8090,11 @@ Domains run in parallel: while each domain's continuations are serial ([§30.13]
 
 A type is **sendable** — a derived type property ([§3.6](#sec-derived-type-properties)) — when a value of the type may cross a domain boundary: as a spawn argument, a spawn result, or a channel element. Sendability is determined by category:
 
-- **Value types** are sendable iff they are not borrow-bearing ([§9.7](#sec-records-and-disposal)) and not move-only ([§15.3](#sec-move-only-value-types)). All primitives and enums are sendable; a record is sendable per its fields, transitively (the borrow-bearing computation already supplies the transitivity). A sendable value crosses as a copy.
+- **Value types** are sendable iff they are not borrow-bearing ([§9.7](#sec-records-and-disposal)) and not move-only ([§15.3](#sec-move-only-value-types)). All primitives and enums are sendable; a record is sendable per its fields, and a choice per its payloads ([§35.12](#sec-choice-sendability)), transitively (the borrow-bearing computation already supplies the transitivity). A sendable value crosses as a copy.
 - **`string`** is sendable; it crosses as a shared reference, which is safe because strings are immutable (implementation note: the runtime's reclamation bookkeeping for strings must tolerate cross-domain sharing). A **boxed value** is sendable iff the boxed value's type is sendable. **Function-typed values are never sendable**: their captures are borrows of the origin domain's scopes ([§28.9](#sec-runtime-managed-types)).
 - **Class types** are sendable iff the class is **transfer-closed**:
   1. The class is `sealed` ([§12.4](#sec-sealing)); or it is `sealed abstract` and every class in its module-closed hierarchy is itself transfer-closed (then the whole closed hierarchy is sendable). Open classes are not sendable — an open class's sendable-looking surface could be extended by a subclass holding origin-domain references, and a base-typed owned field could carry that subclass across.
-  2. Every instance field, including inherited fields, is: a sendable value type; `string`-typed; an `owned` field whose declared type is a sendable class type; or an owning-inline-array field (`[N owned]C` / `[N owned]C?`) whose element class is a sendable class type.
+  2. Every instance field, including inherited fields, is: a sendable value type; `string`-typed; an `owned` field whose declared type is a sendable class type; an owning-inline-array field (`[N owned]C` / `[N owned]C?`) whose element class is a sendable class type; or an owning-choice-typed field whose every `owned` payload class is a sendable class type ([§35.12](#sec-choice-sendability)).
   3. The class has no function-typed fields, no `Object`-typed or interface-typed fields (boxed contents and runtime types behind interfaces cannot be statically verified), and no non-`owned` class-typed fields (a back-reference aliases an object owned in the origin domain).
   Mutually-recursive `owned` references among sendable classes are admitted; the property is evaluated coinductively (assume the types under test sendable, then check the rules). A sendable class instance crosses as an **owned transfer** — the entire ownership tree under it moves with it, and rule 2 guarantees that tree contains everything the instance can reach.
 - **Interface types** are never sendable (rule 3's reasoning, applied at the root).
@@ -8559,7 +8573,7 @@ Only the following types may appear in `extern` method signatures:
 - The unit type `()` — valid as a return type only, mapped to C `void`. An FFI declaration with no `:` clause produces a unit-returning method; an explicit `: ()` is also accepted and means the same thing.
 - Function types `(...) -> T` whose parameters and return type are themselves FFI-compatible. Callback admission is [§32.8](#sec-callbacks)'s; a function type inside an `env`-paired extern declaration may additionally contain one `env` position ([§32.8](#sec-callbacks)). A nullable function type is an optional callback (NULL function pointer, above).
 
-Not allowed: Bezel `string` (use `CString` or `WString`), `char` (use `int` or `byte` and convert), `decimal`, enums (declare the underlying integer type and cast explicitly at the boundary — direct enum admission remains a recorded future convenience), nullable value types (above), classes, interfaces, generic type parameters, `Array<T>`, `OwningArray<T>` and the other collections, records other than the [§32.13](#sec-c-compatible-records) forms, inline arrays outside the element set above.
+Not allowed: Bezel `string` (use `CString` or `WString`), `char` (use `int` or `byte` and convert), `decimal`, enums (declare the underlying integer type and cast explicitly at the boundary — direct enum admission remains a recorded future convenience), choices ([§35.13](#sec-choice-ffi)), nullable value types (above), classes, interfaces, generic type parameters, `Array<T>`, `OwningArray<T>` and the other collections, records other than the [§32.13](#sec-c-compatible-records) forms, inline arrays outside the element set above.
 
 `char` is excluded because Bezel's `char` is a 32-bit Unicode scalar value, while C `char` is conventionally an 8-bit byte and platform character types vary further (Windows `wchar_t` is 16 bits, Unix `wchar_t` is 32 bits but with different encoding assumptions). No single mapping is correct across the relevant ABIs; passing `int` (for full code points) or `byte` (for ASCII / opaque bytes) and converting on the Bezel side is unambiguous.
 
@@ -9220,6 +9234,282 @@ end BankAccount;
 
 ---
 
+<a id="sec-choices"></a>
+## 35. Choices
+
+A **choice** is a closed nominal sum: a value type whose values are drawn from a fixed, named set of **cases**, where each case may carry a positional payload. Conceptually it sits between enums (closed, named, no payloads) and records (field products, no case discrimination). Construction is qualified (`FetchOutcome.Failed(504, "upstream timeout")`); consumption is `case` with positional destructuring and full static exhaustiveness ([§19.6](#sec-exhaustiveness) — no `_` arm needed when every case is covered). *(v0.200; the section is numbered here to preserve every existing section number and anchor — its conceptual home in the [§3.1](#sec-type-kinds) kind ordering is between enums and classes.)*
+
+```bezel
+public choice FetchOutcome
+  Fetched(owned response: Response),      // owned class payload
+  NotModified,                            // payload-free case
+  Failed(status: int, message: string);   // value payloads
+
+  public method IsSuccess(): bool => case this of
+    Fetched(_)   => true,
+    NotModified  => true,
+    Failed(_, _) => false
+  end;
+end FetchOutcome;
+```
+
+<a id="sec-choice-declaration"></a>
+### 35.1 Declaration
+
+Each value of a choice type has exactly one **active case** at a time; the active case determines which payload components the value carries. A case declares zero or more positional **payload fields**, each `Identifier ":" Type` with an optional leading `owned` marker; a case with no payload list is **payload-free**. Case names are PascalCase by convention and must be distinct within the choice; a case name may not collide with any member name of the choice (the [§11.3](#sec-member-body) member rules apply with cases counted as members). A choice declares at least one case. Choices are implicitly sealed and cannot derive from any type; a choice may implement interfaces ([§35.8](#sec-choice-boxing)). Choices cannot have destructors, constructors, instance fields, block-form or storage-backed properties, indexers, or nested types — the same restriction set as enums ([§10.5](#sec-restrictions)), for the same reasons, plus one: a choice's instance storage *is* its cases' payloads, declared in the case list and reachable only through matching.
+
+A choice payload field may not, directly or transitively through value-typed components (record fields, inline-array elements, other choices' payloads), have the declaring choice's own type: a value type cannot contain itself. Recursive sums are expressed with a class node in the cycle (an `owned` class payload whose class holds the nested choice), exactly as recursive records are.
+
+The `owned` payload marker's admissibility follows [§28.1](#sec-where-the-owned-modifier-can-appear)'s type requirement verbatim: admissible on class types, interface types, and bare type parameters; admitted-but-redundant on move-only value types; a compile error on any other type. For a **bare type parameter** payload the marker follows §28.1's per-instantiation erasure (v0.196) — the payload slot is owned at class and interface substitutions and the marker is erased at value and runtime-managed substitutions. Case-payload position is among §28.1's admissible positions.
+
+<a id="sec-choice-members"></a>
+### 35.2 Members
+
+A choice body may declare, after the case list, exactly what an enum body may ([§10.4](#sec-methods-properties-static-members), grammar A.4 `EnumMember`): instance methods, expression-bodied read-only properties, static methods, static readonly fields (including `static owned readonly`), `const` members, and operator overloads. `this` in a choice instance method is a **borrow** of the receiver value; owned-consuming operations through `this` are rejected — the same reasoning as [§19.3](#sec-patterns)'s move-only scrutinee rule (a method invocation must not silently consume its receiver), and for a generic choice this keeps method-body checking independent of the instantiation's classification ([§35.11](#sec-choice-generics)). Choice methods are statically dispatched; `virtual`/`abstract`/`override` are rejected as on enums ([§10.5](#sec-restrictions)), and §10.5's `Equals`/`GetHashCode`/`ToString` plain-member replacement rule carries over for the boxable classifications.
+
+A choice has no user constructors, instance fields, or storage-backed properties by design: a choice's construction *is* case selection — a user constructor would have to pick a case, which the qualified case form already spells — and independent instance storage alongside the payload union would make every value part-product-part-sum, destroying the one-active-case invariant that exhaustiveness and disposal both lean on.
+
+<a id="sec-choice-construction"></a>
+### 35.3 Construction and payload ownership
+
+Construction is qualified, resolving exactly as enum constants do ([§10.1](#sec-basic-syntax)): `FetchOutcome.NotModified` for a payload-free case (a value expression, not a call), `FetchOutcome.Failed(504, "upstream timeout")` for a payload case. Within a `case` over a choice scrutinee the prefix may be omitted in patterns ([§35.5](#sec-choice-matching)); in expression position the qualified form is required, exactly as for enum constants outside their scrutinee. For a **generic** choice the type arguments are written at the construction (`Result<int, string>.Ok(value)`): [§14.5](#sec-type-argument-inference)'s posture — type-level arguments are never inferred from constructor arguments — extends to case construction unchanged.
+
+Payload arguments bind to the case's payload fields as to a parameter list, and the `owned` payload marker has exactly an `owned` parameter's call-site semantics ([§22.3](#sec-parameter-modifiers), [§28.3](#sec-local-variables-ownership-and-borrows)):
+
+```bezel
+var resp := new Response(headers, stream);
+return FetchOutcome.Fetched(owned resp);      // call-site marker; resp is moved-from after
+```
+
+- An argument to an **owned payload slot** is an owned-consuming position (the [K3.3](#sec-kernel-k3) `owned`-argument position): a fresh producer or unbound owned temporary transfers with no marker (no live binding is invalidated); a named owned binding requires the [§22.3](#sec-parameter-modifiers) call-site marker (`owned resp`) and is left moved-from; the consume-site freeze ([K5](#sec-kernel-k5)) rejects the transfer while a live local borrow of the binding exists.
+- An argument to a **plain class- or interface-typed payload slot** is a borrow, and [§9.7](#sec-records-and-disposal)'s **no-temporary-source rule** applies verbatim: constructing a borrow-bearing choice from a temporary bound to a borrow-carrying payload is rejected (bind the source to a named local first).
+- Value, `string`, and runtime-managed payload arguments copy or share per their type kinds.
+
+The constructed value's own ownership follows its classification ([§35.4](#sec-choice-classification)): a value-like construction is an ordinary value; a borrow-bearing construction is a borrow-carrying value under §9.7's rules; an owning construction is an **owned move-only value** — [§28.3](#sec-producers)'s producers rows for move-only values cover it (the caller takes ownership and discharges by binding, storing, returning, or consuming it), and a construction not bound to any name is an unbound owned temporary under [K8](#sec-kernel-k8)'s full-expression machinery.
+
+A method returning an owning choice writes the plain type (`method Fetch(url: string): FetchOutcome`); `owned` on the return is admitted-but-redundant per [§28.1](#sec-where-the-owned-modifier-can-appear)'s move-only clause, exactly as for owning inline arrays.
+
+<a id="sec-choice-classification"></a>
+### 35.4 The classification
+
+The **choice classification** is a derived type property ([§3.6](#sec-derived-type-properties)) computed from the payload fields of *all* the choice's cases:
+
+1. A choice is **owning** if any case has a payload field marked `owned` (a class, interface, or — at a class or interface instantiation — bare-type-parameter payload), or a payload field of a move-only value type ([§15.3](#sec-move-only-value-types) — an owning inline array or another owning choice, transitively).
+2. Otherwise, a choice is **borrow-bearing** if any case has a *borrow-carrying* payload field, under exactly [§9.7](#sec-records-and-disposal)'s definition: a plain (unmarked) field of class or interface type (nullable or not); an inline-array field with reference-typed elements; a borrow-bearing record; or — transitively — a borrow-bearing choice.
+3. Otherwise the choice is **value-like**: every payload is a value, a `string`, a runtime-managed type, or (transitively) a value-like record or choice. A value-like choice is an ordinary copyable value type.
+
+Payloads of runtime-managed reference types (`string`, function types, boxed values) are classification-neutral, exactly as in [§9.7](#sec-records-and-disposal): such values have unbounded lifetime by construction.
+
+**Borrow-bearing choices** are subject to [§28.3](#sec-local-variables-ownership-and-borrows)'s borrow-lifetime rules through [§9.7](#sec-records-and-disposal)'s bullet list, applied verbatim with "record" read as "record or choice": a borrow-bearing choice value may not outlive any carried borrow's source; may not be constructed from a temporary source; may not be stored in a class instance field or (outside the null-source form) a static field; is constrained in returns, closures, and collection copies; and is forbidden as an `async` method's parameter or result ([§30.1](#sec-async-methods)). A live local of borrow-bearing choice type counts as a live local borrow of every carried borrow's source for the consume-site freeze ([K5.5](#sec-kernel-k5)), exactly as for records.
+
+**Owning choices are move-only value types** ([§15.3](#sec-move-only-value-types)). Every §15.3 rule applies as written: local-to-local assignment moves (unmarked — copies are impossible, so there is nothing for a marker to disambiguate); parameter passing is by value-move; return transfers; a move-only value may be a class field (the class's destructor disposes it) and may not be a record field; locals are auto-disposed at scope end with the must-use warning ([K3.14](#sec-kernel-k3)); exception edges discharge implicitly ([K3.15](#sec-kernel-k3)); `using var` is admitted with pin-only effect. Two owning-choice rules are *stronger* than the owning-inline-array precedent, deliberately:
+
+- **Disposal is defined by the active case.** Disposing an owning choice value disposes the active case's `owned` payloads (in payload declaration order) and, recursively, any move-only payloads; payload-free and value-payload cases dispose nothing. There is no per-slot moved-from state to consider: payloads are reachable only through matching, never as assignable slots — the value is always wholly owned or wholly moved-from.
+- **Drop-on-overwrite is defined and automatic** (derives: [K3.11](#sec-kernel-k3)). Whole-value reassignment of an owning-choice local or field *disposes the displaced value* per [§28.7](#sec-reassigning-owned-fields), like an owned class binding — **not** like [§15.3](#sec-move-only-value-types)'s owning-inline-array reassignment rule (the warning-backed manual discipline): that rule exists because an inline array's slots can be individually moved-from, leaving a partial state the compiler cannot cheaply dispose, and a choice has no partial states, so the sound automatic behavior is available and taken. Reassignment is a consume of the displaced value and is frozen while borrows of it live ([K5.2](#sec-kernel-k5)). `x := null;` on an owned `C?` location likewise disposes the displaced value's payloads ([§35.9](#sec-choice-nullable)).
+
+<a id="sec-choice-matching"></a>
+### 35.5 Matching
+
+<a id="sec-choice-borrowing-match"></a>
+#### The borrowing match (the default)
+
+Matching a choice value **non-destructively** is the default everywhere, and [§19.3](#sec-patterns)'s rules apply verbatim: a pattern binding is a borrow whose source is the scrutinee's source; the scrutinee retains its ownership state; the construct never moves from the scrutinee. For a value-like choice, payload bindings are copies (value payloads) or shared references (`string`/runtime-managed payloads); for borrow-bearing and owning choices, class-typed payload bindings are borrows. An **unmarked read of a named owned binding in scrutinee position stays a borrowing match** — [§19.3](#sec-patterns)'s move-only scrutinee rule, now load-bearing: it is what makes *peeking* at an owned outcome legal and non-consuming.
+
+```bezel
+var outcome := client.Fetch(url);       // owned move-only local
+case outcome of                          // borrowing match; outcome unchanged
+  Failed(var s, _) when s >= 500 => ScheduleRetry(),
+  _                              => ()
+end;
+// outcome is still owned here; discharge or auto-drop per §28.3.
+```
+
+<a id="sec-owning-match"></a>
+#### The owning match
+
+An **owning match** transfers the selected case's `owned` payloads into the arm's bindings and consumes the scrutinee value. It is triggered in exactly two scrutinee forms — both *announced*, in the [§28.3](#sec-local-variables-ownership-and-borrows) sense that something at the site tells the reader the value is consumed:
+
+1. **An unbound owned temporary** of owning-choice classification — a fresh construction, an owning-choice-returning call, a `move` result. This is the dominant shape and needs no marker, as fresh producers never do:
+
+   ```bezel
+   case client.Fetch(url) of                 // owning match over the temporary
+     Fetched(var r)       => RenderOwned(owned r),   // r: owned Response in the arm
+     NotModified          => RenderCached(),
+     Failed(var s, var m) => ShowError(s, m)
+   end;
+   ```
+
+   The scrutinee temporary's full expression is the **whole `case` construct** — [K8.3](#sec-kernel-k8), applied unchanged — so payloads not transferred into bindings (discarded slots like `Fetched(_)`, and the payloads of the value when a `_` or non-destructuring arm is selected) are disposed when the construct completes, by the same unbound-temporary pass that disposes the container. An exception out of an arm disposes the not-yet-consumed remainder during unwinding ([K3.15](#sec-kernel-k3)).
+
+2. **A named owned binding under an explicit scrutinee transfer marker** — `case owned outcome of …` (derives: [K3.4](#sec-kernel-k3)'s marked-transfer family; frozen per [K5.1](#sec-kernel-k5)). This is the v0.180 marker discipline ([§28.3](#sec-local-variables-ownership-and-borrows) *Move semantics for owned locals*) extended to scrutinee position, with its exact rules: the marker is required because the unmarked read is a borrow (above), an unmarked read never silently consumes, the marker on a borrowed or fresh-producer scrutinee is an error, and the consumed binding is left **moved-from** when the construct completes. Because the transfer hands payloads **alive** to the arm's bindings — no disposed flag is set, nothing faults — the consume is frozen while a live local borrow of the binding's value exists, precisely the reasoning that froze the owning-iterator `yield return` ([§29.2](#sec-iterator-yield-ownership)) and left Pattern B `await` unfrozen ([§30.5](#sec-result-lifetime-and-task-disposal) sets the disposed flag; this construct does not). *(The marker here is not the admitted-but-redundant no-op [§28.1](#sec-where-the-owned-modifier-can-appear) makes it in other move-only positions: scrutinee position has an unmarked borrow reading to disambiguate, so the marker carries meaning.)*
+
+   ```bezel
+   var outcome := client.Fetch(url);
+   case owned outcome of                     // marked consume; outcome moved-from after `end`
+     Fetched(var r) => do
+       using var resp := owned r;            // adopt: scope-bound disposal (§28.10)
+       Render(resp);
+     end,
+     NotModified          => RenderCached(),
+     Failed(var s, var m) => ShowError(s, m)
+   end;
+   ```
+
+In an owning match, an `owned`-payload binding (`var r` above) is an **owned local of the arm body's scope**, and [§28.3](#sec-local-variables-ownership-and-borrows)'s standard rules apply to it on every arm-exit edge — the [§29.2](#sec-iterator-yield-ownership) owning-iteration-variable model: falling off the arm still owning the value auto-drops it with the must-use warning naming the binding and the standard remedies (`using var u := owned r;` adoption in a `do … end` arm, an owned-consuming call, an explicit `r.Dispose()`, `_ := r;`); exception edges discharge implicitly. In *expression-position* arms (which cannot contain statements, [§19.2](#sec-arms)), the warning-free discharges are an owned-consuming call (`RenderOwned(owned r)`) or §19.2's helper-method extraction. Value payloads bind as copies; discarded owned slots (`Fetched(_)`) are disposed at construct completion as above. Nested destructuring of an owned payload does not arise: owned payloads are class- or interface-typed, and classes do not destructure ([§19.3](#sec-patterns)).
+
+**What does not trigger an owning match:** an unmarked named-binding scrutinee (borrowing, above); a borrowed scrutinee of any provenance (field read, parameter, `this`); and the position of the *construct's result* — whether the `case`'s value flows into an owned slot is the [§28.3](#sec-producers) arm-meet row's business and has no bearing on how the scrutinee is consumed.
+
+<a id="sec-owning-match-guards"></a>
+#### Guards: borrow during trial, transfer on selection
+
+In an owning match, pattern bindings are **borrows of the scrutinee's payloads during pattern matching and guard evaluation**; ownership transfers into the selected arm's bindings **when an arm is selected** (its pattern matched and its guard, if any, evaluated true). A guard therefore observes borrows and cannot consume a binding (owned-consuming positions reject a borrow); after selection, the arm body sees the bindings in their owning-match states.
+
+If **no arm** of an owning match selects: in statement position the construct completes with no action and the consumed value's payloads are disposed at construct completion (the value was consumed by the announced form; its contents have nowhere to go); in expression position `MatchFailureException` is raised ([§19.6](#sec-exhaustiveness)) and the payloads are disposed during unwinding by the standard exception-path machinery. Exhaustive matches — the normal case — never reach either.
+
+<a id="sec-case-patterns"></a>
+#### Case patterns
+
+- A **payload-free case** is matched by its bare name (`NotModified`) — a constant-style pattern resolving through the scrutinee-type prefix-omission rule, extended from enums ([§10.6](#sec-case-matching), [§19.8](#sec-inside-enum-scrutinees)): within a `case` whose scrutinee is a choice, the choice prefix may be omitted. A name resolving to a case is a case pattern, never a type test.
+- A **payload case** is matched by a positional destructuring pattern `CaseName(slot, …)` with the case's exact payload arity — grammar A.7's existing destructuring production. All [§19.3](#sec-patterns) slot rules carry over: naked identifiers bind, `var x` binds explicitly, `_` discards per slot, per-slot `|` alternatives among binding-free members, nested patterns recurse.
+- A payload case may **not** be matched bare: `Fetched` without parentheses is a compile error naming the arity — matching a payload while ignoring it is spelled visibly as `Fetched(_)`, the same explicitness §19.3 demands of record destructuring arity.
+- Payload-free case names are admissible members of `|` **alternative lists** (and count toward exhaustiveness, [§19.6](#sec-exhaustiveness)); payload-carrying case patterns are not, even in the all-discard form — they are destructurings, not constants ([§19.3](#sec-patterns)).
+
+<a id="sec-owning-match-traces"></a>
+#### Disposal traces (the four paths of an owning match)
+
+All four paths ride existing machinery; none introduces a new disposal-site kind.
+
+**(a) Normal path, payload bound and adopted.**
+
+```bezel
+case client.Fetch(url) of
+  Fetched(var r) => do
+    using var resp := owned r;   // r moved into resp; resp disposed at arm-body end
+    Render(resp);
+  end,
+  NotModified          => RenderCached(),
+  Failed(var s, var m) => ShowError(s, m)
+end;
+```
+
+The scrutinee temporary is produced owned; arm selection transfers the payload's ownership into `r`; the adopt idiom moves it into `resp`, disposed at the `do … end` block's close; the container value, now payload-empty, is reclaimed at construct completion with nothing left to dispose. Exactly one disposal of the payload, at a statically known site.
+
+**(b) Normal path, payload discarded.**
+
+```bezel
+case client.Fetch(url) of
+  Fetched(_)  => Count("hit"),     // owned payload never bound
+  _           => Count("other")
+end;
+```
+
+The `Fetched(_)` discard binds nothing; the payload stays with the consumed scrutinee value and is disposed at construct completion by the unbound-temporary pass — the "disposal runs after every use within the expression" ordering [K8.1](#sec-kernel-k8) defines. The `_` arm on a `NotModified`/`Failed` value disposes nothing (those cases carry no owned payloads).
+
+**(c) Guard-declined path.**
+
+```bezel
+case owned outcome of
+  Fetched(var r) when r.IsStale() => do _ := r; RefetchLater(); end,
+  Fetched(var r)                  => do using var resp := owned r; Render(resp); end,
+  _                               => ()
+end;
+```
+
+During the first arm's guard, `r` is a **borrow** — `r.IsStale()` is an ordinary borrowing call, and a consuming use in the guard would be rejected. If the guard declines, no transfer has happened; the second arm's selection performs it. Two arms binding the same payload are two candidate *recipients*, not two owners: transfer happens once, at selection.
+
+**(d) Exception path.**
+
+```bezel
+case owned outcome of
+  Fetched(var r)       => do Validate(r); Publish(owned r); end,   // Validate may throw
+  NotModified          => (),
+  Failed(var s, var m) => throw new UpstreamException(m)
+end;
+```
+
+If `Validate(r)` throws, `r` — an owned local of the arm-body scope — is disposed by the exception-path discharge ([K3.15](#sec-kernel-k3)) exactly as any owned local is; the consumed scrutinee (already payload-transferred) has nothing further to dispose. If the `Failed` arm's `throw` runs, that case's payloads are values and need no disposal; an owned payload in a throwing arm is covered by the same unwind pass. The moved-from `outcome` binding is skipped by every pass, as always.
+
+<a id="sec-choice-diagnostics"></a>
+#### Diagnostics
+
+Per [§3.6](#sec-derived-type-properties) rule 4, the new errors name the classification and the rule. Recommended messages:
+
+- *"Payload case `Fetched` requires a payload pattern: write `Fetched(...)` with 1 slot, or `Fetched(_)` to discard."*
+- *"`case owned` requires a named owned binding of an owning choice type as its scrutinee; `x` is borrowed."* / *"… is a fresh producer, which needs no marker."*
+- *"Cannot consume `outcome` here: the borrow held by `b` (declared at line N) is still live."* ([§28.3](#sec-local-variables-ownership-and-borrows)'s freeze message, reused.)
+- *"`FetchOutcome` is an owning choice (owned payload `response` of case `Fetched`); it cannot be boxed / is not sendable / does not satisfy `new()`."* — each property-keyed rejection naming the payload that decides the classification.
+- *"Case arm does not cover `Failed`: its slot pattern `>= 500` is refutable; static exhaustiveness counts only irrefutable-slot arms."* ([§19.6](#sec-exhaustiveness)'s one-level rule, made legible.)
+- The must-use warning at an owning-match binding's implicit drop names the binding and the arm-position remedies.
+
+<a id="sec-choice-exhaustiveness"></a>
+### 35.6 Exhaustiveness
+
+The static-proof rule for choice scrutinees is [§19.6](#sec-exhaustiveness)'s choice bullet: coverage is counted **per case name, one level deep** — a payload-free case by a constant-style pattern naming it (directly or in a `|` list), a payload case by a destructuring whose every slot is irrefutable. Guarded arms and refutable-slot arms contribute nothing to the static proof. Because the case set is closed by the declaration, exhaustiveness holds across module boundaries, and adding a case to a published choice is a source-breaking change for consumers exactly as adding a sealed leaf is.
+
+Generic choices need no determination machinery: for `case r of Ok(var v) => …, Error(var e) => … end` over a `Result<int, ParseError>` scrutinee, coverage is by case *name* — the bindings simply take the substituted payload types. The [§19.6](#sec-exhaustiveness) generic-leaves determination rule exists because class-hierarchy sums put the discriminant in the runtime *type*; a choice's discriminant is a name, and the problem does not arise. Nested refutable patterns (`Ok(0)`) are admitted syntactically and contribute nothing statically; a program wanting nested totality writes nested `case` constructs, which are proven exhaustive level by level.
+
+<a id="sec-choice-equality"></a>
+### 35.7 Equality, hashing, `ToString`
+
+A **value-like** choice is **auto-equality-bearing** ([§3.6](#sec-derived-type-properties), the [§9.2](#sec-body-records) property) when every payload field of every case is a [§9.2](#sec-body-records) admissible component type, with one addition to the recursive rule: another auto-equality-bearing choice is admissible. The generated `=` is true exactly when both operands have the same active case and every corresponding payload compares equal by its type's `=`; the generated `GetHashCode` combines the case discriminant with the per-payload hashes (order-sensitive, [§8.3](#sec-equals-and-gethashcode)); the generated `ToString` produces `"TypeName.CaseName(field1: value1, …)"`, and `"TypeName.CaseName"` for a payload-free case. Methods, computed properties, statics, and non-equality operators neither qualify nor disqualify, per §9.2's membership list.
+
+A choice that is **not** auto-equality-bearing — any borrow-bearing or owning choice (class-typed payloads are outside the admissible-component rule, exactly as class-typed record fields are), and any value-like choice with an inadmissible payload — draws [§9.2](#sec-body-records)'s **use-site compile error** on `=`, `<>`, and direct `Equals`/`GetHashCode` calls, unless the author declares the operators under [§25.2](#sec-operator-overloading-restrictions)'s co-declaration rule. Declaring the choice is fine; comparing it is the error, with the same remedies §9.2 names. *(This follows the record precedent, not [§15.3](#sec-move-only-value-types)'s inline-array borrowing-equality precedent: reference equality smuggled inside a value type's `=` is virtually never the intended semantics — rationale [§9.6](Bezel_Design_Rationale.md#sec-choices-why-a-new-kind).)*
+
+Value-like auto-equality-bearing choices are **equality-bearing** and usable as hash-container keys; the other classifications are not ([§3.6](#sec-derived-type-properties)'s equality-bearing row, unchanged).
+
+<a id="sec-choice-boxing"></a>
+### 35.8 Boxing and interfaces
+
+Boxing follows the classification, each arm riding an existing [§8.6](#sec-boxing) rule:
+
+- **Value-like** choices box per the general rule; the box is runtime-managed.
+- **Borrow-bearing** choices box under §8.6's borrow-bearing-record rules verbatim: the boxed copy carries the same borrows, extends no lifetime, and may not escape the sources' scopes.
+- **Owning** choices **cannot be boxed** — §8.6's move-only rule, word for word: boxing copies, move-only forbids copying. A program that needs an owning choice's contents to cross a boxed-value boundary transfers the payloads out through a consuming match first.
+
+A choice may declare interface conformance (interfaces only, as for records — [§9.6](#sec-records-and-inheritance)), providing matching public members per [§10.5](#sec-restrictions)'s enum model; [§14.2](#sec-constraints)'s conformance rule gains the corresponding choice clause. For an **owning-classified** choice the conformance declaration remains legal — constraint satisfaction and generic dispatch work without boxing — but the *conversion* of an owning value to an interface or `Object` type is rejected at the conversion site (it is a boxing, forbidden above). For a generic choice this is per-instantiation ([§3.6](#sec-derived-type-properties) rule 2): a conformance-declaring choice converts at value-like instantiations and rejects at owning ones.
+
+`Dispose` stays off the surface everywhere: choices do not implement `IDisposable` ([§8.7](#sec-dispose-is-not-on-object)) — an owning choice's disposal obligation is discharged by its *holder* (scope end, owning field, consuming match), never by calling `Dispose()` on it, exactly as for owning inline arrays.
+
+<a id="sec-choice-nullable"></a>
+### 35.9 Nullable `C?`
+
+`C?` is the ordinary nullable value type ([§7.2](#sec-nullable-value-types)): a `C?` scrutinee adds [§19.6](#sec-exhaustiveness)'s explicit-`null`-arm requirement on top of the choice clause; `?.`/`??`/narrowing compose as for any nullable; boxing strips the wrapper per [§8.6](#sec-boxing)'s nullable-value-type rule (for the boxable classifications).
+
+For an **owning** `C`, the wrapper `C?` is itself move-only (it contains a move-only value), with two consequences: `null` assignment into an owned-state `C?` location is drop-on-overwrite — the displaced value's payloads are disposed ([§35.4](#sec-choice-classification)) — and `default(C?)` is a valid null move-only value, on the precedent of [§17.11](#sec-the-default-operator)'s owning-inline-array form. The polymorphic-null-state row of [§28.3](#sec-producers)'s producers table applies to `var x: C? := null;` unchanged.
+
+<a id="sec-choice-default-with"></a>
+### 35.10 `default`, `with`, and the small surface
+
+- **`default(C)` is a compile error for every choice type** ([§17.11](#sec-the-default-operator)). A sum has no principled zero: electing the first-declared case would make program meaning depend on declaration order, and restricting eligibility to first-case-payload-free would make *eligibility* order-dependent, which is worse. The enum precedent (underlying-0 with a warning) does not transfer — an enum value *is* its integer ([§10.3](#sec-underlying-type)) and 0 exists whether or not named; a choice value is a case, and no case is distinguished. Consequences: choices never satisfy `where T: new()`'s value-type arm ([§14.2](#sec-constraints) keys it on `default`); `serialized skip` on a choice-typed component requires the nullable form ([§9.8](#sec-serialization-synthesis)'s skip rule reaches this by itself). Programs wanting an empty state declare a payload-free case and construct it explicitly, or use `C?`.
+- **`with` does not apply to choices.** [§9.5](#sec-non-destructive-update-with) requires a record-typed source; a choice's payloads are not independently replaceable storage (replacing one field of `Failed` is constructing a new `Failed`). A `with` over a choice-typed source is a compile error naming the remedy (construct the case anew).
+- `nameof(FetchOutcome.Failed)` yields `"Failed"` ([§17.9](#sec-the-nameof-operator)); `typeof(FetchOutcome)` is ordinary; `is`/`as` over choice types follow value-type rules ([§17.4](#sec-the-is-is-not-and-as-operators)) and are rarely useful — the static type is always exact, choices being sealed.
+- The discard `_ := c;` on an owning-choice value follows [§17.13](#sec-the-discard-_)'s move-only discard clause verbatim (disposes at end of statement).
+
+<a id="sec-choice-generics"></a>
+### 35.11 Generics
+
+A choice may declare type parameters and constraints, as records do; payload fields may use the parameters. Classification is evaluated **per instantiation** under [§3.6](#sec-derived-type-properties) rule 2, with the payload marker's meaning fixed by [§28.1](#sec-where-the-owned-modifier-can-appear)'s per-instantiation erasure: a choice with `Ok(owned value: T)` is value-like at `T = int` (marker erased, payload an admissible value) and owning at `T = Connection` (marker means owned). An *unmarked* bare-type-parameter payload is classification-neutral at value and runtime-managed substitutions and **borrow-carrying** at class and interface substitutions — the same reading as a concrete unmarked class payload, making the marked/unmarked split uniform at every level of genericity: unmarked class payload = borrow (borrow-bearing choice), marked = owned (owning choice).
+
+Method bodies of a generic choice type-check once, against `this`-as-borrow ([§35.2](#sec-choice-members)), so their checking is classification-independent; classification-dependent *admissibility* rules — boxing conversions, sendability, equality, conformance conversion — are enforced at the instantiation or use site with [§3.6](#sec-derived-type-properties) rule 2's diagnostics.
+
+The choice classification's per-instantiation *behavior* consequences (copy vs. move on assignment; disposal vs. none at scope end) fall under [§3.6](#sec-derived-type-properties)'s behavior-dispatch reservation as its second scoped exception: the dispatch is performed by the language on a language construct — derived from structure, identical for every user, with no user-programmable hook. Users still cannot write code conditioned on a type parameter's category.
+
+**No variance.** Variance attaches to interface and function-type parameters only ([§12.9](#sec-variance), [§14.3](#sec-generics-variance)); choices, like records and classes, are invariant. A `Result<Derived, E>` is not a `Result<Base, E>`; the conversion is an explicit re-wrap by match.
+
+<a id="sec-choice-sendability"></a>
+### 35.12 Sendability
+
+A choice is **sendable** ([§30.14](#sec-sendable-types)) iff it is value-like and every payload field's type is sendable — the §30.14 value-type rule ("not borrow-bearing and not move-only") with the per-field transitivity the classification computation already supplies; a sendable choice crosses as a copy. Borrow-bearing choices are never sendable (they carry origin-domain borrows). **Owning choices are not directly sendable** — the §30.14 move-only exclusion, unchanged — but §30.14's transfer-closure rule 2 admits an owning-choice-typed field whose every `owned` payload class is itself a sendable class type as a field of a transfer-closed class; such a value crosses inside its owner's ownership tree, exactly as owning-inline-array fields do.
+
+<a id="sec-choice-ffi"></a>
+### 35.13 FFI and serialization
+
+Choices are **not FFI-compatible** ([§32.5](#sec-ffi-compatible-types)): the honest C spelling of a sum — a tag plus a union, with the tag discipline by convention — carries real ABI questions (union layout, tag width, niche packing), and [§32.13](#sec-c-compatible-records)'s layout-promise machinery is the future home if demand materializes. The in-memory layout of a choice (tag and payload representation, niche packing) is implementation-defined; only the value-type semantics of this section are normative.
+
+Serialization synthesis for value-like choices — the `$case`-discriminated object form — is specified in [§9.8](#sec-serialization-synthesis).
+
+---
+
 <a id="sec-appendix-a"></a>
 ## Appendix A: Grammar
 
@@ -9273,6 +9563,7 @@ Import          ::= "import" QualifiedName ("as" Identifier)? ";"
 QualifiedName   ::= Identifier ("." Identifier)*
 
 TopDecl         ::= ClassDecl | InterfaceDecl | RecordDecl | EnumDecl
+                  | ChoiceDecl
                   | ExtensionDecl | TypeAliasDecl | ExternBlock
 TypeAliasDecl   ::= "type" Identifier GenericParams? ":=" Type
                               /* The alias binds with `:=`, like every other
@@ -9378,6 +9669,31 @@ EnumInheritance ::= ":" IntegerType ("," InheritItem)*
                                  token after `:` is an IntegerType keyword. */
 EnumConstants   ::= EnumConstant ("," EnumConstant)* ";"
 EnumConstant    ::= Identifier (":=" ConstExpr)? SerializedClause?
+
+ChoiceDecl      ::= Visibility? "choice" Identifier GenericParams?
+                    Inheritance?
+                    GenericConstraints*
+                    ChoiceCases
+                    ChoiceMember* "end" Identifier? ";"
+ChoiceCases     ::= ChoiceCase ("," ChoiceCase)* ";"
+ChoiceCase      ::= Identifier CasePayload? SerializedClause?
+                              /* SerializedClause on a case admits the rename
+                                 form only; `skip` and `optional` are rejected
+                                 semantically, as on enum constants (§9.8). */
+CasePayload     ::= "(" CaseField ("," CaseField)* ")"
+CaseField       ::= "owned"? Identifier ":" Type SerializedClause?
+                              /* The payload field form is PositionalField plus
+                                 the optional leading `owned` marker; the
+                                 marker's admissibility follows §28.1's type
+                                 requirement, including the bare-type-parameter
+                                 erasure. Inheritance names interfaces only
+                                 (as for records). §35.1. */
+ChoiceMember    ::= MethodDecl | ExpressionPropertyDecl
+                  | StaticReadonlyDecl | StaticConstDecl
+                  | OperatorDecl
+                              /* Identical to EnumMember; kept as a named
+                                 production so the two sections can restrict
+                                 independently if they ever diverge. */
                               /* `serialized "name"` on an enum constant
                                  customizes that member's serialized name
                                  (§9.8). `serialized skip` and `serialized
@@ -10000,7 +10316,14 @@ LambdaSlot      ::= Identifier | "_" | LambdaDestructure
 LambdaBody      ::= Expression
                   | "do" Statement* "end"
 
-CaseExpr        ::= "case" Expression "of" CaseArm ("," CaseArm)* ","? "end" "case"?
+CaseExpr        ::= "case" "owned"? Expression "of" CaseArm ("," CaseArm)* ","? "end" "case"?
+                              /* The optional `owned` is the scrutinee transfer
+                                 marker (§35.5): admitted only when the scrutinee
+                                 is a named owned binding of owning-choice
+                                 classification; anywhere else it is a compile
+                                 error. `owned` is a reserved keyword, so no
+                                 expression can begin with it and the parse is
+                                 unambiguous. */
                               /* The scrutinee Expression is mandatory (#744);
                                  the scrutinee-less condition-dispatch form is
                                  the separate WhenExpr below. `of` delimits the
@@ -10017,7 +10340,8 @@ AltPattern      ::= Pattern ("|" Pattern)*
                                  separator, so no `=>` lookahead is needed and
                                  alternatives are available per positional slot
                                  (see PositionalPattern). `|`-joined members must
-                                 be binding-free: constants, ranges, or
+                                 be binding-free: constants, payload-free choice
+                                 case names (§35.5, v0.200), ranges, or
                                  relationals (§19.3, v0.183). `|` never collides with
                                  bitwise-or: pattern-embedded expressions parse
                                  at Shift level or tighter (§19.3). */
@@ -10119,7 +10443,7 @@ ConstExpr       ::= Expression           /* §17.14 constant expression */
 Constant        ::= "-"? (IntLiteral | FloatLiteral)
                   | CharLiteral
                   | StringLiteral | "true" | "false" | "null"
-                  | QualifiedName        /* enum constant or const reference */
+                  | QualifiedName        /* enum constant, choice case (§35.5), or const reference */
 ```
 
 `Literal` is the form referenced by `PrimaryAtom`; it includes interpolated strings since they are expressions. `Constant` is the restrictive form used in `case` patterns **only** (v0.184); it omits `InterpString` (interpolated strings are not compile-time constants) and adds `QualifiedName` for enum constants and named constant references. `ConstExpr` is an `Expression` restricted semantically to the compile-time constant expressions of [§17.14](#sec-constant-expressions), which defines the admissible forms and the compile-time evaluation, including its faults.
@@ -10136,7 +10460,7 @@ The following identifiers are keywords. Most are reserved unconditionally and ma
 
 **Unconditionally reserved:**
 
-`abstract`, `and`, `as`, `async`, `await`, `base`, `bool`, `break`, `byte`, `case`, `catch`, `char`, `class`, `const`, `constructor`, `continue`, `decimal`, `default`, `destructor`, `do`, `double`, `elif`, `else`, `end`, `enum`, `extension`, `extern`, `false`, `finally`, `float`, `for`, `if`, `import`, `in`, `int`, `interface`, `internal`, `is`, `long`, `method`, `mod`, `module`, `move`, `nameof`, `new`, `not`, `null`, `or`, `out`, `owned`, `override`, `private`, `property`, `protected`, `public`, `readonly`, `record`, `ref`, `return`, `sbyte`, `sealed`, `short`, `static`, `string`, `then`, `this`, `throw`, `true`, `try`, `type`, `typeof`, `uint`, `ulong`, `ushort`, `using`, `var`, `virtual`, `when`, `where`, `while`, `with`, `yield`.
+`abstract`, `and`, `as`, `async`, `await`, `base`, `bool`, `break`, `byte`, `case`, `catch`, `char`, `choice`, `class`, `const`, `constructor`, `continue`, `decimal`, `default`, `destructor`, `do`, `double`, `elif`, `else`, `end`, `enum`, `extension`, `extern`, `false`, `finally`, `float`, `for`, `if`, `import`, `in`, `int`, `interface`, `internal`, `is`, `long`, `method`, `mod`, `module`, `move`, `nameof`, `new`, `not`, `null`, `or`, `out`, `owned`, `override`, `private`, `property`, `protected`, `public`, `readonly`, `record`, `ref`, `return`, `sbyte`, `sealed`, `short`, `static`, `string`, `then`, `this`, `throw`, `true`, `try`, `type`, `typeof`, `uint`, `ulong`, `ushort`, `using`, `var`, `virtual`, `when`, `where`, `while`, `with`, `yield`.
 
 **Contextual (see [§B.2](#sec-contextual-keywords)):**
 
@@ -10195,6 +10519,8 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - Implicit conversions occur only as listed in [§5.1](#sec-implicit-conversions).
 - When more than one overload is applicable to a call only because arguments match through different implicit conversions ([§5.1](#sec-implicit-conversions)), the call resolves to the candidate that is unambiguously better — exact on every argument where another candidate converts, and never worse. An exact match is preferred over any implicit conversion; built-in implicit conversions are not ranked against one another. If no candidate is unambiguously better, the call is ambiguous and is a compile error citing the candidates ([§22.6](#sec-implicit-conversion-ranking)); the programmer disambiguates with an explicit cast. This mirrors overloaded method-reference resolution ([§27.6](#sec-method-references-to-overloaded-methods)). A candidate applicable without filling any parameter default is preferred over one that fills defaults ([§22.6](#sec-implicit-conversion-ranking), v0.181).
 - Generic-method type arguments are inferred per [§14.5](#sec-type-argument-inference): explicit lists are all-or-nothing; bindings for a type parameter must agree exactly (no common-supertype join); lambdas bind in a second phase; the call's target type only completes parameters the arguments left unbound; a failed inference makes that candidate inapplicable; and an otherwise-tied non-generic candidate beats a generic one — the last comparison before ambiguity, after the defaulted-arity tie-break ([§22.6](#sec-overloading), v0.184). Class/record-level type arguments are never inferred from constructor arguments.
+- A choice declares at least one case; case names are distinct and do not collide with member names; a choice has no destructors, constructors, instance fields, storage-backed properties, indexers, or nested types; a choice type does not contain itself through value-typed components ([§35.1](#sec-choice-declaration)).
+- `default(C)` is a compile error for every choice type C; choices never satisfy `where T: new()` ([§35.10](#sec-choice-default-with), [§14.2](#sec-constraints)).
 - A non-nullable reference may not be assigned `null`.
 - A nullable value may not be dereferenced without a null check or `!`.
 - Every non-nullable field is assigned in every constructor or has a field initializer.
@@ -10232,6 +10558,9 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 
 <a id="sec-appendix-c-resource-management"></a>
 ### C.3 Resource management
+
+- An owning-classified choice ([§35.4](#sec-choice-classification)) is a move-only value type: disposal disposes the active case's `owned` payloads exactly once, on every path — scope end, exception edges, drop-on-overwrite (which, for choices, disposes the displaced value automatically), discard, or a consuming match ([§35.5](#sec-owning-match)) ([K3](#sec-kernel-k3), [K5](#sec-kernel-k5)).
+- An owning-classified choice cannot be boxed, is not directly sendable, and does not implement `IDisposable`; its disposal is discharged by its holder ([§35.8](#sec-choice-boxing), [§35.12](#sec-choice-sendability)).
 
 - `Dispose()` is generated for every non-static class ([K4.1](#sec-kernel-k4)'s backstop machinery).
 - The compiler-generated `Dispose()` is thread-safe with respect to idempotency: concurrent calls execute disposal exactly once ([§28.2](#sec-the-idisposable-contract); K4.1).
@@ -10333,7 +10662,8 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - A type-pattern `T` does not bind; a `var name: T` pattern binds.
 - A type-pattern matches only non-null values; `null` matches only the `null` literal pattern, the `var` pattern, and `_`.
 - `step` is not used in patterns; it is a range modifier only.
-- A record-destructuring pattern's positional-binding count matches the record's positional-field count.
+- A record-destructuring pattern's positional-binding count matches the record's positional-field count; the same arity rule applies to choice-case destructuring, and a payload-carrying case may not be matched bare ([§35.5](#sec-choice-matching)).
+- A choice `case` with every declared case covered by an unguarded, irrefutable-slot arm is statically exhaustive with no `_` arm ([§19.6](#sec-exhaustiveness)); the marked owning-match scrutinee (`case owned x of`) is a consume subject to the freeze ([K5](#sec-kernel-k5)), and guard evaluation in an owning match observes borrows, with transfer at arm selection ([§35.5](#sec-owning-match-guards)).
 - Static exhaustiveness counts only **unguarded** arms; a `when`-guarded arm contributes nothing to the proof ([§19.6](#sec-exhaustiveness)).
 - A multi-type catch alternative in **binding** form requires the listed types' nearest common base to be more specific than `Object`; if it is `Object`, the binding form is a compile error (the non-binding form `Type1 | Type2` is unrestricted). The binding's static type is that nearest common base ([§31.2.1](#sec-arm-patterns), v0.182).
 - A generic type parameter used as a catch-arm type must carry a **class-type bound** (`where TEx: C` for a class `C`); an unconstrained, value-constrained, or `where TEx: class`-only parameter is a compile error, checked at the generic declaration ([§31.2.1](#sec-arm-patterns), v0.182).
@@ -10437,7 +10767,7 @@ An implementation may also conform at "Core plus named features" (e.g., *Core + 
 | **Buffers and spans** | the buffer/span clauses of [§28.11](#sec-collection-element-ownership) (`move` on `OwningBuffer`/`Span` slots) | stdlib §3.3, §4.14–4.16 |
 | **Sequence operations (LINQ-style)** | — | stdlib §5 entire |
 | **Shared ownership** | [§28.13](#sec-shared-ownership) | `Shared<T>`, `Weak<T>` (stdlib §2.16) |
-| **Move-only value types (owning inline arrays)** | [§15.1.1](#sec-owning-inline-arrays) and the `owned` slot marker of Appendix A.5's `InlineArrayType`; [§15.3](#sec-move-only-value-types); the move-only discard clause of [§17.13](#sec-the-discard-_); the owning-inline-array field clauses of [§28.5](#sec-owned-fields) (including the double-marking rejection) and [§22.13](#sec-static-initialization-order); the move-only clause of [§28.7](#sec-reassigning-owned-fields); the move-only row of [§28.11](#sec-element-slot-policy)'s element-category table; the owned-slot clauses of [§29.2](#sec-desugaring-of-for)'s inline-array desugaring and the move-only paragraph of [§29.8](#sec-iterators-with-owned-parameters); the move-only instantiation checks of [§7.10](#sec-generics-and-nullability) and [§14.2](#sec-constraints) (`where T: value`) | — |
+| **Move-only value types (owning inline arrays, owning choices)** | [§15.1.1](#sec-owning-inline-arrays) and the `owned` slot marker of Appendix A.5's `InlineArrayType`; [§15.3](#sec-move-only-value-types); the owning choice classification and its clauses — the `owned` payload marker's owning reading, the owning match ([§35.4](#sec-choice-classification)–[§35.5](#sec-owning-match)), the drop-on-overwrite rule, and the transfer-closure field clause of [§35.12](#sec-choice-sendability); the move-only discard clause of [§17.13](#sec-the-discard-_); the owning-inline-array field clauses of [§28.5](#sec-owned-fields) (including the double-marking rejection) and [§22.13](#sec-static-initialization-order); the move-only clause of [§28.7](#sec-reassigning-owned-fields); the move-only row of [§28.11](#sec-element-slot-policy)'s element-category table; the owned-slot clauses of [§29.2](#sec-desugaring-of-for)'s inline-array desugaring and the move-only paragraph of [§29.8](#sec-iterators-with-owned-parameters); the move-only instantiation checks of [§7.10](#sec-generics-and-nullability) and [§14.2](#sec-constraints) (`where T: value`) | — |
 
 Everything not listed is **Core**: lexical structure through generics, records, enums, classes, interfaces, inheritance, nullability, patterns and `case`, expressions and statements, operators and overloading, properties and indexers, the entire ownership system of [§28](#sec-resource-management) (except §28.12, §28.13, and the move-only value-type clauses of §28.5, §28.7, and §28.11 carved to the **Move-only value types** row above), synchronous iteration ([§29](#sec-iteration-2)'s non-async forms, including iterator methods and `IOwningEnumerable<T>`), exceptions ([§31](#sec-exception-handling)), the entry point, and the corresponding standard-library sections.
 
@@ -10446,7 +10776,7 @@ Everything not listed is **Core**: lexical structure through generics, records, 
 
 - Extended features depend on Core; Core depends on no Extended feature. The Core sections' references *into* Extended sections (e.g., [§28.3](#sec-local-variables-ownership-and-borrows)'s notes on async lambdas, [§9.7](#sec-records-and-disposal)'s span examples) are normative only for implementations of the referenced feature.
 - The async-iterator forms belong to **Asynchronous programming** and additionally require synchronous iteration (Core). **Buffers and spans**, **Sequence operations**, and **Shared ownership** depend only on Core. **Events**' async event source requires **Asynchronous programming**; the synchronous `EventSource<T>` does not, and neither do `ISharedEvent<T>`/`SharedEventSource<T>` (v0.187): their capture-free admission is ordinary [§28.14](#sec-scoped-callback-parameters) typing, and in a single-domain build the synchronization guarantee is satisfied vacuously; the deferred shared-async twin, if ever shipped, requires Asynchronous programming like `AsyncEventSource<T>`.
-- **Move-only value types** depend only on Core, and no other Extended feature depends on them: **Buffers and spans** does not (`OwningBuffer<T>`, `Span<T>`, and `ReadOnlySpan<T>` reject move-only element types, [§14.4](#sec-owned-as-a-generic-argument)); **Asynchronous programming** *references* them — [§30.14](#sec-sendable-types)'s transfer-closure rule 2 admits an owning-inline-array field, and [§30.1](#sec-async-methods)'s frame rule covers move-only parameters — but does not depend on them: an Extended section's references into another Extended feature's clauses are normative only for implementations of both features, the first bullet's rule for Core-section references into Extended sections generalized to Extended-to-Extended references.
+- **Move-only value types** depend only on Core (value-like and borrow-bearing choices are Core; only the owning classification is this row's), and no other Extended feature depends on them: **Buffers and spans** does not (`OwningBuffer<T>`, `Span<T>`, and `ReadOnlySpan<T>` reject move-only element types, [§14.4](#sec-owned-as-a-generic-argument)); **Asynchronous programming** *references* them — [§30.14](#sec-sendable-types)'s transfer-closure rule 2 admits an owning-inline-array field, and [§30.1](#sec-async-methods)'s frame rule covers move-only parameters — but does not depend on them: an Extended section's references into another Extended feature's clauses are normative only for implementations of both features, the first bullet's rule for Core-section references into Extended sections generalized to Extended-to-Extended references.
 - A Core implementation's standard library omits the types of unimplemented Extended features entirely (they are absent, not stubbed); programs referencing them fail name resolution with the feature-naming diagnostic of D.1.
 
 <a id="sec-conformance-and-the-runtime-model"></a>

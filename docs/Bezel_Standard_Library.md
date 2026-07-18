@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.199 — July 2026**
+**Companion to the Bezel Language Specification, v0.200 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -808,7 +808,7 @@ public class BinaryDeserializer: IDeserializer, IDisposable
 end BinaryDeserializer;
 ```
 
-**JSON mapping.** The `ISerializer` token stream maps to JSON as follows. `WriteInt`/`WriteUInt` produce JSON numbers; `WriteFloat` produces a JSON number, with non-finite values (`NaN`, `±Infinity`) raising `SerializationException` (JSON has no representation for them — a binary format is the correct choice when non-finite floats must round-trip). `WriteDecimal` produces a JSON number written without precision loss. `WriteBool` produces `true`/`false`; `WriteString` produces a quoted, escaped JSON string; `WriteChar` produces a one-character JSON string. `WriteNull` produces `null`. `BeginObject`/`WriteFieldName`/`EndObject` produce a JSON object; the `fieldCount` argument to `BeginObject` is advisory (JSON objects are not length-prefixed) and is ignored by `JsonSerializer`. `BeginArray`/`EndArray` produce a JSON array; the `elementCount` argument is likewise advisory. **Identity tokens (specified in v0.139):** the graph-identity operations of the synthesis (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis) — first-occurrence tags for `Shared<T>` identity participants and `$ref` back-references for `Weak<T>` and borrowing fields) map to JSON as follows: an object carrying an identity tag is written with a reserved first field `"$id": n` (a positive JSON number, unique per stream); a back-reference is written as the one-field object `{"$ref": n}` in place of the value. On the read side these forms are recognized positionally (an object whose first field is `"$id"` registers the tag; an object whose only field is `"$ref"` resolves it). Field names beginning with `$` are reserved for this mapping: a `serialized "<name>"` rename whose name begins with `$` is a compile error at the conformance declaration. The binary format's tag encoding is internal to it (§9.8's semantics; this paragraph is the JSON wire form only). On the read side, `JsonDeserializer.BeginObject()` and `BeginArray()` return `-1` (JSON does not prefix counts), so consumers use `ReadFieldName()` driven by the object's textual extent and `HasMoreElements()` for arrays. `TryReadNull()` consumes and returns `true` iff the next value is `null`.
+**JSON mapping.** The `ISerializer` token stream maps to JSON as follows. `WriteInt`/`WriteUInt` produce JSON numbers; `WriteFloat` produces a JSON number, with non-finite values (`NaN`, `±Infinity`) raising `SerializationException` (JSON has no representation for them — a binary format is the correct choice when non-finite floats must round-trip). `WriteDecimal` produces a JSON number written without precision loss. `WriteBool` produces `true`/`false`; `WriteString` produces a quoted, escaped JSON string; `WriteChar` produces a one-character JSON string. `WriteNull` produces `null`. `BeginObject`/`WriteFieldName`/`EndObject` produce a JSON object; the `fieldCount` argument to `BeginObject` is advisory (JSON objects are not length-prefixed) and is ignored by `JsonSerializer`. `BeginArray`/`EndArray` produce a JSON array; the `elementCount` argument is likewise advisory. **Identity tokens (specified in v0.139):** the graph-identity operations of the synthesis (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis) — first-occurrence tags for `Shared<T>` identity participants and `$ref` back-references for `Weak<T>` and borrowing fields) map to JSON as follows: an object carrying an identity tag is written with a reserved first field `"$id": n` (a positive JSON number, unique per stream); a back-reference is written as the one-field object `{"$ref": n}` in place of the value. On the read side these forms are recognized positionally (an object whose first field is `"$id"` registers the tag; an object whose only field is `"$ref"` resolves it). Field names beginning with `$` are reserved for this mapping (`$id`, `$ref`, `$type`, and — v0.200 — the choice case discriminator `$case`, language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)): a `serialized "<name>"` rename whose name begins with `$` is a compile error at the conformance declaration. The binary format's tag encoding is internal to it (§9.8's semantics; this paragraph is the JSON wire form only). On the read side, `JsonDeserializer.BeginObject()` and `BeginArray()` return `-1` (JSON does not prefix counts), so consumers use `ReadFieldName()` driven by the object's textual extent and `HasMoreElements()` for arrays. `TryReadNull()` consumes and returns `true` iff the next value is `null`.
 
 **Binary mapping.** The compact binary format is length-prefixed and self-describing enough to be read back without the schema, but it is *not* a stable interchange format across Bezel versions — it is intended for same-version persistence and IPC, where compactness and speed matter and the producer and consumer share a build. Integers use a variable-length encoding; `BeginObject`/`BeginArray` write the count, so `BinaryDeserializer.BeginObject()` and `BeginArray()` return the actual element count and `HasMoreElements()` is answered from it. Non-finite floats round-trip exactly (the format stores IEEE 754 bit patterns via `BitConverter`, [§2.12](#sec-bitconverter)). Programs needing a documented, version-stable wire format use JSON or an explicit hand-written format; the binary format trades interchange stability for size and speed.
 
@@ -948,6 +948,66 @@ end IParsable;
 Conformances: `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `float`, `double`, `decimal` conform to all three; `char` to `ISteppable<char>` and `IParsable<char>`. `string` conforms to none (concatenation is not addition; parsing a string to a string is meaningless). `Parse` is witnessed by the existing per-type members unchanged. For `TryParse`, the per-type members keep their non-nullable value-typed outs (the shape-(c) convention, [§1](#sec-conventions)); the **compiler-provided conformance bridges the out-nullability difference**, so `T.TryParse(s, out using var v)` **through the constraint** has the declared `out owned value: T?` shape (the marker erased at value substitutions, language spec [§28.1](Bezel_Language_Spec.md#sec-where-the-owned-modifier-can-appear)) while a **direct** call keeps `out result: T` (language spec [§11.8](Bezel_Language_Spec.md#sec-static-interface-members)).
 
 **Producer markers (v0.196).** Every §2.19 member that produces a value spells the production: `owned` returns on `Zero`, `One`, the four arithmetic operators, `Step`, and `Parse`, and the `out owned` slot on `TryParse` — arithmetic mints a *new* number, never one of its operands, so at a class or interface conformer each witness transfers a fresh value on every path (language spec [§28.8](Bezel_Language_Spec.md#sec-ownership-transfer)), which is what makes the [§11.8](Bezel_Language_Spec.md#sec-static-interface-members) `Sum<T>` accumulator sound there (each iteration's displaced total is disposed by drop-on-overwrite, language spec [§28.7](Bezel_Language_Spec.md#sec-reassigning-owned-fields)). The `<` operators return `bool` and carry no marker, and the free selectors `Math.Min`/`Max`/`Clamp` ([§2.2](#sec-math)) deliberately keep their bare-`T` borrow signatures — a selector transfers nothing. At every **value or runtime-managed** conformer the markers are erased by the substitution (language spec [§28.1](Bezel_Language_Spec.md#sec-where-the-owned-modifier-can-appear)): the primitive tower's intrinsic witnesses and any user record or enum conformer are declared — and remain — unmarked, matching the erased signatures exactly; only class and interface conformers spell the markers.
+
+<a id="sec-result"></a>
+### 2.20 `Result<T, E>` (v0.200)
+
+The outcome type for expected failure with information (language spec [§35](Bezel_Language_Spec.md#sec-choices)): a closed sum of a success payload and an error payload. Auto-imported. The stdlib ships exactly this one choice; `Option<T>` is deliberately absent — `T?` is Bezel's option type (proposals `DECLINED.md` D-0004).
+
+```bezel
+public choice Result<T, E>
+  Ok(owned value: T),
+  Error(owned error: E);
+
+  public method IsOk(): bool => case this of
+    Ok(_)    => true,
+    Error(_) => false
+  end;
+
+  public method IsError(): bool => not IsOk();
+end Result;
+```
+
+`T` and `E` are unconstrained; the `owned` payload markers follow the per-instantiation erasure of language spec [§28.1](Bezel_Language_Spec.md#sec-where-the-owned-modifier-can-appear): `Result<int, string>` is value-like (Core; copyable; auto-equality-bearing when the payloads are admissible), while `Result<Connection, IoError>` is owning per instantiation (Extended — the move-only row of Appendix D.2). `Result` declares no interface conformances, keeping every instantiation classification-clean. There is no `Unwrap` — a method receives `this` as a borrow (spec [§35.2](Bezel_Language_Spec.md#sec-choice-members)), so an owned-payload extractor is unspellable as a method, correctly: extraction is consumption, and consumption is the owning match's job, exhaustiveness-checked where `Unwrap` would fault. `Map`/`AndThen` combinators are deliberately absent in this revision (over owned payloads they need ownership-polymorphic function parameters — the retired-and-deferred territory of spec §14.4).
+
+```bezel
+// Value-like instantiation (Core): parse outcome with information.
+public method ParsePort(text: string): Result<int, string>
+  if not int.TryParse(text, out var value) then
+    return Result<int, string>.Error($"not a number: {text}");
+  end;
+  if value < 1 or value > 65535 then
+    return Result<int, string>.Error($"out of range: {value}");
+  end;
+  return Result<int, string>.Ok(value);
+end ParsePort;
+
+case ParsePort(arg) of
+  Ok(var p)    => Listen(p),
+  Error(var m) => Console.WriteLine($"bad port: {m}")
+end;                                  // exhaustive; no _ needed
+```
+
+```bezel
+// Owning instantiation (Extended): connect-or-explain.
+public method Connect(host: string): Result<Connection, string>
+  var conn := TryOpen(host);          // illustrative TryOpen(host): owned Connection?
+  if conn = null then
+    return Result<Connection, string>.Error($"unreachable: {host}");
+  end;
+  return Result<Connection, string>.Ok(owned conn);    // owned payload slot: marker consumes
+end Connect;
+
+case Connect(host) of                 // owning match over the temporary
+  Ok(var c) => do
+    using var conn := owned c;        // adopt; disposed at block end
+    conn.Send(payload);
+  end,
+  Error(var m) => Console.WriteLine($"giving up: {m}")
+end;
+```
+
+The Try shapes of §1 remain the right tool for value extraction with a boring failure; the `Result` return is where the failure carries information — the two idioms compose (`ParsePort` uses `TryParse` internally and returns a choice).
 
 <a id="sec-system-text-auto-imported"></a>
 ## 3. `System.Text` (auto-imported)

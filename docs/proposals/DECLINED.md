@@ -51,3 +51,9 @@ Eight further declined-with-reasons entries — metrics API (pending #1363), Big
 3. **The surviving argument depends on a declined feature.** The RFC's strongest remaining case (arm bodies as uniform blocks) reads naturally only under block-*expressions*, which rationale §5.13 declines on recorded grounds; without them the unified form is strictly more ceremony in the common case.
 
 **What would reopen this:** block expressions being reopened first (their own register entry governs), or field evidence that the triad measurably confuses users — not re-asking.
+
+---
+
+## D-0004 — `Option<T>` in the standard library
+
+**Declined 2026-07-19 (0041 graduation, v0.200).** `T?` is Bezel's option type: it has language-level syntax (`?.`, `??`, narrowing, the §19.6 nullable clause), stdlib-wide integration (the Try shapes, `FirstOrNull`), and a design lineage the rationale defends throughout. Shipping `Option<T>` beside the `choice` kind would create two spellings of absence, two conversion questions at every API boundary, and an eternal style war. A choice with one meaningful payload and one empty case *is* what `T?` already provides. Revisiting requires evidence that `T?` structurally cannot serve where `Option<T>` could — not preference.

@@ -1,6 +1,6 @@
 # Bezel Guide 1: Memory and Ownership
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.199.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.200.*
 
 Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope (with a must-use warning), and a use-after-free or double-free is rejected outright. This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 
@@ -367,6 +367,18 @@ yield return l;
 In a *borrowing* iterator the bare `yield return line;` also compiles (it re-borrows the frame-resident value) but leaves the must-use warning on `line`. In an *owning* iterator that bare yield instead *consumes* `line` — the owning return type is the announcement, so no marker is needed.
 
 **Frame-disposed `owned` parameters — adopt on entry.** An `owned` parameter of an iterator or async method is disposed by the frame at teardown, but the must-use warning still fires at the parameter; `using var r := owned reader;` on the first line declares the intent and silences it.
+
+**Consuming a `choice` outcome — match the fresh call, adopt the payload.** A `case` directly over a call returning an owning `choice` (spec §35) is an *owning match*: the selected arm's `owned` payload binding is yours, and the adopt idiom applies inside the arm — while a `case` over a *named* binding just peeks (borrows), and consuming a named binding is spelled `case owned outcome of …`, the same marker discipline as every other transfer:
+
+```bezel
+case Connect(host) of                 // fresh call: owning match
+  Ok(var c) => do
+    using var conn := owned c;        // adopt; disposed at block end
+    conn.Send(payload);
+  end,
+  Error(var m) => Log(m)
+end;
+```
 
 **Three one-line rules.** `_ := x;` disposes `x` *now* and ends the binding — an announced consume, no marker; afterward `x` is treated exactly as after an explicit `.Dispose()`, so a later read is flagged the same way (a straight-line read is a must-use warning plus a checked-mode fault; a read after a *conditional* discard — one branch consumed, another still owning — is a compile error at the merge; see Guide 2 §4). A **closure** may *read* a captured owned value but never dispose, reassign, or move it out; a callback that must consume takes an `owned` parameter. And `Dispose()` needs a receiver you *own* — disposing a borrowed parameter, `this`, or a borrowed element is a compile error (the owner disposes it). The lone exception is per-element cleanup on a *borrowing* collection whose elements you semantically own (`for var e in _index do e.Value.Dispose(); end;`, or `DisposeElements()`) — and even that does not extend to a lazy query over the collection (`for var x in xs.Where(p) do x.Dispose(); end;` is rejected — iterate `xs` directly).
 

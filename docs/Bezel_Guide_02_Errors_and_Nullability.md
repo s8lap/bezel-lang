@@ -1,6 +1,6 @@
 # Bezel Guide 2: Errors and Nullability
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.195.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.200.*
 
 If you know C#, Kotlin, or Swift, most of this chapter is familiar: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. Skim those parts. The three places where the ownership model changes how you write this code — and where a habit from those languages produces a *compile error* — are headed **How Bezel does it**. Read those.
 
@@ -204,6 +204,27 @@ end;                               // c disposed at the end of the enclosing blo
 
 `out using var c` binds the out value as an owned, scope-disposed local — so a successful call that handed you a `Connection` cannot leak. Its scope is the *enclosing* block, from the call onward (not just the `if`), so the connection is disposed when that block ends. Without the `when true` clause you would still write `UseConnection(c!)` — the bool guard alone does not narrow the nullable; only the postcondition does. (`out owned` in the signature and `out using var` at the call site must match: you cannot write `out using var` for a plain `out` parameter, nor plain `out var` for an `out owned` one — the compiler rejects the mismatch, because the ownership would have nowhere to go.) This is the ownership-aware version of C#'s `TryGet`: the contract is "on `true`, you now own it," and `out using var` discharges that obligation for you.
 
+**The `choice` return** when the failure itself carries information (spec §35). Where the nullable return says only "absent" and the Try pattern carries the failure in out-parameters, a `choice` names every outcome and carries each one's data — and the `case` over it is exhaustiveness-checked, so adding an outcome breaks every consumer at compile time instead of silently falling through a null check:
+
+```bezel
+public method ParsePort(text: string): Result<int, string>
+  if not int.TryParse(text, out var value) then
+    return Result<int, string>.Error($"not a number: {text}");
+  end;
+  if value < 1 or value > 65535 then
+    return Result<int, string>.Error($"out of range: {value}");
+  end;
+  return Result<int, string>.Ok(value);
+end ParsePort;
+
+case ParsePort(arg) of
+  Ok(var p)    => Listen(p),
+  Error(var m) => Console.WriteLine($"bad port: {m}")
+end;                                  // exhaustive; no _ arm needed
+```
+
+`Result<T, E>` (stdlib §2.20) is the stdlib's ready-made shape; a domain-specific choice with named cases (`Fetched`/`NotModified`/`Failed`) is often better still. When a case's payload is an owned resource, the `case` over a fresh call is an *owning match*: bind the payload and adopt it (`using var conn := owned c;`) — see Guide 1 §9. The three idioms compose: `T?` for plain absence, the Try shape for value extraction with a boring failure, the choice return where the failure carries information.
+
 ---
 
 ## 6. Choosing the right tool
@@ -212,6 +233,7 @@ end;                               // c disposed at the end of the enclosing blo
 |---|---|
 | Value may legitimately be absent | nullable return `T?`, handle with `?.` / `??` / narrowing |
 | Absent *and* the value would be owned | `Try` pattern: `bool` + `out owned T? when true`, caller uses `out using var` (and drops the `!`) |
+| Failure is expected *and carries information* | `choice` return (`Result<T, E>` or a domain choice, spec §35); consume with an exhaustive `case` |
 | Caller passed something invalid | `throw new ArgumentException(...)` |
 | Operation invalid in current state | `throw new InvalidOperationException(...)` |
 | Must run cleanup that is not a disposal | `try … finally` |
