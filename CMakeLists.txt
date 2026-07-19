@@ -182,6 +182,7 @@ add_library(bezel_core STATIC
     src/sema/StaticInitCycles.cpp
     src/sema/Sendability.cpp
     src/sema/EntryPoint.cpp
+    src/sema/PureChecker.cpp
     src/flow/CFG.cpp
     src/ownership/OwnershipChecker.cpp
     src/ownership/Ownership.cpp

@@ -19,6 +19,7 @@
 // checks (Slice 2+) live in pure_checker_spec_22_15_*.cpp companions.
 
 #include "sema/ExprTypecheck.hpp"
+#include "sema/PureChecker.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/sema_support.hpp"
@@ -31,6 +32,7 @@ bezel::test::SemaResult parseSemaAll(std::string_view src) {
     if (r.sourceFile && r.ctx) {
         bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
         bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
+        bezel::sema::checkPureBodies(*r.sourceFile, *r.ctx);
     }
     return r;
 }

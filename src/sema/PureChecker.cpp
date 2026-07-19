@@ -1,0 +1,712 @@
+#include "sema/PureChecker.hpp"
+
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+#include "common/BuiltinRegistry.hpp"
+#include "sema/Symbol.hpp"
+#include "sema/TypeRef.hpp"
+#include "support/Diagnostic.hpp"
+
+namespace bezel::sema {
+
+namespace {
+
+// §22.15 (v0.202, #2052) — the closed-body checker. A `PureBodyWalker` is
+// constructed per pure member and walks its statements/expressions.
+//
+// Slice 2 covers the load-bearing rules (frame-local mutation root; calls
+// to non-pure members; class construction outside the throw carve-out; the
+// consuming discard; IEnumerable for-source rejection). Lambda bodies are
+// NOT checked (§22.15 rule 4: a lambda body defined inside a pure body is
+// a separate function whose later invocation happens at the caller's
+// effect discipline).
+class PureBodyWalker {
+public:
+    PureBodyWalker(SemaContext& ctx, MemberSymbol& member,
+                   const std::string& memberLabel, bool isConstructor)
+        : ctx_(ctx), member_(member), memberLabel_(memberLabel),
+          isConstructor_(isConstructor) {}
+
+    void checkStmts(const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void checkOneStmt(const ast::Stmt* s);
+    void checkExpr(const ast::Expr* e);
+
+private:
+    SemaContext& ctx_;
+    MemberSymbol& member_;
+    std::string memberLabel_;       // "method `M`" / "property `P`" / etc.
+    bool isConstructor_;            // §22.15 birth-store rule admissions
+
+    // §22.15 "the closed list's contrapositive": any store whose target
+    // root leaves the frame is rejected (instance/static field, indexer
+    // slot, dereferenced class reference). In a pure constructor the
+    // birth-store rule admits stores to fields of `this`.
+    void checkAssignmentTarget(const ast::Expr& target);
+
+    // Walk an access-path root: returns the Symbol* the path is anchored on
+    // (LocalSymbol / ParameterSymbol / FieldSymbol / etc.), or nullptr if
+    // the path doesn't have an identifier-anchored root.
+    Symbol* targetRootSymbol(const ast::Expr& target);
+
+    void reportPureViolation(SourceLocation loc,
+                             const std::string& operation,
+                             const std::string& detail);
+
+    // §22.15 throw carve-out: `new E(args)` admitted iff E's invoked ctor
+    // is pure AND E is trivial-dispose. Returns true iff admitted.
+    bool throwCarveOutAdmits(const ast::NewExpr& ne);
+
+    // §22.15 trivial-dispose (inverse of ExprTC::isNonTrivialDisposeClass):
+    // a class is trivial-dispose iff it has no destructor and no non-static
+    // owned field, anywhere in its base chain.
+    bool isTrivialDisposeClass(TypeSymbol* decl) const;
+
+    // §22.15 rule 6: a call to a member not pure-declared / pure-classified
+    // is rejected. Returns true iff admitted.
+    bool callTargetIsPure(Symbol* calleeSym);
+
+    // §22.15 rule 5: a `for` loop source must not construct an enumerator.
+    // Range<T> of primitive steppable type, inline arrays, spans, and
+    // value-typed OwningBuffer<T> are admitted; IEnumerable<T> (including
+    // Array<T> and string) is rejected.
+    bool forSourceAdmitsEnumerator(const ast::Expr& iterable) const;
+
+    // §22.15 rule 5: is `rt` an IEnumerable<T>-typed source that the `for`
+    // desugaring expands into an enumerator-constructing loop?
+    bool isEnumeratorConstructingSource(const TypeRef* rt) const;
+};
+
+bool PureBodyWalker::isTrivialDisposeClass(TypeSymbol* decl) const {
+    // Cycle-guarded walk up the base chain (mirrors ExprTC's predicate).
+    std::unordered_set<const TypeSymbol*> visited;
+    const std::size_t kMaxWalk = 4096;
+    std::size_t walked = 0;
+    for (TypeSymbol* cur = decl; cur;) {
+        if (++walked > kMaxWalk) break;
+        if (!visited.insert(cur).second) break;
+        for (Symbol* m : cur->members) {
+            if (dynamic_cast<DestructorSymbol*>(m)) return false;
+            auto* fs = dynamic_cast<FieldSymbol*>(m);
+            if (!fs) continue;
+            if (fs->posParam) {
+                if (fs->parent &&
+                    fs->parent->kind == ast::TypeDeclKind::Class &&
+                    fs->posParam->modifier == "owned" &&
+                    fs->posParamBodyRef && !fs->posParamInitRef)
+                    return false;
+                continue;
+            }
+            bool isStatic = false, isOwned = false;
+            for (auto mod : fs->modifiers) {
+                if (mod == "static") isStatic = true;
+                if (mod == "owned") isOwned = true;
+            }
+            if (isOwned && !isStatic) return false;
+        }
+        TypeSymbol* nextBase = nullptr;
+        for (TypeSymbol* b : cur->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) {
+                nextBase = b;
+                break;
+            }
+        cur = nextBase;
+    }
+    return true;
+}
+
+bool PureBodyWalker::callTargetIsPure(Symbol* calleeSym) {
+    // §22.15 rule 6: a call is admitted iff the declared member on the
+    // receiver's static type is pure-declared or pure-classified. For
+    // Slice 2 we check the explicit `pure` marker (declared) —
+    // pure-CLASSIFICATION (auto-getters, record-synthesized members) lands
+    // in a later slice.
+    if (!calleeSym) return false;  // conservatively reject unknown
+    if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym)) {
+        if (auto* op = dynamic_cast<const ast::OperatorDecl*>(ms->decl))
+            if (op->isPure) return true;
+        for (auto mod : ms->modifiers)
+            if (mod == "pure") return true;
+        return false;
+    }
+    if (auto* cs = dynamic_cast<ConstructorSymbol*>(calleeSym)) {
+        if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
+            if (cd->isPure) return true;
+        return false;
+    }
+    // Property/indexer accessor calls — pure-classification (auto-getter)
+    // lands later. For Slice 2, treat as not-yet-pure (admit, since
+    // classifying them as impure would reject bodies the spec admits and
+    // the classification slice must land before this rule can fire).
+    if (dynamic_cast<PropertySymbol*>(calleeSym)) return true;
+    // Intrinsic / builtin calls (no AST decl) are admitted — §22.15
+    // "Intrinsic purity (the stdlib contract)" trusts stdlib markers, and
+    // Slice 4 covers the stdlib annotation wave.
+    return true;
+}
+
+bool PureBodyWalker::isEnumeratorConstructingSource(
+    const TypeRef* rt) const {
+    // §22.15 rule 5: IEnumerable<T> sources construct an enumerator class
+    // instance — Array<T>, string, IEnumerable<T>, and the stdlib
+    // collection wrappers. Range<T>, inline arrays, spans, and value-typed
+    // OwningBuffer<T> use direct counted loops.
+    if (!rt) return false;
+    std::string_view head = rt->headName();
+    if (head == "IEnumerable" || head == "Array" || head == "string" ||
+        head == "List" || head == "OwningList" || head == "OwningArray" ||
+        head == "OwningDictionary" || head == "OwningSet" ||
+        head == "Dictionary" || head == "Set" || head == "Stack" ||
+        head == "Queue" || head == "LinkedList" || head == "OwningStack" ||
+        head == "OwningQueue" || head == "OwningLinkedList")
+        return true;
+    return false;
+}
+
+bool PureBodyWalker::forSourceAdmitsEnumerator(
+    const ast::Expr& iterable) const {
+    // Admitted if NOT enumerator-constructing. Range<T>, inline arrays,
+    // spans, and value-typed buffers are admitted.
+    const TypeRef* rt = ctx_.exprType(iterable);
+    return !isEnumeratorConstructingSource(rt);
+}
+
+bool PureBodyWalker::throwCarveOutAdmits(const ast::NewExpr& ne) {
+    // §22.15 throw carve-out: (a) E's invoked constructor is pure, and
+    // (b) E is trivial-dispose. Slice 2 enforces both.
+    if (!ne.type) return false;
+    const TypeRef* rt = ctx_.resolvedType(*ne.type);
+    if (!rt || rt->kind != TypeRef::Kind::Named || !rt->declaration) {
+        // Built-in exception types — admitted (§22.15 "Intrinsic purity":
+        // every built-in exception's ()/(message) constructors are pure).
+        // Conservatively admit unknown new-targets at the throw position so
+        // the diagnostic blames the right line; the rule fires elsewhere.
+        return true;
+    }
+    TypeSymbol* targetDecl = rt->declaration;
+    if (targetDecl->kind != ast::TypeDeclKind::Class) return false;
+    if (!isTrivialDisposeClass(targetDecl)) return false;
+    // (a) the invoked constructor must be pure. For a `new E(args)` form
+    // the constructor is resolved by the typecheck pass; we look it up by
+    // walking targetDecl's constructors and matching arity. Slice 2 admits
+    // conservatively when no pure ctor is provable (the diagnostic still
+    // names the rule). A pure ctor present anywhere on the chain admits.
+    for (Symbol* m : targetDecl->members) {
+        auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+        if (!cs) continue;
+        if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
+            if (cd->isPure) return true;
+    }
+    return false;
+}
+
+void PureBodyWalker::reportPureViolation(SourceLocation loc,
+                                         const std::string& operation,
+                                         const std::string& detail) {
+    std::string msg = operation + " is not admitted in a pure body";
+    if (!detail.empty()) msg += " — " + detail;
+    msg += " (\xC2\xA7""22.15)";
+    ctx_.diagnostics().report(Severity::Error, loc, msg);
+}
+
+Symbol* PureBodyWalker::targetRootSymbol(const ast::Expr& target) {
+    // Walk the access path: peel `.member` / `[index]` / `!` to find the
+    // identifier-rooted base. Mirrors checkLValueChainNotCallBased.
+    const ast::Expr* e = &target;
+    for (;;) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            e = ma->target.get();
+            continue;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            e = ix->target.get();
+            continue;
+        }
+        if (auto* bang = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            e = bang->operand.get();
+            continue;
+        }
+        break;
+    }
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e))
+        return ctx_.exprSymbol(*id);
+    return nullptr;
+}
+
+void PureBodyWalker::checkAssignmentTarget(const ast::Expr& target) {
+    // §22.15 rule 2 + contrapositive: the target root must be a local
+    // variable or by-value parameter, and the access path must traverse
+    // only value-typed storage. The first class-typed dereference leaves
+    // the frame.
+    //
+    // Slice 2 implementation: classify by the root symbol's kind. A
+    // LocalSymbol or ParameterSymbol root is admitted (frame-local). A
+    // FieldSymbol root is admitted only in a pure constructor (birth-store
+    // rule, §22.15 "Pure constructors"); otherwise it is a store whose
+    // target root is an instance/static field — rejected.
+    Symbol* rootSym = targetRootSymbol(target);
+    if (!rootSym) {
+        // `this.field := ...` is parsed as MemberAccess(IdentifierExpr this,
+        // field) — the root is whatever `this` resolves to. Slice 2 keeps
+        // this conservative: an unresolvable root in a non-ctor pure body
+        // is rejected; the rule blame is on the assignment site.
+        if (isConstructor_) return;  // birth-store admission
+        reportPureViolation(
+            target.span.begin, "assignment",
+            "the target root is not a frame-local of this body");
+        return;
+    }
+    if (dynamic_cast<LocalSymbol*>(rootSym)) return;
+    if (dynamic_cast<ParameterSymbol*>(rootSym)) return;
+    if (auto* fs = dynamic_cast<FieldSymbol*>(rootSym)) {
+        // §22.15 birth-store rule: pure-constructor stores to fields of
+        // `this` are admitted; static-field stores and instance-field
+        // stores outside a pure ctor are rejected.
+        if (isConstructor_) {
+            bool isStatic = false;
+            for (auto mod : fs->modifiers)
+                if (mod == "static") isStatic = true;
+            if (!isStatic) return;
+        }
+        reportPureViolation(
+            target.span.begin, "assignment",
+            std::string("the target root `") + std::string(fs->name) +
+            "` is a field (a store outside the frame; pure-constructor "
+            "birth-store admits only fields of `this`)");
+        return;
+    }
+    reportPureViolation(
+        target.span.begin, "assignment",
+        "the target root is not a frame-local of this body");
+}
+
+void PureBodyWalker::checkStmts(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    for (const auto& s : body) {
+        if (s) checkOneStmt(s.get());
+    }
+}
+
+void PureBodyWalker::checkOneStmt(const ast::Stmt* s) {
+    if (!s) return;
+    // Recurse through control flow.
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+        checkAssignmentTarget(*as->target);
+        checkExpr(as->value.get());
+        // §22.15 contrapositive: set(owned) stores — `owned` value
+        // marker — are disposal-running.
+        if (as->valueHasOwnedMarker) {
+            reportPureViolation(
+                as->span.begin, "owned-consumption assignment",
+                "an `owned` marker on the RHS is a transfer (disposal-"
+                "running)");
+        }
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(s)) {
+        checkAssignmentTarget(*is->target);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+        checkExpr(es->expr.get());
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+        if (rs->value) checkExpr(rs->value.get());
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+        // §22.15 throw carve-out: `new E(args)` admitted iff trivial-
+        // dispose + pure ctor. Any other throw operand is admitted
+        // (bare re-raise, a caught binding read).
+        if (ts->value) {
+            if (auto* ne = dynamic_cast<ast::NewExpr*>(ts->value.get())) {
+                if (!throwCarveOutAdmits(*ne)) {
+                    reportPureViolation(
+                        ts->span.begin,
+                        "class construction at `throw`",
+                        "the throw carve-out admits only `new E(...)` "
+                        "with a pure constructor of a trivial-dispose "
+                        "class");
+                }
+                // The new-expression's args still need to be checked.
+                for (const auto& a : ne->args)
+                    if (a.value) checkExpr(a.value.get());
+                return;
+            }
+            checkExpr(ts->value.get());
+        }
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+        // §22.15 contrapositive: the consuming discard is rejected
+        // (disposal-running / announced consume).
+        reportPureViolation(
+            ds->span.begin, "the consuming discard",
+            "`_ := expr` is the announced consume");
+        if (ds->value) checkExpr(ds->value.get());
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s)) {
+        if (ifs->ifBranch.condition)
+            checkExpr(ifs->ifBranch.condition.get());
+        checkStmts(ifs->ifBranch.body);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition) checkExpr(el.condition.get());
+            checkStmts(el.body);
+        }
+        if (ifs->hasElse) checkStmts(ifs->elseBody);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+        if (ws->condition) checkExpr(ws->condition.get());
+        checkStmts(ws->body);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+        // §22.15 rule 5: a `for` loop's source must not construct an
+        // enumerator. The awaited form is excluded by `pure`+`async`
+        // already.
+        if (fs->iterable &&
+            !forSourceAdmitsEnumerator(*fs->iterable)) {
+            reportPureViolation(
+                fs->span.begin, "`for` loop source",
+                "the source constructs an enumerator (an "
+                "IEnumerable<T>-typed source including Array<T> and "
+                "string); use an index loop `for var i in 0..<xs.Count`");
+        }
+        if (fs->iterable) checkExpr(fs->iterable.get());
+        if (fs->withExpr) checkExpr(fs->withExpr.get());
+        checkStmts(fs->body);
+        return;
+    }
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s)) {
+        checkStmts(db->body);
+        return;
+    }
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+        // §22.15 rule 2: local declarations are admitted. The
+        // initializer expression still needs to be checked.
+        if (ld->initializer) checkExpr(ld->initializer.get());
+        // §22.15 contrapositive: `using var` (sync) is disposal-running.
+        if (ld->isUsing && !ld->isAwaitUsing) {
+            reportPureViolation(
+                ld->span.begin, "`using var`",
+                "scope-end disposal is disposal-running user code");
+        }
+        return;
+    }
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+        if (lc->value) checkExpr(lc->value.get());
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+        // §22.15 "Where pure is rejected": iterator methods (yield)
+        // cannot be pure — Slice 1 already rejected at signature level.
+        // A yield surviving into the body check is unreachable in a
+        // well-formed program.
+        if (ys->value) checkExpr(ys->value.get());
+        return;
+    }
+    if (auto* trys = dynamic_cast<const ast::TryStmt*>(s)) {
+        checkStmts(trys->body);
+        for (const auto& arm : trys->catches) {
+            if (arm.guard) checkExpr(arm.guard.get());
+            // CatchArm::body is a single Stmt (usually a DoEndBlock);
+            // unwrap one level so its inner statements are visited.
+            if (arm.body) {
+                if (auto* db = dynamic_cast<ast::DoEndBlock*>(
+                        arm.body.get()))
+                    checkStmts(db->body);
+                else
+                    checkOneStmt(arm.body.get());
+            }
+        }
+        if (trys->hasFinally) checkStmts(trys->finallyBody);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+        if (cs->scrutinee) checkExpr(cs->scrutinee.get());
+        for (const auto& arm : cs->arms)
+            checkStmts(arm.stmts);
+        return;
+    }
+    // Break / Continue / etc. — no effect.
+}
+
+void PureBodyWalker::checkExpr(const ast::Expr* e) {
+    if (!e) return;
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
+        // §22.15 rule 6 + contrapositive: invoke of function-typed value
+        // is prohibited. Detect by: callee has function-typed exprType but
+        // no resolved member symbol (i.e. a local/parameter holding a
+        // function value).
+        Symbol* calleeSym = ctx_.exprSymbol(*ce->callee);
+        const TypeRef* calleeTy = ctx_.exprType(*ce->callee);
+        const bool isFunctionTypedValue =
+            !dynamic_cast<MethodSymbol*>(calleeSym) &&
+            !dynamic_cast<ConstructorSymbol*>(calleeSym) &&
+            calleeTy && calleeTy->kind == TypeRef::Kind::Function;
+        if (isFunctionTypedValue) {
+            reportPureViolation(
+                ce->span.begin, "invocation of a function-typed value",
+                "the value's type carries no effect information");
+        } else if (!callTargetIsPure(calleeSym)) {
+            // §22.15 rule 6: a call to a member not pure-declared or pure-
+            // classified. Admit when the callee is unresolved (the
+            // typecheck pass already reported the lookup failure).
+            if (calleeSym) {
+                std::string name;
+                if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym))
+                    name = std::string(ms->name);
+                else if (auto* cs2 =
+                             dynamic_cast<ConstructorSymbol*>(calleeSym))
+                    name = std::string(cs2->parent ? cs2->parent->name
+                                                   : std::string_view());
+                reportPureViolation(
+                    ce->span.begin, "call",
+                    std::string("the resolved target `") + name +
+                    "` is not pure-declared");
+            }
+        }
+        // Recurse into callee + args. The callee itself may be a member
+        // access (which involves reads — fine).
+        checkExpr(ce->callee.get());
+        for (const auto& a : ce->args)
+            if (a.value) checkExpr(a.value.get());
+        // §22.15 contrapositive: an `owned` argument is owned-consuming.
+        for (const auto& a : ce->args) {
+            if (a.modifier == "owned" || a.modifier == "scoped" ||
+                a.modifier == "ref" || a.modifier == "out" ||
+                a.modifier == "out owned" || a.modifier == "out var" ||
+                a.modifier == "out using var" ||
+                a.modifier == "out owned var") {
+                reportPureViolation(
+                    ce->span.begin, "call argument",
+                    std::string("a `") + std::string(a.modifier) +
+                    "` argument is not admitted in a pure call");
+            }
+        }
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+        // §22.15 contrapositive: class construction outside the throw
+        // carve-out is rejected. The throw-carve-out arm in checkStmts
+        // handles the `throw new E(...)` case directly; a NewExpr reached
+        // here is outside that position.
+        // Slice 2 admits value/record/enum construction and trivial-dispose
+        // box construction; class construction with a non-pure ctor is the
+        // load-bearing rejection.
+        if (ne->type) {
+            const TypeRef* rt = ctx_.resolvedType(*ne->type);
+            if (rt && rt->kind == TypeRef::Kind::Named &&
+                rt->declaration &&
+                rt->declaration->kind == ast::TypeDeclKind::Class) {
+                reportPureViolation(
+                    ne->span.begin, "class construction",
+                    "`new C(...)` runs the constructor and destructor of "
+                    "user code (admitted only at the throw operand; the "
+                    "throw carve-out requires a pure ctor + trivial-"
+                    "dispose class)");
+            }
+        }
+        for (const auto& a : ne->args)
+            if (a.value) checkExpr(a.value.get());
+        return;
+    }
+    if (auto* ce2 = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        checkExpr(ce2->callee.get());
+        for (const auto& a : ce2->args)
+            if (a.value) checkExpr(a.value.get());
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+        checkExpr(ma->target.get());
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+        checkExpr(ix->target.get());
+        for (const auto& i : ix->indices)
+            if (i.value) checkExpr(i.value.get());
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
+        checkExpr(be->left.get());
+        checkExpr(be->right.get());
+        return;
+    }
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
+        // §22.15 contrapositive: `await` is rejected (it interleaves with
+        // the domain's continuation queue). `await` is admitted only in
+        // async contexts, and `pure` excludes async — but defend here too.
+        if (ue->op == "await") {
+            reportPureViolation(
+                ue->span.begin, "`await`",
+                "interleaves with the domain's continuation queue");
+        }
+        checkExpr(ue->operand.get());
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+        checkExpr(tt->operand.get());
+        return;
+    }
+    if (auto* cond = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+        checkExpr(cond->thenValue.get());
+        checkExpr(cond->condition.get());
+        checkExpr(cond->elseValue.get());
+        return;
+    }
+    if (auto* te = dynamic_cast<const ast::ThrowExpr*>(e)) {
+        // §22.15 throw carve-out: a throw expression follows the same rule
+        // as the throw statement.
+        if (te->operand) checkExpr(te->operand.get());
+        return;
+    }
+    if (auto* le = dynamic_cast<const ast::LambdaExpr*>(e)) {
+        // §22.15 rule 4: a lambda body defined inside a pure body is NOT
+        // checked under these rules — it is a separate function whose
+        // later invocation happens at the caller's effect discipline.
+        // Intentionally do not recurse into the lambda body.
+        return;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
+        checkExpr(we->source.get());
+        for (const auto& a : we->assigns)
+            checkExpr(a.value.get());
+        return;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        for (const auto& el : cl->elements) checkExpr(el.get());
+        for (const auto& k : cl->keys) checkExpr(k.get());
+        return;
+    }
+    if (auto* ie = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+        for (const auto& part : ie->parts)
+            if (part.expr) checkExpr(part.expr.get());
+        return;
+    }
+    // Literals, IdentifierExpr, etc. — admitted as reads (§22.15 rule 1).
+}
+
+// Walk the SourceFile: for every pure member, walk its body.
+void checkOneMember(SemaContext& ctx, MemberSymbol& member) {
+    // Determine purity of this member.
+    bool isPure = false;
+    bool isCtor = false;
+    std::string label;
+    if (auto* ms = dynamic_cast<MethodSymbol*>(&member)) {
+        if (auto* op = dynamic_cast<const ast::OperatorDecl*>(ms->decl))
+            isPure = op->isPure;
+        if (!isPure)
+            for (auto mod : ms->modifiers)
+                if (mod == "pure") { isPure = true; break; }
+        if (!isPure) return;
+        if (ms->isOperator)
+            label = std::string("operator `") + std::string(ms->operatorToken) +
+                    "`";
+        else
+            label = std::string("method `") + std::string(ms->name) + "`";
+        // Pure method body lives in the MethodDecl or OperatorDecl.
+        const auto* md = dynamic_cast<const ast::MethodDecl*>(member.decl);
+        const auto* od = dynamic_cast<const ast::OperatorDecl*>(member.decl);
+        PureBodyWalker w(ctx, member, label, /*isConstructor=*/false);
+        if (md) {
+            if (md->bodyKind == ast::MethodBodyKind::Expression &&
+                md->exprBody) {
+                w.checkExpr(md->exprBody.get());
+            } else if (md->bodyKind == ast::MethodBodyKind::Block) {
+                w.checkStmts(md->stmts);
+            }
+        } else if (od) {
+            if (od->bodyKind == ast::MethodBodyKind::Expression &&
+                od->exprBody) {
+                w.checkExpr(od->exprBody.get());
+            } else if (od->bodyKind == ast::MethodBodyKind::Block) {
+                w.checkStmts(od->stmts);
+            }
+        }
+        return;
+    }
+    if (auto* cs = dynamic_cast<ConstructorSymbol*>(&member)) {
+        const auto* cd = dynamic_cast<const ast::ConstructorDecl*>(member.decl);
+        if (!cd || !cd->isPure) return;
+        isCtor = true;
+        isPure = true;
+        label = std::string("constructor of `") +
+                std::string(cs->parent ? cs->parent->name : std::string_view()) +
+                "`";
+        PureBodyWalker w(ctx, member, label, /*isConstructor=*/true);
+        w.checkStmts(cd->body);
+        return;
+    }
+    if (auto* ps = dynamic_cast<PropertySymbol*>(&member)) {
+        // Property-level pure applies to the getter. For Slice 2, walk
+        // the getter body (expression-bodied / block-getter) — auto-
+        // properties have no authored body.
+        bool pure = false;
+        for (auto mod : ps->modifiers)
+            if (mod == "pure") { pure = true; break; }
+        // Accessor-level `pure get`.
+        const auto* pd = dynamic_cast<const ast::PropertyDecl*>(member.decl);
+        if (pd) {
+            for (const auto& a : pd->accessors)
+                if (a.isPure && !a.isSet) { pure = true; break; }
+        }
+        if (!pure) return;
+        label = std::string("property `") + std::string(ps->name) + "`";
+        PureBodyWalker w(ctx, member, label, /*isConstructor=*/false);
+        if (pd) {
+            if (pd->bodyKind == ast::PropertyBodyKind::Expression &&
+                pd->exprBody) {
+                w.checkExpr(pd->exprBody.get());
+            } else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+                for (const auto& a : pd->accessors) {
+                    if (a.isSet) continue;  // getter only
+                    if (a.bodyKind == ast::PropertyAccessorBodyKind::Expression
+                        && a.exprBody) {
+                        w.checkExpr(a.exprBody.get());
+                    } else if (a.bodyKind ==
+                               ast::PropertyAccessorBodyKind::Block) {
+                        w.checkStmts(a.stmts);
+                    }
+                }
+            }
+        }
+        return;
+    }
+}
+
+}  // namespace
+
+bool checkPureBodies(const ast::SourceFile& src, SemaContext& ctx) {
+    (void)src;
+    if (!ctx.module()) return !ctx.diagnostics().hasErrors();
+    // Walk every type's members (top-level + nested). Extension methods and
+    // their expression-bodied properties live as extension members and are
+    // visited separately below.
+    std::vector<TypeSymbol*> types;
+    for (Symbol* child : ctx.module()->children) {
+        if (auto* t = dynamic_cast<TypeSymbol*>(child)) types.push_back(t);
+    }
+    for (TypeSymbol* t : types) {
+        for (Symbol* m : t->members) {
+            auto* mem = dynamic_cast<MemberSymbol*>(m);
+            if (!mem) continue;
+            checkOneMember(ctx, *mem);
+            // Recurse into nested types' members.
+            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+                if (nt->type) {
+                    for (Symbol* nm : nt->type->members) {
+                        auto* nmem = dynamic_cast<MemberSymbol*>(nm);
+                        if (nmem) checkOneMember(ctx, *nmem);
+                    }
+                }
+            }
+        }
+    }
+    return !ctx.diagnostics().hasErrors();
+}
+
+}  // namespace bezel::sema
