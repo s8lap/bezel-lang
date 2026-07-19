@@ -88,7 +88,7 @@ var t := source.PrefetchAsync();      // returns Task<Buffer>  -> owned (task ca
 var e := move holder.slot;            // move out of owned field -> owned
 ```
 
-The rule of thumb: `new` and any method whose return type says `owned` give you an owned value (you must discharge it). A plain field read or a plain (non-`owned`) return from an *instance* method is a borrow (you must not). Three refinements cover the rest: a *static* method's plain return is treated as owned, with a warning nudging the API author toward writing `owned` (the factory safety net); a call whose declared return type is `Task`/`Task<T>`/`OwningTask<T>` is **owned** no matter the callee — task-returning calls mint a fresh frame at every call, no marker needed (v0.190); and a generic call returning bare `T`, like `Math.Max(a, b)`, is a **borrow of its arguments** (v0.194). When in doubt, the spec's producers table (§28.3) is exhaustive.
+The rule of thumb: `new` and any method whose return type says `owned` give you an owned value (you must discharge it). A plain field read or a plain (non-`owned`) return from an *instance* method is a borrow (you must not). Three refinements cover the rest: a *static* method's class-typed return must say `owned` — the compiler rejects the unmarked form, so a static signature always tells you whether you own the result; a call whose declared return type is `Task`/`Task<T>`/`OwningTask<T>` is **owned** no matter the callee — task-returning calls mint a fresh frame at every call, no marker needed (v0.190); and a generic call returning bare `T`, like `Math.Max(a, b)`, is a **borrow of its arguments** (v0.194). When in doubt, the spec's producers table (§28.3) is exhaustive.
 
 ---
 

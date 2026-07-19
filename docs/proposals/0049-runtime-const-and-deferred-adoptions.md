@@ -1,6 +1,6 @@
 # 0049 — Runtime `const` locals, `where T: sendable`, `Channel<T>.ReceiveAll` — three separable amendment trains
 
-**Status:** draft
+**Status:** superseded — graduated v0.201 (trains A+B; train C was a currency finding, annotated)
 **Tracking issue:** [#2036](https://github.com/s8lap/bezel-lang/issues/2036)
 **Target:** Train A — spec §21.1 (new subsection), §17.14 (two edits), §22.12 (one sentence split), §7.4 (one paragraph), §28.10 (cross-reference), Appendix A.6/A.8 (comment-level), rationale §17.8 rewrite + §18 entry + one decision record. Train B — spec §14.2 (table row + new subsection), §3.6 (one sentence), §30.14 (cross-reference), Appendix A `Constraint` production, Appendix B.2, Appendix C.4 (one bullet), stdlib §6.8/§6.9 signatures, rationale §18 entry + one decision record. Train C — **docs-currency only**: rationale §18 entry annotation, two optional clarification sentences in spec §30.15; no grammar, no stdlib surface change.
 **Written against:** spec v0.197 (stdlib/rationale at the same revision)

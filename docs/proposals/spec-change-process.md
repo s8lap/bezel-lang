@@ -163,6 +163,7 @@ For a **ruling** or a **design-change graduation** (the full path):
 - [ ] `scripts/check_docs.sh` passes (§3).
 - [ ] File a tracking issue for every spec-ahead-of-impl delta; comment/close the issues the revision resolves (§5).
 - [ ] Revalidate the guides if idiom changed; bump their pins (§5).
+- [ ] If the revision ships something the rationale §18 deferred list carries: annotate that entry with the shipped marker in the same revision (v0.201 rule; the ReceiveAll staleness is the cautionary case).
 - [ ] Commit (one revision = one commit or a tight pushed sequence), push, and — for a graduation — flip the proposal to `superseded` and update the README status (§8).
 
 For **editorial** / **clarification** revisions, the path is the same minus the critique/composition steps: still classify, still `check_docs.sh`, still a changelog entry in `Bezel_Changelog.md` (editorial batches may share one), still push.

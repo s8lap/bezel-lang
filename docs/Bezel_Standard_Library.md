@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.200 — July 2026**
+**Companion to the Bezel Language Specification, v0.201 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -3647,51 +3647,51 @@ public static class Domain
   // No result.
   public static method Spawn(entry: () -> ()): owned Task;
   public static method Spawn<A>(entry: (owned A) -> (), owned arg: A): owned Task
-      where A: class;                                      // A sendable (compiler-checked)
+      where A: sendable, class;
   public static method Spawn<A>(entry: (A) -> (), arg: A): owned Task
-      where A: notnull;                                    // A sendable value type or string
+      where A: sendable, notnull;
 
   // Class-typed result: ownership transfers to the awaiter (Pattern B).
   public static method Spawn<R>(entry: () -> owned R): owned OwningTask<R>
-      where R: class;                                      // R sendable (compiler-checked)
+      where R: sendable, class;
   public static method Spawn<A, R>(entry: (owned A) -> owned R, owned arg: A): owned OwningTask<R>
-      where A: class, R: class;
+      where A: sendable, class, R: sendable, class;
   public static method Spawn<A, R>(entry: (A) -> owned R, arg: A): owned OwningTask<R>
-      where A: notnull, R: class;
+      where A: sendable, notnull, R: sendable, class;
 
   // Value-typed or string result (Pattern A).
   public static method Spawn<R>(entry: () -> R): owned Task<R>
-      where R: notnull;                                    // R sendable value type or string
+      where R: sendable, notnull;
   public static method Spawn<A, R>(entry: (owned A) -> R, owned arg: A): owned Task<R>
-      where A: class, R: notnull;
+      where A: sendable, class, R: sendable, notnull;
   public static method Spawn<A, R>(entry: (A) -> R, arg: A): owned Task<R>
-      where A: notnull, R: notnull;
+      where A: sendable, notnull, R: sendable, notnull;
 
   // Async entries (v0.179; spec §30.14 "Async entries"): the runtime awaits the
   // returned task inside the spawned domain; the join handle tracks that task.
   public static method Spawn(entry: () -> Task): owned Task;
   public static method Spawn<A>(entry: (owned A) -> Task, owned arg: A): owned Task
-      where A: class;
+      where A: sendable, class;
   public static method Spawn<A>(entry: (A) -> Task, arg: A): owned Task
-      where A: notnull;
+      where A: sendable, notnull;
 
   public static method Spawn<R>(entry: () -> OwningTask<R>): owned OwningTask<R>
-      where R: class;
+      where R: sendable, class;
   public static method Spawn<A, R>(entry: (owned A) -> OwningTask<R>, owned arg: A): owned OwningTask<R>
-      where A: class, R: class;
+      where A: sendable, class, R: sendable, class;
   public static method Spawn<A, R>(entry: (A) -> OwningTask<R>, arg: A): owned OwningTask<R>
-      where A: notnull, R: class;
+      where A: sendable, notnull, R: sendable, class;
 
   public static method Spawn<R>(entry: () -> Task<R>): owned Task<R>
-      where R: notnull;
+      where R: sendable, notnull;
   public static method Spawn<A, R>(entry: (owned A) -> Task<R>, owned arg: A): owned Task<R>
-      where A: class, R: notnull;
+      where A: sendable, class, R: sendable, notnull;
   public static method Spawn<A, R>(entry: (A) -> Task<R>, arg: A): owned Task<R>
-      where A: notnull, R: notnull;
+      where A: sendable, notnull, R: sendable, notnull;
 end Domain;
 ```
 
-The `where` clauses above are the declared constraints; sendability is the stronger compiler-checked requirement and is diagnosed at the call site naming the failing rule (it is not expressible as a `where` constraint — it is a derived type property). For more than one argument, pass a sendable class aggregating them, an `OwningArray<T>` of sendable elements, or a `ChannelSender<T>` ([§6.9](#sec-channel)) and send the rest.
+The `where` clauses state the full requirement (v0.201): `sendable` is checked per instantiation by the §30.14 computation (language spec §14.2's derived-property constraints), diagnosed at the caller's site naming the failing component. The kind constraints (`class`/`notnull`) remain alongside `sendable` — they select each row's ownership shape, which sendability alone does not determine. For more than one argument, pass a sendable class aggregating them, an `OwningArray<T>` of sendable elements, or a `ChannelSender<T>` ([§6.9](#sec-channel)) and send the rest.
 
 **Async entries (v0.179).** The nine async rows mirror the nine synchronous rows. The entry is a capture-free `async` lambda or a static `async` method reference; the runtime runs it as the spawned domain's first continuation and awaits the returned task **within that domain** (the `async Main` analog, spec §33.2). The join handle completes when that task settles; a fault anywhere in the entry's async chain surfaces at the join as `DomainFaultedException`. The entry's task object never crosses the boundary; for the `OwningTask<R>` rows the runtime is the single Pattern B consumer, and only the sendable result crosses. Overload resolution prefers the async rows for any entry whose return type is in the `Task` family; the synchronous generic rows never bind `R` to a task type (spec §30.14).
 
@@ -3716,7 +3716,7 @@ Multiple-producer, single-consumer channel carrying sendable values between doma
 The signature surface dispatches on T's category, as with `OwningBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)). For class-typed (sendable) T:
 
 ```bezel
-public class Channel<T>                                    // the receiving end; class T form
+public class Channel<T> where T: sendable                  // the receiving end; class T form (v0.201: the constraint states §6.9's element requirement)
   public constructor();                                    // unbounded
   public constructor(capacity: int);                       // BOUNDED (v0.174, #809): back-pressure;
                                                            //   capacity >= 1, ArgumentException otherwise
@@ -3733,7 +3733,7 @@ public class Channel<T>                                    // the receiving end;
                  //   item in reverse insertion order (language spec §30.15)
 end Channel;
 
-public class ChannelSender<T>                              // class T form
+public class ChannelSender<T> where T: sendable            // class T form (v0.201)
   public method Send(owned item: T);                       // transfers ownership into the channel;
                                                            //   never blocks; on a FULL bounded channel
                                                            //   raises ChannelFullException (v0.174);
