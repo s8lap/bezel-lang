@@ -2131,6 +2131,29 @@ void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
                 return;  // valid enum-constant pattern
     }
 
+    // (1c) §35.5 (v0.200, #2045) choice-case pattern. The scrutinee-type
+    //      prefix-omission rule (extended from §10.6 / §19.8) lets a bare
+    //      case name resolve against the choice scrutinee. A PAYLOAD-FREE
+    //      case (`NotModified`) is matched by its bare name — a constant-
+    //      style pattern, valid here. A PAYLOAD-CARRYING case (`Fetched`)
+    //      MAY NOT be matched bare per §35.5 "Case patterns": "A payload
+    //      case may not be matched bare: `Fetched` without parentheses is
+    //      a compile error naming the arity." Reject it with the spec's
+    //      remedy (the explicit discard form `Fetched(_)`).
+    if (auto* cc = findChoiceCaseOnScrutinee(scrutTy, last)) {
+        if (cc->caseDecl && !cc->caseDecl->payload.empty()) {
+            ctx_.diagnostics().report(
+                Severity::Error, np->span.begin,
+                "Payload case `" + std::string(last) + "` requires a payload "
+                "pattern: write `" + std::string(last) + "(" +
+                std::to_string(cc->caseDecl->payload.size()) + " slot" +
+                (cc->caseDecl->payload.size() == 1 ? "" : "s") +
+                ")`, or `" + std::string(last) + "(_)` to discard "
+                "(\xC2\xA7""35.5)");
+        }
+        return;  // payload-free: valid; payload-carrying: reported above
+    }
+
     // (2) Type-test pattern: `last` names a user/imported type (any
     //     TypeDeclKind — class/interface/record/enum), a type alias, or a
     //     built-in type. Mirrors codegen's descriptorForPatternName /
@@ -2217,6 +2240,26 @@ void ExprTC::reportNamedPatternIsValue(const ast::NamedPattern* np,
         "identifier there is a type test. To compare the scrutinee against a "
         "value, use a guard: `var x when x = " + std::string(name) + " => …`");
 }
+
+// §35.5 (v0.200, #2045): find a choice case by bare name on a choice
+// scrutinee's declaration. Returns null when `scrutTy` is not a choice or no
+// case with that name exists. The scrutinee-type prefix-omission rule
+// (§35.5 "Case patterns", extended from §10.6 / §19.8 for enums) lets a
+// bare `NotModified` or `Fetched` resolve against the scrutinee choice's
+// cases the same way `Red` resolves against an enum scrutinee.
+const ChoiceCaseSymbol* ExprTC::findChoiceCaseOnScrutinee(
+    TypeRef* scrutTy, std::string_view name) {
+    if (!scrutTy || scrutTy->kind != TypeRef::Kind::Named || !scrutTy->declaration)
+        return nullptr;
+    if (scrutTy->declaration->kind != ast::TypeDeclKind::Choice) return nullptr;
+    for (Symbol* m : scrutTy->declaration->members) {
+        if (auto* cc = dynamic_cast<ChoiceCaseSymbol*>(m)) {
+            if (cc->name == name) return cc;
+        }
+    }
+    return nullptr;
+}
+
 
 // Slice S21: does a callable with this return-type ascription
 // produce a value? No ascription → no (unit). An ascription that
@@ -9201,12 +9244,21 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // over an enum scrutinee, including arm bodies. Inject the scrutinee
         // enum's constants for the arm bodies (the statement-position analogue
         // of the CaseExpr handler). // per §10.6
+        // §35.5 (v0.200, #2045): the scrutinee-type prefix-omission rule
+        // extends to a choice scrutinee. Inject the choice's PAYLOAD-FREE
+        // case names (constants in the §10.6 sense — usable bare in arm
+        // bodies and as bare patterns); payload-carrying cases are reached
+        // only through DestructuringPattern arms and admissibility is
+        // checked at the pattern, not injected as a name.
         Scope armEnumScope;
         Scope* preArmEnumScope = currentScope_;
         bool savedEnumArms = inEnumScrutineeCaseArms_;
         bool scrutIsEnum = scrutTy && scrutTy->kind == TypeRef::Kind::Named &&
             scrutTy->declaration &&
             scrutTy->declaration->kind == ast::TypeDeclKind::Enum;
+        bool scrutIsChoice = scrutTy && scrutTy->kind == TypeRef::Kind::Named &&
+            scrutTy->declaration &&
+            scrutTy->declaration->kind == ast::TypeDeclKind::Choice;
         if (scrutIsEnum && currentScope_) {
             armEnumScope.parent = currentScope_;
             for (Symbol* m : scrutTy->declaration->members)
@@ -9214,6 +9266,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     armEnumScope.names[m->name] = m;
             currentScope_ = &armEnumScope;
             inEnumScrutineeCaseArms_ = true;
+        } else if (scrutIsChoice && currentScope_) {
+            armEnumScope.parent = currentScope_;
+            for (Symbol* m : scrutTy->declaration->members)
+                if (auto* cc = dynamic_cast<ChoiceCaseSymbol*>(m))
+                    if (cc->caseDecl && cc->caseDecl->payload.empty())
+                        armEnumScope.names[m->name] = m;
+            currentScope_ = &armEnumScope;
         }
         for (const auto& arm : cs->arms) {
             // §19 / §A (#727): scrutinee-less arm — typecheck the bool CONDITION
@@ -9471,6 +9530,78 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 std::string_view lastName = dp->typeName->parts.empty()
                     ? std::string_view{}
                     : dp->typeName->parts.back();
+                // §35.5 (v0.200, #2045): CHOICE case destructuring. When the
+                // scrutinee is a choice and the pattern's head names one of
+                // its cases, bind the case's payload fields as locals — the
+                // §35.5 "Case patterns" positional destructuring production,
+                // the choice analogue of record positional destructuring.
+                // Payload bindings are copies (value-like choices) or borrows
+                // (borrow-bearing/owning) per §35.5 "The borrowing match";
+                // the owning-match transfer machinery lands in a follow-up.
+                if (scrutIsChoice) {
+                    auto* cc = const_cast<ChoiceCaseSymbol*>(
+                        findChoiceCaseOnScrutinee(scrutTy, lastName));
+                    if (cc && cc->caseDecl) {
+                        // §35.5 "Case patterns": "a positional destructuring
+                        // pattern `CaseName(slot, …)` with the case's exact
+                        // payload arity." Reject an arity mismatch (mirrors
+                        // the record-destructure arity check).
+                        if (dp->subPatterns.size() !=
+                            cc->caseDecl->payload.size()) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, dp->span.begin,
+                                "case-destructuring pattern `" +
+                                std::string(lastName) + "(...)` binds " +
+                                std::to_string(dp->subPatterns.size()) +
+                                " slot(s) but case `" + std::string(lastName) +
+                                "` has " +
+                                std::to_string(cc->caseDecl->payload.size()) +
+                                " payload field(s); the slot count must "
+                                "match (\xC2\xA7""35.5)");
+                        }
+                        Scope armScope;
+                        armScope.parent = currentScope_;
+                        for (std::size_t i = 0; i < dp->subPatterns.size();
+                             ++i) {
+                            const auto& sp = dp->subPatterns[i];
+                            TypeRef* fieldTy = nullptr;
+                            if (i < cc->caseDecl->payload.size() &&
+                                cc->caseDecl->payload[i].type) {
+                                fieldTy = ctx_.resolvedType(
+                                    *cc->caseDecl->payload[i].type);
+                            }
+                            if (!sp.nakedBinding.empty()) {
+                                auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                                lsym->name = sp.nakedBinding;
+                                lsym->decl = sp.nakedAnchor.get();
+                                lsym->declType = fieldTy;
+                                armScope.names[sp.nakedBinding] = lsym;
+                            } else if (auto* vbp =
+                                           dynamic_cast<const ast::BindingPattern*>(
+                                               sp.pattern.get())) {
+                                auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                                lsym->name = vbp->name;
+                                lsym->decl = vbp;
+                                lsym->declType = vbp->type
+                                    ? ctx_.resolvedType(*vbp->type) : fieldTy;
+                                armScope.names[vbp->name] = lsym;
+                            }
+                            // §35.5: "Nested destructuring of an owned
+                            // payload does not arise" (owned payloads are
+                            // class/interface-typed). A nested destructure
+                            // of a value-record payload is left to a follow-
+                            // up slice.
+                        }
+                        Scope* saveScope = currentScope_;
+                        currentScope_ = &armScope;
+                        if (arm.guard) visitExpr(*arm.guard);
+                        if (arm.exprBody) visitExpr(*arm.exprBody);
+                        for (const auto& bs : arm.stmts)
+                            if (bs) visitStmt(*bs);
+                        currentScope_ = saveScope;
+                        continue;  // skip the record-destructure path
+                    }
+                }
                 // §19.3: "Destructuring applies to records only — classes do
                 // not have a positional-destructuring surface … use a
                 // type-test pattern (`Dog`, `var d: Dog`) instead."

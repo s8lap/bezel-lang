@@ -701,6 +701,14 @@ private:
     void reportNamedPatternIsValue(const ast::NamedPattern* np,
                                    std::string_view name);
 
+    // §35.5 (v0.200, #2045): find a choice case by bare name on a choice
+    // scrutinee's declaration. Returns null when `scrutTy` is not a choice
+    // or no case with that name exists. Used by checkTopLevelNamedPattern
+    // (payload-free accept / payload-carrying reject) and the CaseExpr /
+    // CaseStmt DestructuringPattern handlers (positional payload matching).
+    const ChoiceCaseSymbol* findChoiceCaseOnScrutinee(TypeRef* scrutTy,
+                                                      std::string_view name);
+
     // Slice S21: does a callable with this return-type ascription
     // produce a value? No ascription → no (unit). An ascription that
     // resolves to the unit type → no. Anything else → yes.

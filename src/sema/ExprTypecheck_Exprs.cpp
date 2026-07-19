@@ -5184,6 +5184,12 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         bool scrutIsEnum = scrutTy && scrutTy->kind == TypeRef::Kind::Named &&
             scrutTy->declaration &&
             scrutTy->declaration->kind == ast::TypeDeclKind::Enum;
+        // §35.5 (v0.200, #2045): the scrutinee-type prefix-omission rule
+        // extends to a choice scrutinee. Inject the choice's PAYLOAD-FREE
+        // case names so a bare `None` resolves in patterns and arm bodies.
+        bool scrutIsChoice = scrutTy && scrutTy->kind == TypeRef::Kind::Named &&
+            scrutTy->declaration &&
+            scrutTy->declaration->kind == ast::TypeDeclKind::Choice;
         if (scrutIsEnum && currentScope_) {
             armEnumScope.parent = currentScope_;
             for (Symbol* m : scrutTy->declaration->members)
@@ -5191,6 +5197,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     armEnumScope.names[m->name] = m;
             currentScope_ = &armEnumScope;
             inEnumScrutineeCaseArms_ = true;
+        } else if (scrutIsChoice && currentScope_) {
+            armEnumScope.parent = currentScope_;
+            for (Symbol* m : scrutTy->declaration->members)
+                if (auto* cc = dynamic_cast<ChoiceCaseSymbol*>(m))
+                    if (cc->caseDecl && cc->caseDecl->payload.empty())
+                        armEnumScope.names[m->name] = m;
+            currentScope_ = &armEnumScope;
         }
         // §19/§5.1 (#1202): a relational (`> EXPR`) or range (`lo..hi`) pattern
         // operand is compared against the scrutinee by codegen with a single
@@ -5559,6 +5572,68 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 std::string_view lastName = dp->typeName->parts.empty()
                     ? std::string_view{}
                     : dp->typeName->parts.back();
+                // §35.5 (v0.200, #2045): CHOICE case destructuring — mirrors
+                // the CaseStmt handler. When the scrutinee is a choice and
+                // the pattern's head names one of its cases, bind the case's
+                // payload fields as locals. Payload bindings are copies
+                // (value-like) or borrows (borrow-bearing/owning) per the
+                // §35.5 borrowing-match default; the owning-match transfer
+                // machinery lands in a follow-up slice.
+                if (scrutIsChoice) {
+                    auto* cc = const_cast<ChoiceCaseSymbol*>(
+                        findChoiceCaseOnScrutinee(scrutTy, lastName));
+                    if (cc && cc->caseDecl) {
+                        if (dp->subPatterns.size() !=
+                            cc->caseDecl->payload.size()) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, dp->span.begin,
+                                "case-destructuring pattern `" +
+                                std::string(lastName) + "(...)` binds " +
+                                std::to_string(dp->subPatterns.size()) +
+                                " slot(s) but case `" + std::string(lastName) +
+                                "` has " +
+                                std::to_string(cc->caseDecl->payload.size()) +
+                                " payload field(s); the slot count must "
+                                "match (\xC2\xA7""35.5)");
+                        }
+                        Scope armScope;
+                        armScope.parent = currentScope_;
+                        for (std::size_t i = 0; i < dp->subPatterns.size();
+                             ++i) {
+                            const auto& sp = dp->subPatterns[i];
+                            TypeRef* fieldTy = nullptr;
+                            if (i < cc->caseDecl->payload.size() &&
+                                cc->caseDecl->payload[i].type) {
+                                fieldTy = ctx_.resolvedType(
+                                    *cc->caseDecl->payload[i].type);
+                            }
+                            if (!sp.nakedBinding.empty()) {
+                                auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                                lsym->name = sp.nakedBinding;
+                                lsym->decl = sp.nakedAnchor.get();
+                                lsym->declType = fieldTy;
+                                armScope.names[sp.nakedBinding] = lsym;
+                            } else if (auto* vbp =
+                                           dynamic_cast<const ast::BindingPattern*>(
+                                               sp.pattern.get())) {
+                                auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                                lsym->name = vbp->name;
+                                lsym->decl = vbp;
+                                lsym->declType = vbp->type
+                                    ? ctx_.resolvedType(*vbp->type) : fieldTy;
+                                armScope.names[vbp->name] = lsym;
+                            }
+                        }
+                        Scope* saveScope = currentScope_;
+                        currentScope_ = &armScope;
+                        if (arm.guard) visitExpr(*arm.guard);
+                        if (arm.exprBody) visitExpr(*arm.exprBody);
+                        for (const auto& bs : arm.stmts)
+                            if (bs) visitStmt(*bs);
+                        currentScope_ = saveScope;
+                        continue;  // skip the record-destructure path
+                    }
+                }
                 // §19.3: "Destructuring applies to records only — classes do
                 // not have a positional-destructuring surface … To match a
                 // class hierarchy, use a type-test pattern (`Dog`, `var d:
