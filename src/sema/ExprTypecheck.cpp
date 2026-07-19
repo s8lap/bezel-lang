@@ -7471,66 +7471,85 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
     } else if (auto* lc =
                    dynamic_cast<const ast::LocalConstDecl*>(&s)) {
         if (lc->value) visitExpr(*lc->value);
-        // Slice S31 (§21.1 / §22.12): a local const's explicit type
-        // must be a primitive value type or string.
+        // §21.1 v0.201 (#2049): classification split for a local `const`.
+        // Compile-time-constant classification requires BOTH (a) the
+        // initializer be a §17.14 constant expression AND (b) the declared
+        // or inferred type be a primitive value type or `string`. Anything
+        // else is a RUNTIME const — a single-assignment, never-owned binding
+        // whose references are NOT constant expressions (no case-pattern /
+        // inline-array-size / constant-narrowing positions). The earlier
+        // "const must be primitive or string" hard error (pre-v0.201) is
+        // removed: a non-primitive explicit type now classifies the local
+        // as a runtime const instead of being rejected.
         TypeRef* lcExplicitTy = nullptr;
         if (lc->type) {
-            if (auto* rt = ctx_.resolvedType(*lc->type)) {
+            if (auto* rt = ctx_.resolvedType(*lc->type))
                 lcExplicitTy = rt;
-                bool ok = rt->kind == TypeRef::Kind::Primitive &&
-                          rt->primitive != PrimitiveType::Object;
-                if (!ok) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, lc->span.begin,
-                        std::string("const `") + std::string(lc->name) +
-                        "` must have a primitive value type or "
-                        "`string` (§22.12)");
-                }
-            }
         }
-        // §17.14 (v0.184, #1688): a local const initializer's compile-time
-        // evaluation fault (integer overflow, division/mod by zero) is a
-        // compile error at the constant expression, never deferred to
-        // runtime. checkTypeConsts (TypeResolution_Checks.cpp) already
-        // enforces this for a CLASS-level const member (#958/#1211); this
-        // mirrors that logic for a LOCAL const, which had no equivalent
-        // check — `const B := 2147483647 + 1;` / `const D := 5 / 0;` inside
-        // a method body compiled cleanly and raised OverflowException /
-        // DivideByZeroException at runtime instead of being rejected here.
-        // Target type: the explicit annotation when primitive, else the
-        // initializer's own inferred type (visitExpr above already set it).
-        if (lc->value) {
-            TypeRef* targetTy =
-                lcExplicitTy ? lcExplicitTy : ctx_.exprType(*lc->value);
-            if (targetTy && targetTy->kind == TypeRef::Kind::Primitive) {
-                using P = PrimitiveType;
-                const P p = targetTy->primitive;
-                const bool isIntConst =
-                    p == P::Byte || p == P::SByte || p == P::Short ||
-                    p == P::UShort || p == P::Int || p == P::UInt ||
-                    p == P::Long || p == P::ULong;
-                if (isIntConst) {
-                    if (auto folded = foldIntConstExprTC(*lc->value)) {
-                        if (!fitsConstIntRange(*folded, p)) {
-                            ctx_.diagnostics().report(
-                                Severity::Error, lc->span.begin,
-                                std::string("const `") + std::string(lc->name) +
-                                "` initializer value " +
-                                std::to_string(*folded) +
-                                " does not fit its declared type — a const "
-                                "initializer must be a representable "
-                                "compile-time constant (§17.14)");
-                        }
-                    } else if (localConstDivByZeroTC(*lc->value)) {
+        TypeRef* lcInferredTy =
+            lc->value ? ctx_.exprType(*lc->value) : nullptr;
+        TypeRef* lcTy = lcExplicitTy ? lcExplicitTy : lcInferredTy;
+        auto typeIsPrimitiveOrString = [](TypeRef* t) -> bool {
+            if (!t) return false;
+            if (t->kind == TypeRef::Kind::Primitive &&
+                t->primitive != PrimitiveType::Object)
+                return true;  // incl. String, Bool, numeric, Char
+            return false;
+        };
+        const bool compileTimeClassified =
+            lc->value && typeIsPrimitiveOrString(lcTy) &&
+            isConstInitExpr(*lc->value);
+        // §7.1 (#1084) parallel: a bare `null` initializer with no type
+        // annotation gives the binding no determinable type. Per §21.1
+        // v0.201 `null` is admissible as a runtime const ONLY with a type
+        // annotation (the binding is "permanently null"); reject the bare
+        // form just as `var x := null;` is rejected.
+        if (!lc->type && lc->value &&
+            dynamic_cast<const ast::NullLiteralExpr*>(lc->value.get())) {
+            ctx_.diagnostics().report(
+                Severity::Error, lc->value->span.begin,
+                "cannot infer a type for `" + std::string(lc->name) +
+                "` from a bare `null` — `null` has no type of its own; "
+                "add a nullable type annotation (`const " +
+                std::string(lc->name) + ": <T>? := null`) (§7.1 / §21.1)");
+        }
+        // §17.14 (v0.184, #1688): a COMPILE-TIME-classified local const's
+        // initializer's compile-time evaluation fault (integer overflow,
+        // division/mod by zero) is a compile error at the constant
+        // expression, never deferred to runtime. checkTypeConsts
+        // (TypeResolution_Checks.cpp) already enforces this for a CLASS-
+        // level const member (#958/#1211); this mirrors that logic for a
+        // LOCAL compile-time const. A runtime const's initializer faults
+        // at runtime like any ordinary expression's — the rule does not
+        // apply to it.
+        if (compileTimeClassified && lcTy && lc->value) {
+            using P = PrimitiveType;
+            const P p = lcTy->primitive;
+            const bool isIntConst =
+                p == P::Byte || p == P::SByte || p == P::Short ||
+                p == P::UShort || p == P::Int || p == P::UInt ||
+                p == P::Long || p == P::ULong;
+            if (isIntConst) {
+                if (auto folded = foldIntConstExprTC(*lc->value)) {
+                    if (!fitsConstIntRange(*folded, p)) {
                         ctx_.diagnostics().report(
                             Severity::Error, lc->span.begin,
                             std::string("const `") + std::string(lc->name) +
-                            "` initializer contains a division or modulo by "
-                            "zero — a const initializer must fold to a "
-                            "representable compile-time-constant value "
-                            "(§17.14)");
+                            "` initializer value " +
+                            std::to_string(*folded) +
+                            " does not fit its declared type — a const "
+                            "initializer must be a representable "
+                            "compile-time constant (§17.14)");
                     }
-                }
+                } else if (localConstDivByZeroTC(*lc->value)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, lc->span.begin,
+                        std::string("const `") + std::string(lc->name) +
+                        "` initializer contains a division or modulo by "
+                        "zero — a const initializer must fold to a "
+                        "representable compile-time-constant value "
+                        "(§17.14)");
+                    }
             }
         }
         if (currentScope_ && !lc->name.empty()) {
@@ -7538,7 +7557,22 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             lsym->name = lc->name;
             lsym->decl = lc;
             lsym->isConst = true;
+            lsym->isCompileTimeConst = compileTimeClassified;
+            // §21.1: a const local's effective type (explicit annotation
+            // when present, else the initializer's inferred type) anchors
+            // identifier references — required for runtime const of
+            // reference type (a borrow, a string, …) so member access,
+            // dispatch, and codegen's slot layout see the right type.
+            if (lcTy) lsym->declType = lcTy;
             currentScope_->names[lc->name] = lsym;
+            // §7.4 (issue #418, v0.201 #2049): a nullable-typed const
+            // local initialized with a non-null value is known non-null
+            // for the rest of its scope — its narrowing is never
+            // invalidated (no invalidating form can apply to a const).
+            if (lc->value && lsym->declType && lsym->declType->nullable) {
+                if (TypeRef* initTy = ctx_.exprType(*lc->value))
+                    if (!initTy->nullable) nullNarrowed_.insert(lsym);
+            }
         }
     } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
         // per §4.2 (v0.182): `return` in a method with a declared wider

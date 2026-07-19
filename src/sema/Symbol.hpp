@@ -214,6 +214,15 @@ struct LocalSymbol : Symbol {
     bool isUsing = false;
     bool isAwaitUsing = false;
     bool isConst = false;
+    // §21.1 v0.201 (#2049): a `const` local's classification split.
+    // `isCompileTimeConst` is true iff the initializer is a §17.14 constant
+    // expression AND the declared/inferred type is a primitive value type or
+    // `string` — the case-pattern / inline-array-size / constant-narrowing
+    // positions admit it as a compile-time value (existing behavior). When
+    // false, the local is a RUNTIME const: a single-assignment, never-owned
+    // binding whose references are NOT constant expressions. Meaningful only
+    // when `isConst` is true.
+    bool isCompileTimeConst = false;
     // §28.3 / #1387: set by the ownership pass on an `out owned var` INLINE local
     // (ls->decl is IdentifierExpr, not LocalDecl) that is never discharged on ANY
     // path — a never-moved genuine owner. Codegen (ensureOutVarSlots) registers a
