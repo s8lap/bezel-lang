@@ -938,6 +938,20 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
             advance();
             continue;
         }
+        // §22.15 (v0.202, #2052): `pure` is a CONTEXTUAL member modifier
+        // (App. B.2 — lexed as Identifier). Admitted at the 11 grammar
+        // positions enumerated in A.4 (MethodDecl, PropertyDecl, IndexerDecl,
+        // ConstructorDecl, OperatorDecl, ExpressionPropertyDecl, IfaceMethod,
+        // IfaceStaticMethod, IfaceProperty, IfaceIndexer, Accessor/get).
+        // Other appearances (events, destructors, fields, extern decls,
+        // static constructors) are rejected semantically — the modifier is
+        // collected here so sema can see it on those kinds too.
+        if (current_.kind == TokenKind::Identifier &&
+            current_.text == "pure") {
+            modifiers.push_back(current_.text);
+            advance();
+            continue;
+        }
         // per §28.14 (v0.175): `scoped` is a CONTEXTUAL field modifier (lexed
         // as Identifier). A `scoped` FIELD holds a callback stored under a
         // `scoped` parameter: invocable / overwritable / clearable, never
@@ -1030,6 +1044,18 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         const bool isAsync =
             std::find(modifiers.begin(), modifiers.end(),
                       std::string_view("async")) != modifiers.end();
+        // §22.15 (v0.202, #2052): `pure` is not admitted on events. The
+        // EventDecl AST does not preserve the modifiers vector, so reject
+        // here at parse time rather than in sema.
+        const bool isPure =
+            std::find(modifiers.begin(), modifiers.end(),
+                      std::string_view("pure")) != modifiers.end();
+        if (isPure) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "`pure` is not admitted on an event — events are the "
+                "synchronization surface purity fences off (§22.15)");
+        }
         advance(); // past `event`
         auto ed = std::make_unique<ast::EventDecl>();
         ed->visibility = visibility;
@@ -1198,6 +1224,11 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         const bool isStatic =
             std::find(modifiers.begin(), modifiers.end(),
                       std::string_view("static")) != modifiers.end();
+        // §22.15 (v0.202, #2052): `pure` on the instance form only; the
+        // static-constructor alternative admits no `pure` (sema rejects).
+        const bool isPure =
+            std::find(modifiers.begin(), modifiers.end(),
+                      std::string_view("pure")) != modifiers.end();
         if (!isStatic && visibility == ast::Visibility::None) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected member visibility before "
@@ -1206,6 +1237,7 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         auto ctor = std::make_unique<ast::ConstructorDecl>();
         ctor->visibility = visibility;
         ctor->isStatic = isStatic;
+        ctor->isPure = isPure;
         advance(); // past `constructor`
         if (!consumePunctuator("(")) {
             diagnostics_.report(
@@ -1330,20 +1362,27 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
     // §A.4 InterfaceMember ::= IfaceMethod | IfaceProperty | IfaceIndexer |
     // IfaceEvent. No visibility (interface members are implicitly public per
     // §10.1), signatures only. The pre-keyword prefix is `readonly?` (for
-    // property), `async?` (for event), and — per §11.8 (v0.176, #807) —
-    // `static` for the abstract-only static method / static operator forms.
-    // All are scanned tentatively then dispatched on the kind keyword.
+    // property), `async?` (for event), `pure?` (§22.15 v0.202 for
+    // IfaceMethod/IfaceProperty/IfaceIndexer/IfaceStaticMethod), and — per
+    // §11.8 (v0.176, #807) — `static` for the abstract-only static method /
+    // static operator forms. All are scanned tentatively then dispatched on
+    // the kind keyword.
     bool readonlyMod = false;
     bool asyncMod = false;
     bool staticMod = false;
+    bool pureMod = false;
     while (isKeyword("readonly") || isKeyword("async") ||
-           isKeyword("static")) {
+           isKeyword("static") ||
+           (current_.kind == TokenKind::Identifier &&
+            current_.text == "pure")) {
         if (isKeyword("readonly")) {
             readonlyMod = true;
         } else if (isKeyword("static")) {
             staticMod = true;  // per §11.8
-        } else {
+        } else if (isKeyword("async")) {
             asyncMod = true;
+        } else {
+            pureMod = true;  // §22.15 (v0.202, #2052)
         }
         advance();
     }
@@ -1363,6 +1402,9 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
         auto pd = std::make_unique<ast::PropertyDecl>();
         pd->visibility = ast::Visibility::None; // implicit public in iface
         if (readonlyMod) pd->modifiers.push_back("readonly");
+        // §22.15 (v0.202, #2052): IfaceProperty/IfaceIndexer admit `pure?`
+        // before `readonly?` per A.4.
+        if (pureMod) pd->modifiers.push_back("pure");
         if (consumePunctuator("[")) {
             pd->isIndexer = true;
             pd->indexerParams = parseParamList();
@@ -1434,6 +1476,13 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
                 "`static` interface members may be methods or operators only "
                 "(§11.8)");
         }
+        // §22.15 (v0.202, #2052): `pure` is not admitted on events (events
+        // are the synchronization surface purity fences off).
+        if (pureMod) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "`pure` is not admitted on an interface event (§22.15)");
+        }
         auto ed = std::make_unique<ast::EventDecl>();
         ed->visibility = ast::Visibility::None;
         ed->isAsync = asyncMod;
@@ -1462,6 +1511,9 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
         // per §11.8 (v0.176, #807): a static interface method. Same signature
         // grammar; abstract-only (the `;` requirement below enforces no body).
         if (staticMod) m->modifiers.push_back("static");
+        // §22.15 (v0.202, #2052): IfaceMethod/IfaceStaticMethod admit `pure?`
+        // before `method` per A.4.
+        if (pureMod) m->modifiers.push_back("pure");
         if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected method name");
@@ -1567,25 +1619,32 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
 }
 
 bool Parser::isPropertyAccessorStart() {
-    // §A.4 Accessor: `Visibility? ("get" | "set")` opens an accessor in a
-    // PropertyBody block form. `get` and `set` are contextual keywords
-    // (App. B.2) so the lexer emits them as Identifier — checked by text.
+    // §A.4 Accessor: `Visibility? "pure"? ("get" | "set")` opens an accessor
+    // in a PropertyBody block form (v0.202, #2052 adds the `pure?` slot).
+    // `get`, `set`, and `pure` are contextual keywords (App. B.2) so the
+    // lexer emits them as Identifier — checked by text.
     auto isGetOrSet = [](const Token& t) {
         return t.kind == TokenKind::Identifier &&
                (t.text == "get" || t.text == "set");
     };
+    auto isPure = [](const Token& t) {
+        return t.kind == TokenKind::Identifier && t.text == "pure";
+    };
     if (isGetOrSet(current_)) return true;
+    if (isPure(current_) && isGetOrSet(peekAt(1))) return true;
     if (isKeyword("public") || isKeyword("private") ||
         isKeyword("internal") || isKeyword("protected")) {
-        return isGetOrSet(peekAt(1));
+        // `Visibility pure? get|set`
+        if (isGetOrSet(peekAt(1))) return true;
+        if (isPure(peekAt(1)) && isGetOrSet(peekAt(2))) return true;
     }
     return false;
 }
 
 ast::PropertyAccessor Parser::parsePropertyAccessor() {
-    // §A.4 `Accessor ::= Visibility? "get" AccessorBody`
+    // §A.4 `Accessor ::= Visibility? "pure"? "get" AccessorBody`
     //                  | Visibility? "set" SetterParamSpec? GenericConstraints?
-    //                      AccessorBody`.
+    //                      AccessorBody` (v0.202, #2052: `pure?` on get only).
     ast::PropertyAccessor acc;
     if (consumeKeyword("public")) {
         acc.visibility = ast::Visibility::Public;
@@ -1595,6 +1654,13 @@ ast::PropertyAccessor Parser::parsePropertyAccessor() {
         acc.visibility = ast::Visibility::Internal;
     } else if (consumeKeyword("protected")) {
         acc.visibility = ast::Visibility::Protected;
+    }
+    // §22.15 (v0.202, #2052): `pure` slot — admitted textually on both get
+    // and set here; sema rejects `pure set`.
+    if (current_.kind == TokenKind::Identifier &&
+        current_.text == "pure") {
+        acc.isPure = true;
+        advance();
     }
     if (current_.kind != TokenKind::Identifier ||
         (current_.text != "get" && current_.text != "set")) {
@@ -1966,13 +2032,17 @@ std::unique_ptr<ast::MethodDecl> Parser::parseMethodDeclBody(
 
 std::unique_ptr<ast::Member> Parser::parseOperatorDeclBody(
     ast::Visibility visibility, std::vector<std::string_view> modifiers) {
-    // A.4 `OperatorDecl ::= Visibility "static" "method" "operator" OpToken
-    //                        "(" ParamList ")" ":" "owned"? Type
-    //                        OperatorBody`. Caller has consumed
+    // A.4 `OperatorDecl ::= "public" "static" "pure"? "method" "operator"
+    //                        OpToken "(" ParamList ")" ":" "owned"? Type
+    //                        OperatorBody` (v0.202, #2052). Caller has consumed
     // `method operator`.
     auto op = std::make_unique<ast::OperatorDecl>();
     op->visibility = visibility;
-    (void)modifiers; // `static` is grammar-required for operators; sema checks.
+    // §22.15: `pure` is admitted on operator declarations; `static` is
+    // grammar-required and is not consumed here (sema checks).
+    op->isPure =
+        std::find(modifiers.begin(), modifiers.end(),
+                  std::string_view("pure")) != modifiers.end();
     // OpToken: whatever punctuator (or keyword like `mod`) the operator is.
     op->opToken = current_.text;
     advance();

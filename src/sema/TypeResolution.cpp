@@ -298,6 +298,8 @@ void Resolver::run(const ast::SourceFile& src) {
     checkStaticNotVirtual();
     // Slice S35: `async abstract` is a compile error (§12.6).
     checkAsyncModifiers();
+    // §22.15 (v0.202, #2052): `pure` placement + signature restrictions.
+    checkPureModifiers();
     // Slice S36: constructor chain-call placement (§12.8).
     checkConstructorChains();
     // Slice S37: static constructor takes no parameters (§22.7).

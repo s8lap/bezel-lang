@@ -5367,4 +5367,270 @@ void Resolver::checkStaticFieldDomains() {
     }
 }
 
+// §22.15 (v0.202, #2052): true iff `rt` is a user-declared CLASS TypeRef
+// (the case the `owned`-return restriction targets — class-typed returns
+// carry disposal). Built-in and non-class types return false.
+namespace {
+bool isUserClassTypeRef(const TypeRef* rt) {
+    return rt && rt->kind == TypeRef::Kind::Named && rt->declaration &&
+           rt->declaration->kind == ast::TypeDeclKind::Class;
+}
+}  // namespace
+
+void Resolver::checkPureModifiers() {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t) continue;
+        checkTypePureModifiers(t);
+        for (Symbol* m : t->members) {
+            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+                if (nt->type) checkTypePureModifiers(nt->type);
+            }
+        }
+    }
+}
+
+void Resolver::checkTypePureModifiers(TypeSymbol* t) {
+    // §22.15 "Where `pure` may appear" / "Parameters and result" — placement
+    // and signature restrictions only; the pure-body rule set (closed body,
+    // throw carve-out, pure constructors) is a separate slice. Per-member:
+    for (Symbol* m : t->members) {
+        // Skip nested-type wrappers; their inner type was visited above.
+        if (dynamic_cast<NestedTypeSymbol*>(m)) continue;
+
+        // ---- MethodDecl / OperatorDecl -------------------------------------
+        if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
+            // MethodDecl carries `pure` in its modifiers; OperatorDecl
+            // carries it on the AST (`OperatorDecl::isPure`) since the
+            // operator parser doesn't propagate modifiers into the symbol.
+            const auto* opDecl =
+                dynamic_cast<const ast::OperatorDecl*>(ms->decl);
+            const bool isPure = hasMod(ms, "pure") ||
+                                (opDecl && opDecl->isPure);
+            if (!isPure) continue;
+            // §22.15 "Where pure is rejected": `pure` and `async` are
+            // mutually exclusive (the two share async's modifier slot, and
+            // an `async` body interleaves with the domain's continuation
+            // queue). Operators are always `public static`, so the
+            // combination cannot arise there.
+            if (hasMod(ms, "async")) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("`pure` combines with neither `async` nor "
+                                "`yield`; method `") +
+                    std::string(ms->name) +
+                    "` is declared `async` (\xC2\xA7""22.15)");
+                continue;
+            }
+            // §22.15 "Where pure is rejected": iterator methods (a body
+            // containing `yield`) may not be `pure`. Operators and abstract
+            // methods have no body to check.
+            if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+                bool bodyHasYield = false;
+                for (const auto& s : md->stmts) {
+                    if (s && dynamic_cast<const ast::YieldStmt*>(s.get())) {
+                        bodyHasYield = true;
+                        break;
+                    }
+                }
+                if (bodyHasYield) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("`pure` combines with neither `async` nor "
+                                    "`yield`; method `") +
+                        std::string(ms->name) +
+                        "` is an iterator method (its body contains "
+                        "`yield`) (\xC2\xA7""22.15)");
+                    continue;
+                }
+            }
+            // §22.15 "Parameters and result": no ref/out/out-owned/owned/
+            // scoped parameters.
+            for (Symbol* p : ms->params) {
+                auto* ps = dynamic_cast<ParameterSymbol*>(p);
+                if (!ps) continue;
+                if (!ps->modifier.empty()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("a `pure` member declares no "
+                                    "`ref`/`out`/`out owned`/`owned`/`scoped` "
+                                    "parameter; method `") +
+                        std::string(ms->name) + "` parameter `" +
+                        std::string(ps->name) + "` carries modifier `" +
+                        std::string(ps->modifier) + "` (\xC2\xA7""22.15)");
+                }
+            }
+            // §22.15 "Parameters and result": no `owned` class-typed return.
+            bool retOwned = opDecl ? opDecl->returnOwned : false;
+            const ast::Type* retTy = opDecl ? opDecl->returnType.get()
+                                            : nullptr;
+            if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+                retOwned = md->returnOwned;
+                retTy = md->returnType.get();
+            }
+            if (retOwned && retTy) {
+                const TypeRef* rt = ctx_.resolvedType(*retTy);
+                if (isUserClassTypeRef(rt)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("a `pure` member declares no `owned` "
+                                    "class-typed return; method `") +
+                        std::string(ms->name) +
+                        "` returns an owned class instance "
+                        "(\xC2\xA7""22.15)");
+                }
+            }
+            continue;
+        }
+
+        // ---- ConstructorDecl ----------------------------------------------
+        if (auto* cs = dynamic_cast<ConstructorSymbol*>(m)) {
+            const auto* cd =
+                dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+            if (!cd || !cd->isPure) continue;
+            // §22.15 "Where pure is rejected": static constructors admit no
+            // `pure` (no call site exists to consume the fact).
+            if (cd->isStatic) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    "`pure` is not admitted on a static constructor "
+                    "(\xC2\xA7""22.15)");
+                continue;
+            }
+            // §22.15 "Parameters and result": same parameter-modifier rule
+            // as for methods.
+            for (Symbol* p : cs->params) {
+                auto* ps = dynamic_cast<ParameterSymbol*>(p);
+                if (!ps) continue;
+                if (!ps->modifier.empty()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("a `pure` member declares no "
+                                    "`ref`/`out`/`out owned`/`owned`/`scoped` "
+                                    "parameter; constructor parameter `") +
+                        std::string(ps->name) + "` carries modifier `" +
+                        std::string(ps->modifier) + "` (\xC2\xA7""22.15)");
+                }
+            }
+            continue;
+        }
+
+        // ---- DestructorDecl ------------------------------------------------
+        if (dynamic_cast<DestructorSymbol*>(m)) {
+            // A destructor carries no modifiers vector in the AST, so `pure`
+            // on a destructor cannot reach sema via the modifier-collection
+            // loop. Still, defend against the case: if a future change stores
+            // modifiers on DestructorDecl, the rule still applies.
+            if (hasMod(dynamic_cast<MemberSymbol*>(m), "pure")) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    "`pure` is not admitted on a destructor — disposal is the "
+                    "effect context purity fences off (\xC2\xA7""22.15)");
+            }
+            continue;
+        }
+
+        // ---- PropertyDecl / IndexerDecl -----------------------------------
+        if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
+            if (!hasMod(ps, "pure")) continue;
+            const auto* pd =
+                dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+            if (!pd) continue;
+            // §22.15: writing `pure` on the auto-property form is rejected
+            // as redundant — the auto-getter is implicitly pure-classified.
+            // An interface property's signature-only form parses as Auto but
+            // is an abstract declaration, not an auto-property with backing
+            // storage — pure is the contract, not redundant.
+            const bool parentIsIface =
+                ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface;
+            if (pd->bodyKind == ast::PropertyBodyKind::Auto &&
+                !parentIsIface) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("`pure` on an auto-property is redundant — the "
+                                "auto-getter is implicitly pure-classified; "
+                                "property `") +
+                    std::string(ps->name) + "` (\xC2\xA7""22.15)");
+                continue;
+            }
+            // §22.15 "Purity attaches to the getter": a read-write block-form
+            // property takes per-accessor `pure get` instead of property-level
+            // `pure`. Property-level `pure` is for read-only / expression-bodied
+            // shapes only.
+            if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+                bool hasSet = false;
+                for (const auto& a : pd->accessors)
+                    if (a.isSet) { hasSet = true; break; }
+                if (hasSet) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("property-level `pure` marks the single "
+                                    "getter; a read-write block-form property "
+                                    "uses per-accessor `pure get` instead; "
+                                    "property `") +
+                        std::string(ps->name) + "` (\xC2\xA7""22.15)");
+                    continue;
+                }
+            }
+            continue;
+        }
+
+        // ---- FieldDecl -----------------------------------------------------
+        if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+            if (hasMod(fs, "pure")) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("`pure` is not admitted on a field; field `") +
+                    std::string(fs->name) + "` (\xC2\xA7""22.15)");
+            }
+            continue;
+        }
+
+        // ---- EventDecl -----------------------------------------------------
+        if (dynamic_cast<EventSymbol*>(m)) {
+            if (hasMod(dynamic_cast<MemberSymbol*>(m), "pure")) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    "`pure` is not admitted on an event — events are the "
+                    "synchronization surface purity fences off "
+                    "(\xC2\xA7""22.15)");
+            }
+            continue;
+        }
+
+        // ---- ConstDecl / EnumConstantSymbol --------------------------------
+        if (dynamic_cast<ConstMemberSymbol*>(m) ||
+            dynamic_cast<EnumConstantSymbol*>(m)) {
+            if (hasMod(dynamic_cast<MemberSymbol*>(m), "pure")) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    "`pure` is not admitted on a const or enum constant "
+                    "(\xC2\xA7""22.15)");
+            }
+            continue;
+        }
+    }
+
+    // §22.15 "Purity attaches to the getter; `pure` on `set` is always
+    // rejected." A second pass over property accessors so a `pure set` inside
+    // any block-form property surfaces regardless of the property's own
+    // modifiers.
+    for (Symbol* m : t->members) {
+        auto* ps = dynamic_cast<PropertySymbol*>(m);
+        if (!ps) continue;
+        const auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (!pd || pd->bodyKind != ast::PropertyBodyKind::Block) continue;
+        for (const auto& a : pd->accessors) {
+            if (a.isPure && a.isSet) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("`pure` on a `set` accessor is always "
+                                "rejected — purity attaches to the getter "
+                                "only (\xC2\xA7""22.15)"));
+            }
+        }
+    }
+}
+
 }  // namespace bezel::sema

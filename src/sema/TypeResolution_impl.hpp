@@ -140,6 +140,18 @@ private:
 
     void checkTypeAsyncModifiers(TypeSymbol* t);
 
+    // §22.15 (v0.202, #2052): placement + signature restrictions on `pure`
+    // members. A pure member is rejected on member kinds that do not admit
+    // it (events, fields, destructors, static constructors), in combination
+    // with `async`, on iterator methods (those whose body contains `yield`),
+    // when its signature carries a `ref`/`out`/`out owned`/`owned`/`scoped`
+    // parameter or an `owned` class-typed return, on the auto-property
+    // declaration form (redundant — the auto-getter is implicitly pure), and
+    // on the `set` accessor. The pure-body rule set (closed-body, throw
+    // carve-out, pure constructors) is enforced in a later slice.
+    void checkPureModifiers();
+    void checkTypePureModifiers(TypeSymbol* t);
+
     // Slice S34 (§12.1): "Fields, constructors, destructors, and static
     // members may not be virtual." A static method or property carrying
     // `virtual` / `abstract` / `override` is rejected.

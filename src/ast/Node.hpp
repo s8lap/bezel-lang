@@ -522,6 +522,10 @@ struct MethodDecl : Member {
 struct ConstructorDecl : Member {
     Visibility visibility = Visibility::None; // none for the static form
     bool isStatic = false;
+    // §22.15 (v0.202, #2052): `pure` on a constructor — admitted on the
+    // instance form only; rejected on the static-constructor alternative
+    // (no call site exists to consume the fact) and on destructors.
+    bool isPure = false;
     std::vector<Param> params;
     std::vector<std::unique_ptr<Stmt>> body;
 };
@@ -567,6 +571,10 @@ enum class PropertyAccessorBodyKind { Expression, Block, Abstract };
 struct PropertyAccessor {
     Visibility visibility = Visibility::None;  // optional per A.4
     bool isSet = false;                        // false = get, true = set
+    // §22.15 (v0.202, #2052): `pure get` — purity attaches to the getter
+    // only; a `pure set` is rejected semantically. Meaningful only when
+    // !isSet (sema enforces).
+    bool isPure = false;
     // SetterParamSpec (set-only): `( ParamMod? Identifier? )`. Both pieces
     // are optional. Implicit param name is `value`; implicit modifier is
     // none (borrow-taking) — sema substitutes the defaults.
@@ -749,6 +757,11 @@ struct OperatorDecl : Member {
     std::vector<Param> params;
     std::unique_ptr<Type> returnType;
     bool returnOwned = false;
+    // §22.15 (v0.202, #2052): `pure` admitted on operator declarations.
+    // Operators are always `public static` (grammar A.4 OperatorDecl), so
+    // `pure` has no `async` conflict; sema checks the body like any pure
+    // member.
+    bool isPure = false;
     MethodBodyKind bodyKind = MethodBodyKind::Abstract;
     std::unique_ptr<Expr> exprBody;
     std::vector<std::unique_ptr<Stmt>> stmts;
