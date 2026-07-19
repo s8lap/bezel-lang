@@ -1966,7 +1966,19 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         // Resolver::argSatisfiesNew. Defer (decided=false).
                                         continue;
                                     }
-                                    if (argDecl->kind == ast::TypeDeclKind::Interface) {
+                                    // §35.10 (v0.200, #2044): "Choices never
+                                    // satisfy the value-type arm — `default(C)`
+                                    // is undefined for every choice type." The
+                                    // new() value-type arm keys off default, so
+                                    // a choice substitution always fails. The
+                                    // DECLARATION-site check is in
+                                    // Resolver::argSatisfiesNew + ExprTC::
+                                    // groundSatisfiesNew; this is the call-site
+                                    // re-check.
+                                    if (argDecl->kind == ast::TypeDeclKind::Choice) {
+                                        decided = true;
+                                        satisfied = false;
+                                    } else if (argDecl->kind == ast::TypeDeclKind::Interface) {
                                         decided = true;
                                         satisfied = false;  // §11.2: not constructible
                                     } else if (argDecl->kind == ast::TypeDeclKind::Class) {

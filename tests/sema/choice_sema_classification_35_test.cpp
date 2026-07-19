@@ -188,6 +188,37 @@ BEZEL_TEST(choice_sema_35, spec_35_10_default_choice_nullable_accepted) {
     }
 }
 
+BEZEL_TEST(choice_sema_35,
+           spec_35_10_generic_call_new_constraint_rejects_choice) {
+    // §35.10 / §14.2 (v0.200, #2044): "Choices never satisfy `where T: new()`'s
+    // value-type arm." This must hold at the GENERIC-CALL-SITE constraint-
+    // satisfaction check, not just at the default(C) site. The call site
+    // (ExprTypecheck_Calls.cpp's checkMethodGenericConstraints) had explicit
+    // kind-cases for Enum/Record/Interface/Class but not Choice — a choice
+    // substitution fell through with `decided=false`, silently accepting the
+    // call. This regression test pins the call-site rejection.
+    auto r = semaAll(
+        "module M; "
+        "choice Opt Some(value: int), None; end Opt; "
+        "static class Utils public static method Make<T>(): int "
+        "  where T: new() using var t := new T(); return 1; "
+        "end Make; end Utils; "
+        "class C public static method Main(): int "
+        "  return Utils.Make<Opt>(); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool seen = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("`Opt`") != std::string::npos &&
+            d.message.find("does not satisfy") != std::string::npos &&
+            d.message.find("new()") != std::string::npos) {
+            seen = true;
+            break;
+        }
+    }
+    BEZEL_EXPECT_TRUE(seen);
+}
+
 // --- §35.3: qualified case access resolves to the choice type --------------
 
 BEZEL_TEST(choice_sema_35, spec_35_3_qualified_payload_free_case_has_choice_type) {
