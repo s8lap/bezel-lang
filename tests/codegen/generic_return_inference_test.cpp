@@ -40,7 +40,7 @@ const char* kFactory =
     "  destructor end destructor; "
     "end Widget; "
     "static class Factory "
-    "  public static method Create<T>(): T where T: class, new() "
+    "  public static method Create<T>(): owned T where T: class, new() "
     "    return new T(); "
     "  end Create; "
     "end Factory; ";
@@ -153,12 +153,15 @@ BEZEL_TEST(generic_return_inference_391, argument_inferred_unaffected) {
 // local compiled.
 
 // A return-position-only T solved by explicit type args, bound to an UNTYPED
-// local — must compile and run.
+// local — must compile and run. v0.201 (#2048): the empty-set bare-T signature
+// is spelled `owned T` per the declaration-site static-return rule; at the
+// value instantiation `int` the marker is erased (§28.1), so the call yields a
+// plain `int` and the local binds without an ownership obligation.
 BEZEL_TEST(generic_return_inference_391, explicit_type_args_no_target_needed_747) {
     auto r = runAot(
         "module M; "
         "class C "
-        "  public static method Make<T>(): T return default(T); end Make; "
+        "  public static method Make<T>(): owned T return default(T); end Make; "
         "  public static method Main(): int "
         "    var x := C.Make<int>(); "  // explicit <int> → no target needed
         "    return x; "  // default(int) = 0

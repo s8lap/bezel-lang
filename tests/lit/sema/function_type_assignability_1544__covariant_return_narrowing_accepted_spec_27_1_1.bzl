@@ -5,12 +5,14 @@
 // () -> Animal" — the value's (narrower) return type reference-converts to
 // the target's (wider) return type.
 //
-// ACCEPT-WITH-WARNING control: bezelc -c must exit zero (the program is legal), but it DOES emit a diagnostic — pinned below so the warning itself stays observed.
+// ACCEPT control: bezelc -c must exit zero. v0.201 (#2048): the fresh-producing
+// factory is spelled `owned Dog` per the declaration-site static-return rule;
+// the function-typed slot carries the marker through §27.1.1's exact-modifier
+// matching.
 //
 // RUN: %bezelc -c -o %t.o %s
-// RUN: %bezelc -c %s 2>&1 | FileCheck %s
+// RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NO-ERROR --allow-empty %s
 
-module M; class Animal end Animal; class Dog: Animal end Dog; class C public static method MakeDog(): Dog return new Dog(); end MakeDog; public static method Main(): int var f: () -> Dog := MakeDog; var g: () -> Animal := f; return 0; end Main; end C;
+module M; class Animal end Animal; class Dog: Animal end Dog; class C public static method MakeDog(): owned Dog return new Dog(); end MakeDog; public static method Main(): int var f: () -> owned Dog := MakeDog; var g: () -> owned Animal := f; return 0; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: static factory method `MakeDog` returns `Dog` with no `owned` qualifier and no structural borrow source; the caller treats the result as owned
-// CHECK-SAME: (§28.3 sourceless-return rule)
+// NO-ERROR-NOT: error:

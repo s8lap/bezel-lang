@@ -3,12 +3,15 @@
 //
 // `T.Zero()` under `where T: INum<T>` typechecks (the constraint provides it).
 //
-// ACCEPT-WITH-WARNING control: bezelc -c must exit zero (the program is legal), but it DOES emit a diagnostic — pinned below so the warning itself stays observed.
+// ACCEPT control: bezelc -c must exit zero. v0.201 (#2048): the fresh-producing
+// static members are spelled `owned T` / `owned Meters` per the declaration-
+// site static-return rule. The generic helper `Z<T>(): owned T` is spelled
+// `owned T` (empty source set) so the body's `T.Zero()` (a fresh value at
+// class T) transfers through the return.
 //
 // RUN: %bezelc -c -o %t.o %s
-// RUN: %bezelc -c %s 2>&1 | FileCheck %s
+// RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NO-ERROR --allow-empty %s
 
-module M; public interface INum<T> where T: INum<T> static method Zero(): T; static operator +(a: T, b: T): T; end INum; public class Meters: INum<Meters> public Value: int; public constructor(v: int) this.Value := v; end; public static method Zero(): Meters => new Meters(0); public static method operator +(a: Meters, b: Meters): Meters => new Meters(a.Value + b.Value); end Meters; static class F public static method Z<T>(): T where T: INum<T> return T.Zero(); end Z; end F;
+module M; public interface INum<T> where T: INum<T> static method Zero(): owned T; static operator +(a: T, b: T): owned T; end INum; public class Meters: INum<Meters> public Value: int; public constructor(v: int) this.Value := v; end; public static method Zero(): owned Meters => new Meters(0); public static method operator +(a: Meters, b: Meters): owned Meters => new Meters(a.Value + b.Value); end Meters; static class F public static method Z<T>(): owned T where T: INum<T> return T.Zero(); end Z; end F;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: static factory method `Zero` returns `Meters` with no `owned` qualifier and no structural borrow source; the caller treats the result as owned
-// CHECK-SAME: (§28.3 sourceless-return rule)
+// NO-ERROR-NOT: error:

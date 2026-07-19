@@ -5,11 +5,14 @@
 // `where T: class` MUST remain accepted — `T?` allows null.
 //
 // Clean-compile ACCEPT control: bezelc -c must exit zero and emit no diagnostics.
+// v0.201 (#2048): the empty-set bare-T signature is spelled `owned T?` per the
+// declaration-site static-return rule (nullability stripped, the rule fires on
+// the bare-T shape); `default(T?)` returns null, admissible on any path.
 //
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; static class Utils public static method GetNull<T>(): T? where T: class return default(T?); end GetNull; end Utils; class C public static method Main(): int return 0; end Main; end C;
+module M; static class Utils public static method GetNull<T>(): owned T? where T: class return default(T?); end GetNull; end Utils; class C public static method Main(): int return 0; end Main; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

@@ -77,13 +77,15 @@ BEZEL_TEST(codegen_cg18, owned_field_subclass_disposed_dynamically) {
 
 BEZEL_TEST(codegen_cg18, using_var_subclass_disposed_dynamically) {
     // A using var statically typed Base, holding a Derived (via a factory),
-    // disposes to Derived.Dispose dynamically → 101 (not 100).
+    // disposes to Derived.Dispose dynamically → 101 (not 100). v0.201 (#2048):
+    // the fresh-producing factory is spelled `owned Base` per the declaration-
+    // site static-return rule.
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "class Base "
         "  public static _n: int := 0; "
         "  destructor _n := _n + 100; end destructor; "
-        "  public static method Make(): Base => new Derived(); "
+        "  public static method Make(): owned Base => new Derived(); "
         "  public static method Main(): int "
         "    do using var b: Base := Make(); end; "
         "    return _n; "

@@ -353,9 +353,11 @@ BEZEL_TEST(own_multihop_escape, value_typed_hop_breaks_chain_clean_28_3) {
 
 // CONTROL: a multi-hop chain whose tail is rebound to null before escape does
 // not carry a live borrow. `var b := r; var c: R? := b; c := null; return c;`.
+// v0.201 (#2048): the static factory's class-typed return is spelled `owned R?`
+// per the declaration-site static-return rule.
 BEZEL_TEST(own_multihop_escape, multihop_rebound_to_null_clean_28_3) {
     auto r = parseAndCheckOwnership(wrap(
-        "public static method Take(): R? "
+        "public static method Take(): owned R? "
         "  using var r := new R(); "
         "  var b := r; "
         "  var c: R? := b; "

@@ -81,12 +81,14 @@ BEZEL_TEST(builtin_interface_value_1115, iequatable_as_value_dispatches) {
         "end Main; end App;"), 7);
 }
 
-// #1115: IComparable<int> as a RETURN type.
+// #1115: IComparable<int> as a RETURN type. v0.201 (#2048): the fresh-producing
+// factory is spelled `owned IComparable<int>` per the declaration-site static-
+// return rule.
 BEZEL_TEST(builtin_interface_value_1115, icomparable_as_return_type) {
     BEZEL_EXPECT_EQ(run(
         std::string(CMP) +
         "class App "
-        "  private static method Make(): IComparable<int> => new C(9); "
+        "  private static method Make(): owned IComparable<int> => new C(9); "
         "  public static method Main(): int return Make().CompareTo(3); end Main; "  // 2
         "end App;"), 2);
 }
@@ -143,11 +145,13 @@ BEZEL_TEST(builtin_interface_value_1115, iequalitycomparer_as_local_dispatches) 
 }
 
 // #975: IEqualityComparer<int> as a RETURN type — dispatch on the returned ref.
+// v0.201 (#2048): the fresh-producing factory is spelled `owned IEqualityComparer<int>`
+// per the declaration-site static-return rule.
 BEZEL_TEST(builtin_interface_value_1115, iequalitycomparer_as_return_type) {
     BEZEL_EXPECT_EQ(run(
         std::string(EQC) +
         "class App "
-        "  private static method Make(): IEqualityComparer<int> => new Cmp(); "
+        "  private static method Make(): owned IEqualityComparer<int> => new Cmp(); "
         "  public static method Main(): int "
         "    using var c := Make(); return c.GetHashCode(11); "    // 22
         "  end Main; end App;"), 22);

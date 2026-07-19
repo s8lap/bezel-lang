@@ -180,7 +180,9 @@ BEZEL_TEST(function_value_equality_1544,
 // IDENTITY: the value is the same function object viewed at a compatible
 // function type ... so function-value equality (§27.7.1) is unaffected by
 // the retyping." A () -> Dog value retyped (covariantly, §27.1.1) to
-// () -> Animal still equals itself.
+// () -> Animal still equals itself. v0.201 (#2048): the fresh-producing
+// factory is spelled `owned Dog` per the declaration-site static-return rule;
+// the function-typed slots follow under §27.1.1's exact-modifier matching.
 BEZEL_TEST(function_value_equality_1544,
           identity_preserved_across_covariant_retyping_spec_27_1_1) {
     BEZEL_EXPECT_EQ(run(
@@ -188,10 +190,10 @@ BEZEL_TEST(function_value_equality_1544,
         "class Animal end Animal; "
         "class Dog: Animal end Dog; "
         "class C "
-        "  public static method MakeDog(): Dog return new Dog(); end MakeDog; "
+        "  public static method MakeDog(): owned Dog return new Dog(); end MakeDog; "
         "  public static method Main(): int "
-        "    var f: () -> Dog := MakeDog; "
-        "    var g: () -> Animal := f; "
+        "    var f: () -> owned Dog := MakeDog; "
+        "    var g: () -> owned Animal := f; "
         "    return 1 if f = g else 0; "
         "  end Main; "
         "end C;"), 1);

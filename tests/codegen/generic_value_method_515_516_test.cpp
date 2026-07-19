@@ -140,6 +140,8 @@ BEZEL_TEST(codegen_generic_value_method_516, apply_bool_lambda_return_14_1_27_3)
 
 // §14.1 / §27.3 / #516: Apply with a REF-type U (class) — must still work as
 // it did before (reference types already dispatched correctly via vtable).
+// v0.201 (#2048): the fresh-producing factory is spelled `owned Box` per the
+// declaration-site static-return rule.
 BEZEL_TEST(codegen_generic_value_method_516, apply_class_ref_type_U_still_works_14_1_27_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
@@ -153,7 +155,7 @@ BEZEL_TEST(codegen_generic_value_method_516, apply_class_ref_type_U_still_works_
         "    => fn(x); "
         "end Helper; "
         "class C "
-        "  public static method GetBox(): Box "
+        "  public static method GetBox(): owned Box "
         "    return Helper.Apply<Box>(7, (x) => new Box(x)); "
         "  end GetBox; "
         "  public static method Main(): int "

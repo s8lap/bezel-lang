@@ -33,10 +33,12 @@ bool rejects(const std::string& src) {
     return !r.ran && r.diagnostics.hasErrors();
 }
 
-// The spec §11.8 Sum example, verbatim shape.
+// The spec §11.8 Sum example, verbatim shape. v0.201 (#2048): the
+// fresh-producing generic signature is spelled `owned T` per the spec's
+// canonical example — the same spelling stdlib §2.19's producer members use.
 const char* kSum =
     "static class F "
-    "  public static method Sum<T>(items: Array<T>): T where T: INumber<T> "
+    "  public static method Sum<T>(items: Array<T>): owned T where T: INumber<T> "
     "    var total := T.Zero(); "
     "    for var x in items do total := total + x; end; "
     "    return total; "
@@ -44,19 +46,23 @@ const char* kSum =
     "end F; ";
 
 // A user INumber<T>-conforming class (stdlib §2.19 + §25.2 complete groups).
+// v0.201 (#2048 / proposal 0048): the fresh-producing static members (`Zero`,
+// `One`, and the arithmetic operators) are spelled `owned Meters` per the
+// declaration-site static-return rule — the canonical §11.8/§2.19 shape the
+// spec itself uses for `INumber<T>`'s producer members.
 const char* kMeters =
     "public class Meters: INumber<Meters> "
     "  public Value: int; "
     "  public constructor(v: int) this.Value := v; end; "
-    "  public static method Zero(): Meters => new Meters(0); "
-    "  public static method One(): Meters => new Meters(1); "
-    "  public static method operator +(a: Meters, b: Meters): Meters => "
+    "  public static method Zero(): owned Meters => new Meters(0); "
+    "  public static method One(): owned Meters => new Meters(1); "
+    "  public static method operator +(a: Meters, b: Meters): owned Meters => "
     "    new Meters(a.Value + b.Value); "
-    "  public static method operator -(a: Meters, b: Meters): Meters => "
+    "  public static method operator -(a: Meters, b: Meters): owned Meters => "
     "    new Meters(a.Value - b.Value); "
-    "  public static method operator *(a: Meters, b: Meters): Meters => "
+    "  public static method operator *(a: Meters, b: Meters): owned Meters => "
     "    new Meters(a.Value * b.Value); "
-    "  public static method operator /(a: Meters, b: Meters): Meters => "
+    "  public static method operator /(a: Meters, b: Meters): owned Meters => "
     "    new Meters(a.Value / b.Value); "
     "  public static method operator <(a: Meters, b: Meters): bool => "
     "    a.Value < b.Value; "
@@ -133,7 +139,12 @@ BEZEL_TEST(static_iface_dispatch_807, sum_user_meters_value) {
 }
 
 BEZEL_TEST(static_iface_dispatch_807, user_one_and_operators) {
-    // T.One() plus the -,*,/ constraint operators on a user type.
+    // T.One() plus the -,*,/ constraint operators on a user type. v0.201
+    // (#2048): the generic helper retains its bare-T signature — the body-side
+    // bare-T check is per-instantiation-category (#2064), so a mixed-domain
+    // constraint like `where T: INumber<T>` (which admits value conformers)
+    // makes the body-side check vacuous at the declaration; the declaration-
+    // site check admits because `a, b: T` are plain source parameters.
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kMeters +
         "static class F "
@@ -280,10 +291,12 @@ BEZEL_TEST(static_iface_dispatch_807, ordering_without_comparison_constraint_rej
 // ── §11.8 / §2.19: the primitive bridge, member by member ───────────────────
 
 BEZEL_TEST(static_iface_dispatch_807, zero_one_bridge_int_double) {
-    // INumber.Zero()/One() lower to the constants for primitive T.
+    // INumber.Zero()/One() lower to the constants for primitive T. v0.201
+    // (#2048): the empty-set bare-T signature is spelled `owned T` per the
+    // declaration-site static-return rule.
     BEZEL_EXPECT_EQ(run(
         "module M; static class F "
-        "  public static method ZO<T>(): T where T: INumber<T> "
+        "  public static method ZO<T>(): owned T where T: INumber<T> "
         "    return T.One() + T.One() + T.Zero(); "
         "  end ZO; "
         "end F; "
@@ -335,6 +348,10 @@ BEZEL_TEST(static_iface_dispatch_807, decimal_bridge) {
 
 BEZEL_TEST(static_iface_dispatch_807, step_bridge_char) {
     // ISteppable.Step for char: advance the code point ('a' + 2 = 'c').
+    // v0.201 (#2048): the generic helper retains its bare-T signature — the
+    // body-side check is per-instantiation-category (#2064), vacuous for the
+    // mixed-domain ISteppable constraint, and the declaration-site check
+    // admits because `v: T` is a plain source parameter.
     BEZEL_EXPECT_EQ(run(
         "module M; static class F "
         "  public static method Nxt<T>(v: T, by: long): T "
@@ -364,10 +381,12 @@ BEZEL_TEST(static_iface_dispatch_807, step_bridge_int_double) {
 }
 
 BEZEL_TEST(static_iface_dispatch_807, parse_bridge_int_double) {
-    // IParsable.Parse routes to the existing runtime parse lowerings.
+    // IParsable.Parse routes to the existing runtime parse lowerings. v0.201
+    // (#2048): the generic helper is spelled `owned T` so the body's
+    // `T.Parse(s)` (a fresh value at class T) transfers through the return.
     BEZEL_EXPECT_EQ(run(
         "module M; static class F "
-        "  public static method P<T>(s: string): T where T: IParsable<T> "
+        "  public static method P<T>(s: string): owned T where T: IParsable<T> "
         "    return T.Parse(s); "
         "  end P; "
         "end F; "
@@ -382,7 +401,7 @@ BEZEL_TEST(static_iface_dispatch_807, parse_bridge_char) {
     // char.Parse via IParsable<char>: a one-code-point string.
     BEZEL_EXPECT_EQ(run(
         "module M; static class F "
-        "  public static method P<T>(s: string): T where T: IParsable<T> "
+        "  public static method P<T>(s: string): owned T where T: IParsable<T> "
         "    return T.Parse(s); "
         "  end P; "
         "end F; "
@@ -450,12 +469,17 @@ BEZEL_TEST(static_iface_dispatch_807, tryparse_bridge_narrowing_scoped_to_then) 
 // ── §11.8: user-type Parse/TryParse (direct static calls, no bridge) ────────
 
 BEZEL_TEST(static_iface_dispatch_807, user_parse_meters) {
+    // v0.201 (#2048): Meters's `Parse` witness is spelled `owned Meters` (the
+    // class-conformer spelling the §11.2/§11.8 exact-match rule requires
+    // against IParsable<T>'s `owned T` declaration); the generic helper `P` is
+    // spelled `owned T` so the body's `T.Parse(s)` (a fresh value at class T)
+    // transfers through the return.
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "public class Meters: IParsable<Meters> "
         "  public Value: int; "
         "  public constructor(v: int) this.Value := v; end; "
-        "  public static method Parse(s: string): Meters => "
+        "  public static method Parse(s: string): owned Meters => "
         "    new Meters(int.Parse(s)); "
         "  public static method TryParse(s: string, out value: Meters?): bool "
         "    if int.TryParse(s, out var n) then "
@@ -465,12 +489,12 @@ BEZEL_TEST(static_iface_dispatch_807, user_parse_meters) {
         "  end TryParse; "
         "end Meters; "
         "static class F "
-        "  public static method P<T>(s: string): T where T: IParsable<T> "
+        "  public static method P<T>(s: string): owned T where T: IParsable<T> "
         "    return T.Parse(s); "
         "  end P; "
         "end F; "
         "class C public static method Main(): int "
-        "  var m := F.P<Meters>(\"37\"); "
+        "  using var m := F.P<Meters>(\"37\"); "
         "  return m.Value; "
         "end Main; end C;"), 37);
 }
@@ -495,6 +519,11 @@ BEZEL_TEST(static_iface_dispatch_807, generic_calls_generic_threading) {
 
 // A CLASS-level type parameter's constraint drives T.Member in method bodies.
 BEZEL_TEST(static_iface_dispatch_807, class_level_constraint) {
+    // v0.201 (#2048): the instance methods retain their bare-T signatures —
+    // instance methods have the receiver as a structural source (the
+    // declaration-site static-return rule does not apply), and the body-side
+    // bare-T check is per-instantiation-category (#2064), vacuous for the
+    // mixed-domain INumber<T> constraint.
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "public class Box<T> where T: INumber<T> "
@@ -559,13 +588,15 @@ BEZEL_TEST(static_iface_dispatch_807, char_not_inumber_rejected) {
 
 BEZEL_TEST(static_iface_dispatch_807, non_generic_operator_overload_unaffected) {
     // A plain user operator overload (no interfaces, no constraints) still
-    // resolves through the ordinary §25 path.
+    // resolves through the ordinary §25 path. v0.201 (#2048): a fresh-producing
+    // operator's class-typed result is spelled `owned Money` per the
+    // declaration-site static-return rule.
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "public class Money "
         "  public Cents: int; "
         "  public constructor(c: int) this.Cents := c; end; "
-        "  public static method operator +(a: Money, b: Money): Money => "
+        "  public static method operator +(a: Money, b: Money): owned Money => "
         "    new Money(a.Cents + b.Cents); "
         "end Money; "
         "class C public static method Main(): int "

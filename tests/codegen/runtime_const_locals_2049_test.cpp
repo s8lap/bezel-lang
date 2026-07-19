@@ -113,12 +113,14 @@ BEZEL_TEST(runtime_const_locals_2049, string_const_from_concat) {
 
 // §21.1: a runtime const initialized from a method-call result. The plain
 // (non-`owned`) call returns a borrow; the const local carries that borrow.
+// v0.201 (#2048): the fresh-producing factory is spelled `owned C` per the
+// declaration-site static-return rule.
 BEZEL_TEST(runtime_const_locals_2049, borrow_from_method_call) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public f: int := 0; "
         "  public constructor(v: int) f := v; end constructor; "
-        "  public static method Make(): C => new C(99); "  // (test only)
+        "  public static method Make(): owned C => new C(99); "  // (test only)
         "  public static method Consume(c: C): int => c.f; "
         "  public static method Main(): int "
         "    using var c := new C(99); "

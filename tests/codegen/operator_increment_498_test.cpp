@@ -114,12 +114,14 @@ BEZEL_TEST(codegen_498, record_operator_increment_loop_single_iter) {
 
 // §17.6 / §25: class with operator ++ — local class var, operator returns new instance.
 // After c++, c.value should be 1.
+// v0.201 (#2048): a fresh-producing operator's class-typed result is spelled
+// `owned Box` per the declaration-site static-return rule.
 BEZEL_TEST(codegen_498, class_operator_increment_local_var) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "class Box "
         "  public value: int := 0; "
-        "  public static method operator ++(b: Box): Box "
+        "  public static method operator ++(b: Box): owned Box "
         "    var r := new Box(); r.value := b.value + 1; return r; "
         "  end; "
         "end Box; "

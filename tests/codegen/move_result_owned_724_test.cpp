@@ -76,11 +76,13 @@ BEZEL_TEST(move_result_owned_724, undischarged_move_result_auto_dropped) {
 }
 
 // #724 F1: the move result is owned, so discharging it by RETURN is accepted.
+// v0.201 (#2048): the fresh-producing factory is spelled `owned R` per the
+// declaration-site static-return rule.
 BEZEL_TEST(move_result_owned_724, move_result_returned_accepted) {
     BEZEL_EXPECT_EQ(compileAndRun(
         std::string("module M; ") + rclass +
         "class C "
-        "  public static method Make(): R "
+        "  public static method Make(): owned R "
         "    var x := new R(); var s := move x; return s; "
         "  end Make; "
         "  public static method Main(): int "

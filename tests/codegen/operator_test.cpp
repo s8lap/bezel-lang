@@ -59,10 +59,12 @@ BEZEL_TEST(codegen_cg48, operator_comparison) {
 }
 
 BEZEL_TEST(codegen_cg48, operator_block_body_returns_object) {
+    // v0.201 (#2048): a fresh-producing operator's class-typed result is
+    // spelled `owned V` per the declaration-site static-return rule.
     BEZEL_EXPECT_EQ(run(
         "module M; class V "
         "  public X: int := 0; "
-        "  public static method operator +(a: V, b: V): V "
+        "  public static method operator +(a: V, b: V): owned V "
         "    var r := new V(); r.X := a.X + b.X; return r; "
         "  end; "
         "end V; "

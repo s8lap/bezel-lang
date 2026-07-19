@@ -520,22 +520,29 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
             const char* nameOrToken;
             std::vector<SParam> params;
             const char* ret;
+            // §28.1 / §11.8 (v0.196, #2048): the producer members of these
+            // static-abstraction interfaces declare `owned T` per stdlib §2.19
+            // — at a class/interface conformer the marker is the explicit
+            // ownership transfer; at a value/runtime-managed conformer the
+            // substitution ERASES the marker (the per-instantiation erasure of
+            // §28.1). The matching logic accounts for both.
+            bool retOwned = false;
         };
         std::vector<SMember> smembers;
         if (name == "INumber") {
             smembers = {
-                {false, "Zero", {}, "T"},
-                {false, "One",  {}, "T"},
-                {true,  "+", {{"a", "T", ""}, {"b", "T", ""}}, "T"},
-                {true,  "-", {{"a", "T", ""}, {"b", "T", ""}}, "T"},
-                {true,  "*", {{"a", "T", ""}, {"b", "T", ""}}, "T"},
-                {true,  "/", {{"a", "T", ""}, {"b", "T", ""}}, "T"},
-                {true,  "<", {{"a", "T", ""}, {"b", "T", ""}}, "bool"},
+                {false, "Zero", {}, "T", true},
+                {false, "One",  {}, "T", true},
+                {true,  "+", {{"a", "T", ""}, {"b", "T", ""}}, "T", true},
+                {true,  "-", {{"a", "T", ""}, {"b", "T", ""}}, "T", true},
+                {true,  "*", {{"a", "T", ""}, {"b", "T", ""}}, "T", true},
+                {true,  "/", {{"a", "T", ""}, {"b", "T", ""}}, "T", true},
+                {true,  "<", {{"a", "T", ""}, {"b", "T", ""}}, "bool", false},
             };
         } else if (name == "ISteppable") {
             smembers = {
-                {false, "Step", {{"value", "T", ""}, {"by", "long", ""}}, "T"},
-                {true,  "<", {{"a", "T", ""}, {"b", "T", ""}}, "bool"},
+                {false, "Step", {{"value", "T", ""}, {"by", "long", ""}}, "T", true},
+                {true,  "<", {{"a", "T", ""}, {"b", "T", ""}}, "bool", false},
             };
         } else {  // IParsable
             // stdlib §1 / §2.19: `TryParse` is a shape-(a) Try — its `out`
@@ -547,11 +554,11 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
             // wrongly sees `v` as still-nullable `T?` (regression from #1597,
             // which correctly stopped stripping the `?` off the recipient).
             smembers = {
-                {false, "Parse", {{"s", "string", ""}}, "T"},
+                {false, "Parse", {{"s", "string", ""}}, "T", true},
                 {false, "TryParse",
                  {{"s", "string", ""},
                   {"value", "T?", "out", ast::OutNullWhen::WhenTrue}},
-                 "bool"},
+                 "bool", false},
             };
         }
 
@@ -617,6 +624,7 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
                     od->params.push_back(std::move(p));
                 }
                 od->returnType = makeTypeNode(sm.ret);
+                od->returnOwned = sm.retOwned;  // §28.1/§11.8 v0.196 (#2048)
                 preResolve(od->returnType.get());
                 rm.m = od.get();
                 typeDecl->members.push_back(std::move(od));
@@ -637,6 +645,7 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
                     md->params.push_back(std::move(p));
                 }
                 md->returnType = makeTypeNode(sm.ret);
+                md->returnOwned = sm.retOwned;  // §28.1/§11.8 v0.196 (#2048)
                 preResolve(md->returnType.get());
                 rm.m = md.get();
                 typeDecl->members.push_back(std::move(md));

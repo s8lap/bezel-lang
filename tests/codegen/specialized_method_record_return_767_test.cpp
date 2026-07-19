@@ -24,13 +24,16 @@ int runFull(const std::string& program) {
 }  // namespace
 
 // §14.1: the #767 repro — `Make<R>()` returning `new T()` compiles (was IR_FAIL)
-// and the returned record's field reads back (the default int, 0).
+// and the returned record's field reads back (the default int, 0). v0.201
+// (#2048): the empty-set bare-T signature is spelled `owned T` per the
+// declaration-site static-return rule; at the record (value) substitution `R`
+// the marker is erased (§28.1).
 BEZEL_TEST(specialized_method_record_return_767, returns_record_type_param) {
     BEZEL_EXPECT_EQ(runFull(
         "module TestGen; "
         "record R(X: int); "
         "static class F "
-        "  public static method Make<T>(): T where T: new() "
+        "  public static method Make<T>(): owned T where T: new() "
         "    return new T(); "
         "  end Make; "
         "end F; "
@@ -44,14 +47,15 @@ BEZEL_TEST(specialized_method_record_return_767, returns_record_type_param) {
 
 // §14.2: two distinct record instantiations of the same generic method each get
 // their own specialized return type (no struct collision). R has one int field
-// (read 0); R2 has two (read 0).
+// (read 0); R2 has two (read 0). v0.201 (#2048): `owned T` per the declaration-
+// site static-return rule; erased at the record substitutions.
 BEZEL_TEST(specialized_method_record_return_767, two_record_instantiations) {
     BEZEL_EXPECT_EQ(runFull(
         "module TestGen; "
         "record R(X: int); "
         "record R2(A: int, B: int); "
         "static class F "
-        "  public static method Make<T>(): T where T: new() return new T(); end Make; "
+        "  public static method Make<T>(): owned T where T: new() return new T(); end Make; "
         "end F; "
         "public static class Program "
         "  public static method Main(): int "

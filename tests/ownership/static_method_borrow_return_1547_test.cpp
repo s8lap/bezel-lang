@@ -145,27 +145,49 @@ BEZEL_TEST(static_borrow_return_1547, static_field_read_stays_accepted) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// §28.3 producers table (v0.180), #1546 conformance batch: a static method
-// returning its own STATIC PROPERTY getter — not merely a static field, the
-// shape `static_field_read_stays_accepted` above covers — is the row this
-// file's #1547 fix was written to satisfy but did not separately exercise:
-// "Static property access `T.P` (class-typed result) | Borrowed (source:
-// the declaring type's static storage — process-lived, so every
+// §28.3 producers table (v0.180), #1546 conformance batch: a STATIC PROPERTY
+// itself — "Static property access `T.P` (class-typed result) | Borrowed
+// (source: the declaring type's static storage — process-lived, so every
 // intra-program liveness constraint is satisfied; static state is disposed
-// only at program exit, §22.13)." A property getter is ordinarily a
-// borrow-producing call sourced from ITS receiver (the "Property access
-// (instance getter)" row immediately above this one in the same table), but
-// for a STATIC property there is no receiver — the source is the declaring
-// type's process-lived static storage instead, exactly as for a static
-// field — so the static-method return must stay accepted.
-BEZEL_TEST(static_borrow_return_1547, static_property_read_stays_accepted) {
+// only at program exit, §22.13)" — stays accepted under v0.201's declaration-
+// site static-return error: static properties are explicitly OUTSIDE the
+// rule (proposal 0048 §3 — "Static property getters — outside, deliberately.
+// They were never under the heuristic … the static property is thus the
+// sanctioned complement of this error — the diagnostic's second remedy —
+// not a target of it."). v0.201 (#2048) DID retire the body-side admission a
+// static METHOD enjoyed when its body returned a static-property read: the
+// signature `static method Get(): Res` is now rejected at the declaration
+// regardless of body content (the predicate is signature-keyed), so the
+// former `Get(): Res => Holder.Shared` shape no longer compiles. The static
+// property alone — the still-relevant claim under v0.201 — is what this test
+// now pins; the wrapping static method was the v0.196 admission that v0.201
+// retires.
+BEZEL_TEST(static_borrow_return_1547, static_property_stays_accepted) {
+    auto r = parseAndCheckOwnership(mod(
+        "class Holder "
+        "  private static readonly _shared: Res := new Res(); "
+        "  public static property Shared: Res => _shared; "
+        "end Holder;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §28.3 v0.201 (#2048): the body-side admission retired — a static method
+// whose body returns a static-property READ is now rejected AT THE
+// DECLARATION (signature-keyed, body-independent). The v0.196 admission
+// opened this for the static-method arm; v0.201 retires it: the
+// `static method Get(): Res` signature fails the announced-set rule
+// regardless of body. The diagnostic teaches the fix — re-expose via the
+// static property directly (which is what `static_property_stays_accepted`
+// above exercises), or add `owned` if the body actually produces a fresh
+// value.
+BEZEL_TEST(static_borrow_return_1547, static_method_wrapping_static_property_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "class Holder "
         "  private static readonly _shared: Res := new Res(); "
         "  public static property Shared: Res => _shared; "
         "  public static method Get(): Res => Holder.Shared; "
         "end Holder;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // --- ACCEPT: instance-method receiver-sourced returns are a separate,

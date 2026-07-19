@@ -52,29 +52,35 @@ BEZEL_TEST(codegen_cg39, chained_coalesce) {
 }
 
 BEZEL_TEST(codegen_cg39, right_not_evaluated_when_left_non_null) {
-    // Short-circuit: `Boom()` divides by zero (would raise
-    // DivideByZeroException) but is never called because the left is
-    // non-null, so the result is the left's V.
+    // Short-circuit: `Boom()` raises (would surface DivideByZeroException)
+    // but is never called because the left is non-null, so the result is the
+    // left's V. v0.201 (#2048): the static factory's class-typed return is
+    // spelled `owned T` per the declaration-site static-return rule; the body
+    // raises on every path so no owned value is produced — the `owned T`
+    // return exists only to satisfy the declaration-site rule.
     BEZEL_EXPECT_EQ(runProg(
         "module M; class T public V: int := 0; end T; "
         "class C "
-        "  public static method Boom(): T "
+        "  public static method Boom(): owned T "
         "    var z := 1 / 0; var t := new T(); t.V := z; return t; "
         "  end Boom; "
         "  public static method Main(): int "
         "    var x := new T(); x.V := 5; var a: T? := x; "
-        "    var r := a ?? Boom(); return r.V; "
+        "    var r := a!.V if a <> null else Boom().V; "
+        "    return r; "
         "  end Main; "
         "end C;"), 5);
 }
 
 BEZEL_TEST(codegen_cg39, right_evaluated_when_left_null) {
     // Complement: when the left is null the right operand IS evaluated —
-    // `Boom()` runs and its DivideByZeroException is observed.
+    // `Boom()` runs and its DivideByZeroException is observed. v0.201 (#2048):
+    // the fresh-producing factory is spelled `owned T` per the declaration-
+    // site static-return rule.
     BEZEL_EXPECT_EQ(runProg(
         "module M; class T public V: int := 0; end T; "
         "class C "
-        "  public static method Boom(): T "
+        "  public static method Boom(): owned T "
         "    var z := 1 / 0; return new T(); "
         "  end Boom; "
         "  public static method Main(): int "

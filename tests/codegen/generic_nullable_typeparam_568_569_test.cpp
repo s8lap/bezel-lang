@@ -56,7 +56,7 @@ BEZEL_TEST(codegen_generic_nullable_typeparam_568, ret_null_int_14_1) {
     auto r = jit(
         "module M; "
         "class Util "
-        "  public static method RetNull<T>(): T? where T: notnull "
+        "  public static method RetNull<T>(): owned T? where T: notnull "
         "    return null; "
         "  end RetNull; "
         "end Util; "
@@ -98,7 +98,7 @@ BEZEL_TEST(codegen_generic_nullable_typeparam_568, ret_record_14_1) {
         "module M; "
         "record Pt(x: int, y: int); "
         "class Util "
-        "  public static method RetNull<T>(): T? where T: notnull "
+        "  public static method RetNull<T>(): owned T? where T: notnull "
         "    return null; "
         "  end RetNull; "
         "  public static method RetVal<T>(x: T): T? where T: notnull "

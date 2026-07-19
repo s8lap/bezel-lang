@@ -377,10 +377,12 @@ BEZEL_TEST(own_indirect_escape, closure_holder_invoked_locally_clean_28_9) {
 // CONTROL: rebinding the holder to a non-borrowing value before return clears
 // the tracked borrow source — `var b := r; b := null; return b;` does not
 // escape `r` (the returned value is null, no live borrow). Guards against a
-// stale-source false positive across reassignment.
+// stale-source false positive across reassignment. v0.201 (#2048): the static
+// factory's class-typed return is spelled `owned R?` per the declaration-site
+// static-return rule.
 BEZEL_TEST(own_indirect_escape, reborrow_then_rebound_to_null_clean_28_3) {
     auto r = parseAndCheckOwnership(wrapClosure(
-        "public static method Take(): R? "
+        "public static method Take(): owned R? "
         "  using var r := new R(); "
         "  var b: R? := r; "
         "  b := null; "
