@@ -1922,6 +1922,42 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         handleLocalDecl(*ld);
         return;
     }
+    // §21.1 v0.201 (#2049): a `const` LOCAL is NEVER-OWNED — the binding takes
+    // no disposal obligation and holds no affine (consumable) value. The
+    // initializer must not be an owned production (§28.3): a fresh `new`, an
+    // `owned`-returning call, a `Task`-family call, a `move`, a marked
+    // transfer, or any other producerState == Owned form. producerState on a
+    // compile-time-const initializer (literal, constant fold, const/enum
+    // reference) returns Borrowed — the check is naturally scoped to runtime
+    // const. Admitted: value-typed expressions, `string`/runtime-managed
+    // values, `null`, borrows. Rejected forms name the rule and the
+    // `using var` remedy (an owned, never-reassigned, scope-disposed local
+    // already exists: `using var`).
+    //
+    // Gated on the final emit pass (suppressDiag_) so the report-suppressed
+    // fixpoint iterations don't duplicate the diagnostic; producerState is a
+    // side-effect-free classifier, so re-running it on the final pass is safe.
+    // Per-instantiation enforcement for substitution-dependent RHS (a generic
+    // body whose initializer's ownership depends on the substitution) is the
+    // §3.6 rule; this site fires per instantiation category and the
+    // diagnostic names the declaration.
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lc->value && !suppressDiag_) {
+            if (producerState(*lc->value) == OwnershipState::Owned) {
+                ctx_.diagnostics().report(
+                    Severity::Error, lc->value->span.begin,
+                    std::string("a `const` local (`") +
+                    std::string(lc->name) +
+                    "`) must not take an owned production — the binding never "
+                    "takes a disposal obligation; bind owned values with "
+                    "`using var` (§21.1 / §28.3)");
+            }
+        }
+        // No state transition: a const local carries no obligation. The
+        // narrowing-persistence rule (§7.4) is enforced in sema; the
+        // ownership pass treats the binding as a no-op for its analysis.
+        return;
+    }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
         if (es->expr) handleDischarge(*es->expr);
         return;

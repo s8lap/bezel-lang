@@ -321,14 +321,19 @@ BEZEL_TEST(runtime_const_locals_2049, read_capture_const_ok) {
 
 // §7.4 v0.201 (#2049): a const local's narrowing is NEVER invalidated — a
 // null test narrows it for the remainder of its scope, across calls. The
-// field-copy idiom of §7.4 is airtight when the copy is `const`.
+// field-copy idiom of §7.4 is airtight when the copy is `const`. The
+// initializer here is a borrow (per §21.1 ownership: a const local must
+// not take an owned production — Slice 3), so the test exercises the
+// narrowing path on a never-owned binding.
 BEZEL_TEST(runtime_const_locals_2049, narrowing_persists_across_call) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
-        "  public f: int := 7; "
+        "  public f: int := 0; "
+        "  public constructor(v: int) f := v; end constructor; "
         "  public static method Helper() Console.WriteLine(\"x\"); end Helper; "
         "  public static method Main(): int "
-        "    const X: C? := new C(); "
+        "    using var c := new C(7); "
+        "    const X: C? := c; "           // runtime const: borrow of c, non-null
         "    if X = null then return 99; end; "
         "    Helper(); "                   // X stays narrowed (const local)
         "    return X.f; "                 // 7 — no `?.` needed
@@ -353,4 +358,72 @@ BEZEL_TEST(runtime_const_locals_2049, var_local_assign_ok) {
         "    return k; "                   // 12
         "  end Main; "
         "end C;"), 12);
+}
+
+// =========================================================================
+// Never-owned ownership rule — §21.1 v0.201 (#2049) Slice 3.
+// A const local must not take an owned production (§28.3): the binding
+// never takes a disposal obligation. The rejected forms — fresh `new`,
+// owned-returning call, `move`, … — name the rule and the `using var`
+// remedy. Admitted forms — value-typed expressions, `string`, `null`,
+// borrows — were exercised in Slice 1 above; the tests below focus on
+// the rejected forms.
+// =========================================================================
+
+// §21.1 / §28.3: a const local initialized from a fresh `new` is rejected
+// — the binding would take a disposal obligation it cannot discharge.
+BEZEL_TEST(runtime_const_locals_2049, owned_new_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    const r := new C(); "
+        "    return 0; "
+        "  end Main; "
+        "end C;"));
+}
+
+// §21.1 / §28.3: a const local initialized from an owned-returning call is
+// rejected. The remedy is `using var` (the binding takes the obligation
+// and disposes at scope exit).
+BEZEL_TEST(runtime_const_locals_2049, owned_call_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public f: int := 0; "
+        "  public static method Make(): owned C => new C(); "
+        "  public static method Main(): int "
+        "    const r := Make(); "
+        "    return 0; "
+        "  end Main; "
+        "end C;"));
+}
+
+// §21.1 / §28.8: a const local initialized from a `move` of an owned
+// binding is rejected — `move` transfers the obligation, which the const
+// cannot take.
+BEZEL_TEST(runtime_const_locals_2049, owned_move_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    using var c := new C(); "
+        "    const r := move c; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"));
+}
+
+// §21.1 / §28.3: the NEVER-OWNED rule admits a const local bound to a
+// borrow (read of an existing owned binding). `using var c := new C();
+// const r := c;` is the spec's borrow-const idiom — `r` is a const borrow
+// of `c`, and reads through `r` observe `c`'s object.
+BEZEL_TEST(runtime_const_locals_2049, borrow_initializer_admitted) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public f: int := 0; "
+        "  public constructor(v: int) f := v; end constructor; "
+        "  public static method Main(): int "
+        "    using var c := new C(42); "
+        "    const r := c; "              // borrow of c (never-owned)
+        "    return r.f; "                // 42
+        "  end Main; "
+        "end C;"), 42);
 }
