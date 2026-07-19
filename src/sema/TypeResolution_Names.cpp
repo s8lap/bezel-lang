@@ -637,6 +637,16 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
     for (const auto& pf : td.positionalFields) {
         if (pf.type) resolveType(*pf.type, &typeScope);
     }
+    // §35.1 (v0.200, #2045): choice cases' payload fields — same Param shape
+    // as record positional fields. Resolved here so the §35.4 classifier
+    // (common/OwnershipFacts.cpp) and downstream §35.5 matching / §35.3
+    // construction can read each payload's resolved type through
+    // ctx_.resolvedType(*pf.type).
+    for (const auto& cc : td.choiceCases) {
+        for (const auto& pf : cc.payload) {
+            if (pf.type) resolveType(*pf.type, &typeScope);
+        }
+    }
     // SerializedClassClause polymorphic case types.
     if (td.serializedClass) {
         for (const auto& pc : td.serializedClass->polyCases) {

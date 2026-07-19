@@ -510,6 +510,165 @@ bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt,
     return isBorrowBearingRecordCommon(rt, ctx, seen);
 }
 
+// §35.4 (v0.200, #2045): the choice classification — see the header comment
+// on `classifyChoiceType` for the full contract. This file-local recursion
+// helper takes the cycle-guard `seen` set the public entrypoint seeds; the
+// guard is the SAME `const ast::TypeDecl*` visited-set
+// `isBorrowBearingRecordCommon` uses, so a record payload reached during the
+// walk can be handed off to that helper without re-introducing a cycle.
+namespace {
+
+// §35.4.1 / §15.3: a payload field's resolved type is a MOVE-ONLY VALUE TYPE
+// — an owning inline array (`[N owned]T`) or another owning choice (reached
+// transitively). Owns cases is what makes a choice owning; value types that
+// are NOT move-only (records, value-like choices, enums, primitives) do not.
+// `seen` bounds the recursion through a payload type cycle.
+bool payloadFieldTypeIsMoveOnly(
+    const sema::TypeRef* ft,
+    const sema::SemaContext& ctx,
+    std::unordered_set<const ast::TypeDecl*>& seen) {
+    if (!ft) return false;
+    // §15.3: an owning inline array is a move-only value type. We do NOT
+    // require `arraySizeValue >= 0` here (unlike MethodOwnership::
+    // isMoveOnlyInlineArrayType) — the size-fold check is the ownership
+    // pass's slot-allocation concern, not the type-property classification.
+    // A payload declared `[N owned]T` is owning regardless of whether N
+    // folds yet; if N never folds the ownership pass rejects the program
+    // separately.
+    if (ft->kind == sema::TypeRef::Kind::InlineArray && ft->arrayOwned)
+        return true;
+    if (ft->kind != sema::TypeRef::Kind::Named || !ft->declaration) return false;
+    if (ft->declaration->kind != ast::TypeDeclKind::Choice) return false;
+    // Transitively another owning choice — recurse via the public helper's
+    // core (below), seeding `seen` so a choice-value cycle (already
+    // rejected by §35.1 but defended here) terminates.
+    const auto* decl =
+        dynamic_cast<const ast::TypeDecl*>(ft->declaration->decl);
+    if (!decl || !seen.insert(decl).second) return false;
+    // Walk the nested choice's cases' payloads.
+    for (const auto& cc : decl->choiceCases) {
+        for (const auto& pf : cc.payload) {
+            if (!pf.type) continue;
+            const sema::TypeRef* pft = ctx.resolvedType(*pf.type);
+            // Owning-marker on a nested payload slot: §28.1 admits `owned`
+            // on class/interface/bare-type-parameter; whatever the element
+            // type, the marker carries owning intent (the §28.1 type-
+            // admissibility check fires separately in sema and rejects an
+            // inadmissible marker; here we trust it).
+            if (pf.modifier == "owned") return true;
+            if (payloadFieldTypeIsMoveOnly(pft, ctx, seen)) return true;
+        }
+    }
+    return false;
+}
+
+// §35.4.2 / §9.7: a payload field's resolved type is BORROW-CARRYING under
+// §9.7's definition (verbatim with "record" read as "record or choice" per
+// §35.4.2): a plain (unmarked) class/interface reference field (nullable
+// or not); an inline array of reference-typed elements; a borrow-bearing
+// record; or transitively a borrow-bearing choice. The caller has already
+// checked the field is NOT `owned`-marked (owning is decided first).
+bool payloadFieldTypeIsBorrowCarrying(
+    const sema::TypeRef* ft,
+    const sema::SemaContext& ctx,
+    std::unordered_set<const ast::TypeDecl*>& seen) {
+    if (!ft) return false;
+    switch (ft->kind) {
+        case sema::TypeRef::Kind::Named: {
+            // A bare (unmarked) type-parameter payload is classification-
+            // neutral at value/runtime-managed substitutions and borrow-
+            // carrying at class/interface substitutions (§35.11). For the
+            // UNINSTANTIATED generic choice this function classifies, take
+            // the conservative reading: it MIGHT carry a borrow.
+            if (!ft->declaration) return true;
+            if (ft->declaration->isValueBuiltin) return false;
+            if (ft->declaration->kind == ast::TypeDeclKind::Class ||
+                ft->declaration->kind == ast::TypeDeclKind::Interface)
+                return true;
+            if (ft->declaration->kind == ast::TypeDeclKind::Record) {
+                std::unordered_set<const ast::TypeDecl*> recSeen = seen;
+                return isBorrowBearingRecordCommon(ft, ctx, recSeen);
+            }
+            if (ft->declaration->kind == ast::TypeDeclKind::Choice) {
+                // Transitively a borrow-bearing choice — recurse via the
+                // payload walk. Seed `seen` for cycle termination.
+                const auto* decl =
+                    dynamic_cast<const ast::TypeDecl*>(ft->declaration->decl);
+                if (!decl || !seen.insert(decl).second) return false;
+                for (const auto& cc : decl->choiceCases) {
+                    for (const auto& pf : cc.payload) {
+                        if (!pf.type) continue;
+                        // An `owned`-marked nested slot is owning, not
+                        // borrow-carrying — does not contribute to this
+                        // leg.
+                        if (pf.modifier == "owned") continue;
+                        if (payloadFieldTypeIsBorrowCarrying(
+                                ctx.resolvedType(*pf.type), ctx, seen))
+                            return true;
+                    }
+                }
+                return false;
+            }
+            return false;  // enum
+        }
+        case sema::TypeRef::Kind::InlineArray:
+            // §9.7: an inline-array field with reference-typed elements is
+            // borrow-carrying; `arrayOwned` would have made it owning
+            // (decided before this leg). Plain element-borrow case only.
+            return ft->arrayElement && !ft->arrayOwned &&
+                   isReferenceTypeForRecordField(ft->arrayElement);
+        default:
+            return false;  // Primitive, Unit, Function, Error
+    }
+}
+
+}  // namespace
+
+std::optional<ChoiceClassification> classifyChoiceType(
+    const sema::TypeRef* rt, const sema::SemaContext& ctx) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return std::nullopt;
+    if (rt->declaration->kind != ast::TypeDeclKind::Choice)
+        return std::nullopt;
+    const auto* decl =
+        dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
+    if (!decl) return std::nullopt;
+
+    std::unordered_set<const ast::TypeDecl*> seen;
+    if (!seen.insert(decl).second) return std::nullopt;  // defensive
+
+    // §35.4.1: OWNING — any case has a payload field marked `owned`, or a
+    // move-only value-typed payload field (owning inline array or owning
+    // choice, transitively).
+    for (const auto& cc : decl->choiceCases) {
+        for (const auto& pf : cc.payload) {
+            if (!pf.type) continue;
+            // §28.1 / §35.3: the `owned` marker on a case payload field is
+            // the direct owning indicator. Its type-admissibility is enforced
+            // separately in sema; here we trust the marker.
+            if (pf.modifier == "owned") return ChoiceClassification::Owning;
+            if (payloadFieldTypeIsMoveOnly(ctx.resolvedType(*pf.type), ctx, seen))
+                return ChoiceClassification::Owning;
+        }
+    }
+    // §35.4.2: BORROW-BEARING — any case has a plain (unmarked) borrow-
+    // carrying payload field under §9.7's definition.
+    for (const auto& cc : decl->choiceCases) {
+        for (const auto& pf : cc.payload) {
+            if (!pf.type) continue;
+            // `owned`-marked slots were decided above; only plain slots
+            // reach the borrow-carrying test.
+            if (pf.modifier == "owned") continue;
+            if (payloadFieldTypeIsBorrowCarrying(
+                    ctx.resolvedType(*pf.type), ctx, seen))
+                return ChoiceClassification::BorrowBearing;
+        }
+    }
+    // §35.4.3: VALUE-LIKE — every payload is a value, `string`, a runtime-
+    // managed type, or (transitively) a value-like record or choice.
+    return ChoiceClassification::ValueLike;
+}
+
 bool declaredReturnIsBareTypeParam(const ast::MethodDecl& md,
                                    const sema::SemaContext& ctx) {
     // `owned T` is the ordinary ownership-transferring return (§28.8), not a

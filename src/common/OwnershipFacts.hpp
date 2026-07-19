@@ -34,6 +34,7 @@
 // are Phase B, deliberately NOT done here.
 
 #include <functional>
+#include <optional>
 #include <vector>
 
 namespace bezel::ast {
@@ -163,6 +164,44 @@ bool staticFactoryReturnsFreshOwned(const ast::MethodDecl& md,
 // two checks from drifting apart.
 bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt,
                                  const sema::SemaContext& ctx);
+
+// §35.4 (v0.200, #2045): the three-way **choice classification** — a derived
+// type property computed over ALL of the choice's cases' payload fields. The
+// decision proceeds in spec order (owning > borrow-bearing > value-like):
+//   1. **Owning** — any case has a payload field marked `owned` (admissible
+//      per §28.1 on class/interface/bare-type-parameter), or a payload field
+//      of a move-only value type per §15.3 (an owning inline array, or
+//      transitively another owning choice).
+//   2. **BorrowBearing** — any case has a plain (unmarked) borrow-carrying
+//      payload field under §9.7's definition: a class/interface reference
+//      (nullable or not), an inline array of reference-typed elements, a
+//      borrow-bearing record, or transitively a borrow-bearing choice.
+//   3. **ValueLike** — otherwise: every payload is a value, `string`, a
+//      runtime-managed type, or (transitively) a value-like record or choice.
+//      A value-like choice is an ordinary copyable value type.
+//
+// Returns `std::nullopt` when `rt` is not a user choice type (so a caller
+// can gate on the kind in one test). Generic choices classify per-
+// instantiation at the USE SITE (§35.11); for an UNINSTANTIATED generic
+// choice this function takes the conservative most-restrictive reading of
+// a bare type-parameter payload (a marked `owned T` payload counts as
+// Owning; an unmarked `T` payload counts as BorrowBearing) — sound because
+// per-instantiation reclassification at a use site can only RELAX it.
+//
+// Recurses through value-typed components (record fields, inline-array
+// elements, other choices' payloads) per §35.4. A cycle guard bounds the
+// recursion through self- or mutually-referential payload types (an
+// instance-field value cycle is already rejected by §35.1's no-self-
+// containment rule; the guard mirrors isBorrowBearingRecordOrSpan's #1611
+// discipline).
+enum class ChoiceClassification {
+    ValueLike,      // §35.4.3
+    BorrowBearing,  // §35.4.2
+    Owning,         // §35.4.1
+};
+
+std::optional<ChoiceClassification> classifyChoiceType(
+    const sema::TypeRef* rt, const sema::SemaContext& ctx);
 
 // §28.3 *Bare-type-parameter returns* (v0.194, #1801). True when `md`'s
 // DECLARED return type — read *before* generic substitution, nullability
