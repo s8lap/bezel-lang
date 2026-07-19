@@ -367,6 +367,13 @@ bool ExprTC::defaultIllFormed(const TypeRef* t) {
                 k == ast::TypeDeclKind::Interface)
                 return !t->declaration->isValueBuiltin;
             if (k == ast::TypeDeclKind::Enum) return false;
+            // §35.10 (v0.200, #2044): `default(C)` is a compile error for
+            // EVERY choice type — a sum has no principled zero (electing a
+            // case would make meaning depend on declaration order). The
+            // nullable form `default(C?)` is the valid null and stays
+            // accepted (t->nullable returned false above for the non-null
+            // case, which is what reaches here).
+            if (k == ast::TypeDeclKind::Choice) return true;
             if (k == ast::TypeDeclKind::Record) {
                 auto* td =
                     dynamic_cast<const ast::TypeDecl*>(t->declaration->decl);
@@ -2349,6 +2356,15 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         rt->declaration->kind == ast::TypeDeclKind::Record)
                         detail = "a record any of whose fields is a "
                                  "non-nullable reference type";
+                    else if (rt->kind == TypeRef::Kind::Named &&
+                             rt->declaration &&
+                             rt->declaration->kind ==
+                                 ast::TypeDeclKind::Choice)
+                        // §35.10 (v0.200, #2044): a sum has no principled
+                        // zero. The remedy is `default(C?)` (the nullable
+                        // form) or an explicit case construction.
+                        detail = "a choice type (no case is distinguished; "
+                                 "§35.10)";
                     else if (rt->kind == TypeRef::Kind::InlineArray)
                         detail = "an inline array whose element type is a "
                                  "non-nullable reference type";

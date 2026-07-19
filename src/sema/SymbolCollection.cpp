@@ -260,6 +260,18 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
         esym->scope = sym->memberScope;
         sym->members.push_back(esym);
     }
+    // §35 (v0.200, #2044): choice cases live alongside members, like enum
+    // constants. Each case carries a pointer back to its AST so downstream
+    // passes can read its payload fields (§35.4 classification, §35.5
+    // matching, §35.3 construction).
+    for (const auto& cc : td.choiceCases) {
+        auto* csym = ctx.makeSymbol<ChoiceCaseSymbol>();
+        csym->name = cc.name;
+        csym->parent = sym;
+        csym->caseDecl = &cc;
+        csym->scope = sym->memberScope;
+        sym->members.push_back(csym);
+    }
     return sym;
 }
 

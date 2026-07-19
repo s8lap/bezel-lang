@@ -138,6 +138,18 @@ inline std::string symbolSummary(const sema::Symbol& s) {
     if (auto* ec = dynamic_cast<const sema::EnumConstantSymbol*>(&s)) {
         return "enum-constant " + parentPrefix(*ec) + std::string(ec->name);
     }
+    // §35 (v0.200, #2044): choice cases render with their arity so a test
+    // can distinguish payload-free from payload-carrying cases.
+    if (auto* cc = dynamic_cast<const sema::ChoiceCaseSymbol*>(&s)) {
+        std::string out = "choice-case " + parentPrefix(*cc) +
+                          std::string(cc->name);
+        if (cc->caseDecl) {
+            out += " (";
+            out += std::to_string(cc->caseDecl->payload.size());
+            out += "-payload)";
+        }
+        return out;
+    }
     if (auto* g = dynamic_cast<const sema::GenericParamSymbol*>(&s)) {
         return "generic-param " + std::string(g->name);
     }

@@ -198,6 +198,18 @@ struct EnumConstantSymbol : MemberSymbol {
     std::int64_t value = 0;
 };
 
+// §35 (v0.200, #2044): a choice case — payload-free (`NotModified`) or
+// payload-carrying (`Failed(status: int, message: string)`). Lives alongside
+// the choice's other members. The case's payload fields are reached through
+// `caseDecl` (a pointer to the ast::ChoiceCase inside the parent TypeDecl's
+// `choiceCases` vector) — they drive §35.4 classification, §35.5 matching,
+// and §35.3 call-site binding when payload construction lands. A
+// payload-free case has `caseDecl->payload.empty()`; a payload case's arity
+// is `caseDecl->payload.size()`.
+struct ChoiceCaseSymbol : MemberSymbol {
+    const ast::ChoiceCase* caseDecl = nullptr;
+};
+
 // Nested type — a TypeSymbol that lives inside another TypeSymbol's
 // members. Same shape; the parent pointer is captured by the enclosing
 // TypeSymbol::members entry. We keep a dedicated wrapper class so

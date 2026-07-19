@@ -944,9 +944,9 @@ static GroundCat groundCategorize(const TypeRef* a) {
                        ? GroundCat::Reference
                        : GroundCat::Value;
         case TypeRef::Kind::Named:
-            // Classes and interfaces are reference types; records and enums are
-            // value types (§9 / §10 / §14.2). A ground Named always carries a
-            // declaration.
+            // Classes and interfaces are reference types; records, enums, and
+            // choices are value types (§9 / §10 / §14.2 / §35, v0.200 #2044).
+            // A ground Named always carries a declaration.
             if (a->declaration) {
                 switch (a->declaration->kind) {
                     case ast::TypeDeclKind::Class:
@@ -954,6 +954,7 @@ static GroundCat groundCategorize(const TypeRef* a) {
                         return GroundCat::Reference;
                     case ast::TypeDeclKind::Record:
                     case ast::TypeDeclKind::Enum:
+                    case ast::TypeDeclKind::Choice:
                         return GroundCat::Value;
                 }
             }
@@ -1200,6 +1201,13 @@ bool ExprTC::groundSatisfiesNew(const TypeRef* arg, bool& decided) {
         if (d->kind == ast::TypeDeclKind::Interface) {
             decided = true;
             return false;  // interfaces are not constructible (§11.2)
+        }
+        // §35.10 (v0.200, #2044): "Choices never satisfy the value-type arm:
+        // `default(C)` is undefined for every choice type." So `where T: new()`
+        // is unsatisfiable for a choice substitution.
+        if (d->kind == ast::TypeDeclKind::Choice) {
+            decided = true;
+            return false;
         }
         if (d->kind == ast::TypeDeclKind::Record) {
             // A positional record satisfies new() iff default(R) is well-defined

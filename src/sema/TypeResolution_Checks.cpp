@@ -3109,14 +3109,16 @@ Resolver::TypeCategory Resolver::categorize(const TypeRef* a) {
             return TypeCategory::Value;
         case TypeRef::Kind::Named:
             if (a->declaration) {
-                // Classes and interfaces are reference types; records and
-                // enums are value types (§9 / §10 / §14.2).
+                // Classes and interfaces are reference types; records,
+                // enums, and choices are value types (§9 / §10 / §14.2 /
+                // §35, v0.200 #2044).
                 switch (a->declaration->kind) {
                     case ast::TypeDeclKind::Class:
                     case ast::TypeDeclKind::Interface:
                         return TypeCategory::Reference;
                     case ast::TypeDeclKind::Record:
                     case ast::TypeDeclKind::Enum:
+                    case ast::TypeDeclKind::Choice:
                         return TypeCategory::Value;
                 }
             }
@@ -3187,6 +3189,13 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
         if (d->kind == ast::TypeDeclKind::Enum) {
             decided = true;  // enum default is the underlying-0 value (§17.11)
             return true;
+        }
+        // §35.10 (v0.200, #2044): "Choices never satisfy the value-type arm:
+        // `default(C)` is undefined for every choice type." So a choice
+        // substitution fails `where T: new()`.
+        if (d->kind == ast::TypeDeclKind::Choice) {
+            decided = true;
+            return false;
         }
         if (d->kind == ast::TypeDeclKind::Record) {
             // A positional record satisfies new() iff default(R) is
