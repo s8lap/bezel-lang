@@ -11451,6 +11451,17 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         et->kind = TypeRef::Kind::Named;
         et->declaration = targetType;
         ctx_.setExprType(&ma, et);
+    } else if (dynamic_cast<ChoiceCaseSymbol*>(member) && targetType) {
+        // §35.3 (v0.200, #2044): a qualified case access `Opt.None` or the
+        // callee of `Opt.Some(value)` has the choice type. The payload
+        // construction lowering itself lands in a follow-up slice; for now
+        // the qualified-name form resolves to the choice type so a local
+        // inferred from `var x := Opt.None` and a `case x of` scrutinee
+        // both carry the choice type.
+        TypeRef* ct = ctx_.makeTypeRef();
+        ct->kind = TypeRef::Kind::Named;
+        ct->declaration = targetType;
+        ctx_.setExprType(&ma, ct);
     } else if (auto* ms = dynamic_cast<MethodSymbol*>(member)) {
         // §27.6 (issue #436): a bare `obj.Method` in value position (not the
         // callee of a CallExpr) is a method reference — a function value of
