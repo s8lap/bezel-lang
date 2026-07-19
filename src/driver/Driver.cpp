@@ -18,6 +18,7 @@
 #include "parser/Parser.hpp"
 #include "sema/DefiniteAssignment.hpp"
 #include "sema/EntryPoint.hpp"
+#include "sema/PureChecker.hpp"
 #include "sema/StaticInitCycles.hpp"
 #include "sema/ExprTypecheck.hpp"
 #include "sema/SemaContext.hpp"
@@ -162,6 +163,10 @@ CompileResult Driver::compileFile(const std::string& path,
         }
         sema::resolveTypes(*unit, semaCtx);
         sema::typecheckExpressions(*unit, semaCtx);
+        // §22.15 (v0.202, #2052): enforce the pure-body rule set on every
+        // pure member. Runs after typecheck so resolved call targets and
+        // expression types are available.
+        sema::checkPureBodies(*unit, semaCtx);
         // Definite-assignment runs after expression typecheck so it
         // can see the same scope structure ExprTypecheck built.
         sema::checkDefiniteAssignment(*unit, semaCtx);
@@ -302,6 +307,10 @@ CompileResult Driver::compileObject(const std::string& path,
         }
         sema::resolveTypes(*unit, semaCtx);
         sema::typecheckExpressions(*unit, semaCtx);
+        // §22.15 (v0.202, #2052): enforce the pure-body rule set on every
+        // pure member. Runs after typecheck so resolved call targets and
+        // expression types are available.
+        sema::checkPureBodies(*unit, semaCtx);
         sema::checkDefiniteAssignment(*unit, semaCtx);
         sema::checkStaticInitCycles(*unit, semaCtx);  // §2.5 / #797
         ownership::checkOwnership(*unit, semaCtx);
