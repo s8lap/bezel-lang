@@ -300,6 +300,11 @@ void Resolver::run(const ast::SourceFile& src) {
     checkAsyncModifiers();
     // §22.15 (v0.202, #2052): `pure` placement + signature restrictions.
     checkPureModifiers();
+    // §22.15 (v0.202, #2052): `pure` dispatch matching (override + iface
+    // implementation). Rule-1 checks run inline in checkHidingAndOverride
+    // and checkAbstractImplementations (which ran earlier above); this
+    // walker is a placeholder for future chain-wide audits.
+    checkPureDispatch();
     // Slice S36: constructor chain-call placement (§12.8).
     checkConstructorChains();
     // Slice S37: static constructor takes no parameters (§22.7).

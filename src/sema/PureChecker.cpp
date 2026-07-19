@@ -705,6 +705,40 @@ bool checkPureBodies(const ast::SourceFile& src, SemaContext& ctx) {
                 }
             }
         }
+        // §22.15 "Pure constructors" (v0.202, #2052): the birth-store rule
+        // extends to the class's field initializers — they execute as part
+        // of construction, so a class with a pure constructor must have
+        // field initializers satisfying the pure-body rules. Walk every
+        // field initializer under a synthesized pure-ctor context.
+        bool hasPureCtor = false;
+        MemberSymbol* pureCtorMember = nullptr;
+        for (Symbol* m : t->members) {
+            auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+            if (!cs) continue;
+            const auto* cd =
+                dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+            if (cd && cd->isPure) {
+                hasPureCtor = true;
+                pureCtorMember = cs;
+                break;
+            }
+        }
+        if (hasPureCtor && pureCtorMember) {
+            const std::string label =
+                std::string("field initializer of class `") +
+                std::string(t->name) +
+                "` (pure constructor birth-store rule)";
+            for (Symbol* m : t->members) {
+                auto* fs = dynamic_cast<FieldSymbol*>(m);
+                if (!fs) continue;
+                const auto* fd =
+                    dynamic_cast<const ast::FieldDecl*>(fs->decl);
+                if (!fd || !fd->initializer) continue;
+                PureBodyWalker w(ctx, *pureCtorMember, label,
+                                 /*isConstructor=*/true);
+                w.checkExpr(fd->initializer.get());
+            }
+        }
     }
     return !ctx.diagnostics().hasErrors();
 }

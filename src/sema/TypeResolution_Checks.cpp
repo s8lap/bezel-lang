@@ -2452,6 +2452,18 @@ void Resolver::checkHidingAndOverride() {
                     // Slice S20: a legal override must match the
                     // base member's signature exactly.
                     checkOverrideSignatureMatch(ms, base);
+                    // §22.15 (v0.202, #2052) dispatch rule 1: an override
+                    // of a pure base member must itself be declared pure.
+                    // Rule 2 (strengthening) is permissive — an override
+                    // MAY declare pure where the base does not.
+                    if (hasMod(base, "pure") && !hasMod(ms, "pure")) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ms->declLoc,
+                            std::string("override of pure member `") +
+                            std::string(ms->name) +
+                            "` must be declared `pure` — purity is never "
+                            "dropped down an override chain (\xC2\xA7""22.15)");
+                    }
                 }
             } else {
                 ctx_.diagnostics().report(
@@ -2724,6 +2736,27 @@ void Resolver::checkAbstractImplementations() {
                              ? std::string("`owned`")
                              : std::string("without `owned`")) +
                         " (§11.2)");
+                }
+                // §22.15 (v0.202, #2052) dispatch rule 1: a class member
+                // implementing a pure interface member must be declared
+                // pure. Rule 2 (strengthening) is permissive. Operators
+                // implementing pure static interface operators are also
+                // covered (the OperatorDecl AST carries isPure).
+                const bool imPure = hasMod(im, "pure");
+                bool implPure = hasMod(impl, "pure");
+                if (!implPure)
+                    if (auto* op = dynamic_cast<const ast::OperatorDecl*>(
+                            impl->decl))
+                        implPure = op->isPure;
+                if (imPure && !implPure) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, impl->declLoc,
+                        std::string("method `") + std::string(name) +
+                        "` implements pure interface member `" +
+                        std::string(name) +
+                        "` and must be declared `pure` — purity is never "
+                        "dropped across an interface implementation "
+                        "(\xC2\xA7""22.15)");
                 }
             }
         }
@@ -5631,6 +5664,37 @@ void Resolver::checkTypePureModifiers(TypeSymbol* t) {
             }
         }
     }
+}
+
+// §22.15 (v0.202, #2052) "Checking and dispatch": the load-bearing rule-1
+// checks (override-of-pure-must-be-pure and impl-of-pure-iface-must-be-
+// pure) are wired into checkHidingAndOverride and checkAbstractImpl-
+// ementations respectively. The standalone walker below is reserved for
+// future rule-3 chain-wide work (monotone-down-the-chain audits) — for
+// now it iterates members so per-type entry points are symmetric with the
+// other pure checks, and any future chain-wide invariant can grow here
+// without re-threading the override walker.
+void Resolver::checkPureDispatch() {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t) continue;
+        checkTypePureDispatch(t);
+        for (Symbol* m : t->members) {
+            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+                if (nt->type) checkTypePureDispatch(nt->type);
+            }
+        }
+    }
+}
+
+void Resolver::checkTypePureDispatch(TypeSymbol* t) {
+    (void)t;
+    // Rule 1 (override-of-pure and impl-of-pure-iface) is enforced inline
+    // in checkHidingAndOverride and checkAbstractImplementations — see the
+    // §22.15 markers there. Rule 2 (strengthening) is permissive. Rule 3
+    // (monotone down the chain) is enforced transitively by rule 1's
+    // nearest-base match.
 }
 
 }  // namespace bezel::sema

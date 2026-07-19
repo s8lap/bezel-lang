@@ -152,6 +152,19 @@ private:
     void checkPureModifiers();
     void checkTypePureModifiers(TypeSymbol* t);
 
+    // §22.15 (v0.202, #2052) "Checking and dispatch" rules 1+2+3:
+    //   1. Purity is never dropped — an `override` of a pure member, or a
+    //      class member implementing a pure interface member, must be
+    //      declared `pure`.
+    //   2. Purity may be strengthened — an override MAY declare `pure`
+    //      where the base does not (permissive; no diagnostic).
+    //   3. Monotone down the chain — an override matches against its
+    //      nearest overridden declaration.
+    // Rule 1 is the load-bearing diagnostic; rules 2 and 3 fall out of
+    // checking each override against its nearest base.
+    void checkPureDispatch();
+    void checkTypePureDispatch(TypeSymbol* t);
+
     // Slice S34 (§12.1): "Fields, constructors, destructors, and static
     // members may not be virtual." A static method or property carrying
     // `virtual` / `abstract` / `override` is rejected.
