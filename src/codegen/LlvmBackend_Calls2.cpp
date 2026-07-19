@@ -949,10 +949,20 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return cmpTrue;
     }
 
-    // int.Parse(s, radix): base-N integer parse (§5.2). The two-argument form
-    // reaches this primitive handler via the lowercase keyword receiver; without
-    // it the call was dropped and the result read an uninitialized slot
-    // (#747 R42). strtol with the given base, narrowed to the target width.
+    // int.Parse(s, radix): base-N integer parse (stdlib §9.1 `Parse(s, radix)`).
+    // The two-argument form reaches this primitive handler via the lowercase
+    // keyword receiver; without it the call was dropped and the result read an
+    // uninitialized slot (#747 R42). The caller-supplied radix is the strtol
+    // `base`; the result is narrowed to the target width.
+    //
+    // #2024 / stdlib §9.1 + §9.3 (strict-fault model): Parse(s, radix) was
+    // silently returning wrong values on invalid/overflow input — strtol was
+    // called with a NULL endptr and no range-check, so `int.Parse("2", 2)`
+    // returned 0 (no conversion), `int.Parse("10x", 16)` returned 16 (trailing
+    // garbage ignored), and `byte.Parse("100", 16)` returned 0 (256 truncated
+    // to the low bits). The single-arg branch already does this right; mirror
+    // it here: strtoll/strtoull with an endptr slot, endptr-based FormatException
+    // guard, per-width range-check for OverflowException.
     if (m == "Parse" && call.args.size() == 2 && call.args[0].value &&
         call.args[1].value) {
         auto* argTy = ctx_.exprType(*call.args[0].value);
@@ -965,15 +975,71 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             llvm::Value* radix = lowerExpr(*call.args[1].value);
             if (!sArg || !radix) return nullptr;
             llvm::Value* data = loadStringData(sArg);
-            // radix is `int` (i32) — strtol's `base` parameter.
+            // radix is `int` (i32) — strtoll/strtoull `base` parameter.
             if (!radix->getType()->isIntegerTy(32))
                 radix = builder_.CreateTrunc(radix, i32());
-            auto* strtolFn = declareC("strtol", i64(), {ptrTy(), ptrTy(), i32()});
-            llvm::Value* r = builder_.CreateCall(
-                strtolFn,
-                {data, llvm::ConstantPointerNull::get(ptrTy()), radix});
-            llvm::Type* tt = lowerPrimitive(pt);
-            return tt->isIntegerTy(64) ? r : builder_.CreateTrunc(r, tt);
+            // strtoull for the unsigned 64-bit width (so the full magnitude is
+            // captured); strtoll for everything else, range-checked below.
+            bool isULongR = (pt == P::ULong);
+            auto* strtoFnR = isULongR
+                ? declareC("strtoull", i64(), {ptrTy(), ptrTy(), i32()})
+                : declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+            auto* endSlotR = entryAlloca(ptrTy());
+            llvm::Value* v64R = builder_.CreateCall(
+                strtoFnR, {data, endSlotR, radix}, "parse.rx");
+            // FormatException guard (mirrors the 1-arg branch): first char
+            // must not be whitespace, the conversion must have advanced the
+            // pointer (rejects leading-invalid-digit like "2" in base 2 / "g"
+            // in base 16 / empty string), and there must be no trailing
+            // garbage (rejects "10x" in base 16). Per §9.3, surrounding
+            // whitespace is also not accepted.
+            auto* i8TyR = llvm::Type::getInt8Ty(llvm_);
+            llvm::Value* fcR = builder_.CreateLoad(i8TyR, data, "parse.fcR");
+            llvm::Value* fcWsR = builder_.CreateICmpULE(
+                fcR, llvm::ConstantInt::get(i8TyR, ' '), "parse.fwsR");
+            llvm::Value* endPtrR = builder_.CreateLoad(ptrTy(), endSlotR, "parse.epR");
+            llvm::Value* advR = builder_.CreateICmpNE(endPtrR, data, "parse.advR");
+            llvm::Value* endChR = builder_.CreateLoad(i8TyR, endPtrR, "parse.echR");
+            llvm::Value* atNulR = builder_.CreateICmpEQ(
+                endChR, llvm::ConstantInt::get(i8TyR, 0), "parse.nulR");
+            llvm::Value* validFmtR = builder_.CreateAnd(
+                builder_.CreateNot(fcWsR),
+                builder_.CreateAnd(advR, atNulR), "parse.vfmtR");
+            // ulong additionally rejects a leading '-' (strtoull silently
+            // negates it, which would let `ulong.Parse("-1", 10)` return a
+            // huge positive value instead of faulting).
+            if (isULongR) {
+                llvm::Value* fcNegR = builder_.CreateICmpEQ(
+                    fcR, llvm::ConstantInt::get(i8TyR, '-'), "parse.negR");
+                validFmtR = builder_.CreateAnd(
+                    validFmtR, builder_.CreateNot(fcNegR), "parse.vfmtRu");
+            }
+            emitGuardThrow(builder_.CreateNot(validFmtR, "parse.fmtbadR"),
+                           "FormatException");
+            // long/ulong are the full strtoll/strtoull width — no range check.
+            if (pt == P::Long || pt == P::ULong) return v64R;
+            // Range check → OverflowException for the narrower widths (mirrors
+            // the 1-arg branch + the TryParse branch above): strtoll returns
+            // the full magnitude at 64 bits, so a value outside the target
+            // type's bounds must fault rather than be silently truncated.
+            int64_t loR, hiR;
+            switch (pt) {
+                case P::Int:    loR = INT32_MIN; hiR = INT32_MAX;  break;
+                case P::UInt:   loR = 0;         hiR = UINT32_MAX; break;
+                case P::Short:  loR = INT16_MIN; hiR = INT16_MAX;  break;
+                case P::UShort: loR = 0;         hiR = UINT16_MAX; break;
+                case P::Byte:   loR = 0;         hiR = UINT8_MAX;  break;
+                default:        loR = INT8_MIN;  hiR = INT8_MAX;   break; // SByte
+            }
+            llvm::Value* tooLowR = builder_.CreateICmpSLT(
+                v64R, llvm::ConstantInt::getSigned(i64(), loR), "parse.loR");
+            llvm::Value* tooHighR = builder_.CreateICmpSGT(
+                v64R, llvm::ConstantInt::getSigned(i64(), hiR), "parse.hiR");
+            emitGuardThrow(builder_.CreateOr(tooLowR, tooHighR, "parse.ovfR"),
+                           "OverflowException");
+            return (pt == P::Int || pt == P::UInt)
+                       ? builder_.CreateTrunc(v64R, i32())
+                       : builder_.CreateTrunc(v64R, lowerPrimitive(pt));
         }
     }
 
