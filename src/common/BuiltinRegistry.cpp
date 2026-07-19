@@ -75,13 +75,18 @@ constexpr std::array<std::string_view, 2> kLinkedListNames = {
 // LlvmBackend_Layout.cpp (see header).  This is the intersection of the two
 // pre-refactor hand-lists: OwningBuffer (astNode-only) and the FFI class names
 // (imported-only) are NOT here — they stay as explicit deltas at the sites.
-constexpr std::array<std::string_view, 63> kHeapPointerReferenceBuiltins = {
+constexpr std::array<std::string_view, 64> kHeapPointerReferenceBuiltins = {
     // §4 collections (SortedSet: stdlib §4.18/#1426 — bz_dict_t* rep, both paths)
     "Array", "OwningArray", "Dictionary", "OwningDictionary",
     "SortedDictionary", "SortedSet", "Stack", "OwningStack", "Queue", "OwningQueue",
     "Set", "OwningSet", "LinkedList", "OwningLinkedList", "LinkedListNode",
     // §3 nullary heap classes with pointer rep
     "StringBuilder", "Random",
+    // stdlib §8.1 (#2025): Stopwatch is a heap-allocated bz_stopwatch_t* — the
+    // generic `new T()` path (where T: new()) reaches lowerNew's bz_stopwatch_alloc
+    // dispatch and returns ptr, so the type must lower to ptr here too, or the
+    // function return type (i32 fallback) mismatches the ptr operand.
+    "Stopwatch",
     // §29 iteration / collection interfaces
     "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
     "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",
