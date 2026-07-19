@@ -10037,6 +10037,104 @@ struct StringEscapeWalker {
         }
     }
 
+    // #2023 / §28.3 / §28.9 / §22.3 / §11 (v0.204): a `new T(args)` expression's
+    // constructor is compiled under the SAME string refcount discipline as a
+    // resolved user method (#1430): every path by which the ctor could extend a
+    // plain-borrow argument's lifetime mints its OWN +1 — a string field store
+    // retains (lowerStringFieldStore's bz_string_retain, the #429 argpass
+    // cardinal canary), a string return mints (#429/#694 return logic), an
+    // onward pass repeats this rule one level down. So a string LOCAL passed in
+    // a plain (no-modifier, positional) parameter position of a RESOLVED
+    // constructor is a CALL-BOUNDED borrow, NOT an escape — exactly the #1430
+    // user-method relaxation extended to the constructor-call form.
+    //
+    // WHY THIS WAS NEEDED. Without it, the StringEscapeWalker's NewExpr arm
+    // (which does not consult walkCallArgs) conservatively treated EVERY arg
+    // as ESCAPED. A `var s := <producer>; var b := new Box(s); …` pattern then
+    // left s EXCLUDED from the scope-end release even though the Box ctor had
+    // retained s into its _s field (rc=2). At scope end Box.Dispose released
+    // _s (rc=1), but s's own +1 was never decremented (rc=1 at exit) → leak
+    // (the #1994 lane's incidental F_field probe, promoted to its own issue
+    // as #2023). The relaxation lets s stay scope-end-release eligible: rc=2
+    // → 1 (Box.Dispose) → 0 (s's release), freed exactly once.
+    //
+    // SOUNDNESS — same anchors as #1430:
+    //   * Gated on stringReleaseMode (the #1997 narrowing) so the shared
+    //     dict-materializer (#1028), grouping (#1930), and borrowing-Array
+    //     (#1003) walks — which have no analogous retain-on-store step — keep
+    //     their conservative ESCAPE for a NewExpr arg.
+    //   * Only a RESOLVED constructor (exactly ONE ctor of the target type
+    //     matches by arity) with a PLAIN parameter at the index qualifies;
+    //     ambiguity, unresolved/builtin types (no TypeSymbol), `owned`/`ref`/
+    //     `out` params, named args, and overload-set collisions all fall through
+    //     to the conservative escape — leak-over-UAF, the safe default.
+    //   * `owned` is inadmissible on a `string` parameter (§28.1), so no string
+    //     owned-sink exists; the only "adopt" for a string is a field store
+    //     (mints its own +1) or an independent escape position (return/new/
+    //     assign/lambda-capture), all of which the expr() walk visits in their
+    //     own arms and which independently taint the local — the transfer-guard
+    //     regression tests pin this.
+    //   * Imported types are admitted: an imported ctor has cs->decl == nullptr
+    //     but cs->params (ParameterSymbol*) is populated from metadata, so the
+    //     plain-param check reads identically to a local ctor.
+    void walkNewArgs(const ast::NewExpr* ne) {
+        auto walkAllEscape = [&]() {
+            for (auto& a : ne->args) expr(a.value.get(), /*safeRead=*/false);
+        };
+        // #2023: relaxation gated on stringReleaseMode (the #1997 narrowing) —
+        // the shared dict/grouping/borrowing-Array walks keep the conservative
+        // NewExpr escape.
+        if (!stringReleaseMode) { walkAllEscape(); return; }
+        // Resolve the target TypeSymbol. The explicit `ne->type` (a NewExpr
+        // with `new T(...)` form) wins; the shorthand `new(args)` form infers
+        // the target from the NewExpr's exprType (the LHS annotation).
+        sema::TypeRef* rt = ne->type
+            ? ctx.resolvedType(*ne->type)
+            : const_cast<sema::TypeRef*>(ctx.exprType(*ne));
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration) {
+            walkAllEscape();  // builtin/unresolved type — no relaxation
+            return;
+        }
+        // Find the constructor with the matching arity. Single-ctor only —
+        // an overloaded arity is ambiguous at this analysis level (the walker
+        // is a free struct without access to ctorForArgs's type-matching), so
+        // the conservative escape applies. The common case (a user class with
+        // one ctor of the relevant arity) is covered.
+        sema::ConstructorSymbol* chosen = nullptr;
+        int matchCount = 0;
+        for (sema::Symbol* m : rt->declaration->members) {
+            auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+            if (!cs || cs->isStatic) continue;
+            // Both local (cd->params) and imported (cs->params) ctors expose
+            // the param count via cs->params — the ConstructorSymbol's params
+            // vector is populated identically by symbol collection (local) and
+            // metadata reconstruction (imported, issue #328 FINDING [7] B).
+            if (cs->params.size() == ne->args.size()) {
+                chosen = cs;
+                ++matchCount;
+                if (matchCount > 1) break;
+            }
+        }
+        if (matchCount != 1 || !chosen) {
+            walkAllEscape();  // 0 or >1 ctors of this arity — ambiguous
+            return;
+        }
+        // For each positional plain-arg, check the corresponding param. A
+        // plain (no-modifier) param admits the #1430 call-bounded-borrow
+        // relaxation; `owned`/`ref`/`out`/named stay escaped.
+        for (std::size_t i = 0; i < ne->args.size(); ++i) {
+            const ast::CallArgument& a = ne->args[i];
+            bool safeArg = false;
+            if (a.modifier.empty() && a.name.empty() &&
+                i < chosen->params.size()) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    chosen->params[i]);
+                if (ps && ps->modifier.empty()) safeArg = true;
+            }
+            expr(a.value.get(), safeArg);
+        }
+    }
+
     void expr(const ast::Expr* e, bool safeRead) {
         if (!e || escaped) return;
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
@@ -10119,7 +10217,8 @@ struct StringEscapeWalker {
             expr(th->operand.get(), /*safeRead=*/false); return;
         }
         if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
-            for (auto& a : n->args) expr(a.value.get(), /*safeRead=*/false);
+            walkNewArgs(n);  // #2023: relax plain-param args (gated on
+                             // stringReleaseMode) like #1430 user-method args.
             return;
         }
         if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
