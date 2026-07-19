@@ -151,3 +151,24 @@ BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
                                "JsonOptions", "Boolean", ""})
         BEZEL_EXPECT_FALSE(isHeapPointerReferenceBuiltin(n));
 }
+
+// --- §22.16 (v0.203, #2053): ContractViolationException registration ---
+// Per spec §22.16 "Failure semantics and the enforcement modes",
+// ContractViolationException joins the built-in hierarchy DERIVING DIRECTLY
+// FROM Exception (clause evaluation is a language operation, like the
+// indexer's IndexOutOfRangeException). Verified here at the data-only
+// registry tier — the runtime lowering that actually raises it lands in
+// a later slice; this snapshot pins the registration so an accidental
+// drop/reparent is caught mechanically.
+BEZEL_TEST(builtin_registry_snapshot, contract_violation_exception_registered_spec_22_16) {
+    BEZEL_EXPECT_TRUE(isBuiltinExceptionName("ContractViolationException"));
+    BEZEL_EXPECT_EQ(builtinExceptionParentOf("ContractViolationException"),
+                    std::string_view("Exception"));
+    // Sanity: the well-known hierarchy is unchanged around the new entry.
+    BEZEL_EXPECT_TRUE(isBuiltinExceptionName("Exception"));
+    BEZEL_EXPECT_EQ(builtinExceptionParentOf("Exception"), std::string_view(""));
+    BEZEL_EXPECT_EQ(builtinExceptionParentOf("ArgumentException"),
+                    std::string_view("Exception"));
+    BEZEL_EXPECT_EQ(builtinExceptionParentOf("IndexOutOfRangeException"),
+                    std::string_view("Exception"));
+}

@@ -123,7 +123,7 @@ struct BuiltinExceptionEdge {
     std::string_view name;
     std::string_view parent;
 };
-constexpr std::array<BuiltinExceptionEdge, 28> kBuiltinExceptionHierarchy = {{
+constexpr std::array<BuiltinExceptionEdge, 29> kBuiltinExceptionHierarchy = {{
     {"Exception", ""},
     {"ArgumentException", "Exception"},
     {"ArgumentNullException", "ArgumentException"},
@@ -152,6 +152,10 @@ constexpr std::array<BuiltinExceptionEdge, 28> kBuiltinExceptionHierarchy = {{
     {"DirectoryNotFoundException", "IOException"},
     {"EndOfStreamException", "IOException"},
     {"PathTooLongException", "IOException"},
+    // §22.16 (v0.203, #2053): clause evaluation is a language operation,
+    // like the indexer's IndexOutOfRangeException; derives directly from
+    // Exception per §22.16 "Failure semantics and the enforcement modes".
+    {"ContractViolationException", "Exception"},
 }};
 
 }  // namespace
