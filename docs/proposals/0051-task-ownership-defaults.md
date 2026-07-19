@@ -1,6 +1,6 @@
 # 0051 - Task-ownership defaults: flip the producer guidance now; a recorded study of bounded lifetime extension
 
-**Status:** draft
+**Status:** Part A superseded — graduated v0.204 (rationale §12.2 flip + §12.1 adapter sentence, docs-only; Q2 declined as redundant). Part B remains a deferred study, gated on the §3.5 measurements taken after the flip has had effect; not adopted.
 **Tracking issue:** [#2038](https://github.com/s8lap/bezel-lang/issues/2038)
 **Target:** Part A (the flip — docs-only): rationale [§12.2](../Bezel_Design_Rationale.md#sec-choosing-between-taskt-and-taskowned-t) (decision tree + the "when in doubt" paragraph rewritten), rationale [§12.1](../Bezel_Design_Rationale.md#sec-pattern-a-vs-pattern-b-is-type-directed) (one qualifying sentence), optionally spec [§30.5](../Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal) (one sentence appended to the existing producer-guidance paragraph — owner question Q2). **No stdlib change** (§1.2: the inventory found zero signatures the flip would re-choose). **No guide change** (§2.5: neither guide teaches the producer decision). Part B (the study): **no target** — its deliverable is decision criteria; if the criteria ever fire, adoption would be its own numbered proposal amending spec §30.5/§28.3 + rationale §5.24/§12; if they don't, a [DECLINED.md](DECLINED.md) entry.
 **Written against:** spec v0.197 (stdlib/rationale at the same revision)
