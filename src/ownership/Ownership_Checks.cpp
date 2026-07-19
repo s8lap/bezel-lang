@@ -5746,16 +5746,46 @@ bool MethodOwnership::checkOwnedReturnBorrowSource(const ast::Expr& e) {
     // exclusion a legal `return move _f;` would be spuriously rejected. The field-
     // restoration obligation of such a move is enforced separately by the moved-
     // from-field check, §28.8.1.) But an owned-field read off a BORROW receiver
-    // (`return move b.f!` where `b` is a borrowed parameter / catch binding /
-    // Borrowed-state local / nested field read) is the #2011 double-free: a
-    // borrower does not own the object, so moving its owned field out and
-    // returning it as `owned` lets the caller dispose a value the field's real
-    // owner also disposes. Only exclude (accept) the OWNED-receiver form; a
-    // borrow-receiver field move falls through to the borrow rejection below.
-    // // per §28.8.1, §28.6
+    // (`return move b.f!` / `return move b.f` where `b` is a borrowed parameter /
+    // catch binding / Borrowed-state local / nested field read) is the #2011
+    // double-free: a borrower does not own the object, so moving its owned field
+    // out and returning it as `owned` lets the caller dispose a value the field's
+    // real owner also disposes. And a `move` of a STATIC owned field
+    // (`return move Registry.Slot`) is the #2027 double-free: a static owned field
+    // is program-owned (§22.13 — enrolled in program-exit disposal,
+    // `bz_dispose_static_owned`), the null-after-move slot machinery is instance-
+    // slot-only, so the program's exit-disposal frees the moved-out value a
+    // SECOND time after the caller's disposal — a SEGV at exit. Only the OWNED-
+    // receiver INSTANCE form (`move this.f` / `move ownedPlace.f`) is the legal
+    // accept. The borrow-receiver form WITH `!` (`move b.f!`) is also caught by
+    // the ownedArgSourceIsBorrow fall-through below; the explicit reject here
+    // closes the #2027 return-position × static-owned-field cell AND the no-`!`
+    // borrow-receiver return form (`move b.f`) that the fall-through misses
+    // (ownedArgSourceIsBorrow's MemberAccessExpr branch is `!unwrappedMove`-gated,
+    // so a `move X.f` without `!` falls through to the not-a-borrow tail). The
+    // field-restoration obligation of the accepted `move this.f` form is enforced
+    // separately (moved-from-field check, §28.8.1). // per §28.8.1, §28.6, §22.13
     const ast::Expr* place = lookThroughForceUnwrap(un->operand.get());
-    if (exprIsOwnedFieldRead(*place) && !ownedFieldMoveReceiverIsBorrow(*place))
-        return false;
+    if (exprIsOwnedFieldRead(*place)) {
+        if (!ownedFieldMoveReceiverIsBorrow(*place)) return false;  // owned place
+        // §22.13 / §28.6 / §28.8.1 (issue #2027, #2011): a STATIC owned field
+        // (program-owned) or an owned field off a BORROW receiver cannot be
+        // returned as `owned` — the caller's disposal and the program's exit-
+        // disposal / the field's real owner's disposal both free the value.
+        report(
+            Severity::Error, un->span.begin,
+            "cannot return a borrow as an `owned` value: `move` of an owned "
+            "field off a BORROW receiver (`move b.f` / `move b.f!` — a borrower "
+            "does not own the object and cannot move its owned fields out, "
+            "§28.6) or of a STATIC owned field (`move C.f` — program-owned, "
+            "§22.13; the null-after-move slot machinery is instance-only, so "
+            "exit-disposal frees it a second time) does not transfer ownership — "
+            "the value is owned elsewhere and the caller would dispose it a "
+            "second time (§28.6 / §28.8 / §22.13 — return an owned value "
+            "produced by `new`, a call returning `owned T`, or `move` of an "
+            "owned local or an owned field of `this` or an owned place)");
+        return true;
+    }
     // Everything else classifies exactly as the argument-sink path: a borrowed
     // local/parameter, a catch-bound exception (§31.1), a Borrowed-state local,
     // or a non-`owned` field is REJECTED; an owned local or an owned producer is
