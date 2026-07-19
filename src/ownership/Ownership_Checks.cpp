@@ -748,6 +748,15 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                                     // rejection via the restoration check.
                                     consumed = true;
                                 }
+                            } else if (rejectNonThisOwnedFieldMoveDischarge(
+                                           *ma, un->span.begin)) {
+                                // §28.8.1 / §28.8 (#2005): `M(move tmp.f!)` where
+                                // `tmp` is a TEMPORARY receiver (a call result /
+                                // fresh value, not an IdentifierExpr) — the tempo-
+                                // rary has no slot to null and no place to restore
+                                // into, and the temporary's own disposal leaks.
+                                // Reject (same rule as the stable-identifier twin).
+                                consumed = true;
                             }
                         }
                     } else if (auto* id =
@@ -775,6 +784,11 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                                 // move into an owned sink — reject (double-free).
                                 consumed = true;
                             }
+                        } else if (rejectNonThisOwnedFieldMoveDischarge(
+                                       *ma, un->span.begin)) {
+                            // §28.8.1 / §28.8 (#2005): TEMPORARY receiver — same
+                            // rejection rule (leak; no restoration possible).
+                            consumed = true;
                         }
                     }
                 }
@@ -1059,6 +1073,11 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                                     // twin above).
                                     consumed = true;
                                 }
+                            } else if (rejectNonThisOwnedFieldMoveDischarge(
+                                           *ma, un->span.begin)) {
+                                // §28.8.1 / §28.8 (#2005): `new T(move tmp.f!)` for
+                                // a TEMPORARY receiver — same rejection rule.
+                                consumed = true;
                             }
                         }
                     } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(un->operand.get())) {
@@ -5366,17 +5385,43 @@ bool MethodOwnership::ownedFieldMoveReceiverIsBorrow(const ast::Expr& fieldRead)
 // a stable non-`this` receiver.
 bool MethodOwnership::rejectNonThisOwnedFieldMoveDischarge(
         const ast::MemberAccessExpr& ma, SourceLocation loc) {
-    // Only a STABLE identifier receiver (`recv.f`), never `this` (the caller's
-    // own branch handles that) and never an arbitrary temporary (`getBox().f`,
-    // whose receiver is not an IdentifierExpr — left to fall through, #1999).
-    const auto* recv = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get());
-    if (!recv || recv->name == "this") return false;
+    // Never `this` (the caller's own branch handles that).
+    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get()))
+        if (tid->name == "this") return false;
     // Only an OWNED field is a transfer whose double-disposal is the hazard; a
     // non-owned field read `recv.f` carries no ownership and is not a `move`
     // source (handled elsewhere as a borrow).
     if (!exprIsOwnedFieldRead(ma)) return false;
-    const std::string recvName(recv->name);
     const std::string member(ma.member);
+    const auto* recv = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get());
+    if (!recv) {
+        // §28.8.1 / §28.8 (#2005): a TEMPORARY receiver (`getBox().f`, a call
+        // result / fresh value not bound to a stable place). The §28.8.1
+        // field-restoration rule cannot be satisfied for a temporary — there is
+        // no stable place to restore into (a second `getBox()` call would mint
+        // a fresh Box, not reassign the moved-from field). The runtime null-
+        // after-move (LlvmBackend lowerUnary) and `fieldMovedFrom_` restoration
+        // tracking are BOTH `this`-only (and even #2002's non-`this` identifier-
+        // receiver slot null requires a stable receiver slot). Worse, the
+        // temporary's own disposal path does not account for the field-move
+        // (codegen emits no cleanup for the temporary after extracting its
+        // field), so the temporary Box itself leaks — the 24-byte LSan hit on
+        // base (issue #2005). Rejection is the consistent outcome, mirroring
+        // the stable-identifier twin below (#1999). The sound form is to bind
+        // the producer to a stable place and use a take-method (§28.6 / §23).
+        report(Severity::Error, loc,
+               "cannot move owned field `" + member +
+                   "` out of a temporary receiver: the temporary has no field "
+                   "slot to null after the move and no place to restore into "
+                   "(§28.8.1), and the temporary's own disposal does not account "
+                   "for the field-move — the temporary leaks (§28.8, §28.6). To "
+                   "hand the field to a sink, bind the producer to a stable "
+                   "place first (`using var b := <call>;`) and give its type a "
+                   "take-method that transfers the field out through `move this." +
+                   member + "` and returns it (§28.6, §23)");
+        return true;
+    }
+    const std::string recvName(recv->name);
     // Tailor the diagnostic: a BORROW receiver never owned the object, so the
     // fix is structural (§28.6/§28.8); an OWNED receiver is the §28.8.1 argument-
     // position field-move-without-restoration case, whose sound form is a take-

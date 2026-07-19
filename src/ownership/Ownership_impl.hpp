@@ -1645,20 +1645,23 @@ private:
     // move sequence and a loop with unconditional restore are accepted.
     void recordFieldMove(std::string_view name, SourceLocation loc);
 
-    // §28.8.1 / §28.8 (issue #1999): in the bare-statement discharge walk
-    // (handleDischarge), reject `M(move recv.f!)` / `new T(move recv.f)` where
-    // the move source is an owned field `f` of a NON-`this` IDENTIFIER receiver
-    // `recv` (an owned local / `using var` / owned parameter, or a borrow of a
-    // class instance). `ma` is the peeled owned-field read `recv.f`; `loc` is the
-    // move site. Returns true (arg now handled — the caller sets `consumed`) if a
-    // diagnostic fired, false if the shape is not a non-`this` owned-field move
-    // (the caller falls through to its normal handling).
+    // §28.8.1 / §28.8 (issue #1999, extended #2005): in the bare-statement
+    // discharge walk (handleDischarge), reject `M(move recv.f!)` / `new
+    // T(move recv.f)` where the move source is an owned field `f` of a NON-`this`
+    // receiver `recv`. Two receiver shapes are covered, each with its own tailored
+    // diagnostic: (a) a STABLE IDENTIFIER receiver — an owned local / `using var` /
+    // owned parameter, or a borrow of a class instance (#1999); (b) a TEMPORARY
+    // receiver — a call result / fresh value not bound to a stable identifier
+    // (`getBox().f`, #2005). `ma` is the peeled owned-field read `recv.f`; `loc`
+    // is the move site. Returns true (arg now handled — the caller sets `consumed`)
+    // if a diagnostic fired, false if the shape is not a non-`this` owned-field
+    // move (the caller falls through to its normal handling).
     //
     // Why reject rather than consume: the SOLE runtime null-after-move of the
     // field slot (LlvmBackend lowerUnary) and the field-restoration tracking
     // (`fieldMovedFrom_`, keyed by field name) are BOTH `this`-only. For a
-    // non-`this` receiver the field is left populated at runtime and never
-    // tracked, so after the move the sink adopts and disposes the value AND
+    // non-`this` IDENTIFIER receiver the field is left populated at runtime and
+    // never tracked, so after the move the sink adopts and disposes the value AND
     // `recv`'s own disposal (scope-end for a `using var`/owned local, the
     // constructed owner for a moved-out owned local, the true owner for a borrow)
     // disposes it again — a double-free / heap-use-after-free. This mirrors the
@@ -1668,10 +1671,16 @@ private:
     // rejects, because an argument-position move cannot restore the field before
     // the (throwable) call returns (§28.8.1 "WrongOrder"). The sound form is the
     // spec's "build then take then restore": `var t := move recv.f!; recv.f := …;
-    // M(owned t)`, which routes through recordMovesIn, not this walk. Scoped to a
-    // STABLE identifier receiver: an arbitrary temporary (`getBox().f`) has no
-    // place to restore and is a separate, harder case — left to fall through here.
-    // // per §28.8.1, §28.8
+    // M(owned t)`, which routes through recordMovesIn, not this walk.
+    //
+    // For a TEMPORARY receiver (#2005) rejection is the ONLY sound outcome: the
+    // §28.8.1 field-restoration rule cannot be satisfied (no stable place to
+    // restore into — a second `getBox()` call would mint a fresh Box), AND the
+    // temporary's own disposal path does not account for the field-move (codegen
+    // emits no cleanup for the temporary after extracting its field), so the
+    // temporary itself leaks — the 24-byte LSan hit on base (issue #2005). The
+    // sound remedy is to bind the producer to a stable place first and use a
+    // take-method (§28.6 / §23). // per §28.8.1, §28.8, §28.6
     bool rejectNonThisOwnedFieldMoveDischarge(const ast::MemberAccessExpr& ma,
                                               SourceLocation loc);
 
