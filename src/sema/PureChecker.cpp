@@ -33,11 +33,34 @@ public:
     void checkOneStmt(const ast::Stmt* s);
     void checkExpr(const ast::Expr* e);
 
+    // §22.16 (v0.203, #2053): walk each contract clause's expression under
+    // the §22.15 pure-body rules APPLIED EXPRESSION-WISE, with the clause-
+    // specific amendments: `throw` is rejected (the carve-out's reverse —
+    // the mechanism, message, and blame of a violation belong to §22.16's
+    // machinery, not to a clause's own throw), and `await` is rejected on
+    // every member (a clause is not part of an async body's statement
+    // sequence). Purity's other rules (frame-local mutation, calls to
+    // pure members, etc.) apply unchanged. Stores and owned-consuming
+    // operations cannot be spelled in an expression, so the borrow-only
+    // guarantee is the sum of these classifications (§22.16 "Clause typing:
+    // bool, pure, borrow-only").
+    void checkContractClauses(
+        const std::vector<ast::ContractClause>& clauses);
+
+    // §22.16: walk an `invariant` member's expression under the same clause
+    // rules (throw/await rejected, pure-body rules expression-wise).
+    void checkInvariantExpr(const ast::Expr& e);
+
 private:
     SemaContext& ctx_;
     MemberSymbol& member_;
     std::string memberLabel_;       // "method `M`" / "property `P`" / etc.
     bool isConstructor_;            // §22.15 birth-store rule admissions
+    // §22.16 (v0.203, #2053): when true, this walker is checking a contract
+    // clause / invariant expression — `throw` is rejected (the carve-out does
+    // NOT apply to clauses), and the violation's `operation` prefix is
+    // "a contract clause's expression" rather than "a pure body".
+    bool clauseMode_ = false;
 
     // §22.15 "the closed list's contrapositive": any store whose target
     // root leaves the frame is rejected (instance/static field, indexer
@@ -317,6 +340,19 @@ void PureBodyWalker::checkOneStmt(const ast::Stmt* s) {
         return;
     }
     if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+        // §22.16 (v0.203, #2053): `throw` is REJECTED in a contract clause
+        // (clauseMode_), even when the operand would otherwise satisfy the
+        // §22.15 throw carve-out — the carve-out remains available to
+        // *callees* of the clause, not to the clause itself.
+        if (clauseMode_) {
+            reportPureViolation(
+                ts->span.begin, "`throw`",
+                "a contract clause states a proposition — the mechanism, "
+                "message, and blame of a violation belong to §22.16's "
+                "machinery, not to the clause's own throw (§22.16)");
+            if (ts->value) checkExpr(ts->value.get());
+            return;
+        }
         // §22.15 throw carve-out: `new E(args)` admitted iff trivial-
         // dispose + pure ctor. Any other throw operand is admitted
         // (bare re-raise, a caught binding read).
@@ -559,6 +595,17 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
         return;
     }
     if (auto* te = dynamic_cast<const ast::ThrowExpr*>(e)) {
+        // §22.16 (v0.203, #2053): `throw` is REJECTED in a contract clause
+        // (clauseMode_), mirroring the throw-statement rule above.
+        if (clauseMode_) {
+            reportPureViolation(
+                te->span.begin, "`throw`",
+                "a contract clause states a proposition — the mechanism, "
+                "message, and blame of a violation belong to §22.16's "
+                "machinery, not to the clause's own throw (§22.16)");
+            if (te->operand) checkExpr(te->operand.get());
+            return;
+        }
         // §22.15 throw carve-out: a throw expression follows the same rule
         // as the throw statement.
         if (te->operand) checkExpr(te->operand.get());
@@ -590,6 +637,34 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
     // Literals, IdentifierExpr, etc. — admitted as reads (§22.15 rule 1).
 }
 
+void PureBodyWalker::checkContractClauses(
+    const std::vector<ast::ContractClause>& clauses) {
+    // §22.16 (v0.203, #2053) — the clause-region equivalent of checkStmts.
+    // Each clause expression is walked under §22.15's pure-body rules with
+    // the clause-specific throw rejection (clauseMode_); the bool typing and
+    // the per-amendment `result`/`old` placement checks happen elsewhere
+    // (the bool typing lands in ExprTypecheck; result/old are addressed in
+    // a later contract slice alongside lowering).
+    if (clauses.empty()) return;
+    const bool saveClauseMode = clauseMode_;
+    clauseMode_ = true;
+    for (const auto& c : clauses) {
+        if (c.expr) checkExpr(c.expr.get());
+    }
+    clauseMode_ = saveClauseMode;
+}
+
+void PureBodyWalker::checkInvariantExpr(const ast::Expr& e) {
+    // §22.16 (v0.203, #2053): an `invariant E;` member declares a predicate
+    // checked under this section's clause rules in the context of the
+    // declaring class. Throw/await are rejected (clauseMode_); the pure-body
+    // rules apply expression-wise.
+    const bool saveClauseMode = clauseMode_;
+    clauseMode_ = true;
+    checkExpr(&e);
+    clauseMode_ = saveClauseMode;
+}
+
 // Walk the SourceFile: for every pure member, walk its body.
 void checkOneMember(SemaContext& ctx, MemberSymbol& member) {
     // Determine purity of this member.
@@ -602,16 +677,23 @@ void checkOneMember(SemaContext& ctx, MemberSymbol& member) {
         if (!isPure)
             for (auto mod : ms->modifiers)
                 if (mod == "pure") { isPure = true; break; }
-        if (!isPure) return;
         if (ms->isOperator)
             label = std::string("operator `") + std::string(ms->operatorToken) +
                     "`";
         else
             label = std::string("method `") + std::string(ms->name) + "`";
-        // Pure method body lives in the MethodDecl or OperatorDecl.
+        // §22.16 (v0.203, #2053): contract clauses are type/purity-checked
+        // on EVERY method regardless of `pure` — a non-pure method may
+        // carry clauses, and each clause expression must satisfy the pure-
+        // body rules expression-wise (clauses never have effects). Run the
+        // clause walker before the body walker so a clause diagnostic is
+        // reported before any body diagnostic.
         const auto* md = dynamic_cast<const ast::MethodDecl*>(member.decl);
         const auto* od = dynamic_cast<const ast::OperatorDecl*>(member.decl);
         PureBodyWalker w(ctx, member, label, /*isConstructor=*/false);
+        if (md) w.checkContractClauses(md->contractClauses);
+        // §22.15 body walk runs only for pure methods/operators.
+        if (!isPure) return;
         if (md) {
             if (md->bodyKind == ast::MethodBodyKind::Expression &&
                 md->exprBody) {
@@ -631,14 +713,20 @@ void checkOneMember(SemaContext& ctx, MemberSymbol& member) {
     }
     if (auto* cs = dynamic_cast<ConstructorSymbol*>(&member)) {
         const auto* cd = dynamic_cast<const ast::ConstructorDecl*>(member.decl);
-        if (!cd || !cd->isPure) return;
-        isCtor = true;
-        isPure = true;
-        label = std::string("constructor of `") +
-                std::string(cs->parent ? cs->parent->name : std::string_view()) +
-                "`";
-        PureBodyWalker w(ctx, member, label, /*isConstructor=*/true);
-        w.checkStmts(cd->body);
+        // §22.16 (v0.203, #2053): clauses are checked on every constructor;
+        // the §22.15 body walk runs only for pure ctors.
+        if (cd) {
+            label = std::string("constructor of `") +
+                    std::string(cs->parent ? cs->parent->name
+                                           : std::string_view()) +
+                    "`";
+            PureBodyWalker w(ctx, member, label, /*isConstructor=*/true);
+            w.checkContractClauses(cd->contractClauses);
+            if (!cd->isPure) return;
+            isCtor = true;
+            isPure = true;
+            w.checkStmts(cd->body);
+        }
         return;
     }
     if (auto* ps = dynamic_cast<PropertySymbol*>(&member)) {

@@ -1059,11 +1059,18 @@ private:
     // Build a method scope (params on top of module scope), then visit
     // body. Locals are registered into this scope as visitStmt walks
     // LocalDecls.
+    // §22.16 (v0.203, #2053): when `clauses` is non-null, each clause's
+    // expression is visited in the SAME method scope (parameters + this +
+    // enclosing statics in scope; body locals are not — they have not been
+    // registered yet), and each clause's expression is checked to be of
+    // type `bool`. Clauses are visited independently of the body so a
+    // clause never observes a body local.
     void runMethodBody(
         const std::vector<ast::Param>& params,
         const std::vector<std::unique_ptr<ast::Stmt>>* stmts,
         const ast::Expr* exprBody,
-        const std::vector<Symbol*>* paramSyms);
+        const std::vector<Symbol*>* paramSyms,
+        const std::vector<ast::ContractClause>* clauses = nullptr);
 
     // §22.4 (v0.183, #1585) callee-side check: at a point where the body
     // returns the value `returnValue` (a `return E;` or the expression body of

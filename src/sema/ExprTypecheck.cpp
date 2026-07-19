@@ -6356,7 +6356,8 @@ void ExprTC::runMethodBody(
     const std::vector<ast::Param>& params,
     const std::vector<std::unique_ptr<ast::Stmt>>* stmts,
     const ast::Expr* exprBody,
-    const std::vector<Symbol*>* paramSyms) {
+    const std::vector<Symbol*>* paramSyms,
+    const std::vector<ast::ContractClause>* clauses) {
     Scope methodScope;
     methodScope.parent = moduleScope_.get();
     if (paramSyms) {
@@ -6490,6 +6491,38 @@ void ExprTC::runMethodBody(
     if (stmts) {
         for (const auto& s : *stmts) {
             if (s) visitStmt(*s);
+        }
+    }
+    // §22.16 (v0.203, #2053): visit each contract clause's expression in the
+    // method scope (params + this + enclosing statics) — body locals are not
+    // registered into `methodScope`, so they are correctly out of reach —
+    // and verify each is of type `bool`. Clauses are visited AFTER the body
+    // so the type lattice for parameter/this reads is fully populated.
+    if (clauses) {
+        for (const auto& c : *clauses) {
+            if (!c.expr) continue;
+            visitExpr(*c.expr);
+            // §22.16 "Clause typing: bool, pure, borrow-only": each clause
+            // expression must be `bool` (§4.1 — no truthiness). Conservative
+            // like checkConditionIsBool: skip when the type is unresolved so
+            // this pass never false-positives on incomplete typing.
+            TypeRef* t = ctx_.exprType(*c.expr);
+            if (!t) continue;
+            if (t->kind == TypeRef::Kind::Primitive &&
+                t->primitive == PrimitiveType::Bool && t->nullable) {
+                ctx_.diagnostics().report(
+                    Severity::Error, c.expr->span.begin,
+                    std::string("a contract clause's expression must be "
+                                "`bool`, not `bool?` — a nullable bool cannot "
+                                "be used in a clause (§22.16, §7.11)"));
+                continue;
+            }
+            if (t->kind != TypeRef::Kind::Primitive) continue;
+            if (t->primitive == PrimitiveType::Bool) continue;
+            ctx_.diagnostics().report(
+                Severity::Error, c.expr->span.begin,
+                std::string("a contract clause's expression must be `bool` "
+                            "(§22.16)"));
         }
     }
     currentScope_ = save;
@@ -6820,7 +6853,10 @@ void ExprTC::visitMember(const ast::Member& m) {
                                         md->span.begin, ctx_);
         bool saveIter = inIteratorMethod_;
         inIteratorMethod_ = isIteratorMethod;
-        runMethodBody(md->params, stmts, expr, paramSymbolsOf(m));
+        // §22.16 (v0.203, #2053): pass the method's contract clauses so each
+        // expression is type-checked (in the method scope) and bool-verified.
+        runMethodBody(md->params, stmts, expr, paramSymbolsOf(m),
+                      &md->contractClauses);
         inIteratorMethod_ = saveIter;
         // Slice DR1 (§21.7): a value-returning method with a block
         // body must return (or otherwise abruptly exit) on every
@@ -6866,8 +6902,12 @@ void ExprTC::visitMember(const ast::Member& m) {
         // Slice S7: readonly fields are assignable inside ctors.
         inConstructor_ = true;
         returnCtx_ = ReturnCtx::CtorDtor;
+        // §22.16 (v0.203, #2053): pass the constructor's contract clauses
+        // (requires/ensures). Sema (later slice) additionally rejects `this`
+        // reads in a ctor's `requires` per §22.7; this slice types + bool-
+        // verifies the expressions only.
         runMethodBody(cd->params, &cd->body, nullptr,
-                      paramSymbolsOf(m));
+                      paramSymbolsOf(m), &cd->contractClauses);
         returnCtx_ = saveRet;
         inStaticMember_ = saveStatic;
         inConstructor_ = saveCtor;
