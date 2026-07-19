@@ -11963,11 +11963,75 @@ struct BoxEscapeWalker {
             return;
         }
         if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            // §8.6 / §28.9 / #2060: a DIRECT method call on the tracked local —
+            // `o.GetHashCode()`, `o.Equals(x)`, `o.ToString()`, `o?.Method()`
+            // — does NOT escape the box. The receiver is `this` inside the
+            // method, which is BORROWED for the call's duration (§22.7 / §28.3:
+            // a method body cannot retain, transfer, or dispose its borrowed
+            // `this`); Bezel's ownership rules forbid storing a borrow into any
+            // longer-lived location, so the call cannot cause the box to be
+            // retained. This matches codegen reality: `bz_box_retain` is emitted
+            // ONLY for lambda capture and class-field store (lowerLambda /
+            // Setup:5421), never for a plain method-call receiver. So when the
+            // callee is a member access (regular OR null-conditional) whose
+            // target IS the tracked local, the receiver read is safe (skip the
+            // walk — the box's rc is unchanged by the call). The CALL'S ARGS are
+            // walked separately as escapes below: passing the box itself as a
+            // call argument (e.g. `other.M(o)`) is still an escape, since the
+            // callee's parameter could be `owned` (retain). `o?.Method()` parses
+            // as CallExpr(callee=NullCondMemberExpr), so BOTH member-access
+            // shapes must be admitted here.
+            if (auto* mem =
+                    dynamic_cast<const ast::MemberAccessExpr*>(c->callee.get())) {
+                if (isTargetIdent(mem->target.get())) {
+                    // Receiver is the tracked local — safe read, do not descend.
+                } else {
+                    expr(mem->target.get(), /*safeRead=*/false);
+                }
+                for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
+                return;
+            }
+            if (auto* mem = dynamic_cast<const ast::NullCondMemberExpr*>(
+                    c->callee.get())) {
+                if (isTargetIdent(mem->target.get())) {
+                    // Receiver is the tracked local — safe read, do not descend.
+                } else {
+                    expr(mem->target.get(), /*safeRead=*/false);
+                }
+                for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
+                return;
+            }
             expr(c->callee.get(), /*safeRead=*/false);
             for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
             return;
         }
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            // §8.6 / §28.9 / #2060: same direct-call relaxation as CallExpr
+            // above, for the `f?(x)` form (null-conditional invocation of an
+            // expression). On the rare occasion the callee is a member access
+            // whose target IS the tracked local, the receiver is borrowed for
+            // the call's duration and cannot be retained by the callee. Only the
+            // args escape.
+            if (auto* mem =
+                    dynamic_cast<const ast::MemberAccessExpr*>(c->callee.get())) {
+                if (isTargetIdent(mem->target.get())) {
+                    // Receiver is the tracked local — safe read, do not descend.
+                } else {
+                    expr(mem->target.get(), /*safeRead=*/false);
+                }
+                for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
+                return;
+            }
+            if (auto* mem = dynamic_cast<const ast::NullCondMemberExpr*>(
+                    c->callee.get())) {
+                if (isTargetIdent(mem->target.get())) {
+                    // Receiver is the tracked local — safe read, do not descend.
+                } else {
+                    expr(mem->target.get(), /*safeRead=*/false);
+                }
+                for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
+                return;
+            }
             expr(c->callee.get(), /*safeRead=*/false);
             for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
             return;
