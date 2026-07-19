@@ -1068,6 +1068,19 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
     // The caller is responsible for null-ing its slot afterward where a second
     // dispatch through the same slot is reachable. free(null) is a no-op.
     emitDynamicDispose(obj);
+    // §8.3 / #2058: reap the side-table entry BEFORE the heap free (the object
+    // is still live here, so the erase cannot read freed memory). Bounds the
+    // identity-hash side-table for long-running services; the per-domain
+    // deterministic counter is untouched, so §30.13 cross-run determinism
+    // holds. Fires in BOTH release and §28.2 checked-disposal modes — a
+    // quarantined disposed instance is logically dead (member access is
+    // DisposedAccessException, §31.4), so its identity hash need not be
+    // preserved. A never-hashed object (the common case) is a cheap mutex
+    // lock + failed find inside the runtime helper.
+    builder_.CreateCall(
+        declareC("bz_obj_identity_hash_forget",
+                 llvm::Type::getVoidTy(llvm_), {ptrTy()}),
+        {obj});
     // §28.2 v0.134 / issue #601: in checked disposal mode the block is
     // quarantined (not freed) after disposal so that the per-instance disposed
     // flag at slot 1 (or 2) remains readable when a subsequent member-entry

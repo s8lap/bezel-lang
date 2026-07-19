@@ -182,6 +182,29 @@ extern "C" int32_t bz_obj_is_string(void* obj, void** vtable_table) {
 // contract because the freed object is unreachable by the time its address is
 // reused, so no live pair of objects ever shares a stored hash.
 //
+// REAP ON FREE (#2058, memory-efficiency hardening of #2055): the side-table
+// maps object pointer → assigned hash and would otherwise grow without bound
+// for a long-running service that hashes many transient objects (every hashed
+// object's entry persists after the object is freed). The fix reaps an entry
+// at the object's free site: `bz_obj_identity_hash_forget(obj)` is emitted by
+// codegen at every owned-class reclaim (emitDisposeAndReclaim, immediately
+// before the heap free in both release and §28.2 checked-disposal modes) and
+// is called directly by `bz_box_release` at the last drop of a box wrapper —
+// the two object kinds whose default `GetHashCode` reaches this helper. The
+// per-domain counter is NOT touched by the reap, so the deterministic counter
+// sequence is unchanged: only the freed object's side-table entry goes away,
+// and with it the only thing the freed object could still answer about itself.
+// Reaping is a pure memory-efficiency optimization — semantically the freed
+// object is unreachable, so no live program behavior depends on its entry.
+//
+// Soundness: the reap runs WHILE THE OBJECT IS STILL LIVE (immediately before
+// the heap free), so erasing its side-table entry cannot read freed memory.
+// `std::unordered_map::erase` is a no-op on a missing key, so calling forget
+// on an object that was never hashed (the common case — most freed objects are
+// never hashed) costs only the mutex lock + a failed find. The erase is under
+// the SAME `g_identity_hashes_mtx` that guards lookup and assignment, so the
+// reap is atomic w.r.t. concurrent hashing on another thread.
+//
 // COUNTERS: per-domain (bz_domain_t::identity_hash_seq) when a domain is
 // active on the calling thread, falling back to g_startup_thread_hash_seq
 // (the startup/shutdown thread's own sequence, §30.13) when g_current_domain
@@ -217,6 +240,32 @@ extern "C" int32_t bz_obj_identity_hash(void* obj) {
     int32_t h = static_cast<int32_t>(next & 0x7fffffffu);
     g_identity_hashes[obj] = h;
     return h;
+}
+
+// §8.3 / #2058: reap the side-table entry for `obj` at its free site. Called
+// by codegen at every owned-class reclaim (emitDisposeAndReclaim, immediately
+// before the heap free) and by `bz_box_release` at the last drop of a box —
+// the two object kinds whose default `GetHashCode` reaches
+// `bz_obj_identity_hash`. Bounds side-table growth for long-running services
+// that hash many transient objects. Determinism is preserved: the per-domain
+// counter is untouched, only the freed object's entry is removed (and the
+// freed object is unreachable, so no live behavior depends on it). A no-op on
+// null and on objects that were never hashed (the common case).
+extern "C" void bz_obj_identity_hash_forget(void* obj) {
+    if (!obj) return;
+    std::lock_guard<std::mutex> lk(g_identity_hashes_mtx);
+    g_identity_hashes.erase(obj);
+}
+
+// §8.3 / #2058: test/debug accessor — the number of live entries currently in
+// the identity-hash side-table. Used by the regression test for #2058 to
+// assert the table is BOUNDED after many alloc+hash+free cycles (it stays
+// small — the live-object count — rather than growing to the cycle count).
+// Harmless in production (reads size() under the lock); never called by
+// generated code.
+extern "C" int32_t bz_identity_hash_table_size(void) {
+    std::lock_guard<std::mutex> lk(g_identity_hashes_mtx);
+    return static_cast<int32_t>(g_identity_hashes.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -375,5 +424,12 @@ extern "C" void bz_box_release(void* b) {
     // (a leaf — no owned sub-objects), so nothing else is freed; the single
     // calloc'd cell is released exactly once. The box was proven non-escaping by
     // codegen, so no other reference exists — no UAF, no double-free.
+    //
+    // §8.3 / #2058: a box whose default GetHashCode was called has an entry in
+    // the identity-hash side-table; reap it BEFORE the free so the table tracks
+    // live objects, not all-time allocations. The box pointer is still valid
+    // here (free is the next call), so the erase cannot read freed memory; a
+    // never-hashed box is a cheap mutex lock + failed find.
+    bz_obj_identity_hash_forget(b);
     free(b);
 }

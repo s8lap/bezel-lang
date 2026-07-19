@@ -1072,6 +1072,20 @@ int32_t bz_obj_is_string(void* obj, void** vtable_table);
 // deterministic under §30.13 — and never expose addresses. Null returns 0.
 int32_t bz_obj_identity_hash(void* obj);
 
+// §8.3 / #2058: reap `obj`'s side-table entry at its free site. Emitted by
+// codegen at every owned-class reclaim (immediately before the heap free) and
+// called by `bz_box_release` at the last drop of a box. Bounds side-table
+// growth for long-running services without affecting the deterministic counter
+// sequence (§30.13). A no-op on null and on objects that were never hashed.
+void bz_obj_identity_hash_forget(void* obj);
+
+// §8.3 / #2058: test/debug accessor — current number of live entries in the
+// identity-hash side-table. Used by the regression test for #2058 to assert
+// the table is BOUNDED after many alloc+hash+free cycles; harmless in
+// production (reads size() under the side-table lock), never called by
+// generated code.
+int32_t bz_identity_hash_table_size(void);
+
 // ---------------------------------------------------------------------------
 // Closure-cell reference counting (§27.5 / §28.9, issue #422 closures
 // increment; issue #672 typed env-disposer foundation).
