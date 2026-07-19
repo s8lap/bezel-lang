@@ -228,10 +228,11 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
     else if (isKeyword("interface")) kind = ast::TypeDeclKind::Interface;
     else if (isKeyword("record"))    kind = ast::TypeDeclKind::Record;
     else if (isKeyword("enum"))      kind = ast::TypeDeclKind::Enum;
+    else if (isKeyword("choice"))    kind = ast::TypeDeclKind::Choice;
     else {
         diagnostics_.report(
             Severity::Error, current_.location,
-            "expected top-level declaration (class, interface, record, enum, type)");
+            "expected top-level declaration (class, interface, record, enum, choice, type)");
         return nullptr;
     }
     advance(); // past the kind keyword
@@ -468,6 +469,70 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
             // StaticReadonlyDecl, and StaticConstDecl (A.3 EnumMember).
             // We accept the full Member grammar at the parse level and let
             // sema filter — keeps the dispatch shared with class/record.
+            while (!isKeyword("end") &&
+                   current_.kind != TokenKind::EndOfFile) {
+                auto m = parseMember();
+                if (m) {
+                    decl->members.push_back(std::move(m));
+                } else if (current_.kind != TokenKind::EndOfFile) {
+                    advance();
+                }
+            }
+        }
+    } else if (decl->kind == ast::TypeDeclKind::Choice) {
+        // §A.3 / §35.1 (v0.200, #2044):
+        //   ChoiceCases ::= ChoiceCase ("," ChoiceCase)* ";"
+        //   ChoiceCase  ::= Identifier CasePayload? SerializedClause?
+        //   CasePayload ::= "(" CaseField ("," CaseField)* ")"
+        // A choice requires at least one case (§35.1).
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected choice case name (choice body requires at least "
+                "one)");
+        } else {
+            auto parseOneCase = [&]() -> ast::ChoiceCase {
+                ast::ChoiceCase c;
+                if (current_.kind != TokenKind::Identifier) {
+                    diagnostics_.report(
+                        Severity::Error, current_.location,
+                        "expected choice case name");
+                } else {
+                    c.name = current_.text;
+                    advance();
+                }
+                // §A.3 CasePayload? — payload-free case (`NotModified`) when
+                // no `(` follows. The payload list reuses Param (its
+                // `modifier` slot carries the optional `owned` marker).
+                if (isPunctuator("(")) {
+                    advance();  // past '('
+                    if (!isPunctuator(")")) {
+                        c.payload = parseCasePayloadList();
+                    }
+                    if (!consumePunctuator(")")) {
+                        diagnostics_.report(
+                            Severity::Error, current_.location,
+                            "expected ')' to close choice case payload list");
+                    }
+                }
+                if (isSerializedClauseStart()) {
+                    c.serialized = parseSerializedClause();
+                }
+                return c;
+            };
+            decl->choiceCases.push_back(parseOneCase());
+            while (consumePunctuator(",")) {
+                decl->choiceCases.push_back(parseOneCase());
+            }
+            if (!consumePunctuator(";")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ';' after choice cases");
+            }
+            // §A.3 ChoiceMember* — identical grammar to EnumMember; parse
+            // through the shared Member grammar and let sema filter the
+            // admissible kinds (MethodDecl, ExpressionPropertyDecl,
+            // StaticReadonlyDecl, StaticConstDecl, OperatorDecl).
             while (!isKeyword("end") &&
                    current_.kind != TokenKind::EndOfFile) {
                 auto m = parseMember();
@@ -890,11 +955,12 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
     }
 
     // A.4 NestedTypeDecl as a Member: `class` / `interface` / `record` /
-    // `enum` keyword after Visibility?+Modifier*. The modifier set for
-    // top-level type-decls (`abstract`/`sealed`/`static`) overlaps with the
+    // `enum` / `choice` keyword after Visibility?+Modifier*. The modifier set
+    // for top-level type-decls (`abstract`/`sealed`/`static`) overlaps with the
     // member-modifier set we already collected, so we hand them down.
     if (isKeyword("class") || isKeyword("interface") ||
-        isKeyword("record") || isKeyword("enum")) {
+        isKeyword("record") || isKeyword("enum") ||
+        isKeyword("choice")) {
         // A nested type is a class member (§11.3) and is not one of §13.3's
         // three no-visibility exceptions (static constructor, `polymorphic`
         // registry, destructor); §11.6 states explicitly that its visibility
@@ -2188,6 +2254,45 @@ std::vector<ast::Param> Parser::parsePositionalFieldList() {
             diagnostics_.report(
                 Severity::Error, current_.location,
                 "expected ':' after positional field name");
+        }
+        p.type = parseType();
+        if (isSerializedClauseStart()) {
+            p.serialized = parseSerializedClause();
+        }
+        return p;
+    };
+    fields.push_back(parseOne());
+    while (consumePunctuator(",")) fields.push_back(parseOne());
+    return fields;
+}
+
+// §A.3 / §35.1 (v0.200, #2044):
+//   CasePayload ::= "(" CaseField ("," CaseField)* ")"
+//   CaseField   ::= "owned"? Identifier ":" Type SerializedClause?
+// CaseField is PositionalField plus the optional leading `owned` payload
+// marker; the marker is stored in `Param::modifier` (semantically the same
+// slot `owned` parameters use, per §35.3 / §28.3).
+std::vector<ast::Param> Parser::parseCasePayloadList() {
+    std::vector<ast::Param> fields;
+    if (isPunctuator(")")) return fields;
+    auto parseOne = [&]() -> ast::Param {
+        ast::Param p;
+        // Optional leading `owned` marker.
+        if (isKeyword("owned")) {
+            p.modifier = "owned";
+            advance();
+        }
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected case payload field name");
+        } else {
+            p.name = current_.text;
+            advance();
+        }
+        if (!consumePunctuator(":")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ':' after case payload field name");
         }
         p.type = parseType();
         if (isSerializedClauseStart()) {

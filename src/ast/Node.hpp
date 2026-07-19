@@ -71,6 +71,7 @@ enum class TypeDeclKind {
     Interface, // §11.x / §A.3 InterfaceDecl
     Record,    // §9
     Enum,      // §10
+    Choice,    // §35 (v0.200, #2044)
 };
 
 // Common base for the grammar's `TopDecl` alternatives (A.2). Concrete
@@ -622,6 +623,24 @@ struct EnumConstant {
     std::unique_ptr<SerializedClause> serialized;
 };
 
+// §A.3 / §35.1 (v0.200, #2044):
+//   ChoiceCase  ::= Identifier CasePayload? SerializedClause?
+//   CasePayload ::= "(" CaseField ("," CaseField)* ")"
+//   CaseField   ::= "owned"? Identifier ":" Type SerializedClause?
+// A case is payload-free when `payload` is empty. The CaseField shape is
+// PositionalField plus the optional leading `owned` marker, so we reuse Param
+// (whose `modifier` slot carries "owned" when the marker is present). The
+// SerializedClause on a case admits the rename form only (semantically
+// rejected for `skip`/`optional`, as on enum constants).
+struct ChoiceCase {
+    std::string_view name;
+    // Empty for a payload-free case (`NotModified`). Each CaseField's
+    // `modifier` is "" or "owned"; `serialized` carries a per-field rename.
+    std::vector<Param> payload;
+    // Null when no `serialized "..."` clause is present on the case.
+    std::unique_ptr<SerializedClause> serialized;
+};
+
 // Class-like top-level declaration. Slice 3 introduced the empty body; slice
 // 5 adds generic parameters and a base-type list. Primary-constructor params
 // (classes), positional fields (records), serialization clauses, generic
@@ -646,6 +665,9 @@ struct TypeDecl : TopDecl {
     // Enum-only: the comma-separated constants (`EnumConstants` per A.3).
     // Empty for non-enum kinds.
     std::vector<EnumConstant> enumConstants;
+    // §35 Choice-only: the comma-separated cases (`ChoiceCases` per A.3, v0.200
+    // #2044). Empty for non-choice kinds.
+    std::vector<ChoiceCase> choiceCases;
     // §A.3 GenericConstraints* after the inheritance clause.
     std::vector<GenericConstraint> genericConstraints;
     // Record-only: the parenthesised positional fields per A.3

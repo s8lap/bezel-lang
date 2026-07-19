@@ -24,9 +24,10 @@ namespace {
 constexpr std::string_view kReservedKeywords[] = {
     "abstract",  "and",     "as",        "async",     "await",
     "base",      "bool",    "break",     "byte",      "case",
-    "catch",     "char",    "class",     "const",     "constructor",
-    "continue",  "decimal", "default",   "destructor", "do",
-    "double",    "elif",    "else",      "end",       "enum",
+    "catch",     "char",    "choice",    "class",     "const",
+    "constructor", "continue", "decimal", "default",  "destructor",
+    "do",        "double",  "elif",      "else",      "end",
+    "enum",
     "event",     "extension", "extern",  "false",     "finally",
     "float",     "for",     "if",        "import",    "in",
     "int",       "interface", "internal", "is",       "long",

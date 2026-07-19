@@ -106,6 +106,10 @@ private:
     // SerializedClause?`. Distinct from ParamList: no modifiers, no default
     // value, but admits a SerializedClause per field.
     std::vector<ast::Param> parsePositionalFieldList();
+    // §A.3 / §35.1 (v0.200, #2044): `CaseField ::= "owned"? Identifier ":"
+    // Type SerializedClause?` — PositionalField plus the optional leading
+    // `owned` marker (stored in `Param::modifier`).
+    std::vector<ast::Param> parseCasePayloadList();
     // Slice 49: A.4 ArgList — `Argument ("," Argument)*`. Caller is
     // positioned at the first token of the first argument; the closing `)`
     // is left for the caller to consume.

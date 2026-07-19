@@ -209,6 +209,7 @@ inline std::string topDeclSummary(const ast::TopDecl& decl) {
             case ast::TypeDeclKind::Interface: out += "interface "; break;
             case ast::TypeDeclKind::Record:    out += "record ";    break;
             case ast::TypeDeclKind::Enum:      out += "enum ";      break;
+            case ast::TypeDeclKind::Choice:    out += "choice ";    break;
         }
         out += std::string(td->name);
         if (td->hasPositionalFields) {
@@ -277,6 +278,41 @@ inline std::string topDeclSummary(const ast::TopDecl& decl) {
                 if (td->enumConstants[i].serialized) {
                     out += serializedClauseString(
                         *td->enumConstants[i].serialized);
+                }
+            }
+            out += " }";
+        }
+        // §35 (v0.200, #2044): render choice cases. Payload-free cases print
+        // bare; payload cases print as `Name(type name: Type, ...)`. An
+        // `owned` payload marker prints as a leading `owned ` modifier.
+        if (!td->choiceCases.empty()) {
+            out += " { ";
+            for (std::size_t i = 0; i < td->choiceCases.size(); ++i) {
+                if (i > 0) out += ", ";
+                out += std::string(td->choiceCases[i].name);
+                if (!td->choiceCases[i].payload.empty()) {
+                    out += '(';
+                    for (std::size_t j = 0;
+                         j < td->choiceCases[i].payload.size(); ++j) {
+                        if (j > 0) out += ", ";
+                        const auto& pf = td->choiceCases[i].payload[j];
+                        if (!pf.modifier.empty()) {
+                            out += std::string(pf.modifier);
+                            out += ' ';
+                        }
+                        out += std::string(pf.name);
+                        out += ": ";
+                        out += pf.type ? typeToString(*pf.type)
+                                       : std::string("<null>");
+                        if (pf.serialized) {
+                            out += serializedClauseString(*pf.serialized);
+                        }
+                    }
+                    out += ')';
+                }
+                if (td->choiceCases[i].serialized) {
+                    out += serializedClauseString(
+                        *td->choiceCases[i].serialized);
                 }
             }
             out += " }";

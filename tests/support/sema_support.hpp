@@ -67,6 +67,7 @@ inline const char* typeKindWord(ast::TypeDeclKind k) {
         case ast::TypeDeclKind::Interface: return "interface";
         case ast::TypeDeclKind::Record:    return "record";
         case ast::TypeDeclKind::Enum:      return "enum";
+        case ast::TypeDeclKind::Choice:    return "choice";  // §35 (v0.200, #2044)
     }
     return "?";
 }
