@@ -20,6 +20,7 @@
 #include <unordered_set>
 
 #include "ast/Node.hpp"
+#include "common/OwnershipFacts.hpp"  // §35.12 (#2045): classifyChoiceType
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
@@ -280,6 +281,34 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
 
         // Enum: value type → sendable.
         if (decl->kind == ast::TypeDeclKind::Enum) return true;
+
+        // §35.12 (v0.200, #2045): a choice is sendable iff it is VALUE-LIKE
+        // AND every payload field's type is sendable; a sendable choice
+        // crosses as a copy. Borrow-bearing choices are never sendable
+        // (they carry origin-domain borrows); owning choices are not
+        // directly sendable (the §30.14 move-only exclusion, unchanged).
+        // The §35.4 classification already supplies the per-field
+        // transitivity (a value-like choice has no class/interface-typed
+        // payload and no move-only payload), so a value-like verdict
+        // leaves only the per-field sendable recursion over the (value-
+        // typed) payloads.
+        if (decl->kind == ast::TypeDeclKind::Choice) {
+            auto verdict = common::classifyChoiceType(rt, ctx);
+            if (!verdict) return false;  // defensive — unresolved
+            if (*verdict != common::ChoiceClassification::ValueLike)
+                return false;  // borrow-bearing or owning → not sendable
+            const auto* td =
+                dynamic_cast<const ast::TypeDecl*>(decl->decl);
+            if (!td) return true;  // no AST → trust the value-like verdict
+            for (const auto& cc : td->choiceCases) {
+                for (const auto& pf : cc.payload) {
+                    if (!pf.type) continue;
+                    const TypeRef* ft = ctx.resolvedType(*pf.type);
+                    if (!isSendableType(ft, ctx, inProgress)) return false;
+                }
+            }
+            return true;
+        }
 
         // Interface: NOT sendable ("no interface-typed fields" rule
         // means interface types themselves cannot be verified).
