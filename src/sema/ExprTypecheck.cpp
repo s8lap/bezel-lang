@@ -3930,6 +3930,14 @@ static bool isValueTypeArg(const TypeRef* t) {
 // Named builtins with the same importedName (arity not recursively checked;
 // deeper nesting is left to the recursive variance walk if ever implemented).
 // Nullability is intentionally ignored — variance operates on the base type.
+//
+// #2007: the composite non-generic kinds InlineArray (`[N]T`) and Function
+// (`(T1,…)->T2`) have no separate "base + arguments" decomposition — the
+// element/parameter/return types ARE the identity. Their shallow base check
+// therefore compares the structural SHAPE: ownedness + folded size + element
+// base for InlineArray (mirroring the #2001 typeRefEqual rule, §15.1: "The
+// size N is part of the type"); parameter count + modifiers + return-ownedness
+// for Function (deep type identity is typeArgIdentical's recursion).
 static bool typeArgSameBase(const TypeRef* a, const TypeRef* b) {
     if (!a || !b) return a == b;
     if (a->kind != b->kind) return false;
@@ -3943,6 +3951,27 @@ static bool typeArgSameBase(const TypeRef* a, const TypeRef* b) {
             return !an.empty() && an == bn;
         }
     }
+    if (a->kind == TypeRef::Kind::InlineArray) {
+        // §15.1: size N is part of the type. Distinguish ONLY when both sizes
+        // are FOLDED (arraySizeValue >= 0, the #2001 rule): if either is still
+        // unfolded (-1) the size is not statically known here, so a fold-state
+        // mismatch must not be read as a base difference. Ownedness always
+        // distinguishes (`[N]T` vs `[N owned]T`). Element base recurses.
+        if (a->arrayOwned != b->arrayOwned) return false;
+        if (a->arraySizeValue >= 0 && b->arraySizeValue >= 0 &&
+            a->arraySizeValue != b->arraySizeValue)
+            return false;
+        return typeArgSameBase(a->arrayElement, b->arrayElement);
+    }
+    if (a->kind == TypeRef::Kind::Function) {
+        // Structural shape: parameter count + per-parameter modifiers + return
+        // ownedness. Parameter/return TYPE identity is typeArgIdentical's job.
+        if (a->funcParams.size() != b->funcParams.size()) return false;
+        for (std::size_t i = 0; i < a->funcParams.size(); ++i)
+            if (a->funcParams[i].modifier != b->funcParams[i].modifier)
+                return false;
+        return a->funcReturnOwned == b->funcReturnOwned;
+    }
     return false;
 }
 
@@ -3953,9 +3982,24 @@ static bool typeArgSameBase(const TypeRef* a, const TypeRef* b) {
 // argument admits (§12.9 "concrete generic types are always invariant"): it is
 // what makes `Array<Dog>` distinct from `Array<Animal>`. Nullability is ignored,
 // matching typeArgSameBase (variance operates on the base type).
+//
+// #2007: InlineArray and Function have no `genericArgs` (their identity lives
+// in `arrayElement` / `funcParams` + `funcReturn`), so the genericArgs loop
+// below would return true even when the element/parameter/return types differ.
+// Recurse into those components directly so e.g. `Box<[3]Array<int>>` is
+// distinct from `Box<[3]Array<string>>` and `Box<(int)->int>` from
+// `Box<(string)->int>` (per §5.1 identity and §15.1 "size is part of the type").
 static bool typeArgIdentical(const TypeRef* a, const TypeRef* b) {
     if (!a || !b) return a == b;
     if (!typeArgSameBase(a, b)) return false;
+    if (a->kind == TypeRef::Kind::InlineArray)
+        return typeArgIdentical(a->arrayElement, b->arrayElement);
+    if (a->kind == TypeRef::Kind::Function) {
+        for (std::size_t i = 0; i < a->funcParams.size(); ++i)
+            if (!typeArgIdentical(a->funcParams[i].type, b->funcParams[i].type))
+                return false;
+        return typeArgIdentical(a->funcReturn, b->funcReturn);
+    }
     if (a->genericArgs.size() != b->genericArgs.size()) return false;
     for (std::size_t i = 0; i < a->genericArgs.size(); ++i)
         if (!typeArgIdentical(a->genericArgs[i], b->genericArgs[i]))
