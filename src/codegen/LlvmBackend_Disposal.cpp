@@ -2503,6 +2503,33 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             builder_.SetInsertPoint(contBB);
             continue;
         }
+        // §6.5 / §24.3 (#2026): a `using var` EventSource<T>/AsyncEventSource<T>
+        // — a bz_event_source_t* with no vtable. Free the subscriber list + struct
+        // via bz_event_source_free (null-safe: `if (!s) return;`, so a ctor that
+        // threw before the local was assigned, or a moved-out slot, is safe). The
+        // freed source does NOT cascade into the borrowed handler closures (those
+        // are owned by their Subscriptions, disposed separately). Null-guard for
+        // consistency with other builtin disposal sites; null the slot after so a
+        // re-entrant / unwind pass is a no-op (no double-free).
+        if (it->eventSource) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* src = builder_.CreateLoad(ptrTy(), addr, "esrc.load");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                src, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* frBB   = llvm::BasicBlock::Create(llvm_, "esrc.free", currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "esrc.cont", currentFn_);
+            builder_.CreateCondBr(isNull, contBB, frBB);
+            builder_.SetInsertPoint(frBB);
+            auto* fn = declareC("bz_event_source_free",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {src});
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), addr);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
         // §6.2 / issue #647: a `using var` Mutex. Dispose via bz_mutex_dispose
         // (marks disposed, drops the Mutex object's core ref; destroys the
         // underlying pthread_mutex when the last Lock is also released).

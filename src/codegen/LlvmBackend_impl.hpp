@@ -832,6 +832,19 @@ private:
         //   4. bz_tcs_free(tcs) — frees the TCS struct itself.
         // No user TypeSymbol; recognised by the builtin type name.
         bool tcs = false;
+        // §6.5 / §24.3 (#2026): a `using var` bound to an EventSource<T> /
+        // AsyncEventSource<T> (constructed via `new EventSource<T>()` / a factory
+        // returning the source). The runtime value is a bz_event_source_t* with
+        // no user TypeSymbol and no vtable, so classOfLocal returns null and
+        // every prior detection block misses it — without this arm the source
+        // leaked its 32-byte struct (and its handler array once subscribed) at
+        // scope end. At scope end it is freed via bz_event_source_free (null-safe:
+        // `if (!s) return;`), which severs the subscriber list and frees the
+        // struct (the borrowed handler closures are owned by their Subscriptions,
+        // disposed separately). Recognised by builtin type name "EventSource" /
+        // "AsyncEventSource" in the declared type, the NewExpr type name, or the
+        // inferred initializer exprType (the #2017 generic-factory shape).
+        bool eventSource = false;
         // #628 / stdlib §4.9 v0.135: a `using var` bound to a DrainedEntry<K,V>
         // obtained from `for var entry in d.Drain() do … end`. The loop variable
         // `entry` is a struct {K key; V* value}; `using var e := entry` transfers

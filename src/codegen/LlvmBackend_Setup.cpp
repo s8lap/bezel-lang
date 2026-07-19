@@ -7637,6 +7637,48 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return;
         }
     }
+    // §6.5 / §24.3 (#2026): a `using var` bound to an EventSource<T> /
+    // AsyncEventSource<T>. These are bz_event_source_t* objects with no user
+    // TypeSymbol and no vtable (the same runtime object emitInstanceInit mints
+    // for a keyword-form event and that Subscribe/Add/Remove/Raise/RaiseAsync
+    // dispatch against); at scope end they are freed via bz_event_source_free
+    // (null-safe: reclaims the subscriber list and the struct, NOT the borrowed
+    // handler closures — those are owned by their Subscriptions). Sync and async
+    // sources share one runtime representation, so both free identically.
+    // Without this arm the source leaked its 32-byte struct at scope end (the
+    // owned-FIELD path in emitOwnedFieldDisposals already freed EventSource
+    // fields via the same runtime call; the local path was simply not wired —
+    // pre-existing gap the #2017 generic-factory path merely reaches).
+    // Detection mirrors ChannelSender / Shared<T>: declared type name, NewExpr
+    // type name, OR inferred initializer exprType name (the generic-factory
+    // shape `using var e := MakeSource<T>();`).
+    {
+        auto isEvSrcName = [](const sema::TypeRef* rt) {
+            return rt && rt->kind == sema::TypeRef::Kind::Named &&
+                   !rt->declaration && rt->astNode && rt->astNode->name &&
+                   !rt->astNode->name->parts.empty() &&
+                   (rt->headName() == "EventSource" ||
+                    rt->headName() == "AsyncEventSource");
+        };
+        bool isES = false;
+        if (ld->type) isES = isEvSrcName(ctx_.resolvedType(*ld->type));
+        if (!isES && ld->initializer) {
+            if (auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
+                isES = ne->type && ne->type->name &&
+                       !ne->type->name->parts.empty() &&
+                       (ne->type->name->parts[0] == "EventSource" ||
+                        ne->type->name->parts[0] == "AsyncEventSource");
+        }
+        if (!isES && ld->initializer)
+            isES = isEvSrcName(ctx_.exprType(*ld->initializer));
+        if (isES) {
+            Disposal d{it->second, nullptr};
+            d.eventSource = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
     // stdlib §6.7 / §30.5: a `using var` bound to a Task / Task<T> / OwningTask<T>.
     // Tasks have no user TypeSymbol; at scope end the task is freed via bz_task_free.
     // Double-free safety: lowerAwait only frees tasks whose operand is an anonymous
