@@ -2344,15 +2344,18 @@ std::vector<ast::GenericConstraint> Parser::parseGenericConstraints() {
 
         auto parseConstraintItem = [&]() -> ast::ConstraintItem {
             ast::ConstraintItem item;
-            // A.3 Constraint ::= "class" | "value" | "notnull" | "new" "(" ")"
-            //                  | Type.
-            // `class` is reserved; `value` and `notnull` are contextual
-            // (App. B.2) so the lexer produces Identifier tokens.
+            // A.3 Constraint ::= "class" | "value" | "notnull" | "sendable"
+            //                  | "new" "(" ")" | Type.
+            // `class` is reserved; `value`, `notnull`, and `sendable` are
+            // contextual (App. B.2) so the lexer produces Identifier tokens.
+            // `sendable` names the §30.14 sendable derived-property constraint
+            // (v0.201, §14.2 "Derived-property constraints").
             if (consumeKeyword("class")) {
                 item.kind = "class";
             } else if (current_.kind == TokenKind::Identifier &&
                        (current_.text == "value" ||
-                        current_.text == "notnull")) {
+                        current_.text == "notnull" ||
+                        current_.text == "sendable")) {
                 item.kind = current_.text;
                 advance();
             } else if (consumeKeyword("new")) {

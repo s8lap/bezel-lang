@@ -180,6 +180,7 @@ add_library(bezel_core STATIC
     src/sema/ExprTypecheck_Calls.cpp
     src/sema/DefiniteAssignment.cpp
     src/sema/StaticInitCycles.cpp
+    src/sema/Sendability.cpp
     src/sema/EntryPoint.cpp
     src/flow/CFG.cpp
     src/ownership/OwnershipChecker.cpp

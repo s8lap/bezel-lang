@@ -3,7 +3,7 @@
 #include "common/BuiltinRegistry.hpp"
 
 #include "sema/ConstFold.hpp"
-
+#include "sema/Sendability.hpp"  // isSendableType — §30.14 sendability computation
 #include "sema/TypeResolution.hpp"
 
 #include <algorithm>
@@ -3324,6 +3324,19 @@ void Resolver::checkOneConstraint(const ast::Type& t,
         bool decided = false;
         bool ok = argSatisfiesNew(arg, decided);
         if (decided && !ok) report("new()");
+        return;
+    }
+    if (item.kind == "sendable") {
+        // §14.2 "Derived-property constraints" (v0.201, #2050): the
+        // constraint names the §30.14 sendable derived-property. Satisfaction
+        // is decided per instantiation, after substitution, by the property's
+        // defining computation — the same evaluation §3.6 rule 2 already
+        // performs; the constraint adds no second definition of the property.
+        // The diagnostic at the instantiation site replaces the interior one
+        // the caller would otherwise hit (§14.2). Defer on an Error TypeRef
+        // (an upstream failure has already been reported).
+        if (arg->kind == TypeRef::Kind::Error) return;
+        if (!isSendableType(arg, ctx_)) report("sendable");
         return;
     }
     if (item.kind == "type") {
