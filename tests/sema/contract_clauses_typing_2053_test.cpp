@@ -160,15 +160,45 @@ BEZEL_TEST(contract_clauses_typing_2053,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §22.16 "clauses never have effects" — class construction (new) in a
-// clause is rejected (the throw carve-out does not apply to clauses).
-// DEFERRED: the §22.15 NewExpr check fires correctly in a pure-BODY context
-// (verified via probe), but the same expression in a clause context is
-// silently admitted — the NewExpr's resolved type appears to differ between
-// the two contexts in a way that bypasses the `rt->declaration->kind ==
-// Class` admission. This is tracked as a follow-up; the load-bearing Slice 2
-// rules (bool typing, throw/await rejection, non-pure-call rejection) are
-// covered by the tests above.
+// §22.16 "clauses never have effects" — class construction (`new C(...)`) in
+// a clause is rejected: the throw carve-out does NOT apply to clauses (a
+// clause states a proposition — §22.16 "Clause typing"), and §22.15's pure-
+// body admission applies expression-wise. The fix (#2062): the contract-
+// clause expression's embedded type nodes (e.g. the `C` in `new C()`) are
+// now resolved by TypeResolution in the method scope, so the PureChecker's
+// NewExpr admission gate (`rt->declaration->kind == Class`) fires identically
+// in body and clause context.
+BEZEL_TEST(contract_clauses_typing_2053,
+           new_in_clause_rejected_spec_22_16) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public method M(x: int): bool "
+        "    requires new C() <> null; "
+        "    => true; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasMsg(r, "class construction"));
+}
+
+// §22.16 non-regression: a clause that does NOT spell class construction
+// still type-checks cleanly — the §22.16 #2062 fix only broadens the clause
+// typing to fire the existing NewExpr gate; the pure-admitted clause surface
+// (parameter/this reads, pure calls, value/record construction) is unaffected.
+// (Records are constructed by name `R(...)` as a CallExpr, not by `new`, so a
+// record-construction clause is admitted without exercising the NewExpr arm.)
+BEZEL_TEST(contract_clauses_typing_2053,
+           new_in_clause_non_regression_pure_clause_spec_22_16) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public pure method P(): bool => true; "
+        "  public method M(x: int) "
+        "    requires x > 0; "
+        "    ensures P(); "
+        "    => true; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
 
 // §22.16 "borrow-only composition": a clause may READ an owned parameter
 // (a borrow read), may not consume/dispose it.

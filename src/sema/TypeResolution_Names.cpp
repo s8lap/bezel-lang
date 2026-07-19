@@ -746,6 +746,19 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
             // factory method's `new T()` has no resolved type.
             resolveTypesInExpr(*md->exprBody, &methodScope);
         }
+        // §22.16 (v0.203, #2062): resolve type nodes embedded in each contract
+        // clause's expression in the method scope — exactly as the body's
+        // types are resolved above. Without this, a clause's `new T(...)`'s
+        // `ne->type` is never resolved: the PureChecker's NewExpr admission
+        // gate (`rt->declaration->kind == Class`, §22.15/§22.16) reads
+        // `ctx_.resolvedType(*ne->type)` and gets null in the clause context,
+        // silently admitting class construction that the same expression's
+        // body-context arm correctly rejects. The clause expr is visited by
+        // ExprTypecheck's `runMethodBody` for bool-typing AFTER this pass; it
+        // too relies on the embedded type having been pre-resolved here.
+        for (const auto& c : md->contractClauses) {
+            if (c.expr) resolveTypesInExpr(*c.expr, &methodScope);
+        }
         currentMethodConstraints_ = savedConstraints;  // §28.1 (v0.196, #1817)
     } else if (auto* od =
                    dynamic_cast<const ast::OperatorDecl*>(&m)) {
@@ -803,6 +816,15 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         // so any postcondition on its parameters is rejected (null returnType).
         checkOutNullPostcond(cd->params, nullptr, &ctorScope, cd->span.begin);
         resolveTypesInBody(cd->body, &ctorScope);
+        // §22.16 (v0.203, #2062): resolve type nodes embedded in each contract
+        // clause's expression in the constructor scope — mirrors the method-
+        // decl handling above. Without this a clause's `new T(...)` has no
+        // resolved type and the PureChecker's NewExpr admission gate
+        // (`rt->declaration->kind == Class`, §22.15/§22.16) silently admits
+        // class construction that the body-context arm correctly rejects.
+        for (const auto& c : cd->contractClauses) {
+            if (c.expr) resolveTypesInExpr(*c.expr, &ctorScope);
+        }
     } else if (auto* dd =
                    dynamic_cast<const ast::DestructorDecl*>(&m)) {
         resolveTypesInBody(dd->body, parent);
