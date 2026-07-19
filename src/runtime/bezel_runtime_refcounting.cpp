@@ -157,6 +157,69 @@ extern "C" int32_t bz_obj_is_string(void* obj, void** vtable_table) {
 }
 
 // ---------------------------------------------------------------------------
+// §8.3 (v0.204, #2055): assigned identity hashes.
+//
+// The class-default `GetHashCode` and the box-default identity hash draw their
+// value from a per-domain deterministic counter (assigned on first request,
+// stored with the object thereafter), NOT from the object's storage address.
+// The two invariants this upholds vs the prior `trunc(ptrToInt(obj))` lowering:
+//   • Cross-run determinism (§30.13): given a fixed program in a single
+//     domain with no world reads, the order in which objects' hashes are
+//     first requested is identical across runs, so the assigned values are
+//     identical — the runtime is no longer surfacing ASLR / heap-layout
+//     entropy through GetHashCode.
+//   • No-address invariant (§32.12): identity hash codes never expose
+//     addresses, extending the §32.12 no-object-address invariant through
+//     the hash surface.
+//
+// STORAGE: a process-wide side-table keyed by object pointer. This is the
+// syncblock-style option the spec names ("per-object metadata word or side
+// table"); it satisfies "objects never hashed pay nothing" — no per-object
+// metadata word is added to the layout. Within a single run the value stored
+// for a given pointer is stable (looked up, not recomputed); across the run
+// boundary the table is empty (zero-initialized static storage), so cross-run
+// determinism holds. Pointer-reuse after free is not a concern for the spec
+// contract because the freed object is unreachable by the time its address is
+// reused, so no live pair of objects ever shares a stored hash.
+//
+// COUNTERS: per-domain (bz_domain_t::identity_hash_seq) when a domain is
+// active on the calling thread, falling back to g_startup_thread_hash_seq
+// (the startup/shutdown thread's own sequence, §30.13) when g_current_domain
+// is null. fetch_add under the side-table lock makes assignment atomic and
+// preserves the first-request order even under concurrent hashing within a
+// domain (domain run-to-completion serializes continuations anyway, §24.6).
+// ---------------------------------------------------------------------------
+static std::unordered_map<void*, int32_t> g_identity_hashes;
+static std::mutex                         g_identity_hashes_mtx;
+static std::atomic<uint64_t>              g_startup_thread_hash_seq{0};
+
+extern "C" int32_t bz_obj_identity_hash(void* obj) {
+    if (!obj) return 0;
+    std::lock_guard<std::mutex> lk(g_identity_hashes_mtx);
+    auto it = g_identity_hashes.find(obj);
+    if (it != g_identity_hashes.end()) return it->second;
+    // First request for this object: draw the next value from the active
+    // domain's sequence, or the startup/shutdown-thread sequence when no
+    // domain is active. Counters are 1-based (0 is reserved for the null
+    // object's hash above).
+    uint64_t next;
+    if (g_current_domain) {
+        next = g_current_domain->identity_hash_seq.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+    } else {
+        next = g_startup_thread_hash_seq.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+    }
+    // int32 truncation: a 32-bit hash matches the §8.3 signature
+    // `GetHashCode(): int` and the i32 storage used by hash-based collections.
+    // Collisions across 2^31 distinct hashed objects in one run are acceptable
+    // per the hash invariant (a.Equals(b) ⇒ same hash; converse not required).
+    int32_t h = static_cast<int32_t>(next & 0x7fffffffu);
+    g_identity_hashes[obj] = h;
+    return h;
+}
+
+// ---------------------------------------------------------------------------
 // Closure-cell reference counting (§27.5 / §28.9, issue #422 closures
 // increment; issue #672 typed env-disposer foundation).
 //

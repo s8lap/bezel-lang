@@ -15179,9 +15179,12 @@ llvm::Constant* Emitter::classHashCodeThunk(const sema::TypeSymbol* ts) {
             }
         }
         if (!result)
-            // §8.3 default: identity hash (pointer bits → i32).
-            result = builder_.CreateTrunc(
-                builder_.CreatePtrToInt(thunk->getArg(0), i64()), i32());
+            // §8.3 (v0.204, #2055): identity hash assigned on first request
+            // from a per-domain deterministic sequence — never derived from
+            // the object's storage address.
+            result = builder_.CreateCall(
+                declareC("bz_obj_identity_hash", i32(), {ptrTy()}),
+                {thunk->getArg(0)});
         builder_.CreateRet(result);
     }
     return thunk;
@@ -15211,7 +15214,9 @@ llvm::Constant* Emitter::boxDefaultEqualsThunk() {
 
 
 // §9.6 (#946/#947/#948): the shared default GetHashCode thunk `i32(ptr this)`
-// installed in BOX vtables — identity hash (the box pointer bits → i32).
+// installed in BOX vtables — identity hash. Per §8.3 (v0.204, #2055) the value
+// is assigned on first request from the per-domain deterministic sequence via
+// bz_obj_identity_hash, never derived from the box pointer bits.
 llvm::Constant* Emitter::boxDefaultHashCodeThunk() {
     if (boxDefaultHashCodeFn_) return boxDefaultHashCodeFn_;
     auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy()}, /*isVarArg=*/false);
@@ -15221,8 +15226,9 @@ llvm::Constant* Emitter::boxDefaultHashCodeThunk() {
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     {
         ThunkScope scope(currentFn_, builder_, thunk, entry);
-        builder_.CreateRet(builder_.CreateTrunc(
-            builder_.CreatePtrToInt(thunk->getArg(0), i64()), i32()));
+        builder_.CreateRet(builder_.CreateCall(
+            declareC("bz_obj_identity_hash", i32(), {ptrTy()}),
+            {thunk->getArg(0)}));
     }
     return thunk;
 }

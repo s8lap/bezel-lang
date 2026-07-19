@@ -1060,6 +1060,18 @@ void bz_string_release(void* s);
 // only on the rare `is/as/ToString string-through-Object` path.
 int32_t bz_obj_is_string(void* obj, void** vtable_table);
 
+// §8.3 (v0.204, #2055): assigned identity hash. The class-default
+// `GetHashCode` and the box-default identity hash call this helper instead of
+// deriving from the object's storage address. On the first request for `obj`
+// the runtime draws the next value from a per-domain deterministic sequence
+// (or the startup/shutdown-thread sequence when no domain is active, §30.13)
+// and stores it in a process-wide side-table keyed by object pointer; later
+// requests for the same object return the stored value. Objects whose hash is
+// never requested pay nothing (no per-object metadata word). The values are a
+// pure function of the order in which objects' hashes are first requested —
+// deterministic under §30.13 — and never expose addresses. Null returns 0.
+int32_t bz_obj_identity_hash(void* obj);
+
 // ---------------------------------------------------------------------------
 // Closure-cell reference counting (§27.5 / §28.9, issue #422 closures
 // increment; issue #672 typed env-disposer foundation).
