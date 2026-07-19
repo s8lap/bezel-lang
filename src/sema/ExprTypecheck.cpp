@@ -3346,6 +3346,25 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
             "` — a const is a compile-time constant");
         return;
     }
+    // §21.1 v0.201 (#2049): a `const` LOCAL — compile-time OR runtime — is a
+    // single-assignment binding: assignment, compound assignment, `??=` are
+    // all compile errors naming the declaration. This covers `K := ...`,
+    // `K += ...`, `K ??= ...`, and every other AssignOp, in any method or
+    // constructor. (Per §21.1: "A `const` local of either classification is
+    // not an assignable location: assignment, compound assignment, `++`/`--`,
+    // and binding to a `ref` or `out` parameter are compile errors naming the
+    // declaration.") `++`/`--` are rejected by the IncrementStmt check; ref/out
+    // by checkRefOutOperandCategory.
+    if (auto* ls = dynamic_cast<LocalSymbol*>(ctx_.exprSymbol(*as.target))) {
+        if (ls->isConst) {
+            ctx_.diagnostics().report(
+                Severity::Error, as.span.begin,
+                std::string("cannot assign to const local `") +
+                std::string(ls->name) +
+                "` — a const local is a single-assignment binding (§21.1)");
+            return;
+        }
+    }
     if (inConstructor_) return;
     // §22.8 (#747 R42): a readonly field may be assigned only in a field
     // initializer or a constructor body; assignment anywhere else is a compile
@@ -3463,6 +3482,21 @@ void ExprTC::checkRefOutOperandCategory(const ast::CallArgument& a) {
         if (id->name == "this" || id->name == "base") return;
         Symbol* sym = ctx_.exprSymbol(target);
         if (auto* ls = dynamic_cast<LocalSymbol*>(sym)) {
+            // §21.1 v0.201 (#2049): a `const` LOCAL — compile-time OR runtime
+            // — is single-assignment; binding it to `ref` or `out` is a
+            // compile error naming the declaration. Per §21.1: "A `const`
+            // local of either classification is not an assignable location:
+            // ... binding to a `ref` or `out` parameter are compile errors
+            // naming the declaration."
+            if (ls->isConst) {
+                ctx_.diagnostics().report(
+                    Severity::Error, target.span.begin,
+                    std::string("a `") + kind + "` argument may not be a "
+                    "const local `" + std::string(id->name) +
+                    "` — a const local is a single-assignment binding "
+                    "(§22.3 / §21.1)");
+                return;
+            }
             // §28.10's pin: a `using var` binding's disposal is scope-bound;
             // a `ref`/`out` write through it is invisible to that machinery.
             if (ls->isUsing) {
@@ -5708,6 +5742,14 @@ void ExprTC::narrowOnAssignment(Symbol* sym, const TypeRef* valueType) {
     if (!dynamic_cast<LocalSymbol*>(sym) &&
         !dynamic_cast<ParameterSymbol*>(sym))
         return;
+    // §7.4 v0.201 (#2049): a `const` local's narrowing is NEVER invalidated
+    // (no invalidating form can apply: it cannot be reassigned, cannot be
+    // passed as ref/out, cannot be mutably captured — all compile errors).
+    // An assignment reaching here for a const local is itself a compile
+    // error already diagnosed by checkReadonlyAssignment; do not let the
+    // error-recovery path also wrongly invalidate the narrowing.
+    if (auto* ls = dynamic_cast<LocalSymbol*>(sym); ls && ls->isConst)
+        return;
     if (valueType && !valueType->nullable)
         nullNarrowed_.insert(sym);
     else
@@ -6270,18 +6312,29 @@ void ExprTC::computeMutablyCaptured(
 // means a closure invoked by the control-transfer operation just executed could
 // have nulled it (the field paragraph's "a closure invoked in between"). No-op
 // when nothing is captured or nothing is narrowed.
+//
+// §7.4 v0.201 (#2049): a `const` local's narrowing is NEVER invalidated —
+// mutable-capture of a const local is a compile error (the same single-
+// assignment rule), so a name appearing in `mutablyCapturedNames_` does NOT
+// imply a const local of that name can actually be mutated at runtime. Skip
+// const locals here so a const local narrowed by a null test stays narrowed
+// for the remainder of its scope, across calls and `await`s.
 void ExprTC::invalidateCapturedNarrowings() {
     if (mutablyCapturedNames_.empty()) return;
     for (auto it = nullNarrowed_.begin(); it != nullNarrowed_.end();) {
         Symbol* s = *it;
-        if (s && mutablyCapturedNames_.count(s->name))
+        if (s && mutablyCapturedNames_.count(s->name) &&
+            !(dynamic_cast<LocalSymbol*>(s) &&
+              dynamic_cast<LocalSymbol*>(s)->isConst))
             it = nullNarrowed_.erase(it);
         else
             ++it;
     }
     for (auto it = narrowings_.begin(); it != narrowings_.end();) {
         Symbol* s = it->first;
-        if (s && mutablyCapturedNames_.count(s->name))
+        if (s && mutablyCapturedNames_.count(s->name) &&
+            !(dynamic_cast<LocalSymbol*>(s) &&
+              dynamic_cast<LocalSymbol*>(s)->isConst))
             it = narrowings_.erase(it);
         else
             ++it;
@@ -9065,7 +9118,17 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 if (id->name != "_") {
                     if (auto* loc = dynamic_cast<LocalSymbol*>(
                             ctx_.exprSymbol(*is->target))) {
-                        if (loc->isUsing)
+                        // §21.1 v0.201 (#2049): a `const` LOCAL — compile-time
+                        // OR runtime — is single-assignment; `++`/`--` reassigns
+                        // it and is a compile error naming the declaration.
+                        if (loc->isConst)
+                            ctx_.diagnostics().report(
+                                Severity::Error, is->target->span.begin,
+                                std::string("cannot increment/decrement const "
+                                "local `") + std::string(id->name) +
+                                "` — a const local is a single-assignment "
+                                "binding (§21.1)");
+                        else if (loc->isUsing)
                             ctx_.diagnostics().report(
                                 Severity::Error, is->target->span.begin,
                                 std::string("cannot increment/decrement "

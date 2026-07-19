@@ -192,3 +192,165 @@ BEZEL_TEST(runtime_const_locals_2049, bare_null_without_annotation_rejected) {
         "  end Main; "
         "end C;"));
 }
+
+// =========================================================================
+// Single-assignment enforcement — §21.1 v0.201 (#2049) Slice 2.
+// A `const` local of either classification is not an assignable location:
+// assignment, compound assignment, `++`/`--`, ref/out binding, and mutable
+// lambda capture are all compile errors naming the declaration. The same
+// forms are admitted on a `var` local — non-regression confirmations below.
+// =========================================================================
+
+// §21.1: assignment to a const local is a compile error.
+BEZEL_TEST(runtime_const_locals_2049, assign_to_const_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    const K := 5; "
+        "    K := 10; "
+        "    return K; "
+        "  end Main; "
+        "end C;"));
+}
+
+// §21.1: compound assignment to a const local is a compile error.
+BEZEL_TEST(runtime_const_locals_2049, compound_assign_to_const_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    const K := 5; "
+        "    K += 1; "
+        "    return K; "
+        "  end Main; "
+        "end C;"));
+}
+
+// §21.1: `??=` to a const local is a compile error.
+BEZEL_TEST(runtime_const_locals_2049, coalesce_assign_to_const_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    const K: int? := 5; "
+        "    K ??= 1; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"));
+}
+
+// §21.1: `++` on a const local is a compile error.
+BEZEL_TEST(runtime_const_locals_2049, increment_const_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    const K := 5; "
+        "    K++; "
+        "    return K; "
+        "  end Main; "
+        "end C;"));
+}
+
+// §21.1: `--` on a const local is a compile error.
+BEZEL_TEST(runtime_const_locals_2049, decrement_const_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    const K := 5; "
+        "    K--; "
+        "    return K; "
+        "  end Main; "
+        "end C;"));
+}
+
+// §21.1 / §22.3: binding a const local to a `ref` parameter is a compile
+// error.
+BEZEL_TEST(runtime_const_locals_2049, ref_const_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static method TakeRef(ref x: int): int => x; "
+        "  public static method Main(): int "
+        "    const K := 5; "
+        "    return TakeRef(ref K); "
+        "  end Main; "
+        "end C;"));
+}
+
+// §21.1 / §22.3: binding a const local to an `out` parameter is a compile
+// error.
+BEZEL_TEST(runtime_const_locals_2049, out_const_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static method TakeOut(out x: int): bool "
+        "    x := 7; return true; "
+        "  end TakeOut; "
+        "  public static method Main(): int "
+        "    const K := 5; "
+        "    if TakeOut(out K) then return K; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"));
+}
+
+// §21.1: mutable-capture of a const local in a lambda body is a compile
+// error (it requires the assignment form, which is itself rejected). A
+// READ capture is fine — that is the lambda's `() => K;` form.
+BEZEL_TEST(runtime_const_locals_2049, mutable_capture_const_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    const K := 5; "
+        "    var f := () => do K := 10; end; "
+        "    return K; "
+        "  end Main; "
+        "end C;"));
+}
+
+// §21.1: a runtime const read from inside a lambda body is fine — a const
+// local may be captured by READ (the immutable form). The lambda observes
+// the const's value at the time it is invoked.
+BEZEL_TEST(runtime_const_locals_2049, read_capture_const_ok) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var n := 40; "
+        "    const K := n + 2; "            // runtime const: 42
+        "    var f := () => K; "            // capture by read
+        "    return f(); "                  // 42
+        "  end Main; "
+        "end C;"), 42);
+}
+
+// §7.4 v0.201 (#2049): a const local's narrowing is NEVER invalidated — a
+// null test narrows it for the remainder of its scope, across calls. The
+// field-copy idiom of §7.4 is airtight when the copy is `const`.
+BEZEL_TEST(runtime_const_locals_2049, narrowing_persists_across_call) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public f: int := 7; "
+        "  public static method Helper() Console.WriteLine(\"x\"); end Helper; "
+        "  public static method Main(): int "
+        "    const X: C? := new C(); "
+        "    if X = null then return 99; end; "
+        "    Helper(); "                   // X stays narrowed (const local)
+        "    return X.f; "                 // 7 — no `?.` needed
+        "  end Main; "
+        "end C;"), 7);
+}
+
+// =========================================================================
+// Non-regression: the same forms on a `var` local must keep working.
+// =========================================================================
+
+// §21.1 (non-regression): `var` locals remain assignable — same forms that
+// are rejected on `const` are admitted on `var`.
+BEZEL_TEST(runtime_const_locals_2049, var_local_assign_ok) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var k := 5; "
+        "    k := 10; "
+        "    k += 1; "
+        "    k++; "
+        "    return k; "                   // 12
+        "  end Main; "
+        "end C;"), 12);
+}
