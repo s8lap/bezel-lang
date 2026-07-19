@@ -1,18 +1,26 @@
 // Codegen — the #1499 fix's DISPOSAL correctness, via runtime destructor
-// counts (JIT exit code). §28.3 "Factory methods and sourceless returns" /
-// Appendix C.3: an unannotated STATIC method whose return is a FRESH owned
-// value is treated as owned by the caller (the same discharge rules as `new`),
-// so a `using var` bound to it disposes exactly once. A static method that
-// returns a BORROW (a static-field read, a receiver-sourced value) is NOT
-// owned — disposing it would double-free a value the callee does not own
-// (§28.10). This file pins BOTH halves at runtime.
+// counts (AOT exit code). §28.3 "Factory methods and sourceless returns"
+// (v0.201, #2048 / proposal 0048) / Appendix C.3: a STATIC method whose
+// declared return type carries `owned` (the v0.201 explicit-marker form of
+// the retired v0.60 treated-owned heuristic) produces an OWNED value the
+// caller discharges (the same discharge rules as `new`), so a `using var`
+// bound to it disposes exactly once. A static method that returns a BORROW
+// (a static-field read, a receiver-sourced value) is NOT owned — disposing
+// it would double-free a value the callee does not own (§28.10). This file
+// pins BOTH halves at runtime.
+//
+// MIGRATION (v0.201, mechanical): the affected `Make(): Res` factory
+// signatures below are spelled `Make(): owned Res` — the one-token edit the
+// v0.201 declaration-site error requires. The caller-side classification is
+// unchanged (the retired heuristic and the explicit marker both yield the
+// identical caller-side Owned state); only the spelling differs.
 //
 // The classification lives once in common::staticFactoryReturnsFreshOwned and
 // is consulted by the sema ownership pass AND the codegen disposal-registration
 // mirrors (usingVarOwnsClassObjectDynamically / unwindOwnedLocalClass) so the
 // sema classification and the actual disposal never diverge. `using var` needs
 // no ownership pass to register its scope-end disposal (`ld->isUsing` drives
-// it), so a plain runJit already exercises the fixed codegen path end-to-end.
+// it), so a plain runAot already exercises the fixed codegen path end-to-end.
 
 #include <string>
 
@@ -42,11 +50,13 @@ const char* kRes =
 
 // --- Owned-factory half (Appendix C.3 / §28.3): FRESH return is disposed. ---
 
-// The issue's repro shape: an unannotated static factory returns `new Res()`;
-// its result, bound via `using var`, is disposed exactly once at scope end.
+// The issue's repro shape: an `owned`-returning static factory returns `new
+// Res()`; its result, bound via `using var`, is disposed exactly once at
+// scope end. (v0.201: `Make(): owned Res` per the declaration-site error's
+// remedy.)
 BEZEL_TEST(codegen_sourceless_static_factory_1499, using_var_fresh_disposes_once) {
     std::string src = std::string(kRes) +
-        "class C public static method Make(): Res return new Res(); end Make; "
+        "class C public static method Make(): owned Res return new Res(); end Make; "
         "end C; "
         "class D "
         "  static method f() using var m := C.Make(); end f; "
@@ -56,10 +66,11 @@ BEZEL_TEST(codegen_sourceless_static_factory_1499, using_var_fresh_disposes_once
 }
 
 // Two independent factory calls, each `using var`-bound in its own scope, each
-// dispose exactly once — no double-free, no missed disposal.
+// dispose exactly once — no double-free, no missed disposal. (v0.201:
+// `Make(): owned Res` per the declaration-site error's remedy.)
 BEZEL_TEST(codegen_sourceless_static_factory_1499, two_fresh_calls_dispose_twice) {
     std::string src = std::string(kRes) +
-        "class C public static method Make(): Res return new Res(); end Make; "
+        "class C public static method Make(): owned Res return new Res(); end Make; "
         "end C; "
         "class D "
         "  static method f() using var m := C.Make(); end f; "
@@ -69,10 +80,11 @@ BEZEL_TEST(codegen_sourceless_static_factory_1499, two_fresh_calls_dispose_twice
 }
 
 // An expression-bodied static factory (`=> new Res()`) is the same fresh-owned
-// shape and is likewise disposed once.
+// shape and is likewise disposed once. (v0.201: `Make(): owned Res` per the
+// declaration-site error's remedy.)
 BEZEL_TEST(codegen_sourceless_static_factory_1499, expr_body_fresh_disposes_once) {
     std::string src = std::string(kRes) +
-        "class C public static method Make(): Res => new Res(); end C; "
+        "class C public static method Make(): owned Res => new Res(); end C; "
         "class D "
         "  static method f() using var m := C.Make(); end f; "
         "  public static method Main(): int f(); return Res._n; end Main; "
@@ -82,7 +94,10 @@ BEZEL_TEST(codegen_sourceless_static_factory_1499, expr_body_fresh_disposes_once
 
 // A static factory declared with an INTERFACE return type, returning a fresh
 // `new` of an implementing class, is owned too — disposal dispatches through
-// the object's own vtable (the interface-return sentinel path).
+// the object's own vtable (the interface-return sentinel path). (v0.201: the
+// `owned IShape` marker is required — an interface return type is a class/
+// interface type, not in the announced set unless `owned` or one of the carves
+// applies.)
 BEZEL_TEST(codegen_sourceless_static_factory_1499, interface_return_fresh_disposes_once) {
     std::string src =
         "module M; interface IShape end IShape; "
@@ -91,7 +106,7 @@ BEZEL_TEST(codegen_sourceless_static_factory_1499, interface_return_fresh_dispos
         "  public constructor() end constructor; "
         "  destructor Sq._n := Sq._n + 1; end destructor; "
         "end Sq; "
-        "class C public static method Make(): IShape return new Sq(); end Make; "
+        "class C public static method Make(): owned IShape return new Sq(); end Make; "
         "end C; "
         "class D "
         "  static method f() using var m := C.Make(); end f; "

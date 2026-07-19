@@ -35,6 +35,21 @@ constexpr std::array<std::string_view, 12> kOwningTypeHeads = {
     "OwningTask",  "IOwningEnumerable", "CancellationTokenSource",
 };
 
+// §28.3 / §29.3 / §30.7 (v0.201, #2048 / proposal 0048): the iterable and
+// enumerator interfaces whose unmarked return type is the announcement of a
+// caller-owned deferred-activation frame (the iterator convention). A static
+// signature declaring one of these heads is in the announced set of the
+// §28.3 *Factory methods and sourceless returns* declaration-site error —
+// the unmarked type itself announces the classification, so no `owned`
+// marker is required. (Each is also a member of kHeapPointerReferenceBuiltins
+// below for lowering; this set is the ownership-pass membership test.)
+constexpr std::array<std::string_view, 8> kIterableInterfaceHeads = {
+    "IEnumerable", "IEnumerator",
+    "IAsyncEnumerable", "IAsyncEnumerator",
+    "IOwningEnumerable", "IOwningEnumerator",
+    "IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
+};
+
 // §28.3 "Task-family calls produce owned frames" (v0.190, SB-01): the
 // Task-family type heads. Distinct from kOwningTypeHeads, which carries
 // `OwningTask` but NOT the plain `Task` head — a `Task`/`Task<T>` return is
@@ -174,6 +189,15 @@ bool isOwningTypeHead(std::string_view head) {
 
 bool isTaskFamilyHead(std::string_view head) {
     return contains(kTaskFamilyHeads, head);
+}
+
+// §28.3 / §29.3 / §30.7 (v0.201, #2048 / proposal 0048): the iterable or
+// enumerator interface heads — the iterator convention's announced caller-
+// owned frame. A static signature with one of these return types is in the
+// announced set of the §28.3 *Factory methods and sourceless returns*
+// declaration-site error. // per §28.3 v0.201
+bool isIterableInterfaceHead(std::string_view head) {
+    return contains(kIterableInterfaceHeads, head);
 }
 
 bool isArrayBackedCollectionName(std::string_view n) {

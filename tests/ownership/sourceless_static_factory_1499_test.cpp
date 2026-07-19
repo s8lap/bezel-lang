@@ -1,28 +1,47 @@
 // Spec-derived tests for the #1499 fix — the SEMA (ownership-pass) side of
 // classifying an unannotated STATIC factory's FRESH-owned return.
 //
-// §28.3 "Factory methods and sourceless returns": "When a method returns a
-// class type T (no `owned`) and the call has no structural borrow source — the
-// method is `static` — the return is treated as owned by the caller ... The
-// caller must discharge the ownership obligation."
+// §28.3 "Factory methods and sourceless returns" (v0.201, #2048): the v0.60
+// treated-owned-with-a-warning heuristic is RETIRED; a static method's
+// non-`owned` class/interface return is now a declaration-site ERROR. The
+// caller-side classification of an `owned`-returning static factory is
+// unchanged: an `owned Res`-returning static call is owned by the caller, and
+// the caller must discharge the ownership obligation (store in an `owned`
+// field, bind with `using var`, transfer, or consume as an unbound owned
+// temporary).
 //
-// Producers table (§28.3): "Method call returning T (no owned) | Borrowed —
-// instance method: source is the receiver; static method: no source, treated
-// as owned with a warning (see Factory methods below)."
+// Producers table (§28.3, v0.201): "Method call returning T (no owned) |
+// Borrowed — instance method: source is the receiver; extension method:
+// source is the receiver parameter. A **static** callee never reaches this
+// row: a static method's non-`owned` class/interface-typed return type is
+// admissible only where the declared type itself announces the
+// classification — a `Task`-family type, an iterable/enumerator interface,
+// or a bare type parameter with a non-empty source set — and any other such
+// static signature is rejected at its declaration."
 //
-// Appendix C.3: "A static method returning a class type without `owned` and
-// without an identifiable borrow source produces an owned value; the same
-// discharge rules as `new` apply."
+// Appendix C.3 (v0.201): "A `static` method or operator whose declared
+// return type (nullability stripped) is a class or interface type must
+// announce its classification in the signature — `owned`, a `Task`-family
+// type, a §29.3/§30.7 iterable or enumerator interface, or a bare type
+// parameter with a non-empty potential source set; any other such static
+// signature (including an empty-set bare-type-parameter return) is a compile
+// error at the declaration (§28.3)."
 //
 // CRITICAL soundness boundary (§28.3 borrow-lifetime rules / "Factory methods"
-// non-normative note; the #1499 regression): the caller-side owned-assumption
-// holds ONLY for a genuinely FRESH-owned return. A static method returning a
-// BORROW — a static-field read (`_shared`, process-lived source, §28.3
-// producers "Static property access ... Borrowed") — must stay Borrowed at the
-// call site; classifying it owned makes `using var r := Get()` dispose a
-// shared/borrowed object (a double-free, §28.10). common::
-// staticFactoryReturnsFreshOwned distinguishes the two by requiring EVERY
-// return path to be a fresh owned producer.
+// non-normative note; the #1499 regression): a static method's body may not
+// re-expose static storage through a non-`owned` return — every caller would
+// mint a second owner for the borrowed-out storage (v0.196 retired the
+// static-METHOD arm of the static-storage admission; the static-property
+// getter is the only admitted re-exposure face). The CALLER side of this
+// boundary is the v0.201 declaration-site error: a static method returning a
+// class type with no `owned` marker fails at the declaration regardless of
+// body content.
+//
+// MIGRATION (v0.201, mechanical): the affected `Make(): Res` signatures below
+// are spelled `Make(): owned Res` — the one-token edit the v0.60 warning has
+// recommended at every affected declaration. The caller-side classification
+// is unchanged (the retired heuristic and the explicit marker both yield the
+// identical caller-side Owned state); only the spelling differs.
 
 #include <string>
 
@@ -34,11 +53,14 @@ using bezel::test::parseAndCheckOwnership;
 
 // --- Owned-factory half: a FRESH static return is classified Owned. ---
 
-// The issue's exact repro shape: a plain `var` bound to an unannotated static
-// factory's `new Res()` result, never discharged. Before the fix: classified
-// Borrowed, zero diagnostics, a silent leak. After: the value is tracked Owned,
-// so the §28.3 affine auto-drop must-use warning fires (no error — auto-drop is
-// a warning, not the discharge error).
+// The issue's exact repro shape: a plain `var` bound to a fresh-owned static
+// factory result, never discharged. Before the fix: classified Borrowed, zero
+// diagnostics, a silent leak. After: the value is tracked Owned, so the §28.3
+// affine auto-drop must-use warning fires (no error — auto-drop is a warning,
+// not the discharge error). (v0.201: the factory's signature is now spelled
+// `Make(): owned Res` — the explicit marker the declaration-site error
+// requires; the caller-side classification is the same as the retired
+// heuristic's treated-owned.)
 BEZEL_TEST(sourceless_static_factory_1499, plain_var_fresh_autodrops_with_warning) {
     auto r = parseAndCheckOwnership(
         "module M; class Res "
@@ -46,7 +68,7 @@ BEZEL_TEST(sourceless_static_factory_1499, plain_var_fresh_autodrops_with_warnin
         "  destructor end destructor; "
         "end Res; "
         "class C "
-        "  public static method Make(): Res return new Res(); end Make; "
+        "  public static method Make(): owned Res return new Res(); end Make; "
         "  public static method Main(): int "
         "    var m := Make(); "
         "    return 0; "
@@ -58,6 +80,7 @@ BEZEL_TEST(sourceless_static_factory_1499, plain_var_fresh_autodrops_with_warnin
 
 // Explicit `using var` discharge: no errors, and the must-use warning is
 // suppressed (the scope-bound intent is explicit — §28.3 "Must-use warning").
+// (v0.201: `Make(): owned Res` per the declaration-site error's remedy.)
 BEZEL_TEST(sourceless_static_factory_1499, fresh_using_var_discharges_no_warning) {
     auto r = parseAndCheckOwnership(
         "module M; class Res "
@@ -65,7 +88,7 @@ BEZEL_TEST(sourceless_static_factory_1499, fresh_using_var_discharges_no_warning
         "  destructor end destructor; "
         "end Res; "
         "class C "
-        "  public static method Make(): Res return new Res(); end Make; "
+        "  public static method Make(): owned Res return new Res(); end Make; "
         "  public static method Main(): int "
         "    using var m := Make(); "
         "    return 0; "
@@ -77,7 +100,8 @@ BEZEL_TEST(sourceless_static_factory_1499, fresh_using_var_discharges_no_warning
 
 // The value is genuinely OWNED, not merely warned-about: it can be transferred
 // out through an `owned` return, exactly like a `new` producer (Appendix C.3:
-// "the same discharge rules as `new` apply").
+// "the same discharge rules as `new` apply"). (v0.201: `Make(): owned Res` per
+// the declaration-site error's remedy.)
 BEZEL_TEST(sourceless_static_factory_1499, fresh_owned_return_transfer_accepted) {
     auto r = parseAndCheckOwnership(
         "module M; class Res "
@@ -85,7 +109,7 @@ BEZEL_TEST(sourceless_static_factory_1499, fresh_owned_return_transfer_accepted)
         "  destructor end destructor; "
         "end Res; "
         "class C "
-        "  public static method Make(): Res return new Res(); end Make; "
+        "  public static method Make(): owned Res return new Res(); end Make; "
         "  public static method Relay(): owned Res return Make(); end Relay; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

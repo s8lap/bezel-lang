@@ -5971,57 +5971,194 @@ bool methodIsStatic(const ast::MethodDecl& md) {
     return false;
 }
 
-// §28.3 "Factory methods and sourceless returns" (fix #1600, follow-up to
-// #1499): "When the compiler cannot identify a source for a non-`owned`
-// class-typed return from a static method, it treats the return as owned and
-// emits a warning recommending that the callee add `owned` to its return
-// type." #1499 shipped the CALLER-side half (the call is classified Owned via
-// common::staticFactoryReturnsFreshOwned, consulted from producerState). This
-// is the missing CALLEE-side half: a DECLARATION-level nudge, distinct from
-// the §28.3 auto-drop must-use warning that fires at undischarged call sites.
-// It fires once per method declaration — a lint on the API's shape,
-// independent of whether/how many times the factory is called — which is why
-// it lives here in checkMember (the per-declaration walker) rather than in
-// MethodOwnership's per-statement dataflow.
+// §28.3 *Factory methods and sourceless returns* (v0.201, #2048 / proposal
+// 0048 — retires the v0.60 treated-owned-with-a-warning heuristic; the
+// declaration-site rule is now an ERROR, not a nudge). Spec §28.3:
 //
-// Reuses staticFactoryReturnsFreshOwned so the nudge fires in EXACTLY the
-// cases where the caller-side rule it documents actually applies: static,
-// non-`owned`, resolves to a plain class/interface (not a value-builtin, not
-// an owning-collection/-wrapper name-head — those carry their own §28.6
-// documented-source rule), and every return path is a fresh owned producer
-// (`new T(...)` or an `owned`-returning call).
+//   "A `static` method or `operator` declaration — wherever it occurs: a
+//   class, a `static` class (§11.7), a record, an enum, or an interface's
+//   static member set (§11.8) — whose declared return type, nullability
+//   stripped, is a class or interface type is a compile error unless one of
+//   the following holds:
+//     - the return type carries `owned`;
+//     - the declared type is a `Task`-family type;
+//     - the declared type is one of the iterable or enumerator interfaces;
+//     - the declared type is a bare type parameter with a non-empty
+//       potential source set.
+//   An empty-set bare-type-parameter return is rejected exactly as a
+//   concrete class type is: spell `owned T`."
 //
-// **Iterator methods are exempt from this warning** (§28.3, same section):
-// "adding `owned` to every iterator return type would be redundant noise."
-// A genuine iterator body (`yield return`/`yield break`, §29.3) has no plain
-// `return EXPR;` at all — only YieldStmt, invisible to
-// staticFactoryReturnsFreshOwned's ReturnStmt walk — so the predicate above
-// already returns false for it (sawReturn stays false); the explicit
-// bodyContainsYield guard below is belt-and-suspenders, matching the spec's
-// own explicit carve-out rather than relying solely on that incidental
-// side effect. An expression-bodied method (`=> E`) cannot contain `yield`
-// (yield is a statement, not an expression), so it needs no such guard.
-void checkStaticFactoryNudgeWarning(const ast::MethodDecl& md,
-                                     sema::SemaContext& ctx) {
-    if (md.returnOwned) return;   // already annotated — no nudge needed
-    if (!md.returnType) return;   // void / no declared return type
-    if (!methodIsStatic(md)) return;  // instance methods have a receiver source
-    if (md.bodyKind == ast::MethodBodyKind::Block &&
-        bodyContainsYield(md.stmts))
-        return;  // §29.3 iterator exemption
-    const sema::TypeRef* resultTy = ctx.resolvedType(*md.returnType);
-    common::TypeParamResolver identity =
-        [](const sema::TypeRef* t) { return t; };
-    if (!common::staticFactoryReturnsFreshOwned(md, resultTy, ctx, identity))
-        return;
-    ctx.diagnostics().report(
-        Severity::Warning, md.span.begin,
-        std::string("static factory method `") + std::string(md.name) +
-        "` returns `" + std::string(resultTy->headName()) +
-        "` with no `owned` qualifier and no structural borrow source; the "
-        "caller treats the result as owned (§28.3 sourceless-return rule) — "
-        "declare the return type `owned " + std::string(resultTy->headName()) +
-        "` to make the ownership transfer explicit");
+// The check is **signature-keyed and decidable at the declaration** — the
+// body content is no longer consulted (the v0.60 heuristic's
+// `staticFactoryReturnsFreshOwned` predicate was body-based; the v0.201 rule
+// retires it). This is why it lives in checkMember (the per-declaration
+// walker) rather than in MethodOwnership's per-statement dataflow: the
+// declaration's shape, not any particular body's, is what announces the
+// caller-side classification. The rule applies wherever the declaration
+// occurs — including the §11.8 abstract-static interface form (which has no
+// body) and the §25 operator form (`public static method operator …`).
+//
+// `descriptorKind`/`descriptorName` carry the human-readable "static method
+// `Make`" / "static operator +" prefix the diagnostic teaches the fix with.
+// `isStatic` lets the same helper serve operators (always static — no
+// modifier list) and methods (must carry the `static` modifier).
+//
+// Returns the type-head string to splice into the diagnostic, or an empty
+// string_view when no error fires (the signature is in the announced set or
+// outside the rule entirely). // per §28.3 v0.201
+static std::string_view staticReturnTypeRejected(
+        const ast::Type& returnType, bool returnOwned, bool isStatic,
+        const std::vector<ast::Param>& params,
+        const std::vector<ast::GenericParam>* methodGenericParams,
+        const std::vector<ast::GenericConstraint>* methodGenericConstraints,
+        const ast::TypeDecl* enclosingType,
+        const sema::SemaContext& ctx) {
+    if (returnOwned) return {};  // the marker is the announcement
+    // Only Named return types with a single-part head are candidates — the
+    // rule keys on the declared type's head (class/interface name, or a bare
+    // type parameter). Function-typed, inline-array, primitive, and unit
+    // returns are outside the rule (they carry no disposal obligation to
+    // transfer, or have their own §28.6 documented-source regime).
+    if (returnType.kind != ast::TypeKind::Named || !returnType.name ||
+        returnType.name->parts.empty())
+        return {};
+    const std::string_view head = returnType.name->parts.front();
+    const sema::TypeRef* rt = ctx.resolvedType(returnType);
+
+    // (A) CONCRETE class/interface return. Not in the announced set unless the
+    // declared head is one of the type-keyed carves: Task-family, iterable/
+    // enumerator interface, or owning-collection/-wrapper name-head (the
+    // latter carries its own §28.6 documented-source borrow assumption).
+    if (isClassOrInterfaceResult(rt)) {
+        if (common::isOwningTypeHead(head)) return {};  // §28.6 carve
+        if (common::isTaskFamilyHead(head)) return {};  // §28.3 v0.190 carve
+        if (common::isIterableInterfaceHead(head)) return {};  // §29.3 carve
+        return head;  // rejected — spell `owned <head>`
+    }
+
+    // (B) BARE-TYPE-PARAMETER return. A bare type parameter resolves to a
+    // null-declaration Named TypeRef; the head must name a method-level or
+    // enclosing-type generic parameter (the name-set test that distinguishes
+    // a bare parameter from a 0-arity builtin sharing the null-declaration
+    // shape). The §14.2 `where T: value` exclusion takes the return outside
+    // the rule entirely (no disposal obligation at any admissible
+    // substitution). Otherwise: an INSTANCE method has the receiver as a
+    // source (non-empty set — admissible); a STATIC method with no plain
+    // source parameter mentioning T has an EMPTY set — rejected, spell
+    // `owned T`. // per §28.3 v0.194 / v0.201
+    if (rt && rt->kind == sema::TypeRef::Kind::Named &&
+        rt->declaration == nullptr) {
+        auto inParams = [&](const std::vector<ast::GenericParam>* ps) -> bool {
+            if (!ps) return false;
+            for (const ast::GenericParam& g : *ps)
+                if (g.name == head) return true;
+            return false;
+        };
+        const bool methodLevel = inParams(methodGenericParams);
+        const bool enclosingLevel =
+            enclosingType ? inParams(&enclosingType->genericParams) : false;
+        if (!methodLevel && !enclosingLevel) return {};
+        // §14.2 `where T: value` exclusion — outside the rule entirely.
+        auto isValueConstrained = [&](const std::vector<ast::GenericConstraint>* cs) -> bool {
+            if (!cs) return false;
+            for (const ast::GenericConstraint& gc : *cs) {
+                if (gc.typeParam != head) continue;
+                for (const ast::ConstraintItem& item : gc.items)
+                    if (item.kind == "value") return true;
+            }
+            return false;
+        };
+        if (isValueConstrained(methodGenericConstraints)) return {};
+        if (enclosingType &&
+            isValueConstrained(&enclosingType->genericConstraints))
+            return {};
+        // Instance method: receiver is a source → non-empty set → admissible.
+        if (!isStatic) return {};
+        // Empty-set iff no plain (non-owned, non-out, non-ref) parameter
+        // mentions the returned parameter.
+        for (const ast::Param& p : params) {
+            if (!p.type) continue;
+            if (p.modifier.find("owned") != std::string_view::npos) continue;
+            if (p.modifier.find("out") != std::string_view::npos) continue;
+            if (p.modifier.find("ref") != std::string_view::npos) continue;
+            if (bareReturnTypeMentionsParam(*p.type, head)) return {};
+        }
+        return head;  // empty-set bare-T → rejected — spell `owned T`
+    }
+
+    return {};
+}
+
+// §28.3 *Factory methods and sourceless returns* (v0.201, #2048): emit the
+// declaration-site ERROR for a STATIC METHOD whose non-`owned` class/
+// interface / empty-set bare-T return is not in the announced set. The
+// diagnostic teaches the fix per proposal 0048 §2.3 — the two remedies are
+// (1) add `owned` to the return type, and (2) for a cached instance the
+// declaring type keeps alive, re-expose it through a static property whose
+// getter returns the `static owned` field (§28.6). The carve list
+// (`Task`-family / iterable / sourced bare-T) needs no marker — the
+// unmarked type is itself the announcement. // per §28.3 v0.201
+void reportStaticReturnError(bezel::SourceLocation spanBegin,
+                             std::string_view descriptorKind,
+                             std::string_view descriptorName,
+                             std::string_view typeHead,
+                             bool isOperator,
+                             sema::SemaContext& ctx) {
+    const std::string opTokQuoted = isOperator
+        ? (std::string(descriptorName) + " ")
+        : (std::string("`") + std::string(descriptorName) + "` ");
+    std::string msg =
+        std::string(descriptorKind) + " " + opTokQuoted +
+        "returns class/interface type `" + std::string(typeHead) +
+        "` without `owned`. A static call has no borrow source, so this "
+        "signature does not say who disposes the result. Add `owned` to the "
+        "return type (or, for a generic signature, `owned " +
+        std::string(typeHead) +
+        "`); or, to re-expose a cached instance the declaring type keeps "
+        "alive, declare a static property whose getter returns the "
+        "`static owned` field (§28.3, §28.6). (`Task`-family and iterable "
+        "return types need no marker — the unmarked type is itself the "
+        "announcement.) (§28.3 *Factory methods and sourceless returns*, "
+        "v0.201.)";
+    ctx.diagnostics().report(Severity::Error, spanBegin, std::move(msg));
+}
+
+// §28.3 v0.201 (#2048): the static-METHOD arm of the declaration-site
+// static-return error. Static-only (instance methods have a receiver source).
+// Iterates the predicate and emits the two-remedy diagnostic.
+void checkStaticMethodReturnDeclaration(const ast::MethodDecl& md,
+                                        const ast::TypeDecl* enclosingType,
+                                        sema::SemaContext& ctx) {
+    if (md.returnOwned) return;        // announced by the marker
+    if (!md.returnType) return;        // void / no declared return type
+    if (!methodIsStatic(md)) return;   // instance methods have a receiver source
+    const std::string_view head = staticReturnTypeRejected(
+        *md.returnType, md.returnOwned, /*isStatic=*/true, md.params,
+        &md.genericParams, &md.genericConstraints, enclosingType, ctx);
+    if (head.empty()) return;  // in the announced set or outside the rule
+    reportStaticReturnError(md.span.begin, "static method", md.name, head,
+                            /*isOperator=*/false, ctx);
+}
+
+// §28.3 v0.201 (#2048): the OPERATOR arm. Operators are `public static method
+// operator` per §25 / grammar A.4 — always static (no `static` modifier in
+// the AST; the grammar guarantees it). The §11.8 INumber<T> shape already
+// spells operator results `owned T`; an unmarked class-typed operator result
+// or empty-set bare-T return is rejected exactly as a static method's is.
+void checkOperatorReturnDeclaration(const ast::OperatorDecl& od,
+                                    const ast::TypeDecl* enclosingType,
+                                    sema::SemaContext& ctx) {
+    if (od.returnOwned) return;        // announced by the marker
+    if (!od.returnType) return;        // no declared return type
+    // Operators have no method-level generic params in this version (A.4); a
+    // bare-T return can only name the enclosing type's parameter.
+    const std::string_view head = staticReturnTypeRejected(
+        *od.returnType, od.returnOwned, /*isStatic=*/true, od.params,
+        /*methodGenericParams=*/nullptr,
+        /*methodGenericConstraints=*/nullptr, enclosingType, ctx);
+    if (head.empty()) return;
+    reportStaticReturnError(od.span.begin, "static operator", od.opToken, head,
+                            /*isOperator=*/true, ctx);
 }
 
 void checkMember(const ast::Member& m, sema::SemaContext& ctx,
@@ -6081,10 +6218,11 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
                 md->returnType.get(), md->returnOwned, methodIsAsync(*md),
                 methodIsStatic(*md), &genericCtx);
         }
-        // §28.3 (fix #1600): the declaration-level "add `owned`" nudge —
-        // independent of bodyKind (both Block and Expression bodies are
-        // checked by staticFactoryReturnsFreshOwned internally).
-        checkStaticFactoryNudgeWarning(*md, ctx);
+        // §28.3 v0.201 (#2048 / proposal 0048): the declaration-site
+        // static-return ERROR — independent of bodyKind (Block / Expression /
+        // Abstract all share the signature-keyed predicate). Replaces the
+        // retired v0.60 treated-owned-with-a-warning heuristic.
+        checkStaticMethodReturnDeclaration(*md, enclosingType, ctx);
     } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
         MethodOwnership mo(ctx);
         mo.run(cd->body, paramSymsOf(m, ctx));
@@ -6096,6 +6234,13 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
         mo.run(dd->body, /*paramSyms=*/nullptr, /*isAsync=*/false,
                /*isDestructor=*/true);
     } else if (auto* od = dynamic_cast<const ast::OperatorDecl*>(&m)) {
+        // §28.3 v0.201 (#2048 / proposal 0048): the declaration-site
+        // static-return ERROR — operators are `public static` per §25, so an
+        // unmarked class/interface or empty-set bare-T operator result is
+        // rejected exactly as a static method's is. The signature-keyed
+        // check runs ahead of body analysis (an Abstract operator has no
+        // body to analyse).
+        checkOperatorReturnDeclaration(*od, enclosingType, ctx);
         if (od->bodyKind == ast::MethodBodyKind::Block) {
             MethodOwnership mo(ctx);
             mo.run(od->stmts);

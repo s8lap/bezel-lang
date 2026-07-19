@@ -104,6 +104,29 @@ BEZEL_TEST(builtin_registry_snapshot, linked_list_set) {
         BEZEL_EXPECT_FALSE(isLinkedListName(n));
 }
 
+// --- isIterableInterfaceHead (§28.3/§29.3/§30.7 v0.201, #2048 / proposal 0048):
+// the iterable/enumerator interface heads whose unmarked return type is the
+// iterator convention's announced caller-owned frame. A static signature
+// returning one of these is in the announced set of the §28.3 declaration-site
+// static-return error. ---
+BEZEL_TEST(builtin_registry_snapshot, iterable_interface_head_set) {
+    static constexpr std::array<std::string_view, 8> kSnapshot = {
+        "IEnumerable", "IEnumerator",
+        "IAsyncEnumerable", "IAsyncEnumerator",
+        "IOwningEnumerable", "IOwningEnumerator",
+        "IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
+    };
+    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isIterableInterfaceHead(n));
+    // The near-neighbours that must stay OUT: the task family (a different
+    // carve), the non-deferred collection interfaces, the collection concrete
+    // types, and the lazy-query sentinel is structural (not name-keyed).
+    for (std::string_view n : {"Task", "OwningTask", "ICollection", "IList",
+                               "IOwningCollection", "IOwningList",
+                               "IReadOnlyCollection", "IReadOnlyList",
+                               "Array", "OwningArray", "IEnumerable<int>", ""})
+        BEZEL_EXPECT_FALSE(isIterableInterfaceHead(n));
+}
+
 // --- isHeapPointerReferenceBuiltin : the shared core of BOTH Layout rep lists.
 // This is the intersection of the two pre-refactor hand-lists in
 // LlvmBackend_Layout.cpp; OwningBuffer (astNode-only) and the FFI class names

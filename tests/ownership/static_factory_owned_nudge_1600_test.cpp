@@ -1,24 +1,40 @@
-// Spec-derived tests for #1600 — the CALLEE (declaration-site) half of §28.3
-// "Factory methods and sourceless returns" that #1499 left unimplemented.
+// Spec-derived tests for #2048 — the CALLEE (declaration-site) half of §28.3
+// "Factory methods and sourceless returns" (v0.201, proposal 0048).
 //
-// §28.3 "Factory methods and sourceless returns" (docs/Bezel_Language_Spec.md):
-// "When the compiler cannot identify a source for a non-`owned` class-typed
-// return from a static method, it treats the return as owned and emits a
-// warning recommending that the callee add `owned` to its return type."
+// §28.3 "Factory methods and sourceless returns" (docs/Bezel_Language_Spec.md,
+// v0.201):
 //
-// This is a SECOND, distinct diagnostic from the caller-side §28.3 auto-drop
-// must-use warning that #1499 already produces (once a call is classified
-// owned, an undischarged local at the call site gets its own warning). This
-// one fires ONCE PER METHOD DECLARATION — a lint on the API's shape,
-// independent of whether/how many times the factory is called — implemented
-// in bezel::ownership::checkStaticFactoryNudgeWarning (Ownership.cpp),
-// reusing common::staticFactoryReturnsFreshOwned (the same predicate #1499's
-// caller-side classification consults) so the nudge fires in exactly the
-// cases where that caller-side rule applies.
+//   "A `static` method or `operator` declaration — wherever it occurs: a
+//   class, a `static` class (§11.7), a record, an enum, or an interface's
+//   static member set (§11.8) — whose declared return type, nullability
+//   stripped, is a class or interface type is a compile error unless one of
+//   the following holds:
+//     - the return type carries `owned`;
+//     - the declared type is a `Task`-family type;
+//     - the declared type is one of the iterable or enumerator interfaces;
+//     - the declared type is a bare type parameter with a non-empty
+//       potential source set.
+//   An empty-set bare-type-parameter return is rejected exactly as a
+//   concrete class type is: spell `owned T`."
 //
-// "Iterator methods are exempt from this warning" (§28.3, same section,
-// §29.3 cross-reference): "adding `owned` to every iterator return type
-// would be redundant noise."
+// This retires the v0.60 treated-owned-with-a-warning heuristic (#1600).
+// The declaration-site rule is now an ERROR (Severity::Error), not a nudge
+// warning — implemented in bezel::ownership::checkStaticMethodReturnDeclaration
+// (Ownership.cpp), with the signature-keyed predicate
+// `staticReturnTypeRejected`. The rule's body-independence is the v0.201
+// soundness core: the caller-side classification is read off the declared
+// return type with no heuristic, so the producers-table row above never
+// classifies a static call. The v0.60 kernel axiom A1 (the treated-owned
+// classification) is tombstoned (rationale §5.7, v0.201).
+//
+// The diagnostic teaches the fix per proposal 0048 §2.3 — two remedies:
+// (1) add `owned` (or `owned T`) to the return type, (2) for a cached
+// instance the declaring type keeps alive, re-expose it through a static
+// property whose getter returns the `static owned` field (§28.6).
+//
+// "Iterator methods are outside the static-return error above" (§28.3, same
+// section, reframed as membership in the announced set v0.201): the iterable
+// interface IS the announcement, so no `owned` marker is required.
 
 #include <string>
 
@@ -29,18 +45,24 @@ using bezel::test::parseAndCheckOwnership;
 
 namespace {
 
-// §28.3 (fix #1600): true when the ownership pass emitted the declaration-
-// site "add `owned`" nudge WARNING — distinct from the auto-drop must-use
-// warning (`hasAutoDropWarning`, tests/support/ownership_support.hpp), which
-// matches on "is implicitly disposed at the end of" instead.
-bool hasFactoryNudgeWarning(const bezel::test::OwnershipResult& r,
-                            const std::string& methodName = "") {
+// §28.3 v0.201 (#2048): true when the ownership pass emitted the declaration-
+// site static-return ERROR — distinguished from the auto-drop must-use
+// WARNING (`hasAutoDropWarning`, tests/support/ownership_support.hpp) and from
+// the v0.196 borrow-return error (`hasStaticPropertyRemedyError`,
+// sourceless_static_factory_1499_test.cpp, which matches on "static property"
+// in an ERROR diagnostic). The fingerprint unique to THIS check is the
+// "without `owned`" + "Factory methods and sourceless returns" reference.
+bool hasStaticReturnError(const bezel::test::OwnershipResult& r,
+                          const std::string& name = "") {
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.severity != bezel::Severity::Warning) continue;
-        if (d.message.find("sourceless-return rule") == std::string::npos)
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("without `owned`") == std::string::npos)
             continue;
-        if (methodName.empty() ||
-            d.message.find("`" + methodName + "`") != std::string::npos)
+        if (d.message.find("Factory methods and sourceless returns") ==
+            std::string::npos)
+            continue;
+        if (name.empty() ||
+            d.message.find("`" + name + "`") != std::string::npos)
             return true;
     }
     return false;
@@ -48,9 +70,12 @@ bool hasFactoryNudgeWarning(const bezel::test::OwnershipResult& r,
 
 }  // namespace
 
-// --- Positive: the exact §28.3 / #1499 "Make(): Res" shape gets the nudge. ---
+// --- Positive: the exact §28.3 / #1499 "Make(): Res" shape is now REJECTED
+// at the declaration (was a WARNING under the v0.60 heuristic; v0.201 flips
+// the severity). The body content is no longer consulted — the signature
+// itself fails the announced-set rule. ---
 
-BEZEL_TEST(static_factory_owned_nudge_1600, sourceless_static_factory_warns) {
+BEZEL_TEST(static_factory_owned_nudge_1600, sourceless_static_factory_rejected) {
     auto r = parseAndCheckOwnership(
         "module M; class Res "
         "  public constructor() end constructor; "
@@ -59,18 +84,18 @@ BEZEL_TEST(static_factory_owned_nudge_1600, sourceless_static_factory_warns) {
         "class Factory "
         "  public static method Make(): Res return new Res(); end Make; "
         "  public static method Main(): int "
-        "    var m := Make(); "
+        "    using var m := Make(); "
         "    return 0; "
         "  end Main; "
         "end Factory;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasFactoryNudgeWarning(r, "Make"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasStaticReturnError(r, "Make"));
 }
 
-// The nudge is a DECLARATION-level lint: it fires even though the fresh
-// return in `Make` is discharged with an explicit `using var` at every call
-// site — the diagnostic is about the callee's ambiguous signature, not about
-// any particular call site's discharge behavior.
+// The declaration-site rule is independent of any caller's discharge shape —
+// it fires whether the call is `var m := Make();`, `using var m := Make();`,
+// or never called at all. (Was the v0.60 warning's "declaration-level lint"
+// property; v0.201 carries it forward as the declaration-level ERROR.)
 BEZEL_TEST(static_factory_owned_nudge_1600,
            fires_regardless_of_caller_discharge_style) {
     auto r = parseAndCheckOwnership(
@@ -85,14 +110,15 @@ BEZEL_TEST(static_factory_owned_nudge_1600,
         "    return 0; "
         "  end Main; "
         "end Factory;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasFactoryNudgeWarning(r, "Make"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasStaticReturnError(r, "Make"));
 }
 
-// Expression-bodied static factories (`Make(): Res => new Res();`) get the
-// same nudge — staticFactoryReturnsFreshOwned handles both bodyKinds.
+// Expression-bodied static factories (`Make(): Res => new Res();`) are
+// rejected identically — the predicate is signature-keyed (bodyKind-
+// independent).
 BEZEL_TEST(static_factory_owned_nudge_1600,
-           expression_bodied_sourceless_factory_warns) {
+           expression_bodied_sourceless_factory_rejected) {
     auto r = parseAndCheckOwnership(
         "module M; class Res "
         "  public constructor() end constructor; "
@@ -105,13 +131,38 @@ BEZEL_TEST(static_factory_owned_nudge_1600,
         "    return 0; "
         "  end Main; "
         "end Factory;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasFactoryNudgeWarning(r, "Make"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasStaticReturnError(r, "Make"));
 }
 
-// --- Negative: already-annotated `owned` return needs no nudge. ---
+// --- The rule is BODY-INDEPENDENT (the v0.201 signature-keyed core): a
+// static-storage-sourced BORROW return is ALSO rejected at the declaration,
+// not only by the v0.196 body-side `checkStaticBorrowReturn`. The body-side
+// error still fires too; this test confirms the declaration-site error is
+// present on top. ---
 
-BEZEL_TEST(static_factory_owned_nudge_1600, owned_return_no_nudge) {
+BEZEL_TEST(static_factory_owned_nudge_1600,
+           borrow_field_return_also_rejected_at_declaration) {
+    auto r = parseAndCheckOwnership(
+        "module M; class Res "
+        "  public constructor() end constructor; "
+        "  destructor end destructor; "
+        "end Res; "
+        "class Holder "
+        "  public static readonly _shared: Res := new Res(); "
+        "  public static method Get(): Res => _shared; "
+        "  public static method Main(): int "
+        "    var r := Get(); "
+        "    return 0; "
+        "  end Main; "
+        "end Holder;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasStaticReturnError(r, "Get"));
+}
+
+// --- Negative: already-annotated `owned` return needs no error. ---
+
+BEZEL_TEST(static_factory_owned_nudge_1600, owned_return_no_error) {
     auto r = parseAndCheckOwnership(
         "module M; class Res "
         "  public constructor() end constructor; "
@@ -125,13 +176,13 @@ BEZEL_TEST(static_factory_owned_nudge_1600, owned_return_no_nudge) {
         "  end Main; "
         "end Factory;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(hasFactoryNudgeWarning(r, "Make"));
+    BEZEL_EXPECT_FALSE(hasStaticReturnError(r, "Make"));
 }
 
 // --- Negative: an INSTANCE method has a structural source (the receiver) —
 // §28.3 producers table ("instance method: source is the receiver"). ---
 
-BEZEL_TEST(static_factory_owned_nudge_1600, instance_method_no_nudge) {
+BEZEL_TEST(static_factory_owned_nudge_1600, instance_method_no_error) {
     auto r = parseAndCheckOwnership(
         "module M; class Res "
         "  public constructor() end constructor; "
@@ -152,14 +203,13 @@ BEZEL_TEST(static_factory_owned_nudge_1600, instance_method_no_nudge) {
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(hasFactoryNudgeWarning(r, "Get"));
+    BEZEL_EXPECT_FALSE(hasStaticReturnError(r, "Get"));
 }
 
 // --- Negative: a value-typed return carries no ownership obligation at all —
-// staticFactoryReturnsFreshOwned's plain-class/interface guard excludes it.
-// ---
+// the announced-set / class-or-interface guard excludes it. ---
 
-BEZEL_TEST(static_factory_owned_nudge_1600, value_typed_return_no_nudge) {
+BEZEL_TEST(static_factory_owned_nudge_1600, value_typed_return_no_error) {
     auto r = parseAndCheckOwnership(
         "module M; class Factory "
         "  public static method Make(): int return 5; end Make; "
@@ -169,41 +219,14 @@ BEZEL_TEST(static_factory_owned_nudge_1600, value_typed_return_no_nudge) {
         "  end Main; "
         "end Factory;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(hasFactoryNudgeWarning(r, "Make"));
+    BEZEL_EXPECT_FALSE(hasStaticReturnError(r, "Make"));
 }
 
-// --- v0.196 RETIREMENT (#1815): a static method returning a BORROW (a static-
-// field read) is now REJECTED (§28.3 ~L5898 / §28.6 ~L6085 — the static-method
-// static-storage re-exposure arm is retired; re-exposure is the static property
-// getter only). This shape previously pinned the now-retired acceptance (no
-// error, no nudge); flipping the error expectation IS the spec-mandated behavior
-// change. The nudge assertion still holds: the nudge fires only for a
-// fresh-owned return (`staticFactoryReturnsFreshOwned`), and a static-field read
-// is a borrow, not fresh — so there is still nothing to annotate `owned` and no
-// nudge fires. The borrow-return Error, not a nudge, is now what is diagnosed. ---
+// --- Negative (v0.201 type-keyed iterator carve): iterator methods are
+// outside the rule because their iterable-interface return type IS the
+// announcement — no `owned` marker needed. ---
 
-BEZEL_TEST(static_factory_owned_nudge_1600, borrow_field_return_no_nudge) {
-    auto r = parseAndCheckOwnership(
-        "module M; class Res "
-        "  public constructor() end constructor; "
-        "  destructor end destructor; "
-        "end Res; "
-        "class Holder "
-        "  public static readonly _shared: Res := new Res(); "
-        "  public static method Get(): Res => _shared; "
-        "  public static method Main(): int "
-        "    var r := Get(); "
-        "    return 0; "
-        "  end Main; "
-        "end Holder;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(hasFactoryNudgeWarning(r, "Get"));
-}
-
-// --- Negative: iterator methods are explicitly exempt (§28.3: "adding
-// `owned` to every iterator return type would be redundant noise"). ---
-
-BEZEL_TEST(static_factory_owned_nudge_1600, iterator_method_no_nudge) {
+BEZEL_TEST(static_factory_owned_nudge_1600, iterator_method_no_error) {
     auto r = parseAndCheckOwnership(
         "module M; class Box "
         "  public constructor() end constructor; "
@@ -221,5 +244,19 @@ BEZEL_TEST(static_factory_owned_nudge_1600, iterator_method_no_nudge) {
         "  end Main; "
         "end Gen;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(hasFactoryNudgeWarning(r, "Make"));
+    BEZEL_EXPECT_FALSE(hasStaticReturnError(r, "Make"));
+}
+
+// --- Negative (v0.201 announced-set carve): a `Task`-family return type is
+// itself the ownership-transferring announcement (§28.3 *Task-family calls
+// produce owned frames*, v0.190) — no `owned` marker required. ---
+
+BEZEL_TEST(static_factory_owned_nudge_1600, task_family_return_no_error) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public static method Make(): Task<int> "
+        "    return Task.FromResult(0); "
+        "  end Make; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasStaticReturnError(r, "Make"));
 }

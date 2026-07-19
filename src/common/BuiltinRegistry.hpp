@@ -50,6 +50,16 @@ bool isOwningTypeHead(std::string_view head);
 // and async bodies. `OwningTask` is in both sets.
 bool isTaskFamilyHead(std::string_view head);
 
+// §28.3 / §29.3 / §30.7 (v0.201, #2048 / proposal 0048): the iterable or
+// enumerator interface heads (`IEnumerable<T>`, `IEnumerator<T>`,
+// `IAsyncEnumerable<T>`, `IAsyncEnumerator<T>`, and the four `IOwning*`
+// forms) — the iterator convention whose unmarked return type is itself the
+// announcement of a caller-owned deferred-activation frame. A static
+// signature with one of these return types is in the announced set of the
+// §28.3 *Factory methods and sourceless returns* declaration-site error and
+// needs no `owned` marker. // per §28.3 v0.201
+bool isIterableInterfaceHead(std::string_view head);
+
 // Array-backed collections (bz_array_t*): the receiver names whose indexer /
 // .Count lower through the bz_array_* runtime.  Backs isCollectionTypeName.
 // per §4.4–§4.7 / §4.14
