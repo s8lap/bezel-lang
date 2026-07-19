@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.201 — July 2026**
+**Companion to the Bezel Language Specification, v0.202 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -960,6 +960,17 @@ Spec §35 adds `choice` — closed nominal sums with payload-carrying cases — 
 **Equality follows the record precedent, not the inline-array one.** §15.3 gives owning inline arrays borrowing equality (per-slot reference equality for class elements); choices instead take §9.2's use-site error for the non-value-like classifications — reference equality smuggled inside a value type's `=` is virtually never the intended semantics, and the two recorded precedents genuinely conflicted; the conflict was surfaced and ruled, not papered over.
 
 **`default` is declined for every choice.** A sum has no principled zero, and electing a case would make meaning depend on declaration order; the enum precedent does not transfer because an enum value *is* its integer and zero exists regardless. Recorded liftable if evidence arrives.
+
+<a id="sec-pure-declared-not-derived"></a>
+### 9.7 `pure` is declared, not derived (v0.202)
+
+Spec §22.15 adds the `pure` member modifier — effect-freedom as a declared, compiler-verified signature fact. The mechanism choice needed defending, because §3.6's closing paragraph pushes new classifications toward *derivation*. Three reasons it is declared:
+
+- §3.6 governs structural classifications of *types*; purity is a behavioral contract of a *member* — the same grammatical species as `owned` on a return or `scoped` on a parameter, all declared, none derivable from structure.
+- §12.6's principle (derived properties are observations, not obligations) inverts here: **inferred** purity would be an observation callers silently convert into an obligation — adding one log line to a leaf method would flip the inferred purity of every transitive caller, breaking every pure-context use with no declaration anywhere recording that a promise existed. Declared purity puts the promise, and the breakage, at an explicit keyword whose removal is a visible signature change.
+- The artifact interface (§2.8.2) carries signatures, not bodies; an inferred fact would make module interfaces change when bodies change — the instability §2.8.2 exists to prevent.
+
+The v1 boundary decisions, recorded: purity is **not determinism** (reads of mutable state are permitted; `det`/`total` are separate future promises — `pure` permanently means effect-free); class construction is excluded except the **throw carve-out** (a trivial-dispose class with a pure constructor as the immediate throw operand — without it, argument validation would be unwritable in the whole pure fragment and programmers would launder faults through provoked built-ins); function-typed values may be defined but not invoked (their types carry no effect information; the `(int) pure -> int` extension is the recorded v2, riding §27.1's modifier-identity precedent); override/implementation matching is strengthening-only (never-drop / may-strengthen / monotone — the exact-match alternative would sever every stdlib interface implementation from purity). The stdlib first wave annotates only non-virtual concrete members; annotating `IComparable<T>`/`IEquatable<T>`/`Object` roots is a recorded breaking-change event for a future major revision. The recorded widening (trivial-dispose construction admission, lifting `string.Split`-class exclusions) is proposal 0042 §8's variant B, staged behind one implementation cycle.
 
 <a id="sec-generics"></a>
 ## 10. Generics

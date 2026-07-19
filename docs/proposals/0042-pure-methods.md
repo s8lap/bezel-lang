@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | superseded — graduated v0.202 |
 | **Tracking issue** | [#2029](https://github.com/s8lap/bezel-lang/issues/2029) |
 | **Target** | Spec: new §22.15 (pure members), §11.5 (modifier order), §12.1/§11.2 (override/implementation matching), §23 (accessor forms), §26 (extension members), Appendix A.4, Appendix B.1/B.2, new Appendix C.14; stdlib: first-wave annotations in §2.2, §9.1–§9.6, §3.3, §4.4, §2.17/spec §31.4 exception constructors; rationale: one new section (declared-not-derived). No Appendix D change (Core). |
 | **Written against** | spec v0.197 (stdlib/rationale at the same revision) |

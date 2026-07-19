@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.201 — July 2026**
+**Version 0.202 — July 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -1664,6 +1664,8 @@ An `owned` primary-constructor parameter referenced in a *body* position is capt
 <a id="sec-interface-declaration"></a>
 ### 11.2 Interface declaration
 
+*(A class member implementing a `pure` interface member is declared `pure` — [§22.15](#sec-pure-dispatch), v0.202.)*
+
 ```bezel
 interface IBankAccount
   method Deposit(amount: decimal);
@@ -1752,7 +1754,7 @@ A class ends with `end ClassName;`. Members may end with `end MemberName;` or `e
 When a member declaration carries multiple modifiers, they appear in this order:
 
 ```
-visibility static async (abstract | virtual | override | sealed override) owned readonly member-kind Name ...
+visibility static (async | pure) (abstract | virtual | override | sealed override) owned readonly member-kind Name ...
 ```
 
 `abstract`, `virtual`, `override`, and `sealed override` are mutually exclusive — at most one may appear. A non-virtual member carries none of them. `sealed override` seals a previously-virtual member against further overriding. `sealed` alone is a class-level modifier that prevents inheritance ([§12.4](#sec-sealing)); it does not appear on individual members.
@@ -1859,6 +1861,8 @@ At a class or interface substitution of `T`, `total` is an owned local: `T.Zero(
 
 <a id="sec-members-are-non-virtual-by-default"></a>
 ### 12.1 Members are non-virtual by default
+
+*(Purity at override boundaries, v0.202: an `override` of a `pure` member restates `pure` — omission is a compile error; an override may add `pure` where the base is not (usable through the derived static type only); purity never narrows down a chain — [§22.15](#sec-pure-dispatch).)*
 
 A method, property, or indexer is non-virtual unless marked `virtual`. To override a virtual member in a derived class, mark the matching member `override`. Visibility, return type, parameter types, and parameter modifiers must match the base member exactly, with one allowance (v0.181): an override may declare a parameter as `T?` where the overridden member declares `T` — the same contravariant nullability widening [§11.2](#sec-interface-declaration) grants interface implementations, admitted here for the same recorded reason (the override accepts more inputs than the virtual slot promises to pass; the reasoning applies verbatim, and the old asymmetry between the two positions was never recorded as intentional). Widening is **monotone down the chain**: an override matches against the *nearest* overridden declaration, so once a parameter is `T?` a further override must keep it `T?` — narrowing back would let a `null` admitted through an intermediate static type reach a non-nullable parameter. The reverse direction (overridden `T?`, override `T`) is rejected, as in §11.2. Return types must still match exactly (no covariance in this version).
 
@@ -4985,6 +4989,97 @@ There are no ref returns. The compiler is expected to apply return-value optimiz
 
 ---
 
+<a id="sec-pure-members"></a>
+### 22.15 Pure members (v0.202)
+
+A member declared **`pure`** promises that evaluating a call to it — including every member it transitively calls — writes no storage outside the call's own frames, performs no I/O, runs no user code through disposal, and creates or touches no task, domain, channel, event, or synchronization object. A pure call may read any reachable state, may allocate runtime-managed values ([§28.9](#sec-runtime-managed-types)) and values of value, record, and enum type, and may fault by `throw` under the operand rule below. Purity is a declared, compiler-verified part of the member's signature — carried by the artifact interface ([§2.8.2](#sec-artifact-interface)) — not a derived type property ([§3.6](#sec-derived-type-properties)) and not a determinism or termination guarantee: a pure member may read *mutable* state, so two calls with identical arguments may return different values. The compiler rejects a `pure` member whose body violates the rules of this section, and rejects, inside a pure body, any call whose statically resolved declaration is not pure.
+
+<a id="sec-pure-admissibility"></a>
+#### Where `pure` may appear
+
+`pure` is admitted on: instance and static methods; extension methods and expression-bodied extension properties; operator declarations; constructors; properties, indexers, and `get` accessors; interface methods, static interface members, interface properties and indexers; abstract and virtual members and overrides. `pure` occupies `async`'s slot in the modifier order ([§11.5](#sec-modifier-order)); the two are mutually exclusive.
+
+`pure` is rejected on: **`async` members** and async lambdas (an `async` body interleaves with the domain's continuation queue and traffics in tasks; `pure` implies non-`async`, so `await` cannot appear in a pure body); **iterator methods** (`yield` — calling one executes none of its body, [§29.4](#sec-lazy-evaluation), and the produced enumerator's disposal runs cleanup at consumer-determined times; a pure-iterator form is deliberately left open, not designed); **destructors** (disposal is the effect context purity fences off); **`extern` declarations** ([§32](#sec-foreign-function-interface) — a foreign body cannot be checked, and no trust tier exists); **fields and auto-properties as declarations** (the auto-accessor classification is implicit, below; writing `pure` on an auto-property is rejected as redundant); **static constructors** ([§22.13](#sec-static-initialization-order) — no call site exists to consume the fact).
+
+<a id="sec-pure-signature"></a>
+#### Parameters and result
+
+A pure member declares **no `ref`, `out`, `out owned`, `owned`, or `scoped` parameters**: `ref` is a writable alias of caller storage; `out` obliges a caller-visible assignment channel (the relaxation under v0.184's copy-out semantics is recorded liftable); `owned` brings a disposal obligation into the frame whose discharge runs `Dispose` — user code at disposal time; `scoped` grants a storage permission ([§28.14](#sec-scoped-callback-parameters)) a pure body can never exercise. Plain parameters remain: value types and records arrive as frame-local copies; class- and interface-typed parameters arrive as **borrows** (readable, never consumed); function-typed parameters arrive as values that may be held and returned but not invoked.
+
+The return type is unrestricted except: an **`owned` class-typed return is rejected** — no pure body can produce an owned class instance, so the declaration would merely defer the error into the body. Returning strings, values, records (including borrow-bearing records, subject to the ordinary [§9.7](#sec-records-and-disposal) lifetime rules), and function values is admitted.
+
+<a id="sec-pure-body-rules"></a>
+#### The pure body
+
+A pure body may contain exactly the following; the list is closed, and everything outside it is rejected with a diagnostic naming the operation and this section.
+
+1. **Reads of anything reachable.** Local and parameter reads; instance-field reads through `this` or any borrow; static field, `static readonly`, and `const` reads; enum constants; `typeof(T)` and `is`/`is not`/`as`; `nameof(…)`; `default(T)`; boxing a value (the box is runtime-managed). Reads are not effects — including reads of mutable state. Reads spelled as calls (property getters, indexers) are calls, governed by rule 6.
+2. **Locals and frame-local mutation.** Variable declarations of every [§21.1](#sec-variable-declarations) form; assignment, compound assignment, and `++`/`--` where the target's **root is a local variable or by-value parameter of this body and the access path from that root traverses only value-typed storage** (record fields, inline-array slots). The first class-typed dereference on a path leaves the frame and makes the target prohibited. Mutating a record local, a record parameter copy, or an inline-array local is frame-private and admitted.
+3. **Value, record, enum, and string construction and operations.** All built-in operators on primitives, enums, and `string` (concatenation included); interpolated strings (each interpolated value's implied `ToString`/`Format` call is governed by rule 6); explicit and implicit conversions; range construction; record construction and `with` update, provided the invoked constructor is compiler-synthesized-pure or declared `pure`; inline-array construction and literals of value/record element type.
+4. **Defining lambdas and forming method references.** Closure allocation is runtime-managed ([§28.9](#sec-runtime-managed-types)) — permitted like string concatenation. A lambda *body* defined inside a pure body is **not** checked under these rules: it is a separate function that provably cannot run during the pure call (invoking function-typed values is prohibited, rule 6's contrapositive), and its later invocation happens at the caller's effect discipline. Captures follow [§28.3](#sec-local-variables-ownership-and-borrows)/[§28.9](#sec-runtime-managed-types) unchanged. (Forming a method reference *from* a pure method loses the purity fact at the formation boundary — function types carry no purity in this revision.)
+5. **All control flow.** `if`/`elif`/`else`, `case`/`when`, `while`, `for`, `do … end`, `break`/`continue`/`return`, `try`/`catch`/`finally`, and `throw` — including the bare re-raise; a caught exception binding is a borrow ([§31.1](#sec-the-throw-operand)) and is readable under rule 1. A `for` loop is admitted when its desugaring does not construct an enumerator: over `Range<T>` of primitive steppable type, the direct counted-loop form ([§16.5](#sec-iteration), [§29.2](#sec-desugaring-of-for)) — elsewhere an admitted elision — is **the normative semantics inside a pure body**; over inline arrays, spans, `ReadOnlyStringSpan`, and value-typed `OwningBuffer<T>` the desugaring is already the direct indexed loop. A `for` over an `IEnumerable<T>`-typed source (including `Array<T>` and `string`) is **rejected**: the desugaring constructs an enumerator class instance; the remedy is an index loop (`for var i in 0..<xs.Count do … xs[i] … end;`).
+6. **Calls to pure members.** A call — method, operator, accessor read, or constructor in the admitted positions — is permitted iff the member **declared on the receiver's static type** (or the statically resolved member, for statics and extensions) is `pure`-declared or pure-classified (below). Every entry point of the task, domain, channel, event, synchronization, and I/O surfaces is excluded by this one rule — none is or can be `pure`-declared — with no per-API enumeration.
+7. **`throw`, with the construction carve-out below.**
+
+Prohibited, as the closed list's contrapositive: any store whose target root is an instance field, a static field, an indexer slot of a class instance, or whose access path dereferences a class-typed reference (stores to `this`'s fields outside pure constructors' birth stores included); every owned-consuming or disposal-running operation (`Dispose()`, `move`, `owned` arguments, `set(owned)` stores, the consuming discard); **class construction** — `new C(…)`, collection literals of class collection types, calls returning `owned` class instances — except the throw operand below (constructors and destructors run arbitrary user code, and an owned instance drags in the discharge machinery); **invoking function-typed values** (the value's type carries no effect information); `await`; `yield`; `extern` calls.
+
+<a id="sec-pure-throw"></a>
+#### The throw carve-out
+
+Inside a pure body, `new E(args)` is admitted **only** as the immediate operand of a `throw` statement or `throw` expression, and only when **(a)** the invoked constructor of `E` is `pure`-declared — covering, transitively, its chained constructors and `E`'s field initializers — and **(b)** `E` is a **trivial-dispose** class ([§28.9](#sec-runtime-managed-types); the diagnostic names the property). Condition (a) fences the constructor's code; for the destructor, ownership of the operand transfers to the exception machinery at the throw ([§31.1](#sec-the-throw-operand)) and disposal runs after the matching catch arm — condition (b) makes every dispose-after-arm reachable inside a pure region provably a no-op, since every exception in flight within the region is either a carve-out throw from the region's own call subtree or a runtime-raised built-in ([§31.4](#sec-standard-exception-types) — all trivial-dispose). The carve-out follows §31.1's operand rule otherwise (any class, not only `Exception`-derived). Without it a pure method could fault only through provoked built-in exceptions — the validation idiom (`throw new ArgumentException(…)`) would be unwritable in the entire pure fragment. The trace capture the exception machinery performs at the throw ([§31.1](#sec-the-throw-operand)) is the runtime's own bookkeeping, not a store the body performs; it does not violate this section's rules.
+
+**Intrinsic purity (the stdlib contract).** A standard-library member whose body is runtime-provided may carry `pure` — including on intrinsic auto-properties and indexer getters, where an authored body would be required otherwise. The marker is the library's *stated contract*, normative for the implementation (the runtime body must satisfy this section's rules — the [§32.10](#sec-boundary-contract)-style documented-contract posture) and trusted by the checker rather than verified from source. An exception raised by a pure intrinsic must be a **trivial-dispose** class ([§28.9](#sec-runtime-managed-types)) — extending the enumeration above, so that every exception in flight within a pure region remains disposal-inert. Every built-in exception type's `()` and `(message)`-form constructors are `pure` ([§31.4](#sec-standard-exception-types)); user-authored `extern` declarations remain outside `pure` entirely.
+
+```bezel
+public static pure method Checked(x: int, low: int, high: int): int
+  if low > high then
+    throw new ArgumentException("low must not exceed high", nameof(low));
+  end;
+  return low if x < low else (high if x > high else x);
+end Checked;
+```
+
+<a id="sec-pure-constructors"></a>
+#### Pure constructors
+
+A constructor may be declared `pure`. Its body is checked under the pure-body rules with one addition, the **birth-store rule**: assignments whose target root is a field of `this` (including `readonly` auto-property backing stores) are permitted — the instance under construction is unreachable from any other holder until the constructor returns, so its initialization is not an observable effect. The rule extends to the class's **field initializers** ([§22.8](#sec-field-initializers) — they execute as part of construction): a class with a pure constructor must have field initializers satisfying the pure-body rules. A pure constructor's `base(…)`/`this(…)` chain target must itself be pure. A record's compiler-synthesized positional constructor is pure-classified (below); an authored record constructor may be declared `pure` under the same rules, and record construction inside a pure body requires a synthesized-pure or `pure`-declared constructor. In this revision, pure *class* constructors are consumable only at the throw operand; they are specified generally because the stdlib exception constructors need them now and future widenings reuse them unchanged.
+
+<a id="sec-pure-classification"></a>
+#### Members classified by rule (synthesized bodies)
+
+Compiler-synthesized member bodies have no author to make a promise; the compiler classifies them by checking its generated code under the pure-body rules: an **auto-property getter** is pure (a backing-field read); an **auto-property setter** is never pure; a **record's synthesized members** — positional constructor, `Equals`/`GetHashCode` ([§9.2](#sec-body-records)), `ToString`, `with`-copy — are pure iff every constituent operation is pure under the ordinary rules (for equality and hash: iff every field's equality dispatch target is pure — primitives, `string`, enums, and qualifying records; a class-typed field's virtual `Equals` disqualifies). The classified body is language-authored — its content changes only when the declaration's form changes, which is already a visible contract event ([§3.6](#sec-derived-type-properties) rule 3's discipline). Authored bodies always require the explicit keyword.
+
+<a id="sec-pure-dispatch"></a>
+#### Checking and dispatch
+
+Each pure body is checked in isolation against the rules above; every call site is admitted by the *declaration* of the statically named member, never by inspecting its body — no inference, no interprocedural fixpoint, and recursion needs no special case (the declarations are the induction hypothesis). Cross-module, the imported declaration carries the modifier ([§2.8.2](#sec-artifact-interface)). Virtual and interface dispatch is sound by three matching rules ([§12.1](#sec-members-are-non-virtual-by-default), [§11.2](#sec-interface-declaration)):
+
+1. **Purity is never dropped.** An `override` of a pure member must itself be declared `pure`, and a class member implementing a pure interface member must be declared `pure`; omission is a compile error at the override or implementation.
+2. **Purity may be strengthened.** An override or implementation *may* declare `pure` where the overridden or interface member is not; the strengthened fact is usable only through the derived or concrete static type — dispatch admission keys on the static type's declaration, so a non-pure base slot admits nothing, whatever the runtime type.
+3. **Monotone down the chain.** An override matches against the nearest overridden declaration: once a chain member is pure, every further override is pure.
+
+Admission therefore implies that every dynamic target of the dispatched call is a checked pure body. `pure` is not an overload discriminator ([§22.6](#sec-overloading)): like `async`, it constrains the body and the contract, not selection. A generic pure member is checked once, at its declaration, under its constraints; calls on constraint-typed values resolve to the constraint interface's declared members — none pure in this revision — so generic pure bodies handle type-parameter-typed values opaquely (copy, hold, return). Nothing purity-relevant depends on the substitution.
+
+<a id="sec-pure-accessors"></a>
+#### Properties, indexers, accessors
+
+Purity attaches to the *getter*; `pure` on `set` is always rejected. Expression-bodied and read-only block-form properties take property-level `pure`, marking the single getter; read-write block-form properties mark per accessor (`pure get => …; set => …;`) — the property stays read-write, only the getter joins the pure surface; indexers follow the same forms; interfaces declare `pure readonly property P: T;`, `pure method …;`, and `pure get;` accessor forms, with implementations restating purity per dispatch rule 1.
+
+```bezel
+public class Account
+  private _balance: decimal := 0m;
+
+  public property Balance: decimal
+    pure get => _balance;
+    set => _balance := value;
+  end Balance;
+
+  public pure property IsOverdrawn: bool => _balance < 0m;
+end Account;
+```
+
+Default-value expressions of a pure member's parameters are checked under the pure-body rules (they evaluate at call sites, [§22.5](#sec-optional-parameters-and-named-arguments)). Purity is deliberately **not determinism**: the stronger tiers (result-depends-only-on-arguments; provable termination) are separate promises with separate machinery, and `pure` permanently means effect-free. Every [§17.14](#sec-constant-expressions) constant expression is valid pure-body material; the converse does not hold — a call to a pure method is not a constant expression, and pure calls are not compile-time evaluated.
+
 <a id="sec-properties-and-indexers"></a>
 ## 23. Properties and Indexers
 
@@ -5231,6 +5326,8 @@ An extension block adds methods and computed read-only properties to a type with
 
 <a id="sec-extension-blocks-declaration"></a>
 ### 26.1 Declaration
+
+*(Extension methods and expression-bodied extension properties may be declared `pure` — [§22.15](#sec-pure-members), v0.202; the receiver borrow composes with the read rules.)*
 
 ```bezel
 extension string
@@ -8477,12 +8574,14 @@ public method Deposit(amount: decimal) ...
 <a id="sec-standard-exception-types"></a>
 ### 31.4 Standard exception types
 
+Every built-in exception type's `()` and `(message)`-form constructors (and `ArgumentException`/`ArgumentOutOfRangeException`'s `(message, paramName)` forms) are **`pure`** ([§22.15](#sec-pure-throw), v0.202 — the throw-carve-out enablers; all built-ins are trivial-dispose). The `(message, cause)` chaining constructor is not pure (its snapshot builds a fresh `Array`).
+
 **The base `Exception` surface (v0.162):**
 
 ```bezel
 public class Exception
-  public constructor();
-  public constructor(message: string);
+  public pure constructor();
+  public pure constructor(message: string);
   public constructor(message: string, cause: Exception);   // snapshot chaining, below
   public readonly property Message: string;
   public readonly property StackTrace: string;             // formatted; "" when unavailable
@@ -8492,8 +8591,8 @@ end Exception;
 public record ExceptionInfo(TypeName: string, Message: string, StackTrace: string);
 
 public class ArgumentException: Exception
-  public constructor(message: string);
-  public constructor(message: string, paramName: string);
+  public pure constructor(message: string);
+  public pure constructor(message: string, paramName: string);
   public readonly property ParamName: string?;   // null when not supplied
 end ArgumentException;
 ```
@@ -9812,7 +9911,7 @@ ExtensionMember ::= MethodDecl | ExpressionPropertyDecl
 
 InterfaceMember ::= IfaceMethod | IfaceProperty | IfaceIndexer
                   | IfaceStaticMethod | IfaceStaticOperator
-IfaceStaticMethod   ::= "static" "method" Identifier GenericParams?
+IfaceStaticMethod   ::= "static" "pure"? "method" Identifier GenericParams?
                         "(" ParamList? ")" (":" "owned"? Type)? ";"
 IfaceStaticOperator ::= "static" "operator" OpToken
                         "(" ParamList? ")" (":" "owned"? Type)? ";"
@@ -9820,16 +9919,16 @@ IfaceStaticOperator ::= "static" "operator" OpToken
                                  error; static properties/consts are
                                  deferred. Conformance and dispatch rules in
                                  §11.8. */
-IfaceMethod     ::= "method" Identifier GenericParams?
+IfaceMethod     ::= "pure"? "method" Identifier GenericParams?
                     "(" ParamList? ")" (":" "owned"? Type)? ";"
                               /* `owned` on the return type follows the same
                                  rule as in MethodDecl. An interface declaring
                                  an `owned` return requires implementations to
                                  declare an `owned` return (§11.2's exact-match
                                  rule). */
-IfaceProperty   ::= "readonly"? "property" Identifier ":" Type
+IfaceProperty   ::= "pure"? "readonly"? "property" Identifier ":" Type
                     ( ";" | Accessor* "end" Identifier? ";" )
-IfaceIndexer    ::= "readonly"? "property" "[" ParamList "]" ":" Type
+IfaceIndexer    ::= "pure"? "readonly"? "property" "[" ParamList "]" ":" Type
                     ( ";" | Accessor* "end" ";" )
                               /* The accessor-block form declares explicit get/set
                                  accessors (e.g. `get; set(owned);`) on an interface
@@ -9845,7 +9944,7 @@ FieldDecl       ::= Visibility "static"? ("owned" | "scoped")? "readonly"?
 ConstDecl       ::= Visibility "static"? "const" Identifier (":" Type)?
                     ":=" ConstExpr ";"
 
-MethodDecl      ::= Visibility "static"? "async"? VirtualKind?
+MethodDecl      ::= Visibility "static"? ("async" | "pure")? VirtualKind?
                     "method" Identifier GenericParams?
                     "(" ParamList? ")" (":" "owned"? Type)?
                     GenericConstraints*
@@ -9872,15 +9971,17 @@ MethodBody      ::= "=>" (Expression | AssignmentStmt) ";"
                                           ";" body here is exclusively for
                                           abstract members. */
 
-PropertyDecl    ::= Visibility "static"? VirtualKind?
+PropertyDecl    ::= Visibility "static"? "pure"? VirtualKind?
                     "readonly"? "property" Identifier ":" Type
                     PropertyBody
 PropertyBody    ::= "=>" Expression ";"
                   | AutoAccessorVis? (":=" Expression)? SerializedClause? ";"   /* auto-property */
                   | Accessor* "end" Identifier? ";"
 AutoAccessorVis ::= Visibility ("get" | "set")   /* e.g. `private set` */
-Accessor        ::= Visibility? "get" AccessorBody
+Accessor        ::= Visibility? "pure"? "get" AccessorBody
                   | Visibility? "set" SetterParamSpec? AccessorBody
+                              /* "pure" is admitted on "get" only; a pure "set"
+                                 is rejected semantically (§22.15) */
 SetterParamSpec ::= "(" ParamMod? Identifier? ")"
                               /* Explicit setter parameter spec, used when
                                  the parameter modifier needs to be declared
@@ -9907,7 +10008,7 @@ AccessorBody    ::= "=>" (Expression | AssignmentStmt | "do" Statement* "end") "
                                  a statement, not an expression) and the do-block
                                  form. */
 
-IndexerDecl     ::= Visibility "static"? VirtualKind?
+IndexerDecl     ::= Visibility "static"? "pure"? VirtualKind?
                               /* "static" is over-admitted here and rejected
                                  semantically: indexers may not be static
                                  (§23.5). */
@@ -9921,7 +10022,9 @@ IndexerDecl     ::= Visibility "static"? VirtualKind?
                                  form for an indexer's block-form `end` is
                                  plain `end;`. Enforced semantically. */
 
-ConstructorDecl ::= Visibility "constructor" "(" ParamList? ")"
+ConstructorDecl ::= Visibility "pure"? "constructor" "(" ParamList? ")"
+                              /* the static-constructor alternative admits no
+                                 "pure" (§22.15) */
                     CtorChain? Statement* "end" "constructor"? ";"
                   | "static" "constructor" "(" ")"
                     Statement* "end" "constructor"? ";"
@@ -9929,7 +10032,7 @@ CtorChain       ::= ("base" | "this") "(" ArgList? ")" ";"
 
 DestructorDecl  ::= "destructor" Statement* "end" "destructor"? ";"
 
-OperatorDecl    ::= "public" "static" "method" "operator" OpToken
+OperatorDecl    ::= "public" "static" "pure"? "method" "operator" OpToken
                     "(" ParamList ")" ":" "owned"? Type OperatorBody
                               /* `owned` on an operator's return type is
                                  permitted for class-typed operators that
@@ -10012,7 +10115,7 @@ EnumMember      ::= MethodDecl | ExpressionPropertyDecl
                               /* v0.183 (#1381): enums may overload operators
                                  (§25, §10.4). OperatorDecl is `public static`
                                  only, as everywhere. */
-ExpressionPropertyDecl ::= Visibility "readonly"? "property" Identifier ":" Type "=>" Expression ";"
+ExpressionPropertyDecl ::= Visibility "pure"? "readonly"? "property" Identifier ":" Type "=>" Expression ";"
                   /* "readonly" is redundant on expression-bodied properties (no setter exists);
                      it is permitted for consistency with block-form property syntax. */
 StaticReadonlyDecl     ::= Visibility "static" "owned"? "readonly" Identifier ":" Type ":=" Expression ";"
@@ -10541,7 +10644,7 @@ Constant        ::= "-"? (IntLiteral | FloatLiteral)
 <a id="sec-reserved-keywords"></a>
 ### B.1 Reserved keywords
 
-The following identifiers are keywords. Most are reserved unconditionally and may not be used as user-defined names. The **contextual keywords** (`convention`, `env`, `get`, `notnull`, `of`, `operator`, `polymorphic`, `scoped`, `sendable`, `serialized`, `set`, `step`, `symbol`, `value`, `variadic`) have keyword meaning only in specific syntactic positions and may be used as identifiers elsewhere; see [§B.2](#sec-contextual-keywords).
+The following identifiers are keywords. Most are reserved unconditionally and may not be used as user-defined names. The **contextual keywords** (`convention`, `env`, `get`, `notnull`, `of`, `operator`, `polymorphic`, `pure`, `scoped`, `sendable`, `serialized`, `set`, `step`, `symbol`, `value`, `variadic`) have keyword meaning only in specific syntactic positions and may be used as identifiers elsewhere; see [§B.2](#sec-contextual-keywords).
 
 **Unconditionally reserved:**
 
@@ -10549,7 +10652,7 @@ The following identifiers are keywords. Most are reserved unconditionally and ma
 
 **Contextual (see [§B.2](#sec-contextual-keywords)):**
 
-`convention`, `env`, `get`, `notnull`, `of`, `operator`, `polymorphic`, `scoped`, `sendable`, `serialized`, `set`, `step`, `symbol`, `value`, `variadic`.
+`convention`, `env`, `get`, `notnull`, `of`, `operator`, `polymorphic`, `pure`, `scoped`, `sendable`, `serialized`, `set`, `step`, `symbol`, `value`, `variadic`.
 
 All keywords are lowercase. Type identifiers in PascalCase (`Object`, `Array`, `Type`, `Exception`, `IDisposable`, `Task`, etc.) are not keywords; they are names defined by the standard library or by compiler intrinsics.
 
@@ -10573,6 +10676,7 @@ The following keywords from [§B.1](#sec-reserved-keywords) carry meaning only i
 | `symbol` | The `:= symbol "…"` alias clause of an extern declaration ([§32.11](#sec-symbol-binding)) | Anywhere else: as an identifier |
 | `variadic` | The `variadic(N)` clause after an extern symbol alias ([§32.11](#sec-symbol-binding)) | Anywhere else: as an identifier |
 | `sendable` | The `where T: sendable` constraint ([§14.2](#sec-constraints), v0.201) | Anywhere else: as an identifier |
+| `pure` | The member-modifier slot ([§11.5](#sec-modifier-order), [§22.15](#sec-pure-members), v0.202) and the `pure get` accessor form | Anywhere else: as an identifier |
 | `env` | The user-data slot marker in an extern parameter list and the corresponding position in an extern callback's function type ([§32.8](#sec-callbacks)) | Anywhere else: as an identifier — including as an extern parameter **name** (`env: IntPtr`; the following `:` disambiguates, grammar A.3). Inside an extern callback's **function type** the marker reading always wins: a user type named `env` is not denotable in that one position (rename or alias the type) |
 
 The setter parameter is named `value` by convention; it is not a true keyword in that role and may be shadowed inside the setter body (though doing so is poor style).
@@ -10828,6 +10932,15 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - Presenting an executable artifact as a dependency is a build error naming the artifact and its kind ([§2.8.4](#sec-program-assembly) rule 4).
 
 ---
+
+### C.14 Purity (v0.202)
+
+- `pure` combines with neither `async` nor `yield`; destructors, static constructors, `extern` declarations, and auto-properties carry no `pure`.
+- A pure member declares no `ref`/`out`/`out owned`/`owned`/`scoped` parameter and no `owned` class-typed return.
+- A pure body contains no store whose target root leaves the frame, no disposal-running or owned-consuming operation, no class construction outside the throw carve-out, no invocation of a function-typed value, no enumerator-constructing `for`, and no call to a member not pure-declared or pure-classified ([§22.15](#sec-pure-body-rules)).
+- The throw-carve-out operand's class is trivial-dispose and its invoked constructor pure ([§22.15](#sec-pure-throw)).
+- Overrides and implementations of pure members restate `pure`; purity never narrows down an override chain ([§22.15](#sec-pure-dispatch)).
+- Field initializers of a pure-constructed class and default-value expressions of pure members' parameters satisfy the pure-body rules.
 
 <a id="appendix-d-conformance-levels"></a>
 ## Appendix D: Conformance Levels

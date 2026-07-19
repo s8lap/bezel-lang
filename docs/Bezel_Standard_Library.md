@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.201 — July 2026**
+**Companion to the Bezel Language Specification, v0.202 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -97,47 +97,47 @@ public static class Math
   public static const E: double := 2.71828182845904523536;
   public static const Tau: double := 6.28318530717958647692;
 
-  public static method Abs(x: int): int;
-  public static method Abs(x: long): long;
-  public static method Abs(x: double): double;
-  public static method Abs(x: decimal): decimal;
+  public static pure method Abs(x: int): int;
+  public static pure method Abs(x: long): long;
+  public static pure method Abs(x: double): double;
+  public static pure method Abs(x: decimal): decimal;
 
   public static method Min<T>(a: T, b: T): T where T: IComparable<T>;
   public static method Max<T>(a: T, b: T): T where T: IComparable<T>;
   public static method Clamp<T>(value: T, low: T, high: T): T where T: IComparable<T>;
       // low > high: ArgumentException (v0.195)
 
-  public static method Sqrt(x: double): double;
-  public static method Pow(x: double, y: double): double;
-  public static method Exp(x: double): double;
-  public static method Log(x: double): double;       // natural log
-  public static method Log(x: double, base_: double): double;
-  public static method Log10(x: double): double;
-  public static method Log2(x: double): double;
+  public static pure method Sqrt(x: double): double;
+  public static pure method Pow(x: double, y: double): double;
+  public static pure method Exp(x: double): double;
+  public static pure method Log(x: double): double;       // natural log
+  public static pure method Log(x: double, base_: double): double;
+  public static pure method Log10(x: double): double;
+  public static pure method Log2(x: double): double;
 
-  public static method Sin(x: double): double;
-  public static method Cos(x: double): double;
-  public static method Tan(x: double): double;
-  public static method Asin(x: double): double;
-  public static method Acos(x: double): double;
-  public static method Atan(x: double): double;
-  public static method Atan2(y: double, x: double): double;
-  public static method Sinh(x: double): double;
-  public static method Cosh(x: double): double;
-  public static method Tanh(x: double): double;
+  public static pure method Sin(x: double): double;
+  public static pure method Cos(x: double): double;
+  public static pure method Tan(x: double): double;
+  public static pure method Asin(x: double): double;
+  public static pure method Acos(x: double): double;
+  public static pure method Atan(x: double): double;
+  public static pure method Atan2(y: double, x: double): double;
+  public static pure method Sinh(x: double): double;
+  public static pure method Cosh(x: double): double;
+  public static pure method Tanh(x: double): double;
 
-  public static method Floor(x: double): double;
-  public static method Ceiling(x: double): double;
-  public static method Round(x: double): double;     // banker's rounding
-  public static method Round(x: double, digits: int): double;
-  public static method Truncate(x: double): double;
+  public static pure method Floor(x: double): double;
+  public static pure method Ceiling(x: double): double;
+  public static pure method Round(x: double): double;     // banker's rounding
+  public static pure method Round(x: double, digits: int): double;
+  public static pure method Truncate(x: double): double;
 
-  public static method Sign(x: int): int;            // -1, 0, or 1
-  public static method Sign(x: long): int;
-  public static method Sign(x: double): int;
+  public static pure method Sign(x: int): int;            // -1, 0, or 1
+  public static pure method Sign(x: long): int;
+  public static pure method Sign(x: double): int;
 
-  public static method Fmod(x: double, y: double): double;
-  public static method IEEERemainder(x: double, y: double): double;
+  public static pure method Fmod(x: double, y: double): double;
+  public static pure method IEEERemainder(x: double, y: double): double;
 end Math;
 ```
 
@@ -1101,34 +1101,34 @@ public record ReadOnlyStringSpan(Source: string, Start: int, Length: int): IRead
     end;
   end;
 
-  public readonly property IsEmpty: bool => Length = 0;
+  public pure readonly property IsEmpty: bool => Length = 0;
 
   // Range construction
-  public method Slice(start: int, length: int): ReadOnlyStringSpan =>
+  public pure method Slice(start: int, length: int): ReadOnlyStringSpan =>
     new ReadOnlyStringSpan(Source, this.Start + start, length);
-  public method Slice(start: int): ReadOnlyStringSpan =>       // v0.195: from offset to end
+  public pure method Slice(start: int): ReadOnlyStringSpan =>       // v0.195: from offset to end
     Slice(start, Length - start);
 
   // Search by char
-  public method IndexOf(value: char): int;
-  public method Contains(value: char): bool;
+  public pure method IndexOf(value: char): int;
+  public pure method Contains(value: char): bool;
 
   // Search by substring (span and string forms)
-  public method IndexOf(value: ReadOnlyStringSpan): int;
-  public method IndexOf(value: string): int;
-  public method Contains(value: ReadOnlyStringSpan): bool;
-  public method Contains(value: string): bool;
+  public pure method IndexOf(value: ReadOnlyStringSpan): int;
+  public pure method IndexOf(value: string): int;
+  public pure method Contains(value: ReadOnlyStringSpan): bool;
+  public pure method Contains(value: string): bool;
 
   // Prefix / suffix (span and string forms)
-  public method StartsWith(prefix: ReadOnlyStringSpan): bool;
-  public method StartsWith(prefix: string): bool;
-  public method EndsWith(suffix: ReadOnlyStringSpan): bool;
-  public method EndsWith(suffix: string): bool;
+  public pure method StartsWith(prefix: ReadOnlyStringSpan): bool;
+  public pure method StartsWith(prefix: string): bool;
+  public pure method EndsWith(suffix: ReadOnlyStringSpan): bool;
+  public pure method EndsWith(suffix: string): bool;
 
   // Equality (span and string forms)
-  public method SequenceEqual(other: ReadOnlyStringSpan): bool;
-  public method SequenceEqual(other: string): bool;
-  public method SequenceEqual(other: IReadOnlySpan<char>): bool; // v0.108 — interface form
+  public pure method SequenceEqual(other: ReadOnlyStringSpan): bool;
+  public pure method SequenceEqual(other: string): bool;
+  public pure method SequenceEqual(other: IReadOnlySpan<char>): bool; // v0.108 — interface form
 
   // Bulk copy (v0.109)
   public method CopyTo(destination: Span<char>);    // copy chars to destination;
@@ -1136,7 +1136,7 @@ public record ReadOnlyStringSpan(Source: string, Start: int, Length: int): IRead
                                                      //   ArgumentException (the §4.14 rule)
 
   // Materialization
-  public method ToString(): string;
+  public pure method ToString(): string;
 end ReadOnlyStringSpan;
 ```
 
@@ -1281,8 +1281,8 @@ public class Array<T>: IList<T>
   public constructor(size: int, fill: T);                // Count = size, every slot = fill (v0.165, #1375);
                                                           //   size < 0: ArgumentOutOfRangeException (v0.183, #1396)
 
-  public readonly property Count: int;
-  public readonly property Capacity: int;
+  public pure readonly property Count: int;
+  public pure readonly property Capacity: int;
   public property [i: int]: T;
 
   public method Add(item: T);
@@ -4279,15 +4279,15 @@ public record Int32: IComparable<int>, IEquatable<int>
   public static const MinValue: int := -2_147_483_648;
   public static const MaxValue: int := 2_147_483_647;
 
-  public static method Parse(s: string): int;
+  public static pure method Parse(s: string): int;
   public static method TryParse(s: string, out result: int): bool;
-  public static method Parse(s: string, radix: int): int;        // 2, 8, 10, 16
+  public static pure method Parse(s: string, radix: int): int;        // 2, 8, 10, 16
 
-  public method ToString(): string;
-  public method ToString(format: string): string;
-  public method ToString(radix: int): string;
+  public pure method ToString(): string;
+  public pure method ToString(format: string): string;
+  public pure method ToString(radix: int): string;
 
-  public method CompareTo(other: int): int;
+  public pure method CompareTo(other: int): int;
   // Equals(other: int): bool — auto-generated from IEquatable<int>
   //   per language spec §9.2; not shown explicitly.
 end Int32;
@@ -4308,22 +4308,22 @@ public record Double: IComparable<double>, IEquatable<double>
   public static const NegativeInfinity: double;
   public static const NaN: double;
 
-  public static method IsNaN(value: double): bool;
-  public static method IsInfinity(value: double): bool;
-  public static method IsPositiveInfinity(value: double): bool;
-  public static method IsNegativeInfinity(value: double): bool;
-  public static method IsFinite(value: double): bool;
+  public static pure method IsNaN(value: double): bool;
+  public static pure method IsInfinity(value: double): bool;
+  public static pure method IsPositiveInfinity(value: double): bool;
+  public static pure method IsNegativeInfinity(value: double): bool;
+  public static pure method IsFinite(value: double): bool;
 
-  public static method Parse(s: string): double;
+  public static pure method Parse(s: string): double;
   public static method TryParse(s: string, out result: double): bool;
 
   // Equality variants
-  public static method IeeeEquals(a: double, b: double): bool;       // strict IEEE
-  public static method BitwiseEquals(a: double, b: double): bool;    // bit-pattern equal
+  public static pure method IeeeEquals(a: double, b: double): bool;       // strict IEEE
+  public static pure method BitwiseEquals(a: double, b: double): bool;    // bit-pattern equal
 
-  public method ToString(): string;
-  public method ToString(format: string): string;
-  public method CompareTo(other: double): int;
+  public pure method ToString(): string;
+  public pure method ToString(format: string): string;
+  public pure method CompareTo(other: double): int;
 end Double;
 ```
 
@@ -4341,22 +4341,22 @@ public record Float: IComparable<float>, IEquatable<float>
   public static const NegativeInfinity: float;
   public static const NaN: float;
 
-  public static method IsNaN(value: float): bool;
-  public static method IsInfinity(value: float): bool;
-  public static method IsPositiveInfinity(value: float): bool;
-  public static method IsNegativeInfinity(value: float): bool;
-  public static method IsFinite(value: float): bool;
+  public static pure method IsNaN(value: float): bool;
+  public static pure method IsInfinity(value: float): bool;
+  public static pure method IsPositiveInfinity(value: float): bool;
+  public static pure method IsNegativeInfinity(value: float): bool;
+  public static pure method IsFinite(value: float): bool;
 
-  public static method Parse(s: string): float;
+  public static pure method Parse(s: string): float;
   public static method TryParse(s: string, out result: float): bool;
 
   // Equality variants
-  public static method IeeeEquals(a: float, b: float): bool;       // strict IEEE
-  public static method BitwiseEquals(a: float, b: float): bool;    // bit-pattern equal
+  public static pure method IeeeEquals(a: float, b: float): bool;       // strict IEEE
+  public static pure method BitwiseEquals(a: float, b: float): bool;    // bit-pattern equal
 
-  public method ToString(): string;
-  public method ToString(format: string): string;
-  public method CompareTo(other: float): int;
+  public pure method ToString(): string;
+  public pure method ToString(format: string): string;
+  public pure method CompareTo(other: float): int;
 end Float;
 ```
 
@@ -4373,13 +4373,13 @@ public record Decimal: IComparable<decimal>, IEquatable<decimal>
   public static const Zero: decimal;
   public static const One: decimal;
 
-  public static method Parse(s: string): decimal;
+  public static pure method Parse(s: string): decimal;
   public static method TryParse(s: string, out result: decimal): bool;
 
-  public method ToString(): string;
-  public method ToString(format: string): string;
-  public method CompareTo(other: decimal): int;
-  public method Round(digits: int): decimal;    // banker's rounding (round-half-to-even), matching
+  public pure method ToString(): string;
+  public pure method ToString(format: string): string;
+  public pure method CompareTo(other: decimal): int;
+  public pure method Round(digits: int): decimal;    // banker's rounding (round-half-to-even), matching
                                                 //   Math.Round (§2.2); digits outside 0..28:
                                                 //   ArgumentOutOfRangeException (v0.195)
 end Decimal;
@@ -4393,10 +4393,10 @@ end Decimal;
 ```bezel
 /// Compiler-intrinsic; aliased by the keyword `bool`.
 public record Boolean: IEquatable<bool>
-  public static method Parse(s: string): bool;            // "true"/"false", case-insensitive
+  public static pure method Parse(s: string): bool;            // "true"/"false", case-insensitive
   public static method TryParse(s: string, out result: bool): bool;
 
-  public method ToString(): string;                       // "True" or "False"
+  public pure method ToString(): string;                       // "True" or "False"
 end Boolean;
 ```
 
@@ -4409,20 +4409,20 @@ public record Char: IComparable<char>, IEquatable<char>
   public static const MinValue: char;             // U+0000
   public static const MaxValue: char;             // U+10FFFF (excluding surrogates)
 
-  public static method IsDigit(c: char): bool;
-  public static method IsLetter(c: char): bool;
-  public static method IsLetterOrDigit(c: char): bool;
-  public static method IsWhiteSpace(c: char): bool;
-  public static method IsUpper(c: char): bool;
-  public static method IsLower(c: char): bool;
-  public static method IsControl(c: char): bool;
-  public static method IsPunctuation(c: char): bool;
+  public static pure method IsDigit(c: char): bool;
+  public static pure method IsLetter(c: char): bool;
+  public static pure method IsLetterOrDigit(c: char): bool;
+  public static pure method IsWhiteSpace(c: char): bool;
+  public static pure method IsUpper(c: char): bool;
+  public static pure method IsLower(c: char): bool;
+  public static pure method IsControl(c: char): bool;
+  public static pure method IsPunctuation(c: char): bool;
 
-  public static method ToUpper(c: char): char;
-  public static method ToLower(c: char): char;
+  public static pure method ToUpper(c: char): char;
+  public static pure method ToLower(c: char): char;
 
-  public method ToString(): string;
-  public method CompareTo(other: char): int;
+  public pure method ToString(): string;
+  public pure method CompareTo(other: char): int;
 end Char;
 ```
 
@@ -4433,59 +4433,59 @@ The most extensive primitive type. `String` is treated as both a primitive (with
 
 ```bezel
 public class String: IEnumerable<char>, IComparable<string>, IEquatable<string>     // alias: string
-  public readonly property Length: int;            // number of code points (O(1))
-  public readonly property IsAscii: bool;          // true iff every code point < 128 (O(1))
-  public readonly property [i: int]: char;                  // O(1)
+  public pure readonly property Length: int;            // number of code points (O(1))
+  public pure readonly property IsAscii: bool;          // true iff every code point < 128 (O(1))
+  public pure readonly property [i: int]: char;                  // O(1)
 
   // Construction
-  public static method From(value: char): string;
-  public static method From(buffer: Array<char>, start: int, count: int): string;
+  public static pure method From(value: char): string;
+  public static pure method From(buffer: Array<char>, start: int, count: int): string;
   public static method From(value: CString): string;                  // FFI-boundary, owned-instance source
   public static method From(value: WString): string;                  // FFI-boundary, owned-instance source
   public static method FromCStringPointer(p: IntPtr): string;         // FFI-boundary, raw-pointer source
   public static method FromWStringPointer(p: IntPtr): string;         // FFI-boundary, raw-pointer source
-  public static method Repeat(c: char, count: int): string;
+  public static pure method Repeat(c: char, count: int): string;
   public static method Join(separator: string, items: IEnumerable<string>): string;
 
   // Inspection
-  public static method IsNullOrEmpty(value: string?): bool;
-  public static method IsNullOrWhiteSpace(value: string?): bool;
-  public method Contains(value: string): bool;
-  public method Contains(value: char): bool;
-  public method StartsWith(value: string): bool;
-  public method EndsWith(value: string): bool;
-  public method IndexOf(value: char): int;       // code-point index of first occurrence, or -1 (v0.195)
-  public method IndexOf(value: string): int;     // -1 when absent; IndexOf("") = 0 (v0.195)
-  public method LastIndexOf(value: char): int;   // last occurrence, or -1
-  public method LastIndexOf(value: string): int; // -1 when absent; LastIndexOf("") = Length (v0.195)
+  public static pure method IsNullOrEmpty(value: string?): bool;
+  public static pure method IsNullOrWhiteSpace(value: string?): bool;
+  public pure method Contains(value: string): bool;
+  public pure method Contains(value: char): bool;
+  public pure method StartsWith(value: string): bool;
+  public pure method EndsWith(value: string): bool;
+  public pure method IndexOf(value: char): int;       // code-point index of first occurrence, or -1 (v0.195)
+  public pure method IndexOf(value: string): int;     // -1 when absent; IndexOf("") = 0 (v0.195)
+  public pure method LastIndexOf(value: char): int;   // last occurrence, or -1
+  public pure method LastIndexOf(value: string): int; // -1 when absent; LastIndexOf("") = Length (v0.195)
 
   // Substring
-  public method Substring(startIndex: int): string;
-  public method Substring(startIndex: int, length: int): string;
-  public readonly property [r: Range<int>]: string;       // slicing form (§4.6 of the language spec)
+  public pure method Substring(startIndex: int): string;
+  public pure method Substring(startIndex: int, length: int): string;
+  public pure readonly property [r: Range<int>]: string;       // slicing form (§4.6 of the language spec)
 
   // Span views (v0.104)
-  public method AsSpan(): ReadOnlyStringSpan;             // full string as a span
-  public method AsSpan(start: int): ReadOnlyStringSpan;   // from offset to end
-  public method AsSpan(start: int, length: int): ReadOnlyStringSpan;
-  public method AsSpan(r: Range<int>): ReadOnlyStringSpan; // parallels [r: Range<int>]: string
+  public pure method AsSpan(): ReadOnlyStringSpan;             // full string as a span
+  public pure method AsSpan(start: int): ReadOnlyStringSpan;   // from offset to end
+  public pure method AsSpan(start: int, length: int): ReadOnlyStringSpan;
+  public pure method AsSpan(r: Range<int>): ReadOnlyStringSpan; // parallels [r: Range<int>]: string
 
   // Modification (returns a new string; original unchanged)
-  public method Trim(): string;
-  public method Trim(chars: IEnumerable<char>): string;
-  public method TrimStart(): string;
-  public method TrimEnd(): string;
-  public method ToUpper(): string;
-  public method ToLower(): string;
-  public method Replace(oldChar: char, newChar: char): string;
-  public method Replace(oldValue: string, newValue: string): string;
-  public method PadLeft(totalWidth: int): string;
-  public method PadLeft(totalWidth: int, paddingChar: char): string;
-  public method PadRight(totalWidth: int): string;
-  public method PadRight(totalWidth: int, paddingChar: char): string;
-  public method Insert(startIndex: int, value: string): string;
-  public method Remove(startIndex: int): string;
-  public method Remove(startIndex: int, count: int): string;
+  public pure method Trim(): string;
+  public pure method Trim(chars: IEnumerable<char>): string;
+  public pure method TrimStart(): string;
+  public pure method TrimEnd(): string;
+  public pure method ToUpper(): string;
+  public pure method ToLower(): string;
+  public pure method Replace(oldChar: char, newChar: char): string;
+  public pure method Replace(oldValue: string, newValue: string): string;
+  public pure method PadLeft(totalWidth: int): string;
+  public pure method PadLeft(totalWidth: int, paddingChar: char): string;
+  public pure method PadRight(totalWidth: int): string;
+  public pure method PadRight(totalWidth: int, paddingChar: char): string;
+  public pure method Insert(startIndex: int, value: string): string;
+  public pure method Remove(startIndex: int): string;
+  public pure method Remove(startIndex: int, count: int): string;
 
   // Splitting
   public method Split(separator: char): owned Array<string>;
@@ -4498,18 +4498,18 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string> 
   // compares each code point's simple Unicode case-folded form, with no locale
   // or culture-specific tailoring. Culture-aware comparison will be provided by
   // System.Globalization in a future revision.
-  public method CompareTo(other: string): int;            // ordinal
-  public static method Compare(a: string, b: string): int;
-  public static method Compare(a: string, b: string, ignoreCase: bool): int;
-  public method Equals(other: string?): bool;             // satisfies IEquatable<string>'s
+  public pure method CompareTo(other: string): int;            // ordinal
+  public static pure method Compare(a: string, b: string): int;
+  public static pure method Compare(a: string, b: string, ignoreCase: bool): int;
+  public pure method Equals(other: string?): bool;             // satisfies IEquatable<string>'s
                                                           //   Equals(string) under §11.2's
                                                           //   parameter-nullability widening
-  public method Equals(other: string?, ignoreCase: bool): bool;
+  public pure method Equals(other: string?, ignoreCase: bool): bool;
 
   // Object overrides
-  public override method Equals(other: Object?): bool;    // content-based, not reference-based
-  public override method GetHashCode(): int;              // content-based, agrees with Equals
-  public override method ToString(): string;              // returns this
+  public pure override method Equals(other: Object?): bool;    // content-based, not reference-based
+  public pure override method GetHashCode(): int;              // content-based, agrees with Equals
+  public pure override method ToString(): string;              // returns this
 
   // Conversion
   public method ToCharArray(): owned Array<char>;
@@ -4518,7 +4518,7 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string> 
   public method GetEnumerator(): owned IEnumerator<char>;
 
   // Operators
-  public static method operator +(left: string, right: string): string;
+  public static pure method operator +(left: string, right: string): string;
 end String;
 ```
 
