@@ -85,6 +85,30 @@ private:
     std::vector<std::unique_ptr<ast::Type>> parseInheritance();
     // Slice 24: zero or more `where T: Constraint, ...` clauses.
     std::vector<ast::GenericConstraint> parseGenericConstraints();
+    // §22.16 (v0.203, #2053): zero or more contract clauses
+    // (A.4 `ContractClause ::= "static"? ("requires"|"ensures") Expression ";"`)
+    // in the clause region of a method or constructor. Returns whatever
+    // clauses were parsed; the marker-wins rule (App. B.2 — `requires`/
+    // `ensures` are contextual keywords whose keyword reading always wins
+    // in this region) means a `requires`/`ensures` Identifier always opens a
+    // clause here, never an expression. The clause region ends at the first
+    // non-clause token (the body's `=>` / `;` / statement-starter, or the
+    // enclosing scope's continuation for a clause-terminated body-less
+    // member).
+    std::vector<ast::ContractClause> parseContractClauses();
+    // §22.16 (v0.203, #2053): does the token stream at current_ look like the
+    // start of a contract clause (`requires` / `ensures`, optionally preceded
+    // by `static`)? Used to gate entry into the clause region without
+    // committing (so existing zero-clause methods continue to parse exactly
+    // as before). Non-const because the two-token lookahead for `static
+    // requires|ensures` uses the lazily-populating peekAt buffer.
+    bool currentTokenStartsContractClause();
+    // §22.16 (v0.203, #2053): could `current_` begin a statement inside a
+    // method/constructor block body? Used to discriminate a clause-bearing
+    // member whose clauses terminate a body-less declaration (next token is
+    // a class member keyword / `end` / EOF) from one whose clauses are
+    // followed by a real block body (next token starts a statement).
+    bool tokenLooksLikeStatementStarter() const;
     // Slice 6/10/19/...: a single class member.
     std::unique_ptr<ast::Member> parseMember();
     // Slice 34: a single interface member (A.4 InterfaceMember). Smaller and

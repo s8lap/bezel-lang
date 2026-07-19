@@ -484,12 +484,32 @@ struct GenericConstraint {
 //                      "method" Identifier GenericParams?
 //                      "(" ParamList? ")" (":" "owned"? Type)?
 //                      GenericConstraints*
-//                      MethodBody`
+//                      ContractClause* MethodBody`
 // MethodBody has three shapes per A.4:
 //   `=> Expression ";"` (expression-body)
 //   `Statement* "end" Identifier? ";"` (block body)
 //   `";"` (abstract — body-less)
 enum class MethodBodyKind { Expression, Block, Abstract };
+
+// §22.16 (v0.203, proposal 0043, #2053) — contract clauses.
+// A.4 `ContractClause ::= "static"? ("requires" | "ensures") Expression ";"`.
+// A clause occupies exactly one enforcement tier (proven/checked/assumed,
+// §22.16 "The tier system"); the `static` qualifier demands the proven tier,
+// and is the only tier-affecting surface form in this revision.
+//
+// Slice 1 (this commit) introduces the AST and the parse — the clauses are
+// carried but not yet type-checked, lowered, or enforced. Subsequent slices
+// add the §22.15 expression-wise purity admission, the evaluation lowering,
+// and the runtime + inheritance binding.
+struct ContractClause {
+    enum class Kind { Requires, Ensures };
+    Kind kind = Kind::Requires;
+    // A.4 `"static"?` qualifier — meaningful only at the parse tier in this
+    // slice; sema (later slice) enforces the proven-tier demand.
+    bool isStatic = false;
+    std::unique_ptr<Expr> expr;
+    SourceLocation loc;  // the clause-introducing keyword (`requires`/`ensures`)
+};
 
 struct MethodDecl : Member {
     Visibility visibility = Visibility::None;
@@ -507,6 +527,11 @@ struct MethodDecl : Member {
     std::vector<std::unique_ptr<Stmt>> stmts; // for Block (empty until slice 11+)
     std::string_view endLabel;             // optional `end Identifier?` for Block
     std::vector<GenericConstraint> genericConstraints; // A.4 `where T: …`
+    // §22.16 (v0.203, #2053): the declaration's `requires`/`ensures` clauses,
+    // in declaration order. `requires` and `ensures` interleave textually per
+    // the spec's evaluation order (requires prologue, then old-binding, then
+    // the body, then ensures epilogue) — the kind tag tells them apart.
+    std::vector<ContractClause> contractClauses;
 };
 
 // A.4: `ConstructorDecl ::= Visibility "constructor" "(" ParamList? ")"
@@ -528,12 +553,36 @@ struct ConstructorDecl : Member {
     bool isPure = false;
     std::vector<Param> params;
     std::vector<std::unique_ptr<Stmt>> body;
+    // §22.16 (v0.203, #2053): the constructor's `requires`/`ensures` clauses
+    // (A.4 places them between the parameter list's `)` and the CtorChain/
+    // body). `ensures` over a constructor evaluates at body completion, where
+    // every §7.9-required field is assigned.
+    std::vector<ContractClause> contractClauses;
 };
 
 // A.4: `DestructorDecl ::= "destructor" Statement* "end" "destructor"? ";"`.
 // No visibility or parameters per the grammar.
 struct DestructorDecl : Member {
     std::vector<std::unique_ptr<Stmt>> body;
+};
+
+// §22.16 (v0.203, proposal 0043, #2053): A.4
+//   `InvariantDecl ::= "static"? "invariant" Expression ";"`
+// A class-body member declaring an instance-state predicate. The class
+// invariant of C is the conjunction of every InvariantDecl of C and every
+// base class, evaluated base-first, declaration order within each class
+// (§22.16 "Class invariants"). Class-body-only per A.4; semantically
+// rejected in records, static classes, and outside class bodies.
+// `static invariant` parses from day one (the prover fragment, when it
+// lands, gives it meaning); in this revision a `static` invariant is
+// accepted at parse, rejected at sema as out-of-fragment.
+//
+// Slice 1 carries the parsed member only; instrumentation, instrumentation
+// set, and the checked/unchecked face split land in later slices.
+struct InvariantDecl : Member {
+    bool isStatic = false;
+    std::unique_ptr<Expr> expr;
+    SourceLocation loc;  // the `invariant` keyword
 };
 
 // A.4 `EventDecl ::= Visibility "static"? "async"? "event" Identifier
