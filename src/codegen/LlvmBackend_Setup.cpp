@@ -3374,7 +3374,13 @@ std::string Emitter::descReadableMangle(const sema::TypeRef* t) {
                 for (const sema::TypeRef* a : t->genericArgs)
                     s += "_" + descReadableMangle(a);
             } else {
+                // #2022: a null-declaration builtin (Array<T>, …) — recurse into
+                // args for a readable per-instantiation global name (cosmetic —
+                // LLVM uniquifies on collision; the identity key already
+                // distinguishes them per #2013). Mirrors the resolved-Named arm.
                 s = std::string(t->headName());
+                for (const sema::TypeRef* a : t->genericArgs)
+                    s += "_" + descReadableMangle(a);
             }
             break;
         case sema::TypeRef::Kind::Primitive: {
@@ -3507,11 +3513,28 @@ std::string Emitter::typeRefIdentityKey(const sema::TypeRef* t) {
 // `Box<[3]int>` and `Box<[4]int>` mint DISTINCT descriptors. An UNFOLDED size
 // (< 0) stays conservatively non-concrete (its key still collapses). (Inlined
 // rather than calling typeRefIdentityToken, which is a private Emitter member.)
+// #2022 (§12.9 type-test invariance, §14.2 monomorphization, §17.4 is/as): a
+// null-DECLARATION builtin generic (Array<T>, Dictionary<K,V>, Task<T>, … —
+// declaration intentionally null per §2.5/§29.3) with NON-EMPTY genericArgs
+// that are recursively concrete is ALSO distinguishable: appendDescKey recurses
+// into its args (#2013, "U"+headName+"<argkeys>"), so the descriptor keys
+// (descIdentityKey) for Wrap<Array<int>> and Wrap<Array<string>> are distinct
+// → a per-monomorphization descriptor can be soundly minted. A bare parameter
+// placeholder (null-decl + no args) stays non-concrete — it has no arg key and
+// would collapse onto a single erased key. The empty-args split mirrors
+// refMentionsTypeVariable / typeTestTargetMentionsTypeVariable, which already
+// treat a null-decl-no-args Named as a type-variable mention.
 static bool descTypeArgConcrete(const sema::TypeRef* a) {
     if (!a) return false;
     if (a->kind == sema::TypeRef::Kind::InlineArray)
         return a->arraySizeValue >= 0 && descTypeArgConcrete(a->arrayElement);
-    if (a->kind == sema::TypeRef::Kind::Named) return a->declaration != nullptr;
+    if (a->kind == sema::TypeRef::Kind::Named) {
+        if (a->declaration) return true;
+        if (a->genericArgs.empty()) return false;  // bare param placeholder
+        for (const sema::TypeRef* g : a->genericArgs)
+            if (!descTypeArgConcrete(g)) return false;
+        return true;
+    }
     return a->kind == sema::TypeRef::Kind::Primitive;
 }
 

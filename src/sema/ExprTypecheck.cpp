@@ -4698,7 +4698,26 @@ bool ExprTC::typeArgRuntimeReified(const TypeRef* t) {
     if (!t) return false;
     switch (t->kind) {
         case TypeRef::Kind::Named:
-            if (!t->declaration) return false;  // unresolved param — no token.
+            if (!t->declaration) {
+                // #2022 (§12.9, §14.2, §17.4, v0.197): a null-DECLARATION builtin
+                // generic (Array<T>, Dictionary<K,V>, … — declaration null per
+                // §2.5/§29.3) with NON-EMPTY recursively-reified genericArgs IS
+                // runtime-reified: appendDescKey (the descriptor-key factory)
+                // recurses into the args per #2013, and the codegen gate
+                // (descTypeArgConcrete / descArgsConcrete) now admits it, so the
+                // runtime mints a precise per-monomorphization descriptor for
+                // Wrap<Array<int>> vs Wrap<Array<string>> (distinct descriptor
+                // globals, so `is`/`as` distinguishes them). A bare parameter
+                // placeholder (null-decl + no args) stays erased — it collapses
+                // onto a single key. The arity split mirrors
+                // refMentionsTypeVariable / typeTestTargetMentionsTypeVariable,
+                // which already treat a null-decl-no-args Named as a type-
+                // variable mention distinct from a constructed null-decl builtin.
+                if (t->genericArgs.empty()) return false;
+                for (const TypeRef* a : t->genericArgs)
+                    if (!typeArgRuntimeReified(a)) return false;
+                return true;
+            }
             for (const TypeRef* a : t->genericArgs)
                 if (!typeArgRuntimeReified(a)) return false;
             return true;
