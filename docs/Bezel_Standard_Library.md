@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.202 — July 2026**
+**Companion to the Bezel Language Specification, v0.203 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -878,6 +878,8 @@ Usage notes:
 
 <a id="sec-built-in-exceptions-cross-reference"></a>
 ### 2.17 Built-in exception types (cross-reference)
+
+*(v0.203: `ContractViolationException` — a `requires`/`ensures`/`invariant` clause evaluated `false`; language spec [§22.16](Bezel_Language_Spec.md#sec-contract-clauses), [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types).)*
 
 The built-in exception hierarchy — `Exception` and the types available without `import` — is normative in the language spec ([§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)); this document does not repeat it. Exceptions whose producers live in this document require the producer's `import` and are declared alongside it (e.g. `KeyNotFoundException` in [§4.8](#sec-dictionaryk-v), the IO exceptions in [§7.5](#sec-io-exception-types)).
 

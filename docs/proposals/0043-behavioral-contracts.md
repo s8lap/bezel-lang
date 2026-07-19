@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | superseded — graduated v0.203 (stages 1 + 4; stage 2 rides 0044, stage 3 the prover remains) |
 | **Tracking issue** | [#2030](https://github.com/s8lap/bezel-lang/issues/2030) |
 | **Target** | Spec: new §22.16 (contract clauses; numbered after proposal 0042's §22.15, which this proposal depends on), amendments to §22.4 (retro-unification), §11.2/§12.1/§12.5 (clause binding at interface/override/abstract boundaries), §22.7 (constructor clauses and the invariant's construction story), §30.1 (async requires), §31.4 (`ContractViolationException`), Appendix A.4, Appendix B.1/B.2, new Appendix C.15, new Appendix D.2 row (contract proving); stdlib: §2.17 cross-reference only — **no stdlib clause wave in v1** (§14); rationale: one new section (tiers, and why contracts are grammar). |
 | **Written against** | spec v0.197 (stdlib/rationale at the same revision) |

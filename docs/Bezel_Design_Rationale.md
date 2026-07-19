@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.202 — July 2026**
+**Companion to the Bezel Language Specification, v0.203 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -971,6 +971,23 @@ Spec §22.15 adds the `pure` member modifier — effect-freedom as a declared, c
 - The artifact interface (§2.8.2) carries signatures, not bodies; an inferred fact would make module interfaces change when bodies change — the instability §2.8.2 exists to prevent.
 
 The v1 boundary decisions, recorded: purity is **not determinism** (reads of mutable state are permitted; `det`/`total` are separate future promises — `pure` permanently means effect-free); class construction is excluded except the **throw carve-out** (a trivial-dispose class with a pure constructor as the immediate throw operand — without it, argument validation would be unwritable in the whole pure fragment and programmers would launder faults through provoked built-ins); function-typed values may be defined but not invoked (their types carry no effect information; the `(int) pure -> int` extension is the recorded v2, riding §27.1's modifier-identity precedent); override/implementation matching is strengthening-only (never-drop / may-strengthen / monotone — the exact-match alternative would sever every stdlib interface implementation from purity). The stdlib first wave annotates only non-virtual concrete members; annotating `IComparable<T>`/`IEquatable<T>`/`Object` roots is a recorded breaking-change event for a future major revision. The recorded widening (trivial-dispose construction admission, lifting `string.Split`-class exclusions) is proposal 0042 §8's variant B, staged behind one implementation cycle.
+
+<a id="sec-contracts-grammar-and-tiers"></a>
+### 9.8 Contracts are grammar, and the tier is the contract's honesty (v0.203)
+
+Spec §22.16 adds `requires`/`ensures`/`invariant` — SPARK-lineage behavioral contracts, not Dafny-lineage proof obligations. The decisions with recorded reasons:
+
+**Grammar, not attributes or library calls.** Bezel has no attribute system and the deferral is reasoned (§18); C# Code Contracts — conditions as method calls, a bolt-on rewriter, no compiler ownership — is the named cautionary lineage, and §22.4 already chose the compiler-recognized-clause route for exactly this kind of declaration. A body statement (`Verify.That`) cannot appear in the signature or artifact interface, cannot bind overrides, cannot be consumed by callers, and has no `result`/`old` or every-return-edge evaluation point; 0031's `Verify.That` stays as the body-internal complement with its distinct exception.
+
+**Clauses are pure borrows** — the 0042 dependency: because a clause has no effects, evaluating, eliding, and proving it are indistinguishable to every non-violating program, which is what makes the tier system (proven / checked / assumed) coherent and the checked→proven ratchet meaning-preserving. Eiffel's side-effecting assertions and its global suppression flag are the counter-examples; both are declined.
+
+**One violation exception, always-on `requires`.** `ContractViolationException` for all three kinds — the `ArgumentException`-compatible alternative was presented and declined (no honest `ParamName` mapping for multi-term conditions; two types for one mechanism; recovery arms written for input validation should not silently absorb bug reports; the per-member migration cost is recorded and borne deliberately, which is why the stdlib ships no clause conversions yet). `requires` is never elided (the 0031 posture — it replaces an always-on idiom); `ensures`/`invariant` run under checked-contracts mode, the §28.2 two-mode shape with a crucially different relaxation: non-evaluation (defined behavior, purity making it unobservable), not undefined behavior.
+
+**Behavioral subtyping without weakening syntax.** Overrides inherit clauses verbatim, may add `ensures`, may not declare `requires`; multi-root preconditions combine by disjunction (the Eiffel inherited-precondition rule, arrived at for the same reason); `require else`/`ensure then` refinement syntax is declined until demand materializes.
+
+**Invariants at the public boundary with the `this`-reentrancy exemption** — the Eiffel lessons adopted (interior algorithms legitimately traverse broken states; checked/unchecked faces make the exemption statically decidable), the Eiffel machinery (suppression flags, refinement keywords) not. Getters exempt, with the residual recorded; construction checks at most-derived exit only, composing with §22.7's observation gate by construction.
+
+**The prover floor is honest.** Exactly two things are proven in this revision: constant folds and §22.4's `when` clauses (the shipped flow prover, now *named* as the prover it is — §22.4 is retro-unified as a `static ensures`, surface-preserved, zero migration). Essentially every authored clause is checked; the extended fragment (linear integer arithmetic, null-test flow, closed-set case analysis) is fixed now as an Appendix D feature so `static`'s meaning never drifts — a demanded proof never silently becomes a runtime check.
 
 <a id="sec-generics"></a>
 ## 10. Generics
