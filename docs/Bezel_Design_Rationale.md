@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.203 — July 2026**
+**Companion to the Bezel Language Specification, v0.204 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -989,6 +989,17 @@ Spec §22.16 adds `requires`/`ensures`/`invariant` — SPARK-lineage behavioral 
 
 **The prover floor is honest.** Exactly two things are proven in this revision: constant folds and §22.4's `when` clauses (the shipped flow prover, now *named* as the prover it is — §22.4 is retro-unified as a `static ensures`, surface-preserved, zero migration). Essentially every authored clause is checked; the extended fragment (linear integer arithmetic, null-test flow, closed-set case analysis) is fixed now as an Appendix D feature so `static`'s meaning never drifts — a demanded proof never silently becomes a runtime check.
 
+<a id="sec-interface-carries-contracts"></a>
+### 9.9 The interface carries contracts, textually (v0.204)
+
+Spec §2.8.2's contract records (v0.204) rest on three decisions worth recording.
+
+**Clause identity is textual.** Semantic equivalence of clauses is undecidable (clauses are boolean expressions over arithmetic and calls; deciding `requires a and b;` ≡ `requires b and a;` in general is deciding formula equivalence), and any decidable approximation misclassifies in one direction or the other. Textual identity is the conservative choice with a stated bias: it never *under*-reports a contract change — soundness for any gate built on the classification — at the cost of over-reporting stylistic re-spellings (`1_000` → `1000`, added parentheses, re-qualified names) as clause replacements. The two admitted canonicalizations (comments and whitespace; parameter and type-parameter positions) are exactly the ones that keep the record stable under edits *invisible at every use site*: a `ref`/`out`/`owned` parameter rename is call-site-invisible (spec §22.5: those arguments are positional-only), a plain-parameter rename is already a *signature* event (named arguments) and should surface once, as one — not twice with a spurious clause delta beside it; type-parameter names are likewise not part of signature identity (arity is). Semantic normalization — commutativity, constant folding, SMT-checked implication — was declined for the verdict itself: it would make the classification depend on prover strength, so two conforming tools could classify one delta differently, which for a CI gate is the worst available property. (Implication checking has a natural home as a future *advisory* layer, never as the verdict.) Redacting non-public state from carried clause text was also declined: a redacted record cannot be agreement-checked or diffed, which forfeits the staleness backstop exactly where stale consumption is least visible; the disclosure has the definition-site precedent and the same recompile-the-world cost profile.
+
+**The recorded tier is demand-derived.** Spec §22.16 lets an implementation opportunistically discharge unqualified clauses and elide their checks, as-if. If the interface recorded those discharges, the recorded tier would be a function of the member's **body** — a body edit could flip proven→checked with no declaration change, silently invalidating the interface bytes (defeating early-cutoff builds keyed on interface identity) and, worse, silently invalidating any downstream proof that consumed the tier, with nothing in any declaration to point at. Deriving the recorded tier from the declaration alone — the `static` qualifier, plus §22.16's constant-fold floor, whose fold reads only the clause text and the `const` values it names — makes the tier a declaration fact: stable under body edits, guaranteed by compilation (a demanded proof that fails is a compile error), and therefore safe for downstream consumption. The recorded tier is simply the clause's §22.16 tier — one term, one value; what is never recorded is the per-site as-if elision of a checked clause, the only discharge that is not a declaration fact. The matching consumption rule in §2.8.2 is the same decision seen from the consumer: a proof no interface promises is not consumable.
+
+**Identity excludes contracts; the verdict is layered.** Folding contract records into §2.8.3's type-identity key would make a clause edit mint a "new" type — every `is` test, `catch` clause, and pattern over it would bifurcate for values sharing one runtime representation — and would replace the *useful* answer to a contract mismatch (the staleness error, naming the stale artifact and the fix) with an unrelated-types error naming nothing. Identity is runtime oneness; contracts are obligations revised across revisions of one module while the type stays the same type. And a tier demotion gets a per-level verdict (spec §2.8.6) because both flat answers are wrong: flat-breaking cries wolf at every Core-level consumer (nothing they can consume changed — a tool that over-alarms teaches itself to be ignored), while flat-preserving mislabels a real break at the proof level. "Breaking where callers consumed the proof" is undecidable for a tool that cannot see callers; *level-gating* is its decidable refinement, and it keeps the ratchet culture healthy — promotion is everywhere-preserving, demotion is an honest, level-scoped event.
+
 <a id="sec-generics"></a>
 ## 10. Generics
 
@@ -1166,7 +1177,7 @@ using var token := await sem.AcquireAsync();
 DoCriticalWork();
 ```
 
-Producers who want both shapes declare two methods with distinct names.
+Producers who want both shapes declare two methods with distinct names — and the second is typically one line: a Pattern B await is an owned expression, so an async façade's `return await CoreOwnedAsync(…);` republishes the owned result through a Pattern A task's owned slot (the adapter shape worked in [§12.2](#sec-choosing-between-taskt-and-taskowned-t)).
 
 <a id="sec-choosing-between-taskt-and-taskowned-t"></a>
 ### 12.2 Choosing between `Task<T>` and `OwningTask<T>`
@@ -1184,60 +1195,26 @@ public async method CountAsync(): Task<int>          // value type — no patter
 public async method FetchNameAsync(): Task<string>   // string — no pattern
 ```
 
-**Step 2: The result is a class type. Does the operation produce a fresh resource the caller should own and dispose?**
+**Step 2: The result is a class type. Will more than one consumer legitimately read the *same result instance*?**
 
-The hallmark of a resource-acquisition operation: the caller asked the system to create, open, connect, or acquire something, and the caller is the one who must close, release, or dispose it when done. The operation's purpose is to hand over a resource.
+This is the fan-out question, and it is architectural, not incidental: a config cache shared by every caller (spec [§22.13](Bezel_Language_Spec.md#sec-static-initialization-order) pattern (b)'s static task caches), a lookup result several subscribers await, a task stored once and awaited from multiple places (spec §30.4). Fan-out is announced in a design — it is rarely discovered late.
 
-If yes → **Pattern B: `OwningTask<T>`**
-
-```bezel
-public async method ConnectAsync(url: string): OwningTask<Connection>
-public async method AcquireAsync(): OwningTask<SemaphoreToken>
-public async method OpenAsync(path: string): OwningTask<FileStream>
-```
-
-The caller writes:
+If yes → **Pattern A: `Task<T>`** — and say why at the declaration:
 
 ```bezel
-using var conn := await ConnectAsync(url);
-// conn is owned; disposed at scope end.
-```
-
-**Step 3: The result is a class type, but the operation is not producing a fresh resource. Could multiple consumers need the same result?**
-
-This covers caches, shared lookups, fan-out patterns — any case where the result lives longer than a single consumer, or where multiple awaiters read from the same task.
-
-If yes → **Pattern A: `Task<T>`**
-
-```bezel
+/// Pattern A (fan-out): one fetch, every caller borrows the same Config.
 public async method FetchConfigAsync(): Task<Config>
-public async method LoadProfileAsync(id: int): Task<UserProfile>
 ```
 
-The caller writes:
+The same answer covers **chained republication** — an async body that re-exposes a longer-lived owner's result by chaining (`return await repo.LoadAsync(id);` — the source task's ownership transfers into the outer task, spec [§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal)'s chained slots) or that shares a fresh value through the task's owned slot. Not "the task borrowing from the repository": a task cannot hold a borrow it did not produce — §30.5/§28.3's return rules forbid returning a bare borrow through a task (the original wording here predated the v0.67 owns-result ruling and was corrected in the 2026-07 review, #1332). Callers borrow *through the task*, whose teardown is the defined owner at every link.
+
+**Step 3: Otherwise — the result is a fresh, single-consumer class value → Pattern B: `OwningTask<T>`.**
+
+This is the default, and it covers more than classic resource acquisition. Connections, lock tokens, and file handles qualify, but so does ordinary fresh *data* the caller will hold: a parsed document, a materialized array, a response object. The consumer writes the form every caller writes unprompted:
 
 ```bezel
-using var task := FetchConfigAsync();
-var config := await task;              // config is borrowed from the task
-UseConfig(config);
-// task disposed at scope end; config disposed with it.
-```
-
-Multiple awaiters may share the task:
-
-```bezel
-using var task := FetchConfigAsync();
-var c1 := await task;                  // borrow
-var c2 := await task;                  // same borrow, same underlying object
-```
-
-**Step 4: The result is a class type produced by a query or lookup against longer-lived state (a repository, a cache, a parent object).**
-
-This is still Pattern A — but not by "the task borrowing from the repository" (a task cannot hold a borrow it did not produce; §30.5/§28.3's return rules forbid returning a bare borrow through a task — the original wording here predated the v0.67 owns-result ruling and was unimplementable as stated, 2026-07 review #1332). The shape that types is: the async body *chains* (`return await repo.LoadAsync(id);` — the source task's ownership transfers into the outer task, §30.5's chained slots) or the body constructs/receives a fresh owned value to be shared through the task (owned slot). Either way callers borrow *through the task*, whose destructor is the defined owner of whatever the slot holds.
-
-```bezel
-public async method FindUserAsync(id: int): Task<User>
-public async method GetCachedItemAsync(key: string): Task<CacheEntry>
+using var conn := await ConnectAsync(url);    // owned; disposed at scope end
+var doc := await ParseAsync(input);           // owned local; affine discharge rules apply
 ```
 
 **Summary**
@@ -1245,13 +1222,27 @@ public async method GetCachedItemAsync(key: string): Task<CacheEntry>
 | Question | Answer | Pattern | Return type |
 |---|---|---|---|
 | Result is value type / string / runtime-managed? | Yes | Neither | `Task<T>` |
-| Operation produces a fresh resource the caller must dispose? | Yes | B | `OwningTask<T>` |
-| Multiple consumers may read the same result? | Yes | A | `Task<T>` |
-| Result is borrowed from an existing owner? | Yes | A | `Task<T>` |
+| Several consumers read the same result instance (fan-out), or the body republishes a longer-lived owner's result (chaining)? | Yes | A — say why at the declaration | `Task<T>` |
+| Fresh, single-consumer class result — including plain data the caller will hold? | Yes | **B (the default)** | `OwningTask<T>` |
+| Still in doubt? | — | **B** | `OwningTask<T>` |
 
-**When in doubt, choose Pattern A.** It is the conservative default: the task owns the result, callers borrow, and no one can accidentally leak. Pattern B is the explicit opt-in for "I am handing you a resource; you are now responsible for it." If the producer isn't sure whether the caller needs ownership, Pattern A keeps the decision reversible — the producer can widen to Pattern B later without breaking existing callers (they'll just need to add `using var`). Going the other direction — narrowing from Pattern B to Pattern A — is a breaking change because callers already wrote `using var x := await t;` and relied on owning the result.
+**When in doubt, choose Pattern B.** *(v0.204 — this reverses the guidance recorded here through v0.203; the changelog v0.204 entry carries the evidence for the reversal.)* Four reasons, each a recorded fact of the current model:
 
-**The one question that settles it:** *"If the caller forgets to dispose the result, is that a resource leak?"* If yes, Pattern B — force the caller to take ownership. If no (the result is just data, or someone else owns it), Pattern A.
+1. *The failure mode is caught.* Under the affine model ([§5.23](#sec-the-affine-model), v0.150), an owned result the caller never discharges is auto-dropped at scope end with the must-use warning — forgetting to dispose is not a leak, it is a diagnostic. The old argument for A-as-conservative ("no one can accidentally leak") was grounded in the pre-affine model; it is now equally true of B.
+2. *A does not reduce the caller's obligations.* Since v0.190 ([§12.10](#sec-calls-mint-storage-lends)) the caller owns the *task* in either pattern. A moves the discharge obligation from the value the caller wants onto the wrapper around it; B puts it on the value itself and lets the await discharge the wrapper.
+3. *The consumer form is the natural one.* B's canonical call site is the one-line `using var x := await …;` A's is the two-line bound-task form, and the one-line `var` bind of a Pattern A await is a compile error (spec [§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal)).
+4. *B is recoverable; the recovery is one line.* A producer who chose B and later discovers a fan-out need does not narrow the existing signature (that would break owners); it publishes a sibling ([§12.1](#sec-pattern-a-vs-pattern-b-is-type-directed)'s "two methods with distinct names"), and the adapter is the shape §30.5 itself anticipates: a Pattern B await is an owned expression, and a Pattern A async body's `return` of an owned expression fills the task's owned slot.
+
+```bezel
+/// Pattern A façade over the Pattern B core, for subscribers.
+public async method FetchSharedAsync(url: string): Task<Config>
+  return await FetchOwnedAsync(url);   // B result (owned) fills the A task's owned slot
+end FetchSharedAsync;
+```
+
+The reversibility asymmetry the old guidance rested on is real and stays recorded: **A→B remains the mechanical-migration direction** (widening `Task<T>` to `OwningTask<T>` breaks callers loudly and compilably — one-line binds keep compiling as owned binds; non-owned-consuming awaits and multi-await sites are rejected with the §30.5 diagnostics, and the fixes are local), and **B→A remains breaking** (callers wrote `using var x := await t;` and owned the result; under A that same line is rejected). What the flip re-weighs is which default you *start* from: the reversibility argument buys an option — start at A, widen to B once ownership need is proven — that the recorded surface has never needed (no stdlib API started at A and widened; every recorded doubt-case went straight to B), and it pays for that option with the two-line consumer tax on every call site in the meantime, while the reverse risk has the one-line sibling recovery above, which does not touch the existing signature at all. Optimizing the everyday path over an unexercised option is the trade; it is made with the evidence attached, so it can be revisited if the evidence ever inverts.
+
+**The question that settles it** is no longer "would forgetting to dispose leak?" (the affine model answers that for both patterns) but: ***"can a second consumer legitimately need this same result instance?"*** If yes, Pattern A — the task is the shared owner. If no — or if you are unsure — Pattern B: hand the caller the value, and let the ownership machinery do what it exists to do.
 
 <a id="sec-no-configureawait"></a>
 ### 12.3 No `ConfigureAwait`
@@ -1466,6 +1457,13 @@ already deliver. Evidence first.
 The declined alternative was the marker: require `owned` on every fresh-task-returning signature. The blast radius alone was disqualifying — every async signature in every program, every task-returning function type, both decision trees above — but the deeper defect is what the *unmarked* spelling would then mean, because a marker whose omission compiles must leave the unmarked form meaning something. As a borrow it is a standing leak-by-omission trap, worst through interfaces, where a caller cannot see whether the implementation behind a signature is async; as a hard error it forces the marker onto every task signature — [§5.5](#sec-local-variable-ownership-is-inferred-not-annotated)'s "redundant noise" verdict, transplanted to the language's most common async surface. The declared return type already carries exactly the bit the marker would add; this is the announcement-by-declared-type doctrine the iterator convention had established, applied to the type family whose calls produce frames by construction. Also declined: post-substitution keying (`First<T>()` at `T = Task<int>` would mint a disposal obligation over a collection-owned element — the decline v0.194's bare-type-parameter ruling later reaffirmed, [§5.7](#sec-factory-method-ownership)), and extending calls-mint uniformly to all deferred-activation kinds — unsound for iterables, where the stored-collection view idiom (`method Items(): IEnumerable<Item> => return _items;`) is legitimate and common. The task/iterable asymmetry is principled, and is recorded here so the iterable analogue is not later "fixed" by copying this ruling blindly.
 
 The rule is the §30.11 precedent made general. v0.184 had already decided, for one type, that a `TaskCompletionSource` owns its task and consumers reach it through the `.Task` **property** ([§12.7](#sec-memory-model-edges) above; spec [§30.11](Bezel_Language_Spec.md#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet)) — the source owns, storage lends. v0.190 draws that line everywhere, callee side included: an unmarked `Task`-family return type is itself container-ownership-transferring, so a non-`async` body must supply an owned task on every return path, and a *stored* task is re-exposed through a property, field, or collection slot — never through a non-`owned` method return. Costs, recorded: the stored-task *method* accessor became inexpressible (the storage-accessor shape belongs to properties — the same property-face resolution as the static idioms of §13.6); and the pre-existing `owned Task` markers on `Domain.Spawn` and the `Parallel` combinators became emphasis rather than contrast — recorded deliberately against the v0.186 note that the two spellings were "deliberate, not to be silently harmonized": this is the non-silent harmonization that note demanded.
+
+<a id="sec-determinism-stated-hashes-assigned"></a>
+### 12.11 Determinism is stated, and identity hashes are assigned (v0.204)
+
+Spec §30.13's *Determinism* subsection adds no rule — every clause of it was already a consequence of serial-per-domain execution, the five memory-model edges, sendability, and the no-object-address invariant. It is stated anyway, for two reasons. First, as an audit obligation on the implementation: once "a domain's execution is a deterministic function of what its edges deliver" is normative, any within-domain nondeterminism given fixed edges — an uninitialized read, an unpinned iteration order, an address leak into an observable value — is a runtime *bug by definition*, not implementation latitude; the paragraph converts a diffuse design intention into a checkable property. Second, as the foundation record/replay tooling needs: a recorded execution is replayable exactly because everything a domain observes arrives through an enumerable set of runtime-mediated edges (proposal 0045 is the tooling design; the spec paragraph is what makes it *possible* rather than heroic). The exclusions are exactly two — elapsed real time, and foreign memory beyond declared writebacks — because those are the two places the runtime genuinely does not mediate.
+
+Two supporting rulings landed with it. **Identity hashes are assigned, not derived** (spec §8.3): the .NET lazy-syncblock design with the entropy source replaced by a per-domain deterministic sequence. Without it the determinism statement is false for any program that hashes a class by identity — an address-derived hash is a per-run accident — and the address itself would leak into observable values, which §32.12's no-object-address invariant exists to prevent. Objects never hashed pay nothing; the storage is the runtime's per-object metadata word or a side table (implementation detail); programs are promised only within-run stability and address-independence, so no existing program's meaning changes. **`OwningDictionary<K, V>` iteration is deterministic-given-history, not order-pinned** (stdlib §4.9): pinning insertion order outright would force order metadata into the drain-and-rebuild representation whose economics §4.9 already chose; determinism given the operation-and-hash history is everything replay needs and is what the reference implementation already does. The borrowing containers (`Dictionary`, `Set`) were already insertion-order-pinned, so no frame-by-frame journaling of container iteration is ever needed.
 
 <a id="sec-events"></a>
 ## 13. Events
