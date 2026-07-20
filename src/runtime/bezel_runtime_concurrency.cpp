@@ -959,6 +959,27 @@ void bz_task_free(void* tp) {
     // called synchronously on an already-done task, or via the fire-and-forget
     // completion continuation) and no other thread still touches the struct —
     // the same invariant the pre-existing lock-free reads below already rely on.
+    //
+    // NOTE on error_obj: bz_task_free does NOT dispose error_obj. The owning
+    // task's fault exception is disposed by:
+    //   • codegen's scope-end error_obj disposal (LlvmBackend_Disposal.cpp,
+    //     when bz_task_is_error(t) was true at scope end), which runs BEFORE
+    //     fire-and-forget on the fast path; or
+    //   • the slow-path fire-and-forget continuation registered by
+    //     bz_task_fire_and_forget / bz_task_fire_and_forget_checked at the
+    //     task local's scope end (see §30.9 / #1601 item 4 / #1021 — the
+    //     "still running at scope end" arm must dispose when the abandoned
+    //     task later faults); or
+    //   • the `await` of a faulted task that re-raises the error_obj (the
+    //     catch arm's terminal act, deferred from scope end under #1528's
+    //     in-flight deferral).
+    // Doing it HERE would be wrong for two reasons: (a) WhenAllOwned captures
+    // the input task's error_obj into `fault_objs[i]` BEFORE calling
+    // bz_task_free on the input (Pattern B — the input task transfers
+    // ownership of the exception to the aggregate; if bz_task_free disposed
+    // it, the captured pointer would dangle and the aggregate's re-raise
+    // would UAF); (b) the fast path already-nulled error_obj path is the
+    // SCOPE-END disposal's job, not bz_task_free's.
     if (task->result_disposer && !task->is_error && task->result &&
         task->result_size >= (int64_t)sizeof(void*)) {
         void* obj = *(void**)task->result;
@@ -1525,10 +1546,33 @@ void  bz_task_fire_and_forget(void* tp) {
         // Fast path: task is complete; free immediately without the scheduler.
         bz_task_free(tp);
     } else {
-        // Slow path: task still running; register a continuation so the worker
-        // frees it when it eventually completes.
+        // Slow path: task still running at scope end (the "still-running"
+        // arm of #1601 item 4 / #1021); register a continuation that
+        // disposes the task's OWNED fault exception (if the abandoned task
+        // later settles faulted) AND frees the task struct. Pre-fix the
+        // continuation only called bz_task_free, which reclaims the task
+        // struct + error_msg but NOT the Bezel exception object — every
+        // abandoned-then-faulted task leaked its error_obj (the 16-byte
+        // calloc'd exception visible in LSan). Spec §30.9 (v0.179): "a task
+        // owns its fault exception and disposes it exactly once, by the
+        // task that owns it, when the task is disposed" — an abandoned task
+        // (no awaiter) satisfies "disposed when the task is disposed" here
+        // via the slow-path fire-and-forget continuation.
         bz_task_then(tp,
             [](void* completedTask, void* /*state*/) {
+                auto* t = (bz_task_t*)completedTask;
+                // Dispose the OWNED fault exception unless (a) the task
+                // succeeded (no error_obj), (b) the error_obj was already
+                // reclaimed by the fast-path scope-end disposal (won't
+                // happen here — slow path means task was not done at scope
+                // end, so codegen's `bz_task_is_error(t)` branch was
+                // skipped), or (c) the task is a WhenAll/WhenAll<T>
+                // aggregate that BORROWED its fault from an input task
+                // (§30.10 / #1529: the input remains the sole owner).
+                if (t->error_obj && !t->fault_borrowed) {
+                    bz_dispose_class_obj(t->error_obj);
+                    t->error_obj = nullptr;
+                }
                 bz_task_free(completedTask);
             },
             nullptr);
@@ -1601,11 +1645,27 @@ void  bz_task_fire_and_forget_checked(void* tp, void* disposedAccessVtable) {
         // Slow path: task still running at the moment of abandonment — a
         // genuinely abandoned continuation. Register a continuation that,
         // when the task eventually settles, checks for the
-        // DisposedAccessException backstop before freeing the task struct.
+        // DisposedAccessException backstop, then disposes any REMAINING
+        // OWNED fault exception (the #1601 item 4 / #1021 arm: an
+        // abandoned-then-faulted task's error_obj must be disposed by the
+        // fire-and-forget continuation since no awaiter ever will), then
+        // frees the task struct.
+        //
+        // Two-stage disposal: bz_task_faf_report_disposed_access inspects
+        // error_obj for the DisposedAccessException vtable and (if matched)
+        // reports + disposes + nulls error_obj. The new block below then
+        // disposes any NON-DisposedAccessException fault still present
+        // (error_obj != null after the report step). The fault_borrowed
+        // guard skips WhenAll/WhenAll<T> aggregates that borrowed their
+        // fault from an input task (§30.10 / #1529).
         bz_task_then(tp,
             [](void* completedTask, void* state) {
-                bz_task_faf_report_disposed_access((bz_task_t*)completedTask,
-                                                    state);
+                auto* t = (bz_task_t*)completedTask;
+                bz_task_faf_report_disposed_access(t, state);
+                if (t->error_obj && !t->fault_borrowed) {
+                    bz_dispose_class_obj(t->error_obj);
+                    t->error_obj = nullptr;
+                }
                 bz_task_free(completedTask);
             },
             disposedAccessVtable);
