@@ -13,6 +13,57 @@
 
 namespace bezel::sema {
 
+// §11.8/§28.1 (v0.196, #2063): owned-marker erasure at value/runtime-managed
+// substitutions on the witness-side conformance match. A LAYER-LOCAL copy of
+// the value-kind predicate the declaration-site check (Resolver::
+// checkOwnedDeclType, §28.1) uses to decide where `owned` is admissible: it
+// returns true on exactly that check's REJECT set — the value and runtime-
+// managed types (§28.9) on which `owned` carries no disposal obligation to
+// transfer. When an interface member declares `owned T` (or `out owned T`)
+// on a bare type parameter T of the interface, §28.1 (v0.196) ERASES the
+// marker at a value/runtime-managed conformer: the substituted signature is
+// the unmarked one, so the witness is spelled without the marker (which the
+// concrete type would reject). The marker is RETAINED at class and interface
+// substitutions (ordinary transfer meaning) and at move-only value
+// substitutions (admitted-but-redundant, §15.3). Kept as a private copy
+// (mirroring ExprTypecheck_Calls.cpp's ownedMarkerErasedAtSubstitutedType,
+// same reasoning) so the two layers do not share mutable state; the
+// classification is deliberately identical.
+static bool ownedMarkerErasedAtSubstitutedType(const TypeRef* t) {
+    if (!t) return false;
+    switch (t->kind) {
+    case TypeRef::Kind::Error:
+        return false;  // resolution failed — leave the marker untouched.
+    case TypeRef::Kind::Unit:
+        return true;   // the unit type `()` — a value type.
+    case TypeRef::Kind::Function:
+        return true;   // a function value is a runtime-managed reference (§28.9).
+    case TypeRef::Kind::Primitive:
+        // Every primitive is a value type, or — for `string`/`Object` — a
+        // runtime-managed reference type (§28.9); none carries a disposal
+        // obligation, mirroring checkOwnedDeclType's uniform primitive reject.
+        return true;
+    case TypeRef::Kind::InlineArray:
+        // §15.3: an owning inline array is a MOVE-ONLY value type — the marker
+        // is retained (admitted-but-redundant), so return false; a non-owning
+        // inline array is a plain value type and erases.
+        return !t->arrayOwned;
+    case TypeRef::Kind::Named: {
+        const TypeSymbol* ts = t->declaration;
+        if (ts)
+            return ts->isValueBuiltin ||
+                   ts->kind == ast::TypeDeclKind::Record ||
+                   ts->kind == ast::TypeDeclKind::Enum;
+        // No TypeSymbol: a value-type builtin (DateTime/Guid/… —
+        // isValueBuiltinByName) erases; a class/interface builtin (Array<T>,
+        // Task, …) and an UNRESOLVED bare type parameter (a nested generic
+        // still abstract at this instantiation) both RETAIN the marker.
+        return isValueBuiltinByName(t->headName());
+    }
+    }
+    return false;
+}
+
 // #1272 (§9): value-containment-cycle detection for records. Returns true when
 // `start` is transitively reachable from `cur` by following value-typed record
 // fields (record, nullable-record, and inline-array-of-record fields — all
@@ -2997,11 +3048,28 @@ void Resolver::checkStaticInterfaceConformance() {
                         auto* ip = dynamic_cast<ParameterSymbol*>(im->params[pi]);
                         auto* cp = dynamic_cast<ParameterSymbol*>(cms->params[pi]);
                         if (!ip || !cp) { ok = false; break; }
-                        if (ip->modifier != cp->modifier) { ok = false; break; }
                         TypeRef* it2 = resolvedOf(ip->declType);
                         TypeRef* ct = resolvedOf(cp->declType);
                         if (!it2 || !ct) { ok = false; break; }
-                        if (!typesMatch(subst(it2, map), ct)) { ok = false; break; }
+                        // §11.8/§28.1 (v0.196, #2063): an `owned`/`out owned`
+                        // slot on a bare type parameter of the interface is
+                        // erased by the substitution at a value/runtime-managed
+                        // conformer — the witness is spelled without the
+                        // marker (which the concrete type would reject). Only
+                        // applied when substitution actually rewrote the slot
+                        // (`sub != it2`), so a still-abstract bare parameter
+                        // retains the marker and a concretely-spelled `owned`
+                        // interface parameter (already validated at the
+                        // interface's own declaration) is unaffected.
+                        TypeRef* subIt2 = subst(it2, map);
+                        std::string_view imMod = ip->modifier;
+                        if (subIt2 != it2 &&
+                            (imMod == "owned" || imMod == "out owned") &&
+                            ownedMarkerErasedAtSubstitutedType(subIt2)) {
+                            imMod = (imMod == "out owned") ? "out" : "";
+                        }
+                        if (imMod != cp->modifier) { ok = false; break; }
+                        if (!typesMatch(subIt2, ct)) { ok = false; break; }
                     }
                     if (!ok) continue;
                     // Return type (including `owned`, §11.2 exact-match rule).
@@ -3016,13 +3084,29 @@ void Resolver::checkStaticInterfaceConformance() {
                         cRetNode = cod->returnType.get();
                         cRetOwned = cod->returnOwned;
                     }
-                    if (imRetOwned != cRetOwned) continue;
-                    if (!imRetNode != !cRetNode) continue;  // unit vs typed
+                    // §11.8/§28.1 (v0.196, #2063): the same erasure on the
+                    // return slot — `owned T` at a value/runtime-managed
+                    // conformer substitutes to plain `T`, so the witness is
+                    // spelled without the marker. Gated on substitution having
+                    // rewritten the return (`sub != irt`); a concrete `owned
+                    // C` interface return and an unresolved bare-T both retain.
+                    bool effImRetOwned = imRetOwned;
+                    TypeRef* subIrt = nullptr;
                     if (imRetNode) {
                         TypeRef* irt = resolvedOf(imRetNode);
+                        if (irt) {
+                            subIrt = subst(irt, map);
+                            if (subIrt != irt && effImRetOwned &&
+                                ownedMarkerErasedAtSubstitutedType(subIrt))
+                                effImRetOwned = false;
+                        }
+                    }
+                    if (effImRetOwned != cRetOwned) continue;
+                    if (!imRetNode != !cRetNode) continue;  // unit vs typed
+                    if (imRetNode) {
                         TypeRef* crt = resolvedOf(cRetNode);
-                        if (!irt || !crt) continue;
-                        if (!typesMatch(subst(irt, map), crt)) continue;
+                        if (!subIrt || !crt) continue;
+                        if (!typesMatch(subIrt, crt)) continue;
                     }
                     matched = true;
                     break;
