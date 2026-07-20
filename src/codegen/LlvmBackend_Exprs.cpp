@@ -24,7 +24,10 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     }
     // CG30: an enum constant (`Color.Green`) is its integer value.
     if (llvm::Value* ev = enumConstant(e)) return ev;
-    if (llvm::Value* cv = constMemberValue(e)) return cv;
+    // §35.3 (#2045): a payload-free choice case access (`Opt.None`)
+    // materializes as the choice struct constant.
+    if (llvm::Value* cv = choiceCaseConstant(e)) return cv;
+    if (llvm::Value* cv2 = constMemberValue(e)) return cv2;
     if (auto* lit = dynamic_cast<const ast::IntLiteralExpr*>(&e)) {
         // CG25: the literal's width comes from its resolved type
         // (e.g. an `L`-suffixed literal is i64).

@@ -2785,6 +2785,82 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         }
     }
     sema::Symbol* calleeSym = ctx_.exprSymbol(*call.callee);
+    // §35.3 (v0.200, #2045): a CHOICE CASE construction `Opt.Some(42)` —
+    // the callee is a ChoiceCaseSymbol (resolved in sema,
+    // ExprTypecheck_Calls.cpp). Build the choice struct: tag = caseIndex,
+    // the active case's payload slot filled with the call arguments in
+    // declaration order, other slots undef. NB: a payload-free case is
+    // the bare `Opt.None` form (no parens, no call) — handled by
+    // choiceCaseConstant in lowerExpr's early exit, NOT here.
+    if (auto* cc = dynamic_cast<sema::ChoiceCaseSymbol*>(calleeSym)) {
+        auto* choiceTy = dynamic_cast<sema::TypeSymbol*>(cc->parent);
+        if (choiceTy &&
+            choiceTy->kind == ast::TypeDeclKind::Choice &&
+            cc->caseDecl) {
+            std::size_t tag = 0;
+            if (!choiceCaseByName(choiceTy, cc->name, &tag)) {
+                // Defensive — sema should have rejected an unknown case.
+                ctx_.diagnostics().report(
+                    Severity::Error, call.span.begin,
+                    "choice case `" + std::string(cc->name) +
+                    "` not found on choice type (§35.3)");
+                return nullptr;
+            }
+            auto* st = choiceStruct(choiceTy);
+            // §35.3: payload arguments bind to the case's payload fields
+            // as to a parameter list (per §35.3). Build the active case's
+            // payload struct value from the call arguments, in declaration
+            // order. Extra/missing args are a sema error — assume arity
+            // matches (a mismatch was a sema compile error that should
+            // have stopped codegen already).
+            std::size_t argCount = 0;
+            for (const auto& a : call.args) if (a.value) ++argCount;
+            // §A.6 CallExpr's `args` carry positional arguments only (named
+            // args are not in this surface). Bind positionally.
+            std::vector<llvm::Value*> payloadFields;
+            std::size_t argIdx = 0;
+            for (const auto& pf : cc->caseDecl->payload) {
+                (void)pf;
+                if (argIdx < call.args.size() && call.args[argIdx].value) {
+                    payloadFields.push_back(
+                        lowerExpr(*call.args[argIdx].value));
+                } else {
+                    // Defensive — sema should have rejected an under-bound
+                    // call. Use undef of the right type.
+                    auto* pty = st->getElementType(1 + tag);
+                    if (auto* payloadStruct =
+                            llvm::dyn_cast<llvm::StructType>(pty)) {
+                        auto idx = payloadFields.size();
+                        if (idx < payloadStruct->getNumElements()) {
+                            payloadFields.push_back(llvm::UndefValue::get(
+                                payloadStruct->getElementType(idx)));
+                        } else {
+                            payloadFields.push_back(llvm::UndefValue::get(
+                                i32()));
+                        }
+                    } else {
+                        payloadFields.push_back(llvm::UndefValue::get(pty));
+                    }
+                }
+                ++argIdx;
+            }
+            // Build the case's payload struct value.
+            auto* payloadTy = st->getElementType(1 + tag);
+            llvm::Value* payload = llvm::UndefValue::get(payloadTy);
+            for (std::size_t i = 0; i < payloadFields.size(); ++i) {
+                if (payloadFields[i])
+                    payload = builder_.CreateInsertValue(
+                        payload, payloadFields[i], {(unsigned)i});
+            }
+            // Build the full choice struct value: tag + payload slots.
+            llvm::Value* whole = llvm::UndefValue::get(st);
+            whole = builder_.CreateInsertValue(
+                whole, llvm::ConstantInt::get(i32(), tag), {0});
+            whole = builder_.CreateInsertValue(
+                whole, payload, {1 + (unsigned)tag});
+            return whole;
+        }
+    }
     // CG44: an enum cast `E(i)` (§5.4) — the callee is an enum type
     // name. An enum is represented by its underlying integer (i32), so
     // the argument, width-adjusted to i32, is the enum value.

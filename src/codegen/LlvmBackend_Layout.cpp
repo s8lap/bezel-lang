@@ -757,6 +757,14 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             if (rt->declaration &&
                 rt->declaration->kind == ast::TypeDeclKind::Enum)
                 return enumLlvmType(rt->declaration);
+            // §35 (v0.200, #2045): a choice lowers to a value-type struct
+            // `{ i32 tag, case0_payload, case1_payload, ... }` — see
+            // choiceStruct for the layout rationale. NB: this is the
+            // non-nullable form; the nullable `C?` wraps this struct in
+            // nullableValueStructTy's `{ i8 hasValue, <choice struct> }`.
+            if (rt->declaration &&
+                rt->declaration->kind == ast::TypeDeclKind::Choice)
+                return choiceStruct(rt->declaration);
             // fix #1220 (residual) / stdlib §4.8 / §5: DictionaryEntry<K,V> is
             // the element type for a Dictionary LINQ pipeline. It is a synthetic
             // Named TypeRef (importedName="DictionaryEntry", no declaration/astNode)
@@ -1108,6 +1116,81 @@ llvm::StructType* Emitter::recordStruct(const sema::TypeSymbol* t) {
     for (const sema::Symbol* m : storage) {
         fieldTys.push_back(storageType(m));
         fieldIndex_[m] = idx++;
+    }
+    st->setBody(fieldTys);
+    return st;
+}
+
+
+// §35 (v0.200, #2045): choice cases in declaration order. The case's index
+// in this vector is its runtime tag value (stored at field 0 of the choice
+// struct, read by the match-side tag comparison). The `ChoiceCaseSymbol`s
+// live alongside other members of the choice TypeSymbol (§35.1, collected
+// in SymbolCollection.cpp). Defined here (next to choiceStruct) since the
+// layout and the case-index contract are inseparable.
+std::vector<const sema::ChoiceCaseSymbol*> Emitter::choiceCasesOf(
+        const sema::TypeSymbol* choiceTy) {
+    std::vector<const sema::ChoiceCaseSymbol*> out;
+    if (!choiceTy) return out;
+    for (const sema::Symbol* m : choiceTy->members) {
+        if (auto* cc = dynamic_cast<const sema::ChoiceCaseSymbol*>(m))
+            out.push_back(cc);
+    }
+    return out;
+}
+
+const sema::ChoiceCaseSymbol* Emitter::choiceCaseByName(
+        const sema::TypeSymbol* choiceTy, std::string_view name,
+        std::size_t* tagOut) {
+    auto cases = choiceCasesOf(choiceTy);
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        if (cases[i]->name == name) {
+            if (tagOut) *tagOut = i;
+            return cases[i];
+        }
+    }
+    return nullptr;
+}
+
+// §35: a case's payload struct type — `{ type0, type1, ... }` for the
+// case's payload fields (lowered via lowerType on each Param's AST type),
+// or `{ i8 }` for a payload-free case. Every case occupies exactly one
+// field in the choice struct so the active-case slot index is uniform
+// (1 + caseIndex); a payload-free case still needs a slot for layout
+// uniformity, so it gets the i8 placeholder. NB: this does NOT include
+// the tag — the tag is added by choiceStruct at field 0.
+llvm::StructType* Emitter::choiceCasePayloadStruct(
+        const sema::TypeSymbol* /*choiceTy*/,
+        const sema::ChoiceCaseSymbol* cc) {
+    if (!cc || !cc->caseDecl || cc->caseDecl->payload.empty()) {
+        return llvm::StructType::get(llvm_, {i8()}, /*isPacked=*/false);
+    }
+    std::vector<llvm::Type*> fieldTys;
+    for (const ast::Param& pf : cc->caseDecl->payload) {
+        if (!pf.type) {
+            fieldTys.push_back(i32());  // defensive — unresolved → i32
+            continue;
+        }
+        fieldTys.push_back(lowerType(pf.type.get()));
+    }
+    return llvm::StructType::get(llvm_, fieldTys, /*isPacked=*/false);
+}
+
+llvm::StructType* Emitter::choiceStruct(const sema::TypeSymbol* t) {
+    auto it = structs_.find(t);
+    if (it != structs_.end()) return it->second;
+    auto* st = llvm::StructType::create(
+        llvm_, std::string("choice.") + std::string(t->name));
+    structs_[t] = st;  // before filling, to support self-reference
+
+    // §35: `{ i32 tag, case0_payload, case1_payload, ... }`. Each case's
+    // payload occupies field index `1 + caseIndex`. The tag (field 0) is
+    // the case's declaration-order index.
+    std::vector<llvm::Type*> fieldTys;
+    fieldTys.push_back(i32());  // tag — §35.13 implementation-defined width
+    auto cases = choiceCasesOf(t);
+    for (const sema::ChoiceCaseSymbol* cc : cases) {
+        fieldTys.push_back(choiceCasePayloadStruct(t, cc));
     }
     st->setBody(fieldTys);
     return st;

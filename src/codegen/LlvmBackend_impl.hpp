@@ -3159,6 +3159,41 @@ private:
     // prefix-layout walk.
     llvm::StructType* recordStruct(const sema::TypeSymbol* t);
 
+    // §35 (v0.200, #2045): the choice struct — a value-type sum lowered as
+    // `{ i32 tag, case0_payload, case1_payload, ... }`. Each case's payload
+    // is its own struct type at field index `1 + caseIndex` (a payload-free
+    // case's slot is a single-byte `{ i8 }` placeholder; a payload case's
+    // slot is `{ type0, type1, ... }` for its payload fields in declaration
+    // order). The tag is the case's declaration-order index (0-based). This
+    // "one slot per case" representation wastes memory (only the active
+    // case's slot is live) but is dead-simple to lower — no union byte-
+    // casting — and is sound for the §35.13 "implementation-defined layout"
+    // latitude. Cached in `structs_[t]` like recordStruct.
+    llvm::StructType* choiceStruct(const sema::TypeSymbol* t);
+
+    // §35: a choice's cases in declaration order. The case's index in this
+    // vector is its tag value. Defined in LlvmBackend_Layout.cpp (needs
+    // dynamic_cast on the choice's members).
+    std::vector<const sema::ChoiceCaseSymbol*> choiceCasesOf(
+        const sema::TypeSymbol* choiceTy);
+
+    // §35: find a choice case by name on a choice TypeSymbol; null if not
+    // found. Reports the case's declaration-order tag index via *tagOut
+    // (when non-null) — the value stored into the tag slot at construction
+    // and read by the match-side tag comparison.
+    const sema::ChoiceCaseSymbol* choiceCaseByName(
+        const sema::TypeSymbol* choiceTy, std::string_view name,
+        std::size_t* tagOut = nullptr);
+
+    // §35: a case's payload struct type — the LLVM struct laid out as
+    // `{ type0, type1, ... }` for the case's payload fields in declaration
+    // order, or `{ i8 }` for a payload-free case (the placeholder slot —
+    // every case occupies exactly one field in the choice struct so the
+    // active-case slot index is uniform: `1 + caseIndex`).
+    llvm::StructType* choiceCasePayloadStruct(
+        const sema::TypeSymbol* choiceTy,
+        const sema::ChoiceCaseSymbol* cc);
+
     // §9 / §9.1 (#1759): if the instance method currently being emitted is a
     // RECORD method, return its record TypeSymbol; otherwise null (class / enum
     // / extension receiver, a static method, or no method in flight). Recovers
@@ -3310,6 +3345,21 @@ private:
     // names sema does not resolve to symbols. Null if no such constant.
     llvm::Value* enumConstantByName(const sema::TypeSymbol* enumTy,
                                     std::string_view name);
+
+    // §35 (v0.200, #2045): the choice-typed analogue of enumTypeOf —
+    // recover a choice TypeSymbol from a value expression (a scrutinee,
+    // a local, a qualified case access). Null when the expr's resolved
+    // type is not a choice. Defined in LlvmBackend_Setup.cpp next to
+    // enumTypeOf.
+    const sema::TypeSymbol* choiceTypeOf(const ast::Expr& e);
+
+    // §35.3 (#2045): materialize a bare PAYLOAD-FREE choice case access
+    // (`Opt.None`) as the choice struct constant. The payload-carrying
+    // call form (`Opt.Some(42)`) is lowered by lowerCall; this handles
+    // only the no-parens value position. Null when `e` is not a choice-
+    // case access or the case carries a payload. Defined in
+    // LlvmBackend_Setup.cpp next to enumConstant.
+    llvm::Value* choiceCaseConstant(const ast::Expr& e);
 
     // CG36: a const member (`const X := …`) lowers to its initializer's
     // value (a compile-time constant). Covers bare `X` and `Type.X`.

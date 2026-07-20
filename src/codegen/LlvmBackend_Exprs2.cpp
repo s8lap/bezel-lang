@@ -5492,6 +5492,96 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
     if (dynamic_cast<const ast::DiscardPattern*>(pat))
         return builder_.getInt1(true);
 
+    // §35.5 (v0.200, #2045): a CHOICE scrutinee. The scrutinee's resolved
+    // type is a choice (a value-typed sum lowered as `{ i32 tag, … }` per
+    // choiceStruct); match is by tag, not by value equality. Two pattern
+    // shapes reach here:
+    //   * NamedPattern (bare case name) — matches when tag == caseIndex.
+    //     A payload-carrying case bare-named is a sema error (rejected by
+    //     checkTopLevelNamedPattern), so the bare form here is always a
+    //     payload-free case.
+    //   * DestructuringPattern (CaseName(slots...)) — matches when
+    //     tag == caseIndex AND binds the case's payload fields. Sub-pattern
+    //     checks on the payload slots are deferred (the slot binding is
+    //     the dominant shape — `Some(var v)`, `First(a, b)`).
+    // A choice's NamedPattern never resolves through the enum-constant or
+    // type-test legs below (choice cases carry no enumValue_ entry and no
+    // descriptor), so this early branch is the only path that admits them.
+    if (scrutTy && scrutTy->kind == sema::TypeRef::Kind::Named &&
+        scrutTy->declaration &&
+        scrutTy->declaration->kind == ast::TypeDeclKind::Choice) {
+        const sema::TypeSymbol* choiceTy = scrutTy->declaration;
+        // NamedPattern: payload-free case by bare name (`None => …`).
+        if (auto* np = dynamic_cast<const ast::NamedPattern*>(pat)) {
+            if (np->name && !np->name->parts.empty()) {
+                std::size_t tag = 0;
+                if (auto* cc = choiceCaseByName(choiceTy,
+                                                np->name->parts.back(), &tag)) {
+                    (void)cc;
+                    llvm::Value* tagVal =
+                        builder_.CreateExtractValue(scrut, {0}, "choice.tag");
+                    return builder_.CreateICmpEQ(
+                        tagVal, llvm::ConstantInt::get(i32(), tag),
+                        "choice.tag.eq");
+                }
+            }
+        }
+        // DestructuringPattern: payload case by `CaseName(slots...)`.
+        if (auto* dp = dynamic_cast<const ast::DestructuringPattern*>(pat)) {
+            if (dp->typeName && !dp->typeName->parts.empty()) {
+                std::size_t tag = 0;
+                if (auto* cc = choiceCaseByName(
+                        choiceTy, dp->typeName->parts.back(), &tag)) {
+                    llvm::Value* tagVal =
+                        builder_.CreateExtractValue(scrut, {0}, "choice.tag");
+                    llvm::Value* matched = builder_.CreateICmpEQ(
+                        tagVal, llvm::ConstantInt::get(i32(), tag),
+                        "choice.tag.eq");
+                    // Bind the case's payload fields. The case's payload
+                    // slot is at field index `1 + caseIndex` in the choice
+                    // struct; each payload field is a sub-field of that
+                    // struct (in declaration order). Naked and `var x`
+                    // sub-patterns install a local slot keyed on the same
+                    // AST node sema used (mirrors the record-destructure
+                    // binding in the DestructuringPattern handler below).
+                    if (cc->caseDecl) {
+                        for (std::size_t i = 0;
+                             i < dp->subPatterns.size() &&
+                             i < cc->caseDecl->payload.size();
+                             ++i) {
+                            const auto& sp = dp->subPatterns[i];
+                            llvm::Value* slotStruct =
+                                builder_.CreateExtractValue(
+                                    scrut, {1 + (unsigned)tag},
+                                    "choice.case.slot");
+                            llvm::Value* fv =
+                                builder_.CreateExtractValue(
+                                    slotStruct, {(unsigned)i},
+                                    "choice.case.field");
+                            if (!sp.nakedBinding.empty()) {
+                                llvm::AllocaInst* slot =
+                                    entryAlloca(fv->getType());
+                                builder_.CreateStore(fv, slot);
+                                locals_[sp.nakedAnchor.get()] = slot;
+                            } else if (auto* vbp =
+                                           dynamic_cast<const ast::BindingPattern*>(
+                                               sp.pattern.get())) {
+                                llvm::AllocaInst* slot =
+                                    entryAlloca(fv->getType());
+                                builder_.CreateStore(fv, slot);
+                                locals_[vbp] = slot;
+                            }
+                        }
+                    }
+                    return matched;
+                }
+            }
+        }
+        // Other pattern kinds on a choice scrutinee are not supported
+        // (fall through to the deferred-return-null path below; the
+        // caller degrades the arm to no-match, never a miscompile).
+    }
+
     // §19.3 (v0.183, #1584): a heterogeneous alternative list (AltPattern) —
     // ranges/relationals mixed with constants — lowers as the OR of its
     // members' individual tests. Each member is matched against the same

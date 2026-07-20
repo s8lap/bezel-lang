@@ -280,6 +280,65 @@ const sema::TypeSymbol* Emitter::enumTypeOf(const ast::Expr& e) {
     return nullptr;
 }
 
+// §35 (v0.200, #2045): recover the choice TypeSymbol of a scrutinee/value
+// expression — the parallel of enumTypeOf for choice-typed scrutinees.
+// Returns null when the expr's resolved type is not a choice. Used by the
+// CaseStmt/CaseExpr match lowering (to look up case tag indices) and by
+// the choice-construction path.
+const sema::TypeSymbol* Emitter::choiceTypeOf(const ast::Expr& e) {
+    const sema::TypeRef* rt = ctx_.exprType(e);
+    if (!rt) {
+        sema::Symbol* sym = ctx_.exprSymbol(e);
+        if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym))
+            rt = loc->declType;
+        else if (auto* par = dynamic_cast<sema::ParameterSymbol*>(sym))
+            rt = par->declType ? ctx_.resolvedType(*par->declType)
+                               : nullptr;
+    }
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return nullptr;
+    const sema::TypeSymbol* ts = rt->declaration;
+    if (ts && ts->kind == ast::TypeDeclKind::Choice) return ts;
+    return nullptr;
+}
+
+// §35.3 (v0.200, #2045): materialize a PAYLOAD-FREE choice case access
+// (`Opt.None`) as the choice struct constant `{ tag: <caseIndex>, ... }`.
+// The payload slots for non-active cases are `undef` (only the tag and the
+// active case's slot are read; choice values carry no per-slot moved-from
+// state per §35.4). Returns null when `e` is not a choice-case access or
+// the case is payload-carrying (the call form `Opt.Some(42)` is lowered in
+// LlvmBackend_Calls2.cpp's lowerCall, not here — this is the bare value
+// form `Opt.None`).
+llvm::Value* Emitter::choiceCaseConstant(const ast::Expr& e) {
+    auto* sym = ctx_.exprSymbol(e);
+    if (!sym) return nullptr;
+    auto* cc = dynamic_cast<sema::ChoiceCaseSymbol*>(sym);
+    if (!cc) return nullptr;
+    // The qualified-name form `Opt.None` resolves the MemberAccess to the
+    // ChoiceCaseSymbol but the exprType is the choice type (sema,
+    // ExprTypecheck_Calls.cpp:11479). Recover the choice TypeSymbol from
+    // the case's parent (a more authoritative source than exprType, which
+    // may be null in early codegen paths).
+    auto* choiceTy = dynamic_cast<sema::TypeSymbol*>(cc->parent);
+    if (!choiceTy || choiceTy->kind != ast::TypeDeclKind::Choice) return nullptr;
+    // Payload-carrying cases do not materialize here — they are the call
+    // form (`Opt.Some(42)`) and lowered by lowerCall. Only payload-free
+    // cases reach value position as a bare `Opt.None`-style access.
+    if (cc->caseDecl && !cc->caseDecl->payload.empty()) return nullptr;
+    std::size_t tag = 0;
+    if (!choiceCaseByName(choiceTy, cc->name, &tag)) return nullptr;
+    auto* st = choiceStruct(choiceTy);
+    // Build the struct constant: tag = caseIndex, all payload slots undef.
+    std::vector<llvm::Constant*> fields;
+    fields.push_back(llvm::ConstantInt::get(i32(), tag));
+    auto cases = choiceCasesOf(choiceTy);
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        auto* payloadTy = st->getElementType(i + 1);
+        fields.push_back(llvm::UndefValue::get(payloadTy));
+    }
+    return llvm::ConstantStruct::get(st, fields);
+}
+
 
 llvm::Value* Emitter::enumConstantOfPatternExpr(const ast::Expr& e,
                                        const sema::TypeSymbol* enumTy) {
