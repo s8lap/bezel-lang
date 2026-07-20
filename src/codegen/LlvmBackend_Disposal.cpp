@@ -1961,6 +1961,17 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // never-moved/disposed owned locals/params, but the null-check is kept
         // for the nullable-owned and defensive cases). The dispatch is dynamic
         // (runtime class), matching every other class-instance dispose site.
+        // #2000 / §28.13 / §28.4 / §28.6: an `unwindOnly` entry whose type is a
+        // compiler-known builtin owned handle (ChannelSender<T> / Channel<T> /
+        // Shared<T> / Weak<T>) — released via a TYPE-SPECIFIC runtime call
+        // (bz_channel_sender_release / bz_channel_dispose / bz_shared_release /
+        // bz_weak_release) rather than the generic vtable slot 2, which does
+        // not touch the handle refcount and cannot close the channel. After the
+        // release the slot is NULLed — same dispose-exactly-once pattern as the
+        // class path below — so a sibling / outer disposal registered against
+        // the same slot reads null on its own (later, in reverse-declaration-
+        // order iteration) unwind path and skips. The unbox is load → null-
+        // check → release → store null, identical shape to the class path.
         if (it->unwindOnly) {
             if (!isUnwind) continue;
             llvm::Type* ety = nullptr;
@@ -1974,7 +1985,25 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                                     currentFn_);
             builder_.CreateCondBr(isNull, contBB, dispBB);
             builder_.SetInsertPoint(dispBB);
-            emitDisposeAndReclaim(obj);
+            if (it->sharedHandle) {
+                auto* fn = declareC("bz_shared_release",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(fn, {obj});
+            } else if (it->channel) {
+                auto* fn = declareC("bz_channel_dispose",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(fn, {obj});
+            } else if (it->channelSender) {
+                auto* fn = declareC("bz_channel_sender_release",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(fn, {obj});
+            } else if (it->weakHandle) {
+                auto* fn = declareC("bz_weak_release",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(fn, {obj});
+            } else {
+                emitDisposeAndReclaim(obj);
+            }
             builder_.CreateStore(
                 llvm::ConstantPointerNull::get(ptrTy()), addr);
             builder_.CreateBr(contBB);

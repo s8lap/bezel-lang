@@ -4199,14 +4199,24 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                         // transfer keeps a live disposal (mirrors why #1918 nulls
                         // at runtime instead of erasing the registration).
                         // Restricted to a vtable-dispatchable user class/interface
-                        // instance — exactly what registerUnwindOwnedLocal/Param
-                        // and the plain unwindOnly dispatch cover; a builtin owned
-                        // handle (Channel/Shared/…, released by a type-specific
-                        // runtime call, not vtable slot 2) or an erased generic is
-                        // left to its declaring-scope registration. // per §28.3
+                        // instance OR a compiler-known builtin owned handle
+                        // (ChannelSender<T> / Channel<T> / Shared<T> / Weak<T>,
+                        // recognised by head name — same detector as the using-var
+                        // path and #1957's registerUnwindOwnedParam branch) —
+                        // exactly the set `unwindOnly` dispose covers (class via
+                        // vtable slot 2, builtin via the type-specific runtime
+                        // release in the extended unwindOnly block below). A bare
+                        // owned LOCAL of one of these builtin handle types has no
+                        // registerUnwindOwnedLocal registration (unwindOwnedLocalClass
+                        // returns null — no user TypeSymbol) and no registerUnwindOwnedParam
+                        // registration (it is a local, not a param), so without
+                        // THIS transient the local is never released on the caught
+                        // arg-throw — the #2000 leak. An erased generic is
+                        // left to its declaring-scope registration (no class symbol
+                        // and no builtin name). // per §28.3 / §28.4 / §28.6 / §28.13
                         if (!disposeStack_.empty()) {
                             const sema::TypeRef* at = ctx_.exprType(*id);
-                            bool dispatchable =
+                            bool classOrInterface =
                                 at &&
                                 at->kind == sema::TypeRef::Kind::Named &&
                                 at->declaration &&
@@ -4214,9 +4224,34 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                                      ast::TypeDeclKind::Class ||
                                  at->declaration->kind ==
                                      ast::TypeDeclKind::Interface);
-                            if (dispatchable) {
+                            // Mirror the builtinHead detector in
+                            // registerUnwindOwnedParam (#1957). A builtin named
+                            // type carries an astNode + head name but NO user
+                            // TypeSymbol (at->declaration is null) — that is the
+                            // shape ChannelSender/Channel/Shared/Weak resolve to.
+                            std::string_view bhead;
+                            if (at && at->kind == sema::TypeRef::Kind::Named &&
+                                !at->declaration &&
+                                at->astNode && at->astNode->name &&
+                                !at->astNode->name->parts.empty()) {
+                                bhead = at->headName();
+                            }
+                            bool builtinShared    = bhead == "Shared";
+                            bool builtinChannel   = bhead == "Channel";
+                            bool builtinSender    = bhead == "ChannelSender";
+                            bool builtinWeak      = bhead == "Weak";
+                            bool builtin =
+                                builtinShared || builtinChannel ||
+                                builtinSender  || builtinWeak;
+                            if (classOrInterface || builtin) {
                                 Disposal d{s, nullptr};
                                 d.unwindOnly = true;
+                                if (builtin) {
+                                    d.sharedHandle  = builtinShared;
+                                    d.channel       = builtinChannel;
+                                    d.channelSender = builtinSender;
+                                    d.weakHandle    = builtinWeak;
+                                }
                                 disposeStack_.back().push_back(d);
                             }
                         }
