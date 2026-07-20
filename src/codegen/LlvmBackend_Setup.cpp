@@ -3697,9 +3697,24 @@ const sema::TypeRef* Emitter::substituteTypeRefLocal(
                     return it->second;
                 }
             }
-            return t;
+            // #2057 (§14 substitution, v0.201): a null-decl builtin generic
+            // (`Array<T>`, `Dictionary<K,V>`, `Task<T>`, … — declaration
+            // intentionally null per §2.5/§29.3) WITH generic args still recurses
+            // into its args on the failed-head-name path. A bare parameter
+            // placeholder (null decl + empty genericArgs, e.g. the W in
+            // `Array<W>`) has no arg key to substitute and falls through
+            // unchanged; mirroring appendDescKey (#2013) and descTypeArgConcrete
+            // (#2022) which already split null-decl-no-args from null-decl-with-
+            // args. Without the recursion, `instanceDescriptorFor`'s super-chain
+            // walk records the unsubstituted base arg (e.g. `Array<W>` under
+            // `{W: int}`), the inner W stays unbound, and the base falls back
+            // to the shared descriptor — a sound false-negative on `is
+            // Base<Array<int>>` against a `class C<W>: Base<Array<W>>` object
+            // monomorphized at W=int.
+            if (t->genericArgs.empty()) return t;
         }
-        // A constructed type: substitute inside its arguments.
+        // A constructed type (or a null-decl builtin with generic args, #2057):
+        // substitute inside its arguments.
         bool changed = false;
         std::vector<sema::TypeRef*> newArgs;
         newArgs.reserve(t->genericArgs.size());
