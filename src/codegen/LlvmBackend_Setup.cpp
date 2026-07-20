@@ -2460,6 +2460,14 @@ Emitter::builtinExceptionHierarchy() {
         {"DirectoryNotFoundException", "IOException"},
         {"EndOfStreamException", "IOException"},
         {"PathTooLongException", "IOException"},
+        // §22.16 (v0.203, #2053): ContractViolationException — raised by the
+        // always-on requires prologue (and the checked-contracts ensures/
+        // invariant evaluation) when a clause evaluates false. Derives
+        // directly from Exception per §22.16. Mirrored in
+        // kBuiltinExceptionHierarchy (src/common/BuiltinRegistry.cpp); this
+        // codegen-side copy drives the descriptor + vtable population that
+        // `catch ContractViolationException` and the runtime throw go through.
+        {"ContractViolationException", "Exception"},
     };
     return h;
 }
@@ -2962,6 +2970,64 @@ void Emitter::emitThrowBuiltin(const char* name) {
     builder_.CreateStore(obj, emitExcSlot());
     emitUnwindDisposals();
     builder_.CreateBr(unwindBB());
+}
+
+// §22.16 (v0.203, #2053): construct + throw a ContractViolationException
+// carrying `msgStr` (a lowered bz_string pointer) as its Message slot. The
+// Message slot is at byte offset 8 of the uniform kExcObjSize block (§31.4);
+// calloc zero-fills the rest (InnerException/CauseChain/ParamName left null).
+void Emitter::emitThrowContractViolation(llvm::Value* msgStr) {
+    auto vit = builtinVtable_.find("ContractViolationException");
+    if (vit == builtinVtable_.end()) {
+        // Defensive: ContractViolationException is registered in the same
+        // slice as this helper; if it is somehow missing, fall back to a
+        // bare Exception throw so the unwind path is still well-formed.
+        emitThrowBuiltin("Exception");
+        return;
+    }
+    llvm::Value* obj = builder_.CreateCall(
+        callocFn(), {builder_.getInt64(1), builder_.getInt64(kExcObjSize)});
+    builder_.CreateStore(vit->second, obj);
+    // Message ptr is at byte offset 8 — slot 1 of the raw built-in layout.
+    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+    llvm::Value* msgSlot =
+        builder_.CreateGEP(i8Ty, obj, builder_.getInt64(8));
+    builder_.CreateStore(msgStr, msgSlot);
+    builder_.CreateStore(obj, emitExcSlot());
+    emitUnwindDisposals();
+    builder_.CreateBr(unwindBB());
+}
+
+// §22.16 (v0.203, #2053): the always-on requires prologue. For each
+// `requires` clause in declaration order, lower its expression and invert;
+// on false, throw ContractViolationException with a message naming the
+// clause kind and the qualified member. The clause expression is typed
+// `bool` (§22.16 typing) and pure (no effects), so evaluating it before
+// the body is observably equivalent to eliding it for every non-violating
+// call. Purity of the lowering itself is the §22.15 admission's burden.
+void Emitter::emitRequiresPrologue(
+    const std::vector<ast::ContractClause>& clauses,
+    std::string_view typeName, std::string_view memberName) {
+    for (const auto& c : clauses) {
+        if (c.kind != ast::ContractClause::Kind::Requires) continue;
+        if (!c.expr) continue;
+        llvm::Value* condV = lowerExpr(*c.expr);
+        if (!condV) continue;  // lowering failure already diagnosed upstream
+        // §22.16: a clause evaluating false raises ContractViolationException.
+        llvm::Value* failed = builder_.CreateNot(condV, "req.fail");
+        auto* throwBB =
+            llvm::BasicBlock::Create(llvm_, "req.throw", currentFn_);
+        auto* contBB =
+            llvm::BasicBlock::Create(llvm_, "req.cont", currentFn_);
+        builder_.CreateCondBr(failed, throwBB, contBB);
+        builder_.SetInsertPoint(throwBB);
+        std::string msg = std::string("requires precondition of ") +
+                          std::string(typeName) + "." +
+                          std::string(memberName) + " failed";
+        llvm::Value* msgStr = lowerStringLiteral("\"" + msg + "\"", false);
+        emitThrowContractViolation(msgStr);
+        builder_.SetInsertPoint(contBB);
+    }
 }
 
 
@@ -4169,6 +4235,27 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         emitGuardThrow(disposed, "DisposedAccessException");
     }
 
+    // §22.16 (v0.203, #2053): the requires prologue. A `requires` clause
+    // evaluates on EVERY invocation, AFTER argument binding completes and
+    // BEFORE any of the member's own execution — before the body's first
+    // statement, before static-init triggers sibling-type init, before the
+    // checked-disposal guard fires for a public method on a disposed object
+    // (clause violations are caller bugs, not disposal-state bugs). Always-on:
+    // the runtime check is emitted in every build mode (§22.16 "Failure
+    // semantics"). Static methods and entry points are admitted — clauses on
+    // them evaluate the same way.
+    if (ms->decl) {
+        if (auto* md =
+                dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+            if (!md->contractClauses.empty()) {
+                emitRequiresPrologue(
+                    md->contractClauses,
+                    ms->parent ? ms->parent->name : std::string_view{},
+                    md->name);
+            }
+        }
+    }
+
     // CG47: run every static constructor once, before the program's
     // body. The entry point Main is the single root, so calling them at
     // its start runs them before any user code (§22.7).
@@ -5073,6 +5160,20 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     moveOnlyArrayTransferredFn_ = fn;
     collectMoveOnlyArrayTransferred(cd->body);  // §15.3 (#747)
     bindParameters(fn, /*hasThis=*/true, &cs->params);
+
+    // §22.16 (v0.203, #2053): a constructor's `requires` clauses evaluate
+    // AFTER argument binding completes and BEFORE any of the member's own
+    // execution — explicitly before the `base(...)`/`this(...)` chain (which
+    // is the constructor's first execution step). A violation here faults
+    // before any state is touched (clauses are pure: parameters bound, no
+    // body effect has occurred, the object and all arguments are exactly as
+    // the caller left them).
+    if (!cd->contractClauses.empty()) {
+        emitRequiresPrologue(cd->contractClauses,
+                             cs->parent ? cs->parent->name
+                                        : std::string_view{},
+                             "constructor");
+    }
 
     // CG16 (§12.8): a leading `base(...)`/`this(...)` chain call runs
     // before the body. `this(...)` delegates to a sibling ctor (which

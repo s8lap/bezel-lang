@@ -9655,7 +9655,9 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                n == "FileNotFoundException"     ||
                                n == "DirectoryNotFoundException"||
                                n == "EndOfStreamException"      ||
-                               n == "PathTooLongException";
+                               n == "PathTooLongException"      ||
+                               // §22.16 (v0.203, #2053): clause-violation type.
+                               n == "ContractViolationException";
                     };
                     if (beName(ttName)) {
                         ctx_.setExprType(
@@ -11346,7 +11348,9 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                        n == "FileNotFoundException"     ||
                        n == "DirectoryNotFoundException"||
                        n == "EndOfStreamException"      ||
-                       n == "PathTooLongException";
+                       n == "PathTooLongException"      ||
+                       // §22.16 (v0.203, #2053): clause-violation type.
+                       n == "ContractViolationException";
             };
             for (const TypeSymbol* cur = targetType; cur && !isBuiltinExInheritedMember;) {
                 auto* td = dynamic_cast<const ast::TypeDecl*>(cur->decl);

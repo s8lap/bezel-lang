@@ -282,7 +282,9 @@ static bool isBuiltinExceptionTypeName(std::string_view n) {
            n == "FileNotFoundException"     ||
            n == "DirectoryNotFoundException"||
            n == "EndOfStreamException"      ||
-           n == "PathTooLongException";
+           n == "PathTooLongException"      ||
+           // §22.16 (v0.203, #2053): clause-violation exception type.
+           n == "ContractViolationException";
 }
 
 // #625 / §12 / §31: true when `ts` (a user class TypeSymbol) or any user-class

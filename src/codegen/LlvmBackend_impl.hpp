@@ -3893,6 +3893,25 @@ private:
     // CG22: construct + throw a built-in exception by name, then unwind.
     void emitThrowBuiltin(const char* name);
 
+    // §22.16 (v0.203, #2053): construct + throw a ContractViolationException
+    // carrying `msgStr` (a lowered bz_string pointer) as its Message slot,
+    // then unwind. The Message slot is at byte offset 8 of the uniform
+    // kExcObjSize block (§31.4). Leaves the current block terminated.
+    void emitThrowContractViolation(llvm::Value* msgStr);
+
+    // §22.16 (v0.203, #2053): emit the runtime checks for a member's
+    // `requires` clauses — the always-on prologue that runs AFTER argument
+    // binding and BEFORE any of the member's own execution (before a
+    // constructor's `base(...)`/`this(...)` chain, before field initializers,
+    // before the first body statement). Each clause's expression is lowered
+    // and inverted; a false result throws ContractViolationException with a
+    // message naming the clause kind, the enclosing type, and the member.
+    // Source-text-in-message is deferred (recorded decision; the message
+    // carries kind + qualified member name for this slice).
+    void emitRequiresPrologue(
+        const std::vector<ast::ContractClause>& clauses,
+        std::string_view typeName, std::string_view memberName);
+
     // CG20/CG40: throw `excVal` (or re-raise the enclosing catch arm's
     // exception when `excVal` is null and one is in flight): store it to
     // the exception global, dispose the unwound using-vars, and branch to

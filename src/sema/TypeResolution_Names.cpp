@@ -111,6 +111,13 @@ int Resolver::builtinTypeArity(std::string_view n) {
         n == "TimeoutException" || n == "IOException" ||
         n == "FileNotFoundException" || n == "DirectoryNotFoundException" ||
         n == "EndOfStreamException" || n == "PathTooLongException" ||
+        // §22.16 (v0.203, #2053): ContractViolationException — raised by the
+        // always-on requires prologue (and the checked-contracts ensures/
+        // invariant evaluation) when a clause evaluates false. Registered in
+        // the built-in exception hierarchy (kBuiltinExceptionHierarchy, slice
+        // 3) deriving directly from Exception; resolvable here so a
+        // `catch ContractViolationException` arm type-checks.
+        n == "ContractViolationException" ||
         // §31.4 (v0.162): the ExceptionInfo record — the element type of
         // Exception.CauseChain. A zero-arity built-in value type with three
         // string fields (TypeName, Message, StackTrace); resolves without import

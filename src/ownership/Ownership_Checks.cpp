@@ -3153,7 +3153,9 @@ static bool ownershipIsBuiltinExceptionName(std::string_view n) {
            n == "FileNotFoundException"     ||
            n == "DirectoryNotFoundException"||
            n == "EndOfStreamException"      ||
-           n == "PathTooLongException";
+           n == "PathTooLongException"      ||
+           // §22.16 (v0.203, #2053): clause-violation exception type.
+           n == "ContractViolationException";
 }
 
 // §31.2.4 / #811 (v0.162): true when `rt` is a built-in exception type or a
