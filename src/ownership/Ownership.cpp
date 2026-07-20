@@ -1844,6 +1844,23 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
                 ifCondOutOwnedSyms_[&block] = std::move(condSyms);
         }
         handleDischarge(*block.condition);
+        // §27 / §28.3 v0.184 (#1967): a controlling expression (if / while
+        // condition) is reached by handleDischarge but not by the
+        // visitStmt-driven captured-owned-consume prologue, so a lambda
+        // literal that consumes a captured owned binding INSIDE the condition
+        // was never walked. The IIFE form `if (() => do Sink(owned r); end)()
+        // then …` invokes the closure synchronously; the closure body
+        // disposes `r`, the enclosing scope disposes it again — heap UAF.
+        // Run the captured-owned-consume walk on the condition here (this
+        // block has already processed the preceding LocalDeclStmts so any
+        // owned local they seeded is in `states_` and `isCapturedOwnedBinding`
+        // resolves). The scan's LambdaExpr/IIFE arm flips insideLambda to
+        // true on entry, so a closure body inside the condition is scanned
+        // with the borrow-state semantics §28.3 demands. Suppressed on the
+        // report-suppressed fixpoint iterations — same gating as the
+        // visitStmt prologue. // per §27, §28.3 v0.184
+        if (!suppressDiag_) scanCapturedOwnedConsumeExpr(*block.condition,
+                                                         /*insideLambda=*/false);
     }
 }
 

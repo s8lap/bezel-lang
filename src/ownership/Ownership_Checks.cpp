@@ -1808,8 +1808,21 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
                 ++pos;
             }
         }
-        if (call->callee)
-            scanCapturedOwnedConsumeExpr(*call->callee, insideLambda);
+        if (call->callee) {
+            // §27 / §28.3 v0.184 (#1967): an IIFE — `CallExpr` whose callee is
+            // a `LambdaExpr` — invokes the lambda body synchronously, so any
+            // consume inside that body is a captured-owned-consume at the
+            // invocation site. The LambdaExpr arm above flips insideLambda to
+            // true only when a LambdaExpr is reached DIRECTLY; reached via
+            // CallExpr → callee the flip must happen here, otherwise the body
+            // is scanned as outer code and consumes slip through (UAF at scope
+            // end — closure disposes it, enclosing scope disposes it again).
+            const bool calleeIsLambda =
+                dynamic_cast<const ast::LambdaExpr*>(call->callee.get()) !=
+                nullptr;
+            scanCapturedOwnedConsumeExpr(*call->callee,
+                                         insideLambda || calleeIsLambda);
+        }
         for (const auto& a : call->args)
             if (a.value) scanCapturedOwnedConsumeExpr(*a.value, insideLambda);
         return;
