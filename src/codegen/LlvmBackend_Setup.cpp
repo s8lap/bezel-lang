@@ -9560,6 +9560,69 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // #2065 / §8.5 / §9.1 / §9.2 / §4.6 / §28.9 (v0.204): the SYNTHESIZED
+    // `ToString()` on a positional or auto-equality-bearing body record is a
+    // +1 string PRODUCER. It lowers in lowerValueSemMethodOn to emitRecordToString
+    // (LlvmBackend_String.cpp), which builds `"TypeName(Field: value, …)"` via a
+    // chain of emitStringConcat calls; the FINAL concatenation mints the fresh
+    // heap `bz.string` at rc := 1 (initStringRc) that the call hands the caller
+    // as its single +1 reference — exactly the +1 single-reference shape of
+    // `+`/interpolation/primitive-ToString/string.Join/StringBuilder.ToString
+    // above. (The intermediate concats in the chain are a SEPARATE pre-existing
+    // leak path — each is a +1 producer borrowed-then-dropped without an
+    // in-chain release; out of scope for #2065, filed as a follow-up. The FINAL
+    // string — the value the local actually binds — is what #2065 pins.)
+    //
+    // WHY THIS WAS NEEDED. Without this recognition the result was treated as a
+    // BORROW: the local was retained at bind (rc 1→2) and released at scope end
+    // (rc 2→1), so the producer's original +1 was NEVER decremented → leak. Each
+    // iteration of a loop leaked the 32-byte bz.string header + its data buffer
+    // (the #2060 lane's omitted ToString variant, promoted to its own issue as
+    // #2065 — distinct from #1994 WriteLine-arg and #2023 ctor-arg: this is the
+    // method-call-return-into-local shape).
+    //
+    // SOUNDNESS — same anchors as the other synthesized-ToString arms:
+    //   * The synthesized record ToString goes through lowerValueSemMethodOn ONLY
+    //     when no user-defined ToString override resolves on the record (a user
+    //     override is a resolved MethodSymbol handled by isUserMethodStringReturnCall
+    //     below — which already recognizes a user-method string return as +1).
+    //   * Only an auto-bearing record (positional OR auto-equality-bearing body)
+    //     qualifies: the dispatcher returns the type-name STRING LITERAL (a pooled
+    //     immortal sentinel, NOT +1) for an ineligible body record's ToString
+    //     (§8.5), so the +1 recognition must NOT fire there — the literal-binding
+    //     path leaves the slot alone (a sentinel retain/release is a no-op).
+    //   * Enum.ToString also returns a literal (§8.5); excluded by the Record kind
+    //     check below.
+    //   * An ESCAPING local is excluded from the scope-end release by the escape
+    //     walk (its +1 then leaks — the safe direction); the bind TRANSFERS the
+    //     single reference (no extra retain is emitted), so the release drops it
+    //     exactly once. No double-free.
+    // The shape is matched structurally — CallExpr, empty args, member "ToString",
+    // receiver type a Named record, auto-bearing per the SAME positional ||
+    // isAutoEqualityBearingBodyRecord test lowerValueSemMethodOn keys on — so the
+    // producer decision and the lowering decision stay in lockstep.
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (call->args.empty() && call->callee) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+                if (ma->member == "ToString" && ma->target) {
+                    auto* tt = ctx_.exprType(*ma->target);
+                    if (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                        tt->declaration &&
+                        tt->declaration->kind == ast::TypeDeclKind::Record) {
+                        const sema::TypeSymbol* ts = tt->declaration;
+                        bool positional = false;
+                        if (auto* td =
+                                dynamic_cast<const ast::TypeDecl*>(ts->decl))
+                            positional = td->hasPositionalFields;
+                        if (positional ||
+                            sema::isAutoEqualityBearingBodyRecord(ts, ctx_))
+                            return true;  // emitRecordToString → rc=1 heap string
+                    }
+                }
+            }
+        }
+    }
     // §9.6 / §28.3 (#1184): `string.Join(separator, items)` lowers (in
     // LlvmBackend_Calls.cpp) to a freshly malloc'd buffer wrapped in a heap
     // `bz.string` whose rc := 1 (initStringRc) — exactly the +1 single-reference
