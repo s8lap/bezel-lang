@@ -16,6 +16,7 @@
 #include "sema/Sendability.hpp"
 
 #include <functional>
+#include <string>
 #include <string_view>
 #include <unordered_set>
 
@@ -540,6 +541,441 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
         }
     }
     return false; // unknown kind
+}
+
+// ── §14.2 (v0.201 sharpened §3.6 rule 4, #2059) component-path walker ──────
+//
+// Given a type that has just FAILED `isSendableType`, walk its structure to
+// find the first field/element that violates a §30.14 sub-rule and return a
+// fragment (shaped to APPEND to the existing flat diagnostic) naming the
+// offending component and the rule it violates. Returns empty when the
+// verdict cannot be confidently pinned to a single component (the spec
+// sharpening disallows over-promising detail — fall back to the flat
+// message rather than guess). Depth is bounded by `kMaxDepth` to keep the
+// walk terminating and the message readable.
+
+namespace {
+
+constexpr int kMaxDepth = 3;  // component-path chain length cap.
+
+// Display name for a TypeRef suitable for a diagnostic message: prefers the
+// declaration's name; falls back to the syntactic head / stdlib imported
+// name; finally a few kind-based spellings. Returns "<type>" on no verdict.
+std::string typeDisplayName(const TypeRef* rt) {
+    if (!rt) return "<type>";
+    if (rt->kind == TypeRef::Kind::Named) {
+        if (rt->declaration) return std::string(rt->declaration->name);
+        if (!rt->headName().empty()) return std::string(rt->headName());
+        return "<type>";
+    }
+    if (rt->kind == TypeRef::Kind::Primitive) {
+        using P = PrimitiveType;
+        switch (rt->primitive) {
+            case P::Bool:    return "bool";
+            case P::Char:    return "char";
+            case P::String:  return "string";
+            case P::Int:     return "int";
+            case P::Object:  return "Object";
+            case P::Byte:    return "byte";
+            case P::SByte:   return "sbyte";
+            case P::Short:   return "short";
+            case P::UShort:  return "ushort";
+            case P::UInt:    return "uint";
+            case P::Long:    return "long";
+            case P::ULong:   return "ulong";
+            case P::Float:   return "float";
+            case P::Double:  return "double";
+            case P::Decimal: return "decimal";
+            default:         return "primitive";
+        }
+    }
+    if (rt->kind == TypeRef::Kind::Function) return "function type";
+    if (rt->kind == TypeRef::Kind::InlineArray)
+        return rt->arrayOwned ? "[N owned]T" : "[N]T";
+    if (rt->kind == TypeRef::Kind::Unit) return "()";
+    return "<type>";
+}
+
+// True iff `rt` is a builtin stdlib type whose sendability is decided by a
+// §30.14 stdlib-table override (rather than by walking its fields). The
+// component-path walker bails on these — the stdlib rule, not a field, is
+// the structural reason, and the flat diagnostic already names §30.14.
+bool isStdlibSendabilityOverride(const TypeRef* rt) {
+    if (!rt || rt->kind != TypeRef::Kind::Named) return false;
+    if (rt->declaration) return false;  // user-declared → walk its fields
+    return !rt->headName().empty();     // builtin-name sentinel
+}
+
+// One-level walk for a user-declared record: returns the diagnostic fragment
+// naming the first field whose own type is non-sendable per the §30.14 /
+// §9.7 record rule, or empty when no single field can be pinned.
+std::string recordFailurePath(const TypeRef* rt, SemaContext& ctx, int depth) {
+    const TypeSymbol* decl = rt->declaration;
+    if (!decl) return {};
+    const auto* td = dynamic_cast<const ast::TypeDecl*>(decl->decl);
+
+    // Per-field predicate matching Sendability.cpp's `fieldSendable` (record
+    // branch): a field fails when its type is function-typed, Object-typed,
+    // an interface, a class (records hold only borrows; §9.7 forbids owned
+    // record fields), or a non-sendable builtin / nested record.
+    auto checkOne = [&](const TypeRef* ft) -> std::string {
+        if (!ft) return {};
+        if (ft->kind == TypeRef::Kind::Function)
+            return "has function type (§30.14 value-type rule)";
+        if (ft->kind == TypeRef::Kind::Primitive &&
+            ft->primitive == PrimitiveType::Object)
+            return "has `Object` type (§30.14 value-type rule)";
+        if (ft->kind == TypeRef::Kind::Named && ft->declaration &&
+            ft->declaration->kind == ast::TypeDeclKind::Interface)
+            return std::string("has interface type `") +
+                   typeDisplayName(ft) + "` (§30.14 value-type rule)";
+        if (ft->kind == TypeRef::Kind::Named && ft->declaration &&
+            ft->declaration->kind == ast::TypeDeclKind::Class)
+            return std::string("has class type `") +
+                   typeDisplayName(ft) +
+                   "` (§9.7 borrow-bearing record)";
+        if (ft->kind == TypeRef::Kind::Named && ft->declaration &&
+            ft->declaration->kind == ast::TypeDeclKind::Record) {
+            if (isSendableType(ft, ctx)) return {};
+            std::string sub;
+            if (depth + 1 < kMaxDepth) sub = recordFailurePath(ft, ctx, depth + 1);
+            return std::string("has record type `") +
+                   typeDisplayName(ft) + "` that is not sendable" + sub;
+        }
+        if (ft->kind == TypeRef::Kind::Named && !ft->declaration &&
+            !ft->headName().empty() &&
+            !isSendableType(ft, ctx))
+            return std::string("has type `") + typeDisplayName(ft) +
+                   "` that is not sendable (§30.14 value-type rule)";
+        if (ft->kind == TypeRef::Kind::InlineArray &&
+            !isSendableType(ft, ctx))
+            return std::string("has inline-array type `") +
+                   typeDisplayName(ft) + "` that is not sendable";
+        return {};
+    };
+
+    // AST path: positional fields, body fields, auto-properties.
+    if (td) {
+        for (const ast::Param& f : td->positionalFields) {
+            if (!f.type || f.name.empty()) continue;
+            const TypeRef* ft = ctx.resolvedType(*f.type);
+            if (!ft) continue;
+            std::string verdict = checkOne(ft);
+            if (!verdict.empty())
+                return std::string("field `") + std::string(f.name) + "` " +
+                       verdict;
+        }
+        for (const auto& m : td->members) {
+            std::string_view fName;
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get())) {
+                if (!fd->type) continue;
+                fName = fd->name;
+                const TypeRef* ft = ctx.resolvedType(*fd->type);
+                if (!ft) continue;
+                std::string verdict = checkOne(ft);
+                if (!verdict.empty())
+                    return std::string("field `") + std::string(fName) + "` " +
+                           verdict;
+            } else if (auto* pd =
+                           dynamic_cast<const ast::PropertyDecl*>(m.get())) {
+                if (pd->bodyKind != ast::PropertyBodyKind::Auto || !pd->type)
+                    continue;
+                fName = pd->name;
+                const TypeRef* ft = ctx.resolvedType(*pd->type);
+                if (!ft) continue;
+                std::string verdict = checkOne(ft);
+                if (!verdict.empty())
+                    return std::string("field `") + std::string(fName) + "` " +
+                           verdict;
+            }
+        }
+        return {};
+    }
+
+    // #1824 imported-record path: walk reconstructed storage members via
+    // the side table (no ast::TypeDecl available). Positional / body fields
+    // and auto-properties all reconstruct as Field/Property members here.
+    for (Symbol* ms : decl->members) {
+        std::string_view fName;
+        if (auto* fs = dynamic_cast<const FieldSymbol*>(ms)) {
+            if (fs->posParam && !fs->posParam->name.empty())
+                fName = fs->posParam->name;
+            else
+                fName = fs->name;
+        } else if (auto* ps = dynamic_cast<const PropertySymbol*>(ms)) {
+            if (ps->isIndexer) continue;
+            fName = ps->name;
+        } else {
+            continue;
+        }
+        if (fName.empty()) continue;
+        const TypeRef* ft = ctx.importedMemberType(ms);
+        if (!ft) continue;
+        std::string verdict = checkOne(ft);
+        if (!verdict.empty())
+            return std::string("field `") + std::string(fName) + "` " + verdict;
+    }
+    return {};
+}
+
+// One-level walk for a user-declared sealed class: returns the diagnostic
+// fragment naming the first field that violates §30.14 rule 2 or rule 3
+// (after rule 1 — sealing — is already verified by the caller), or empty
+// when no single field can be pinned. Mirrors Sendability.cpp's class
+// branch `checkField` exactly so the verdict never disagrees with the
+// property computation.
+std::string sealedClassFailurePath(const TypeRef* rt, SemaContext& ctx,
+                                   int depth) {
+    const TypeSymbol* decl = rt->declaration;
+    if (!decl) return {};
+
+    // Per-field predicate mirroring Sendability.cpp's class branch
+    // `checkField`: function / Object / interface / class-not-owned /
+    // class-owned-non-sendable / nested-non-sendable.
+    auto checkOne = [&](const TypeRef* ft, bool isOwned) -> std::string {
+        if (!ft) return {};
+        if (ft->kind == TypeRef::Kind::Function)
+            return "has function type (§30.14 rule 3)";
+        if (ft->kind == TypeRef::Kind::Primitive &&
+            ft->primitive == PrimitiveType::Object)
+            return "has `Object` type (§30.14 rule 3)";
+        if (ft->kind == TypeRef::Kind::Named && ft->declaration &&
+            ft->declaration->kind == ast::TypeDeclKind::Interface)
+            return std::string("has interface type `") +
+                   typeDisplayName(ft) + "` (§30.14 rule 3)";
+        if (ft->kind == TypeRef::Kind::Named && ft->declaration &&
+            ft->declaration->kind == ast::TypeDeclKind::Class) {
+            if (!isOwned)
+                return std::string("has class type `") +
+                       typeDisplayName(ft) +
+                       "` that is not `owned` (§30.14 rule 3)";
+            if (isSendableType(ft, ctx)) return {};
+            // Owned-but-non-sendable class field: recurse one level for the
+            // inner reason (typically "not sealed" or another offending
+            // field) so the diagnostic chain stays informative.
+            std::string sub;
+            if (depth + 1 < kMaxDepth) {
+                bool innerSealed = false;
+                for (auto mod : ft->declaration->modifiers)
+                    if (mod == "sealed") { innerSealed = true; break; }
+                sub = innerSealed ? sealedClassFailurePath(ft, ctx, depth + 1)
+                                  : std::string(" class `") +
+                                        typeDisplayName(ft) +
+                                        "` is not sealed (§30.14 rule 1)";
+            }
+            return std::string("has `owned` class type `") +
+                   typeDisplayName(ft) + "` that is not sendable" + sub;
+        }
+        if (!isSendableType(ft, ctx))
+            return std::string("has type `") + typeDisplayName(ft) +
+                   "` that is not sendable (§30.14 rule 2)";
+        return {};
+    };
+
+    // AST path: walk own members then inherited members.
+    auto walkAtd = [&](const ast::TypeDecl* atd) -> std::string {
+        for (const auto& m : atd->members) {
+            std::string_view fName;
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get())) {
+                if (!fd->type) continue;
+                fName = fd->name;
+                const TypeRef* ft = ctx.resolvedType(*fd->type);
+                if (!ft) continue;
+                bool isOwned = false;
+                for (auto mod : fd->modifiers)
+                    if (mod == "owned") { isOwned = true; break; }
+                std::string verdict = checkOne(ft, isOwned);
+                if (!verdict.empty())
+                    return std::string("field `") + std::string(fName) + "` " +
+                           verdict;
+            } else if (auto* pd =
+                           dynamic_cast<const ast::PropertyDecl*>(m.get())) {
+                if (pd->bodyKind != ast::PropertyBodyKind::Auto || !pd->type)
+                    continue;
+                fName = pd->name;
+                const TypeRef* ft = ctx.resolvedType(*pd->type);
+                if (!ft) continue;
+                bool isOwned = false;
+                for (auto mod : pd->modifiers)
+                    if (mod == "owned") { isOwned = true; break; }
+                std::string verdict = checkOne(ft, isOwned);
+                if (!verdict.empty())
+                    return std::string("field `") + std::string(fName) + "` " +
+                           verdict;
+            }
+        }
+        return {};
+    };
+
+    // Imported-class path: reconstructed storage members via the side table
+    // (#1732). Same predicate; the `owned` modifier rides MemberSymbol.
+    auto walkReconstructed = [&](const TypeSymbol* ts) -> std::string {
+        for (Symbol* ms : ts->members) {
+            const MemberSymbol* mem = nullptr;
+            std::string_view fName;
+            if (auto* fs = dynamic_cast<const FieldSymbol*>(ms)) {
+                mem = fs;
+                if (fs->posParam && !fs->posParam->name.empty())
+                    fName = fs->posParam->name;
+                else
+                    fName = fs->name;
+            } else if (auto* ps = dynamic_cast<const PropertySymbol*>(ms)) {
+                if (ps->isIndexer) continue;
+                mem = ps;
+                fName = ps->name;
+            } else {
+                continue;
+            }
+            if (fName.empty()) continue;
+            const TypeRef* ft = ctx.importedMemberType(ms);
+            if (!ft) continue;
+            bool isOwned = false;
+            for (auto mod : mem->modifiers)
+                if (mod == "owned") { isOwned = true; break; }
+            std::string verdict = checkOne(ft, isOwned);
+            if (!verdict.empty())
+                return std::string("field `") + std::string(fName) + "` " +
+                       verdict;
+        }
+        return {};
+    };
+
+    if (const auto* td = dynamic_cast<const ast::TypeDecl*>(decl->decl)) {
+        if (std::string r = walkAtd(td); !r.empty()) return r;
+    } else {
+        if (std::string r = walkReconstructed(decl); !r.empty()) return r;
+    }
+    for (const TypeSymbol* base : decl->baseTypes) {
+        if (!base || base->kind != ast::TypeDeclKind::Class) continue;
+        const auto* btd = dynamic_cast<const ast::TypeDecl*>(base->decl);
+        if (btd) {
+            if (std::string r = walkAtd(btd); !r.empty()) return r;
+        } else {
+            if (std::string r = walkReconstructed(base); !r.empty()) return r;
+        }
+    }
+    return {};
+}
+
+}  // namespace
+
+std::string sendableFailureComponentPath(const TypeRef* rt, SemaContext& ctx) {
+    if (!rt || rt->kind == TypeRef::Kind::Error) return {};
+
+    // §30.14: function-typed values are never sendable — flat reason at the
+    // root, no component chain to walk.
+    if (rt->kind == TypeRef::Kind::Function) return {};
+
+    // Fragment prefix — every successful return below starts with this so
+    // the message reads naturally after the parent diagnostic's §14.2
+    // citation: "...does not satisfy the constraint `where T: sendable`
+    // (§14.2): field `f` has class type `X` ...".
+    constexpr char kPrefix[] = ": ";
+
+    // InlineArray. [N owned]T is move-only per §15.3 (flat reason); [N]T is
+    // a value array whose element determines sendability.
+    if (rt->kind == TypeRef::Kind::InlineArray) {
+        if (rt->arrayOwned) return {};  // move-only — flat reason
+        if (!rt->arrayElement) return {};
+        const TypeRef* elem = rt->arrayElement;
+        if (isSendableType(elem, ctx)) return {};  // unexpected — bail
+        if (elem->kind == TypeRef::Kind::Primitive &&
+            elem->primitive == PrimitiveType::Object)
+            return std::string(kPrefix) +
+                   "element type `Object` is not sendable "
+                   "(§30.14 value-type rule)";
+        if (isUserClass(elem))
+            return std::string(kPrefix) + "element class type `" +
+                   typeDisplayName(elem) +
+                   "` is a borrow (§30.14 value-type rule)";
+        if (isUserRecord(elem)) {
+            // Recurse one level into the element record for a deeper chain.
+            std::string sub = recordFailurePath(elem, ctx, 1);
+            return std::string(kPrefix) + "element record type `" +
+                   typeDisplayName(elem) + "` is not sendable" +
+                   (sub.empty() ? std::string() : std::string(": ") + sub);
+        }
+        return std::string(kPrefix) + "element type `" +
+               typeDisplayName(elem) +
+               "` is not sendable (§30.14 value-type rule)";
+    }
+
+    // Primitives: only `Object` fails among the primitives — flat reason.
+    if (rt->kind == TypeRef::Kind::Primitive) {
+        if (rt->primitive == PrimitiveType::Object)
+            return std::string(kPrefix) +
+                   "`Object` is not sendable (§30.14 value-type rule)";
+        return {};  // other primitives are sendable — unexpected, bail.
+    }
+
+    if (rt->kind != TypeRef::Kind::Named) return {};
+
+    // Builtin stdlib type decided by a §30.14 stdlib-table override (Task<T>,
+    // Weak<T>, Channel/atomics, etc.) — the §30.14 stdlib rule, not a field,
+    // is the structural reason. The flat diagnostic already names §30.14.
+    if (isStdlibSendabilityOverride(rt)) return {};
+
+    const TypeSymbol* decl = rt->declaration;
+    if (!decl) return {};
+
+    // Interface at root: flat reason ("interface types are never sendable"
+    // per §30.14 rule 3's reasoning) — no component to walk.
+    if (decl->kind == ast::TypeDeclKind::Interface) return {};
+
+    // Enum at root: sendable by §30.14 — would not reach here.
+    if (decl->kind == ast::TypeDeclKind::Enum) return {};
+
+    // Choice: borrow-bearing / owning choices are non-sendable for a
+    // category-level §35.4 / §35.12 reason (flat). Value-like choices with
+    // a non-sendable payload field name that payload.
+    if (decl->kind == ast::TypeDeclKind::Choice) {
+        auto verdict = common::classifyChoiceType(rt, ctx);
+        if (!verdict) return {};
+        if (*verdict != common::ChoiceClassification::ValueLike)
+            return {};  // category-level — flat reason
+        const auto* td = dynamic_cast<const ast::TypeDecl*>(decl->decl);
+        if (!td) return {};
+        for (const auto& cc : td->choiceCases) {
+            for (const auto& pf : cc.payload) {
+                if (!pf.type) continue;
+                const TypeRef* ft = ctx.resolvedType(*pf.type);
+                if (!ft) continue;
+                if (!isSendableType(ft, ctx)) {
+                    std::string_view pName =
+                        !pf.name.empty() ? pf.name : cc.name;
+                    return std::string(kPrefix) + "payload `" +
+                           std::string(pName) + "` of type `" +
+                           typeDisplayName(ft) +
+                           "` is not sendable (§35.12)";
+                }
+            }
+        }
+        return {};
+    }
+
+    // Record: walk fields for the first non-sendable component per §9.7 /
+    // §30.14 (borrow-bearing record).
+    if (decl->kind == ast::TypeDeclKind::Record) {
+        std::string inner = recordFailurePath(rt, ctx, 0);
+        return inner.empty() ? std::string() : std::string(kPrefix) + inner;
+    }
+
+    // Class: §30.14 transfer-closed rules.
+    if (decl->kind == ast::TypeDeclKind::Class) {
+        // Rule 1: sealing. A non-sealed class fails at the root for a
+        // structural reason the field walk cannot pin — name the rule.
+        bool isSealed = false;
+        for (auto mod : decl->modifiers)
+            if (mod == "sealed") { isSealed = true; break; }
+        if (!isSealed)
+            return std::string(kPrefix) +
+                   "class is not sealed (§30.14 rule 1)";
+        // Sealed: walk fields per rule 2/3.
+        std::string inner = sealedClassFailurePath(rt, ctx, 0);
+        return inner.empty() ? std::string() : std::string(kPrefix) + inner;
+    }
+
+    return {};
 }
 
 }  // namespace bezel::sema

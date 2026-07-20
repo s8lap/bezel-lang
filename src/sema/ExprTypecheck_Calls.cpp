@@ -1803,13 +1803,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (ai == subst.end() || !ai->second) continue;
                             TypeRef* argRef = ai->second;
                             TypeSymbol* argDecl = argRef->declaration;  // may be null
-                            auto report = [&](const std::string& reason) {
-                                ctx_.diagnostics().report(
-                                    Severity::Error, ce.span.begin,
+                            auto report = [&](const std::string& reason,
+                                              const std::string& detail = {}) {
+                                // §3.6 rule 4 (sharpened v0.201, #2059):
+                                // a derived-property constraint failure may
+                                // carry a component-path fragment naming the
+                                // offending field/element + the failing sub-
+                                // rule. APPENDED after the §14.2 citation
+                                // (the fragment carries its own backticks).
+                                std::string msg =
                                     "type argument `" + argNameOf(argRef) +
                                     "` does not satisfy the constraint `where " +
                                     std::string(gc.typeParam) + ": " + reason +
-                                    "` (§14.2)");
+                                    "` (§14.2)";
+                                if (!detail.empty()) msg += detail;
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin, msg);
                             };
                             for (const auto& item : gc.items) {
                                 if (item.kind == "type" && item.typeArg) {
@@ -1959,9 +1968,21 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     // (Resolver::checkOneConstraint) and the
                                     // call-site arg/result sendable gates use.
                                     // Defer on an Error TypeRef.
+                                    //
+                                    // §3.6 rule 4 (sharpened v0.201, #2059): the
+                                    // diagnostic NAMES the structural reason "as
+                                    // a component path" — the offending field /
+                                    // element chain + the failing §30.14 rule.
+                                    // The component-path fragment is APPENDED
+                                    // after the §14.2 citation only when the
+                                    // shared walk confidently pins the failure
+                                    // to a single component; ambiguous verdicts
+                                    // fall back to the flat message.
                                     if (argRef->kind != TypeRef::Kind::Error &&
                                         !isSendableType(argRef, ctx_))
-                                        report("sendable");
+                                        report("sendable",
+                                               sendableFailureComponentPath(
+                                                   argRef, ctx_));
                                 } else if (item.kind == "new") {
                                     // §14.2 (#864 part 2): `where T: new()`
                                     // requires an accessible parameterless ctor.

@@ -27,6 +27,7 @@
 // single-arg overload) and the implementation threads it through the
 // recursive sub-calls.
 
+#include <string>
 #include <unordered_set>
 
 #include "sema/SemaContext.hpp"
@@ -46,5 +47,30 @@ inline bool isSendableType(const TypeRef* rt, SemaContext& ctx) {
     std::unordered_set<const TypeSymbol*> ip;
     return isSendableType(rt, ctx, ip);
 }
+
+// §14.2 (v0.201 sharpened §3.6 rule 4, #2059): given a type that has just
+// FAILED the §30.14 sendability check, walk its structure to identify the
+// FIRST structural reason for failure and return a component-path fragment
+// naming the offending field/element + the failing §30.14 rule, shaped to
+// APPEND to the existing flat constraint-failure diagnostic, e.g.
+//   ": field `f` of type `Open` is not owned (§30.14 rule 3)"
+//   ": element type `Open` is not sendable (§30.14 value-type rule)"
+//   ": class is not sealed (§30.14 rule 1)"
+//
+// Returns empty when the walk is ambiguous (generic-parameter reference,
+// stdlib compiler-known override, function-typed value at the root, an
+// unresolved / Error TypeRef, or any other verdict the structural walk
+// cannot confidently pin to a single field-or-element chain) — callers
+// then keep the existing flat message rather than over-promising detail.
+// The depth-bounded walk terminates at a non-recursing leaf (typically
+// the first field whose own type is non-sendable for a non-structural
+// reason; nested sealed-class chains recurse one level deep).
+//
+// Used by BOTH constraint-check sites — the type-instantiation site
+// (Resolver::checkOneConstraint in TypeResolution_Checks.cpp) and the
+// method-call site (checkMethodGenericConstraints in
+// ExprTypecheck_Calls.cpp) — per the #2059 deferral-from-#2050 note:
+// "the component-path machinery is shared by both check sites".
+std::string sendableFailureComponentPath(const TypeRef* rt, SemaContext& ctx);
 
 }  // namespace bezel::sema

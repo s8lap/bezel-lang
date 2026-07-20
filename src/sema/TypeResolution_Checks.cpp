@@ -3320,12 +3320,19 @@ void Resolver::checkOneConstraint(const ast::Type& t,
                                   Scope* boundScope) {
     const std::string param(paramName);
     const std::string argName = argSpelling(argAst);
-    auto report = [&](const std::string& reason) {
-        ctx_.diagnostics().report(
-            Severity::Error, t.span.begin,
+    auto report = [&](const std::string& reason,
+                      const std::string& detail = {}) {
+        // §3.6 rule 4 (sharpened v0.201, #2059): a derived-property
+        // constraint failure may carry a component-path fragment naming
+        // the offending field/element + the failing sub-rule. The fragment
+        // is APPENDED after the §14.2 citation (not inside the `where T: …`
+        // backtick enclosure — the fragment carries its own backticks).
+        std::string msg =
             std::string("type argument `") + argName +
             "` does not satisfy the constraint `where " + param + ": " +
-            reason + "` (§14.2)");
+            reason + "` (§14.2)";
+        if (!detail.empty()) msg += detail;
+        ctx_.diagnostics().report(Severity::Error, t.span.begin, msg);
     };
 
     if (item.kind == "notnull") {
@@ -3368,8 +3375,17 @@ void Resolver::checkOneConstraint(const ast::Type& t,
         // The diagnostic at the instantiation site replaces the interior one
         // the caller would otherwise hit (§14.2). Defer on an Error TypeRef
         // (an upstream failure has already been reported).
+        //
+        // §3.6 rule 4 (sharpened v0.201, #2059): the diagnostic NAMES the
+        // structural reason "as a component path" — the offending field /
+        // element chain + the failing §30.14 rule. The flat "sendable"
+        // spelling remains; the component-path fragment is APPENDED only
+        // when the structural walk confidently pins the failure to a
+        // single component (conservative — falls back to the flat message
+        // rather than over-promising detail on ambiguous verdicts).
         if (arg->kind == TypeRef::Kind::Error) return;
-        if (!isSendableType(arg, ctx_)) report("sendable");
+        if (!isSendableType(arg, ctx_))
+            report("sendable", sendableFailureComponentPath(arg, ctx_));
         return;
     }
     if (item.kind == "type") {
