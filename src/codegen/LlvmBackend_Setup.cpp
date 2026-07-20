@@ -13407,6 +13407,58 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
             isClassOrInterfaceRef(resolveTypeParamRef(initTy)))
             return true;
     }
+    // (a1u) §28.6 / §28.10 (v0.180, #1972): the UNMARKED sibling of (a1) — a
+    // bare-identifier binding whose (possibly INFERRED) type is a class or
+    // interface and which is UNANNOTATED, with NO `owned` marker on the
+    // initializer: `using var y := x;` / `var y := x;` where the source is
+    // interface-typed. The ownership pass (handleLocalDecl, using-var adoption
+    // block) treats an unmarked `using var y := x;` over an owned source as an
+    // adoption: `y`'s state is Owned+implicitDischarge and `x` is moved-from. An
+    // INTERFACE-typed owned source has no disposerFns_ entry (classOfLocal returns
+    // the interface symbol), so neither the static class-of-local path nor any
+    // existing branch of this classifier matched this shape, and the adopted
+    // value LEAKED on the NORMAL path at scope end. Register a single dynamic
+    // (vtable-slot-2) dispose here — exactly-once, mirroring (a1) without the
+    // marker check. The plain-`var` affine auto-drop path in lowerStmt also
+    // routes through this function (registerUsingDisposal), so the same fix
+    // covers `var y := x;` over an interface-typed owned source. GATED on the
+    // source being OWNED — a borrow local (usingVarSourceIsBorrow, set by
+    // handleLocalDecl for any named owned-binding read classified Borrowed) or a
+    // non-`owned` parameter (modifier != "owned") is a borrow pin (#1274 /
+    // #1285), not an adoption, and the disposal the using-var's real owner
+    // registers is the sole one. Without this gate, a `using var c := x;` over a
+    // Cell-typed BORROW param would re-register a second dispose and double-free
+    // (#1274). A CLASS-typed source returns before this function via
+    // classOfLocal's static path, so this fires only for the interface / erased-
+    // generic case — no double-registration. // per §28.6 #1972 (mirrors #1962)
+    if (!ld->initializerHasOwnedMarker && ld->initializer &&
+        !ld->type &&
+        dynamic_cast<const ast::IdentifierExpr*>(ld->initializer.get())) {
+        // Source-must-be-owned gate: skip borrow pins.
+        bool sourceIsOwned = false;
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                ld->initializer.get())) {
+            if (auto* sym = ctx_.exprSymbol(*id)) {
+                if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+                    // §28.8: a parameter with the `owned` modifier carries an
+                    // obligation; a borrow parameter (no modifier) does not.
+                    sourceIsOwned = (ps->modifier == "owned");
+                } else {
+                    // Local source — handleLocalDecl sets usingVarSourceIsBorrow
+                    // whenever the source's tracked state is Borrowed (#1285);
+                    // absent or false ⇒ source is Owned and the using-var
+                    // adopts. (Fields / statics aren't bare-id sources here.)
+                    sourceIsOwned = !ld->usingVarSourceIsBorrow;
+                }
+            }
+        }
+        if (sourceIsOwned) {
+            const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
+            if (isClassOrInterfaceRef(initTy) ||
+                isClassOrInterfaceRef(resolveTypeParamRef(initTy)))
+                return true;
+        }
+    }
     // (a2) §28.3 arm-meet (v0.184, #1661): an inferred `using var x := new T()
     // if c else Make();` (both arms fresh owned producers) — an owned-meet
     // if/case initializer. classOfLocal captures no class for an untyped
