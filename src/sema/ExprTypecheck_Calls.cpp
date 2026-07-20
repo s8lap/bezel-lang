@@ -11074,7 +11074,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // Deserialize which only reads typed results from binder calls).
             }
         } else if (targetType->kind == ast::TypeDeclKind::Record ||
-                   targetType->kind == ast::TypeDeclKind::Enum) {
+                   targetType->kind == ast::TypeDeclKind::Enum ||
+                   targetType->kind == ast::TypeDeclKind::Choice) {
             // §8 / §9 / §10: the value-semantics members the compiler
             // synthesizes for records and enums. No MemberSymbol exists for
             // them, but the call result is well-typed so callers (and string
@@ -11116,6 +11117,32 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         " `=` and `<>` overloads (with `Equals`/`GetHashCode`),"
                         " or simplify the record to an auto-equality-bearing"
                         " form.");
+                }
+            }
+            // §35.7 (v0.200, #2045): a choice that is NOT value-like rejects
+            // direct `.Equals(...)` / `.GetHashCode()` at the call site,
+            // mirroring the record rule above (§9.2 use-site discipline).
+            if ((m == "Equals" || m == "GetHashCode") &&
+                targetType->kind == ast::TypeDeclKind::Choice) {
+                sema::TypeRef rt;
+                rt.kind = sema::TypeRef::Kind::Named;
+                rt.declaration = targetType;
+                auto verdict = common::classifyChoiceType(&rt, ctx_);
+                if (verdict &&
+                    *verdict != common::ChoiceClassification::ValueLike) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "`." + std::string(m) + "` is not available on choice `" +
+                        std::string(targetType->name) +
+                        "`: it is not auto-equality-bearing (§35.7) — the "
+                        "choice is " +
+                        (*verdict == common::ChoiceClassification::Owning
+                             ? "owning"
+                             : "borrow-bearing") +
+                        ", and a non-value-like choice carries no value "
+                        "equality. Declare `=` and `<>` overloads (with "
+                        "`Equals`/`GetHashCode`), or restructure to a "
+                        "value-like choice.");
                 }
             }
             if (m == "ToString")

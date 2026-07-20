@@ -1,6 +1,7 @@
 #include "sema/ExprTypecheck_impl.hpp"
 
 #include "common/BuiltinRegistry.hpp"
+#include "common/OwnershipFacts.hpp"  // §35.7 (#2045): classifyChoiceType
 
 #include <cmath>
 #include <unordered_set>
@@ -3025,6 +3026,34 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                         " `=` and `<>` overloads (with `Equals`/`GetHashCode`),"
                         " or simplify the record to an auto-equality-bearing form.");
                     break;
+                }
+            }
+            // §35.7 (v0.200, #2045): a choice that is NOT value-like — any
+            // borrow-bearing or owning choice — draws §9.2's use-site
+            // compile error on `=`/`<>`, exactly as a non-auto-equality-
+            // bearing record does. (A value-like choice with an
+            // inadmissible payload also rejects per §35.7's recursive
+            // admissibility rule, but that recursion is deferred — the
+            // classification-driven rule covers the common cases.)
+            if (ts && ts->kind == ast::TypeDeclKind::Choice) {
+                sema::TypeRef rt;
+                rt.kind = sema::TypeRef::Kind::Named;
+                rt.declaration = ts;
+                auto verdict = common::classifyChoiceType(&rt, ctx_);
+                if (verdict &&
+                    *verdict != common::ChoiceClassification::ValueLike) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, be.span.begin,
+                        "`" + std::string(op) + "` is not available on choice `" +
+                        std::string(ts->name) + "`: it is not auto-equality-"
+                        "bearing (§35.7) — the choice is " +
+                        (*verdict == common::ChoiceClassification::Owning
+                             ? "owning"
+                             : "borrow-bearing") +
+                        ", and a non-value-like choice carries no value "
+                        "equality. Declare `=` and `<>` overloads (with "
+                        "`Equals`/`GetHashCode`), or restructure to a "
+                        "value-like choice.");
                 }
             }
         }
