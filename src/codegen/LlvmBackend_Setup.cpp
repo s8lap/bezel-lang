@@ -8407,31 +8407,7 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
             // #1349 merge-gate ASan probe) nor disposed on an exception unwind,
             // and §28.7 drop-on-overwrite skipped it. Mirrors the using-var
             // allowlist (usingVarOwnsClassObjectDynamically b2).
-            //
-            // #1970 / §28.4 / §28.6: extend this to the EXCLUDED owning-
-            // collection element-insert shapes from the #1955 pre-gate review —
-            // OwningSet.Add dedup, OwningLinkedList.AddFirst/AddLast/AddBefore/
-            // AddAfter, OwningDictionary.Add + indexer-set — whose transfer-
-            // lowering now nulls the caller's slot (see the
-            // nullTransferredOwnedLocalSlot calls in LlvmBackend_Calls.cpp,
-            // LlvmBackend_Calls3.cpp, LlvmBackend_Assign.cpp, and
-            // LlvmBackend_Exprs2.cpp). Admitting them here lets a plain
-            // `var b := new R(); ll.AddLast(owned b);` be tracked as owned,
-            // so the auto-dispose covers the throw-BEFORE edge.
-            //
-            // Note: do NOT require `!ms` here — the #1970 shapes (OwningSet/Set/
-            // OwningDictionary element-transfer methods, OwningLinkedList
-            // AddFirst/AddLast/AddBefore/AddAfter) DO carry a user-level
-            // MethodSymbol (the stdlib method declarations are user code),
-            // so `ms` is non-null for them. The discriminator is the
-            // isBuiltinOwnedTransferCall predicate itself, which already gates
-            // on the builtin-owned-transfer RECOGNIZED set (PopLast/PopFirst/
-            // PopAt/PopValue for the standard owned collections, plus the
-            // #1970 extension). The user-method (b) arm above handles the
-            // ordinary `var x := M(owned b)` case where ms->decl is a
-            // user MethodDecl; this b3 arm handles the BUILTIN shapes whose
-            // codegen knows the transfer semantics.
-            if (isBuiltinOwnedTransferCall(*call)) {
+            if (!ms && isBuiltinOwnedTransferCall(*call)) {
                 const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
                 if (isClassOrInterfaceRef(initTy)) {
                     if (initTy->kind == sema::TypeRef::Kind::Named &&
@@ -8729,40 +8705,27 @@ inline bool calleeIsUserMethod(const sema::SemaContext& ctx,
 // argument's local eligible for unwind disposal (the null-guarded unwindOnly
 // disposal stays exactly-once), as it does for an ordinary user method.
 //
-// #1970 / §28.4 / §28.6 extends the allowlist with the EXCLUDED shapes from
-// the #1955 pre-gate review (OwningSet.Add dedup-insert, OwningLinkedList
-// AddFirst/AddLast/AddBefore/AddAfter, OwningDictionary.Add + indexer-set).
-// Each of those transfer-lowering sites now calls
-// `nullTransferredOwnedLocalSlot` for a bare owned local/param element
-// argument, so admitting them in the walker keeps the `eligible ⟹ nulled`
-// invariant exact — a throw BEFORE the call disposes the still-live value
-// once, a throw AFTER skips the already-transferred value (no double-free
-// with the recipient's own disposal). A BORROWING collection
-// (`Array<T>.Add`) is likewise excluded — no ownership transfer, the caller
-// keeps ownership.
+// This is a deliberate ALLOWLIST, not a broad `isOwningPrefixedName` check,
+// because the invariant the two sites must jointly preserve is `eligible ⟹
+// nulled`. The other owning collections take insert paths that do NOT null:
+// OwningSet.Add dedup-inserts (emitSetDedupInsert), OwningLinkedList uses the
+// linked-list runtime, OwningDictionary the hash runtime. Admitting them here
+// would leave their transferred local eligible with a NON-null slot → a double-
+// free on the transfer-window throw edge. They stay tainted (a safe residual
+// leak on a preceding-throw edge, never a double-free) until their own paths
+// null too. A BORROWING collection (`Array<T>.Add`) is likewise excluded — no
+// ownership transfer, the caller keeps ownership.
 inline bool calleeIsOwningCollectionTransfer(const sema::SemaContext& ctx,
                                              const ast::Expr* callee) {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
     if (!ma || !ma->target) return false;
     const auto& m = ma->member;
-    // #1970 / §28.4 / §28.6: extend the method-name allowlist to the
-    // OwningLinkedList element-insert shapes (AddFirst/AddLast/AddBefore/
-    // AddAfter) in addition to the array-backed collection Add/Push/Enqueue/
-    // Insert. Each of these lowering sites now calls
-    // nullTransferredOwnedLocalSlot for a bare owned local/param element
-    // argument, so the walker may leave the source untainted (the null-guarded
-    // unwindOnly disposal stays exactly-once). A BORROWING collection
-    // (`LinkedList<T>.AddFirst`) is excluded — no ownership transfer.
-    if (m != "Add" && m != "Push" && m != "Enqueue" && m != "Insert" &&
-        m != "AddFirst" && m != "AddLast" &&
-        m != "AddBefore" && m != "AddAfter")
+    if (m != "Add" && m != "Push" && m != "Enqueue" && m != "Insert")
         return false;
     const sema::TypeRef* recvTy = ctx.exprType(*ma->target);
     if (!recvTy) return false;
     std::string_view h = recvTy->headName();
-    return h == "OwningArray" || h == "OwningStack" || h == "OwningQueue" ||
-           h == "OwningSet" || h == "OwningLinkedList" ||
-           h == "OwningDictionary";
+    return h == "OwningArray" || h == "OwningStack" || h == "OwningQueue";
 }
 
 // #1955 / §28.3: true iff `new <type>(args)` resolves to an EXPLICIT user
@@ -8790,16 +8753,7 @@ inline bool newExprRoutesThroughNullingCtor(const sema::SemaContext& ctx,
                                             const ast::NewExpr* n) {
     if (!n || !n->type) return false;
     const sema::TypeRef* nt = ctx.resolvedType(*n->type);
-    if (!nt) return false;
-    // #1970 / §28.4 / §28.6: the `new Shared<T>(owned x)` builtin ctor
-    // manually lowers via bz_shared_new (LlvmBackend_Exprs2.cpp) and now
-    // nulls the caller's slot for a bare owned local/param argument
-    // (mirrors the #1955 user-ctor nulling path). Admit it so the walker
-    // can leave the source untainted — the null-guarded unwindOnly disposal
-    // is then exactly-once (throw-before disposes, throw-after skips the
-    // already-moved value). Other builtin ctors (Weak/Locked/RwLocked) still
-    // do not null and stay excluded (a safe leak, never a double-free).
-    if (!nt->declaration) return nt->headName() == "Shared";
+    if (!nt || !nt->declaration) return false;          // builtin (null decl)
     if (ctx.isImported(nt->declaration)) return false;  // imported → manual lower
     for (sema::Symbol* m : nt->declaration->members) {
         auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
@@ -9214,53 +9168,7 @@ struct UnwindIneligibleWalker {
                 as->valueHasOwnedMarker &&
                 dynamic_cast<const ast::IdentifierExpr*>(as->target.get()) &&
                 markedOwnedSourceEligible(ctx, as->value.get());
-            // #1970 / §28.4 / §28.6: an indexer-set assignment for an OWNING
-            // collection (`arr[i] := owned v` on OwningArray<T>,
-            // `dict[k] := owned v` on OwningDictionary<K,V>) lowers through
-            // lowerCollectionIndexerSet, which NULLS the caller's slot for a
-            // bare owned local/param element/value argument (mirrors the
-            // #1955 nullTransferredOwnedLocalSlot call for collection-Add). The
-            // walker therefore leaves the RHS untainted on those shapes — the
-            // null-guarded unwindOnly disposal is exactly-once: a throw BEFORE
-            // the indexer-set disposes the still-live value, a throw AFTER skips
-            // the already-transferred value (no double-free with the collection's
-            // own disposal of the displaced prior element on the update arm).
-            // Only the bare-identifier RHS shape gets the untaint — a non-id
-            // RHS (`arr[i] := move x`, `dict[k] := producer()`) is handled by
-            // `expr(consuming=true)` (the regular path).
-            bool indexerSetEligibleSource = false;
-            if (auto* asIx =
-                    dynamic_cast<const ast::IndexExpr*>(as->target.get())) {
-                // The OwningArray<T> indexer-set path's lowering (null
-                // on disposing-set value/element argument) is in
-                // lowerCollectionIndexerSet's array branch; the
-                // OwningDictionary<K,V> indexer-set path's lowering is
-                // in its dict branch (only when the value is class — V: class).
-                if (as->value) {
-                    const sema::TypeRef* ixRecvTy =
-                        ctx.exprType(*asIx->target.get());
-                    if (ixRecvTy) {
-                        std::string_view h = ixRecvTy->headName();
-                        if (h == "OwningArray" || h == "OwningDictionary") {
-                            if (auto* id =
-                                    dynamic_cast<const ast::IdentifierExpr*>(
-                                        as->value.get())) {
-                                sema::Symbol* asym = ctx.exprSymbol(*id);
-                                if (auto* loc = dynamic_cast<
-                                        sema::LocalSymbol*>(asym))
-                                    indexerSetEligibleSource =
-                                        loc->decl && !loc->isUsing;
-                                else if (auto* ps = dynamic_cast<
-                                             sema::ParameterSymbol*>(asym))
-                                    indexerSetEligibleSource =
-                                        (ps->modifier == "owned");
-                            }
-                        }
-                    }
-                }
-            }
-            bool eligibleSource = markedEligibleSource || indexerSetEligibleSource;
-            expr(as->value.get(), /*consuming=*/!eligibleSource);
+            expr(as->value.get(), /*consuming=*/!markedEligibleSource);
             return;
         }
         if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
