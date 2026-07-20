@@ -2919,27 +2919,83 @@ llvm::Value* Emitter::emitRecordToString(llvm::Value* recVal,
                                          const sema::TypeSymbol* rec) {
     llvm::Value* acc = lowerStringLiteral(
         std::string("\"") + std::string(rec->name) + "(\"", false);
+    // #2066 / §4.6 / §28.9: track whether `acc` currently holds a fresh +1
+    // producer (a previous emitStringConcat result) or the initial literal
+    // (a sentinel — release is a no-op). Each emitStringConcat mints a fresh
+    // rc=1 bz.string whose DATA is a byte-copy of its operands; the previous
+    // `acc` is now only referenced by the caller (this accumulator slot) —
+    // without a mid-chain release, every intermediate concat buffer leaks
+    // (a multi-field record's ToString produces one intermediate per concat
+    // step plus one per value-typed field's ToString). This mirrors BinaryExpr
+    // `+`'s releaseConcatIntermediate (LlvmBackend_Exprs.cpp): release the
+    // previous `acc` AFTER the concat has produced its +1 result so the
+    // intermediate is fully consumed first — no UAF, no double-free. The
+    // initial literal has sentinel rc, so its release is a no-op; subsequent
+    // `acc` values are real +1 producers released exactly once here. The
+    // FINAL `acc` is returned to the caller (the +1 it binds) and is NOT
+    // released here.
+    bool accIsPlusOne = false;   // `lowerStringLiteral` returns a sentinel.
     std::vector<const sema::Symbol*> storage;
     collectRecordStorage(rec, storage);
     unsigned idx = 0;       // struct element index
     bool first = true;
+    using K = sema::TypeRef::Kind;
+    using P = sema::PrimitiveType;
     for (const sema::Symbol* m : storage) {
-        if (!first)
+        if (!first) {
+            llvm::Value* prev = acc;
             acc = emitStringConcat(acc, lowerStringLiteral("\", \"", false));
+            if (accIsPlusOne) emitStringRelease(prev);
+            accIsPlusOne = true;
+        }
         first = false;
         // `PropName: ` prefix — the member's declared name verbatim (§9.1:
         // "the compiler does not transform them").
-        acc = emitStringConcat(acc, lowerStringLiteral(
-            std::string("\"") + std::string(m->name) + ": \"", false));
+        {
+            llvm::Value* prev = acc;
+            acc = emitStringConcat(acc, lowerStringLiteral(
+                std::string("\"") + std::string(m->name) + ": \"", false));
+            if (accIsPlusOne) emitStringRelease(prev);
+            accIsPlusOne = true;
+        }
         llvm::Value* fieldVal = builder_.CreateExtractValue(recVal, {idx});
         // issue #462 / §14.1: a generic record's `T`-typed field formats by its
         // CONCRETE type under the active subst (a string renders its value, a
         // record recurses) — not the type-erased shape fallback.
-        acc = emitStringConcat(
-            acc, emitValueToString(fieldVal, recordMemberTypeResolved(m)));
+        const sema::TypeRef* fieldTy = recordMemberTypeResolved(m);
+        llvm::Value* fieldStr = emitValueToString(fieldVal, fieldTy);
+        {
+            llvm::Value* prev = acc;
+            acc = emitStringConcat(acc, fieldStr);
+            if (accIsPlusOne) emitStringRelease(prev);
+            accIsPlusOne = true;
+        }
+        // #2066 / §4.6 / §28.9: a value-typed field's ToString is a fresh +1
+        // producer (int via bz_int_to_string, double via bz_double_to_string,
+        // char via bz_char_to_string, decimal via bz_decimal_to_string, a
+        // nested record's final concat, a boxed Object dispatch, a class
+        // ToString override). Now that the concat above has consumed it
+        // (made its own +1 byte-copy), release the field's +1 — mirroring
+        // BinaryExpr `+`'s releaseConcatIntermediate. A literal-form result
+        // (bool.ToString → "True"/"False" sentinel; class without ToString →
+        // type-name sentinel) has sentinel rc, so its release is a no-op.
+        // A STRING field's ToString is IDENTITY (§9.6 — `emitPrimitiveToString`
+        // returns `val` itself): it is a BORROW of the record's own slot, not
+        // a +1, and must NOT be released (the record still owns it; releasing
+        // would double-free on the record's own disposal). The same applies
+        // to a `string?` field whose non-null branch returns the borrow.
+        bool fieldStrIsBorrow = fieldTy &&
+            fieldTy->kind == K::Primitive &&
+            fieldTy->primitive == P::String;
+        if (!fieldStrIsBorrow) emitStringRelease(fieldStr);
         ++idx;
     }
-    acc = emitStringConcat(acc, lowerStringLiteral("\")\"", false));
+    {
+        llvm::Value* prev = acc;
+        acc = emitStringConcat(acc, lowerStringLiteral("\")\"", false));
+        if (accIsPlusOne) emitStringRelease(prev);
+        // `acc` is the FINAL +1 result the caller binds — keep it.
+    }
     return acc;
 }
 
