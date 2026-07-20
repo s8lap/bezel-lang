@@ -7076,10 +7076,11 @@ ExprTC::BindResult ExprTC::bindArgsToParams(
 // list — §22.5 binding (positional then named, arity, no-duplicate,
 // required-supplied), then per-argument assignability over the bound
 // mapping. Callers must have already ruled out overload ambiguity.
-void ExprTC::checkArgsAgainstParams(const std::vector<ast::Param>& params,
-                                    const std::vector<ast::CallArgument>& args,
-                                    SourceLocation loc,
-                                    const std::string& calleeDesc) {
+void ExprTC::checkArgsAgainstParams(
+    const std::vector<ast::Param>& params,
+    const std::vector<ast::CallArgument>& args, SourceLocation loc,
+    const std::string& calleeDesc, const ast::Expr* classTarget,
+    TypeSymbol* classParent) {
     // per §22.5: bind arguments to parameters. The binding emits its own
     // arity / named-arg diagnostics; on failure there is no consistent
     // per-parameter mapping to type-check, so stop here.
@@ -7116,6 +7117,14 @@ void ExprTC::checkArgsAgainstParams(const std::vector<ast::Param>& params,
         const ast::Param& p = params[j];
         if (!p.type) continue;
         TypeRef* paramTy = ctx_.resolvedType(*p.type);
+        // §5.1 identity / §14.1 (#2056): a constructor parameter declared in
+        // terms of its class's type parameter is checked at the concrete
+        // instantiation. For `new Box<(int) -> int>(f)`, substitute `U` in
+        // `constructor(v: U)` before applying the implicit-conversion rules;
+        // treating the raw `U` as a non-function type conservatively rejects
+        // the valid function-type identity case.
+        if (paramTy && classTarget && classParent)
+            paramTy = substituteMemberType(paramTy, classTarget, classParent);
         // per §15.4 (#1174): a collection literal passed directly to a
         // parameter of interface type (IEnumerable<T>/IList<T>/ICollection<T>/
         // IReadOnly*) is not admissible — the literal has no concrete backing
@@ -7319,9 +7328,10 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         if (decls.empty()) return;  // no bindable ctor — defer (no check)
         if (decls.size() == 1) {
             if (emitModifierMismatch(decls[0]->params, binds[0])) return;
-            checkArgsAgainstParams(decls[0]->params, ne.args, ne.span.begin,
-                                   std::string("`new ") +
-                                       std::string(t->name) + "`");
+            checkArgsAgainstParams(
+                decls[0]->params, ne.args, ne.span.begin,
+                std::string("`new ") + std::string(t->name) + "`",
+                &ne, t);
             return;
         }
         // A call-site modifier on an argument is outside §22.6's ranking;
@@ -7347,8 +7357,10 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                     continue;
                 }
                 paramTypes[c].push_back(
-                    params[j].type ? ctx_.resolvedType(*params[j].type)
-                                   : nullptr);
+                    params[j].type
+                        ? substituteMemberType(
+                              ctx_.resolvedType(*params[j].type), &ne, t)
+                        : nullptr);
                 argTypeRows[c].push_back(
                     ne.args[static_cast<std::size_t>(ai)].value
                         ? ctx_.exprType(
@@ -7398,9 +7410,10 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
     BindResult b = bindArgsToParams(cd->params, ne.args, ne.span.begin,
                                     /*calleeDesc=*/std::string(), /*emit=*/false);
     if (b.ok && emitModifierMismatch(cd->params, b)) return;
-    checkArgsAgainstParams(cd->params, ne.args, ne.span.begin,
-                           std::string("`new ") + std::string(t->name) +
-                           "`");
+    checkArgsAgainstParams(
+        cd->params, ne.args, ne.span.begin,
+        std::string("`new ") + std::string(t->name) + "`",
+        &ne, t);
 }
 
 // §2.2 / §2.5 / §22.7 (issue #328 FINDING [7] B): type-check `new ImportedT(args)`

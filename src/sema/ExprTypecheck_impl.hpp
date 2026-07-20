@@ -1252,10 +1252,12 @@ private:
     // total] (optional params lower the minimum), then per-argument
     // assignability. Callers must have already ruled out named args
     // and overload ambiguity.
-    void checkArgsAgainstParams(const std::vector<ast::Param>& params,
-                                const std::vector<ast::CallArgument>& args,
-                                SourceLocation loc,
-                                const std::string& calleeDesc);
+    void checkArgsAgainstParams(
+        const std::vector<ast::Param>& params,
+        const std::vector<ast::CallArgument>& args, SourceLocation loc,
+        const std::string& calleeDesc,
+        const ast::Expr* classTarget = nullptr,
+        TypeSymbol* classParent = nullptr);
 
     // Slice T7: check `new T(args)` against T's sole constructor (if
     // any). Zero declared constructors → the implicit default ctor
