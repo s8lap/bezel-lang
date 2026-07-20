@@ -299,6 +299,16 @@ private:
     // parameter-sourced borrow returns. Defaults true (a no-op) so a non-bare-T
     // method is never affected. // per §28.3 v0.194
     bool bareReturnSourceSetEmpty_ = true;
+    // §28.3 v0.194 *Bare-type-parameter returns* Callee side, per-instantiation-
+    // category admission (#2064): true when the returned parameter is constrained
+    // `where T: class` at its own level, so every substitution is class/interface
+    // and the body-side reject is decidable at the declaration. False for a
+    // mixed-domain parameter (no class constraint) — value substitutions are
+    // spec-vacuous and the body is admitted at the declaration; the per-call-site
+    // class-substitution check is the recorded residual. Defaults false (the
+    // check is a no-op) so a non-bare-T method is never affected.
+    // // per §28.3 v0.194, §3.6 rule 2
+    bool bareReturnAllClassInstantiations_ = false;
     // §29.3 / §29.8 (#945): true when this method's body uses `yield` (it is an
     // iterator method). A SYNC iterator (sawYield_ && !isAsync_) whose `owned`
     // parameter is never moved out gets §29.8 state-machine auto-dispose instead

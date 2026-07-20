@@ -20,6 +20,14 @@
 // ones; the `where T: value` exclusion (spec item 5) keeps a value-only returned
 // parameter outside the rule entirely.
 //
+// #2064 (per §28.3 v0.194, §3.6 rule 2): the body-side admission is decidable
+// at the declaration ONLY when ALL instantiations of the returned parameter are
+// class/interface (a `where T: class` constraint at the parameter's own level).
+// For a mixed-domain parameter (no class constraint), value substitutions are
+// spec-vacuous, so the body is ADMITTED at the declaration; the per-call-site
+// class-substitution check is the recorded residual (the AOT ownership pass
+// does not re-check the body per instantiation today).
+//
 // The callee-side hole this closes: before S6 the ownership pass classified a
 // bare-`T` non-`owned` return as unborrowable (isBorrowableType is false for an
 // abstract type parameter), so checkStaticBorrowReturn was vacuous and a callee
@@ -30,11 +38,13 @@
 #include <string>
 #include <string_view>
 
+#include "support/aot_support.hpp"        // runAot — AOT oracle for #2064
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::OwnershipResult;
 using bezel::test::parseAndCheckOwnership;
+using bezel::test::runAot;
 
 namespace {
 
@@ -53,12 +63,15 @@ constexpr std::string_view kBareReject =
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// REJECT-1. A static `Sel<T>(a: T, owned b: T): T` returning the `owned`
-// parameter `b` under a bare-`T` (non-`owned`) return. The potential source set
-// is {a} (the plain parameter mentions T; the `owned` parameter is never a
-// source), so it is NON-EMPTY. Returning `b` hands back a value the callee owns
-// and disposes at frame end, while every caller re-establishes only a BORROW —
-// a dangling borrow. Rejected at the return site (declare `owned T`).
+// REJECT-1. A static `Sel<T>(a: T, owned b: T): T where T: class` returning the
+// `owned` parameter `b` under a bare-`T` (non-`owned`) return. The potential
+// source set is {a} (the plain parameter mentions T; the `owned` parameter is
+// never a source), so it is NON-EMPTY. The `where T: class` constraint forces
+// every substitution to be a class — the body-side admission is decidable at
+// the declaration (#2064 per-instantiation-category gate). Returning `b` hands
+// back a value the callee owns and disposes at frame end, while every caller
+// re-establishes only a BORROW — a dangling borrow. Rejected at the return site
+// (declare `owned T`).
 // FAILS WITHOUT THE FIX: bare-`T` was unborrowable, so this compiled clean.
 // ---------------------------------------------------------------------------
 
@@ -67,7 +80,8 @@ BEZEL_TEST(bare_type_param_returns_callee,
     auto r = parseAndCheckOwnership(
         "module M; "
         "class Util "
-        "  public static method Sel<T>(a: T, owned b: T): T return b; end Sel; "
+        "  public static method Sel<T>(a: T, owned b: T): T where T: class "
+        "    return b; end Sel; "
         "end Util;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(errorSays(r, kBareReject));
@@ -79,7 +93,7 @@ BEZEL_TEST(bare_type_param_returns_callee,
     auto r = parseAndCheckOwnership(
         "module M; "
         "class Util "
-        "  public static method Sel<T>(a: T, owned b: T): T => b; "
+        "  public static method Sel<T>(a: T, owned b: T): T where T: class => b; "
         "end Util;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(errorSays(r, kBareReject));
@@ -88,8 +102,9 @@ BEZEL_TEST(bare_type_param_returns_callee,
 // ---------------------------------------------------------------------------
 // REJECT-2. A fresh owned value returned under a bare-`T` signature with a
 // non-empty source set. `where T: class` fixes the class-instantiation category
-// (where the rule bites); the return `new T()` is a fresh owned value the caller
-// cannot own through a non-`owned` return. Rejected. FAILS WITHOUT THE FIX.
+// (where the rule bites — #2064's per-instantiation gate fires here); the
+// return `new T()` is a fresh owned value the caller cannot own through a
+// non-`owned` return. Rejected. FAILS WITHOUT THE FIX.
 // ---------------------------------------------------------------------------
 
 BEZEL_TEST(bare_type_param_returns_callee,
@@ -106,16 +121,18 @@ BEZEL_TEST(bare_type_param_returns_callee,
 
 // ---------------------------------------------------------------------------
 // REJECT — enclosing-type parameter. The classification is inherited from the
-// ENCLOSING TYPE's parameter, not only a method-level one: `class Box<T> ...
-// static method Make(a: T, owned b: T): T` returns the class's own `T`. Same
-// per-instantiation reject as the method-level case.
+// ENCLOSING TYPE's parameter, not only a method-level one: `class Box<T> where
+// T: class ... static method Make(a: T, owned b: T): T` returns the class's own
+// `T`. The enclosing type's `where T: class` makes the admission decidable at
+// the declaration (#2064 per-instantiation gate). Same per-instantiation reject
+// as the method-level case.
 // ---------------------------------------------------------------------------
 
 BEZEL_TEST(bare_type_param_returns_callee,
            enclosing_type_param_returns_owned_param_rejected_spec_28_3) {
     auto r = parseAndCheckOwnership(
         "module M; "
-        "class Box<T> "
+        "class Box<T> where T: class "
         "  public static method Make(a: T, owned b: T): T return b; end Make; "
         "end Box;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -244,4 +261,118 @@ BEZEL_TEST(bare_type_param_returns_callee,
     // The non-empty-set bare-`T` reject must NOT fire (the factory regime
     // governs; the caller side treats the result as owned-with-warning).
     BEZEL_EXPECT_FALSE(errorSays(r, kBareReject));
+}
+
+// ---------------------------------------------------------------------------
+// #2064 — per-instantiation-category admission (§28.3 v0.194, §3.6 rule 2).
+//
+// A mixed-domain generic helper (no `where T: class` constraint) whose body
+// returns a fresh value via the constraint's `new()` member has a per-call-site
+// verdict: at a value substitution the body is a value copy (vacuous per §28.3
+// v0.194), and only at a class substitution would the borrow-vs-owned admission
+// bite. The declaration-level body check is NOT decidable for the mixed-domain
+// case — the per-call-site class-substitution enforcement is the recorded
+// residual. The declaration must be ADMITTED so legitimate §11.8-style generic
+// helpers (Sum, ZO, Nxt, P, Calc — the §2.19 producer members keyed through a
+// constraint) are not over-rejected. WITHOUT THE #2064 FIX this body emitted
+// kBareReject and forced these signatures to be spelled `owned T` to sidestep.
+// ---------------------------------------------------------------------------
+
+// Mixed-domain, non-empty source set, fresh owned value — ADMITTED at the
+// declaration. The #2048-era generic helpers (e.g. `Sum<T>` over `INumber<T>`)
+// have exactly this shape: a plain T source parameter plus a fresh value via
+// the constraint's producer members.
+BEZEL_TEST(bare_type_param_returns_callee,
+           mixed_domain_fresh_owned_admitted_per_instantiation_2064) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Util "
+        "  public static method Make<T>(a: T): T where T: new() "
+        "    return new T(); end Make; "
+        "end Util;");
+    BEZEL_EXPECT_FALSE(errorSays(r, kBareReject));
+}
+
+// Mixed-domain, non-empty source set, owned-parameter borrow — ADMITTED at the
+// declaration. The SAME signature as REJECT-1 but WITHOUT the `where T: class`
+// constraint is admitted: at a value instantiation the `owned` modifier is
+// erased per §28.1 (v0.196) and the body is a plain value copy. Contrast with
+// REJECT-1, which uses `where T: class` to make the rejection decidable.
+BEZEL_TEST(bare_type_param_returns_callee,
+           mixed_domain_owned_param_admitted_per_instantiation_2064) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Util "
+        "  public static method Sel<T>(a: T, owned b: T): T return b; end Sel; "
+        "end Util;");
+    BEZEL_EXPECT_FALSE(errorSays(r, kBareReject));
+}
+
+// Mixed-domain at the enclosing-type level — ADMITTED at the declaration. Same
+// shape as the enclosing-type REJECT but WITHOUT the enclosing type's
+// `where T: class` constraint, so the per-instantiation gate (#2064) does not
+// fire at the declaration.
+BEZEL_TEST(bare_type_param_returns_callee,
+           enclosing_type_param_mixed_domain_admitted_per_instantiation_2064) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Box<T> "
+        "  public static method Make(a: T, owned b: T): T return b; end Make; "
+        "end Box;");
+    BEZEL_EXPECT_FALSE(errorSays(r, kBareReject));
+}
+
+// ---------------------------------------------------------------------------
+// #2064 contrast pair — `where T: notnull` is NOT a class constraint (it admits
+// both class and non-null value substitutions), so the per-instantiation gate
+// does not fire at the declaration; the body is admitted. The class-only reject
+// remains decidable only under `where T: class`.
+// ---------------------------------------------------------------------------
+
+BEZEL_TEST(bare_type_param_returns_callee,
+           notnull_constraint_does_not_force_class_category_2064) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Util "
+        "  public static method Sel<T>(a: T, owned b: T): T where T: notnull "
+        "    return b; end Sel; "
+        "end Util;");
+    BEZEL_EXPECT_FALSE(errorSays(r, kBareReject));
+}
+
+// ---------------------------------------------------------------------------
+// #2064 — AOT-level end-to-end run (§28.3 v0.194, §3.6 rule 2). The same
+// mixed-domain generic helper from the sema-level ADMIT test above, called at
+// a VALUE-type (record Pt) substitution: the program compiles (the body is no
+// longer over-rejected at the declaration) AND runs to clean exit — at a value
+// substitution the return is a plain value copy, vacuous per §28.3 v0.194.
+// FAILS WITHOUT THE #2064 FIX: the over-strict declaration-level check emitted
+// kBareReject at sema and the AOT compile never linked. (The caller-side
+// classification is unchanged: at a value substitution the call produces a
+// value, not a borrow — no leak.)
+// ---------------------------------------------------------------------------
+
+BEZEL_TEST(bare_type_param_returns_callee,
+           mixed_domain_helper_runs_at_value_substitution_spec_28_3) {
+    std::string src =
+        "module M; "
+        "record Pt "
+        "  public x: int := 0; "
+        "  public y: int := 0; "
+        "  public constructor() end constructor; "
+        "  public constructor(nx: int, ny: int) x := nx; y := ny; end constructor; "
+        "end Pt; "
+        "class Util "
+        "  public static method Make<T>(proto: T): T where T: new() "
+        "    return new T(); end Make; "             // mixed-domain fresh-value body
+        "end Util; "
+        "class Prog "
+        "  public static method Main(): int "
+        "    var p := Util.Make(new Pt(3, 4)); "      // T = Pt (value): body is a copy
+        "    return 7 + p.x - 3; "                    // = 7 + 0 - 3 = 4 (new Pt() = 0,0)
+        "  end Main; "
+        "end Prog;";
+    auto r = runAot(src);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 4);   // deterministic exit code (new Pt() = default 0,0)
 }

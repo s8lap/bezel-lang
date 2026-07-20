@@ -5608,6 +5608,26 @@ static bool bareReturnParamIsValueConstrained(
     return false;
 }
 
+// §28.3 v0.194 *Bare-type-parameter returns* Callee side, per-instantiation-
+// category admission (#2064): true when `constraints` declare `where <name>:
+// class`, forcing every substitution of the returned parameter to be a class
+// or interface type. At such substitutions the body-side admission is enforced
+// at the declaration; without this gate the check would also fire on mixed-
+// domain generics (no `where T: class`), whose value substitutions are spec-
+// vacuous (returning a parameter copies the value). Null vector → no
+// constraints → not class-forced. // per §28.3 v0.194, §3.6 rule 2
+static bool bareReturnParamIsClassConstrained(
+    std::string_view name,
+    const std::vector<ast::GenericConstraint>* constraints) {
+    if (!constraints) return false;
+    for (const ast::GenericConstraint& gc : *constraints) {
+        if (gc.typeParam != name) continue;
+        for (const ast::ConstraintItem& item : gc.items)
+            if (item.kind == "class") return true;
+    }
+    return false;
+}
+
 // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6). See the header for the
 // full contract. Recognizes the bare-type-parameter return positionally (the
 // return head names a method-level or enclosing-type generic parameter, not a
@@ -5618,6 +5638,7 @@ void MethodOwnership::computeBareReturnContext(
         const GenericReturnContext* genericCtx) {
     returnIsBareTypeParam_ = false;
     bareReturnSourceSetEmpty_ = true;
+    bareReturnAllClassInstantiations_ = false;
     // §28.3 (v0.194 S10; #1885): carry the inherited-bare-T fact computed in
     // checkMember (where the enclosing type's base types are reachable) onto the
     // pass, so checkInstanceBorrowReturn admits a parameter-sourced borrow return
@@ -5669,6 +5690,17 @@ void MethodOwnership::computeBareReturnContext(
         }
     }
     bareReturnSourceSetEmpty_ = !nonEmpty;
+    // §28.3 v0.194 per-instantiation-category admission (#2064): the body-side
+    // reject is decidable at the declaration only when ALL instantiations of
+    // the returned parameter are class/interface — a `where T: class` constraint
+    // at the parameter's own level forces this. For a mixed-domain (no class
+    // constraint) or value-only parameter, the body check is vacuous at the
+    // declaration; the per-call-site enforcement is the recorded residual. The
+    // value-only case already exited above (the `where T: value` exclusion).
+    // // per §28.3 v0.194, §3.6 rule 2
+    bareReturnAllClassInstantiations_ =
+        bareReturnParamIsClassConstrained(head, genericCtx->methodConstraints) ||
+        bareReturnParamIsClassConstrained(head, genericCtx->enclosingConstraints);
 }
 
 // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6) — CALLEE side. See the
@@ -5686,6 +5718,15 @@ void MethodOwnership::checkBareTypeParamReturn(const ast::Expr& e) {
     // admitted, static-storage rejected — checkStaticBorrowReturn and the factory
     // rule handle it); this check does not fire. // per §28.3 v0.194
     if (bareReturnSourceSetEmpty_) return;
+    // §28.3 v0.194 per-instantiation-category admission (#2064): the body-side
+    // reject is decidable at the declaration ONLY when ALL instantiations of
+    // the returned parameter are class/interface — `where T: class` forces this.
+    // For a mixed-domain parameter (no class constraint), value substitutions
+    // are spec-vacuous (returning a parameter copies the value), so the body
+    // must be admitted at the declaration; the per-call-site class-substitution
+    // check is the recorded residual (no per-instantiation body re-check exists
+    // in the AOT ownership pass today). // per §28.3 v0.194, §3.6 rule 2
+    if (!bareReturnAllClassInstantiations_) return;
     // ADMIT `null` — no value to own; the caller's owned/borrowed target absorbs
     // it (§28.3 null-literal producers row).
     if (dynamic_cast<const ast::NullLiteralExpr*>(&e)) return;
