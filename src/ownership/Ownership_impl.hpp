@@ -2170,11 +2170,20 @@ private:
     const ast::Expr* selectorLambdaMintingReturn(const ast::LambdaExpr& lam);
     // True when `retExpr` — a lazy `Select` selector's return value — mints a
     // fresh owned/heap value with no borrow source: an owned-class producer
-    // (producerState == Owned), a fresh string (a `+` concatenation or an
-    // interpolation), or a conditional either of whose arms mints. A borrowed
+    // (producerState == Owned), a fresh string (a `+` concatenation, an
+    // interpolation, or (#1931) a call to a stdlib string-minting method on a
+    // string receiver), or a conditional either of whose arms mints. A borrowed
     // projection (the element itself, a field / index read, a value-typed
-    // projection) is NOT a mint and is admitted. // per §28.3 / stdlib §5 (#1917)
+    // projection) is NOT a mint and is admitted. // per §28.3 / stdlib §5
+    // (#1917, #1931)
     bool lazySelectSelectorReturnMints(const ast::Expr& retExpr);
+    // §28.3 / stdlib §9.6 (#1931): true when `ce` is a CALL to a STDLIB string-
+    // minting method on a string receiver — the documented stdlib §9.6 (v0.197)
+    // mint set (`ToUpper`/`ToLower`/`Substring`/`Trim`/`TrimStart`/`TrimEnd`/
+    // `Replace`/`PadLeft`/`PadRight`/`Insert`/`Remove`). User overrides (which
+    // may return a borrow) and non-string receivers are excluded. // per §28.3
+    // / stdlib §9.6 (#1931)
+    bool isStdlibStringMintingCall(const ast::CallExpr& ce);
 
     // True when `callResult`'s resolved type is one of the deferred-
     // activation frame shapes above: an iterator/async-iterator interface,

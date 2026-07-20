@@ -7978,16 +7978,19 @@ const ast::Expr* MethodOwnership::selectorLambdaMintingReturn(
     return mintingReturn;
 }
 
-// §28.3 / stdlib §5 (#1917): see the declaration comment. // per §28.3 (#1917)
+// §28.3 / stdlib §5 (#1917, #1931): see the declaration comment. // per §28.3
 bool MethodOwnership::lazySelectSelectorReturnMints(const ast::Expr& retExpr) {
     // A freshly-produced OWNED value: `new ClassType(...)`, an `owned`-returning
     // call, a `move` result — producerState's exact §28.3 producer classifier.
     if (producerState(retExpr) == OwnershipState::Owned) return true;
-    // A fresh STRING with no borrow source: string `+` concatenation or an
-    // interpolation always allocates. (A bare element / field / index read of a
-    // string is a BORROW — not one of these shapes — and stays admitted; a
-    // string-returning method call is the recorded interprocedural gap and is
-    // NOT flagged here.) // per §28.3 (#1917)
+    // A fresh STRING with no borrow source: string `+` concatenation, an
+    // interpolation, or (#1931) a call to a stdlib string-minting method on a
+    // string receiver. (A bare element / field / index read of a string is a
+    // BORROW — not one of these shapes — and stays admitted; a USER-DEFINED
+    // method returning a borrowed string is also left alone — the no-
+    // MethodDecl gate in isStdlibStringMintingCall keeps only the documented
+    // stdlib minting set in scope, never an arbitrary override.) // per §28.3
+    // (#1917, #1931)
     const sema::TypeRef* rt = ctx_.exprType(retExpr);
     const bool isString = rt && rt->kind == sema::TypeRef::Kind::Primitive &&
                           rt->primitive == sema::PrimitiveType::String;
@@ -7996,6 +7999,17 @@ bool MethodOwnership::lazySelectSelectorReturnMints(const ast::Expr& retExpr) {
             if (be->op == "+") return true;
         if (dynamic_cast<const ast::InterpolatedStringExpr*>(&retExpr))
             return true;
+        // §28.3 / stdlib §5 (#1931): a call to a STDLIB string-minting method
+        // (`s.ToUpper()`, `s.Substring(...)`, `s.Trim()`, `s.Replace(...)`,
+        // `s.PadLeft(...)`, `s.Insert(...)`, `s.Remove(...)`, ...) mints a
+        // fresh string per element. The documented mint set is stdlib §9.6
+        // `String` (v0.197) — every method whose contract is "returns a new
+        // `string` value; original unchanged". A user-defined override is left
+        // alone (over-rejection guard, same as #1917's `Select` gate); a
+        // non-string receiver and a non-string result are likewise excluded.
+        // // per §28.3 / stdlib §9.6 (#1931)
+        if (auto* ce = dynamic_cast<const ast::CallExpr*>(&retExpr))
+            if (isStdlibStringMintingCall(*ce)) return true;
     }
     // A conditional projects a mint if EITHER arm mints.
     if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&retExpr)) {
@@ -8005,6 +8019,52 @@ bool MethodOwnership::lazySelectSelectorReturnMints(const ast::Expr& retExpr) {
             return true;
     }
     return false;
+}
+
+// §28.3 / stdlib §9.6 (#1931): true when `ce` is a CALL to a STDLIB string-
+// minting method on a string receiver — a documented-mint set whose contract
+// (stdlib §9.6 `String`, v0.197) is "returns a new `string` value; original
+// unchanged" and which therefore mints a fresh heap allocation per call. Used
+// by lazySelectSelectorReturnMints to extend the §28.3 minting-selector reject
+// to method-call selectors — the interprocedural gap left by #1917. The
+// user-MethodDecl gate (mirroring checkLazySelectMintingSelector's
+// `Select`-is-an-intrinsic gate) keeps the classification to the stdlib method
+// only; a user override that returns a borrowed string is left alone. // per
+// §28.3 / stdlib §9.6 (#1931)
+bool MethodOwnership::isStdlibStringMintingCall(const ast::CallExpr& ce) {
+    // §28.3 (#1931): a USER override of a string-returning method may return a
+    // borrow — only stdlib methods (no user MethodDecl) are classified as mint.
+    // Mirrors checkLazySelectMintingSelector's gate for `Select` / `Min` / `Max`
+    // (a user-defined method with the same name resolves to a MethodDecl and is
+    // governed by its declared parameter/return modifiers). // per §28.3
+    if (common::calleeMethodDecl(ce, ctx_)) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+    if (!ma) return false;
+    // Documented stdlib §9.6 string-mint set (v0.197). Every method whose
+    // contract is "returns a new `string` value; original unchanged". ToUpper /
+    // ToLower (case mapping), Substring (two overloads — covered by name only;
+    // overload resolution is independent), Trim / TrimStart / TrimEnd (whitespace
+    // / char-set trim), Replace (two overloads — same), PadLeft / PadRight
+    // (two overloads each), Insert, Remove (two overloads).
+    // // per stdlib §9.6 (v0.197)
+    static constexpr std::string_view kMintMethods[] = {
+        "ToUpper",   "ToLower",   "Substring",  "Trim",
+        "TrimStart", "TrimEnd",   "Replace",    "PadLeft",
+        "PadRight",  "Insert",    "Remove",
+    };
+    bool isMintName = false;
+    for (auto m : kMintMethods)
+        if (m == ma->member) { isMintName = true; break; }
+    if (!isMintName) return false;
+    // Receiver must be a string (stdlib §9.6 string-method receiver type).
+    // Read the receiver's resolved type — same path isBuiltinOwnedTransferCall
+    // uses for the `PopLast` / `PopFirst` / etc. receiver-type gate. // per
+    // §28.3 (#1931)
+    if (!ma->target) return false;
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy) return false;
+    return recvTy->kind == sema::TypeRef::Kind::Primitive &&
+           recvTy->primitive == sema::PrimitiveType::String;
 }
 
 // §30.5 / §30.4 (#834): true when `e`'s static type is an `OwningTask<...>`
