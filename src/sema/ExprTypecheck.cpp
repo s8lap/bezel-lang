@@ -1777,6 +1777,92 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
         return;
     }
 
+    // §35.6 (v0.200, #2045): a CHOICE scrutinee is exhaustive when every
+    // case is covered, counted per case NAME one level deep — a payload-
+    // free case by a constant-style pattern naming it (NamedPattern); a
+    // payload case by a destructuring whose every slot is irrefutable
+    // (naked binding, `var x`, or `_`). Guarded arms contribute nothing
+    // to the static proof; refutable-slot arms (e.g. `Some(0)` — a
+    // constant slot) likewise. The case set is closed by declaration
+    // (§35.1), so exhaustiveness holds across module boundaries.
+    if (sub && sub->kind == ast::TypeDeclKind::Choice) {
+        // Collect the case names declared on the choice.
+        std::vector<std::string_view> allCases;
+        for (const Symbol* m : sub->members) {
+            if (dynamic_cast<const ChoiceCaseSymbol*>(m))
+                allCases.push_back(m->name);
+        }
+        // Gather covered case names per §35.6.
+        std::unordered_set<std::string_view> covered;
+        // §35.6: a destructuring slot is irrefutable when it is a naked
+        // binding, a `var x` BindingPattern, or a `_` DiscardPattern.
+        // Anything else (a constant, a relational, a nested destructuring
+        // whose inner slots are refutable) makes the arm contribute
+        // nothing to the static proof.
+        auto slotsIrrefutable = [](const ast::DestructuringPattern& dp) -> bool {
+            for (const auto& sp : dp.subPatterns) {
+                if (!sp.nakedBinding.empty()) continue;  // naked binding
+                if (!sp.pattern) return false;  // defensive
+                if (dynamic_cast<const ast::DiscardPattern*>(sp.pattern.get()))
+                    continue;
+                if (dynamic_cast<const ast::BindingPattern*>(sp.pattern.get()))
+                    continue;  // `var x` (an untyped binding is irrefutable)
+                return false;  // any other slot shape is refutable
+            }
+            return true;
+        };
+        for (const auto& arm : ce.arms) {
+            // §19.6 / §35.6: a guarded arm contributes nothing.
+            if (arm.guard) continue;
+            if (auto* np = dynamic_cast<const ast::NamedPattern*>(
+                    arm.pattern.get())) {
+                // A bare case name — payload-free case only. (A payload
+                // case matched bare was rejected by sema at checkTopLevel
+                // NamedPattern; here it would not be in `covered` either
+                // way, and the warn-missing path below reports it.)
+                if (np->name && !np->name->parts.empty()) {
+                    std::string_view last = np->name->parts.back();
+                    for (Symbol* m : sub->members) {
+                        if (auto* cc = dynamic_cast<ChoiceCaseSymbol*>(m)) {
+                            if (cc->name == last &&
+                                cc->caseDecl &&
+                                cc->caseDecl->payload.empty())
+                                covered.insert(last);
+                        }
+                    }
+                }
+            } else if (auto* dp = dynamic_cast<const ast::DestructuringPattern*>(
+                           arm.pattern.get())) {
+                // A payload case by destructuring — covers the case iff
+                // every slot is irrefutable (§35.6).
+                if (dp->typeName && !dp->typeName->parts.empty() &&
+                    slotsIrrefutable(*dp)) {
+                    std::string_view last = dp->typeName->parts.back();
+                    for (Symbol* m : sub->members) {
+                        if (auto* cc = dynamic_cast<ChoiceCaseSymbol*>(m)) {
+                            if (cc->name == last) covered.insert(last);
+                        }
+                    }
+                }
+            }
+        }
+        std::vector<std::string_view> missingCases;
+        for (std::string_view cn : allCases)
+            if (!covered.count(cn)) missingCases.push_back(cn);
+        if (!missingCases.empty() || nullableUncovered) {
+            std::string detail = "choice `" + std::string(sub->name) + "`";
+            if (!missingCases.empty()) {
+                detail += " is missing case(s):";
+                for (auto n : missingCases) detail += " " + std::string(n);
+            }
+            if (nullableUncovered)
+                detail += (missingCases.empty() ? " nullable value not covered"
+                                                : " (and a `null` arm)");
+            warn(detail);
+        }
+        return;
+    }
+
     if (sub && sub->kind == ast::TypeDeclKind::Class) {
         // §11.7 / §19.6: the scrutinee's hierarchy is closed only when the
         // base is `sealed abstract`, or a same-module abstract whose every
