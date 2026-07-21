@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.212 — July 2026**
+**Companion to the Bezel Language Specification, v0.213 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -1204,7 +1204,6 @@ public interface ICollection<T>: IReadOnlyCollection<T>
   method Clear();
   method Contains(item: T): bool;
   method Remove(item: T): bool;
-  method DisposeElements();
 end ICollection;
 
 public interface IList<T>: IReadOnlyList<T>, ICollection<T>
@@ -1217,7 +1216,7 @@ The four interfaces form the borrowing collection family. `IReadOnlyCollection<T
 
 `IsReadOnly` is `false` for every standard collection implementing `ICollection<T>` (`Array<T>`, `LinkedList<T>`, `Set<T>`, `Dictionary<K, V>`; `Stack<T>`/`Queue<T>` conform only to `IReadOnlyCollection<T>` since v0.165 (#1354) and have no `IsReadOnly` member). The standard library currently ships no read-only `ICollection<T>` implementation; the member exists for user-defined read-only implementations, which return `true` and raise `InvalidOperationException` from the mutating methods (v0.195).
 
-`DisposeElements()` disposes every class-typed element and then clears the collection. For value-only types it is equivalent to `Clear()`. This is a destructive operation provided as a convenience for borrowing collections whose elements happen to be class instances that the caller wants to dispose en masse; it does *not* indicate that the collection owns its elements.
+Element disposal is never performed by or through a borrowing collection (spec §28.6, v0.213): a holder that owns its elements uses the owning family, whose `Dispose()` cascades; selective cleanup takes elements out (`Drain()`, `Pop*`, `move coll[i]`) into owned bindings first. (The pre-v0.213 `DisposeElements()` escape hatch is retired with spec axiom A8.)
 
 <a id="sec-owning-collection-interfaces"></a>
 ### 4.2 Owning collection interfaces
@@ -1304,7 +1303,6 @@ public class Array<T>: IList<T>
   public method Reversed(): owned Array<T>;                       // fresh reversed copy
 
   public method ToArray(): owned Array<T>;      // fresh heap-array copy
-  public method DisposeElements();              // disposes each class-typed element
 
   // Span views (v0.107)
   public method AsSpan(): ArraySpan<T>;                          // full array, writable
@@ -1330,7 +1328,7 @@ end;
 
 A collection literal `[1, 2, 3]` constructs an `Array<T>` when the target type is `Array<T>`; it constructs an inline array `[N]T` when the target is an inline array. See language spec [§15.4](Bezel_Language_Spec.md#sec-collection-literals) for the contextual-typing rules.
 
-`Array<T>` stores borrows: when the element type is a class, the elements are references whose ownership remains with whoever passed them in. The array's `Dispose()` is a no-op — `Array<T>` is trivial-dispose (language spec [§28.9](Bezel_Language_Spec.md#sec-runtime-managed-types), v0.184): the backing storage is reclaimed with the instance — and the elements are not disposed. To dispose owned class instances when clearing the collection, either call `DisposeElements()` (which disposes each class-typed element then clears) or use `OwningArray<T>` ([§4.5](#sec-ownedarrayt)) instead.
+`Array<T>` stores borrows: when the element type is a class, the elements are references whose ownership remains with whoever passed them in. The array's `Dispose()` is a no-op — `Array<T>` is trivial-dispose (language spec [§28.9](Bezel_Language_Spec.md#sec-runtime-managed-types), v0.184): the backing storage is reclaimed with the instance — and the elements are not disposed. To have elements disposed, use `OwningArray<T>` ([§4.5](#sec-ownedarrayt)) — element disposal never happens through the borrowing type (spec §28.6, v0.213).
 
 `Reverse`/`Sort` versus `Reversed`/`Sorted` follow a uniform naming convention: the imperative-verb form (`Reverse`, `Sort`) mutates the receiver in place and returns nothing; the past-participle form (`Reversed`, `Sorted`) leaves the receiver unchanged and returns a fresh `owned Array<T>` with the elements in the new order. The result's ownership mirrors `ToArray(): owned Array<T>` — it is a borrowing array (a fresh backing buffer holding the same element borrows), so the caller is responsible for disposing the array itself, not its elements. `Sorted` comes in two forms, mirroring `Sort`: the comparer-taking method on `Array<T>`, and the parameterless `Sorted()` in the `where T: IComparable<T>` extension that sorts by the natural order. `OwningArray<T>` deliberately has **no** value copy-forms — neither `Reversed`/`Sorted` nor `ToArray` — because its elements are uniquely owned: a copy would either double-own each element (two arrays claiming the same owned instances) or drain the source (leaving it empty). To reorder an `OwningArray<T>`, use the in-place `Reverse()`/`Sort()`; to move its elements into a new owning array, drain it (`Drain()`), which transfers ownership and empties the original.
 
@@ -1392,7 +1390,7 @@ The indexer getter produces a borrow of the slot's owned element; the borrow is 
 
 There is no `ToArray()` on `OwningArray<T>` that produces a non-owning copy: copying the array would manufacture duplicate ownership of each element. To produce a fresh `OwningArray<T>` with the same elements, the source array must be drained — the original ceases to own its elements.
 
-`OwningArray<T>` does not declare `DisposeElements()` — disposing the array automatically disposes every element. The method would be redundant.
+Disposing an `OwningArray<T>` automatically disposes every element — the cascade is the type's contract.
 
 A collection literal `[c1, c2, c3]` with target type `OwningArray<Connection>` constructs an owning array and transfers ownership of each element in:
 
@@ -1538,7 +1536,7 @@ public class LinkedList<T>: ICollection<T>
   public method RemoveNode(node: LinkedListNode<T>);
   public method Find(item: T): LinkedListNode<T>?;
   // Plus the standard ICollection<T> operations: Add (appends at the tail,
-  // = AddLast — v0.195), Clear, Contains, Remove, IsReadOnly, DisposeElements.
+  // = AddLast — v0.195), Clear, Contains, Remove, IsReadOnly.
 end LinkedList;
 
 public class LinkedListNode<T>
@@ -1626,7 +1624,6 @@ public class Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>
   public method GetOrAdd(key: K, factory: (K) -> V): V;
 
   public method Clear();
-  public method DisposeElements();                  // disposes class-typed
                                                     //   keys and values
 end Dictionary;
 
@@ -1754,7 +1751,7 @@ end DrainAndProcess2;
 
 `GetOrAdd(key, factory)`'s factory produces an `owned V`; the dictionary stores the value (taking ownership) and the call returns a borrow of the now-stored value.
 
-There is no `DisposeElements()` on `OwningDictionary<K, V>` — the dictionary's `Dispose()` cascade handles every value disposal.
+The dictionary's `Dispose()` cascade handles every value disposal.
 
 The `Keys` and `Values` properties return read-only borrowing views; their type is `IReadOnlyCollection<K>` and `IReadOnlyCollection<V>` (the unmodified types, since reading produces borrows). The view objects are owned by the collection and handed out as receiver-sourced borrows (a property getter may not mint — spec §28.6): they stay valid while the collection lives and reflect subsequent mutations; the same identity holds for `Dictionary<K, V>.Keys`/`Values` ([§4.8](#sec-dictionaryk-v)) (v0.195). Code that needs to mutate the dictionary calls `Add`, `Remove`, etc. directly.
 

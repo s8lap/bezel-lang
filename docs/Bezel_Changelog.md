@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.212 — July 2026**
+**Companion to the Bezel Language Specification, v0.213 — July 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -6950,3 +6950,11 @@ Rationale §3.3 is rewritten as the recorded reversal it is: the #1373 ruling's 
 **Kernel classification (the v0.198 obligation):** no ownership rule changes — the frame-carriage classification of the returned iterable is the existing v0.179/v0.196 machinery; the owned-parameter and drain semantics are K3/K6 verbatim.
 
 **Migration.** Purely additive stdlib surface; impl tracker filed at this landing.
+
+### v0.213 changelog (v0.212 → v0.213)
+
+**Design change — axiom A8 (the transit exception) is retired; only owners dispose, with no exception.** The caller-vouched right to dispose element borrows obtained from a borrowing-family collection — and its bulk form, `DisposeElements()` — is deleted. The evidence gate the retirement was conditioned on (#2075) came back empty: the 2026-07 corpus sweep classified all 34 transit-regime occurrences and found zero load-bearing asymmetric clients — every real use was whole-collection-owned (migratable to the owning family's cascade), the values-owned dictionary shape is what `OwningDictionary<K, V>` expresses by construction, and the genuinely inexpressible direction (owned keys, borrowed values) has no client anywhere in the corpus. The kernel's headline rule is now carve-free: `Dispose()` requires an owned receiver (K3.10), through any borrow it is a compile error, full stop. Elements a holder owns belong in owning locations — the owning family cascades; selective or interleaved cleanup takes elements out first (`Drain()`, `move coll[i]`, the `Pop*` family) into owned bindings. Surfaces: spec §28.6 (the transit paragraph replaced by the exception-free rule), §28.9/§28.11 (tables, the BankAccount and asymmetric-dictionary examples rewritten to the owning forms), Appendix C.3; the register — **A8 → tombstone; twelve live axioms, two tombstones**; stdlib §4.x (the `DisposeElements` declarations and prose removed from `ICollection<T>`, `Array<T>`, `LinkedList<T>`, `Dictionary<K, V>`); rationale §5.1/§5.3/§5.26 updated to the retired state; Guide 1's three-one-line-rules paragraph loses its "lone exception" (pin → v0.213). The adversarial design record is the 2026-07-21 kernel review (candidate C8) plus the #2075 sweep, both run before this landing.
+
+**Kernel classification (the v0.198 obligation):** an axiom retirement — no derivation changes; K3.10/K4 stand with strictly less recorded trust. The budget shrinks: twelve live axioms.
+
+**Migration.** Newly **rejected**: explicit `Dispose()` on an element borrow read from a borrowing-family collection (indexer-get, iteration variable, dictionary-entry fields), and any call to the removed `DisposeElements()`. Remedies, per shape: whole-collection ownership → declare the owning-family type and let `Dispose()` cascade; selective disposal → take the element out first. The conformance corpus's transit cases (`spec_0214`/`spec_0215` mirrors) and the #1653 lit acceptance test flip to reject/migrated forms **with the compiler change**, tracked by the impl issue filed at this landing; #2075 closes as decided.
