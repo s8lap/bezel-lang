@@ -3299,11 +3299,29 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         // positional function-typed parameter skipped the closure-call path and
         // fell through to a no-method/garbage result; the same call worked only
         // after extracting `b.fn` to a local first.
+        //
+        // fix #2068: a field declared as a generic type parameter `U` (e.g.
+        // `record Box<U>(V: U)` instantiated with `Box<(int) -> int>`) has
+        // `fs->posParam->type` resolve to the bare generic-param TypeRef, not
+        // the SUBSTITUTED concrete type. The non-generic case above works
+        // because the declared type already IS the function type; the generic
+        // case needs the call-site substituted type — `ctx_.exprType(*call.callee)`
+        // — which sema has already substituted via §14.1 (D13 / #361).
         sema::TypeRef* rt = nullptr;
         if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
             if (fd->type) rt = ctx_.resolvedType(*fd->type);
         } else if (fs->posParam && fs->posParam->type) {
             rt = ctx_.resolvedType(*fs->posParam->type);
+        }
+        if (rt && rt->kind != sema::TypeRef::Kind::Function) {
+            // Declared type isn't itself a function — but for a generic-param
+            // field the substitution at the call site may have made it one.
+            // Trust the call-site substituted type (which can only differ for
+            // a generic-param field whose substitution resolves to Function).
+            if (sema::TypeRef* sub =
+                    ctx_.exprType(*call.callee);
+                sub && sub->kind == sema::TypeRef::Kind::Function)
+                rt = sub;
         }
         if (rt && rt->kind == sema::TypeRef::Kind::Function) {
             llvm::Value* closurePtr = lowerExpr(*call.callee);
