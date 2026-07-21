@@ -39,6 +39,7 @@ DOCS = {
     'changelog': 'docs/Bezel_Changelog.md',
     'guide01':   'docs/Bezel_Guide_01_Memory_and_Ownership.md',
     'guide02':   'docs/Bezel_Guide_02_Errors_and_Nullability.md',
+    'guide03':   'docs/Bezel_Guide_03_Modeling_Data.md',
 }
 text = {}
 for k, p in DOCS.items():

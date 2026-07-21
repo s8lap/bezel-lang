@@ -1,6 +1,6 @@
 # Bezel Guide 2: Errors and Nullability
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.200.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.211.*
 
 If you know C#, Kotlin, or Swift, most of this chapter is familiar: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. Skim those parts. The three places where the ownership model changes how you write this code — and where a habit from those languages produces a *compile error* — are headed **How Bezel does it**. Read those.
 
@@ -234,10 +234,11 @@ end;                                  // exhaustive; no _ arm needed
 | Value may legitimately be absent | nullable return `T?`, handle with `?.` / `??` / narrowing |
 | Absent *and* the value would be owned | `Try` pattern: `bool` + `out owned T? when true`, caller uses `out using var` (and drops the `!`) |
 | Failure is expected *and carries information* | `choice` return (`Result<T, E>` or a domain choice, spec §35); consume with an exhaustive `case` |
-| Caller passed something invalid | `throw new ArgumentException(...)` |
-| Operation invalid in current state | `throw new InvalidOperationException(...)` |
+| Caller violated something a correct caller guarantees (a **bug**, not an outcome) | a `requires(...)` clause (spec §22.16) — always-on, faults `ContractViolationException`; never use `requires` for input whose invalidity is a normal outcome at a trust boundary (that is the `T?`/Try/`choice` territory above) |
+| Invalid input at a boundary with no contract (interop, pre-contract code) | `throw new ArgumentException(...)` — the residual idiom `requires` replaces where a contract is possible |
+| Operation invalid in current state | `throw new InvalidOperationException(...)` (or an `invariant(...)`/`requires(...)` where the condition is a class or caller contract) |
 | Must run cleanup that is not a disposal | `try … finally` |
 | Must dispose an owned resource on failure | nothing — ownership handles it automatically |
 | Preserve failure details past a `catch` | copy `ex.Message` / `ex.StackTrace` into owned values; never the exception itself |
 
-Two habits carry most of it: prefer a nullable or `Try` return over an exception whenever the failure is expected, and inside a `catch` treat the exception as something you read and let go of — copy out the strings you need, never the instance. The familiar C# syntax mostly transfers; the ownership rules around exceptions and `out` values are the part to internalize.
+Two habits carry most of it: prefer a nullable, `Try`, or `choice` return over an exception whenever the failure is *expected* — and a `requires(...)` clause over a `throw` whenever the condition is something a correct caller already guarantees — and inside a `catch` treat the exception as something you read and let go of — copy out the strings you need, never the instance. The familiar C# syntax mostly transfers; the ownership rules around exceptions and `out` values are the part to internalize.

@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.210 — July 2026**
+**Companion to the Bezel Language Specification, v0.211 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -1480,6 +1480,18 @@ The rule is the §30.11 precedent made general. v0.184 had already decided, for 
 Spec §30.13's *Determinism* subsection adds no rule — every clause of it was already a consequence of serial-per-domain execution, the five memory-model edges, sendability, and the no-object-address invariant. It is stated anyway, for two reasons. First, as an audit obligation on the implementation: once "a domain's execution is a deterministic function of what its edges deliver" is normative, any within-domain nondeterminism given fixed edges — an uninitialized read, an unpinned iteration order, an address leak into an observable value — is a runtime *bug by definition*, not implementation latitude; the paragraph converts a diffuse design intention into a checkable property. Second, as the foundation record/replay tooling needs: a recorded execution is replayable exactly because everything a domain observes arrives through an enumerable set of runtime-mediated edges (proposal 0045 is the tooling design; the spec paragraph is what makes it *possible* rather than heroic). The exclusions are exactly two — elapsed real time, and foreign memory beyond declared writebacks — because those are the two places the runtime genuinely does not mediate.
 
 Two supporting rulings landed with it. **Identity hashes are assigned, not derived** (spec §8.3): the .NET lazy-syncblock design with the entropy source replaced by a per-domain deterministic sequence. Without it the determinism statement is false for any program that hashes a class by identity — an address-derived hash is a per-run accident — and the address itself would leak into observable values, which §32.12's no-object-address invariant exists to prevent. Objects never hashed pay nothing; the storage is the runtime's per-object metadata word or a side table (implementation detail); programs are promised only within-run stability and address-independence, so no existing program's meaning changes. **`OwningDictionary<K, V>` iteration is deterministic-given-history, not order-pinned** (stdlib §4.9): pinning insertion order outright would force order metadata into the drain-and-rebuild representation whose economics §4.9 already chose; determinism given the operation-and-hash history is everything replay needs and is what the reference implementation already does. The borrowing containers (`Dictionary`, `Set`) were already insertion-order-pinned, so no frame-by-frame journaling of container iteration is ever needed.
+
+
+<a id="sec-choosing-the-concurrency-shape"></a>
+### 12.12 Choosing the concurrency shape: structured by default (v0.211)
+
+The mechanisms are settled individually — `TaskScope` (stdlib §6.10), `Task.WhenAll`/`WhenAllOwned` (§6.4), `WhenAny`, `Task.FireAndForget`, bare task binds, and `Domain.Spawn` (§30.14) — but the map between them was reconstructible only from scattered passages. The doctrine, in one place:
+
+**Structured is the default.** Spec §30.10 states the posture: concurrent fan-out reaches for the nursery — `await using var scope := new TaskScope();` — and the two discard idioms are the named escape hatches, not peers. The nursery's guarantee is lifetime-shaped: children cannot outlive the scope, and the scope's disposal is the join.
+
+**The fault fork is the real chooser.** `WhenAll` *collects*: it awaits every task and re-raises the first non-success — it never cancels or abandons the laggards (§30.10's aggregation contract). `TaskScope` *supervises*: a child's fault cancels the siblings through the scope token, and `Join` surfaces the failure after quiescence. So: results-of-independent-work → `WhenAll` (all work is wanted regardless of failures); a unit of work whose parts stand or fall together → `TaskScope`. `WhenAny` is a selector, not a supervisor — the losers keep running and remain the caller's to settle. `FireAndForget` is the recorded abandon-with-supervision spelling for work whose result nobody will read (§17.13 routes the `Task` discard here precisely so abandonment is always a visible decision). `Domain.Spawn` is not a concurrency combinator at all — it is an isolation boundary (§12.5), chosen for state separation, with sendability doing the checking.
+
+Why this is a rationale entry rather than new normative text: every sentence above restates a rule the spec already carries; what was missing was the adjacency. (The streaming as-completed combinator, `Task.WhenEach`, joins the map at its graduation — proposal 0023.)
 
 <a id="sec-events"></a>
 ## 13. Events

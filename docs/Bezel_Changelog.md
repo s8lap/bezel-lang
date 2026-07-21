@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.210 — July 2026**
+**Companion to the Bezel Language Specification, v0.211 — July 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -6928,3 +6928,15 @@ Rationale §3.3 is rewritten as the recorded reversal it is: the #1373 ruling's 
 **Kernel classification (the v0.198 obligation):** no ownership rule changes; K7's wording edit is terminology only (the meet, its operands, and every verdict are unchanged); the derived-property ruling touches §3.6/§9.2/§35.7 classification, outside the obligation lattice.
 
 **Migration.** No source breaks. Newly *defined* (previously implemented-but-unwritten): the bare-`null` branch type; `??=` narrowing; the atoms as narrowing establishers. Newly *consistent*: a strict §9.2/§3.6 reader now accepts the value-like-choice compositions §35.7 always granted (permissive widening; impl tracker filed for the compiler's §9.2-composition check if it followed the strict reading).
+
+### v0.211 changelog (v0.210 → v0.211)
+
+**Docs-only — the teaching train (the 2026-07-21 sweep's doctrine tier).** Guides 02/03; rationale §12.12; no spec-rule changes.
+
+**Guide 2 §6 catches up to v0.203 contracts.** The selection table's "caller passed something invalid → `ArgumentException`" row predated §22.16 and mis-routed the bug half of the boundary; it now splits per the normative rule — a violated caller *guarantee* is a `requires(…)` clause; the `ArgumentException` idiom is the residual for boundaries where no contract is possible — and the closing habits sentence carries the same split. Guide 2 re-validated (pin → v0.211).
+
+**New Guide 3 — Modeling Data.** The picking rules the reference prose defines but never collects: the five data kinds (enum / record / choice / class / sealed hierarchy) with the practice-boundary calls (enum-vs-choice, record-vs-class, choice-vs-hierarchy, choice-vs-`T?` per the recorded `Option<T>` decline); the three selection atoms with the three-sentence chooser and the arms-bind/exhaustiveness/meet notes; a one-line pointer to Guide 2 §6 as the failure-signal home (no duplication). Registered in the docs gate (`check_docs.sh`); the spec's introduction and CLAUDE.md name it.
+
+**Rationale §12.12 — choosing the concurrency shape.** The structured-by-default doctrine and the fault fork stated once with adjacency: `WhenAll` collects and never cancels laggards; `TaskScope` supervises and cancels siblings; `WhenAny` selects and settles nothing; `FireAndForget` is the visible abandonment; `Domain.Spawn` is an isolation boundary, not a combinator. Every sentence restates an existing rule; the entry adds the map.
+
+**Migration.** None — teaching material only.
