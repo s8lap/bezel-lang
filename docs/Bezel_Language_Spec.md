@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.209 — July 2026**
+**Version 0.210 — July 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -354,7 +354,7 @@ Contract deltas, per matched member ("slot" = overridable as above):
 |---|---|---|
 | `requires` clause removed | preserving; **breaking on a slot** | A weaker precondition admits every old caller. On a slot, implementor bodies assumed the inherited clause ([§22.16](#sec-contract-inheritance)) and are now reachable with arguments they excluded. |
 | `requires` clause added | **breaking** | Narrows every caller, through every face of every slot ([§22.16](#sec-contract-inheritance)). |
-| `ensures` clause added | preserving *(slot note: binds every implementor's next checked run — behavior-revealing, not compile-breaking)* | A strengthened postcondition; callers were promised no less. |
+| `ensures` clause added | preserving *(slot note: binds every implementor's next checked run — behavior-revealing, not compile-breaking; a clause of the [§22.4](#sec-out-nullability-postcondition) `when`-family shape — detectable from the record alone — classifies under the `when`-added row below instead, whose stricter slot verdict wins per this section's audience rule)* | A strengthened postcondition; callers were promised no less. |
 | `ensures` clause removed | **breaking** | Callers consumed the promise — runtime reliance at every level, proof consumption at the contract-proving level. |
 | clause text changed (either kind) | **breaking** | Removal plus addition under textual identity; at least one direction breaks. |
 | clause list reordered, same record set | preserving | Order changes only which violation is blamed first ([§22.16](#sec-clause-evaluation)); no conforming execution differs. |
@@ -498,8 +498,8 @@ The derived type properties of this revision:
 | **trivial-dispose** | [§28](#sec-resource-management) intro, [§28.9](#sec-runtime-managed-types) | classes whose `Dispose()` does nothing: no destructor, no `owned` fields, no owning-inline-array fields, trivial-dispose base |
 | **borrow-bearing** | [§9.7](#sec-records-and-disposal) | records (and inline arrays, [§15.1](#sec-inline-arrays); choices, [§35.4](#sec-choice-classification)) carrying at least one borrow of a non-runtime-managed reference type |
 | **choice classification** | [§35.4](#sec-choice-classification) | every choice type, as value-like, borrow-bearing, or owning — the classification on which a choice's copyability, lifetime tracking, and disposal obligation depend |
-| **auto-equality-bearing** | [§9.2](#sec-body-records) | records for which `=`, `GetHashCode`, and `ToString` are synthesized |
-| **serialization-eligible** | [§9.8](#sec-serialization-synthesis) | records and enums for which `Serialize`/`Deserialize` are synthesized |
+| **auto-equality-bearing** | [§9.2](#sec-body-records) | records and value-like choices for which `=`, `GetHashCode`, and `ToString` are synthesized ([§35.7](#sec-choice-equality)) |
+| **serialization-eligible** | [§9.8](#sec-serialization-synthesis) | records, enums, and value-like choices for which `Serialize`/`Deserialize` are synthesized ([§35.7](#sec-choice-equality)) |
 | **equality-bearing** | [§8.3](#sec-equals-and-gethashcode), [§9.2](#sec-body-records) | types usable where consistent `Equals`/`GetHashCode` are required (hash-container keys/elements): every type except a record that is neither auto-equality-bearing nor declares user equality (`operator =`/`<>` with `Equals(T)`/`GetHashCode` per the [§25.2](#sec-operator-overloading-restrictions) co-declaration rule) |
 | **element category** | [§28.11](#sec-collection-element-ownership), stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans) | every type, as collection-element: value, runtime-managed reference, class/interface, or move-only value — the classification on which collection and buffer slot semantics dispatch |
 | **sendable** | [§30.14](#sec-sendable-types) | types whose values may cross an execution-domain boundary (spawn arguments and results, channel elements) |
@@ -970,10 +970,10 @@ Narrowing also applies after early return, after `is not null`, inside the contr
 
 **How narrowing is established (v0.182).** Narrowing is flow-sensitive: at each program point the compiler tracks, per local, whether its value is known non-null. The knowledge is established by:
 
-- a null test — `x <> null` (narrowing the true branch), `x = null` (narrowing the *false* branch), `x is not null`, or a successful `is`/typed-pattern test ([§12.7](#sec-type-tests-is-is-not-as), [§19.3](#sec-patterns)) — in an `if`/`elif` condition, a `while` condition, or a `when` guard;
-- boolean composition of tests: in `A and B`, `B` (and the true branch) is checked under `A`'s true-facts; in `A or B`, `B` (and the false branch) sees `A`'s false-facts; `not` swaps the fact sets — the standard three-outcome flow analysis, so `x <> null and x.Length > 0` is well-typed;
+- a null test — `x <> null` (narrowing the true branch), `x = null` (narrowing the *false* branch), `x is not null`, or a successful `is`/typed-pattern test ([§12.7](#sec-type-tests-is-is-not-as), [§19.3](#sec-patterns)) — in an `if`/`elif` condition (of the statement or of the [§20](#sec-the-if-expression) conditional atom, each condition narrowing its own branches), a `while` condition, a `when` guard, or a `(when …)` arm condition ([§19.1](#sec-forms), narrowing that arm's body);
+- boolean composition of tests: in `A and B`, `B` (and the true branch) is checked under `A`'s true-facts; in `A or B`, `B` (and the false branch) sees `A`'s false-facts; `not` swaps the fact sets — the standard three-outcome flow analysis, so `x <> null and x.Length > 0` is well-typed. The `not`-swap applies to **null facts**; a *type-classification* fact is established only by the `is`/`is not` operators and typed patterns directly, never by `not`-composition — `not (x is T)` has the same truth value as `x is not T` but narrows neither branch ([§17.4](#sec-the-is-is-not-and-as-operators));
 - an early exit: after `if x = null then return; end;` (or `throw`, `break`, `continue` in that branch), the surviving path is narrowed;
-- assignment: after `x := expr;` where `expr`'s static type is non-nullable — or `expr` is itself narrowed non-null at that point — `x` is narrowed until invalidated;
+- assignment: after `x := expr;` where `expr`'s static type is non-nullable — or `expr` is itself narrowed non-null at that point — `x` is narrowed until invalidated; likewise after `x ??= expr;` with such an `expr` (on every path `x` then holds a non-null value, [§7.7](#sec-null-coalescing-and-=));
 - a call to a method declaring a `when true`/`when false` nullability postcondition on an `out` recipient ([§22.4](#sec-out-nullability-postcondition), v0.183): in any region where the call's `bool` result is statically known to equal the stated constant, the recipient is narrowed non-null, composing through boolean operators and early exits like any other fact.
 
 **How narrowing is invalidated (v0.182).** The narrowing of a variable is invalidated when, within the controlled block:
@@ -1278,7 +1278,8 @@ A body-only record receives auto-generated `=`, `<>`, `GetHashCode`, and `ToStri
 - a primitive type, an enum, or `string`;
 - another record that is itself auto-equality-bearing (recursively, this same rule);
 - `T?` where `T` is admissible — the comparison is the null-safe `=` of [§8.4](#sec-=-and)/[§7.11](#sec-lifted-operators);
-- a non-owning inline array `[N]T` or `[N]T?` whose element type is admissible — the comparison is element-by-element per [§8.3](#sec-equals-and-gethashcode)'s inline-array rows.
+- a non-owning inline array `[N]T` or `[N]T?` whose element type is admissible — the comparison is element-by-element per [§8.3](#sec-equals-and-gethashcode)'s inline-array rows;
+- a **value-like choice** that is itself auto-equality-bearing ([§35.7](#sec-choice-equality) — recursively, this same list applied to every case's payload fields).
 
 Such a record is said to be **auto-equality-bearing** — a derived type property ([§3.6](#sec-derived-type-properties)). The generated `=` compares each auto-property by its declared type's `=`; the generated `GetHashCode` combines per-property hashes; the generated `ToString` produces `"TypeName(Prop1: value1, Prop2: value2)"` over the auto-properties in declaration order (matching the positional-record form in [§8.5](#sec-tostring)). Computed (expression-bodied) properties are not part of the equality comparison or the ToString output even when they are visible on the public surface — equality and the auto-formatted representation are always over storage, never over derived values.
 
@@ -1806,12 +1807,12 @@ A class ends with `end ClassName;`. Members may end with `end MemberName;` or `e
 When a member declaration carries multiple modifiers, they appear in this order:
 
 ```
-visibility static (async | pure) (abstract | virtual | override | sealed override) owned readonly member-kind Name ...
+visibility static (async | pure) (abstract | virtual | override | sealed override) (owned | scoped) readonly member-kind Name ...
 ```
 
 `abstract`, `virtual`, `override`, and `sealed override` are mutually exclusive — at most one may appear. A non-virtual member carries none of them. `sealed override` seals a previously-virtual member against further overriding. `sealed` alone is a class-level modifier that prevents inheritance ([§12.4](#sec-sealing)); it does not appear on individual members.
 
-`owned` ([§28.5](#sec-owned-fields)) appears between the virtual-modifier slot and `readonly`. It applies only to fields; methods, properties, and other members do not carry `owned`. The combination `static owned readonly` is the canonical form for a static field that owns a long-lived resource ([§22.13](#sec-static-initialization-order)).
+`owned` ([§28.5](#sec-owned-fields)) — or, on function-typed fields, `scoped` ([§28.14](#sec-scoped-callback-parameters)), which occupies the same slot and is mutually exclusive with it — appears between the virtual-modifier slot and `readonly`. It applies only to fields; methods, properties, and other members do not carry `owned`. The combination `static owned readonly` is the canonical form for a static field that owns a long-lived resource ([§22.13](#sec-static-initialization-order)).
 
 The compiler rejects out-of-order modifiers.
 
@@ -2153,7 +2154,7 @@ Every class member must declare its visibility explicitly, with three exceptions
 - A `polymorphic` registry declaration carries no visibility keyword (it is a compiler-consumed serialization map, not a callable member; see [§9.8](#sec-serialization-synthesis) and Appendix A.3).
 - A `destructor` carries no visibility keyword. A destructor is an implementation hook called by the compiler-generated `Dispose()` method; it is not directly callable by user code. The customization point is `destructor`; the public surface is `Dispose()` (see [§28.4](#sec-the-destructor)).
 
-Outside these three cases, omitting the visibility keyword is a compile error.
+Outside these three cases, omitting the visibility keyword is a compile error. (The asymmetry with [§13.2](#sec-top-level-types)'s file-scope default is deliberate: file scope has one safe default — module-internal — while a member's four-way choice has none, so explicitness is demanded.)
 
 Interface members do not declare visibility; they are implicitly public.
 
@@ -4018,7 +4019,7 @@ The `if` expression selects between values, condition-first, as a parenthesized,
 
 The parentheses are part of the form: in atom-start position, `(` followed by the reserved `if` — which begins no other expression — commits the reading at the second token, and the matching `)` closes the atom; there is no `end`. In call- and index-argument position the leading `(` is the argument list's own, so the atom supplies its pair — `f((if c then a else b))`. The reserved `then`, `elif`, and `else` separate the segments; the `else` branch is mandatory (an expression produces a value on every path); and each condition and branch is a **full expression** with no precedence restriction — in particular, a `throw` branch is admitted in *any* branch position.
 
-Both branches must have a common type. **The common type (v0.159, codifying the implemented rule):** the common type of branch types A and B is whichever of the two the other implicitly converts into — identical types trivially; [§5.1](#sec-implicit-conversions) widening (including constant narrowing); non-nullable `T` into `T?`; a subtype into its base class or implemented interface (a [§5.1](#sec-reference-conversions) reference conversion). If neither converts into the other, the expression is a compile error directing to an explicit conversion or upcast — there is **no** sibling-class least-upper-bound search (deliberately unlike the nearest-common-base rule of [§31.2.1](#sec-arm-patterns), which applies only to multi-type catch bindings). A `throw` branch is bottom-typed ([§17.12](#sec-the-throw-expression)) and imposes no constraint. Conditions are evaluated in textual order; the first `true` condition selects its branch, the `else` branch is selected when none holds, and only the selected branch is evaluated. When the branches are class-typed, the expression's **ownership** is the arm-meet of [§28.3](#sec-producers)'s producers table (v0.184): owned arms meet to owned, borrowed arms to borrowed with unioned source constraints, mixed arms are rejected; an *unmarked* read of a named owned binding written as a branch is a borrow arm, and the **marked** branch `owned x` — `x` a local binding or `owned` parameter — transfers, consuming on the path where its branch is selected and leaving the binding per-path consumed after the construct ([§28.3](#sec-producers), [K7.4](#sec-kernel-k7); v0.209): `var best := (if fresh.Score() > cached.Score() then owned fresh else owned cached);`.
+Both branches must have a common type. **The common type (v0.159, codifying the implemented rule):** the common type of branch types A and B is whichever of the two the other implicitly converts into — identical types trivially; [§5.1](#sec-implicit-conversions) widening (including constant narrowing); non-nullable `T` into `T?`; a subtype into its base class or implemented interface (a [§5.1](#sec-reference-conversions) reference conversion). If neither converts into the other, the expression is a compile error directing to an explicit conversion or upcast — there is **no** sibling-class least-upper-bound search (deliberately unlike the nearest-common-base rule of [§31.2.1](#sec-arm-patterns), which applies only to multi-type catch bindings). A `throw` branch is bottom-typed ([§17.12](#sec-the-throw-expression)) and imposes no constraint. A bare `null` branch likewise imposes no constraint of its own (v0.210, codifying the implemented rule): it target-types to the **nullable form** of the other branches' common type — `(if c then s else null)` with `s: string` has type `string?`; its ownership is [§28.3](#sec-producers)'s null-arm absorption; an all-`null` arm set has no type and is a compile error. Conditions are evaluated in textual order; the first `true` condition selects its branch, the `else` branch is selected when none holds, and only the selected branch is evaluated. When the branches are class-typed, the expression's **ownership** is the arm-meet of [§28.3](#sec-producers)'s producers table (v0.184): owned arms meet to owned, borrowed arms to borrowed with unioned source constraints, mixed arms are rejected; an *unmarked* read of a named owned binding written as a branch is a borrow arm, and the **marked** branch `owned x` — `x` a local binding or `owned` parameter — transfers, consuming on the path where its branch is selected and leaving the binding per-path consumed after the construct ([§28.3](#sec-producers), [K7.4](#sec-kernel-k7); v0.209): `var best := (if fresh.Score() > cached.Score() then owned fresh else owned cached);`.
 
 ```bezel
 var max := (if a > b then a else b);
@@ -6156,8 +6157,8 @@ The taxonomy defines what a source *is* and how it bounds a borrow; which source
 **K7 — The join rule.** At every control-flow join — statement merges, `??`, `if` expressions, expression-position `case`/`when` arms, loop back edges — a variable's or expression's state is the lattice meet, owned ⊑ borrowed:
 
 1. owned ⊓ owned = **owned**, obligation carried forward (for expression arms: exactly one arm's value exists at runtime, so exactly one obligation);
-2. borrowed ⊓ borrowed = **borrowed**, carrying the union of the branches' source sets (K2.2);
-3. owned ⊓ borrowed = **rejected** — no single state is correct, and demoting owned would silently drop an obligation; the program equalizes the branches first;
+2. borrowed ⊓ borrowed = **borrowed**, carrying the union of the arms' source sets (K2.2);
+3. owned ⊓ borrowed = **rejected** — no single state is correct, and demoting owned would silently drop an obligation; the program equalizes the arms first;
 4. owned ⊓ moved-from and owned ⊓ explicitly-disposed = **maybe-consumed** — unreadable after the join, no flow around a back edge into a use; scope-end disposal per-path;
 5. `null`-literal and bottom-typed (`throw`) arms absorb to the other arm's state.
 
@@ -8550,7 +8551,7 @@ Normative semantics (full API: stdlib [§6.9](Bezel_Standard_Library.md#sec-chan
 
 - **`new Channel<T>()`** creates an unbounded channel. **`NewSender(): owned ChannelSender<T>`** mints a sender endpoint; any number may be minted, and each is an independently owned, sendable object. The channel and its senders share an internal core whose synchronization is the implementation's responsibility and invisible to programs.
 - **`Send(owned item: T)`** (class-typed T; for sendable value types and `string` the parameter is unmodified) appends the item, transferring ownership into the channel. Unbounded channels never block on send. Sending on a closed channel raises `ChannelClosedException`.
-- **`Receive()`** is asynchronous — `OwningTask<T>` for class-typed T (Pattern B: awaiting transfers ownership of the item to the receiver), `Task<T>` otherwise. If the channel is empty and open, the receive completes when an item arrives; if empty and closed, it raises `ChannelClosedException`. **`TryReceive(out owned item: T?): bool`** is the non-blocking form (Try pattern; `out using var` at the call site); it returns `false` when no item is available — consult **`IsClosed`** to distinguish empty-but-open from closed. **Abandoning a pending receive deregisters, never consumes (v0.179).** Disposing a `Receive` task before an item has been dequeued into it deregisters the waiter; **no message is consumed or lost** — the next item goes to the next receive. An item being handed to the waiter at the instant of disposal is returned to the channel's head (an internal give-back; items remain exactly-once). This is the one place [§30.5](#sec-result-lifetime-and-task-disposal)'s dispose-continuation semantics do not apply to a pending result: the channel's item is given back rather than produced-then-disposed. (A first-class cancellable receive and multi-source select remain deferred to the give-back-protocol RFC — stdlib [§6.9](Bezel_Standard_Library.md#sec-channel)'s deferral list. Until it lands, the sanctioned multi-source shape is to **merge into one channel**: one forwarder task per source, each `Send`ing into a single merged channel, the consumer receiving from that channel only — no task is abandoned mid-receive, and per-sender FIFO is preserved per source.)
+- **`Receive()`** is asynchronous — `OwningTask<T>` for class-typed T (Pattern B: awaiting transfers ownership of the item to the receiver), `Task<T>` otherwise. If the channel is empty and open, the receive completes when an item arrives; if empty and closed, it raises `ChannelClosedException`. **`TryReceive(out owned item: T?): bool`** is the non-blocking form (Try pattern; `out using var` at the call site); it returns `false` when no item is available — consult **`IsClosed`** to distinguish empty-but-open from closed. **Abandoning a pending receive deregisters, never consumes (v0.179).** Disposing a `Receive` task before an item has been dequeued into it deregisters the waiter; **no message is consumed or lost** — the next item goes to the next receive. An item being handed to the waiter at the instant of disposal is returned to the channel's head (an internal give-back; items remain exactly-once). This is the one place [§30.5](#sec-result-lifetime-and-task-disposal)'s dispose-continuation semantics do not apply to a pending result: the channel's item is given back rather than produced-then-disposed. (A first-class cancellable receive and multi-source select remain deferred to the give-back protocol design — proposal 0060, consolidating stdlib [§6.9](Bezel_Standard_Library.md#sec-channel)'s deferral list. Until it lands, the sanctioned multi-source shape is to **merge into one channel**: one forwarder task per source, each `Send`ing into a single merged channel, the consumer receiving from that channel only — no task is abandoned mid-receive, and per-sender FIFO is preserved per source.)
 - **`ReceiveAll()` (v0.186)** is the non-exceptional drain form: an async enumeration (`IOwningAsyncEnumerable<T>` for class-typed T, `IAsyncEnumerable<T>` otherwise — [§30.7](#sec-asynchronous-programming-async-iterators)) that yields each item with `Receive`'s transfer semantics, suspends while the channel is empty and open, and completes **normally** when the channel is drained and closed. At most one consumption may be in progress (the channel is single-consumer; this names the obligation): beginning a `ReceiveAll` while another enumeration is active **or while a `Receive` task is pending**, and calling `Receive`/`TryReceive` while a `ReceiveAll` enumeration is active, raise `InvalidOperationException`. The enumerator is affine ([§29.11](#sec-multiple-enumeration)). Abandoning the enumeration mid-drain deregisters like an abandoned `Receive` (below); no item is consumed or lost. An enumeration ended by a cancellation fault ([§30.7](#sec-asynchronous-programming-async-iterators)'s token routing) deregisters the same way — an item mid-handoff at that instant is returned to the channel's head; items already yielded to the body are the consumer's. The at-most-one-consumption obligation releases when an enumeration ends by any edge — normal completion, fault, or enumerator disposal — after which a `Receive`, `TryReceive`, or fresh `ReceiveAll()` (a new affine enumerable) is admissible (v0.201, stated).
 - **Closing.** Disposing the last `ChannelSender<T>` *closes* the channel: items already sent remain receivable (the channel drains), and after the drain, receives raise `ChannelClosedException`. Disposing the `Channel<T>` itself closes it immediately and disposes every undelivered class-typed item in reverse insertion order (the owned column of [§28.11](#sec-element-slot-policy)); subsequent sends raise `ChannelClosedException`.
 - **Ordering.** Items from one sender are received in the order sent; items from different senders interleave in an unspecified but consistent total order (each item is received exactly once).
@@ -10189,8 +10190,9 @@ PropertyBody    ::= "=>" Expression ";"
 AutoAccessorVis ::= Visibility ("get" | "set")   /* e.g. `private set` */
 Accessor        ::= Visibility? "pure"? "get" AccessorBody
                   | Visibility? "set" SetterParamSpec? AccessorBody
-                              /* "pure" is admitted on "get" only; a pure "set"
-                                 is rejected semantically (§22.15) */
+                              /* "pure" is admitted on "get" only — a "pure set"
+                                 does not parse (the set alternative carries no
+                                 "pure" slot); §22.15 states the rule */
 SetterParamSpec ::= "(" ParamMod? Identifier? ")"
                               /* Explicit setter parameter spec, used when
                                  the parameter modifier needs to be declared
@@ -10229,7 +10231,11 @@ IndexerDecl     ::= Visibility "static"? "pure"? VirtualKind?
                                  declarations (matching the property's name);
                                  indexers have no name, so the only valid
                                  form for an indexer's block-form `end` is
-                                 plain `end;`. Enforced semantically. */
+                                 plain `end;`. Enforced semantically —
+                                 IfaceIndexer states the same rule structurally
+                                 in its bespoke body; this production's
+                                 reuse-plus-semantic-rejection is the grammar's
+                                 deliberate shared-production policy. */
 
 ConstructorDecl ::= Visibility "pure"? "constructor" "(" ParamList? ")"
                     ContractClause*
