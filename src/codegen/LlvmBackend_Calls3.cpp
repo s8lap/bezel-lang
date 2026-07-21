@@ -1951,8 +1951,21 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         builder_.CreateStore(v, slot);
         auto* fn = declareC("bz_llist_add_first", ptrTy(),
                             {ptrTy(), ptrTy(), i64()});
-        return builder_.CreateCall(fn, {recv, slot, builder_.getInt64(esz)},
-                                   "ll.addFirst");
+        llvm::Value* r = builder_.CreateCall(fn,
+            {recv, slot, builder_.getInt64(esz)}, "ll.addFirst");
+        // fix #1970 / §28.4 / §28.6: for OwningLinkedList<T>.AddFirst the
+        // element parameter is `owned`, so a bare owned local/param argument's
+        // ownership just transferred into the list (the runtime mem-copies
+        // from `slot` into the new node, then the node now owns `v`). Null the
+        // caller's slot so the caller's null-guarded unwindOnly disposal —
+        // which UnwindIneligibleWalker now leaves eligible for this callee shape
+        // (calleeIsOwningCollectionTransfer) — is exactly-once: it skips the
+        // just-moved value (no double-free with the list's element disposal on
+        // Clear/Remove*) yet disposes a value still live at a throw that
+        // PRECEDES the AddFirst. A BORROWING LinkedList<T>.AddFirst keeps the
+        // caller as owner — no transfer, no nulling.
+        if (isOwning) nullTransferredOwnedLocalSlot(call.args[0].value.get());
+        return r;
     }
     // --- AddLast(item): LinkedListNode<T> ---
     if (m == "AddLast" && call.args.size() == 1 && call.args[0].value) {
@@ -1962,8 +1975,15 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         builder_.CreateStore(v, slot);
         auto* fn = declareC("bz_llist_add_last", ptrTy(),
                             {ptrTy(), ptrTy(), i64()});
-        return builder_.CreateCall(fn, {recv, slot, builder_.getInt64(esz)},
-                                   "ll.addLast");
+        llvm::Value* r = builder_.CreateCall(fn,
+            {recv, slot, builder_.getInt64(esz)}, "ll.addLast");
+        // fix #1970 / §28.4 / §28.6: see the AddFirst note above — the
+        // OwningLinkedList AddLast path transfers ownership of the element;
+        // null the caller's slot so the UnwindIneligibleWalker-eligible local
+        // gets exactly-once disposal. Borrowing LinkedList<T>.AddLast stays
+        // caller-owned and is NOT nulled.
+        if (isOwning) nullTransferredOwnedLocalSlot(call.args[0].value.get());
+        return r;
     }
     // --- AddBefore(node, item): LinkedListNode<T> ---
     if (m == "AddBefore" && call.args.size() == 2 &&
@@ -1975,8 +1995,15 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         builder_.CreateStore(v, slot);
         auto* fn = declareC("bz_llist_add_before", ptrTy(),
                             {ptrTy(), ptrTy(), ptrTy(), i64()});
-        return builder_.CreateCall(fn,
+        llvm::Value* r = builder_.CreateCall(fn,
             {recv, node, slot, builder_.getInt64(esz)}, "ll.addBefore");
+        // fix #1970 / §28.4 / §28.6: see the AddFirst note — for
+        // OwningLinkedList.AddBefore the element (arg 1) is `owned` and has
+        // just been transferred into the new list node; null the caller's
+        // slot for a bare owned local/param. Borrowing LinkedList.AddBefore
+        // takes the item by borrow — no null.
+        if (isOwning) nullTransferredOwnedLocalSlot(call.args[1].value.get());
+        return r;
     }
     // --- AddAfter(node, item): LinkedListNode<T> ---
     if (m == "AddAfter" && call.args.size() == 2 &&
@@ -1988,8 +2015,15 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         builder_.CreateStore(v, slot);
         auto* fn = declareC("bz_llist_add_after", ptrTy(),
                             {ptrTy(), ptrTy(), ptrTy(), i64()});
-        return builder_.CreateCall(fn,
+        llvm::Value* r = builder_.CreateCall(fn,
             {recv, node, slot, builder_.getInt64(esz)}, "ll.addAfter");
+        // fix #1970 / §28.4 / §28.6: see the AddFirst note — for
+        // OwningLinkedList.AddAfter the element (arg 1) is `owned` and has
+        // just been transferred into the new list node; null the caller's
+        // slot for a bare owned local/param. Borrowing LinkedList.AddAfter
+        // takes the item by borrow — no null.
+        if (isOwning) nullTransferredOwnedLocalSlot(call.args[1].value.get());
+        return r;
     }
     // --- PopFirst(): owned T / PopLast(): owned T (OwningLinkedList only) ---
     // fix #642 / stdlib §4.7: transfer ownership of the first/last element to the

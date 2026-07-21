@@ -891,6 +891,21 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                     {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
                 builder_.CreateCall(fn, {recv, idx, slot, builder_.getInt64(esz),
                                          elemDisp});
+                // fix #1970 / §28.4 / §28.6: OwningArray<T>[i] := owned v (and
+                // any IOwningList<T>[i] := owned v via the §4.2 path) has just
+                // transferred ownership of `v` into the array slot. Null the
+                // caller's slot for a bare owned local/param RHS so the caller's
+                // null-guarded unwindOnly disposal — which
+                // UnwindIneligibleWalker now leaves eligible for this
+                // AssignmentStmt shape (see indexerSetEligibleSource in
+                // LlvmBackend_Setup.cpp's UnwindIneligibleWalker) — is
+                // exactly-once: disposes a value still live at a throw that
+                // PRECEDES the indexer-set (fixes the #1970 leak); skips the
+                // already-stored value at the post-set throw edge (no double-
+                // free with the array's slot-owner element disposal on the
+                // displaced-prior branch). Mirrors the OwningArray.Add / Push /
+                // Enqueue / Insert nulling paths.
+                nullTransferredOwnedLocalSlot(valueExpr);
                 return true;
             }
         }
@@ -1032,6 +1047,21 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy(),
                                                ptrTy()});
             builder_.CreateCall(fn, {recv, keyPtr, vPtr, valDisp});
+            // fix #1970 / §28.4 / §28.6: OwningDictionary<K,V>[k] := owned v
+            // has just transferred ownership of `v` (the disposed prior value
+            // for an existing key is handled by the runtime's disposing setter;
+            // for a fresh key the new value is stored). Null the caller's slot
+            // for a bare owned local/param RHS so the caller's null-guarded
+            // unwindOnly disposal — which UnwindIneligibleWalker now leaves
+            // eligible for this AssignmentStmt shape (indexerSetEligibleSource
+            // for OwningDictionary) — is exactly-once: disposes a value still
+            // live at a throw that PRECEDES the indexer-set (fixes the #1970
+            // leak); skips the just-stored value at the post-set throw edge
+            // (no double-free with the dict's table-disposal of the displaced
+            // prior element). Mirrors the OwningDictionary.Add / Insert /
+            // OwningArray.Add nulling paths.
+            if (dictIsOwning2)
+                nullTransferredOwnedLocalSlot(valueExpr);
         } else {
             auto* fn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy(), ptrTy()});
@@ -1046,6 +1076,11 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
             llvm::Type::getVoidTy(llvm_),
             {ptrTy(), ptrTy(), i64(), ptrTy(), ptrTy()});
         builder_.CreateCall(fn, {recv, kd, kl, vPtr, valDisp});
+        // fix #1970 / §28.4 / §28.6: see the gen-key branch above — for an
+        // OwningDictionary<K,V> with string key the value has just been
+        // transferred; null the caller's slot for a bare owned local/param RHS.
+        if (dictIsOwning2)
+            nullTransferredOwnedLocalSlot(valueExpr);
     } else {
         auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
                             {ptrTy(), ptrTy(), i64(), ptrTy()});

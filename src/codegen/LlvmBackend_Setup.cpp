@@ -8695,47 +8695,70 @@ inline bool calleeIsUserMethod(const sema::SemaContext& ctx,
     return ms && dynamic_cast<const ast::MethodDecl*>(ms->decl) != nullptr;
 }
 
-// #1955 / §28.3: true iff `callee` is an ARRAY-BACKED owning-collection element-
-// transfer method — `OwningArray.Add` / `.Insert`, `OwningStack.Push`,
-// `OwningQueue.Enqueue`. For these the element parameter is definitionally
-// `owned` (the collection takes over the element's disposal), and the element
-// lowers through bz_array_add / bz_array_insert_at (LlvmBackend_Calls.cpp) —
-// EXACTLY the paths that now NULL the caller's slot for a bare owned local/param
-// element argument (nullTransferredOwnedLocalSlot). So the walker may leave that
-// argument's local eligible for unwind disposal (the null-guarded unwindOnly
-// disposal stays exactly-once), as it does for an ordinary user method.
+// #1955 / §28.3 (extended by #1970 / §28.4 / §28.6): true iff `callee` is an
+// owning-collection element-transfer method whose lowering site NULLS the
+// caller's slot for a bare owned local/param element argument
+// (nullTransferredOwnedLocalSlot). So the walker may leave that argument's
+// local eligible for unwind disposal (the null-guarded unwindOnly disposal
+// stays exactly-once), as it does for an ordinary user method.
 //
-// This is a deliberate ALLOWLIST, not a broad `isOwningPrefixedName` check,
-// because the invariant the two sites must jointly preserve is `eligible ⟹
-// nulled`. The other owning collections take insert paths that do NOT null:
-// OwningSet.Add dedup-inserts (emitSetDedupInsert), OwningLinkedList uses the
-// linked-list runtime, OwningDictionary the hash runtime. Admitting them here
-// would leave their transferred local eligible with a NON-null slot → a double-
-// free on the transfer-window throw edge. They stay tainted (a safe residual
-// leak on a preceding-throw edge, never a double-free) until their own paths
-// null too. A BORROWING collection (`Array<T>.Add`) is likewise excluded — no
-// ownership transfer, the caller keeps ownership.
+// The receiver allowlist is the EXACT set of collections whose element-/value-
+// transfer lowering now nulls the caller's slot:
+//   - OwningArray.Add/Insert, OwningStack.Push, OwningQueue.Enqueue (#1955).
+//   - OwningSet.Add (#1970; the OwningSet.Add dedup-insert helper, and the
+//     dup-branch disposes/transfers — either way ownership resolves and the
+//     slot must be nulled for an exactly-once unwind disposal).
+//   - OwningLinkedList.AddFirst/AddLast/AddBefore/AddAfter (#1970; the linked-
+//     list runtime takes a mem-copy from a temp slot, so nulling the caller's
+//     slot after the runtime call is correct — the list's node now owns `v`).
+//   - OwningDictionary.Add (#1970; the dict table stores `v`; the duplicate-
+//     key branch in the same lowering disposes `v` before throwing, so a
+//     transfer-window throw after that branch is impossible — the non-dup
+//     store path transfers, and nulling after stores is correct).
+//
+// This is a deliberate ALLOWLIST (each shape's nulling is verified against its
+// own lowering), not a broad `isOwningPrefixedName` check, because the
+// invariant the two sites must jointly preserve is `eligible ⟹ nulled`. A
+// BORROWING collection (`Array<T>.Add`, `LinkedList<T>.AddFirst`,
+// `Dictionary<K,V>.Add`) is likewise excluded — no ownership transfer, the
+// caller keeps ownership, the slot must stay live. The manual-lowered builtin
+// ctors (`Shared<T>`, `Weak<T>`, `Locked<T>`, `RwLocked<T>`) live on the
+// NewExpr path (newExprRoutesThroughNullingCtor), not here.
 inline bool calleeIsOwningCollectionTransfer(const sema::SemaContext& ctx,
                                              const ast::Expr* callee) {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
     if (!ma || !ma->target) return false;
     const auto& m = ma->member;
-    if (m != "Add" && m != "Push" && m != "Enqueue" && m != "Insert")
+    // #1970 / §28.4 / §28.6: extend the method-name set with the OwningLinkedList
+    // element-insert family (AddFirst/AddLast/AddBefore/AddAfter); all five
+    // names route through tryLowerLinkedListInstanceCall's bz_llist_add_*
+    // runtime calls, each of which now nulls the caller's slot (for Owning-
+    // LinkedList only — LinkedList borrow args are non-mutating and not
+    // nulled; see the callee-receiver gate below).
+    if (m != "Add" && m != "Push" && m != "Enqueue" && m != "Insert" &&
+        m != "AddFirst" && m != "AddLast" &&
+        m != "AddBefore" && m != "AddAfter")
         return false;
     const sema::TypeRef* recvTy = ctx.exprType(*ma->target);
     if (!recvTy) return false;
     std::string_view h = recvTy->headName();
-    return h == "OwningArray" || h == "OwningStack" || h == "OwningQueue";
+    // Receiving-type allowlist — the Owning-prefix names whose element/value
+    // transfer now nulls. A borrowing LinkedList/Dictionary/Set/Array stays
+    // out (no ownership transfer at the call).
+    return h == "OwningArray" || h == "OwningStack" || h == "OwningQueue" ||
+           h == "OwningSet" || h == "OwningLinkedList" ||
+           h == "OwningDictionary";
 }
 
-// #1955 / §28.3: true iff `new <type>(args)` resolves to an EXPLICIT user
-// constructor — a non-static ConstructorSymbol backed by an ast::ConstructorDecl
-// whose arity matches. That is EXACTLY the `new` shape whose lowerNew arg-
-// lowering routes through `buildOrderedArgs(nullTransferredOwned=true)` (via
-// `ctorForArgs`, LlvmBackend_Exprs2.cpp) and therefore NULLS the caller's slot
-// for a bare owned local/param `owned x` argument — so the walker may leave that
-// local eligible for unwind disposal (the null-guarded unwindOnly disposal stays
-// exactly-once).
+// #1955 / §28.3 (extended by #1970 / §28.4 / §28.6): true iff `new <type>(args)`
+// resolves to an EXPLICIT user constructor — a non-static ConstructorSymbol
+// backed by an ast::ConstructorDecl whose arity matches — OR to the builtin
+// `new Shared<T>(owned v)` shape whose manually-lowered bz_shared_new call now
+// NULLS the caller's slot for a bare owned local/param `owned v` argument (see
+// the Shared ctor branch in LlvmBackend_Exprs2.cpp's lowerNew). Either case is
+// the `new` shape whose lowering path nulls the caller's slot, so the walker
+// may leave that local eligible for unwind disposal (the null-guarded
+// unwindOnly disposal stays exactly-once).
 //
 // It is NOT enough to key on `TypeDeclKind::Class`/`Record`: a PRIMARY-ctor class
 // (`class Box(owned r: Resource)`) has NO ConstructorSymbol — sema stores its
@@ -8744,16 +8767,26 @@ inline bool calleeIsOwningCollectionTransfer(const sema::SemaContext& ctx,
 // positional-field path (LlvmBackend_Exprs2.cpp), which does NOT null the slot.
 // Untainting there would leave a NON-null slot eligible → the class's field
 // disposer frees the value on unwind, then the caller's unwind disposal frees it
-// AGAIN (double-free). A builtin owned-consuming ctor (Shared<T>/Weak<T> — null
-// `declaration`) and an imported ctor likewise lower manually without nulling.
-// All of those stay TAINTED (a safe residual leak on a throw-BEFORE-transfer
-// edge, a tracked #1955 follow-up, never a double-free). This predicate keeps
-// the walker's `eligible ⟹ nulled` invariant EXACT.
+// AGAIN (double-free). Other builtin owned-consuming ctors (Weak<T>/Locked<T>/
+// RwLocked<T> — null `declaration`, head-name != "Shared") likewise lower
+// manually without nulling and stay TAINTED (a safe residual leak, never a
+// double-free). Imported ctors likewise lack the explicit-decl nulling path.
+// This predicate keeps the walker's `eligible ⟹ nulled` invariant EXACT.
 inline bool newExprRoutesThroughNullingCtor(const sema::SemaContext& ctx,
                                             const ast::NewExpr* n) {
     if (!n || !n->type) return false;
     const sema::TypeRef* nt = ctx.resolvedType(*n->type);
-    if (!nt || !nt->declaration) return false;          // builtin (null decl)
+    if (!nt) return false;
+    // fix #1970 / §28.4 / §28.6: the builtin `new Shared<T>(owned v)` ctor
+    // manually lowers via bz_shared_new (LlvmBackend_Exprs2.cpp's lowerNew)
+    // and now NULLS the caller's slot for a bare owned local/param `owned v`
+    // argument (mirrors the user-ctor nulling path). Admit it so the walker
+    // can leave the source untainted — the null-guarded unwindOnly disposal
+    // is then exactly-once (throw-before disposes, throw-after skips the
+    // already-moved value). Other builtin ctors (Weak<T>/Locked<T>/
+    // RwLocked<T>) still do NOT null and stay excluded (a safe leak, never a
+    // double-free — see the inline nulling-notes in each ctor's lowering).
+    if (!nt->declaration) return nt->headName() == "Shared";
     if (ctx.isImported(nt->declaration)) return false;  // imported → manual lower
     for (sema::Symbol* m : nt->declaration->members) {
         auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
@@ -9168,7 +9201,48 @@ struct UnwindIneligibleWalker {
                 as->valueHasOwnedMarker &&
                 dynamic_cast<const ast::IdentifierExpr*>(as->target.get()) &&
                 markedOwnedSourceEligible(ctx, as->value.get());
-            expr(as->value.get(), /*consuming=*/!markedEligibleSource);
+            // fix #1970 / §28.4 / §28.6: an indexer-set assignment for an OWNING
+            // collection (`arr[i] := owned v` on OwningArray<T> /
+            // IOwningList<T>, `dict[k] := owned v` on OwningDictionary<K,V>)
+            // lowers through lowerCollectionIndexerSet, which NULLS the caller's
+            // slot for a bare owned local/param element/value argument (mirrors
+            // the #1955 nullTransferredOwnedLocalSlot call for collection-Add).
+            // The walker therefore leaves the RHS untainted on those shapes —
+            // the null-guarded unwindOnly disposal is exactly-once: a throw
+            // BEFORE the indexer-set disposes the still-live value, a throw
+            // AFTER skips the already-transferred value (no double-free with
+            // the collection's slot-disposal of the displaced prior element on
+            // the update arm). Only the bare-identifier RHS shape gets the
+            // untaint — a non-id RHS (`arr[i] := move x`, `dict[k] :=
+            // producer()`) is handled by `expr(consuming=true)` (the regular
+            // path). Restricted to the EXACT slots the lowering nulls: a plain
+            // `var` owned local (non-`using`) or an `owned` parameter, mirroring
+            // markedOwnedSourceEligible / nullTransferredOwnedLocalSlot's own
+            // eligibility test (the `eligible ⟹ nulled` invariant stays exact).
+            bool indexerSetEligibleSource = false;
+            if (as->value &&
+                dynamic_cast<const ast::IdentifierExpr*>(as->value.get()) &&
+                dynamic_cast<const ast::IndexExpr*>(as->target.get())) {
+                const sema::TypeRef* ixRecvTy =
+                    ctx.exprType(*static_cast<const ast::IndexExpr*>(
+                                     as->target.get())->target.get());
+                if (ixRecvTy) {
+                    std::string_view h = ixRecvTy->headName();
+                    if (h == "OwningArray" || h == "OwningDictionary") {
+                        sema::Symbol* asym =
+                            ctx.exprSymbol(*dynamic_cast<const ast::IdentifierExpr*>(
+                                               as->value.get()));
+                        if (auto* loc = dynamic_cast<sema::LocalSymbol*>(asym))
+                            indexerSetEligibleSource =
+                                loc->decl && !loc->isUsing;
+                        else if (auto* ps =
+                                     dynamic_cast<sema::ParameterSymbol*>(asym))
+                            indexerSetEligibleSource = (ps->modifier == "owned");
+                    }
+                }
+            }
+            bool eligibleSource = markedEligibleSource || indexerSetEligibleSource;
+            expr(as->value.get(), /*consuming=*/!eligibleSource);
             return;
         }
         if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {

@@ -2938,7 +2938,26 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     ? llvm::cast<llvm::Value>(dispFn)
                     : llvm::ConstantPointerNull::get(ptrTy());
                 auto* newFn = declareC("bz_shared_new", ptrTy(), {ptrTy(), ptrTy()});
-                return builder_.CreateCall(newFn, {val, dispArg}, "shared.new");
+                llvm::Value* r = builder_.CreateCall(newFn, {val, dispArg},
+                                                     "shared.new");
+                // fix #1970 / §28.4 / §28.6: `new Shared<T>(owned v)` (§28.13)
+                // takes ownership of `v` (the disposer thunk or builtin
+                // disposer is stored in the control block; on the last strong
+                // release it disposes `v`). Null the caller's slot for a bare
+                // owned local/param argument so the caller's null-guarded
+                // unwindOnly disposal — which the walker now leaves eligible
+                // for this NewExpr shape via newExprRoutesThroughNullingCtor's
+                // builtin Shared head-name branch — is exactly-once: disposes a
+                // value still live at a throw that PRECEDES the ctor (fixes
+                // the #1970 leak); skips the already-stored value at the
+                // post-ctor throw edge (no double-free with Shared's
+                // disposer on the last-release path, the standard §28.13
+                // dispose-once invariant). A `new Shared<T>(move x)` / `new
+                // Shared<T>(producer())` source shape is unaffected
+                // (nullTransferredOwnedLocalSlot's own eligibility test
+                // restricts to a plain owned local / owned parameter).
+                nullTransferredOwnedLocalSlot(ne.args[0].value.get());
+                return r;
             }
             // §30.15 (#600 phase c): new Channel<T>() — allocate a bz_channel_t.
             // The dispose_elem callback is derived from elementPolicyFor:

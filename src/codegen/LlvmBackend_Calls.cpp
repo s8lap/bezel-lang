@@ -3545,6 +3545,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* item = lowerExpr(*call.args[0].value);
             if (!item) return nullptr;
             if (!emitSetDedupInsert(item)) return nullptr;
+            // fix #1970 / §28.4 / §28.6: OwningSet<T>.Add takes `owned item`
+            // (the dup branch disposes `item`, the non-dup branch transfers
+            // ownership into the backing array). Either way ownership has
+            // resolved at this point and the caller's slot is no longer
+            // live. Null it for a bare owned local/param argument so the
+            // caller's null-guarded unwindOnly disposal — which
+            // UnwindIneligibleWalker now leaves eligible for this callee shape
+            // (calleeIsOwningCollectionTransfer) — is exactly-once: it
+            // disposes a value still live at a throw that PRECEDES the Add,
+            // and skips the already-resolved value at the Add-or-dup throw-
+            // after edge (no double-free with this lowering's own disposer
+            // call on the dup branch). Mirrors the OwningArray.Add/Insert and
+            // user-method nulling paths (#1955 / #1918).
+            nullTransferredOwnedLocalSlot(call.args[0].value.get());
             return llvm::ConstantInt::get(i32(), 0);  // unit
         }
         // fix #1474 / stdlib §4.10: OwningSet<T>.UnionWith(owned other:
@@ -5020,12 +5034,35 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 auto* fn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
                                     {ptrTy(), ptrTy(), ptrTy()});
                 builder_.CreateCall(fn, {recv, genKeyPtr(k), vPtr});
+                // fix #1970 / §28.4 / §28.6: for OwningDictionary<K,V>.Add the
+                // value parameter is `owned` and has just been stored into the
+                // dict's table (the duplicate-key branch above already disposed
+                // `v` and threw — argument-shape skipped, slot still live; the
+                // common path here transferred ownership). Null the caller's
+                // slot for a bare owned local/param `owned v` so the caller's
+                // null-guarded unwindOnly disposal — which
+                // UnwindIneligibleWalker now leaves eligible for this callee
+                // shape (calleeIsOwningCollectionTransfer) — is exactly-once:
+                // disposes a value still live at a throw that PRECEDES the Add
+                // (fixes the #1970 leak); skips the just-transferred value at
+                // the post-transfer throw edge (no double-free with the
+                // dict's table disposal on Clear/Drain). Mirror the OwningArray
+                // / OwningSet Add nulling paths.
+                if (dictValIsOwning)
+                    nullTransferredOwnedLocalSlot(call.args[1].value.get());
                 return llvm::ConstantInt::get(i32(), 0);
             }
             auto [kd, kl] = strDataLen(k);
             auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy(), i64(), ptrTy()});
             builder_.CreateCall(fn, {recv, kd, kl, vPtr});
+            // fix #1970 / §28.4 / §28.6: see the gen-key branch above — for
+            // OwningDictionary<K,V> with a string key, the value (arg 1) has
+            // just been transferred. Null the caller's bare owned local/param
+            // slot; the UnwindIneligibleWalker-eligible unwindOnly disposal
+            // stays exactly-once (throw-before disposes, throw-after skips).
+            if (dictValIsOwning)
+                nullTransferredOwnedLocalSlot(call.args[1].value.get());
             return llvm::ConstantInt::get(i32(), 0);
         }
         // .Remove(k): bool — per §4.9: OwningDictionary.Remove disposes the
