@@ -801,9 +801,25 @@ BEZEL_TEST(vacuous_pin_lint_2073,
     BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "tcs"));
 }
 
-// OwningTask — §6.6 negative control.
+// OwningTask — §6.7 negative control. `Task.FromOwnedResult<T>(owned value: T):
+// OwningTask<T> where T: class` (stdlib §6.7) returns an OwningTask<T> — the
+// `OwningTask` head is in rhsIsDisposableClassType's disposable-builtin set
+// (spec §28.10 / §28.11), so the inert-RHS branch must NOT fire; this pins
+// that the head-name exclusion fires for the call-form, not only the new-form.
+// Per spec §28.10 (v0.215) + §30.3; the owning-consume context is `using var`.
 BEZEL_TEST(vacuous_pin_lint_2073, owning_task_using_var_no_warn_spec_28_10) {
-    auto r = parseAndCheckOwnership("module M; class C public method M(): int using var t := OwningTask.FromResult<int>(42); return 0; end M; public static method Main(): int return 0; end Main; end C;");
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Cell public constructor() end constructor; "
+        "destructor end destructor; end Cell; "
+        "class C "
+        "  public method M(): int "
+        "    var cell := new Cell(); "
+        "    using var t := Task.FromOwnedResult<Cell>(cell); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "t"));
     BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "t"));
