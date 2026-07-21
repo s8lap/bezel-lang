@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | under-review (adversarial critique run 2026-07-21; both blocking findings resolved by narrowing — see §8) |
+| **Status** | superseded — graduated v0.209 (as narrowed; `when`-arm results admitted for parity at the composition gate — mutually-exclusive expression arms, same K7 meet). Impl delta tracked at the landing issue |
 | **Tracking issue** | [#2076](https://github.com/s8lap/bezel-lang/issues/2076) |
 | **Target** | Spec: §28.3 (K1.5 producers table — one new row; K3.4's marked-transfer family — two new positions; axiom register — A7 *narrowed*, not retired; the "equalize the branches" worked examples gain the expression form), §17 (the if-expression section), §35 (expression-position `case` arm results), Appendix A.6 (the marked-identifier atom + the unification with the v0.180 binding-slot marker); rationale §5.26 (A7 bullet updated). No stdlib changes. |
 | **Written against** | spec v0.206 |
