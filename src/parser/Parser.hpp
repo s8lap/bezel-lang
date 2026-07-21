@@ -103,12 +103,6 @@ private:
     // as before). Non-const because the two-token lookahead for `static
     // requires|ensures` uses the lazily-populating peekAt buffer.
     bool currentTokenStartsContractClause();
-    // §22.16 (v0.203, #2053): could `current_` begin a statement inside a
-    // method/constructor block body? Used to discriminate a clause-bearing
-    // member whose clauses terminate a body-less declaration (next token is
-    // a class member keyword / `end` / EOF) from one whose clauses are
-    // followed by a real block body (next token starts a statement).
-    bool tokenLooksLikeStatementStarter() const;
     // Slice 6/10/19/...: a single class member.
     std::unique_ptr<ast::Member> parseMember();
     // Slice 34: a single interface member (A.4 InterfaceMember). Smaller and

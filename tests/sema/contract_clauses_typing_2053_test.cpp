@@ -1,6 +1,7 @@
-// Spec-derived sema tests for §22.16 contract clauses (v0.203, proposal
-// 0043, #2053) — Slice 2: clause TYPING (bool + §22.15 pure-body admission,
-// expression-wise; throw/await rejection).
+// Spec-derived sema tests for §22.16 contract clauses (v0.207, proposal
+// 0055, #2078) — Slice 2: clause TYPING (bool + §22.15 pure-body admission,
+// expression-wise; throw/await rejection). Clauses use the structural-paren
+// surface `requires(E)` / `ensures(E)` (proposal 0055).
 //
 // Spec §22.16 "Clause typing: bool, pure, borrow-only":
 //   * the clause expression (and each operand of `old` within it) is type-
@@ -65,9 +66,9 @@ BEZEL_TEST(contract_clauses_typing_2053,
         "class Account "
         "  private _balance: int := 0; "
         "  public method Withdraw(amount: int) "
-        "    requires amount > 0; "
-        "    requires amount <= _balance; "
-        "    ensures _balance - amount >= 0; "
+        "    requires(amount > 0) "
+        "    requires(amount <= _balance) "
+        "    ensures(_balance - amount >= 0) "
         "    _balance := _balance - amount; "
         "  end Withdraw; "
         "end Account;");
@@ -82,7 +83,7 @@ BEZEL_TEST(contract_clauses_typing_2053,
         "module M; "
         "class C "
         "  public method M(amount: int) "
-        "    requires amount; "
+        "    requires(amount) "
         "    => 0; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasMsg(r, "must be `bool`"));
@@ -96,7 +97,7 @@ BEZEL_TEST(contract_clauses_typing_2053,
         "module M; "
         "class C "
         "  public method M(amount: int): int "
-        "    ensures amount + 1; "
+        "    ensures(amount + 1) "
         "    => amount; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasMsg(r, "must be `bool`"));
@@ -110,7 +111,7 @@ BEZEL_TEST(contract_clauses_typing_2053,
         "module M; "
         "class C "
         "  public method M(x: int) "
-        "    requires x > 0 or (do throw new ArgumentException(); end); "
+        "    requires(x > 0 or (do throw new ArgumentException(); end)) "
         "    => 0; "
         "end C;");
     // Either the bool typing rejects the do-block (it's not bool) or the
@@ -125,7 +126,7 @@ BEZEL_TEST(contract_clauses_typing_2053,
         "module M; "
         "class C "
         "  public method M(x: int): int "
-        "    ensures (throw new ArgumentException()) if x < 0 else x > 0; "
+        "    ensures((throw new ArgumentException()) if x < 0 else x > 0) "
         "    => x; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasMsg(r, "throw"));
@@ -140,7 +141,7 @@ BEZEL_TEST(contract_clauses_typing_2053,
         "class C "
         "  public method Helper(): int => 42; "
         "  public method M(x: int) "
-        "    requires Helper() > 0; "
+        "    requires(Helper() > 0) "
         "    => 0; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasMsg(r, "not pure-declared"));
@@ -154,7 +155,7 @@ BEZEL_TEST(contract_clauses_typing_2053,
         "class C "
         "  public pure method Helper(): int => 42; "
         "  public method M(x: int) "
-        "    requires Helper() > 0; "
+        "    requires(Helper() > 0) "
         "    => 0; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -174,7 +175,7 @@ BEZEL_TEST(contract_clauses_typing_2053,
         "module M; "
         "class C "
         "  public method M(x: int): bool "
-        "    requires new C() <> null; "
+        "    requires(new C() <> null) "
         "    => true; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasMsg(r, "class construction"));
@@ -193,8 +194,8 @@ BEZEL_TEST(contract_clauses_typing_2053,
         "class C "
         "  public pure method P(): bool => true; "
         "  public method M(x: int) "
-        "    requires x > 0; "
-        "    ensures P(); "
+        "    requires(x > 0) "
+        "    ensures(P()) "
         "    => true; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -208,7 +209,7 @@ BEZEL_TEST(contract_clauses_typing_2053,
         "module M; "
         "class C "
         "  public method M(s: string) "
-        "    requires s.Length > 0; "
+        "    requires(s.Length > 0) "
         "    => 0; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -233,8 +234,8 @@ BEZEL_TEST(contract_clauses_typing_2053,
         "class C "
         "  private _v: int := 0; "
         "  public constructor(v: int) "
-        "    requires v >= 0; "
-        "    ensures _v = v; "
+        "    requires(v >= 0) "
+        "    ensures(_v = v) "
         "    _v := v; "
         "  end constructor; "
         "end C;");
@@ -248,7 +249,7 @@ BEZEL_TEST(contract_clauses_typing_2053,
         "module M; "
         "class C "
         "  public constructor(v: int) "
-        "    requires v; "
+        "    requires(v) "
         "  end constructor; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasMsg(r, "must be `bool`"));
@@ -262,7 +263,7 @@ BEZEL_TEST(contract_clauses_typing_2053,
         "class C "
         "  private _count: int := 0; "
         "  public method M(amount: int) "
-        "    requires amount <= _count; "
+        "    requires(amount <= _count) "
         "    => 0; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

@@ -1324,14 +1324,14 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         return std::unique_ptr<ast::Member>(dtor.release());
     }
 
-    // §22.16 (v0.203, #2053): A.4 `InvariantDecl ::= "static"? "invariant"
-    // Expression ";"` — a class-body member declaring an instance-state
-    // predicate. `invariant` is a contextual keyword (App. B.2), lexed as an
-    // Identifier; it carries no Visibility per grammar. The optional `static`
-    // qualifier was collected into `modifiers` by the modifier loop above —
-    // extract it here. `invariant` is matched BEFORE the FieldDecl fallback
-    // so an Identifier-named "invariant" at member-position is the member,
-    // not a field name.
+    // §22.16 (v0.207, proposal 0055, #2078): A.4 `InvariantDecl ::=
+    // "static"? "invariant" "(" Expression ")" ";"` — a class-body member
+    // declaring an instance-state predicate. `invariant` is a contextual
+    // keyword (App. B.2), lexed as an Identifier; it carries no Visibility
+    // per grammar. The optional `static` qualifier was collected into
+    // `modifiers` by the modifier loop above — extract it here.
+    // `invariant` is matched BEFORE the FieldDecl fallback so an Identifier-
+    // named "invariant" at member-position is the member, not a field name.
     if (current_.kind == TokenKind::Identifier &&
         current_.text == "invariant") {
         // A.4: InvariantDecl has no Visibility slot.
@@ -1350,7 +1350,21 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         inv->isStatic = isStatic;
         inv->loc = current_.location;
         advance();  // past `invariant`
+        // §22.16 v0.207: structural parens around the predicate. The `;` is
+        // the ordinary member terminator.
+        if (!consumePunctuator("(")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected '(' to open an `invariant` predicate (§22.16)");
+            // Recovery: still try to parse an expression so partial AST shape
+            // survives; report the missing ')' at close-paren time below.
+        }
         inv->expr = parseExpression();
+        if (!consumePunctuator(")")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ')' to close an `invariant` predicate (§22.16)");
+        }
         if (!consumePunctuator(";")) {
             diagnostics_.report(
                 Severity::Error, current_.location,
@@ -1589,21 +1603,16 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
             advance();               // past `=>`
             (void)parseExpression(); // skim the body expression
         }
-        // §22.16 (v0.203, #2053): IfaceMethod/IfaceStaticMethod admit a
-        // clause region per A.4 — `( ";" | ContractClause+ )`. The clauses
-        // are the slot's contract, written where the slot is declared.
+        // §22.16 (v0.207, proposal 0055, #2078): A.4 IfaceMethod's body
+        // slot returns to the uniform `ContractClause* ";"` — every member
+        // ends with `;`, clause-bearing or not. The clause region parses
+        // `("(" Expression ")")` and consumes no `;` of its own.
         m->contractClauses = parseContractClauses();
-        // After clauses, the interface method ends at its last clause's `;`
-        // (§22.16) — no additional `;` is required. Without clauses the lone
-        // `;` terminates the signature as before.
-        const bool endsAtLastClause = !m->contractClauses.empty() &&
-                                      !isPunctuator(";");
-        if (!endsAtLastClause) {
-            if (!consumePunctuator(";")) {
-                diagnostics_.report(
-                    Severity::Error, current_.location,
-                    "expected ';' after interface method signature");
-            }
+        // §22.16 v0.207: the member-terminating `;` is unconditional.
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ';' after interface method signature");
         }
         m->bodyKind = ast::MethodBodyKind::Abstract;
         return std::unique_ptr<ast::Member>(m.release());
@@ -1993,40 +2002,21 @@ std::unique_ptr<ast::MethodDecl> Parser::parseMethodDeclBody(
 
     m->genericConstraints = parseGenericConstraints();
 
-    // §22.16 (v0.203, #2053): the contract-clause region — zero or more
-    // `requires`/`ensures` clauses between the signature and the body
-    // (A.4 MethodDecl's `ContractClause*` slot). The marker-wins rule (App.
-    // B.2) means a `requires`/`ensures` Identifier here is always a clause
-    // marker, never an expression operand.
+    // §22.16 (v0.207, proposal 0055, #2078): the contract-clause region —
+    // zero or more `requires`/`ensures` clauses between the signature and the
+    // body (A.4 MethodDecl's `ContractClause*` slot). The marker-wins rule
+    // (App. B.2) means a `requires`/`ensures` Identifier here is always a
+    // clause marker, never an expression operand.
     m->contractClauses = parseContractClauses();
 
     // A.4 MethodBody: `=> (Expression | AssignmentStmt) ";"` | Block | ";"
     // (v0.160: AssignmentStmt alternative in the `=>` body; valid only for
     // unit methods, i.e. no declared return type — enforced semantically, §22.2.)
-    // §22.16: a clause-bearing member may be BODY-LESS — the clauses' own `;`
-    // terminated the declaration, so the next token belongs to the enclosing
-    // scope (the class's next member, or `end`). In that case the method is
-    // abstract (its clauses bind every override per §22.16's inheritance
-    // rules) and we do not consume further here.
-    const bool clausesTerminateBodyless =
-        !m->contractClauses.empty() &&
-        !isPunctuator("=>") && !isPunctuator(";") &&
-        current_.kind != TokenKind::EndOfFile &&
-        // If the next token could START a statement (block body) we must not
-        // short-circuit — `requires …; stmt; end M;` is a clause-bearing
-        // block body. Visibility/modifier/member-kind keywords and the class
-        // `end` cannot start a statement, so they trigger the body-less form.
-        !tokenLooksLikeStatementStarter();
-    if (clausesTerminateBodyless) {
-        m->bodyKind = ast::MethodBodyKind::Abstract;
-        // Stamp the span from the recorded member start to the current token
-        // (one-past the last clause's `;` is current_ already).
-        if (memberStart.line != 0) {
-            m->span.begin = memberStart;
-            m->span.end   = current_.location;
-        }
-        return m;
-    }
+    // §22.16 v0.207: a clause-bearing member is no longer body-less. Each
+    // `ContractClause` is self-delimiting (its structural parens close it),
+    // so the same `=>`/Block/`;` body dispatch applies at any clause count.
+    // The §22.16 collision remedy (#2053's "stray `;` after clauses"
+    // ambiguity) is gone by construction — a double `;` is unspellable.
     if (consumePunctuator("=>")) {
         // Parse the leading expression first (LHS of potential assignment).
         auto lhs = parseExpression();
@@ -2559,63 +2549,15 @@ bool Parser::currentTokenStartsContractClause() {
     return false;
 }
 
-// §22.16 (v0.203, #2053): could `current_` begin a statement inside a block
-// body? A.6's statement productions start with control-flow keywords
-// (`if`/`elif`/`else`/`while`/`for`/`do`/`return`/`throw`/`break`/`continue`/
-// `yield`/`try`/`case`/`when`), `var`/`using`/`await using`/`const` local-
-// declaration keywords, the discard `_`, or an expression-starter (Identifier
-// / literal / `(`/`new`/`nameof`/`typeof`/…). Member-position tokens that
-// could follow a clause-bearing body-less member — visibility keywords
-// (`public`/`private`/`internal`/`protected`), the modifier keywords
-// (`static`/`async`/`pure`/`abstract`/`virtual`/`sealed`/`override`/`readonly`/
-// `owned`/`scoped`), member-kind keywords (`method`/`constructor`/`destructor`/
-// `property`/`const`/`event`/`extension`/`extern`/`invariant`), nested-type
-// keywords (`class`/`interface`/`record`/`enum`/`choice`), and the class-body
-// terminator `end` — are NOT statement starters in this position. `static` is
-// included in the negative sense: it cannot start a statement.
-bool Parser::tokenLooksLikeStatementStarter() const {
-    if (current_.kind == TokenKind::EndOfFile) return false;
-    // The statement-position keywords. (Most are unconditionally reserved; a
-    // few — like `await`, which is reserved — appear here for clarity.) This
-    // list mirrors parseStatementImpl's dispatch.
-    if (current_.kind == TokenKind::Keyword) {
-        static constexpr std::string_view kStarters[] = {
-            "if", "elif", "else", "while", "for", "do", "return", "throw",
-            "break", "continue", "yield", "try", "case", "when",
-            "var", "using", "await", "const"
-            // Note: not `end`, `public`/`private`/`internal`/`protected`,
-            // not modifiers, not member-kind keywords.
-        };
-        for (auto s : kStarters)
-            if (current_.text == s) return true;
-        return false;
-    }
-    // Identifier / literal / punctuator that could begin an expression
-    // statement. The only punctuator-or-identifier that would NOT be an
-    // expression-starter here is a member-kind contextual-keyword Identifier
-    // (`invariant`, or `method`/`property`/`const`/`event`/etc. — but those
-    // are unconditionally reserved keywords, not Identifiers, so they fall
-    // into the Keyword branch above and return false). `invariant` is the
-    // sole Identifier that begins a member-position construct and never a
-    // statement — exclude it explicitly so the body-less form closes
-    // correctly when the next member is itself an InvariantDecl.
-    if (current_.kind == TokenKind::Identifier &&
-        current_.text == "invariant") {
-        return false;
-    }
-    // `_` is the discard statement's lead; an Identifier is an expression-
-    // statement's lead (assignment-target or call). Both are statement
-    // starters.
-    return true;
-}
-
 std::vector<ast::ContractClause> Parser::parseContractClauses() {
-    // A.4 `ContractClause ::= "static"? ("requires" | "ensures") Expression ";"`.
-    // The clause region is zero or more clauses; the marker-wins rule means a
+    // A.4 (v0.207, proposal 0055, #2078):
+    //   `ContractClause ::= "static"? ("requires" | "ensures") "(" Expression ")"`
+    // The clause region is zero or more clauses. The marker-wins rule means a
     // `requires`/`ensures` Identifier here is always a clause marker, never an
-    // expression operand (App. B.2 — the keyword reading wins). Each clause
-    // carries its own terminating `;`, so a body-less member whose clauses are
-    // its terminator ends naturally at the last clause's `;`.
+    // expression operand (App. B.2 — the keyword reading wins). Each clause's
+    // parens are CLOSE-WHEN-BALANCED (the expression cannot span a statement),
+    // so the clause is self-delimiting and the parser carries no clause-level
+    // `;` here — the member's terminating `;` lives in the body dispatch.
     std::vector<ast::ContractClause> out;
     while (currentTokenStartsContractClause()) {
         ast::ContractClause c;
@@ -2637,13 +2579,22 @@ std::vector<ast::ContractClause> Parser::parseContractClauses() {
         c.kind = isRequires ? ast::ContractClause::Kind::Requires
                             : ast::ContractClause::Kind::Ensures;
         advance();  // past `requires` / `ensures`
-        c.expr = parseExpression();
-        if (!consumePunctuator(";")) {
+        if (!consumePunctuator("(")) {
             diagnostics_.report(
                 Severity::Error, current_.location,
-                "expected ';' to terminate a contract clause (§22.16)");
-            // Recovery: stop consuming clauses so the caller can attempt to
-            // reach the body or the enclosing terminator.
+                "expected '(' to open a contract clause (§22.16)");
+            // Recovery: do not push a partially-formed clause — leave the
+            // outer body dispatch to surface its own diagnostics on whatever
+            // token follows.
+            break;
+        }
+        c.expr = parseExpression();
+        if (!consumePunctuator(")")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ')' to close a contract clause (§22.16)");
+            // Recovery: still record the clause; further clauses' parsing is
+            // best-effort.
             out.push_back(std::move(c));
             break;
         }

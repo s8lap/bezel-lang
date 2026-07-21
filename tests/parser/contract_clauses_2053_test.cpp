@@ -1,17 +1,18 @@
-// Spec-derived parser tests for §22.16 contract clauses (v0.203, proposal
-// 0043, #2053) — Slice 1: clause-region PARSE + AST.
+// Spec-derived parser tests for §22.16 contract clauses (v0.207, proposal
+// 0055, #2078) — Slice 1: clause-region PARSE + AST.
 //
-// Grammar (Appendix A.4):
-//   ContractClause  ::= "static"? ("requires" | "ensures") Expression ";"
-//   InvariantDecl   ::= "static"? "invariant" Expression ";"
+// Grammar (Appendix A.4, v0.207):
+//   ContractClause  ::= "static"? ("requires" | "ensures") "(" Expression ")"
+//   InvariantDecl   ::= "static"? "invariant" "(" Expression ")" ";"
 //   MethodDecl      ::= ... ContractClause* MethodBody
 //   ConstructorDecl ::= ... ContractClause* CtorChain? Statement* "end" ...
-//   IfaceMethod     ::= ... ( ";" | ContractClause+ )
+//   IfaceMethod     ::= ... ContractClause* ";"
 //
 // The marker-wins rule (Appendix B.2): in the clause region, the keyword
 // reading of `requires`/`ensures` always wins; elsewhere they are ordinary
-// identifiers. The body-less-member closure (§22.16): a clause-bearing
-// member may be body-less, terminated at its last clause's `;`.
+// identifiers. v0.207 deletes the body-less-closure rule (#2070's lenient
+// double-`;` acceptance is structurally impossible — clauses are now self-
+// delimiting via their structural parens).
 //
 // Slice 1 covers these Appendix C.15 bullets:
 //   * "Clauses never distinguish overloads; `invariant` members appear only
@@ -76,8 +77,9 @@ std::size_t countClauses(const NodeT* n, bezel::ast::ContractClause::Kind k) {
 }  // namespace
 
 // =========================================================================
-// §22.16 example: a method with `requires` + `ensures` + a block body
-// parses cleanly. Additive — zero-clause methods continue to parse.
+// §22.16 v0.207 example: a method with `requires(x)`, `requires(x)`,
+// `ensures(result)` and a block body parses cleanly. Additive — zero-clause
+// methods continue to parse.
 // =========================================================================
 BEZEL_TEST(parser_contract_clauses_2053,
            method_with_requires_and_ensures_parses_spec_22_16) {
@@ -86,9 +88,9 @@ BEZEL_TEST(parser_contract_clauses_2053,
         "class C "
         "  private _balance: decimal := 0m; "
         "  public method Withdraw(amount: decimal) "
-        "    requires amount > 0m; "
-        "    requires amount <= _balance; "
-        "    ensures _balance = old(_balance) - amount; "
+        "    requires(amount > 0m) "
+        "    requires(amount <= _balance) "
+        "    ensures(_balance = old(_balance) - amount) "
         "    _balance := _balance - amount; "
         "  end Withdraw; "
         "end C;");
@@ -110,7 +112,7 @@ BEZEL_TEST(parser_contract_clauses_2053,
         "module M; "
         "class C "
         "  public method Identity(x: int): int "
-        "    requires x > 0; "
+        "    requires(x > 0) "
         "    => x; "
         "end C;");
     const auto* m = firstMethod(r);
@@ -120,16 +122,17 @@ BEZEL_TEST(parser_contract_clauses_2053,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §22.16 "a clause-bearing abstract method ends at its last clause's `;`":
-// no extra `;` after the clauses. Body is body-less (Abstract).
+// §22.16 v0.207: clauses on an ABSTRACT (body-less) method end with `;`.
+// The clauses' parens are self-delimiting; the member terminates with `;`.
+// Body is Abstract.
 BEZEL_TEST(parser_contract_clauses_2053,
-           clause_bearing_bodyless_method_clauses_terminate_spec_22_16) {
+           clause_bearing_abstract_method_parses_spec_22_16) {
     auto r = parseAll(
         "module M; "
         "class C "
         "  public method M(x: int): int "
-        "    requires x > 0; "
-        "    ensures result > 0; "
+        "    requires(x > 0) "
+        "    ensures(result > 0); "
         "  public method Next(): int => 1; "
         "end C;");
     const auto* m = firstMethod(r);
@@ -139,8 +142,12 @@ BEZEL_TEST(parser_contract_clauses_2053,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §22.16 lenient: a clause-bearing method followed by an explicit `;` is
-// also accepted as body-less (the grammar's `;` MethodBody alternative).
+// §22.16 v0.207 — #2070 regression test: the lenient `requires x > 0; ;`
+// double-semicolon form (#2053's body-less-closure spelling) is REJECTED
+// under v0.207 — a clause's predicate must be parenthesized AND its
+// trailing `;` belongs to the member, not the clause. Both the omitted
+// parens (token `x` vs expected `(`) and the stray `;` (no preceding
+// body) are reported.
 BEZEL_TEST(parser_contract_clauses_2053,
            clause_bearing_bodyless_method_with_semicolon_spec_22_16) {
     auto r = parseAll(
@@ -149,11 +156,10 @@ BEZEL_TEST(parser_contract_clauses_2053,
         "  public method M(x: int): int "
         "    requires x > 0; ; "
         "end C;");
-    const auto* m = firstMethod(r);
-    BEZEL_EXPECT_TRUE(m != nullptr);
-    BEZEL_EXPECT_EQ(m->contractClauses.size(), std::size_t{1});
-    BEZEL_EXPECT_EQ(m->bodyKind, bezel::ast::MethodBodyKind::Abstract);
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // v0.207 grammar: clause is `requires(Expr)` — the bare `x` after
+    // `requires` is an unexpected token. The double-`;` is a secondary
+    // artifact of the same lax pre-fix surface.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // §22.16 / A.4: the `static` qualifier demands the proven tier. Parsing
@@ -165,8 +171,8 @@ BEZEL_TEST(parser_contract_clauses_2053,
         "module M; "
         "class C "
         "  public method M(x: int) "
-        "    static requires x > 0; "
-        "    static ensures true; "
+        "    static requires(x > 0) "
+        "    static ensures(true) "
         "    => 0; "
         "end C;");
     const auto* m = firstMethod(r);
@@ -185,7 +191,7 @@ BEZEL_TEST(parser_contract_clauses_2053,
         "class C "
         "  private _limit: decimal := 0m; "
         "  public constructor(limit: decimal) "
-        "    requires limit >= 0m; "
+        "    requires(limit >= 0m) "
         "    _limit := limit; "
         "  end constructor; "
         "end C;");
@@ -208,8 +214,8 @@ BEZEL_TEST(parser_contract_clauses_2053,
         "class C "
         "  private _v: int := 0; "
         "  public constructor(v: int) "
-        "    requires v >= 0; "
-        "    ensures _v = v; "
+        "    requires(v >= 0) "
+        "    ensures(_v = v) "
         "    _v := v; "
         "  end constructor; "
         "end C;");
@@ -228,7 +234,7 @@ BEZEL_TEST(parser_contract_clauses_2053,
         "class C "
         "  private _balance: decimal := 0m; "
         "  private _limit: decimal := 0m; "
-        "  invariant _balance + _limit >= 0m; "
+        "  invariant(_balance + _limit >= 0m); "
         "end C;");
     const auto* inv = firstInvariant(r);
     BEZEL_EXPECT_TRUE(inv != nullptr);
@@ -245,7 +251,7 @@ BEZEL_TEST(parser_contract_clauses_2053,
         "module M; "
         "class C "
         "  private _v: int := 0; "
-        "  static invariant _v >= 0; "
+        "  static invariant(_v >= 0); "
         "end C;");
     const auto* inv = firstInvariant(r);
     BEZEL_EXPECT_TRUE(inv != nullptr);
@@ -262,7 +268,7 @@ BEZEL_TEST(parser_contract_clauses_2053,
         "module M; "
         "class C "
         "  private _v: int := 0; "
-        "  public invariant _v >= 0; "
+        "  public invariant(_v >= 0); "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
@@ -283,17 +289,17 @@ BEZEL_TEST(parser_contract_clauses_2053,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §22.16 / A.4 IfaceMethod: an interface method may carry ContractClause+
-// as its body-less form (the slot's contract written where the slot is
-// declared). The declaration ends at its last clause's `;`.
+// §22.16 / A.4 IfaceMethod: an interface method may carry ContractClause*
+// as its contract, written where the slot is declared. The declaration
+// ends with the member-terminating `;`.
 BEZEL_TEST(parser_contract_clauses_2053,
            iface_method_with_clauses_parses_spec_22_16) {
     auto r = parseAll(
         "module M; "
         "interface I "
         "  method M(x: int): int "
-        "    requires x > 0; "
-        "    ensures result > 0; "
+        "    requires(x > 0) "
+        "    ensures(result > 0); "
         "end I;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     const auto* m = firstMethod(r);
@@ -340,10 +346,10 @@ BEZEL_TEST(parser_contract_clauses_2053,
         "module M; "
         "class C "
         "  public method M(x: int): int "
-        "    requires x > 0; "
-        "    ensures result > 0; "
-        "    requires x < 100; "
-        "    ensures result < 100; "
+        "    requires(x > 0) "
+        "    ensures(result > 0) "
+        "    requires(x < 100) "
+        "    ensures(result < 100) "
         "    => x; "
         "end C;");
     const auto* m = firstMethod(r);
@@ -358,4 +364,67 @@ BEZEL_TEST(parser_contract_clauses_2053,
     BEZEL_EXPECT_EQ(m->contractClauses[3].kind,
                     bezel::ast::ContractClause::Kind::Ensures);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ---------------------------------------------------------------------
+// v0.207-specific regressions (#2078, proposal 0055):
+//
+// (a) Clause parity is enforced — an unparenthesized `requires E;` is
+//     rejected (the v0.203 grammar that allowed it was retired).
+// (b) A clause with a missing `)` is reported, and the parser does not
+//     silently swallow further clauses — it still surfaces the structural
+//     `(`/`)` pair's need.
+// (c) An `invariant` member without parens (the v0.203 surface) is rejected.
+// (d) An iface-method clause-bearing declaration WITHOUT the trailing `;`
+//     is rejected — v0.207 makes the member `;` unconditional.
+// ---------------------------------------------------------------------
+BEZEL_TEST(parser_contract_clauses_2053,
+           unparenthesized_requires_clause_rejected_spec_22_16) {
+    auto r = parseAll(
+        "module M; "
+        "class C "
+        "  public method M(x: int): int "
+        "    requires x > 0 "
+        "    => x; "
+        "end C;");
+    // v0.207: missing `(` — the clause spine is `requires ( Expression )`.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(parser_contract_clauses_2053,
+           unclosed_clause_paren_reported_spec_22_16) {
+    auto r = parseAll(
+        "module M; "
+        "class C "
+        "  public method M(x: int): int "
+        "    requires(x > 0 "
+        "    => x; "
+        "end C;");
+    // v0.207: missing `)` on the clause spine.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(parser_contract_clauses_2053,
+           unparenthesized_invariant_member_rejected_spec_22_16) {
+    auto r = parseAll(
+        "module M; "
+        "class C "
+        "  private _v: int := 0; "
+        "  invariant _v >= 0; "
+        "end C;");
+    // v0.207: invariant member is `invariant ( Expression ) ;`.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(parser_contract_clauses_2053,
+           iface_method_with_clauses_missing_trailing_semicolon_spec_22_16) {
+    auto r = parseAll(
+        "module M; "
+        "interface I "
+        "  method M(x: int): int "
+        "    requires(x > 0) "
+        "    ensures(result > 0) "
+        "end I;");
+    // v0.207: the member `;` is unconditional on IfaceMethod.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }

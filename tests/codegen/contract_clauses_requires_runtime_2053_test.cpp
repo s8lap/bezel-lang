@@ -1,5 +1,6 @@
-// Spec-derived runtime tests for §22.16 contract clauses (v0.203, proposal
-// 0043, #2053) — Slice 4a: requires-prologue LOWERING.
+// Spec-derived runtime tests for §22.16 contract clauses (v0.207, proposal
+// 0055, #2078) — Slice 4a: requires-prologue LOWERING. Clauses use the
+// structural-paren surface `requires(E)` / `ensures(E)` (proposal 0055).
 //
 // Spec §22.16 "Evaluation semantics":
 //   * `requires` clauses evaluate on every invocation, AFTER argument binding
@@ -45,7 +46,7 @@ BEZEL_TEST(contract_clauses_requires_runtime_2053,
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
         "  public method M(x: int): int "
-        "    requires x > 0; "
+        "    requires(x > 0) "
         "    return x; "
         "  end M; "
         "  public static method Main(): int "
@@ -61,7 +62,7 @@ BEZEL_TEST(contract_clauses_requires_runtime_2053,
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
         "  public method M(x: int): int "
-        "    requires x > 0; "
+        "    requires(x > 0) "
         "    return x; "
         "  end M; "
         "  public static method Main(): int "
@@ -83,7 +84,7 @@ BEZEL_TEST(contract_clauses_requires_runtime_2053,
         "module M; class C "
         "  public v: int := 0; "
         "  public constructor(v: int) "
-        "    requires v > 0; "
+        "    requires(v > 0) "
         "    this.v := v; "
         "  end constructor; "
         "  public static method Main(): int "
@@ -105,8 +106,8 @@ BEZEL_TEST(contract_clauses_requires_runtime_2053,
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
         "  public method M(x: int): int "
-        "    requires x > 100; "
-        "    requires x < 5; "
+        "    requires(x > 100) "
+        "    requires(x < 5) "
         "    return x; "
         "  end M; "
         "  public static method Main(): int "
@@ -127,7 +128,7 @@ BEZEL_TEST(contract_clauses_requires_runtime_2053,
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
         "  public method M(x: int): int "
-        "    requires x > 0; "
+        "    requires(x > 0) "
         "    return x; "
         "  end M; "
         "  public static method Main(): int "
@@ -150,7 +151,7 @@ BEZEL_TEST(contract_clauses_requires_runtime_2053,
         "module M; class C "
         "  private _max: int := 10; "
         "  public method Add(x: int): int "
-        "    requires x <= _max; "
+        "    requires(x <= _max) "
         "    return x; "
         "  end Add; "
         "  public static method Main(): int "
