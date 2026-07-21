@@ -1,5 +1,6 @@
 #include "module/ModuleLoader.hpp"
 
+#include <algorithm>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -117,6 +118,21 @@ ast::Visibility fromMetaVisibility(MetaVisibility v) {
         case MetaVisibility::Protected: return ast::Visibility::Protected;
     }
     return ast::Visibility::None;
+}
+
+std::vector<sema::ContractRecord> toContractRecords(
+    const std::vector<MetaContractRecord>& in) {
+    std::vector<sema::ContractRecord> out;
+    out.reserve(in.size());
+    for (const MetaContractRecord& mc : in) {
+        sema::ContractRecord c;
+        c.kind = static_cast<sema::ContractKind>(mc.kind);
+        c.isStatic = mc.isStatic;
+        c.canonicalText = mc.canonicalText;
+        c.tier = static_cast<sema::ContractTier>(mc.tier);
+        out.push_back(std::move(c));
+    }
+    return out;
 }
 
 // One reconstruction context for a single loadMetadata call. Holds the
@@ -267,6 +283,7 @@ struct Loader {
         t->memberScope = ctx.newScope();
         // §9.2 (issue #501): propagate positional-record flag.
         t->hasPositionalFields = td.hasPositionalFields;
+        t->invariantContracts = toContractRecords(td.invariants);
         t->genericParams = convertGenericParams(td.genericParams, t->memberScope);
         for (const MetaType& base : td.baseTypes) {
             sema::TypeRef* ref = convert(base);
@@ -285,6 +302,15 @@ struct Loader {
     // caller) or null for member kinds not reconstructed in this increment.
     sema::Symbol* convertMember(const MetaMember& mm, sema::TypeSymbol& parent) {
         const sema::ScopeId scope = ctx.newScope();
+        auto applyBehavior = [&](sema::MemberSymbol* member) {
+            if (!member) return;
+            member->isPure = mm.isPure;
+            member->contractRecords = toContractRecords(mm.contracts);
+            if (mm.isPure && std::find(member->modifiers.begin(),
+                                      member->modifiers.end(), "pure") ==
+                                  member->modifiers.end())
+                member->modifiers.push_back(ctx.internString("pure"));
+        };
         switch (mm.kind) {
             case MetaMemberKind::Method: {
                 auto* m = ctx.makeImportedSymbol<sema::MethodSymbol>();
@@ -303,6 +329,7 @@ struct Loader {
                 // resolution / codegen can read it (see returnTypeOf below).
                 returnTypes_[m] = convert(mm.type);
                 returnOwned_[m] = mm.returnOwned;
+                applyBehavior(m);
                 return m;
             }
             case MetaMemberKind::Field: {
@@ -322,6 +349,7 @@ struct Loader {
                 // non-foldable initializer (`new Array()`, `DateTime.Now`) is not
                 // carried (valueText empty) — see ModuleMetadataBuilder.
                 if (!mm.valueText.empty()) constValues_[f] = mm.valueText;
+                applyBehavior(f);
                 return f;
             }
             case MetaMemberKind::Const: {
@@ -338,6 +366,7 @@ struct Loader {
                 // library emits no storage symbol for a const). Recorded only
                 // when the builder rendered a value (non-empty).
                 if (!mm.valueText.empty()) constValues_[c] = mm.valueText;
+                applyBehavior(c);
                 return c;
             }
             case MetaMemberKind::EnumConstant: {
@@ -354,6 +383,7 @@ struct Loader {
                 // when it could not (a non-literal const-expr initializer) the
                 // value stays 0, matching the metadata's default.
                 if (mm.hasEnumValue) e->value = mm.enumValue;
+                applyBehavior(e);
                 return e;
             }
             case MetaMemberKind::Constructor: {
@@ -377,6 +407,7 @@ struct Loader {
                 for (const std::string& md : mm.modifiers)
                     if (md == "static") c->isStatic = true;
                 c->params = convertParams(mm.params, scope);
+                applyBehavior(c);
                 return c;
             }
             case MetaMemberKind::Property: {
@@ -401,6 +432,7 @@ struct Loader {
                 p->scope = parent.memberScope;
                 p->isIndexer = false;
                 fieldTypes_[p] = convert(mm.type);
+                applyBehavior(p);
                 return p;
             }
             case MetaMemberKind::NestedType: {
@@ -418,6 +450,7 @@ struct Loader {
                 nts->parent = &parent;
                 nts->scope = parent.memberScope;
                 nts->type = reconstructTypeSymbol(*mm.nestedType, parent);
+                applyBehavior(nts);
                 return nts;
             }
             // Indexer / Event are part of the schema but deferred.
@@ -1259,6 +1292,51 @@ static bool parseAndAttachMethodBody(
 
 }  // namespace
 
+void stripContractFacts(MetaMember& member) {
+    member.isPure = false;
+    member.contracts.clear();
+    member.modifiers.erase(
+        std::remove(member.modifiers.begin(), member.modifiers.end(), "pure"),
+        member.modifiers.end());
+    if (member.nestedType) {
+        for (MetaMember& nested : member.nestedType->members)
+            stripContractFacts(nested);
+        member.nestedType->invariants.clear();
+    }
+}
+
+void stripContractFacts(MetaTypeDecl& type) {
+    type.invariants.clear();
+    for (MetaMember& member : type.members) stripContractFacts(member);
+}
+
+void stripContractFacts(MetaFunction& function) {
+    function.isPure = false;
+    function.contracts.clear();
+    function.modifiers.erase(
+        std::remove(function.modifiers.begin(), function.modifiers.end(), "pure"),
+        function.modifiers.end());
+}
+
+// §2.8.3 rule 3 / §2.8.2 (#2054): a pre-carriage artifact makes no behavioral
+// claim. When either duplicate description is opaque, compare the structural
+// interface only; when both carry records, every behavioral field must agree.
+bool metadataDescriptionsAgree(const ModuleMetadata& lhs,
+                               const ModuleMetadata& rhs) {
+    if (lhs.moduleName != rhs.moduleName) return false;
+    if (lhs.contractRecordsCarried && rhs.contractRecordsCarried)
+        return lhs == rhs;
+    ModuleMetadata a = lhs;
+    ModuleMetadata b = rhs;
+    for (MetaTypeDecl& type : a.types) stripContractFacts(type);
+    for (MetaTypeDecl& type : b.types) stripContractFacts(type);
+    for (MetaFunction& function : a.functions) stripContractFacts(function);
+    for (MetaFunction& function : b.functions) stripContractFacts(function);
+    a.contractRecordsCarried = true;
+    b.contractRecordsCarried = true;
+    return a == b;
+}
+
 // §2.5 / #1487 — Pass 1: create a TypeSymbol shell per exported type AND
 // register it globally, so a cross-reference (a member/base whose type is a
 // sibling or a type from ANOTHER dependency) resolves by name in pass 2
@@ -1287,6 +1365,7 @@ static void loadMetadataPass1(
         // §9.2 auto-equality check in ExprTypecheck_Exprs.cpp reads it from
         // TypeSymbol::hasPositionalFields (no ast::TypeDecl exists for imported types).
         t->hasPositionalFields = td.hasPositionalFields;
+        t->invariantContracts = toContractRecords(td.invariants);
         localTypes[td.name] = t;
         created.push_back(t);
         ctx.registerImportedType(md.moduleName, t);
@@ -1476,6 +1555,7 @@ bool loadDependencies(const std::vector<std::string>& artifactPaths,
     // builtin-import paths untouched.
     struct DepState {
         ModuleMetadata md;
+        std::string path;
         std::unordered_map<std::string, sema::TypeSymbol*> localTypes;
         std::vector<sema::TypeSymbol*> created;
     };
@@ -1505,7 +1585,34 @@ bool loadDependencies(const std::vector<std::string>& artifactPaths,
             if (failedPath) *failedPath = path;
             return false;
         }
+        // §2.8.3 rule 3 / §2.8.1 rule 3: repeated artifacts for one module
+        // are idempotent only when their descriptions agree. This is the
+        // metadata-time staleness backstop for carried contract records.
+        auto prior = std::find_if(
+            states.begin(), states.end(), [&](const DepState& state) {
+                return state.md.moduleName == md->moduleName;
+            });
+        if (prior != states.end()) {
+            if (!metadataDescriptionsAgree(prior->md, *md)) {
+                if (diag)
+                    *diag = "stale or disagreeing descriptions for module '" +
+                            md->moduleName + "' in dependency artifacts '" +
+                            prior->path + "' and '" + path +
+                            "' (§2.8.3 rule 3; recompile dependents)";
+                if (failedPath) *failedPath = path;
+                return false;
+            }
+            // Prefer a record-carrying rebuild over an opaque legacy copy; an
+            // equal carried duplicate otherwise needs no second symbol shell.
+            if (!prior->md.contractRecordsCarried &&
+                md->contractRecordsCarried) {
+                prior->md = std::move(*md);
+                prior->path = path;
+            }
+            continue;
+        }
         DepState st;
+        st.path = path;
         st.md = std::move(*md);
         states.push_back(std::move(st));
     }

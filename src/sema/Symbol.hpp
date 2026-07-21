@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -35,6 +36,29 @@ class SemaContext;  // see SemaContext.hpp; forward-declared so the §9.2
 // module-level entities whose lifetime is the whole compilation).
 using ScopeId = std::uint32_t;
 inline constexpr ScopeId kModuleScope = 1;
+
+// §22.16 / §2.8.2 (v0.204, #2054): imported behavioral facts are kept on
+// symbols as an implementation-neutral side table. The module metadata layer
+// converts its wire enums to these stable values; no AST is required on the
+// importing side.
+enum class ContractKind : std::uint8_t {
+    Requires = 0,
+    Ensures = 1,
+    Invariant = 2,
+};
+
+enum class ContractTier : std::uint8_t {
+    Proven = 0,
+    Checked = 1,
+    Assumed = 2,
+};
+
+struct ContractRecord {
+    ContractKind kind = ContractKind::Requires;
+    bool isStatic = false;
+    std::string canonicalText;
+    ContractTier tier = ContractTier::Checked;
+};
 
 // Polymorphic Symbol base. dynamic_cast distinguishes kinds; no kind tag
 // is duplicated on the base.
@@ -68,6 +92,10 @@ struct TypeSymbol : Symbol {
     std::vector<std::string_view> modifiers; // "abstract", "sealed", "static"
     std::vector<Symbol*> genericParams;      // GenericParamSymbol*
     std::vector<Symbol*> members;            // Field/Method/Property/...
+    // §22.16 / #2054: invariant records carried by an imported class, in
+    // base-first order. Local classes derive these from their AST; imported
+    // classes have no AST, so the loader publishes this side-table vector.
+    std::vector<ContractRecord> invariantContracts;
     // Scope inside which members and generic params live. Always greater
     // than `scope` (which is the type's own enclosing scope).
     ScopeId memberScope = kModuleScope;
@@ -126,6 +154,11 @@ struct MemberSymbol : Symbol {
     ast::Visibility visibility = ast::Visibility::None;
     std::vector<std::string_view> modifiers;
     TypeSymbol* parent = nullptr;
+    // §22.15 / §22.16 / #2054: explicit purity and declaration-derived
+    // contract records reconstructed from an imported artifact. Local members
+    // continue to read their AST declarations during the ordinary passes.
+    bool isPure = false;
+    std::vector<ContractRecord> contractRecords;
 };
 
 struct FieldSymbol : MemberSymbol {

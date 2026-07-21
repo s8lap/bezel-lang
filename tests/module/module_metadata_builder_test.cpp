@@ -65,7 +65,7 @@ std::unique_ptr<BuiltMeta> buildFromSource(std::string_view source) {
     sema::collectSymbols(*r->sourceFile, *r->ctx);
     sema::resolveTypes(*r->sourceFile, *r->ctx);
     sema::typecheckExpressions(*r->sourceFile, *r->ctx);
-    r->meta = buildModuleMetadata(*r->ctx);
+    r->meta = buildModuleMetadata(*r->ctx, source);
     r->ok = !r->diagnostics.hasErrors();
     return r;
 }
@@ -382,6 +382,78 @@ BEZEL_TEST(module_metadata_emit, object_section_roundtrip_spec_2_6) {
     std::remove(srcPath.c_str());
     std::remove(exePath.c_str());
     std::remove(objPath.c_str());
+}
+
+// #2054 / spec §2.8.2 (v0.204): the builder carries purity, authored
+// clauses, and class invariants. The primary spelling uses v0.207's structural
+// clause parentheses; the legacy fallback keeps this fixture runnable on a
+// pre-#2078 checkout while the implementation train is being integrated.
+BEZEL_TEST(module_metadata_builder,
+           contract_carriage_and_positional_text_spec_2_8_2_2054) {
+    const std::string modern =
+        "module Lib; "
+        "public class Account "
+        "  private _balance: int := 0; "
+        "  invariant(this._balance >= 0); "
+        "  public pure method Withdraw(amount: int): int "
+        "    requires(amount > 0) "
+        "    ensures(amount > 1) "
+        "    ensures(1 = 1) "
+        "    return amount; "
+        "  end Withdraw; "
+        "end Account;";
+    const std::string legacy =
+        "module Lib; "
+        "public class Account "
+        "  private _balance: int := 0; "
+        "  invariant(this._balance >= 0); "
+        "  public pure method Withdraw(amount: int): int "
+        "    requires(amount > 0); "
+        "    ensures(amount > 1); "
+        "    ensures(1 = 1); "
+        "    return amount; "
+        "  end Withdraw; "
+        "end Account;";
+
+    auto r = buildFromSource(modern);
+    if (!r->ctx || r->diagnostics.hasErrors()) r = buildFromSource(legacy);
+    BEZEL_EXPECT_TRUE(r->ctx != nullptr);
+    const MetaTypeDecl* account = findType(r->meta, "Account");
+    BEZEL_EXPECT_TRUE(account != nullptr);
+    if (!account) return;
+    const MetaMember* withdraw = findMember(*account, "Withdraw");
+    BEZEL_EXPECT_TRUE(withdraw != nullptr);
+    if (!withdraw) return;
+
+    BEZEL_EXPECT_TRUE(r->meta.contractRecordsCarried);
+    BEZEL_EXPECT_TRUE(withdraw->isPure);
+    BEZEL_EXPECT_EQ(withdraw->contracts.size(), std::size_t{3});
+    if (withdraw->contracts.size() == 3) {
+        BEZEL_EXPECT_TRUE(withdraw->contracts[0].kind ==
+                          MetaContractKind::Requires);
+        BEZEL_EXPECT_TRUE(withdraw->contracts[1].kind ==
+                          MetaContractKind::Ensures);
+        BEZEL_EXPECT_TRUE(withdraw->contracts[0].tier ==
+                          MetaContractTier::Checked);
+        BEZEL_EXPECT_TRUE(withdraw->contracts[2].tier ==
+                          MetaContractTier::Proven);
+        BEZEL_EXPECT_TRUE(withdraw->contracts[0].canonicalText.find("%0") !=
+                          std::string::npos);
+        BEZEL_EXPECT_TRUE(withdraw->contracts[0].canonicalText.find("amount") ==
+                          std::string::npos);
+    }
+    BEZEL_EXPECT_EQ(account->invariants.size(), std::size_t{1});
+    if (!account->invariants.empty()) {
+        BEZEL_EXPECT_TRUE(account->invariants[0].kind ==
+                          MetaContractKind::Invariant);
+        BEZEL_EXPECT_TRUE(!account->invariants[0].canonicalText.empty());
+        BEZEL_EXPECT_TRUE(account->invariants[0].canonicalText.find(
+                              "Lib.Account._balance") != std::string::npos);
+    }
+
+    auto decoded = deserialize(serialize(r->meta));
+    BEZEL_EXPECT_TRUE(decoded.has_value());
+    if (decoded) BEZEL_EXPECT_TRUE(*decoded == r->meta);
 }
 
 } // namespace bezel::module

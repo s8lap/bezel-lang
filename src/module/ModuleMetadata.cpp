@@ -41,7 +41,8 @@ enum BlockID : unsigned {
     GENERIC_BLOCK = 13, // one MetaGenericParam
     PARAM_BLOCK = 14,   // one MetaParam
     METATYPE_BLOCK = 15, // one MetaType (a signature type, possibly nested)
-    // 16.. reserved for future additive subblocks (a reader skips unknown ids)
+    CONTRACT_BLOCK = 16, // one MetaContractRecord (§22.16 / #2054)
+    // 17.. reserved for future additive subblocks (a reader skips unknown ids)
     UNKNOWN_FUTURE_BLOCK = 99, // test-only: a subblock id this reader skips
 };
 
@@ -113,6 +114,13 @@ void hashParam(std::uint64_t& h, const MetaParam& p) {
     hashStr(h, p.defaultText);
 }
 
+void hashContract(std::uint64_t& h, const MetaContractRecord& c) {
+    hashByte(h, static_cast<std::uint8_t>(c.kind));
+    hashBool(h, c.isStatic);
+    hashStr(h, c.canonicalText);
+    hashByte(h, static_cast<std::uint8_t>(c.tier));
+}
+
 void hashTypeDecl(std::uint64_t& h, const MetaTypeDecl& ty);  // fwd
 
 void hashMember(std::uint64_t& h, const MetaMember& m) {
@@ -121,6 +129,9 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     hashByte(h, static_cast<std::uint8_t>(m.visibility));
     hashU64(h, m.modifiers.size());
     for (const std::string& s : m.modifiers) hashStr(h, s);
+    hashBool(h, m.isPure);
+    hashU64(h, m.contracts.size());
+    for (const MetaContractRecord& c : m.contracts) hashContract(h, c);
     hashType(h, m.type);
     hashU64(h, m.genericParams.size());
     for (const MetaGenericParam& g : m.genericParams) hashGeneric(h, g);
@@ -154,6 +165,8 @@ void hashTypeDecl(std::uint64_t& h, const MetaTypeDecl& ty) {
     for (const MetaType& b : ty.baseTypes) hashType(h, b);
     hashU64(h, ty.members.size());
     for (const MetaMember& m : ty.members) hashMember(h, m);
+    hashU64(h, ty.invariants.size());
+    for (const MetaContractRecord& c : ty.invariants) hashContract(h, c);
     // §9.2 (issue #501): include the positional-record flag.
     hashBool(h, ty.hasPositionalFields);
     // §14 / #662c (schema v5): destructor body source text for generic classes.
@@ -187,6 +200,9 @@ std::uint64_t semanticHash(const ModuleMetadata& md) {
         for (const MetaParam& p : fn.params) hashParam(h, p);
         hashType(h, fn.returnType);
         hashBool(h, fn.returnOwned);
+        hashBool(h, fn.isPure);
+        hashU64(h, fn.contracts.size());
+        for (const MetaContractRecord& c : fn.contracts) hashContract(h, c);
     }
     hashU64(h, md.constants.size());
     for (const MetaConstant& c : md.constants) {
@@ -195,10 +211,16 @@ std::uint64_t semanticHash(const ModuleMetadata& md) {
         hashType(h, c.type);
         hashStr(h, c.valueText);
     }
+    hashBool(h, md.contractRecordsCarried);
     return h;
 }
 
 // --- Equality ---------------------------------------------------------------
+
+bool MetaContractRecord::operator==(const MetaContractRecord& o) const {
+    return kind == o.kind && isStatic == o.isStatic &&
+           canonicalText == o.canonicalText && tier == o.tier;
+}
 
 bool MetaType::operator==(const MetaType& o) const {
     return kind == o.kind && nullable == o.nullable &&
@@ -229,6 +251,7 @@ MetaMember::MetaMember(const MetaMember& o)
     : kind(o.kind), name(o.name), visibility(o.visibility),
       modifiers(o.modifiers), type(o.type), valueText(o.valueText),
       ctorBodyText(o.ctorBodyText), methodBodyText(o.methodBodyText),
+      isPure(o.isPure), contracts(o.contracts),
       genericParams(o.genericParams), params(o.params),
       isOperator(o.isOperator), returnOwned(o.returnOwned),
       hasEnumValue(o.hasEnumValue), enumValue(o.enumValue) {
@@ -241,6 +264,7 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
         kind = o.kind; name = o.name; visibility = o.visibility;
         modifiers = o.modifiers; type = o.type; valueText = o.valueText;
         ctorBodyText = o.ctorBodyText; methodBodyText = o.methodBodyText;
+        isPure = o.isPure; contracts = o.contracts;
         genericParams = o.genericParams; params = o.params;
         isOperator = o.isOperator; returnOwned = o.returnOwned;
         hasEnumValue = o.hasEnumValue; enumValue = o.enumValue;
@@ -257,6 +281,7 @@ bool MetaMember::operator==(const MetaMember& o) const {
         (nestedType && o.nestedType && *nestedType == *o.nestedType);
     return kind == o.kind && name == o.name && visibility == o.visibility &&
            modifiers == o.modifiers && type == o.type &&
+           isPure == o.isPure && contracts == o.contracts &&
            genericParams == o.genericParams && params == o.params &&
            isOperator == o.isOperator && returnOwned == o.returnOwned &&
            hasEnumValue == o.hasEnumValue && enumValue == o.enumValue &&
@@ -269,6 +294,7 @@ bool MetaTypeDecl::operator==(const MetaTypeDecl& o) const {
     return name == o.name && kind == o.kind && visibility == o.visibility &&
            modifiers == o.modifiers && genericParams == o.genericParams &&
            baseTypes == o.baseTypes && members == o.members &&
+           invariants == o.invariants &&
            hasPositionalFields == o.hasPositionalFields &&
            dtorBodyText == o.dtorBodyText;
 }
@@ -277,7 +303,8 @@ bool MetaFunction::operator==(const MetaFunction& o) const {
     return name == o.name && visibility == o.visibility &&
            modifiers == o.modifiers && genericParams == o.genericParams &&
            params == o.params && returnType == o.returnType &&
-           returnOwned == o.returnOwned;
+           returnOwned == o.returnOwned && isPure == o.isPure &&
+           contracts == o.contracts;
 }
 
 bool MetaConstant::operator==(const MetaConstant& o) const {
@@ -289,7 +316,8 @@ bool ModuleMetadata::operator==(const ModuleMetadata& o) const {
     return moduleName == o.moduleName && exports == o.exports &&
            types == o.types && functions == o.functions &&
            constants == o.constants &&
-           isExecutable == o.isExecutable;  // §2.8.4 rule 4 (#1733, v6)
+           isExecutable == o.isExecutable &&
+           contractRecordsCarried == o.contractRecordsCarried;  // §2.8.6 (#2054)
 }
 
 // --- Serialize --------------------------------------------------------------
@@ -357,13 +385,25 @@ void emitParam(llvm::BitstreamWriter& w, const MetaParam& p) {
     w.ExitBlock();
 }
 
+void emitContract(llvm::BitstreamWriter& w, const MetaContractRecord& c) {
+    w.EnterSubblock(CONTRACT_BLOCK, 4);
+    llvm::SmallVector<std::uint64_t, 3> sc{
+        static_cast<std::uint64_t>(c.kind),
+        c.isStatic ? 1u : 0u,
+        static_cast<std::uint64_t>(c.tier),
+    };
+    w.EmitRecord(REC_SCALARS, sc);
+    emitString(w, c.canonicalText);
+    w.ExitBlock();
+}
+
 // Forward declarations for mutual recursion (MetaMember ↔ MetaTypeDecl).
 void emitMember(llvm::BitstreamWriter& w, const MetaMember& m);  // fwd
 void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty);  // fwd
 
 void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     w.EnterSubblock(MEMBER_BLOCK, 4);
-    llvm::SmallVector<std::uint64_t, 8> sc{
+    llvm::SmallVector<std::uint64_t, 10> sc{
         static_cast<std::uint64_t>(m.kind),
         static_cast<std::uint64_t>(m.visibility),
         m.isOperator ? 1u : 0u,
@@ -372,6 +412,8 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
         static_cast<std::uint64_t>(m.enumValue),
         m.genericParams.size(),
         m.params.size(),
+        m.contracts.size(),
+        m.isPure ? 1u : 0u,
     };
     w.EmitRecord(REC_SCALARS, sc);
     emitString(w, m.name);
@@ -379,6 +421,7 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     emitType(w, m.type);
     for (const MetaGenericParam& g : m.genericParams) emitGeneric(w, g);
     for (const MetaParam& p : m.params) emitParam(w, p);
+    for (const MetaContractRecord& c : m.contracts) emitContract(w, c);
     // §22.12 const value (schema v2, issue #328 FINDING [3] BUG A): a trailing
     // REC_STRING after the params. A v1 reader skips it (skip-unknown); a v2
     // reader reads it tolerantly and an absent record yields "" (a v1 blob).
@@ -413,13 +456,14 @@ void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty) {
     // §9.2 (schema v4, issue #501): add hasPositionalFields as the 6th scalar.
     // v3 readers reject v4 blobs so they never see this; v4 readers tolerate
     // a v3 blob where sc.size() == 5 (hasPositionalFields treated as false).
-    llvm::SmallVector<std::uint64_t, 6> sc{
+    llvm::SmallVector<std::uint64_t, 7> sc{
         static_cast<std::uint64_t>(ty.kind),
         static_cast<std::uint64_t>(ty.visibility),
         ty.genericParams.size(),
         ty.baseTypes.size(),
         ty.members.size(),
         ty.hasPositionalFields ? 1u : 0u,
+        ty.invariants.size(),
     };
     w.EmitRecord(REC_SCALARS, sc);
     emitString(w, ty.name);
@@ -427,6 +471,7 @@ void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty) {
     for (const MetaGenericParam& g : ty.genericParams) emitGeneric(w, g);
     for (const MetaType& b : ty.baseTypes) emitType(w, b);
     for (const MetaMember& m : ty.members) emitMember(w, m);
+    for (const MetaContractRecord& c : ty.invariants) emitContract(w, c);
     // §14 / #662c (schema v5): for a GENERIC class, a trailing REC_STRING after
     // the members carries the destructor body source text (empty = no user body).
     // v4 readers encounter finishBlock which skips all trailing content, so this
@@ -438,11 +483,13 @@ void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty) {
 
 void emitFunction(llvm::BitstreamWriter& w, const MetaFunction& fn) {
     w.EnterSubblock(FUNC_BLOCK, 4);
-    llvm::SmallVector<std::uint64_t, 4> sc{
+    llvm::SmallVector<std::uint64_t, 6> sc{
         static_cast<std::uint64_t>(fn.visibility),
         fn.returnOwned ? 1u : 0u,
         fn.genericParams.size(),
         fn.params.size(),
+        fn.contracts.size(),
+        fn.isPure ? 1u : 0u,
     };
     w.EmitRecord(REC_SCALARS, sc);
     emitString(w, fn.name);
@@ -450,6 +497,7 @@ void emitFunction(llvm::BitstreamWriter& w, const MetaFunction& fn) {
     emitType(w, fn.returnType);
     for (const MetaGenericParam& g : fn.genericParams) emitGeneric(w, g);
     for (const MetaParam& p : fn.params) emitParam(w, p);
+    for (const MetaContractRecord& c : fn.contracts) emitContract(w, c);
     w.ExitBlock();
 }
 
@@ -509,9 +557,10 @@ std::vector<std::uint8_t> serializeImpl(const ModuleMetadata& md,
             // makes it reject one); a v6 reader reads the flag, and a v<=5 BLOB
             // read by a v6 reader has only three scalars → isExecutable = false
             // (library), preserving back-compat for existing library artifacts.
-            llvm::SmallVector<std::uint64_t, 4> counts{
+            llvm::SmallVector<std::uint64_t, 5> counts{
                 md.types.size(), md.functions.size(), md.constants.size(),
-                md.isExecutable ? 1u : 0u};
+                md.isExecutable ? 1u : 0u,
+                md.contractRecordsCarried ? 1u : 0u};
             w.EmitRecord(REC_SCALARS, counts);
         }
         for (const MetaTypeDecl& ty : md.types) emitTypeDecl(w, ty);
@@ -771,6 +820,21 @@ bool readParam(Reader& r, MetaParam& p) {
     return readParamBody(r, p);
 }
 
+bool readContractBody(Reader& r, MetaContractRecord& c) {
+    llvm::SmallVector<std::uint64_t, 3> sc;
+    if (!expectScalars(r, sc) || sc.size() < 3) return false;
+    c.kind = static_cast<MetaContractKind>(sc[0]);
+    c.isStatic = sc[1] != 0;
+    c.tier = static_cast<MetaContractTier>(sc[2]);
+    if (!expectString(r, c.canonicalText)) return false;
+    return finishBlock(r);
+}
+
+bool readContract(Reader& r, MetaContractRecord& c) {
+    if (!enterSubblock(r, CONTRACT_BLOCK)) return false;
+    return readContractBody(r, c);
+}
+
 // Forward declarations for mutual recursion (readMemberBody ↔ readTypeDeclBody).
 bool readMember(Reader& r, MetaMember& m);
 bool readTypeDecl(Reader& r, MetaTypeDecl& ty);
@@ -787,6 +851,8 @@ bool readMemberBody(Reader& r, MetaMember& m) {
     m.enumValue = static_cast<std::int64_t>(sc[5]);
     std::uint64_t nGeneric = sc[6];
     std::uint64_t nParams = sc[7];
+    std::uint64_t nContracts = sc.size() >= 9 ? sc[8] : 0;
+    m.isPure = sc.size() >= 10 && sc[9] != 0;
     if (!expectString(r, m.name)) return false;
     if (!readStringList(r, m.modifiers)) return false;
     if (!readType(r, m.type)) return false;
@@ -797,6 +863,10 @@ bool readMemberBody(Reader& r, MetaMember& m) {
     m.params.resize(nParams);
     for (std::uint64_t i = 0; i < nParams; ++i) {
         if (!readParam(r, m.params[i])) return false;
+    }
+    m.contracts.resize(nContracts);
+    for (std::uint64_t i = 0; i < nContracts; ++i) {
+        if (!readContract(r, m.contracts[i])) return false;
     }
     // §22.12 const value (schema v2): the optional trailing REC_STRING. Read it
     // tolerantly — a v1 blob has none, so `m.valueText` stays empty.
@@ -903,6 +973,7 @@ bool readTypeDeclBody(Reader& r, MetaTypeDecl& ty) {
     // §9.2 (schema v4, issue #501): 6th scalar = hasPositionalFields.
     // A v3 blob (read by v4 reader) has only 5 scalars → treat as false.
     if (sc.size() >= 6) ty.hasPositionalFields = sc[5] != 0;
+    std::uint64_t nInvariants = sc.size() >= 7 ? sc[6] : 0;
     if (!expectString(r, ty.name)) return false;
     if (!readStringList(r, ty.modifiers)) return false;
     ty.genericParams.resize(nGeneric);
@@ -916,6 +987,10 @@ bool readTypeDeclBody(Reader& r, MetaTypeDecl& ty) {
     ty.members.resize(nMembers);
     for (std::uint64_t i = 0; i < nMembers; ++i) {
         if (!readMember(r, ty.members[i])) return false;
+    }
+    ty.invariants.resize(nInvariants);
+    for (std::uint64_t i = 0; i < nInvariants; ++i) {
+        if (!readContract(r, ty.invariants[i])) return false;
     }
     // §14 / #662c (schema v5): trailing REC_STRING = dtorBodyText for generic
     // classes.  A v4 reader's finishBlock already skips all trailing content,
@@ -936,6 +1011,8 @@ bool readFunctionBody(Reader& r, MetaFunction& fn) {
     fn.returnOwned = sc[1] != 0;
     std::uint64_t nGeneric = sc[2];
     std::uint64_t nParams = sc[3];
+    std::uint64_t nContracts = sc.size() >= 5 ? sc[4] : 0;
+    fn.isPure = sc.size() >= 6 && sc[5] != 0;
     if (!expectString(r, fn.name)) return false;
     if (!readStringList(r, fn.modifiers)) return false;
     if (!readType(r, fn.returnType)) return false;
@@ -946,6 +1023,10 @@ bool readFunctionBody(Reader& r, MetaFunction& fn) {
     fn.params.resize(nParams);
     for (std::uint64_t i = 0; i < nParams; ++i) {
         if (!readParam(r, fn.params[i])) return false;
+    }
+    fn.contracts.resize(nContracts);
+    for (std::uint64_t i = 0; i < nContracts; ++i) {
+        if (!readContract(r, fn.contracts[i])) return false;
     }
     return finishBlock(r);
 }
@@ -1025,6 +1106,10 @@ std::optional<ModuleMetadata> deserialize(
     // artifact-kind flag. Absent (a v<=5 blob) → false = library-kind, so an
     // existing library artifact still loads as a library (back-compat).
     md.isExecutable = counts.size() >= 4 && counts[3] != 0;
+    // §2.8.6 (#2054): a pre-v7 blob carries no contract claim. Current v7
+    // blobs write an explicit fifth scalar even when the record vectors are
+    // empty, so absence is distinguishable from an asserted empty set.
+    md.contractRecordsCarried = counts.size() >= 5 && counts[4] != 0;
     md.types.resize(counts[0]);
     for (std::uint64_t i = 0; i < counts[0]; ++i) {
         if (!readTypeDecl(r, md.types[i])) return std::nullopt;

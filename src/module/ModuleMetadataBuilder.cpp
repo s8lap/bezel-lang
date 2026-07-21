@@ -1,14 +1,21 @@
 #include "module/ModuleMetadataBuilder.hpp"
 
+#include <algorithm>
 #include <cstdlib>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ast/Node.hpp"
+#include "lexer/Lexer.hpp"
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
+#include "support/Diagnostic.hpp"
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -238,6 +245,480 @@ bool tryEvalIntLiteral(const ast::Expr* e, std::int64_t& out) {
     return true;
 }
 
+// --- §22.16 contract-record carriage (#2054) -------------------------------
+
+struct CanonicalToken {
+    Token token;
+    std::size_t offset = 0;  // absolute offset in the compilation source
+};
+
+std::vector<CanonicalToken> lexCanonicalTokens(std::string_view text,
+                                                std::size_t baseOffset) {
+    DiagnosticEngine diagnostics;
+    Lexer lexer(text, diagnostics);
+    std::vector<CanonicalToken> out;
+    for (;;) {
+        Token tok = lexer.next();
+        if (tok.kind == TokenKind::EndOfFile) break;
+        out.push_back({tok, baseOffset + tok.location.offset});
+    }
+    return out;
+}
+
+std::string moduleNameFor(sema::SemaContext& ctx) {
+    const sema::ModuleSymbol* mod = ctx.module();
+    if (!mod) return {};
+    if (auto* decl = dynamic_cast<const ast::ModuleDecl*>(mod->decl)) {
+        if (decl->name && !decl->name->parts.empty()) {
+            std::string out;
+            for (std::size_t i = 0; i < decl->name->parts.size(); ++i) {
+                if (i) out += '.';
+                out += std::string(decl->name->parts[i]);
+            }
+            return out;
+        }
+    }
+    return std::string(mod->name);
+}
+
+bool hasModifier(const std::vector<std::string_view>& modifiers,
+                 std::string_view wanted) {
+    return std::find(modifiers.begin(), modifiers.end(), wanted) !=
+           modifiers.end();
+}
+
+std::string qualifiedSymbolName(const sema::Symbol* symbol,
+                                std::string_view moduleName) {
+    if (!symbol) return {};
+    if (auto* member = dynamic_cast<const sema::MemberSymbol*>(symbol)) {
+        if (member->parent) {
+            std::string out(moduleName);
+            if (!out.empty()) out += '.';
+            out += std::string(member->parent->name);
+            out += '.';
+            out += std::string(member->name);
+            return out;
+        }
+    }
+    if (auto* type = dynamic_cast<const sema::TypeSymbol*>(symbol)) {
+        std::string out(moduleName);
+        if (!out.empty()) out += '.';
+        out += std::string(type->name);
+        return out;
+    }
+    // Builtins and contextual names have no declaration-site module. Keeping
+    // their spelling is deterministic and avoids inventing a stdlib module
+    // qualification that the resolver did not provide.
+    return std::string(symbol->name);
+}
+
+std::string fallbackExprText(const ast::Expr* e) {
+    if (!e) return {};
+    std::string literal = renderConstExpr(e);
+    if (!literal.empty()) return literal;
+    if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+        return "(" + fallbackExprText(b->left.get()) + " " +
+               std::string(b->op) + " " + fallbackExprText(b->right.get()) +
+               ")";
+    }
+    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e))
+        return std::string(u->op) + " " + fallbackExprText(u->operand.get());
+    if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e))
+        return fallbackExprText(m->target.get()) + "." + std::string(m->member);
+    if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e))
+        return fallbackExprText(m->target.get()) + "?." + std::string(m->member);
+    if (auto* c = dynamic_cast<const ast::CallExpr*>(e))
+        return fallbackExprText(c->callee.get()) + "(...)";
+    if (auto* i = dynamic_cast<const ast::IdentifierExpr*>(e))
+        return std::string(i->name);
+    return "<expression>";
+}
+
+std::string canonicalClauseText(const ast::Expr& expr,
+                                const sema::SemaContext& ctx,
+                                std::string_view source,
+                                const std::vector<sema::Symbol*>& params,
+                                const std::vector<sema::Symbol*>& genericParams,
+                                std::string_view moduleName,
+                                const sema::TypeSymbol* ownerType) {
+    const std::size_t begin = expr.span.begin.offset;
+    const std::size_t end = expr.span.end.offset;
+    if (source.empty() || expr.span.begin.line == 0 || end <= begin ||
+        end > source.size())
+        return fallbackExprText(&expr);
+
+    const std::vector<CanonicalToken> tokens =
+        lexCanonicalTokens(source.substr(begin, end - begin), begin);
+    if (tokens.empty()) return fallbackExprText(&expr);
+
+    std::unordered_map<std::size_t, std::string> replacements;
+    std::unordered_map<std::string, std::size_t> genericByName;
+    for (std::size_t i = 0; i < genericParams.size(); ++i) {
+        if (genericParams[i])
+            genericByName.emplace(std::string(genericParams[i]->name), i);
+    }
+
+    std::unordered_map<std::string, std::string> ownerMembers;
+    std::unordered_set<const sema::TypeSymbol*> ownerVisited;
+    for (auto* type = ownerType;
+         type && ownerVisited.insert(type).second;) {
+        for (sema::Symbol* symbol : type->members) {
+            auto* member = dynamic_cast<const sema::MemberSymbol*>(symbol);
+            if (!member) continue;
+            std::string qualified = qualifiedSymbolName(member, moduleName);
+            if (!qualified.empty()) ownerMembers.emplace(member->name, qualified);
+        }
+        const sema::TypeSymbol* next = nullptr;
+        for (const sema::TypeSymbol* base : type->baseTypes) {
+            if (base && base->kind == ast::TypeDeclKind::Class) {
+                next = base;
+                break;
+            }
+        }
+        type = next;
+    }
+
+    for (const auto& [node, symbol] : ctx.allExprSymbols()) {
+        if (!node || !symbol || node->span.begin.line == 0) continue;
+        const auto* id = dynamic_cast<const ast::IdentifierExpr*>(node);
+        if (!id) continue;
+        const std::size_t off = node->span.begin.offset;
+        if (off < begin || off >= end) continue;
+        if (id->name == "this" || id->name == "base") continue;
+        if (auto* parameter = dynamic_cast<const sema::ParameterSymbol*>(symbol)) {
+            auto it = std::find(params.begin(), params.end(), parameter);
+            if (it != params.end()) {
+                replacements[off] = "%" +
+                    std::to_string(static_cast<std::size_t>(it - params.begin()));
+                continue;
+            }
+        }
+        if (auto* generic = dynamic_cast<const sema::GenericParamSymbol*>(symbol)) {
+            auto it = genericByName.find(std::string(generic->name));
+            if (it != genericByName.end()) {
+                replacements[off] = "%" + std::to_string(it->second);
+                continue;
+            }
+        }
+        std::string qualified = qualifiedSymbolName(symbol, moduleName);
+        if (!qualified.empty()) replacements[off] = std::move(qualified);
+    }
+    // MemberAccessExpr nodes do not have a separate member-token location in
+    // the AST. For the outer nodes (the parser stamps their spans), locate the
+    // member token in the exact `.`/`?.` token pair. Bare field references are
+    // covered by the IdentifierExpr loop above; this adds declaration-qualified
+    // spelling for the common explicit-receiver form without rewriting syntax.
+    std::vector<const ast::MemberAccessExpr*> memberNodes;
+
+    for (const auto& [node, symbol] : ctx.allExprSymbols()) {
+        if (!node || !symbol) continue;
+        auto* member = dynamic_cast<const ast::MemberAccessExpr*>(node);
+        if (!member || member->span.begin.line == 0) continue;
+        if (member->span.end.offset <= begin || member->span.begin.offset >= end)
+            continue;
+        memberNodes.push_back(member);
+    }
+    std::sort(memberNodes.begin(), memberNodes.end(),
+              [](const auto* a, const auto* b) {
+                  return a->span.begin.offset < b->span.begin.offset;
+              });
+    for (const auto* member : memberNodes) {
+        sema::Symbol* symbol = ctx.exprSymbol(*member);
+        if (!symbol) continue;
+        std::string qualified = qualifiedSymbolName(symbol, moduleName);
+        if (qualified.empty()) continue;
+        for (std::size_t i = 1; i < tokens.size(); ++i) {
+            if (tokens[i].offset < member->span.begin.offset ||
+                tokens[i].offset >= member->span.end.offset ||
+                tokens[i].token.text != member->member)
+                continue;
+            if (tokens[i - 1].token.text == "." ||
+                tokens[i - 1].token.text == "?.") {
+                replacements[tokens[i].offset] = qualified;
+                break;
+            }
+        }
+    }
+
+    // For nested postfix nodes the parser intentionally leaves `span` empty
+    // (the enclosing expression owns the stamped range). Use the resolved
+    // member name as a second, ambiguity-safe lookup so `this._field` and
+    // `Math.Abs(x)` receive the same declaration qualification even when they
+    // occur below a binary/call node. If two declaring types expose the same
+    // member spelling in this clause, leave that spelling unchanged rather than
+    // guessing; the source-qualified outer node path remains available above.
+    std::unordered_map<std::string, std::string> memberQualified;
+    std::unordered_set<std::string> ambiguousMembers;
+    auto rememberMember = [&](const ast::Expr* node, sema::Symbol* symbol,
+                              std::string_view name) {
+        if (!node || !symbol || name.empty()) return;
+        if (node->span.begin.line != 0 &&
+            (node->span.end.offset <= begin || node->span.begin.offset >= end))
+            return;
+        std::string qualified = qualifiedSymbolName(symbol, moduleName);
+        if (qualified.empty()) return;
+        auto [it, inserted] = memberQualified.emplace(std::string(name),
+                                                       qualified);
+        if (!inserted && it->second != qualified)
+            ambiguousMembers.insert(std::string(name));
+    };
+    for (const auto& [node, symbol] : ctx.allExprSymbols()) {
+        if (!node || !symbol) continue;
+        if (auto* member = dynamic_cast<const ast::MemberAccessExpr*>(node))
+            rememberMember(member, symbol, member->member);
+        else if (auto* member =
+                     dynamic_cast<const ast::NullCondMemberExpr*>(node))
+            rememberMember(member, symbol, member->member);
+    }
+
+    std::string out;
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        if (i) out.push_back(' ');
+        auto it = replacements.find(tokens[i].offset);
+        if (it != replacements.end()) {
+            out += it->second;
+            continue;
+        }
+        if (ownerType && tokens[i].token.kind == TokenKind::Identifier) {
+            const bool bare = i == 0 ||
+                (tokens[i - 1].token.text != "." &&
+                 tokens[i - 1].token.text != "?.");
+            const bool thisMember = i >= 2 &&
+                (tokens[i - 1].token.text == "." ||
+                 tokens[i - 1].token.text == "?.") &&
+                (tokens[i - 2].token.text == "this" ||
+                 tokens[i - 2].token.text == "base");
+            if (bare || thisMember) {
+                auto ownerIt = ownerMembers.find(
+                    std::string(tokens[i].token.text));
+                if (ownerIt != ownerMembers.end()) {
+                    out += ownerIt->second;
+                    continue;
+                }
+            }
+        }
+        if (i > 0 && (tokens[i - 1].token.text == "." ||
+                      tokens[i - 1].token.text == "?.") &&
+            tokens[i].token.kind == TokenKind::Identifier) {
+            auto memberIt = memberQualified.find(
+                std::string(tokens[i].token.text));
+            if (memberIt != memberQualified.end() &&
+                !ambiguousMembers.count(std::string(tokens[i].token.text))) {
+                out += memberIt->second;
+                continue;
+            }
+        }
+        // Type-parameter occurrences inside `typeof`/`new` type syntax may not
+        // have an Expr side-table entry. Positionalize those lexical names too,
+        // but never a member suffix (`obj.T`) and never a keyword/literal.
+        if (tokens[i].token.kind == TokenKind::Identifier &&
+            (i == 0 || (tokens[i - 1].token.text != "." &&
+                        tokens[i - 1].token.text != "?."))) {
+            auto git = genericByName.find(std::string(tokens[i].token.text));
+            if (git != genericByName.end()) {
+                out += "%" + std::to_string(git->second);
+                continue;
+            }
+        }
+        out += std::string(tokens[i].token.text);
+    }
+    return out;
+}
+
+std::optional<std::int64_t> constantIntValue(
+    const ast::Expr* e, const sema::SemaContext* ctx, int depth = 0) {
+    if (!e || depth > 32) return std::nullopt;
+    (void)ctx;
+    if (auto* literal = dynamic_cast<const ast::IntLiteralExpr*>(e)) {
+        char* end = nullptr;
+        std::string text(literal->text);
+        const long long value = std::strtoll(text.c_str(), &end, 0);
+        if (end == text.c_str()) return std::nullopt;
+        return static_cast<std::int64_t>(value);
+    }
+    if (auto* unary = dynamic_cast<const ast::UnaryExpr*>(e)) {
+        auto value = constantIntValue(unary->operand.get(), ctx, depth + 1);
+        if (!value) return std::nullopt;
+        if (unary->op == "+") return *value;
+        if (unary->op == "-") return -*value;
+        if (unary->op == "~") return ~*value;
+        return std::nullopt;
+    }
+    auto* binary = dynamic_cast<const ast::BinaryExpr*>(e);
+    if (!binary) return std::nullopt;
+    auto lhs = constantIntValue(binary->left.get(), ctx, depth + 1);
+    auto rhs = constantIntValue(binary->right.get(), ctx, depth + 1);
+    if (!lhs || !rhs) return std::nullopt;
+    if (binary->op == "+") return *lhs + *rhs;
+    if (binary->op == "-") return *lhs - *rhs;
+    if (binary->op == "*") return *lhs * *rhs;
+    if (binary->op == "/" && *rhs != 0) return *lhs / *rhs;
+    if (binary->op == "mod" && *rhs != 0) return *lhs % *rhs;
+    if (binary->op == "&") return *lhs & *rhs;
+    if (binary->op == "|") return *lhs | *rhs;
+    if (binary->op == "^") return *lhs ^ *rhs;
+    if (binary->op == "<<") return *lhs << *rhs;
+    if (binary->op == ">>") return *lhs >> *rhs;
+    return std::nullopt;
+}
+
+std::optional<bool> constantBoolValue(const ast::Expr* e,
+                                      const sema::SemaContext* ctx,
+                                      int depth = 0) {
+    if (!e || depth > 32) return std::nullopt;
+    if (auto* literal = dynamic_cast<const ast::BoolLiteralExpr*>(e))
+        return literal->value;
+    if (auto* unary = dynamic_cast<const ast::UnaryExpr*>(e)) {
+        if (unary->op == "not") {
+            auto value = constantBoolValue(unary->operand.get(), ctx, depth + 1);
+            if (value) return !*value;
+        }
+        return std::nullopt;
+    }
+    auto* binary = dynamic_cast<const ast::BinaryExpr*>(e);
+    if (!binary) return std::nullopt;
+    auto lhsBool = constantBoolValue(binary->left.get(), ctx, depth + 1);
+    auto rhsBool = constantBoolValue(binary->right.get(), ctx, depth + 1);
+    if (binary->op == "and" && lhsBool && rhsBool) return *lhsBool && *rhsBool;
+    if (binary->op == "or" && lhsBool && rhsBool) return *lhsBool || *rhsBool;
+    if ((binary->op == "=" || binary->op == "<>") && lhsBool && rhsBool)
+        return binary->op == "=" ? *lhsBool == *rhsBool
+                                   : *lhsBool != *rhsBool;
+
+    auto lhsInt = constantIntValue(binary->left.get(), ctx, depth + 1);
+    auto rhsInt = constantIntValue(binary->right.get(), ctx, depth + 1);
+    if (!lhsInt || !rhsInt) return std::nullopt;
+    if (binary->op == "=") return *lhsInt == *rhsInt;
+    if (binary->op == "<>") return *lhsInt != *rhsInt;
+    if (binary->op == "<") return *lhsInt < *rhsInt;
+    if (binary->op == ">") return *lhsInt > *rhsInt;
+    if (binary->op == "<=") return *lhsInt <= *rhsInt;
+    if (binary->op == ">=") return *lhsInt >= *rhsInt;
+    return std::nullopt;
+}
+
+MetaContractTier contractTier(const ast::ContractClause& clause,
+                              const sema::SemaContext& ctx) {
+    // §22.16: `static` demands proof. The v0.204 prover floor also records a
+    // declaration-only constant-true clause as proven; opportunistic call-site
+    // discharge is deliberately not consulted here.
+    if (clause.isStatic) return MetaContractTier::Proven;
+    if (auto value = constantBoolValue(clause.expr.get(), &ctx); value && *value)
+        return MetaContractTier::Proven;
+    return MetaContractTier::Checked;
+}
+
+MetaContractRecord makeContractRecord(const ast::ContractClause& clause,
+                                      const sema::SemaContext& ctx,
+                                      std::string_view source,
+                                      const std::vector<sema::Symbol*>& params,
+                                      const std::vector<sema::Symbol*>& generics,
+                                      std::string_view moduleName,
+                                      const sema::TypeSymbol* ownerType) {
+    MetaContractRecord out;
+    out.kind = clause.kind == ast::ContractClause::Kind::Requires
+                   ? MetaContractKind::Requires
+                   : MetaContractKind::Ensures;
+    out.isStatic = clause.isStatic;
+    out.tier = contractTier(clause, ctx);
+    if (clause.expr)
+        out.canonicalText = canonicalClauseText(
+            *clause.expr, ctx, source, params, generics, moduleName, ownerType);
+    return out;
+}
+
+std::vector<MetaContractRecord> convertContracts(
+    const std::vector<ast::ContractClause>& clauses,
+    const std::vector<ast::Param>& astParams,
+    const std::vector<sema::Symbol*>& paramSymbols,
+    const std::vector<sema::Symbol*>& genericSymbols,
+    sema::SemaContext& ctx, std::string_view source,
+    std::string_view moduleName, const sema::TypeSymbol* ownerType) {
+    std::vector<MetaContractRecord> out;
+    // §22.4: `when` is the shipped static-ensures family. It is emitted before
+    // authored clauses because its source position is in the parameter list and
+    // its desugared declaration precedes the post-signature clause region.
+    for (std::size_t i = 0; i < astParams.size(); ++i) {
+        const ast::Param& p = astParams[i];
+        if (p.outNullPostcond == ast::OutNullWhen::None) continue;
+        MetaContractRecord c;
+        c.kind = MetaContractKind::Ensures;
+        c.isStatic = true;
+        c.tier = MetaContractTier::Proven;
+        const char* relation =
+            p.outNullPostcond == ast::OutNullWhen::WhenTrue ? "not result or "
+                                                             : "result or ";
+        c.canonicalText = std::string(relation) + "%" + std::to_string(i) +
+                          " <> null";
+        out.push_back(std::move(c));
+    }
+    for (const auto& clause : clauses)
+        out.push_back(makeContractRecord(clause, ctx, source, paramSymbols,
+                                         genericSymbols, moduleName, ownerType));
+    return out;
+}
+
+MetaContractRecord convertInvariant(const ast::InvariantDecl& inv,
+                                    const std::vector<sema::Symbol*>& generics,
+                                    sema::SemaContext& ctx,
+                                    std::string_view source,
+                                    std::string_view moduleName,
+                                    const sema::TypeSymbol* ownerType) {
+    MetaContractRecord out;
+    out.kind = MetaContractKind::Invariant;
+    out.isStatic = inv.isStatic;
+    out.tier = inv.isStatic ? MetaContractTier::Proven
+                            : MetaContractTier::Checked;
+    if (inv.expr)
+        out.canonicalText = canonicalClauseText(
+            *inv.expr, ctx, source, {}, generics, moduleName, ownerType);
+    return out;
+}
+
+void collectInvariants(const sema::TypeSymbol& type,
+                       sema::SemaContext& ctx, std::string_view source,
+                       std::string_view moduleName,
+                       std::vector<MetaContractRecord>& out,
+                       std::unordered_set<const sema::TypeSymbol*>& visiting) {
+    if (!visiting.insert(&type).second) return;
+    for (const sema::TypeSymbol* base : type.baseTypes) {
+        if (base && base->kind == ast::TypeDeclKind::Class)
+            collectInvariants(*base, ctx, source, moduleName, out, visiting);
+    }
+    auto* td = dynamic_cast<const ast::TypeDecl*>(type.decl);
+    if (td) {
+        for (const auto& member : td->members) {
+            auto* inv = dynamic_cast<const ast::InvariantDecl*>(member.get());
+            if (!inv) continue;
+            out.push_back(convertInvariant(*inv, type.genericParams, ctx, source,
+                                           moduleName, &type));
+        }
+    } else {
+        // Imported base classes have no AST in this compilation. Re-emit the
+        // loader's side-table records so a local derived class's interface keeps
+        // the required base-first invariant carriage.
+        for (const auto& in : type.invariantContracts) {
+            MetaContractRecord c;
+            c.kind = static_cast<MetaContractKind>(in.kind);
+            c.isStatic = in.isStatic;
+            c.canonicalText = in.canonicalText;
+            c.tier = static_cast<MetaContractTier>(in.tier);
+            out.push_back(std::move(c));
+        }
+    }
+    visiting.erase(&type);
+}
+
+std::vector<MetaContractRecord> typeInvariants(const sema::TypeSymbol& type,
+                                               sema::SemaContext& ctx,
+                                               std::string_view source,
+                                               std::string_view moduleName) {
+    std::vector<MetaContractRecord> out;
+    std::unordered_set<const sema::TypeSymbol*> visiting;
+    collectInvariants(type, ctx, source, moduleName, out, visiting);
+    return out;
+}
+
 // --- §22 parameters ---------------------------------------------------------
 
 MetaParam convertParam(const sema::ParameterSymbol& p, sema::SemaContext& ctx) {
@@ -333,6 +814,7 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
                    bool isGenericType, std::string_view source) {
     out.visibility = toMetaVisibility(m.visibility, inInterface);
     out.modifiers = toStrings(m.modifiers);
+    out.isPure = hasModifier(m.modifiers, "pure");
     out.name = std::string(m.name);
 
     if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.decl)) {
@@ -369,12 +851,26 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
         out.kind = MetaMemberKind::Method;
         out.isOperator = meth->isOperator;
         if (auto* md = dynamic_cast<const ast::MethodDecl*>(m.decl)) {
+            out.isPure = hasModifier(md->modifiers, "pure");
             out.type = convertAstType(md->returnType.get(), ctx);
             out.returnOwned = md->returnOwned;
             out.genericParams = convertGenericParams(
                 meth->genericParams, md->genericConstraints, ctx);
             out.params = convertParams(meth->params, ctx);
             fillParamDefaults(out.params, md->params);
+            std::vector<sema::Symbol*> contractGenerics;
+            if (meth->parent) {
+                contractGenerics.insert(contractGenerics.end(),
+                                        meth->parent->genericParams.begin(),
+                                        meth->parent->genericParams.end());
+            }
+            contractGenerics.insert(contractGenerics.end(),
+                                    meth->genericParams.begin(),
+                                    meth->genericParams.end());
+            out.contracts = convertContracts(
+                md->contractClauses, md->params, meth->params,
+                contractGenerics, ctx, source, moduleNameFor(ctx),
+                meth->parent);
             // §14.1 / #783: for a GENERIC class, export the full method
             // declaration source text (extracted via the AST span stamped by
             // parseMethodDeclBody) so the importer can re-parse and monomorphize
@@ -392,6 +888,7 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             }
         } else if (auto* od = dynamic_cast<const ast::OperatorDecl*>(m.decl)) {
             // §25 operator overload.
+            out.isPure = od->isPure;
             out.type = convertAstType(od->returnType.get(), ctx);
             out.returnOwned = od->returnOwned;
             out.params = convertParams(meth->params, ctx);
@@ -403,7 +900,18 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
         out.kind = MetaMemberKind::Constructor;
         out.params = convertParams(ctor->params, ctx);
         if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(m.decl)) {
+            out.isPure = cd->isPure;
             fillParamDefaults(out.params, cd->params);
+            std::vector<sema::Symbol*> contractGenerics;
+            if (ctor->parent) {
+                contractGenerics.insert(contractGenerics.end(),
+                                        ctor->parent->genericParams.begin(),
+                                        ctor->parent->genericParams.end());
+            }
+            out.contracts = convertContracts(
+                cd->contractClauses, cd->params, ctor->params,
+                contractGenerics, ctx, source, moduleNameFor(ctx),
+                ctor->parent);
             // §14 / #662c: for a GENERIC class, export the full constructor
             // declaration source text (extracted via AST span) so the importer
             // can re-parse and inline it with genericSubst_ active.  The span
@@ -529,6 +1037,11 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
     // §12 base class + interfaces (resolved TypeRefs, parallel to baseTypes).
     for (sema::TypeRef* baseRef : t.baseTypeRefs)
         out.baseTypes.push_back(convertType(baseRef));
+
+    // §22.16 / §2.8.2 (#2054): carry invariant records in base-first order.
+    // The record list is declaration-derived; no per-call-site discharge is
+    // consulted while emitting an interface.
+    out.invariants = typeInvariants(t, ctx, source, moduleNameFor(ctx));
 
     // Members — the §13 exported surface (public/protected).
     // §14/#662c / #695: for generic classes, also include private METHOD

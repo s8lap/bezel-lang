@@ -184,6 +184,7 @@ bool PureBodyWalker::callTargetIsPure(Symbol* calleeSym) {
     // in a later slice.
     if (!calleeSym) return false;  // conservatively reject unknown
     if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym)) {
+        if (ms->isPure) return true;
         if (auto* op = dynamic_cast<const ast::OperatorDecl*>(ms->decl))
             if (op->isPure) return true;
         for (auto mod : ms->modifiers)
@@ -191,8 +192,11 @@ bool PureBodyWalker::callTargetIsPure(Symbol* calleeSym) {
         return false;
     }
     if (auto* cs = dynamic_cast<ConstructorSymbol*>(calleeSym)) {
+        if (cs->isPure) return true;
         if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
             if (cd->isPure) return true;
+        for (auto mod : cs->modifiers)
+            if (mod == "pure") return true;
         return false;
     }
     // Property/indexer accessor calls — pure-classification (auto-getter)
@@ -441,8 +445,11 @@ bool PureBodyWalker::throwCarveOutAdmits(const ast::NewExpr& ne) {
     for (Symbol* m : targetDecl->members) {
         auto* cs = dynamic_cast<ConstructorSymbol*>(m);
         if (!cs) continue;
+        if (cs->isPure) return true;
         if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
             if (cd->isPure) return true;
+        for (auto mod : cs->modifiers)
+            if (mod == "pure") return true;
     }
     return false;
 }

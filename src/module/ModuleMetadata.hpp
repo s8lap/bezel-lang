@@ -108,7 +108,12 @@ inline constexpr std::uint32_t kMetadataMagic = 0x644D7A42; // 'B','z','M','d' L
 //     rule: a bump is reserved for a change that makes an old reader MISINTERPRET
 //     an existing field — this only ADDS a trailing record that old readers skip).
 //
-// v6 (issue #1733, spec §2.8.4 rule 4, v0.188): ARTIFACT KIND. ModuleMetadata
+// v7 (#2054 / spec §2.8.2, v0.204): contract carriage. The public
+// interface records per-member purity plus ordered contract records and
+// per-class invariant records. A v7 reader accepts v1-v6 blobs, but marks a
+// pre-v7 blob contract-opaque rather than treating it as an empty record set
+// (spec §2.8.6 degradation rule).
+//
 // gains `isExecutable` — true when the artifact was emitted as an executable
 // build (§2.8.4 rule 1: it carries a native entry symbol), false for a library.
 // It rides the MODULE_BLOCK's top-level counts record as a 4th scalar
@@ -124,7 +129,7 @@ inline constexpr std::uint32_t kMetadataMagic = 0x644D7A42; // 'B','z','M','d' L
 // soundness-relevant field. `isExecutable` is NOT folded into semanticHash:
 // artifact kind is a build property, not part of the public-INTERFACE content
 // that staleness detection tracks.
-inline constexpr std::uint32_t kSchemaVersion = 6;
+inline constexpr std::uint32_t kSchemaVersion = 7;
 
 // --- Type representation (decoupled mirror of sema::TypeRef) ----------------
 
@@ -239,6 +244,32 @@ struct MetaParam {
     bool operator==(const MetaParam&) const;
 };
 
+// §22.16 / §2.8.2 (v0.204, #2054): the by-value contract record carried
+// across an artifact boundary. Canonical text is declaration-derived; it is
+// deliberately not a semantic normal form (the spec makes textual identity
+// the sound, deterministic comparison rule).
+enum class MetaContractKind : std::uint8_t {
+    Requires = 0,
+    Ensures = 1,
+    Invariant = 2,
+};
+
+enum class MetaContractTier : std::uint8_t {
+    Proven = 0,
+    Checked = 1,
+    Assumed = 2,
+};
+
+struct MetaContractRecord {
+    MetaContractKind kind = MetaContractKind::Requires;
+    bool isStatic = false;
+    std::string canonicalText;
+    MetaContractTier tier = MetaContractTier::Checked;
+
+    bool operator==(const MetaContractRecord&) const;
+};
+
+
 // The member kinds of a type's public surface (§9-§12, §22-§25). Numeric
 // values are part of the wire format.
 enum class MetaMemberKind : std::uint8_t {
@@ -307,6 +338,15 @@ struct MetaMember {
     // members (caps[1] is null), and a v4 reader rejects a v5 blob outright.
     std::string methodBodyText;       // §14.1/#783: method source text for generics
 
+    // §22.15 / §2.8.2: whether this member is declared pure. It is kept as
+    // an explicit bit in addition to the general modifier list so consumers
+    // need not infer behavioral metadata from spelling conventions.
+    bool isPure = false;
+
+    // §22.16 / §2.8.2: clauses in declaration order. For a `when` form from
+    // §22.4 the builder emits the equivalent static-ensures record here.
+    std::vector<MetaContractRecord> contracts;
+
     // Method / Constructor / Indexer:
     std::vector<MetaGenericParam> genericParams; // §14 (methods only)
     std::vector<MetaParam> params;
@@ -349,6 +389,9 @@ struct MetaTypeDecl {
     // are interfaces — same convention as sema::TypeSymbol::baseTypeRefs.
     std::vector<MetaType> baseTypes;
     std::vector<MetaMember> members;
+    // §22.16 / §2.8.2: invariant records, base classes first, then this
+    // class's invariant members in declaration order.
+    std::vector<MetaContractRecord> invariants;
     // §9.1 / §9.2 (issue #501): true when this type is a positional record
     // (declared with a `(field...)` list). Carried in the metadata so an
     // importer can reconstruct TypeSymbol::hasPositionalFields, which the
@@ -379,6 +422,12 @@ struct MetaFunction {
     MetaType returnType;
     bool returnOwned = false;
 
+    // §22.15 / §22.16: top-level callable behavioral metadata. The current
+    // parser has no free-function declarations, but the schema is complete for
+    // the interface requirement and future top-level forms.
+    bool isPure = false;
+    std::vector<MetaContractRecord> contracts;
+
     bool operator==(const MetaFunction&) const;
 };
 
@@ -408,6 +457,12 @@ struct ModuleMetadata {
     // dependency whose artifact is executable-kind (§2.8.4 rule 4). Not part of
     // the semantic hash (a build property, not public-interface content).
     bool isExecutable = false;
+
+    // §2.8.6 degradation rule (v0.204): false means this metadata came from a
+    // pre-carriage artifact and makes no contract claim. Current metadata built
+    // by this compiler defaults to true, even when the explicit record vectors
+    // are empty; an absent record set is never fabricated as an empty set.
+    bool contractRecordsCarried = true;
 
     bool operator==(const ModuleMetadata&) const;
     bool operator!=(const ModuleMetadata& other) const {

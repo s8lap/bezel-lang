@@ -438,4 +438,66 @@ BEZEL_TEST(module_metadata, rejects_bad_magic_issue_328) {
     BEZEL_EXPECT_FALSE(readSchemaVersion(garbage).has_value());
 }
 
+// #2054 / spec §2.8.2 (v0.204): contract records are interface content,
+// not body-local annotations. They retain kind, `static`, canonical text, and
+// demand-derived tier through the wire format, and a change affects the
+// semantic hash.
+BEZEL_TEST(module_metadata, contract_records_roundtrip_spec_2_8_2_2054) {
+    ModuleMetadata md;
+    md.moduleName = "Contracts";
+    md.exports = {"Account"};
+
+    MetaTypeDecl account;
+    account.name = "Account";
+    account.kind = MetaTypeDeclKind::Class;
+    account.visibility = MetaVisibility::Public;
+
+    MetaMember method;
+    method.kind = MetaMemberKind::Method;
+    method.name = "Withdraw";
+    method.visibility = MetaVisibility::Public;
+    method.isPure = true;  // §22.15 carriage
+    MetaContractRecord reqRecord;
+    reqRecord.kind = MetaContractKind::Requires;
+    reqRecord.canonicalText = "%0 > 0";
+    reqRecord.tier = MetaContractTier::Checked;
+    MetaContractRecord ensRecord;
+    ensRecord.kind = MetaContractKind::Ensures;
+    ensRecord.isStatic = true;
+    ensRecord.canonicalText = "result = %0";
+    ensRecord.tier = MetaContractTier::Proven;
+    method.contracts = {reqRecord, ensRecord};
+    account.members.push_back(method);
+
+    MetaContractRecord invariant;
+    invariant.kind = MetaContractKind::Invariant;
+    invariant.canonicalText = "Contracts.Account._balance >= 0";
+    invariant.tier = MetaContractTier::Checked;
+    account.invariants.push_back(invariant);
+    md.types.push_back(account);
+
+    std::optional<ModuleMetadata> decoded = deserialize(serialize(md));
+    BEZEL_EXPECT_TRUE(decoded.has_value());
+    if (!decoded) return;
+    BEZEL_EXPECT_TRUE(decoded->contractRecordsCarried);
+    BEZEL_EXPECT_TRUE(*decoded == md);
+    if (decoded->types.empty()) return;
+    BEZEL_EXPECT_EQ(decoded->types[0].invariants.size(), std::size_t{1});
+    BEZEL_EXPECT_EQ(decoded->types[0].members[0].contracts.size(),
+                    std::size_t{2});
+    BEZEL_EXPECT_TRUE(decoded->types[0].members[0].isPure);
+
+    ModuleMetadata changed = md;
+    changed.types[0].members[0].contracts[0].canonicalText = "%0 >= 0";
+    BEZEL_EXPECT_TRUE(semanticHash(changed) != semanticHash(md));
+
+    // §2.8.6 degradation: an explicitly opaque snapshot remains distinguishable
+    // from a current artifact asserting an empty contract set.
+    ModuleMetadata opaque = md;
+    opaque.contractRecordsCarried = false;
+    auto opaqueDecoded = deserialize(serialize(opaque));
+    BEZEL_EXPECT_TRUE(opaqueDecoded.has_value());
+    if (opaqueDecoded) BEZEL_EXPECT_TRUE(!opaqueDecoded->contractRecordsCarried);
+}
+
 } // namespace bezel::module
