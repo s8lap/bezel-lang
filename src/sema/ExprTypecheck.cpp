@@ -2930,10 +2930,25 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
     // whose scalar argument did not match the callee's pointer/function-value
     // parameter. Reject with a §5.1 diagnostic so the user sees a clean
     // compile-time error instead of an IR-verifier abort.
+    //
+    // §5.1 narrow exception (#2067 follow-up): a `null` LITERAL into a
+    // NULLABLE function-typed target — `null` implicitly converts to `T?`
+    // for any T (§5.1 v0.204 "Nullable conversions"), and function types are
+    // no exception: `(int) -> int` admits `null` only at its nullable form
+    // `((int) -> int)?`. The first cut of #2067 over-rejected this as a
+    // non-function → function pair because the source's static type is the
+    // pre-target `nullable Object` placeholder the literal carries before
+    // target-directed refinement; gate the reject on a non-null literal
+    // source so the legitimate §5.1 null→T? path survives.
     if (to->kind == TypeRef::Kind::Function &&
         from->kind != TypeRef::Kind::Function) {
-        reportNotConvertible();
-        return;
+        const bool nullLitToNullableFn =
+            to->nullable && fromExpr &&
+            dynamic_cast<const ast::NullLiteralExpr*>(fromExpr);
+        if (!nullLitToNullableFn) {
+            reportNotConvertible();
+            return;
+        }
     }
     // §27.6 / §5.1 (issue #436): a bare method reference has a Function type.
     // A Function value is not implicitly convertible to a non-Function type

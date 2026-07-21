@@ -141,3 +141,43 @@ BEZEL_TEST(scalar_to_function_param_2067,
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// §5.1 (#2067 follow-up, narrow): a `null` LITERAL into a NULLABLE function-
+// typed return slot is accepted per §5.1 nullable conversions ("for any type
+// T, T implicitly converts to T?"; "null converts to null"). Function types
+// are no exception: `(() -> int)?` is the nullable form of `() -> int`, and
+// `return null;` from a method returning the nullable function type is the
+// ordinary null→T? conversion. The first cut of #2067 (commit 2c82459)
+// over-rejected this as a non-function → function pair because the source's
+// static type is the pre-target `nullable Object` placeholder the literal
+// carries before target-directed refinement; the narrow fix gates the reject
+// on a non-null-literal source so the legitimate §5.1 path survives.
+BEZEL_TEST(scalar_to_function_param_2067,
+           null_literal_to_nullable_func_return_accepted_spec_5_1) {
+    auto r = check(
+        "module M; "
+        "class C "
+        "  public method M(): (() -> int)? "
+        "    return null; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §5.1 (#2067 follow-up, narrow): a `null` LITERAL passed to a NON-NULLABLE
+// function-typed parameter is rejected — there is no implicit conversion from
+// `null` (Object?) to a non-nullable function type, so the §5.1 reject still
+// fires. This pins the negative arm of the narrow exception so a future
+// loosening cannot accidentally make every non-function → function pair
+// pass when the source happens to be a null literal.
+BEZEL_TEST(scalar_to_function_param_2067,
+           null_literal_to_non_nullable_func_param_rejected_spec_5_1) {
+    auto r = check(
+        "module M; "
+        "class C "
+        "  public static method Take(f: (int) -> int): int return 0; end Take; "
+        "  public static method Main(): int return Take(null); end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasNotImplicitlyConvertible(r));
+}
