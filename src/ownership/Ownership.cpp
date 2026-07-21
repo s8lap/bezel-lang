@@ -3315,36 +3315,39 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
         // `using var` is always Owned and implicitly discharged.
         lo.state = OwnershipState::Owned;
         lo.implicitDischarge = true;
-        // §28.3 / §28.10 adoption (Guide 1 §7 Pattern B; spec §30.15 example):
-        // `using var x := <owned local or owned param>;` is an owned-consuming
-        // binding — the using var IS an owned location, so the source's
-        // obligation transfers (a move). Without this the source stays Owned
-        // and is falsely reported dropped at method exit. Only an Owned
-        // source transfers; a borrow RHS keeps §28.10's pin-without-obligation
-        // behavior unchanged.
+        // §28.10 (v0.180, #2071) unmarked bare-id source. The MARKED form
+        // (`using var y := owned x;`) is an ADOPTION — handled above by the
+        // initializerHasOwnedMarker branch (checkAndMoveBindingOwnedMarker
+        // records the move, and `y` carries the obligation through
+        // implicitDischarge). The UNMARKED form (`using var y := x;` where `x`
+        // is a named owned binding) is a BORROW-PIN, not an adoption: `x`
+        // retains the obligation (auto-drop at scope end) and `y` disposes
+        // nothing. Pre-v0.180 the unmarked form adopted the obligation; that
+        // was wrong per the v0.180 ruling and produced "owned value in `x` was
+        // already moved out" on a later borrow read of `x` (issue #2071).
+        // §28.10 (#1285) covers the borrow-RHS analogue — a using var bound to
+        // a borrow pins without obligation. We unify both into the same
+        // borrow-pin regime: classify the source (Borrowed or Owned bare-id)
+        // and set usingVarSourceIsBorrow so codegen skips the disposal.
         if (ld.initializer) {
             if (auto* aid = dynamic_cast<const ast::IdentifierExpr*>(
                     ld.initializer.get())) {
-                for (auto& [s, st] : states_) {
-                    if (s->name == aid->name &&
-                        st.state == OwnershipState::Owned) {
-                        markMovedByName(aid->name, aid->span.begin);
-                        break;
-                    }
-                }
-                // §28.10 (#1285): if the bare-id source resolves to a local (or
-                // parameter) that the flow currently holds as a BORROW — a
-                // borrow local aliasing a borrow, or a borrow parameter — the
-                // using var only pins it and must NOT dispose it at scope end
-                // (its real owner does). Record that on the decl so codegen
-                // skips the disposal. Only a positive Borrowed classification
-                // sets the flag, so an owned transfer (Owned above), a
-                // drain-loop element, or an owned parameter (which register
-                // real disposals) is untouched.
+                // §28.10 / §28.3 (v0.180, #2071): any bare-id source — Owned or
+                // Borrowed — yields a borrow-pin (no obligation on `y`). The
+                // MARKED branch above is the only path that transfers
+                // obligation (a real adoption), so this unmarked branch never
+                // marks the source moved. Owned sources retain the obligation
+                // and auto-dispose at scope end; a borrow read of `x` after
+                // the using var is then legal per §28.3 (v0.180). Only a
+                // positive classification (Borrowed) or a positive symbol
+                // resolved to an Owned bare-id source sets the flag; the
+                // moved-from / drain-loop element / owned-parameter source
+                // paths above the using-var use different mechanisms.
                 if (sema::Symbol* srcSym = ctx_.exprSymbol(*aid)) {
                     auto it = states_.find(srcSym);
                     if (it != states_.end() &&
-                        it->second.state == OwnershipState::Borrowed)
+                        (it->second.state == OwnershipState::Borrowed ||
+                         it->second.state == OwnershipState::Owned))
                         const_cast<ast::LocalDecl&>(ld)
                             .usingVarSourceIsBorrow = true;
                     // §28.10 / §29.2 (#1287): a `using var u := item` whose

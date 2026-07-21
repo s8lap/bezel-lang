@@ -9400,6 +9400,25 @@ struct UnwindIneligibleWalker {
                 expr(ld->initializer.get(), /*consuming=*/false);
                 return;
             }
+            // §28.10 (v0.180, #2071): an UNMARKED `using var y := x;` where `x`
+            // is a named owned local / owned parameter is a BORROW-PIN (per spec
+            // §28.10, the ownership pass keeps `x` Owned and only registers `y`
+            // as a no-obligation pin). `x` is NOT consumed: it retains the
+            // obligation, the ownership pass will flag autoDropAtScopeEnd, and
+            // codegen needs the slot ELIGIBLE for that auto-drop registration
+            // (otherwise `x` leaks on a throw that PRECEDES or POSTCEDES the
+            // using-var). Walk the source as a borrow — same shape as the marked
+            // branch above but without the marker (the marker nulls the source
+            // slot; the borrow-pin case does NOT null, but the live value in the
+            // slot is the one `x` owns, which the auto-drop will dispose exactly
+            // once on the normal exit / the unwind). A bare-id `using var` over
+            // a borrow source stays the existing borrow path (nothing changes).
+            // // per §28.10 v0.180 #2071
+            if (ld->isUsing && !ld->initializerHasOwnedMarker &&
+                dynamic_cast<const ast::IdentifierExpr*>(ld->initializer.get())) {
+                expr(ld->initializer.get(), /*consuming=*/false);
+                return;
+            }
             // `var s := x;` moves x (owned local read in an owning init); a
             // `move`/call/new RHS is handled by expr(consuming). Treat the whole
             // initializer as a consuming position.

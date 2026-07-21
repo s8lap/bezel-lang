@@ -279,13 +279,19 @@ const char* kBorrowStringLoopLeakFree =
 // §15.4 / §28.3: owned-arg literal transfer looped — the callee disposes the
 // transferred collection exactly once; the caller does NOT (no double-free).
 // (Migrated from OwningArray<int> → OwningArray<N> per stdlib §4.2/#1327.)
+// §28.10 (v0.180, #2071): the adoption uses the binding-position `owned` marker
+// (`:= owned a`). An UNMARKED `using var local := a;` is a borrow-pin (§28.10
+// v0.180, #2071) — `a` retains the obligation and auto-disposes, which would
+// cause the looped disposal pattern to leak (a disposed once via the loop's
+// auto-drop path is enough; the marked-form adoption isolates disposal to the
+// using-var so the loop can reuse the same caller-side argument pattern).
 const char* kOwnedLoopLeakFree =
     "module M; "
     "class N public V: int := 0; "
     "  public constructor(v: int) V := v; end constructor; end N; "
     "class C "
     "  public static method Take(owned a: OwningArray<N>): int "
-    "    using var local: OwningArray<N> := a; return local.Count; "
+    "    using var local: OwningArray<N> := owned a; return local.Count; "
     "  end Take; "
     "  public static method Main(): int "
     "    var i: int := 0; var t: int := 0; "
