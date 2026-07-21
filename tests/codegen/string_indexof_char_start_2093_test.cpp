@@ -1,7 +1,8 @@
 // Spec-derived tests for fix #2093 (proposal 0062 item 2) — the additive
 // `string.IndexOf(value: char, startIndex: int)` overload.
-// Authority: stdlib v0.215, `IndexOf(value: char, startIndex: int)` — spec §4.6
-// (the string section). The stdlib pre-v0.215 ships only the 1-arg
+// Authority: stdlib v0.215 §9.6 (String section),
+// `IndexOf(value: char, startIndex: int)` (line 4544; proposal 0062 item 2).
+// The stdlib pre-v0.215 ships only the 1-arg
 // `IndexOf(char)` form; the 2-arg char form is the additive overload from
 // proposal 0062 item 2, parallel to the pre-existing
 // `IndexOf(value: string, startIndex: int)` form (stdlib lines 4545-4547, #649).
