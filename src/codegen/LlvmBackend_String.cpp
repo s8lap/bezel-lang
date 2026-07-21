@@ -1725,6 +1725,59 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                 return result;
             }
         }
+        // §9.6 v0.215 / proposal 0062 item 2: IndexOf(value: char, startIndex: int).
+        // Linear scan starting at the code-point index startIndex; startIndex is
+        // required to lie in [0, Length] (IndexOutOfRangeException otherwise).
+        if (call.args.size() == 2 && call.args[0].value && call.args[1].value) {
+            auto* argTy = ctx_.exprType(*call.args[0].value);
+            if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
+                argTy->primitive == sema::PrimitiveType::Char) {
+                llvm::Value* needle = lowerExpr(*call.args[0].value);
+                if (!needle) return nullptr;
+                llvm::Value* startV = lowerExpr(*call.args[1].value);
+                if (!startV) return nullptr;
+                // Normalize startV to i64 for the loop counter / bounds check.
+                llvm::Value* start64 = startV->getType()->isIntegerTy(64)
+                    ? startV
+                    : builder_.CreateSExt(startV, i64(), "ioc2.s64");
+                llvm::Value* len = loadStringLen(self);
+                // Bounds check: 0 <= startIndex <= Length.
+                llvm::Value* oor = builder_.CreateOr(
+                    builder_.CreateICmpSLT(start64, builder_.getInt64(0), "ioc2.sneg"),
+                    builder_.CreateICmpSGT(start64, len, "ioc2.sbig"), "ioc2.oor");
+                emitGuardThrow(oor, "IndexOutOfRangeException");
+                // Inline forward scan from startIndex, mirroring the 1-arg form.
+                auto* idxS = entryAlloca(i64());
+                builder_.CreateStore(start64, idxS);
+                auto* cBB = llvm::BasicBlock::Create(llvm_, "ioc2.c", currentFn_);
+                auto* bBB = llvm::BasicBlock::Create(llvm_, "ioc2.b", currentFn_);
+                auto* sBB = llvm::BasicBlock::Create(llvm_, "ioc2.s", currentFn_);
+                auto* eBB = llvm::BasicBlock::Create(llvm_, "ioc2.e", currentFn_);
+                builder_.CreateBr(cBB);
+                builder_.SetInsertPoint(cBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxS);
+                builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bBB, sBB);
+                builder_.SetInsertPoint(bBB);
+                llvm::Value* idxB = builder_.CreateLoad(i64(), idxS);
+                llvm::Value* cp = loadCodePoint(self, idxB);
+                llvm::Value* found = builder_.CreateICmpEQ(cp, needle);
+                auto* incBB = llvm::BasicBlock::Create(llvm_, "ioc2.inc", currentFn_);
+                builder_.CreateCondBr(found, eBB, incBB);
+                builder_.SetInsertPoint(incBB);
+                builder_.CreateStore(builder_.CreateAdd(idxB, builder_.getInt64(1)), idxS);
+                builder_.CreateBr(cBB);
+                builder_.SetInsertPoint(sBB);  // not found
+                builder_.CreateBr(eBB);
+                builder_.SetInsertPoint(eBB);
+                llvm::Value* fi = builder_.CreateLoad(i64(), idxS);
+                // If we exited because idx >= len (sBB), result = -1.
+                llvm::Value* exhausted = builder_.CreateICmpSGE(fi, len, "ioc2.exhausted");
+                llvm::Value* result = builder_.CreateSelect(exhausted,
+                    llvm::ConstantInt::getSigned(i32(), -1),
+                    builder_.CreateTrunc(fi, i32()), "ioc2.result");
+                return result;
+            }
+        }
         // §9.6 / #649: IndexOf(sub: string, start: int) — 2-arg overload.
         // `start` is a code-point index (§4.6 adaptive-width strings); the
         // runtime bz_str_indexof_from honours the width-aware code-point model.
