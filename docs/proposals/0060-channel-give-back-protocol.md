@@ -29,3 +29,8 @@ v0.179's receive-abandonment (spec §30.15) is the shipped half: *"an item being
 ## 4. Non-goals
 
 Multi-consumer receiver cloning stays a separate question (§28.13 domain-locality — the one remaining reason of the MPMC deferral); capacity-zero rendezvous stays deferred on its own recorded reason.
+
+## 5. Evidence log
+
+*2026-07-21 (writer-seat sweep, worker-pipeline program):* all three of the program's top frictions were this proposal's surface — non-cancellable `Receive` silently defeating `TaskScope` supervision, no `TrySend`/cancellable send (producer-deadlock hazard), and the design nuance that a producer *outside* the nursery needs the send-side cancellation most. The N-channel round-robin replacement was reconstructed near-verbatim from stdlib §6.9's own example, confirming the sanctioned idiom is learnable but ceremonial. Strengthens the case for scheduling this design.
+
