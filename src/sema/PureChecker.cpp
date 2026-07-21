@@ -33,6 +33,19 @@ public:
     void checkOneStmt(const ast::Stmt* s);
     void checkExpr(const ast::Expr* e);
 
+    // §22.15 "Pure constructors" (v0.202, #2052, #2061): a pure constructor's
+    // explicit `base(…)`/`this(…)` chain call (§11.1) must target a pure
+    // constructor — the chain target's purity propagates upward. The chain
+    // surfaces as the body's first ExpressionStmt whose expression is a
+    // CallExpr on a `this` or `base` identifier. We resolve the target
+    // constructor by CLASS IDENTITY (the same class for `this(…)`; the
+    // class-typed first base for `base(…)`) and arity — there is no
+    // ambiguity in the pure-classification call: the class narrows the
+    // search, the call's argument count picks the single overload. Reports
+    // a §22.15 diagnostic when the resolved target is not pure-declared.
+    void checkPureCtorChainPurity(const ast::ConstructorDecl& cd,
+                                  const ConstructorSymbol& cs);
+
     // §22.16 (v0.203, #2053): walk each contract clause's expression under
     // the §22.15 pure-body rules APPLIED EXPRESSION-WISE, with the clause-
     // specific amendments: `throw` is rejected (the carve-out's reverse —
@@ -89,6 +102,30 @@ private:
     // §22.15 rule 6: a call to a member not pure-declared / pure-classified
     // is rejected. Returns true iff admitted.
     bool callTargetIsPure(Symbol* calleeSym);
+
+    // §22.15 "Members classified by rule" (#2061, item 2): a record's
+    // synthesized Equals/GetHashCode/ToString are pure-classified iff every
+    // field's equality dispatch target is pure (auto-equality-bearing form).
+    // The synthesized-positional-ctor / with-copy forms are matched by
+    // `recordConstructionIsPure`. Returns true when the call IS to a
+    // synthesized record member AND the record is auto-equality-bearing
+    // (class-identity check); false otherwise. Sets
+    // *outIsSynthesizedRecordMember to true when the call resolves to a
+    // record-synthesized member regardless of purity (so the caller can
+    // distinguish "non-record call — fall through" from "record-synth
+    // but not pure-classified — report").
+    bool recordSynthesizedCallIsPure(const ast::CallExpr& ce,
+                                     bool* outIsSynthesizedRecordMember);
+
+    // §22.15 "Pure constructors" + "Members classified by rule" (#2061,
+    // item 2): record construction `new R(args)` is admitted in a pure body
+    // iff the invoked constructor is compiler-synthesized-pure (a POSITIONAL
+    // record — class-identity check, not arity-based) OR a user-declared
+    // pure constructor with matching arity (body records have no synthesized
+    // ctor). Returns true iff the construction is provably pure-classified;
+    // returns false on a record construction that does not satisfy this
+    // rule (caller may then report).
+    bool recordConstructionIsPure(const ast::NewExpr& ne);
 
     // §22.15 rule 5: a `for` loop source must not construct an enumerator.
     // Range<T> of primitive steppable type, inline arrays, spans, and
@@ -167,6 +204,192 @@ bool PureBodyWalker::callTargetIsPure(Symbol* calleeSym) {
     // "Intrinsic purity (the stdlib contract)" trusts stdlib markers, and
     // Slice 4 covers the stdlib annotation wave.
     return true;
+}
+
+// §22.15 "Members classified by rule" (#2061, item 2): a record's
+// synthesized Equals/GetHashCode/ToString are pure-classified iff the
+// record class is auto-equality-bearing — every constituent operation
+// (field read + the dispatched equality/hash/ToString on each field's
+// type) is itself pure. The §9.2/§9.3 admissibility helpers in
+// SymbolCollection.cpp already implement this recursive field rule;
+// PureChecker reuses them rather than duplicating the walk.
+//
+// Match BY RECORD CLASS IDENTITY — not by arity. A record's synthesized
+// Equals/GetHashCode/ToString exist for the WHOLE record class (every
+// positional or body record has them); the receiver's static type alone
+// determines whether the call targets a synthesized record member. The
+// arity of the call is irrelevant (these members take `Equals(R)` /
+// `int GetHashCode()` / `string ToString()`, all fixed signatures).
+//
+// Returns true when the call IS to a record-synthesized member AND the
+// record is auto-equality-bearing. Sets *outIsSynthesizedRecordMember
+// to true when the call resolves to a synthesized record member
+// REGARDLESS of purity, so the caller can distinguish "non-record call —
+// fall through" from "record-synthesized but not pure-classified — report".
+bool PureBodyWalker::recordSynthesizedCallIsPure(
+    const ast::CallExpr& ce, bool* outIsSynthesizedRecordMember) {
+    if (outIsSynthesizedRecordMember) *outIsSynthesizedRecordMember = false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+    if (!ma || !ma->target) return false;
+    // §22.15: synthesized set here is Equals/GetHashCode/ToString. The
+    // synthesized positional ctor is reached via `new R(...)` (handled
+    // by recordConstructionIsPure) and the with-copy via `r with { ... }`
+    // (a pure-body WithExpr walks its source + values recursively).
+    if (ma->member != "Equals" && ma->member != "GetHashCode" &&
+        ma->member != "ToString")
+        return false;
+    const TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named ||
+        !recvTy->declaration) return false;
+    TypeSymbol* rec = recvTy->declaration;
+    // Class-identity check: a synthesized record member exists for the
+    // WHOLE record class (pos or body); the receiver's record-typing
+    // confirms the call shape.
+    if (rec->kind != ast::TypeDeclKind::Record) return false;
+    if (outIsSynthesizedRecordMember) *outIsSynthesizedRecordMember = true;
+    if (rec->hasPositionalFields)
+        return isPositionalRecordEqualityBearing(rec, ctx_);
+    if (auto* td = dynamic_cast<const ast::TypeDecl*>(rec->decl))
+        if (td->hasPositionalFields)
+            return isPositionalRecordEqualityBearing(rec, ctx_);
+    return isAutoEqualityBearingBodyRecord(rec, ctx_);
+}
+
+// Resolve a body record's user-declared constructor of matching arity, or
+// a positional record's user-declared override of the synthesized ctor.
+// Returns nullptr when no ctor of that arity exists OR when the overload
+// set is ambiguous (handled by the overload-resolution pass, not here).
+// The pure-classification rule keys on existence + purity, not on
+// overload tie-breaking.
+static const ast::ConstructorDecl* findUserCtorByArity(
+    const TypeSymbol* rec, std::size_t arity) {
+    const ast::ConstructorDecl* match = nullptr;
+    int matching = 0;
+    for (Symbol* m : rec->members) {
+        auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+        if (!cs || cs->isStatic) continue;
+        if (cs->params.size() != arity) continue;
+        const auto* cd =
+            dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+        if (!cd) continue;
+        ++matching;
+        match = cd;
+    }
+    return matching == 1 ? match : nullptr;
+}
+
+// §22.15 "Members classified by rule" (#2061, item 2): record construction
+// `new R(args)` is admitted in a pure body iff the invoked constructor is
+// compiler-synthesized-pure (positional record — class-identity check) OR
+// `pure`-declared. The synthesized positional ctor copies args into
+// positional fields — a birth-store, pure for the same reason a pure
+// ctor's field stores are — and is pure-classified iff the record class
+// is auto-equality-bearing. A body record has no synthesized ctor: its
+// authored ctor of matching arity must carry `pure`. The arity match here
+// is for resolving WHICH user-declared ctor is invoked (a class-identity
+// question per record class); the PURITY of the construction is the
+// CLASS's classification, not an arity-dependent verdict.
+//
+// Returns true iff the NewExpr constructs a record AND the invoked ctor is
+// pure-classified; false otherwise (caller may then report a §22.15
+// violation).
+bool PureBodyWalker::recordConstructionIsPure(const ast::NewExpr& ne) {
+    if (!ne.type) return false;
+    const TypeRef* rt = ctx_.resolvedType(*ne.type);
+    if (!rt || rt->kind != TypeRef::Kind::Named || !rt->declaration)
+        return false;
+    TypeSymbol* rec = rt->declaration;
+    if (rec->kind != ast::TypeDeclKind::Record) return false;
+    // CLASS-IDENTITY: a positional record has a synthesized ctor whose
+    // purity is the record-class's auto-equality-bearing classification.
+    const bool isPositional =
+        rec->hasPositionalFields ||
+        (dynamic_cast<const ast::TypeDecl*>(rec->decl) &&
+         dynamic_cast<const ast::TypeDecl*>(rec->decl)->hasPositionalFields);
+    const std::size_t arity = ne.args.size();
+    const ast::ConstructorDecl* userCtor =
+        findUserCtorByArity(rec, arity);
+    if (isPositional) {
+        // When a user declared a ctor with matching arity, it shadows the
+        // synthesized positional one (§9.5); that ctor must carry `pure`.
+        // Otherwise the synthesized positional ctor is invoked — its
+        // purity follows from the record's CLASS identity, not from any
+        // arity-specific check.
+        if (userCtor) return userCtor->isPure;
+        return isPositionalRecordEqualityBearing(rec, ctx_);
+    }
+    // Body record: there is no synthesized ctor, so the invoked user-
+    // declared ctor must be `pure`-declared.
+    if (!userCtor) return false;
+    return userCtor->isPure;
+}
+
+// §22.15 "Pure constructors" (#2061, item 1): a pure ctor's explicit
+// `base(...)`/`this(...)` chain target must itself be pure (§22.15:
+// "A pure constructor's `base(…)`/`this(…)` chain target must itself be
+// pure"). The chain call surfaces as the body's first ExpressionStmt whose
+// expression is a CallExpr on `this` or `base` (Node.hpp CtorChain).
+//
+// Resolution narrows by class: `this(...)` targets a ctor in the SAME
+// class as this ctor; `base(...)` targets a ctor in the first class base.
+// Within the narrowed class, the call's argument count picks the single
+// overload — there is no further overload ambiguity in the chain call.
+void PureBodyWalker::checkPureCtorChainPurity(
+    const ast::ConstructorDecl& cd, const ConstructorSymbol& cs) {
+    if (cd.body.empty() || !cd.body.front()) return;
+    auto* es = dynamic_cast<const ast::ExpressionStmt*>(cd.body.front().get());
+    if (!es || !es->expr) return;
+    auto* call = dynamic_cast<const ast::CallExpr*>(es->expr.get());
+    if (!call || !call->callee) return;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(call->callee.get());
+    if (!id) return;
+    const bool isThisChain = (id->name == "this");
+    const bool isBaseChain = (id->name == "base");
+    if (!isThisChain && !isBaseChain) return;  // not a chain call
+    // CLASS-IDENTITY narrowing: `this(args)` → same class (cs.parent);
+    // `base(args)` → first class base (mirrors codegen's chain target
+    // resolution). The implicit Object base has no constructor symbols —
+    // admit silently when no explicit base exists.
+    TypeSymbol* targetClass = nullptr;
+    if (isThisChain) {
+        targetClass = cs.parent;
+    } else {
+        for (TypeSymbol* b : cs.parent->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) {
+                targetClass = b;
+                break;
+            }
+    }
+    if (!targetClass) return;
+    const std::size_t arity = call->args.size();
+    const ast::ConstructorDecl* targetCD = nullptr;
+    int matching = 0;
+    for (Symbol* m : targetClass->members) {
+        auto* ct = dynamic_cast<ConstructorSymbol*>(m);
+        if (!ct || ct->isStatic) continue;
+        if (ct == &cs) continue;  // `this(...)` cannot recurse to itself
+        if (ct->params.size() != arity) continue;
+        const auto* cd2 =
+            dynamic_cast<const ast::ConstructorDecl*>(ct->decl);
+        if (!cd2) continue;
+        ++matching;
+        targetCD = cd2;
+    }
+    if (!targetCD) {
+        // No matching ctor — primary-ctor class chain (no
+        // ConstructorSymbol: the parser synthesizes the chain's body),
+        // or an arity mismatch already caught by sema. Admit silently:
+        // the chain target's purity is provable by the primary-ctor
+        // birth-store rule, and an arity mismatch is not a §22.15 defect.
+        return;
+    }
+    (void)matching;
+    if (targetCD->isPure) return;  // chain target is pure — OK
+    reportPureViolation(
+        call->span.begin, "constructor chain call",
+        std::string(isThisChain ? "this(" : "base(") + "...) target is "
+        "not pure — a pure constructor's chain target must itself be "
+        "declared `pure`");
 }
 
 bool PureBodyWalker::isEnumeratorConstructingSource(
@@ -488,6 +711,35 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
             reportPureViolation(
                 ce->span.begin, "invocation of a function-typed value",
                 "the value's type carries no effect information");
+        } else if (!calleeSym) {
+            // §22.15 "Members classified by rule" (#2061, item 2): the
+            // callee resolves to no symbol when the call targets a record's
+            // synthesized member — codegen synthesizes the body, so sema
+            // leaves no MethodSymbol on the callee. Classify the call by
+            // the receiver's record-class identity (the synthesized
+            // member's purity is a class property, NOT an arity match):
+            //   - positional record: synthesized Equals/GetHashCode/
+            //     ToString are pure iff the record is auto-equality-bearing
+            //     (every field's dispatch is pure under §22.15 rules 1+
+            //     3+6, via the §9.2/§9.3 admissibility helpers).
+            //   - non-record calls or unresolved callees of other kinds
+            //     (codegen fallthrough / member-not-found) are admitted:
+            //     the typecheck pass already reported the lookup failure,
+            //     and the pure-body checker does not double-report.
+            bool isSynthRecMember = false;
+            const bool recSynthPure =
+                recordSynthesizedCallIsPure(*ce, &isSynthRecMember);
+            if (isSynthRecMember && !recSynthPure) {
+                reportPureViolation(
+                    ce->span.begin,
+                    "call to a record-synthesized member",
+                    "the receiver record is not auto-equality-bearing — "
+                    "a class-typed field's virtual dispatch disqualifies "
+                    "the synthesized Equals/GetHashCode/ToString; declare "
+                    "`=`/`<>` with `pure` overrides, or simplify the "
+                    "record to the auto-equality-bearing form (§22.15 "
+                    "\"Members classified by rule\")");
+            }
         } else if (!callTargetIsPure(calleeSym)) {
             // §22.15 rule 6: a call to a member not pure-declared or pure-
             // classified. Admit when the callee is unresolved (the
@@ -533,7 +785,10 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
         // here is outside that position.
         // Slice 2 admits value/record/enum construction and trivial-dispose
         // box construction; class construction with a non-pure ctor is the
-        // load-bearing rejection.
+        // load-bearing rejection. Slice 2's record path was a silent
+        // admit; #2061 refines it to require a pure-classified record ctor
+        // (synthesized positional ctor when admissible; `pure`-declared
+        // user ctor otherwise).
         if (ne->type) {
             const TypeRef* rt = ctx_.resolvedType(*ne->type);
             if (rt && rt->kind == TypeRef::Kind::Named &&
@@ -545,6 +800,26 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
                     "user code (admitted only at the throw operand; the "
                     "throw carve-out requires a pure ctor + trivial-"
                     "dispose class)");
+            } else if (rt && rt->kind == TypeRef::Kind::Named &&
+                       rt->declaration &&
+                       rt->declaration->kind == ast::TypeDeclKind::Record) {
+                // §22.15 "Members classified by rule" (#2061, item 2):
+                // record construction `new R(args)` is admitted iff the
+                // invoked ctor is compiler-synthesized-pure (positional
+                // record auto-equality-bearing) or `pure`-declared. The
+                // classification is a class-identity property of the
+                // record, not an arity match — see
+                // recordConstructionIsPure above.
+                if (!recordConstructionIsPure(*ne)) {
+                    reportPureViolation(
+                        ne->span.begin, "record construction",
+                        "the invoked constructor is not pure-declared and "
+                        "the record is not of the synthesized-pure "
+                        "positional form (§22.15 \"Members classified by "
+                        "rule\" — declare the ctor `pure`, or drop the "
+                        "disqualifying class-typed field so the record is "
+                        "auto-equality-bearing)");
+                }
             }
         }
         for (const auto& a : ne->args)
@@ -725,6 +1000,12 @@ void checkOneMember(SemaContext& ctx, MemberSymbol& member) {
             if (!cd->isPure) return;
             isCtor = true;
             isPure = true;
+            // §22.15 "Pure constructors" (#2061, item 1): a pure
+            // constructor's explicit `base(...)`/`this(...)` chain target
+            // must itself be pure. Run before the body walk so the chain
+            // diagnostic is reported first (the chain's purity shapes the
+            // whole ctors contract).
+            w.checkPureCtorChainPurity(*cd, *cs);
             w.checkStmts(cd->body);
         }
         return;

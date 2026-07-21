@@ -295,9 +295,7 @@ BEZEL_TEST(pure_body_22_15, pure_ctor_writes_static_field_rejected_spec_22_15) {
     BEZEL_EXPECT_TRUE(hasMsg(r, "assignment is not admitted in a pure body"));
 }
 
-// §22.15 "Pure constructors": a pure constructor's `base(...)`/`this(...)`
-// chain target must itself be pure. Slice 2's call-rule fires on resolved
-// member calls; the CtorChain form parses as an ExpressionStmt-of-Call but
-// resolves through a dedicated path, so the chain-purity check is
-// conservatively DEFERRED to the implicit-classification + dispatch slice
-// (Slice 3) — recorded here as a known TODO.
+// §22.15 "Pure constructors" (#2061, item 1): a pure constructor's
+// `base(...)`/`this(...)` chain target must itself be pure. Implemented in
+// PureChecker::checkPureCtorChainPurity; regression tests live in
+// pure_residuals_2061_test.cpp.
