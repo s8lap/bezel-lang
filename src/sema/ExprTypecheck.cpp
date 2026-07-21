@@ -2918,6 +2918,23 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
             }
         }
     }
+    // §5.1 / §27.1.1 (#2067): a non-function source is NEVER implicitly
+    // convertible to a function-typed target — there is no scalar-to-function
+    // conversion (§5.1 v0.204 enumerates identity/widening/integer-promotion/
+    // reference/numeric/null but not a function-formation rule). The §27.6
+    // property-getter promotion above is the only exception (zero-argument
+    // function whose return matches the property's declared type, returning
+    // early when accepted). Every other non-function → function pair (e.g. an
+    // `int` literal in a `(int) -> int` parameter slot) was previously
+    // silently accepted and reached codegen, producing a malformed LLVM call
+    // whose scalar argument did not match the callee's pointer/function-value
+    // parameter. Reject with a §5.1 diagnostic so the user sees a clean
+    // compile-time error instead of an IR-verifier abort.
+    if (to->kind == TypeRef::Kind::Function &&
+        from->kind != TypeRef::Kind::Function) {
+        reportNotConvertible();
+        return;
+    }
     // §27.6 / §5.1 (issue #436): a bare method reference has a Function type.
     // A Function value is not implicitly convertible to a non-Function type
     // (Primitive or Named). Report a type mismatch so the user sees a clean
