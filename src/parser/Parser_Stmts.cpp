@@ -1,6 +1,7 @@
 #include "parser/Parser.hpp"
 
 #include <algorithm>
+#include <string>
 #include <string_view>
 
 namespace bezel {
@@ -280,8 +281,22 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
             advance(); // past `var`
         }
         if (current_.kind != TokenKind::Identifier) {
-            diagnostics_.report(Severity::Error, current_.location,
-                                "expected local-variable name");
+            // Appendix B.1 (v0.215) / #2090: a keyword in the identifier
+            // slot is almost certainly an attempted local name. Diagnose the
+            // cause directly and consume it so one typo does not cascade into
+            // opaque expression and terminator errors.
+            if (current_.kind == TokenKind::Keyword) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    std::string("`") + std::string(current_.text) +
+                        "` is a reserved keyword and cannot be used as an "
+                        "identifier (Appendix B.1); rename it");
+                decl->name = current_.text;
+                advance();
+            } else {
+                diagnostics_.report(Severity::Error, current_.location,
+                                    "expected local-variable name");
+            }
         } else {
             decl->name = current_.text;
             advance();
