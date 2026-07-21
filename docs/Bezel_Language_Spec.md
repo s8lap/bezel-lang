@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.206 — July 2026**
+**Version 0.207 — July 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -4345,7 +4345,7 @@ When a method parameter is declared `out owned`, the callee produces an owned va
 <a id="sec-out-nullability-postcondition"></a>
 #### Nullability postcondition on `out` parameters (v0.183)
 
-*(v0.203: this clause **is** a proven-tier contract clause — normatively, `out p: T? when true` on a `bool`-returning method carries `static ensures not result or p <> null;`, discharged by this section's flow analysis; [§22.16](#sec-when-clause-unification). The `when` spelling remains the surface form; nothing here changes.)*
+*(v0.203: this clause **is** a proven-tier contract clause — normatively, `out p: T? when true` on a `bool`-returning method carries `static ensures(not result or p <> null)`, discharged by this section's flow analysis; [§22.16](#sec-when-clause-unification). The `when` spelling remains the surface form; nothing here changes.)*
 
 A `bool`-returning method may declare, on an `out` (or `out owned`) parameter of nullable type, the clause **`when true`** (or **`when false`**) after the parameter's type:
 
@@ -5143,24 +5143,24 @@ Default-value expressions of a pure member's parameters are checked under the pu
 <a id="sec-contract-clauses"></a>
 ### 22.16 Contract clauses (v0.203)
 
-A method or constructor declaration may carry **contract clauses** between its signature and its body — precondition clauses **`requires E;`** and postcondition clauses **`ensures E;`** — and a class body may declare **invariant members** (**`invariant E;`**). Each clause's expression is of type `bool`, is admitted under the pure-body discipline of [§22.15](#sec-pure-members) with the amendments of this section, and can neither write state, consume or dispose a value, nor suspend. A `requires` clause is evaluated on every invocation, after argument binding and before any execution of the member; a clause evaluating `false` raises `ContractViolationException` ([§31.4](#sec-standard-exception-types)), in every build mode. An `ensures` clause is evaluated on every normal-completion path, after the return value and every `out` slot are bound and before the frame's scope-end disposals; within it the contextual keyword `result` denotes the returned value, read as a borrow, and `old(E)` denotes the value `E` had at entry; a path that exits by `throw` evaluates no `ensures` clause. The class invariant — the conjunction of a class's and its base classes' invariant members — is evaluated at the boundaries this section fixes: construction exit and the public entry and exit points, with `this`-receiver calls exempt. Every clause occupies exactly one recorded enforcement tier — **proven**, **checked**, or **assumed** — and the `static` clause qualifier demands the proven tier: a `static` clause the implementation cannot discharge statically is a compile error. Clauses bind overrides and implementations ([§12.1](#sec-members-are-non-virtual-by-default), [§11.2](#sec-interface-declaration)): they are inherited, never restated; an override or implementation may add `ensures` clauses and may not declare `requires` clauses. Contract clauses are part of the member's contract, carried by the artifact interface ([§2.8.2](#sec-artifact-interface)); they never distinguish overloads ([§22.6](#sec-overloading)).
+A method or constructor declaration may carry **contract clauses** between its signature and its body — precondition clauses **`requires(E)`** and postcondition clauses **`ensures(E)`** — and a class body may declare **invariant members** (**`invariant(E);`**). A clause's parentheses are structural — part of the clause syntax, not of its expression — so a clause is self-delimiting and carries no terminator; the `invariant` member, being a member, keeps the member-terminating `;`. Each clause's expression is of type `bool`, is admitted under the pure-body discipline of [§22.15](#sec-pure-members) with the amendments of this section, and can neither write state, consume or dispose a value, nor suspend. A `requires` clause is evaluated on every invocation, after argument binding and before any execution of the member; a clause evaluating `false` raises `ContractViolationException` ([§31.4](#sec-standard-exception-types)), in every build mode. An `ensures` clause is evaluated on every normal-completion path, after the return value and every `out` slot are bound and before the frame's scope-end disposals; within it the contextual keyword `result` denotes the returned value, read as a borrow, and `old(E)` denotes the value `E` had at entry; a path that exits by `throw` evaluates no `ensures` clause. The class invariant — the conjunction of a class's and its base classes' invariant members — is evaluated at the boundaries this section fixes: construction exit and the public entry and exit points, with `this`-receiver calls exempt. Every clause occupies exactly one recorded enforcement tier — **proven**, **checked**, or **assumed** — and the `static` clause qualifier demands the proven tier: a `static` clause the implementation cannot discharge statically is a compile error. Clauses bind overrides and implementations ([§12.1](#sec-members-are-non-virtual-by-default), [§11.2](#sec-interface-declaration)): they are inherited, never restated; an override or implementation may add `ensures` clauses and may not declare `requires` clauses. Contract clauses are part of the member's contract, carried by the artifact interface ([§2.8.2](#sec-artifact-interface)); they never distinguish overloads ([§22.6](#sec-overloading)).
 
 ```bezel
 public class Account
   private _balance: decimal := 0m;
   private _limit: decimal := 0m;
 
-  invariant _balance + _limit >= 0m;
+  invariant(_balance + _limit >= 0m);
 
   public constructor(limit: decimal)
-    requires limit >= 0m;
+    requires(limit >= 0m)
     _limit := limit;
   end constructor;
 
   public method Withdraw(amount: decimal)
-    requires amount > 0m;
-    requires amount <= _balance + _limit;
-    ensures _balance = old(_balance) - amount;
+    requires(amount > 0m)
+    requires(amount <= _balance + _limit)
+    ensures(_balance = old(_balance) - amount)
     _balance := _balance - amount;
   end Withdraw;
 end Account;
@@ -5171,7 +5171,7 @@ end Account;
 
 A contract clause's expression — and each operand of `old` within it — is type-checked in the context of the declaring member: the member's parameters (all modifiers), `this` where the member has one, and the enclosing scopes' static and type members are in scope; the member's body locals are not. The expression must be of type `bool` ([§4.1](#sec-bool) — no truthiness), and is admitted under the **pure-body rules of [§22.15](#sec-pure-body-rules)**, applied expression-wise, with three clause-specific amendments: **`throw` is rejected** (a clause states a proposition; the mechanism, message, and blame of a violation belong to this section's machinery — the pure fragment's throw carve-out remains available to *callees* of the clause); **`await` is rejected**, on every member including `async` ones (a clause is not part of an async body's statement sequence and has no suspension semantics); **`old` and `result`** are admitted only as this section defines, and anywhere else each is an ordinary identifier ([Appendix B.2](#sec-contextual-keywords)).
 
-The borrow-only guarantee — a clause may not consume, dispose, move, or reassign — is the sum of existing classifications, not a new checker: assignment, compound assignment, and `++`/`--` are *statements* and cannot be spelled in an expression; stores reachable through calls are excluded because callees must be pure; no owned-consuming position can arise (pure callees declare no `owned` parameters, `move` is prohibited by purity, the `throw` operand is rejected above, the discard and marked-transfer forms are statements, `set(owned)` stores are stores) — a read of a named owned binding in a clause is always [§28.3](#sec-local-variables-ownership-and-borrows)'s unmarked borrow read; and `Dispose()` is never pure-declared. An `ensures` clause reading an `owned` parameter is checked against §28.3's per-path ownership state at each return edge: on a path where the binding was moved out, the read is a moved-from read and a compile error naming the consuming site — the idiom for contracts over consumed inputs is `old(…)`. Flow narrowing works inside clauses unchanged (`requires x <> null and x.Count > 0;` narrows per [§7.4](#sec-member-access-on-nullable-values)).
+The borrow-only guarantee — a clause may not consume, dispose, move, or reassign — is the sum of existing classifications, not a new checker: assignment, compound assignment, and `++`/`--` are *statements* and cannot be spelled in an expression; stores reachable through calls are excluded because callees must be pure; no owned-consuming position can arise (pure callees declare no `owned` parameters, `move` is prohibited by purity, the `throw` operand is rejected above, the discard and marked-transfer forms are statements, `set(owned)` stores are stores) — a read of a named owned binding in a clause is always [§28.3](#sec-local-variables-ownership-and-borrows)'s unmarked borrow read; and `Dispose()` is never pure-declared. An `ensures` clause reading an `owned` parameter is checked against §28.3's per-path ownership state at each return edge: on a path where the binding was moved out, the read is a moved-from read and a compile error naming the consuming site — the idiom for contracts over consumed inputs is `old(…)`. Flow narrowing works inside clauses unchanged (`requires(x <> null and x.Count > 0)` narrows per [§7.4](#sec-member-access-on-nullable-values)).
 
 Purity is what makes the tier system coherent: because a clause has no effects, evaluating it, eliding it, or proving it are indistinguishable to every non-violating program.
 
@@ -5194,7 +5194,7 @@ Purity is what makes the tier system coherent: because a clause has no effects, 
 
 **No nested-check suppression.** Clause evaluation calls pure members; those members' own clauses check normally during the outer clause's evaluation — checks compose as ordinary calls. A genuinely cyclic `requires` chain manifests as `StackOverflowException`, like any unbounded recursion.
 
-**Clause granularity is semantic.** `requires a; requires b;` is not a style variant of `requires a and b;`: the clause is the unit of tier, blame, evaluation order (stop at first failure), and interface identity. Recommended style, non-normative: one condition per clause.
+**Clause granularity is semantic.** `requires(a) requires(b)` is not a style variant of `requires(a and b)`: the clause is the unit of tier, blame, evaluation order (stop at first failure), and interface identity. Recommended style, non-normative: one condition per clause, each clause on its own line.
 
 <a id="sec-contract-violation"></a>
 #### Failure semantics and the enforcement modes
@@ -5232,7 +5232,7 @@ Clauses never distinguish overloads and are not part of [§22.6](#sec-overloadin
 <a id="sec-class-invariants"></a>
 #### Class invariants
 
-An **invariant member** (`invariant E;`) declares a predicate over the instance's state, checked under this section's clause rules in the context of the declaring class (its `private` fields readable; `old` and `result` rejected). The **class invariant** of C is the conjunction of every invariant member of C and of every base class, evaluated base-first, declaration order within each class. The invariant is an *observable-boundary* property: it must hold whenever the instance is observable from outside itself, and it may be freely false while the instance is operating on itself.
+An **invariant member** (`invariant(E);`) declares a predicate over the instance's state, checked under this section's clause rules in the context of the declaring class (its `private` fields readable; `old` and `result` rejected). The **class invariant** of C is the conjunction of every invariant member of C and of every base class, evaluated base-first, declaration order within each class. The invariant is an *observable-boundary* property: it must hold whenever the instance is observable from outside itself, and it may be freely false while the instance is operating on itself.
 
 **The instrumentation set** — the invariant is evaluated at exactly these points, in checked-contracts mode:
 
@@ -5258,7 +5258,7 @@ In scope: instance, static, and extension methods (the receiver is a borrow, [§
 <a id="sec-when-clause-unification"></a>
 #### The `when`-clause identity
 
-[§22.4](#sec-out-nullability-postcondition)'s nullability postcondition **is** a proven-tier contract clause. Normatively, for a `bool`-returning method, `method M(…, out p: T? when true, …): bool` is `method M(…, out p: T?, …): bool` carrying the clause `static ensures not result or p <> null;` (and `when false` correspondingly `static ensures result or p <> null;`). Everything §22.4 mandates falls out of this section's rules: the declaring-body obligation is the §7 flow prover discharging a `static ensures` at its discharge site; the evaluation point is this section's; the call-site narrowing is caller-side **consumption of a proven ensures** — the first shipped instance of the consumption pattern the prover fragment generalizes. The `when true`/`when false` spelling remains the surface form — no source changes anywhere; writing the desugared `static ensures` form directly is equally legal and is the same declaration. One rule is deliberately retained rather than generalized: [§12.1](#sec-members-are-non-virtual-by-default) requires an override to repeat the `when` clause exactly — the zero-migration reading; a postcondition is never weakened under either reading.
+[§22.4](#sec-out-nullability-postcondition)'s nullability postcondition **is** a proven-tier contract clause. Normatively, for a `bool`-returning method, `method M(…, out p: T? when true, …): bool` is `method M(…, out p: T?, …): bool` carrying the clause `static ensures(not result or p <> null)` (and `when false` correspondingly `static ensures(result or p <> null)`). Everything §22.4 mandates falls out of this section's rules: the declaring-body obligation is the §7 flow prover discharging a `static ensures` at its discharge site; the evaluation point is this section's; the call-site narrowing is caller-side **consumption of a proven ensures** — the first shipped instance of the consumption pattern the prover fragment generalizes. The `when true`/`when false` spelling remains the surface form — no source changes anywhere; writing the desugared `static ensures` form directly is equally legal and is the same declaration. One rule is deliberately retained rather than generalized: [§12.1](#sec-members-are-non-virtual-by-default) requires an override to repeat the `when` clause exactly — the zero-migration reading; a postcondition is never weakened under either reading.
 
 <a id="sec-properties-and-indexers"></a>
 ## 23. Properties and Indexers
@@ -10111,7 +10111,7 @@ InterfaceMember ::= IfaceMethod | IfaceProperty | IfaceIndexer
                   | IfaceStaticMethod | IfaceStaticOperator
 IfaceStaticMethod   ::= "static" "pure"? "method" Identifier GenericParams?
                         "(" ParamList? ")" (":" "owned"? Type)?
-                        ( ";" | ContractClause+ )
+                        ContractClause* ";"
                               /* same body slot as IfaceMethod (§22.16) */
 IfaceStaticOperator ::= "static" "operator" OpToken
                         "(" ParamList? ")" (":" "owned"? Type)? ";"
@@ -10121,9 +10121,10 @@ IfaceStaticOperator ::= "static" "operator" OpToken
                                  §11.8. */
 IfaceMethod     ::= "pure"? "method" Identifier GenericParams?
                     "(" ParamList? ")" (":" "owned"? Type)?
-                    ( ";" | ContractClause+ )
-                              /* a clause-bearing declaration ends at its final
-                                 clause's ";" (§22.16) */
+                    ContractClause* ";"
+                              /* clauses are self-delimited; the lone ";" is the
+                                 uniform member terminator, clause-bearing or not
+                                 (§22.16, v0.207) */
                               /* `owned` on the return type follows the same
                                  rule as in MethodDecl. An interface declaring
                                  an `owned` return requires implementations to
@@ -10147,10 +10148,14 @@ FieldDecl       ::= Visibility "static"? ("owned" | "scoped")? "readonly"?
 ConstDecl       ::= Visibility "static"? "const" Identifier (":" Type)?
                     ":=" ConstExpr ";"
 
-ContractClause  ::= "static"? ("requires" | "ensures") Expression ";"
-InvariantDecl   ::= "static"? "invariant" Expression ";"
+ContractClause  ::= "static"? ("requires" | "ensures") "(" Expression ")"
+                              /* the parentheses are clause syntax, not expression
+                                 tokens (§22.16, v0.207): a clause is self-
+                                 delimiting and carries no terminator. */
+InvariantDecl   ::= "static"? "invariant" "(" Expression ")" ";"
                               /* class bodies only; rejected semantically in
-                                 records and static classes (§22.16) */
+                                 records and static classes (§22.16); the `;` is
+                                 the ordinary member terminator. */
                               /* the clause region (§22.16): after the signature's
                                  GenericConstraints*, the tokens requires/ensures
                                  (or static followed by either) open it; keyword
@@ -10161,9 +10166,9 @@ MethodDecl      ::= Visibility "static"? ("async" | "pure")? VirtualKind?
                     "(" ParamList? ")" (":" "owned"? Type)?
                     GenericConstraints* ContractClause*
                     MethodBody
-                              /* a clause-bearing abstract method ends at its
-                                 last clause; the lone-";" MethodBody alternative
-                                 is reachable only with zero clauses (§22.16) */
+                              /* clauses are self-delimited (§22.16, v0.207); every
+                                 MethodBody alternative, the lone ";" included, is
+                                 reachable at any clause count */
                               /* The optional `owned` modifier on the return
                                  type marks methods whose result transfers
                                  ownership to the caller (§28.8). It applies

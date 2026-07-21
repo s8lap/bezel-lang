@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.206 — July 2026**
+**Companion to the Bezel Language Specification, v0.207 — July 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -6877,3 +6877,11 @@ v0.186 is the **shared-state & data-parallelism graduation** — accepted propos
 **Kernel classification (the v0.198 obligation):** presentation only — no rule changes, no derivation changes, no axiom changes; the budget stands. A preservation audit over the edit set (the v0.198/v0.199 discipline) was run at this landing.
 
 **Migration.** None — doc-only; no program changes meaning, no diagnostic changes.
+
+### v0.207 changelog (v0.206 → v0.207)
+
+**Design change — contract-clause surface syntax (proposal 0055 graduates).** Contract clauses are respelled with structural parentheses: `requires(E)` / `ensures(E)` / `static` variants, and the invariant member `invariant(E);` (the `;` there is the ordinary member terminator). A clause's parentheses are clause syntax, not expression tokens; a clause is self-delimiting and carries no terminator of its own. Grammar (A.4): `ContractClause ::= "static"? ("requires" | "ensures") "(" Expression ")"`; `InvariantDecl ::= "static"? "invariant" "(" Expression ")" ";"`; the interface body slots return to the uniform `ContractClause* ";"` — every member ends with `;`, clause-bearing or not — and every `MethodBody` alternative, the lone `;` included, is reachable at any clause count. What this deletes, by design: the body-less-closure rule ("a clause-bearing declaration ends at its last clause's `;`") and its reachability caveats; the redundant-`;` question entirely (a double `;` after clauses is now unspellable — the divergence #2070 reported becomes structurally impossible); the `; =>` seam on expression-bodied members; and the visual identity of clauses with body statements. The marker-wins clause-region entry rule (Appendix B.2) is unchanged. Contract records (§2.8.2) are unchanged: canonical clause text is the clause *expression's* token sequence, and the structural parens are not expression tokens — no artifact-interface migration exists for any clause in the corpus (all unparenthesized; a hypothetical fully-parenthesized v0.203 clause `requires (E);` migrates as `requires((E))` to preserve its record). Alternatives declined and the collision analysis (first-statement calls to a parameter named `requires`; the per-member-kind failure modes) are recorded in proposal 0055 §3/§8. Rules, tiers, evaluation, inheritance, carriage: untouched — this is a surface revision of v0.203's feature.
+
+**Kernel classification (the v0.198 obligation):** no ownership rule is touched; no kernel deltas.
+
+**Migration.** Source-breaking for v0.203-syntax clauses, mechanically: `requires E;` → `requires(E)`, `ensures E;` → `ensures(E)`, `invariant E;` → `invariant(E);`; a clause-bearing body-less member gains the ordinary `;` terminator its clause list previously subsumed. The conformance corpus carries no clause-bearing cases at this revision (verified); the compiler's #2053 slice-1 parser and its tests are the tracked impl delta (issue filed at this landing; #2070 is superseded — the lenient acceptance it reported is unspellable under this grammar). Spec-ahead-of-impl until that lands.
