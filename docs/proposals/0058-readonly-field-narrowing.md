@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted (owner, 2026-07-21, in-session — the sweep's Tier-2 headline); graduation queued as v0.213 |
+| **Status** | superseded — graduated v0.214 (critique-gated; the path-shape, construction-residual, and §22.8-citation findings resolved in the landed text) |
 | **Tracking issue** | assigned at landing |
 | **Target** | Spec §7.4 (the locals-only rule gains the readonly-field extension), §6.1-adjacent rationale (the "never fields" record gains its carve-out). Impl: sema narrowing pass. |
 | **Written against** | spec v0.212 |
@@ -14,7 +14,7 @@ Flow narrowing (§7.4) extends to reads of **`readonly` and `static readonly` fi
 
 - Admitted roots: `this` (never reassigned), a type name (static readonly), and a narrowing-tracked local (uncaptured or under §7.4's existing captured-local regime). `obj.F` narrows exactly while `obj`'s own tracking survives; reassigning `obj` invalidates the path's facts — the field's facts ride the root's.
 - **A readonly-field fact is never invalidated by calls, `await`s, or closures.** §6.1's invalidators are all *writers*; a `readonly` field has none after construction, through any alias, on any path — that is the whole justification, and it is the same justification the const-local ruling accepted at v0.201.
-- **The construction window is excluded**: inside the declaring type's constructors and field initializers (where §22.7 admits assignment to `readonly` fields), the rule does not apply — fields there follow today's no-narrowing rule.
+- **The construction window is excluded**: inside the declaring type's constructors, field initializers, static constructor, and static field initializers (the §22.8 assignment window), the rule does not apply. The tracked path is exactly **one field off an admitted root**; any non-final field segment makes a path non-trackable (`a.b.F` establishes nothing). The §22.7 `this`-escape residual is inherited, not enlarged: a during-construction test observes the watermark (no fact) or the single assigned value (final by §22.8's single-assignment rule).
 - FFI foreign-writer residual: unchanged (§30.12's recorded residual covers all memory, narrowed or not).
 
 ## 2. What it deletes

@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.213 — July 2026**
+**Companion to the Bezel Language Specification, v0.214 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -708,7 +708,7 @@ public class Order(id: int, owned customer: Customer,
                    owned lines: OwningArray<LineItem>): ISerializable, IDeserializable
   public owned Customer: Customer := customer;        // owned: an owning edge, serialized inline
   public owned Lines: OwningArray<LineItem> := lines;
-  public readonly property Id: int => id;
+  public property Id: int => id;
   // compiler synthesizes Serialize / Deserialize; each owned child recurses
   // through its own synthesized members. The primary constructor binds every
   // serialized component (id, customer, lines), matched case-insensitively to
@@ -725,7 +725,7 @@ public class Invoice(number: string, owned seller: Company, owned buyer: Company
   public owned Buyer: Company := buyer;               // owned
   public AccountManager: Employee := accountManager;  // borrow: a back-edge, e.g. an
                                                       //   Employee owned by Seller
-  public readonly property Number: string => number;
+  public property Number: string => number;
 end Invoice;
 ```
 
@@ -739,7 +739,7 @@ public abstract class Shape: ISerializable, IDeserializable
 end Shape;
 
 public class Circle(radius: double): Shape, ISerializable, IDeserializable
-  public readonly property Radius: double => radius;
+  public property Radius: double => radius;
 end Circle;
 ```
 
@@ -752,7 +752,7 @@ public class Node(label: string): ISerializable, IDeserializable
   public owned Next: Shared<Node>?;  // owned handle to the shared spine (identity
                                      //   participant); nullable to terminate the chain
   public owned Back: Weak<Node>?;    // back-edge: a weak observer that may close a cycle
-  public readonly property Label: string => label;
+  public property Label: string => label;
 end Node;
 ```
 
@@ -1104,7 +1104,7 @@ public record ReadOnlyStringSpan(Source: string, Start: int, Length: int): IRead
     end;
   end;
 
-  public pure readonly property IsEmpty: bool => Length = 0;
+  public pure property IsEmpty: bool => Length = 0;
 
   // Range construction
   public pure method Slice(start: int, length: int): ReadOnlyStringSpan =>
@@ -1426,8 +1426,8 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
     _storage := new OwningBuffer<T>((if capacity > 0 then capacity else 1));
   end constructor;
 
-  public readonly property Count: int => _count;
-  public readonly property Capacity: int => _storage.Length;
+  public property Count: int => _count;
+  public property Capacity: int => _storage.Length;
 
   public property [i: int]: T
     get => do
@@ -2204,7 +2204,7 @@ public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOn
   end;
 
   // Range query (v0.101).
-  public readonly property IsEmpty: bool => Length = 0;
+  public property IsEmpty: bool => Length = 0;
 
   // Search (v0.101).
   public method IndexOf(value: T?): int;          // -1 if not found
@@ -2263,7 +2263,7 @@ public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOn
   end;
 
   // Range query.
-  public readonly property IsEmpty: bool => Length = 0;
+  public property IsEmpty: bool => Length = 0;
 
   // Search.
   public method IndexOf(value: T): int;
@@ -2353,7 +2353,7 @@ public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int):
     end;
   end;
 
-  public readonly property IsEmpty: bool => Length = 0;
+  public property IsEmpty: bool => Length = 0;
 
   public method IndexOf(value: T?): int;
   public method Contains(value: T?): bool;
@@ -2382,7 +2382,7 @@ public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int):
     end;
   end;
 
-  public readonly property IsEmpty: bool => Length = 0;
+  public property IsEmpty: bool => Length = 0;
 
   public method IndexOf(value: T): int;
   public method Contains(value: T): bool;
@@ -2587,7 +2587,7 @@ public record ArraySpan<T>(Source: Array<T>, Start: int, Length: int): IReadOnly
     end;
   end;
 
-  public readonly property IsEmpty: bool => Length = 0;
+  public property IsEmpty: bool => Length = 0;
 
   // Range construction
   public method Slice(start: int, length: int): ArraySpan<T> =>
@@ -2654,7 +2654,7 @@ public record ReadOnlyArraySpan<T>(Source: Array<T>, Start: int, Length: int): I
     end;
   end;
 
-  public readonly property IsEmpty: bool => Length = 0;
+  public property IsEmpty: bool => Length = 0;
 
   public method Slice(start: int, length: int): ReadOnlyArraySpan<T> =>
     new ReadOnlyArraySpan<T>(Source, this.Start + start, length);

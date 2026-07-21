@@ -2,9 +2,9 @@
 
 | | |
 |---|---|
-| **Status** | accepted (owner, 2026-07-21, in-session); graduation queued as v0.213 |
+| **Status** | superseded — graduated v0.214 (critique-gated; the landed sweep is exhaustive over Appendix A's eighteen comma-list productions, per the critique's enumeration — the draft's list was short by seven) |
 | **Tracking issue** | assigned at landing |
-| **Target** | Spec §1.6 (one normative sentence), Appendix A (`","?` added to every comma-separated list production that lacks it: ArgList, ParamList, LambdaParams, GenericParams, GenericArgs, PositionalFields, EnumConstants, ChoiceCases, InheritItems, constraint lists). Impl: parser. |
+| **Target** | Spec §1.6 (one normative sentence), Appendix A (`","?` added to every comma-separated list production that lacks it: all eighteen comma-list productions: ArgList, ParamList, LambdaParams, LambdaDestructure, GenericParams, GenericArgs, GenericConstraints, PositionalFields, PositionalPatternList, EnumConstants, ChoiceCases, CasePayload, PolymorphicMember, ExternParamList, FunctionType, Inheritance, EnumInheritance (both alternatives)). Impl: parser. |
 | **Written against** | spec v0.212 |
 | **Origin** | 2026-07-21 sweep (consistency lens, survivor 1): four constructs allow the trailing comma, seven forbid it, and the boundary is unrecorded and unprincipled — enum constants and choice cases, the most one-per-line lists in the language, forbid what collection literals allow. |
 

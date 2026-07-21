@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.213 — July 2026**
+**Companion to the Bezel Language Specification, v0.214 — July 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -6958,3 +6958,19 @@ Rationale §3.3 is rewritten as the recorded reversal it is: the #1373 ruling's 
 **Kernel classification (the v0.198 obligation):** an axiom retirement — no derivation changes; K3.10/K4 stand with strictly less recorded trust. The budget shrinks: twelve live axioms.
 
 **Migration.** Newly **rejected**: explicit `Dispose()` on an element borrow read from a borrowing-family collection (indexer-get, iteration variable, dictionary-entry fields), and any call to the removed `DisposeElements()`. Remedies, per shape: whole-collection ownership → declare the owning-family type and let `Dispose()` cascade; selective disposal → take the element out first. The conformance corpus's transit cases (`spec_0214`/`spec_0215` mirrors) and the #1653 lit acceptance test flip to reject/migrated forms **with the compiler change**, tracked by the impl issue filed at this landing; #2075 closes as decided.
+
+### v0.214 changelog (v0.213 → v0.214)
+
+**Design changes, four trains, one composition-gated revision (proposals 0058/0059 graduate; two rulings).**
+
+**Train 1 — `readonly` nullable fields narrow (0058).** §7.4's blanket field refusal keeps its premise and loses its over-reach: a `readonly` field has no writer outside §22.8's single-assignment window, so flow narrowing now tracks facts about it — keyed on exactly one field off an admitted root (`this`, a type name, a tracked local; any non-final field segment de-tracks the path), never invalidated by calls/`await`s/closures, inapplicable inside the (static or instance) construction window, and composing with §22.7's `this`-escape residual as inherited-not-enlarged (a mid-construction test sees the watermark — no fact — or the single final value). This deletes the copy-to-local ceremony for the injected-optional-dependency shape; mutable fields and properties are unchanged (rationale §6.1 updated). The critique's findings — the unstated single-segment rule, the static-construction window, the §22.7→§22.8 citation, the during-construction monotonicity reliance — are all resolved in the landed text.
+
+**Train 2 — uniform trailing commas (0059).** §1.6 states the rule once — every comma-separated list admits one optional trailing comma before its closer, no exceptions — and Appendix A adds `","?` to all **eighteen** comma-list productions (the critique's exhaustive enumeration; the draft had missed seven, including choice-case payloads, positional patterns, extern parameters, and function-type parameter lists). Purely additive; `|`-alternative lists are not comma lists; no parse carve anywhere (verified: argument/`ref`/`out` lists, `>`/`>>` closers, the `","? ";"` enum/choice tails, single-parameter function types).
+
+**Train 3 — the `hashable` constraint (ruling; the §14.2 one-property-one-decision mechanism).** `where T: hashable` joins the derived-property admitted set, mapping to §3.6's **equality-bearing** property (the property keeps its name; the keyword names the capability site — the hyphenated property name cannot be a source token, and `equatable` was rejected as both colliding with `IEquatable<T>` and misdescribing the property's breadth). Satisfaction is per-instantiation by §3.6 rule 2, carriage pre-exists (§2.8.2/§2.8.6 already name equality-bearing verdicts), and the admission follows the sendable precedent exactly — including landing one revision after v0.210 corrected the property's choice edges, which is deliberate sequencing, not accident. `hashable` joins B.1/B.2 as a contextual keyword.
+
+**Train 4 — `readonly` on properties has one meaning (ruling).** `readonly` is written exactly where shape cannot express read-onlyness — auto-properties and interface properties; on every body-bearing form (expression-bodied properties and indexers, get-only blocks, the choice/enum/extension expression properties — all three grammar slots) it is a compile error, as it is on a setter-declaring block. The stdlib's thirteen decorative uses are stripped in this revision; the two normative documents now agree.
+
+**Kernel classification (the v0.198 obligation):** no ownership rules touched (narrowing is the nullability system; the rest is surface/constraint machinery).
+
+**Migration.** Newly **accepted**: narrowed reads of nullable `readonly` fields (permissive); trailing commas in the seventeen previously-forbidding lists; `where T: hashable`. Newly **rejected**: `readonly` on body-bearing property forms (thirteen stdlib strips land atomically here; user migration is deletion). Impl trackers filed at this landing.

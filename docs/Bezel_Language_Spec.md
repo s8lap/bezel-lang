@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.213 — July 2026**
+**Version 0.214 — July 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -102,6 +102,8 @@ Every statement terminates with a semicolon. Block-bodied constructs terminate w
 The unlabelled form `end;` is always valid everywhere — the label is for readability across long bodies and carries no semantic weight beyond compile-time verification that it matches.
 
 ---
+
+**Trailing commas (v0.214).** Every comma-separated list admits one optional trailing comma before its closer — argument, parameter, and generic lists, positional fields, enum constants, choice cases, inheritance and constraint lists, lambda parameters and destructuring slots, positional patterns, extern parameters, and the literal/arm/assignment lists that always allowed it. One rule, no exceptions; `|`-separated pattern alternatives are not comma lists.
 
 <a id="sec-modules-and-compilation"></a>
 ## 2. Modules and Compilation
@@ -998,7 +1000,9 @@ if u <> null then
 end;
 ```
 
-Local-variable narrowing applies to the copy, which no other thread can observe. Accessing a nullable field without first copying it to a local is a compile error when the access requires non-null.
+Local-variable narrowing applies to the copy, which no other thread can observe. Accessing a nullable *mutable* field without first copying it to a local is a compile error when the access requires non-null.
+
+**`readonly` fields narrow (v0.214).** A nullable **`readonly`** field — instance or `static` — participates in flow narrowing, because the blanket refusal's premise (unseen writers) does not exist for it: outside its construction window ([§22.8](#sec-field-initializers)'s single-assignment rule) a `readonly` field has no writer on any path, through any alias, so no call, `await`, or closure can invalidate a fact about its value. The tracked shape is exactly **one field off an admitted root** — `this._f`, `TypeName._s`, or `local._f` where `local` is itself narrowing-tracked; a fact rides its root (reassigning `local` drops it), and **any non-final field segment makes a path non-trackable** (`a.b._f` establishes nothing — `a.b` is a mutable read). The rule does not apply inside the declaring type's constructors, field initializers, static constructor, or static field initializers (the assignment window); elsewhere it composes with construction's [§22.7](#sec-observing-this-during-construction) `this`-escape residual exactly as stated there: a during-construction narrowing test observes either the null watermark (establishing nothing) or the field's single assigned value, final by §22.8 — the residual is §22.7's, inherited, not enlarged. Mutable fields and properties are unchanged: copy to a local first (rationale [§6.1](Bezel_Design_Rationale.md#sec-field-narrowing-is-not-safe-across-threads)).
 
 <a id="sec-null-conditional-access"></a>
 ### 7.5 Null-conditional access (`?.`)
@@ -2258,6 +2262,7 @@ The `where` clause restricts the substitutions a type parameter accepts:
 | `where T: U` (U a type parameter) | Non-nullable types assignable to the substitution for `U`. See "Type-parameter bounds" below. |
 | `where T: new()` | Class types with a `public` parameterless constructor; value types (records, enums, primitives, inline arrays, the unit type) whose `default(T)` is well-defined ([§17.11](#sec-the-default-operator)). |
 | `where T: sendable` | Types whose **sendable** derived type property ([§3.6](#sec-derived-type-properties), [§30.14](#sec-sendable-types)) holds, decided by the §30.14 computation unchanged (v0.201; "Derived-property constraints" below). Composes with the other forms (`where T: sendable, class` admits sendable class types). |
+| `where T: hashable` | Types whose **equality-bearing** derived type property ([§3.6](#sec-derived-type-properties)) holds — consistent `Equals`/`GetHashCode`, usable as hash-container keys and elements — decided per instantiation by §3.6's computation (v0.214; the keyword names the capability site, the property keeps its §3.6 name). States in the signature what `Dictionary<K, V>`/`Set<T>` keys structurally require, so the diagnostic lands at the instantiation of the *user's* generic rather than deep inside the stdlib type. |
 
 Constraints may be combined: `where T: class, IDisposable, new()` requires a non-nullable reference type that implements `IDisposable` and has a public parameterless constructor.
 
@@ -5269,6 +5274,8 @@ The compiler generates the backing field. A `readonly` auto-property may be assi
 
 <a id="sec-expression-bodied-read-only-properties"></a>
 ### 23.2 Expression-bodied read-only properties
+
+**`readonly` has one meaning (v0.214): it is written exactly where shape cannot express read-onlyness** — auto-properties ([§23.1](#sec-auto-properties)) and interface properties, whose accessor sets are declared, not shaped. On every body-bearing form — an expression-bodied property or indexer, a get-only block form, and the expression-bodied properties of choices, enums, and extensions — read-onlyness is already expressed by the shape, and writing `readonly` there is a compile error (the grammar's `readonly?` slots on those productions are over-admissions, rejected semantically per the shared-production policy); on a block form declaring a setter it is contradictory and likewise an error.
 
 ```bezel
 public property Area: decimal => Width * Height;
@@ -9920,7 +9927,7 @@ ClassDecl       ::= Visibility? Modifier* "class" Identifier GenericParams?
                     Inheritance?
                     GenericConstraints*
                     ClassBody
-PolymorphicMember ::= "polymorphic" "(" PolyCase ("," PolyCase)* ")" ";"
+PolymorphicMember ::= "polymorphic" "(" PolyCase ("," PolyCase)* ","? ")" ";"
 PolyCase ::= StringLiteral ":" TypeName
                               /* A `polymorphic` registry is a class-body member
                                  (at most one per class; takes no visibility).
@@ -9956,7 +9963,7 @@ Modifier        ::= "abstract" | "sealed" | "static"
                                  (closed abstract class); other combinations
                                  with `static` are rejected. */
 PrimaryCtorParams ::= "(" ParamList? ")"
-Inheritance     ::= ":" InheritItem ("," InheritItem)*
+Inheritance     ::= ":" InheritItem ("," InheritItem)* ","?
 InheritItem     ::= Type ("(" ArgList? ")")?
                               /* The grammar accepts the optional argument list
                                  on every InheritItem; semantically, the
@@ -9973,7 +9980,7 @@ RecordDecl      ::= Visibility? "record" Identifier GenericParams?
                     Inheritance?
                     GenericConstraints*
                     ( ";" | RecordBody )
-PositionalFields ::= "(" PositionalField ("," PositionalField)* ")"
+PositionalFields ::= "(" PositionalField ("," PositionalField)* ","? ")"
 PositionalField ::= Identifier ":" Type SerializedClause?
 SerializedClause ::= "serialized" ( "skip" | SerializedName )
 SerializedName   ::= StringLiteral? "optional"?   /* at least one of the two
@@ -9998,15 +10005,15 @@ RecordBody      ::= Member* "end" Identifier? ";"
 EnumDecl        ::= Visibility? "enum" Identifier EnumInheritance?
                     EnumConstants
                     EnumMember* "end" Identifier? ";"
-EnumInheritance ::= ":" IntegerType ("," InheritItem)*
-                  | ":" InheritItem ("," InheritItem)*
+EnumInheritance ::= ":" IntegerType ("," InheritItem)* ","?
+                  | ":" InheritItem ("," InheritItem)* ","?
                               /* The first form is `enum E: int, IComparable<E>` —
                                  explicit underlying type followed by interfaces.
                                  The second form is `enum E: IComparable<E>` —
                                  default underlying type (int), interfaces only.
                                  The grammar disambiguates by whether the first
                                  token after `:` is an IntegerType keyword. */
-EnumConstants   ::= EnumConstant ("," EnumConstant)* ";"
+EnumConstants   ::= EnumConstant ("," EnumConstant)* ","? ";"
 EnumConstant    ::= Identifier (":=" ConstExpr)? SerializedClause?
 
 ChoiceDecl      ::= Visibility? "choice" Identifier GenericParams?
@@ -10014,12 +10021,12 @@ ChoiceDecl      ::= Visibility? "choice" Identifier GenericParams?
                     GenericConstraints*
                     ChoiceCases
                     ChoiceMember* "end" Identifier? ";"
-ChoiceCases     ::= ChoiceCase ("," ChoiceCase)* ";"
+ChoiceCases     ::= ChoiceCase ("," ChoiceCase)* ","? ";"
 ChoiceCase      ::= Identifier CasePayload? SerializedClause?
                               /* SerializedClause on a case admits the rename
                                  form only; `skip` and `optional` are rejected
                                  semantically, as on enum constants (§9.8). */
-CasePayload     ::= "(" CaseField ("," CaseField)* ")"
+CasePayload     ::= "(" CaseField ("," CaseField)* ","? ")"
 CaseField       ::= "owned"? Identifier ":" Type SerializedClause?
                               /* The payload field form is PositionalField plus
                                  the optional leading `owned` marker; the
@@ -10049,7 +10056,7 @@ ExternBlock     ::= "extern" StringLiteral ("convention" StringLiteral)?
 ExternDecl      ::= Visibility? "method" Identifier "(" ExternParamList? ")"
                     (":" "owned"? Type)?
                     (":=" "symbol" StringLiteral VariadicClause?)? ";"
-ExternParamList ::= ExternParam ("," ExternParam)*
+ExternParamList ::= ExternParam ("," ExternParam)* ","?
 ExternParam     ::= Param | "env"
 VariadicClause  ::= "variadic" "(" IntLiteral ")"
                               /* `owned` on the return marks ownership transfer
@@ -10256,7 +10263,7 @@ NestedTypeDecl  ::= ClassDecl | InterfaceDecl | RecordDecl | EnumDecl
                                  required (§13.3, §11.6, v0.181); omission is
                                  rejected semantically. */
 
-ParamList       ::= Param ("," Param)*
+ParamList       ::= Param ("," Param)* ","?
 Param           ::= ParamModifiers? Identifier ":" Type (":=" Expression)?
                     OutNullPostcond?
 OutNullPostcond ::= "when" ("true" | "false")
@@ -10280,7 +10287,7 @@ ParamModifiers  ::= "ref"
                                  (§28.14, v0.180). Other parameter types are
                                  rejected semantically. Illegal on extern
                                  declarations (§32). */
-ArgList         ::= Argument ("," Argument)*
+ArgList         ::= Argument ("," Argument)* ","?
 Argument        ::= ArgModifiers ArgExpression
                   | (Identifier ":=")? ArgExpression
                               /* ref/out/owned arguments are positional-only
@@ -10328,7 +10335,7 @@ StaticConstDecl        ::= Visibility "const" Identifier (":" Type)? ":=" ConstE
 
 Visibility      ::= "public" | "internal" | "protected" | "private"
 
-GenericParams   ::= "<" GenericParam ("," GenericParam)* ">"
+GenericParams   ::= "<" GenericParam ("," GenericParam)* ","? ">"
 GenericParam    ::= Variance? Identifier
 Variance        ::= "in" | "out"
                               /* Variance markers are semantically valid only on
@@ -10336,12 +10343,12 @@ Variance        ::= "in" | "out"
                                  on interfaces declaring static members, §11.8).
                                  On class/record/method/alias parameters the
                                  marker is rejected semantically. */
-GenericConstraints ::= "where" Identifier ":" Constraint ("," Constraint)*
+GenericConstraints ::= "where" Identifier ":" Constraint ("," Constraint)* ","?
                               /* The pre-v0.97 `where T is owned` modifier-
                                  constraint form is retired along with `<owned T>`
                                  generic arguments (§14.4); constraints bound
                                  types only. */
-Constraint      ::= "class" | "value" | "notnull" | "sendable" | "new" "(" ")" | Type
+Constraint      ::= "class" | "value" | "notnull" | "sendable" | "hashable" | "new" "(" ")" | Type
                               /* "new" "(" ")" is the parameterless-constructor
                                  constraint, three tokens with whitespace
                                  permitted (lexer-level) — `new()` and
@@ -10376,14 +10383,14 @@ InlineArrayType ::= "[" ConstIntExpr "owned"? "]" Type
                                  types are not provided in this revision. */
 ConstIntExpr    ::= Expression           /* a §17.14 constant expression of
                        integer type; see §15.1 "Size" */
-GenericArgs     ::= "<" GenericArg ("," GenericArg)* ">"
+GenericArgs     ::= "<" GenericArg ("," GenericArg)* ","? ">"
 GenericArg      ::= Type
                               /* In v0.97 and later, `owned` is not admitted on
                                  generic type arguments; the owned-bearing
                                  collection and task types are separate named
                                  classes (`OwningArray<T>`, `OwningTask<T>`, etc.).
                                  See §14.4. */
-FunctionType    ::= "(" (FuncParamType ("," FuncParamType)*)? ")" "->" "owned"? Type
+FunctionType    ::= "(" (FuncParamType ("," FuncParamType)* ","?)? ")" "->" "owned"? Type
                               /* The optional `owned` on the return marks
                                  a function type whose result transfers
                                  ownership to the caller. See §28.1. The
@@ -10705,10 +10712,10 @@ NewExpr         ::= "new" Type "(" ArgList? ")"
 InitAssign      ::= Identifier ":=" Expression
 
 LambdaExpr      ::= "async"? "(" LambdaParams? ")" "=>" LambdaBody
-LambdaParams    ::= LambdaParam ("," LambdaParam)*
+LambdaParams    ::= LambdaParam ("," LambdaParam)* ","?
 LambdaParam     ::= FuncParamMods? Identifier (":" Type)?
                   | LambdaDestructure
-LambdaDestructure ::= QualifiedName "(" LambdaSlot ("," LambdaSlot)* ")"
+LambdaDestructure ::= QualifiedName "(" LambdaSlot ("," LambdaSlot)* ","? ")"
 LambdaSlot      ::= Identifier | "_" | LambdaDestructure
                               /* Positional-record destructuring in parameter
                                  position (§27.4, v0.183, #1408): irrefutable
@@ -10825,7 +10832,7 @@ Pattern         ::= "_"                       /* discard */
                                  applies to QualifiedNames — `Color.Red` is a
                                  constant pattern; `System.IO.Stream` is a
                                  type-test pattern. */
-PositionalPatternList ::= PositionalPattern ("," PositionalPattern)*
+PositionalPatternList ::= PositionalPattern ("," PositionalPattern)* ","?
 PositionalPattern     ::= AltPattern              /* per-slot alternatives
                                                      (v0.167, #1371):
                                                      TwoColor(Red | Blue, var x) */
@@ -10895,7 +10902,7 @@ Constant        ::= "-"? (IntLiteral | FloatLiteral)
 <a id="sec-reserved-keywords"></a>
 ### B.1 Reserved keywords
 
-The following identifiers are keywords. Most are reserved unconditionally and may not be used as user-defined names. The **contextual keywords** (`convention`, `ensures`, `env`, `get`, `invariant`, `notnull`, `of`, `old`, `operator`, `polymorphic`, `pure`, `requires`, `result`, `scoped`, `sendable`, `serialized`, `set`, `step`, `symbol`, `value`, `variadic`) have keyword meaning only in specific syntactic positions and may be used as identifiers elsewhere; see [§B.2](#sec-contextual-keywords).
+The following identifiers are keywords. Most are reserved unconditionally and may not be used as user-defined names. The **contextual keywords** (`convention`, `ensures`, `env`, `get`, `hashable`, `invariant`, `notnull`, `of`, `old`, `operator`, `polymorphic`, `pure`, `requires`, `result`, `scoped`, `sendable`, `serialized`, `set`, `step`, `symbol`, `value`, `variadic`) have keyword meaning only in specific syntactic positions and may be used as identifiers elsewhere; see [§B.2](#sec-contextual-keywords).
 
 **Unconditionally reserved:**
 
@@ -10903,7 +10910,7 @@ The following identifiers are keywords. Most are reserved unconditionally and ma
 
 **Contextual (see [§B.2](#sec-contextual-keywords)):**
 
-`convention`, `ensures`, `env`, `get`, `invariant`, `notnull`, `of`, `old`, `operator`, `polymorphic`, `pure`, `requires`, `result`, `scoped`, `sendable`, `serialized`, `set`, `step`, `symbol`, `value`, `variadic`.
+`convention`, `ensures`, `env`, `get`, `hashable`, `invariant`, `notnull`, `of`, `old`, `operator`, `polymorphic`, `pure`, `requires`, `result`, `scoped`, `sendable`, `serialized`, `set`, `step`, `symbol`, `value`, `variadic`.
 
 All keywords are lowercase. Type identifiers in PascalCase (`Object`, `Array`, `Type`, `Exception`, `IDisposable`, `Task`, etc.) are not keywords; they are names defined by the standard library or by compiler intrinsics.
 
@@ -10927,6 +10934,7 @@ The following keywords from [§B.1](#sec-reserved-keywords) carry meaning only i
 | `symbol` | The `:= symbol "…"` alias clause of an extern declaration ([§32.11](#sec-symbol-binding)) | Anywhere else: as an identifier |
 | `variadic` | The `variadic(N)` clause after an extern symbol alias ([§32.11](#sec-symbol-binding)) | Anywhere else: as an identifier |
 | `sendable` | The `where T: sendable` constraint ([§14.2](#sec-constraints), v0.201) | Anywhere else: as an identifier |
+| `hashable` | The `where T: hashable` constraint ([§14.2](#sec-constraints), v0.214) | Anywhere else: as an identifier |
 | `pure` | The member-modifier slot ([§11.5](#sec-modifier-order), [§22.15](#sec-pure-members), v0.202) and the `pure get` accessor form | Anywhere else: as an identifier |
 | `requires`, `ensures` | Opening a contract clause in the clause region of a method or constructor declaration ([§22.16](#sec-contract-clauses), v0.203); the keyword reading always wins there | Anywhere else: as identifiers |
 | `invariant` | Member-leading position in a class body, optionally after `static` ([§22.16](#sec-class-invariants), v0.203) | Anywhere else: as an identifier |

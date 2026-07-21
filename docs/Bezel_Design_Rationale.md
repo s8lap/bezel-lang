@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.213 — July 2026**
+**Companion to the Bezel Language Specification, v0.214 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -854,7 +854,7 @@ What the examination *conceded* is recorded with equal weight. The keyword adds 
 
 `if user <> null then user.Method() end;` works for locals because the compiler knows nothing else can reassign them. For fields, the same code is a compile error — not primarily because of threads (since v0.131 a domain's continuations are serial, [§12.5](#sec-execution-domains)), but because the field can be reassigned between the check and the use by paths the compiler cannot see: a method call whose body writes the field (directly or through an alias to the same object), a closure invoked in between, re-entrant code reached from the check's own expression, or — across an `await` — any other continuation of the same domain interleaving at the suspension point. Foreign threads introduced through the FFI remain a residual case ([§16](#sec-ffi), spec §30.12). An **uncaptured** local has none of these writers, so narrowing it is sound; a local mutably captured by a lambda has exactly one — the closure — which is why spec §7.4 (v0.182) invalidates a captured local's narrowing at any call, function-value invocation, or `await` inside the controlled block.
 
-The compiler does not narrow fields. The recommended pattern is to copy the field to a local before checking:
+The compiler does not narrow mutable fields. Since v0.214 the one field kind with *no* writers outside construction — `readonly` (single-assignment, §22.8; no `ref`/`out` escape, §22.3) — narrows, with the single-segment path and construction-window rules spec §7.4 states; the copy-to-local pattern remains for everything mutable:
 
 ```bezel
 var u := _user;
