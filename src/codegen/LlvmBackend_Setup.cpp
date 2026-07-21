@@ -8522,6 +8522,62 @@ bool Emitter::registerInlineOwnedArrayDisposal(const ast::LocalDecl* ld) {
 }
 
 
+bool Emitter::registerOwningChoiceDisposal(const ast::LocalDecl* ld) {
+    // §35.4 (v0.200, #2045 stage 3): an OWNING-classified choice local.
+    // The classifier (#2045 stage 1) walks every case's payload fields —
+    // an `owned` marker or a move-only value-typed payload decides Owning.
+    // For an owning choice, the active-case disposal (§35.4 "Disposal is
+    // defined by the active case") emits a switch on the runtime tag and
+    // disposes the active case's owned payloads in payload declaration
+    // order. This is the SAME disposal a `using var` triggers — the flag
+    // makes the disposal run regardless of the local-decl flavor, so
+    // `var o: Outcome := …;` (must-use warning path) and
+    // `using var o: Outcome := …;` (auto-dispose path) both reach it.
+    //
+    // Why bypass the using/task/unwind chain: a plain `var x: Class := new C();`
+    // is NOT auto-disposed at scope end on the normal exit (sema enforces a
+    // must-reach-discharge rule, §28.3). But owning choices are VALUE-typed,
+    // not reference-typed — there is no separate `owned x: Outcome`; the
+    // value lives on the stack as the choice struct. The active-case disposal
+    // is the SOLE disposal site for the slot's owned payloads; routing through
+    // `classOfLocal` (null for choice) or `unwindOwnedLocalClass` (also null
+    // for choice — not a class/interface ref) would miss it entirely.
+    const sema::TypeRef* rt =
+        ld->type ? ctx_.resolvedType(*ld->type)
+                 : (ld->initializer ? ctx_.exprType(*ld->initializer) : nullptr);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration) {
+        return false;
+    }
+    // Resolve via the active generic substitution so a generic choice at a
+    // concrete instantiation resolves to its specialized fields — the same
+    // path choiceStruct walks.
+    rt = resolveTypeParamRef(rt);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration) {
+        return false;
+    }
+    if (rt->declaration->kind != ast::TypeDeclKind::Choice) {
+        return false;
+    }
+    // Re-classify under the (possibly specialized) substitution. Per §3.6 rule 2
+    // + §35.4: classification is per-instantiation, with the `owned` marker's
+    // meaning fixed by §28.1's per-instantiation erasure. The classifier returns
+    // std::nullopt for non-choice types — we just guarded that.
+    auto verdict = common::classifyChoiceType(rt, ctx_);
+    if (!verdict || *verdict != common::ChoiceClassification::Owning) {
+        return false;  // value-like / borrow-bearing — no per-tag switch needed
+    }
+    if (disposeStack_.empty()) return true;
+    if (emittingDisposerBody_) return true;  // class disposer walks fields directly
+    auto it = locals_.find(ld);
+    if (it == locals_.end() || !it->second) return true;
+    Disposal d{it->second, nullptr};
+    d.owningChoice = true;
+    d.owningChoiceTy = rt->declaration;
+    disposeStack_.back().push_back(d);
+    return true;
+}
+
+
 void Emitter::registerUnwindOwnedLocal(const ast::LocalDecl* ld) {
     // §28.3 (line 4910): a plain `var` owned local is auto-disposed when an
     // exception unwinds out of its scope (an `unwindOnly` Disposal — normal exit

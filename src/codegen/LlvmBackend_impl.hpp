@@ -968,6 +968,28 @@ private:
         // the grouping pointer; bz_grouping_free is null-safe (an *OrNull empty
         // result is null). The class/collection/dict fields are unused.
         bool grouping = false;
+        // §35.4 (v0.200, #2045 stage 3): an OWNING-CLASSIFIED choice local
+        // (a sum whose classification is Owning, e.g. one with an `owned`
+        // payload slot per §35.4.1). At scope end the active case's owned
+        // payloads are disposed in payload declaration order (§35.4 "Disposal
+        // is defined by the active case"). `slot` holds the choice struct
+        // value (the `tag` lives at field 0; payload slot i is field 1+i).
+        // The disposal emit switches on tag, dispatching Dispose via the
+        // payload's runtime vtable (dynamicDispose, since the static class
+        // may not be known at the choice site — an interface-typed payload
+        // or an interface return reaching an owning choice). For payload-
+        // free / value-payload active cases the switch arm is empty.
+        // Choice typed by `choiceTy` (the TypeSymbol — null when the slot
+        // is statically known to be an owning choice via the
+        // payload-marker walk).
+        bool owningChoice = false;
+        // §35.4 (#2045 stage 3): the choice TypeSymbol whose owning-
+        // classified payload fields the active-case disposal switch must
+        // traverse. Set together with `owningChoice = true`. Used by the
+        // emit to walk the cases in declaration order and find each case's
+        // owned payload fields; pairing these (tag == i, payload slot ==
+        // 1+i) lets the dispose switch pick the right field offsets.
+        const sema::TypeSymbol* owningChoiceTy = nullptr;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // §28.3 (line 4910): owned parameters of the current function awaiting
@@ -6126,6 +6148,20 @@ private:
     // value-typed local). Returns false for any non-(inline-owned-array) local.
     bool registerInlineOwnedArrayDisposal(const ast::LocalDecl* ld);
 
+    // §35.4 (v0.200, #2045 stage 3): if `ld` is an OWNING-CLASSIFIED choice
+    // local (a sum whose classification is Owning — any case has an `owned`
+    // payload field, or a move-only value-typed payload field), register its
+    // scope-end active-case disposal and return true (the using/task/unwind
+    // chain does not apply — the disposal shape is per-tag switch). Returns
+    // false for any non-(owning-choice) local; for value-like and borrow-
+    // bearing choices, the choice struct is a plain value with no slot-
+    // resident owned payloads to dispose, so the ordinary local path runs.
+    // The register-using-task-unwind chain (`using var`, etc.) still applies
+    // for an owning choice: a `using var o: Outcome := Outcome.Fetched(...);`
+    // is the normal spelling, and the active-case disposal runs on top of
+    // the using-var's normal-exit-and-unwind path.
+    bool registerOwningChoiceDisposal(const ast::LocalDecl* ld);
+
     // §29.11 (#943): if `ld` is a plain (non-`using`) `var` whose value is a
     // vtable-backed re-iterable IEnumerable<T>/IOwningEnumerable<T> (the result of
     // a yield iterator method, or an array/user-class wrapped into one), register
@@ -6834,6 +6870,23 @@ private:
     // loop body's scope — the cleanup `break`/`continue` runs before
     // jumping out of / around the loop body.
     void emitLoopDisposals(std::size_t loopScopeDepth);
+
+    // §35.4 (v0.200, #2045 stage 3): emit the active-case disposal for an
+    // OWNING-classified choice value held in `slot`. Reads the runtime TAG
+    // (field 0 of the choice struct, see choiceStruct), switches on it, and
+    // for each case with at least one `owned` payload field, GEPs into the
+    // case's payload slot (field 1+caseIndex), extracts each owned payload's
+    // pointer, null-guards, and dispatches Dispose+reclaim via the runtime
+    // vtable (dynamic dispatch — the concrete class is the runtime payload
+    // type, statically unknown at the choice site). Payload-free / value-
+    // payload cases dispose nothing, so their switch arm is a direct branch
+    // to the join. Fires on BOTH the normal and unwind exit — like an
+    // `inlineOwnedArray` disposal, the slot value is whatever the active
+    // case holds at scope end, and disposing it is the SOLE path for those
+    // payloads (no separate `using var` registration fires for choice
+    // payloads — the choice value IS the owner).
+    void emitOwningChoiceActiveCaseDisposal(llvm::AllocaInst* slot,
+                                            const sema::TypeSymbol* choiceTy);
 
     // Lower a statement list into the current block; returns true if the
     // list terminated the block (so the caller stops adding to it).

@@ -280,12 +280,22 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
     // Resolve callee parameter list for implicit ownership transfer check.
     const ast::MethodDecl*     calleeMethod = nullptr;
     const ast::ConstructorDecl* calleeCtor  = nullptr;
+    const sema::ChoiceCaseSymbol* calleeChoiceCase = nullptr;
     if (callee) {
         sema::Symbol* sym = ctx_.exprSymbol(*callee);
         if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym)) {
             calleeMethod = dynamic_cast<const ast::MethodDecl*>(ms->decl);
         } else if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym)) {
             calleeCtor = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+        } else if (auto* cc = dynamic_cast<sema::ChoiceCaseSymbol*>(sym)) {
+            // §35.3 / §35.4 (v0.200, #2045 stage 3): a CHOICE-CASE construction
+            // (`Opt.Some(value)`, `Outcome.Fetched(value)`) carries its payload
+            // fields in `caseDecl->payload` — each Param's `modifier` slot holds
+            // the optional `owned` marker the case declaration wrote. Wire the
+            // payload list as the parameter list so the §22.3 owned-marker check
+            // below sees the case payload's modifier and admits the call-site
+            // `owned` marker on `owned` payload fields (the §35.3 + §28.1 form).
+            calleeChoiceCase = cc;
         }
     }
     std::size_t pos = 0;
@@ -306,6 +316,8 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
         const std::vector<ast::Param>* params = nullptr;
         if (calleeMethod)  params = &calleeMethod->params;
         if (calleeCtor)    params = &calleeCtor->params;
+        if (calleeChoiceCase && calleeChoiceCase->caseDecl)
+            params = &calleeChoiceCase->caseDecl->payload;
         // §22.5 (v0.184, #1973): classify by the BOUND parameter's modifier, not
         // the source position — a named argument `name := value` binds the
         // parameter NAMED `name`, so a reordered owned/borrow call maps correctly.
@@ -414,7 +426,24 @@ bool MethodOwnership::isImplicitOwned(const std::vector<ast::CallArgument>& args
         cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
     const std::vector<ast::Param>* params =
         md ? &md->params : (cd ? &cd->params : nullptr);
-    if (!params) return false;
+    // §35.3 / §35.4 (v0.200, #2045 stage 3): a CHOICE-CASE construction
+    // (`Opt.Some(value)`, `Outcome.Fetched(value)`) is callable via its
+    // ChoiceCaseSymbol, which carries its payload fields in `caseDecl->payload`
+    // (each Param's `modifier` slot holds the optional `owned` marker the
+    // case declaration wrote). The same plain-`owned` formal sink rule
+    // applies: a payload field marked `owned` is an owned-IN sink — the
+    // call-site `owned` marker is admitted there, exactly as it is on a
+    // user `owned` parameter. Without this, every owning-choice construction
+    // rejects the `owned` marker the spec admits on `owned` payload fields
+    // (§35.3 + §28.1).
+    if (!params) {
+        if (auto* cc = dynamic_cast<sema::ChoiceCaseSymbol*>(sym)) {
+            if (!cc->caseDecl) return false;
+            params = &cc->caseDecl->payload;
+        } else {
+            return false;
+        }
+    }
     // §22.5 (v0.184, #1973): resolve the BOUND parameter (named-arg binding),
     // not the source position — a reordered `owned`/borrow named-arg call
     // otherwise mis-classifies the consume. See boundParamIndex.

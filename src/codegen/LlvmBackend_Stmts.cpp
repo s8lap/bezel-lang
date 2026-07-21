@@ -22,6 +22,16 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // When handled, bypass the using/task/unwind chain (none applies to a
         // move-only value-typed local).
         if (registerInlineOwnedArrayDisposal(ld)) return false;
+        // §35.4 (v0.200, #2045 stage 3): an OWNING-classified choice local
+        // registers its active-case disposal (per-tag switch over the active
+        // case's owned payloads). Bypasses the using/task/unwind chain because
+        // a choice is a value type (the active-case disposal is the SOLE slot
+        // path for its owned payloads; classOfLocal is null, unwindOwnedLocalClass
+        // is null — neither catches it). The using-var normal-exit path still
+        // runs on top via the separate d.dynamicDispose/etc. branches the
+        // registration already covers (using var registers both layers), so
+        // exactly-once disposal holds on both the normal and unwind exits.
+        if (registerOwningChoiceDisposal(ld)) return false;
         // §29.11 (#943): a plain `var` holding a vtable-backed re-iterable
         // IEnumerable<T>/IOwningEnumerable<T> source (a yield-iterator result, or an
         // array/user-class wrapped into one) is disposed once at scope end — the

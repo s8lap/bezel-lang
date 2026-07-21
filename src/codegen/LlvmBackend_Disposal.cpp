@@ -1092,6 +1092,113 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
 }
 
 
+void Emitter::emitOwningChoiceActiveCaseDisposal(
+        llvm::AllocaInst* slot, const sema::TypeSymbol* choiceTy) {
+    // §35.4 (v0.200, #2045 stage 3) "Disposal is defined by the active
+    // case." Reads the runtime TAG (field 0 of the choice struct), switches
+    // on it, and for each case whose payload has at least one `owned`-marked
+    // field, GEPs into that case's payload slot (field 1+caseIndex), extracts
+    // each owned payload pointer, null-guards, and dispatches Dispose+reclaim
+    // via the runtime vtable — the concrete class is the runtime payload
+    // type, statically unknown at the choice site, so dynamic dispatch
+    // (emitDisposeAndReclaim, which loads the vtable slot 2 and reclaims the
+    // block) is the only safe site. Payload-free / value-payload cases
+    // dispose nothing, so their switch arm is a direct branch to the join.
+    //
+    // WHY DYNAMIC DISPATCH (§35.4 + §8.6): the choice's payload type is the
+    // STATIC field type — a class, an interface, or a generic parameter
+    // (§28.1's per-instantiation erasure of `owned`). The runtime TYPE of
+    // the payload is the concrete class the user stored (a subclass of the
+    // declared type, or an interface's concrete implementation). The vtable
+    // slot 2 holds the most-derived Dispose; emitDisposeAndReclaim loads it
+    // and reclaims the block. This is the SAME path class-field auto-
+    // disposal uses (§28.4 / CG18) — exactly the right invariant.
+    //
+    // WHY NO NULL-AFTER (yet): unlike a class field, the choice struct is a
+    // value-typed slot on the stack. After dispose, the slot is dead (its
+    // payloads are gone); a re-entrant dispose through the same slot would
+    // read the same tag and re-dispatch on the (now-disposed) owned field,
+    // which is freed memory. emitDisposals fires this at scope-end on a
+    // single exit edge, so a second pass through the same Disposal entry is
+    // structurally impossible (the slot goes out of scope). The null-after
+    // pattern would matter for a heap-resident choice or for a nested
+    // owning match (which is the v0.200 stage 4 follow-up) — keep that
+    // for the future; the current invariant (single fire, fresh tag)
+    // means the dispose is exactly-once.
+    if (!slot || !choiceTy) return;
+    auto cases = choiceCasesOf(choiceTy);
+    if (cases.empty()) return;
+    // The choice struct is { i32 tag, case0_payload, case1_payload, … }
+    // (see choiceStruct). The tag is field 0 (i32); the i-th case's payload
+    // struct is field 1+i.
+    llvm::StructType* st = choiceStruct(choiceTy);
+    if (!st) return;
+    llvm::Value* choiceVal = builder_.CreateLoad(st, slot, "choice.val");
+    llvm::Value* tag = builder_.CreateExtractValue(
+        choiceVal, {0}, "choice.tag");
+    auto* joinBB =
+        llvm::BasicBlock::Create(llvm_, "ocd.join", currentFn_);
+    auto* switchBB =
+        llvm::BasicBlock::Create(llvm_, "ocd.switch", currentFn_);
+    builder_.CreateBr(switchBB);
+    builder_.SetInsertPoint(switchBB);
+    auto* sw = builder_.CreateSwitch(
+        tag, joinBB, static_cast<unsigned>(cases.size()));
+    // Walk every case in declaration order, building one switch arm per
+    // case that has at least one owned payload field.
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        const sema::ChoiceCaseSymbol* cc = cases[i];
+        if (!cc || !cc->caseDecl) continue;
+        // §28.1 + §35.4: only `owned`-marked payload fields are owning slots;
+        // plain (unmarked) class payloads are borrows (the borrow-bearing
+        // classification), value payloads are value-typed (no dispose), and
+        // strings are runtime-managed. Walk the AST payload list, collect
+        // indices of owned fields, and emit one dispose site per owned
+        // field, in payload declaration order (§35.4 "in payload
+        // declaration order").
+        std::vector<unsigned> ownedFieldIdxs;
+        for (std::size_t j = 0; j < cc->caseDecl->payload.size(); ++j) {
+            if (cc->caseDecl->payload[j].modifier == "owned") {
+                ownedFieldIdxs.push_back(static_cast<unsigned>(j));
+            }
+        }
+        if (ownedFieldIdxs.empty()) continue;  // nothing to dispose — switch
+                                               // arm collapses to join.
+        auto* armBB =
+            llvm::BasicBlock::Create(llvm_, "ocd.arm", currentFn_);
+        sw->addCase(
+            llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_), i), armBB);
+        builder_.SetInsertPoint(armBB);
+        // GEP into the case's payload slot (field 1+i) and load the
+        // payload struct value, then extract each owned field and dispose.
+        llvm::Value* casePayload = builder_.CreateExtractValue(
+            choiceVal, {1 + (unsigned)i}, "ocd.case.payload");
+        for (unsigned j : ownedFieldIdxs) {
+            llvm::Value* ownedPtr = builder_.CreateExtractValue(
+                casePayload, {j}, "ocd.owned.field");
+            // Null-guard: a never-bound arm of the active-case match could
+            // leave an `owned`-payload slot null (the binding took it out);
+            // or a payload-defaulted construction. `emitDisposeAndReclaim`
+            // is null-safe (free(null) no-op) but the dispatch on a null
+            // vtable would crash — guard explicitly.
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                ownedPtr, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* dispBB = llvm::BasicBlock::Create(
+                llvm_, "ocd.dispose", currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(
+                llvm_, "ocd.cont", currentFn_);
+            builder_.CreateCondBr(isNull, contBB, dispBB);
+            builder_.SetInsertPoint(dispBB);
+            emitDisposeAndReclaim(ownedPtr);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+        }
+        builder_.CreateBr(joinBB);
+    }
+    builder_.SetInsertPoint(joinBB);
+}
+
+
 void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
                                           llvm::Value* recvPtr,
                                           const sema::TypeRef* resultTy) {
@@ -2921,6 +3028,16 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // chain (idempotent, §28.2) and reclaims the block once (#380); the slot
         // is nulled afterward so any further disposal through it is a no-op
         // (§28.2; the #396 slot-null precedent).
+        // §35.4 (v0.200, #2045 stage 3): an OWNING-classified choice local.
+        // The active-case disposal emits a switch on the runtime tag and
+        // disposes the active case's owned payloads. Fires on BOTH the
+        // normal and unwind exit — like an `inlineOwnedArray` disposal, the
+        // slot value is whatever the active case holds at scope end, and
+        // disposing it is the SOLE path for those payloads.
+        if (it->owningChoice) {
+            emitOwningChoiceActiveCaseDisposal(it->slot, it->owningChoiceTy);
+            continue;
+        }
         if (it->dynamicDispose) {
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
