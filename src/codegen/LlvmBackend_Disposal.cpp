@@ -854,7 +854,38 @@ llvm::BasicBlock* Emitter::propagateBB() {
             builder_.CreateCall(fn, {exc, builtinExcVtableTablePtr()});
             builder_.CreateUnreachable();
         } else {
+            // §22.16 (v0.203, #2053) Slice 4b: emitImplicitReturn is the
+            // redirect-aware variant (it routes through the armed ensures
+            // epilogue when one is armed). But here we're synthesizing the
+            // per-function fallback block for the exception path — there is
+            // NO body here, just a `ret` to unwind the frame. Forcing the
+            // redirect here would route the exception path back into the
+            // ensures epilogue and re-evaluate clauses that have already
+            // fired (or, worse, loop the frame). Disable the redirect for
+            // this one emission so the propagate block emits a clean `ret`.
+            llvm::Function* savedEnsuresFn = ensuresFn_;
+            llvm::BasicBlock* savedEnsuresExitBB = ensuresExitBB_;
+            llvm::AllocaInst* savedEnsuresResultSlot = ensuresResultSlot_;
+            const ast::Type* savedEnsuresRetNode = ensuresReturnTypeNode_;
+            const std::vector<ast::ContractClause>* savedEnsuresClauses =
+                ensuresClauses_;
+            std::string savedEnsuresTypeName = std::move(ensuresTypeName_);
+            std::string savedEnsuresMemberName = std::move(ensuresMemberName_);
+            ensuresFn_ = nullptr;
+            ensuresExitBB_ = nullptr;
+            ensuresResultSlot_ = nullptr;
+            ensuresReturnTypeNode_ = nullptr;
+            ensuresClauses_ = nullptr;
+            ensuresTypeName_.clear();
+            ensuresMemberName_.clear();
             emitImplicitReturn(currentFn_);
+            ensuresFn_ = savedEnsuresFn;
+            ensuresExitBB_ = savedEnsuresExitBB;
+            ensuresResultSlot_ = savedEnsuresResultSlot;
+            ensuresReturnTypeNode_ = savedEnsuresRetNode;
+            ensuresClauses_ = savedEnsuresClauses;
+            ensuresTypeName_ = std::move(savedEnsuresTypeName);
+            ensuresMemberName_ = std::move(savedEnsuresMemberName);
         }
         if (save) builder_.SetInsertPoint(save);
     }

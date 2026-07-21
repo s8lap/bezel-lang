@@ -3031,6 +3031,110 @@ void Emitter::emitRequiresPrologue(
 }
 
 
+// §22.16 (v0.203, #2053) Slice 4b: arm the ensures single-exit epilogue.
+// Creates the result-temp alloca (for non-void returns) and the epilogue
+// basic block, and publishes them via `ensuresFn_` so `emitReturn` redirects
+// to the epilogue instead of emitting `ret` directly. The body is then
+// lowered with the redirect in effect; `finalizeEnsuresEpilogue` (called by
+// the body-emission driver after the body is complete) populates the
+// epilogue block. Idempotent in the sense that a body with no `ensures`
+// clauses returns false and emitReturn is unchanged.
+bool Emitter::armEnsuresEpilogue(
+    llvm::Function* fn, const std::vector<ast::ContractClause>& clauses,
+    const ast::Type* returnTypeNode,
+    std::string_view typeName, std::string_view memberName) {
+    bool hasEnsures = false;
+    for (const auto& c : clauses)
+        if (c.kind == ast::ContractClause::Kind::Ensures && c.expr) {
+            hasEnsures = true;
+            break;
+        }
+    if (!hasEnsures) return false;
+    ensuresFn_ = fn;
+    ensuresClauses_ = &clauses;
+    ensuresReturnTypeNode_ = returnTypeNode;
+    ensuresTypeName_ = std::string(typeName);
+    ensuresMemberName_ = std::string(memberName);
+    ensuresExitBB_ = llvm::BasicBlock::Create(llvm_, "ens.exit", fn);
+    // Result temp: only needed when the function returns a value. For a
+    // unit method or a constructor (void return) the epilogue evaluates
+    // `ensures` clauses over the frame's current state and then ret-voids.
+    if (!fn->getReturnType()->isVoidTy()) {
+        ensuresResultSlot_ = entryAlloca(fn->getReturnType());
+    } else {
+        ensuresResultSlot_ = nullptr;
+    }
+    return true;
+}
+
+// §22.16 (v0.203, #2053) Slice 4b: populate the armed ensures epilogue.
+// Sets the builder's insertion point to the epilogue block, evaluates each
+// `ensures` clause in declaration order (throwing ContractViolationException
+// on a false clause), and finally performs the original return — reload the
+// result temp (if any), apply the same box/coerce emitReturn would have
+// done, and emit `ret`. The §22.16 ordering — ensures evaluated AFTER the
+// return value is bound and BEFORE the frame's scope-end disposals — is
+// honored by emitting the epilogue's checks BEFORE the body's unwind
+// registration fires (the body's scope-end disposals run on the throw edge
+// only; the normal-completion path runs ensures, then ret, leaving the
+// caller to drive any remaining out-param copy-out). Clears the armed
+// state so a nested callable's body (emitted afterwards) sees no epilogue.
+void Emitter::finalizeEnsuresEpilogue() {
+    if (!ensuresFn_) return;
+    llvm::Function* fn = ensuresFn_;
+    const auto* clauses = ensuresClauses_;
+    std::string typeName = std::move(ensuresTypeName_);
+    std::string memberName = std::move(ensuresMemberName_);
+    const ast::Type* retTypeNode = ensuresReturnTypeNode_;
+    llvm::AllocaInst* resultSlot = ensuresResultSlot_;
+    llvm::BasicBlock* exitBB = ensuresExitBB_;
+    // Clear armed state BEFORE evaluating the clauses' expressions, so a
+    // nested emitReturn (e.g. inside a pure-callee that itself has clauses)
+    // does not redirect back into this epilogue. Also clear before the
+    // final ret below so emitReturn's redirect logic is inert here.
+    ensuresFn_ = nullptr;
+    ensuresExitBB_ = nullptr;
+    ensuresResultSlot_ = nullptr;
+    ensuresClauses_ = nullptr;
+    ensuresReturnTypeNode_ = nullptr;
+    ensuresTypeName_.clear();
+    ensuresMemberName_.clear();
+
+    builder_.SetInsertPoint(exitBB);
+    for (const auto& c : *clauses) {
+        if (c.kind != ast::ContractClause::Kind::Ensures) continue;
+        if (!c.expr) continue;
+        // §22.16 typing: each ensures expr is bool; the result temp holds the
+        // return value for `result` (Slice 4c). For Slice 4b the expressions
+        // reference parameters/this/statics only.
+        llvm::Value* condV = lowerExpr(*c.expr);
+        if (!condV) continue;  // lowering failure already diagnosed upstream
+        llvm::Value* failed = builder_.CreateNot(condV, "ens.fail");
+        auto* throwBB =
+            llvm::BasicBlock::Create(llvm_, "ens.throw", fn);
+        auto* contBB =
+            llvm::BasicBlock::Create(llvm_, "ens.cont", fn);
+        builder_.CreateCondBr(failed, throwBB, contBB);
+        builder_.SetInsertPoint(throwBB);
+        std::string msg = std::string("ensures postcondition of ") +
+                          typeName + "." + memberName + " failed";
+        llvm::Value* msgStr = lowerStringLiteral("\"" + msg + "\"", false);
+        emitThrowContractViolation(msgStr);
+        builder_.SetInsertPoint(contBB);
+    }
+    // Reload the result temp (if any) and emit the original return. We
+    // temporarily swap `currentReturnTypeNode_` so emitReturn's box/coerce
+    // matches what the original return sites would have done.
+    const ast::Type* savedRetNode = currentReturnTypeNode_;
+    if (retTypeNode) currentReturnTypeNode_ = retTypeNode;
+    llvm::Value* rv = resultSlot
+        ? builder_.CreateLoad(fn->getReturnType(), resultSlot, "ens.result")
+        : nullptr;
+    emitReturn(fn, rv);  // inert: ensuresFn_ is null so no redirect
+    currentReturnTypeNode_ = savedRetNode;
+}
+
+
 void Emitter::emitThrowValue(llvm::Value* excVal, const ast::Expr* excAst) {
     if (excVal) {
         // #397 / §31.1: a `throw <newExpr>` leaving a catch arm. Relax the
@@ -4268,6 +4372,16 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
                     ms->parent ? ms->parent->name : std::string_view{},
                     md->name);
             }
+            // §22.16 (v0.203, #2053) Slice 4b: arm the ensures single-exit
+            // epilogue before lowering the body. If armed, emitReturn
+            // redirects every normal-completion path through the epilogue
+            // block, which evaluates the ensures clauses and only then
+            // performs the original ret. Finalized after the body is
+            // complete (below).
+            armEnsuresEpilogue(fn, md->contractClauses, md->returnType.get(),
+                               ms->parent ? ms->parent->name
+                                          : std::string_view{},
+                               md->name);
         }
     }
 
@@ -4406,6 +4520,16 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         terminated = lowerScopedBlock(*ci.stmts);
     }
     if (!terminated) emitImplicitReturn(fn);
+    // §22.16 (v0.203, #2053) Slice 4b: if the ensures epilogue was armed,
+    // finalize it now — populate the epilogue block (evaluating the clauses
+    // over the result temp + frame state) and emit the original ret. Any
+    // normal-completion path the body reached (explicit return, fall-through,
+    // expression-body completion) was redirected to the epilogue block by
+    // emitReturn; we emit the epilogue AFTER the body's terminator so the
+    // epilogue block is the last block in the function and the body's
+    // scope-end work (the §28.3 dispose registrations) was already collected
+    // during lowering.
+    finalizeEnsuresEpilogue();
     currentEnumMethod_ = savedEnumMethod;
 }
 
@@ -5188,6 +5312,14 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
                              cs->parent ? cs->parent->name
                                         : std::string_view{},
                              "constructor");
+        // §22.16 (v0.203, #2053) Slice 4b: arm the ensures single-exit
+        // epilogue for the ctor (return type is null — ctor's return is
+        // void, so no result temp). Finalized at body-end (below).
+        armEnsuresEpilogue(fn, cd->contractClauses,
+                           /*returnTypeNode=*/nullptr,
+                           cs->parent ? cs->parent->name
+                                      : std::string_view{},
+                           "constructor");
     }
 
     // CG16 (§12.8): a leading `base(...)`/`this(...)` chain call runs
@@ -5328,7 +5460,20 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
         emitOwnFieldInit(cs->parent, currentThis_, classStruct(cs->parent));
 
     bool terminated = lowerScopedBlock(cd->body, startIdx);
-    if (!terminated) builder_.CreateRetVoid();
+    // §22.16 (v0.203, #2053) Slice 4b: a ctor body that falls off its end is
+    // a normal-completion path — route it through the armed ensures epilogue
+    // (if any) so the postconditions evaluate before the implicit ret-void.
+    // finalizeEnsuresEpilogue (below) populates the epilogue and emits the
+    // final CreateRetVoid. If the epilogue is not armed, the original
+    // CreateRetVoid fires unchanged.
+    if (!terminated) {
+        if (ensuresFn_ && fn == ensuresFn_) {
+            builder_.CreateBr(ensuresExitBB_);
+        } else {
+            builder_.CreateRetVoid();
+        }
+    }
+    finalizeEnsuresEpilogue();
 }
 
 
@@ -6241,6 +6386,47 @@ const std::vector<sema::Symbol*>* Emitter::paramSymbolsOf(const ast::MethodDecl*
 
 
 bool Emitter::emitReturn(llvm::Function* fn, llvm::Value* v) {
+    // §22.16 (v0.203, #2053) Slice 4b: if the ensures epilogue is armed for
+    // THIS function, redirect the return into the result temp + a branch to
+    // the epilogue block (which evaluates the ensures clauses and then
+    // performs the actual ret). The `fn == ensuresFn_` check is load-bearing
+    // — it scopes the redirect to the function that owns the epilogue, so a
+    // nested lambda/accessor body (which sets its own currentFn_ and emits
+    // its own returns) does not accidentally route through the outer
+    // method's epilogue.
+    if (ensuresFn_ && fn == ensuresFn_) {
+        if (ensuresResultSlot_ && v) {
+            // Coerce v to the function's return type BEFORE storing, so the
+            // epilogue's reload sees a value of the right shape (matches the
+            // coercion emitReturn would apply on the direct-ret path).
+            llvm::Type* retTy = fn->getReturnType();
+            v = coerceThisRecordValue(v, retTy);
+            v = unwrapNarrowedNullable(v, retTy);
+            if (v && v->getType() != retTy &&
+                llvm::isa<llvm::StructType>(retTy)) {
+                if (auto* st = llvm::dyn_cast<llvm::StructType>(retTy)) {
+                    if (st->getNumElements() == 2 &&
+                        st->getElementType(0) == nullablePrimHasValTy()) {
+                        if (v->getType()->isPointerTy() &&
+                            llvm::isa<llvm::ConstantPointerNull>(v)) {
+                            v = llvm::ConstantAggregateZero::get(retTy);
+                        } else if (v->getType() == st->getElementType(1)) {
+                            llvm::Value* res = builder_.CreateInsertValue(
+                                llvm::UndefValue::get(retTy),
+                                llvm::ConstantInt::get(
+                                    nullablePrimHasValTy(), 1), {0u});
+                            v = builder_.CreateInsertValue(res, v, {1u});
+                        }
+                    }
+                }
+            }
+            if (emittingGenericTemplateBody_ && v && v->getType() != retTy)
+                v = llvm::Constant::getNullValue(retTy);
+            builder_.CreateStore(v, ensuresResultSlot_);
+        }
+        builder_.CreateBr(ensuresExitBB_);
+        return true;  // current block terminated by the branch
+    }
     if (fn->getReturnType()->isVoidTy()) builder_.CreateRetVoid();
     else {
         llvm::Type* retTy = fn->getReturnType();
@@ -6292,6 +6478,23 @@ bool Emitter::emitReturn(llvm::Function* fn, llvm::Value* v) {
 
 
 void Emitter::emitImplicitReturn(llvm::Function* fn) {
+    // §22.16 (v0.203, #2053) Slice 4b: a method falling off its end is a
+    // normal-completion path — route it through the armed ensures epilogue
+    // (if any) so the postconditions evaluate before the implicit return.
+    if (ensuresFn_ && fn == ensuresFn_) {
+        if (ensuresResultSlot_) {
+            // A value-returning method that fell through without `return
+            // expr;` is ill-typed (sema's bodyAlwaysExits rejects it); the
+            // null store below is a defensive fallback so the epilogue's
+            // reload sees a defined value rather than an uninitialised
+            // slot on the (already-diagnosed) error path.
+            builder_.CreateStore(
+                llvm::Constant::getNullValue(fn->getReturnType()),
+                ensuresResultSlot_);
+        }
+        builder_.CreateBr(ensuresExitBB_);
+        return;
+    }
     if (fn->getReturnType()->isVoidTy()) builder_.CreateRetVoid();
     else builder_.CreateRet(
         llvm::Constant::getNullValue(fn->getReturnType()));

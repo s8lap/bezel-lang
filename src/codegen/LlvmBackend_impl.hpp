@@ -383,6 +383,28 @@ private:
     // emitted, so a `return <value>` whose declared return type is
     // Object/interface boxes the value before returning.
     const ast::Type* currentReturnTypeNode_ = nullptr;
+    // §22.16 (v0.203, #2053) Slice 4b: the ensures single-exit epilogue state
+    // for the method/ctor currently being emitted. When `ensuresFn_` is
+    // non-null, `emitReturn(fn, v)` redirects the return into
+    // `ensuresResultSlot_` and branches to `ensuresExitBB_` instead of emitting
+    // `ret` directly; the epilogue block (emitted by `finalizeEnsuresEpilogue`
+    // at body-end) reloads the result temp, evaluates each `ensures` clause in
+    // declaration order, throws ContractViolationException on a false clause,
+    // and only then performs the original `ret`. `ensuresReturnTypeNode_`
+    // carries the declared return-type node so the epilogue can box/coerce
+    // the result temp exactly as emitReturn would have done. Restored to null
+    // when the body is complete and the epilogue has been emitted — so a
+    // nested lambda/accessor body (which swaps `currentFn_` and restores it
+    // on exit) sees `ensuresFn_ == nullptr` for ITS own returns, even while
+    // the outer method is still mid-emission. The save/restore pattern keeps
+    // the epilogue scoped to one body.
+    llvm::Function* ensuresFn_ = nullptr;
+    llvm::BasicBlock* ensuresExitBB_ = nullptr;
+    llvm::AllocaInst* ensuresResultSlot_ = nullptr;  // null for void return
+    const ast::Type* ensuresReturnTypeNode_ = nullptr;
+    const std::vector<ast::ContractClause>* ensuresClauses_ = nullptr;
+    std::string ensuresTypeName_;
+    std::string ensuresMemberName_;
     // CG9: the `this` pointer of the instance method currently being
     // emitted (null in static methods). Kept as a value, not a slot —
     // `this` is never reassignable.
@@ -3933,6 +3955,30 @@ private:
     void emitRequiresPrologue(
         const std::vector<ast::ContractClause>& clauses,
         std::string_view typeName, std::string_view memberName);
+
+    // §22.16 (v0.203, #2053) Slice 4b: arm the single-exit ensures epilogue
+    // for the body about to be emitted. Sets up `ensuresFn_` /
+    // `ensuresExitBB_` / `ensuresResultSlot_` so `emitReturn` redirects to
+    // the epilogue, and the epilogue evaluates each `ensures` clause in
+    // declaration order, throwing ContractViolationException on a false
+    // clause. Returns true iff the epilogue was armed (i.e. `clauses`
+    // contains at least one `ensures` clause). `returnTypeNode` is the
+    // declared return type (null for constructors / unit methods); it is
+    // carried so the epilogue can box/coerce the result temp exactly as the
+    // original return would have done.
+    bool armEnsuresEpilogue(
+        llvm::Function* fn, const std::vector<ast::ContractClause>& clauses,
+        const ast::Type* returnTypeNode,
+        std::string_view typeName, std::string_view memberName);
+
+    // §22.16 Slice 4b: emit the armed ensures epilogue at the current
+    // insertion point. The caller (emitFunctionBody / emitConstructorBody)
+    // arranges for the current block to be the epilogue's predecessor
+    // (either via emitReturn's redirect or via the body's fall-through into
+    // the epilogue). Reloads the result temp, evaluates each ensures clause,
+    // throws on failure, then performs the original return (ret value / ret
+    // void). Clears the armed state.
+    void finalizeEnsuresEpilogue();
 
     // CG20/CG40: throw `excVal` (or re-raise the enclosing catch arm's
     // exception when `excVal` is null and one is in flight): store it to
