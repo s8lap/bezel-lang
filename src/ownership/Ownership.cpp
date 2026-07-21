@@ -72,12 +72,19 @@ static bool bareReturnTypeMentionsParam(const ast::Type& t, std::string_view nam
 void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
          const std::vector<sema::Symbol*>* paramSyms, bool isAsync,
          bool isDestructor, const ast::Type* returnType, bool returnOwned,
-         bool isStatic, const GenericReturnContext* genericCtx) {
+         bool isStatic, const GenericReturnContext* genericCtx,
+         bool isGenericBody) {
     isAsync_ = isAsync;
     isDestructor_ = isDestructor;
     returnType_ = returnType;
     returnOwned_ = returnOwned;
     isStatic_ = isStatic;
+    // #2073 / §28.10: vacuous-pin lint gate. Suppress in generic bodies
+    // (type-parameter-dependent classification). Defaults false at every
+    // non-method entry point (ctor / dtor / operator) and at the
+    // expression-bodied branch, which carry their own typed-statement
+    // analyses but never reach handleLocalDecl's inert/vacuous-borrow branch.
+    isGenericBody_ = isGenericBody;
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): recognize a bare-T
     // return and classify its potential source set BEFORE any statement is
     // visited, so checkBareTypeParamReturn (called from handleReturn) sees a
@@ -3503,6 +3510,98 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
             }
         }
     }
+    // #2073 / §28.10 (v0.215): vacuous-pin lint. The `using var` keyword admits
+    // every RHS shape (§28.10: "safe to use uniformly in generic code … without
+    // inspecting the underlying type kind"), but two cases make the keyword
+    // strictly less expressive than `const` — the disposal is a no-op, or the
+    // pin extends nothing. Fire a WARNING at the declaration, never an error;
+    // steering, not rejection. Suppressed in generic bodies (the classification
+    // varies per instantiation, §28.10's reason for the uniform admissibility).
+    // // per §28.10, #2073
+    if (ld.isUsing && ld.initializer && !ld.initializerHasOwnedMarker &&
+        !isGenericBody_) {
+        // Case A: inert RHS. Value-typed or runtime-managed types carry no
+        // disposal obligation (§28.9), so the scope-end `Dispose()` a `using
+        // var` would call is a no-op; the only effect is the reassignment lock
+        // — exactly what `const x := …` states (§21.1, v0.201).
+        const sema::TypeRef* rhsTy = ctx_.exprType(*ld.initializer);
+        if (rhsTy && !isBorrowableType(rhsTy)) {
+            report(Severity::Warning, ld.span.begin,
+                std::string("`using var` `") + std::string(lsym->name) +
+                "` is vacuous — the RHS is a value-typed/runtime-managed "
+                "value with no disposal obligation (§28.9); use `const x := …;` "
+                "for a fixed alias without the disposal hint (§28.10 / §17.8)");
+        }
+        // Case B: vacuous borrow-pin. RHS classifies as a borrow and every
+        // source already outlives this scope (a borrow parameter, `this`, a
+        // static access, a field chain rooted in such). The pin extends
+        // nothing — the §28.10 rationale for a borrow-pin (§28.3's liveness
+        // rule) does not apply. Both conditions are checked by rhsIsVacuous-
+        // BorrowPin: wider-than-scope AND borrow (the unmarked-adoption of
+        // an owned binding is NOT a borrow, so it stays out of the classifier).
+        else if (rhsIsVacuousBorrowPin(*ld.initializer)) {
+            report(Severity::Warning, ld.span.begin,
+                std::string("`using var` `") + std::string(lsym->name) +
+                "` pins a source that already outlives this scope — for a "
+                "fixed alias, `const x := …;` states it without implying a "
+                "disposal obligation (§28.10 / §17.8)");
+        }
+    }
+}
+
+// #2073 / §28.10: vacuous-borrow-pin classifier. True when the RHS is a BORROW
+// source AND that source already outlives this scope — a borrow parameter,
+// `this`, a static access, or a field chain rooted in such. False for a
+// scope-local local source (the pin is load-bearing — it extends the local's
+// lifetime past its natural death, both for an owned binding and for a
+// borrow binding), and for the more complex shapes (call results,
+// expression-position `if`/`case` arms); those are left to a future
+// refinement. Conservative: returns false when the source cannot be
+// classified, so the lint stays quiet on any shape it cannot prove vacuous.
+// // per #2073, §28.10
+bool MethodOwnership::rhsIsVacuousBorrowPin(const ast::Expr& e) const {
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        // `this` — a receiver is a borrow whose lifetime is the object's,
+        // always wider than this scope.
+        if (id->name == "this") return true;
+        if (sema::Symbol* s = ctx_.exprSymbol(*id)) {
+            // Borrow parameter (no `owned` modifier): the parameter outlives
+            // every body-local scope, so the pin extends nothing. An
+            // `owned`-modified parameter is an OWNED TRANSFER (handled by the
+            // caller's marker filter and by markMovedByName); its using-var is
+            // Owned, not a borrow pin, so the wider-than-scope property does
+            // not imply vacuousness here.
+            if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(s))
+                return ps->modifier != "owned";
+            // A local is never wider-than-scope; even a borrow-local pin is
+            // load-bearing (it extends the local's lifetime past its natural
+            // death). Always false for a local — covers both an owned binding
+            // (state == Owned in states_) and a borrow binding (state ==
+            // Borrowed).
+        }
+        return false;
+    }
+    // Field chain: `target.member`. The chain is vacuous only if its ROOT is
+    // wider-than-scope — a parameter, `this`, or a static class name. Static
+    // access (`ClassName.field`) is the receiver-less case.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (!ma->target) return false;
+        // Static field access (`ClassName.field`): target resolves to a
+        // TypeSymbol — no narrower owner.
+        if (auto* tid =
+                dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+            if (sema::Symbol* s = ctx_.exprSymbol(*tid))
+                if (dynamic_cast<sema::TypeSymbol*>(s)) return true;
+        }
+        // Recursive chain: recurse on the target expression. `this.x.y.z`
+        // resolves through `this.x.y` to `this`, which returns true.
+        return rhsIsVacuousBorrowPin(*ma->target);
+    }
+    // CallExpr result, ConditionalExpr / CaseExpr arm set, IndexExpr slot,
+    // NewExpr fresh producer, and every other shape — leave to a future
+    // refinement (don't fire on an unclassified shape; the lint must stay
+    // quiet rather than wrong).
+    return false;
 }
 
 void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
@@ -6215,9 +6314,21 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
         }
         if (md->bodyKind == ast::MethodBodyKind::Block) {
             MethodOwnership mo(ctx);
+            // #2073 / §28.10: a method body is "generic" for lint purposes
+            // when EITHER the method declares its own `<T>` parameters OR the
+            // enclosing type is generic (`class C<T> method M(c: T) using var
+            // x := c`) — in both cases the classification varies per
+            // instantiation (§28.10's reason for the uniform admissibility of
+            // `using var`) so the vacuous-pin lint must be suppressed. The
+            // extension-block path (no `enclosingType`) is per-method only.
+            // // per §28.10, #2073
+            const bool isGenericBody =
+                !md->genericParams.empty() ||
+                (enclosingType && !enclosingType->genericParams.empty());
             mo.run(md->stmts, paramSymsOf(m, ctx), methodIsAsync(*md),
                    /*isDestructor=*/false, md->returnType.get(),
-                   md->returnOwned, methodIsStatic(*md), &genericCtx);
+                   md->returnOwned, methodIsStatic(*md), &genericCtx,
+                   isGenericBody);
         } else if (md->bodyKind == ast::MethodBodyKind::Expression &&
                    md->exprBody) {
             // §28.3 / §5.11 (#1007): an expression-bodied method `M(): T => E`

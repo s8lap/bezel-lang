@@ -143,7 +143,8 @@ public:
              bool isAsync = false, bool isDestructor = false,
              const ast::Type* returnType = nullptr, bool returnOwned = false,
              bool isStatic = false,
-             const GenericReturnContext* genericCtx = nullptr);
+             const GenericReturnContext* genericCtx = nullptr,
+             bool isGenericBody = false);
 
     // §28.3 / §5.11 (#1007): apply ONLY the borrow-returned-through-owning-type
     // check to an expression-bodied method `M(): T => exprBody` (which the full
@@ -235,6 +236,18 @@ public:
     // True when `e` is a temporary (not a named place — identifier / member
     // access / index slot — whose storage can outlive the construction).
     bool exprIsTemporary(const ast::Expr& e) const;
+    // #2073 / §28.10: vacuous-borrow-pin classification. True when `e` is a
+    // BORROW source whose root already outlives this scope — a borrow
+    // parameter, `this`, a static access, or a field chain rooted in such.
+    // The pin extends nothing (§28.10's borrow-pin rationale is the §28.3
+    // liveness rule, which doesn't apply when the source outlives the scope).
+    // False for a scope-local local source (the pin is load-bearing — it
+    // extends the local's lifetime past its natural death) and for the more
+    // complex shapes (call results, expression-position `if`/`case` arms);
+    // those are left to a future refinement. Conservative: returns false
+    // when the source cannot be classified, so the lint stays quiet on any
+    // shape it cannot prove vacuous. // per #2073, §28.10
+    bool rhsIsVacuousBorrowPin(const ast::Expr& e) const;
 
 private:
     sema::SemaContext& ctx_;
@@ -281,6 +294,16 @@ private:
     // Gates checkBareTypeParamReturn's callee-side admission. Computed once by
     // computeBareReturnContext. // per §28.3 v0.194
     bool returnIsBareTypeParam_ = false;
+    // #2073 / §28.10 (v0.215): true when this method's body is generic — the
+    // method itself declares type parameters, OR the method's enclosing type
+    // does (a non-generic method inside `class C<T>` is also generic-bodied).
+    // The vacuous-pin lint (the `using var` whose pin adds nothing) is
+    // suppressed in generic bodies because the classification varies per
+    // instantiation — a "value-typed" RHS whose substituted type is
+    // class-typed at one instantiation and value-typed at another must NOT
+    // be steered. Defaults false so a non-generic method is unaffected and
+    // existing callers do not need to thread the flag. // per §28.10, #2073
+    bool isGenericBody_ = false;
     // §28.3 (v0.194 S10; #1885): true when this method implements/overrides a
     // generic declaration whose return type is a bare type parameter, so its
     // return classification is inherited (callers dispatch through the generic
