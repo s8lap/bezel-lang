@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft (owner queue) — seven trivial-to-small additions, each verified absent and un-recorded; plus an examined-and-deferred register |
+| **Status** | superseded — graduated v0.215 (critique-gated). Graduation deltas from this draft, recorded: the upsert landed as `Counter<K>` (§4.20; unit-returning `Increment` — the count-returning form would draw §21.9 at the canonical loop; the viable constrained-extension alternative recorded), `DivRem` kept the out-shape and is non-`pure` (§22.15 forbids `out` on pure; no tuples exist), the `GetInt`/`GetBool` absent/malformed conflation is recorded as the convenience tier, the existing `Repeat`/`Pad` contracts were pinned first, JSON options parity extended to the array-span ctor, and the purity pass narrowed to non-comparing reads (`Contains` family stays impure — it runs user equality). |
 | **Origin** | The 2026-07-21 writer-seat dogfooding sweep: six programs written strictly against v0.214; every item below survived decline-aware verification. |
 | **Written against** | stdlib/spec v0.214 |
 

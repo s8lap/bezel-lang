@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.214 — July 2026**
+**Companion to the Bezel Language Specification, v0.215 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -111,6 +111,12 @@ public static class Math
 
   public static pure method Sqrt(x: double): double;
   public static pure method Pow(x: double, y: double): double;
+  public static method DivRem(a: int, b: int, out remainder: int): int;    // v0.215: returns the quotient;
+  public static method DivRem(a: long, b: long, out remainder: long): long; //   b = 0 raises DivideByZeroException
+                                                                            //   (§6.1, as `/`). Not `pure`: a pure
+                                                                            //   member declares no `out` (§22.15);
+                                                                            //   the tuple shape 0062 sketched does
+                                                                            //   not exist (no tuples).
   public static pure method Exp(x: double): double;
   public static pure method Log(x: double): double;       // natural log
   public static pure method Log(x: double, base_: double): double;
@@ -198,6 +204,12 @@ public static class Environment
                                                                     //   mutating it is a programming error (v0.195)
 
   public static method GetEnvironmentVariable(name: string): string?;
+  public static method GetInt(name: string): int?;    // v0.215 convenience tier: null when the variable is
+  public static method GetBool(name: string): bool?;  //   absent OR malformed — deliberately conflated
+                                                      //   (recorded): callers that must distinguish keep the
+                                                      //   two-step idiom (GetEnvironmentVariable + TryParse).
+                                                      //   GetBool accepts exactly Boolean.Parse's forms
+                                                      //   ("true"/"false", case-insensitive); "1"/"yes" are null.
   public static method SetEnvironmentVariable(name: string, value: string?);
       // value = null removes the variable; an empty name, or one containing "=",
       //   raises ArgumentException (v0.195)
@@ -782,6 +794,8 @@ public class JsonDeserializer: IDeserializer, IDisposable
                                                           //   borrowed identically for the deserializer's lifetime
   public constructor(input: string);                  // convenience
   public constructor(input: ReadOnlySpan<byte>, options: JsonOptions);
+  public constructor(input: ReadOnlyArraySpan<byte>, options: JsonOptions);  // v0.215: options parity
+  public constructor(input: string, options: JsonOptions);                   //   for every input form
   // IDeserializer surface (§2.14) implemented for JSON text.
 end JsonDeserializer;
 
@@ -1027,7 +1041,7 @@ public class StringBuilder
   public constructor(initial: string);
 
   public readonly property Length: int;
-  public readonly property Capacity: int;
+  public pure readonly property Capacity: int;
 
   public method Append(value: string): StringBuilder;
   public method Append(value: char): StringBuilder;
@@ -1191,7 +1205,7 @@ The naming convention (v0.168, #1372): borrowing collection types use their plai
 
 ```bezel
 public interface IReadOnlyCollection<out T>: IEnumerable<T>
-  readonly property Count: int;
+  pure readonly property Count: int;
 end IReadOnlyCollection;
 
 public interface IReadOnlyList<out T>: IReadOnlyCollection<T>
@@ -1347,8 +1361,8 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
   public constructor();
   public constructor(capacity: int);
 
-  public readonly property Count: int;
-  public readonly property Capacity: int;
+  public pure readonly property Count: int;
+  public pure readonly property Capacity: int;
 
   public property [i: int]: T
     get;                                     // borrow of slot
@@ -1521,11 +1535,11 @@ public class LinkedList<T>: ICollection<T>
   public constructor();
   public constructor(source: IEnumerable<T>);
 
-  public readonly property Count: int;
-  public readonly property FirstNode: LinkedListNode<T>?;
-  public readonly property LastNode: LinkedListNode<T>?;
-  public readonly property First: T?;
-  public readonly property Last: T?;
+  public pure readonly property Count: int;
+  public pure readonly property FirstNode: LinkedListNode<T>?;
+  public pure readonly property LastNode: LinkedListNode<T>?;
+  public pure readonly property First: T?;
+  public pure readonly property Last: T?;
 
   public method AddFirst(item: T): LinkedListNode<T>;
   public method AddLast(item: T): LinkedListNode<T>;
@@ -1561,11 +1575,11 @@ Owning doubly-linked list.
 public class OwningLinkedList<T>: IOwningCollection<T> where T: class
   public constructor();
 
-  public readonly property Count: int;
-  public readonly property FirstNode: LinkedListNode<T>?;       // borrow if non-null
-  public readonly property LastNode: LinkedListNode<T>?;
-  public readonly property First: T?;                           // borrow
-  public readonly property Last: T?;
+  public pure readonly property Count: int;
+  public pure readonly property FirstNode: LinkedListNode<T>?;       // borrow if non-null
+  public pure readonly property LastNode: LinkedListNode<T>?;
+  public pure readonly property First: T?;                           // borrow
+  public pure readonly property Last: T?;
 
   public method AddFirst(owned item: T): LinkedListNode<T>;
   public method AddLast(owned item: T): LinkedListNode<T>;
@@ -1609,7 +1623,7 @@ public class Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>
   public constructor(comparer: IEqualityComparer<K>);
   public constructor(capacity: int, comparer: IEqualityComparer<K>);
 
-  public readonly property Count: int;
+  public pure readonly property Count: int;
   public readonly property Keys: IReadOnlyCollection<K>;      // v0.165 (#1354): read-only views, matching §4.9
   public readonly property Values: IReadOnlyCollection<V>;
 
@@ -1653,7 +1667,7 @@ if not counts.ContainsKey(w) then counts[w] := 0; end;
 counts[w] += 1;
 ```
 
-(or `TryGetValue` plus an indexer-set). `GetOrAdd(key, factory)` is a *read* path, not an update path: it returns the stored value — a copy for value-typed `V` — so incrementing through its result mutates nothing. No single-lookup upsert member exists; the two-lookup idiom is the supported form.
+(or `TryGetValue` plus an indexer-set). `GetOrAdd(key, factory)` is a *read* path, not an update path: it returns the stored value — a copy for value-typed `V` — so incrementing through its result mutates nothing. No single-lookup upsert member exists on `Dictionary`; for **tallying**, `Counter<K>` ([§4.20](#sec-counterk)) is the dedicated form (v0.215), and the two-lookup idiom remains the supported form for general non-`int` accumulation.
 
 Iteration over a `Dictionary<K, V>` — `for var entry in dict do ... end` — yields `DictionaryEntry<K, V>` values (the element type of the `ICollection<DictionaryEntry<K, V>>` conformance), one per live entry in a single pass, in insertion order. `entry.Key` and `entry.Value` read the entry; for class-typed values, `entry.Value` is a *borrow* of the stored value — the dictionary retains ownership (the borrowing column of language spec [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy)). Removing a key and re-adding it places it at the end of the iteration order. `Clear()` resets the order. `Contains(key)` is an alias for `ContainsKey(key)`, enabling the `in` operator (language spec [§17.5](Bezel_Language_Spec.md#sec-the-in-operator)) to test key membership: `key in dict` is equivalent to `dict.ContainsKey(key)`.
 
@@ -1682,7 +1696,7 @@ public class OwningDictionary<K, V>: IDisposable where V: class
   public constructor(comparer: IEqualityComparer<K>);
   public constructor(capacity: int, comparer: IEqualityComparer<K>);
 
-  public readonly property Count: int;
+  public pure readonly property Count: int;
   public readonly property Keys: IReadOnlyCollection<K>;       // borrowing view
   public readonly property Values: IReadOnlyCollection<V>;     // borrowing view
 
@@ -1951,7 +1965,7 @@ public class Stack<T>: IReadOnlyCollection<T>   // v0.165 (#1354)
   public method Push(item: T);
   public method Contains(item: T): bool;        // explicit (v0.165; declaration restored v0.195)
   public method Pop(): T;             // raises if empty
-  public method Peek(): T;
+  public pure method Peek(): T;
   public method TryPop(out item: T?): bool;    // v0.171 (#1336)
   public method TryPeek(out item: T?): bool;
 end Stack;
@@ -1960,7 +1974,7 @@ public class OwningStack<T>: IOwningCollection<T> where T: class
   public constructor();
   public method Push(owned item: T);
   public method Pop(): owned T;                   // raises if empty; transfers out
-  public method Peek(): T;                         // borrow of top element
+  public pure method Peek(): T;                         // borrow of top element
   public method TryPop(out owned item: T?): bool;   // v0.171 (#1336)
   public method TryPeek(out item: T?): bool;       // out is borrow
   public method Clear();                           // disposes every element
@@ -1971,7 +1985,7 @@ public class Queue<T>: IReadOnlyCollection<T>   // v0.165 (#1354)
   public constructor();
   public method Enqueue(item: T);
   public method Dequeue(): T;
-  public method Peek(): T;
+  public pure method Peek(): T;
   public method Contains(item: T): bool;        // explicit (v0.165)
   public method TryDequeue(out item: T?): bool;   // v0.171 (#1336)
   public method TryPeek(out item: T?): bool;
@@ -1981,7 +1995,7 @@ public class OwningQueue<T>: IOwningCollection<T> where T: class
   public constructor();
   public method Enqueue(owned item: T);
   public method Dequeue(): owned T;
-  public method Peek(): T;                         // borrow of front element
+  public pure method Peek(): T;                         // borrow of front element
   public method TryDequeue(out owned item: T?): bool;   // v0.171 (#1336)
   public method TryPeek(out item: T?): bool;       // out is borrow
   public method Clear();                           // disposes every element
@@ -2740,7 +2754,7 @@ A comparison-ordered associative collection: iteration visits entries in ascendi
 public class SortedDictionary<K, V>: IReadOnlyCollection<DictionaryEntry<K, V>> where K: IComparable<K>   // conformance added v0.165 (#1354): makes for-in/LINQ legal per spec §29; explicit IDisposable dropped v0.195 (§1 convention — implicit, trivial-dispose)
   public constructor();
 
-  public readonly property Count: int;
+  public pure readonly property Count: int;
 
   public property [key: K]: V;                  // get: KeyNotFoundException if absent
                                                 // set: insert or replace
@@ -2750,8 +2764,8 @@ public class SortedDictionary<K, V>: IReadOnlyCollection<DictionaryEntry<K, V>> 
   public method Remove(key: K): bool;           // false if absent
   public method Clear();
 
-  public readonly property FirstKey: K;         // least key; InvalidOperationException if empty
-  public readonly property LastKey: K;          // greatest key; InvalidOperationException if empty
+  public pure readonly property FirstKey: K;         // least key; InvalidOperationException if empty
+  public pure readonly property LastKey: K;          // greatest key; InvalidOperationException if empty
 end SortedDictionary;
 ```
 
@@ -2768,7 +2782,7 @@ A comparison-ordered set: membership by `CompareTo`-equality, iteration in ascen
 public class SortedSet<T>: IReadOnlyCollection<T> where T: IComparable<T>   // conformance added v0.165 (#1354); explicit IDisposable dropped v0.195
   public constructor();
 
-  public readonly property Count: int;
+  public pure readonly property Count: int;
 
   public method Add(item: T);                   // v0.165 (#1354): unit-returning, matching §4.10's convention
   public method TryAdd(item: T): bool;          // false if an equal item is present
@@ -2776,8 +2790,8 @@ public class SortedSet<T>: IReadOnlyCollection<T> where T: IComparable<T>   // c
   public method Remove(item: T): bool;          // false if absent
   public method Clear();
 
-  public readonly property First: T;            // least; InvalidOperationException if empty
-  public readonly property Last: T;             // greatest; InvalidOperationException if empty
+  public pure readonly property First: T;            // least; InvalidOperationException if empty
+  public pure readonly property Last: T;             // greatest; InvalidOperationException if empty
 end SortedSet;
 ```
 
@@ -2874,6 +2888,40 @@ specifically; a frozen view family should be designed once, together with the fo
 first).
 
 ---
+
+
+<a id="sec-counterk"></a>
+### 4.20 `Counter<K>` (v0.215)
+
+A tally: distinct keys mapped to `int` counts. The first stdlib surface to state its key requirement with the `where K: hashable` constraint ([§14.2](Bezel_Language_Spec.md#sec-constraints), v0.214) — an inadmissible key diagnoses at the *user's* instantiation site. (Recorded: `Dictionary`/`Set` keep their §3.6-rule-2 structural checks — the two mechanisms decide identically, and re-spelling the existing containers is churn without payoff. Also recorded: a constrained-generic `extension Dictionary<K, V> where …` upsert was viable; the dedicated type was chosen for the tally-specific surface — `Total`, distinct-`Count`, creation-at-delta — not out of impossibility.)
+
+```bezel
+public class Counter<K> where K: hashable
+  public constructor();
+
+  public method Increment(key: K, delta: int := 1);   // absent key is created at `delta`
+  public method CountOf(key: K): int;                 // 0 when absent — not `pure`: compares
+                                                      //   via K's equality (§22.15's line;
+                                                      //   the same reason Contains is not pure)
+  public method ContainsKey(key: K): bool;            // distinguishes present-at-zero from absent
+  public method Remove(key: K): bool;
+  public method Clear();
+
+  public pure readonly property Count: int;           // distinct keys currently stored
+  public pure readonly property Total: int;           // sum of all counts (may be negative)
+end Counter;
+```
+
+`Counter<K>` implements `IEnumerable<DictionaryEntry<K, int>>`; iteration is **insertion-ordered**, exactly as `Dictionary` ([§4.8](#sec-dictionaryk-v)): `Increment` on an existing key updates in place and preserves its position. Negative `delta` is admitted; a key decremented to zero or below is **not** removed — it keeps its position, counts toward `Count`, and `CountOf` returns its (possibly zero or negative) value; only `Remove` deletes it. `CountOf` therefore returns `0` for both an absent key and a present-at-zero key — `ContainsKey` distinguishes them. Trivial-dispose; the key regime is `Dictionary`'s (class-typed keys are borrows).
+
+The counting idiom, replacing §4.8's two-lookup dance for tallies:
+
+```bezel
+using var tally := new Counter<string>();
+for var word in words do
+  tally.Increment(word);
+end;
+```
 
 <a id="sec-system-collections-linq"></a>
 ## 5. `System.Collections.Linq`
@@ -4477,7 +4525,11 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string> 
   public static method From(value: WString): string;                  // FFI-boundary, owned-instance source
   public static method FromCStringPointer(p: IntPtr): string;         // FFI-boundary, raw-pointer source
   public static method FromWStringPointer(p: IntPtr): string;         // FFI-boundary, raw-pointer source
-  public static pure method Repeat(c: char, count: int): string;
+  public static pure method Repeat(c: char, count: int): string;      // count < 0 raises
+                                                                      //   ArgumentOutOfRangeException; count = 0 is "" (v0.215, pinning
+                                                                      //   the previously-unstated contract)
+  public static pure method Repeat(unit: string, count: int): string; // v0.215: same count contract;
+                                                                      //   Repeat("", n) = ""
   public static method Join(separator: string, items: IEnumerable<string>): string;
 
   // Inspection
@@ -4489,6 +4541,10 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string> 
   public pure method EndsWith(value: string): bool;
   public pure method IndexOf(value: char): int;       // code-point index of first occurrence, or -1 (v0.195)
   public pure method IndexOf(value: string): int;     // -1 when absent; IndexOf("") = 0 (v0.195)
+  public pure method IndexOf(value: char, startIndex: int): int;    // v0.215: search from the code-point
+  public pure method IndexOf(value: string, startIndex: int): int;  //   index startIndex; 0 <= startIndex <= Length
+                                                                    //   (IndexOutOfRangeException otherwise);
+                                                                    //   IndexOf("", start) = start
   public pure method LastIndexOf(value: char): int;   // last occurrence, or -1
   public pure method LastIndexOf(value: string): int; // -1 when absent; LastIndexOf("") = Length (v0.195)
 
@@ -4516,6 +4572,14 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string> 
   public pure method PadLeft(totalWidth: int, paddingChar: char): string;
   public pure method PadRight(totalWidth: int): string;
   public pure method PadRight(totalWidth: int, paddingChar: char): string;
+  public pure method PadCenter(totalWidth: int): string;                    // v0.215
+  public pure method PadCenter(totalWidth: int, paddingChar: char): string; // v0.215
+                              // Pad contract (v0.215, pinning the previously-unstated rules for all
+                              // five Pad forms): totalWidth <= Length returns the original string
+                              // unchanged; totalWidth < 0 raises ArgumentOutOfRangeException.
+                              // PadCenter splits the padding evenly; when it is odd, the extra
+                              // character goes to the RIGHT: "ab".PadCenter(5) = " ab  ".
+
   public pure method Insert(startIndex: int, value: string): string;
   public pure method Remove(startIndex: int): string;
   public pure method Remove(startIndex: int, count: int): string;

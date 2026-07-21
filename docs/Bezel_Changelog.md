@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.214 — July 2026**
+**Companion to the Bezel Language Specification, v0.215 — July 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -6974,3 +6974,17 @@ Rationale §3.3 is rewritten as the recorded reversal it is: the #1373 ruling's 
 **Kernel classification (the v0.198 obligation):** no ownership rules touched (narrowing is the nullability system; the rest is surface/constraint machinery).
 
 **Migration.** Newly **accepted**: narrowed reads of nullable `readonly` fields (permissive); trailing commas in the seventeen previously-forbidding lists; `where T: hashable`. Newly **rejected**: `readonly` on body-bearing property forms (thirteen stdlib strips land atomically here; user migration is deletion). Impl trackers filed at this landing.
+
+### v0.215 changelog (v0.214 → v0.215)
+
+**Design changes, two trains (proposals 0062/0063 graduate, critique-gated), plus one v0.214 seam fix.**
+
+**Seam fix.** §14.2's "admitted set of this revision" sentence had not been updated when v0.214 added the `hashable` table row — the two statements contradicted. Fixed: the admitted set is `sendable`, `hashable`.
+
+**Train 1 — the stdlib ergonomics batch (0062).** New **§4.20 `Counter<K>`** — the tally type and the first stdlib user of `where K: hashable`: unit-returning `Increment(key, delta := 1)` (creation-at-delta; the returning-count variant was rejected at design time because the canonical loop would draw §21.9's warning), non-`pure` `CountOf` (it compares via `K`'s equality — the same line that keeps every `Contains` non-pure), `ContainsKey` (present-at-zero vs absent), insertion-ordered `DictionaryEntry<K, int>` iteration, no auto-remove at zero, `Total` may go negative; §4.8's counting note now routes tallies here. Recorded honestly: a constrained-generic extension upsert was viable — the dedicated type is a design choice, and `Dictionary`/`Set` keep their structural key checks. Plus: `string.IndexOf(char|string, startIndex)` (code-point index, `0 ≤ start ≤ Length`, `IndexOf("", start) = start`); `String.Repeat(unit: string, count)`; `String.PadCenter` (odd padding goes right: `"ab".PadCenter(5) = " ab  "`) — with the previously-unstated `Repeat`/`Pad` contracts pinned for the existing members (negative count/width fault; `totalWidth ≤ Length` returns the original); `JsonDeserializer` options-ctor parity for `string` and `ReadOnlyArraySpan<byte>` inputs; `Math.DivRem(a, b, out remainder)` for `int`/`long` (returns the quotient; not `pure` — §22.15 admits no `out` on pure members, and the tuple shape 0062 sketched does not exist; recorded); `Environment.GetInt`/`GetBool` (the convenience tier — absent and malformed deliberately conflate to `null`, recorded, the two-step idiom remaining the distinguishing form). **And the #2089 purity pass, corrected at critique**: `pure` lands on the *non-comparing* reads only — `Count` (including the `IReadOnlyCollection<out T>` slot, a **breaking-on-a-slot** purity addition per §2.8.6 forcing every conformer, acceptable at zero users and permanently forbidding caching `Count` implementations), `Capacity`, `Peek`, `First`/`Last`/`FirstNode`/`LastNode`, `FirstKey`/`LastKey` — twenty-six sites. `Contains`/`ContainsKey` stay non-`pure` everywhere, deliberately: they invoke user `Equals`/`GetHashCode`/comparers, which purity does not require of the equality contract; the library's own precedent (`Array.Contains` was never pure) is now the stated rule rather than an accident.
+
+**Train 2 — the fluent-receiver discard exemption (0063, sharpened at graduation).** §21.9's warning now exempts a discarded **method-call** result that is a borrow sourced within the statement's receiver chain **and** of the receiver's static type — the `return this` fluent shape (`sb.Append(x);`), chained calls included. Both conditions are load-bearing (the type test keeps same-source *queries* warned; the method-call scope keeps accessor reads out), the base-typed-fluent case stays conservatively warned, `_ :=` remains, and owned results keep the full regime. The proposal's original source-set-only test was found over-broad at graduation and the sharpening is recorded in the proposal.
+
+**Kernel classification (the v0.198 obligation):** no ownership rules touched — Train 2 consumes the existing K1.5 classification for a diagnostic; Train 1 is stdlib surface.
+
+**Migration.** Newly accepted: everything in Train 1 (additive), the exempted fluent discards (a warning disappears). Newly required: `pure` on every `Count` conformance (stdlib-internal; zero external users). #2089 closes at this landing; impl trackers filed.

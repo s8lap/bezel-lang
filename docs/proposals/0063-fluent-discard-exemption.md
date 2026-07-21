@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft (owner queue) |
+| **Status** | superseded — graduated v0.215, sharpened: the landed rule adds two conditions the draft lacked — the result's static type must equal the receiver's (else same-source *queries* like `FirstOrNull()` would be silenced), and the exemption covers method-call results only (not accessor reads). Base-typed fluent returns stay conservatively warned. |
 | **Origin** | 2026-07-21 writer-seat sweep: the single highest-*frequency* language-level friction found. `StringBuilder`'s fluent API returns `StringBuilder` from every `Append`/`AppendLine` (stdlib §3.1), so the canonical `sb.Append(x);` statement draws §21.9's discarded-result warning at every call site; the sanctioned remedies (`_ := sb.Append(x);` everywhere, or a unit-returning wrapper) are ceremony against the stdlib's own idiom. |
 | **Written against** | spec v0.214 |
 
