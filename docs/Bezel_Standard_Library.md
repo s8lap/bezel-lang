@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.211 — July 2026**
+**Companion to the Bezel Language Specification, v0.212 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -3639,6 +3639,39 @@ end ProcessAll;
 The `using var f := owned file;` shape on entry to the body — the `owned` marker is the v0.180 binding-position transfer spelling (language spec [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows); unmarked, the binding would only borrow-pin) — is the canonical way to discharge the iteration variable, exactly as for synchronous owned-element iteration (language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for)).
 
 The async-iterator form is preferable when the consumer processes each result before requesting the next; `WhenAllOwned` is preferable when the consumer needs all results at once.
+
+#### `WhenEach`: streaming fan-in (v0.212, graduated from proposal 0023)
+
+Where `WhenAll` collects every result before returning, `WhenEach` streams each task **as it completes** — the as-completed loop that otherwise requires a hand-built merge channel:
+
+```bezel
+// No-result form.
+public static method WhenEach(tasks: Array<Task>): IAsyncEnumerable<Task>;
+
+// Value-typed, string, or runtime-managed result (Pattern A). Each element is an
+// already-completed Task<T>; await it to observe the result or re-raise its fault.
+public static method WhenEach<T>(tasks: Array<Task<T>>): IAsyncEnumerable<Task<T>>;
+
+// Owning form for class T (Pattern B). Takes ownership of the array and every
+// task in it; yields each completed OwningTask<T> as an owned iteration variable.
+public static method WhenEachOwned<T>(
+    owned tasks: OwningArray<OwningTask<T>>
+): IOwningAsyncEnumerable<OwningTask<T>> where T: class;
+```
+
+- **Completion order.** The first element yielded is whichever task completed first; ties break in unspecified order. An empty input produces an enumerator that completes immediately.
+- **Faulted and cancelled tasks are yielded, not skipped**: the fault or `OperationCanceledException` surfaces when the caller awaits the yielded element — the caller decides per task, unlike `WhenAll`'s first-fault re-raise.
+- **Observer, not owner.** `WhenEach` borrows its input: the returned iterable is a deferred-activation frame carrying the array's borrow (spec §28.3, v0.179 carriage), so the compiler holds the array alive for the frame's bound; enumeration neither cancels nor settles the tasks. `WhenEachOwned` is the ownership-transferring dual: tasks not consumed before enumeration ends are disposed by the enumerator. Supervision (fault ⇒ cancel siblings) remains `TaskScope`'s job (§6.10; rationale §12.12) — `WhenEach` only reports.
+- **Building the borrowed input.** Under spec §28.3's calls-mint rule a fresh `GetXAsync(…)` result is an *owned* task, and a borrowing `Array<Task<T>>` slot takes no ownership — so `tasks.Add(GetXAsync(url))` abandons the freshly-minted task at end of statement (the #1813 seam, shared with `WhenAll`'s input). Build the borrowed array over **named** task bindings (`var t1 := GetXAsync(a); … var tasks: Array<Task<string>> := [t1, t2];`), or use the owning forms (`WhenEachOwned`, `WhenAllOwned`) for dynamically-sized fan-in — the input-side redesign for the borrowing family remains tracked at #1813.
+- **Single consumption (affine).** Both returned sequences follow spec §29.11: a second `GetAsyncEnumerator` raises `InvalidOperationException`. The `CancellationToken` accepted by `GetAsyncEnumerator(token)` (the standard §30.7 shape) fires at `await MoveNextAsync()` boundaries and stops **enumeration only** — the tasks keep running and remain the caller's to settle.
+
+```bezel
+await for var t in Task.WhenEachOwned(owned tasks) do   // t: owned OwningTask<Report>
+  using var report := await t;                          // Pattern B: result transfers
+  Publish(report);
+end;
+```
+
 
 <a id="sec-domain"></a>
 ### 6.8 `Domain`

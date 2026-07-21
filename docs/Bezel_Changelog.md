@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.211 — July 2026**
+**Companion to the Bezel Language Specification, v0.212 — July 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -6940,3 +6940,13 @@ Rationale §3.3 is rewritten as the recorded reversal it is: the #1373 ruling's 
 **Rationale §12.12 — choosing the concurrency shape.** The structured-by-default doctrine and the fault fork stated once with adjacency: `WhenAll` collects and never cancels laggards; `TaskScope` supervises and cancels siblings; `WhenAny` selects and settles nothing; `FireAndForget` is the visible abandonment; `Domain.Spawn` is an isolation boundary, not a combinator. Every sentence restates an existing rule; the entry adds the map.
 
 **Migration.** None — teaching material only.
+
+### v0.212 changelog (v0.211 → v0.212)
+
+**Design change — `Task.WhenEach` graduates (proposal 0023, accepted 2026-07-07, owner-confirmed 2026-07-21).** Stdlib §6.7 gains the streaming fan-in family: `WhenEach(Array<Task>)`, `WhenEach<T>(Array<Task<T>>)` (Pattern A — elements are already-completed borrowed tasks, delivered in completion order), and `WhenEachOwned<T>(owned OwningArray<OwningTask<T>>): IOwningAsyncEnumerable<OwningTask<T>>` (Pattern B — ownership transfers; unconsumed tasks disposed by the enumerator). The D1–D7 rulings land as drafted: completion-order delivery; faulted/cancelled tasks yielded, not skipped (per-task decisions, unlike `WhenAll`'s first-fault re-raise); observer-not-owner (the returned iterable is a deferred-activation frame carrying the input array's borrow — compiler-tracked, not a programmer promise); token cancellation stops enumeration only; both sequences affine per §29.11. Rationale §12.12's concurrency map gains the combinator.
+
+**The #1813 input seam is documented, not resolved.** v0.190's calls-mint makes the dynamic borrowed-input idiom (`tasks.Add(GetXAsync(url))`) an abandonment — a seam `WhenEach` *shares with the shipped `WhenAll`*. The stdlib text states the discipline (named-binding builds for the borrowing forms; owning forms for dynamic fan-in) and cites #1813, which stays open as the joint input-side redesign for the borrowing family.
+
+**Kernel classification (the v0.198 obligation):** no ownership rule changes — the frame-carriage classification of the returned iterable is the existing v0.179/v0.196 machinery; the owned-parameter and drain semantics are K3/K6 verbatim.
+
+**Migration.** Purely additive stdlib surface; impl tracker filed at this landing.

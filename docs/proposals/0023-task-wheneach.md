@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
+| **Status** | superseded — graduated v0.212 (owner-accepted 2026-07-21 in-session; D1–D7 as drafted) |
 | **Tracking issue** | [#1450](https://github.com/s8lap/bezel-lang/issues/1450) |
 | **Target module(s)** | `System.Threading` (stdlib §6) — added as new members on the `Task` static class (§6.7) |
 | **Written against** | spec **v0.177**; stdlib companion v0.165 |

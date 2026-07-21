@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.211 — July 2026**
+**Companion to the Bezel Language Specification, v0.212 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -1491,7 +1491,7 @@ The mechanisms are settled individually — `TaskScope` (stdlib §6.10), `Task.W
 
 **The fault fork is the real chooser.** `WhenAll` *collects*: it awaits every task and re-raises the first non-success — it never cancels or abandons the laggards (§30.10's aggregation contract). `TaskScope` *supervises*: a child's fault cancels the siblings through the scope token, and `Join` surfaces the failure after quiescence. So: results-of-independent-work → `WhenAll` (all work is wanted regardless of failures); a unit of work whose parts stand or fall together → `TaskScope`. `WhenAny` is a selector, not a supervisor — the losers keep running and remain the caller's to settle. `FireAndForget` is the recorded abandon-with-supervision spelling for work whose result nobody will read (§17.13 routes the `Task` discard here precisely so abandonment is always a visible decision). `Domain.Spawn` is not a concurrency combinator at all — it is an isolation boundary (§12.5), chosen for state separation, with sendability doing the checking.
 
-Why this is a rationale entry rather than new normative text: every sentence above restates a rule the spec already carries; what was missing was the adjacency. (The streaming as-completed combinator, `Task.WhenEach`, joins the map at its graduation — proposal 0023.)
+Why this is a rationale entry rather than new normative text: every sentence above restates a rule the spec already carries; what was missing was the adjacency. (The streaming as-completed combinator is `Task.WhenEach` — stdlib §6.7, graduated from proposal 0023 at v0.212: it *reports* completions in order without supervising or settling anything, the observer complement to `TaskScope`.)
 
 <a id="sec-events"></a>
 ## 13. Events
