@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.208 — July 2026**
+**Version 0.209 — July 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -3816,6 +3816,8 @@ Each arm has the form `pattern => body`. An arm body has three possible shapes:
 - **A single statement** (e.g. `=> _x := y;`, `=> return;`, `=> throw new ArgumentException("nope");`). Valid in *statement-position* `case` only. The statement's terminating `;` ends the arm body, and the arm separator `,` follows. This is the convenient form for the common one-line arm body that is a statement rather than an expression.
 - **A `do … end` block** of statements. Has type `()` and produces no value, so it is valid in statement-position `case` only. Use this when the arm body needs multiple statements.
 
+In an expression-position `case`, an arm result may be the **marked transfer** `owned x` ([§28.3](#sec-producers), K3.4; v0.209): the named binding is consumed on the path where that arm is selected, and is per-path consumed after the construct ([K7.4](#sec-kernel-k7)). An arm result marking the *scrutinee's own binding* is always rejected by the consume-site freeze — the scrutinee borrow is live through the selected arm's completion ([K8.3](#sec-kernel-k8), [§28.3](#sec-consume-site-freeze)); transfer after the construct instead.
+
 Multi-statement logic in *expression-position* arms is extracted into a helper method or local lambda — both produce values, and the extraction makes the arm's intent visible at its declaration site:
 
 ```bezel
@@ -4016,7 +4018,7 @@ The `if` expression selects between values, condition-first, as a parenthesized,
 
 The parentheses are part of the form: in atom-start position, `(` followed by the reserved `if` — which begins no other expression — commits the reading at the second token, and the matching `)` closes the atom; there is no `end`. In call- and index-argument position the leading `(` is the argument list's own, so the atom supplies its pair — `f((if c then a else b))`. The reserved `then`, `elif`, and `else` separate the segments; the `else` branch is mandatory (an expression produces a value on every path); and each condition and branch is a **full expression** with no precedence restriction — in particular, a `throw` branch is admitted in *any* branch position.
 
-Both branches must have a common type. **The common type (v0.159, codifying the implemented rule):** the common type of branch types A and B is whichever of the two the other implicitly converts into — identical types trivially; [§5.1](#sec-implicit-conversions) widening (including constant narrowing); non-nullable `T` into `T?`; a subtype into its base class or implemented interface (a [§5.1](#sec-reference-conversions) reference conversion). If neither converts into the other, the expression is a compile error directing to an explicit conversion or upcast — there is **no** sibling-class least-upper-bound search (deliberately unlike the nearest-common-base rule of [§31.2.1](#sec-arm-patterns), which applies only to multi-type catch bindings). A `throw` branch is bottom-typed ([§17.12](#sec-the-throw-expression)) and imposes no constraint. Conditions are evaluated in textual order; the first `true` condition selects its branch, the `else` branch is selected when none holds, and only the selected branch is evaluated. When the branches are class-typed, the expression's **ownership** is the arm-meet of [§28.3](#sec-producers)'s producers table (v0.184): owned arms meet to owned, borrowed arms to borrowed with unioned source constraints, mixed arms are rejected, and a named owned binding written as a branch is a borrow arm.
+Both branches must have a common type. **The common type (v0.159, codifying the implemented rule):** the common type of branch types A and B is whichever of the two the other implicitly converts into — identical types trivially; [§5.1](#sec-implicit-conversions) widening (including constant narrowing); non-nullable `T` into `T?`; a subtype into its base class or implemented interface (a [§5.1](#sec-reference-conversions) reference conversion). If neither converts into the other, the expression is a compile error directing to an explicit conversion or upcast — there is **no** sibling-class least-upper-bound search (deliberately unlike the nearest-common-base rule of [§31.2.1](#sec-arm-patterns), which applies only to multi-type catch bindings). A `throw` branch is bottom-typed ([§17.12](#sec-the-throw-expression)) and imposes no constraint. Conditions are evaluated in textual order; the first `true` condition selects its branch, the `else` branch is selected when none holds, and only the selected branch is evaluated. When the branches are class-typed, the expression's **ownership** is the arm-meet of [§28.3](#sec-producers)'s producers table (v0.184): owned arms meet to owned, borrowed arms to borrowed with unioned source constraints, mixed arms are rejected; an *unmarked* read of a named owned binding written as a branch is a borrow arm, and the **marked** branch `owned x` — `x` a local binding or `owned` parameter — transfers, consuming on the path where its branch is selected and leaving the binding per-path consumed after the construct ([§28.3](#sec-producers), [K7.4](#sec-kernel-k7); v0.209): `var best := (if fresh.Score() > cached.Score() then owned fresh else owned cached);`.
 
 ```bezel
 var max := (if a > b then a else b);
@@ -6099,7 +6101,7 @@ The taxonomy defines what a source *is* and how it bounds a borrow; which source
 1. store into an `owned` field or owning-collection slot, including through a `set(owned)` accessor ([§23.3](#sec-block-form-properties));
 2. `return` under an `owned` return type, or — non-`async` bodies — under an unmarked `Task`-family return type (v0.190);
 3. an `owned` argument under the call-site marker ([§22.3](#sec-parameter-modifiers));
-4. a marked binding or assignment transfer — `var y := owned x;`, `y := owned x;`, `using var y := owned x;` (v0.180) — and (v0.200) the marked owning-match scrutinee `case owned x of …` ([§35.5](#sec-owning-match));
+4. a marked binding or assignment transfer — `var y := owned x;`, `y := owned x;`, `using var y := owned x;` (v0.180) — (v0.200) the marked owning-match scrutinee `case owned x of …` ([§35.5](#sec-owning-match)) — and (v0.209) the **marked arm transfer**: `owned x` as an if-expression branch or an expression-`case` arm result ([§20](#sec-the-if-expression), [§19.2](#sec-arms)), consuming on the path where its arm is selected;
 5. the operand of a Pattern B `await` ([§30.5](#sec-result-lifetime-and-task-disposal));
 6. the owned parameter-or-plain-local source of a Pattern A chaining `return await` ([§30.5](#sec-result-lifetime-and-task-disposal), v0.184);
 7. the operand of `yield return` in an owning iterator ([§29.2](#sec-iterator-yield-ownership), v0.184);
@@ -6193,7 +6195,7 @@ Thirteen axioms (and one tombstone). Each is a rule the kernel cannot derive —
 | A4 | Accessor read faces are lend-only: property and indexer *types* carry no `owned`, and a getter may not return a fresh owned value; `set(owned)` is the announced write face (K3.1) | [§28.6](#sec-leak-prevention), [§23](#sec-properties-and-indexers) | Signature predictability: every accessor read classifies as a borrow with no marker position available; factories are methods. |
 | A5 | `using var` is a scope pin: non-reassignable, never movable out | [§28.10](#sec-using-var); rationale §5.23 | Declared-intent form; scope-pinning is its entire meaning (kept strict deliberately at the affine transition). |
 | A6 | `Task`/`Task<T>` may not be discarded; `Task.FireAndForget` is the routed spelling | [§17.13](#sec-the-discard-_); rationale §5.23 | Semantic, not memory: abandoning a running operation is a decision, not a disposal. |
-| A7 | No transfer marker exists in arm or operand position: a named owned binding as a `??`/`if`/`case` arm, or as an operator operand, is a borrow arm | [§28.3](#sec-producers), [§22.3](#sec-parameter-modifiers) | Recorded liftable bound; keeps no-silent-consume (K3.13) uniform until a marker spelling is designed. |
+| A7 | No transfer marker exists in `??`-operand or operator-operand position: a named owned binding there is a borrow arm. (Narrowed v0.209: the if-/case-arm half was lifted into a K3.4 derivation — proposal 0056; the `??` lift is gated on the null-evaluated-transfer ruling that proposal records.) | [§28.3](#sec-producers), [§22.3](#sec-parameter-modifiers) | Recorded liftable bound, narrowed; keeps no-silent-consume (K3.13) uniform where no marker spelling exists. |
 | A8 | The transit exception: element borrows read from a *borrowing-family* collection may be explicitly disposed, keyed on the source's static type | [§28.6](#sec-leak-prevention); rationale §5.3/§5.1 | The element's true owner is structurally unknowable; the caller-vouched escape hatch (manual form of `DisposeElements()`), backstopped per K4.1. |
 | A9 | The two collection families: borrowing by default, owning as separately named types | [§28.11](#sec-collection-element-ownership); rationale §5.3 | The recorded v0.97 resolution; the declined merged-generic form is rationale §5.3/§5.11's record. |
 | A10 | Stdlib certification grants: `CancellationToken`'s source-outlives-settlement certification; the legacy completion-source admission | [§30.1](#sec-async-methods), [§30.8](#sec-cancellation), [§30.11](#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet) | A named allowlist of trust granted to specific stdlib types — by construction not derivable; each entry normatively stated at its type. |
@@ -6244,6 +6246,8 @@ end;
 // x reaches an owned slot, is disposed, or auto-drops at scope end (§28.3).
 ```
 
+*(v0.209.)* Where one branch is a **named owned binding**, the marked arm transfer ([K3.4](#sec-kernel-k3)) writes the same equalization as one expression: `var x := (if useFresh then new Stream() else owned cached);` — both arms owned, `cached` consumed only on the selected path and per-path consumed after the construct ([K7.4](#sec-kernel-k7)).
+
 Equalizing to borrowed (Pattern 1) does not merely require both branches to *be* borrows — it requires each branch's borrow source to outlive the merge point ([K2.1](#sec-kernel-k2)). Binding `x` in one branch to a borrow of a `using var` that is discharged at that branch's end does **not** equalize the merge: it produces a borrow whose source is already gone by the time `x` is read after the `if`, and the borrow-lifetime rule rejects it exactly as it rejects any other use of a borrow past its source's scope. The `using var` in such a branch must complete its own work and be discharged *within* the branch; `x` must take its post-merge value from a source that lives past the `if` (as `primary` and `otherSource` do above).
 
 <a id="sec-producers"></a>
@@ -6276,7 +6280,7 @@ The ownership state of an expression is determined by the expression form — th
 | Function call producing a move-only value type (an owning inline array `[N owned]T?` or `[N owned]T`, or an owning-classified choice — [§35.4](#sec-choice-classification), including a case construction) | Owned. The result is a move-only value ([§15.3](#sec-move-only-value-types)); the caller takes ownership and must discharge by binding into a local (auto-disposed at scope end via the move-only-local rule), into an owning-inline-array slot, into a class field of move-only type, or — for a choice — by a consuming match ([§35.5](#sec-owning-match)). |
 | `x as T` | Borrowed (source: same as `x`'s source if `x` is borrowed; `x` itself if `x` is owned). The cast does not move from `x`; `x` retains its ownership state. The result is nullable. See [§17.4](#sec-the-is-is-not-and-as-operators) for the rationale. |
 | `a ?? b` (null-coalescing, [§7.7](#sec-null-coalescing-and-=)) | The **meet** of the ownership states of `a` and `b` per [K7](#sec-kernel-k7) — the same two-branch merge as the control-flow join above (v0.180): owned ⊓ owned = **owned** (exactly one of the two owned values is produced at runtime and is discharged once — no leak, no double-free), borrowed ⊓ borrowed = **borrowed** carrying the union of both arms' source sets, and a mixed owned/borrowed arm pair is **rejected** — equalize the arms first ([§28.3](#sec-local-variables-ownership-and-borrows) two-branch patterns). A **named owned binding** written as an arm is an *unmarked read* and therefore a **borrow** arm, per the local-variable-read row above (axiom A7 — there is no arm-position transfer marker in this revision; recorded, liftable): `a ?? b` over two named owned locals is a borrowed ⊓ borrowed merge and consumes neither binding; to coalesce two named owned bindings into one owned result, equalize explicitly — `if a <> null then r := owned a; else r := owned b; end;` — which keeps the no-silent-consume rule of *Move semantics* uniform. A `null`-literal or bottom-typed (`throw`) arm absorbs to the other arm's state (K7.5), legitimizing the `x ?? throw …` shape ([§17.12](#sec-the-throw-expression)). The compound form `a ??= b` assigns into `a` and follows the same meet rule for the assigned-into location. |
-| `(if c then v1 else v2)` ([§20](#sec-the-if-expression)); the result of an expression-position `case`/`when` ([§19.1](#sec-forms), [§19.2](#sec-arms)) | The **meet** of the arms' ownership states, identically to the `a ?? b` row above ([K7](#sec-kernel-k7) at expression joins; v0.184): owned ⊓ owned = **owned** — exactly one arm's value is produced at runtime and is discharged once; borrowed ⊓ borrowed = **borrowed**, carrying the union of the arms' source sets; a mixed owned/borrowed arm set is **rejected** — equalize the arms. A **named owned binding** written as an arm is an unmarked read and therefore a **borrow** arm (axiom A7 — the same recorded, liftable bound as `??`); a `throw` arm is bottom-typed and a `null`-literal arm absorbs to the other arms' state (K7.5; [§17.12](#sec-the-throw-expression)). For `case`/`when` the meet ranges over every arm's result expression. |
+| `(if c then v1 else v2)` ([§20](#sec-the-if-expression)); the result of an expression-position `case`/`when` ([§19.1](#sec-forms), [§19.2](#sec-arms)) | The **meet** of the arms' ownership states, identically to the `a ?? b` row above ([K7](#sec-kernel-k7) at expression joins; v0.184): owned ⊓ owned = **owned** — exactly one arm's value is produced at runtime and is discharged once; borrowed ⊓ borrowed = **borrowed**, carrying the union of the arms' source sets; a mixed owned/borrowed arm set is **rejected** — equalize the arms. An **unmarked** read of a named owned binding written as an arm is a **borrow** arm (K3.13 — no silent consume); the **marked arm** `owned x` — admitted in if-expression branches and expression-`case` arm results (v0.209) — is an **owned** producer, a [K3.4](#sec-kernel-k3) transfer consuming on the path where its arm is selected, the binding joining per [K7.4](#sec-kernel-k7) after the construct (in `??`-operand position no marker exists — axiom A7); a `throw` arm is bottom-typed and a `null`-literal arm absorbs to the other arms' state (K7.5; [§17.12](#sec-the-throw-expression)). For `case`/`when` the meet ranges over every arm's result expression. |
 | Captured borrow inside a closure | Borrowed (source: same as the captured local's source). The closure value itself is runtime-managed; the captured borrow's lifetime is tracked separately. |
 | Captured owned local inside a closure | Borrowed (source: the local's enclosing scope). Capturing does not transfer ownership; the closure cannot outlive the local's scope. See [§28.9](#sec-runtime-managed-types). |
 
@@ -6286,7 +6290,7 @@ The **borrow-consuming positions** — `x` retains ownership, and the value is b
 
 - a non-`owned` argument;
 - an indexer or property access;
-- an arm of a null-coalescing expression (`a ?? b` — the table's `??` row then sees a borrow arm) or of an `if` expression or expression-position `case`/`when` (the table's arm-meet row likewise sees a borrow arm, v0.184);
+- an operand of a null-coalescing expression (`a ?? b` — the table's `??` row then sees a borrow arm; no marker exists in that position, axiom [A7](#sec-axiom-register)), or an **unmarked** if-expression branch or expression-`case` arm result (the arm-meet row sees a borrow arm, v0.184; the *marked* form `owned x` in those two positions is instead the K3.4 arm transfer, v0.209);
 - the operand of a `yield return` in a borrowing iterator (a re-borrow, source the binding itself — [§29.2](#sec-iterator-yield-ownership), v0.184);
 - an **unmarked** local binding or assignment RHS — `var y := x;`, `y := x;`: a plain alias binding is a borrow of `x`, source `x` itself (v0.180);
 - for move-only locals, a borrow of the value through indexing or equality comparison.
@@ -6965,7 +6969,7 @@ end ProcessFile;
 
 Disposal happens on every exit path: normal completion, `break`, `return`, or exception. **Cleanup ordering is uniform across exit edges (v0.182):** `using var` compiles to `try`/`finally` ([§29.6](#sec-restrictions-inside-try-catch-finally)), so `using var` disposals and explicit `finally` clauses form one establishment-ordered stack — on *every* exit edge (normal, `return`, `break`/`continue`, exception, and an iterator's early disposal, [§29.7](#sec-disposal-of-partially-consumed-iterators)), pending cleanups run in reverse order of establishment. No edge runs the two kinds in separate category-ordered phases.
 
-An expression whose arm-meet is **owned** — a `??`, an `if` expression, or an expression-position `case`/`when` over owned producers (the [K7](#sec-kernel-k7) meet; [§28.3](#sec-producers), v0.184) — is an owned producer for this section's admission: `using var x := (if useFresh then new Buffer() else source.CloneBuffer());` — where `CloneBuffer` is declared `CloneBuffer(): owned Buffer`, making both arms fresh producers — binds `x` owned and disposes it at scope end. (An arm that reads a *named* owned binding is a borrow arm per the producers table; the whole expression is then a borrow, and the `using var` is a borrow-pin, not an owned binding.)
+An expression whose arm-meet is **owned** — a `??`, an `if` expression, or an expression-position `case`/`when` over owned producers (the [K7](#sec-kernel-k7) meet; [§28.3](#sec-producers), v0.184) — is an owned producer for this section's admission: `using var x := (if useFresh then new Buffer() else source.CloneBuffer());` — where `CloneBuffer` is declared `CloneBuffer(): owned Buffer`, making both arms fresh producers — binds `x` owned and disposes it at scope end. (An arm that is an *unmarked* read of a named owned binding is a borrow arm per the producers table — the whole expression is then a borrow and the `using var` a borrow-pin; a **marked** arm `owned cached` is an owned arm, v0.209.)
 
 `using var` is a scope pin (axiom [A5](#sec-axiom-register)): it is implicitly non-reassignable, and reassigning a `using var` variable is a compile error. To use a different resource later in the method, introduce a new `do ... end` block.
 
@@ -10438,18 +10442,19 @@ WhenStmt        ::= "when" WhenArm ("," WhenArm)* ","? "end" "when"? ";"
                                  arm. The `owned` scrutinee marker rule is
                                  §35.5's, identical to the atom's. */
 
-LocalDecl       ::= "var" Identifier (":" Type)? (":=" "owned"? Expression)? ";"
-                  | "using" "var" Identifier (":" Type)? ":=" "owned"? Expression ";"
-                  | "await" "using" "var" Identifier (":" Type)? ":=" "owned"? Expression ";"
+LocalDecl       ::= "var" Identifier (":" Type)? (":=" Expression)? ";"
+                  | "using" "var" Identifier (":" Type)? ":=" Expression ";"
+                  | "await" "using" "var" Identifier (":" Type)? ":=" Expression ";"
                               /* The `await using var` form is admitted by the
                                  grammar at any LocalDecl position; it is
                                  valid only inside `async` methods and `async`
                                  lambdas, enforced semantically (§28.12,
-                                 Appendix C.6). The optional "owned" after ":="
-                                 (v0.180, §28.3) is the binding-position
-                                 transfer marker: valid only when the RHS is a
-                                 read of a named owned binding; rejected on
-                                 borrows and fresh producers semantically. A
+                                 Appendix C.6). The v0.180 binding-position
+                                 transfer marker is the MarkedTransfer atom
+                                 (A.7, v0.209) at RHS root: `var y := owned x;`
+                                 is the atom as the entire RHS, with identical
+                                 meaning; admission is positional, enforced
+                                 semantically (§28.3). A
                                  LocalDecl with neither a type ascription nor an
                                  initializer is rejected semantically (nothing
                                  determines the type; typed uninitialized locals
@@ -10463,12 +10468,12 @@ LocalConstDecl  ::= "const" Identifier (":" Type)? ":=" ConstExpr ";"
                                  remains Expression, restricted semantically. */
                                 /* local const; no visibility or static modifier */
 
-AssignmentStmt  ::= LValue AssignOp "owned"? Expression ";"
-                              /* The optional "owned" (v0.180, §28.3) is the
-                                 assignment-position transfer marker: valid only
-                                 with ":=" and only when the RHS is a read of a
-                                 named owned binding; rejected elsewhere
-                                 semantically. */
+AssignmentStmt  ::= LValue AssignOp Expression ";"
+                              /* The v0.180 assignment-position transfer marker
+                                 is the MarkedTransfer atom (A.7, v0.209) at RHS
+                                 root: `y := owned x;`. Valid only with ":=";
+                                 admission is positional, enforced semantically
+                                 (§28.3). */
 AssignOp        ::= ":=" | "+=" | "-=" | "*=" | "/=" | "&=" | "|=" | "^="
                   | "<<=" | ">>=" | "??="
 LValue          ::= Identifier | "this"
@@ -10674,6 +10679,7 @@ PrimaryAtom     ::= Literal
                   | IfExpr
                   | CaseExpr
                   | WhenExpr
+                  | MarkedTransfer
                   | "this" | "base"
                   | NameOfExpr | TypeOfExpr | DefaultExpr
                   | CollectionLiteral
@@ -10721,6 +10727,23 @@ LambdaSlot      ::= Identifier | "_" | LambdaDestructure
 LambdaBody      ::= Expression
                   | "do" Statement* "end"
 
+MarkedTransfer  ::= "owned" Identifier
+                              /* The K3.4 transfer marker as an expression atom
+                                 (v0.209). `owned` is reserved and begins no
+                                 other expression, so the form is additive.
+                                 Admission is positional, enforced semantically
+                                 (§28.3): the entire RHS of a binding or
+                                 assignment (the v0.180 forms), an if-expression
+                                 branch, or an expression-`case` arm result.
+                                 Everywhere else — `??` operands, operator
+                                 operands, guards, argument subexpressions —
+                                 it is a compile error naming axiom A7's
+                                 narrowed bound. The Identifier names a local
+                                 binding or `owned` parameter; field paths use
+                                 `move x.f` (§28.8.1). The call-site argument
+                                 marker (ArgModifiers) and the `case owned x of`
+                                 scrutinee marker are separate productions,
+                                 unchanged. */
 IfExpr          ::= "(" "if" Expression "then" Expression
                     ("elif" Expression "then" Expression)*
                     "else" Expression ")"

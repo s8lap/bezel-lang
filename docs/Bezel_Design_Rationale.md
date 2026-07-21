@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.208 — July 2026**
+**Companion to the Bezel Language Specification, v0.209 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -818,7 +818,7 @@ Spec §28.3 opens with the ownership kernel — nine principles, K1–K9, from w
 - **A4 (accessor faces are lend-only)** — signature predictability: an accessor read has no marker position, so admitting owned production through a getter would make ownership invisible at every property read; factories are methods, where the `owned` return announces. (Recorded here; spec §23/§28.6 state the rule.)
 - **A5 (`using var` is a scope pin)** — [§5.23](#sec-the-affine-model): the form's entire meaning is declared intent plus scope-pinning; movability was deliberately kept out at the affine transition so that the two declaration forms keep distinct intents.
 - **A6 (`Task` discard rejection)** — [§5.23](#sec-the-affine-model) and [§3.2](#sec-the-discard-_): abandoning a running operation is a semantic decision, not a disposal; the routed spelling (`Task.FireAndForget`) keeps the decision visible.
-- **A7 (no arm/operand transfer marker)** — a recorded liftable bound: no marker spelling exists in arm or operand position, and inventing one is a syntax design of its own; until then, no-silent-consume stays uniform by reading named owned bindings in those positions as borrows.
+- **A7 (no `??`-operand/operator-operand transfer marker; narrowed v0.209)** — the register's liftable bound, half-lifted as designed: proposal 0056 supplied the arm spelling (`owned x` in if-expression branches and expression-`case` arm results — a K3.4 derivation riding K7.4's existing per-path machinery, no new axiom), and the row narrowed to the positions still unspelled. The `??`-operand lift is gated on a genuinely new ruling 0056 records (the post-state of a marked nullable binding evaluated while null); operator operands remain unmotivated. No-silent-consume stays uniform where no marker exists.
 - **A8 (the transit exception)** — [§5.3](#sec-collections-do-not-own-their-elements) (v0.184 note) and [§5.1](#sec-owned-not-borrows): element borrows from a borrowing-family collection are the one place a value's true owner is structurally unknowable, so per-element disposal is caller-vouched — the manual form of `DisposeElements()`, backstopped by checked disposal.
 - **A9 (the two collection families)** — [§5.3](#sec-collections-do-not-own-their-elements)/[§5.11](#sec-owned-element-collections): the v0.97 resolution after the `<owned T>` merged form (v0.88–v0.96) collapsed under its substitution machinery.
 - **A10 (stdlib certification grants)** — a named allowlist of trust granted to specific stdlib types (`CancellationToken`'s source-outlives-settlement certification; the legacy completion-source admission): by construction not derivable — the grant is the stdlib vouching for its own implementation — and acceptable only because the list is closed, named, and normatively stated at each type.
