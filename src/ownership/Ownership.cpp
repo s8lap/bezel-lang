@@ -3539,7 +3539,7 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
                 std::string("`using var` `") + std::string(lsym->name) +
                 "` is vacuous — the RHS is a value-typed/runtime-managed "
                 "value with no disposal obligation (§28.9); use `const x := …;` "
-                "for a fixed alias without the disposal hint (§28.10 / §17.8)");
+                "for a fixed alias without the disposal hint (§28.10 / §21.1)");
         }
         // Case B: vacuous borrow-pin. RHS classifies as a borrow and every
         // source already outlives this scope (a borrow parameter, `this`, a
@@ -3553,7 +3553,7 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
                 std::string("`using var` `") + std::string(lsym->name) +
                 "` pins a source that already outlives this scope — for a "
                 "fixed alias, `const x := …;` states it without implying a "
-                "disposal obligation (§28.10 / §17.8)");
+                "disposal obligation (§28.10 / §21.1)");
         }
     }
 }
@@ -3626,13 +3626,20 @@ bool MethodOwnership::rhsIsVacuousBorrowPin(const ast::Expr& e) const {
 // the inert-RHS check would over-fire on every disposable-typed `using var`
 // binding. The disposable built-in set mirrors the stdlib's runtime-disposal
 // contract surface (Channel/EventSource/TaskScope/CancellationTokenSource/
-// Mutex/Semaphore/Lock/Shared/Weak/Owning*/Task/OwningTask family, etc.) —
-// all of these types have destructors or interface inheritance from
-// `IDisposable`/`IAsyncDisposable` that the runtime actually invokes.
-// Interfaces with user TypeDecls (IEvent<T>, IAsyncEvent<T>, the
-// IOwningEnumerable<T> family, IEnumerable<T>, IAsyncEnumerable<T>, …) are
-// already covered by isBorrowableType's interface branch (returns true) and
-// never reach this exclusion. // per §28.10, #2073 (rework 2)
+// Mutex/Semaphore/Lock/Shared/Weak/Owning*/Task/OwningTask family, plus the
+// §2.15 concrete serializers/deserializers BinarySerializer/
+// BinaryDeserializer/JsonSerializer/JsonDeserializer) — all of these types
+// have destructors or interface inheritance from `IDisposable`/
+// `IAsyncDisposable` that the runtime actually invokes. Borrowing-family
+// collections (`Array<T>`/`Stack<T>`/`Queue<T>`/`Set<T>`/`LinkedList<T>`/
+// `Dictionary<K,V>`) are deliberately EXCLUDED: per §28.11 their `Dispose()`
+// is a no-op (trivial-dispose), so a `using var` over `new Array<int>()` is
+// the vacuous pattern the lint exists to steer away from — the §21.1 const
+// alias is the correct spelling. Interfaces with user TypeDecls (IEvent<T>,
+// IAsyncEvent<T>, the IOwningEnumerable<T> family, IEnumerable<T>,
+// IAsyncEnumerable<T>, …) are already covered by isBorrowableType's
+// interface branch (returns true) and never reach this exclusion.
+// // per §28.10, §28.11, #2073 (rework 3c)
 bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
     if (!rt) return false;
     if (rt->kind != sema::TypeRef::Kind::Named) return false;
@@ -3661,6 +3668,15 @@ bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
     if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
         return false;
     std::string_view head = rt->headName();
+    // §2.15 concrete serializers/deserializers: each explicitly implements
+    // IDisposable and owns parser or output-buffer state (the §2.15 spec
+    // example uses `using var s := new JsonSerializer();`), so a `using var`
+    // over `new BinarySerializer()` / `new JsonDeserializer()` is the
+    // canonical pattern — not vacuous. Added per §28.10 / §28.11 in #2073
+    // (rework 3b).
+    if (head == "BinarySerializer" || head == "BinaryDeserializer" ||
+        head == "JsonSerializer"   || head == "JsonDeserializer")
+        return true;
     return head == "Channel" || head == "ChannelSender" ||
            head == "EventSource" || head == "AsyncEventSource" ||
            head == "Subscription" || head == "TaskScope" ||

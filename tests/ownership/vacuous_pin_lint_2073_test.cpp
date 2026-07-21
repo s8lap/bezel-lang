@@ -454,4 +454,490 @@ BEZEL_TEST(vacuous_pin_lint_2073,
     BEZEL_EXPECT_EQ(countInertRhsWarnings(r, "s"), 1);
 }
 
+// ============================================================================
+// rework 3c — direct negative-control coverage for EVERY retained head in
+// `rhsIsDisposableClassType` (#2073). Each test below exercises one head: a
+// `using var x := new <Head>()`, asserting the inert-RHS warning does NOT
+// fire and the borrow-pin warning does NOT fire. The heads without public
+// constructors (`Subscription`, `SemaphoreToken`, `Lock`, `OwningTask`,
+// `BinaryDeserializer`, `JsonDeserializer`) are tested via the public API
+// that produces them — the head is the static type of the `using var`'s
+// RHS, which is what `rhsIsDisposableClassType` keys on.
+// // per §28.10 / §28.11, #2073 (rework 3c)
+// ============================================================================
+
+// AsyncEventSource<T> — §6.5 / #1536 canonical pattern (async variant of
+// EventSource). Destructor severs the subscriber list before reclamation.
+BEZEL_TEST(vacuous_pin_lint_2073,
+           async_event_source_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; import System.Serialization; "
+        "class C "
+        "  public method M(): int "
+        "    using var src := new AsyncEventSource<int>(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "src"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "src"));
+}
+
+// Subscription — no public constructor; obtained from `EventSource.Subscribe`
+// (or analogous register-and-unregister APIs, §2.11 stdlib). The
+// `using var` over the returned `Subscription` IS the canonical pattern.
+// // per §28.10 / §2.11, #2073 (rework 3c)
+BEZEL_TEST(vacuous_pin_lint_2073,
+           subscription_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; import System.Serialization; "
+        "class C "
+        "  public method M(): int "
+        "    using var src := new EventSource<int>(); "
+        "    using var sub := src.Subscribe((x) => do return (); end); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "sub"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "sub"));
+}
+
+// TaskScope — §6.10 / #1990 (IAsyncDisposable; `await using` only — the
+// sync `using var` form is rejected at the binding site, §6.10 v0.175). The
+// load-bearing assertion is that the binding does NOT also fire the
+// inert-RHS warning: `TaskScope` is on the disposable-built-in list and the
+// `rhsIsDisposableClassType` exclusion fires before any §6.10 complaint.
+// // per §28.10 / §6.10, #2073 (rework 3c)
+BEZEL_TEST(vacuous_pin_lint_2073,
+           task_scope_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public async method M(): Task<int> "
+        "    await using var scope := new TaskScope(); "
+        "    await scope.Join(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "scope"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "scope"));
+}
+
+// CancellationTokenSource — §6.1 (auto-imported via System).
+BEZEL_TEST(vacuous_pin_lint_2073,
+           cancellation_token_source_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public method M(): int "
+        "    using var cts := new CancellationTokenSource(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "cts"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "cts"));
+}
+
+// Mutex — §6.2 (synchronized primitive; `Shared`-payload sendable set).
+BEZEL_TEST(vacuous_pin_lint_2073,
+           mutex_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public method M(): int "
+        "    using var m := new Mutex(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "m"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "m"));
+}
+
+// Semaphore — §6.2 (synchronized primitive; constructor requires
+// `initialCount: int`). The Mutex/Semaphore heads are listed alongside the
+// §6.2 synchronized primitives — both have non-trivial `Dispose` (release
+// internal native handle).
+BEZEL_TEST(vacuous_pin_lint_2073,
+           semaphore_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public method M(): int "
+        "    using var sem := new Semaphore(1); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "sem"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "sem"));
+}
+
+// SemaphoreToken — no public constructor; obtained from Semaphore.Acquire.
+// The `using var` over the returned token IS the canonical §6.2 pattern.
+// // per §28.10 / §6.2, #2073 (rework 3c)
+BEZEL_TEST(vacuous_pin_lint_2073,
+           semaphore_token_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public method M(): int "
+        "    using var sem := new Semaphore(1); "
+        "    using var tok := sem.Acquire(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "tok"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "tok"));
+}
+
+// Lock — no public constructor; obtained from Mutex.Acquire (the §6.2
+// canonical pattern). The `using var` over the held lock is the documented
+// canonical pattern in the §6.2 example.
+// // per §28.10 / §6.2, #2073 (rework 3c)
+BEZEL_TEST(vacuous_pin_lint_2073,
+           lock_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public method M(): int "
+        "    using var m := new Mutex(); "
+        "    using var guard := m.Acquire(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "guard"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "guard"));
+}
+
+// Shared<T> — §2.16 / §28.13 (scoped shared ownership; `IDisposable`,
+// last-disposer-wins). The constructor consumes an owned value; uses a
+// user-defined class so the disposal is observable in the test surface.
+BEZEL_TEST(vacuous_pin_lint_2073,
+           shared_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Cell public constructor() end constructor; "
+        "destructor end destructor; end Cell; "
+        "class C "
+        "  public method M(): int "
+        "    using var cell := new Shared<Cell>(new Cell()); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "cell"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "cell"));
+}
+
+// Weak<T> — §2.16 (no public constructor; obtained from `Shared.Downgrade()`).
+// The `using var` over the `Weak` observer releases the weak handle at
+// scope end; the underlying value is unaffected.
+// // per §28.10 / §2.16, #2073 (rework 3c)
+BEZEL_TEST(vacuous_pin_lint_2073,
+           weak_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Cell public constructor() end constructor; "
+        "destructor end destructor; end Cell; "
+        "class C "
+        "  public method M(): int "
+        "    using var sh := new Shared<Cell>(new Cell()); "
+        "    using var w := sh.Downgrade(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "w"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "w"));
+}
+
+// OwningDictionary<K, V> — §4.9 (Dispose cascades over values). The
+// `where V: class` constraint requires a class-typed value; use a user class
+// so the disposal cascade is observable.
+BEZEL_TEST(vacuous_pin_lint_2073,
+           owning_dictionary_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Cell public constructor() end constructor; "
+        "destructor end destructor; end Cell; "
+        "class C "
+        "  public method M(): int "
+        "    using var d := new OwningDictionary<string, Cell>(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "d"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "d"));
+}
+
+// OwningSet<T> — §4.10 (Dispose cascades over elements).
+BEZEL_TEST(vacuous_pin_lint_2073,
+           owning_set_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Cell public constructor() end constructor; "
+        "destructor end destructor; end Cell; "
+        "class C "
+        "  public method M(): int "
+        "    using var s := new OwningSet<Cell>(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "s"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "s"));
+}
+
+// OwningStack<T> — §4.11 (Dispose cascades over elements).
+BEZEL_TEST(vacuous_pin_lint_2073,
+           owning_stack_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Cell public constructor() end constructor; "
+        "destructor end destructor; end Cell; "
+        "class C "
+        "  public method M(): int "
+        "    using var stk := new OwningStack<Cell>(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "stk"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "stk"));
+}
+
+// OwningQueue<T> — §4.12 (Dispose cascades over elements).
+BEZEL_TEST(vacuous_pin_lint_2073,
+           owning_queue_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Cell public constructor() end constructor; "
+        "destructor end destructor; end Cell; "
+        "class C "
+        "  public method M(): int "
+        "    using var q := new OwningQueue<Cell>(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "q"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "q"));
+}
+
+// OwningLinkedList<T> — §4.7 (Dispose cascades over nodes/elements).
+BEZEL_TEST(vacuous_pin_lint_2073,
+           owning_linked_list_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Cell public constructor() end constructor; "
+        "destructor end destructor; end Cell; "
+        "class C "
+        "  public method M(): int "
+        "    using var list := new OwningLinkedList<Cell>(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "list"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "list"));
+}
+
+// OwningBuffer<T> — §4.14 (the storage primitive over which resizable
+// owning collections compose; class-T form disposes each non-null slot).
+BEZEL_TEST(vacuous_pin_lint_2073,
+           owning_buffer_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Cell public constructor() end constructor; "
+        "destructor end destructor; end Cell; "
+        "class C "
+        "  public method M(): int "
+        "    using var buf := new OwningBuffer<Cell>(4); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "buf"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "buf"));
+}
+
+// TaskCompletionSource (non-generic, void-completion form) — §6.6.
+BEZEL_TEST(vacuous_pin_lint_2073,
+           task_completion_source_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public method M(): int "
+        "    using var tcs := new TaskCompletionSource(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "tcs"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "tcs"));
+}
+
+// OwningTask — §6.6 negative control.
+BEZEL_TEST(vacuous_pin_lint_2073, owning_task_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership("module M; class C public method M(): int using var t := OwningTask.FromResult<int>(42); return 0; end M; public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "t"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "t"));
+}
+
+// OwningTaskCompletionSource<T> — §6.6 (class-T form: Pattern B task).
+BEZEL_TEST(vacuous_pin_lint_2073,
+           owning_task_completion_source_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Cell public constructor() end constructor; "
+        "destructor end destructor; end Cell; "
+        "class C "
+        "  public method M(): int "
+        "    using var tcs := new OwningTaskCompletionSource<Cell>(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "tcs"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "tcs"));
+}
+
+// BinarySerializer — §2.15 concrete format (implements IDisposable, owns
+// internal growable byte buffer). The §2.15 docstring example uses exactly
+// this `using var s := new BinarySerializer();` pattern. Note: the type
+// lives in `System.Serialization` (NOT auto-imported); the in-process
+// helper has no module loader, so the type-resolution diagnostic is
+// tolerated. The load-bearing assertion is the inert-RHS warning is NOT
+// emitted — `rhsIsDisposableClassType` recognizes the head from
+// `headName()` (which is the unparsed textual name), so the head-name
+// exclusion fires before any type resolution would fail.
+// // per §28.10 / §2.15, #2073 (rework 3c)
+BEZEL_TEST(vacuous_pin_lint_2073,
+           binary_serializer_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; import System.Serialization; "
+        "class C "
+        "  public method M(): int "
+        "    using var bs := new BinarySerializer(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "bs"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "bs"));
+}
+
+// JsonSerializer — §2.15 (mirror of BinarySerializer).
+BEZEL_TEST(vacuous_pin_lint_2073,
+           json_serializer_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; import System.Serialization; "
+        "class C "
+        "  public method M(): int "
+        "    using var js := new JsonSerializer(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "js"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "js"));
+}
+
+// BinaryDeserializer — §2.15 (constructor takes a `ReadOnlySpan<byte>`;
+// using `new BinaryDeserializer(<span>)` mirrors the §2.15 docstring
+// example for `LoadPoint`). Tolerated: type-resolution diagnostic from the
+// un-imported serializer module; load-bearing: the inert-RHS warning is
+// NOT emitted.
+// // per §28.10 / §2.15, #2073 (rework 3c)
+BEZEL_TEST(vacuous_pin_lint_2073,
+           binary_deserializer_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public method M(): int "
+        "    using var buf := new OwningBuffer<byte>(1); "
+        "    using var d := new BinaryDeserializer(buf.AsReadOnlySpan()); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "d"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "d"));
+}
+
+// JsonDeserializer — §2.15 (mirror of BinaryDeserializer; constructor takes
+// a `ReadOnlySpan<byte>` input — same `AsReadOnlySpan()` plumbing).
+// // per §28.10 / §2.15, #2073 (rework 3c)
+BEZEL_TEST(vacuous_pin_lint_2073,
+           json_deserializer_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public method M(): int "
+        "    using var buf := new OwningBuffer<byte>(1); "
+        "    using var d := new JsonDeserializer(buf.AsReadOnlySpan()); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "d"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "d"));
+}
+
+// ============================================================================
+// rework 3c — positive controls for the borrowing-collection TRIVIAL-DISPOSE
+// carve-out. Per §28.11 (v0.215) the borrowing family (Array/Stack/Queue/Set/
+// SortedSet/Dictionary/SortedDictionary/LinkedList) has a no-op `Dispose()`,
+// so a `using var` over `new Array<int>()` etc. is genuinely vacuous — the
+// §21.1 `const` alias is the correct spelling. These tests pin the
+// §28.10/§28.11 narrowing of the disposable-types list: a future rework
+// that adds borrowing collections to `rhsIsDisposableClassType` (a regression
+// to the pre-v0.215 surface) would silence these inert warnings, breaking
+// the test — making the carve-out structural, not just commented.
+// // per §28.10 / §28.11 / §21.1, #2073 (rework 3c)
+// ============================================================================
+BEZEL_TEST(vacuous_pin_lint_2073,
+           borrowing_collections_inert_rhs_warns_spec_28_11) {
+    const char* cases[] = {
+        "Array<int>", "Stack<int>", "Queue<int>", "Set<int>",
+        "SortedSet<int>", "Dictionary<string, int>",
+        "SortedDictionary<string, int>", "LinkedList<int>"};
+    const char* names[] = {"a", "s", "q", "set", "sorted", "dict",
+                           "sortedDict", "list"};
+    for (std::size_t i = 0; i < std::size(cases); ++i) {
+        std::string source =
+            std::string("module M; class C public method M(): int using var ") +
+            names[i] + " := new " + cases[i] + "(); return 0; end M; "
+            "public static method Main(): int return 0; end Main; end C;";
+        auto r = parseAndCheckOwnership(source);
+        BEZEL_EXPECT_TRUE(hasInertRhsWarning(r, names[i]));
+    }
+}
+
 }  // namespace

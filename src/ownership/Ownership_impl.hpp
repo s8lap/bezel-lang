@@ -236,37 +236,8 @@ public:
     // True when `e` is a temporary (not a named place — identifier / member
     // access / index slot — whose storage can outlive the construction).
     bool exprIsTemporary(const ast::Expr& e) const;
-    // #2073 / §28.10: vacuous-borrow-pin classification. True when `e` is a
-    // BORROW source whose root already outlives this scope — a borrow
-    // parameter, `this`, a static access, or a field chain rooted in such.
-    // The pin extends nothing (§28.10's borrow-pin rationale is the §28.3
-    // liveness rule, which doesn't apply when the source outlives the scope).
-    // False for a scope-local local source (the pin is load-bearing — it
-    // extends the local's lifetime past its natural death) and for the more
-    // complex shapes (call results, expression-position `if`/`case` arms);
-    // those are left to a future refinement. Conservative: returns false
-    // when the source cannot be classified, so the lint stays quiet on any
-    // shape it cannot prove vacuous. // per #2073, §28.10
     bool rhsIsVacuousBorrowPin(const ast::Expr& e) const;
-    // #2073 rework 2 / §28.10: disposable-type classification. True when
-    // `rt` is a class/interface that carries a real disposal obligation — a
-    // non-trivial-dispose USER class (has a destructor or `owned` field
-    // anywhere in its base chain, §28.9), or a compiler-known built-in
-    // class/interface that the runtime disposes (Channel, ChannelSender,
-    // EventSource, AsyncEventSource, Subscription, TaskScope,
-    // CancellationTokenSource, Mutex, Semaphore, SemaphoreToken, Lock,
-    // OwningTask, Task, Shared, Weak, OwningArray, OwningDictionary,
-    // OwningSet, OwningStack, OwningQueue, OwningLinkedList, OwningBuffer,
-    // TaskCompletionSource, OwningTaskCompletionSource). A `using var` over
-    // a disposable type is the CORRECT canonical pattern (§28.10) — the
-    // scope-end `Dispose()` runs real cleanup logic, not a no-op. Used to
-    // suppress the vacuous-pin lint's inert-RHS branch: isBorrowableType
-    // returns false for these built-in class types (they have no user
-    // TypeDecl, so the named-class branch falls through to the
-    // not-a-builtin-exception path and reports false), so without this
-    // exclusion the inert-RHS check would over-fire on every
-    // disposable-typed `using var` binding. // per §28.10, #2073 (rework 2)
-    static bool rhsIsDisposableClassType(const sema::TypeRef* rt);
+    bool rhsIsDisposableClassType(const sema::TypeRef* rt);
 
 private:
     sema::SemaContext& ctx_;
@@ -275,6 +246,7 @@ private:
     // Gates the at-await-site Pattern A/B checks and the SuspendLocal
     // annotation so they never affect a synchronous body. // per §30.5
     bool isAsync_ = false;
+    bool isGenericBody_ = false;
     // §28.8.1 (#763): true while analysing a DESTRUCTOR body. Inside a
     // destructor the field-restoration rule does NOT require reassigning a
     // moved-from owned field — the object is being torn down and no future read
@@ -313,16 +285,6 @@ private:
     // Gates checkBareTypeParamReturn's callee-side admission. Computed once by
     // computeBareReturnContext. // per §28.3 v0.194
     bool returnIsBareTypeParam_ = false;
-    // #2073 / §28.10 (v0.215): true when this method's body is generic — the
-    // method itself declares type parameters, OR the method's enclosing type
-    // does (a non-generic method inside `class C<T>` is also generic-bodied).
-    // The vacuous-pin lint (the `using var` whose pin adds nothing) is
-    // suppressed in generic bodies because the classification varies per
-    // instantiation — a "value-typed" RHS whose substituted type is
-    // class-typed at one instantiation and value-typed at another must NOT
-    // be steered. Defaults false so a non-generic method is unaffected and
-    // existing callers do not need to thread the flag. // per §28.10, #2073
-    bool isGenericBody_ = false;
     // §28.3 (v0.194 S10; #1885): true when this method implements/overrides a
     // generic declaration whose return type is a bare type parameter, so its
     // return classification is inherited (callers dispatch through the generic
