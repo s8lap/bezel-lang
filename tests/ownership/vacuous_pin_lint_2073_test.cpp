@@ -278,4 +278,180 @@ BEZEL_TEST(vacuous_pin_lint_2073,
     BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "x"));
 }
 
+// Negative control (rework 2, 2026-07-22) — `using var` over a disposable
+// class type is the CORRECT canonical pattern (§28.10), not vacuous: the
+// scope-end `Dispose()` runs real cleanup logic. The original implementation
+// keyed only on `isBorrowableType`, which returns false for built-in class
+// heads (Channel, EventSource, OwningArray, …) because they have no user
+// TypeDecl — so the named-class branch falls through to the
+// not-a-builtin-exception path and reports false. Without the rework-2
+// exclusion the inert-RHS check over-fires on every disposable-typed
+// `using var` binding (the #600 Channel/EventSource/etc. acceptance tests
+// and the #1595 `using var t := F.Work(p)` Task-family pattern). FAILS WITHOUT
+// THE REWORK. // per §28.10 #2073 (rework 2)
+
+// `using var` over a fresh Channel<T> — the §6.9 / #600 canonical pattern.
+BEZEL_TEST(vacuous_pin_lint_2073,
+           channel_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "record Report(Name: string) end Report; "
+        "class C "
+        "  public method M(): int "
+        "    using var ch := new Channel<Report>(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "ch"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "ch"));
+}
+
+// `using var` over a ChannelSender<T> (the §6.9 send endpoint).
+BEZEL_TEST(vacuous_pin_lint_2073,
+           channel_sender_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "record Report(Name: string) end Report; "
+        "class C "
+        "  public method M(): int "
+        "    using var inbox := new Channel<Report>(); "
+        "    using var sender := inbox.NewSender(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "inbox"));
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "sender"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "sender"));
+}
+
+// `using var` over a fresh EventSource<T> — the §6.5 / #1536 canonical
+// pattern (destructor severs the subscriber list before reclamation,
+// §28.14 quiescence).
+BEZEL_TEST(vacuous_pin_lint_2073,
+           event_source_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public method M(): int "
+        "    using var src := new EventSource<int>(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "src"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "src"));
+}
+
+// `using var inbox := ch;` where `ch` is a `using var`-bound Channel local
+// (the borrow-pin classifier returns false for locals — the pin extends
+// the local's lifetime, which IS load-bearing for an owned local — and
+// the inert-RHS branch must also not fire because `Channel<Report>` is a
+// disposable class). // per §28.10 #2073 (rework 2)
+BEZEL_TEST(vacuous_pin_lint_2073,
+           local_channel_borrow_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "record Report(Name: string) end Report; "
+        "class C "
+        "  public method M(): int "
+        "    using var ch := new Channel<Report>(); "
+        "    using var inbox := ch; "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "inbox"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "inbox"));
+}
+
+// `using var` over a Task-family return (§28.3 "calls mint" / v0.190 SB-01) —
+// the canonical pattern for binding a task frame whose disposal obligation
+// transfers to the caller. FAILS WITHOUT THE REWORK (the `Task<Pair>` type
+// is a built-in with no user TypeDecl, so isBorrowableType returns false
+// and the inert-RHS branch over-fires; see the #1595 acceptance test).
+// // per §28.10 #2073 (rework 2)
+BEZEL_TEST(vacuous_pin_lint_2073,
+           task_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "record Pair(X: int, Y: int); "
+        "static class F public static async method Work<T>(x: T): Task<T> return x; end Work; end F; "
+        "class C "
+        "  public static method Main(): int "
+        "    var p := new Pair(1, 2); "
+        "    using var t := F.Work(p); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "t"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "t"));
+}
+
+// `using var` over an `owning` collection (OwningArray<T>) — the §4
+// canonical pattern (Dispose cascades through every element).
+// // per §28.10 #2073 (rework 2)
+BEZEL_TEST(vacuous_pin_lint_2073,
+           owning_array_using_var_no_warn_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Cell public constructor() end constructor; "
+        "destructor end destructor; end Cell; "
+        "class C "
+        "  public method M(): int "
+        "    using var arr := new OwningArray<Cell>(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "arr"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "arr"));
+}
+
+// Sanity control — the rework-2 exclusion must NOT mask true inert-RHS
+// diagnostics on value-typed / runtime-managed types: `using var x := 42`
+// is still vacuous and STILL fires the inert-RHS warning (the int RHS
+// is not a disposable class type). // per §28.10 #2073 (rework 2)
+BEZEL_TEST(vacuous_pin_lint_2073,
+           rework2_does_not_mask_int_param_lint) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public method M(b: int): int "
+        "    using var x := b; "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasInertRhsWarning(r, "x"));
+    BEZEL_EXPECT_EQ(countInertRhsWarnings(r, "x"), 1);
+}
+
+// Sanity control — `using var s := "hello"` (runtime-managed string)
+// remains inert and STILL fires the inert-RHS warning.
+// // per §28.10 #2073 (rework 2)
+BEZEL_TEST(vacuous_pin_lint_2073,
+           rework2_does_not_mask_string_literal_lint) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public method M(): int "
+        "    using var s := \"hello\"; "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasInertRhsWarning(r, "s"));
+    BEZEL_EXPECT_EQ(countInertRhsWarnings(r, "s"), 1);
+}
+
 }  // namespace

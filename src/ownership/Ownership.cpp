@@ -3524,8 +3524,17 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
         // disposal obligation (§28.9), so the scope-end `Dispose()` a `using
         // var` would call is a no-op; the only effect is the reassignment lock
         // — exactly what `const x := …` states (§21.1, v0.201).
+        // Exclude disposable class types (rhsIsDisposableClassType) — these
+        // carry real disposal obligations and `using var` over them is the
+        // correct canonical pattern (§28.10), not vacuous. isBorrowableType
+        // returns false for the built-in class heads (Channel, EventSource,
+        // OwningArray, …) because they have no user TypeDecl, so the
+        // named-class branch falls through to "not a builtin exception →
+        // not borrowable"; without this exclusion the inert-RHS check
+        // would over-fire on every disposable-typed `using var` binding
+        // (#2073 rework 2). // per §28.10, #2073 (rework 2)
         const sema::TypeRef* rhsTy = ctx_.exprType(*ld.initializer);
-        if (rhsTy && !isBorrowableType(rhsTy)) {
+        if (rhsTy && !isBorrowableType(rhsTy) && !rhsIsDisposableClassType(rhsTy)) {
             report(Severity::Warning, ld.span.begin,
                 std::string("`using var` `") + std::string(lsym->name) +
                 "` is vacuous — the RHS is a value-typed/runtime-managed "
@@ -3602,6 +3611,68 @@ bool MethodOwnership::rhsIsVacuousBorrowPin(const ast::Expr& e) const {
     // refinement (don't fire on an unclassified shape; the lint must stay
     // quiet rather than wrong).
     return false;
+}
+
+// #2073 rework 2 / §28.10: disposable-type classification. True when `rt` is
+// a class/interface that carries a real disposal obligation — a
+// non-trivial-dispose USER class (has a destructor or `owned` field anywhere
+// in its base chain, §28.9), or a compiler-known built-in class/interface
+// that the runtime disposes. A `using var` over a disposable type is the
+// CORRECT canonical pattern (§28.10), not vacuous — the scope-end `Dispose()`
+// runs real cleanup logic. Used to suppress the vacuous-pin lint's inert-RHS
+// branch: isBorrowableType returns false for these built-in class types (they
+// have no user TypeDecl, so the named-class branch falls through to the
+// not-a-builtin-exception path and reports false), so without this exclusion
+// the inert-RHS check would over-fire on every disposable-typed `using var`
+// binding. The disposable built-in set mirrors the stdlib's runtime-disposal
+// contract surface (Channel/EventSource/TaskScope/CancellationTokenSource/
+// Mutex/Semaphore/Lock/Shared/Weak/Owning*/Task/OwningTask family, etc.) —
+// all of these types have destructors or interface inheritance from
+// `IDisposable`/`IAsyncDisposable` that the runtime actually invokes.
+// Interfaces with user TypeDecls (IEvent<T>, IAsyncEvent<T>, the
+// IOwningEnumerable<T> family, IEnumerable<T>, IAsyncEnumerable<T>, …) are
+// already covered by isBorrowableType's interface branch (returns true) and
+// never reach this exclusion. // per §28.10, #2073 (rework 2)
+bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
+    if (!rt) return false;
+    if (rt->kind != sema::TypeRef::Kind::Named) return false;
+    // Path 1: user class/interface with disposal obligation. Walk the
+    // declaration's members for a destructor or `owned` field (the §28.9
+    // non-trivial-dispose test, inlined here because isNonTrivialDisposeClass
+    // lives in sema::ExprTC and pulling it in would create a circular
+    // dependency between the ownership pass and sema). False for a value
+    // type (record/enum/inline-array) — those are never disposable.
+    if (rt->declaration) {
+        if (rt->declaration->kind != ast::TypeDeclKind::Class &&
+            rt->declaration->kind != ast::TypeDeclKind::Interface)
+            return false;
+        for (sema::Symbol* m : rt->declaration->members) {
+            if (dynamic_cast<sema::DestructorSymbol*>(m)) return true;
+            auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
+            if (!fs) continue;
+            for (auto mod : fs->modifiers) {
+                if (mod == "owned") return true;
+            }
+        }
+        return false;
+    }
+    // Path 2: built-in named type with no user TypeDecl. Match on the head
+    // name against the stdlib's runtime-disposal contract surface.
+    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+        return false;
+    std::string_view head = rt->headName();
+    return head == "Channel" || head == "ChannelSender" ||
+           head == "EventSource" || head == "AsyncEventSource" ||
+           head == "Subscription" || head == "TaskScope" ||
+           head == "CancellationTokenSource" || head == "Mutex" ||
+           head == "Semaphore" || head == "SemaphoreToken" || head == "Lock" ||
+           head == "OwningTask" || head == "Task" ||
+           head == "Shared" || head == "Weak" ||
+           head == "OwningArray" || head == "OwningDictionary" ||
+           head == "OwningSet" || head == "OwningStack" ||
+           head == "OwningQueue" || head == "OwningLinkedList" ||
+           head == "OwningBuffer" ||
+           head == "TaskCompletionSource" || head == "OwningTaskCompletionSource";
 }
 
 void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {

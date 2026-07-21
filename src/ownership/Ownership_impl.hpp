@@ -248,6 +248,25 @@ public:
     // when the source cannot be classified, so the lint stays quiet on any
     // shape it cannot prove vacuous. // per #2073, §28.10
     bool rhsIsVacuousBorrowPin(const ast::Expr& e) const;
+    // #2073 rework 2 / §28.10: disposable-type classification. True when
+    // `rt` is a class/interface that carries a real disposal obligation — a
+    // non-trivial-dispose USER class (has a destructor or `owned` field
+    // anywhere in its base chain, §28.9), or a compiler-known built-in
+    // class/interface that the runtime disposes (Channel, ChannelSender,
+    // EventSource, AsyncEventSource, Subscription, TaskScope,
+    // CancellationTokenSource, Mutex, Semaphore, SemaphoreToken, Lock,
+    // OwningTask, Task, Shared, Weak, OwningArray, OwningDictionary,
+    // OwningSet, OwningStack, OwningQueue, OwningLinkedList, OwningBuffer,
+    // TaskCompletionSource, OwningTaskCompletionSource). A `using var` over
+    // a disposable type is the CORRECT canonical pattern (§28.10) — the
+    // scope-end `Dispose()` runs real cleanup logic, not a no-op. Used to
+    // suppress the vacuous-pin lint's inert-RHS branch: isBorrowableType
+    // returns false for these built-in class types (they have no user
+    // TypeDecl, so the named-class branch falls through to the
+    // not-a-builtin-exception path and reports false), so without this
+    // exclusion the inert-RHS check would over-fire on every
+    // disposable-typed `using var` binding. // per §28.10, #2073 (rework 2)
+    static bool rhsIsDisposableClassType(const sema::TypeRef* rt);
 
 private:
     sema::SemaContext& ctx_;
