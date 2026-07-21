@@ -347,7 +347,7 @@ BEZEL_TEST(vacuous_pin_lint_2073,
     BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "src"));
 }
 
-// `using var inbox := ch;` where `ch` is a `using var`-bound Channel local
+// `using var inbox := ch;` where `ch` is a plain-`var`-owned Channel local
 // (the borrow-pin classifier returns false for locals — the pin extends
 // the local's lifetime, which IS load-bearing for an owned local — and
 // the inert-RHS branch must also not fire because `Channel<Report>` is a
@@ -359,7 +359,7 @@ BEZEL_TEST(vacuous_pin_lint_2073,
         "record Report(Name: string) end Report; "
         "class C "
         "  public method M(): int "
-        "    using var ch := new Channel<Report>(); "
+        "    var ch := new Channel<Report>(); "
         "    using var inbox := ch; "
         "    return 0; "
         "  end M; "
