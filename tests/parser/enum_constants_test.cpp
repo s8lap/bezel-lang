@@ -61,8 +61,10 @@ BEZEL_TEST(parser_enum_constants, missing_semicolon_after_constants_is_error) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-BEZEL_TEST(parser_enum_constants, dangling_comma_is_error) {
-    // `A, ;` — name expected after comma.
+BEZEL_TEST(parser_enum_constants, trailing_comma_is_allowed) {
+    // §1.6 / proposal 0059 (v0.214): the uniform-trailing-comma rule admits
+    // a single `,` directly before the `;` that closes the enum-constants
+    // list. `A, ;` is now legal (not a parse error).
     auto r = parseAll("module M; enum E A, ; end E;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

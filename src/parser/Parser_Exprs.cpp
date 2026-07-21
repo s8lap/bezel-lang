@@ -453,6 +453,14 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
             e->typeArgs.push_back(parseType());
             while (isPunctuator(",")) {
                 advance(); // past `,`
+                // per §1.6 / proposal 0059 (v0.214): optional trailing `,`
+                // before the closing angle — consumeClosingAngle below
+                // handles `>` / `>>` / `>=` / `>>=`.
+                if (current_.kind == TokenKind::Punctuator &&
+                    !current_.text.empty() &&
+                    current_.text.front() == '>') {
+                    break;
+                }
                 e->typeArgs.push_back(parseType());
             }
             if (!consumeClosingAngle()) {
@@ -643,6 +651,9 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
             // Non-empty LambdaParams.
             lam->params.push_back(parseLambdaParam());
             while (consumePunctuator(",")) {
+                // per §1.6 / proposal 0059 (v0.214): optional trailing `,`
+                // before the `)` that closes the lambda parameter list.
+                if (isPunctuator(")")) break;
                 lam->params.push_back(parseLambdaParam());
             }
             if (!consumePunctuator(")")) {
@@ -941,6 +952,9 @@ std::unique_ptr<ast::DestructuringPattern> Parser::parseLambdaDestructure() {
     if (!isPunctuator(")")) {
         dp->subPatterns.push_back(parsePositionalPattern());
         while (consumePunctuator(",")) {
+            // per §1.6 / proposal 0059 (v0.214): optional trailing `,` before
+            // the `)` that closes the destructuring pattern slot list.
+            if (isPunctuator(")")) break;
             dp->subPatterns.push_back(parsePositionalPattern());
         }
     }
@@ -1225,6 +1239,10 @@ std::unique_ptr<ast::Pattern> Parser::parsePrimaryPattern(
             if (!isPunctuator(")")) {
                 dp->subPatterns.push_back(parsePositionalPattern());
                 while (consumePunctuator(",")) {
+                    // per §1.6 / proposal 0059 (v0.214): optional trailing `,`
+                    // before the `)` that closes the case destructuring slot
+                    // list (PositionalPatternList).
+                    if (isPunctuator(")")) break;
                     dp->subPatterns.push_back(parsePositionalPattern());
                 }
             }
@@ -1456,6 +1474,13 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
                     idHead->typeArgs.push_back(parseType());
                     while (isPunctuator(",")) {
                         advance(); // past `,`
+                        // per §1.6 / proposal 0059 (v0.214): optional
+                        // trailing `,` before the closing angle.
+                        if (current_.kind == TokenKind::Punctuator &&
+                            !current_.text.empty() &&
+                            current_.text.front() == '>') {
+                            break;
+                        }
                         idHead->typeArgs.push_back(parseType());
                     }
                     if (!consumeClosingAngle()) {
@@ -1487,6 +1512,13 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
                 access->typeArgs.push_back(parseType());
                 while (isPunctuator(",")) {
                     advance(); // past `,`
+                    // per §1.6 / proposal 0059 (v0.214): optional trailing
+                    // `,` before the closing angle.
+                    if (current_.kind == TokenKind::Punctuator &&
+                        !current_.text.empty() &&
+                        current_.text.front() == '>') {
+                        break;
+                    }
                     access->typeArgs.push_back(parseType());
                 }
                 if (!consumeClosingAngle()) {
@@ -1517,6 +1549,13 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
                 a->typeArgs.push_back(parseType());
                 while (isPunctuator(",")) {
                     advance(); // past `,`
+                    // per §1.6 / proposal 0059 (v0.214): optional trailing
+                    // `,` before the closing angle.
+                    if (current_.kind == TokenKind::Punctuator &&
+                        !current_.text.empty() &&
+                        current_.text.front() == '>') {
+                        break;
+                    }
                     a->typeArgs.push_back(parseType());
                 }
                 if (!consumeClosingAngle()) {

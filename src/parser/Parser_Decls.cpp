@@ -259,6 +259,11 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
     if (decl->kind == ast::TypeDeclKind::Enum && consumePunctuator(":")) {
         decl->baseTypes.push_back(parseType());
         while (consumePunctuator(",")) {
+            // per §1.6 / proposal 0059 (v0.214): optional trailing `,` covers
+            // both EnumInheritance alternatives — the comma must be followed
+            // by a token that closes the EnumInheritance region (the next
+            // body/term token, e.g. the constants list `;`).
+            if (isPunctuator(";")) break;
             decl->baseTypes.push_back(parseType());
         }
     }
@@ -442,6 +447,9 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
             }
             decl->enumConstants.push_back(std::move(ec));
             while (consumePunctuator(",")) {
+                // per §1.6 / proposal 0059 (v0.214): optional trailing `,`
+                // before the closing `;`.
+                if (isPunctuator(";")) break;
                 if (current_.kind != TokenKind::Identifier) {
                     diagnostics_.report(
                         Severity::Error, current_.location,
@@ -522,6 +530,9 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
             };
             decl->choiceCases.push_back(parseOneCase());
             while (consumePunctuator(",")) {
+                // per §1.6 / proposal 0059 (v0.214): optional trailing `,`
+                // before the closing `;`.
+                if (isPunctuator(";")) break;
                 decl->choiceCases.push_back(parseOneCase());
             }
             if (!consumePunctuator(";")) {
@@ -837,6 +848,9 @@ std::unique_ptr<ast::Type> Parser::parseType() {
             };
             type->funcParams.push_back(parseFuncParam());
             while (consumePunctuator(",")) {
+                // per §1.6 / proposal 0059 (v0.214): optional trailing `,`
+                // before the `)` that closes the function-type parameter list.
+                if (isPunctuator(")")) break;
                 type->funcParams.push_back(parseFuncParam());
             }
             if (!consumePunctuator(")")) {
@@ -887,6 +901,14 @@ std::unique_ptr<ast::Type> Parser::parseType() {
         type->genericArgs.push_back(parseType());
         while (isPunctuator(",")) {
             advance(); // past ','
+            // per §1.6 / proposal 0059 (v0.214): optional trailing `,` before
+            // the closing angle — consumeClosingAngle below handles the
+            // `>` / `>>` / `>=` / `>>=` lexer tokens that may close a nested
+            // generic list.
+            if (current_.kind == TokenKind::Punctuator &&
+                !current_.text.empty() && current_.text.front() == '>') {
+                break;
+            }
             type->genericArgs.push_back(parseType());
         }
         if (!consumeClosingAngle()) {
@@ -1938,6 +1960,8 @@ void Parser::parsePolymorphicMember(ast::TypeDecl& decl) {
     };
     decl.serializedClass->polyCases.push_back(parseOne());
     while (consumePunctuator(",")) {
+        // per §1.6 / proposal 0059 (v0.214): optional trailing `,` before `)`.
+        if (isPunctuator(")")) break;
         decl.serializedClass->polyCases.push_back(parseOne());
     }
     if (!consumePunctuator(")")) {
@@ -2269,6 +2293,15 @@ std::vector<ast::Param> Parser::parseParamList() {
 
     params.push_back(parseOne());
     while (consumePunctuator(",")) {
+        // per §1.6 / proposal 0059 (v0.214): an optional trailing `,` before
+        // the closer. ParamList is reused for indexer params (closer `]`) as
+        // well as method/primary-ctor params (closer `)`); accept any
+        // punctuator that cannot begin a Parameter.
+        if (current_.kind == TokenKind::Punctuator &&
+            (current_.text == ")" || current_.text == "]" ||
+             current_.text == "}" || current_.text == ";")) {
+            break;
+        }
         params.push_back(parseOne());
     }
     return params;
@@ -2373,6 +2406,17 @@ std::vector<ast::CallArgument> Parser::parseArgList() {
     };
     args.push_back(parseOne());
     while (consumePunctuator(",")) {
+        // per §1.6 / proposal 0059 (v0.214): optional trailing `,` before
+        // the closer. The ArgList production is also reused for IndexExpr
+        // (closer `]`) and NullCondCallExpr (closer `)`), so accept any
+        // punctuator that cannot begin an Argument expression (`)` / `]`
+        // / `}` / `;` / `,`).
+        if (current_.kind == TokenKind::Punctuator &&
+            (current_.text == ")" || current_.text == "]" ||
+             current_.text == "}" || current_.text == ";" ||
+             current_.text == ",")) {
+            break;
+        }
         args.push_back(parseOne());
     }
     return args;
@@ -2405,7 +2449,11 @@ std::vector<ast::Param> Parser::parsePositionalFieldList() {
         return p;
     };
     fields.push_back(parseOne());
-    while (consumePunctuator(",")) fields.push_back(parseOne());
+    while (consumePunctuator(",")) {
+        // per §1.6 / proposal 0059 (v0.214): optional trailing `,` before `)`.
+        if (isPunctuator(")")) break;
+        fields.push_back(parseOne());
+    }
     return fields;
 }
 
@@ -2444,7 +2492,11 @@ std::vector<ast::Param> Parser::parseCasePayloadList() {
         return p;
     };
     fields.push_back(parseOne());
-    while (consumePunctuator(",")) fields.push_back(parseOne());
+    while (consumePunctuator(",")) {
+        // per §1.6 / proposal 0059 (v0.214): optional trailing `,` before `)`.
+        if (isPunctuator(")")) break;
+        fields.push_back(parseOne());
+    }
     return fields;
 }
 
@@ -2518,6 +2570,20 @@ std::vector<ast::GenericConstraint> Parser::parseGenericConstraints() {
 
         clause.items.push_back(parseConstraintItem());
         while (consumePunctuator(",")) {
+            // per §1.6 / proposal 0059 (v0.214): optional trailing `,` before
+            // the end of the where-clause region. A ConstraintItem starts with
+            // the keyword `class` / `new`, or an Identifier (a contextual
+            // constraint name like `value` / `notnull` / `sendable`, or a
+            // type name). Anything else — the next `where` keyword (next
+            // clause), the body opener `{`, the record-shorthand terminator
+            // `;`, an expression-body arrow `=>`, a member visibility
+            // (`public`/`private`/`protected`/`internal`) or member-kind
+            // keyword — ends the region.
+            const bool cantStartConstraint =
+                (current_.kind == TokenKind::Punctuator) ||
+                (current_.kind == TokenKind::Keyword &&
+                 current_.text != "class" && current_.text != "new");
+            if (cantStartConstraint) break;
             clause.items.push_back(parseConstraintItem());
         }
         all.push_back(std::move(clause));
@@ -2632,6 +2698,13 @@ std::vector<ast::GenericParam> Parser::parseGenericParams() {
     params.push_back(parseOne());
     while (isPunctuator(",")) {
         advance();
+        // per §1.6 / proposal 0059 (v0.214): optional trailing `,` before the
+        // closing angle. consumeClosingAngle below handles the `>` / `>>` /
+        // `>=` / `>>=` lexer tokens that may close a nested generic list.
+        if (current_.kind == TokenKind::Punctuator &&
+            !current_.text.empty() && current_.text.front() == '>') {
+            break;
+        }
         params.push_back(parseOne());
     }
     if (!consumeClosingAngle()) {
@@ -2668,6 +2741,22 @@ std::vector<std::unique_ptr<ast::Type>> Parser::parseInheritance() {
     items.push_back(parseOne());
     while (isPunctuator(",")) {
         advance();
+        // per §1.6 / proposal 0059 (v0.214): optional trailing `,` before the
+        // end of the inheritance region. The region's terminator is the first
+        // token that cannot begin a Type — the next `where`-clause region
+        // (`where`), the body opener (`{`), the record-shorthand terminator
+        // (`;`), or a member-starter keyword (`public`, `private`, `protected`,
+        // `internal`, `static`, `owned`, `readonly`, `async`, `abstract`,
+        // `virtual`, `sealed`, `override`, `method`, `constructor`,
+        // `destructor`, `property`, `event`, `const`, `operator`, `pure`).
+        // Practically: a Keyword that isn't a primitive-type keyword, or a
+        // Punctuator that isn't `(` / `[` (which begin type expressions).
+        const bool cantStartType =
+            (current_.kind == TokenKind::Keyword &&
+             !isPrimitiveTypeKeyword(current_.text)) ||
+            (current_.kind == TokenKind::Punctuator &&
+             current_.text != "(" && current_.text != "[");
+        if (cantStartType) break;
         items.push_back(parseOne());
     }
     return items;
