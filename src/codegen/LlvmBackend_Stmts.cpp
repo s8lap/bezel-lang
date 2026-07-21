@@ -274,6 +274,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                 ? llvm::dyn_cast<llvm::ArrayType>(aelemTy)
                                 : nullptr) {
                             if (aaddr) {
+                                // §28.7 / §15.3 (#1385): dispose each non-null
+                                // slot of the displaced value in reverse order
+                                // BEFORE the per-slot stores below overwrite
+                                // them. The plain AssignmentStmt path
+                                // (lowerOwningInlineArrayReassign called from
+                                // the `:=` block at line 504) covers
+                                // non-collection-literal RHS forms; this call
+                                // covers the literal form, which the literal
+                                // handler short-circuits past the line-504 site.
+                                lowerOwningInlineArrayReassign(*as->target,
+                                                               aaddr, aelemTy);
                                 llvm::Type* et = aty->getElementType();
                                 for (std::size_t i = 0;
                                      i < cl->elements.size() &&
@@ -512,6 +523,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 }
             }
             if (as->op == ":=") {
+                // §28.7 / §15.3 (#1385): whole-value reassignment of a move-only
+                // OWNING inline-array local or field (`[N owned]T` / `[N owned]T?`)
+                // disposes each non-null slot of the displaced value in reverse
+                // slot order, BEFORE the new-value store. Runs first so the
+                // subsequent per-slot / whole-struct stores overwrite the
+                // correctly-disposed (null) slots. No-op for non-move-only-array
+                // targets (the helpers below / the plain CreateStore handle them).
+                // RHS is already evaluated (lines 377-388 above) so the disposal
+                // runs after the RHS's side effects, matching §28.7's
+                // "RHS-first, then dispose displaced, then store" ordering.
+                lowerOwningInlineArrayReassign(*as->target, addr, elemTy);
                 // #429 / §4.6 / §28.9: a store into a CLASS string field /
                 // auto-property takes an independent +1 (retain-new or transfer-
                 // producer / release-old), released on the owner's disposal.
@@ -2196,6 +2218,61 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         return false;
     }
     return false;  // unhandled statement kinds land in later slices
+}
+
+
+bool Emitter::lowerOwningInlineArrayReassign(const ast::Expr& target,
+                                              llvm::Value* arrayAddr,
+                                              llvm::Type* elemTy) {
+    // §28.7 / §15.3 (#1385): whole-value reassignment of a move-only OWNING
+    // inline-array local or field (`[N owned]T` / `[N owned]T?`) disposes each
+    // non-moved-from slot of the displaced value in REVERSE slot order, then
+    // the caller performs the new-value store. Sema's `moveOnlyArrayLive_` map
+    // (#1549) tracks per-slot moved-from state statically, but we rely on the
+    // runtime invariant that `move a[i]` nulls the slot in the alloca
+    // (lowerMoveFromCollectionSlot, #747) — so a slot that is semantically
+    // moved-from is also literally null at the reassignment site, and the
+    // null-guard below skips it. Whole-array moves `var b := a;` likewise
+    // dispose `a`'s slots when they go out of scope, leaving the alloca's
+    // slots live but semantically transferred (sema suppresses the scope-end
+    // disposal in that case); this helper covers the leak in any path where
+    // the new value is about to overwrite an unset slot. Returns true iff
+    // the helper ran; the caller continues with the new-value store.
+    if (!arrayAddr || !elemTy) return false;
+    const sema::TypeRef* rt = ctx_.exprType(target);
+    if (!rt || rt->kind != sema::TypeRef::Kind::InlineArray || !rt->arrayOwned)
+        return false;
+    auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(elemTy);
+    if (!arrTy) return false;
+    // Per §15.1.1 / #747, the owning inline-array slot storage is `[N x ptr]`
+    // (a null ptr means empty; a non-null ptr owns the slot's object). Iterate
+    // in REVERSE order per the spec wording on #1385: "disposes each non-moved-
+    // from slot of the displaced value (reverse slot order), then stores".
+    unsigned N = arrTy->getNumElements();
+    for (unsigned i = N; i > 0; --i) {
+        unsigned idx = i - 1;
+        llvm::Value* slotAddr = builder_.CreateInBoundsGEP(
+            arrTy, arrayAddr,
+            {builder_.getInt32(0), builder_.getInt32(idx)},
+            "ioar.slot");
+        llvm::Value* obj = builder_.CreateLoad(ptrTy(), slotAddr, "ioar.val");
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            obj, llvm::ConstantPointerNull::get(ptrTy()));
+        auto* dispBB =
+            llvm::BasicBlock::Create(llvm_, "ioar.dispose", currentFn_);
+        auto* contBB =
+            llvm::BasicBlock::Create(llvm_, "ioar.cont", currentFn_);
+        builder_.CreateCondBr(isNull, contBB, dispBB);
+        builder_.SetInsertPoint(dispBB);
+        // Same dispatch the scope-end disposal uses (Disposal.inlineOwnedArray,
+        // LlvmBackend_Disposal.cpp ~1890): dynamic-dispatched Dispose + block
+        // reclaim via the slot object's own vtable. Idempotent on a null input
+        // (the guard above already routed null to contBB).
+        emitDisposeAndReclaim(obj);
+        builder_.CreateBr(contBB);
+        builder_.SetInsertPoint(contBB);
+    }
+    return true;
 }
 
 

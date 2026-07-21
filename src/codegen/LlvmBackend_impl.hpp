@@ -6670,6 +6670,24 @@ private:
                                    llvm::Value* fieldAddr,
                                    llvm::Value* newVal);
 
+    // §28.7 / §15.3 (#1385): drop-on-overwrite for a WHOLE-VALUE reassignment
+    // of a move-only OWNING inline-array local or field (`[N owned]T` /
+    // `[N owned]T?`). Disposes each non-null slot of the displaced value in
+    // REVERSE slot order (the spec wording of #1385: "disposes each non-moved-
+    // from slot of the displaced value (reverse slot order), then stores"), then
+    // returns so the caller performs the new-value store. A slot that has been
+    // `move a[i]`d or that the user restored with `a[i] := null` already holds
+    // null in the alloca (codegen nulls on `lowerMoveFromCollectionSlot` per
+    // #747), so the null-guard skips it — exactly once across move + reassign
+    // + scope-end. Called from the AssignmentStmt lowering path after RHS
+    // evaluation and before any field-store handler / the plain CreateStore.
+    // Returns true when it ran (slot disposal emitted); the caller continues
+    // with the store. Returns false when the target is not a move-only owning
+    // inline array (no-op — caller is on the ordinary path).
+    bool lowerOwningInlineArrayReassign(const ast::Expr& target,
+                                        llvm::Value* arrayAddr,
+                                        llvm::Type* elemTy);
+
     // #429 (box FIELD-STORE / disposal) / §8.6 / §28.9: the per-module set of
     // class field symbols (FieldSymbol / auto-property PropertySymbol) for which
     // EVERY store (across all methods + constructors + field initializers of the
