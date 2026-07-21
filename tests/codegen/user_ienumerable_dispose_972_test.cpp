@@ -47,7 +47,7 @@ static const char* kCountingEnum = R"(
     private cur: int; private limit: int;
     public constructor(limit: int) this.cur := 0; this.limit := limit; end constructor;
     public method MoveNext(): bool cur := cur + 1; return cur <= limit; end MoveNext;
-    public readonly property Current: int get => cur; end Current;
+    public property Current: int get => cur; end Current;
     destructor EnumDisposed.n := EnumDisposed.n + 1; end destructor;
   end CountingEnum;
   class CountingRange

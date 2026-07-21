@@ -9,7 +9,7 @@ public record ReadOnlyStringSpan(Source: string, Start: int, Length: int): IRead
     end;
   end;
 
-  public readonly property IsEmpty: bool => Length = 0;
+  public property IsEmpty: bool => Length = 0;
 
   // Range construction
   public method Slice(start: int, length: int): ReadOnlyStringSpan =>

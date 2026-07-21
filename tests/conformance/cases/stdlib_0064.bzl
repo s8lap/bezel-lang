@@ -15,7 +15,7 @@ public record ArraySpan<T>(Source: Array<T>, Start: int, Length: int): IReadOnly
     end;
   end;
 
-  public readonly property IsEmpty: bool => Length = 0;
+  public property IsEmpty: bool => Length = 0;
 
   // Range construction
   public method Slice(start: int, length: int): ArraySpan<T> =>

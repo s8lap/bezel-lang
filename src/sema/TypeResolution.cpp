@@ -305,6 +305,13 @@ void Resolver::run(const ast::SourceFile& src) {
     // and checkAbstractImplementations (which ran earlier above); this
     // walker is a placeholder for future chain-wide audits.
     checkPureDispatch();
+    // §23.2 (v0.214, #2088, proposal 0058): `readonly` is meaningful only on
+    // auto-properties and interface properties — anywhere body-bearing it is
+    // either redundant (shape expresses read-onlyness) or contradictory
+    // (block form with a `set` accessor). The grammar admits `readonly?` on
+    // the body-bearing productions as an over-admission; this pass performs
+    // the §23.2 semantic rejection.
+    checkReadonlyPropertyForms();
     // Slice S36: constructor chain-call placement (§12.8).
     checkConstructorChains();
     // Slice S37: static constructor takes no parameters (§22.7).

@@ -252,10 +252,12 @@ BEZEL_TEST(ref_out_operand_category_1682, ref_to_mutable_static_rejected_22_3) {
 }
 
 // §22.3: a property with no setter is not a storage location at all.
+// (Property is expression-bodied; per §23.2 (v0.214) `readonly` is no longer
+// admitted on expression-bodied properties — the keyword has been dropped.)
 BEZEL_TEST(ref_out_operand_category_1682, ref_to_no_setter_property_rejected_22_3) {
     auto r = runJit(
         "module M; class C "
-        "  public readonly property P: int => 5; "
+        "  public property P: int => 5; "
         "  public static method Bump(ref x: int) x := x + 1; end Bump; "
         "  public method Do() C.Bump(ref this.P); end Do; "
         "  public static method Main(): int return 0; end Main; "

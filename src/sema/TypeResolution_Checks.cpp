@@ -5797,4 +5797,134 @@ void Resolver::checkTypePureDispatch(TypeSymbol* t) {
     // nearest-base match.
 }
 
+// §23.2 (v0.214, issue #2088, proposal 0058): `readonly` is written exactly
+// where the SHAPE cannot express read-onlyness — auto-properties (§23.1) and
+// interface properties, whose abstract accessor sets are declared rather than
+// implemented (so the absencd-of-setter cannot express it). On every BODY-
+// BEARING form — an expression-bodied property or indexer (`=>`), a get-only
+// block-form accessor list, a block form declaring a setter, and the
+// expression-bodied properties of choices / enums / extensions — read-onlyness
+// is already expressed by the shape (or contradicted by it). The grammar's
+// `readonly?` slot on the body-bearing productions is the shared-production
+// over-admission; this pass performs the §23.2 semantic rejection.
+//
+// Accept (read-only is meaningful):  bodyKind == Auto on class / record /
+//                                    choice / enum / extension, and on
+//                                    interface (signature form).
+// Reject (redundant or contradictory): bodyKind == Expression any depth;
+//                                      bodyKind == Block regardless of
+//                                      accessors, AND indexer with body.
+void Resolver::checkReadonlyPropertyForms() {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        if (auto* t = dynamic_cast<TypeSymbol*>(child)) {
+            checkTypeReadonlyPropertyForms(t);
+            for (Symbol* m : t->members) {
+                if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+                    if (nt->type) checkTypeReadonlyPropertyForms(nt->type);
+                }
+            }
+            continue;
+        }
+        // §23.2: extensions (`ExtensionSymbol`) live at module scope, not
+        // under a TypeSymbol, and their members are tagged with `parent =
+        // nullptr` during symbol collection (§26, #433). The expression-
+        // bodied property of an extension is one of the three body-bearing
+        // grammar slots named in issue #2088; visit them explicitly.
+        if (auto* ext = dynamic_cast<ExtensionSymbol*>(child)) {
+            for (Symbol* m : ext->members) {
+                auto* ps = dynamic_cast<PropertySymbol*>(m);
+                if (!ps) continue;
+                checkTypeReadonlyPropertyFormsMember(ps);
+            }
+        }
+    }
+}
+
+void Resolver::checkTypeReadonlyPropertyForms(TypeSymbol* t) {
+    for (Symbol* m : t->members) {
+        auto* ps = dynamic_cast<PropertySymbol*>(m);
+        if (!ps) continue;
+        checkTypeReadonlyPropertyFormsMember(ps);
+    }
+}
+
+// §23.2 per-member check — extracted so extensions (`ExtensionSymbol`,
+// which lives at module scope) can share it.
+void Resolver::checkTypeReadonlyPropertyFormsMember(PropertySymbol* ps) {
+    // §23.2: a `readonly` property is meaningful only on the Auto form.
+    // Anything body-bearing — expression body, indexer arrow, block body
+    // (get-only or setter-bearing) — is rejected. Interface properties
+    // may carry `readonly` (their abstract accessor set is declared, not
+    // implemented) and they parse to PropertyDecl with bodyKind=Auto
+    // when in signature form, so the Auto branch below accepts them.
+    if (!hasMod(ps, "readonly")) return;
+    const auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    if (!pd) return;
+
+    const bool parentIsIface =
+        ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface;
+
+    // Auto body: the SHAPE cannot express read-onlyness — accept.
+    // (This covers class/record auto-properties AND interface
+    // signature-form properties; both reject nothing here.)
+    if (pd->bodyKind == ast::PropertyBodyKind::Auto) {
+        // An interface property declared with an abstract block body
+        // (`{ get; end }`) is body-bearing and SHOULD be rejected; the
+        // check below handles Block. For Auto-body interface props this
+        // branch accepts and we are done.
+        return;
+    }
+
+    // From here on, the property has a body — `readonly` is redundant
+    // or contradictory. The diagnostic message differs by shape so the
+    // user sees the §23.2 reason in their tool window.
+    std::string whatName;
+    if (pd->isIndexer) {
+        whatName = "indexer";
+    } else if (parentIsIface) {
+        whatName = "interface property";
+    } else {
+        whatName = "property";
+    }
+
+    const Symbol* m = ps;
+    if (pd->bodyKind == ast::PropertyBodyKind::Expression) {
+        // Expression-bodied form — read-onlyness is expressed by the
+        // shape, so `readonly` is redundant. Applies to class/record
+        // expression-bodied properties (PropertyDecl arrow), and to the
+        // expression-bodied properties of choices / enums / extensions
+        // (ExpressionPropertyDecl — same AST node, same bodyKind), and
+        // to expression-bodied indexers (IndexerDecl arrow).
+        ctx_.diagnostics().report(
+            Severity::Error, m->declLoc,
+            std::string("`readonly` is redundant on an expression-bodied ") +
+            whatName + " — the `=>` form is read-only by shape; remove the "
+            "`readonly` keyword (§23.2, v0.214)");
+        return;
+    }
+
+    // Block body — accessors are declared. Two reject cases:
+    //   * a `set` accessor contradicts `readonly` (semantic conflict);
+    //   * a get-only block ALSO expresses read-onlyness by shape, so
+    //     `readonly` is redundant rather than contradictory.
+    bool hasSet = false;
+    for (const auto& a : pd->accessors)
+        if (a.isSet) { hasSet = true; break; }
+
+    if (hasSet) {
+        ctx_.diagnostics().report(
+            Severity::Error, m->declLoc,
+            std::string("`readonly` is contradictory on a block-form ") +
+            whatName + " that declares a `set` accessor — remove the "
+            "`readonly` keyword or remove the `set` arm (§23.2, v0.214)");
+    } else {
+        ctx_.diagnostics().report(
+            Severity::Error, m->declLoc,
+            std::string("`readonly` is redundant on a get-only block-form ") +
+            whatName + " — omitting `set` already expresses read-onlyness; "
+            "remove the `readonly` keyword (§23.2, v0.214)");
+    }
+}
+
 }  // namespace bezel::sema

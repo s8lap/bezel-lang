@@ -10,7 +10,7 @@ public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int):
     end;
   end;
 
-  public readonly property IsEmpty: bool => Length = 0;
+  public property IsEmpty: bool => Length = 0;
 
   public method IndexOf(value: T?): int;
   public method Contains(value: T?): bool;
@@ -34,7 +34,7 @@ public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int):
     end;
   end;
 
-  public readonly property IsEmpty: bool => Length = 0;
+  public property IsEmpty: bool => Length = 0;
 
   public method IndexOf(value: T): int;
   public method Contains(value: T): bool;

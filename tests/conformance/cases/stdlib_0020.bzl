@@ -58,7 +58,7 @@ end IDeserializable;
 public class Order(id: int) : ISerializable, IDeserializable
   public owned Customer: Customer;        // nested owned class, also tree
   public owned Lines: OwningArray<owned LineItem>;
-  public readonly property Id: int => id;
+  public property Id: int => id;
   // compiler synthesizes Serialize / Deserialize (type-driven, v0.141); each
   // owned child recurses through its own synthesized members
 end Order;

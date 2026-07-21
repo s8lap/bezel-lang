@@ -1,6 +1,10 @@
 // Spec-derived parser tests for IndexerDecl — §A.4 indexer form of the
 // property family: `Visibility "static"? VirtualKind? "readonly"? "property"
-// "[" ParamList "]" ":" Type PropertyBody`.
+// "[" ParamList "]" ":" Type PropertyBody`. The `readonly?` slot is an
+// over-admission on the body-bearing indexer productions (§23.2 / v0.214);
+// sema rejects it on an expression-bodied indexer. These tests exercise the
+// PARSER only (no sema), and verify that the keyword-less expression-bodied
+// indexer is the valid accepted form.
 
 #include <string>
 
@@ -31,20 +35,6 @@ BEZEL_TEST(parser_indexer, multi_dimensional_indexer) {
         BEZEL_EXPECT_EQ(
             ms[0],
             std::string("public property [r: int, c: int]: int => values"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
-BEZEL_TEST(parser_indexer, readonly_indexer) {
-    auto r = parseAll(
-        "module M; class Foo "
-        "public readonly property [i: int]: string => items; "
-        "end Foo;");
-    const auto ms = memberSummaries(r);
-    if (ms.size() == 1)
-        BEZEL_EXPECT_EQ(
-            ms[0],
-            std::string(
-                "public readonly property [i: int]: string => items"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 

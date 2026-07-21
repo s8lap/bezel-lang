@@ -10,7 +10,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; interface IBox<T> readonly property Item: T; end IBox; class IntBox : IBox<int> public readonly property Item: int => 7; end IntBox;
+module M; interface IBox<T> readonly property Item: T; end IBox; class IntBox : IBox<int> public property Item: int => 7; end IntBox;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

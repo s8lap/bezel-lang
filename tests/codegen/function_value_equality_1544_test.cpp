@@ -147,12 +147,14 @@ BEZEL_TEST(function_value_equality_1544,
 
 // §27.7.1 fourth bullet: "property references follow the method-reference
 // rule (the getter is the method)" — two property-getter references on the
-// same class-typed receiver are equal.
+// same class-typed receiver are equal. (Property is expression-bodied; per
+// §23.2 / v0.214 `readonly` is no longer admitted on expression-bodied
+// properties — the `readonly` keyword has been removed from the spelling.)
 BEZEL_TEST(function_value_equality_1544,
           property_reference_same_receiver_equal_spec_27_7_1) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class Box public readonly property Count: int => 7; end Box; "
+        "class Box public property Count: int => 7; end Box; "
         "class C public static method Main(): int "
         "  using var b := new Box(); "
         "  var f: () -> int := b.Count; "

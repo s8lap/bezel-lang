@@ -110,13 +110,15 @@ BEZEL_TEST(pure_modifiers_2052, pure_get_accessor_accepted_spec_22_15) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §22.15: a pure indexer getter (read-only block form).
-BEZEL_TEST(pure_modifiers_2052, pure_readonly_indexer_accepted_spec_22_15) {
+// §22.15: a pure indexer getter (expression-bodied; the `readonly` keyword
+// has been removed in v0.214 per §23.2 — it no longer combines with an
+// expression body, since the body already expresses read-onlyness).
+BEZEL_TEST(pure_modifiers_2052, pure_indexer_accepted_spec_22_15) {
     auto r = parseSemaAll(
         "module M; "
         "class Bag "
         "  private _v: int := 0; "
-        "  public pure readonly property this[i: int]: int => _v; "
+        "  public pure property this[i: int]: int => _v; "
         "end Bag;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

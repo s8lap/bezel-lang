@@ -18,7 +18,7 @@ public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOn
   end;
 
   // Range query (v0.101).
-  public readonly property IsEmpty: bool => Length = 0;
+  public property IsEmpty: bool => Length = 0;
 
   // Search (v0.101).
   public method IndexOf(value: T?): int;          // -1 if not found

@@ -60,5 +60,5 @@ public abstract class Shape : ISerializable, IDeserializable
 end Shape;
 
 public class Circle(radius: double) : Shape
-  public readonly property Radius: double => radius;
+  public property Radius: double => radius;
 end Circle;

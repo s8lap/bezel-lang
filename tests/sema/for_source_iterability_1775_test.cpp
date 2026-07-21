@@ -55,7 +55,7 @@ constexpr const char* kIntRange =
     "  private lo: int; private hi: int; private cur: int; "
     "  public constructor(lo: int, hi: int) this.lo:=lo; this.hi:=hi; cur:=lo-1; end constructor; "
     "  public method MoveNext(): bool cur:=cur+1; return cur<=hi; end MoveNext; "
-    "  public readonly property Current: int get => cur; end Current; "
+    "  public property Current: int get => cur; end Current; "
     "end IntRangeEnum; "
     "class IntRange: IEnumerable<int> "
     "  private lo: int; private hi: int; "

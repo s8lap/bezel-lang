@@ -10,8 +10,8 @@ public class OwningArray<T>: IOwningList<T> where T: class
     _storage := new OwningBuffer<T>(if capacity > 0 then capacity else 1);
   end constructor;
 
-  public readonly property Count: int => _count;
-  public readonly property Capacity: int => _storage.Length;
+  public property Count: int => _count;
+  public property Capacity: int => _storage.Length;
 
   public property [i: int]: T
     get => do

@@ -44,7 +44,7 @@ const char* kBase =
     "  private lo: int; private hi: int; private cur: int; "
     "  public constructor(lo: int, hi: int) this.lo:=lo; this.hi:=hi; cur:=lo-1; end constructor; "
     "  public method MoveNext(): bool cur:=cur+1; return cur<=hi; end MoveNext; "
-    "  public readonly property Current: int get => cur; end Current; "
+    "  public property Current: int get => cur; end Current; "
     "end IntRangeEnum; "
     "interface IMyColl: IEnumerable<int> end IMyColl; "
     "class IntRange: IMyColl "

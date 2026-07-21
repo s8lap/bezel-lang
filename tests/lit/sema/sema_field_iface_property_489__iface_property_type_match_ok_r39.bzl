@@ -8,7 +8,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; interface IVal readonly property Name: string; end IVal; class Impl : IVal public readonly property Name: string => "hi"; end Impl;
+module M; interface IVal readonly property Name: string; end IVal; class Impl : IVal public property Name: string => "hi"; end Impl;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

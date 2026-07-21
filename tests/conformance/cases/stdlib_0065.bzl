@@ -9,7 +9,7 @@ public record ReadOnlyArraySpan<T>(Source: Array<T>, Start: int, Length: int): I
     end;
   end;
 
-  public readonly property IsEmpty: bool => Length = 0;
+  public property IsEmpty: bool => Length = 0;
 
   public method Slice(start: int, length: int): ReadOnlyArraySpan<T> =>
     new ReadOnlyArraySpan<T>(Source, this.Start + start, length);

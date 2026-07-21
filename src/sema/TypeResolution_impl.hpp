@@ -165,6 +165,22 @@ private:
     void checkPureDispatch();
     void checkTypePureDispatch(TypeSymbol* t);
 
+    // §23.2 (v0.214, issue #2088, proposal 0058): `readonly` on a property /
+    // indexer / expression-bodied member is REDUNDANT on body-bearing forms
+    // (expression-bodied properties, expression-bodied indexers, get-only block
+    // forms, block forms declaring a setter, and the expression-bodied
+    // properties of choices/enums/extensions — all parse to PropertyDecl with
+    // bodyKind ∈ {Expression, Block, isIndexer}). It is admitted only where
+    // the SHAPE cannot express read-onlyness: auto-properties (§23.1) and
+    // interface properties (§11.1 — whose abstract accessor set is declared,
+    // not implemented), where the bodyKind is Auto. The grammar's `readonly?`
+    // slot on the body-bearing productions is an over-admission (shared-
+    // production policy); this pass performs the semantic rejection spelled
+    // out in §23.2.
+    void checkReadonlyPropertyForms();
+    void checkTypeReadonlyPropertyForms(TypeSymbol* t);
+    void checkTypeReadonlyPropertyFormsMember(PropertySymbol* ps);
+
     // Slice S34 (§12.1): "Fields, constructors, destructors, and static
     // members may not be virtual." A static method or property carrying
     // `virtual` / `abstract` / `override` is rejected.
