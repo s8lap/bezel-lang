@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.205 — July 2026**
+**Companion to the Bezel Language Specification, v0.206 — July 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -6867,3 +6867,13 @@ v0.186 is the **shared-state & data-parallelism graduation** — accepted propos
 **Kernel classification (the v0.198 obligation):** no ownership rule changes. §5.27 re-affirms axiom A5 and the v0.201 §21.1/§28.10 division as decided; no new axioms; no derivations change. Implementation trackers filed alongside, not part of this revision: #2071 (unmarked `using var` adoption divergence, spec §28.10 v0.180), #2072 (single classification funnel), #2073 (vacuous-pin lint).
 
 **Migration.** None — doc-only; no program changes meaning and no diagnostic changes in this revision.
+
+### v0.206 changelog (v0.205 → v0.206)
+
+**Clarification, docs-only (spec §28.3 — kernel presentation).** The single-definition-site restatement of the kernel's closed sets, recommended by the 2026-07-21 kernel review (its C4). Zero semantic delta — every rule keeps its id, its content, and its derivation tags; what changes is how many times each closed set is stated.
+
+**The announced-kill set is now defined once.** The set — explicit `Dispose()`, the discard, `throw x`, Pattern B `await` — was stated four times: K4.2 (with disposal moments), as K3 rows 5/8/9/10, as K5.3's placement list, and a fourth time in the §28.3 freeze sub-block. K4.2 is now the sole definition site: K3 gains a one-sentence family classification of its twelve rows (stores into announced owned destinations 1–4/12; ownership-taking kills and transfers 5–10, of which 5/8/9/10 are exactly K4.2's kills; displacement 11) with the rows themselves unchanged; K5.3 states the derivation (announced ∧ flag-backstopped ⇒ unfrozen) and points at K4.2 for membership; the freeze sub-block's boundary paragraph references K5.1–K5.4 instead of re-enumerating both placement lists. K5.1 absorbs the one fact that had lived only in the freeze sub-block's enumeration (the unmarked `Task`-family return of a non-`async` body is a frozen transferring kill, per K3.2). K5.7 keeps its rule and points its reason at §28.14, where the strengthening and its rationale were already stated under A11's forms. This closes the drift hazard the review named (a set extended at one statement site and missed at another — the v0.200 landing had to verify K5.1's wording separately for exactly this reason).
+
+**Kernel classification (the v0.198 obligation):** presentation only — no rule changes, no derivation changes, no axiom changes; the budget stands. A preservation audit over the edit set (the v0.198/v0.199 discipline) was run at this landing.
+
+**Migration.** None — doc-only; no program changes meaning, no diagnostic changes.
