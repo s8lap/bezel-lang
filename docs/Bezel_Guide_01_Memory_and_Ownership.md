@@ -1,6 +1,6 @@
 # Bezel Guide 1: Memory and Ownership
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.200.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.208.*
 
 Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope (with a must-use warning), and a use-after-free or double-free is rejected outright. This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 
@@ -309,17 +309,17 @@ end Emit;
 
 `Emit` borrows `sink` (no `owned`), so it imposes no disposal obligation and works identically whether the caller passes a borrowed parameter or a local `using var`. This is the idiomatic shape: the shared logic takes a borrow; each caller supplies a destination whose lifetime it controls. The ownership question is answered once, locally, at each call site — never smuggled through a merge or a `??`.
 
-**Pattern B — make both branches owned.** When the two possibilities are both *owned values of the same type*, you have a choice of form. The `if`-expression (`trueValue if condition else falseValue`) is the idiomatic one and reads best:
+**Pattern B — make both branches owned.** When the two possibilities are both *owned values of the same type*, you have a choice of form. The `if`-expression (`(if condition then trueValue else falseValue)`) is the idiomatic one and reads best:
 
 ```bezel
-using var x := new Buffer() if useFresh else source.CloneBuffer();
+using var x := (if useFresh then new Buffer() else source.CloneBuffer());
 x.Process();
 // CloneBuffer is declared `CloneBuffer(): owned Buffer`, so both arms are
 // owned Buffer — the expression has a single, unambiguous ownership: owned.
 // `using var` discharges it at scope end.
 ```
 
-This works *precisely because both arms have the same ownership*. It is the same principle as the bad merge in §8, seen from the other side: a `value if c else value` expression (and `??`, above) is only well-formed when both arms agree on ownership. Here they do — both are fresh owned producers — so there is nothing for the compiler to reject. (Write two *named* owned locals as the arms and the expression becomes a borrow merge, exactly as with `??`; coalescing them into one owned result then takes the explicit `if`/`else` below.)
+This works *precisely because both arms have the same ownership*. It is the same principle as the bad merge in §8, seen from the other side: a `(if c then value else value)` expression (and `??`, above) is only well-formed when both arms agree on ownership. Here they do — both are fresh owned producers — so there is nothing for the compiler to reject. (Write two *named* owned locals as the arms and the expression becomes a borrow merge, exactly as with `??`; coalescing them into one owned result then takes the explicit `if`/`else` below.)
 
 The statement form is equivalent and is what you fall back to when the branches need more than one expression each. Note it is a *statement* (`if … then … else … end;`), not the ternary above — declare the variable first, assign in each branch:
 

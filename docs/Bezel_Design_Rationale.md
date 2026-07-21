@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.207 — July 2026**
+**Companion to the Bezel Language Specification, v0.208 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -88,13 +88,13 @@ Ownership gives the same form a second job: applied to a named owned binding, `_
 `_` is a sink, not a binding. It cannot be read.
 
 <a id="sec-the-value-position-conditional"></a>
-### 3.3 The value-position conditional is value-first (`a if c else b`)
+### 3.3 The value-position conditional is condition-first and paren-delimited (`(if c then a else b)`)
 
-The expression form of selection is Python's postfix conditional — `value if condition else fallback` — while the statement form is condition-first (`if c then … else … end;`). The two word orders differ deliberately; the choice was re-examined and confirmed in 2026-07 (issue #1373).
+The expression form of selection is the parenthesized, condition-first atom — `(if c then a elif c2 then b else fallback)` — the same word order as the statement form, with the atom's parentheses as its delimiters and no `end` (spec §20, v0.208; proposal 0057). The form's history is a genuine reversal, recorded as one: through v0.207 the expression form was Python's postfix conditional (`value if condition else fallback`), a deliberate word-order split re-examined and confirmed in 2026-07 (issue #1373) on the strength of the value-first reading for the default-with-override idiom. The v0.208 re-weighing — by the same decider — overturned that preference: one selection word order across the language retires the asymmetry's erratum class (#748); first-class `elif` replaces the postfix form's right-nested chaining; the branches of a delimited atom derive full expressions, dissolving the v0.182 true-branch `throw` parse trap and the conditional's precedence entry outright; and the value-first idiom's strongest case keeps `??` for the nullable default, with the boolean-conditioned default now reading condition-first — a real, accepted residual cost. What made the reversal available rather than a re-ask was the delimiter design: the #1373-era condition-first candidate was `if c then a else b end`, declined for `end`-noise inside nested expressions; the paren-delimited atom adopts the statement's word order while deleting exactly that cost.
 
-Why value-first in expression position: there, the *value* is the point — the dominant idiom is a default with an override (`var port := requested if requested > 0 else 8080;`), which reads in exactly the order the reader cares about. The form cannot dangle (the `else` is mandatory, so totality is syntactically visible), and it is familiar from Python. The recorded cost: the word-order asymmetry against the statement form occasionally trips an author writing one where they meant the other (erratum #748); this is accepted.
+The atom's parentheses earn their keep three ways: `(` + `if` commits the parse at the second token; the delimiters make dangling-`else` and extent-by-precedence questions unaskable; and the form composes in any operand position like the `(case …)`/`(when …)` atoms. The recorded ergonomic cost: in call- and index-argument position the atom supplies its own pair inside the argument list's (`f((if c then a else b))`).
 
-Alternatives considered and declined: a prefix expression form `if c then a else b end` (heavier in expression position and adds `end`-noise inside nested expressions; the value-first reading was judged the better fit for the default-with-override idiom); C's `c ? a : b` (two more sigils in a language that spells `and`/`or`/`not` as words).
+Alternatives declined: the postfix form (retired v0.208, above — reopening it requires new evidence against this section's reasons, per the standing discipline); `if c then a else b end` (the end-noise objection stands; the adopted form is its repair); C's `c ? a : b` (two more sigils in a language that spells `and`/`or`/`not` as words); the bare unparenthesized `if c then a else b` (statement-position prefix collision with the statement form, dangling-`else` under nesting).
 
 <a id="sec-compound-assignment-spelling"></a>
 ### 3.4 Compound assignment keeps the C spellings
@@ -396,7 +396,7 @@ The error-message-side complexity is small: an iterator's static signature is kn
 <a id="sec-no-block-expressions"></a>
 ### 5.13 No block expressions
 
-Bezel does not provide a value-returning `do ... end` form. `do ... end` is a statement-sequencing block with type `()` everywhere it appears — in method bodies, in `case` arms at statement position, in `for` and `while` bodies, and as the body of a multi-statement lambda. Multi-statement logic in expression-position contexts (most visibly, `case` arms inside `var x := case ...`) is written as an extracted helper method or a local lambda, both of which produce values.
+Bezel does not provide a value-returning `do ... end` form. `do ... end` is a statement-sequencing block with type `()` everywhere it appears — in method bodies, in `case` arms at statement position, in `for` and `while` bodies, and as the body of a multi-statement lambda. Multi-statement logic in expression-position contexts (most visibly, `case` arms inside `var x := (case ...)`) is written as an extracted helper method or a local lambda, both of which produce values.
 
 Earlier revisions of this spec flagged the absence of block expressions as an "ergonomic gap" and anticipated a future revision adding a value-returning form. v0.93 closes the question: the gap is real but the answer is to leave it. The reasoning, briefly:
 
@@ -1043,12 +1043,11 @@ Two alternatives were declined. *Restricting the domain* — confining the numer
 A common need is "test totally different conditions." Forcing those into a scrutinee-having `case` would require gymnastics. Bezel provides `when` — a scrutinee-less sibling of `case` whose every arm is a full boolean test:
 
 ```bezel
-var grade := when
+var grade := (when
   score >= 90 => "A",
   score >= 80 => "B",
   score >= 70 => "C",
-  _ => "F"
-end;
+  _ => "F");
 ```
 
 This subsumes most `if-else-if` chains.

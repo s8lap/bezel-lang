@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.207 — July 2026**
+**Companion to the Bezel Language Specification, v0.208 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -963,10 +963,9 @@ public choice Result<T, E>
   Ok(owned value: T),
   Error(owned error: E);
 
-  public method IsOk(): bool => case this of
+  public method IsOk(): bool => (case this of
     Ok(_)    => true,
-    Error(_) => false
-  end;
+    Error(_) => false);
 
   public method IsError(): bool => not IsOk();
 end Result;
@@ -1426,7 +1425,7 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
     if capacity < 0 then
       throw new ArgumentOutOfRangeException("capacity");
     end;
-    _storage := new OwningBuffer<T>(capacity if capacity > 0 else 1);
+    _storage := new OwningBuffer<T>((if capacity > 0 then capacity else 1));
   end constructor;
 
   public readonly property Count: int => _count;

@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.207 — July 2026**
+**Version 0.208 — July 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -1336,17 +1336,17 @@ A `with` expression produces a new record value with named fields replaced:
 
 ```bezel
 var p1 := new Point(1, 2);
-var p2 := p1 with Y := 99 end;          // Point(1, 99)
-var p3 := p2 with X := 0, Y := 0 end;   // Point(0, 0)
+var p2 := p1 with(Y := 99);             // Point(1, 99)
+var p3 := p2 with(X := 0, Y := 0);      // Point(0, 0)
 ```
 
-Syntax: `recordExpr with Name := value, ... end`. A trailing comma after the last assignment is permitted. The source expression must be **record-typed**; `with` produces a copy with the named fields replaced — the original record value is unchanged. A `with` expression whose source is class-typed is a **compile error naming this rule** (v0.188 — the retired object-initializer reading, [§22.11](#sec-object-initializer-blocks)); the diagnostic names both remedies: named/optional constructor arguments ([§22.5](#sec-optional-parameters-and-named-arguments)), which run the constructor and respect its invariants, or binding the instance to a named local and assigning its members as statements. The discriminator is the source expression's **type kind**, never the presence of `new`: `new Point(1, 2) with Y := 9 end` has a record-typed source and is an ordinary record `with` applied to the freshly-constructed value; the same spelling on a class-typed `new` expression is rejected.
+Syntax: `recordExpr with(Name := value, ...)`. The parentheses are part of the suffix — the assignment list reads as a named-argument list ([§22.5](#sec-optional-parameters-and-named-arguments)) — and the suffix carries no `end`. A trailing comma after the last assignment is permitted. The source expression must be **record-typed**; `with` produces a copy with the named fields replaced — the original record value is unchanged. A `with` expression whose source is class-typed is a **compile error naming this rule** (v0.188 — the retired object-initializer reading, [§22.11](#sec-object-initializer-blocks)); the diagnostic names both remedies: named/optional constructor arguments ([§22.5](#sec-optional-parameters-and-named-arguments)), which run the constructor and respect its invariants, or binding the instance to a named local and assigning its members as statements. The discriminator is the source expression's **type kind**, never the presence of `new`: `new Point(1, 2) with(Y := 9)` has a record-typed source and is an ordinary record `with` applied to the freshly-constructed value; the same spelling on a class-typed `new` expression is rejected.
 
 The named fields must be auto-generated positional-field properties (regardless of their read-only status), auto-properties declared in the record body, or public fields. A `with` target must be **accessible at the use site under the member's own declared accessibility** ([§13](#sec-visibility), v0.180): a `private` auto-property is a valid target only inside the declaring record. Because `with` copies storage directly and never invokes setters (below), **accessor-level** visibility is irrelevant — a `private set` does not restrict `with`, by the same logic that lets read-only positional-field properties, which have no setter at all, be targets. For body-only records, `with` targets any auto-property that has backing storage; expression-bodied (computed) properties are not valid targets. All other fields keep their values from the source record. The result has the same static type as the source. The `with` operation constructs the copy directly from the source's storage; it does not invoke setters, so read-only positional-field properties are valid targets even though they have no setter.
 
 `with` copies field values directly; it does not invoke the record's constructor. A constructor that validates cross-field invariants (e.g. `Width > 0 and Height > 0`) is not re-run during `with`. If a record enforces invariants that may be violated by independent field replacement, the record should provide a named method for constrained updates rather than relying on `with`.
 
-The `with` keyword has two uses across the language: record non-destructive update (this section) and cancellation in `await for ... with token` ([§30.7](#sec-asynchronous-programming-async-iterators)). The two are syntactically distinguished by grammar position: record `with` is a primary suffix following the source expression; `await for`'s `with` follows the iteration source and precedes `do`.
+The `with` keyword has two uses across the language: record non-destructive update (this section) and cancellation in `await for ... with token` ([§30.7](#sec-asynchronous-programming-async-iterators)). The two are syntactically distinguished by grammar position and shape: record `with(...)` is a parenthesized primary suffix following the source expression; `await for`'s `with` (no parenthesized assignment list — its content is a single `CancellationToken` expression) follows the iteration source and precedes `do`. In an `await for` header, `with` followed by `(` and `Identifier :=` is the record-update suffix binding to the source expression; any other `with` opens the cancellation clause.
 
 <a id="sec-records-and-inheritance"></a>
 ### 9.6 Records and inheritance
@@ -1356,17 +1356,14 @@ A record cannot derive from another record or from a class (other than the impli
 ```bezel
 record Point(X: int, Y: int): IComparable<Point>
   public method CompareTo(other: Point): int =>
-    when
-      X <> other.X => when
+    (when
+      X <> other.X => (when
         X < other.X => -1,
-        _ => 1
-      end,
-      Y <> other.Y => when
+        _ => 1),
+      Y <> other.Y => (when
         Y < other.Y => -1,
-        _ => 1
-      end,
-      _ => 0
-    end;
+        _ => 1),
+      _ => 0);
 end Point;
 ```
 
@@ -1576,21 +1573,19 @@ enum Priority
 
   public method IsUrgent(): bool => this = High;
 
-  public property Name: string => case this of
+  public property Name: string => (case this of
     Low => "Low",
     Medium => "Medium",
-    High => "High"
-  end;
+    High => "High");
 
   public static readonly All: Array<Priority> := [Low, Medium, High];
 
   public static method Parse(text: string): Priority?
-    return case text of
+    return (case text of
       "Low" => Low,
       "Medium" => Medium,
       "High" => High,
-      _ => null
-    end;
+      _ => null);
   end Parse;
 end Priority;
 ```
@@ -1626,11 +1621,10 @@ enum Priority: IComparable<Priority>
   Low, Medium, High;
 
   public method CompareTo(other: Priority): int =>
-    when
+    (when
       int(this) < int(other) => -1,
       int(this) > int(other) => 1,
-      _ => 0
-    end;
+      _ => 0);
 end Priority;
 ```
 
@@ -1847,7 +1841,7 @@ A class declared `static` may contain only static members:
 
 ```bezel
 public static class Utils
-  public static method Max(a: int, b: int): int => a if a > b else b;
+  public static method Max(a: int, b: int): int => (if a > b then a else b);
 end Utils;
 ```
 
@@ -3047,7 +3041,7 @@ for var i in 10.. do ... end;     // WARNING: open-ended range cannot be iterate
 For ranges stored in variables, the check is deferred to runtime:
 
 ```bezel
-var r: Range<int> := 1..10 if someCondition else 10..;
+var r: Range<int> := (if someCondition then 1..10 else 10..);
 for var i in r do ... end;        // InvalidOperationException if r is open-ended
 ```
 
@@ -3092,7 +3086,7 @@ Operators are evaluated according to the following table, from highest to lowest
 | 12 | Null-coalescing | `??` | right-to-left |
 | 13 | Logical AND | `and` | left-to-right |
 | 14 | Logical OR | `or` | left-to-right |
-| 15 | Conditional | `expr if cond else expr`, `throw expr` | right-to-left |
+| 15 | Throw | `throw expr` | right-to-left |
 | 16 | Assignment | `:=` `+=` `-=` `*=` `/=` `&=` `\|=` `^=` `<<=` `>>=` `??=` | right-to-left |
 
 <a id="sec-notes-on-operators"></a>
@@ -3101,7 +3095,7 @@ Operators are evaluated according to the following table, from highest to lowest
 - `and` and `or` short-circuit: the right operand is not evaluated if the result is determined by the left.
 - `??` is right-associative: `a ?? b ?? c` means `a ?? (b ?? c)`. `??` binds tighter than `and`/`or`, so `a ?? b or c` parses as `(a ?? b) or c`.
 - `?.`, `?(...)`, and `!` (postfix) are primary-level. They bind as tightly as `.` and `[ ]`.
-- `case … end` and `when … end` do not appear in the table (v0.182): they are self-delimited and parse as **primary atoms** (grammar A.7 `PrimaryAtom`), composable in any operand position without parentheses. `throw expr` genuinely belongs at level 15: its operand is a full `Expression`, so it extends maximally to the right — note that the conditional's *true* branch parses at a higher level and derives no bare `throw` ([§20](#sec-the-if-expression)).
+- The `(if …)`, `(case …)`, and `(when …)` expression atoms do not appear in the table (v0.208): each is self-delimited and parses as a **primary atom** (grammar A.7 `PrimaryAtom`), composable in any operand position without further parenthesization. `throw expr` genuinely belongs at level 15: its operand is a full `Expression`, so it extends maximally to the right; inside an atom, a branch or arm derives a full expression, so a bare `throw` branch needs no parenthesization ([§20](#sec-the-if-expression)).
 - Assignments and compound assignments are statements, not expressions; they produce no value.
 - **Event-subscription forms `+=`/`-=` (v0.187).** When the static type of the left operand of `+=` or `-=` is `EventSource<T>`, `AsyncEventSource<T>`, or `SharedEventSource<T>` (stdlib [§6.5](Bezel_Standard_Library.md#sec-events-ievent-eventsource)), the statement is a fixed, language-defined desugaring: `lhs += h` rewrites to `lhs.Add(h)` and `lhs -= h` to `lhs.Remove(h)`, selected by that operand type before the compound-assignment rules of [§6.6](#sec-compound-assignments) apply. Grammatically the form is an `AssignmentStmt` (A.6) reinterpreted by the LHS's static type; the forms are not compound assignments, not user-overloadable ([§25.1](#sec-overloadable-operators)), and `lhs += h` **evaluates `lhs` only as the receiver of the desugared call** — it performs no read-modify-write of the location and never assigns to it. The desugaring is recognized **before** `readonly`-assignability checking, so the forms are available on a `readonly` field — the recommended declaration of stdlib §6.5's event pattern (`private owned readonly _clicked: EventSource<T> := new();` … `_clicked += OnClicked;`). `Add` is a `scoped` (storing) position: [§28.14](#sec-scoped-callback-parameters)'s storage-bounded admission applies to the desugared call (for the pattern's spelling the receiver chain roots at `this` through an `owned` field — form 4); on `SharedEventSource<T>` the handler position admits only **capture-free** handlers ([§28.14](#sec-scoped-callback-parameters)'s stdlib-stated capture-free register). `Remove` is call-bounded — it only compares its argument, by function-value equality ([§27.7.1](#sec-equality-of-function-values)); when no handler matches, `-=` is a no-op.
 - `++` and `--` are statement-only ([§17.6](#sec-the-increment-and-decrement-operators)) and do not appear in the precedence table. They are not expression operators; they cannot be combined with other operators.
@@ -3112,7 +3106,7 @@ Operators are evaluated according to the following table, from highest to lowest
   - `1<<2..1<<10` parses as `(1<<2)..(1<<10)` — Range looser than Shift.
   - `score in 60..100` parses as `score in (60..100)` — Range tighter than Relational.
   - `r = 0..10` parses as `r = (0..10)` — Range tighter than Equality.
-  - `0..10 if cond else 20..30` parses as `(0..10) if cond else (20..30)` — Range tighter than Conditional.
+  - `(if cond then 0..10 else 20..30)` — the conditional atom's branches are full expressions, so range branches need no grouping.
 - The placement of Range in the bitwise band (level 6) is deliberate. Earlier revisions placed Range at high precedence (just below Primary), which forced explicit parentheses around any arithmetic in range bounds. v0.69 moved Range to the lowest binary level, but that broke `score in 60..100` and similar `in`-with-range idioms. v0.71 settled on level 6, which makes both arithmetic-in-bounds (`0..n+1`) and `in`-with-range (`x in a..b`) parse naturally without parentheses; bitwise-with-range mixes are rejected by the mandatory-parenthesization rules below.
 - `await` is a unary-precedence prefix operator (level 2). Worked examples:
   - `await x.y` parses as `await (x.y)` — primary access binds tighter than unary `await`.
@@ -3385,15 +3379,14 @@ In a generic body:
 Both forms have the bottom type — assignable to any expected type — because control transfers to the matching handler before any value is produced.
 
 ```bezel
-public property [i: int]: double => case i of
+public property [i: int]: double => (case i of
   0 => X,
   1 => Y,
   2 => Z,
-  _ => throw new IndexOutOfRangeException()
-end;
+  _ => throw new IndexOutOfRangeException());
 
-var name := user.Name if user <> null else
-            throw new InvalidOperationException("user is null");
+var name := (if user <> null then user.Name
+             else throw new InvalidOperationException("user is null"));
 
 var config := LoadConfig() ?? throw new InvalidOperationException("no config");
 
@@ -3540,7 +3533,7 @@ A **constant expression** is built from exactly these forms:
   boolean (`and`, `or`) operators applied to constant operands of primitive
   or `string` type — including `+` as constant `string` concatenation, which
   folds;
-- the `if` expression `a if c else b` ([§20](#sec-the-if-expression)) whose
+- the `if` expression `(if c then a else b)` ([§20](#sec-the-if-expression)) whose
   condition and both branches are constant expressions;
 - a parenthesized constant expression.
 
@@ -3587,7 +3580,7 @@ const Flags: long := (1 << 10) | (1 << 3); // folds under §6.5 semantics (paren
                                            //   shift-with-bitwise is not a §17.2 mandatory mix)
 const Greeting := "Hello, " + "world";    // constant string concatenation
 const Who := nameof(Greeting);            // "Greeting"
-const Cap := 64 if Flags > 0 else 32;     // constant conditional
+const Cap := (if Flags > 0 then 64 else 32);     // constant conditional
 // const B := 2147483647 + 1;             // compile error: constant evaluation overflows (§6.1)
 // const S := $"v{H}";                    // compile error: interpolated strings are not constant
 ```
@@ -3708,7 +3701,7 @@ x := 3.0;
 Console.WriteLine($"[{x,8:F2}]");      // prints: [    3.00] — present value: ordinary dispatch
 ```
 
-**Hole delimitation (normative, v0.172, #1339).** Inside `{…}` the lexer tracks nesting of `(` `)` `[` `]` `{` `}` and skips nested string/char literals (recognized by their own opening quote and parsed as complete literals; they do not terminate the outer string). The alignment `,` and the format-spec `:` are recognized only at the **top nesting level** of the hole; the first top-level `,` begins the alignment, the first top-level `:` begins the format spec. Consequently `{d[k]:F2}` needs no parenthesization tricks (`[…]` nests its colon) and `{(a if c else b),8}` aligns the conditional. The format spec runs from its `:` to the hole's closing `}`; braces do not appear inside a format spec (a `{` there is a compile error).
+**Hole delimitation (normative, v0.172, #1339).** Inside `{…}` the lexer tracks nesting of `(` `)` `[` `]` `{` `}` and skips nested string/char literals (recognized by their own opening quote and parsed as complete literals; they do not terminate the outer string). The alignment `,` and the format-spec `:` are recognized only at the **top nesting level** of the hole; the first top-level `,` begins the alignment, the first top-level `:` begins the format spec. Consequently `{d[k]:F2}` needs no parenthesization tricks (`[…]` nests its colon) and `{(if c then a else b),8}` aligns the conditional. The format spec runs from its `:` to the hole's closing `}`; braces do not appear inside a format spec (a `{` there is a compile error).
 
 **Literal braces (v0.172, #1339).** In interpolated strings (`$"…"` and `$@"…"`), a doubled brace denotes a literal brace: `{{` produces `{`, `}}` produces `}`. An unescaped `}` that does not close a hole is a compile error; write `}}` for a literal closing brace. Non-interpolated strings are unaffected (braces are ordinary characters there).
 
@@ -3764,7 +3757,7 @@ Surrogate escapes (U+D800–U+DFFF) are compile errors.
 <a id="sec-the-case-construct"></a>
 ## 19. The `case` and `when` Constructs
 
-`case` is multi-way pattern matching against a scrutinee. Its sibling `when` is multi-way **condition** dispatch with no scrutinee — each arm is a boolean test, and the first true arm wins. Both are single constructs that produce a value; in statement position, the value is discarded per the [§21.9](#sec-statement-form-of-expressions) rules (applied per arm — see below). **Expression-position type (v0.159):** the construct's type is the left-fold of its arm-body types under the [§20](#sec-the-if-expression) common-type rule (`throw` arms are bottom-typed and impose no constraint). Only the selected arm's body is evaluated. They share the same arm bodies ([§19.2](#sec-arms)) and the same `end` terminator, and either may appear in expression or statement position.
+`case` is multi-way pattern matching against a scrutinee. Its sibling `when` is multi-way **condition** dispatch with no scrutinee — each arm is a boolean test, and the first true arm wins. Both are single constructs that produce a value; in statement position, the value is discarded per the [§21.9](#sec-statement-form-of-expressions) rules (applied per arm — see below). **Expression-position type (v0.159):** the construct's type is the left-fold of its arm-body types under the [§20](#sec-the-if-expression) common-type rule (`throw` arms are bottom-typed and impose no constraint). Only the selected arm's body is evaluated. They share the same arm bodies ([§19.2](#sec-arms)) and appear in either position, with the closer keyed to the position (v0.208): in expression position each is a parenthesized, self-delimited **atom** — `(case … of …)` / `(when …)`, expression-bodied arms only — and in statement position each is an `end`-terminated **statement** (`case … of … end case?;` / `when … end when?;`, grammar A.6 `CaseStmt`/`WhenStmt`) whose arms may also be single statements or `do … end` blocks.
 
 <a id="sec-forms"></a>
 ### 19.1 Forms
@@ -3785,23 +3778,21 @@ end;
 A missing `of` is a syntax error at the first arm token; the diagnostic names the delimiter ("expected `of` after the case scrutinee").
 
 ```bezel
-var grade := case score of
+var grade := (case score of
   90..100 => "A",
   80..89 => "B",
   70..<80 => "C",
-  _ => "F"
-end;
+  _ => "F");
 ```
 
 **`when` (condition dispatch)** — `when` followed by arms whose patterns are full boolean expressions. The arms are evaluated in textual order; the first whose expression is `true` is selected. This subsumes the `if`/`elif` chain. `when` takes no scrutinee.
 
 ```bezel
-var grade := when
+var grade := (when
   score >= 90 => "A",
   score >= 80 => "B",
   score >= 70 => "C",
-  _ => "F"
-end;
+  _ => "F");
 ```
 
 `when` exists in both expression position (above) and statement position:
@@ -3828,16 +3819,15 @@ Each arm has the form `pattern => body`. An arm body has three possible shapes:
 Multi-statement logic in *expression-position* arms is extracted into a helper method or local lambda — both produce values, and the extraction makes the arm's intent visible at its declaration site:
 
 ```bezel
-var description := case score of
+var description := (case score of
   > 90 => "excellent",
   > 70 => "good",
   > 50 => "passing",
-  _    => Classify(score)            // helper for the multi-step case
-end;
+  _    => Classify(score)            // helper for the multi-step case);
 
 private static method Classify(score: int): string
   Log("low score: " + score.ToString());
-  return "invalid" if score < 0 else "failing";
+  return (if score < 0 then "invalid" else "failing");
 end Classify;
 ```
 
@@ -3930,11 +3920,10 @@ public sealed class Circle: Shape ... end Circle;
 public sealed class Square: Shape ... end Square;
 public sealed class Triangle: Shape ... end Triangle;
 
-var area := case shape of
+var area := (case shape of
   var c: Circle => Math.Pi * c.Radius * c.Radius,
   var s: Square => s.Side * s.Side,
-  var t: Triangle => 0.5 * t.Base * t.Height
-end;                       // exhaustive: every leaf covered, no _ needed
+  var t: Triangle => 0.5 * t.Base * t.Height);                       // exhaustive: every leaf covered, no _ needed
 ```
 
 When the hierarchy is open (the base is neither `sealed abstract` nor an abstract class whose transitive subclass set is closed per the rule above), exhaustiveness cannot be proven statically and the warning is emitted unless the user supplies `_`.
@@ -3963,10 +3952,9 @@ public sealed abstract class Result<T> ... end Result;
 public sealed class Ok<T>(value: T): Result<T> ... end Ok;
 public sealed class Err<T>(error: string): Result<T> ... end Err;
 
-var label := case r of                     // r: Result<int>
+var label := (case r of                     // r: Result<int>
   var o: Ok<int> => $"ok: {o.Value}",      // T := int — the sole solution
-  var e: Err<int> => $"err: {e.Error}"     // T := int — the sole solution
-end;          // exhaustive: Ok<int> and Err<int> are the only inhabitants
+  var e: Err<int> => $"err: {e.Error}"     // T := int — the sole solution);          // exhaustive: Ok<int> and Err<int> are the only inhabitants
 
 // Undetermined: Tagged's U never reaches the base clause, so
 // Tagged<int>, Tagged<string>, ... all inhabit Message.
@@ -3974,11 +3962,10 @@ public sealed abstract class Message ... end Message;
 public sealed class Text(body: string): Message ... end Text;
 public sealed class Tagged<U>(tag: U): Message ... end Tagged;
 
-var kind := case m of                      // m: Message
+var kind := (case m of                      // m: Message
   var t: Text => "text",
   var g: Tagged<int> => "int tag",         // one instantiation — not the leaf
-  _ => "other"
-end;          // _ required: Tagged is undetermined at Message; without it,
+  _ => "other");          // _ required: Tagged is undetermined at Message; without it,
               // the warning names Tagged and U and prescribes _ (or the
               // determined shape: Tagged<U>: Message<U> under a generic root)
 ```
@@ -3995,21 +3982,20 @@ The recommended discipline is treating any addition of a leaf type to a sealed h
 <a id="sec-termination"></a>
 ### 19.7 Termination
 
-A `case` ends with `end`. The trailing `;` belongs to the enclosing statement, not the case:
+The closer is keyed to the position (v0.208). In expression position the construct is a parenthesized atom — it opens with `(case` (or `(when`) and its closing parenthesis is the terminator; there is no `end`. In statement position it is an `end`-terminated statement, with the statement's `;` following the `end`:
 
 ```bezel
-var grade := case score of
+var grade := (case score of
   90..100 => "A",
-  _ => "F"
-end;                   // ; ends the assignment
+  _ => "F");             // the atom's ')' closes the case; ';' ends the declaration
 
 case month of
   1 => Console.WriteLine("Jan"),
   _ => Console.WriteLine("Other")
-end;                   // ; ends the statement
+end;                    // statement position: 'end' closes the case; ';' the statement
 ```
 
-Because `case ... end` is self-delimited, it composes inside any expression position without parenthesization, including inside string interpolations and as another arm's body.
+The atom is self-delimited and composes inside any expression position, including inside string interpolations and as another arm's body. In call- and index-argument position its parentheses are its own — the argument list's do not substitute: `f((case x of 1 => a, 2 => b), y)`.
 
 <a id="sec-inside-enum-scrutinees"></a>
 ### 19.8 Inside enum scrutinees
@@ -4021,33 +4007,34 @@ When the scrutinee has an enum type, the enum prefix may be omitted in patterns.
 <a id="sec-the-if-expression"></a>
 ## 20. The `if` Expression
 
-The `if` expression selects between two values:
+The `if` expression selects between values, condition-first, as a parenthesized, self-delimiting atom (grammar A.7 `IfExpr`, the PrimaryAtom family; v0.208):
 
 ```
-trueValue if condition else falseValue
+(if condition then trueValue else falseValue)
+(if c1 then v1 elif c2 then v2 else fallback)
 ```
 
-Both branches must have a common type. **The common type (v0.159, codifying the implemented rule):** the common type of branch types A and B is whichever of the two the other implicitly converts into — identical types trivially; [§5.1](#sec-implicit-conversions) widening (including constant narrowing); non-nullable `T` into `T?`; a subtype into its base class or implemented interface (a [§5.1](#sec-reference-conversions) reference conversion). If neither converts into the other, the expression is a compile error directing to an explicit conversion or upcast — there is **no** sibling-class least-upper-bound search (deliberately unlike the nearest-common-base rule of [§31.2.1](#sec-arm-patterns), which applies only to multi-type catch bindings). A `throw` branch is bottom-typed ([§17.12](#sec-the-throw-expression)) and imposes no constraint. The condition is evaluated first; only the selected branch is then evaluated. When the branches are class-typed, the expression's **ownership** is the arm-meet of [§28.3](#sec-producers)'s producers table (v0.184): owned arms meet to owned, borrowed arms to borrowed with unioned source constraints, mixed arms are rejected, and a named owned binding written as a branch is a borrow arm.
+The parentheses are part of the form: in atom-start position, `(` followed by the reserved `if` — which begins no other expression — commits the reading at the second token, and the matching `)` closes the atom; there is no `end`. In call- and index-argument position the leading `(` is the argument list's own, so the atom supplies its pair — `f((if c then a else b))`. The reserved `then`, `elif`, and `else` separate the segments; the `else` branch is mandatory (an expression produces a value on every path); and each condition and branch is a **full expression** with no precedence restriction — in particular, a `throw` branch is admitted in *any* branch position.
+
+Both branches must have a common type. **The common type (v0.159, codifying the implemented rule):** the common type of branch types A and B is whichever of the two the other implicitly converts into — identical types trivially; [§5.1](#sec-implicit-conversions) widening (including constant narrowing); non-nullable `T` into `T?`; a subtype into its base class or implemented interface (a [§5.1](#sec-reference-conversions) reference conversion). If neither converts into the other, the expression is a compile error directing to an explicit conversion or upcast — there is **no** sibling-class least-upper-bound search (deliberately unlike the nearest-common-base rule of [§31.2.1](#sec-arm-patterns), which applies only to multi-type catch bindings). A `throw` branch is bottom-typed ([§17.12](#sec-the-throw-expression)) and imposes no constraint. Conditions are evaluated in textual order; the first `true` condition selects its branch, the `else` branch is selected when none holds, and only the selected branch is evaluated. When the branches are class-typed, the expression's **ownership** is the arm-meet of [§28.3](#sec-producers)'s producers table (v0.184): owned arms meet to owned, borrowed arms to borrowed with unioned source constraints, mixed arms are rejected, and a named owned binding written as a branch is a borrow arm.
 
 ```bezel
-var max := a if a > b else b;
-var status := "adult" if age >= 18 else "minor";
+var max := (if a > b then a else b);
+var status := (if age >= 18 then "adult" else "minor");
 ```
 
-The form composes recursively, right-associatively:
+Multi-way selection chains with `elif`, in the statement form's word order:
 
 ```bezel
-var grade := "A" if score >= 90 else
-             "B" if score >= 80 else
-             "C" if score >= 70 else
-             "F";
+var grade := (if score >= 90 then "A"
+              elif score >= 80 then "B"
+              elif score >= 70 then "C"
+              else "F");
 ```
 
-For more than two or three branches, `case` is preferred.
+For many-way selection over one scrutinee, `case` is preferred ([§19](#sec-the-case-construct)).
 
-Precedence is level 15 ([§17.1](#sec-precedence)): `a ?? b if c else d` parses as `(a ?? b) if c else d`. When an `if` expression appears inside another expression with potentially-confusing grouping, parenthesize.
-
-One parse is subtle enough to state (v0.182): the rule above that a `throw` branch is bottom-typed and imposes no constraint reaches the **`else`** branch directly — `v if c else throw e` parses as intended, the `else` position deriving a full expression — but the *true*-branch position derives no bare `throw`: `throw a if c else b` parses as `throw (a if c else b)`, because `throw`'s operand is a full expression ([§17.12](#sec-the-throw-expression), grammar A.7). A conditional that throws on the true branch parenthesizes — `(throw e) if c else v` — or, usually clearer, inverts the condition.
+The atom takes no precedence-table entry ([§17.1](#sec-precedence)): it is self-delimited and composes in any operand position without further parenthesization, exactly as the `case` and `when` atoms do.
 
 ---
 
@@ -4270,7 +4257,7 @@ When the body is a single expression, `=> expression` replaces the block. A meth
 
 ```bezel
 public method Area(): decimal => Width * Height;
-public method Max(a: int, b: int): int => a if a > b else b;
+public method Max(a: int, b: int): int => (if a > b then a else b);
 ```
 
 <a id="sec-parameter-modifiers"></a>
@@ -4900,7 +4887,7 @@ A class with a primary constructor may declare additional convenience constructo
 <a id="sec-object-initializer-blocks"></a>
 ### 22.11 Object initializer blocks (retired v0.188)
 
-Retired. Earlier revisions defined an **object-initializer block** here: `new T(args) with ... end` on a **class** type, sugar for binding the fresh instance to a local and assigning public settable properties or public fields in textual order. The class-source meaning of `with ... end` is retired (v0.188): a `with` expression requires a record-typed source, and a class-typed source is a compile error ([§9.5](#sec-non-destructive-update-with)). In its place: named/optional constructor arguments ([§22.5](#sec-optional-parameters-and-named-arguments)) — which run the constructor and respect its invariants — or binding the instance to a local and assigning its members as ordinary statements, whose exception-path disposal is [§28.3](#sec-local-variables-ownership-and-borrows)'s general discharge of an owned local (no construct-specific rule remains). Record `with` on a freshly-constructed record (`new Point(1, 2) with Y := 9 end`) is unaffected ([§9.5](#sec-non-destructive-update-with)). The section number is retained so §22.12+ citations stay stable; the decision record is the v0.188 changelog entry ([`Bezel_Changelog.md`](Bezel_Changelog.md)).
+Retired. Earlier revisions defined an **object-initializer block** here: `new T(args) with(...)` on a **class** type, sugar for binding the fresh instance to a local and assigning public settable properties or public fields in textual order. The class-source meaning of the `with` suffix is retired (v0.188): a `with` expression requires a record-typed source, and a class-typed source is a compile error ([§9.5](#sec-non-destructive-update-with)). In its place: named/optional constructor arguments ([§22.5](#sec-optional-parameters-and-named-arguments)) — which run the constructor and respect its invariants — or binding the instance to a local and assigning its members as ordinary statements, whose exception-path disposal is [§28.3](#sec-local-variables-ownership-and-borrows)'s general discharge of an owned local (no construct-specific rule remains). Record `with` on a freshly-constructed record (`new Point(1, 2) with(Y := 9)`) is unaffected ([§9.5](#sec-non-destructive-update-with)). The section number is retained so §22.12+ citations stay stable; the decision record is the v0.188 changelog entry ([`Bezel_Changelog.md`](Bezel_Changelog.md)).
 
 <a id="sec-static-members"></a>
 ### 22.12 Static members
@@ -5095,7 +5082,7 @@ public static pure method Checked(x: int, low: int, high: int): int
   if low > high then
     throw new ArgumentException("low must not exceed high", nameof(low));
   end;
-  return low if x < low else (high if x > high else x);
+  return (if x < low then low else (if x > high then high else x));
 end Checked;
 ```
 
@@ -5452,11 +5439,10 @@ For domain-specific inversion that does not match a bitwise reading, define a na
 
 ```bezel
 record TriBool(Value: int)
-  public method Negate(): TriBool => case Value of
+  public method Negate(): TriBool => (case Value of
     0 => new TriBool(1),
     1 => new TriBool(0),
-    _ => this
-  end;
+    _ => this);
 end TriBool;
 ```
 
@@ -6290,7 +6276,7 @@ The ownership state of an expression is determined by the expression form — th
 | Function call producing a move-only value type (an owning inline array `[N owned]T?` or `[N owned]T`, or an owning-classified choice — [§35.4](#sec-choice-classification), including a case construction) | Owned. The result is a move-only value ([§15.3](#sec-move-only-value-types)); the caller takes ownership and must discharge by binding into a local (auto-disposed at scope end via the move-only-local rule), into an owning-inline-array slot, into a class field of move-only type, or — for a choice — by a consuming match ([§35.5](#sec-owning-match)). |
 | `x as T` | Borrowed (source: same as `x`'s source if `x` is borrowed; `x` itself if `x` is owned). The cast does not move from `x`; `x` retains its ownership state. The result is nullable. See [§17.4](#sec-the-is-is-not-and-as-operators) for the rationale. |
 | `a ?? b` (null-coalescing, [§7.7](#sec-null-coalescing-and-=)) | The **meet** of the ownership states of `a` and `b` per [K7](#sec-kernel-k7) — the same two-branch merge as the control-flow join above (v0.180): owned ⊓ owned = **owned** (exactly one of the two owned values is produced at runtime and is discharged once — no leak, no double-free), borrowed ⊓ borrowed = **borrowed** carrying the union of both arms' source sets, and a mixed owned/borrowed arm pair is **rejected** — equalize the arms first ([§28.3](#sec-local-variables-ownership-and-borrows) two-branch patterns). A **named owned binding** written as an arm is an *unmarked read* and therefore a **borrow** arm, per the local-variable-read row above (axiom A7 — there is no arm-position transfer marker in this revision; recorded, liftable): `a ?? b` over two named owned locals is a borrowed ⊓ borrowed merge and consumes neither binding; to coalesce two named owned bindings into one owned result, equalize explicitly — `if a <> null then r := owned a; else r := owned b; end;` — which keeps the no-silent-consume rule of *Move semantics* uniform. A `null`-literal or bottom-typed (`throw`) arm absorbs to the other arm's state (K7.5), legitimizing the `x ?? throw …` shape ([§17.12](#sec-the-throw-expression)). The compound form `a ??= b` assigns into `a` and follows the same meet rule for the assigned-into location. |
-| `v1 if c else v2` ([§20](#sec-the-if-expression)); the result of an expression-position `case`/`when` ([§19.1](#sec-forms), [§19.2](#sec-arms)) | The **meet** of the arms' ownership states, identically to the `a ?? b` row above ([K7](#sec-kernel-k7) at expression joins; v0.184): owned ⊓ owned = **owned** — exactly one arm's value is produced at runtime and is discharged once; borrowed ⊓ borrowed = **borrowed**, carrying the union of the arms' source sets; a mixed owned/borrowed arm set is **rejected** — equalize the arms. A **named owned binding** written as an arm is an unmarked read and therefore a **borrow** arm (axiom A7 — the same recorded, liftable bound as `??`); a `throw` arm is bottom-typed and a `null`-literal arm absorbs to the other arms' state (K7.5; [§17.12](#sec-the-throw-expression)). For `case`/`when` the meet ranges over every arm's result expression. |
+| `(if c then v1 else v2)` ([§20](#sec-the-if-expression)); the result of an expression-position `case`/`when` ([§19.1](#sec-forms), [§19.2](#sec-arms)) | The **meet** of the arms' ownership states, identically to the `a ?? b` row above ([K7](#sec-kernel-k7) at expression joins; v0.184): owned ⊓ owned = **owned** — exactly one arm's value is produced at runtime and is discharged once; borrowed ⊓ borrowed = **borrowed**, carrying the union of the arms' source sets; a mixed owned/borrowed arm set is **rejected** — equalize the arms. A **named owned binding** written as an arm is an unmarked read and therefore a **borrow** arm (axiom A7 — the same recorded, liftable bound as `??`); a `throw` arm is bottom-typed and a `null`-literal arm absorbs to the other arms' state (K7.5; [§17.12](#sec-the-throw-expression)). For `case`/`when` the meet ranges over every arm's result expression. |
 | Captured borrow inside a closure | Borrowed (source: same as the captured local's source). The closure value itself is runtime-managed; the captured borrow's lifetime is tracked separately. |
 | Captured owned local inside a closure | Borrowed (source: the local's enclosing scope). Capturing does not transfer ownership; the closure cannot outlive the local's scope. See [§28.9](#sec-runtime-managed-types). |
 
@@ -6979,7 +6965,7 @@ end ProcessFile;
 
 Disposal happens on every exit path: normal completion, `break`, `return`, or exception. **Cleanup ordering is uniform across exit edges (v0.182):** `using var` compiles to `try`/`finally` ([§29.6](#sec-restrictions-inside-try-catch-finally)), so `using var` disposals and explicit `finally` clauses form one establishment-ordered stack — on *every* exit edge (normal, `return`, `break`/`continue`, exception, and an iterator's early disposal, [§29.7](#sec-disposal-of-partially-consumed-iterators)), pending cleanups run in reverse order of establishment. No edge runs the two kinds in separate category-ordered phases.
 
-An expression whose arm-meet is **owned** — a `??`, an `if` expression, or an expression-position `case`/`when` over owned producers (the [K7](#sec-kernel-k7) meet; [§28.3](#sec-producers), v0.184) — is an owned producer for this section's admission: `using var x := new Buffer() if useFresh else source.CloneBuffer();` — where `CloneBuffer` is declared `CloneBuffer(): owned Buffer`, making both arms fresh producers — binds `x` owned and disposes it at scope end. (An arm that reads a *named* owned binding is a borrow arm per the producers table; the whole expression is then a borrow, and the `using var` is a borrow-pin, not an owned binding.)
+An expression whose arm-meet is **owned** — a `??`, an `if` expression, or an expression-position `case`/`when` over owned producers (the [K7](#sec-kernel-k7) meet; [§28.3](#sec-producers), v0.184) — is an owned producer for this section's admission: `using var x := (if useFresh then new Buffer() else source.CloneBuffer());` — where `CloneBuffer` is declared `CloneBuffer(): owned Buffer`, making both arms fresh producers — binds `x` owned and disposes it at scope end. (An arm that reads a *named* owned binding is a borrow arm per the producers table; the whole expression is then a borrow, and the `using var` is a borrow-pin, not an owned binding.)
 
 `using var` is a scope pin (axiom [A5](#sec-axiom-register)): it is implicitly non-reassignable, and reassigning a `using var` variable is a compile error. To use a different resource later in the method, introduce a new `do ... end` block.
 
@@ -8047,7 +8033,7 @@ await for var line in ReadLinesAsync(path) with token do
 end;
 ```
 
-The `with token` clause passes `token` as the argument to `GetAsyncEnumerator(token)`. When omitted, `CancellationToken.None` is passed. The `with` clause is syntactically distinct from the record `with` expression — it appears after the `in` source expression and before `do`, and its only legal content is a single expression of type `CancellationToken`.
+The `with token` clause passes `token` as the argument to `GetAsyncEnumerator(token)`. When omitted, `CancellationToken.None` is passed. The `with` clause is syntactically distinct from the record `with(...)` suffix — it appears after the `in` source expression and before `do`, its content is a single expression of type `CancellationToken`, and it carries no parenthesized assignment list ([§9.5](#sec-non-destructive-update-with)'s header rule: `with` followed by `(` `Identifier` `:=` is the record-update suffix on the source; any other `with` opens this clause).
 
 **Token routing in generated async iterators (v0.179, #1351).** For a compiler-generated async iterator, the enumerator returned by the generated `GetAsyncEnumerator(token)` captures the token, and every `MoveNextAsync()` performs an implicit `token.ThrowIfCancellationRequested()` — on entry, and at each resume from suspension within the advance — so a requested cancellation faults the in-flight `MoveNextAsync` task with `OperationCanceledException` at the next suspension boundary. The iterator body cannot otherwise observe the enumerator's token: there is no implicit binding of it to a body name (a C#-`[EnumeratorCancellation]`-style parameter binding is declined as implicit magic). A body that needs to observe cancellation mid-operation declares its own `CancellationToken` parameter, and the caller passes the same token both ways.
 
@@ -9608,11 +9594,10 @@ public choice FetchOutcome
   NotModified,                            // payload-free case
   Failed(status: int, message: string);   // value payloads
 
-  public method IsSuccess(): bool => case this of
+  public method IsSuccess(): bool => (case this of
     Fetched(_)   => true,
     NotModified  => true,
-    Failed(_, _) => false
-  end;
+    Failed(_, _) => false);
 end FetchOutcome;
 ```
 
@@ -10436,9 +10421,22 @@ PrimitiveType   ::= IntegerType | "float" | "double" | "decimal"
 Statement       ::= LocalDecl | LocalConstDecl | AssignmentStmt | ExpressionStmt
                   | DiscardStmt
                   | IfStmt | WhileStmt | ForStmt | DoEndBlock
+                  | CaseStmt | WhenStmt
                   | ReturnStmt | ThrowStmt | BreakStmt | ContinueStmt
                   | TryStmt | YieldStmt
                   | IncrementStmt
+
+CaseStmt        ::= "case" "owned"? Expression "of" CaseArm ("," CaseArm)* ","? "end" "case"? ";"
+WhenStmt        ::= "when" WhenArm ("," WhenArm)* ","? "end" "when"? ";"
+                              /* The statement forms of §19's constructs (v0.208):
+                                 `end`-terminated, with the statement's `;`
+                                 following the closer. Arms use the same CaseArm/
+                                 WhenArm grammar as the A.7 atoms, and here
+                                 ArmBody additionally admits its Statement and
+                                 `do … end` alternatives; an expression-bodied
+                                 arm's value is discarded per §21.9, applied per
+                                 arm. The `owned` scrutinee marker rule is
+                                 §35.5's, identical to the atom's. */
 
 LocalDecl       ::= "var" Identifier (":" Type)? (":=" "owned"? Expression)? ";"
                   | "using" "var" Identifier (":" Type)? ":=" "owned"? Expression ";"
@@ -10548,18 +10546,15 @@ YieldStmt       ::= "yield" "return" Expression ";"
 The grammar shown here is informal: it lists the alternatives at each precedence level rather than expanding every binary level into recursive productions. Operator precedence is given in [§17.1](#sec-precedence).
 
 ```
-Expression      ::= ConditionalExpr
-ConditionalExpr ::= LogicalOr ("if" Expression "else" Expression)?
+Expression      ::= LogicalOr
                   | ThrowExpr
-                              /* CaseExpr and WhenExpr are PrimaryAtom forms
-                                 (self-delimited, usable in any operand
-                                 position); v0.182 removed their duplicate
-                                 listing here, which misread as a level-15
-                                 placement (§17.1). A bare ThrowExpr appears
-                                 only at top level or in the `else` branch:
-                                 the true branch is the LogicalOr prefix and
-                                 derives no ThrowExpr — `throw a if c else b`
-                                 parses as `throw (a if c else b)` (§20). */
+                              /* IfExpr, CaseExpr, and WhenExpr are PrimaryAtom
+                                 forms (self-delimited, usable in any operand
+                                 position); no conditional level exists in the
+                                 operator table (§17.1, v0.208). A bare ThrowExpr
+                                 appears at Expression top level and, because an
+                                 atom's branches and arm bodies derive full
+                                 Expressions, in any branch or arm body (§20). */
 ThrowExpr       ::= "throw" Expression?
                               /* Bare "throw" (no operand) is valid only inside a
                                  catch arm body; outside a catch arm body, the
@@ -10640,7 +10635,7 @@ PrimarySuffix   ::= "." Identifier GenericArgs?
                   | "(" ArgList? ")"
                   | "?(" ArgList? ")"
                   | "!"
-                  | "with" InitAssign ("," InitAssign)* ","? "end"
+                  | "with" "(" InitAssign ("," InitAssign)* ","? ")"
                               /* The `with` suffix is the record copy-with-
                                  overrides expression (§9.5). It requires a
                                  record-typed source; a class-typed source is
@@ -10676,6 +10671,7 @@ PrimaryAtom     ::= Literal
                   | NewExpr
                   | MoveExpr
                   | LambdaExpr
+                  | IfExpr
                   | CaseExpr
                   | WhenExpr
                   | "this" | "base"
@@ -10701,7 +10697,7 @@ MoveExpr        ::= "move" PrimaryExpr
 
 NewExpr         ::= "new" Type "(" ArgList? ")"
                   | "new" "(" ArgList? ")"              /* shorthand */
-                              /* `new T(...) with X := 5 end` is parsed as
+                              /* `new T(...) with(X := 5)` is parsed as
                                  `NewExpr` followed by a `with` PrimarySuffix;
                                  there is no separate ObjectInit production.
                                  The suffix is the record `with` of §9.5:
@@ -10725,7 +10721,23 @@ LambdaSlot      ::= Identifier | "_" | LambdaDestructure
 LambdaBody      ::= Expression
                   | "do" Statement* "end"
 
-CaseExpr        ::= "case" "owned"? Expression "of" CaseArm ("," CaseArm)* ","? "end" "case"?
+IfExpr          ::= "(" "if" Expression "then" Expression
+                    ("elif" Expression "then" Expression)*
+                    "else" Expression ")"
+                              /* The conditional atom (§20, v0.208). The
+                                 parentheses are part of the form: in atom-start
+                                 position, "(" followed by the reserved "if"
+                                 commits the reading at the second token; in
+                                 call/index-argument position the atom supplies
+                                 its own pair. Each condition and branch derives
+                                 a full Expression (a bare throw branch is
+                                 admitted anywhere); "else" is mandatory. */
+CaseExpr        ::= "(" "case" "owned"? Expression "of" CaseArm ("," CaseArm)* ","? ")"
+                              /* The expression-position case atom (v0.208): arms
+                                 are Expression-bodied only (ArmBody's Statement
+                                 and do-block alternatives belong to the A.6
+                                 CaseStmt). "(case" commits at the second token —
+                                 "case" begins no other expression. */
                               /* The optional `owned` is the scrutinee transfer
                                  marker (§35.5): admitted only when the scrutinee
                                  is a named owned binding of owning-choice
@@ -10754,23 +10766,25 @@ AltPattern      ::= Pattern ("|" Pattern)*
                                  relationals (§19.3, v0.183). `|` never collides with
                                  bitwise-or: pattern-embedded expressions parse
                                  at Shift level or tighter (§19.3). */
-WhenExpr        ::= "when" WhenArm ("," WhenArm)* ","? "end" "when"?
-                              /* Scrutinee-less condition dispatch (§19.1). Arms
-                                 are tried in textual order; the first whose
-                                 condition is `true` is selected. Valid in both
-                                 expression and statement position. The construct
-                                 keyword `when` is distinct from the guard `when`
-                                 of a CaseArm/CatchArm — position disambiguates. */
+WhenExpr        ::= "(" "when" WhenArm ("," WhenArm)* ","? ")"
+                              /* Scrutinee-less condition dispatch (§19.1), the
+                                 expression-position atom (v0.208): arms are
+                                 Expression-bodied only; the statement form is
+                                 A.6's WhenStmt. Arms are tried in textual order;
+                                 the first whose condition is `true` is selected.
+                                 The construct keyword `when` is distinct from
+                                 the guard `when` of a CaseArm/CatchArm —
+                                 position disambiguates. */
 WhenArm         ::= (Expression | "_") "=>" ArmBody
                               /* The Expression is a `bool` condition. `_` is the
                                  always-true catch-all and, if present, must be the
                                  last arm. ArmBody follows the same rules as CaseArm. */
 ArmBody         ::= Expression
-                  | Statement                  /* valid only in statement-position case
+                  | Statement                  /* valid only in a CaseStmt/WhenStmt (A.6)
                                                   or in a catch arm; reads as a single
                                                   statement whose terminating `;` ends the
                                                   arm body, the same as `do Statement end` */
-                  | "do" Statement* "end"     /* type (); valid only in statement-position case
+                  | "do" Statement* "end"     /* type (); valid only in a CaseStmt/WhenStmt
                                                   or in a catch arm */
 Pattern         ::= "_"                       /* discard */
                   | "null"                     /* null literal pattern */
