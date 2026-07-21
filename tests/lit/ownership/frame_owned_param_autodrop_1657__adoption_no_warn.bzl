@@ -22,12 +22,12 @@ class P
   public method Wait(): Task => Task.Delay(0);
   // owned `ic` adopted into a `using var` -> discharged, no warning.
   public static method UseIter(owned ic: Cell): IEnumerable<int>
-    using var holdI := ic;
+    using var _ := owned ic;
     yield return 1;
   end UseIter;
   // owned `ac` adopted into a `using var` -> discharged, no warning.
   public async method UseAsync(owned ac: Cell): Task
-    using var holdA := ac;
+    using var _ := owned ac;
     await Wait();
   end UseAsync;
 end P;

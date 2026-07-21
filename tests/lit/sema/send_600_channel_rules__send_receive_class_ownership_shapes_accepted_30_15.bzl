@@ -10,7 +10,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; sealed class Report public Id: int := 0; destructor end destructor; end Report; class Receiver public static async method RunReceiver(owned ch: Channel<Report>): Task using var inbox := ch; using var item := await inbox.Receive(); end RunReceiver; end Receiver;
+module M; sealed class Report public Id: int := 0; destructor end destructor; end Report; class Receiver public static async method RunReceiver(owned ch: Channel<Report>): Task using var inbox := owned ch; using var item := await inbox.Receive(); end RunReceiver; end Receiver;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

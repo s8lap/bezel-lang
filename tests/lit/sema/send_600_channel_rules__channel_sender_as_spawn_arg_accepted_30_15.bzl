@@ -9,7 +9,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; sealed class Report public Id: int := 0; destructor end destructor; end Report; class Worker public static method ProcessAll(owned tx: ChannelSender<Report>) using var sender := tx; sender.Send(new Report()); end ProcessAll; end Worker; class Main public static async method Go(): Task using var inbox := new Channel<Report>(); using var t := Domain.Spawn(Worker.ProcessAll, inbox.NewSender()); await t; end Go; end Main;
+module M; sealed class Report public Id: int := 0; destructor end destructor; end Report; class Worker public static method ProcessAll(owned tx: ChannelSender<Report>) tx.Send(new Report()); tx.Dispose(); end ProcessAll; end Worker; class Main public static async method Go(): Task using var inbox := new Channel<Report>(); using var t := Domain.Spawn(Worker.ProcessAll, inbox.NewSender()); await t; end Go; end Main;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

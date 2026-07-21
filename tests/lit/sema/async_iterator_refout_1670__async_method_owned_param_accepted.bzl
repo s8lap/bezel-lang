@@ -9,7 +9,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class Res destructor end destructor; end Res; class Foo public async method Take(owned r: Res): Task using var x := r; return; end Take; end Foo;
+module M; class Res destructor end destructor; end Res; class Foo public async method Take(owned r: Res): Task using var _ := owned r; return; end Take; end Foo;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §
