@@ -2402,6 +2402,21 @@ private:
     // structural equality emitted by emitStructEquality.
     llvm::Value* emitRecordHashCode(llvm::Value* recVal,
                                     const sema::TypeSymbol* rec);
+    // §35.7 (v0.210, #2083): per-value equality and hashing over a choice
+    // struct. Both compare the i32 tag first; on tag match they descend
+    // into the active case's payload struct field-by-field using the
+    // case's payload types (so a payload's record recurses structurally,
+    // a payload's string compares by content). Inactive-case payload
+    // slots are NOT compared — their bits are `undef` in freshly
+    // constructed values (§35.13 implementation-defined layout, and
+    // struct storage order is unordered for inactive unions). Dispatched
+    // from emitValueEquality/emitValueHashCode when a field's declared
+    // type is a Choice, so a record can hold a choice component and the
+    // synthesized Equals/GetHashCode remains consistent.
+    llvm::Value* emitChoiceEquality(llvm::Value* l, llvm::Value* r,
+                                    const sema::TypeSymbol* choiceTy);
+    llvm::Value* emitChoiceHashCode(llvm::Value* val,
+                                    const sema::TypeSymbol* choiceTy);
     // §8.5: enum ToString → the type's qualified name (the spec default for
     // enums; member-name formatting is left to user code via Type.EnumNames).
     // §8.3: enum GetHashCode → the underlying integer value.

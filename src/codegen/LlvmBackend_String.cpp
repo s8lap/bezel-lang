@@ -3191,6 +3191,16 @@ llvm::Value* Emitter::emitValueHashCode(llvm::Value* val,
         }
         return builder_.CreateZExtOrTrunc(val, i32());
     }
+    // §9.2 v0.210 (#2083) / §35.7: a CHOICE-typed field hashes by active-case
+    // tag + active-case payload fields (per emitChoiceHashCode). Dispatched
+    // BEFORE the int/struct fall-through so a fresh choice value's payload
+    // bits (which contain undef in inactive-case slots) don't dominate the
+    // hash. Returns the case-switched fold described by §35.7: discriminant
+    // mixed in first, then per-payload fields h = h*31 + fieldHash.
+    if (fieldTy && fieldTy->kind == K::Named && fieldTy->declaration &&
+        fieldTy->declaration->kind == ast::TypeDeclKind::Choice &&
+        val->getType()->isStructTy())
+        return emitChoiceHashCode(val, fieldTy->declaration);
     if (val->getType()->isDoubleTy())
         return builder_.CreateTrunc(
             builder_.CreateBitCast(val, i64()), i32());

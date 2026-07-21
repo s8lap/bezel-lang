@@ -1,6 +1,7 @@
 #include "sema/SymbolCollection.hpp"
 
 #include "ast/Node.hpp"
+#include "common/OwnershipFacts.hpp"
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
@@ -368,6 +369,13 @@ bool isAutoPropertySymbol(const Symbol* m) {
 bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
                                         const SemaContext& ctx);
 
+// §35.7 (v0.210, #2083): forward decl. Body is below — after the
+// admissibility predicate it depends on (`isAdmissibleComponentType` calls
+// it; admit all names before any definition site, so the recursion through
+// `isAdmissibleComponentType` is defined).
+bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
+                                 const SemaContext& ctx);
+
 // §9.2 v0.158: resolve a record storage component (an auto-property, a body
 // field, or a §9.1 positional field) to its declared TypeRef. Returns null when
 // the type is not resolvable (an imported member with no local ast::Type node
@@ -398,7 +406,10 @@ static const TypeRef* storageComponentType(const Symbol* m,
 //   - another record that is itself auto-equality-bearing (recursively);
 //   - `T?` where `T` is admissible (the null-safe `=` of §8.4/§7.11);
 //   - a non-owning inline array `[N]T`/`[N]T?` whose element is admissible
-//     (element-by-element per §8.3's inline-array rows).
+//     (element-by-element per §8.3's inline-array rows);
+//   - a **value-like choice** that is itself auto-equality-bearing
+//     (§35.7, v0.210 #2083) — recursively applying this same list to every
+//     case's payload fields.
 // A class/interface/`Object`/function value/owning-inline-array component is NOT
 // admissible (they are reference or move-only types, not structural value
 // components). An unresolvable component type (null / Error / an unresolved
@@ -454,6 +465,16 @@ static bool isAdmissibleComponentType(const TypeRef* ty, const SemaContext& ctx,
                         return isPositionalRecordEqualityBearing(decl, ctx);
                 return isAutoEqualityBearingBodyRecord(decl, ctx);
             }
+            // §9.2 v0.210 (#2083): a CHOICE component is admissible iff it is
+            // value-like AND itself auto-equality-bearing (§35.7). Borrow-bearing
+            // and owning choices are NOT admissible in any component — their
+            // class-typed payload slots are reference or move-only types, exactly
+            // the categories the rule rejects. Auto-equality-bearing for choices
+            // is the same predicate used by isEqualityBearing as a hash-key
+            // check (and codegen uses it to dispatch the choice-specific
+            // Equals/GetHashCode synthesis) — see isAutoEqualityBearingChoice.
+            if (decl->kind == ast::TypeDeclKind::Choice)
+                return isAutoEqualityBearingChoice(decl, ctx);
             // class / interface — reference types are not admissible.
             return false;
         }
@@ -647,6 +668,74 @@ bool recordHasUserDeclaredEquality(const TypeSymbol* rec) {
     return false;
 }
 
+// §35.7 (v0.200, #2044) / v0.210 (#2083): a choice is auto-equality-bearing
+// iff (a) its §35.4 classification is ValueLike AND (b) every payload field of
+// every case is a §9.2 admissible component type — with "another auto-
+// equality-bearing choice" admitted to the recursive rule. Per §35.7's first
+// paragraph this is the property that allows `=`, `<>`, `.Equals()`, and
+// `.GetHashCode()` on the choice without the §9.2 use-site error. The
+// classification checkup-front rejects borrow-bearing and owning choices
+// (class-typed payloads are reference/move-only types, outside the admissible
+// rule by the same token class-typed record fields are). The per-payload
+// admissibility check then covers value payloads that themselves fail the
+// §9.2 list (e.g. a payload typed as a class — would be admitted only by
+// the existing choice type rejection above, but a value payload of an
+// interface, function, or owning-inline-array type would reach here).
+//
+// Imported choices (no ast::TypeDecl — only the body symbol) are conservatively
+// treated as auto-equality-bearing when the classification succeeds: the
+// per-payload rule operates on the AST's Param types, which are not locally
+// available across module boundaries for an imported choice. The §3.6 rule-2
+// per-instantiation discipline re-checks concrete generic arguments at each
+// instantiation.
+//
+// NB: the "non-trivial constructor / method body" §9.2 membership exemption
+// does not carry over to choices — choices have no user constructors or
+// instance fields, so all equality-relevant storage IS the case payload fields.
+// Methods/computed properties declared in the choice body (§35.2) are by
+// §35.7 ruled like §9.2: they do not disqualify (a `=`/`<>` overload, an
+// `Equals`/`GetHashCode` override, would; but the choice surface is so
+// constrained that this is a non-issue in practice — flagged in case a future
+// admission widens it). The conservative mirror of the §9.2 record rule
+// dispatches on the body member list, but the result is identical for a
+// legal choice (every body member is benign).
+bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
+                                 const SemaContext& ctx) {
+    if (!ch || ch->kind != ast::TypeDeclKind::Choice) return false;
+    // §35.4: compute the classification. classifyChoiceType returns nullopt
+    // for non-choice types and imported choices without an AST node; the
+    // import path is handled conservatively below.
+    TypeRef rt;
+    rt.kind = TypeRef::Kind::Named;
+    rt.declaration = const_cast<TypeSymbol*>(ch);
+    auto verdict = common::classifyChoiceType(&rt, ctx);
+    if (!verdict || *verdict != common::ChoiceClassification::ValueLike)
+        return false;
+    // Imported choice: classification succeeds (in-tree) or we treat as
+    // auto-equality-bearing conservatively. If the AST is missing we cannot
+    // walk payloads — accept on the classification verdict alone.
+    auto* td = dynamic_cast<const ast::TypeDecl*>(ch->decl);
+    if (!td) return true;
+    // Every case: every payload field must be a §9.2 admissible component
+    // type. The recursive call is the same `isAdmissibleComponentType` that
+    // drives the body-record rule, so "another auto-equality-bearing choice"
+    // is admitted via the K::Named/Choice branch added in v0.210 (#2083).
+    for (const auto& cc : td->choiceCases) {
+        for (const auto& pf : cc.payload) {
+            // §35.4: an `owned`-marked payload yields Owning classification
+            // (caught above), but for defensive depth the marker makes the
+            // payload unconditionally inadmissible — a structural check that
+            // parallels isAdmissibleComponentType's reference/owning rejection.
+            if (pf.modifier == "owned") return false;
+            if (!pf.type) continue;  // unresolved → skip (defensive)
+            if (!isAdmissibleComponentType(ctx.resolvedType(*pf.type),
+                                           ctx, 0))
+                return false;
+        }
+    }
+    return true;
+}
+
 // §3.6 / §8.3 (v0.158, #1338): see Symbol.hpp. A type is equality-bearing unless
 // it is a record that neither synthesizes equality nor declares user equality.
 bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx) {
@@ -658,24 +747,35 @@ bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx) {
                       // unresolved (generic param, imported builtin) — all bear
                       // consistent equality.
     const TypeSymbol* ts = ty->declaration;
-    if (ts->kind != ast::TypeDeclKind::Record)
-        return true;  // class (reference identity), interface, enum — all bear
-                      // consistent Equals/GetHashCode.
-    // A record: equality-bearing iff it synthesizes equality (positional /
-    // combined §9.1/§9.3, or an auto-equality-bearing body record §9.2) or
-    // declares user equality (an `operator =`/`<>` overload — its §25.2
-    // co-declared `Equals(T)`/`GetHashCode` companions are separately enforced).
-    // §9.3 (v0.158, #1383): positional/combined records must pass the
-    // admissibility check; the blind `return true` was the pre-#1383 bug.
-    if (ts->hasPositionalFields)
-        return isPositionalRecordEqualityBearing(ts, ctx) ||
-               recordHasUserDeclaredEquality(ts);
-    if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
-        if (td->hasPositionalFields)
+    if (ts->kind == ast::TypeDeclKind::Record) {
+        // A record: equality-bearing iff it synthesizes equality (positional /
+        // combined §9.1/§9.3, or an auto-equality-bearing body record §9.2) or
+        // declares user equality (an `operator =`/`<>` overload — its §25.2
+        // co-declared `Equals(T)`/`GetHashCode` companions are separately
+        // enforced).
+        // §9.3 (v0.158, #1383): positional/combined records must pass the
+        // admissibility check; the blind `return true` was the pre-#1383 bug.
+        if (ts->hasPositionalFields)
             return isPositionalRecordEqualityBearing(ts, ctx) ||
                    recordHasUserDeclaredEquality(ts);
-    return isAutoEqualityBearingBodyRecord(ts, ctx) ||
-           recordHasUserDeclaredEquality(ts);
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
+            if (td->hasPositionalFields)
+                return isPositionalRecordEqualityBearing(ts, ctx) ||
+                       recordHasUserDeclaredEquality(ts);
+        return isAutoEqualityBearingBodyRecord(ts, ctx) ||
+               recordHasUserDeclaredEquality(ts);
+    }
+    // §35.7 (v0.210, #2083): a CHOICE is equality-bearing exactly when it is
+    // auto-equality-bearing — i.e. value-like with all case payloads
+    // admissibly typed. A borrow-bearing or owning choice carries no value
+    // equality contract and is NOT equality-bearing (Dictionary<Outcome, _>
+    // keys fail here per §3.6). A primitive, string, class, interface,
+    // function, enum, or inline array is equality-bearing (the `return true`
+    // fall-through applies).
+    if (ts->kind == ast::TypeDeclKind::Choice)
+        return isAutoEqualityBearingChoice(ts, ctx);
+    return true;  // class (reference identity), interface, enum — all bear
+                  // consistent Equals/GetHashCode.
 }
 
 bool collectSymbols(const ast::SourceFile& src, SemaContext& ctx) {

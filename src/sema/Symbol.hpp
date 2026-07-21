@@ -413,6 +413,29 @@ bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
 bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
                                      const SemaContext& ctx);
 
+// §9.2 v0.210 (#2083) auto-equality eligibility for a *value-like choice*
+// (a choice whose §35.4 classification is ValueLike — every payload is a
+// value, a `string`, a runtime-managed type, or (transitively) a value-like
+// record or choice, with no `owned`-marked payload and no borrow-carrying
+// payload — v0.200, #2044). The §9.2 admissible-component list now includes
+// "a value-like choice that is itself auto-equality-bearing" — applying the
+// recursive rule to every case's payload fields. Borrow-bearing and owning
+// choices are not admissible in any component (class-typed payloads are
+// outside the rule, exactly as class-typed record fields are — §9.7 / §35.7).
+//
+// The method body disjunction ("case methods / computed members / non-
+// equality operator overloads / constructors don't disqualify") does not
+// carry over to a choice — a choice has no instance storage beyond its
+// case-payload fields, so equality is purely per-payload. v0.210 cites
+// §35.7 directly: every payload field of every case must be a §9.2
+// admissible component type, with "another auto-equality-bearing choice"
+// admitted to the recursive rule.
+//
+// Returns false for non-choice types and for choices whose classification
+// is NOT ValueLike or whose payloads are not all admissible.
+bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
+                                 const SemaContext& ctx);
+
 // §9.2/§8.4: does this type declare its own equality member, i.e. an
 // `operator =` / `operator <>` overload, or an `Equals` / `GetHashCode`
 // method? Per §9.2 "Authors who want explicit equality on a record outside
