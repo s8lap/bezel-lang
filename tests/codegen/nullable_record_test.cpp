@@ -275,7 +275,7 @@ BEZEL_TEST(codegen_nullable_record, with_replaces_nullable_int_field_r40) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Box(n: int?); "
         "class C public static method Main(): int "
-        "  var b := new Box(1); var b2 := b with n := 9 end; "
+        "  var b := new Box(1); var b2 := b with(n := 9); "
         "  return b2.n!; "  // 9, not the stale 1
         "end Main; end C;"), 9);
 }
@@ -285,8 +285,8 @@ BEZEL_TEST(codegen_nullable_record, with_sets_nullable_field_to_null_r40) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Box(n: int?); "
         "class C public static method Main(): int "
-        "  var b := new Box(5); var b2 := b with n := null end; "
-        "  return (42 if b2.n = null else 0); "
+        "  var b := new Box(5); var b2 := b with(n := null); "
+        "  return (if b2.n = null then 42 else 0); "
         "end Main; end C;"), 42);
 }
 
@@ -295,7 +295,7 @@ BEZEL_TEST(codegen_nullable_record, with_one_nullable_field_preserves_others_r40
     BEZEL_EXPECT_EQ(run(
         "module M; record Box(n: int?, m: int?); "
         "class C public static method Main(): int "
-        "  var b := new Box(1, 2); var b2 := b with n := 40 end; "
+        "  var b := new Box(1, 2); var b2 := b with(n := 40); "
         "  return b2.n! + b2.m!; "  // 40 + 2 = 42 (m preserved)
         "end Main; end C;"), 42);
 }
@@ -333,7 +333,7 @@ BEZEL_TEST(codegen_nullable_record, sbyte_nullable_positional_negative_743) {
         "module M; record Box(n: sbyte?); "
         "class C public static method Main(): int "
         "  var b := new Box(-5); "
-        "  return (1 if int(b.n!) = -5 else 0); "
+        "  return (if int(b.n!) = -5 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -343,7 +343,7 @@ BEZEL_TEST(codegen_nullable_record, short_nullable_positional_field_743) {
         "module M; record Box(h: short?); "
         "class C public static method Main(): int "
         "  var b := new Box(30000); "
-        "  return (1 if int(b.h!) = 30000 else 0); "
+        "  return (if int(b.h!) = 30000 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -353,6 +353,6 @@ BEZEL_TEST(codegen_nullable_record, byte_nullable_positional_null_743) {
         "module M; record Box(n: byte?); "
         "class C public static method Main(): int "
         "  var b := new Box(null); "
-        "  return (1 if b.n = null else 0); "
+        "  return (if b.n = null then 1 else 0); "
         "end Main; end C;"), 1);
 }

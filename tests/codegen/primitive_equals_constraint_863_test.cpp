@@ -24,7 +24,7 @@ int run(const std::string& prog) {
 const char* kEq =
     "static class U "
     "  public static method Eq<T>(a: T, b: T): int where T: IEquatable<T> "
-    "    return (1 if a.Equals(b) else 0); end Eq; "
+    "    return (if a.Equals(b) then 1 else 0); end Eq; "
     "end U; ";
 }  // namespace
 
@@ -54,7 +54,7 @@ BEZEL_TEST(primitive_equals_constraint_863, compareto_still_dispatches) {
         "module M; "
         "static class U "
         "  public static method Cmp<T>(a: T, b: T): int where T: IComparable<T> "
-        "    return (1 if a.CompareTo(b) < 0 else 0); end Cmp; "
+        "    return (if a.CompareTo(b) < 0 then 1 else 0); end Cmp; "
         "end U; "
         "class C public static method Main(): int "
         "  return U.Cmp(3, 9); "  // 3 < 9 → 1
@@ -77,7 +77,7 @@ BEZEL_TEST(primitive_equals_constraint_863, record_compareto_via_constraint) {
         "end Score; "
         "static class U "
         "  public static method Cmp<T>(a: T, b: T): int where T: IComparable<T> "
-        "    return (1 if a.CompareTo(b) < 0 else 0); end Cmp; "
+        "    return (if a.CompareTo(b) < 0 then 1 else 0); end Cmp; "
         "end U; "
         "class C public static method Main(): int "
         "  return U.Cmp(new Score(7), new Score(42)); "  // -35 < 0 → 1
@@ -97,7 +97,7 @@ BEZEL_TEST(primitive_equals_constraint_863, user_class_equals_via_constraint) {
         "end Pt; "
         "static class U "
         "  public static method Eq<T>(a: T, b: T): int where T: IEquatable<T> "
-        "    return (1 if a.Equals(b) else 0); end Eq; "
+        "    return (if a.Equals(b) then 1 else 0); end Eq; "
         "end U; "
         "class C public static method Main(): int "
         "  using var p1 := new Pt(9); using var p2 := new Pt(9); "

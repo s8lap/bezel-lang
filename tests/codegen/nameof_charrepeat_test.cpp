@@ -30,7 +30,7 @@ BEZEL_TEST(codegen_nameof_spec17_9, nameof_type_name) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var n := nameof(C); "
-        "  return (1 if n = \"C\" else 0); "
+        "  return (if n = \"C\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -40,7 +40,7 @@ BEZEL_TEST(codegen_nameof_spec17_9, nameof_local_var) {
         "module M; class C public static method Main(): int "
         "  var amount := 42; "
         "  var n := nameof(amount); "
-        "  return (1 if n = \"amount\" else 0); "
+        "  return (if n = \"amount\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -58,7 +58,7 @@ BEZEL_TEST(codegen_nameof_spec17_9, nameof_qualified_name_rightmost) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var n := nameof(C.Main); "
-        "  return (1 if n = \"Main\" else 0); "
+        "  return (if n = \"Main\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -68,7 +68,7 @@ BEZEL_TEST(codegen_nameof_spec17_9, nameof_two_segment_qualified_rightmost) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var n := nameof(M.C); "
-        "  return (1 if n = \"C\" else 0); "
+        "  return (if n = \"C\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -78,7 +78,7 @@ BEZEL_TEST(codegen_nameof_spec17_9, nameof_used_in_concat) {
         "module M; class C public static method Main(): int "
         "  var n := nameof(C); "
         "  var full := \"class:\" + n; "
-        "  return (1 if full = \"class:C\" else 0); "
+        "  return (if full = \"class:C\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -88,7 +88,7 @@ BEZEL_TEST(codegen_nameof_spec17_9, nameof_underscore_prefix) {
         "module M; class C public static method Main(): int "
         "  var _balance := 0; "
         "  var n := nameof(_balance); "
-        "  return (1 if n = \"_balance\" else 0); "
+        "  return (if n = \"_balance\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -102,7 +102,7 @@ BEZEL_TEST(codegen_string_repeat_spec9_6, repeat_x_three_times) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var rep: string := string.Repeat('x', 3); "
-        "  return (1 if rep = \"xxx\" else 0); "
+        "  return (if rep = \"xxx\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -111,7 +111,7 @@ BEZEL_TEST(codegen_string_repeat_spec9_6, repeat_zero_times_is_empty) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var rep: string := string.Repeat('a', 0); "
-        "  return (1 if rep = \"\" else 0); "
+        "  return (if rep = \"\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -130,6 +130,6 @@ BEZEL_TEST(codegen_string_repeat_spec9_6, repeat_used_in_concat) {
         "module M; class C public static method Main(): int "
         "  var rep: string := string.Repeat('a', 2); "
         "  var s := \"x\" + rep + \"x\"; "
-        "  return (1 if s = \"xaax\" else 0); "
+        "  return (if s = \"xaax\" then 1 else 0); "
         "end Main; end C;"), 1);
 }

@@ -48,7 +48,7 @@ BEZEL_TEST(generic_record_field_force_unwrap_786, long_field) {
         "module M; record Box<T>(V: T?); "
         "class P public static method Main(): int "
         "  var b := new Box<long>(5000000000L); "
-        "  return (0 if b.V! = 5000000000L else 1); "
+        "  return (if b.V! = 5000000000L then 0 else 1); "
         "end Main; end P;"), 0);
 }
 

@@ -62,10 +62,9 @@ BEZEL_TEST(sema_class_destruct, class_positional_pattern_in_case_expr_spec_19_3)
         "class C public static method Main(): int "
         "  using var c := new Circle(5); "
         "  var shape: Shape := c; "
-        "  return case shape of "
+        "  return (case shape of "
         "    Circle(_) => 1, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;");
     // §19.3: class positional-destructuring is a compile error.
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -85,10 +84,9 @@ BEZEL_TEST(sema_class_destruct, class_multi_subpat_in_case_expr_spec_19_3) {
         "class C public static method Main(): int "
         "  using var d := new Dog(\"Rex\", 3); "
         "  var obj: Dog := d; "
-        "  return case obj of "
+        "  return (case obj of "
         "    Dog(_, _) => 1, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;");
     // §19.3: Dog(_, _) on a class is a compile error.
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -140,7 +138,7 @@ BEZEL_TEST(sema_class_destruct, record_destructure_over_binding_expr_r34) {
         "record Pt(X: int, Y: int); "
         "class C public static method Main(): int "
         "  var p := new Pt(3, 4); "
-        "  return case p of Pt(x, y, z) => 1, _ => 0 end; "
+        "  return (case p of Pt(x, y, z) => 1, _ => 0); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasArityDiag(r));
@@ -168,7 +166,7 @@ BEZEL_TEST(sema_class_destruct, record_destructure_under_binding_r34) {
         "record Pt(X: int, Y: int); "
         "class C public static method Main(): int "
         "  var p := new Pt(3, 4); "
-        "  return case p of Pt(x) => 1, _ => 0 end; "
+        "  return (case p of Pt(x) => 1, _ => 0); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasArityDiag(r));
@@ -181,7 +179,7 @@ BEZEL_TEST(sema_class_destruct, record_destructure_correct_arity_ok_r34) {
         "record Pt(X: int, Y: int); "
         "class C public static method Main(): int "
         "  var p := new Pt(3, 4); "
-        "  return case p of Pt(x, y) => x + y, _ => 0 end; "
+        "  return (case p of Pt(x, y) => x + y, _ => 0); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(!hasArityDiag(r));
 }
@@ -202,10 +200,9 @@ BEZEL_TEST(sema_class_destruct, class_type_test_pattern_ok_spec_19_3) {
         "class C public static method Main(): int "
         "  using var c := new Circle(5); "
         "  var shape: Shape := c; "
-        "  return case shape of "
+        "  return (case shape of "
         "    Circle => 1, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;");
     // Bare type-name pattern is valid (§19.3). No errors expected.
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -224,10 +221,9 @@ BEZEL_TEST(sema_class_destruct, class_typed_binding_pattern_ok_spec_19_3) {
         "class C public static method Main(): int "
         "  using var c := new Circle(5); "
         "  var shape: Shape := c; "
-        "  return case shape of "
+        "  return (case shape of "
         "    var c: Circle => c._r, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;");
     // Typed-binding pattern is valid (§19.3). No errors expected.
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -243,10 +239,9 @@ BEZEL_TEST(sema_class_destruct, record_destructuring_still_ok_spec_19_3) {
         "record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var p := new Point(3, 4); "
-        "  return case p of "
+        "  return (case p of "
         "    Point(x, y) => x + y, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;");
     // Record destructuring is valid (§19.3). No errors expected.
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -259,10 +254,9 @@ BEZEL_TEST(sema_class_destruct, record_destructuring_with_discard_ok_spec_19_3) 
         "record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var p := new Point(10, 20); "
-        "  return case p of "
+        "  return (case p of "
         "    Point(_, y) => y, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;");
     // §19.3: _ in positional position is a valid discard sub-pattern for records.
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

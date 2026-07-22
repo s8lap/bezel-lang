@@ -47,7 +47,7 @@ BEZEL_TEST(codegen_1843, is_constructed_generic_wrong_arg_is_false) {
     BEZEL_EXPECT_EQ(runProg(
         "using var b: Box<string> := new Box<string>(\"hi\"); "
         "var o: Object := b; "
-        "return (1 if o is Box<int> else 0);"), 0);
+        "return (if o is Box<int> then 1 else 0);"), 0);
 }
 
 // The genuinely-matching case still matches: `Box<string> is Box<string>`.
@@ -55,7 +55,7 @@ BEZEL_TEST(codegen_1843, is_constructed_generic_right_arg_is_true) {
     BEZEL_EXPECT_EQ(runProg(
         "using var b: Box<string> := new Box<string>(\"hi\"); "
         "var o: Object := b; "
-        "return (1 if o is Box<string> else 0);"), 1);
+        "return (if o is Box<string> then 1 else 0);"), 1);
 }
 
 // `as` to the wrong instantiation yields null (§17.4) — no reinterpretation.
@@ -64,7 +64,7 @@ BEZEL_TEST(codegen_1843, as_constructed_generic_wrong_arg_is_null) {
         "using var b: Box<string> := new Box<string>(\"hi\"); "
         "var o: Object := b; "
         "var w: Box<int>? := o as Box<int>; "
-        "return (1 if w = null else 0);"), 1);
+        "return (if w = null then 1 else 0);"), 1);
 }
 
 // `as` to the correct instantiation succeeds (non-null borrow).
@@ -73,7 +73,7 @@ BEZEL_TEST(codegen_1843, as_constructed_generic_right_arg_non_null) {
         "using var b: Box<string> := new Box<string>(\"hi\"); "
         "var o: Object := b; "
         "var w: Box<string>? := o as Box<string>; "
-        "return (1 if w <> null else 0);"), 1);
+        "return (if w <> null then 1 else 0);"), 1);
 }
 
 // Subtyping over a GENERIC base: Ok<int> : Result<int>, so `is Result<int>`
@@ -82,7 +82,7 @@ BEZEL_TEST(codegen_1843, is_generic_base_matching_arg_is_true) {
     BEZEL_EXPECT_EQ(runProg(
         "using var ok: Ok<int> := new Ok<int>(42); "
         "var r: Object := ok; "
-        "return (1 if r is Result<int> else 0);"), 1);
+        "return (if r is Result<int> then 1 else 0);"), 1);
 }
 
 // But `is Result<string>` on an Ok<int> is False — the base's type argument
@@ -91,7 +91,7 @@ BEZEL_TEST(codegen_1843, is_generic_base_wrong_arg_is_false) {
     BEZEL_EXPECT_EQ(runProg(
         "using var ok: Ok<int> := new Ok<int>(42); "
         "var r: Object := ok; "
-        "return (1 if r is Result<string> else 0);"), 0);
+        "return (if r is Result<string> then 1 else 0);"), 0);
 }
 
 // A sibling leaf at the wrong instantiation does not match: Ok<int> is Ok<int>
@@ -102,9 +102,9 @@ BEZEL_TEST(codegen_1843, is_generic_sibling_and_wrong_leaf_arg) {
     BEZEL_EXPECT_EQ(runProg(
         "using var ok: Ok<int> := new Ok<int>(42); "
         "var r: Object := ok; "
-        "var a := 1 if r is Ok<int> else 0; "
-        "var b := 1 if r is Ok<string> else 0; "
-        "var c := 1 if r is Err<int> else 0; "
+        "var a := (if r is Ok<int> then 1 else 0); "
+        "var b := (if r is Ok<string> then 1 else 0); "
+        "var c := (if r is Err<int> then 1 else 0); "
         "return a * 4 + b * 2 + c;"), 4);
 }
 
@@ -114,8 +114,8 @@ BEZEL_TEST(codegen_1843, is_nested_generic_inner_arg) {
     BEZEL_EXPECT_EQ(runProg(
         "using var bb: Box<Box<int>> := new Box<Box<int>>(new Box<int>(1)); "
         "var o: Object := bb; "
-        "var m := 1 if o is Box<Box<int>> else 0; "
-        "var n := 1 if o is Box<Box<string>> else 0; "
+        "var m := (if o is Box<Box<int>> then 1 else 0); "
+        "var n := (if o is Box<Box<string>> then 1 else 0); "
         "return m * 2 + n;"), 2);
 }
 
@@ -136,8 +136,8 @@ BEZEL_TEST(codegen_1843, case_generic_leaf_arm_honors_arg) {
         "  using var ts: Tagged<string> := new Tagged<string>(\"x\"); "
         "  var m1: Message := ti; "
         "  var m2: Message := ts; "
-        "  var a := case m1 of var g: Tagged<int> => 1, _ => 0 end; "
-        "  var b := case m2 of var g: Tagged<int> => 1, _ => 0 end; "
+        "  var a := (case m1 of var g: Tagged<int> => 1, _ => 0); "
+        "  var b := (case m2 of var g: Tagged<int> => 1, _ => 0); "
         "  return a * 2 + b; "  // Tagged<int> matches (1), Tagged<string> does not (0) → 2
         " end Main; end C;");
     BEZEL_EXPECT_EQ(code, 2);
@@ -154,9 +154,9 @@ BEZEL_TEST(codegen_1843, nongeneric_is_as_unchanged) {
         "class C public static method Main(): int "
         "  using var d: Dog := new Dog(); "
         "  var a: Object := d; "
-        "  var x := 1 if a is Animal else 0; "
-        "  var y := 1 if a is Dog else 0; "
-        "  var z := 1 if a is Cat else 0; "
+        "  var x := (if a is Animal then 1 else 0); "
+        "  var y := (if a is Dog then 1 else 0); "
+        "  var z := (if a is Cat then 1 else 0); "
         "  return x * 4 + y * 2 + z; "  // Animal(1) Dog(1) Cat(0) → 6
         " end Main; end C;");
     BEZEL_EXPECT_EQ(code, 6);
@@ -176,8 +176,8 @@ BEZEL_TEST(codegen_1843, is_nested_type_param_in_generic_body) {
         "  public constructor(v: U) V := v; end constructor; end Box; "
         "class Checker<T> "
         "  public method probe(m: Object, w: Object): int "
-        "    => (1 if m is Box<Box<T>> else 0) * 2 "
-        "     + (1 if w is Box<Box<T>> else 0); "
+        "    => (if m is Box<Box<T>> then 1 else 0) * 2 "
+        "     + (if w is Box<Box<T>> then 1 else 0); "
         "end Checker; "
         "class C public static method Main(): int "
         "  using var bbi: Box<Box<int>> := new Box<Box<int>>(new Box<int>(1)); "
@@ -200,8 +200,8 @@ BEZEL_TEST(codegen_1843, case_nested_type_param_in_generic_body) {
         "  public constructor(v: U) V := v; end constructor; end Box; "
         "class Checker<T> "
         "  public method probe(m: Object, w: Object): int "
-        "    var a := case m of var g: Box<Box<T>> => 1, _ => 0 end; "
-        "    var b := case w of var g: Box<Box<T>> => 1, _ => 0 end; "
+        "    var a := (case m of var g: Box<Box<T>> => 1, _ => 0); "
+        "    var b := (case w of var g: Box<Box<T>> => 1, _ => 0); "
         "    return a * 2 + b; "
         "  end probe; "
         "end Checker; "

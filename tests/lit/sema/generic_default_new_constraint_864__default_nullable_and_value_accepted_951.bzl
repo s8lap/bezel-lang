@@ -8,7 +8,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class Cell destructor end destructor; end Cell; class C public static method Main(): int var c: Cell? := default(Cell?); var s: string? := default(string?); var i: int := default(int); var b: bool := default(bool); return i + (1 if b else 0); end Main; end C;
+module M; class Cell destructor end destructor; end Cell; class C public static method Main(): int var c: Cell? := default(Cell?); var s: string? := default(string?); var i: int := default(int); var b: bool := default(bool); return i + (if b then 1 else 0); end Main; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

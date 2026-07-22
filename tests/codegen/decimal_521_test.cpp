@@ -631,7 +631,7 @@ BEZEL_TEST(codegen_decimal_521, decimal_from_large_uint_743) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var u: uint := 3000000000u; var d: decimal := decimal(u); "
-        "  return (1 if d > 2500000000m else 0); "  // 3e9 > 2.5e9 → 1
+        "  return (if d > 2500000000m then 1 else 0); "  // 3e9 > 2.5e9 → 1
         "end Main; end C;"), 1);
 }
 
@@ -639,7 +639,7 @@ BEZEL_TEST(codegen_decimal_521, decimal_from_large_ulong_743) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var u: ulong := 10000000000000000000uL; var d: decimal := decimal(u); "
-        "  return (1 if d > 9300000000000000000m else 0); "  // 1e19 > 9.3e18 → 1
+        "  return (if d > 9300000000000000000m then 1 else 0); "  // 1e19 > 9.3e18 → 1
         "end Main; end C;"), 1);
 }
 
@@ -648,7 +648,7 @@ BEZEL_TEST(codegen_decimal_521, large_uint_plus_decimal_widening_743) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var u: uint := 3000000000u; var r: decimal := u + 0m; "
-        "  return (1 if r > 2500000000m else 0); "  // 1
+        "  return (if r > 2500000000m then 1 else 0); "  // 1
         "end Main; end C;"), 1);
 }
 
@@ -657,7 +657,7 @@ BEZEL_TEST(codegen_decimal_521, decimal_from_negative_int_unchanged_743) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var n: int := -7; var d: decimal := decimal(n); "
-        "  return (1 if d < 0m else 0); "  // 1
+        "  return (if d < 0m then 1 else 0); "  // 1
         "end Main; end C;"), 1);
 }
 
@@ -684,8 +684,8 @@ BEZEL_TEST(codegen_decimal_521, tostring_f2_content_1099b) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := (1.5m).ToString(\"F2\"); "
-        "  return (1 if s[0] = char(49) and s[1] = char(46) and "
-        "                s[2] = char(53) and s[3] = char(48) else 0); "  // '1''.'​'5''0'
+        "  return (if s[0] = char(49) and s[1] = char(46) and "
+        "                s[2] = char(53) and s[3] = char(48) then 1 else 0); "  // '1''.'​'5''0'
         "end Main; end C;"), 1);
 }
 
@@ -694,7 +694,7 @@ BEZEL_TEST(codegen_decimal_521, tostring_f2_rounds_half_up_1099b) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := (123.456m).ToString(\"F2\"); "
-        "  return (1 if s.Length = 6 and s[5] = char(54) else 0); "  // "123.46"
+        "  return (if s.Length = 6 and s[5] = char(54) then 1 else 0); "  // "123.46"
         "end Main; end C;"), 1);
 }
 

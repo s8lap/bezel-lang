@@ -287,7 +287,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  using var p2 := Person.Deserialize(d); "
         "  if p2.Name <> \"Alice\" then return 91; end; "
-        "  return (42 if p2.Age = 30 else 92); "
+        "  return (if p2.Age = 30 then 42 else 92); "
         "end Main; end C;"), 42);
 }
 
@@ -311,7 +311,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  using var c2 := Config.Deserialize(d); "
         "  if c2.Enabled <> true then return 91; end; "
-        "  return (42 if c2.Ratio = 1.5 else 92); "
+        "  return (if c2.Ratio = 1.5 then 42 else 92); "
         "end Main; end C;"), 42);
 }
 
@@ -349,7 +349,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  using var o2 := Outer.Deserialize(d); "
         "  if o2.Child.X <> 7 then return 91; end; "
-        "  return (42 if o2.Tag = \"hello\" else 92); "
+        "  return (if o2.Tag = \"hello\" then 42 else 92); "
         "end Main; end C;"), 42);
 }
 
@@ -386,7 +386,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  using var r2 := Root.Deserialize(d); "
         "  if r2.M.L.V <> 5 then return 91; end; "
         "  if r2.M.N <> 10 then return 92; end; "
-        "  return (42 if r2.Name = \"root\" else 93); "
+        "  return (if r2.Name = \"root\" then 42 else 93); "
         "end Main; end C;"), 42);
 }
 
@@ -422,7 +422,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  using var sh2 := Shape.Deserialize(d); "
         "  if sh2.Center.X <> 3 then return 91; end; "
         "  if sh2.Center.Y <> 4 then return 92; end; "
-        "  return (42 if sh2.Label = \"circle\" else 93); "
+        "  return (if sh2.Label = \"circle\" then 42 else 93); "
         "end Main; end C;"), 42);
 }
 
@@ -448,7 +448,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  using var it2 := Item.Deserialize(d); "
         "  if it2.Name <> \"thing\" then return 91; end; "
-        "  return (42 if it2.St = Status.Active else 92); "
+        "  return (if it2.St = Status.Active then 42 else 92); "
         "end Main; end C;"), 42);
 }
 
@@ -508,7 +508,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  if p2.Tag <> 7 then return 91; end; "
         "  var oc := p2.OptChild; "
         "  if oc = null then return 92; end; "
-        "  return (42 if oc.V = 99 else 93); "
+        "  return (if oc.V = 99 then 42 else 93); "
         "end Main; end C;"), 42);
 }
 
@@ -537,7 +537,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  using var p2 := Parent.Deserialize(d); "
         "  if p2.Tag <> 5 then return 91; end; "
-        "  return (42 if p2.OptChild = null else 92); "
+        "  return (if p2.OptChild = null then 42 else 92); "
         "end Main; end C;"), 42);
 }
 
@@ -570,7 +570,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  using var u2 := User.Deserialize(d); "
         "  if u2.Id <> 1 then return 91; end; "
-        "  return (42 if u2.FirstName = \"Bob\" else 92); "
+        "  return (if u2.FirstName = \"Bob\" then 42 else 92); "
         "end Main; end C;"), 42);
 }
 
@@ -596,7 +596,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  using var w2 := Widget.Deserialize(d); "
         "  if w2.X <> 10 then return 91; end; "
         // Secret was excluded; Deserialize supplies default(int) = 0.
-        "  return (42 if w2.Secret = 0 else 92); "
+        "  return (if w2.Secret = 0 then 42 else 92); "
         "end Main; end C;"), 42);
 }
 
@@ -621,7 +621,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  using var m2 := Meta.Deserialize(d); "
         "  if m2.Code <> 7 then return 91; end; "
-        "  return (42 if m2.Note = null else 92); "
+        "  return (if m2.Note = null then 42 else 92); "
         "end Main; end C;"), 42);
 }
 
@@ -655,7 +655,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  using var n2 := Node.Deserialize(d); "
         "  if n2.Label <> \"alpha\" then return 91; end; "
-        "  return (42 if n2.Count = 5 else 92); "
+        "  return (if n2.Count = 5 then 42 else 92); "
         "end Main; end C;"), 42);
 }
 
@@ -775,7 +775,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  using var e2 := Entry.Deserialize(d); "
         "  if e2.Key <> \"x\" then return 91; end; "
-        "  return (42 if e2.Val = 7 else 92); "
+        "  return (if e2.Val = 7 then 42 else 92); "
         "end Main; end C;"), 42);
 }
 
@@ -874,7 +874,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  using var box2 := Container.Deserialize(d); "
-        "  return (42 if box2.S.Kind() = 1 else 91); "
+        "  return (if box2.S.Kind() = 1 then 42 else 91); "
         "end Main; end C;"), 42);
 }
 
@@ -914,7 +914,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  using var box2 := Container.Deserialize(d); "
-        "  return (42 if box2.S.Kind() = 2 else 91); "
+        "  return (if box2.S.Kind() = 2 then 42 else 91); "
         "end Main; end C;"), 42);
 }
 
@@ -962,7 +962,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         // Deserialize returns owned Counter (§28.8 transfer to caller).
         "  using var c2 := Counter.Deserialize(d); "
-        "  return (42 if c2.Count = 13 else 91); "
+        "  return (if c2.Count = 13 then 42 else 91); "
         "end Main; end C;"), 42);
 }
 
@@ -990,7 +990,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  using var t2 := Token.Deserialize(d); "
-        "  return (42 if t2.Value = 77 else 91); "
+        "  return (if t2.Value = 77 then 42 else 91); "
         "end Main; end C;"), 42);
 }
 
@@ -1026,7 +1026,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  b.Serialize(s); "
         "  using var bytes := s.ToBytes(); "
         // ToBytes produces a non-empty buffer; we verify run completes.
-        "  return (42 if bytes.Count > 0 else 91); "
+        "  return (if bytes.Count > 0 then 42 else 91); "
         "end Main; end C;"), 42);
 }
 
@@ -1236,7 +1236,7 @@ const char* kTruncatedInput3Level =
     "      return 0; "
     "    catch SerializationException => caught := true; "
     "    end; "
-    "    return (42 if caught else 1); "
+    "    return (if caught then 42 else 1); "
     "  end Main; "
     "end Program;";
 

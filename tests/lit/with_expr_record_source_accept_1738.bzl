@@ -20,7 +20,7 @@ record Point(X: int, Y: int);
 class C
   public static method Main(): int
     var p := new Point(1, 2);
-    var q := p with Y := 9 end;
+    var q := p with(Y := 9);
     return q.X + q.Y;
   end Main;
 end C;

@@ -28,7 +28,7 @@ std::string cast(const std::string& srcTy, const std::string& val,
     return "module M; class C public static method Main(): int "
            "  var f: " + srcTy + " := " + val + "; "
            "  try var y: " + dstTy + " := " + dstTy + "(f); "
-           "    return (42 if y = " + eq + " else 0); "
+           "    return (if y = " + eq + " then 42 else 0); "
            "  catch OverflowException => return 1; end; "
            "end Main; end C;";
 }
@@ -86,7 +86,7 @@ BEZEL_TEST(float_to_int_truncation_858, int_from_float_min_accepted) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var f: float := -2147483648.0f; "
-        "  try var y: int := int(f); return (42 if y = int.MinValue else 0); "
+        "  try var y: int := int(f); return (if y = int.MinValue then 42 else 0); "
         "  catch OverflowException => return 1; end; "
         "end Main; end C;"), 42);
 }

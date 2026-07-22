@@ -148,7 +148,7 @@ BEZEL_TEST(codegen_string_methods_535, lastindexof_ascii_control_is_2) {
 BEZEL_TEST(codegen_string_methods_535, contains_ascii_in_mixed_is_true) {
     BEZEL_EXPECT_EQ(runBody(
         std::string("var s := \"") + kHelloJapanWorld + "\"; "
-        "return (1 if s.Contains(\"Hello\") else 0);"), 1);
+        "return (if s.Contains(\"Hello\") then 1 else 0);"), 1);
 }
 
 // "Hello 日本 World".Contains("日本") must be true.
@@ -156,21 +156,21 @@ BEZEL_TEST(codegen_string_methods_535, contains_japanese_in_mixed_is_true) {
     BEZEL_EXPECT_EQ(runBody(
         std::string("var s := \"") + kHelloJapanWorld + "\"; "
         "var n := \"" + kJapan + "\"; "
-        "return (1 if s.Contains(n) else 0);"), 1);
+        "return (if s.Contains(n) then 1 else 0);"), 1);
 }
 
 // "Hello 日本 World".Contains("xyz") must be false.
 BEZEL_TEST(codegen_string_methods_535, contains_absent_is_false) {
     BEZEL_EXPECT_EQ(runBody(
         std::string("var s := \"") + kHelloJapanWorld + "\"; "
-        "return (1 if s.Contains(\"xyz\") else 0);"), 0);
+        "return (if s.Contains(\"xyz\") then 1 else 0);"), 0);
 }
 
 // ASCII control: "Hello World".Contains("lo W") must still be true.
 BEZEL_TEST(codegen_string_methods_535, contains_ascii_control_is_true) {
     BEZEL_EXPECT_EQ(runBody(
         "var s := \"Hello World\"; "
-        "return (1 if s.Contains(\"lo W\") else 0);"), 1);
+        "return (if s.Contains(\"lo W\") then 1 else 0);"), 1);
 }
 
 // ── §9.6 / #535: StartsWith — code-point-aware prefix check ─────────────────
@@ -181,7 +181,7 @@ BEZEL_TEST(codegen_string_methods_535, contains_ascii_control_is_true) {
 BEZEL_TEST(codegen_string_methods_535, startswith_ascii_in_mixed_is_true) {
     BEZEL_EXPECT_EQ(runBody(
         std::string("var s := \"Hello ") + kJapan + "\"; "
-        "return (1 if s.StartsWith(\"Hello\") else 0);"), 1);
+        "return (if s.StartsWith(\"Hello\") then 1 else 0);"), 1);
 }
 
 // "日本 Hello".StartsWith("日本") must be true.
@@ -189,21 +189,21 @@ BEZEL_TEST(codegen_string_methods_535, startswith_japanese_prefix_is_true) {
     BEZEL_EXPECT_EQ(runBody(
         std::string("var s := \"") + kJapan + " Hello\"; "
         "var p := \"" + kJapan + "\"; "
-        "return (1 if s.StartsWith(p) else 0);"), 1);
+        "return (if s.StartsWith(p) then 1 else 0);"), 1);
 }
 
 // "日本 Hello".StartsWith("Hello") must be false.
 BEZEL_TEST(codegen_string_methods_535, startswith_wrong_prefix_is_false) {
     BEZEL_EXPECT_EQ(runBody(
         std::string("var s := \"") + kJapan + " Hello\"; "
-        "return (1 if s.StartsWith(\"Hello\") else 0);"), 0);
+        "return (if s.StartsWith(\"Hello\") then 1 else 0);"), 0);
 }
 
 // ASCII control: "Hello World".StartsWith("Hello") must still be true.
 BEZEL_TEST(codegen_string_methods_535, startswith_ascii_control_is_true) {
     BEZEL_EXPECT_EQ(runBody(
         "var s := \"Hello World\"; "
-        "return (1 if s.StartsWith(\"Hello\") else 0);"), 1);
+        "return (if s.StartsWith(\"Hello\") then 1 else 0);"), 1);
 }
 
 // ── §9.6 / #535: EndsWith — code-point-aware suffix check ───────────────────
@@ -216,28 +216,28 @@ BEZEL_TEST(codegen_string_methods_535, endswith_japanese_suffix_is_true) {
     BEZEL_EXPECT_EQ(runBody(
         std::string("var s := \"Hello ") + kJapan + "\"; "
         "var suf := \"" + kJapan + "\"; "
-        "return (1 if s.EndsWith(suf) else 0);"), 1);
+        "return (if s.EndsWith(suf) then 1 else 0);"), 1);
 }
 
 // "日本 Hello".EndsWith("Hello") must be true.
 BEZEL_TEST(codegen_string_methods_535, endswith_ascii_suffix_in_mixed_is_true) {
     BEZEL_EXPECT_EQ(runBody(
         std::string("var s := \"") + kJapan + " Hello\"; "
-        "return (1 if s.EndsWith(\"Hello\") else 0);"), 1);
+        "return (if s.EndsWith(\"Hello\") then 1 else 0);"), 1);
 }
 
 // "Hello 日本".EndsWith("Hello") must be false.
 BEZEL_TEST(codegen_string_methods_535, endswith_wrong_suffix_is_false) {
     BEZEL_EXPECT_EQ(runBody(
         std::string("var s := \"Hello ") + kJapan + "\"; "
-        "return (1 if s.EndsWith(\"Hello\") else 0);"), 0);
+        "return (if s.EndsWith(\"Hello\") then 1 else 0);"), 0);
 }
 
 // ASCII control: "Hello World".EndsWith("World") must still be true.
 BEZEL_TEST(codegen_string_methods_535, endswith_ascii_control_is_true) {
     BEZEL_EXPECT_EQ(runBody(
         "var s := \"Hello World\"; "
-        "return (1 if s.EndsWith(\"World\") else 0);"), 1);
+        "return (if s.EndsWith(\"World\") then 1 else 0);"), 1);
 }
 
 // ── §9.6 / #535: Substring — code-point-based start/length ──────────────────
@@ -258,7 +258,7 @@ BEZEL_TEST(codegen_string_methods_535, substring_japanese_equals_japan) {
         std::string("var s := \"") + kHelloJapanWorld + "\"; "
         "var sub := s.Substring(6, 2); "
         "var n := \"" + kJapan + "\"; "
-        "return (1 if sub = n else 0);"), 1);
+        "return (if sub = n then 1 else 0);"), 1);
 }
 
 // "Hello 日本 World".Substring(0, 5) must equal "Hello".
@@ -266,7 +266,7 @@ BEZEL_TEST(codegen_string_methods_535, substring_ascii_prefix_from_mixed) {
     BEZEL_EXPECT_EQ(runBody(
         std::string("var s := \"") + kHelloJapanWorld + "\"; "
         "var sub := s.Substring(0, 5); "
-        "return (1 if sub = \"Hello\" else 0);"), 1);
+        "return (if sub = \"Hello\" then 1 else 0);"), 1);
 }
 
 // "Hello 日本 World".Substring(9) must equal "World" (from code point 9 onward).
@@ -274,7 +274,7 @@ BEZEL_TEST(codegen_string_methods_535, substring_tail_from_mixed) {
     BEZEL_EXPECT_EQ(runBody(
         std::string("var s := \"") + kHelloJapanWorld + "\"; "
         "var sub := s.Substring(9); "
-        "return (1 if sub = \"World\" else 0);"), 1);
+        "return (if sub = \"World\" then 1 else 0);"), 1);
 }
 
 // ASCII control: "Hello World".Substring(6, 5) must still equal "World".
@@ -282,7 +282,7 @@ BEZEL_TEST(codegen_string_methods_535, substring_ascii_control) {
     BEZEL_EXPECT_EQ(runBody(
         "var s := \"Hello World\"; "
         "var sub := s.Substring(6, 5); "
-        "return (1 if sub = \"World\" else 0);"), 1);
+        "return (if sub = \"World\" then 1 else 0);"), 1);
 }
 
 // ── §9.6 / #535: Replace (string overload) — code-point-aware ───────────────
@@ -293,7 +293,7 @@ BEZEL_TEST(codegen_string_methods_535, replace_japanese_with_ascii) {
         std::string("var s := \"") + kHelloJapanWorld + "\"; "
         "var n := \"" + kJapan + "\"; "
         "var r := s.Replace(n, \"Bezel\"); "
-        "return (1 if r = \"Hello Bezel World\" else 0);"), 1);
+        "return (if r = \"Hello Bezel World\" then 1 else 0);"), 1);
 }
 
 // "Hello World".Replace("World", "日本") must give "Hello 日本".
@@ -303,7 +303,7 @@ BEZEL_TEST(codegen_string_methods_535, replace_ascii_with_japanese) {
         "var n := \"") + kJapan + "\"; "
         "var r := s.Replace(\"World\", n); "
         "var expect := \"Hello \" + n; "
-        "return (1 if r = expect else 0);"), 1);
+        "return (if r = expect then 1 else 0);"), 1);
 }
 
 // ASCII control: "abcabc".Replace("bc", "x") must still give "axax".
@@ -311,7 +311,7 @@ BEZEL_TEST(codegen_string_methods_535, replace_ascii_control) {
     BEZEL_EXPECT_EQ(runBody(
         "var s := \"abcabc\"; "
         "var r := s.Replace(\"bc\", \"x\"); "
-        "return (1 if r = \"axax\" else 0);"), 1);
+        "return (if r = \"axax\" then 1 else 0);"), 1);
 }
 
 // ── §9.6 / #535: Split (char overload) — code-point-aware ───────────────────
@@ -361,7 +361,7 @@ BEZEL_TEST(codegen_string_methods_535, split_by_space_second_is_japan) {
         std::string("var s := \"") + kHelloJapanWorld + "\"; "
         "var parts := s.Split(' '); "
         "var n := \"" + kJapan + "\"; "
-        "return (1 if parts[1] = n else 0);"), 1);
+        "return (if parts[1] = n then 1 else 0);"), 1);
 }
 
 // ASCII control: "a b c".Split(' ') must still yield 3 parts.

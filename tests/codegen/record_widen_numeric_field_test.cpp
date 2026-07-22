@@ -29,7 +29,7 @@ BEZEL_TEST(record_widen_numeric_field, long_field_from_int_literal) {
         "module M; record R(X: long); "
         "class C public static method Main(): int "
         "  var r := new R(10); "
-        "  return (0 if r.X = 10 else 1); "  // 0
+        "  return (if r.X = 10 then 0 else 1); "  // 0
         "end Main; end C;"), 0);
 }
 
@@ -50,7 +50,7 @@ BEZEL_TEST(record_widen_numeric_field, short_field_named_args) {
         "module M; record P(A: short, B: long); "
         "class C public static method Main(): int "
         "  var p := new P(A := 300, B := 12345); "
-        "  return (0 if p.A = 300 and p.B = 12345 else 1); "  // 0
+        "  return (if p.A = 300 and p.B = 12345 then 0 else 1); "  // 0
         "end Main; end C;"), 0);
 }
 

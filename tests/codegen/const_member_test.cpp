@@ -92,7 +92,7 @@ BEZEL_TEST(codegen_cg36_609, inferred_local_from_const_value_correct) {
         "class Config public const Limit: int := 42; end Config; "
         "class C public static method Main(): int "
         "  var fromConst := Config.Limit; "
-        "  return (1 if fromConst.ToString() = \"42\" else 0); "
+        "  return (if fromConst.ToString() = \"42\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -105,7 +105,7 @@ BEZEL_TEST(codegen_cg36_609, const_arithmetic_inferred_tostring) {
         "class Config public const Limit: int := 42; end Config; "
         "class C public static method Main(): int "
         "  var result := Config.Limit + 1; "
-        "  return (1 if result.ToString() = \"43\" else 0); "
+        "  return (if result.ToString() = \"43\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -127,6 +127,6 @@ BEZEL_TEST(codegen_cg36_609, unannotated_const_inferred_tostring) {
         "class Config public const Limit := 42; end Config; "
         "class C public static method Main(): int "
         "  var fromConst := Config.Limit; "
-        "  return (1 if fromConst.ToString() = \"42\" else 0); "
+        "  return (if fromConst.ToString() = \"42\" then 1 else 0); "
         "end Main; end C;"), 1);
 }

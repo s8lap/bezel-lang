@@ -63,7 +63,7 @@ BEZEL_TEST(codegen_boxed_value_equals_961, record_differing_values_false) {
         "class C public static method Main(): int "
         "  var o: Object := new Pt(1, 2); "
         "  var p: Object := new Pt(1, 3); "
-        "  return (1 if o.Equals(p) else 0); "
+        "  return (if o.Equals(p) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -75,7 +75,7 @@ BEZEL_TEST(codegen_boxed_value_equals_961, record_equals_null_is_false) {
         "class C public static method Main(): int "
         "  var o: Object := new Pt(1, 2); "
         "  var n: Object? := null; "
-        "  return (1 if o.Equals(n) else 0); "
+        "  return (if o.Equals(n) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -89,7 +89,7 @@ BEZEL_TEST(codegen_boxed_value_equals_961, record_different_type_false) {
         "class C public static method Main(): int "
         "  var o: Object := new Pt(1, 2); "
         "  var v: Object := new Vec(1, 2); "
-        "  return (1 if o.Equals(v) else 0); "
+        "  return (if o.Equals(v) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -130,7 +130,7 @@ BEZEL_TEST(codegen_boxed_value_equals_961, primitive_int_equal_values) {
         "module M; class C public static method Main(): int "
         "  var o: Object := 5; "
         "  var p: Object := 5; "
-        "  return (1 if o.Equals(p) else 0); "
+        "  return (if o.Equals(p) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -140,7 +140,7 @@ BEZEL_TEST(codegen_boxed_value_equals_961, primitive_int_differing_values_false)
         "module M; class C public static method Main(): int "
         "  var o: Object := 5; "
         "  var p: Object := 6; "
-        "  return (1 if o.Equals(p) else 0); "
+        "  return (if o.Equals(p) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -150,7 +150,7 @@ BEZEL_TEST(codegen_boxed_value_equals_961, primitive_int_equals_null_false) {
         "module M; class C public static method Main(): int "
         "  var o: Object := 42; "
         "  var n: Object? := null; "
-        "  return (1 if o.Equals(n) else 0); "
+        "  return (if o.Equals(n) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -163,7 +163,7 @@ BEZEL_TEST(codegen_boxed_value_equals_961, primitive_vs_record_type_mismatch_fal
         "class C public static method Main(): int "
         "  var o: Object := 1; "
         "  var w: Object := new Wrap(1); "
-        "  return (1 if o.Equals(w) else 0); "
+        "  return (if o.Equals(w) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 

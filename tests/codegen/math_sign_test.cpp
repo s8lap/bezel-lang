@@ -51,21 +51,21 @@ BEZEL_TEST(math_sign, sign_double_negative_is_minus_one_spec_2_2) {
     // Before fix: sg typed as double → comparison with int -1 → SIGABRT.
     BEZEL_EXPECT_EQ(run(
         "var sg := Math.Sign(0.0 - 5.0); "
-        "return (1 if sg = -1 else 0);"), 1);
+        "return (if sg = -1 then 1 else 0);"), 1);
 }
 
 BEZEL_TEST(math_sign, sign_double_positive_is_plus_one_spec_2_2) {
     // stdlib §2.2: Sign(x: double): int — positive argument yields 1.
     BEZEL_EXPECT_EQ(run(
         "var sg := Math.Sign(5.0); "
-        "return (1 if sg = 1 else 0);"), 1);
+        "return (if sg = 1 then 1 else 0);"), 1);
 }
 
 BEZEL_TEST(math_sign, sign_double_zero_is_zero_spec_2_2) {
     // stdlib §2.2: Sign(x: double): int — zero argument yields 0.
     BEZEL_EXPECT_EQ(run(
         "var sg := Math.Sign(0.0); "
-        "return (1 if sg = 0 else 0);"), 1);
+        "return (if sg = 0 then 1 else 0);"), 1);
 }
 
 // ── stdlib §2.2 Math.Sign(x: int): int ───────────────────────────────────────
@@ -74,21 +74,21 @@ BEZEL_TEST(math_sign, sign_int_negative_is_minus_one_spec_2_2) {
     // stdlib §2.2: Sign(x: int): int — negative int argument yields -1.
     BEZEL_EXPECT_EQ(run(
         "var sg := Math.Sign(0 - 3); "
-        "return (1 if sg = -1 else 0);"), 1);
+        "return (if sg = -1 then 1 else 0);"), 1);
 }
 
 BEZEL_TEST(math_sign, sign_int_positive_is_plus_one_spec_2_2) {
     // stdlib §2.2: Sign(x: int): int — positive int argument yields 1.
     BEZEL_EXPECT_EQ(run(
         "var sg := Math.Sign(42); "
-        "return (1 if sg = 1 else 0);"), 1);
+        "return (if sg = 1 then 1 else 0);"), 1);
 }
 
 BEZEL_TEST(math_sign, sign_int_zero_is_zero_spec_2_2) {
     // stdlib §2.2: Sign(x: int): int — zero int argument yields 0.
     BEZEL_EXPECT_EQ(run(
         "var sg := Math.Sign(0); "
-        "return (1 if sg = 0 else 0);"), 1);
+        "return (if sg = 0 then 1 else 0);"), 1);
 }
 
 // ── stdlib §2.2 Math.Sign(x: long): int ──────────────────────────────────────
@@ -99,7 +99,7 @@ BEZEL_TEST(math_sign, sign_long_negative_is_minus_one_spec_2_2) {
     BEZEL_EXPECT_EQ(run(
         "var n: long := 0L - 999L; "
         "var sg := Math.Sign(n); "
-        "return (1 if sg = -1 else 0);"), 1);
+        "return (if sg = -1 then 1 else 0);"), 1);
 }
 
 BEZEL_TEST(math_sign, sign_long_positive_is_plus_one_spec_2_2) {
@@ -107,7 +107,7 @@ BEZEL_TEST(math_sign, sign_long_positive_is_plus_one_spec_2_2) {
     BEZEL_EXPECT_EQ(run(
         "var n: long := 999L; "
         "var sg := Math.Sign(n); "
-        "return (1 if sg = 1 else 0);"), 1);
+        "return (if sg = 1 then 1 else 0);"), 1);
 }
 
 // ── result used in int arithmetic (the crash trigger path) ───────────────────
@@ -129,7 +129,7 @@ BEZEL_TEST(math_sign, sign_result_compared_to_negative_literal_spec_2_2) {
     // type; if Sign is typed as double this emits double ICmp int → SIGABRT.
     BEZEL_EXPECT_EQ(run(
         "var sg := Math.Sign(0.0 - 5.0); "
-        "return (1 if sg = -1 else 0);"), 1);
+        "return (if sg = -1 then 1 else 0);"), 1);
 }
 
 // ── control: Math.Abs remains polymorphic (still returns argument type) ───────
@@ -140,7 +140,7 @@ BEZEL_TEST(math_sign, abs_double_returns_double_spec_2_2) {
     // We verify by using the result in a double comparison (would fail if int).
     BEZEL_EXPECT_EQ(run(
         "var a := Math.Abs(0.0 - 5.0); "
-        "return (1 if a > 4.9 and a < 5.1 else 0);"), 1);
+        "return (if a > 4.9 and a < 5.1 then 1 else 0);"), 1);
 }
 
 BEZEL_TEST(math_sign, abs_int_returns_int_spec_2_2) {
@@ -148,5 +148,5 @@ BEZEL_TEST(math_sign, abs_int_returns_int_spec_2_2) {
     // Polymorphic override: int arg → int result.
     BEZEL_EXPECT_EQ(run(
         "var a := Math.Abs(0 - 5); "
-        "return (1 if a = 5 else 0);"), 1);
+        "return (if a = 5 then 1 else 0);"), 1);
 }

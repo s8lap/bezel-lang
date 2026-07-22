@@ -198,10 +198,9 @@ BEZEL_TEST(codegen_choice_35,
     auto r = runDecls(
         "choice Opt Some(value: int), None; end Opt;",
         "var x: Opt := Opt.Some(7); "
-        "var r: int := case x of "
+        "var r: int := (case x of "
         "  Some(var v) => v, "
-        "  None        => 0 "
-        "end; "
+        "  None        => 0); "
         "return r;");
     BEZEL_EXPECT_EQ(r, 7);
 }

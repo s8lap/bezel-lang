@@ -101,7 +101,7 @@ std::string prog(const std::string& mainBody) {
            "class Foo end Foo;\n"
            "class C\n"
            "  public static method Tag<T>(o: Object): int\n"
-           "    return case o of T => 1, _ => 0 end;\n"
+           "    return (case o of T => 1, _ => 0);\n"
            "  end Tag;\n"
            "  public static method Main(): int\n" +
            mainBody +

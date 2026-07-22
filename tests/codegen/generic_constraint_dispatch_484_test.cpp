@@ -208,7 +208,7 @@ BEZEL_TEST(generic_constraint_dispatch_484, primitive_compareto_via_constraint_7
         "    var lt := GetComp<int>(1, 10); "
         "    var gt := GetComp<int>(10, 1); "
         "    var eq := GetComp<int>(5, 5); "
-        "    return (1 if (lt < 0 and gt > 0 and eq = 0) else 0); "
+        "    return (if (lt < 0 and gt > 0 and eq = 0) then 1 else 0); "
         "  end Main; "
         "end C;"), 1);
 }

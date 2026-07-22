@@ -98,10 +98,10 @@ BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
         "interface IBox<T>\nend IBox;\n"
         "class Box<T> : IBox<T>\nend Box;\n",
         "  public method M(b: IBox<int>): int\n"
-        "    var n := case b of\n"
+        "    var n := (case b of\n"
         "      var x: Box<string> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_TRUE(hasBindAmbiguousError(r));
@@ -138,10 +138,10 @@ BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
         "interface IMarker<T>\nend IMarker;\n"
         "sealed class C<T> : IMarker<T>, IMarker<int>\nend C;\n",
         "  public method M(m: IMarker<int>): int\n"
-        "    var n := case m of\n"
+        "    var n := (case m of\n"
         "      var x: C<int> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasBindAmbiguousError(r));
@@ -177,10 +177,10 @@ BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
         "interface IMarker<T>\nend IMarker;\n"
         "sealed class C<T> : IMarker<T>, IMarker<int>\nend C;\n",
         "  public method M(m: IMarker<int>): int\n"
-        "    var n := case m of\n"
+        "    var n := (case m of\n"
         "      var x: C<string> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasBindAmbiguousError(r));
@@ -198,10 +198,10 @@ BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
         "interface IMarker<T>\nend IMarker;\n"
         "sealed class Pair<T, U> : IMarker<T>\nend Pair;\n",
         "  public method M(m: IMarker<int>): int\n"
-        "    var n := case m of\n"
+        "    var n := (case m of\n"
         "      var x: Pair<int, string> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasBindAmbiguousError(r));
@@ -219,10 +219,10 @@ BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
         "interface IBox<T>\nend IBox;\n"
         "sealed class Box<T> : IBox<T>\nend Box;\n",
         "  public method M(b: IBox<int>): int\n"
-        "    var n := case b of\n"
+        "    var n := (case b of\n"
         "      var x: Box<int> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasBindAmbiguousError(r));
@@ -241,10 +241,10 @@ BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
         "interface IMarker<T>\nend IMarker;\n"
         "sealed class C<T> : IMarker<T>, IMarker<int>\nend C;\n",
         "  public method M(m: IMarker<string>): int\n"
-        "    var n := case m of\n"
+        "    var n := (case m of\n"
         "      var x: C<string> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasBindAmbiguousError(r));
@@ -261,10 +261,10 @@ BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
         "interface IBox<T>\nend IBox;\n"
         "sealed class Box<T> : IBox<T>\nend Box;\n",
         "  public method Rig<U>(b: IBox<U>): int\n"
-        "    var n := case b of\n"
+        "    var n := (case b of\n"
         "      var x: Box<int> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end Rig;\n"));
     BEZEL_EXPECT_FALSE(hasBindAmbiguousError(r));
@@ -285,10 +285,10 @@ BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
         "sealed class Dog : Animal\nend Dog;\n"
         "sealed class Box<T> : IReadOnly<T>\nend Box;\n",
         "  public method M(b: IReadOnly<Animal>): int\n"
-        "    var n := case b of\n"
+        "    var n := (case b of\n"
         "      var x: Box<Dog> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasBindAmbiguousError(r));
@@ -315,10 +315,10 @@ BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
         "interface IMarker<T>\nend IMarker;\n"
         "sealed class C<T> : IMarker<T>, IMarker<int>\nend C;\n",
         "  public method M(m: IMarker<int>): int\n"
-        "    var n := case m of\n"
+        "    var n := (case m of\n"
         "      var x: C<(int) -> int> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_TRUE(hasErasedAmbiguousError(r));
@@ -337,10 +337,10 @@ BEZEL_TEST(case_type_test_iface_bind_ambiguous_1927,
         "interface IMarker<T>\nend IMarker;\n"
         "sealed class Pair<T, U> : IMarker<T>\nend Pair;\n",
         "  public method M(m: IMarker<int>): int\n"
-        "    var n := case m of\n"
+        "    var n := (case m of\n"
         "      var x: Pair<int, (int) -> int> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_TRUE(hasErasedAmbiguousError(r));

@@ -1,4 +1,1 @@
-var grade := "A" if score >= 90 else
-             "B" if score >= 80 else
-             "C" if score >= 70 else
-             "F";
+var grade := (if score >= 90 then "A" elif score >= 80 then "B" elif score >= 70 then "C" else "F");

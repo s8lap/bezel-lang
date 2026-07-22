@@ -247,7 +247,7 @@ BEZEL_TEST(codegen_cg45, null_default_nullable_int_omitted_spec_22_5_issue1235) 
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method F(n: int? := null): int "
-        "    => (n! if n <> null else 0); "
+        "    => (if n <> null then n! else 0); "
         "  public static method Main(): int => F(); "
         "end C;"), 0);
 }
@@ -259,7 +259,7 @@ BEZEL_TEST(codegen_cg45, null_default_nullable_int_explicit_null_spec_22_5_issue
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method F(n: int? := null): int "
-        "    => (n! if n <> null else 0); "
+        "    => (if n <> null then n! else 0); "
         "  public static method Main(): int => F(null); "
         "end C;"), 0);
 }
@@ -270,7 +270,7 @@ BEZEL_TEST(codegen_cg45, null_default_nullable_int_explicit_value_spec_22_5_issu
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method F(n: int? := null): int "
-        "    => (n! if n <> null else 0); "
+        "    => (if n <> null then n! else 0); "
         "  public static method Main(): int => F(5); "
         "end C;"), 5);
 }
@@ -283,7 +283,7 @@ BEZEL_TEST(codegen_cg45, null_default_nullable_enum_omitted_spec_22_5_issue1235)
         "enum Color Red := 1, Green := 2, Blue := 3; end Color; "
         "class C "
         "  public static method F(c: Color? := null): int "
-        "    => (1 if c <> null else 0); "
+        "    => (if c <> null then 1 else 0); "
         "  public static method Main(): int => F(); "
         "end C;"), 0);
 }
@@ -296,7 +296,7 @@ BEZEL_TEST(codegen_cg45, null_default_nullable_record_omitted_spec_22_5_issue123
         "record Point(X: int, Y: int); "
         "class C "
         "  public static method F(p: Point? := null): int "
-        "    => (p!.X + p!.Y if p <> null else 0); "
+        "    => (if p <> null then p!.X + p!.Y else 0); "
         "  public static method Main(): int => F(); "
         "end C;"), 0);
 }

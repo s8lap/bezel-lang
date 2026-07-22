@@ -110,7 +110,7 @@ BEZEL_TEST(parse_overloads_747, int_tryparse_overflow_returns_false_1134) {
         "module M; static class F public static method Main(): int "
         "  var v: int := 0; "
         "  var ok: bool := int.TryParse(\"99999999999\", out v); "
-        "  return (1 if not ok else 0); "                      // ok must be false
+        "  return (if not ok then 1 else 0); "                      // ok must be false
         "end Main; end F;"), 1);
 }
 
@@ -120,7 +120,7 @@ BEZEL_TEST(parse_overloads_747, int_tryparse_in_range_unaffected_1134) {
         "module M; static class F public static method Main(): int "
         "  var v: int := 0; "
         "  var ok: bool := int.TryParse(\"123\", out v); "
-        "  return (v if ok else 0); "                          // 123
+        "  return (if ok then v else 0); "                          // 123
         "end Main; end F;"), 123);
 }
 
@@ -175,7 +175,7 @@ BEZEL_TEST(parse_overloads_747, int_tryparse_trailing_garbage_zeroes_out_1227) {
         "module M; static class F public static method Main(): int "
         "  var v: int := 99; "
         "  var ok: bool := int.TryParse(\"123abc\", out v); "
-        "  return (v if not ok else 1); "  // ok=false, v must be 0
+        "  return (if not ok then v else 1); "  // ok=false, v must be 0
         "end Main; end F;"), 0);
 }
 
@@ -262,7 +262,7 @@ BEZEL_TEST(parse_overloads_747, double_tryparse_trailing_garbage_zeroes_out_1227
         "module M; static class F public static method Main(): int "
         "  var v: double := 99.0; "
         "  var ok: bool := double.TryParse(\"1.5abc\", out v); "
-        "  return (int(v) if not ok else 1); "  // ok=false, v must be 0.0
+        "  return (if not ok then int(v) else 1); "  // ok=false, v must be 0.0
         "end Main; end F;"), 0);
 }
 
@@ -310,6 +310,6 @@ BEZEL_TEST(parse_overloads_747, math_abs_near_minvalue_unaffected_1231) {
     BEZEL_EXPECT_EQ(run(
         "module M; static class F public static method Main(): int "
         "  var r := Math.Abs(int.MinValue + 1); "  // 2147483647 = MaxValue
-        "  return (42 if r = int.MaxValue else 0); "
+        "  return (if r = int.MaxValue then 42 else 0); "
         "end Main; end F;"), 42);
 }

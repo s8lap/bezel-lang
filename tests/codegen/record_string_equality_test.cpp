@@ -36,7 +36,7 @@ BEZEL_TEST(codegen_record_str_eq, positional_string_equal_content_spec_8_3) {
         "class C public static method Main(): int "
         "  var a := new Name(\"Ann\"); "
         "  var b := new Name(\"An\" + \"n\"); "  // distinct heap string
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -47,7 +47,7 @@ BEZEL_TEST(codegen_record_str_eq, positional_string_neq_false_spec_8_3) {
         "class C public static method Main(): int "
         "  var a := new Name(\"Ann\"); "
         "  var b := new Name(\"An\" + \"n\"); "
-        "  return (1 if a <> b else 0); "
+        "  return (if a <> b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -59,7 +59,7 @@ BEZEL_TEST(codegen_record_str_eq, positional_string_equals_method_spec_9_1) {
         "class C public static method Main(): int "
         "  var a := new Name(\"Ann\"); "
         "  var b := new Name(\"An\" + \"n\"); "
-        "  return (1 if a.Equals(b) else 0); "
+        "  return (if a.Equals(b) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -70,7 +70,7 @@ BEZEL_TEST(codegen_record_str_eq, positional_string_different_content_spec_8_3) 
         "class C public static method Main(): int "
         "  var a := new Name(\"Ann\"); "
         "  var b := new Name(\"Bob\"); "
-        "  return (1 if (a = b) or (a <> b = false) else 0); "
+        "  return (if (a = b) or (a <> b = false) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -82,7 +82,7 @@ BEZEL_TEST(codegen_record_str_eq, mixed_string_int_all_equal_spec_8_3) {
         "class C public static method Main(): int "
         "  var a := new Person(\"Ann\", 30); "
         "  var b := new Person(\"An\" + \"n\", 30); "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -93,7 +93,7 @@ BEZEL_TEST(codegen_record_str_eq, mixed_string_int_int_differs_spec_8_3) {
         "class C public static method Main(): int "
         "  var a := new Person(\"Ann\", 30); "
         "  var b := new Person(\"An\" + \"n\", 31); "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -104,7 +104,7 @@ BEZEL_TEST(codegen_record_str_eq, mixed_string_int_string_differs_spec_8_3) {
         "class C public static method Main(): int "
         "  var a := new Person(\"Ann\", 30); "
         "  var b := new Person(\"Bob\", 30); "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -117,7 +117,7 @@ BEZEL_TEST(codegen_record_str_eq, gethashcode_agrees_with_equality_spec_8_3) {
         "class C public static method Main(): int "
         "  var a := new Person(\"Ann\", 30); "
         "  var b := new Person(\"An\" + \"n\", 30); "
-        "  return (1 if a = b and a.GetHashCode() = b.GetHashCode() else 0); "
+        "  return (if a = b and a.GetHashCode() = b.GetHashCode() then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -133,8 +133,8 @@ BEZEL_TEST(codegen_record_str_eq, body_record_string_auto_property_spec_9_2) {
         "class C public static method Main(): int "
         "  var a := new Greeting(\"hi\"); "
         "  var b := new Greeting(\"h\" + \"i\"); "
-        "  return (1 if a.Equals(b) "
-        "             and a.GetHashCode() = b.GetHashCode() else 0); "
+        "  return (if a.Equals(b) "
+        "             and a.GetHashCode() = b.GetHashCode() then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -150,7 +150,7 @@ BEZEL_TEST(codegen_record_str_eq, body_record_string_differs_spec_9_2) {
         "class C public static method Main(): int "
         "  var a := new Greeting(\"hi\"); "
         "  var b := new Greeting(\"bye\"); "
-        "  return (1 if a.Equals(b) else 0); "
+        "  return (if a.Equals(b) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -165,7 +165,7 @@ BEZEL_TEST(codegen_record_str_eq, nested_record_inner_string_equal_spec_9_1) {
         "class C public static method Main(): int "
         "  var a := new Tagged(new Label(\"ok\"), 1); "
         "  var b := new Tagged(new Label(\"o\" + \"k\"), 1); "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -178,7 +178,7 @@ BEZEL_TEST(codegen_record_str_eq, nested_record_inner_string_differs_spec_9_1) {
         "class C public static method Main(): int "
         "  var a := new Tagged(new Label(\"ok\"), 1); "
         "  var b := new Tagged(new Label(\"no\"), 1); "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -208,7 +208,7 @@ BEZEL_TEST(codegen_record_str_eq, nullable_string_both_null_equal_spec_8_3) {
         "class C public static method Main(): int "
         "  var a := new Name(null); "
         "  var b := new Name(null); "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -220,7 +220,7 @@ BEZEL_TEST(codegen_record_str_eq, nullable_string_one_null_not_equal_spec_8_3) {
         "class C public static method Main(): int "
         "  var a := new Name(null); "
         "  var b := new Name(\"x\"); "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -231,7 +231,7 @@ BEZEL_TEST(codegen_record_str_eq, nullable_string_one_null_neq_true_spec_8_3) {
         "class C public static method Main(): int "
         "  var a := new Name(null); "
         "  var b := new Name(\"x\"); "
-        "  return (1 if a <> b else 0); "
+        "  return (if a <> b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -244,7 +244,7 @@ BEZEL_TEST(codegen_record_str_eq, nullable_string_equals_method_spec_9_1) {
         "  var a := new Data(null); "
         "  var b := new Data(null); "
         "  var c := new Data(\"x\"); "
-        "  return (1 if a.Equals(b) and not a.Equals(c) else 0); "
+        "  return (if a.Equals(b) and not a.Equals(c) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -258,8 +258,8 @@ BEZEL_TEST(codegen_record_str_eq, nullable_string_gethashcode_null_spec_8_3) {
         "  var a := new Data(null); "
         "  var b := new Data(null); "
         "  var c := new Data(\"x\"); "
-        "  return (1 if a.GetHashCode() = b.GetHashCode() "
-        "             and a.GetHashCode() <> c.GetHashCode() else 0); "
+        "  return (if a.GetHashCode() = b.GetHashCode() "
+        "             and a.GetHashCode() <> c.GetHashCode() then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -272,8 +272,8 @@ BEZEL_TEST(codegen_record_str_eq, nullable_string_tostring_null_spec_8_5) {
         "class C public static method Main(): int "
         "  var m := new Msg(null); "
         "  var n := new Msg(\"hi\"); "
-        "  return (1 if m.ToString() = \"Msg(opt: null)\" "
-        "             and n.ToString() = \"Msg(opt: hi)\" else 0); "
+        "  return (if m.ToString() = \"Msg(opt: null)\" "
+        "             and n.ToString() = \"Msg(opt: hi)\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -286,10 +286,10 @@ BEZEL_TEST(codegen_record_str_eq, nullable_string_field_roundtrip_spec_9_1) {
         "class C public static method Main(): int "
         "  var a := new Box(null, 7); "
         "  var b := new Box(null, 7); "
-        "  return (1 if a = b "
+        "  return (if a = b "
         "             and a.Equals(b) "
         "             and a.GetHashCode() = b.GetHashCode() "
-        "             and a.ToString() = \"Box(s: null, n: 7)\" else 0); "
+        "             and a.ToString() = \"Box(s: null, n: 7)\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -310,7 +310,7 @@ BEZEL_TEST(codegen_record_str_eq, nullable_class_field_eq_is_compile_error_spec_
         "class C public static method Main(): int "
         "  var a := new Holder(null); "
         "  var b := new Holder(null); "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), -999);  // -999 = did not run (compile error)
 }
 
@@ -341,7 +341,7 @@ BEZEL_TEST(codegen_record_str_eq, nullable_int_equal_value_spec_8_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Box(n: int?); "
         "class C public static method Main(): int "
-        "  return (1 if new Box(5) = new Box(5) else 0); "
+        "  return (if new Box(5) = new Box(5) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -351,8 +351,8 @@ BEZEL_TEST(codegen_record_str_eq, nullable_int_different_value_spec_8_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Box(n: int?); "
         "class C public static method Main(): int "
-        "  return (1 if new Box(5) <> new Box(6) and (new Box(5) = new Box(6)) = false "
-        "             else 0); "
+        "  return (if new Box(5) <> new Box(6) and (new Box(5) = new Box(6)) = false "
+        "             then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -361,7 +361,7 @@ BEZEL_TEST(codegen_record_str_eq, nullable_int_both_null_equal_spec_8_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Box(n: int?); "
         "class C public static method Main(): int "
-        "  return (1 if new Box(null) = new Box(null) else 0); "
+        "  return (if new Box(null) = new Box(null) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -370,8 +370,8 @@ BEZEL_TEST(codegen_record_str_eq, nullable_int_one_null_not_equal_spec_8_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Box(n: int?); "
         "class C public static method Main(): int "
-        "  return (1 if (new Box(5) = new Box(null)) = false "
-        "             and (new Box(null) = new Box(5)) = false else 0); "
+        "  return (if (new Box(5) = new Box(null)) = false "
+        "             and (new Box(null) = new Box(5)) = false then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -381,9 +381,9 @@ BEZEL_TEST(codegen_record_str_eq, nullable_int_equals_method_spec_9_1) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Box(n: int?); "
         "class C public static method Main(): int "
-        "  return (1 if new Box(7).Equals(new Box(7)) "
+        "  return (if new Box(7).Equals(new Box(7)) "
         "             and new Box(null).Equals(new Box(null)) "
-        "             and new Box(7).Equals(new Box(null)) = false else 0); "
+        "             and new Box(7).Equals(new Box(null)) = false then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -394,9 +394,9 @@ BEZEL_TEST(codegen_record_str_eq, nullable_int_gethashcode_agrees_spec_8_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Box(n: int?); "
         "class C public static method Main(): int "
-        "  return (1 if new Box(42).GetHashCode() = new Box(42).GetHashCode() "
+        "  return (if new Box(42).GetHashCode() = new Box(42).GetHashCode() "
         "             and new Box(null).GetHashCode() = new Box(null).GetHashCode() "
-        "             else 0); "
+        "             then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -406,8 +406,8 @@ BEZEL_TEST(codegen_record_str_eq, nullable_int_tostring_value_spec_8_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Box(n: int?); "
         "class C public static method Main(): int "
-        "  return (1 if new Box(5).ToString() = \"Box(n: 5)\" "
-        "             and new Box(99).ToString() = \"Box(n: 99)\" else 0); "
+        "  return (if new Box(5).ToString() = \"Box(n: 5)\" "
+        "             and new Box(99).ToString() = \"Box(n: 99)\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -417,7 +417,7 @@ BEZEL_TEST(codegen_record_str_eq, nullable_int_tostring_null_spec_8_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Box(n: int?); "
         "class C public static method Main(): int "
-        "  return (1 if new Box(null).ToString() = \"Box(n: null)\" else 0); "
+        "  return (if new Box(null).ToString() = \"Box(n: null)\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -431,8 +431,8 @@ BEZEL_TEST(codegen_record_str_eq, nullable_int_body_record_tostring_spec_9_2) {
         "  public constructor(n: int?) N := n; end constructor; "
         "end Box; "
         "class C public static method Main(): int "
-        "  return (1 if new Box(5).ToString() = \"Box(N: 5)\" "
-        "             and new Box(null).ToString() = \"Box(N: null)\" else 0); "
+        "  return (if new Box(5).ToString() = \"Box(N: 5)\" "
+        "             and new Box(null).ToString() = \"Box(N: null)\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -443,12 +443,12 @@ BEZEL_TEST(codegen_record_str_eq, nullable_bool_value_semantics_spec_8_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Flag(b: bool?); "
         "class C public static method Main(): int "
-        "  return (1 if new Flag(true) = new Flag(true) "
+        "  return (if new Flag(true) = new Flag(true) "
         "             and (new Flag(true) = new Flag(false)) = false "
         "             and new Flag(null) = new Flag(null) "
         "             and new Flag(true).GetHashCode() = new Flag(true).GetHashCode() "
         "             and new Flag(true).ToString() = \"Flag(b: True)\" "  // #452: bool.ToString() → "True"/"False" per stdlib
-        "             and new Flag(null).ToString() = \"Flag(b: null)\" else 0); "
+        "             and new Flag(null).ToString() = \"Flag(b: null)\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -464,9 +464,9 @@ BEZEL_TEST(codegen_record_str_eq, nested_record_nullable_int_inherits_spec_9_1) 
         "  var b := new Outer(new Inner(8)); "
         "  var c := new Outer(new Inner(null)); "
         "  var d := new Outer(new Inner(null)); "
-        "  return (1 if a = b and c = d and (a = c) = false "
+        "  return (if a = b and c = d and (a = c) = false "
         "             and a.GetHashCode() = b.GetHashCode() "
         "             and a.ToString() = \"Outer(inner: Inner(n: 8))\" "
-        "             and c.ToString() = \"Outer(inner: Inner(n: null))\" else 0); "
+        "             and c.ToString() = \"Outer(inner: Inner(n: null))\" then 1 else 0); "
         "end Main; end C;"), 1);
 }

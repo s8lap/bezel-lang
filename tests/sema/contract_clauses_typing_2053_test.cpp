@@ -126,7 +126,7 @@ BEZEL_TEST(contract_clauses_typing_2053,
         "module M; "
         "class C "
         "  public method M(x: int): int "
-        "    ensures((throw new ArgumentException()) if x < 0 else x > 0) "
+        "    ensures((if x < 0 then (throw new ArgumentException()) else x > 0)) "
         "    => x; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasMsg(r, "throw"));

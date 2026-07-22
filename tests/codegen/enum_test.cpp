@@ -25,23 +25,23 @@ const char* kColor = "enum Color Red := 1, Green := 2, Blue := 3; end Color;";
 
 BEZEL_TEST(codegen_cg30, constant_equality) {
     BEZEL_EXPECT_EQ(run(kColor,
-        "var c := Color.Green; return (7 if c = Color.Green else 0);"), 7);
+        "var c := Color.Green; return (if c = Color.Green then 7 else 0);"), 7);
 }
 
 BEZEL_TEST(codegen_cg30, distinct_constants_not_equal) {
     BEZEL_EXPECT_EQ(run(kColor,
-        "var c := Color.Red; return (1 if c = Color.Green else 9);"), 9);
+        "var c := Color.Red; return (if c = Color.Green then 1 else 9);"), 9);
 }
 
 BEZEL_TEST(codegen_cg30, inequality_operator) {
     BEZEL_EXPECT_EQ(run(kColor,
-        "return (4 if Color.Red <> Color.Blue else 0);"), 4);
+        "return (if Color.Red <> Color.Blue then 4 else 0);"), 4);
 }
 
 BEZEL_TEST(codegen_cg30, reassignment) {
     BEZEL_EXPECT_EQ(run(kColor,
         "var c := Color.Red; c := Color.Blue; "
-        "return (3 if c = Color.Blue else 0);"), 3);
+        "return (if c = Color.Blue then 3 else 0);"), 3);
 }
 
 BEZEL_TEST(codegen_cg30, used_in_if_condition) {
@@ -55,7 +55,7 @@ BEZEL_TEST(codegen_cg30, implicit_auto_increment_values) {
     // round-trip through a local.
     BEZEL_EXPECT_EQ(run(
         "enum E A, B, C; end E;",
-        "var x := E.C; return (8 if x = E.C else 0);"), 8);
+        "var x := E.C; return (if x = E.C then 8 else 0);"), 8);
 }
 
 BEZEL_TEST(codegen_cg30, explicit_then_implicit_values) {
@@ -63,7 +63,7 @@ BEZEL_TEST(codegen_cg30, explicit_then_implicit_values) {
     BEZEL_EXPECT_EQ(run(
         "enum E A := 5, B, C; end E;",
         "var x := E.B; "
-        "return (6 if (x = E.B) and (x <> E.A) else 0);"), 6);
+        "return (if (x = E.B) and (x <> E.A) then 6 else 0);"), 6);
 }
 
 // ---- #435 / §10 / §8.6 / §13: enum implementing interface, box thunk --------
@@ -153,7 +153,7 @@ BEZEL_TEST(codegen_cg30_iface, record_interface_box_thunk_regression) {
 BEZEL_TEST(codegen_enum, negative_explicit_value_739) {
     BEZEL_EXPECT_EQ(run(
         "enum E A := 5, B := -5; end E; ",
-        "return (0 if int(E.B) = -5 else int(E.B));"), 0);
+        "return (if int(E.B) = -5 then 0 else int(E.B));"), 0);
 }
 
 // #739 / §10.2: explicit value as ARITHMETIC and a reference to an earlier

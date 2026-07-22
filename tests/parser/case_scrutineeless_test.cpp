@@ -70,11 +70,11 @@ BEZEL_TEST(parser_case_scrutineeless,
     // Using \n to separate `case` from its first arm.
     auto r = parseAll(
         "module M; class C public method M(score: int) _ := "
-        "when\n"
+        "(when\n"
         "  score >= 90 => \"A\",\n"
         "  score >= 80 => \"B\",\n"
         "  _ => \"F\"\n"
-        "end"
+        ")"
         "; end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     const auto* e = extractExpr(r);
@@ -112,11 +112,11 @@ BEZEL_TEST(parser_case_scrutineeless,
     auto r = parseAll(
         "module M; class C "
         "  public method CompareTo(x: int, y: int): int =>\n"
-        "    when\n"
+        "    (when\n"
         "      int(x) < int(y) => -1,\n"
         "      int(x) > int(y) => 1,\n"
         "      _ => 0\n"
-        "    end; "
+        "    ); "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     // Verify bare (null scrutinee) form.
@@ -131,10 +131,10 @@ BEZEL_TEST(parser_case_scrutineeless,
         "module M; "
         "record Point(X: int, Y: int) "
         "  public method CompareTo(other: Point): int =>\n"
-        "    when\n"
+        "    (when\n"
         "      X <> other.X => 1,\n"
         "      _ => 0\n"
-        "    end; "
+        "    ); "
         "end Point;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -148,10 +148,10 @@ BEZEL_TEST(parser_case_scrutineeless,
     auto r = parseAll(
         "module M; class C public method M(x: int): int\n"
         "_ :=\n"
-        "when\n"
+        "(when\n"
         "  x = 1 or x = 2 => 10,\n"
         "  _ => 0\n"
-        "end"
+        ")"
         "; end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     const auto* e = extractExpr(r);
@@ -169,7 +169,7 @@ BEZEL_TEST(parser_case_scrutineeless,
     // Block-body method so extractExpr (stmts[0]) works correctly.
     auto r = parseAll(
         "module M; class C public method M(x: int): int "
-        "_ := when x = 1 or x = 2 => 10, _ => 0 end"
+        "_ := (when x = 1 or x = 2 => 10, _ => 0)"
         "; end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     const auto* e = extractExpr(r);
@@ -189,7 +189,7 @@ BEZEL_TEST(parser_case_scrutineeless,
     // Block-body method so extractExpr (stmts[0]) works correctly.
     auto r = parseAll(
         "module M; class C public method M(x: int): int "
-        "_ := case x of 1 => 10, _ => 0 end"
+        "_ := (case x of 1 => 10, _ => 0)"
         "; end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     const auto* e = extractExpr(r);
@@ -268,7 +268,7 @@ BEZEL_TEST(parser_case_scrutineeless,
     // The fix only suppresses TypePattern when followed by `(`.
     auto r = parseAll(
         "module M; class C public method M() _ := "
-        "case x of int => 1, string => 2, _ => 0 end"
+        "(case x of int => 1, string => 2, _ => 0)"
         "; end M; end C;");
     // Note: `x` is unresolved in parser-only test; we just check parse success.
     // The test verifies the TypePattern branch still fires for bare `int`.

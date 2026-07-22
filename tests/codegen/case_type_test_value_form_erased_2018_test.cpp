@@ -49,10 +49,9 @@ BEZEL_TEST(codegen_2018, function_arg_false_positive_no_longer_compiles) {
     BEZEL_EXPECT_EQ(runProg(
         "using var w := new Wrap<(int) -> int>(7); "
         "var o: Object := w; "
-        "var n := case o of "
+        "var n := (case o of "
         "  var x: Wrap<(string) -> string> => 1, "
-        "  _ => 0 "
-        "end; "
+        "  _ => 0); "
         "return n;"), -999);
 }
 
@@ -62,8 +61,8 @@ BEZEL_TEST(codegen_2018, primitive_arg_is_precise) {
     BEZEL_EXPECT_EQ(runProg(
         "using var w := new Wrap<int>(7); "
         "var o: Object := w; "
-        "var a := case o of var x: Wrap<int> => 1, _ => 0 end; "
-        "var b := case o of var y: Wrap<string> => 1, _ => 0 end; "
+        "var a := (case o of var x: Wrap<int> => 1, _ => 0); "
+        "var b := (case o of var y: Wrap<string> => 1, _ => 0); "
         "return a * 2 + b;"), 2);
 }
 
@@ -72,8 +71,8 @@ BEZEL_TEST(codegen_2018, named_class_arg_is_precise) {
     BEZEL_EXPECT_EQ(runProg(
         "using var w := new Wrap<Foo>(7); "
         "var o: Object := w; "
-        "var a := case o of var x: Wrap<Foo> => 1, _ => 0 end; "
-        "var b := case o of var y: Wrap<int> => 1, _ => 0 end; "
+        "var a := (case o of var x: Wrap<Foo> => 1, _ => 0); "
+        "var b := (case o of var y: Wrap<int> => 1, _ => 0); "
         "return a * 2 + b;"), 2);
 }
 
@@ -83,8 +82,8 @@ BEZEL_TEST(codegen_2018, inline_array_arg_is_precise) {
     BEZEL_EXPECT_EQ(runProg(
         "using var w := new Wrap<[3]int>(7); "
         "var o: Object := w; "
-        "var a := case o of var x: Wrap<[3]int> => 1, _ => 0 end; "
-        "var b := case o of var y: Wrap<[4]int> => 1, _ => 0 end; "
+        "var a := (case o of var x: Wrap<[3]int> => 1, _ => 0); "
+        "var b := (case o of var y: Wrap<[4]int> => 1, _ => 0); "
         "return a * 2 + b;"), 2);
 }
 
@@ -98,7 +97,7 @@ BEZEL_TEST(codegen_2018, bare_type_parameter_resolves_at_monomorphization) {
         "  public constructor(t: int) tag := t; end constructor; end Wrap; "
         "class Checker<T> "
         "  public method probe(m: Object): int "
-        "    var n := case m of var x: Wrap<T> => 1, _ => 0 end; "
+        "    var n := (case m of var x: Wrap<T> => 1, _ => 0); "
         "    return n; "
         "  end probe; "
         "end Checker; "

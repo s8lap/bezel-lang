@@ -162,7 +162,7 @@ BEZEL_TEST(codegen_json_550, record_int_roundtrip_spec_2_15) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var p2 := Point.Deserialize(d); "
-        "  return (1 if p2.X = 3 and p2.Y = 7 else 0); "
+        "  return (if p2.X = 3 and p2.Y = 7 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -178,7 +178,7 @@ BEZEL_TEST(codegen_json_550, record_bool_roundtrip_spec_2_15) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var f2 := Flags.Deserialize(d); "
-        "  return (1 if f2.Active = true and f2.Done = false else 0); "
+        "  return (if f2.Active = true and f2.Done = false then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -194,7 +194,7 @@ BEZEL_TEST(codegen_json_550, record_string_roundtrip_spec_2_15) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var m2 := Msg.Deserialize(d); "
-        "  return (1 if m2.Text = \"hello\" else 0); "
+        "  return (if m2.Text = \"hello\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -211,7 +211,7 @@ BEZEL_TEST(codegen_json_550, string_escape_dquote_spec_2_15) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var w2 := W.Deserialize(d); "
-        "  return (1 if w2.V = \"say \\\"hi\\\"\" else 0); "
+        "  return (if w2.V = \"say \\\"hi\\\"\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -228,7 +228,7 @@ BEZEL_TEST(codegen_json_550, string_escape_backslash_spec_2_15) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var p2 := P.Deserialize(d); "
-        "  return (1 if p2.Path = \"a\\\\b\" else 0); "
+        "  return (if p2.Path = \"a\\\\b\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -245,7 +245,7 @@ BEZEL_TEST(codegen_json_550, string_escape_control_chars_spec_2_15) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var l2 := L.Deserialize(d); "
-        "  return (1 if l2.Line = \"a\\nb\" else 0); "
+        "  return (if l2.Line = \"a\\nb\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -262,7 +262,7 @@ BEZEL_TEST(codegen_json_550, record_float_roundtrip_spec_2_15) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var r2 := R.Deserialize(d); "
-        "  return (1 if r2.V = 2.5f else 0); "
+        "  return (if r2.V = 2.5f then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -278,7 +278,7 @@ BEZEL_TEST(codegen_json_550, record_decimal_roundtrip_spec_2_15) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var d1 := D.Deserialize(d); "
-        "  return (1 if d1.V = 1.25m else 0); "
+        "  return (if d1.V = 1.25m then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -293,7 +293,7 @@ BEZEL_TEST(codegen_json_550, enum_roundtrip_name_form_spec_2_15_9_8) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var v := Color.Deserialize(d); "
-        "  return (1 if v = Color.Green else 0); "
+        "  return (if v = Color.Green then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -310,7 +310,7 @@ BEZEL_TEST(codegen_json_550, nested_record_roundtrip_spec_2_15) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var o2 := Outer.Deserialize(d); "
-        "  return (1 if o2.A.X = 42 and o2.B = 7 else 0); "
+        "  return (if o2.A.X = 42 and o2.B = 7 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -326,7 +326,7 @@ BEZEL_TEST(codegen_json_550, nullable_null_roundtrip_spec_2_15) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var r2 := R.Deserialize(d); "
-        "  return (1 if r2.V = null else 0); "
+        "  return (if r2.V = null then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -342,7 +342,7 @@ BEZEL_TEST(codegen_json_550, nullable_nonnull_roundtrip_spec_2_15) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var r2 := R.Deserialize(d); "
-        "  return (1 if r2.V = 99 else 0); "
+        "  return (if r2.V = 99 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -364,7 +364,7 @@ BEZEL_TEST(codegen_json_550, tree_class_roundtrip_spec_2_15_9_8) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  using var n2 := Node.Deserialize(d); "
-        "  return (1 if n2.Val = 55 else 0); "
+        "  return (if n2.Val = 55 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -468,7 +468,7 @@ BEZEL_TEST(codegen_json_550, tostring_produces_valid_json_spec_2_15) {
         "  var json := s.ToString(); "
         "  using var d := new JsonDeserializer(json); "
         "  var p2 := Point.Deserialize(d); "
-        "  return (1 if p2.X = 3 and p2.Y = 7 else 0); "
+        "  return (if p2.X = 3 and p2.Y = 7 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -501,7 +501,7 @@ BEZEL_TEST(codegen_json_550, write_null_roundtrip_spec_2_15) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var r2 := R.Deserialize(d); "
-        "  return (1 if r2.V = null else 0); "
+        "  return (if r2.V = null then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -576,7 +576,7 @@ BEZEL_TEST(codegen_json_1229,
         "  using var bytes := s2.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var g2 := Good.Deserialize(d); "
-        "  return (1 if g2.X = 42 else 0); "
+        "  return (if g2.X = 42 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -595,7 +595,7 @@ BEZEL_TEST(codegen_json_1229,
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  var r2 := DVal.Deserialize(d); "
-        "  return (1 if double.IsNaN(r2.V) else 0); "
+        "  return (if double.IsNaN(r2.V) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -612,7 +612,7 @@ BEZEL_TEST(codegen_json_1229,
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var r2 := DVal.Deserialize(d); "
-        "  return (1 if r2.V = 3.14 else 0); "
+        "  return (if r2.V = 3.14 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -657,7 +657,7 @@ BEZEL_TEST(codegen_json_550, asan_record_roundtrip_no_leaks_spec_2_15) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var p2 := Point.Deserialize(d); "
-        "  return (1 if p2.X = 3 and p2.Y = 7 else 0); "
+        "  return (if p2.X = 3 and p2.Y = 7 then 1 else 0); "
         "end Main; end C;",
         /*detectLeaks=*/true);
     // rc == -1 means toolchain unavailable → SKIP.

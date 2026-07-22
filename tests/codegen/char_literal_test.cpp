@@ -49,19 +49,19 @@ std::string compileAndCapture(const std::string& source) {
 } // namespace
 
 BEZEL_TEST(codegen_cg32, char_code_point) {
-    BEZEL_EXPECT_EQ(run("var c := 'A'; return (1 if c = 'A' else 0);"), 1);
+    BEZEL_EXPECT_EQ(run("var c := 'A'; return (if c = 'A' then 1 else 0);"), 1);
 }
 
 BEZEL_TEST(codegen_cg32, distinct_chars) {
-    BEZEL_EXPECT_EQ(run("var c := 'A'; return (1 if c = 'B' else 9);"), 9);
+    BEZEL_EXPECT_EQ(run("var c := 'A'; return (if c = 'B' then 1 else 9);"), 9);
 }
 
 BEZEL_TEST(codegen_cg32, char_ordering) {
-    BEZEL_EXPECT_EQ(run("return (1 if 'a' < 'z' else 0);"), 1);
+    BEZEL_EXPECT_EQ(run("return (if 'a' < 'z' then 1 else 0);"), 1);
 }
 
 BEZEL_TEST(codegen_cg32, newline_escape_is_10) {
-    BEZEL_EXPECT_EQ(run("var c := '\\n'; return (1 if c = '\\n' else 0);"), 1);
+    BEZEL_EXPECT_EQ(run("var c := '\\n'; return (if c = '\\n' then 1 else 0);"), 1);
 }
 
 BEZEL_TEST(codegen_cg32, char_passed_to_putchar) {
@@ -87,7 +87,7 @@ BEZEL_TEST(codegen_cg32, char_tostring_high_codepoint_roundtrips_1282) {
     // char(321 & 0xFF)==char(65)=='A'. Return 1 on success.
     BEZEL_EXPECT_EQ(run(
         "var c := char(321); var s := c.ToString(); "
-        "return (1 if s[0] = c else 0);"), 1);
+        "return (if s[0] = c then 1 else 0);"), 1);
 }
 
 // #1282: two chars whose code points differ only above the low byte must NOT
@@ -96,12 +96,12 @@ BEZEL_TEST(codegen_cg32, char_tostring_no_low_byte_collision_1282) {
     // char(321) low byte == 65 == 'A'. Their ToString()s must now differ.
     BEZEL_EXPECT_EQ(run(
         "var hi := char(321).ToString(); var lo := char(65).ToString(); "
-        "return (1 if hi <> lo else 0);"), 1);
+        "return (if hi <> lo then 1 else 0);"), 1);
 }
 
 // #1282: a char above the BMP (U+1F600) round-trips its single code point.
 BEZEL_TEST(codegen_cg32, char_tostring_astral_codepoint_roundtrips_1282) {
     BEZEL_EXPECT_EQ(run(
         "var c := char(128512); var s := c.ToString(); "
-        "return (s.Length * 10 + (1 if s[0] = c else 0));"), 11);  // Length 1, s[0]==c
+        "return (s.Length * 10 + (if s[0] = c then 1 else 0));"), 11);  // Length 1, s[0]==c
 }

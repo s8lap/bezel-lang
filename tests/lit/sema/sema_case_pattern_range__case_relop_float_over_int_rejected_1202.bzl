@@ -7,7 +7,7 @@
 // scrutinee (cross-numeric reconcile is a separate §19.3 ruling); reject
 // rather than abort the backend. #1202.
 
-module M; class C public static method M(x: int): int return case x of > 1.5 => 1, _ => 0 end; end M; end C;
+module M; class C public static method M(x: int): int return (case x of > 1.5 => 1, _ => 0); end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: case pattern operand type is not compatible with the scrutinee type
 // CHECK-SAME: (§19)

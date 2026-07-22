@@ -64,7 +64,7 @@ BEZEL_TEST(format_revision_812_1339, binary_byte_natural_width) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
   var b: byte := 255;
-  return 1 if $"{b:B}" = "11111111" else 0;
+  return (if $"{b:B}" = "11111111" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -104,7 +104,7 @@ BEZEL_TEST(format_revision_812_1339, noformat_equals_R) {
 module M; class C public static method Main(): int
   var x := 1.0 / 3.0;
   var y := 0.1 + 0.2;
-  return 3 if ($"{x}" = $"{x:R}") and ($"{y}" = $"{y:R}") else 0;
+  return (if ($"{x}" = $"{x:R}") and ($"{y}" = $"{y:R}") then 3 else 0);
 end Main; end C;
 )BZ"), 3);
 }
@@ -113,7 +113,7 @@ BEZEL_TEST(format_revision_812_1339, float_round_trip) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
   var f: float := 0.1f;
-  return 3 if ($"{f}" = "0.1") and ($"{f:R}" = "0.1") else 0;
+  return (if ($"{f}" = "0.1") and ($"{f:R}" = "0.1") then 3 else 0);
 end Main; end C;
 )BZ"), 3);
 }
@@ -200,7 +200,7 @@ class Temp: IFormattable
 end Temp;
 class C public static method Main(): int
   using var t := new Temp(7);
-  return 1 if $"{t:C2}" = "<C2=7>" else 0;
+  return (if $"{t:C2}" = "<C2=7>" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -217,7 +217,7 @@ record Money: IFormattable
 end Money;
 class C public static method Main(): int
   var m := new Money(42);
-  return 1 if $"{m:F2}" = "[F2:42]" else 0;
+  return (if $"{m:F2}" = "[F2:42]" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -309,7 +309,7 @@ BEZEL_TEST(format_revision_812_1339, nested_bracket_colon) {
 module M; class C public static method Main(): int
   using var d := new Dictionary<string, double>();
   d["pi"] := 3.14159;
-  return 1 if $"{d["pi"]:F2}" = "3.14" else 0;
+  return (if $"{d["pi"]:F2}" = "3.14" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }

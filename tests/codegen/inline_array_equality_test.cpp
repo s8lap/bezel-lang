@@ -37,7 +37,7 @@ BEZEL_TEST(codegen_inline_array_eq, int2_equal_spec_15_1_2) {
         "module M; class C public static method Main(): int "
         "  var a: [2]int := [1, 2]; "
         "  var b: [2]int := [1, 2]; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -47,7 +47,7 @@ BEZEL_TEST(codegen_inline_array_eq, int2_unequal_spec_15_1_2) {
         "module M; class C public static method Main(): int "
         "  var a: [2]int := [1, 2]; "
         "  var b: [2]int := [1, 3]; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -58,7 +58,7 @@ BEZEL_TEST(codegen_inline_array_eq, int2_unequal_first_slot_spec_15_1_2) {
         "module M; class C public static method Main(): int "
         "  var a: [2]int := [9, 2]; "
         "  var b: [2]int := [1, 2]; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -68,7 +68,7 @@ BEZEL_TEST(codegen_inline_array_eq, int3_equal_spec_15_1_2) {
         "module M; class C public static method Main(): int "
         "  var a: [3]int := [1, 2, 3]; "
         "  var b: [3]int := [1, 2, 3]; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -78,7 +78,7 @@ BEZEL_TEST(codegen_inline_array_eq, int3_unequal_spec_15_1_2) {
         "module M; class C public static method Main(): int "
         "  var a: [3]int := [1, 2, 3]; "
         "  var b: [3]int := [1, 9, 3]; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -88,7 +88,7 @@ BEZEL_TEST(codegen_inline_array_eq, int2_neq_equal_arrays_spec_8_4) {
         "module M; class C public static method Main(): int "
         "  var a: [2]int := [4, 5]; "
         "  var b: [2]int := [4, 5]; "
-        "  return (1 if a <> b else 0); "
+        "  return (if a <> b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -98,7 +98,7 @@ BEZEL_TEST(codegen_inline_array_eq, int2_neq_unequal_arrays_spec_8_4) {
         "module M; class C public static method Main(): int "
         "  var a: [2]int := [4, 5]; "
         "  var b: [2]int := [4, 6]; "
-        "  return (1 if a <> b else 0); "
+        "  return (if a <> b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -110,7 +110,7 @@ BEZEL_TEST(codegen_inline_array_eq, record2_equal_spec_15_1_2) {
         "class C public static method Main(): int "
         "  var a: [2]Point := [new Point(1, 2), new Point(3, 4)]; "
         "  var b: [2]Point := [new Point(1, 2), new Point(3, 4)]; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -121,7 +121,7 @@ BEZEL_TEST(codegen_inline_array_eq, record2_unequal_spec_15_1_2) {
         "class C public static method Main(): int "
         "  var a: [2]Point := [new Point(1, 2), new Point(3, 4)]; "
         "  var b: [2]Point := [new Point(1, 2), new Point(3, 9)]; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -134,7 +134,7 @@ BEZEL_TEST(codegen_inline_array_eq, string2_equal_by_content_spec_15_1_2) {
         "module M; class C public static method Main(): int "
         "  var a: [2]string; a[0] := \"foo\"; a[1] := \"ba\" + \"r\"; "
         "  var b: [2]string; b[0] := \"f\" + \"oo\"; b[1] := \"bar\"; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -144,6 +144,6 @@ BEZEL_TEST(codegen_inline_array_eq, string2_unequal_by_content_spec_15_1_2) {
         "module M; class C public static method Main(): int "
         "  var a: [2]string; a[0] := \"foo\"; a[1] := \"bar\"; "
         "  var b: [2]string; b[0] := \"foo\"; b[1] := \"baz\"; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 0);
 }

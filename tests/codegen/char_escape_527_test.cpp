@@ -142,7 +142,7 @@ BEZEL_TEST(codegen_char_escape_527, control_tab_escape_is_9) {
 // §18.8 \x used for a simple ASCII value matches plain literal.
 // '\x41' == 'A' both must equal 65.
 BEZEL_TEST(codegen_char_escape_527, control_xhex_equals_plain_ascii) {
-    BEZEL_EXPECT_EQ(run("return (1 if '\\x41' = 'A' else 0);"), 1);
+    BEZEL_EXPECT_EQ(run("return (if '\\x41' = 'A' then 1 else 0);"), 1);
 }
 
 // ── Non-ASCII comparison: §4.5 chars compare by code-point value ─────────────
@@ -152,7 +152,7 @@ BEZEL_TEST(codegen_char_escape_527, control_xhex_equals_plain_ascii) {
 // Before the fix both likely decoded to the wrong first byte (0xC4) → equal.
 BEZEL_TEST(codegen_char_escape_527, spec_4_5_nonascii_comparison_i_tilde_gt_I_tilde) {
     // Source file is UTF-8; the chars embed the correct byte sequences.
-    BEZEL_EXPECT_EQ(run("return (1 if 'ĩ' > 'Ĩ' else 0);"), 1);
+    BEZEL_EXPECT_EQ(run("return (if 'ĩ' > 'Ĩ' then 1 else 0);"), 1);
 }
 
 // ── Char range count over a small non-ASCII range ────────────────────────────

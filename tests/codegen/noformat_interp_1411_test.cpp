@@ -37,7 +37,7 @@ BEZEL_TEST(noformat_interp_1411, timespan_noformat_is_c_spec_2_18) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
   var ts := TimeSpan.FromSeconds(3661.0);
-  return 1 if $"{ts}" = "01:01:01" else 0;
+  return (if $"{ts}" = "01:01:01" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -47,7 +47,7 @@ BEZEL_TEST(noformat_interp_1411, timespan_zero_noformat_spec_2_18) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
   var ts := TimeSpan.FromSeconds(0.0);
-  return 1 if $"{ts}" = "00:00:00" else 0;
+  return (if $"{ts}" = "00:00:00" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -57,7 +57,7 @@ BEZEL_TEST(noformat_interp_1411, timespan_noformat_equals_explicit_c_spec_2_18) 
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
   var ts := TimeSpan.FromSeconds(90.0);
-  return 1 if $"{ts}" = $"{ts:c}" else 0;
+  return (if $"{ts}" = $"{ts:c}" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -70,7 +70,7 @@ BEZEL_TEST(noformat_interp_1411, dateonly_noformat_is_iso8601_spec_2_18) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
   var d := new DateOnly(2024, 3, 15);
-  return 1 if $"{d}" = "2024-03-15" else 0;
+  return (if $"{d}" = "2024-03-15" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -80,7 +80,7 @@ BEZEL_TEST(noformat_interp_1411, dateonly_noformat_equals_explicit_fmt_spec_2_18
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
   var d := new DateOnly(2000, 1, 1);
-  return 1 if $"{d}" = $"{d:yyyy-MM-dd}" else 0;
+  return (if $"{d}" = $"{d:yyyy-MM-dd}" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -93,7 +93,7 @@ BEZEL_TEST(noformat_interp_1411, timeonly_noformat_is_hhmmss_spec_2_18) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
   var t := new TimeOnly(13, 5, 9);
-  return 1 if $"{t}" = "13:05:09" else 0;
+  return (if $"{t}" = "13:05:09" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -103,7 +103,7 @@ BEZEL_TEST(noformat_interp_1411, timeonly_noformat_equals_explicit_fmt_spec_2_18
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
   var t := new TimeOnly(0, 0, 0);
-  return 1 if $"{t}" = $"{t:HH:mm:ss}" else 0;
+  return (if $"{t}" = $"{t:HH:mm:ss}" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -116,7 +116,7 @@ BEZEL_TEST(noformat_interp_1411, guid_noformat_is_D_spec_2_18) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
   var g := Guid.Empty;
-  return 1 if $"{g}" = "00000000-0000-0000-0000-000000000000" else 0;
+  return (if $"{g}" = "00000000-0000-0000-0000-000000000000" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -126,7 +126,7 @@ BEZEL_TEST(noformat_interp_1411, guid_noformat_equals_explicit_D_spec_2_18) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
   var g := Guid.Empty;
-  return 1 if $"{g}" = $"{g:D}" else 0;
+  return (if $"{g}" = $"{g:D}" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }

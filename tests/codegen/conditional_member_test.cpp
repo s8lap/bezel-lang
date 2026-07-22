@@ -21,7 +21,7 @@ BEZEL_TEST(codegen_if_member, member_on_conditional_result_then) {
     BEZEL_EXPECT_EQ(runProg(std::string(kN) +
         "class C public static method Main(): int "
         "  var a := new N(); a.V := 3; var b := new N(); b.V := 9; "
-        "  var ok := true; var r := (a if ok else b); return r.V; "
+        "  var ok := true; var r := (if ok then a else b); return r.V; "
         "end Main; end C;"), 3);
 }
 
@@ -29,7 +29,7 @@ BEZEL_TEST(codegen_if_member, member_on_conditional_result_else) {
     BEZEL_EXPECT_EQ(runProg(std::string(kN) +
         "class C public static method Main(): int "
         "  var a := new N(); a.V := 3; var b := new N(); b.V := 9; "
-        "  var ok := false; var r := (a if ok else b); return r.V; "
+        "  var ok := false; var r := (if ok then a else b); return r.V; "
         "end Main; end C;"), 9);
 }
 
@@ -37,6 +37,6 @@ BEZEL_TEST(codegen_if_member, member_directly_on_conditional) {
     BEZEL_EXPECT_EQ(runProg(std::string(kN) +
         "class C public static method Main(): int "
         "  var a := new N(); a.V := 7; var b := new N(); b.V := 1; "
-        "  var ok := true; return (a if ok else b).V; "
+        "  var ok := true; return (if ok then a else b).V; "
         "end Main; end C;"), 7);
 }

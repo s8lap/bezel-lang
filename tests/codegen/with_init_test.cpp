@@ -38,7 +38,7 @@ BEZEL_TEST(codegen_cg34, with_sets_fields) {
         "module M; record R(_x: int, _y: int); "
         "class C "
         "  public static method Main(): int "
-        "    var r := new R(0, 0) with _x := 40, _y := 2 end; "
+        "    var r := new R(0, 0) with(_x := 40, _y := 2); "
         "    return r._x + r._y; "
         "  end Main; "
         "end C;"), 42);

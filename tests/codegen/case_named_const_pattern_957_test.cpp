@@ -35,7 +35,7 @@ BEZEL_TEST(case_named_const_pattern_957, qualified_const_expr_match) {
         "  public const K: int := 42; "
         "  public static method Main(): int "
         "    var x := 42; "
-        "    return case x of  C.K => 0, _ => 1 end; "  // 0
+        "    return (case x of  C.K => 0, _ => 1); "  // 0
         "  end Main; "
         "end C;"), 0);
 }
@@ -48,7 +48,7 @@ BEZEL_TEST(case_named_const_pattern_957, qualified_const_expr_nomatch) {
         "  public const K: int := 42; "
         "  public static method Main(): int "
         "    var x := 7; "
-        "    return case x of  C.K => 0, _ => 1 end; "  // 1
+        "    return (case x of  C.K => 0, _ => 1); "  // 1
         "  end Main; "
         "end C;"), 1);
 }
@@ -76,7 +76,7 @@ BEZEL_TEST(case_named_const_pattern_957, string_const_match) {
         "  public const S: string := \"hi\"; "
         "  public static method Main(): int "
         "    var x := \"hi\"; "
-        "    return case x of  C.S => 5, _ => 6 end; "  // 5
+        "    return (case x of  C.S => 5, _ => 6); "  // 5
         "  end Main; "
         "end C;"), 5);
 }
@@ -88,7 +88,7 @@ BEZEL_TEST(case_named_const_pattern_957, string_const_nomatch) {
         "  public const S: string := \"hi\"; "
         "  public static method Main(): int "
         "    var x := \"bye\"; "
-        "    return case x of  C.S => 5, _ => 6 end; "  // 6
+        "    return (case x of  C.S => 5, _ => 6); "  // 6
         "  end Main; "
         "end C;"), 6);
 }
@@ -101,7 +101,7 @@ BEZEL_TEST(case_named_const_pattern_957, bare_own_class_const_match) {
         "  public const K: int := 3; "
         "  public static method Main(): int "
         "    var x := 3; "
-        "    return case x of  K => 7, _ => 8 end; "  // 7
+        "    return (case x of  K => 7, _ => 8); "  // 7
         "  end Main; "
         "end C;"), 7);
 }
@@ -115,7 +115,7 @@ BEZEL_TEST(case_named_const_pattern_957, const_alternative_with_literal) {
         "  public const K: int := 42; "
         "  public static method Main(): int "
         "    var x := 99; "
-        "    return case x of  C.K | 99 => 0, _ => 1 end; "  // 0
+        "    return (case x of  C.K | 99 => 0, _ => 1); "  // 0
         "  end Main; "
         "end C;"), 0);
 }
@@ -130,7 +130,7 @@ BEZEL_TEST(case_named_const_pattern_957, enum_constant_still_works) {
         "class C "
         "  public static method Main(): int "
         "    var c := Color.Green; "
-        "    return case c of  Red => 1, Green => 2, Color.Blue => 3 end; "  // 2
+        "    return (case c of  Red => 1, Green => 2, Color.Blue => 3); "  // 2
         "  end Main; "
         "end C;"), 2);
 }

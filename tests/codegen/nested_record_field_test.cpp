@@ -118,7 +118,7 @@ BEZEL_TEST(codegen_nested_record_field, record_method_after_with_update) {
         "end Outer; "
         "class C public static method Main(): int "
         "  var o := new Outer(new Inner(7), 0); "
-        "  var o2 := o with extra := 99 end; "
+        "  var o2 := o with(extra := 99); "
         "  return o2.GetVal(); "
         "end Main; end C;"),
         7);

@@ -31,7 +31,7 @@ BEZEL_TEST(decimal_compound_assign, plus_equals) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var d: decimal := 1.0m; d += 2.0m; "
-        "  return (0 if d.CompareTo(3.0m) = 0 else 1); "
+        "  return (if d.CompareTo(3.0m) = 0 then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -42,7 +42,7 @@ BEZEL_TEST(decimal_compound_assign, div_sub_mul_equals) {
         "  var d: decimal := 12.0m; d /= 4.0m; "  // 3
         "  d -= 1.0m; "                            // 2
         "  d *= 5.0m; "                            // 10
-        "  return (0 if d.CompareTo(10.0m) = 0 else 1); "
+        "  return (if d.CompareTo(10.0m) = 0 then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -51,7 +51,7 @@ BEZEL_TEST(decimal_compound_assign, increment_decrement) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var d: decimal := 1.0m; d++; d++; d--; "  // 2
-        "  return (0 if d.CompareTo(2.0m) = 0 else 1); "
+        "  return (if d.CompareTo(2.0m) = 0 then 0 else 1); "
         "end Main; end C;"), 0);
 }
 

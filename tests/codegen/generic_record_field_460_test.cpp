@@ -65,7 +65,7 @@ BEZEL_TEST(generic_record_string_field_460, box_string_value_roundtrips) {
         "module M; record Box<T>(value: T); "
         "class C public static method Main(): int "
         "  using var b := new Box<string>(\"hello\"); "
-        "  return (1 if b.value = \"hello\" else 0); "  // §20 if-expr
+        "  return (if b.value = \"hello\" then 1 else 0); "  // §20 if-expr
         "end Main; end C;"), 1);
 }
 
@@ -154,7 +154,7 @@ BEZEL_TEST(generic_record_string_field_460, control_box_long) {
         "module M; record Box<T>(value: T); "
         "class C public static method Main(): int "
         "  using var b := new Box<long>(5000000000L); "
-        "  return (1 if b.value = 5000000000L else 0); "  // full i64 width
+        "  return (if b.value = 5000000000L then 1 else 0); "  // full i64 width
         "end Main; end C;"), 1);
 }
 

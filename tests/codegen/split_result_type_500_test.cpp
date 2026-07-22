@@ -51,7 +51,7 @@ BEZEL_TEST(split_result_type_500, char_get_unannotated_spec_9_6) {
         "module M; class C public static method Main(): int "
         "  var s := \"a,b,c\"; "
         "  using var parts := s.Split(','); "
-        "  return (1 if parts.Get(1) = \"b\" else 0); "
+        "  return (if parts.Get(1) = \"b\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -64,7 +64,7 @@ BEZEL_TEST(split_result_type_500, char_indexer_unannotated_spec_9_6) {
         "module M; class C public static method Main(): int "
         "  var s := \"aa,bb,cc\"; "
         "  using var parts := s.Split(','); "
-        "  return (1 if parts[1] = \"bb\" else 0); "
+        "  return (if parts[1] = \"bb\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -107,7 +107,7 @@ BEZEL_TEST(split_result_type_500, string_delim_get_unannotated_spec_9_6) {
         "module M; class C public static method Main(): int "
         "  var s := \"aa::bb::cc\"; "
         "  using var parts := s.Split(\"::\"); "
-        "  return (1 if parts.Get(0) = \"aa\" else 0); "
+        "  return (if parts.Get(0) = \"aa\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -133,7 +133,7 @@ BEZEL_TEST(split_result_type_500, char_no_separator_spec_9_6) {
         "module M; class C public static method Main(): int "
         "  var s := \"abc\"; "
         "  using var parts := s.Split(','); "
-        "  return (1 if (parts.Count = 1 and parts.Get(0) = \"abc\") else 0); "
+        "  return (if (parts.Count = 1 and parts.Get(0) = \"abc\") then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

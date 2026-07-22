@@ -287,7 +287,7 @@ BEZEL_TEST(owned_collection_remove_M3,
         "  using var lst := new OwningLinkedList<R>(); "
         "  lst.AddLast(move (new R())); "
         "  var removed := lst.Remove(lst.First!); "
-        "  return (1 if removed else 0);"   // must compile + run correctly
+        "  return (if removed then 1 else 0);"   // must compile + run correctly
         "end Main; end C;"),
         1);   // Remove found and removed the element → removed == true → 1
 }
@@ -302,7 +302,7 @@ BEZEL_TEST(owned_collection_remove_M3,
         "  lst.AddLast(move (new R())); "
         "  using var probe := new R(); "  // not stored in lst
         "  var removed := lst.Remove(probe); "
-        "  return (1 if removed else 0);"
+        "  return (if removed then 1 else 0);"
         "end Main; end C;"),
         0);   // probe not found → removed == false → 0
 }

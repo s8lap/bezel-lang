@@ -160,7 +160,7 @@ BEZEL_TEST(codegen_cg35_itable, is_interface_check_still_works) {
         "class Square : IShape public method Area(): int => 9; end Square; "
         "class C public static method Main(): int "
         "  var s: IShape := new Square(); "
-        "  return (1 if s is Square else 0); "
+        "  return (if s is Square then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

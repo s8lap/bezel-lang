@@ -46,7 +46,7 @@ BEZEL_TEST(codegen_cg27c, int_tostring_equality) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var n := 42; var s := n.ToString(); "
-        "  return (1 if s = \"42\" else 0); "
+        "  return (if s = \"42\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -74,7 +74,7 @@ BEZEL_TEST(codegen_cg27c, bool_true_tostring_equality) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var b := true; var s := b.ToString(); "
-        "  return (1 if s = \"True\" else 0); "
+        "  return (if s = \"True\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -83,7 +83,7 @@ BEZEL_TEST(codegen_cg27c, bool_false_tostring_equality) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var b := false; var s := b.ToString(); "
-        "  return (1 if s = \"False\" else 0); "
+        "  return (if s = \"False\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -93,7 +93,7 @@ BEZEL_TEST(codegen_cg27c, bool_true_interpolation_capitalized) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var b := true; var s := $\"{b}\"; "
-        "  return (1 if s = \"True\" else 0); "
+        "  return (if s = \"True\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -102,7 +102,7 @@ BEZEL_TEST(codegen_cg27c, bool_false_interpolation_capitalized) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var b := false; var s := $\"{b}\"; "
-        "  return (1 if s = \"False\" else 0); "
+        "  return (if s = \"False\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -118,7 +118,7 @@ BEZEL_TEST(codegen_cg27c, long_tostring_length) {
 BEZEL_TEST(codegen_cg27c, string_tostring_identity) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var s := \"hi\"; return (1 if s.ToString() = \"hi\" else 0); "
+        "  var s := \"hi\"; return (if s.ToString() = \"hi\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

@@ -55,7 +55,7 @@ BEZEL_TEST(null_cond_value_method_1075, primitive_tostring_string_compare) {
         "module M; class C public static method Main(): int "
         "  using var n: int? := 7; "
         "  using var s := n?.ToString(); "
-        "  return 1 if s = \"7\" else 0; "                // 1
+        "  return (if s = \"7\" then 1 else 0); "                // 1
         "end Main; end C;"), 1);
 }
 
@@ -65,7 +65,7 @@ BEZEL_TEST(null_cond_value_method_1075, primitive_tostring_null) {
         "module M; class C public static method Main(): int "
         "  using var n: int? := null; "
         "  using var s := n?.ToString(); "
-        "  return 1 if s = null else 0; "                 // 1
+        "  return (if s = null then 1 else 0); "                 // 1
         "end Main; end C;"), 1);
 }
 
@@ -75,7 +75,7 @@ BEZEL_TEST(null_cond_value_method_1075, primitive_equals_present) {
         "module M; class C public static method Main(): int "
         "  using var n: int? := 7; "
         "  var be := n?.Equals(7); "
-        "  return 1 if be = true else 0; "                // 1
+        "  return (if be = true then 1 else 0); "                // 1
         "end Main; end C;"), 1);
 }
 
@@ -95,9 +95,9 @@ BEZEL_TEST(null_cond_value_method_1075, record_tostring_present_and_null) {
         "module M; record Pt(x: int, y: int); "
         "class C public static method Main(): int "
         "  using var p: Pt? := new Pt(1, 2); "
-        "  var live := 1 if (p?.ToString()) <> null else 0; "
+        "  var live := (if (p?.ToString()) <> null then 1 else 0); "
         "  using var pn: Pt? := null; "
-        "  var none := 1 if (pn?.ToString()) = null else 0; "
+        "  var none := (if (pn?.ToString()) = null then 1 else 0); "
         "  return live + none; "                          // 1 + 1 = 2
         "end Main; end C;"), 2);
 }

@@ -10,7 +10,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; import System.Serialization; enum Status: ISerializable, IDeserializable Active, Inactive; end Status; class C public static method Main(): int using var s := new BinarySerializer(); Status.Active.Serialize(s); using var bytes := s.ToBytes(); using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); var v := Status.Deserialize(d); return (1 if v = Status.Active else 0); end Main; end C;
+module M; import System.Serialization; enum Status: ISerializable, IDeserializable Active, Inactive; end Status; class C public static method Main(): int using var s := new BinarySerializer(); Status.Active.Serialize(s); using var bytes := s.ToBytes(); using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); var v := Status.Deserialize(d); return (if v = Status.Active then 1 else 0); end Main; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

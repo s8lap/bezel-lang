@@ -41,37 +41,37 @@ int expectsThrow(const std::string& body) {
 // 2^64-1 without the fix; must raise OverflowException.
 BEZEL_TEST(widen_to_unsigned_1159, int_neg_to_ulong_throws) {
     BEZEL_EXPECT_EQ(expectsThrow(
-        "var a: int := -1; var b: ulong := ulong(a); ok := (1 if b > 0 else 2);"), 0);
+        "var a: int := -1; var b: ulong := ulong(a); ok := (if b > 0 then 1 else 2);"), 0);
 }
 
 // §5.2/#1159: short(-1) → uint widening (i16 → i32) is checked.
 BEZEL_TEST(widen_to_unsigned_1159, short_neg_to_uint_throws) {
     BEZEL_EXPECT_EQ(expectsThrow(
-        "var a: short := -1; var b: uint := uint(a); ok := (1 if b > 0 else 2);"), 0);
+        "var a: short := -1; var b: uint := uint(a); ok := (if b > 0 then 1 else 2);"), 0);
 }
 
 // §5.2/#1159: short(-1) → ulong widening (i16 → i64) is checked.
 BEZEL_TEST(widen_to_unsigned_1159, short_neg_to_ulong_throws) {
     BEZEL_EXPECT_EQ(expectsThrow(
-        "var a: short := -1; var b: ulong := ulong(a); ok := (1 if b > 0 else 2);"), 0);
+        "var a: short := -1; var b: ulong := ulong(a); ok := (if b > 0 then 1 else 2);"), 0);
 }
 
 // §5.2/#1159: sbyte(-1) → ushort widening (i8 → i16) is checked.
 BEZEL_TEST(widen_to_unsigned_1159, sbyte_neg_to_ushort_throws) {
     BEZEL_EXPECT_EQ(expectsThrow(
-        "var a: sbyte := -1; var b: ushort := ushort(a); ok := (1 if b > 0 else 2);"), 0);
+        "var a: sbyte := -1; var b: ushort := ushort(a); ok := (if b > 0 then 1 else 2);"), 0);
 }
 
 // §5.2/#1159: sbyte(-1) → uint widening (i8 → i32) is checked.
 BEZEL_TEST(widen_to_unsigned_1159, sbyte_neg_to_uint_throws) {
     BEZEL_EXPECT_EQ(expectsThrow(
-        "var a: sbyte := -1; var b: uint := uint(a); ok := (1 if b > 0 else 2);"), 0);
+        "var a: sbyte := -1; var b: uint := uint(a); ok := (if b > 0 then 1 else 2);"), 0);
 }
 
 // §5.2/#1159: sbyte(-1) → ulong widening (i8 → i64) is checked.
 BEZEL_TEST(widen_to_unsigned_1159, sbyte_neg_to_ulong_throws) {
     BEZEL_EXPECT_EQ(expectsThrow(
-        "var a: sbyte := -1; var b: ulong := ulong(a); ok := (1 if b > 0 else 2);"), 0);
+        "var a: sbyte := -1; var b: ulong := ulong(a); ok := (if b > 0 then 1 else 2);"), 0);
 }
 
 // §5.2/#1159: a NON-negative signed → wider-unsigned cast is in range — it
@@ -83,7 +83,7 @@ BEZEL_TEST(widen_to_unsigned_1159, nonneg_signed_to_unsigned_ok) {
         "  var b: ulong := ulong(a); "
         "  var c: short := 7; "
         "  var d: uint := uint(c); "
-        "  return (0 if (b = 5UL and d = 7u) else 1); "
+        "  return (if (b = 5UL and d = 7u) then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -94,7 +94,7 @@ BEZEL_TEST(widen_to_unsigned_1159, signed_to_signed_widen_unaffected) {
         "module M; class C public static method Main(): int "
         "  var a: int := -1; "
         "  var b: long := long(a); "
-        "  return (0 if b = -1L else 1); "
+        "  return (if b = -1L then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -106,6 +106,6 @@ BEZEL_TEST(widen_to_unsigned_1159, unsigned_widen_unaffected) {
         "  var a: uint := 4294967295u; "
         "  var b: ulong := ulong(a); "       // unsigned → wider unsigned: zext
         "  var c: long := long(a); "          // unsigned → wider signed: fits
-        "  return (0 if (b = 4294967295UL and c = 4294967295L) else 1); "
+        "  return (if (b = 4294967295UL and c = 4294967295L) then 0 else 1); "
         "end Main; end C;"), 0);
 }

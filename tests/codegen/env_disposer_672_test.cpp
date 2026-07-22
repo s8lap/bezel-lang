@@ -409,8 +409,8 @@ const char* kBoxMultiCaptureValue =
     "    var r: int := 0; "
     "    do "
     "      var o: Object := 42; "
-    "      var f: () -> int := lambda() => case o of var n: int => 1, _ => 0 end; "
-    "      var g: () -> int := lambda() => case o of var n: int => 1, _ => 0 end; "
+    "      var f: () -> int := lambda() => (case o of var n: int => 1, _ => 0); "
+    "      var g: () -> int := lambda() => (case o of var n: int => 1, _ => 0); "
     "      r := f() + g(); "
     "    end; "
     "    return r; "   // 2

@@ -62,7 +62,7 @@ BEZEL_TEST(codegen_serialization_550, enum_roundtrip_spec_9_8) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  var v := Color.Deserialize(d); "
-        "  return (1 if v = Color.Green else 0); "
+        "  return (if v = Color.Green then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -77,7 +77,7 @@ BEZEL_TEST(codegen_serialization_550, enum_roundtrip_last_member_spec_9_8) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  var v := Dir.Deserialize(d); "
-        "  return (1 if v = Dir.West else 0); "
+        "  return (if v = Dir.West then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -92,7 +92,7 @@ BEZEL_TEST(codegen_serialization_550, enum_roundtrip_first_member_spec_9_8) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  var v := Priority.Deserialize(d); "
-        "  return (1 if v = Priority.Low else 0); "
+        "  return (if v = Priority.Low then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -110,7 +110,7 @@ BEZEL_TEST(codegen_serialization_550, enum_serialized_name_clause_spec_9_8) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  var v := State.Deserialize(d); "
-        "  return (1 if v = State.On else 0); "
+        "  return (if v = State.On then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -131,7 +131,7 @@ BEZEL_TEST(codegen_serialization_550, record_int_fields_roundtrip_spec_9_8) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  var p2 := Point.Deserialize(d); "
-        "  return (1 if p2.X = 3 and p2.Y = 7 else 0); "
+        "  return (if p2.X = 3 and p2.Y = 7 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -147,7 +147,7 @@ BEZEL_TEST(codegen_serialization_550, record_string_field_roundtrip_spec_9_8) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  var n2 := Named.Deserialize(d); "
-        "  return (1 if n2.Name = \"Alice\" and n2.Age = 30 else 0); "
+        "  return (if n2.Name = \"Alice\" and n2.Age = 30 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -164,7 +164,7 @@ BEZEL_TEST(codegen_serialization_550, record_bool_double_fields_roundtrip_spec_9
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  var f2 := Flags.Deserialize(d); "
-        "  return (1 if f2.Active and f2.Value = 3.14 else 0); "
+        "  return (if f2.Active and f2.Value = 3.14 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -181,7 +181,7 @@ BEZEL_TEST(codegen_serialization_550, record_enum_field_roundtrip_spec_9_8) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  var it2 := Item.Deserialize(d); "
-        "  return (1 if it2.Name = \"thing\" and it2.St = Status.Active else 0); "
+        "  return (if it2.Name = \"thing\" and it2.St = Status.Active then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -198,8 +198,8 @@ BEZEL_TEST(codegen_serialization_550, record_nested_record_roundtrip_spec_9_8) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  var ln2 := Line.Deserialize(d); "
-        "  return (1 if ln2.A.X = 1 and ln2.A.Y = 2 "
-        "             and ln2.B.X = 3 and ln2.B.Y = 4 else 0); "
+        "  return (if ln2.A.X = 1 and ln2.A.Y = 2 "
+        "             and ln2.B.X = 3 and ln2.B.Y = 4 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -218,7 +218,7 @@ BEZEL_TEST(codegen_serialization_550, record_serialized_name_clause_roundtrip_sp
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  var u2 := User.Deserialize(d); "
-        "  return (1 if u2.Id = 42 and u2.FirstName = \"Bob\" else 0); "
+        "  return (if u2.Id = 42 and u2.FirstName = \"Bob\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -239,7 +239,7 @@ BEZEL_TEST(codegen_serialization_550, record_serialized_skip_clause_spec_9_8) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  var r2 := R.Deserialize(d); "
-        "  return (1 if r2.X = 5 and r2.Secret = 0 else 0); "
+        "  return (if r2.X = 5 and r2.Secret = 0 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -270,7 +270,7 @@ BEZEL_TEST(codegen_serialization_550, body_record_serialized_skip_clause_spec_9_
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  var back := Cached.Deserialize(d); "
         // Cache was excluded; Deserialize supplies default(int) = 0.
-        "  return (1 if back.Id = 7 and back.Cache = 0 else 0); "
+        "  return (if back.Id = 7 and back.Cache = 0 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -288,7 +288,7 @@ BEZEL_TEST(codegen_serialization_550, record_deserialize_by_field_name_spec_9_8)
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  var r2 := R.Deserialize(d); "
-        "  return (1 if r2.A = 10 and r2.B = 20 and r2.C = 30 else 0); "
+        "  return (if r2.A = 10 and r2.B = 20 and r2.C = 30 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -431,7 +431,7 @@ BEZEL_TEST(codegen_serialization_550,
         "  public property N: int; "
         "end Plain; "
         "class C public static method Main(): int "
-        "  var original := new Plain() with N := 7 end; "
+        "  var original := new Plain() with(N := 7); "
         "  using var s := new BinarySerializer(); "
         "  original.Serialize(s); "
         "  using var bytes := s.ToBytes(); "

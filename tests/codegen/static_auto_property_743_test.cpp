@@ -77,7 +77,7 @@ BEZEL_TEST(static_auto_property_743, string_static_auto_property) {
         "  public static property Name: string; "
         "  public static method Main(): int "
         "    C.Name := \"hi\"; "
-        "    return (1 if C.Name = \"hi\" else 0); "
+        "    return (if C.Name = \"hi\" then 1 else 0); "
         "  end Main; "
         "end C;"), 1);
 }
@@ -98,7 +98,7 @@ BEZEL_TEST(static_auto_property_743, static_auto_property_bool_initializer_1146)
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static readonly property Flag: bool := true; "
-        "  public static method Main(): int return (7 if C.Flag else 0); end Main; "
+        "  public static method Main(): int return (if C.Flag then 7 else 0); end Main; "
         "end C;"), 7);
 }
 

@@ -73,7 +73,7 @@ BEZEL_TEST(await_for_with_token_765, with_and_without_coexist) {
         "    var a := 0; var b := 0; "
         "    await for var x in Gen() with CancellationToken.None do a := a + x; end; "
         "    await for var y in Gen() do b := b + y; end; "
-        "    return (0 if (a = 3 and b = 3) else 1); "  // both 3 → 0
+        "    return (if (a = 3 and b = 3) then 0 else 1); "  // both 3 → 0
         "  end Main; "
         "end C;"), 0);
 }

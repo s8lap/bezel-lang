@@ -64,10 +64,10 @@ BEZEL_TEST(case_type_test_iface_bind_inline_array_2001,
         "interface IMarker<T>\nend IMarker;\n"
         "sealed class C<T> : IMarker<T>, IMarker<int>\nend C;\n",
         "  public method M(m: IMarker<int>): int\n"
-        "    var n := case m of\n"
+        "    var n := (case m of\n"
         "      var x: C<[3]int> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasErasedAmbiguousError(r));
@@ -85,10 +85,10 @@ BEZEL_TEST(case_type_test_iface_bind_inline_array_2001,
         "class Box<U>\nend Box;\n"
         "sealed class C<T> : IMarker<T>, IMarker<int>\nend C;\n",
         "  public method M(m: IMarker<int>): int\n"
-        "    var n := case m of\n"
+        "    var n := (case m of\n"
         "      var x: C<Box<[3]int>> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasErasedAmbiguousError(r));
@@ -107,10 +107,10 @@ BEZEL_TEST(case_type_test_iface_bind_inline_array_2001,
         "interface IMarker<T>\nend IMarker;\n"
         "sealed class C<T> : IMarker<T>, IMarker<int>\nend C;\n",
         "  public method M(m: IMarker<int>): int\n"
-        "    var n := case m of\n"
+        "    var n := (case m of\n"
         "      var x: C<(int) -> int> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_TRUE(hasErasedAmbiguousError(r));

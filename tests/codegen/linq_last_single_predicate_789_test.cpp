@@ -49,7 +49,7 @@ BEZEL_TEST(linq_last_single_predicate_789, single_predicate_multiple_throws) {
         "  using var arr: Array<int> := new Array<int>(3); arr.Add(2); arr.Add(2); arr.Add(3); "
         "  try "
         "    var v: int := arr.Single(lambda(x) => x = 2); "
-        "    return (7 if v = v else 8); "
+        "    return (if v = v then 7 else 8); "
         "  catch var ex: InvalidOperationException => do return 0; end "
         "  end; "
         "end Main; end C;"), 0);
@@ -62,7 +62,7 @@ BEZEL_TEST(linq_last_single_predicate_789, single_predicate_none_throws) {
         arr123 +
         "  try "
         "    var v: int := arr.Single(lambda(x) => x = 9); "
-        "    return (7 if v = v else 8); "
+        "    return (if v = v then 7 else 8); "
         "  catch var ex: InvalidOperationException => do return 0; end "
         "  end; "
         "end Main; end C;"), 0);
@@ -75,7 +75,7 @@ BEZEL_TEST(linq_last_single_predicate_789, last_predicate_none_throws) {
         arr123 +
         "  try "
         "    var v: int := arr.Last(lambda(x) => x > 9); "
-        "    return (7 if v = v else 8); "
+        "    return (if v = v then 7 else 8); "
         "  catch var ex: InvalidOperationException => do return 0; end "
         "  end; "
         "end Main; end C;"), 0);

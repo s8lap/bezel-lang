@@ -53,7 +53,7 @@ BEZEL_TEST(enum_as_cast_1072, as_failed_cast_is_null) {
         "class C public static method Main(): int "
         "  var o: Object := 42; "
         "  var d := o as Color; "
-        "  return 7 if d <> null else 0; "
+        "  return (if d <> null then 7 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -63,6 +63,6 @@ BEZEL_TEST(enum_as_cast_1072, as_unbox_compares_equal) {
         "class C public static method Main(): int "
         "  var o: Object := Color.Green; "
         "  var d := o as Color; "
-        "  return 9 if d = Color.Green else 0; "
+        "  return (if d = Color.Green then 9 else 0); "
         "end Main; end C;"), 9);
 }

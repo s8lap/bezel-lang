@@ -122,7 +122,7 @@ BEZEL_TEST(generic_concrete_return_817, concrete_derived_inherited_method_902) {
         "class C public static method Main(): int "
         "  using var h := new CtrHolder(new Counter(7)); "
         "  var c := h.GetConcrete(); "
-        "  return (c!.id if c is not null else -1); "  // 7
+        "  return (if c is not null then c!.id else -1); "  // 7
         "end Main; end C;"), 7);
 }
 

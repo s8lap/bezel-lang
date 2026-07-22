@@ -435,7 +435,7 @@ BEZEL_TEST(datetime_noarg_tostring_iso_1114, agrees_with_explicit_iso_format) {
         "var d := new DateTime(2024, 3, 15); "
         "var a := d.ToString(); "
         "var b := d.ToString(\"yyyy-MM-ddTHH:mm:ss\"); "
-        "return 1 if a = b else 0; ")), 1);
+        "return (if a = b then 1 else 0); ")), 1);
 }
 
 // #1114 regression: ToString(format) still works after the fix.

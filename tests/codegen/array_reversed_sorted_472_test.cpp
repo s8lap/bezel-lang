@@ -431,7 +431,7 @@ const char* kBox1195 =
     "module M; import System; "
     "class Box(v: int): IComparable<Box> "
     "  public method CompareTo(other: Box): int => "
-    "    (1 if v > other.v else (-1 if v < other.v else 0)); "
+    "    (if v > other.v then 1 else (if v < other.v then -1 else 0)); "
     "end Box; ";
 std::string boxMain1195(const std::string& body) {
     return std::string(kBox1195) +

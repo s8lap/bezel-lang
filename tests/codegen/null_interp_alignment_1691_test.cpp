@@ -48,7 +48,7 @@ BEZEL_TEST(null_interp_alignment_1691, nullable_double_null_align_format) {
         "module M; class C public static method Main(): int "
         "  var x: double? := null; "
         "  var s := $\"[{x,8:F2}]\"; "
-        "  return (1 if s = \"[    null]\" else 2); "
+        "  return (if s = \"[    null]\" then 1 else 2); "
         "end Main; end C;"), 1);
 }
 
@@ -60,7 +60,7 @@ BEZEL_TEST(null_interp_alignment_1691, nullable_double_present_align_format) {
         "module M; class C public static method Main(): int "
         "  var x: double? := 3.0; "
         "  var s := $\"[{x,8:F2}]\"; "
-        "  return (1 if s = \"[    3.00]\" else 2); "
+        "  return (if s = \"[    3.00]\" then 1 else 2); "
         "end Main; end C;"), 1);
 }
 
@@ -72,7 +72,7 @@ BEZEL_TEST(null_interp_alignment_1691, nullable_int_null_bare_align) {
         "module M; class C public static method Main(): int "
         "  var x: int? := null; "
         "  var s := $\"[{x,6}]\"; "
-        "  return (1 if s = \"[  null]\" else 2); "
+        "  return (if s = \"[  null]\" then 1 else 2); "
         "end Main; end C;"), 1);
 }
 
@@ -83,7 +83,7 @@ BEZEL_TEST(null_interp_alignment_1691, nullable_double_null_left_align) {
         "module M; class C public static method Main(): int "
         "  var x: double? := null; "
         "  var s := $\"[{x,-8:F2}]\"; "
-        "  return (1 if s = \"[null    ]\" else 2); "
+        "  return (if s = \"[null    ]\" then 1 else 2); "
         "end Main; end C;"), 1);
 }
 
@@ -96,7 +96,7 @@ BEZEL_TEST(null_interp_alignment_1691, nullable_string_null_align) {
         "module M; class C public static method Main(): int "
         "  var s: string? := null; "
         "  var t := $\"[{s,8}]\"; "
-        "  return (1 if t = \"[    null]\" else 2); "
+        "  return (if t = \"[    null]\" then 1 else 2); "
         "end Main; end C;"), 1);
 }
 
@@ -107,6 +107,6 @@ BEZEL_TEST(null_interp_alignment_1691, nullable_string_present_align) {
         "module M; class C public static method Main(): int "
         "  var s: string? := \"hi\"; "
         "  var t := $\"[{s,8}]\"; "
-        "  return (1 if t = \"[      hi]\" else 2); "
+        "  return (if t = \"[      hi]\" then 1 else 2); "
         "end Main; end C;"), 1);
 }

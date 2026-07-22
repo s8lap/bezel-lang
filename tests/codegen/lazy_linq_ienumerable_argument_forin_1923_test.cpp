@@ -186,7 +186,7 @@ BEZEL_TEST(codegen_lazy_linq_ienumerable_argument_forin_1923,
         "      var r: int := SumOrThrow(xs.Select(lambda(n) => n + 1)); "
         "    catch Exception => do caught := true; end "
         "    end; "
-        "    return 42 if caught else 0; "
+        "    return (if caught then 42 else 0); "
         "  end Main; "
         "end C;";
     BEZEL_EXPECT_EQ(run(src), 42);
@@ -222,7 +222,7 @@ BEZEL_TEST(codegen_lazy_linq_ienumerable_argument_forin_1923,
         "      var r: int := Sum2(xs.Select(lambda(n) => n + 1), Boom()); "
         "    catch Exception => do caught := true; end "
         "    end; "
-        "    return 42 if caught else 0; "
+        "    return (if caught then 42 else 0); "
         "  end Main; "
         "end C;";
     BEZEL_EXPECT_EQ(run(src), 42);

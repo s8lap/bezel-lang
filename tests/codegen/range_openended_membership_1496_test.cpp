@@ -39,7 +39,7 @@ BEZEL_TEST(range_openended_membership_1496, isempty_open_upper_false) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r := 10..; "
-        "  return (0 if r.IsEmpty else 1); "
+        "  return (if r.IsEmpty then 0 else 1); "
         "end Main; end C;"), 1);
 }
 
@@ -48,7 +48,7 @@ BEZEL_TEST(range_openended_membership_1496, isempty_open_lower_false) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var h := ..<0; "
-        "  return (0 if h.IsEmpty else 1); "
+        "  return (if h.IsEmpty then 0 else 1); "
         "end Main; end C;"), 1);
 }
 
@@ -57,7 +57,7 @@ BEZEL_TEST(range_openended_membership_1496, in_open_upper_unbounded_hit) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r := 10..; "
-        "  return (1 if 50 in r else 0); "
+        "  return (if 50 in r then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -67,7 +67,7 @@ BEZEL_TEST(range_openended_membership_1496, contains_open_upper_below_lower_boun
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r := 10..; "
-        "  return (1 if r.Contains(5) else 0); "
+        "  return (if r.Contains(5) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -78,7 +78,7 @@ BEZEL_TEST(range_openended_membership_1496, contains_open_upper_sentinel_value_e
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r := 10..; "
-        "  return (1 if r.Contains(0) else 0); "
+        "  return (if r.Contains(0) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -87,7 +87,7 @@ BEZEL_TEST(range_openended_membership_1496, contains_open_lower_within_upper_bou
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var h := ..<0; "
-        "  return (1 if h.Contains(-3) else 0); "
+        "  return (if h.Contains(-3) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -97,7 +97,7 @@ BEZEL_TEST(range_openended_membership_1496, contains_open_lower_unbounded_far_va
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var h := ..<0; "
-        "  return (1 if h.Contains(-1000000) else 0); "
+        "  return (if h.Contains(-1000000) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -107,7 +107,7 @@ BEZEL_TEST(range_openended_membership_1496, contains_open_lower_excludes_halfope
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var h := ..<0; "
-        "  return (1 if h.Contains(0) else 0); "
+        "  return (if h.Contains(0) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -117,7 +117,7 @@ BEZEL_TEST(range_openended_membership_1496, contains_open_lower_includes_inclusi
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var h := ..0; "
-        "  return (1 if h.Contains(0) else 0); "
+        "  return (if h.Contains(0) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -151,35 +151,35 @@ BEZEL_TEST(range_openended_membership_1496, in_and_contains_agree_open_upper_mis
 BEZEL_TEST(range_openended_membership_1496, inline_literal_isempty_false) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  return (0 if (10..).IsEmpty else 1); "
+        "  return (if (10..).IsEmpty then 0 else 1); "
         "end Main; end C;"), 1);
 }
 
 BEZEL_TEST(range_openended_membership_1496, inline_literal_in_open_upper_hit) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  return (1 if 50 in (10..) else 0); "
+        "  return (if 50 in (10..) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
 BEZEL_TEST(range_openended_membership_1496, inline_literal_in_open_upper_miss) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  return (1 if 5 in (10..) else 0); "
+        "  return (if 5 in (10..) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
 BEZEL_TEST(range_openended_membership_1496, inline_literal_contains_open_upper_below_lower) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  return (1 if (10..).Contains(5) else 0); "
+        "  return (if (10..).Contains(5) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
 BEZEL_TEST(range_openended_membership_1496, inline_literal_contains_open_lower_hit) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  return (1 if (..<0).Contains(-3) else 0); "
+        "  return (if (..<0).Contains(-3) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -199,8 +199,8 @@ BEZEL_TEST(range_openended_membership_1496, closed_range_descending_unaffected) 
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r := 10..0 step -1; "
-        "  var a := 1 if 5 in r else 0; "
-        "  var b := 1 if r.Contains(11) else 0; "
+        "  var a := (if 5 in r then 1 else 0); "
+        "  var b := (if r.Contains(11) then 1 else 0); "
         "  return a * 2 + b; "
         "end Main; end C;"), 2);
 }

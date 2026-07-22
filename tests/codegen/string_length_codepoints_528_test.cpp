@@ -170,16 +170,16 @@ BEZEL_TEST(codegen_string_length_528, interp_prefix_nonascii_length) {
 BEZEL_TEST(codegen_string_length_528, padleft_wide_codepoint_1295) {
     BEZEL_EXPECT_EQ(runBody(
         "var p := \"\xe4\xb8\xad\".PadLeft(4); "
-        "return (1 if (p.Length = 4) and (int(p[3]) = 20013) "
-        "and (int(p[0]) = 32) else 0);"), 1);
+        "return (if (p.Length = 4) and (int(p[3]) = 20013) "
+        "and (int(p[0]) = 32) then 1 else 0);"), 1);
 }
 
 // §9.6 (#1295): "中".PadRight(3) → "中  "; the head code point is preserved.
 BEZEL_TEST(codegen_string_length_528, padright_wide_codepoint_1295) {
     BEZEL_EXPECT_EQ(runBody(
         "var p := \"\xe4\xb8\xad\".PadRight(3); "
-        "return (1 if (p.Length = 3) and (int(p[0]) = 20013) "
-        "and (int(p[2]) = 32) else 0);"), 1);
+        "return (if (p.Length = 3) and (int(p[0]) = 20013) "
+        "and (int(p[2]) = 32) then 1 else 0);"), 1);
 }
 
 // §9.6 (#1295): a WIDE pad char widens the result — "x".PadLeft(3, '★'
@@ -187,8 +187,8 @@ BEZEL_TEST(codegen_string_length_528, padright_wide_codepoint_1295) {
 BEZEL_TEST(codegen_string_length_528, pad_widens_for_wide_padchar_1295) {
     BEZEL_EXPECT_EQ(runBody(
         "var p := \"x\".PadLeft(3, '\xe2\x98\x85'); "
-        "return (1 if (p.Length = 3) and (int(p[0]) = 9733) "
-        "and (int(p[2]) = 120) else 0);"), 1);
+        "return (if (p.Length = 3) and (int(p[0]) = 9733) "
+        "and (int(p[2]) = 120) then 1 else 0);"), 1);
 }
 
 // §9.6 (#1295) control: pure-ASCII PadLeft/PadRight are unchanged.
@@ -196,5 +196,5 @@ BEZEL_TEST(codegen_string_length_528, pad_ascii_unchanged_1295) {
     BEZEL_EXPECT_EQ(runBody(
         "var a := \"ab\".PadLeft(5); "
         "var b := \"ab\".PadRight(4, '*'); "
-        "return (1 if (a = \"   ab\") and (b = \"ab**\") else 0);"), 1);
+        "return (if (a = \"   ab\") and (b = \"ab**\") then 1 else 0);"), 1);
 }

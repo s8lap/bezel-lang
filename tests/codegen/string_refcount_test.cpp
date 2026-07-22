@@ -347,7 +347,7 @@ const char* kRepeatStaticUsed =
     "module M; class C "
     "  public static method Main(): int "
     "    var s: string := string.Repeat('x', 1000); "
-    "    return (0 if s.Length = 1000 else 1); "  // 0
+    "    return (if s.Length = 1000 then 0 else 1); "  // 0
     "  end Main; "
     "end C;";
 
@@ -369,7 +369,7 @@ const char* kStringBuilderMutateLoop =
     "      sb.Remove(0, 1); "
     "      i := i + 1; "
     "    end; "
-    "    return (0 if sb.ToString() = \"start\" else 1); "
+    "    return (if sb.ToString() = \"start\" then 0 else 1); "
     "  end Main; "
     "end C;";
 

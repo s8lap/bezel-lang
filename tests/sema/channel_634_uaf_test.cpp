@@ -63,7 +63,7 @@ BEZEL_TEST(channel_634_uaf, p1_send_after_channel_dispose_raises_cce_30_15) {
         "    end; "
         "    tx.Dispose(); "
         // Return 42 if the exception was raised (fix verified), 91 if not (bug).
-        "    return (42 if raised else 91); "
+        "    return (if raised then 42 else 91); "
         "  end Main; "
         "end Program;");
     // §30.15: send after Channel.Dispose must raise ChannelClosedException.
@@ -98,7 +98,7 @@ BEZEL_TEST(channel_634_uaf, p2_two_senders_send_after_channel_dispose_cce_30_15)
         "    try tx2.Send(22); catch ChannelClosedException => r2 := true; end; "
         "    tx1.Dispose(); "
         "    tx2.Dispose(); "
-        "    return (42 if (r1 and r2) else 91); "
+        "    return (if (r1 and r2) then 42 else 91); "
         "  end Main; "
         "end Program;");
     // fix #634: both senders see closed channel, raise CCE; no crash.
@@ -133,7 +133,7 @@ BEZEL_TEST(channel_634_uaf, p3_sender_outlives_channel_domain_send_raises_cce_30
         "      sender.Send(new Token(7)); "
         "    catch ChannelClosedException => raised := true; "
         "    end; "
-        "    return (1 if raised else 0); "
+        "    return (if raised then 1 else 0); "
         "  end TrySend; "
         "end Worker; "
         "class Program "
@@ -187,7 +187,7 @@ BEZEL_TEST(channel_634_uaf, p4_dispose_channel_with_items_flushes_in_reverse_30_
         "    catch ChannelClosedException => raised := true; "
         "    end; "
         "    tx.Dispose(); "
-        "    return (42 if raised else 91); "
+        "    return (if raised then 42 else 91); "
         "  end Main; "
         "end Program;");
     // §28.11 / §30.15: items disposed; subsequent send raises CCE.
@@ -221,7 +221,7 @@ BEZEL_TEST(channel_634_uaf, l1_channel_dispose_before_senders_no_crash_30_15) {
         // Release senders — last release frees core.
         "    tx1.Dispose(); "
         "    tx2.Dispose(); "
-        "    return (42 if (r1 and r2) else 91); "
+        "    return (if (r1 and r2) then 42 else 91); "
         "  end Main; "
         "end Program;");
     // fix #634: core freed after last sender; no crash.
@@ -291,7 +291,7 @@ BEZEL_TEST(channel_634_uaf, l3_interleaved_dispose_no_crash_30_15) {
         "    try tx2.Send(5); catch ChannelClosedException => raised := true; end; "
         // Release second sender — last release; core_refs 1 → 0 → freed.
         "    tx2.Dispose(); "
-        "    return (42 if raised else 91); "
+        "    return (if raised then 42 else 91); "
         "  end Main; "
         "end Program;");
     // fix #634: core freed exactly once; no double-free or UAF.

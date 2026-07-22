@@ -54,7 +54,7 @@ BEZEL_TEST(codegen_cg48, operator_comparison) {
         "end V; "
         "class C public static method Main(): int "
         "  var a := new V(); a.X := 3; var b := new V(); b.X := 5; "
-        "  return (1 if a < b else 0); "
+        "  return (if a < b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -227,7 +227,7 @@ BEZEL_TEST(codegen_cg48, generic_record_increment_with_body_1219) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Cnt<T>(V: int) "
-        "  public static method operator ++(c: Cnt<T>): Cnt<T> => c with V := c.V + 1 end; "
+        "  public static method operator ++(c: Cnt<T>): Cnt<T> => c with(V := c.V + 1); "
         "end Cnt; "
         "class C public static method Main(): int "
         "  var c: Cnt<string> := new Cnt<string>(10); c++; c++; c++; return c.V; "

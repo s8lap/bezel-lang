@@ -8,7 +8,7 @@
 // as the explicit-duplicate case above (§10.2: "whether written explicitly
 // ... or produced by auto-increment continuation").
 
-module M; enum E A := 1, B, C := 2; end E; class D public method M(v: E): int return case v of B => 1, C => 2, _ => 0 end; end M; end D;
+module M; enum E A := 1, B, C := 2; end E; class D public method M(v: E): int return (case v of B => 1, C => 2, _ => 0); end M; end D;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: this `case` arm is unreachable: `C` denotes the same underlying value as `B`, already matched by an earlier unguarded arm
 // CHECK-SAME: (§10.2)

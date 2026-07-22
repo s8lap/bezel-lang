@@ -201,7 +201,7 @@ BEZEL_TEST(codegen_serialization_t4_poly,
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  using var box2 := Container.Deserialize(d); "
-        "  return (42 if box2.S.Kind() = 1 else 91); "
+        "  return (if box2.S.Kind() = 1 then 42 else 91); "
         "end Main; end C;"), 42);
 }
 
@@ -218,7 +218,7 @@ BEZEL_TEST(codegen_serialization_t4_poly,
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  using var box2 := Container.Deserialize(d); "
-        "  return (42 if box2.S.Kind() = 2 else 91); "
+        "  return (if box2.S.Kind() = 2 then 42 else 91); "
         "end Main; end C;"), 42);
 }
 
@@ -241,7 +241,7 @@ BEZEL_TEST(codegen_serialization_t4_poly,
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  using var box2 := Container.Deserialize(d); "
-        "  return (42 if box2.S.Kind() = 1 else 91); "
+        "  return (if box2.S.Kind() = 1 then 42 else 91); "
         "end Main; end C;"), 42);
 }
 
@@ -259,7 +259,7 @@ BEZEL_TEST(codegen_serialization_t4_poly,
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  using var box2 := Container.Deserialize(d); "
-        "  return (42 if box2.S.Kind() = 2 else 91); "
+        "  return (if box2.S.Kind() = 2 then 42 else 91); "
         "end Main; end C;"), 42);
 }
 
@@ -293,7 +293,7 @@ BEZEL_TEST(codegen_serialization_t4_poly,
         "  using var box2 := Container.Deserialize(d); "
         // Verify Tag round-tripped and the owned Shape is a Circle.
         "  if box2.Tag <> 99 then return 91; end; "
-        "  return (42 if box2.S.Kind() = 1 else 92); "
+        "  return (if box2.S.Kind() = 1 then 42 else 92); "
         "end Main; end C;"), 42);
 }
 
@@ -329,7 +329,7 @@ BEZEL_TEST(codegen_serialization_t4_poly,
         "    return 0; "  // reached only if no exception — wrong
         "  catch SerializationException => caught := true; "
         "  end; "
-        "  return (42 if caught else 1); "
+        "  return (if caught then 42 else 1); "
         "end Main; end C;"), 42);
 }
 
@@ -385,7 +385,7 @@ BEZEL_TEST(codegen_serialization_t4_poly,
         "    return 0; "
         "  catch SerializationException => caught := true; "
         "  end; "
-        "  return (42 if caught else 1); "
+        "  return (if caught then 42 else 1); "
         "end Main; end C;"), 42);
 }
 
@@ -437,7 +437,7 @@ BEZEL_TEST(codegen_serialization_t4_poly,
         // Primary dispatched to Circle via $type; Alias resolved from $ref.
         "  if hub2.Primary.Kind() <> 1 then return 91; end; "
         "  if hub2.Alias = null then return 92; end; "
-        "  return (42 if hub2.Alias?.Kind() = 1 else 93); "
+        "  return (if hub2.Alias?.Kind() = 1 then 42 else 93); "
         "end Main; end C;"), 42);
 }
 
@@ -459,7 +459,7 @@ BEZEL_TEST(codegen_serialization_t4_poly,
         "  using var bytes := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  using var box2 := Container.Deserialize(d); "
-        "  return (42 if box2.S.Kind() = 1 else 91); "
+        "  return (if box2.S.Kind() = 1 then 42 else 91); "
         "end Main; end Program;";
     // JIT leg: verify correct exit code.
     BEZEL_EXPECT_EQ(run(src), 42);
@@ -490,7 +490,7 @@ BEZEL_TEST(codegen_serialization_t4_poly,
         "    return 0; "
         "  catch SerializationException => caught := true; "
         "  end; "
-        "  return (42 if caught else 1); "
+        "  return (if caught then 42 else 1); "
         "end Main; end Program;";
     BEZEL_EXPECT_EQ(run(src), 42);
     int asan = runUnderLeakSanitizer(src, /*detectLeaks=*/true);

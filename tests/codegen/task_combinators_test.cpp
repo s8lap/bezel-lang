@@ -830,7 +830,7 @@ BEZEL_TEST(task_state_942, from_result_is_completed) {
     expectValueLeakFree(
         "module M; class C public static method Main(): int "
         "  using var tc := Task.FromResult<int>(42); "
-        "  return (1 if tc.IsCompleted else 0); "
+        "  return (if tc.IsCompleted then 1 else 0); "
         "end Main; end C;",
         1);
 }
@@ -861,7 +861,7 @@ BEZEL_TEST(task_state_942, from_exception_is_faulted_not_cancelled) {
         "      new InvalidOperationException(\"x\")); "
         "  if not tf.IsCompleted then return 7; end; "
         "  if tf.IsCancelled then return 8; end; "
-        "  return (1 if tf.IsFaulted else 0); "
+        "  return (if tf.IsFaulted then 1 else 0); "
         "end Main; end C;",
         1);
 }
@@ -876,7 +876,7 @@ BEZEL_TEST(task_state_942, from_cancelled_is_cancelled_not_faulted) {
         "  using var tc := Task.FromCancelled<int>(); "
         "  if not tc.IsCompleted then return 7; end; "
         "  if tc.IsFaulted then return 8; end; "
-        "  return (1 if tc.IsCancelled else 0); "
+        "  return (if tc.IsCancelled then 1 else 0); "
         "end Main; end C;",
         1);
 }
@@ -889,7 +889,7 @@ BEZEL_TEST(task_state_942, from_exception_user_type_unawaited_leak_free_962) {
         "class MyErr: Exception public constructor(m: string) base(m); end constructor; end MyErr; "
         "class C public static method Main(): int "
         "  using var tf := Task.FromException<int>(new MyErr(\"boom\")); "
-        "  return (1 if tf.IsFaulted else 0); "
+        "  return (if tf.IsFaulted then 1 else 0); "
         "end Main; end C;",
         1);
 }

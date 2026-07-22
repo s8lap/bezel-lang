@@ -24,7 +24,7 @@ BEZEL_TEST(codegen_cg29c, with_updates_one_field) {
     BEZEL_EXPECT_EQ(run(
         "module M; record P(x: int, y: int); "
         "class C public static method Main(): int "
-        "  var a := new P(1, 2); var b := a with x := 9 end; "
+        "  var a := new P(1, 2); var b := a with(x := 9); "
         "  return b.x * 10 + b.y; "
         "end Main; end C;"), 92);
 }
@@ -33,7 +33,7 @@ BEZEL_TEST(codegen_cg29c, with_does_not_mutate_source) {
     BEZEL_EXPECT_EQ(run(
         "module M; record P(x: int, y: int); "
         "class C public static method Main(): int "
-        "  var a := new P(1, 2); var b := a with x := 9 end; "
+        "  var a := new P(1, 2); var b := a with(x := 9); "
         "  return a.x * 10 + a.y; "
         "end Main; end C;"), 12);
 }
@@ -50,7 +50,7 @@ BEZEL_TEST(codegen_cg29c, with_override_nullable_record_field_widens) {
         "module M; record Inner(v: int); record Outer(i: Inner?); "
         "class C public static method Main(): int "
         "  var o := new Outer(new Inner(3)); "
-        "  var o2 := o with i := new Inner(5) end; "
+        "  var o2 := o with(i := new Inner(5)); "
         "  return o2.i!.v; "
         "end Main; end C;"), 5);
 }
@@ -62,7 +62,7 @@ BEZEL_TEST(codegen_cg29c, with_override_nullable_record_field_null_source) {
         "module M; record Inner(v: int); record Outer(i: Inner?); "
         "class C public static method Main(): int "
         "  var o := new Outer(null); "
-        "  var o2 := o with i := new Inner(5) end; "
+        "  var o2 := o with(i := new Inner(5)); "
         "  return o2.i!.v; "
         "end Main; end C;"), 5);
 }
@@ -74,7 +74,7 @@ BEZEL_TEST(codegen_cg29c, with_override_nullable_record_field_to_null) {
         "module M; record Inner(v: int); record Outer(i: Inner?, tag: int); "
         "class C public static method Main(): int "
         "  var o := new Outer(new Inner(3), 9); "
-        "  var o2 := o with i := null end; "
+        "  var o2 := o with(i := null); "
         "  if o2.i = null then return 42; end; "
         "  return o2.i!.v; "
         "end Main; end C;"), 42);
@@ -91,7 +91,7 @@ BEZEL_TEST(codegen_cg29c, with_on_nullable_record_source_1273) {
         "module M; record P(A: int, B: int); "
         "class C public static method Main(): int "
         "  var p: P? := new P(1, 2); "
-        "  var q := p with A := 9 end; "
+        "  var q := p with(A := 9); "
         "  return q!.A * 10 + q!.B; "  // 9*10 + 2 = 92
         "end Main; end C;"), 92);
 }
@@ -103,7 +103,7 @@ BEZEL_TEST(codegen_cg29c, with_on_null_record_source_propagates_null_1273) {
         "module M; record P(A: int, B: int); "
         "class C public static method Main(): int "
         "  var p: P? := null; "
-        "  var q := p with A := 9 end; "
-        "  return (1 if q is null else 0); "
+        "  var q := p with(A := 9); "
+        "  return (if q is null then 1 else 0); "
         "end Main; end C;"), 1);
 }

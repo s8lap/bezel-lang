@@ -1,7 +1,7 @@
-var grade := case score of
+var grade := (case score of
   90..100 => "A",
   _ => "F"
-end;                   // ; ends the assignment
+);                   // ; ends the assignment
 
 case month of
   1 => Console.WriteLine("Jan"),

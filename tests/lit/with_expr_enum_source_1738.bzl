@@ -22,7 +22,7 @@ end Color;
 class C
   public static method Main(): int
     var c := Color.Red;
-    var d := c with X := 1 end;
+    var d := c with(X := 1);
     // CHECK: :[[@LINE-1]]:{{[0-9]+}}: `with` requires a record-typed source; this source is enum-typed (§9.5)
     // CHECK-SAME: (§10.5)
     return 0;

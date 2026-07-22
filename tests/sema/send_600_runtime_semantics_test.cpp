@@ -172,7 +172,7 @@ BEZEL_TEST(send_600_runtime,
         // §A.7 Bezel conditional: `value if cond else other` (not C `cond ? a : b`).
         "    catch var e: DomainFaultedException => "
         // Verify Message is non-empty (a copy of the original text).
-        "      return 1 if e.Message.Length > 0 else -2; "
+        "      return (if e.Message.Length > 0 then 1 else -2); "
         "    end; "
         "  end Main; "
         "end Program;");

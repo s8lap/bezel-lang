@@ -52,7 +52,7 @@ BEZEL_TEST(case_string_scrutinee_record_destructure_1949, string_scrutinee_no_fa
         "record Pt(x: int, y: int); "
         "class Program public static method Main(): int "
         "  var s: string := \"hi\"; "
-        "  return case s of Pt(a, b) => a + b, _ => 9 end; "
+        "  return (case s of Pt(a, b) => a + b, _ => 9); "
         "end Main; end Program;"), 9);
 }
 
@@ -64,7 +64,7 @@ BEZEL_TEST(case_string_scrutinee_record_destructure_1949, string_param_no_fault)
         "record Pt(x: int, y: int); "
         "class P "
         "  public static method Case(s: string): int "
-        "    return case s of Pt(a, b) => a + b, _ => 9 end; "
+        "    return (case s of Pt(a, b) => a + b, _ => 9); "
         "  end Case; "
         "end P; "
         "class Program public static method Main(): int "
@@ -83,7 +83,7 @@ BEZEL_TEST(case_string_scrutinee_record_destructure_1949, record_value_still_des
         "record Pt(x: int, y: int); "
         "class Program public static method Main(): int "
         "  var p := new Pt(3, 4); "
-        "  return case p of Pt(a, b) => a + b, _ => 9 end; "
+        "  return (case p of Pt(a, b) => a + b, _ => 9); "
         "end Main; end Program;"), 7);
 }
 
@@ -97,6 +97,6 @@ BEZEL_TEST(case_string_scrutinee_record_destructure_1949, boxed_record_still_des
         "record Pt(x: int, y: int); "
         "class Program public static method Main(): int "
         "  var o: Object := new Pt(5, 6); "
-        "  return case o of Pt(a, b) => a + b, _ => 9 end; "
+        "  return (case o of Pt(a, b) => a + b, _ => 9); "
         "end Main; end Program;"), 11);
 }

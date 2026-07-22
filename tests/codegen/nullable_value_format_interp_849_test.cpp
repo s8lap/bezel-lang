@@ -31,7 +31,7 @@ BEZEL_TEST(nullable_value_format_interp_849, int_nullable_hex_format) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var v: int? := 255; var s := $\"{v:X}\"; "
-        "  return (1 if s = \"FF\" else 2); "
+        "  return (if s = \"FF\" then 1 else 2); "
         "end Main; end C;"), 1);
 }
 
@@ -41,7 +41,7 @@ BEZEL_TEST(nullable_value_format_interp_849, int_nullable_fixed_format) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var v: int? := 42; var s := $\"{v:F2}\"; "
-        "  return (1 if s = \"42.00\" else 2); "
+        "  return (if s = \"42.00\" then 1 else 2); "
         "end Main; end C;"), 1);
 }
 
@@ -50,7 +50,7 @@ BEZEL_TEST(nullable_value_format_interp_849, null_with_format_renders_null) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var v: int? := null; var s := $\"{v:X}\"; "
-        "  return (1 if s = \"null\" else 2); "
+        "  return (if s = \"null\" then 1 else 2); "
         "end Main; end C;"), 1);
 }
 
@@ -59,7 +59,7 @@ BEZEL_TEST(nullable_value_format_interp_849, double_nullable_fixed_format) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var v: double? := 3.14159; var s := $\"{v:F2}\"; "
-        "  return (1 if s = \"3.14\" else 2); "
+        "  return (if s = \"3.14\" then 1 else 2); "
         "end Main; end C;"), 1);
 }
 
@@ -68,7 +68,7 @@ BEZEL_TEST(nullable_value_format_interp_849, null_char_renders_null) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var c: char? := null; var s := $\"{c}\"; "
-        "  return (1 if s = \"null\" else 2); "
+        "  return (if s = \"null\" then 1 else 2); "
         "end Main; end C;"), 1);
 }
 

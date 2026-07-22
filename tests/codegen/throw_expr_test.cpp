@@ -50,7 +50,7 @@ BEZEL_TEST(codegen_cg40, coalesce_throw_taken) {
 BEZEL_TEST(codegen_cg40, conditional_else_throw_not_taken) {
     BEZEL_EXPECT_EQ(runProg(std::string(kE) +
         "class C public static method Main(): int "
-        "  var ok := true; var r := (5 if ok else throw new E()); return r; "
+        "  var ok := true; var r := (if ok then 5 else throw new E()); return r; "
         "end Main; end C;"), 5);
 }
 
@@ -58,7 +58,7 @@ BEZEL_TEST(codegen_cg40, conditional_else_throw_taken) {
     BEZEL_EXPECT_EQ(runProg(std::string(kE) +
         "class C public static method Main(): int "
         "  var ok := false; "
-        "  try var r := (5 if ok else throw new E()); return r; "
+        "  try var r := (if ok then 5 else throw new E()); return r; "
         "  catch E => return 9; end; "
         "end Main; end C;"), 9);
 }
@@ -69,7 +69,7 @@ BEZEL_TEST(codegen_cg40, conditional_then_throw_not_taken) {
     BEZEL_EXPECT_EQ(runProg(std::string(kE) +
         "class C public static method Main(): int "
         "  var bad := false; "
-        "  var r := ((throw new E()) if bad else 7); return r; "
+        "  var r := (if bad then (throw new E()) else 7); return r; "
         "end Main; end C;"), 7);
 }
 

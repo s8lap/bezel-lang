@@ -151,8 +151,8 @@ BEZEL_TEST(range_contains_nonempty_1340, isempty_agrees_contains_mismatch_empty)
 BEZEL_TEST(range_contains_nonempty_1340, ascending_normal_literals_unchanged) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var a := 1 if 5 in 0..10 else 0; "
-        "  var b := 0 if 11 in 0..10 else 1; "
+        "  var a := (if 5 in 0..10 then 1 else 0); "
+        "  var b := (if 11 in 0..10 then 0 else 1); "
         "  return a + b; "
         "end Main; end C;"), 2);
 }
@@ -163,10 +163,10 @@ BEZEL_TEST(range_contains_nonempty_1340, descending_stepped_unchanged) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r: Range<int> := 10..0 step -1; "
-        "  var a := 1 if 5 in r else 0; "
-        "  var b := 1 if r.Contains(0) else 0; "
-        "  var c := 1 if r.Contains(10) else 0; "
-        "  var d := 1 if r.Contains(11) else 0; "
+        "  var a := (if 5 in r then 1 else 0); "
+        "  var b := (if r.Contains(0) then 1 else 0); "
+        "  var c := (if r.Contains(10) then 1 else 0); "
+        "  var d := (if r.Contains(11) then 1 else 0); "
         "  return a + b * 2 + c * 4 + d * 8; "
         "end Main; end C;"), 7);
 }
@@ -177,9 +177,9 @@ BEZEL_TEST(range_contains_nonempty_1340, descending_halfopen_excludes_end) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r: Range<int> := 10..<0 step -1; "
-        "  var a := 1 if 5 in r else 0; "
-        "  var b := 1 if r.Contains(0) else 0; "
-        "  var c := 1 if r.Contains(10) else 0; "
+        "  var a := (if 5 in r then 1 else 0); "
+        "  var b := (if r.Contains(0) then 1 else 0); "
+        "  var c := (if r.Contains(10) then 1 else 0); "
         "  return a + b * 2 + c * 4; "
         "end Main; end C;"), 5);
 }

@@ -54,7 +54,7 @@ BEZEL_TEST(generic_record_with_462, with_box_string_replace_value) {
         "module M; record Box<T>(value: T); "
         "class C public static method Main(): int "
         "  var b1 := new Box<string>(\"hi\"); "
-        "  var b2 := b1 with value := \"world\" end; "
+        "  var b2 := b1 with(value := \"world\"); "
         "  return b2.value.Length; "             // 5
         "end Main; end C;"), 5);
 }
@@ -66,8 +66,8 @@ BEZEL_TEST(generic_record_with_462, with_box_string_roundtrips) {
         "module M; record Box<T>(value: T); "
         "class C public static method Main(): int "
         "  var b1 := new Box<string>(\"hi\"); "
-        "  var b2 := b1 with value := \"world\" end; "
-        "  return (1 if b2.value = \"world\" else 0); "
+        "  var b2 := b1 with(value := \"world\"); "
+        "  return (if b2.value = \"world\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -78,7 +78,7 @@ BEZEL_TEST(generic_record_with_462, with_box_string_source_unchanged) {
         "module M; record Box<T>(value: T); "
         "class C public static method Main(): int "
         "  var b1 := new Box<string>(\"hi\"); "
-        "  var b2 := b1 with value := \"world\" end; "
+        "  var b2 := b1 with(value := \"world\"); "
         "  return b1.value.Length * 100 + b2.value.Length; "  // 2*100 + 5 = 205
         "end Main; end C;"), 205);
 }
@@ -91,7 +91,7 @@ BEZEL_TEST(generic_record_with_462, with_pair_int_string_replace_int) {
         "module M; record Pair<A, B>(a: A, b: B); "
         "class C public static method Main(): int "
         "  var p1 := new Pair<int, string>(1, \"hello\"); "
-        "  var p2 := p1 with a := 7 end; "
+        "  var p2 := p1 with(a := 7); "
         "  Console.WriteLine(p2.a * 100 + p2.b.Length); return 0; "    // 7*100 + 5 = 705
         "end Main; end C;"), "705");
 }
@@ -103,7 +103,7 @@ BEZEL_TEST(generic_record_with_462, with_pair_int_string_replace_string) {
         "module M; record Pair<A, B>(a: A, b: B); "
         "class C public static method Main(): int "
         "  var p1 := new Pair<int, string>(3, \"x\"); "
-        "  var p2 := p1 with b := \"planet\" end; "
+        "  var p2 := p1 with(b := \"planet\"); "
         "  Console.WriteLine(p2.a * 100 + p2.b.Length); return 0; "    // 3*100 + 6 = 306
         "end Main; end C;"), "306");
 }
@@ -116,8 +116,8 @@ BEZEL_TEST(generic_record_with_462, with_box_long_full_width) {
         "module M; record Box<T>(value: T); "
         "class C public static method Main(): int "
         "  var b1 := new Box<long>(10L); "
-        "  var b2 := b1 with value := 5000000042L end; "
-        "  return (1 if b2.value = 5000000042L else 0); "
+        "  var b2 := b1 with(value := 5000000042L); "
+        "  return (if b2.value = 5000000042L then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -128,8 +128,8 @@ BEZEL_TEST(generic_record_with_462, with_box_double_value) {
         "module M; record Box<T>(value: T); "
         "class C public static method Main(): int "
         "  var b1 := new Box<double>(1.0); "
-        "  var b2 := b1 with value := 6.5 end; "
-        "  return (1 if b2.value = 6.5 else 0); "
+        "  var b2 := b1 with(value := 6.5); "
+        "  return (if b2.value = 6.5 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -141,7 +141,7 @@ BEZEL_TEST(generic_record_with_462, with_box_value_record) {
         "module M; record Point(X: int, Y: int); record Box<T>(value: T); "
         "class C public static method Main(): int "
         "  var b1 := new Box<Point>(new Point(1, 1)); "
-        "  var b2 := b1 with value := new Point(3, 4) end; "
+        "  var b2 := b1 with(value := new Point(3, 4)); "
         "  return b2.value.X * 10 + b2.value.Y; "  // 34
         "end Main; end C;"), 34);
 }
@@ -155,7 +155,7 @@ BEZEL_TEST(generic_record_with_462, control_with_box_int) {
         "module M; record Box<T>(value: T); "
         "class C public static method Main(): int "
         "  var b1 := new Box<int>(1); "
-        "  var b2 := b1 with value := 9 end; "
+        "  var b2 := b1 with(value := 9); "
         "  return b2.value; "                    // 9
         "end Main; end C;"), 9);
 }
@@ -169,7 +169,7 @@ BEZEL_TEST(generic_record_with_462, control_with_box_record_with_string) {
         "record Box<T>(value: T); "
         "class C public static method Main(): int "
         "  var b1 := new Box<Named>(new Named(\"x\", 1)); "
-        "  var b2 := b1 with value := new Named(\"abc\", 7) end; "
+        "  var b2 := b1 with(value := new Named(\"abc\", 7)); "
         "  Console.WriteLine(b2.value.Name.Length * 100 + b2.value.Age); return 0; "  // 3*100 + 7 = 307
         "end Main; end C;"), "307");
 }
@@ -190,7 +190,7 @@ BEZEL_TEST(generic_record_eq_462, box_string_equal_distinct_pointers) {
         "  var a := \"hel\" + \"lo\"; "
         "  var x := new Box<string>(a); "
         "  var y := new Box<string>(\"hello\"); "
-        "  return (1 if x = y else 0); "         // content-equal → 1
+        "  return (if x = y then 1 else 0); "         // content-equal → 1
         "end Main; end C;"), 1);
 }
 
@@ -202,7 +202,7 @@ BEZEL_TEST(generic_record_eq_462, box_string_not_equal_different) {
         "class C public static method Main(): int "
         "  var x := new Box<string>(\"hello\"); "
         "  var y := new Box<string>(\"world\"); "
-        "  return (1 if x = y else 0); "         // different → 0
+        "  return (if x = y then 1 else 0); "         // different → 0
         "end Main; end C;"), 0);
 }
 
@@ -215,7 +215,7 @@ BEZEL_TEST(generic_record_eq_462, box_string_notequal_op_content_equal) {
         "  var a := \"wor\" + \"ld\"; "
         "  var x := new Box<string>(a); "
         "  var y := new Box<string>(\"world\"); "
-        "  return (1 if x <> y else 0); "        // content-equal → <> is 0
+        "  return (if x <> y then 1 else 0); "        // content-equal → <> is 0
         "end Main; end C;"), 0);
 }
 
@@ -228,7 +228,7 @@ BEZEL_TEST(generic_record_eq_462, pair_string_int_structural_equal) {
         "  var s := \"fo\" + \"o\"; "
         "  var x := new Pair<string, int>(s, 42); "
         "  var y := new Pair<string, int>(\"foo\", 42); "
-        "  return (1 if x = y else 0); "         // 1
+        "  return (if x = y then 1 else 0); "         // 1
         "end Main; end C;"), 1);
 }
 
@@ -240,7 +240,7 @@ BEZEL_TEST(generic_record_eq_462, pair_string_int_diff_int_not_equal) {
         "class C public static method Main(): int "
         "  var x := new Pair<string, int>(\"foo\", 42); "
         "  var y := new Pair<string, int>(\"foo\", 99); "
-        "  return (1 if x = y else 0); "         // 0
+        "  return (if x = y then 1 else 0); "         // 0
         "end Main; end C;"), 0);
 }
 
@@ -255,7 +255,7 @@ BEZEL_TEST(generic_record_eq_462, box_string_gethashcode_equal) {
         "  var a := \"hel\" + \"lo\"; "
         "  var x := new Box<string>(a); "
         "  var y := new Box<string>(\"hello\"); "
-        "  return (1 if x.GetHashCode() = y.GetHashCode() else 0); "  // 1
+        "  return (if x.GetHashCode() = y.GetHashCode() then 1 else 0); "  // 1
         "end Main; end C;"), 1);
 }
 
@@ -279,7 +279,7 @@ BEZEL_TEST(generic_record_eq_462, box_string_tostring_contains_value) {
         "module M; record Box<T>(value: T); "
         "class C public static method Main(): int "
         "  var b := new Box<string>(\"hello\"); "
-        "  return (1 if b.ToString().Contains(\"hello\") else 0); "  // 1
+        "  return (if b.ToString().Contains(\"hello\") then 1 else 0); "  // 1
         "end Main; end C;"), 1);
 }
 
@@ -292,7 +292,7 @@ BEZEL_TEST(generic_record_eq_462, box_string_equals_method) {
         "  var a := \"hel\" + \"lo\"; "
         "  var x := new Box<string>(a); "
         "  var y := new Box<string>(\"hello\"); "
-        "  return (1 if x.Equals(y) else 0); "   // 1
+        "  return (if x.Equals(y) then 1 else 0); "   // 1
         "end Main; end C;"), 1);
 }
 
@@ -305,7 +305,7 @@ BEZEL_TEST(generic_record_eq_462, control_box_int_equal) {
         "class C public static method Main(): int "
         "  var x := new Box<int>(42); "
         "  var y := new Box<int>(42); "
-        "  return (1 if x = y else 0); "         // 1
+        "  return (if x = y then 1 else 0); "         // 1
         "end Main; end C;"), 1);
 }
 
@@ -316,7 +316,7 @@ BEZEL_TEST(generic_record_eq_462, control_box_int_not_equal) {
         "class C public static method Main(): int "
         "  var x := new Box<int>(42); "
         "  var y := new Box<int>(7); "
-        "  return (1 if x = y else 0); "         // 0
+        "  return (if x = y then 1 else 0); "         // 0
         "end Main; end C;"), 0);
 }
 
@@ -331,7 +331,7 @@ BEZEL_TEST(generic_record_eq_462, control_box_record_with_string_equal) {
         "  var s := \"al\" + \"ice\"; "
         "  var x := new Box<Named>(new Named(s, 30)); "
         "  var y := new Box<Named>(new Named(\"alice\", 30)); "
-        "  return (1 if x = y else 0); "         // 1
+        "  return (if x = y then 1 else 0); "         // 1
         "end Main; end C;"), 1);
 }
 
@@ -388,7 +388,7 @@ BEZEL_TEST(generic_record_nullable_462, nullable_box_string_null_case) {
         "class C public static method Main(): int "
         "  var b: Box<string>? := null; "
         "  var s := b?.value; "
-        "  return s!.Length if s is not null else 99; "  // 99
+        "  return (if s is not null then s!.Length else 99); "  // 99
         "end Main; end C;"), 99);
 }
 
@@ -399,7 +399,7 @@ BEZEL_TEST(generic_record_nullable_462, nullable_box_string_is_not_null) {
         "module M; record Box<T>(value: T); "
         "class C public static method Main(): int "
         "  var b: Box<string>? := new Box<string>(\"hi\"); "
-        "  return (0 if b is null else 1); "     // 1
+        "  return (if b is null then 0 else 1); "     // 1
         "end Main; end C;"), 1);
 }
 

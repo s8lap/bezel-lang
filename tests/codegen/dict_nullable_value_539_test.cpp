@@ -149,7 +149,7 @@ BEZEL_TEST(dict_nullable_value_539, int_key_nonnull_bool_set_tryget_spec_4_8_7) 
         "  var found := d.TryGetValue(1, out out_bv); "
         "  if not found then return -1; end; "
         "  if out_bv = null then return -2; end; "
-        "  return (1 if out_bv! else 0); "
+        "  return (if out_bv! then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

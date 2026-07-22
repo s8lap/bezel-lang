@@ -76,7 +76,7 @@ int runRef(const std::string& body) {
 // Before fix: LLVM PHI assertion abort (i32 vs {i8,i32} mismatch).
 BEZEL_TEST(codegen_conditional_nullable, int_nullable_true_branch_has_value_spec_17_7) {
     BEZEL_EXPECT_EQ(runMain(
-        "var r: int? := (42 if true else null); "
+        "var r: int? := (if true then 42 else null); "
         "if r = null then return -1; end; "
         "return r!;"), 42);
 }
@@ -85,7 +85,7 @@ BEZEL_TEST(codegen_conditional_nullable, int_nullable_true_branch_has_value_spec
 // non-null, `r ?? -1` returns r's value (42).
 BEZEL_TEST(codegen_conditional_nullable, int_nullable_true_branch_coalesce_spec_17_7) {
     BEZEL_EXPECT_EQ(runMain(
-        "var r: int? := (42 if true else null); "
+        "var r: int? := (if true then 42 else null); "
         "return r ?? -1;"), 42);
 }
 
@@ -98,7 +98,7 @@ BEZEL_TEST(codegen_conditional_nullable, int_nullable_true_branch_coalesce_spec_
 BEZEL_TEST(codegen_conditional_nullable, int_nullable_false_branch_is_null_spec_17_7) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
-        "var r: int? := (42 if false else null); "
+        "var r: int? := (if false then 42 else null); "
         "Console.WriteLine(r ?? -1); return 0;"
         " end Main; end C;"), "-1");
 }
@@ -106,7 +106,7 @@ BEZEL_TEST(codegen_conditional_nullable, int_nullable_false_branch_is_null_spec_
 // Confirm with `= null` (§8.4): a null int? is `= null`.
 BEZEL_TEST(codegen_conditional_nullable, int_nullable_false_branch_equals_null_spec_8_4) {
     BEZEL_EXPECT_EQ(runMain(
-        "var r: int? := (42 if false else null); "
+        "var r: int? := (if false then 42 else null); "
         "return int(r = null);"), 1);
 }
 
@@ -116,14 +116,14 @@ BEZEL_TEST(codegen_conditional_nullable, int_nullable_false_branch_equals_null_s
 // Condition false → else branch (7) taken; result int? with hasValue=1.
 BEZEL_TEST(codegen_conditional_nullable, int_nullable_null_first_else_value_spec_17_7) {
     BEZEL_EXPECT_EQ(runMain(
-        "var r: int? := (null if false else 7); "
+        "var r: int? := (if false then null else 7); "
         "return r ?? -1;"), 7);
 }
 
 // `(null if true else 7)` — null branch taken; result is null.
 BEZEL_TEST(codegen_conditional_nullable, int_nullable_null_first_true_spec_17_7) {
     BEZEL_EXPECT_EQ(runMain(
-        "var r: int? := (null if true else 7); "
+        "var r: int? := (if true then null else 7); "
         "return int(r = null);"), 1);
 }
 
@@ -133,7 +133,7 @@ BEZEL_TEST(codegen_conditional_nullable, int_nullable_null_first_true_spec_17_7)
 BEZEL_TEST(codegen_conditional_nullable, int_nullable_var_cond_true_spec_17_7) {
     BEZEL_EXPECT_EQ(runMain(
         "var flag := true; "
-        "var r: int? := (42 if flag else null); "
+        "var r: int? := (if flag then 42 else null); "
         "return r ?? -1;"), 42);
 }
 
@@ -142,7 +142,7 @@ BEZEL_TEST(codegen_conditional_nullable, int_nullable_var_cond_false_spec_17_7) 
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "var flag := false; "
-        "var r: int? := (42 if flag else null); "
+        "var r: int? := (if flag then 42 else null); "
         "Console.WriteLine(r ?? -1); return 0;"
         " end Main; end C;"), "-1");
 }
@@ -152,7 +152,7 @@ BEZEL_TEST(codegen_conditional_nullable, int_nullable_var_cond_false_spec_17_7) 
 // `(true if true else null)` → bool? holding true.  Unwrap with !; int(true)=1.
 BEZEL_TEST(codegen_conditional_nullable, bool_nullable_true_branch_spec_17_7) {
     BEZEL_EXPECT_EQ(runMain(
-        "var r: bool? := (true if true else null); "
+        "var r: bool? := (if true then true else null); "
         "if r = null then return -1; end; "
         "return int(r!);"), 1);
 }
@@ -160,7 +160,7 @@ BEZEL_TEST(codegen_conditional_nullable, bool_nullable_true_branch_spec_17_7) {
 // `(true if false else null)` → bool? is null.
 BEZEL_TEST(codegen_conditional_nullable, bool_nullable_false_branch_is_null_spec_17_7) {
     BEZEL_EXPECT_EQ(runMain(
-        "var r: bool? := (true if false else null); "
+        "var r: bool? := (if false then true else null); "
         "return int(r = null);"), 1);
 }
 
@@ -170,7 +170,7 @@ BEZEL_TEST(codegen_conditional_nullable, bool_nullable_false_branch_is_null_spec
 // We convert to int (truncate) for observable exit code: int(3.5) = 3.
 BEZEL_TEST(codegen_conditional_nullable, double_nullable_true_branch_spec_17_7) {
     BEZEL_EXPECT_EQ(runMain(
-        "var r: double? := (3.5 if true else null); "
+        "var r: double? := (if true then 3.5 else null); "
         "if r = null then return -1; end; "
         "return int(r!);"), 3);
 }
@@ -178,7 +178,7 @@ BEZEL_TEST(codegen_conditional_nullable, double_nullable_true_branch_spec_17_7) 
 // `(3.5 if false else null)` → double? is null.
 BEZEL_TEST(codegen_conditional_nullable, double_nullable_false_branch_is_null_spec_17_7) {
     BEZEL_EXPECT_EQ(runMain(
-        "var r: double? := (3.5 if false else null); "
+        "var r: double? := (if false then 3.5 else null); "
         "return int(r = null);"), 1);
 }
 
@@ -188,7 +188,7 @@ BEZEL_TEST(codegen_conditional_nullable, double_nullable_false_branch_is_null_sp
 // int(Color.Green) = 1.
 BEZEL_TEST(codegen_conditional_nullable, enum_nullable_true_branch_spec_17_7_10) {
     BEZEL_EXPECT_EQ(runEnum(
-        "var r: Color? := (Color.Green if true else null); "
+        "var r: Color? := (if true then Color.Green else null); "
         "if r = null then return -1; end; "
         "return int(r!);"), 1);
 }
@@ -196,7 +196,7 @@ BEZEL_TEST(codegen_conditional_nullable, enum_nullable_true_branch_spec_17_7_10)
 // `(Color.Green if false else null)` → Color? is null. Must not equal Red (0).
 BEZEL_TEST(codegen_conditional_nullable, enum_nullable_false_branch_is_null_spec_17_7_10) {
     BEZEL_EXPECT_EQ(runEnum(
-        "var r: Color? := (Color.Green if false else null); "
+        "var r: Color? := (if false then Color.Green else null); "
         "return int(r = null);"), 1);
 }
 
@@ -206,7 +206,7 @@ BEZEL_TEST(codegen_conditional_nullable, enum_nullable_false_branch_is_null_spec
 // Narrow via `<> null` then read V.
 BEZEL_TEST(codegen_conditional_nullable, record_nullable_true_branch_spec_17_7) {
     BEZEL_EXPECT_EQ(runBox(
-        "var r: Box? := (new Box(9) if true else null); "
+        "var r: Box? := (if true then new Box(9) else null); "
         "if r <> null then return r!.V; end; "
         "return -1;"), 9);
 }
@@ -214,14 +214,14 @@ BEZEL_TEST(codegen_conditional_nullable, record_nullable_true_branch_spec_17_7) 
 // `(new Box(9) if false else null)` → Box? is null.
 BEZEL_TEST(codegen_conditional_nullable, record_nullable_false_branch_is_null_spec_17_7) {
     BEZEL_EXPECT_EQ(runBox(
-        "var r: Box? := (new Box(9) if false else null); "
+        "var r: Box? := (if false then new Box(9) else null); "
         "return int(r = null);"), 1);
 }
 
 // Reversed: `(null if false else new Box(5))` — value branch is the else arm.
 BEZEL_TEST(codegen_conditional_nullable, record_nullable_null_first_else_value_spec_17_7) {
     BEZEL_EXPECT_EQ(runBox(
-        "var r: Box? := (null if false else new Box(5)); "
+        "var r: Box? := (if false then null else new Box(5)); "
         "if r <> null then return r!.V; end; "
         "return -1;"), 5);
 }
@@ -231,12 +231,12 @@ BEZEL_TEST(codegen_conditional_nullable, record_nullable_null_first_else_value_s
 // A plain non-nullable conditional must still work correctly after the fix.
 BEZEL_TEST(codegen_conditional_nullable, control_non_nullable_int_true_spec_17) {
     BEZEL_EXPECT_EQ(runMain(
-        "return (1 if true else 2);"), 1);
+        "return (if true then 1 else 2);"), 1);
 }
 
 BEZEL_TEST(codegen_conditional_nullable, control_non_nullable_int_false_spec_17) {
     BEZEL_EXPECT_EQ(runMain(
-        "return (1 if false else 2);"), 2);
+        "return (if false then 1 else 2);"), 2);
 }
 
 // ── (g) CONTROL: nullable REFERENCE conditional — unchanged, §17/§7 ───────
@@ -247,7 +247,7 @@ BEZEL_TEST(codegen_conditional_nullable, control_non_nullable_int_false_spec_17)
 BEZEL_TEST(codegen_conditional_nullable, control_nullable_ref_non_null_spec_17_7) {
     BEZEL_EXPECT_EQ(runRef(
         "var a := new T(); a.V := 11; "
-        "var r: T? := (a if true else null); "
+        "var r: T? := (if true then a else null); "
         "if r = null then return -1; end; "
         "return r!.V;"), 11);
 }
@@ -255,6 +255,6 @@ BEZEL_TEST(codegen_conditional_nullable, control_nullable_ref_non_null_spec_17_7
 BEZEL_TEST(codegen_conditional_nullable, control_nullable_ref_null_spec_17_7) {
     BEZEL_EXPECT_EQ(runRef(
         "var a := new T(); a.V := 11; "
-        "var r: T? := (a if false else null); "
+        "var r: T? := (if false then a else null); "
         "return int(r = null);"), 1);
 }

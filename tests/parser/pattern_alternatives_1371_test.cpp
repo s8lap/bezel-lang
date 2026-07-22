@@ -85,7 +85,7 @@ const bezel::ast::CaseExpr* firstCase(const bezel::test::ParseResult& r) {
 BEZEL_TEST(parser_alt_1371, two_int_alternatives_pipe) {
     // §19.3 example: `1 | 2 => "low"` matches 1 or 2.
     BEZEL_EXPECT_EQ(
-        renderCase("case x of 1 | 2 => \"low\", 3 => \"high\" end"),
+        renderCase("(case x of 1 | 2 => \"low\", 3 => \"high\")"),
         std::string(
             "case x of { 1, 2 => \"low\" | 3 => \"high\" } end"));
 }
@@ -93,7 +93,7 @@ BEZEL_TEST(parser_alt_1371, two_int_alternatives_pipe) {
 BEZEL_TEST(parser_alt_1371, four_int_alternatives_pipe) {
     // §19.3 example: `2 | 3 | 4 | 5`.
     BEZEL_EXPECT_EQ(
-        renderCase("case x of 2 | 3 | 4 | 5 => \"mid\", _ => \"other\" end"),
+        renderCase("(case x of 2 | 3 | 4 | 5 => \"mid\", _ => \"other\")"),
         std::string(
             "case x of { 2, 3, 4, 5 => \"mid\" | _ => \"other\" } end"));
 }
@@ -101,7 +101,7 @@ BEZEL_TEST(parser_alt_1371, four_int_alternatives_pipe) {
 BEZEL_TEST(parser_alt_1371, enum_name_alternatives_pipe) {
     BEZEL_EXPECT_EQ(
         renderCase(
-            "case c of Color.Red | Color.Blue => \"cool\", _ => \"warm\" end"),
+            "(case c of Color.Red | Color.Blue => \"cool\", _ => \"warm\")"),
         std::string(
             "case c of { Color.Red, Color.Blue => \"cool\" "
             "| _ => \"warm\" } end"));
@@ -109,21 +109,21 @@ BEZEL_TEST(parser_alt_1371, enum_name_alternatives_pipe) {
 
 BEZEL_TEST(parser_alt_1371, mixed_literal_alternatives_pipe) {
     BEZEL_EXPECT_EQ(
-        renderCase("case x of 1 | \"two\" | null => \"odd\", _ => \"n\" end"),
+        renderCase("(case x of 1 | \"two\" | null => \"odd\", _ => \"n\")"),
         std::string(
             "case x of { 1, \"two\", null => \"odd\" | _ => \"n\" } end"));
 }
 
 BEZEL_TEST(parser_alt_1371, negative_alternatives_pipe) {
     BEZEL_EXPECT_EQ(
-        renderCase("case x of -1 | 0 | 1 => \"near\", _ => \"far\" end"),
+        renderCase("(case x of -1 | 0 | 1 => \"near\", _ => \"far\")"),
         std::string(
             "case x of { (-1), 0, 1 => \"near\" | _ => \"far\" } end"));
 }
 
 BEZEL_TEST(parser_alt_1371, alternatives_with_when_guard_pipe) {
     BEZEL_EXPECT_EQ(
-        renderCase("case x of 1 | 2 when x > 0 => \"pl\", _ => \"o\" end"),
+        renderCase("(case x of 1 | 2 when x > 0 => \"pl\", _ => \"o\")"),
         std::string(
             "case x of { 1, 2 when (x > 0) => \"pl\" | _ => \"o\" } end"));
 }
@@ -136,8 +136,8 @@ BEZEL_TEST(parser_alt_1371, per_slot_alternatives_shape) {
     // the AST directly (the flat debug render is ambiguous for a per-slot list).
     auto r = parseAll(
         "module M; class C public method M() "
-        "_ := case p of TwoColor(Color.Red | Color.Blue, var x) => x, "
-        "_ => 0 end; end M; end C;");
+        "_ := (case p of TwoColor(Color.Red | Color.Blue, var x) => x, "
+        "_ => 0); end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     const auto* ce = firstCase(r);
     BEZEL_EXPECT_TRUE(ce != nullptr);
@@ -167,7 +167,7 @@ BEZEL_TEST(parser_alt_1371, positional_comma_is_still_slot_separator) {
     // no alternatives are formed.
     auto r = parseAll(
         "module M; class C public method M() "
-        "_ := case p of Point(x, y) => x, _ => 0 end; end M; end C;");
+        "_ := (case p of Point(x, y) => x, _ => 0); end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     const auto* ce = firstCase(r);
     if (!ce || ce->arms.empty()) return;
@@ -204,7 +204,7 @@ BEZEL_TEST(parser_alt_1371, catch_multi_type_with_binding_pipe) {
 BEZEL_TEST(parser_alt_1371, old_comma_alternative_is_a_parse_error) {
     // `1, 2 => "low"` now reads as arm `1` (no body → error) then arm
     // `2 => "low"`. The comma is the arm separator; `1` lacks its `=> body`.
-    BEZEL_EXPECT_FALSE(parses("case x of 1, 2 => \"low\", _ => \"o\" end"));
+    BEZEL_EXPECT_FALSE(parses("(case x of 1, 2 => \"low\", _ => \"o\")"));
 }
 
 BEZEL_TEST(parser_alt_1371, old_catch_comma_list_no_longer_one_arm) {
@@ -222,7 +222,7 @@ BEZEL_TEST(parser_alt_1371, pipe_after_constant_is_alternative_not_bitwise) {
     // `100 | 101` is two alternative constants, NOT the bitwise-or `100 | 101`.
     auto r = parseAll(
         "module M; class C public method M() "
-        "_ := case x of 100 | 101 => \"a\", _ => \"b\" end; end M; end C;");
+        "_ := (case x of 100 | 101 => \"a\", _ => \"b\"); end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     const auto* ce = firstCase(r);
     if (!ce || ce->arms.empty()) return;
@@ -236,11 +236,11 @@ BEZEL_TEST(parser_alt_1371, relational_operand_is_shift_level) {
     // `> a * 3` — the operand parses at Shift level (below `|`), so a trailing
     // arm separator is unaffected and the operand is the full `a * 3`.
     BEZEL_EXPECT_TRUE(parses(
-        "case x of > a * 3 => \"hi\", _ => \"lo\" end"));
+        "(case x of > a * 3 => \"hi\", _ => \"lo\")"));
 }
 
 BEZEL_TEST(parser_alt_1371, leading_range_bound_is_shift_level) {
     // `..< a + 10` — the open-range upper bound parses at Shift level.
     BEZEL_EXPECT_TRUE(parses(
-        "case x of ..< a + 10 => \"lo\", _ => \"hi\" end"));
+        "(case x of ..< a + 10 => \"lo\", _ => \"hi\")"));
 }

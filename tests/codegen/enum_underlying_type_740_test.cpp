@@ -33,7 +33,7 @@ BEZEL_TEST(enum_underlying_740, long_constant_round_trips) {
         "enum BigEnum: long Big := 9000000000L; end BigEnum; "
         "class C public static method Main(): int "
         "  var b: long := long(BigEnum.Big); "
-        "  return (0 if b = 9000000000L else 1); "
+        "  return (if b = 9000000000L then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -45,7 +45,7 @@ BEZEL_TEST(enum_underlying_740, long_case_dispatch_full_width) {
         "enum Big: long A := 1L, B := 9000000000L, C := 3L; end Big; "
         "class C public static method Main(): int "
         "  var x: Big := Big.B; "
-        "  return case x of Big.A => 1, Big.B => 2, Big.C => 3 end; "
+        "  return (case x of Big.A => 1, Big.B => 2, Big.C => 3); "
         "end Main; end C;"), 2);
 }
 
@@ -71,7 +71,7 @@ BEZEL_TEST(enum_underlying_740, int_to_long_enum_cast) {
         "enum Big: long A := 1L, B := 9000000000L; end Big; "
         "class C public static method Main(): int "
         "  var b: Big := Big(9000000000L); "
-        "  return (0 if b = Big.B else 1); "
+        "  return (if b = Big.B then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -93,7 +93,7 @@ BEZEL_TEST(enum_underlying_740, sbyte_negative_sign_extends) {
         "module M; "
         "enum E: sbyte Neg := -100, Pos := 100; end E; "
         "class C public static method Main(): int "
-        "  return (0 if int(E.Neg) = -100 else 1); "
+        "  return (if int(E.Neg) = -100 then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -136,7 +136,7 @@ BEZEL_TEST(enum_underlying_740, long_enum_keyed_dictionary) {
         "class C public static method Main(): int "
         "  using var d := new Dictionary<Big, int>(); "
         "  d[Big.B] := 42; d[Big.A] := 7; "
-        "  return (0 if d[Big.B] = 42 else 1); "
+        "  return (if d[Big.B] = 42 then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -166,7 +166,7 @@ BEZEL_TEST(enum_underlying_740, enum_method_this_full_width) {
         "  public method Doubled(): long return long(this) * 2L; end Doubled; "
         "end Big; "
         "class C public static method Main(): int "
-        "  return (0 if Big.B.Doubled() = 18000000000L else 1); "
+        "  return (if Big.B.Doubled() = 18000000000L then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -199,7 +199,7 @@ BEZEL_TEST(enum_underlying_740, long_enum_tostring_is_type_name) {
         "enum Big: long A := 1L, B := 9000000000L; end Big; "
         "class C public static method Main(): int "
         "  var x: Big := Big.B; "
-        "  return (0 if x.ToString() = \"Big\" else 1); "
+        "  return (if x.ToString() = \"Big\" then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -212,7 +212,7 @@ BEZEL_TEST(enum_underlying_740, default_int_enum_unchanged) {
         "class C public static method Main(): int "
         "  var d: Dir := Dir.East; "
         "  if int(d) <> 2 then return 1; end; "
-        "  return case d of Dir.North => 10, Dir.East => 0, _ => 9 end; "
+        "  return (case d of Dir.North => 10, Dir.East => 0, _ => 9); "
         "end Main; end C;"), 0);
 }
 
@@ -229,7 +229,7 @@ BEZEL_TEST(enum_underlying_740, long_member_bare_literal_no_suffix) {
         "enum Big: long A := 5000000000, B := 6000000000; end Big; "
         "class C public static method Main(): int "
         "  var x: Big := Big.B; "
-        "  return (0 if long(x) = 6000000000L else 1); "
+        "  return (if long(x) = 6000000000L then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -240,7 +240,7 @@ BEZEL_TEST(enum_underlying_740, uint_member_bare_literal_no_suffix) {
         "module M; "
         "enum UI: uint A := 4000000000; end UI; "
         "class C public static method Main(): int "
-        "  return (0 if long(UI.A) = 4000000000L else 1); "
+        "  return (if long(UI.A) = 4000000000L then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -253,7 +253,7 @@ BEZEL_TEST(enum_underlying_740, ulong_member_bare_literal_no_suffix) {
         "module M; "
         "enum U: ulong A := 5000000000; end U; "
         "class C public static method Main(): int "
-        "  return (0 if ulong(U.A) = 5000000000UL else 1); "
+        "  return (if ulong(U.A) = 5000000000UL then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -294,7 +294,7 @@ BEZEL_TEST(enum_underlying_749, ulong_member_above_long_max_round_trips) {
         "module M; "
         "enum U: ulong A := 18000000000000000000UL; end U; "
         "class C public static method Main(): int "
-        "  return (0 if ulong(U.A) = 18000000000000000000UL else 1); "
+        "  return (if ulong(U.A) = 18000000000000000000UL then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -307,7 +307,7 @@ BEZEL_TEST(enum_underlying_749, ulong_member_at_2p63_round_trips) {
         "enum U: ulong A := 9223372036854775808, B := 9223372036854775808UL; end U; "
         "class C public static method Main(): int "
         "  if ulong(U.A) <> 9223372036854775808UL then return 1; end; "
-        "  return (0 if ulong(U.B) = 9223372036854775808UL else 2); "
+        "  return (if ulong(U.B) = 9223372036854775808UL then 0 else 2); "
         "end Main; end C;"), 0);
 }
 
@@ -319,7 +319,7 @@ BEZEL_TEST(enum_underlying_749, ulong_auto_increment_above_2p63) {
         "module M; "
         "enum U: ulong A := 9223372036854775808UL, B; end U; "
         "class C public static method Main(): int "
-        "  return (0 if ulong(U.B) = 9223372036854775809UL else 1); "
+        "  return (if ulong(U.B) = 9223372036854775809UL then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -333,7 +333,7 @@ BEZEL_TEST(enum_underlying_749, long_min_value_enum_member_round_trips) {
         "module M; "
         "enum L: long N := -9223372036854775808L; end L; "
         "class C public static method Main(): int "
-        "  return (0 if long(L.N) = -9223372036854775808L else 1); "
+        "  return (if long(L.N) = -9223372036854775808L then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -360,7 +360,7 @@ BEZEL_TEST(enum_underlying_749, ulong_max_value_accepted) {
         "module M; "
         "enum U: ulong Max := 18446744073709551615UL; end U; "
         "class C public static method Main(): int "
-        "  return (0 if ulong(U.Max) = 18446744073709551615UL else 1); "
+        "  return (if ulong(U.Max) = 18446744073709551615UL then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -373,7 +373,7 @@ BEZEL_TEST(enum_underlying_749, long_min_value_literal_accepted) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x: long := -9223372036854775808L; "
-        "  return (0 if x = -9223372036854775808L else 1); "
+        "  return (if x = -9223372036854775808L then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -409,7 +409,7 @@ BEZEL_TEST(enum_underlying_1189, unsigned_enum_relational_compare_nullable) {
         "enum Code: byte Lo := 10, Hi := 200; end Code; "
         "class C public static method Main(): int "
         "  var a: Code? := Code.Lo; var b: Code? := Code.Hi; "
-        "  return (0 if a < b else 1); "
+        "  return (if a < b then 0 else 1); "
         "end Main; end C;"), 0);
 }
 

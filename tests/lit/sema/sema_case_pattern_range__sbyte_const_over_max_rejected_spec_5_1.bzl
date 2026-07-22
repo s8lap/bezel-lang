@@ -6,7 +6,7 @@
 // A negative constant that underflows the (unsigned) byte range is rejected. A
 // signed `sbyte` scrutinee with 200 (> 127) is likewise rejected. #1153.
 
-module M; class C public static method M(x: sbyte): int return case x of 200 => 1, _ => 0 end; end M; end C;
+module M; class C public static method M(x: sbyte): int return (case x of 200 => 1, _ => 0); end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: the `case` pattern constant `200` has a type that is not implicitly convertible to the scrutinee type
 // CHECK-SAME: (§5.1)

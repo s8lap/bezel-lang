@@ -7,7 +7,7 @@
 // the case's common type is `int?`. Returning it from an `int`-returning method
 // is a §7 nullable-into-non-nullable error — NOT a compiler crash.
 
-module M; class C public static method Main(): int var x: int? := 1; return case x of null => 0, var n => n end; end Main; end C;
+module M; class C public static method Main(): int var x: int? := 1; return (case x of null => 0, var n => n); end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: the returned value is nullable but the target type is non-nullable
 // CHECK-SAME: (§7)

@@ -47,7 +47,7 @@ const char* kClassCase =
     "class Dog    public method K(): int return 2; end K; end Dog; "
     "class P "
     "  public static method Case(o: Object): int "
-    "    return case o of Animal => 2, _ => 9 end; "
+    "    return (case o of Animal => 2, _ => 9); "
     "  end Case; "
     "end P; ";
 
@@ -58,7 +58,7 @@ const char* kClassBind =
     "class Dog    public method K(): int return 2; end K; end Dog; "
     "class P "
     "  public static method Bind(o: Object): int "
-    "    return case o of var x: Animal => 2, _ => 9 end; "
+    "    return (case o of var x: Animal => 2, _ => 9); "
     "  end Bind; "
     "end P; ";
 
@@ -70,7 +70,7 @@ const char* kIfaceCase =
     "class Plain  public method P(): int return 0; end P; end Plain; "
     "class P "
     "  public static method Case(o: Object): int "
-    "    return case o of IShape => 2, _ => 9 end; "
+    "    return (case o of IShape => 2, _ => 9); "
     "  end Case; "
     "end P; ";
 
@@ -80,7 +80,7 @@ const char* kRecordCase =
     "record Pt(x: int, y: int); "
     "class P "
     "  public static method Case(o: Object): int "
-    "    return case o of Pt(a, b) => a + b, _ => 9 end; "
+    "    return (case o of Pt(a, b) => a + b, _ => 9); "
     "  end Case; "
     "end P; ";
 }  // namespace

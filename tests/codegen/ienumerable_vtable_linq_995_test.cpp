@@ -142,7 +142,7 @@ BEZEL_TEST(ienumerable_vtable_linq_995, sum_on_interface_typed_local) {
 BEZEL_TEST(ienumerable_vtable_linq_995, any_on_yield_method_result) {
     BEZEL_EXPECT_EQ(run(std::string(kSeq) +
         "  public static method Main(): int "
-        "    return 1 if P.Seq().Any() else 0; "
+        "    return (if P.Seq().Any() then 1 else 0); "
         "  end Main; end P;"), 1);
 }
 

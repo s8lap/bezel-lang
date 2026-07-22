@@ -35,7 +35,7 @@ BEZEL_TEST(case_incompatible_type_pattern, class_pattern_on_int_never_matches) {
         "class Box private _x: int := 0; destructor end destructor; end Box; "
         "class C public static method Main(): int "
         "  var n: int := 5; "
-        "  return case n of  Box => 1, _ => 0 end; "  // 0
+        "  return (case n of  Box => 1, _ => 0); "  // 0
         "end Main; end C;"), 0);
 }
 
@@ -46,7 +46,7 @@ BEZEL_TEST(case_incompatible_type_pattern, class_pattern_on_string_never_matches
         "class Animal private _x: int := 0; destructor end destructor; end Animal; "
         "class C public static method Main(): int "
         "  var s: string := \"hello\"; "
-        "  return case s of  Animal => 1, _ => 0 end; "  // 0
+        "  return (case s of  Animal => 1, _ => 0); "  // 0
         "end Main; end C;"), 0);
 }
 
@@ -56,7 +56,7 @@ BEZEL_TEST(case_incompatible_type_pattern, primitive_pattern_mismatch_no_match) 
         "module M; "
         "class C public static method Main(): int "
         "  var x: int := 42; "
-        "  return case x of  string => 1, _ => 0 end; "  // 0
+        "  return (case x of  string => 1, _ => 0); "  // 0
         "end Main; end C;"), 0);
 }
 
@@ -71,6 +71,6 @@ BEZEL_TEST(case_incompatible_type_pattern, valid_object_to_class_test_still_matc
         "class C public static method Main(): int "
         "  using var b := new Box(7); "
         "  var o: Object := b; "
-        "  return case o of  Box => 1, _ => 0 end; "  // 1
+        "  return (case o of  Box => 1, _ => 0); "  // 1
         "end Main; end C;"), 1);
 }

@@ -383,7 +383,7 @@ BEZEL_TEST(collections_r9, queue_trydequeue_725) {
         "  q.Enqueue(5); q.Enqueue(7); "
         "  var item: int? := null; "  // v0.171 (#1336): TryDequeue out is T?
         "  var ok := q.TryDequeue(out item); "      // front=5
-        "  return (1 if (ok and item = 5 and q.Count = 1) else 0); "
+        "  return (if (ok and item = 5 and q.Count = 1) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -395,6 +395,6 @@ BEZEL_TEST(collections_r9, stack_queue_trypeek_no_removal_725) {
         "  var top: int? := null; var ok := s.TryPeek(out top); "  // top=20, kept
         "  using var q := new Queue<int>(); q.Enqueue(3); q.Enqueue(4); "
         "  var front: int? := null; var ok2 := q.TryPeek(out front); "  // front=3, kept
-        "  return (1 if (top = 20 and s.Count = 2 and front = 3 and q.Count = 2) else 0); "
+        "  return (if (top = 20 and s.Count = 2 and front = 3 and q.Count = 2) then 1 else 0); "
         "end Main; end C;"), 1);
 }

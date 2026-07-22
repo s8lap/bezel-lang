@@ -112,7 +112,7 @@ BEZEL_TEST(array_getenumerator_1002, repro_a_inferred_movenext_spec_29_3) {
         "  arr.Add(5); arr.Add(6); "
         "  using var e := arr.GetEnumerator(); "
         "  var ok := e.MoveNext(); "
-        "  return 1 if ok else 0; "
+        "  return (if ok then 1 else 0); "
         "end Main; end P;"), 1);
 }
 
@@ -127,7 +127,7 @@ BEZEL_TEST(array_getenumerator_1002, repro_b_explicit_bool_movenext_spec_29_3) {
         "  arr.Add(5); arr.Add(6); "
         "  using var e := arr.GetEnumerator(); "
         "  var ok: bool := e.MoveNext(); "
-        "  return 1 if ok else 0; "
+        "  return (if ok then 1 else 0); "
         "end Main; end P;"), 1);
 }
 

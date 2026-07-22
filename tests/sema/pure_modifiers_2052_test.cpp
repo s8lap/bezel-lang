@@ -76,7 +76,7 @@ BEZEL_TEST(pure_modifiers_2052, pure_checked_signature_accepted_spec_22_15) {
         "module M; "
         "class C "
         "  public static pure method Checked(x: int, low: int, high: int): int "
-        "    return low if x < low else (high if x > high else x); "
+        "    return (if x < low then low else (if x > high then high else x)); "
         "  end Checked; "
         "end C;");
     // Body-rule check is Slice 2; the signature is fine.

@@ -26,26 +26,26 @@ int run(const std::string& body) {
 BEZEL_TEST(codegen_cg28, constant_match) {
     BEZEL_EXPECT_EQ(run(
         "var x := 2; "
-        "var r := case x of 1 => 10, 2 => 20, 3 => 30 end; return r;"), 20);
+        "var r := (case x of 1 => 10, 2 => 20, 3 => 30); return r;"), 20);
 }
 
 BEZEL_TEST(codegen_cg28, first_arm_match) {
     BEZEL_EXPECT_EQ(run(
         "var x := 1; "
-        "var r := case x of 1 => 10, 2 => 20 end; return r;"), 10);
+        "var r := (case x of 1 => 10, 2 => 20); return r;"), 10);
 }
 
 BEZEL_TEST(codegen_cg28, constant_alternatives) {
     // One arm listing several constants matches any of them.
     BEZEL_EXPECT_EQ(run(
         "var x := 3; "
-        "var r := case x of 1 | 2 | 3 => 99, 4 => 0 end; return r;"), 99);
+        "var r := (case x of 1 | 2 | 3 => 99, 4 => 0); return r;"), 99);
 }
 
 BEZEL_TEST(codegen_cg28, discard_is_catch_all) {
     BEZEL_EXPECT_EQ(run(
         "var x := 42; "
-        "var r := case x of 1 => 1, _ => 7 end; return r;"), 7);
+        "var r := (case x of 1 => 1, _ => 7); return r;"), 7);
 }
 
 // NOTE: relational-operator patterns (`< EXPR`, `>= EXPR`) and range /
@@ -57,18 +57,17 @@ BEZEL_TEST(codegen_cg28, guard) {
     // A `when` guard refining a constant pattern (guard uses an outer var).
     BEZEL_EXPECT_EQ(run(
         "var x := 2; var y := 1; "
-        "var r := case x of "
+        "var r := (case x of "
         "  2 when y > 0 => 50, "
         "  2 => 60, "
-        "  _ => 0 "
-        "end; return r;"), 50);
+        "  _ => 0); return r;"), 50);
 }
 
 BEZEL_TEST(codegen_cg28, no_match_raises_match_failure) {
     // No arm matches and there is no discard → MatchFailureException.
     BEZEL_EXPECT_EQ(run(
         "var x := 9; "
-        "try var r := case x of 1 => 10, 2 => 20 end; return r; "
+        "try var r := (case x of 1 => 10, 2 => 20); return r; "
         "catch MatchFailureException => return 77; end;"), 77);
 }
 
@@ -76,33 +75,33 @@ BEZEL_TEST(codegen_cg28, no_match_raises_match_failure) {
 BEZEL_TEST(codegen_cg28, range_pattern_hit) {
     BEZEL_EXPECT_EQ(run(
         "var x := 5; "
-        "var r := case x of 1..3 => 1, 4..6 => 2, _ => 3 end; return r;"), 2);
+        "var r := (case x of 1..3 => 1, 4..6 => 2, _ => 3); return r;"), 2);
 }
 
 BEZEL_TEST(codegen_cg28, range_pattern_low_arm) {
     BEZEL_EXPECT_EQ(run(
         "var x := 2; "
-        "var r := case x of 1..3 => 1, 4..6 => 2, _ => 3 end; return r;"), 1);
+        "var r := (case x of 1..3 => 1, 4..6 => 2, _ => 3); return r;"), 1);
 }
 
 BEZEL_TEST(codegen_cg28, range_pattern_wildcard_fallthrough) {
     BEZEL_EXPECT_EQ(run(
         "var x := 9; "
-        "var r := case x of 1..3 => 1, 4..6 => 2, _ => 3 end; return r;"), 3);
+        "var r := (case x of 1..3 => 1, 4..6 => 2, _ => 3); return r;"), 3);
 }
 
 BEZEL_TEST(codegen_cg28, range_pattern_half_open) {
     // `..<` excludes the upper bound.
     BEZEL_EXPECT_EQ(run(
         "var x := 6; "
-        "var r := case x of 1..<6 => 1, 6..10 => 2, _ => 0 end; return r;"), 2);
+        "var r := (case x of 1..<6 => 1, 6..10 => 2, _ => 0); return r;"), 2);
 }
 
 BEZEL_TEST(codegen_cg28, range_pattern_combined_with_constant) {
     // A range pattern and a constant pattern in the same case.
     BEZEL_EXPECT_EQ(run(
         "var x := 0; "
-        "var r := case x of 0 => 10, 1..5 => 20, _ => 30 end; return r;"), 10);
+        "var r := (case x of 0 => 10, 1..5 => 20, _ => 30); return r;"), 10);
 }
 
 // CG28b / CG38b: binding patterns (`var n`) in case expressions / statements.
@@ -113,28 +112,28 @@ BEZEL_TEST(codegen_cg28b, binding_pattern_basic) {
     // `var n` always matches; `n` should equal the scrutinee (5).
     BEZEL_EXPECT_EQ(run(
         "var x := 5; "
-        "var r := case x of var n => n end; return r;"), 5);
+        "var r := (case x of var n => n); return r;"), 5);
 }
 
 BEZEL_TEST(codegen_cg28b, binding_pattern_with_arithmetic) {
     // Body can compute with the bound name.
     BEZEL_EXPECT_EQ(run(
         "var x := 7; "
-        "var r := case x of var n => n + 1 end; return r;"), 8);
+        "var r := (case x of var n => n + 1); return r;"), 8);
 }
 
 BEZEL_TEST(codegen_cg28b, binding_pattern_after_non_match) {
     // A binding pattern following unmatched constant arms catches the value.
     BEZEL_EXPECT_EQ(run(
         "var x := 9; "
-        "var r := case x of 1 => 0, 2 => 0, var n => n * 2 end; return r;"), 18);
+        "var r := (case x of 1 => 0, 2 => 0, var n => n * 2); return r;"), 18);
 }
 
 BEZEL_TEST(codegen_cg28b, binding_pattern_with_guard_true) {
     // A `when` guard can reference the bound name; guard passes.
     BEZEL_EXPECT_EQ(run(
         "var x := 4; "
-        "var r := case x of var n when n > 2 => n + 10, _ => 0 end; return r;"),
+        "var r := (case x of var n when n > 2 => n + 10, _ => 0); return r;"),
         14);
 }
 
@@ -142,7 +141,7 @@ BEZEL_TEST(codegen_cg28b, binding_pattern_with_guard_false) {
     // Guard fails → fall through to wildcard.
     BEZEL_EXPECT_EQ(run(
         "var x := 1; "
-        "var r := case x of var n when n > 2 => n + 10, _ => 99 end; return r;"),
+        "var r := (case x of var n when n > 2 => n + 10, _ => 99); return r;"),
         99);
 }
 
@@ -167,10 +166,9 @@ BEZEL_TEST(codegen_cg28_destructure, record_case_expr_sum_fields) {
         "record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var p := new Point(3, 4); "
-        "  return case p of "
+        "  return (case p of "
         "    Point(x, y) => x + y, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 7);
 }
 
@@ -181,10 +179,9 @@ BEZEL_TEST(codegen_cg28_destructure, record_case_expr_first_field) {
         "record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var p := new Point(10, 20); "
-        "  return case p of "
+        "  return (case p of "
         "    Point(x, y) => x, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 10);
 }
 
@@ -195,10 +192,9 @@ BEZEL_TEST(codegen_cg28_destructure, record_case_expr_second_field) {
         "record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var p := new Point(10, 20); "
-        "  return case p of "
+        "  return (case p of "
         "    Point(x, y) => y, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 20);
 }
 
@@ -211,10 +207,9 @@ BEZEL_TEST(codegen_cg28_destructure, record_case_expr_fallthrough_discard) {
         "record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var p := new Point(5, 6); "
-        "  return case p of "
+        "  return (case p of "
         "    Point(x, y) => x * y, "
-        "    _ => -1 "
-        "  end; "
+        "    _ => -1); "
         "end Main; end C;"), 30);
 }
 
@@ -231,10 +226,9 @@ BEZEL_TEST(codegen_cg28_destructure, const_then_binding) {
         "module M; record Pair(a: int, b: int); "
         "class C public static method Main(): int "
         "  var p := new Pair(0, 7); "
-        "  return case p of "
+        "  return (case p of "
         "    Pair(0, b) => b, "
-        "    _ => -1 "
-        "  end; "
+        "    _ => -1); "
         "end Main; end C;"), 7);
 }
 
@@ -244,10 +238,9 @@ BEZEL_TEST(codegen_cg28_destructure, const_then_binding_no_match) {
         "module M; record Pair(a: int, b: int); "
         "class C public static method Main(): int "
         "  var p := new Pair(5, 7); "
-        "  Console.WriteLine(case p of "
+        "  Console.WriteLine((case p of "
         "    Pair(0, b) => b, "
-        "    _ => -1 "
-        "  end); return 0; "
+        "    _ => -1)); return 0; "
         "end Main; end C;"), "-1");
 }
 
@@ -257,10 +250,9 @@ BEZEL_TEST(codegen_cg28_destructure, binding_then_const) {
         "module M; record Pair(a: int, b: int); "
         "class C public static method Main(): int "
         "  var p := new Pair(3, 0); "
-        "  return case p of "
+        "  return (case p of "
         "    Pair(a, 0) => a, "
-        "    _ => -1 "
-        "  end; "
+        "    _ => -1); "
         "end Main; end C;"), 3);
 }
 
@@ -270,10 +262,9 @@ BEZEL_TEST(codegen_cg28_destructure, both_const_no_match) {
         "module M; record Pair(a: int, b: int); "
         "class C public static method Main(): int "
         "  var p := new Pair(3, 4); "
-        "  return case p of "
+        "  return (case p of "
         "    Pair(0, 0) => 99, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 0);
 }
 
@@ -292,7 +283,7 @@ BEZEL_TEST(codegen_cg28_destructure, both_const_no_match) {
 BEZEL_TEST(codegen_cg28, throw_arm_value_path) {
     BEZEL_EXPECT_EQ(run(
         "var c := true; "
-        "var x := case c of true => 7, _ => throw new Exception(\"e\") end; "
+        "var x := (case c of true => 7, _ => throw new Exception(\"e\")); "
         "return x;"), 7);
 }
 
@@ -302,7 +293,7 @@ BEZEL_TEST(codegen_cg28, throw_arm_throw_path) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
         "  public static method Helper(c: bool): int "
-        "    return case c of true => 7, _ => throw new Exception(\"e\") end; "
+        "    return (case c of true => 7, _ => throw new Exception(\"e\")); "
         "  end Helper; "
         "  public static method Main(): int "
         "    try return Helper(false); "
@@ -318,7 +309,7 @@ BEZEL_TEST(codegen_cg28, throw_arm_throw_path) {
 BEZEL_TEST(codegen_cg28, throw_arm_first_value_path) {
     BEZEL_EXPECT_EQ(run(
         "var c := false; "
-        "var x := case c of true => throw new Exception(\"e\"), _ => 8 end; "
+        "var x := (case c of true => throw new Exception(\"e\"), _ => 8); "
         "return x;"), 8);
 }
 
@@ -340,10 +331,9 @@ BEZEL_TEST(codegen_cg28, all_arms_throw_diverges) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
         "  public static method Helper(c: bool): int "
-        "    return case c of "
+        "    return (case c of "
         "      true => throw new Exception(\"a\"), "
-        "      _ => throw new Exception(\"b\") "
-        "    end; "
+        "      _ => throw new Exception(\"b\")); "
         "  end Helper; "
         "  public static method Main(): int "
         "    try return Helper(true); "
@@ -363,8 +353,8 @@ BEZEL_TEST(codegen_cg28, numeric_widening_long_arm) {
         "module M; class C "
         "  public static method Main(): int "
         "    var c := false; "
-        "    var hi: long := case c of true => 5, _ => 9000000000L end; "
-        "    return 1 if hi = 9000000000L else 0; "
+        "    var hi: long := (case c of true => 5, _ => 9000000000L); "
+        "    return (if hi = 9000000000L then 1 else 0); "
         "  end Main; "
         "end C;"), 1);
 }
@@ -376,8 +366,8 @@ BEZEL_TEST(codegen_cg28, numeric_widening_int_arm) {
         "module M; class C "
         "  public static method Main(): int "
         "    var c := true; "
-        "    var v: long := case c of true => 5, _ => 9000000000L end; "
-        "    return 1 if v = 5L else 0; "
+        "    var v: long := (case c of true => 5, _ => 9000000000L); "
+        "    return (if v = 5L then 1 else 0); "
         "  end Main; "
         "end C;"), 1);
 }
@@ -391,10 +381,9 @@ BEZEL_TEST(codegen_cg28, incompatible_value_arms_is_type_error) {
         "module M; class N end N; class C "
         "  public static method Main(): int "
         "    var x := new N(); "
-        "    var y := case 1 of "
+        "    var y := (case 1 of "
         "      1 => 5, "
-        "      _ => x "
-        "    end; "
+        "      _ => x); "
         "    return 0; "
         "  end Main; "
         "end C;");
@@ -407,7 +396,7 @@ BEZEL_TEST(codegen_cg28, incompatible_value_arms_is_type_error) {
 BEZEL_TEST(codegen_cg28, control_all_value_arms_same_type) {
     BEZEL_EXPECT_EQ(run(
         "var x := 2; "
-        "var r := case x of 1 => 10, 2 => 20, _ => 30 end; return r;"), 20);
+        "var r := (case x of 1 => 10, 2 => 20, _ => 30); return r;"), 20);
 }
 
 // ── §19 / §7 / issues #447 + #448: case over nullable VALUE types ─────────────
@@ -423,32 +412,29 @@ BEZEL_TEST(codegen_cg28, control_all_value_arms_same_type) {
 BEZEL_TEST(codegen_cg28_nullable_value_case, int_nullable_value_arm_spec_19_7_issue_447) {
     BEZEL_EXPECT_EQ(run(
         "var x: int? := 42; "
-        "var r := case x of "
+        "var r := (case x of "
         "  42 => 1, "
         "  null => 2, "
-        "  _ => 3 "
-        "end; return r;"), 1);
+        "  _ => 3); return r;"), 1);
 }
 
 // #447: null arm selected when x: int? = null
 BEZEL_TEST(codegen_cg28_nullable_value_case, int_nullable_null_arm_spec_19_7_issue_447) {
     BEZEL_EXPECT_EQ(run(
         "var x: int? := null; "
-        "var r := case x of "
+        "var r := (case x of "
         "  42 => 1, "
         "  null => 2, "
-        "  _ => 3 "
-        "end; return r;"), 2);
+        "  _ => 3); return r;"), 2);
 }
 
 // #447: _ arm fires when no constant or null arm matches
 BEZEL_TEST(codegen_cg28_nullable_value_case, int_nullable_discard_arm_spec_19_7_issue_447) {
     BEZEL_EXPECT_EQ(run(
         "var x: int? := 7; "
-        "var r := case x of "
+        "var r := (case x of "
         "  42 => 1, "
-        "  _ => 99 "
-        "end; return r;"), 99);
+        "  _ => 99); return r;"), 99);
 }
 
 // #447: nullable enum case — value arm selected (Color.Green)
@@ -458,12 +444,11 @@ BEZEL_TEST(codegen_cg28_nullable_value_case, enum_nullable_value_arm_spec_19_8_i
         "enum Color Red := 0, Green := 1, Blue := 2; end Color; "
         "class C public static method Main(): int "
         "  var c: Color? := Color.Green; "
-        "  return case c of "
+        "  return (case c of "
         "    Color.Green => 10, "
         "    Color.Red => 20, "
         "    null => 30, "
-        "    _ => 40 "
-        "  end; "
+        "    _ => 40); "
         "end Main; end C;"), 10);
 }
 
@@ -474,11 +459,10 @@ BEZEL_TEST(codegen_cg28_nullable_value_case, enum_nullable_null_arm_spec_19_8_is
         "enum Color Red := 0, Green := 1, Blue := 2; end Color; "
         "class C public static method Main(): int "
         "  var c: Color? := null; "
-        "  return case c of "
+        "  return (case c of "
         "    Color.Green => 10, "
         "    null => 30, "
-        "    _ => 40 "
-        "  end; "
+        "    _ => 40); "
         "end Main; end C;"), 30);
 }
 
@@ -489,11 +473,10 @@ BEZEL_TEST(codegen_cg28_nullable_value_case, enum_nullable_discard_arm_spec_19_8
         "enum Color Red := 0, Green := 1, Blue := 2; end Color; "
         "class C public static method Main(): int "
         "  var c: Color? := Color.Blue; "
-        "  return case c of "
+        "  return (case c of "
         "    Color.Green => 10, "
         "    null => 30, "
-        "    _ => 99 "
-        "  end; "
+        "    _ => 99); "
         "end Main; end C;"), 99);
 }
 
@@ -501,7 +484,7 @@ BEZEL_TEST(codegen_cg28_nullable_value_case, enum_nullable_discard_arm_spec_19_8
 BEZEL_TEST(codegen_cg28_nullable_value_case, nonnull_int_case_regression) {
     BEZEL_EXPECT_EQ(run(
         "var x := 5; "
-        "var r := case x of 5 => 1, _ => 0 end; return r;"), 1);
+        "var r := (case x of 5 => 1, _ => 0); return r;"), 1);
 }
 
 // REGRESSION: non-nullable enum case still works after the fix
@@ -511,11 +494,10 @@ BEZEL_TEST(codegen_cg28_nullable_value_case, nonnull_enum_case_regression) {
         "enum Color Red := 0, Green := 1, Blue := 2; end Color; "
         "class C public static method Main(): int "
         "  var c: Color := Color.Red; "
-        "  return case c of "
+        "  return (case c of "
         "    Color.Green => 10, "
         "    Color.Red => 20, "
-        "    _ => 30 "
-        "  end; "
+        "    _ => 30); "
         "end Main; end C;"), 20);
 }
 
@@ -541,10 +523,9 @@ BEZEL_TEST(codegen_cg28_473, type_pattern_arm_hit_spec_19_3) {
         "class C public static method Main(): int "
         "  using var d := new Dog(); "
         "  var a: Animal := d; "
-        "  return case a of "
+        "  return (case a of "
         "    Dog => 1, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 1);
 }
 
@@ -559,10 +540,9 @@ BEZEL_TEST(codegen_cg28_473, type_pattern_arm_no_match_falls_to_discard) {
         "class C public static method Main(): int "
         "  using var c := new Cat(); "
         "  var a: Animal := c; "
-        "  return case a of "
+        "  return (case a of "
         "    Dog => 1, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 0);
 }
 
@@ -575,10 +555,9 @@ BEZEL_TEST(codegen_cg28_473, type_pattern_subtype_matches_base_spec_19_3) {
         "class C public static method Main(): int "
         "  using var d := new Dog(); "
         "  var a: Animal := d; "
-        "  return case a of "
+        "  return (case a of "
         "    Animal => 1, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 1);
 }
 
@@ -594,11 +573,10 @@ BEZEL_TEST(codegen_cg28_473, binding_then_type_pattern_bound_value_used_spec_19_
         "class C public static method Main(): int "
         "  using var d := new Dog(); "
         "  var a: Animal := d; "
-        "  return case a of "
+        "  return (case a of "
         "    var x: Dog => x.Tag(), "
         "    Dog => 2, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 11);
 }
 
@@ -615,11 +593,10 @@ BEZEL_TEST(codegen_cg28_473, binding_with_guard_false_falls_through_spec_19_4) {
         "class C public static method Main(): int "
         "  using var d := new Dog(); "
         "  var a: Animal := d; "
-        "  return case a of "
+        "  return (case a of "
         "    var x: Dog when x.Size() > 5 => 1, "
         "    Dog => 2, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 2);
 }
 
@@ -635,11 +612,10 @@ BEZEL_TEST(codegen_cg28_473, binding_with_guard_true_selects_arm_spec_19_4) {
         "class C public static method Main(): int "
         "  using var d := new Dog(); "
         "  var a: Animal := d; "
-        "  return case a of "
+        "  return (case a of "
         "    var x: Dog when x.Size() < 5 => x.Size() + 10, "
         "    Dog => 2, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 13);
 }
 
@@ -655,11 +631,10 @@ BEZEL_TEST(codegen_cg28_473, null_then_binding_nonnull_ref_spec_19_5) {
         "class C public static method Main(): int "
         "  using var d := new Dog(); "
         "  var a: Animal? := d; "
-        "  return case a of "
+        "  return (case a of "
         "    null => 5, "
         "    var x: Dog => 7, "
-        "    _ => 9 "
-        "  end; "
+        "    _ => 9); "
         "end Main; end C;"), 7);
 }
 
@@ -672,11 +647,10 @@ BEZEL_TEST(codegen_cg28_473, null_then_binding_null_ref_spec_19_5) {
         "class Dog : Animal end Dog; "
         "class C public static method Main(): int "
         "  var a: Animal? := null; "
-        "  return case a of "
+        "  return (case a of "
         "    null => 5, "
         "    var x: Dog => 7, "
-        "    _ => 9 "
-        "  end; "
+        "    _ => 9); "
         "end Main; end C;"), 5);
 }
 
@@ -687,7 +661,7 @@ BEZEL_TEST(codegen_cg28_473, null_then_binding_null_ref_spec_19_5) {
 BEZEL_TEST(codegen_cg28_473, constant_then_primitive_binding_spec_19_3) {
     BEZEL_EXPECT_EQ(run(
         "var a: int := 5; "
-        "var r := case a of 0 => 100, var v: int => v end; return r;"), 5);
+        "var r := (case a of 0 => 100, var v: int => v); return r;"), 5);
 }
 
 // #473 B2 variant: the constant arm HITS (scrutinee 0) — the primitive
@@ -695,7 +669,7 @@ BEZEL_TEST(codegen_cg28_473, constant_then_primitive_binding_spec_19_3) {
 BEZEL_TEST(codegen_cg28_473, constant_then_primitive_binding_const_hit_spec_19_3) {
     BEZEL_EXPECT_EQ(run(
         "var a: int := 0; "
-        "var r := case a of 0 => 100, var v: int => v end; return r;"), 100);
+        "var r := (case a of 0 => 100, var v: int => v); return r;"), 100);
 }
 
 // #473: a bare primitive type pattern `int` (TypePattern) on an int scrutinee.
@@ -704,7 +678,7 @@ BEZEL_TEST(codegen_cg28_473, constant_then_primitive_binding_const_hit_spec_19_3
 BEZEL_TEST(codegen_cg28_473, bare_primitive_type_pattern_spec_19_3) {
     BEZEL_EXPECT_EQ(run(
         "var a: int := 9; "
-        "var r := case a of 0 => 1, int => 42, _ => 0 end; return r;"), 42);
+        "var r := (case a of 0 => 1, int => 42, _ => 0); return r;"), 42);
 }
 
 // #473 mixed: 3+ arms with a TYPE pattern in the MIDDLE — exercises the merge
@@ -720,12 +694,11 @@ BEZEL_TEST(codegen_cg28_473, type_pattern_in_middle_arm_spec_19_3) {
         "class C public static method Main(): int "
         "  using var c := new Cat(); "
         "  var a: Animal := c; "
-        "  return case a of "
+        "  return (case a of "
         "    Dog => 1, "
         "    Cat => 2, "
         "    Fish => 3, "
-        "    _ => 4 "
-        "  end; "
+        "    _ => 4); "
         "end Main; end C;"), 2);
 }
 
@@ -734,7 +707,7 @@ BEZEL_TEST(codegen_cg28_473, type_pattern_in_middle_arm_spec_19_3) {
 BEZEL_TEST(codegen_cg28_473, regression_constant_discard_case_still_works) {
     BEZEL_EXPECT_EQ(run(
         "var x := 2; "
-        "var r := case x of 1 => 10, 2 => 20, _ => 30 end; return r;"), 20);
+        "var r := (case x of 1 => 10, 2 => 20, _ => 30); return r;"), 20);
 }
 
 // #473 REGRESSION: the case STATEMENT form with a type-test pattern still
@@ -766,10 +739,9 @@ BEZEL_TEST(codegen_cg28_473, regression_case_statement_type_pattern_still_works)
 BEZEL_TEST(codegen_cg28, relational_pattern_variable_operand_726) {
     BEZEL_EXPECT_EQ(run(
         "var limit := 5; var x := 7; "
-        "var r := case x of "
+        "var r := (case x of "
         "    > limit => 1, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "return r;"), 1);
 }
 
@@ -777,11 +749,10 @@ BEZEL_TEST(codegen_cg28, relational_pattern_variable_operand_726) {
 BEZEL_TEST(codegen_cg28, relational_pattern_ge_lt_variable_726) {
     BEZEL_EXPECT_EQ(run(
         "var lo := 10; var x := 3; "
-        "var r := case x of "
+        "var r := (case x of "
         "    >= lo => 100, "
         "    < lo => 7, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "return r;"), 7);  // 3 < 10
 }
 
@@ -791,10 +762,9 @@ BEZEL_TEST(codegen_cg28, relational_pattern_ge_lt_variable_726) {
 BEZEL_TEST(codegen_cg28, trailing_open_range_pattern_726) {
     BEZEL_EXPECT_EQ(run(
         "var x := 80; "
-        "var r := case x of "
+        "var r := (case x of "
         "    80.. => 2, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "return r;"), 2);  // 80 >= 80
 }
 
@@ -802,10 +772,9 @@ BEZEL_TEST(codegen_cg28, trailing_open_range_pattern_726) {
 BEZEL_TEST(codegen_cg28, trailing_open_range_boundary_726) {
     BEZEL_EXPECT_EQ(run(
         "var x := 31; "
-        "var r := case x of "
+        "var r := (case x of "
         "    31.. => 9, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "return r;"), 9);
 }
 
@@ -817,10 +786,9 @@ BEZEL_TEST(codegen_cg28, trailing_open_range_boundary_726) {
 BEZEL_TEST(codegen_cg28, leading_open_exclusive_range_pattern_744) {
     BEZEL_EXPECT_EQ(run(
         "var x := -3; "
-        "var r := case x of "
+        "var r := (case x of "
         "    ..<0 => 1, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "return r;"), 1);  // -3 < 0
 }
 
@@ -828,10 +796,9 @@ BEZEL_TEST(codegen_cg28, leading_open_exclusive_range_pattern_744) {
 BEZEL_TEST(codegen_cg28, leading_open_exclusive_boundary_744) {
     BEZEL_EXPECT_EQ(run(
         "var x := 0; "
-        "var r := case x of "
+        "var r := (case x of "
         "    ..<0 => 1, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "return r;"), 0);  // 0 is not < 0
 }
 
@@ -840,10 +807,9 @@ BEZEL_TEST(codegen_cg28, leading_open_exclusive_boundary_744) {
 BEZEL_TEST(codegen_cg28, leading_open_inclusive_boundary_744) {
     BEZEL_EXPECT_EQ(run(
         "var x := 5; "
-        "var r := case x of "
+        "var r := (case x of "
         "    ..5 => 7, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "return r;"), 7);  // 5 <= 5
 }
 
@@ -853,11 +819,10 @@ BEZEL_TEST(codegen_cg28, leading_open_inclusive_boundary_744) {
 BEZEL_TEST(codegen_cg28, leading_open_first_arm_not_swallowed_744) {
     BEZEL_EXPECT_EQ(run(
         "var x := 3; "
-        "var r := case x of "
+        "var r := (case x of "
         "    ..<10 => 1, "
         "    10.. => 2, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "return r;"), 1);  // 3 < 10
 }
 
@@ -868,7 +833,7 @@ BEZEL_TEST(codegen_cg28, step_in_range_pattern_rejected_738) {
     JitResult r = runAot(
         "module M; class C public static method Main(): int "
         "  var x := 4; "
-        "  var r := case x of 0..10 step 2 => 1, _ => 0 end; "
+        "  var r := (case x of 0..10 step 2 => 1, _ => 0); "
         "  return r; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -889,7 +854,7 @@ BEZEL_TEST(codegen_cg28, discard_not_last_arm_rejected_738) {
     JitResult r = runAot(
         "module M; class C public static method Main(): int "
         "  var x := 5; "
-        "  var r := case x of _ => 0, 1 => 1, 5 => 5 end; "
+        "  var r := (case x of _ => 0, 1 => 1, 5 => 5); "
         "  return r; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -901,7 +866,7 @@ BEZEL_TEST(codegen_cg28, discard_not_last_arm_rejected_738) {
 BEZEL_TEST(codegen_cg28, guarded_discard_before_last_ok_738) {
     BEZEL_EXPECT_EQ(run(
         "var x := 5; "
-        "var r := case x of _ when x > 100 => 0, 5 => 5, _ => 9 end; "
+        "var r := (case x of _ when x > 100 => 0, 5 => 5, _ => 9); "
         "return r;"), 5);
 }
 
@@ -911,13 +876,13 @@ BEZEL_TEST(codegen_cg28, guarded_discard_before_last_ok_738) {
 BEZEL_TEST(codegen_cg28, typed_binding_over_nullable_value_738) {
     BEZEL_EXPECT_EQ(run(
         "var x: int? := 5; "
-        "var r := case x of var n: int => n, _ => 99 end; "
+        "var r := (case x of var n: int => n, _ => 99); "
         "return r;"), 5);  // present → bound unwrapped
 }
 BEZEL_TEST(codegen_cg28, typed_binding_over_nullable_value_null_738) {
     BEZEL_EXPECT_EQ(run(
         "var x: int? := null; "
-        "var r := case x of var n: int => n, _ => 99 end; "
+        "var r := (case x of var n: int => n, _ => 99); "
         "return r;"), 99);  // §19.5: typed binding never matches null
 }
 
@@ -927,13 +892,13 @@ BEZEL_TEST(codegen_cg28, typed_binding_over_nullable_value_null_738) {
 BEZEL_TEST(codegen_cg28, range_pattern_over_nullable_value_738) {
     BEZEL_EXPECT_EQ(run(
         "var x: int? := 5; "
-        "var r := case x of null => 0, 5..10 => 1, _ => 2 end; "
+        "var r := (case x of null => 0, 5..10 => 1, _ => 2); "
         "return r;"), 1);
 }
 BEZEL_TEST(codegen_cg28, range_pattern_over_nullable_value_null_738) {
     BEZEL_EXPECT_EQ(run(
         "var x: int? := null; "
-        "var r := case x of null => 0, 5..10 => 1, _ => 2 end; "
+        "var r := (case x of null => 0, 5..10 => 1, _ => 2); "
         "return r;"), 0);  // null arm wins
 }
 
@@ -950,62 +915,62 @@ BEZEL_TEST(codegen_cg28, neg_range_pos_range_regression_1233) {
     // 7 ∈ [6..10] → 1
     BEZEL_EXPECT_EQ(run(
         "var x := 7; "
-        "return case x of 6..10 => 1, _ => 0 end;"), 1);
+        "return (case x of 6..10 => 1, _ => 0);"), 1);
 }
 BEZEL_TEST(codegen_cg28, neg_range_pos_range_regression_miss_1233) {
     // 5 ∉ [6..10] → 0
     BEZEL_EXPECT_EQ(run(
         "var x := 5; "
-        "return case x of 6..10 => 1, _ => 0 end;"), 0);
+        "return (case x of 6..10 => 1, _ => 0);"), 0);
 }
 
 // §19.3: closed negative range `lo..hi`; scrutinee -8 ∈ [-10..-6].
 BEZEL_TEST(codegen_cg28, neg_range_inside_1233) {
     BEZEL_EXPECT_EQ(run(
         "var x := -8; "
-        "return case x of -10..-6 => 1, _ => 0 end;"), 1);
+        "return (case x of -10..-6 => 1, _ => 0);"), 1);
 }
 
 // §19.3: lower bound inclusive: -10 ∈ [-10..-6].
 BEZEL_TEST(codegen_cg28, neg_range_at_lower_1233) {
     BEZEL_EXPECT_EQ(run(
         "var x := -10; "
-        "return case x of -10..-6 => 1, _ => 0 end;"), 1);
+        "return (case x of -10..-6 => 1, _ => 0);"), 1);
 }
 
 // §19.3: upper bound inclusive: -6 ∈ [-10..-6].
 BEZEL_TEST(codegen_cg28, neg_range_at_upper_1233) {
     BEZEL_EXPECT_EQ(run(
         "var x := -6; "
-        "return case x of -10..-6 => 1, _ => 0 end;"), 1);
+        "return (case x of -10..-6 => 1, _ => 0);"), 1);
 }
 
 // §19.3: value just above upper bound: -5 ∉ [-10..-6] → 0.
 BEZEL_TEST(codegen_cg28, neg_range_above_upper_1233) {
     BEZEL_EXPECT_EQ(run(
         "var x := -5; "
-        "return case x of -10..-6 => 1, _ => 0 end;"), 0);
+        "return (case x of -10..-6 => 1, _ => 0);"), 0);
 }
 
 // §19.3: positive value outside a negative range: 2 ∉ [-10..-6] → 0.
 BEZEL_TEST(codegen_cg28, neg_range_pos_value_miss_1233) {
     BEZEL_EXPECT_EQ(run(
         "var x := 2; "
-        "return case x of -10..-6 => 1, _ => 0 end;"), 0);
+        "return (case x of -10..-6 => 1, _ => 0);"), 0);
 }
 
 // §19.3: half-open `..<`: upper bound is exclusive, so -6 ∉ [-10..<-6].
 BEZEL_TEST(codegen_cg28, neg_range_half_open_upper_excluded_1233) {
     BEZEL_EXPECT_EQ(run(
         "var x := -6; "
-        "return case x of -10..<-6 => 1, _ => 0 end;"), 0);
+        "return (case x of -10..<-6 => 1, _ => 0);"), 0);
 }
 
 // §19.3: -7 ∈ [-10..<-6] (below exclusive upper).
 BEZEL_TEST(codegen_cg28, neg_range_half_open_inside_1233) {
     BEZEL_EXPECT_EQ(run(
         "var x := -7; "
-        "return case x of -10..<-6 => 1, _ => 0 end;"), 1);
+        "return (case x of -10..<-6 => 1, _ => 0);"), 1);
 }
 
 // §19.3: multiple arms spanning negative and positive ranges; verify all
@@ -1014,22 +979,22 @@ BEZEL_TEST(codegen_cg28, neg_range_half_open_inside_1233) {
 BEZEL_TEST(codegen_cg28, neg_range_multi_arm_neg_arm_1233) {
     BEZEL_EXPECT_EQ(run(
         "var x := -8; "
-        "return case x of -10..-6 => 1, -5..5 => 2, 6..10 => 3, _ => 0 end;"), 1);
+        "return (case x of -10..-6 => 1, -5..5 => 2, 6..10 => 3, _ => 0);"), 1);
 }
 BEZEL_TEST(codegen_cg28, neg_range_multi_arm_mid_arm_1233) {
     BEZEL_EXPECT_EQ(run(
         "var x := 0; "
-        "return case x of -10..-6 => 1, -5..5 => 2, 6..10 => 3, _ => 0 end;"), 2);
+        "return (case x of -10..-6 => 1, -5..5 => 2, 6..10 => 3, _ => 0);"), 2);
 }
 BEZEL_TEST(codegen_cg28, neg_range_multi_arm_pos_arm_1233) {
     BEZEL_EXPECT_EQ(run(
         "var x := 7; "
-        "return case x of -10..-6 => 1, -5..5 => 2, 6..10 => 3, _ => 0 end;"), 3);
+        "return (case x of -10..-6 => 1, -5..5 => 2, 6..10 => 3, _ => 0);"), 3);
 }
 BEZEL_TEST(codegen_cg28, neg_range_multi_arm_wildcard_1233) {
     BEZEL_EXPECT_EQ(run(
         "var x := 11; "
-        "return case x of -10..-6 => 1, -5..5 => 2, 6..10 => 3, _ => 0 end;"), 0);
+        "return (case x of -10..-6 => 1, -5..5 => 2, 6..10 => 3, _ => 0);"), 0);
 }
 
 // §19.3: negative range on a `long` scrutinee (fix #1233 must apply at
@@ -1037,24 +1002,24 @@ BEZEL_TEST(codegen_cg28, neg_range_multi_arm_wildcard_1233) {
 BEZEL_TEST(codegen_cg28, neg_range_long_inside_1233) {
     BEZEL_EXPECT_EQ(run(
         "var x: long := -8L; "
-        "return case x of -10L..-6L => 1, _ => 0 end;"), 1);
+        "return (case x of -10L..-6L => 1, _ => 0);"), 1);
 }
 BEZEL_TEST(codegen_cg28, neg_range_long_miss_1233) {
     BEZEL_EXPECT_EQ(run(
         "var x: long := -5L; "
-        "return case x of -10L..-6L => 1, _ => 0 end;"), 0);
+        "return (case x of -10L..-6L => 1, _ => 0);"), 0);
 }
 
 // §19.3: negative range on a `double` scrutinee.
 BEZEL_TEST(codegen_cg28, neg_range_double_inside_1233) {
     BEZEL_EXPECT_EQ(run(
         "var x: double := -3.0; "
-        "return case x of -5.0..-1.0 => 1, _ => 0 end;"), 1);
+        "return (case x of -5.0..-1.0 => 1, _ => 0);"), 1);
 }
 BEZEL_TEST(codegen_cg28, neg_range_double_miss_1233) {
     BEZEL_EXPECT_EQ(run(
         "var x: double := 0.0; "
-        "return case x of -5.0..-1.0 => 1, _ => 0 end;"), 0);
+        "return (case x of -5.0..-1.0 => 1, _ => 0);"), 0);
 }
 
 // ── fix #1234 / §19 / §9.4: DestructuringPattern on an Object/interface ──
@@ -1076,10 +1041,9 @@ BEZEL_TEST(codegen_cg28_destructure, object_scrutinee_single_field_1234) {
         "record Box(v: int); "
         "class C public static method Main(): int "
         "  var o: Object := new Box(42); "
-        "  return case o of "
+        "  return (case o of "
         "    Box(var v) => v, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 42);
 }
 
@@ -1091,10 +1055,9 @@ BEZEL_TEST(codegen_cg28_destructure, object_scrutinee_two_fields_1234) {
         "record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var o: Object := new Point(3, 4); "
-        "  return case o of "
+        "  return (case o of "
         "    Point(x, y) => x + y, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 7);
 }
 
@@ -1107,10 +1070,9 @@ BEZEL_TEST(codegen_cg28_destructure, object_scrutinee_isa_miss_1234) {
         "record Other(v: int); "
         "class C public static method Main(): int "
         "  var o: Object := new Other(5); "
-        "  return case o of "
+        "  return (case o of "
         "    Box(var v) => v, "
-        "    _ => 99 "
-        "  end; "
+        "    _ => 99); "
         "end Main; end C;"), 99);
 }
 
@@ -1122,10 +1084,9 @@ BEZEL_TEST(codegen_cg28_destructure, object_scrutinee_const_subpat_match_1234) {
         "record Box(v: int); "
         "class C public static method Main(): int "
         "  var o: Object := new Box(7); "
-        "  return case o of "
+        "  return (case o of "
         "    Box(7) => 42, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 42);
 }
 BEZEL_TEST(codegen_cg28_destructure, object_scrutinee_const_subpat_miss_1234) {
@@ -1134,10 +1095,9 @@ BEZEL_TEST(codegen_cg28_destructure, object_scrutinee_const_subpat_miss_1234) {
         "record Box(v: int); "
         "class C public static method Main(): int "
         "  var o: Object := new Box(8); "
-        "  return case o of "
+        "  return (case o of "
         "    Box(7) => 42, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 0);
 }
 
@@ -1149,10 +1109,9 @@ BEZEL_TEST(codegen_cg28_destructure, direct_scrutinee_regression_1234) {
         "record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var p := new Point(10, 20); "
-        "  return case p of "
+        "  return (case p of "
         "    Point(x, y) => x + y, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 30);
 }
 
@@ -1172,7 +1131,7 @@ BEZEL_TEST(codegen_cg28_destructure, direct_scrutinee_regression_1234) {
 BEZEL_TEST(codegen_cg28b, parenthesized_when_guard_1256) {
     BEZEL_EXPECT_EQ(run(
         "var x := 5; "
-        "return case x of var t when (t > 0) => t, _ => -1 end;"), 5);
+        "return (case x of var t when (t > 0) => t, _ => -1);"), 5);
 }
 
 // §19.4/§17 (#1256): parenthesised guard is false — falls through to `_`.
@@ -1183,7 +1142,7 @@ BEZEL_TEST(codegen_cg28b, parenthesized_when_guard_false_1256) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "var x := -3; "
-        "Console.WriteLine(case x of var t when (t > 0) => t, _ => -1 end); return 0; "
+        "Console.WriteLine((case x of var t when (t > 0) => t, _ => -1)); return 0; "
         " end Main; end C;"), "-1");
 }
 
@@ -1192,5 +1151,5 @@ BEZEL_TEST(codegen_cg28b, parenthesized_when_guard_false_1256) {
 BEZEL_TEST(codegen_cg28b, parenthesized_compound_when_guard_1256) {
     BEZEL_EXPECT_EQ(run(
         "var x := 5; "
-        "return case x of var t when (t >= 1 and t <= 9) => t * 2, _ => 0 end;"), 10);
+        "return (case x of var t when (t >= 1 and t <= 9) => t * 2, _ => 0);"), 10);
 }

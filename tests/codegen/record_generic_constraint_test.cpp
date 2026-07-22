@@ -225,7 +225,7 @@ BEZEL_TEST(record_generic_constraint_903, record_compareto_builtin_icomparable) 
         "  end CmpG; "
         "end Utils; "
         "class C public static method Main(): int "
-        "  return (1 if Utils.CmpG(new Score(7), new Score(42)) < 0 else 0); "
+        "  return (if Utils.CmpG(new Score(7), new Score(42)) < 0 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -243,8 +243,8 @@ BEZEL_TEST(record_generic_constraint_903, record_equals_builtin_iequatable) {
         "  end EqG; "
         "end U; "
         "class C public static method Main(): int "
-        "  return (1 if U.EqG(new Pt(5), new Pt(5)) "
-        "             and not U.EqG(new Pt(5), new Pt(9)) else 0); "
+        "  return (if U.EqG(new Pt(5), new Pt(5)) "
+        "             and not U.EqG(new Pt(5), new Pt(9)) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -265,7 +265,7 @@ BEZEL_TEST(record_generic_constraint_903, class_compareto_builtin_icomparable) {
         "end U; "
         "class C public static method Main(): int "
         "  using var a := new Box(7); using var b := new Box(42); "
-        "  return (1 if U.CmpG(a, b) < 0 else 0); "
+        "  return (if U.CmpG(a, b) < 0 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -279,7 +279,7 @@ BEZEL_TEST(record_generic_constraint_903, primitive_compareto_unregressed) {
         "  end CmpG; "
         "end U; "
         "class C public static method Main(): int "
-        "  return (1 if U.CmpG(7, 42) < 0 else 0); "
+        "  return (if U.CmpG(7, 42) < 0 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -313,7 +313,7 @@ BEZEL_TEST(enum_generic_constraint_1495, enum_compareto_builtin_icomparable_spec
         "  end CmpG; "
         "end U; "
         "class C public static method Main(): int "
-        "  return (1 if U.CmpG(Prio.Low, Prio.High) < 0 else 0); "
+        "  return (if U.CmpG(Prio.Low, Prio.High) < 0 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -330,7 +330,7 @@ BEZEL_TEST(enum_generic_constraint_1495, enum_larger_picks_greater_spec_14_2) {
         "end Prio; "
         "static class U "
         "  public static method Larger<T>(a: T, b: T): T where T: IComparable<T> "
-        "    return a if a.CompareTo(b) >= 0 else b; "
+        "    return (if a.CompareTo(b) >= 0 then a else b); "
         "  end Larger; "
         "end U; "
         "class C public static method Main(): int "
@@ -353,8 +353,8 @@ BEZEL_TEST(enum_generic_constraint_1495, enum_equals_builtin_iequatable_spec_10_
         "  end EqG; "
         "end U; "
         "class C public static method Main(): int "
-        "  return (1 if U.EqG(Color.Red, Color.Red) "
-        "             and not U.EqG(Color.Red, Color.Green) else 0); "
+        "  return (if U.EqG(Color.Red, Color.Red) "
+        "             and not U.EqG(Color.Red, Color.Green) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -375,6 +375,6 @@ BEZEL_TEST(enum_generic_constraint_1495, enum_user_interface_constraint_spec_14_
         "  end RankG; "
         "end U; "
         "class C public static method Main(): int "
-        "  return (1 if U.RankG(Color.Red, Color.Blue) = -8 else 0); "
+        "  return (if U.RankG(Color.Red, Color.Blue) = -8 then 1 else 0); "
         "end Main; end C;"), 1);
 }

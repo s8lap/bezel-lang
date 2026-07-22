@@ -145,7 +145,7 @@ BEZEL_TEST(parser_keyword_lambda, spec_27_3_ascribed_block_body) {
 BEZEL_TEST(parser_keyword_lambda, spec_19_4_paren_guard_not_lambda_prefix) {
     BEZEL_EXPECT_TRUE(parsesClean(
         "module M; class C public method M(t: int): int "
-        "return case t of _ when (t > 0) => 1, _ => 0 end; "
+        "return (case t of _ when (t > 0) => 1, _ => 0); "
         "end M; end C;"));
 }
 
@@ -155,7 +155,7 @@ BEZEL_TEST(parser_keyword_lambda, spec_19_4_paren_guard_not_lambda_prefix) {
 BEZEL_TEST(parser_keyword_lambda, spec_19_4_lambda_inside_guard_call_arg) {
     BEZEL_EXPECT_TRUE(parsesClean(
         "module M; class C public method M(xs: Array<int>, t: int): int "
-        "return case t of _ when xs.Any(lambda(y) => y > 0) => 1, _ => 0 end; "
+        "return (case t of _ when xs.Any(lambda(y) => y > 0) => 1, _ => 0); "
         "end M; end C;"));
 }
 

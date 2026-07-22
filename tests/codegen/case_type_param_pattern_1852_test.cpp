@@ -66,7 +66,7 @@ const char* kBoxBare =
     "class Dog    public method K(): int return 2; end K; end Dog; "
     "class Box<T> "
     "  public method Kind(o: Object): int "
-    "    return case o of T => 2, _ => 9 end; "
+    "    return (case o of T => 2, _ => 9); "
     "  end Kind; "
     "end Box; ";
 
@@ -77,7 +77,7 @@ const char* kBoxVar =
     "class Dog    public method K(): int return 2; end K; end Dog; "
     "class Box<T> "
     "  public method Kind(o: Object): int "
-    "    return case o of var x: T => 2, _ => 9 end; "
+    "    return (case o of var x: T => 2, _ => 9); "
     "  end Kind; "
     "end Box; ";
 }  // namespace
@@ -187,7 +187,7 @@ BEZEL_TEST(case_type_param_pattern_1852, bare_interface_matches_and_rejects) {
         "class Square: IShape public method Area(): int return 4; end Area; end Square; "
         "class Plain public method P(): int return 0; end P; end Plain; "
         "class Box<T> public method Kind(o: Object): int "
-        "  return case o of T => 2, _ => 9 end; end Kind; end Box; "
+        "  return (case o of T => 2, _ => 9); end Kind; end Box; "
         "class Program public static method Main(): int "
         "  using var b := new Box<IShape>(); "
         "  using var s := new Square(); "
@@ -208,7 +208,7 @@ BEZEL_TEST(case_type_param_pattern_1852, typed_binding_bound_value) {
         "class Plain public method P(): int return 0; end P; end Plain; "
         "class ShapeBox<T> where T: IShape "
         "  public method Bind(o: Object): int "
-        "    return case o of var x: T => x.Area(), _ => 9 end; "
+        "    return (case o of var x: T => x.Area(), _ => 9); "
         "  end Bind; "
         "end ShapeBox; ";
     // Match: the bound x is the Square, x.Area() == 4.
@@ -240,7 +240,7 @@ BEZEL_TEST(case_type_param_pattern_1852, bare_record_static_match_and_reject) {
         "record Pt(x: int, y: int); "
         "record Other(a: int); "
         "class Chk<T, U> public method M(a: U): int "
-        "  return case a of T => 2, _ => 9 end; end M; end Chk; "
+        "  return (case a of T => 2, _ => 9); end M; end Chk; "
         "class Program public static method Main(): int "
         "  using var c1 := new Chk<Pt, Pt>(); "
         "  using var c2 := new Chk<Pt, Other>(); "
@@ -257,7 +257,7 @@ BEZEL_TEST(case_type_param_pattern_1852, bare_enum_static_match) {
         "module M; "
         "enum Color Red, Green, Blue; end Color; "
         "class Same<T> public method Match(a: T): int "
-        "  return case a of T => 2, _ => 9 end; end Match; end Same; "
+        "  return (case a of T => 2, _ => 9); end Match; end Same; "
         "class Program public static method Main(): int "
         "  using var s := new Same<Color>(); "
         "  var c := Color.Green; "
@@ -330,10 +330,10 @@ const char* kWrapContainer =
     "class Wrap<U> public method Tag(): int return 7; end Tag; end Wrap; "
     "class Container<T> "
     "  public method Kind(o: Object): int "
-    "    return case o of T => 2, _ => 9 end; "
+    "    return (case o of T => 2, _ => 9); "
     "  end Kind; "
     "  public method KindVar(o: Object): int "
-    "    return case o of var x: T => 2, _ => 9 end; "
+    "    return (case o of var x: T => 2, _ => 9); "
     "  end KindVar; "
     "end Container; ";
 }  // namespace

@@ -69,7 +69,7 @@ BEZEL_TEST(function_value_equality_1544,
         "module M; class C public static method Main(): int "
         "  var f := lambda() => 1; "
         "  var g := f; "
-        "  return 1 if f = g else 0; "
+        "  return (if f = g then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -81,7 +81,7 @@ BEZEL_TEST(function_value_equality_1544,
         "module M; class C public static method Main(): int "
         "  var f := lambda() => 1; "
         "  var g := lambda() => 1; "
-        "  return 1 if f = g else 0; "
+        "  return (if f = g then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -95,7 +95,7 @@ BEZEL_TEST(function_value_equality_1544,
         "  public static method Main(): int "
         "    var f := C.M1; "
         "    var g := C.M1; "
-        "    return 1 if f = g else 0; "
+        "    return (if f = g then 1 else 0); "
         "  end Main; "
         "end C;"), 1);
 }
@@ -111,7 +111,7 @@ BEZEL_TEST(function_value_equality_1544,
         "  using var o := new Obj(); "
         "  var f := o.M1; "
         "  var g := o.M1; "
-        "  return 1 if f = g else 0; "
+        "  return (if f = g then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -127,7 +127,7 @@ BEZEL_TEST(function_value_equality_1544,
         "  using var o2 := new Obj(); "
         "  var f := o1.M1; "
         "  var g := o2.M1; "
-        "  return 1 if f = g else 0; "
+        "  return (if f = g then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -140,7 +140,7 @@ BEZEL_TEST(function_value_equality_1544,
         "  public static method Main(): int "
         "    var f: () -> int := C.M1; "
         "    var g: () -> int := lambda() => 1; "
-        "    return 1 if f = g else 0; "
+        "    return (if f = g then 1 else 0); "
         "  end Main; "
         "end C;"), 0);
 }
@@ -159,7 +159,7 @@ BEZEL_TEST(function_value_equality_1544,
         "  using var b := new Box(); "
         "  var f: () -> int := b.Count; "
         "  var g: () -> int := b.Count; "
-        "  return 1 if f = g else 0; "
+        "  return (if f = g then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -173,7 +173,7 @@ BEZEL_TEST(function_value_equality_1544,
         "  public static method Main(): int "
         "    var f := C.M1; "
         "    var g := C.M1; "
-        "    return 1 if f <> g else 0; "
+        "    return (if f <> g then 1 else 0); "
         "  end Main; "
         "end C;"), 0);
 }
@@ -196,7 +196,7 @@ BEZEL_TEST(function_value_equality_1544,
         "  public static method Main(): int "
         "    var f: () -> owned Dog := MakeDog; "
         "    var g: () -> owned Animal := f; "
-        "    return 1 if f = g else 0; "
+        "    return (if f = g then 1 else 0); "
         "  end Main; "
         "end C;"), 1);
 }
@@ -222,7 +222,7 @@ BEZEL_TEST(function_value_equality_1544,
         "  public static method Main(): int "
         "    var f := MakeL(); "
         "    var g := MakeL(); "
-        "    return 1 if f = g else 0; "
+        "    return (if f = g then 1 else 0); "
         "  end Main; "
         "end C;"), 0);
 }
@@ -238,7 +238,7 @@ BEZEL_TEST(function_value_equality_1544,
         "  public static method Main(): int "
         "    var f := MakeL(); "
         "    var g := f; "
-        "    return 1 if f = g else 0; "
+        "    return (if f = g then 1 else 0); "
         "  end Main; "
         "end C;"), 1);
 }
@@ -260,7 +260,7 @@ BEZEL_TEST(function_value_equality_1544,
         "  var r := new R(5); "
         "  var f := r.GetV; "
         "  var g := r.GetV; "
-        "  return 1 if f = g else 0; "
+        "  return (if f = g then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -280,7 +280,7 @@ BEZEL_TEST(function_value_equality_1544,
         "  var r := new R(5); "
         "  var f := r.GetV; "
         "  var g := f; "
-        "  return 1 if f = g else 0; "
+        "  return (if f = g then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -298,6 +298,6 @@ BEZEL_TEST(function_value_equality_1544,
         "  using var o := new Obj(); "
         "  var f: () -> int := lambda() => 1; "
         "  var g: () -> int := o.M1; "
-        "  return 1 if f = g else 0; "
+        "  return (if f = g then 1 else 0); "
         "end Main; end C;"), 0);
 }

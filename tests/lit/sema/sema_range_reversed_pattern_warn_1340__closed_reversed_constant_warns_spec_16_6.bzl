@@ -10,7 +10,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck %s
 
-module M; class C public static method M(x: int): int return case x of 100..0 => 1, _ => 0 end; end M; end C;
+module M; class C public static method M(x: int): int return (case x of 100..0 => 1, _ => 0); end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: this pattern never matches — bounds are reversed
 // CHECK-SAME: (§16.6)

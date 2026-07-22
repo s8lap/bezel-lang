@@ -48,14 +48,14 @@ std::string renderCase(const std::string& expr) {
 
 BEZEL_TEST(parser_const_alt, two_int_alternatives) {
     BEZEL_EXPECT_EQ(
-        renderCase("case x of 1 | 2 => \"low\", _ => \"high\" end"),
+        renderCase("(case x of 1 | 2 => \"low\", _ => \"high\")"),
         std::string(
             "case x of { 1, 2 => \"low\" | _ => \"high\" } end"));
 }
 
 BEZEL_TEST(parser_const_alt, three_int_alternatives) {
     BEZEL_EXPECT_EQ(
-        renderCase("case x of 1 | 2 | 3 => \"low\", _ => \"high\" end"),
+        renderCase("(case x of 1 | 2 | 3 => \"low\", _ => \"high\")"),
         std::string(
             "case x of { 1, 2, 3 => \"low\" | _ => \"high\" } end"));
 }
@@ -63,8 +63,8 @@ BEZEL_TEST(parser_const_alt, three_int_alternatives) {
 BEZEL_TEST(parser_const_alt, qualified_name_alternatives) {
     BEZEL_EXPECT_EQ(
         renderCase(
-            "case c of Color.Red | Color.Green => \"warm\", "
-            "Color.Blue => \"cool\" end"),
+            "(case c of Color.Red | Color.Green => \"warm\", "
+            "Color.Blue => \"cool\")"),
         std::string(
             "case c of { Color.Red, Color.Green => \"warm\" "
             "| Color.Blue => \"cool\" } end"));
@@ -73,7 +73,7 @@ BEZEL_TEST(parser_const_alt, qualified_name_alternatives) {
 BEZEL_TEST(parser_const_alt, mixed_literal_alternatives) {
     BEZEL_EXPECT_EQ(
         renderCase(
-            "case x of 1 | \"two\" | null => \"odd\", _ => \"normal\" end"),
+            "(case x of 1 | \"two\" | null => \"odd\", _ => \"normal\")"),
         std::string(
             "case x of { 1, \"two\", null => \"odd\" "
             "| _ => \"normal\" } end"));
@@ -81,7 +81,7 @@ BEZEL_TEST(parser_const_alt, mixed_literal_alternatives) {
 
 BEZEL_TEST(parser_const_alt, boolean_alternatives) {
     BEZEL_EXPECT_EQ(
-        renderCase("case b of true | false => \"either\" end"),
+        renderCase("(case b of true | false => \"either\")"),
         std::string(
             "case b of { true, false => \"either\" } end"));
 }
@@ -92,7 +92,7 @@ BEZEL_TEST(parser_const_alt, single_literal_no_extra_comma) {
     // Constant (e.g. `_`, `var`, `null` is also not interpreted unless
     // following a Constant `,` — but `_` IS not a constant so it stops).
     BEZEL_EXPECT_EQ(
-        renderCase("case x of 1 => \"one\", _ => \"other\" end"),
+        renderCase("(case x of 1 => \"one\", _ => \"other\")"),
         std::string(
             "case x of { 1 => \"one\" | _ => \"other\" } end"));
 }
@@ -100,7 +100,7 @@ BEZEL_TEST(parser_const_alt, single_literal_no_extra_comma) {
 BEZEL_TEST(parser_const_alt, alternatives_with_when_guard) {
     BEZEL_EXPECT_EQ(
         renderCase(
-            "case x of 1 | 2 when x > 0 => \"pos-low\", _ => \"other\" end"),
+            "(case x of 1 | 2 when x > 0 => \"pos-low\", _ => \"other\")"),
         std::string(
             "case x of { 1, 2 when (x > 0) => \"pos-low\" "
             "| _ => \"other\" } end"));
@@ -113,7 +113,7 @@ BEZEL_TEST(parser_const_alt, alternatives_with_when_guard) {
 BEZEL_TEST(parser_const_alt, single_negative_int) {
     // A single negative constant as the whole arm pattern.
     BEZEL_EXPECT_EQ(
-        renderCase("case x of -1 => \"neg\", _ => \"other\" end"),
+        renderCase("(case x of -1 => \"neg\", _ => \"other\")"),
         std::string(
             "case x of { (-1) => \"neg\" | _ => \"other\" } end"));
 }
@@ -121,7 +121,7 @@ BEZEL_TEST(parser_const_alt, single_negative_int) {
 BEZEL_TEST(parser_const_alt, two_negative_int_alternatives) {
     // #1341: `-2, -3` must parse as two ConstantPattern alternatives.
     BEZEL_EXPECT_EQ(
-        renderCase("case x of -2 | -3 => \"small neg\", _ => \"other\" end"),
+        renderCase("(case x of -2 | -3 => \"small neg\", _ => \"other\")"),
         std::string(
             "case x of { (-2), (-3) => \"small neg\" "
             "| _ => \"other\" } end"));
@@ -131,7 +131,7 @@ BEZEL_TEST(parser_const_alt, mixed_positive_and_negative_alternatives) {
     // A mix of positive and negative constants in one alternatives list.
     BEZEL_EXPECT_EQ(
         renderCase(
-            "case x of -1 | 0 | 1 => \"near zero\", _ => \"other\" end"),
+            "(case x of -1 | 0 | 1 => \"near zero\", _ => \"other\")"),
         std::string(
             "case x of { (-1), 0, 1 => \"near zero\" "
             "| _ => \"other\" } end"));
@@ -141,7 +141,7 @@ BEZEL_TEST(parser_const_alt, negative_first_arm_then_positive_arm) {
     // Each arm is independent; verify the arm boundary is correct.
     BEZEL_EXPECT_EQ(
         renderCase(
-            "case x of -1 => \"minus one\", 1 => \"one\", _ => \"other\" end"),
+            "(case x of -1 => \"minus one\", 1 => \"one\", _ => \"other\")"),
         std::string(
             "case x of { (-1) => \"minus one\" | 1 => \"one\" "
             "| _ => \"other\" } end"));

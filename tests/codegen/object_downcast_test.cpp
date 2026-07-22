@@ -57,7 +57,7 @@ int runWithP(const std::string& mainBody) {
 BEZEL_TEST(codegen_object_downcast, equals_override_equal_fields) {
     BEZEL_EXPECT_EQ(runWithP(
         "using var a := new P(7); using var b := new P(7); "
-        "return (1 if a.Equals(b) else 0);"), 1);
+        "return (if a.Equals(b) then 1 else 0);"), 1);
 }
 
 // §8.3 / §17.4: differing field values → the downcast succeeds but the field
@@ -65,7 +65,7 @@ BEZEL_TEST(codegen_object_downcast, equals_override_equal_fields) {
 BEZEL_TEST(codegen_object_downcast, equals_override_differing_fields) {
     BEZEL_EXPECT_EQ(runWithP(
         "using var a := new P(7); using var b := new P(9); "
-        "return (1 if a.Equals(b) else 0);"), 0);
+        "return (if a.Equals(b) then 1 else 0);"), 0);
 }
 
 // §17.4: `as` is null when the runtime type does not match. Passing `null`
@@ -74,7 +74,7 @@ BEZEL_TEST(codegen_object_downcast, equals_override_differing_fields) {
 BEZEL_TEST(codegen_object_downcast, equals_override_null_argument) {
     BEZEL_EXPECT_EQ(runWithP(
         "using var a := new P(7); var n: Object? := null; "
-        "return (1 if a.Equals(n) else 0);"), 0);
+        "return (if a.Equals(n) then 1 else 0);"), 0);
 }
 
 // §17.4: `as` from an Object? operand whose runtime type does not match the
@@ -88,7 +88,7 @@ BEZEL_TEST(codegen_object_downcast, as_from_object_unrelated_type_is_null) {
         "  public static method Main(): int "
         "    using var q := new Q(); "
         "    var o: Object? := q; "
-        "    return (1 if (o as P) is P else 0); "
+        "    return (if (o as P) is P then 1 else 0); "
         "  end Main; "
         "end C;"), 0);
 }
@@ -102,7 +102,7 @@ BEZEL_TEST(codegen_object_downcast, is_from_object_matching_type) {
         "  public static method Main(): int "
         "    using var p := new P(); "
         "    var o: Object? := p; "
-        "    return (1 if o is P else 0); "
+        "    return (if o is P then 1 else 0); "
         "  end Main; "
         "end C;"), 1);
 }
@@ -116,7 +116,7 @@ BEZEL_TEST(codegen_object_downcast, is_from_null_object_is_false) {
         "class C "
         "  public static method Main(): int "
         "    var o: Object? := null; "
-        "    return (1 if o is P else 0); "
+        "    return (if o is P then 1 else 0); "
         "  end Main; "
         "end C;"), 0);
 }
@@ -129,7 +129,7 @@ BEZEL_TEST(codegen_object_downcast, is_from_object_parameter) {
         "class P end P; "
         "class C "
         "  public static method Check(o: Object?): int "
-        "    => (1 if o is P else 0); "
+        "    => (if o is P then 1 else 0); "
         "  public static method Main(): int "
         "    using var p := new P(); return Check(p); "
         "  end Main; "
@@ -147,7 +147,7 @@ BEZEL_TEST(codegen_object_downcast, as_from_concrete_class_still_works) {
         "class C "
         "  public static method Main(): int "
         "    var d := new Dog(); "
-        "    return (1 if (d as Animal) is Dog else 0); "
+        "    return (if (d as Animal) is Dog then 1 else 0); "
         "  end Main; "
         "end C;"), 1);
 }

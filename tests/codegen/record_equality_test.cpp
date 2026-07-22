@@ -28,7 +28,7 @@ BEZEL_TEST(codegen_cg29b, equal_records_are_equal) {
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var a := new Point(1, 2); var b := new Point(1, 2); "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -38,7 +38,7 @@ BEZEL_TEST(codegen_cg29b, different_records_are_not_equal) {
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var a := new Point(1, 2); var b := new Point(1, 3); "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -48,7 +48,7 @@ BEZEL_TEST(codegen_cg29b, neq_operator) {
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var a := new Point(1, 2); var b := new Point(9, 9); "
-        "  return (1 if a <> b else 0); "
+        "  return (if a <> b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -58,7 +58,7 @@ BEZEL_TEST(codegen_cg29b, first_field_mismatch) {
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var a := new Point(7, 2); var b := new Point(1, 2); "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -68,7 +68,7 @@ BEZEL_TEST(codegen_cg29b, three_field_equality) {
         "module M; record T(a: int, b: int, c: int); "
         "class C public static method Main(): int "
         "  var p := new T(1, 2, 3); var q := new T(1, 2, 3); "
-        "  return (1 if p = q else 0); "
+        "  return (if p = q then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -81,7 +81,7 @@ BEZEL_TEST(codegen_cg29b, nested_record_equality) {
         "class C public static method Main(): int "
         "  var x := new Outer(new Inner(3, 4), 5); "
         "  var y := new Outer(new Inner(3, 4), 5); "
-        "  return (1 if x = y else 0); "
+        "  return (if x = y then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -94,7 +94,7 @@ BEZEL_TEST(codegen_cg29b, nested_record_inner_mismatch) {
         "class C public static method Main(): int "
         "  var x := new Outer(new Inner(3, 4), 5); "
         "  var y := new Outer(new Inner(3, 9), 5); "
-        "  return (1 if x = y else 0); "
+        "  return (if x = y then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -108,7 +108,7 @@ BEZEL_TEST(codegen_cg29b, double_field_nan_records_are_equal) {
         "class C public static method Main(): int "
         "  var nan := 0.0 / 0.0; "
         "  var a := new R(nan); var b := new R(nan); "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -118,7 +118,7 @@ BEZEL_TEST(codegen_cg29b, double_field_equal_records) {
         "module M; record R(v: double); "
         "class C public static method Main(): int "
         "  var a := new R(1.5); var b := new R(1.5); "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -129,7 +129,7 @@ BEZEL_TEST(codegen_cg29b, double_field_distinct_records_not_equal) {
         "module M; record R(v: double); "
         "class C public static method Main(): int "
         "  var a := new R(1.0); var b := new R(2.0); "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -141,9 +141,9 @@ BEZEL_TEST(codegen_cg29b, double_field_signed_zero_matches_scalar) {
         "module M; record R(v: double); "
         "class C public static method Main(): int "
         "  var negz := -0.0; "
-        "  var recEq := 1 if new R(0.0) = new R(negz) else 0; "
-        "  var scalarEq := 1 if 0.0 = negz else 0; "
-        "  return (1 if recEq = scalarEq else 0); "
+        "  var recEq := (if new R(0.0) = new R(negz) then 1 else 0); "
+        "  var scalarEq := (if 0.0 = negz then 1 else 0); "
+        "  return (if recEq = scalarEq then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -155,9 +155,9 @@ BEZEL_TEST(codegen_cg29b, mixed_field_record_equality) {
         "class C public static method Main(): int "
         "  var a := new Mixed(3.5, 7, \"hi\"); "
         "  var b := new Mixed(3.5, 7, \"hi\"); "
-        "  var eq := 1 if a = b else 0; "
+        "  var eq := (if a = b then 1 else 0); "
         "  var c := new Mixed(3.5, 8, \"hi\"); "
-        "  var neq := 1 if a = c else 0; "
-        "  return (1 if eq = 1 and neq = 0 else 0); "
+        "  var neq := (if a = c then 1 else 0); "
+        "  return (if eq = 1 and neq = 0 then 1 else 0); "
         "end Main; end C;"), 1);
 }

@@ -49,7 +49,7 @@ BEZEL_TEST(codegen_cg27d, int_expression_equality) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var n := 7; var s := $\"x={n}\"; "
-        "  return (1 if s = \"x=7\" else 0); "
+        "  return (if s = \"x=7\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -59,7 +59,7 @@ BEZEL_TEST(codegen_cg27d, multiple_expressions) {
         "module M; class C public static method Main(): int "
         "  var a := 1; var b := 2; "
         "  var s := $\"{a}+{b}={a+b}\"; "
-        "  return (1 if s = \"1+2=3\" else 0); "
+        "  return (if s = \"1+2=3\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -69,7 +69,7 @@ BEZEL_TEST(codegen_cg27d, string_expression_part) {
         "module M; class C public static method Main(): int "
         "  var name := \"World\"; "
         "  var s := $\"Hello, {name}!\"; "
-        "  return (1 if s = \"Hello, World!\" else 0); "
+        "  return (if s = \"Hello, World!\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -81,7 +81,7 @@ BEZEL_TEST(codegen_cg27d, bool_expression_part) {
         "module M; class C public static method Main(): int "
         "  var b := true; "
         "  var s := $\"ok={b}\"; "
-        "  return (1 if s = \"ok=True\" else 0); "
+        "  return (if s = \"ok=True\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -91,7 +91,7 @@ BEZEL_TEST(codegen_cg27d, expression_only) {
         "module M; class C public static method Main(): int "
         "  var n := 99; "
         "  var s := $\"{n}\"; "
-        "  return (1 if s = \"99\" else 0); "
+        "  return (if s = \"99\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -114,7 +114,7 @@ BEZEL_TEST(codegen_cg27d, null_nullable_string_renders_null_r35) {
         "module M; class C public static method Main(): int "
         "  var s: string? := null; "
         "  var result := $\"val={s}\"; "
-        "  return (1 if result = \"val=null\" else 0); "
+        "  return (if result = \"val=null\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -124,7 +124,7 @@ BEZEL_TEST(codegen_cg27d, nonnull_nullable_string_renders_value_r35) {
         "module M; class C public static method Main(): int "
         "  var s: string? := \"hi\"; "
         "  var r := $\"v={s}\"; "
-        "  return (1 if r = \"v=hi\" else 0); "
+        "  return (if r = \"v=hi\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -162,7 +162,7 @@ BEZEL_TEST(codegen_cg27d, verbatim_interpolated_hole_still_substitutes_r36) {
         "module M; class C public static method Main(): int "
         "  var n := 7; "
         "  var s := $@\"x{n}y\"; "
-        "  return (1 if s = \"x7y\" else 0); "
+        "  return (if s = \"x7y\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -175,7 +175,7 @@ BEZEL_TEST(codegen_cg27d, percent_format_p1_float_739) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var ratio: float := 0.85f; var s := $\"{ratio:P1}\"; "
-        "  return (1 if s = \"85.0%\" else 0); "
+        "  return (if s = \"85.0%\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -183,7 +183,7 @@ BEZEL_TEST(codegen_cg27d, percent_format_p1_double_739) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r: double := 0.85; var s := $\"{r:P1}\"; "
-        "  return (1 if s = \"85.0%\" else 0); "
+        "  return (if s = \"85.0%\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -192,7 +192,7 @@ BEZEL_TEST(codegen_cg27d, percent_format_default_digits_739) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r: double := 0.5; var s := $\"{r:P}\"; "
-        "  return (1 if s = \"50.00%\" else 0); "
+        "  return (if s = \"50.00%\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -204,7 +204,7 @@ BEZEL_TEST(codegen_cg27d, scientific_format_case_honoured_739) {
         "module M; class C public static method Main(): int "
         "  var v: float := 1.23f; "
         "  var up := $\"{v:E2}\"; var lo := $\"{v:e2}\"; "
-        "  return (1 if (up.Contains(\"E\") and lo.Contains(\"e\")) else 0); "
+        "  return (if (up.Contains(\"E\") and lo.Contains(\"e\")) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -222,7 +222,7 @@ BEZEL_TEST(codegen_cg27d, fixed_point_format_on_int_value_739) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var n: int := 42; var s := $\"{n:F2}\"; "
-        "  return (1 if s = \"42.00\" else 0); "
+        "  return (if s = \"42.00\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -235,7 +235,7 @@ BEZEL_TEST(codegen_cg27d, fixed_point_format_double_unchanged_739) {
         "  var f := $\"{amount:F2}\"; "
         "  var aligned := $\"|{amount,12:F2}|\"; "
         "  var ok := (f = \"1234.50\") and (aligned = \"|     1234.50|\"); "
-        "  return (1 if ok else 0); "
+        "  return (if ok then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -251,7 +251,7 @@ BEZEL_TEST(codegen_cg27d, interp_wide_alignment_no_overread_1186) {
         "  var s := $\"{x,200}\"; "
         "  var expected := x.ToString().PadLeft(200); "
         "  var ok := (s.Length = 200) and (s = expected); "
-        "  return (1 if ok else 0); "
+        "  return (if ok then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -265,7 +265,7 @@ BEZEL_TEST(codegen_cg27d, interp_wide_format_spec_no_overread_1186) {
         "  var s := $\"{n:D100}\"; "
         "  var expected := n.ToString().PadLeft(100, '0'); "
         "  var ok := (s.Length = 100) and (s = expected); "
-        "  return (1 if ok else 0); "
+        "  return (if ok then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -285,7 +285,7 @@ BEZEL_TEST(codegen_cg27d, enum_alignment_renders_type_name_1283) {
         "class C public static method Main(): int "
         "  var col := Color.Green; "
         "  var s := $\"[{col,8}]\"; "        // "[   Color]" (5-char name in width 8)
-        "  return (1 if s = \"[   Color]\" else 0); "
+        "  return (if s = \"[   Color]\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -296,7 +296,7 @@ BEZEL_TEST(codegen_cg27d, enum_alignment_left_1283) {
         "class C public static method Main(): int "
         "  var col := Color.Green; "
         "  var s := $\"[{col,-8}]\"; "       // "[Color   ]"
-        "  return (1 if s = \"[Color   ]\" else 0); "
+        "  return (if s = \"[Color   ]\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -309,7 +309,7 @@ BEZEL_TEST(codegen_cg27d, record_alignment_padded_1283) {
         "class C public static method Main(): int "
         "  var p := new Point(1, 2); "
         "  var s := $\"[{p,22}]\"; "         // 5 leading spaces + 17-char ToString
-        "  return (1 if s = \"[     Point(x: 1, y: 2)]\" else 0); "
+        "  return (if s = \"[     Point(x: 1, y: 2)]\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -322,7 +322,7 @@ BEZEL_TEST(codegen_cg27d, class_override_alignment_padded_1283) {
         "class C public static method Main(): int "
         "  using var w := new W(); "
         "  var s := $\"[{w,8}]\"; "          // "[      WW]" (6 spaces + "WW")
-        "  return (1 if s = \"[      WW]\" else 0); "
+        "  return (if s = \"[      WW]\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

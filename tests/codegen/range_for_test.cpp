@@ -180,28 +180,28 @@ BEZEL_TEST(codegen_cg51b, step_with_break) {
 BEZEL_TEST(codegen_in_range, in_inclusive_hit) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var x := 5; return (1 if x in 1..10 else 0); "
+        "  var x := 5; return (if x in 1..10 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
 BEZEL_TEST(codegen_in_range, in_inclusive_miss) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var x := 15; return (1 if x in 1..10 else 0); "
+        "  var x := 15; return (if x in 1..10 then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
 BEZEL_TEST(codegen_in_range, in_inclusive_boundary_lo) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var x := 1; return (1 if x in 1..10 else 0); "
+        "  var x := 1; return (if x in 1..10 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
 BEZEL_TEST(codegen_in_range, in_inclusive_boundary_hi) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var x := 10; return (1 if x in 1..10 else 0); "
+        "  var x := 10; return (if x in 1..10 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -209,7 +209,7 @@ BEZEL_TEST(codegen_in_range, in_half_open_excludes_hi) {
     // `..<` excludes the upper bound.
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var x := 10; return (1 if x in 1..<10 else 0); "
+        "  var x := 10; return (if x in 1..<10 then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -217,7 +217,7 @@ BEZEL_TEST(codegen_in_range, in_with_variable_bounds) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x := 5; var lo := 1; var hi := 10; "
-        "  return (1 if x in lo..hi else 0); "
+        "  return (if x in lo..hi then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

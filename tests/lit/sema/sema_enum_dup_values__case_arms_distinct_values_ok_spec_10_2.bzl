@@ -9,7 +9,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; enum E A := 1, B := 2, C := 3; end E; class D public method M(v: E): int return case v of A => 1, B => 2, C => 3 end; end M; end D;
+module M; enum E A := 1, B := 2, C := 3; end E; class D public method M(v: E): int return (case v of A => 1, B => 2, C => 3); end M; end D;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

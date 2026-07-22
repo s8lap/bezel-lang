@@ -49,25 +49,25 @@ int runRec(const std::string& mainBody) {
 BEZEL_TEST(codegen_boxing_06, is_record_via_object_true) {
     // var o: Object := new Rect(3,4); o is Rect → true. Was 0 (false).
     BEZEL_EXPECT_EQ(runRec(
-        "var o: Object := new Rect(3, 4); return (1 if o is Rect else 0);"), 1);
+        "var o: Object := new Rect(3, 4); return (if o is Rect then 1 else 0);"), 1);
 }
 
 BEZEL_TEST(codegen_boxing_06, is_record_via_interface_true) {
     // §9.6: a record boxed into an interface variable retains its type.
     BEZEL_EXPECT_EQ(runRec(
-        "var s: IShape := new Rect(3, 4); return (1 if s is Rect else 0);"), 1);
+        "var s: IShape := new Rect(3, 4); return (if s is Rect then 1 else 0);"), 1);
 }
 
 BEZEL_TEST(codegen_boxing_06, is_record_wrong_type_false) {
     // The boxed value's dynamic type is Rect, not Box → `is Box` is false.
     BEZEL_EXPECT_EQ(runRec(
-        "var o: Object := new Rect(3, 4); return (1 if o is Box else 0);"), 0);
+        "var o: Object := new Rect(3, 4); return (if o is Box then 1 else 0);"), 0);
 }
 
 BEZEL_TEST(codegen_boxing_06, is_not_record_false_branch) {
     // `o is not Rect` on a boxed Rect → false.
     BEZEL_EXPECT_EQ(runRec(
-        "var o: Object := new Rect(3, 4); return (1 if o is not Rect else 0);"),
+        "var o: Object := new Rect(3, 4); return (if o is not Rect then 1 else 0);"),
         0);
 }
 
@@ -85,7 +85,7 @@ BEZEL_TEST(codegen_boxing_12, is_int_wrong_target_false) {
     // A boxed int is not a bool.
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "var o: Object := 42; return (1 if o is bool else 0); "
+        "var o: Object := 42; return (if o is bool then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -93,7 +93,7 @@ BEZEL_TEST(codegen_boxing_12, is_bool_via_object_true) {
     // A boxed bool is a bool.
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "var o: Object := true; return (1 if o is bool else 0); "
+        "var o: Object := true; return (if o is bool then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -133,7 +133,7 @@ BEZEL_TEST(codegen_boxing_13, as_int_wrong_target_null) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "var o: Object := 42; var b: bool? := o as bool; "
-        "return (1 if b = null else 0); "
+        "return (if b = null then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -198,7 +198,7 @@ BEZEL_TEST(codegen_boxing_regress, ref_is_class_via_object) {
     BEZEL_EXPECT_EQ(run(
         "module M; class Animal end Animal; class Dog : Animal end Dog; "
         "class C public static method Main(): int "
-        "using var d: Object := new Dog(); return (1 if d is Animal else 0); "
+        "using var d: Object := new Dog(); return (if d is Animal then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -208,7 +208,7 @@ BEZEL_TEST(codegen_boxing_regress, ref_as_class_via_object) {
         "module M; class Animal end Animal; class Dog : Animal end Dog; "
         "class C public static method Main(): int "
         "using var o: Object := new Dog(); "
-        "return (1 if (o as Dog) is Dog else 0); "
+        "return (if (o as Dog) is Dog then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -217,7 +217,7 @@ BEZEL_TEST(codegen_boxing_regress, ref_object_null_is_class) {
     BEZEL_EXPECT_EQ(run(
         "module M; class Animal end Animal; class Dog : Animal end Dog; "
         "class C public static method Main(): int "
-        "var o: Object? := null; return (1 if o is Dog else 0); "
+        "var o: Object? := null; return (if o is Dog then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -246,7 +246,7 @@ BEZEL_TEST(codegen_boxing_regress, generic_nullable_value_param_boxed_return_127
         "    return x; end Box; end U; "
         "class C public static method Main(): int "
         "  var x: int? := 33; var o := U.Box<int>(x); "
-        "  return (33 if o is not null else -1); "
+        "  return (if o is not null then 33 else -1); "
         "end Main; end C;"), 33);
 }
 

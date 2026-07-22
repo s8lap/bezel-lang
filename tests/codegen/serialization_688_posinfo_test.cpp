@@ -19,7 +19,7 @@
 // Note on catch-arm syntax: per §31.2.2 / §A.6, a catch arm body is ONE of:
 //   (1) an expression (no `;`), (2) a statement (with `;`), or (3) `do … end`.
 // To test e.Message.Contains inside a catch arm, we use the expression-form
-// assignment `hasX := (1 if e.Message.Contains("x") else 0);` which is a
+// assignment `hasX := (if e.Message.Contains("x") then 1 else 0);` which is a
 // single assignment statement and parses correctly as form (2).
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
@@ -64,9 +64,9 @@ BEZEL_TEST(codegen_serialization_688,
         "    try "
         "      var p := Pt.Deserialize(d); "
         "    catch var e: SerializationException => "
-        "      hasLine := (1 if e.Message.Contains(\"line\") and e.Message.Contains(\"column\") else 0); "
+        "      hasLine := (if e.Message.Contains(\"line\") and e.Message.Contains(\"column\") then 1 else 0); "
         "    end; "
-        "    return (42 if hasLine = 1 else 1); "
+        "    return (if hasLine = 1 then 42 else 1); "
         "  end Main; "
         "end Program;"), 42);
 }
@@ -86,10 +86,10 @@ BEZEL_TEST(codegen_serialization_688,
         "    try "
         "      var p := Pt.Deserialize(d); "
         "    catch var e: SerializationException => "
-        "      hasPos := (1 if e.Message.Contains(\"line\") or e.Message.Contains(\"column\") "
-        "                    or e.Message.Contains(\"byte offset\") else 0); "
+        "      hasPos := (if e.Message.Contains(\"line\") or e.Message.Contains(\"column\") "
+        "                    or e.Message.Contains(\"byte offset\") then 1 else 0); "
         "    end; "
-        "    return (42 if hasPos = 1 else 1); "
+        "    return (if hasPos = 1 then 42 else 1); "
         "  end Main; "
         "end Program;"), 42);
 }
@@ -114,9 +114,9 @@ BEZEL_TEST(codegen_serialization_688,
         "    try "
         "      var p := Pt.Deserialize(d); "
         "    catch var e: SerializationException => "
-        "      hasLine2 := (1 if e.Message.Contains(\"line 2\") else 0); "
+        "      hasLine2 := (if e.Message.Contains(\"line 2\") then 1 else 0); "
         "    end; "
-        "    return (42 if hasLine2 = 1 else 1); "
+        "    return (if hasLine2 = 1 then 42 else 1); "
         "  end Main; "
         "end Program;"), 42);
 }
@@ -146,9 +146,9 @@ BEZEL_TEST(codegen_serialization_688,
         "    try "
         "      var bad := Pt.Deserialize(de); "
         "    catch var e: SerializationException => "
-        "      hasByteOffset := (1 if e.Message.Contains(\"byte offset\") else 0); "
+        "      hasByteOffset := (if e.Message.Contains(\"byte offset\") then 1 else 0); "
         "    end; "
-        "    return (42 if hasByteOffset = 1 else 1); "
+        "    return (if hasByteOffset = 1 then 42 else 1); "
         "  end Main; "
         "end Program;"), 42);
 }
@@ -172,9 +172,9 @@ BEZEL_TEST(codegen_serialization_688,
         "    try "
         "      var bad := Pt.Deserialize(de); "
         "    catch var e: SerializationException => "
-        "      hasByteOffset := (1 if e.Message.Contains(\"byte offset\") else 0); "
+        "      hasByteOffset := (if e.Message.Contains(\"byte offset\") then 1 else 0); "
         "    end; "
-        "    return (42 if hasByteOffset = 1 else 1); "
+        "    return (if hasByteOffset = 1 then 42 else 1); "
         "  end Main; "
         "end Program;"), 42);
 }
@@ -198,7 +198,7 @@ BEZEL_TEST(codegen_serialization_688,
         "      var p := Pt.Deserialize(d); "
         "    catch SerializationException => caught := 1; "
         "    end; "
-        "    return (42 if caught = 1 else 1); "
+        "    return (if caught = 1 then 42 else 1); "
         "  end Main; "
         "end Program;"), 42);
 }
@@ -222,7 +222,7 @@ BEZEL_TEST(codegen_serialization_688,
         "      var bad := TwoFR.Deserialize(de); "
         "    catch SerializationException => caught := 1; "
         "    end; "
-        "    return (42 if caught = 1 else 1); "
+        "    return (if caught = 1 then 42 else 1); "
         "  end Main; "
         "end Program;"), 42);
 }
@@ -242,7 +242,7 @@ BEZEL_TEST(codegen_serialization_688,
         // The \\n sequences become literal \n in the Bezel string.
         "    using var d := new JsonDeserializer(\"{\\n  \\\"X\\\": 3,\\n  \\\"Y\\\": 7\\n}\"); "
         "    var got := Pt.Deserialize(d); "
-        "    return (42 if got.X = 3 and got.Y = 7 else 1); "
+        "    return (if got.X = 3 and got.Y = 7 then 42 else 1); "
         "  end Main; "
         "end Program;"), 42);
 }

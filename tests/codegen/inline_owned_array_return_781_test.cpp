@@ -31,7 +31,7 @@ BEZEL_TEST(inline_owned_array_return_781, returned_array_first_slot_materialized
         "  end Make; "
         "  public static method Main(): int "
         "    var a := C.Make(); "
-        "    return 0 if a[0] = null else a[0]!.n; "  // 5
+        "    return (if a[0] = null then 0 else a[0]!.n); "  // 5
         "  end Main; "
         "end C;"), 5);
 }

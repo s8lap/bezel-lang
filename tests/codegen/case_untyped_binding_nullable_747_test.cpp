@@ -26,11 +26,10 @@ BEZEL_TEST(codegen_case_untyped_binding_nullable_747, var_arm_value_path) {
         "module M; class C "
         "  public static method Main(): int "
         "    var x: int? := 7; "
-        "    var r: int? := case x of "
+        "    var r: int? := (case x of "
         "      null => 0, "
-        "      var n => n "
-        "    end; "
-        "    return 99 if r = null else r!; "  // → 7
+        "      var n => n); "
+        "    return (if r = null then 99 else r!); "  // → 7
         "  end Main; "
         "end C;"), 7);
 }
@@ -41,11 +40,10 @@ BEZEL_TEST(codegen_case_untyped_binding_nullable_747, null_arm_value_path) {
         "module M; class C "
         "  public static method Main(): int "
         "    var x: int? := null; "
-        "    var r: int? := case x of "
+        "    var r: int? := (case x of "
         "      null => 0, "
-        "      var n => n "
-        "    end; "
-        "    return 99 if r = null else r! + 5; "  // 0 + 5 = 5
+        "      var n => n); "
+        "    return (if r = null then 99 else r! + 5); "  // 0 + 5 = 5
         "  end Main; "
         "end C;"), 5);
 }
@@ -58,9 +56,8 @@ BEZEL_TEST(codegen_case_untyped_binding_nullable_747, bound_name_is_nullable_val
         "module M; class C "
         "  public static method Main(): int "
         "    var x: int? := 11; "
-        "    var r: int? := case x of "
-        "      var n => (100 if n = null else n!) "
-        "    end; "
+        "    var r: int? := (case x of "
+        "      var n => (if n = null then 100 else n!)); "
         "    return r!; "  // n is non-null 11 → 11
         "  end Main; "
         "end C;"), 11);
@@ -73,10 +70,9 @@ BEZEL_TEST(codegen_case_untyped_binding_nullable_747, typed_binding_unwraps_to_i
         "module M; class C "
         "  public static method Main(): int "
         "    var x: int? := 42; "
-        "    return case x of "
+        "    return (case x of "
         "      null => 0, "
-        "      var n: int => n "
-        "    end; "  // → 42
+        "      var n: int => n); "  // → 42
         "  end Main; "
         "end C;"), 42);
 }

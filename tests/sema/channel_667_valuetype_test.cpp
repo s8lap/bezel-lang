@@ -308,7 +308,7 @@ BEZEL_TEST(channel_667_valuetype,
         "    catch ChannelClosedException => raised := true; "
         "    end; "
         "    sender.Dispose(); "
-        "    return (42 if raised else 91); "
+        "    return (if raised then 42 else 91); "
         "  end Main; "
         "end Program;");
     // fix #634: send-after-dispose raises CCE; no regression.

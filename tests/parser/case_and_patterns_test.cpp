@@ -89,32 +89,32 @@ bool missingOfDiagnostic(const std::string& expr) {
 
 BEZEL_TEST(parser_case, two_literal_arms) {
     BEZEL_EXPECT_EQ(
-        renderCase("case x of 1 => \"one\", 2 => \"two\" end"),
+        renderCase("(case x of 1 => \"one\", 2 => \"two\")"),
         std::string("case x of { 1 => \"one\" | 2 => \"two\" } end"));
 }
 
 BEZEL_TEST(parser_case, discard_default_arm) {
     BEZEL_EXPECT_EQ(
-        renderCase("case x of 1 => \"one\", _ => \"other\" end"),
+        renderCase("(case x of 1 => \"one\", _ => \"other\")"),
         std::string("case x of { 1 => \"one\" | _ => \"other\" } end"));
 }
 
 BEZEL_TEST(parser_case, null_pattern) {
     BEZEL_EXPECT_EQ(
-        renderCase("case x of null => 0, var y => y end"),
+        renderCase("(case x of null => 0, var y => y)"),
         std::string("case x of { null => 0 | var y => y } end"));
 }
 
 BEZEL_TEST(parser_case, var_pattern_with_type) {
     BEZEL_EXPECT_EQ(
-        renderCase("case x of var n: int => n, _ => 0 end"),
+        renderCase("(case x of var n: int => n, _ => 0)"),
         std::string("case x of { var n: int => n | _ => 0 } end"));
 }
 
 BEZEL_TEST(parser_case, when_guard) {
     BEZEL_EXPECT_EQ(
         renderCase(
-            "case x of var n: int when n > 0 => \"pos\", _ => \"non-pos\" end"),
+            "(case x of var n: int when n > 0 => \"pos\", _ => \"non-pos\")"),
         std::string(
             "case x of { var n: int when (n > 0) => \"pos\" "
             "| _ => \"non-pos\" } end"));
@@ -124,13 +124,13 @@ BEZEL_TEST(parser_case, named_pattern_qualified) {
     // `Color.Red` parses as NamedPattern (sema resolves Constant-vs-Type-test
     // per §A.7).
     BEZEL_EXPECT_EQ(
-        renderCase("case x of Color.Red => 1, Color.Blue => 2 end"),
+        renderCase("(case x of Color.Red => 1, Color.Blue => 2)"),
         std::string("case x of { Color.Red => 1 | Color.Blue => 2 } end"));
 }
 
 BEZEL_TEST(parser_case, primitive_type_pattern) {
     BEZEL_EXPECT_EQ(
-        renderCase("case x of int => 1, string => 2, _ => 0 end"),
+        renderCase("(case x of int => 1, string => 2, _ => 0)"),
         std::string(
             "case x of { int => 1 | string => 2 | _ => 0 } end"));
 }
@@ -138,7 +138,7 @@ BEZEL_TEST(parser_case, primitive_type_pattern) {
 BEZEL_TEST(parser_case, range_pattern_with_lower_bound) {
     BEZEL_EXPECT_EQ(
         renderCase(
-            "case x of 0..10 => \"small\", 10..<100 => \"mid\", _ => \"big\" end"),
+            "(case x of 0..10 => \"small\", 10..<100 => \"mid\", _ => \"big\")"),
         std::string(
             "case x of { (0 .. 10) => \"small\" "
             "| (10 ..< 100) => \"mid\" "
@@ -147,7 +147,7 @@ BEZEL_TEST(parser_case, range_pattern_with_lower_bound) {
 
 BEZEL_TEST(parser_case, destructuring_pattern) {
     BEZEL_EXPECT_EQ(
-        renderCase("case x of Some(v) => v, None => 0 end"),
+        renderCase("(case x of Some(v) => v, None => 0)"),
         std::string(
             "case x of { Some(v) => v | None => 0 } end"));
 }
@@ -155,7 +155,7 @@ BEZEL_TEST(parser_case, destructuring_pattern) {
 BEZEL_TEST(parser_case, destructuring_with_nested_patterns) {
     BEZEL_EXPECT_EQ(
         renderCase(
-            "case x of Pair(var a, var b) => a + b, _ => 0 end"),
+            "(case x of Pair(var a, var b) => a + b, _ => 0)"),
         std::string(
             "case x of { Pair(var a, var b) => (a + b) "
             "| _ => 0 } end"));
@@ -165,13 +165,13 @@ BEZEL_TEST(parser_case, destructuring_naked_binding) {
     // A naked binding (`v` not `var v`) is valid inside destructuring;
     // the spec admits the bare Identifier as a PositionalPattern shape.
     BEZEL_EXPECT_EQ(
-        renderCase("case x of Some(v) => v end"),
+        renderCase("(case x of Some(v) => v)"),
         std::string("case x of { Some(v) => v } end"));
 }
 
 BEZEL_TEST(parser_case, trailing_comma_allowed) {
     BEZEL_EXPECT_EQ(
-        renderCase("case x of 1 => \"a\", 2 => \"b\", end"),
+        renderCase("(case x of 1 => \"a\", 2 => \"b\",)"),
         std::string("case x of { 1 => \"a\" | 2 => \"b\" } end"));
 }
 
@@ -181,7 +181,7 @@ BEZEL_TEST(parser_case, case_inside_method_compiles) {
     auto r = parseAll(
         "module M; class C "
         "public method Pick(): string "
-        "  return case 1 of 1 => \"a\", _ => \"b\" end; "
+        "  return (case 1 of 1 => \"a\", _ => \"b\"); "
         "end Pick; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -195,15 +195,15 @@ BEZEL_TEST(parser_case, case_inside_method_compiles) {
 // first arm token; the diagnostic names the delimiter.
 BEZEL_TEST(parser_case_of, missing_of_is_a_syntax_error_spec_19_1) {
     BEZEL_EXPECT_TRUE(
-        missingOfDiagnostic("case x 1 => \"one\", _ => \"other\" end"));
+        missingOfDiagnostic("(case x 1 => \"one\", _ => \"other\")"));
     // A bare scrutinee with no `of` and no arm token still names the delimiter.
-    BEZEL_EXPECT_TRUE(missingOfDiagnostic("case x end"));
+    BEZEL_EXPECT_TRUE(missingOfDiagnostic("(case x)"));
 }
 
 // §19.1: with `of` present, the same construct parses cleanly.
 BEZEL_TEST(parser_case_of, of_present_parses_cleanly_spec_19_1) {
     BEZEL_EXPECT_EQ(
-        renderCase("case x of 1 => \"one\", _ => \"other\" end"),
+        renderCase("(case x of 1 => \"one\", _ => \"other\")"),
         std::string("case x of { 1 => \"one\" | _ => \"other\" } end"));
 }
 
@@ -211,7 +211,7 @@ BEZEL_TEST(parser_case_of, of_present_parses_cleanly_spec_19_1) {
 // parentheses now that `of` marks the boundary (`case x - 1 of`).
 BEZEL_TEST(parser_case_of, additive_scrutinee_unparenthesized_spec_19_1) {
     BEZEL_EXPECT_EQ(
-        renderCase("case x - 1 of 0..3 => \"lo\", _ => \"hi\" end"),
+        renderCase("(case x - 1 of 0..3 => \"lo\", _ => \"hi\")"),
         std::string(
             "case (x - 1) of { (0 .. 3) => \"lo\" | _ => \"hi\" } end"));
 }
@@ -220,7 +220,7 @@ BEZEL_TEST(parser_case_of, additive_scrutinee_unparenthesized_spec_19_1) {
 // of`) — the old multiplicative-level restriction is gone.
 BEZEL_TEST(parser_case_of, bitwise_scrutinee_unparenthesized_spec_19_1) {
     BEZEL_EXPECT_EQ(
-        renderCase("case flags & mask of 0 => \"none\", _ => \"some\" end"),
+        renderCase("(case flags & mask of 0 => \"none\", _ => \"some\")"),
         std::string(
             "case (flags & mask) of { 0 => \"none\" | _ => \"some\" } end"));
 }
@@ -229,7 +229,7 @@ BEZEL_TEST(parser_case_of, bitwise_scrutinee_unparenthesized_spec_19_1) {
 // a first pattern may still begin with `..` / `..<` with no ambiguity.
 BEZEL_TEST(parser_case_of, range_scrutinee_unparenthesized_spec_19_1) {
     BEZEL_EXPECT_EQ(
-        renderCase("case lo..hi of _ => \"r\" end"),
+        renderCase("(case lo..hi of _ => \"r\")"),
         std::string("case (lo .. hi) of { _ => \"r\" } end"));
 }
 
@@ -239,8 +239,8 @@ BEZEL_TEST(parser_case_of, range_scrutinee_unparenthesized_spec_19_1) {
 BEZEL_TEST(parser_case_of, leading_negative_range_first_pattern_spec_19_1) {
     BEZEL_EXPECT_EQ(
         renderCase(
-            "case delta of -10..-6 => \"strongly down\", ..<0 => \"down\", "
-            "0 => \"flat\", _ => \"up\" end"),
+            "(case delta of -10..-6 => \"strongly down\", ..<0 => \"down\", "
+            "0 => \"flat\", _ => \"up\")"),
         std::string(
             "case delta of { ((-10) .. (-6)) => \"strongly down\" "
             "| (<> ..< 0) => \"down\" | 0 => \"flat\" | _ => \"up\" } end"));
@@ -249,7 +249,7 @@ BEZEL_TEST(parser_case_of, leading_negative_range_first_pattern_spec_19_1) {
 // §19.1: a trailing comma before `end` is still accepted with `of` present.
 BEZEL_TEST(parser_case_of, trailing_comma_still_allowed_spec_19_1) {
     BEZEL_EXPECT_EQ(
-        renderCase("case x of 1 => \"a\", 2 => \"b\", end"),
+        renderCase("(case x of 1 => \"a\", 2 => \"b\",)"),
         std::string("case x of { 1 => \"a\" | 2 => \"b\" } end"));
 }
 
@@ -258,11 +258,10 @@ BEZEL_TEST(parser_case_of, trailing_comma_still_allowed_spec_19_1) {
 BEZEL_TEST(parser_case_of, when_construct_unaffected_by_of_spec_19_1) {
     auto r = parseAll(
         "module M; class C public method M(score: int): string "
-        "  return when "
+        "  return (when "
         "    score >= 90 => \"A\", "
         "    score >= 80 => \"B\", "
-        "    _ => \"F\" "
-        "  end; "
+        "    _ => \"F\"); "
         "end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -274,7 +273,7 @@ BEZEL_TEST(parser_case_of, of_still_usable_as_identifier_spec_B) {
     auto r = parseAll(
         "module M; class C public method M(): int "
         "  var of := 42; "
-        "  return case of of 42 => 1, _ => 0 end; "
+        "  return (case of of 42 => 1, _ => 0); "
         "end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

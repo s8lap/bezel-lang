@@ -71,7 +71,7 @@ BEZEL_TEST(codegen_2007, typed_annotation_as_inline_array_compiles_and_runs) {
         "  using var b := new Box<[3]int>(a); "
         "  var o: Object := b; "
         "  var w: Box<[3]int>? := o as Box<[3]int>; "   // the over-reject site
-        "  return (1 if w <> null else 0); "
+        "  return (if w <> null then 1 else 0); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(rejectedOnFiveOne(r));
@@ -113,7 +113,7 @@ BEZEL_TEST(codegen_2007, distinct_sizes_still_not_assignable) {
         "  using var b := new Box<[3]int>(a); "
         "  var o: Object := b; "
         "  var w: Box<[4]int>? := o as Box<[4]int>; "   // wrong size → null
-        "  return (1 if w = null else 0); "
+        "  return (if w = null then 1 else 0); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);   // `as` returned null: sizes genuinely differ
@@ -131,7 +131,7 @@ BEZEL_TEST(codegen_2007, distinct_elements_still_not_assignable) {
         "  using var b := new Box<int>(7); "
         "  var o: Object := b; "
         "  var w: Box<string>? := o as Box<string>; "   // wrong element → null
-        "  return (1 if w = null else 0); "
+        "  return (if w = null then 1 else 0); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);
@@ -148,7 +148,7 @@ BEZEL_TEST(codegen_2007, nested_inline_array_as_right_size_non_null) {
         "  using var outer := new Box<Box<[3]int>>(wrap); "
         "  var o: Object := outer; "
         "  var w := o as Box<Box<[3]int>>; "
-        "  return (1 if w <> null else 0);"), 1);
+        "  return (if w <> null then 1 else 0);"), 1);
 }
 
 // Nested, WRONG size → null (the size distinction recurses through the
@@ -160,5 +160,5 @@ BEZEL_TEST(codegen_2007, nested_inline_array_as_wrong_size_null) {
         "  using var outer := new Box<Box<[3]int>>(wrap); "
         "  var o: Object := outer; "
         "  var w := o as Box<Box<[4]int>>; "
-        "  return (1 if w = null else 0);"), 1);
+        "  return (if w = null then 1 else 0);"), 1);
 }

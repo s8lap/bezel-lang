@@ -357,7 +357,7 @@ const char* kValueCaptureIntBool =
     "  public static method Main(): int "
     "    var k: int := 7; "
     "    var flag: bool := true; "
-    "    var f: (int) -> int := lambda(x: int) => (x + k) if flag else 0; "
+    "    var f: (int) -> int := lambda(x: int) => (if flag then (x + k) else 0); "
     "    var r: int := f(3); "  // 3 + 7 = 10
     "    if r = 10 then return 0; end; return 1; "
     "  end Main; "

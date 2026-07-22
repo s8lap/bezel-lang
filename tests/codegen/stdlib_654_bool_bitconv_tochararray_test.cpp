@@ -51,7 +51,7 @@ BEZEL_TEST(codegen_654_bool_tryparse, tryparse_true_lowercase_ok) {
     BEZEL_EXPECT_EQ(run(prog(
         "var result: bool; "
         "var ok := bool.TryParse(\"true\", out result); "
-        "return (1 if ok else 0); ")), 1);
+        "return (if ok then 1 else 0); ")), 1);
 }
 
 // stdlib §9.4: TryParse("true") sets result to true (value check).
@@ -59,7 +59,7 @@ BEZEL_TEST(codegen_654_bool_tryparse, tryparse_true_value) {
     BEZEL_EXPECT_EQ(run(prog(
         "var result: bool; "
         "var ok := bool.TryParse(\"true\", out result); "
-        "if ok then return (1 if result else 0); end; "
+        "if ok then return (if result then 1 else 0); end; "
         "return -1; ")), 1);
 }
 
@@ -68,7 +68,7 @@ BEZEL_TEST(codegen_654_bool_tryparse, tryparse_false_lowercase_ok) {
     BEZEL_EXPECT_EQ(run(prog(
         "var result: bool; "
         "var ok := bool.TryParse(\"false\", out result); "
-        "return (1 if ok else 0); ")), 1);
+        "return (if ok then 1 else 0); ")), 1);
 }
 
 // stdlib §9.4: TryParse("false") sets result to false.
@@ -76,7 +76,7 @@ BEZEL_TEST(codegen_654_bool_tryparse, tryparse_false_value) {
     BEZEL_EXPECT_EQ(run(prog(
         "var result: bool; "
         "var ok := bool.TryParse(\"false\", out result); "
-        "if ok then return (0 if result else 1); end; "
+        "if ok then return (if result then 0 else 1); end; "
         "return -1; ")), 1);
 }
 
@@ -85,7 +85,7 @@ BEZEL_TEST(codegen_654_bool_tryparse, tryparse_true_uppercase) {
     BEZEL_EXPECT_EQ(run(prog(
         "var result: bool; "
         "var ok := bool.TryParse(\"True\", out result); "
-        "return (1 if ok else 0); ")), 1);
+        "return (if ok then 1 else 0); ")), 1);
 }
 
 // stdlib §9.4: TryParse("FALSE") case-insensitive → ok=true, result=false.
@@ -93,7 +93,7 @@ BEZEL_TEST(codegen_654_bool_tryparse, tryparse_false_uppercase) {
     BEZEL_EXPECT_EQ(run(prog(
         "var result: bool; "
         "var ok := bool.TryParse(\"FALSE\", out result); "
-        "if ok then return (0 if result else 1); end; "
+        "if ok then return (if result then 0 else 1); end; "
         "return -1; ")), 1);
 }
 
@@ -102,7 +102,7 @@ BEZEL_TEST(codegen_654_bool_tryparse, tryparse_garbage_returns_false) {
     BEZEL_EXPECT_EQ(run(prog(
         "var result: bool; "
         "var ok := bool.TryParse(\"yes\", out result); "
-        "return (0 if ok else 1); ")), 1);
+        "return (if ok then 0 else 1); ")), 1);
 }
 
 // stdlib §9.4: TryParse("1") → ok=false (only "true"/"false", not "1").
@@ -112,7 +112,7 @@ BEZEL_TEST(codegen_654_bool_tryparse, tryparse_one_is_not_accepted) {
     BEZEL_EXPECT_EQ(run(prog(
         "var result: bool; "
         "var ok := bool.TryParse(\"1\", out result); "
-        "return (0 if ok else 1); ")), 1);
+        "return (if ok then 0 else 1); ")), 1);
 }
 
 // stdlib §9.4: Boolean.TryParse (boxed-type name spelling) also works.
@@ -120,7 +120,7 @@ BEZEL_TEST(codegen_654_bool_tryparse, boolean_tryparse_name_spelling) {
     BEZEL_EXPECT_EQ(run(prog(
         "var result: bool; "
         "var ok := Boolean.TryParse(\"true\", out result); "
-        "return (1 if ok else 0); ")), 1);
+        "return (if ok then 1 else 0); ")), 1);
 }
 
 // ===========================================================================
@@ -138,19 +138,19 @@ BEZEL_TEST(codegen_654_bool_tryparse, boolean_tryparse_name_spelling) {
 // stdlib §9.4: bool.Parse("true") → true.
 BEZEL_TEST(codegen_1035_bool_parse, parse_true) {
     BEZEL_EXPECT_EQ(run(prog(
-        "var b := bool.Parse(\"true\"); return (7 if b else 9); ")), 7);
+        "var b := bool.Parse(\"true\"); return (if b then 7 else 9); ")), 7);
 }
 
 // stdlib §9.4: bool.Parse("false") → false.
 BEZEL_TEST(codegen_1035_bool_parse, parse_false) {
     BEZEL_EXPECT_EQ(run(prog(
-        "var b := bool.Parse(\"false\"); return (1 if b else 4); ")), 4);
+        "var b := bool.Parse(\"false\"); return (if b then 1 else 4); ")), 4);
 }
 
 // stdlib §9.4: recognition is case-insensitive ("TRUE" → true).
 BEZEL_TEST(codegen_1035_bool_parse, parse_case_insensitive) {
     BEZEL_EXPECT_EQ(run(prog(
-        "var b := bool.Parse(\"TRUE\"); return (42 if b else 0); ")), 42);
+        "var b := bool.Parse(\"TRUE\"); return (if b then 42 else 0); ")), 42);
 }
 
 // stdlib §9.4 / §9.x strict-fault: an unrecognised word raises FormatException.
@@ -167,7 +167,7 @@ BEZEL_TEST(codegen_1035_bool_parse, parse_invalid_raises_format_exception) {
 // stdlib §9.4: Boolean.Parse (boxed-type name spelling) also lowers.
 BEZEL_TEST(codegen_1035_bool_parse, boolean_parse_name_spelling) {
     BEZEL_EXPECT_EQ(run(prog(
-        "var b := Boolean.Parse(\"false\"); return (1 if b else 4); ")), 4);
+        "var b := Boolean.Parse(\"false\"); return (if b then 1 else 4); ")), 4);
 }
 
 // ===========================================================================
@@ -179,28 +179,28 @@ BEZEL_TEST(codegen_1035_bool_parse, boolean_parse_name_spelling) {
 BEZEL_TEST(codegen_654_bitconverter, float_to_int32bits_zero) {
     BEZEL_EXPECT_EQ(run(prog(
         "var bits := BitConverter.FloatToInt32Bits(0.0); "
-        "return (1 if bits = 0 else 0); ")), 1);
+        "return (if bits = 0 then 1 else 0); ")), 1);
 }
 
 // stdlib §2.12: FloatToInt32Bits(1.0) == 0x3F800000 (1065353216).
 BEZEL_TEST(codegen_654_bitconverter, float_to_int32bits_one) {
     BEZEL_EXPECT_EQ(run(prog(
         "var bits := BitConverter.FloatToInt32Bits(1.0); "
-        "return (1 if bits = 1065353216 else 0); ")), 1);
+        "return (if bits = 1065353216 then 1 else 0); ")), 1);
 }
 
 // stdlib §2.12: Int32BitsToFloat(0) == 0.0.
 BEZEL_TEST(codegen_654_bitconverter, int32bits_to_float_zero) {
     BEZEL_EXPECT_EQ(run(prog(
         "var f := BitConverter.Int32BitsToFloat(0); "
-        "return (1 if f = 0.0 else 0); ")), 1);
+        "return (if f = 0.0 then 1 else 0); ")), 1);
 }
 
 // stdlib §2.12: Int32BitsToFloat(1065353216) == 1.0.
 BEZEL_TEST(codegen_654_bitconverter, int32bits_to_float_one) {
     BEZEL_EXPECT_EQ(run(prog(
         "var f := BitConverter.Int32BitsToFloat(1065353216); "
-        "return (1 if f = 1.0 else 0); ")), 1);
+        "return (if f = 1.0 then 1 else 0); ")), 1);
 }
 
 // stdlib §2.12: FloatToInt32Bits round-trips: FloatToInt32Bits(Int32BitsToFloat(n)) = n.
@@ -209,28 +209,28 @@ BEZEL_TEST(codegen_654_bitconverter, float_roundtrip) {
     BEZEL_EXPECT_EQ(run(prog(
         "var f := BitConverter.Int32BitsToFloat(1065353216); "
         "var bits := BitConverter.FloatToInt32Bits(f); "
-        "return (1 if bits = 1065353216 else 0); ")), 1);
+        "return (if bits = 1065353216 then 1 else 0); ")), 1);
 }
 
 // stdlib §2.12: DoubleToInt64Bits(0.0) == 0.
 BEZEL_TEST(codegen_654_bitconverter, double_to_int64bits_zero) {
     BEZEL_EXPECT_EQ(run(prog(
         "var bits := BitConverter.DoubleToInt64Bits(0.0); "
-        "return (1 if bits = 0 else 0); ")), 1);
+        "return (if bits = 0 then 1 else 0); ")), 1);
 }
 
 // stdlib §2.12: DoubleToInt64Bits(1.0) == 0x3FF0000000000000 (4607182418800017408L).
 BEZEL_TEST(codegen_654_bitconverter, double_to_int64bits_one) {
     BEZEL_EXPECT_EQ(run(prog(
         "var bits := BitConverter.DoubleToInt64Bits(1.0); "
-        "return (1 if bits = 4607182418800017408L else 0); ")), 1);
+        "return (if bits = 4607182418800017408L then 1 else 0); ")), 1);
 }
 
 // stdlib §2.12: Int64BitsToDouble(0) == 0.0.
 BEZEL_TEST(codegen_654_bitconverter, int64bits_to_double_zero) {
     BEZEL_EXPECT_EQ(run(prog(
         "var d := BitConverter.Int64BitsToDouble(0); "
-        "return (1 if d = 0.0 else 0); ")), 1);
+        "return (if d = 0.0 then 1 else 0); ")), 1);
 }
 
 // stdlib §2.12: Double round-trips: DoubleToInt64Bits(Int64BitsToDouble(n)) = n.
@@ -239,7 +239,7 @@ BEZEL_TEST(codegen_654_bitconverter, double_roundtrip) {
     BEZEL_EXPECT_EQ(run(prog(
         "var d := BitConverter.Int64BitsToDouble(4611686018427387904L); "
         "var bits := BitConverter.DoubleToInt64Bits(d); "
-        "return (1 if bits = 4611686018427387904L else 0); ")), 1);
+        "return (if bits = 4611686018427387904L then 1 else 0); ")), 1);
 }
 
 // #1038 / §3.4: BitConverter (§2.12) is a pure-static utility class with
@@ -255,7 +255,7 @@ BEZEL_TEST(codegen_654_bitconverter, unknown_static_rejected_1038) {
 BEZEL_TEST(codegen_654_bitconverter, reinterpret_still_works_1038) {
     BEZEL_EXPECT_EQ(run(prog(
         "var x: int := BitConverter.Reinterpret<int>(1.0f); "
-        "return (1 if x = 1065353216 else 0); ")), 1);
+        "return (if x = 1065353216 then 1 else 0); ")), 1);
 }
 
 // ===========================================================================
@@ -276,7 +276,7 @@ BEZEL_TEST(codegen_654_tochararray, first_char_correct) {
         "var s := \"abc\"; "
         "using var a := s.ToCharArray(); "
         "var c := a.Get(0); "
-        "return (1 if c = 'a' else 0); ")), 1);
+        "return (if c = 'a' then 1 else 0); ")), 1);
 }
 
 // stdlib §9.6: ToCharArray()[1] is the second code point.
@@ -285,7 +285,7 @@ BEZEL_TEST(codegen_654_tochararray, second_char_correct) {
         "var s := \"abc\"; "
         "using var a := s.ToCharArray(); "
         "var c := a.Get(1); "
-        "return (1 if c = 'b' else 0); ")), 1);
+        "return (if c = 'b' then 1 else 0); ")), 1);
 }
 
 // stdlib §9.6: ToCharArray() on empty string returns empty array (Count = 0).
@@ -334,7 +334,7 @@ BEZEL_TEST(codegen_string_from_747, empty_array_zero_count_equals_empty) {
         "module M; class C public static method Main(): int "
         "  using var chars := new Array<char>(); "
         "  var s := string.From(chars, 0, 0); "
-        "  return 0 if s = \"\" else 1; "  // 0
+        "  return (if s = \"\" then 0 else 1); "  // 0
         "end Main; end C;"), 0);
 }
 
@@ -345,7 +345,7 @@ BEZEL_TEST(codegen_string_from_747, builds_substring_content) {
         "  using var chars := new Array<char>(); "
         "  chars.Add('H'); chars.Add('i'); chars.Add('!'); "
         "  var s := string.From(chars, 0, 2); "
-        "  return s.Length if s = \"Hi\" else 99; "  // 2
+        "  return (if s = \"Hi\" then s.Length else 99); "  // 2
         "end Main; end C;"), 2);
 }
 
@@ -355,7 +355,7 @@ BEZEL_TEST(codegen_string_from_747, roundtrips_with_to_char_array) {
         "module M; class C public static method Main(): int "
         "  using var arr := \"World\".ToCharArray(); "
         "  var s := string.From(arr, 1, 3); "
-        "  return 0 if s = \"orl\" else s.Length; "  // 0
+        "  return (if s = \"orl\" then 0 else s.Length); "  // 0
         "end Main; end C;"), 0);
 }
 
@@ -365,7 +365,7 @@ BEZEL_TEST(codegen_string_from_747, non_ascii_roundtrip_width) {
         "module M; class C public static method Main(): int "
         "  using var arr := \"caf\xC3\xA9\".ToCharArray(); "
         "  var s := string.From(arr, 0, 4); "
-        "  return s.Length if s = \"caf\xC3\xA9\" else 99; "  // 4
+        "  return (if s = \"caf\xC3\xA9\" then s.Length else 99); "  // 4
         "end Main; end C;"), 4);
 }
 

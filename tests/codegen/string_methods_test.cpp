@@ -20,7 +20,7 @@ BEZEL_TEST(codegen_cg27f, starts_with_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"Hello World\"; "
-        "  return (1 if s.StartsWith(\"Hello\") else 0); "
+        "  return (if s.StartsWith(\"Hello\") then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -28,7 +28,7 @@ BEZEL_TEST(codegen_cg27f, starts_with_false) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"Hello World\"; "
-        "  return (1 if s.StartsWith(\"World\") else 0); "
+        "  return (if s.StartsWith(\"World\") then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -36,7 +36,7 @@ BEZEL_TEST(codegen_cg27f, starts_with_empty_prefix) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"abc\"; "
-        "  return (1 if s.StartsWith(\"\") else 0); "
+        "  return (if s.StartsWith(\"\") then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -45,7 +45,7 @@ BEZEL_TEST(codegen_cg27f, ends_with_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"Hello World\"; "
-        "  return (1 if s.EndsWith(\"World\") else 0); "
+        "  return (if s.EndsWith(\"World\") then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -53,7 +53,7 @@ BEZEL_TEST(codegen_cg27f, ends_with_false) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"Hello World\"; "
-        "  return (1 if s.EndsWith(\"Hello\") else 0); "
+        "  return (if s.EndsWith(\"Hello\") then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -62,7 +62,7 @@ BEZEL_TEST(codegen_cg27f, contains_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"Hello World\"; "
-        "  return (1 if s.Contains(\"lo W\") else 0); "
+        "  return (if s.Contains(\"lo W\") then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -70,7 +70,7 @@ BEZEL_TEST(codegen_cg27f, contains_false) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"Hello World\"; "
-        "  return (1 if s.Contains(\"xyz\") else 0); "
+        "  return (if s.Contains(\"xyz\") then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -101,7 +101,7 @@ BEZEL_TEST(codegen_cg27f, substring_from_offset) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"Hello World\"; var t := s.Substring(6); "
-        "  return (1 if t = \"World\" else 0); "
+        "  return (if t = \"World\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -110,7 +110,7 @@ BEZEL_TEST(codegen_cg27f, substring_with_length) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"Hello World\"; var t := s.Substring(0, 5); "
-        "  return (1 if t = \"Hello\" else 0); "
+        "  return (if t = \"Hello\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -185,7 +185,7 @@ BEZEL_TEST(codegen_string_split_char_spec_9_6, part_content) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var p: Array<string> := \"aa,bb,cc\".Split(','); "
-        "  return (1 if p[1] = \"bb\" else 0); "
+        "  return (if p[1] = \"bb\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -195,7 +195,7 @@ BEZEL_TEST(codegen_string_split_char_spec_9_6, empty_segment_between_separators)
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var p: Array<string> := \"a,,b\".Split(','); "
-        "  return (1 if (p.Count = 3 and p[1] = \"\") else 0); "
+        "  return (if (p.Count = 3 and p[1] = \"\") then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -203,7 +203,7 @@ BEZEL_TEST(codegen_string_split_char_spec_9_6, no_separator_whole_string) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var p: Array<string> := \"abc\".Split(','); "
-        "  return (1 if (p.Count = 1 and p[0] = \"abc\") else 0); "
+        "  return (if (p.Count = 1 and p[0] = \"abc\") then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -226,7 +226,7 @@ BEZEL_TEST(codegen_string_split_str_spec_9_6, multichar_delim_part_content) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var p: Array<string> := \"aa::bb::cc\".Split(\"::\"); "
-        "  return (1 if (p[0] = \"aa\" and p[1] = \"bb\" and p[2] = \"cc\") else 0); "
+        "  return (if (p[0] = \"aa\" and p[1] = \"bb\" and p[2] = \"cc\") then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -234,7 +234,7 @@ BEZEL_TEST(codegen_string_split_str_spec_9_6, multichar_delim_no_match_whole_str
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var p: Array<string> := \"abc\".Split(\"::\"); "
-        "  return (1 if (p.Count = 1 and p[0] = \"abc\") else 0); "
+        "  return (if (p.Count = 1 and p[0] = \"abc\") then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -253,7 +253,7 @@ BEZEL_TEST(codegen_string_compare_spec_9_6, compare_equal) {
 BEZEL_TEST(codegen_string_compare_spec_9_6, compare_less) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  return (1 if string.Compare(\"abc\", \"abd\") < 0 else 0); "
+        "  return (if string.Compare(\"abc\", \"abd\") < 0 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -268,7 +268,7 @@ BEZEL_TEST(codegen_string_compare_spec_9_6, ordinal_uppercase_less_than_lowercas
     // Ordinal (ignoreCase=false): 'A' (65) < 'a' (97), so "ABC" < "abc".
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  return (1 if string.Compare(\"ABC\", \"abc\", false) < 0 else 0); "
+        "  return (if string.Compare(\"ABC\", \"abc\", false) < 0 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -287,7 +287,7 @@ BEZEL_TEST(codegen_string_repeat_spec_9_6, repeat_content) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s: string := string.Repeat('a', 3); "
-        "  return (1 if s = \"aaa\" else 0); "
+        "  return (if s = \"aaa\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -307,7 +307,7 @@ BEZEL_TEST(codegen_string_repeat_spec_9_6, repeat_zero_is_empty) {
 BEZEL_TEST(codegen_string_741, is_ascii_true_for_ascii) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  return (1 if \"Hello\".IsAscii else 0); "
+        "  return (if \"Hello\".IsAscii then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -315,7 +315,7 @@ BEZEL_TEST(codegen_string_741, is_ascii_true_for_ascii) {
 BEZEL_TEST(codegen_string_741, is_ascii_false_for_latin1) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  return (1 if \"H\\u00e9llo\".IsAscii else 0); "  // é = U+00E9
+        "  return (if \"H\\u00e9llo\".IsAscii then 1 else 0); "  // é = U+00E9
         "end Main; end C;"), 0);
 }
 
@@ -323,7 +323,7 @@ BEZEL_TEST(codegen_string_741, is_ascii_false_for_latin1) {
 BEZEL_TEST(codegen_string_741, is_ascii_empty_is_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  return (1 if \"\".IsAscii else 0); "
+        "  return (if \"\".IsAscii then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -385,7 +385,7 @@ BEZEL_TEST(codegen_string_741, trim_char_set_content) {
         "  using var chars := new Array<char>(); "
         "  chars.Add('_'); chars.Add('-'); "
         "  var t := \"_-mid-_\".Trim(chars); "
-        "  return (1 if t = \"mid\" else 0); "
+        "  return (if t = \"mid\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -402,7 +402,7 @@ BEZEL_TEST(codegen_string_equals_ignorecasenull_1244_spec_9_6,
         "module M; class C public static method Main(): int "
         "  var s := \"hello\"; "
         "  var other: string? := null; "
-        "  return (1 if not s.Equals(other, true) else 0); "
+        "  return (if not s.Equals(other, true) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -414,7 +414,7 @@ BEZEL_TEST(codegen_string_equals_ignorecasenull_1244_spec_9_6,
         "module M; class C public static method Main(): int "
         "  var s := \"hello\"; "
         "  var other: string? := null; "
-        "  return (1 if not s.Equals(other, false) else 0); "
+        "  return (if not s.Equals(other, false) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -424,7 +424,7 @@ BEZEL_TEST(codegen_string_equals_ignorecasenull_1244_spec_9_6,
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"hello\"; "
-        "  return (0 if s.Equals(\"HELLO\", true) else 1); "
+        "  return (if s.Equals(\"HELLO\", true) then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -434,7 +434,7 @@ BEZEL_TEST(codegen_string_equals_ignorecasenull_1244_spec_9_6,
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"hello\"; "
-        "  return (1 if not s.Equals(\"world\", true) else 0); "
+        "  return (if not s.Equals(\"world\", true) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -444,7 +444,7 @@ BEZEL_TEST(codegen_string_equals_ignorecasenull_1244_spec_9_6,
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"hello\"; "
-        "  return (0 if s.Equals(\"hello\", false) else 1); "
+        "  return (if s.Equals(\"hello\", false) then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -454,7 +454,7 @@ BEZEL_TEST(codegen_string_equals_ignorecasenull_1244_spec_9_6,
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"hello\"; "
-        "  return (1 if not s.Equals(\"HELLO\", false) else 0); "
+        "  return (if not s.Equals(\"HELLO\", false) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

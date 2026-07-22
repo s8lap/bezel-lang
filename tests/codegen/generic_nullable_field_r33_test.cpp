@@ -35,7 +35,7 @@ BEZEL_TEST(codegen_generic_nullable_field_r33, compare_class_typeparam_nullable_
         "class Item public constructor() end constructor; destructor end destructor; end Item; "
         "class C public static method Main(): int "
         "  using var m := new Maybe<Item>(); "
-        "  return (1 if m.HasValue() else 0); "
+        "  return (if m.HasValue() then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -51,7 +51,7 @@ BEZEL_TEST(codegen_generic_nullable_field_r33, compare_value_typeparam_nullable_
         "end Maybe; "
         "class C public static method Main(): int "
         "  using var m := new Maybe<int>(); "
-        "  return (1 if m.IsNull() else 0); "  // _value is null → IsNull true → 1
+        "  return (if m.IsNull() then 1 else 0); "  // _value is null → IsNull true → 1
         "end Main; end C;"), 1);
 }
 

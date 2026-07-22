@@ -12,9 +12,8 @@ public class Runner
     // "object initializer block" reading of `with` was retired in v0.188
     // (proposal 0037); see spec_0138 for the remedy this diagnostic names
     // (bind to a local, assign members as statements).
-    using var t := new WaferTest(zUp := true) with
-      SaveResults := true,
+    using var t := new WaferTest(zUp := true) with(SaveResults := true,
       NotifyUi := false
-    end;
+    );
   end Main;
 end Runner;

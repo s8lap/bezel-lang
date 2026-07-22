@@ -78,7 +78,7 @@ BEZEL_TEST(case_type_test_value_scrutinee_ref_pattern_1936,
            int_vs_builtin_exception_rejected) {
     auto r = parseSemaAll(prog(
         "  public static method Main(): int\n"
-        "    return case 5 of var x: IOException => 1, _ => 9 end;\n"
+        "    return (case 5 of var x: IOException => 1, _ => 9);\n"
         "  end Main;\n"));
     BEZEL_EXPECT_TRUE(hasRefTypeBindError(r));
 }
@@ -88,7 +88,7 @@ BEZEL_TEST(case_type_test_value_scrutinee_ref_pattern_1936,
            int_vs_base_exception_rejected) {
     auto r = parseSemaAll(prog(
         "  public static method Main(): int\n"
-        "    return case 5 of var x: Exception => 1, _ => 9 end;\n"
+        "    return (case 5 of var x: Exception => 1, _ => 9);\n"
         "  end Main;\n"));
     BEZEL_EXPECT_TRUE(hasRefTypeBindError(r));
 }
@@ -100,7 +100,7 @@ BEZEL_TEST(case_type_test_value_scrutinee_ref_pattern_1936,
     auto r = parseSemaAll(prog(
         "  public static method Main(): int\n"
         "    var p := new Pt(1, 2);\n"
-        "    return case p of var q: C => 1, _ => 9 end;\n"
+        "    return (case p of var q: C => 1, _ => 9);\n"
         "  end Main;\n"));
     BEZEL_EXPECT_TRUE(hasRefTypeBindError(r));
 }
@@ -111,7 +111,7 @@ BEZEL_TEST(case_type_test_value_scrutinee_ref_pattern_1936,
     auto r = parseSemaAll(prog(
         "  public static method Main(): int\n"
         "    var p := new Pt(1, 2);\n"
-        "    return case p of var q: I => 1, _ => 9 end;\n"
+        "    return (case p of var q: I => 1, _ => 9);\n"
         "  end Main;\n"));
     BEZEL_EXPECT_TRUE(hasRefTypeBindError(r));
 }
@@ -122,7 +122,7 @@ BEZEL_TEST(case_type_test_value_scrutinee_ref_pattern_1936,
     auto r = parseSemaAll(prog(
         "  public static method Main(): int\n"
         "    var p := new Pt(1, 2);\n"
-        "    return case p of var q: IOException => 1, _ => 9 end;\n"
+        "    return (case p of var q: IOException => 1, _ => 9);\n"
         "  end Main;\n"));
     BEZEL_EXPECT_TRUE(hasRefTypeBindError(r));
 }
@@ -133,7 +133,7 @@ BEZEL_TEST(case_type_test_value_scrutinee_ref_pattern_1936,
     auto r = parseSemaAll(prog(
         "  public static method Main(): int\n"
         "    var c := Color.Red;\n"
-        "    return case c of var q: C => 1, _ => 9 end;\n"
+        "    return (case c of var q: C => 1, _ => 9);\n"
         "  end Main;\n"));
     BEZEL_EXPECT_TRUE(hasRefTypeBindError(r));
 }
@@ -144,7 +144,7 @@ BEZEL_TEST(case_type_test_value_scrutinee_ref_pattern_1936,
     auto r = parseSemaAll(prog(
         "  public static method Main(): int\n"
         "    var c := Color.Red;\n"
-        "    return case c of var q: IOException => 1, _ => 9 end;\n"
+        "    return (case c of var q: IOException => 1, _ => 9);\n"
         "  end Main;\n"));
     BEZEL_EXPECT_TRUE(hasRefTypeBindError(r));
 }
@@ -189,7 +189,7 @@ BEZEL_TEST(case_type_test_value_scrutinee_ref_pattern_1936,
         "    var r := 0;\n"
         "    try throw new InvalidOperationException(\"x\");\n"
         "    catch e: Exception =>\n"
-        "      r := case e of var x: InvalidOperationException => 3, _ => 0 end;\n"
+        "      r := (case e of var x: InvalidOperationException => 3, _ => 0);\n"
         "    end;\n"
         "    return r;\n"
         "  end Main;\n"
@@ -205,7 +205,7 @@ BEZEL_TEST(case_type_test_value_scrutinee_ref_pattern_1936,
            string_scrutinee_vs_string_binding_accepted) {
     auto r = parseSemaAll(prog(
         "  public static method Take(s: string): int\n"
-        "    return case s of var x: string => 1, _ => 9 end;\n"
+        "    return (case s of var x: string => 1, _ => 9);\n"
         "  end Take;\n"));
     BEZEL_EXPECT_FALSE(hasRefTypeBindError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -221,7 +221,7 @@ BEZEL_TEST(case_type_test_value_scrutinee_ref_pattern_1936,
         "class Dog : Animal public method Bark(): int return 1; end Bark; end Dog;\n"
         "class Program\n"
         "  public static method Take(a: Animal): int\n"
-        "    return case a of var d: Dog => 1, _ => 9 end;\n"
+        "    return (case a of var d: Dog => 1, _ => 9);\n"
         "  end Take;\n"
         "end Program;\n");
     BEZEL_EXPECT_FALSE(hasRefTypeBindError(r));
@@ -235,7 +235,7 @@ BEZEL_TEST(case_type_test_value_scrutinee_ref_pattern_1936,
            int_vs_int_binding_accepted) {
     auto r = parseSemaAll(prog(
         "  public static method Main(): int\n"
-        "    return case 5 of var x: int => x, _ => 9 end;\n"
+        "    return (case 5 of var x: int => x, _ => 9);\n"
         "  end Main;\n"));
     BEZEL_EXPECT_FALSE(hasRefTypeBindError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -249,7 +249,7 @@ BEZEL_TEST(case_type_test_value_scrutinee_ref_pattern_1936,
     auto r = parseSemaAll(prog(
         "  public static method Main(): int\n"
         "    var p := new Pt(1, 2);\n"
-        "    return case p of Pt(a, b) => a + b, _ => 9 end;\n"
+        "    return (case p of Pt(a, b) => a + b, _ => 9);\n"
         "  end Main;\n"));
     BEZEL_EXPECT_FALSE(hasRefTypeBindError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

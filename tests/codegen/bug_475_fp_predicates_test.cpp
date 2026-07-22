@@ -101,7 +101,7 @@ BEZEL_TEST(bug475_fp_predicates, double_IsNaN_stored_in_bool_var_475) {
     BEZEL_EXPECT_EQ(run(
         "var nan := double.NaN; "
         "var b := double.IsNaN(nan); "
-        "return (1 if b else 0);"), 1);
+        "return (if b then 1 else 0);"), 1);
 }
 
 // ── §9.2 double.IsInfinity ────────────────────────────────────────────────────
@@ -371,7 +371,7 @@ BEZEL_TEST(bug475_fp_predicates, double_IsFinite_stored_in_bool_var_475) {
     // stdlib §9.2: result is a proper i1 bool — stored and retrieved correctly.
     BEZEL_EXPECT_EQ(run(
         "var b := double.IsFinite(3.14); "
-        "return (1 if b else 0);"), 1);
+        "return (if b then 1 else 0);"), 1);
 }
 
 // ── §9.2 float predicate combined with double comparison ─────────────────────

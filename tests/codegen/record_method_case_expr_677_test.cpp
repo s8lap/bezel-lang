@@ -32,11 +32,10 @@ int runProg(const std::string& src) {
 const char* kTriBool =
     "module M; "
     "record TriBool(Value: int) "
-    "  public method Negate(): TriBool => case Value of "
+    "  public method Negate(): TriBool => (case Value of "
     "    0 => new TriBool(1), "
     "    1 => new TriBool(0), "
-    "    _ => this "
-    "  end; "
+    "    _ => this); "
     "end TriBool; ";
 
 } // namespace
@@ -105,10 +104,9 @@ BEZEL_TEST(codegen_677_record_case_this, case_no_this_arm_spec_9_4_19_2) {
     BEZEL_EXPECT_EQ(runProg(
         "module M; "
         "record Pair(a: int, b: int) "
-        "  public method Swap(): Pair => case a of "
+        "  public method Swap(): Pair => (case a of "
         "    0 => new Pair(b, a), "
-        "    _ => new Pair(b, a + 1) "
-        "  end; "
+        "    _ => new Pair(b, a + 1)); "
         "end Pair; "
         "class App "
         "  public static method Main(): int "
@@ -125,9 +123,8 @@ BEZEL_TEST(codegen_677_record_case_this, two_this_arms_spec_9_4_19_2) {
     BEZEL_EXPECT_EQ(runProg(
         "module M; "
         "record Pt(x: int) "
-        "  public method Clamp(lo: int, hi: int): Pt => case x of "
-        "    _ => this "
-        "  end; "
+        "  public method Clamp(lo: int, hi: int): Pt => (case x of "
+        "    _ => this); "
         "end Pt; "
         "class App "
         "  public static method Main(): int "
@@ -147,7 +144,7 @@ BEZEL_TEST(codegen_677_record_case_this, enum_method_case_this_regression_spec_1
         "module M; "
         "enum Dir North := 1, South := 2, East := 3; "
         "  public method Code(): int => "
-        "    case this of Dir.North => 10, Dir.South => 20, Dir.East => 30, end; "
+        "    (case this of Dir.North => 10, Dir.South => 20, Dir.East => 30,); "
         "end Dir; "
         "class App "
         "  public static method Main(): int "

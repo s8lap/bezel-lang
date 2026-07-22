@@ -80,7 +80,7 @@ BEZEL_TEST(codegen_2022, direct_is_wrong_arg_is_false) {
         "using var ai := new Array<int>(); ai.Add(5); "
         "using var w := new Wrap<Array<int>>(7); "
         "var o: Object := w; "
-        "return (1 if o is Wrap<Array<string>> else 0);"), 0);
+        "return (if o is Wrap<Array<string>> then 1 else 0);"), 0);
 }
 
 // The genuinely-matching arg still matches (TRUE). Pins both directions of the
@@ -90,7 +90,7 @@ BEZEL_TEST(codegen_2022, direct_is_right_arg_is_true) {
         "using var ai := new Array<int>(); ai.Add(5); "
         "using var w := new Wrap<Array<int>>(7); "
         "var o: Object := w; "
-        "return (1 if o is Wrap<Array<int>> else 0);"), 1);
+        "return (if o is Wrap<Array<int>> then 1 else 0);"), 1);
 }
 
 // `as` to the wrong arg yields null (§17.4) — no reinterpretation. This is the
@@ -102,7 +102,7 @@ BEZEL_TEST(codegen_2022, direct_as_wrong_arg_is_null) {
         "using var w := new Wrap<Array<int>>(7); "
         "var o: Object := w; "
         "var x := o as Wrap<Array<string>>; "
-        "return (1 if x = null else 0);"), 1);
+        "return (if x = null then 1 else 0);"), 1);
 }
 
 // `as` to the matching arg succeeds (non-null).
@@ -112,7 +112,7 @@ BEZEL_TEST(codegen_2022, direct_as_right_arg_non_null) {
         "using var w := new Wrap<Array<int>>(7); "
         "var o: Object := w; "
         "var x := o as Wrap<Array<int>>; "
-        "return (1 if x <> null else 0);"), 1);
+        "return (if x <> null then 1 else 0);"), 1);
 }
 
 // ---- THE HEADLINE: combined is/as, both directions in one program -------------
@@ -126,10 +126,10 @@ BEZEL_TEST(codegen_2022, combined_repro_is_as_correct) {
         "using var ai := new Array<int>(); ai.Add(5); "
         "using var w := new Wrap<Array<int>>(7); "
         "var o: Object := w; "
-        "var r1 := (1 if o is Wrap<Array<int>> else 0); "
-        "var r2 := (1 if o is Wrap<Array<string>> else 0); "
+        "var r1 := (if o is Wrap<Array<int>> then 1 else 0); "
+        "var r2 := (if o is Wrap<Array<string>> then 1 else 0); "
         "var x := o as Wrap<Array<string>>; "
-        "var r3 := (1 if x = null else 0); "
+        "var r3 := (if x = null then 1 else 0); "
         "return r1 * 100 + r2 * 10 + r3;"), 101);
 }
 
@@ -143,10 +143,10 @@ BEZEL_TEST(codegen_2022, multi_param_dictionary_value_arg_distinguishes) {
         "using var d := new Dictionary<int, string>(); d.Add(1, \"a\"); "
         "using var w := new Wrap<Dictionary<int, string>>(7); "
         "var o: Object := w; "
-        "var r1 := (1 if o is Wrap<Dictionary<int, string>> else 0); "
-        "var r2 := (1 if o is Wrap<Dictionary<int, long>> else 0); "
+        "var r1 := (if o is Wrap<Dictionary<int, string>> then 1 else 0); "
+        "var r2 := (if o is Wrap<Dictionary<int, long>> then 1 else 0); "
         "var x := o as Wrap<Dictionary<int, long>>; "
-        "var r3 := (1 if x = null else 0); "
+        "var r3 := (if x = null then 1 else 0); "
         "return r1 * 100 + r2 * 10 + r3;"), 101);
 }
 
@@ -159,8 +159,8 @@ BEZEL_TEST(codegen_2022, nested_array_of_array_distinguishes) {
     BEZEL_EXPECT_EQ(runProg(
         "using var w := new Wrap<Array<Array<int>>>(7); "
         "var o: Object := w; "
-        "var r1 := (1 if o is Wrap<Array<Array<int>>> else 0); "
-        "var r2 := (1 if o is Wrap<Array<Array<string>>> else 0); "
+        "var r1 := (if o is Wrap<Array<Array<int>>> then 1 else 0); "
+        "var r2 := (if o is Wrap<Array<Array<string>>> then 1 else 0); "
         "return r1 * 10 + r2;"), 10);
 }
 
@@ -172,7 +172,7 @@ BEZEL_TEST(codegen_2022, control_primitive_arg_wrong_is_false) {
     BEZEL_EXPECT_EQ(runProg(
         "using var w := new Wrap<int>(7); "
         "var o: Object := w; "
-        "return (1 if o is Wrap<string> else 0);"), 0);
+        "return (if o is Wrap<string> then 1 else 0);"), 0);
 }
 
 // `Wrap<int> is Wrap<int>` — same primitive arg → still TRUE.
@@ -180,7 +180,7 @@ BEZEL_TEST(codegen_2022, control_primitive_arg_right_is_true) {
     BEZEL_EXPECT_EQ(runProg(
         "using var w := new Wrap<int>(7); "
         "var o: Object := w; "
-        "return (1 if o is Wrap<int> else 0);"), 1);
+        "return (if o is Wrap<int> then 1 else 0);"), 1);
 }
 
 // ---- CONTROL: dedup preserved — two Wrap<Array<int>> values share one ---------
@@ -194,8 +194,8 @@ BEZEL_TEST(codegen_2022, control_same_arg_dedup_both_match) {
         "using var w1 := new Wrap<Array<int>>(1); "
         "using var w2 := new Wrap<Array<int>>(2); "
         "var o1: Object := w1; var o2: Object := w2; "
-        "var m1 := 1 if o1 is Wrap<Array<int>> else 0; "
-        "var m2 := 1 if o2 is Wrap<Array<int>> else 0; "
+        "var m1 := (if o1 is Wrap<Array<int>> then 1 else 0); "
+        "var m2 := (if o2 is Wrap<Array<int>> then 1 else 0); "
         "return m1 * 10 + m2;"), 11);
 }
 
@@ -224,10 +224,10 @@ BEZEL_TEST(codegen_2022, both_instantiations_compile_link_and_run_precise) {
         "  using var ws := new Wrap<Array<string>>(9, 2); "
         "  var s := wi.GetLabel() + ws.GetLabel(); "          // 1 + 2 = 3
         "  var oi: Object := wi; var os: Object := ws; "
-        "  var t1 := 1 if oi is Wrap<Array<int>> else 0; "    // 1
-        "  var t2 := 1 if oi is Wrap<Array<string>> else 0; " // 0
-        "  var t3 := 1 if os is Wrap<Array<string>> else 0; " // 1
-        "  var t4 := 1 if os is Wrap<Array<int>> else 0; "    // 0
+        "  var t1 := (if oi is Wrap<Array<int>> then 1 else 0); "    // 1
+        "  var t2 := (if oi is Wrap<Array<string>> then 1 else 0); " // 0
+        "  var t3 := (if os is Wrap<Array<string>> then 1 else 0); " // 1
+        "  var t4 := (if os is Wrap<Array<int>> then 1 else 0); "    // 0
         "  return s + 10*t1 + 20*t2 + 30*t3 + 40*t4; "        // 3+10+0+30+0=43
         "end Main; end C;"), 43);
 }
@@ -247,7 +247,7 @@ BEZEL_TEST(codegen_2022, control_function_arg_still_rejected) {
         "class C public static method Main(): int "
         "  using var w := new Wrap<(int) -> int>(7); "
         "  var o: Object := w; "
-        "  return (1 if o is Wrap<(string) -> string> else 0); "
+        "  return (if o is Wrap<(string) -> string> then 1 else 0); "
         "end Main; end C;");
     // The #2006 erasure guard fires at sema → runAot's ran is false and the
     // diagnostics carry the guard's "is`/`as` target is not runtime-

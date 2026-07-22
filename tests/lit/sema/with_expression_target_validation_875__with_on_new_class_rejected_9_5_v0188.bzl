@@ -10,7 +10,7 @@
 // a record-typed source ... the same spelling on a class-typed new
 // expression is rejected."
 
-module M; class Box public property V: int; public constructor() V := 0; end constructor; destructor end destructor; end Box; class C public static method Main(): int using var b := new Box() with V := 42 end; return b.V; end Main; end C;
+module M; class Box public property V: int; public constructor() V := 0; end constructor; destructor end destructor; end Box; class C public static method Main(): int using var b := new Box() with(V := 42); return b.V; end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: `with` requires a record-typed source; this source is class-typed
 // CHECK-SAME: (§9.5, v0.188)

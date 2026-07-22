@@ -44,7 +44,7 @@ BEZEL_TEST(codegen_nullable_string_cmp, null_eq_null_spec_7_2_8_4) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a: string? := null; var b: string? := null; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -53,7 +53,7 @@ BEZEL_TEST(codegen_nullable_string_cmp, null_neq_null_spec_8_4) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a: string? := null; var b: string? := null; "
-        "  return (1 if a <> b else 0); "
+        "  return (if a <> b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -85,7 +85,7 @@ BEZEL_TEST(codegen_nullable_string_cmp, null_neq_nonnull_spec_4_6) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a: string? := null; var b: string? := \"x\"; "
-        "  return (1 if a <> b else 0); "
+        "  return (if a <> b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -94,7 +94,7 @@ BEZEL_TEST(codegen_nullable_string_cmp, nonnull_neq_null_spec_4_6) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a: string? := \"hello\"; var b: string? := null; "
-        "  return (1 if a <> b else 0); "
+        "  return (if a <> b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -105,7 +105,7 @@ BEZEL_TEST(codegen_nullable_string_cmp, nonnull_equal_content_spec_9_1) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a: string? := \"hello\"; var b: string? := \"hello\"; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -114,7 +114,7 @@ BEZEL_TEST(codegen_nullable_string_cmp, nonnull_different_content_spec_9_1) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a: string? := \"hello\"; var b: string? := \"world\"; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -123,7 +123,7 @@ BEZEL_TEST(codegen_nullable_string_cmp, nonnull_neq_equal_content_spec_4_6) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a: string? := \"a\"; var b: string? := \"a\"; "
-        "  return (1 if a <> b else 0); "
+        "  return (if a <> b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -132,7 +132,7 @@ BEZEL_TEST(codegen_nullable_string_cmp, nonnull_neq_different_content_spec_4_6) 
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a: string? := \"a\"; var b: string? := \"b\"; "
-        "  return (1 if a <> b else 0); "
+        "  return (if a <> b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -144,7 +144,7 @@ BEZEL_TEST(codegen_nullable_string_cmp, nonnull_nullable_vs_plain_equal_spec_4_6
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a: string? := \"hi\"; var b: string := \"hi\"; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -153,6 +153,6 @@ BEZEL_TEST(codegen_nullable_string_cmp, nonnull_nullable_vs_plain_diff_spec_4_6)
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a: string? := \"hi\"; var b: string := \"bye\"; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 0);
 }

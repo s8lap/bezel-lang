@@ -64,7 +64,7 @@ BEZEL_TEST(xmod_enum_method_735, imported_enum_instance_method_dispatch) {
         "public enum Status "
         "  Ok, Error, Pending; "
         "  public method IsOk(): bool => this = Status.Ok; "
-        "  public method Code(): int => 0 if this = Status.Ok else 1; "
+        "  public method Code(): int => (if this = Status.Ok then 0 else 1); "
         "end Status;");
 
     BEZEL_EXPECT_TRUE(compileObj735(aSrc.path, aObj.path));

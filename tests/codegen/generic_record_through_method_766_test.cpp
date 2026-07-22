@@ -77,7 +77,7 @@ BEZEL_TEST(generic_record_through_method_766, default_yields_null) {
         "public static class Program "
         "  public static method Main(): int "
         "    var r := F.Make<int>(); "
-        "    return 0 if r.V2 = null else 1; "
+        "    return (if r.V2 = null then 0 else 1); "
         "  end Main; "
         "end Program;"), 0);
 }

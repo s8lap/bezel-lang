@@ -92,18 +92,17 @@ BEZEL_TEST(codegen_482_spec_10_spec_17, local_variable_cast) {
 BEZEL_TEST(codegen_482_spec_10_spec_17, equality_comparison) {
     BEZEL_EXPECT_EQ(run482(
         "using var c := new Container(); "
-        "return (7 if c._status = Container.Status.Active else 0);"), 7);
+        "return (if c._status = Container.Status.Active then 7 else 0);"), 7);
 }
 
 // (d2) §10 / §19: nested enum used in a `case` arm.
 BEZEL_TEST(codegen_482_spec_10_spec_17, case_expr_on_nested_enum) {
     BEZEL_EXPECT_EQ(run482(
         "var s := Container.Status.Inactive; "
-        "return case s of "
+        "return (case s of "
         "  Container.Status.Active   => 0, "
         "  Container.Status.Inactive => 9, "
-        "  _ => -1, "
-        "end;"), 9);
+        "  _ => -1,);"), 9);
 }
 
 // (e) CONTROL: a module-level enum `int()` cast must still work (regression

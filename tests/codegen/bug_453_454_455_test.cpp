@@ -41,7 +41,7 @@ BEZEL_TEST(bug453_object_interpolation, interpolate_object_boxed_int_453) {
         "module M; class C public static method Main(): int "
         "  var o: Object := 42; "
         "  var s := $\"{o}\"; "
-        "  return (1 if s = \"42\" else 0); "
+        "  return (if s = \"42\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -73,7 +73,7 @@ BEZEL_TEST(bug453_object_interpolation, interpolate_object_composite_453) {
         "module M; class C public static method Main(): int "
         "  var o: Object := 7; "
         "  var s := $\"val={o}\"; "
-        "  return (1 if s = \"val=7\" else 0); "
+        "  return (if s = \"val=7\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -82,7 +82,7 @@ BEZEL_TEST(bug453_object_interpolation, regression_object_tostring_direct_453) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var o: Object := 99; "
-        "  return (1 if o.ToString() = \"99\" else 0); "
+        "  return (if o.ToString() = \"99\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -182,7 +182,7 @@ BEZEL_TEST(bug455_nullable_elem_array, add_null_get_null_455) {
         "  using var a := new Array<int?>(); "
         "  a.Add(null); "
         "  var v: int? := a.Get(0); "
-        "  return (1 if v = null else 0); "
+        "  return (if v = null then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -214,7 +214,7 @@ BEZEL_TEST(bug455_nullable_elem_array, add_get_bool_nullable_455) {
         "  if v0 = null then return -1; end; "
         "  if v1 = null then return -2; end; "
         "  if v2 <> null then return -3; end; "
-        "  return (1 if v0! and not v1! else 0); "
+        "  return (if v0! and not v1! then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

@@ -105,7 +105,7 @@ BEZEL_TEST(parser_case_stmt, case_expression_still_works_in_expr_position) {
     // arms allow Expression bodies.
     auto r = parseAll(
         "module M; class C "
-        "public method M() _ := case x of 1 => \"one\", _ => \"other\" end; "
+        "public method M() _ := (case x of 1 => \"one\", _ => \"other\"); "
         "end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

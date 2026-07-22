@@ -22,7 +22,7 @@ class W
   public static method Main(): int
     var c := true;
     using var held := new Res(2);
-    using var x := new Res(1) if c else held;
+    using var x := (if c then new Res(1) else held);
     return 0;
   end Main;
 end W;

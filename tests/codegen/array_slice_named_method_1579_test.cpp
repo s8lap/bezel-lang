@@ -60,7 +60,7 @@ BEZEL_TEST(array_slice_named_method_1579, slice_method_matches_indexer_count) {
     BEZEL_EXPECT_EQ(run(std::string(kFiveElemArray) +
         "  using var s1 := arr.Slice(1..3); "
         "  using var s2 := arr[1..3]; "
-        "  return (1 if s1.Count = s2.Count else 0); "
+        "  return (if s1.Count = s2.Count then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -69,8 +69,8 @@ BEZEL_TEST(array_slice_named_method_1579, slice_method_matches_indexer_elements)
     BEZEL_EXPECT_EQ(run(std::string(kFiveElemArray) +
         "  using var s1 := arr.Slice(1..3); "
         "  using var s2 := arr[1..3]; "
-        "  return (1 if (s1[0] = s2[0]) and (s1[1] = s2[1]) and "
-        "                (s1[2] = s2[2]) else 0); "
+        "  return (if (s1[0] = s2[0]) and (s1[1] = s2[1]) and "
+        "                (s1[2] = s2[2]) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

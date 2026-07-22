@@ -31,7 +31,7 @@ BEZEL_TEST(case_pattern_null_alt_1471, int_nullable_null_matches_alt) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class App public static method Main(): int "
         "  var x: int? := null; "
-        "  var r := case x of 1 | null => 111, _ => 999 end; "
+        "  var r := (case x of 1 | null => 111, _ => 999); "
         "  return r; "
         "end Main; end App;"), 111);
 }
@@ -42,7 +42,7 @@ BEZEL_TEST(case_pattern_null_alt_1471, int_nullable_literal_member_matches) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class App public static method Main(): int "
         "  var x: int? := 1; "
-        "  var r := case x of 1 | null => 111, _ => 999 end; "
+        "  var r := (case x of 1 | null => 111, _ => 999); "
         "  return r; "
         "end Main; end App;"), 111);
 }
@@ -54,7 +54,7 @@ BEZEL_TEST(case_pattern_null_alt_1471, int_nullable_present_nonmatch_falls_throu
     BEZEL_EXPECT_EQ(runFull(
         "module M; class App public static method Main(): int "
         "  var x: int? := 2; "
-        "  var r := case x of 1 | null => 111, _ => 42 end; "
+        "  var r := (case x of 1 | null => 111, _ => 42); "
         "  return r; "
         "end Main; end App;"), 42);
 }
@@ -65,7 +65,7 @@ BEZEL_TEST(case_pattern_null_alt_1471, enum_nullable_null_matches_alt) {
         "module M; enum Color Red, Green, Blue; end Color; "
         "class App public static method Main(): int "
         "  var x: Color? := null; "
-        "  var r := case x of Red | null => 111, _ => 999 end; "
+        "  var r := (case x of Red | null => 111, _ => 999); "
         "  return r; "
         "end Main; end App;"), 111);
 }
@@ -76,7 +76,7 @@ BEZEL_TEST(case_pattern_null_alt_1471, enum_nullable_constant_member_matches) {
         "module M; enum Color Red, Green, Blue; end Color; "
         "class App public static method Main(): int "
         "  var x: Color? := Color.Red; "
-        "  var r := case x of Red | null => 111, _ => 999 end; "
+        "  var r := (case x of Red | null => 111, _ => 999); "
         "  return r; "
         "end Main; end App;"), 111);
 }
@@ -86,7 +86,7 @@ BEZEL_TEST(case_pattern_null_alt_1471, bool_nullable_null_matches_alt) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class App public static method Main(): int "
         "  var x: bool? := null; "
-        "  var r := case x of true | null => 111, _ => 999 end; "
+        "  var r := (case x of true | null => 111, _ => 999); "
         "  return r; "
         "end Main; end App;"), 111);
 }

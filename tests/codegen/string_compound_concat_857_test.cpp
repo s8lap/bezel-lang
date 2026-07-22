@@ -35,7 +35,7 @@ BEZEL_TEST(string_compound_concat_857, chained_plus_equals_content) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"ab\"; s += \"cd\"; s += \"ef\"; "
-        "  return (1 if s = \"abcdef\" else 0); "  // 1
+        "  return (if s = \"abcdef\" then 1 else 0); "  // 1
         "end Main; end C;"), 1);
 }
 
@@ -45,7 +45,7 @@ BEZEL_TEST(string_compound_concat_857, string_plus_equals_int) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"n=\"; s += 5; "
-        "  return (1 if s = \"n=5\" else 0); "  // 1
+        "  return (if s = \"n=5\" then 1 else 0); "  // 1
         "end Main; end C;"), 1);
 }
 
@@ -79,7 +79,7 @@ BEZEL_TEST(string_compound_concat_857, self_append) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"ab\"; s += s; "
-        "  return (1 if s = \"abab\" else 0); "  // 1
+        "  return (if s = \"abab\" then 1 else 0); "  // 1
         "end Main; end C;"), 1);
 }
 

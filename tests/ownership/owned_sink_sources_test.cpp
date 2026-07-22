@@ -392,7 +392,7 @@ BEZEL_TEST(owned_sink_sources, destructure_binding_read_in_arm_accepted_1280) {
         "module M; record Inner(v: int); record Outer(i: Inner); "
         "class C public static method Main(): int "
         "  var o := new Outer(new Inner(9)); "
-        "  return case o of Outer(Inner(x)) => x, _ => 0, end; "
+        "  return (case o of Outer(Inner(x)) => x, _ => 0,); "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -422,7 +422,7 @@ BEZEL_TEST(owned_sink_sources, destructure_binding_into_owned_arg_case_expr_reje
         "class Prog "
         "  public static method Sink(owned w: Widget): int return 0; end Sink; "
         "  public static method Use(b: Box): int "
-        "    return case b of Box(a) => Prog.Sink(a), _ => -1, end; "
+        "    return (case b of Box(a) => Prog.Sink(a), _ => -1,); "
         "  end Use; "
         "end Prog;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -436,7 +436,7 @@ BEZEL_TEST(owned_sink_sources, owned_new_into_owned_arg_case_expr_accepted_1284)
         "class Prog "
         "  public static method Sink(owned w: Widget): int return 0; end Sink; "
         "  public static method Use(n: int): int "
-        "    return case n of 0 => Prog.Sink(new Widget()), _ => -1, end; "
+        "    return (case n of 0 => Prog.Sink(new Widget()), _ => -1,); "
         "  end Use; "
         "end Prog;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

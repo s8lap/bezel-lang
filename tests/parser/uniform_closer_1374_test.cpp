@@ -164,13 +164,13 @@ BEZEL_TEST(parser_uniform_closer_1374, end_case_expr_label_accepted) {
     // §1.6 / v0.170: `end case` as labeled closer for expression-position case.
     // Used in assignment; `end case;` terminates the expression statement.
     auto r = parseAll(
-        wrapMethod("var y := case x of 1 => 10, _ => 0 end case;"));
+        wrapMethod("var y := (case x of 1 => 10, _ => 0);"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 BEZEL_TEST(parser_uniform_closer_1374, end_case_expr_label_parses_same_as_bare) {
-    auto bare    = parseMethodBody("var y := case x of 1 => 10, _ => 0 end;");
-    auto labeled = parseMethodBody("var y := case x of 1 => 10, _ => 0 end case;");
+    auto bare    = parseMethodBody("var y := (case x of 1 => 10, _ => 0);");
+    auto labeled = parseMethodBody("var y := (case x of 1 => 10, _ => 0);");
     BEZEL_EXPECT_EQ(labeled, bare);
 }
 
@@ -198,13 +198,13 @@ BEZEL_TEST(parser_uniform_closer_1374, end_when_stmt_wrong_keyword_is_error) {
 BEZEL_TEST(parser_uniform_closer_1374, end_when_expr_label_accepted) {
     // §1.6 / v0.170: `end when` in expression position.
     auto r = parseAll(
-        wrapMethod("var y := when x > 0 => 1, _ => 0 end when;"));
+        wrapMethod("var y := (when x > 0 => 1, _ => 0);"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 BEZEL_TEST(parser_uniform_closer_1374, end_when_expr_label_parses_same_as_bare) {
-    auto bare    = parseMethodBody("var y := when x > 0 => 1, _ => 0 end;");
-    auto labeled = parseMethodBody("var y := when x > 0 => 1, _ => 0 end when;");
+    auto bare    = parseMethodBody("var y := (when x > 0 => 1, _ => 0);");
+    auto labeled = parseMethodBody("var y := (when x > 0 => 1, _ => 0);");
     BEZEL_EXPECT_EQ(labeled, bare);
 }
 
@@ -219,7 +219,7 @@ BEZEL_TEST(parser_uniform_closer_1374, end_extension_label_accepted) {
 BEZEL_TEST(parser_uniform_closer_1374, end_extension_label_with_member) {
     auto r = parseAll(
         "module M; extension int "
-        "public method Abs(): int => when this >= 0 => this, _ => -this end; "
+        "public method Abs(): int => (when this >= 0 => this, _ => -this); "
         "end extension;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -338,10 +338,9 @@ BEZEL_TEST(parser_uniform_closer_1374, expr_when_inside_case_arm_with_label) {
     // the `,` is the outer CaseStmt arm separator.
     auto r = parseAll(
         wrapMethod(
-            "var y := case x of "
-            "  1 => when x > 0 => 10, _ => 20 end when, "
-            "  _ => 0 "
-            "end case;"));
+            "var y := (case x of "
+            "  1 => (when x > 0 => 10, _ => 20), "
+            "  _ => 0);"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
@@ -350,10 +349,9 @@ BEZEL_TEST(parser_uniform_closer_1374, expr_case_inside_when_arm_with_label) {
     // a `when` expression.
     auto r = parseAll(
         wrapMethod(
-            "var y := when x > 0 => "
-            "  case x of 1 => 10, _ => 0 end case, "
-            "  _ => -1 "
-            "end when;"));
+            "var y := (when x > 0 => "
+            "  (case x of 1 => 10, _ => 0), "
+            "  _ => -1);"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 

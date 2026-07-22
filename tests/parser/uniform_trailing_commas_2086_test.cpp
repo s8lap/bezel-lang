@@ -331,8 +331,8 @@ BEZEL_TEST(parser_trailing_comma_positional_fields, record_with_serialized) {
 
 BEZEL_TEST(parser_trailing_comma_positional_pattern, case_destructuring) {
     const std::string src =
-        "module M; class C public method M() _ := case x of"
-        " Pair(a, b,) => 1 end; end M; end C;";
+        "module M; class C public method M() _ := (case x of"
+        " Pair(a, b,) => 1); end M; end C;";
     auto r = parseAll(src);
     BEZEL_EXPECT_FALSE(hasParseErrors(r));
 }

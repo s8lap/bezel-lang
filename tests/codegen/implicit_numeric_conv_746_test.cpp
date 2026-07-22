@@ -48,7 +48,7 @@ BEZEL_TEST(implicit_numeric_746, sbyte_local_sign_extends_in_return) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method F(): int var s: sbyte := -7; return s; end F; "
-        "  public static method Main(): int return (1 if F() = -7 else 0); "
+        "  public static method Main(): int return (if F() = -7 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -58,7 +58,7 @@ BEZEL_TEST(implicit_numeric_746, implicit_int_to_decimal) {
         "module P; class M public static method Main(): int "
         "  var i: int := 42; "
         "  var m: decimal := i; "
-        "  return (1 if m = 42.0m else 0); "
+        "  return (if m = 42.0m then 1 else 0); "
         "end Main; end M;"), 1);
 }
 
@@ -68,7 +68,7 @@ BEZEL_TEST(implicit_numeric_746, implicit_byte_to_decimal) {
         "module P; class M public static method Main(): int "
         "  var b: byte := 5; "
         "  var d: decimal := b; "
-        "  return (1 if d = 5.0m else 0); "
+        "  return (if d = 5.0m then 1 else 0); "
         "end Main; end M;"), 1);
 }
 
@@ -78,6 +78,6 @@ BEZEL_TEST(implicit_numeric_746, implicit_long_to_decimal) {
         "module P; class M public static method Main(): int "
         "  var n: long := 9000000000L; "
         "  var d: decimal := n; "
-        "  return (1 if d = 9000000000.0m else 0); "
+        "  return (if d = 9000000000.0m then 1 else 0); "
         "end Main; end M;"), 1);
 }

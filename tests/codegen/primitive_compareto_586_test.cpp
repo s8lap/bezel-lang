@@ -33,7 +33,7 @@ BEZEL_TEST(codegen_586, int_compareto_greater_returns_positive) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := 10; var b := 3; var r := a.CompareTo(b); "
-        "  return (2 if r > 0 else (0 if r = 0 else 1)); "
+        "  return (if r > 0 then 2 else (if r = 0 then 0 else 1)); "
         "end Main; end C;"), 2);
 }
 
@@ -42,7 +42,7 @@ BEZEL_TEST(codegen_586, int_compareto_less_returns_negative) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := 3; var b := 10; var r := a.CompareTo(b); "
-        "  return (2 if r > 0 else (0 if r = 0 else 1)); "
+        "  return (if r > 0 then 2 else (if r = 0 then 0 else 1)); "
         "end Main; end C;"), 1);
 }
 
@@ -51,7 +51,7 @@ BEZEL_TEST(codegen_586, int_compareto_equal_returns_zero) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := 5; var r := a.CompareTo(5); "
-        "  return (2 if r > 0 else (0 if r = 0 else 1)); "
+        "  return (if r > 0 then 2 else (if r = 0 then 0 else 1)); "
         "end Main; end C;"), 0);
 }
 
@@ -63,7 +63,7 @@ BEZEL_TEST(codegen_586, int_compareto_two_calls_consistent) {
         "  var a := 10; var b := 3; "
         "  var r1 := a.CompareTo(b); "   // should be positive
         "  var r2 := a.CompareTo(b); "   // second call must also be positive
-        "  return (2 if (r1 > 0 and r2 > 0) else 1); "
+        "  return (if (r1 > 0 and r2 > 0) then 2 else 1); "
         "end Main; end C;"), 2);
 }
 
@@ -72,7 +72,7 @@ BEZEL_TEST(codegen_586, int_compareto_negative_values) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := -5; var b := 0; var r := a.CompareTo(b); "
-        "  return (2 if r > 0 else (0 if r = 0 else 1)); "
+        "  return (if r > 0 then 2 else (if r = 0 then 0 else 1)); "
         "end Main; end C;"), 1);
 }
 
@@ -81,7 +81,7 @@ BEZEL_TEST(codegen_586, int_compareto_both_negative) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := -3; var b := -10; var r := a.CompareTo(b); "
-        "  return (2 if r > 0 else (0 if r = 0 else 1)); "
+        "  return (if r > 0 then 2 else (if r = 0 then 0 else 1)); "
         "end Main; end C;"), 2);
 }
 
@@ -94,7 +94,7 @@ BEZEL_TEST(codegen_586, double_compareto_greater_returns_positive) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := 3.14; var b := 2.71; var r := a.CompareTo(b); "
-        "  return (2 if r > 0 else (0 if r = 0 else 1)); "
+        "  return (if r > 0 then 2 else (if r = 0 then 0 else 1)); "
         "end Main; end C;"), 2);
 }
 
@@ -103,7 +103,7 @@ BEZEL_TEST(codegen_586, double_compareto_less_returns_negative) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := 1.0; var b := 2.0; var r := a.CompareTo(b); "
-        "  return (2 if r > 0 else (0 if r = 0 else 1)); "
+        "  return (if r > 0 then 2 else (if r = 0 then 0 else 1)); "
         "end Main; end C;"), 1);
 }
 
@@ -112,7 +112,7 @@ BEZEL_TEST(codegen_586, double_compareto_equal_returns_zero) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := 1.5; var r := a.CompareTo(1.5); "
-        "  return (2 if r > 0 else (0 if r = 0 else 1)); "
+        "  return (if r > 0 then 2 else (if r = 0 then 0 else 1)); "
         "end Main; end C;"), 0);
 }
 
@@ -125,7 +125,7 @@ BEZEL_TEST(codegen_586, char_compareto_greater_returns_positive) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := 'z'; var b := 'a'; var r := a.CompareTo(b); "
-        "  return (2 if r > 0 else (0 if r = 0 else 1)); "
+        "  return (if r > 0 then 2 else (if r = 0 then 0 else 1)); "
         "end Main; end C;"), 2);
 }
 
@@ -134,7 +134,7 @@ BEZEL_TEST(codegen_586, char_compareto_less_returns_negative) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := 'a'; var b := 'z'; var r := a.CompareTo(b); "
-        "  return (2 if r > 0 else (0 if r = 0 else 1)); "
+        "  return (if r > 0 then 2 else (if r = 0 then 0 else 1)); "
         "end Main; end C;"), 1);
 }
 
@@ -143,7 +143,7 @@ BEZEL_TEST(codegen_586, char_compareto_equal_returns_zero) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := 'x'; var r := a.CompareTo('x'); "
-        "  return (2 if r > 0 else (0 if r = 0 else 1)); "
+        "  return (if r > 0 then 2 else (if r = 0 then 0 else 1)); "
         "end Main; end C;"), 0);
 }
 
@@ -156,7 +156,7 @@ BEZEL_TEST(codegen_586, string_compareto_regression_greater) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := \"z\"; var b := \"a\"; var r := a.CompareTo(b); "
-        "  return (2 if r > 0 else (0 if r = 0 else 1)); "
+        "  return (if r > 0 then 2 else (if r = 0 then 0 else 1)); "
         "end Main; end C;"), 2);
 }
 
@@ -165,7 +165,7 @@ BEZEL_TEST(codegen_586, string_compareto_regression_less) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := \"a\"; var b := \"z\"; var r := a.CompareTo(b); "
-        "  return (2 if r > 0 else (0 if r = 0 else 1)); "
+        "  return (if r > 0 then 2 else (if r = 0 then 0 else 1)); "
         "end Main; end C;"), 1);
 }
 
@@ -174,7 +174,7 @@ BEZEL_TEST(codegen_586, string_compareto_regression_equal) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := \"hello\"; var r := a.CompareTo(\"hello\"); "
-        "  return (2 if r > 0 else (0 if r = 0 else 1)); "
+        "  return (if r > 0 then 2 else (if r = 0 then 0 else 1)); "
         "end Main; end C;"), 0);
 }
 
@@ -233,6 +233,6 @@ BEZEL_TEST(codegen_586, int_gethashcode_is_value_747) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a: int := 42; "
-        "  return 0 if a.GetHashCode() = 42 else 1; "  // 0
+        "  return (if a.GetHashCode() = 42 then 0 else 1); "  // 0
         "end Main; end C;"), 0);
 }

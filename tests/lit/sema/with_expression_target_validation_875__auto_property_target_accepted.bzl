@@ -9,7 +9,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; record Person public Name: string; public Age: int; end Person; class C public static method Main(): int var p := new Person(); var q := p with Age := 31 end; return q.Age; end Main; end C;
+module M; record Person public Name: string; public Age: int; end Person; class C public static method Main(): int var p := new Person(); var q := p with(Age := 31); return q.Age; end Main; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

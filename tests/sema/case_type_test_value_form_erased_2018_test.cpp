@@ -93,10 +93,10 @@ std::string wrap(const std::string& body) {
 BEZEL_TEST(case_type_test_value_form_erased_2018, is_function_arg_rejected) {
     auto r = parseSemaAll(wrap(
         "  public method M(o: Object): int\n"
-        "    var n := case o of\n"
+        "    var n := (case o of\n"
         "      var x: Wrap<(int) -> int> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_TRUE(hasValueCaseErasedError(r));
@@ -109,10 +109,10 @@ BEZEL_TEST(case_type_test_value_form_erased_2018,
            nested_function_arg_rejected) {
     auto r = parseSemaAll(wrap(
         "  public method M(o: Object): int\n"
-        "    var n := case o of\n"
+        "    var n := (case o of\n"
         "      var x: Wrap<Wrap<(int) -> int>> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_TRUE(hasValueCaseErasedError(r));
@@ -129,10 +129,10 @@ BEZEL_TEST(case_type_test_value_form_erased_2018,
         "class Wrap<W> : IThing\nend Wrap;\n"
         "class Program\n"
         "  public method M(o: IThing): int\n"
-        "    var n := case o of\n"
+        "    var n := (case o of\n"
         "      var x: Wrap<(int) -> int> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"
         "end Program;\n");
@@ -146,10 +146,10 @@ BEZEL_TEST(case_type_test_value_form_erased_2018,
 BEZEL_TEST(case_type_test_value_form_erased_2018, primitive_arg_accepted) {
     auto r = parseSemaAll(wrap(
         "  public method M(o: Object): int\n"
-        "    var n := case o of\n"
+        "    var n := (case o of\n"
         "      var x: Wrap<int> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasValueCaseErasedError(r));
@@ -160,10 +160,10 @@ BEZEL_TEST(case_type_test_value_form_erased_2018, primitive_arg_accepted) {
 BEZEL_TEST(case_type_test_value_form_erased_2018, named_class_arg_accepted) {
     auto r = parseSemaAll(wrap(
         "  public method M(o: Object): int\n"
-        "    var n := case o of\n"
+        "    var n := (case o of\n"
         "      var x: Wrap<Foo> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasValueCaseErasedError(r));
@@ -175,10 +175,10 @@ BEZEL_TEST(case_type_test_value_form_erased_2018, named_class_arg_accepted) {
 BEZEL_TEST(case_type_test_value_form_erased_2018, nested_reified_arg_accepted) {
     auto r = parseSemaAll(wrap(
         "  public method M(o: Object): int\n"
-        "    var n := case o of\n"
+        "    var n := (case o of\n"
         "      var x: Wrap<Wrap<int>> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasValueCaseErasedError(r));
@@ -192,10 +192,10 @@ BEZEL_TEST(case_type_test_value_form_erased_2018, nested_reified_arg_accepted) {
 BEZEL_TEST(case_type_test_value_form_erased_2018, inline_array_arg_accepted) {
     auto r = parseSemaAll(wrap(
         "  public method M(o: Object): int\n"
-        "    var n := case o of\n"
+        "    var n := (case o of\n"
         "      var x: Wrap<[3]int> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasValueCaseErasedError(r));
@@ -207,10 +207,10 @@ BEZEL_TEST(case_type_test_value_form_erased_2018, inline_array_arg_accepted) {
 BEZEL_TEST(case_type_test_value_form_erased_2018, nongeneric_target_accepted) {
     auto r = parseSemaAll(wrap(
         "  public method M(o: Object): int\n"
-        "    var n := case o of\n"
+        "    var n := (case o of\n"
         "      var x: Foo => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasValueCaseErasedError(r));
@@ -226,10 +226,10 @@ BEZEL_TEST(case_type_test_value_form_erased_2018,
            bare_type_parameter_accepted) {
     auto r = parseSemaAll(wrap(
         "  public method Chk<T>(o: Object): int\n"
-        "    var n := case o of\n"
+        "    var n := (case o of\n"
         "      var x: Wrap<T> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end Chk;\n"));
     BEZEL_EXPECT_FALSE(hasValueCaseErasedError(r));
@@ -248,10 +248,10 @@ BEZEL_TEST(case_type_test_value_form_erased_2018,
            generic_interface_scrutinee_still_rejected_once) {
     auto r = parseSemaAll(wrap(
         "  public method M(m: IMarker<int>): int\n"
-        "    var n := case m of\n"
+        "    var n := (case m of\n"
         "      var x: C<(int) -> int> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     // Rejected via the interface guard (the #1946 wording), NOT the plain-scrutinee
@@ -269,10 +269,10 @@ BEZEL_TEST(case_type_test_value_form_erased_2018,
            generic_interface_scrutinee_reified_admitted) {
     auto r = parseSemaAll(wrap(
         "  public method M(m: IMarker<int>): int\n"
-        "    var n := case m of\n"
+        "    var n := (case m of\n"
         "      var x: C<string> => 7,\n"
         "      _ => 3\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasValueCaseErasedError(r));

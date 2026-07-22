@@ -30,11 +30,10 @@ int classify(const std::string& scrut) {
     return runProg(
         std::string("module M; class C public static method Main(): int ") +
         "  var x := " + scrut + "; "
-        "  return case x of "
+        "  return (case x of "
         "    1 | 2 | 3 => 10, "
         "    7 | 8 | 9 => 20, "
-        "    _ => 30 "
-        "  end; end Main; end C;");
+        "    _ => 30); end Main; end C;");
 }
 
 } // namespace
@@ -72,11 +71,10 @@ BEZEL_TEST(codegen_alt_1371, per_slot_alternative_selects) {
         "record Pair(a: Color, b: int); "
         "class C "
         "  public static method Describe(p: Pair): int "
-        "    return case p of "
+        "    return (case p of "
         "      Pair(Color.Red | Color.Blue, var x) => x, "
         "      Pair(Color.Green, _) => 100, "
-        "      _ => 200 "
-        "    end; "
+        "      _ => 200); "
         "  end Describe; ";
     BEZEL_EXPECT_EQ(runProg(base +
         "  public static method Main(): int "
@@ -142,12 +140,11 @@ BEZEL_TEST(codegen_alt_1371, pipe_below_shift_with_range_and_relational) {
     const std::string prog =
         "module M; class C "
         "  public static method Grade(score: int, base_: int): int "
-        "    return case score of "
+        "    return (case score of "
         "      ..< base_ + 10 => 1, "        // leading range, Shift-level bound
         "      100 | 101 => 5, "             // constant `|` alternatives
         "      > base_ * 3 => 9, "           // relational, Shift-level operand
-        "      _ => 0 "
-        "    end; "
+        "      _ => 0); "
         "  end Grade; "
         "  public static method Main(): int "
         "    Console.WriteLine(Grade(5, 10) * 1000 + Grade(100, 10) * 100 "

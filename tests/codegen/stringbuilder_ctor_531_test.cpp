@@ -88,7 +88,7 @@ BEZEL_TEST(codegen_sb_ctor_531, initial_string_tostring) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var sb := new StringBuilder(initial := \"hello\"); "
-        "  return (1 if sb.ToString() = \"hello\" else 0); "
+        "  return (if sb.ToString() = \"hello\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -110,7 +110,7 @@ BEZEL_TEST(codegen_sb_ctor_531, initial_then_append_tostring) {
         "module M; class C public static method Main(): int "
         "  using var sb := new StringBuilder(initial := \"hello\"); "
         "  sb.Append(\" world\"); "
-        "  return (1 if sb.ToString() = \"hello world\" else 0); "
+        "  return (if sb.ToString() = \"hello world\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

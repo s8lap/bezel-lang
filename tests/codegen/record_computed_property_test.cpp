@@ -77,7 +77,7 @@ BEZEL_TEST(codegen_record_computed_property, computed_over_body_record_autoprops
         "  public property Area: int => Width * Height; "
         "end Rect; "
         "class C public static method Main(): int "
-        "  var r := new Rect() with Width := 6, Height := 7 end; "
+        "  var r := new Rect() with(Width := 6, Height := 7); "
         "  return r.Area; "
         "end Main; end C;"), 42);
 }

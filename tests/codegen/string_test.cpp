@@ -41,7 +41,7 @@ BEZEL_TEST(codegen_cg27a, string_equality_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := \"abc\"; var b := \"abc\"; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -50,7 +50,7 @@ BEZEL_TEST(codegen_cg27a, string_inequality_different) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := \"abc\"; var b := \"xyz\"; "
-        "  return (1 if a <> b else 0); "
+        "  return (if a <> b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -59,7 +59,7 @@ BEZEL_TEST(codegen_cg27a, string_equality_different_length) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := \"hi\"; var b := \"hello\"; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -80,7 +80,7 @@ BEZEL_TEST(codegen_cg27a, string_concat_equality) {
         "module M; class C public static method Main(): int "
         "  var a := \"He\" + \"llo\"; "
         "  var b := \"Hello\"; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -108,7 +108,7 @@ BEZEL_TEST(codegen_cg27a, string_param_equality) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Check(a: string, b: string): int "
-        "    return (1 if a = b else 0); "
+        "    return (if a = b then 1 else 0); "
         "  end Check; "
         "  public static method Main(): int "
         "    return Check(\"xyz\", \"xyz\"); "
@@ -121,7 +121,7 @@ BEZEL_TEST(codegen_cg27a, string_literal_nonnull) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s: string? := \"hi\"; "
-        "  return (1 if s <> null else 0); "
+        "  return (if s <> null then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

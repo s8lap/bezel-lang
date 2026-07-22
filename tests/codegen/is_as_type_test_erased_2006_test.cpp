@@ -43,8 +43,8 @@ BEZEL_TEST(codegen_2006, primitive_arg_is_precise) {
     BEZEL_EXPECT_EQ(runProg(
         "using var w := new Wrap<int>(7); "
         "var o: Object := w; "
-        "var a := 1 if o is Wrap<int> else 0; "
-        "var b := 1 if o is Wrap<string> else 0; "
+        "var a := (if o is Wrap<int> then 1 else 0); "
+        "var b := (if o is Wrap<string> then 1 else 0); "
         "return a * 2 + b;"), 2);  // match(1)*2 + wrong(0)
 }
 
@@ -53,8 +53,8 @@ BEZEL_TEST(codegen_2006, named_class_arg_is_precise) {
     BEZEL_EXPECT_EQ(runProg(
         "using var w := new Wrap<Foo>(7); "
         "var o: Object := w; "
-        "var a := 1 if o is Wrap<Foo> else 0; "
-        "var b := 1 if o is Wrap<int> else 0; "
+        "var a := (if o is Wrap<Foo> then 1 else 0); "
+        "var b := (if o is Wrap<int> then 1 else 0); "
         "return a * 2 + b;"), 2);
 }
 
@@ -64,8 +64,8 @@ BEZEL_TEST(codegen_2006, inline_array_arg_is_precise) {
     BEZEL_EXPECT_EQ(runProg(
         "using var w := new Wrap<[3]int>(7); "
         "var o: Object := w; "
-        "var a := 1 if o is Wrap<[3]int> else 0; "
-        "var b := 1 if o is Wrap<[4]int> else 0; "
+        "var a := (if o is Wrap<[3]int> then 1 else 0); "
+        "var b := (if o is Wrap<[4]int> then 1 else 0); "
         "return a * 2 + b;"), 2);
 }
 
@@ -75,8 +75,8 @@ BEZEL_TEST(codegen_2006, nested_reified_arg_is_precise) {
     BEZEL_EXPECT_EQ(runProg(
         "using var w := new Wrap<Wrap<int>>(7); "
         "var o: Object := w; "
-        "var a := 1 if o is Wrap<Wrap<int>> else 0; "
-        "var b := 1 if o is Wrap<Wrap<string>> else 0; "
+        "var a := (if o is Wrap<Wrap<int>> then 1 else 0); "
+        "var b := (if o is Wrap<Wrap<string>> then 1 else 0); "
         "return a * 2 + b;"), 2);
 }
 
@@ -88,8 +88,8 @@ BEZEL_TEST(codegen_2006, as_reified_arg_is_precise) {
         "var o: Object := w; "
         "var hit := o as Wrap<int>; "
         "var miss := o as Wrap<string>; "
-        "var a := 1 if hit <> null else 0; "
-        "var b := 1 if miss = null else 0; "
+        "var a := (if hit <> null then 1 else 0); "
+        "var b := (if miss = null then 1 else 0); "
         "return a * 2 + b;"), 3);  // hit non-null(1)*2 + miss null(1) = 3
 }
 
@@ -104,8 +104,8 @@ BEZEL_TEST(codegen_2006, bare_type_parameter_resolves_at_monomorphization) {
         "  public constructor(t: int) tag := t; end constructor; end Wrap; "
         "class Checker<T> "
         "  public method probe(m: Object, w: Object): int "
-        "    => (1 if m is Wrap<Wrap<T>> else 0) * 2 "
-        "     + (1 if w is Wrap<Wrap<T>> else 0); "
+        "    => (if m is Wrap<Wrap<T>> then 1 else 0) * 2 "
+        "     + (if w is Wrap<Wrap<T>> then 1 else 0); "
         "end Checker; "
         "class C public static method Main(): int "
         "  using var wi := new Wrap<Wrap<int>>(1); "

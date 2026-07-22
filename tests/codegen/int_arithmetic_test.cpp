@@ -93,33 +93,33 @@ int runBody(const std::string& body) {
 }  // namespace
 BEZEL_TEST(codegen_1049_unsigned_compare, ulong_high_bit_gt_small_literal) {
     BEZEL_EXPECT_EQ(runBody(
-        "var u: ulong := 18000000000000000000; return (1 if (u > 1000) else 0);"), 1);
+        "var u: ulong := 18000000000000000000; return (if (u > 1000) then 1 else 0);"), 1);
 }
 BEZEL_TEST(codegen_1049_unsigned_compare, ulong_maxvalue_gt_small_literal) {
-    BEZEL_EXPECT_EQ(runBody("return (1 if (ulong.MaxValue > 1000) else 0);"), 1);
+    BEZEL_EXPECT_EQ(runBody("return (if (ulong.MaxValue > 1000) then 1 else 0);"), 1);
 }
 BEZEL_TEST(codegen_1049_unsigned_compare, uint_high_bit_gt_small_literal) {
     BEZEL_EXPECT_EQ(runBody(
-        "var u: uint := 3000000000; return (1 if (u > 1000) else 0);"), 1);
+        "var u: uint := 3000000000; return (if (u > 1000) then 1 else 0);"), 1);
 }
 BEZEL_TEST(codegen_1049_unsigned_compare, ulong_high_bit_lt_small_literal_false) {
     BEZEL_EXPECT_EQ(runBody(
-        "var u: ulong := 18000000000000000000; return (1 if (u < 1000) else 0);"), 0);
+        "var u: ulong := 18000000000000000000; return (if (u < 1000) then 1 else 0);"), 0);
 }
 BEZEL_TEST(codegen_1049_unsigned_compare, ulong_ge_small_literal) {
     BEZEL_EXPECT_EQ(runBody(
-        "var u: ulong := 18000000000000000000; return (1 if (u >= 5) else 0);"), 1);
+        "var u: ulong := 18000000000000000000; return (if (u >= 5) then 1 else 0);"), 1);
 }
 // No-regression: a small unsigned vs a NEGATIVE constant keeps the signed
 // compare (`u > -5` is true), and small unsigned vs a larger positive literal
 // is still correctly false.
 BEZEL_TEST(codegen_1049_unsigned_compare, ulong_small_gt_negative_literal) {
     BEZEL_EXPECT_EQ(runBody(
-        "var u: ulong := 10; return (1 if (u > 0 - 5) else 0);"), 1);
+        "var u: ulong := 10; return (if (u > 0 - 5) then 1 else 0);"), 1);
 }
 BEZEL_TEST(codegen_1049_unsigned_compare, uint_small_gt_large_literal_false) {
     BEZEL_EXPECT_EQ(runBody(
-        "var u: uint := 5; return (1 if (u > 1000) else 0);"), 0);
+        "var u: uint := 5; return (if (u > 1000) then 1 else 0);"), 0);
 }
 
 // #1050 / §5.1: the LIFTED (nullable) relational comparison had the same
@@ -130,28 +130,28 @@ BEZEL_TEST(codegen_1049_unsigned_compare, uint_small_gt_large_literal_false) {
 BEZEL_TEST(codegen_1050_lifted_unsigned_compare, uint_nullable_high_bit_gt_literal) {
     BEZEL_EXPECT_EQ(runBody(
         "var u: uint? := 3000000000; var r: bool? := u > 1000; "
-        "return (1 if (r ?? false) else 0);"), 1);
+        "return (if (r ?? false) then 1 else 0);"), 1);
 }
 BEZEL_TEST(codegen_1050_lifted_unsigned_compare, ulong_nullable_high_bit_gt_literal) {
     BEZEL_EXPECT_EQ(runBody(
         "var u: ulong? := 18000000000000000000; var r: bool? := u > 1000; "
-        "return (1 if (r ?? false) else 0);"), 1);
+        "return (if (r ?? false) then 1 else 0);"), 1);
 }
 BEZEL_TEST(codegen_1050_lifted_unsigned_compare, uint_nullable_lt_literal_false) {
     BEZEL_EXPECT_EQ(runBody(
         "var u: uint? := 3000000000; var r: bool? := u < 1000; "
-        "return (1 if (r ?? false) else 0);"), 0);
+        "return (if (r ?? false) then 1 else 0);"), 0);
 }
 // No-regression: signed nullable and null propagation unchanged.
 BEZEL_TEST(codegen_1050_lifted_unsigned_compare, int_nullable_signed_compare_unchanged) {
     BEZEL_EXPECT_EQ(runBody(
         "var i: int? := 0 - 5; var r: bool? := i < 1000; "
-        "return (1 if (r ?? false) else 0);"), 1);
+        "return (if (r ?? false) then 1 else 0);"), 1);
 }
 BEZEL_TEST(codegen_1050_lifted_unsigned_compare, uint_nullable_null_propagates) {
     BEZEL_EXPECT_EQ(runBody(
         "var u: uint? := null; var r: bool? := u > 1000; "
-        "return (1 if (r ?? false) else 0);"), 0);
+        "return (if (r ?? false) then 1 else 0);"), 0);
 }
 
 // #1210 / §6.5: const-fold of a shift masks the count by the LEFT operand's

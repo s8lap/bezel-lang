@@ -96,8 +96,8 @@ BEZEL_TEST(value_builtin_eq_1464, dict_guid_contains_key) {
     BEZEL_EXPECT_EQ(run(
         "using var d := new Dictionary<Guid, int>(); "
         "d.Add(Guid.Empty, 1); "
-        "var hit  := when d.ContainsKey(Guid.Empty)   => 5,   _ => 0 end; "
-        "var miss := when d.ContainsKey(Guid.NewGuid()) => 100, _ => 0 end; "
+        "var hit  := (when d.ContainsKey(Guid.Empty)   => 5,   _ => 0); "
+        "var miss := (when d.ContainsKey(Guid.NewGuid()) => 100, _ => 0); "
         "return hit + miss;"), 5);
 }
 

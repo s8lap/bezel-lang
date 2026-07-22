@@ -100,7 +100,7 @@ BEZEL_TEST(closure_call_nullable_param_557,
         "  var fn: (int?, int, bool?) -> int := "
         "    lambda(a: int?, b: int, c: bool?) => do "
         "      var sum: int := a ?? 0; "
-        "      var extra: int := (b if c ?? false else 0); "
+        "      var extra: int := (if c ?? false then b else 0); "
         "      return sum + extra; "
         "    end; "
         "  var result: int := fn(10, 5, true); "
@@ -124,7 +124,7 @@ BEZEL_TEST(closure_call_nullable_param_557,
 BEZEL_TEST(closure_call_nullable_param_557,
            bool_literal_arg_to_nullable_bool_param_spec_7_5) {
     BEZEL_EXPECT_EQ(runMain(
-        "  var fn: (bool?) -> int := lambda(x: bool?) => (1 if x ?? false else 0); "
+        "  var fn: (bool?) -> int := lambda(x: bool?) => (if x ?? false then 1 else 0); "
         "  return fn(true);"),
         1);
 }

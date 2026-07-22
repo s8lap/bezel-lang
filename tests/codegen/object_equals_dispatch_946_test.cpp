@@ -66,7 +66,7 @@ BEZEL_TEST(codegen_object_equals_946, string_content_equality_through_object) {
         "  var x: string := \"hel\" + \"lo\"; "
         "  var y: string := \"he\" + \"llo\"; "
         "  var ox: Object := x; var oy: Object := y; "
-        "  return (1 if ox.Equals(oy) else 0); "
+        "  return (if ox.Equals(oy) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -76,7 +76,7 @@ BEZEL_TEST(codegen_object_equals_946, user_override_reached_through_object) {
     BEZEL_EXPECT_EQ(runWithP(
         "using var a := new P(5); using var b := new P(5); "
         "var oa: Object := a; var ob: Object := b; "
-        "return (1 if oa.Equals(ob) else 0);"), 1);
+        "return (if oa.Equals(ob) then 1 else 0);"), 1);
 }
 
 // #946 / §8.3: a user override is reached through Object and a field mismatch
@@ -85,7 +85,7 @@ BEZEL_TEST(codegen_object_equals_946, user_override_differing_fields_false) {
     BEZEL_EXPECT_EQ(runWithP(
         "using var a := new P(5); using var b := new P(9); "
         "var oa: Object := a; var ob: Object := b; "
-        "return (1 if oa.Equals(ob) else 0);"), 0);
+        "return (if oa.Equals(ob) then 1 else 0);"), 0);
 }
 
 // #946 / §8.3: a class WITHOUT an Equals override keeps reference identity
@@ -99,7 +99,7 @@ BEZEL_TEST(codegen_object_equals_946, no_override_is_reference_identity) {
         "  using var a := new Q(5); using var b := new Q(5); "
         "  var oa: Object := a; var ob: Object := b; "
         "  if oa.Equals(ob) then return 9; end; "
-        "  return (1 if oa.Equals(oa) else 0); "
+        "  return (if oa.Equals(oa) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -122,7 +122,7 @@ BEZEL_TEST(codegen_object_equals_946, override_reached_through_interface) {
         "class C public static method Main(): int "
         "  using var a := new Sq(4); using var b := new Sq(4); "
         "  var ia: IShape := a; var ib: IShape := b; "
-        "  return (1 if ia.Equals(ib) else 0); "
+        "  return (if ia.Equals(ib) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -194,7 +194,7 @@ BEZEL_TEST(codegen_reference_equals_1119, null_equals_null) {
         "module M; class N public v: int := 0; end N; "
         "class C public static method Main(): int "
         "  var a: N? := null; "
-        "  return (1 if Object.ReferenceEquals(a, null) else 0); "
+        "  return (if Object.ReferenceEquals(a, null) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -203,7 +203,7 @@ BEZEL_TEST(codegen_reference_equals_1119, null_equals_null) {
 BEZEL_TEST(codegen_reference_equals_1119, value_type_args_always_false) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  return (1 if Object.ReferenceEquals(5, 5) else 0); "
+        "  return (if Object.ReferenceEquals(5, 5) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -215,7 +215,7 @@ BEZEL_TEST(codegen_reference_equals_1119, class_and_interface_ref_same_object) {
         "class Sq: IShape public method Area(): int => 4; end Sq; "
         "class C public static method Main(): int "
         "  using var s := new Sq(); var i: IShape := s; "
-        "  return (1 if Object.ReferenceEquals(s, i) else 0); "
+        "  return (if Object.ReferenceEquals(s, i) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -236,7 +236,7 @@ BEZEL_TEST(codegen_object_equals_946, value_typed_equals_int_compiles_1151) {
         "  public method Equals(other: int): bool => other > 3; "
         "  public static method Main(): int "
         "    using var c := new C(); "
-        "    return (5 if c.Equals(7) else 0); "          // true → 5
+        "    return (if c.Equals(7) then 5 else 0); "          // true → 5
         "  end Main; end C;"), 5);
 }
 
@@ -263,6 +263,6 @@ BEZEL_TEST(codegen_object_equals_946, object_param_equals_still_overrides_1151) 
         "  public override method GetHashCode(): int => 0; "
         "  public static method Main(): int "
         "    using var a := new P(); using var b := new P(); "
-        "    return (7 if a.Equals(b) else 0) + (3 if a = b else 0); "  // 10
+        "    return (if a.Equals(b) then 7 else 0) + (if a = b then 3 else 0); "  // 10
         "  end Main; end P;"), 10);
 }

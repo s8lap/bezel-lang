@@ -75,19 +75,19 @@ where T: class
     end;
     for var i in 0..items.Count do
       var pt := default(Point);
-      pt := pt with x := i, y := i * 2 end;
+      pt := pt with(x := i, y := i * 2);
       _ := pt;
     end;
   end LoadAll;
 
   public method Classify(x: int): string
-    return case x of
+    return (case x of
       0 => "zero",
       1 | 2 | 3 => "low",
       0..10 => "medium",
       var n when n > 0 => "positive",
       _ => "other"
-    end;
+    );
   end Classify;
 
   public method Process(items: [10]int): int

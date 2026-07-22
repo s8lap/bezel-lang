@@ -1,8 +1,12 @@
-Expression      ::= ConditionalExpr
-ConditionalExpr ::= LogicalOr ("if" Expression "else" Expression)?
-                  | CaseExpr
-                  | WhenExpr
+Expression      ::= LogicalOr
                   | ThrowExpr
+                              /* IfExpr, CaseExpr, and WhenExpr are PrimaryAtom
+                                 forms (self-delimited, usable in any operand
+                                 position); no conditional level exists in the
+                                 operator table (§17.1, v0.208). A bare ThrowExpr
+                                 appears at Expression top level and, because an
+                                 atom's branches and arm bodies derive full
+                                 Expressions, in any branch or arm body (§20). */
 ThrowExpr       ::= "throw" Expression?
                               /* Bare "throw" (no operand) is valid only inside a
                                  catch arm body; outside a catch arm body, the
@@ -55,6 +59,12 @@ RangeExpr       ::= Shift                                    /* no range */
 Shift           ::= Additive (("<<" | ">>") Additive)*
 Additive        ::= Multiplicative (("+" | "-") Multiplicative)*
 Multiplicative  ::= UnaryExpr (("*" | "/" | "mod") UnaryExpr)*
+                              /* The binary-level productions above derive the
+                                 operator-category mixes that §17.2's mandatory-
+                                 parenthesization rules reject (bitwise↔equality/
+                                 relational/logical, shift↔additive, range↔bitwise);
+                                 such a mix parses and is then rejected post-parse,
+                                 enforced semantically per §17.2. */
 UnaryExpr       ::= ("+" | "-" | "not" | "~") UnaryExpr
                   | "await" UnaryExpr
                   | PrimaryExpr
@@ -77,18 +87,13 @@ PrimarySuffix   ::= "." Identifier GenericArgs?
                   | "(" ArgList? ")"
                   | "?(" ArgList? ")"
                   | "!"
-                  | "with" InitAssign ("," InitAssign)* ","? "end"
-                              /* The `with` suffix produces either a copy-with-
-                                 overrides (when the source is a record) or
-                                 setter-mutation on a freshly-constructed class
-                                 (when the source is `new C(...)` — object
-                                 initializer, §22.11). The form is syntactically
-                                 unified; the type checker resolves the semantic
-                                 difference from the source expression's type.
-                                 Placing `with` at suffix level eliminates the
-                                 left-recursive ambiguity that an earlier
-                                 grammar had with a standalone WithExpr at
-                                 PrimaryAtom level. */
+                  | "with" "(" InitAssign ("," InitAssign)* ","? ")"
+                              /* The `with` suffix is the record copy-with-
+                                 overrides expression (§9.5). It requires a
+                                 record-typed source; a class-typed source is
+                                 rejected semantically (§9.5, v0.188) — the
+                                 grammar over-admits and the type checker
+                                 rejects, the same pattern A.4 uses throughout. */
 
 PrimaryAtom     ::= Literal
                   | PrimitiveType
@@ -118,8 +123,11 @@ PrimaryAtom     ::= Literal
                   | NewExpr
                   | MoveExpr
                   | LambdaExpr
+                  | IfExpr
                   | CaseExpr
                   | WhenExpr
+                  | BindExpr
+                  | MarkedTransfer
                   | "this" | "base"
                   | NameOfExpr | TypeOfExpr | DefaultExpr
                   | CollectionLiteral
@@ -134,76 +142,161 @@ MoveExpr        ::= "move" PrimaryExpr
                                  the named field is `owned`; or (b) an
                                  indexer access `PrimaryExpr "[" Expression "]"`
                                  where the receiver is an owning collection
-                                 admitting slot-level move (`OwnedArray<T>`,
-                                 `OwnedDictionary<K, V>`, `OwnedBuffer<T>`
+                                 admitting slot-level move (`OwningArray<T>`,
+                                 `OwningDictionary<K, V>`, `OwningBuffer<T>`
                                  for class-typed T, `Span<T>` over class-typed
-                                 `OwnedBuffer<T>`, or an owning inline array
+                                 `OwningBuffer<T>`, or an owning inline array
                                  `[N owned]…`). Both rejections are compile
                                  errors. See §28.8.1 and §28.11. */
 
 NewExpr         ::= "new" Type "(" ArgList? ")"
                   | "new" "(" ArgList? ")"              /* shorthand */
-                              /* The object-initializer form `new T() with X := 5 end`
-                                 is parsed as `NewExpr` followed by a `with`
-                                 PrimarySuffix; there is no separate ObjectInit
-                                 production. */
+                              /* `new T(...) with(X := 5)` is parsed as
+                                 `NewExpr` followed by a `with` PrimarySuffix;
+                                 there is no separate ObjectInit production.
+                                 The suffix is the record `with` of §9.5:
+                                 legal when the constructed type is a record,
+                                 rejected semantically when it is a class
+                                 (v0.188). */
 InitAssign      ::= Identifier ":=" Expression
 
-LambdaExpr      ::= "async"? "(" LambdaParams? ")" "=>" LambdaBody
-LambdaParams    ::= LambdaParam ("," LambdaParam)*
+LambdaExpr      ::= "async"? "lambda" "(" LambdaParams? ")"
+                    (":" Type)? "=>" LambdaBody
+                              /* Keyword-led (§27.3, v0.217): `lambda` is
+                                 reserved and begins no other expression or
+                                 statement, so the reading commits at the
+                                 first token (the second, after `async`) —
+                                 no scan to the matching `)` is ever needed,
+                                 and a parenthesized construct followed by
+                                 `=>` (a when-guard arm, a grouped
+                                 expression) is never a lambda prefix. The
+                                 parameter parens are mandatory, including
+                                 the empty pair. The optional `":" Type` is
+                                 the return-type ascription (§27.3); no Type
+                                 production contains `=>` (function types
+                                 use `->`), so the ascription ends
+                                 deterministically before the arrow. */
+LambdaParams    ::= LambdaParam ("," LambdaParam)* ","?
 LambdaParam     ::= FuncParamMods? Identifier (":" Type)?
+                  | LambdaDestructure
+LambdaDestructure ::= QualifiedName "(" LambdaSlot ("," LambdaSlot)* ","? ")"
+LambdaSlot      ::= Identifier | "_" | LambdaDestructure
+                              /* Positional-record destructuring in parameter
+                                 position (§27.4, v0.183, #1408): irrefutable
+                                 binding form only — the head names the
+                                 parameter's exact positional-record type; no
+                                 modifiers, no annotation, no refutable
+                                 pattern elements. */
 LambdaBody      ::= Expression
                   | "do" Statement* "end"
 
-CaseExpr        ::= "case" Expression CaseArm ("," CaseArm)* ","? "end"
-                              /* The scrutinee Expression is mandatory (#744).
-                                 The scrutinee-less condition-dispatch form is
-                                 the separate WhenExpr below. The scrutinee is
-                                 parsed at the MULTIPLICATIVE level (multiplicative
-                                 and postfix expressions only) — normative rule in
-                                 §19.1 — so a following `-` (negative range bound),
-                                 relational, range, or open-ended-range token
-                                 begins the first arm's Pattern rather than being
-                                 absorbed into the scrutinee. An additive, shift,
-                                 bitwise, range, or relational scrutinee must be
-                                 parenthesized. */
-CaseArm         ::= ArmPattern ("when" Expression)? "=>" ArmBody
-ArmPattern      ::= Pattern ("," Pattern)*
-                              /* Comma-separated pattern ALTERNATIVES exist at
-                                 the arm level only (`1, 2 => "low"`); they are
-                                 factored out of Pattern so that inside a
-                                 positional destructure list the comma is
-                                 unambiguously the SLOT separator (#1300/#1321).
-                                 The arm separator and the alternative separator
-                                 are disambiguated by `=>`, which always follows
-                                 the complete ArmPattern (§19.3). */
-WhenExpr        ::= "when" WhenArm ("," WhenArm)* ","? "end"
-                              /* Scrutinee-less condition dispatch (§19.1). Arms
-                                 are tried in textual order; the first whose
-                                 condition is `true` is selected. Valid in both
-                                 expression and statement position. The construct
-                                 keyword `when` is distinct from the guard `when`
-                                 of a CaseArm/CatchArm — position disambiguates. */
+MarkedTransfer  ::= "owned" Identifier
+                              /* The K3.4 transfer marker as an expression atom
+                                 (v0.209). `owned` is reserved and begins no
+                                 other expression, so the form is additive.
+                                 Admission is positional, enforced semantically
+                                 (§28.3): the entire RHS of a binding or
+                                 assignment (the v0.180 forms; a BindExpr
+                                 clause's RHS included, v0.216), an if-expression
+                                 branch, or an expression-`case`/`when` arm
+                                 result.
+                                 Everywhere else — `??` operands, operator
+                                 operands, guards, argument subexpressions —
+                                 it is a compile error naming axiom A7's
+                                 narrowed bound. The Identifier names a local
+                                 binding or `owned` parameter; field paths use
+                                 `move x.f` (§28.8.1). The call-site argument
+                                 marker (ArgModifiers) and the `case owned x of`
+                                 scrutinee marker are separate productions,
+                                 unchanged. */
+IfExpr          ::= "(" "if" Expression "then" Expression
+                    ("elif" Expression "then" Expression)*
+                    "else" Expression ")"
+                              /* The conditional atom (§20, v0.208). The
+                                 parentheses are part of the form: in atom-start
+                                 position, "(" followed by the reserved "if"
+                                 commits the reading at the second token; in
+                                 call/index-argument position the atom supplies
+                                 its own pair. Each condition and branch derives
+                                 a full Expression (a bare throw branch is
+                                 admitted anywhere); "else" is mandatory. */
+CaseExpr        ::= "(" "case" "owned"? Expression "of" CaseArm ("," CaseArm)* ","? ")"
+                              /* The expression-position case atom (v0.208): arms
+                                 are Expression-bodied only (ArmBody's Statement
+                                 and do-block alternatives belong to the A.6
+                                 CaseStmt). "(case" commits at the second token —
+                                 "case" begins no other expression. */
+                              /* The optional `owned` is the scrutinee transfer
+                                 marker (§35.5): admitted only when the scrutinee
+                                 is a named owned binding of owning-choice
+                                 classification; anywhere else it is a compile
+                                 error. `owned` is a reserved keyword, so no
+                                 expression can begin with it and the parse is
+                                 unambiguous. */
+                              /* The scrutinee Expression is mandatory (#744);
+                                 the scrutinee-less condition-dispatch form is
+                                 the separate WhenExpr below. `of` delimits the
+                                 scrutinee from the first arm (v0.166, #1370), so
+                                 the scrutinee is a FULL Expression — no
+                                 precedence restriction, no parenthesization
+                                 rule — and a first pattern may begin with `-`,
+                                 `..`, `..<`, or a relational token without
+                                 ambiguity. */
+CaseArm         ::= AltPattern ("when" Expression)? "=>" ArmBody
+AltPattern      ::= Pattern ("|" Pattern)*
+                              /* Pattern ALTERNATIVES are `|`-separated (v0.167,
+                                 #1371): the comma is exclusively the arm/slot
+                                 separator, so no `=>` lookahead is needed and
+                                 alternatives are available per positional slot
+                                 (see PositionalPattern). `|`-joined members must
+                                 be binding-free: constants, payload-free choice
+                                 case names (§35.5, v0.200), ranges, or
+                                 relationals (§19.3, v0.183). `|` never collides with
+                                 bitwise-or: pattern-embedded expressions parse
+                                 at Shift level or tighter (§19.3). */
+WhenExpr        ::= "(" "when" WhenArm ("," WhenArm)* ","? ")"
+                              /* Scrutinee-less condition dispatch (§19.1), the
+                                 expression-position atom (v0.208): arms are
+                                 Expression-bodied only; the statement form is
+                                 A.6's WhenStmt. Arms are tried in textual order;
+                                 the first whose condition is `true` is selected.
+                                 The construct keyword `when` is distinct from
+                                 the guard `when` of a CaseArm/CatchArm —
+                                 position disambiguates. */
 WhenArm         ::= (Expression | "_") "=>" ArmBody
                               /* The Expression is a `bool` condition. `_` is the
                                  always-true catch-all and, if present, must be the
                                  last arm. ArmBody follows the same rules as CaseArm. */
+BindExpr        ::= "(" BindClause+ Expression ")"
+BindClause      ::= "var" Identifier (":" Type)? ":=" Expression ";"
+                              /* The binding atom (§17.15, v0.216): "(" followed
+                                 by the reserved "var" — which begins no other
+                                 expression — commits the reading at the second
+                                 token, like the other paren atoms. Each clause
+                                 introduces one single-assignment binding, in
+                                 scope for the later clauses and the body; the
+                                 ";" terminates the clause (no expression
+                                 contains a top-level ";"). The body is one full
+                                 Expression and supplies the atom's value and
+                                 type. Clause initializers admit the marked
+                                 transfer `owned x` (a K3.4 binding transfer,
+                                 §28.3); the body position does not. */
 ArmBody         ::= Expression
-                  | Statement                  /* valid only in statement-position case
+                  | Statement                  /* valid only in a CaseStmt/WhenStmt (A.6)
                                                   or in a catch arm; reads as a single
                                                   statement whose terminating `;` ends the
                                                   arm body, the same as `do Statement end` */
-                  | "do" Statement* "end"     /* type (); valid only in statement-position case
+                  | "do" Statement* "end"     /* type (); valid only in a CaseStmt/WhenStmt
                                                   or in a catch arm */
 Pattern         ::= "_"                       /* discard */
                   | "null"                     /* null literal pattern */
                   | "var" Identifier (":" Type)?      /* binding */
-                  | Constant                          /* single constant; comma
+                  | Constant                          /* single constant; `|`
                                                          alternatives live in
-                                                         ArmPattern above */
+                                                         AltPattern above */
                   | RangePattern                      /* closed, half-open, or
                                                          open-ended range */
-                  | RelOpPattern Expression           /* relational; restricted
+                  | RelOpPattern Shift                 /* relational; restricted
                                                          operator set, see below */
                   | Type                              /* type test */
                   | QualifiedName "(" PositionalPatternList ")" /* destructuring */
@@ -218,8 +311,10 @@ Pattern         ::= "_"                       /* discard */
                                  applies to QualifiedNames — `Color.Red` is a
                                  constant pattern; `System.IO.Stream` is a
                                  type-test pattern. */
-PositionalPatternList ::= PositionalPattern ("," PositionalPattern)*
-PositionalPattern     ::= Pattern
+PositionalPatternList ::= PositionalPattern ("," PositionalPattern)* ","?
+PositionalPattern     ::= AltPattern              /* per-slot alternatives
+                                                     (v0.167, #1371):
+                                                     TwoColor(Red | Blue, var x) */
                         | Identifier              /* naked binding,
                                                      valid only inside
                                                      positional destructuring */
@@ -229,8 +324,7 @@ RangePattern    ::= PatternBound (".." | "..<") PatternBound
                   | (".." | "..<") PatternBound
                   | ".."
 PatternBound    ::= "-"? Shift
-                              /* Dedicated pattern-position range form (mirrors
-                                 the v0.94 RelOpPattern fix): no bare-expression
+                              /* Dedicated pattern-position range form (mirrors RelOpPattern): no bare-expression
                                  leg (a lone Shift is not a range pattern) and no
                                  `step` (patterns test written bounds; stride has no
                                  membership meaning, §16.4). Bounds admit a
@@ -254,8 +348,8 @@ RelOpPattern    ::= "<" | ">" | "<=" | ">="
                                  semantically because `<` between a value and
                                  a range is not defined. */
 
-CollectionLiteral ::= "[" (Expression ("," Expression)*)? "]"
-                    | "[" DictEntry ("," DictEntry)* "]"                   /* dictionary */
+CollectionLiteral ::= "[" (Expression ("," Expression)* ","?)? "]"
+                    | "[" DictEntry ("," DictEntry)* ","? "]"                   /* dictionary */
 DictEntry         ::= Expression ":" Expression
 
 NameOfExpr      ::= "nameof" "(" QualifiedName ")"

@@ -175,7 +175,7 @@ BEZEL_TEST(codegen_cg50, out_discard_preserves_bool_return_1301) {
         "    n := 5; return true; "
         "  end Try; "
         "  public static method Main(): int "
-        "    return (1 if C.Try(out _) else 0); "  // 1, not 0
+        "    return (if C.Try(out _) then 1 else 0); "  // 1, not 0
         "  end Main; "
         "end C;"), 1);
 }
@@ -202,7 +202,7 @@ BEZEL_TEST(codegen_cg50, dict_trygetvalue_out_discard_found_1301) {
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
         "  d.Add(\"k\", 9); "
-        "  return (1 if d.TryGetValue(\"k\", out _) else 2); "  // 1 — present
+        "  return (if d.TryGetValue(\"k\", out _) then 1 else 2); "  // 1 — present
         "end Main; end C;"), 1);
 }
 
@@ -211,6 +211,6 @@ BEZEL_TEST(codegen_cg50, dict_trygetvalue_out_discard_missing_1301) {
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
         "  d.Add(\"k\", 9); "
-        "  return (1 if d.TryGetValue(\"nope\", out _) else 2); "  // 2 — absent
+        "  return (if d.TryGetValue(\"nope\", out _) then 1 else 2); "  // 2 — absent
         "end Main; end C;"), 2);
 }

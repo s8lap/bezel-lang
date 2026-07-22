@@ -123,7 +123,7 @@ BEZEL_TEST(codegen_record_named_args_540, with_expression_still_works) {
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var a := new Point(3, 4); "
-        "  var b := a with x := 9 end; "
+        "  var b := a with(x := 9); "
         "  return b.x * 10 + b.y; "
         "end Main; end C;"), 94);
 }

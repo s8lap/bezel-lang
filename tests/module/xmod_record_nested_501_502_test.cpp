@@ -117,7 +117,7 @@ BEZEL_TEST(xmod_record_nested_501_502, same_module_positional_eq_spec_9_1_9_2) {
         "  public static method Main(): int "
         "    var p := new Point(1, 2); "
         "    var q := new Point(1, 2); "
-        "    return (10 if p = q else 0); "
+        "    return (if p = q then 10 else 0); "
         "  end Main; "
         "end Program;");
 
@@ -148,7 +148,7 @@ BEZEL_TEST(xmod_record_nested_501_502, imported_positional_eq_typechecks_clean_s
         "  public static method Main(): int "
         "    var p := new Point(1, 2); "
         "    var q := new Point(1, 2); "
-        "    return (1 if p = q else 0); "
+        "    return (if p = q then 1 else 0); "
         "  end Main; "
         "end Program;");
     BEZEL_EXPECT_TRUE(!r->hadErrors);
@@ -176,7 +176,7 @@ BEZEL_TEST(xmod_record_nested_501_502, imported_positional_eq_equal_case_spec_9_
         "  public static method Main(): int "
         "    var p := new Point(3, 4); "
         "    var q := new Point(3, 4); "
-        "    return (7 if p = q else 0); "   // equal → 7
+        "    return (if p = q then 7 else 0); "   // equal → 7
         "  end Main; "
         "end Program;");
 
@@ -215,7 +215,7 @@ BEZEL_TEST(xmod_record_nested_501_502, imported_positional_eq_unequal_case_spec_
         "  public static method Main(): int "
         "    var p := new Point(1, 2); "
         "    var q := new Point(3, 4); "
-        "    return (1 if p = q else 0); "   // not equal → 0
+        "    return (if p = q then 1 else 0); "   // not equal → 0
         "  end Main; "
         "end Program;");
 
@@ -253,7 +253,7 @@ BEZEL_TEST(xmod_record_nested_501_502, imported_body_record_eq_still_errors_spec
         "  public static method Main(): int "
         "    using var a := new Box(1); "
         "    using var b := new Box(1); "
-        "    return (1 if a = b else 0); "   // must be an error
+        "    return (if a = b then 1 else 0); "   // must be an error
         "  end Main; "
         "end Program;");
     BEZEL_EXPECT_TRUE(r->hadErrors);

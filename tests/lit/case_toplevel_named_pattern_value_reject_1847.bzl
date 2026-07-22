@@ -48,10 +48,10 @@ class Program
 
     // (C) expression position, a bare identifier resolving to a runtime VALUE
     //     — the reported malformed-IR / ICE.
-    var s := case n of
+    var s := (case n of
       target => "x",
       _      => "y"
-    end;
+    );
     Console.WriteLine(s);
     // CHECK: :[[@LINE-4]]:{{[0-9]+}}: `target` is a value, not a type or constant, so it cannot be a top-level `case` pattern (§19.3)
   end Main;

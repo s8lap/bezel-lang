@@ -61,7 +61,7 @@ BEZEL_TEST(primitive_tostring_518, int_tostring_hex_255_518) {
     // stdlib §9.1: ToString(16) → lowercase hex.
     BEZEL_EXPECT_EQ(run(
         "var s := (255).ToString(16); "
-        "return (1 if s = \"ff\" else 0);"), 1);
+        "return (if s = \"ff\" then 1 else 0);"), 1);
 }
 
 // stdlib §9.1: (255).ToString(2) = "11111111"
@@ -69,7 +69,7 @@ BEZEL_TEST(primitive_tostring_518, int_tostring_binary_255_518) {
     // stdlib §9.1: ToString(2) → binary digits.
     BEZEL_EXPECT_EQ(run(
         "var s := (255).ToString(2); "
-        "return (1 if s = \"11111111\" else 0);"), 1);
+        "return (if s = \"11111111\" then 1 else 0);"), 1);
 }
 
 // stdlib §9.1: (255).ToString(8) = "377"
@@ -77,7 +77,7 @@ BEZEL_TEST(primitive_tostring_518, int_tostring_octal_255_518) {
     // stdlib §9.1: ToString(8) → octal digits.
     BEZEL_EXPECT_EQ(run(
         "var s := (255).ToString(8); "
-        "return (1 if s = \"377\" else 0);"), 1);
+        "return (if s = \"377\" then 1 else 0);"), 1);
 }
 
 // stdlib §9.1: (255).ToString(10) = "255" (decimal, same as no-arg)
@@ -85,7 +85,7 @@ BEZEL_TEST(primitive_tostring_518, int_tostring_decimal_255_518) {
     // stdlib §9.1: ToString(10) → decimal.
     BEZEL_EXPECT_EQ(run(
         "var s := (255).ToString(10); "
-        "return (1 if s = \"255\" else 0);"), 1);
+        "return (if s = \"255\" then 1 else 0);"), 1);
 }
 
 // stdlib §9.1: (255).ToString() = "255" — regression guard
@@ -93,7 +93,7 @@ BEZEL_TEST(primitive_tostring_518, int_tostring_noarg_255_518) {
     // stdlib §9.1: ToString() (no arg) → decimal; must still work.
     BEZEL_EXPECT_EQ(run(
         "var s := (255).ToString(); "
-        "return (1 if s = \"255\" else 0);"), 1);
+        "return (if s = \"255\" then 1 else 0);"), 1);
 }
 
 // stdlib §9.1: (0).ToString(16) = "0"
@@ -101,7 +101,7 @@ BEZEL_TEST(primitive_tostring_518, int_tostring_hex_zero_518) {
     // stdlib §9.1: zero in hex → "0".
     BEZEL_EXPECT_EQ(run(
         "var s := (0).ToString(16); "
-        "return (1 if s = \"0\" else 0);"), 1);
+        "return (if s = \"0\" then 1 else 0);"), 1);
 }
 
 // stdlib §9.1: (0).ToString(2) = "0"
@@ -109,7 +109,7 @@ BEZEL_TEST(primitive_tostring_518, int_tostring_binary_zero_518) {
     // stdlib §9.1: zero in binary → "0".
     BEZEL_EXPECT_EQ(run(
         "var s := (0).ToString(2); "
-        "return (1 if s = \"0\" else 0);"), 1);
+        "return (if s = \"0\" then 1 else 0);"), 1);
 }
 
 // stdlib §9.1: verify Length of (255).ToString(16) == 2
@@ -133,7 +133,7 @@ BEZEL_TEST(primitive_tostring_518, int_tostring_hex_16_518) {
     // stdlib §9.1: 16 in hex → "10".
     BEZEL_EXPECT_EQ(run(
         "var s := (16).ToString(16); "
-        "return (1 if s = \"10\" else 0);"), 1);
+        "return (if s = \"10\" then 1 else 0);"), 1);
 }
 
 // stdlib §9.1: long.ToString(radix) — Int64 has analogous shape.
@@ -143,7 +143,7 @@ BEZEL_TEST(primitive_tostring_518, long_tostring_hex_255_518) {
     BEZEL_EXPECT_EQ(run(
         "var n: long := 255L; "
         "var s := n.ToString(16); "
-        "return (1 if s = \"ff\" else 0);"), 1);
+        "return (if s = \"ff\" then 1 else 0);"), 1);
 }
 
 // stdlib §9.1: (255L).ToString(2) = "11111111"
@@ -152,7 +152,7 @@ BEZEL_TEST(primitive_tostring_518, long_tostring_binary_255_518) {
     BEZEL_EXPECT_EQ(run(
         "var n: long := 255L; "
         "var s := n.ToString(2); "
-        "return (1 if s = \"11111111\" else 0);"), 1);
+        "return (if s = \"11111111\" then 1 else 0);"), 1);
 }
 
 // ── #519: double.IeeeEquals ───────────────────────────────────────────────────

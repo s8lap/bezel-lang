@@ -107,10 +107,9 @@ BEZEL_TEST(choice_match_35_5,
         "module M; choice Opt Some(value: int), None; end Opt; "
         "class C public static method Main(): int "
         "  var x: Opt := Opt.None; "
-        "  return case x of "
+        "  return (case x of "
         "    Some(var v) => v, "
-        "    None        => 0 "
-        "  end; "
+        "    None        => 0); "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(reportsUnresolved(r, "None"));
 }

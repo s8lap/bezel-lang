@@ -30,30 +30,30 @@ class Program
 
   // A genuine TYPE-TEST pattern (§19.3 "Type patterns without binding: … Dog").
   public static method Kind(a: Animal): string
-    return case a of
+    return (case a of
       Dog => "dog",
       Cat => "cat",
       _   => "other"
-    end;
+    );
   end Kind;
 
   // A bare ENUM-CONSTANT pattern over an enum scrutinee (§10.6 / §19.8).
   public static method Name(c: Color): string
-    return case c of
+    return (case c of
       Red   => "r",
       Green => "g",
       Blue  => "b"
-    end;
+    );
   end Name;
 
   // A named-`const` pattern, a literal pattern, a `var` binding, and `_`.
   public static method Classify(n: int): string
-    return case n of
+    return (case n of
       LIMIT      => "limit",
       0          => "zero",
       var x when x < 0 => "neg",
       _          => "pos"
-    end;
+    );
   end Classify;
 
   public static method Main()

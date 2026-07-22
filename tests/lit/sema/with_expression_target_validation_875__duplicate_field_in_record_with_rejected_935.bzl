@@ -5,7 +5,7 @@
 //
 // REJECT: duplicate field name in a record `with`.
 
-module M; record Point(X: int, Y: int); class C public static method Main(): int var p := new Point(1, 2); var p2 := p with X := 5, X := 10 end; return p2.X; end Main; end C;
+module M; record Point(X: int, Y: int); class C public static method Main(): int var p := new Point(1, 2); var p2 := p with(X := 5, X := 10); return p2.X; end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: field `X` is assigned more than once in this `with` expression
 // CHECK-SAME: (§9.5)

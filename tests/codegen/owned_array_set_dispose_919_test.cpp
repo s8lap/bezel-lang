@@ -43,6 +43,6 @@ BEZEL_TEST(owned_array_set_dispose_919, indexer_set_replaces_value_correctly) {
         "  using var arr := new OwningArray<Cell>(); "
         "  arr.Add(new Cell(1)); arr.Add(new Cell(2)); arr.Add(new Cell(3)); "
         "  arr[1] := new Cell(99); "  // slot1 := 99, dispose old Cell(2)
-        "  return arr[1].id + (100 if Cell.n = 3 else 0); "  // 99 + 100 = 199
+        "  return arr[1].id + (if Cell.n = 3 then 100 else 0); "  // 99 + 100 = 199
         "end Main; end C;"), 199);
 }

@@ -62,7 +62,7 @@ BEZEL_TEST(generic_extension_773, no_free_var_method_dispatches) {
         "  public method IsEmpty(): bool => this.Count() = 0; "
         "end; ",
         "  using var b := new Bag<W>(); "
-        "  return 0 if b.IsEmpty() else 1; ")), 0);  // empty -> IsEmpty true
+        "  return (if b.IsEmpty() then 0 else 1); ")), 0);  // empty -> IsEmpty true
 }
 
 // §26.5: after adding an element, the extension method observes the receiver's
@@ -74,7 +74,7 @@ BEZEL_TEST(generic_extension_773, method_sees_receiver_state) {
         "end; ",
         "  using var b := new Bag<W>(); "
         "  b.Add(new W(1)); "
-        "  return 0 if not b.IsEmpty() else 1; ")), 0);  // non-empty
+        "  return (if not b.IsEmpty() then 0 else 1); ")), 0);  // non-empty
 }
 
 // §26.5 SCOPE: a method whose signature uses the free var is kept cleanly

@@ -28,7 +28,7 @@ BEZEL_TEST(typed_binding_string_pattern_856, nullable_string_matches) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s: string? := \"hello\"; "
-        "  return case s of var n: string => 1, _ => 2 end; "  // 1
+        "  return (case s of var n: string => 1, _ => 2); "  // 1
         "end Main; end C;"), 1);
 }
 
@@ -37,7 +37,7 @@ BEZEL_TEST(typed_binding_string_pattern_856, binds_unwrapped_string) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s: string? := \"hello\"; "
-        "  return case s of var n: string => n.Length, _ => 0 end; "  // 5
+        "  return (case s of var n: string => n.Length, _ => 0); "  // 5
         "end Main; end C;"), 5);
 }
 
@@ -46,7 +46,7 @@ BEZEL_TEST(typed_binding_string_pattern_856, null_string_takes_default) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s: string? := null; "
-        "  return case s of var n: string => 1, _ => 2 end; "  // 2
+        "  return (case s of var n: string => 1, _ => 2); "  // 2
         "end Main; end C;"), 2);
 }
 
@@ -55,7 +55,7 @@ BEZEL_TEST(typed_binding_string_pattern_856, object_holding_string_matches) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var o: Object := \"hi\"; "
-        "  return case o of var n: string => n.Length, _ => 0 end; "  // 2
+        "  return (case o of var n: string => n.Length, _ => 0); "  // 2
         "end Main; end C;"), 2);
 }
 
@@ -64,7 +64,7 @@ BEZEL_TEST(typed_binding_string_pattern_856, object_holding_int_no_string_match)
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var o: Object := 42; "
-        "  return case o of var n: string => 1, _ => 9 end; "  // 9
+        "  return (case o of var n: string => 1, _ => 9); "  // 9
         "end Main; end C;"), 9);
 }
 
@@ -74,6 +74,6 @@ BEZEL_TEST(typed_binding_string_pattern_856, int_pattern_vs_object_string_regres
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var o: Object := \"hi\"; "
-        "  return case o of var n: int => 1, _ => 7 end; "  // 7
+        "  return (case o of var n: int => 1, _ => 7); "  // 7
         "end Main; end C;"), 7);
 }

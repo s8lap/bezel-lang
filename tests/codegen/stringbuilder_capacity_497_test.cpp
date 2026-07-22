@@ -101,7 +101,7 @@ BEZEL_TEST(codegen_sb_capacity_497, tostring_after_appends_correct) {
         "  sb.Append(\"Hello\"); "
         "  sb.Append(\" \"); "
         "  sb.Append(\"World\"); "
-        "  return (1 if sb.ToString() = \"Hello World\" else 0); "
+        "  return (if sb.ToString() = \"Hello World\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

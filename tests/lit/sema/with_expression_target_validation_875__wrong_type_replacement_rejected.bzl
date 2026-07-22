@@ -6,7 +6,7 @@
 // §9.5/§5.1, #875: a wrong-type replacement value is a compile error.
 // `p with X := "hi" end` where X: int must be rejected.
 
-module M; record Point(X: int, Y: int); class C public static method Main(): int var p := new Point(1, 2); var q := p with X := "hi" end; return q.Y; end Main; end C;
+module M; record Point(X: int, Y: int); class C public static method Main(): int var p := new Point(1, 2); var q := p with(X := "hi"); return q.Y; end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: the replacement value for `X` has a type that is not implicitly convertible to the target type
 // CHECK-SAME: (§5.1)

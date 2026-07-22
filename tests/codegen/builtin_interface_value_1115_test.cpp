@@ -29,7 +29,7 @@ const char* CMP =
     "class C: IComparable<int> "
     "  private _v: int; "
     "  public constructor(v: int) _v := v; end constructor; "
-    "  public method CompareTo(other: int): int => (2 if _v > other else 0); "
+    "  public method CompareTo(other: int): int => (if _v > other then 2 else 0); "
     "end C; ";
 const char* EQ =
     "module M; "
@@ -77,7 +77,7 @@ BEZEL_TEST(builtin_interface_value_1115, iequatable_as_value_dispatches) {
         std::string(EQ) +
         "class App public static method Main(): int "
         "  using var c := new C(5); var e: IEquatable<int> := c; "
-        "  return (7 if e.Equals(5) else 0) + (1 if e.Equals(9) else 0); "  // 7
+        "  return (if e.Equals(5) then 7 else 0) + (if e.Equals(9) then 1 else 0); "  // 7
         "end Main; end App;"), 7);
 }
 
@@ -111,7 +111,7 @@ BEZEL_TEST(builtin_interface_value_1115, where_icomparable_constraint_unchanged)
         "module M; import System; "
         "record Money(cents: int): IComparable<Money> "
         "  public method CompareTo(other: Money): int => "
-        "    (1 if cents > other.cents else (-1 if cents < other.cents else 0)); "
+        "    (if cents > other.cents then 1 else (if cents < other.cents then -1 else 0)); "
         "end Money; "
         "class App public static method Main(): int "
         "  var a := new Money(150); var b := new Money(99); "
@@ -126,7 +126,7 @@ BEZEL_TEST(builtin_interface_value_1115, iequalitycomparer_as_param_dispatches) 
         std::string(EQC) +
         "class App "
         "  private static method Use(c: IEqualityComparer<int>): int => "
-        "    (10 if c.Equals(5, 5) else 0) + c.GetHashCode(7); "   // 10 + 14
+        "    (if c.Equals(5, 5) then 10 else 0) + c.GetHashCode(7); "   // 10 + 14
         "  public static method Main(): int "
         "    using var cmp := new Cmp(); return Use(cmp); "        // 24
         "  end Main; end App;"), 24);
@@ -138,8 +138,8 @@ BEZEL_TEST(builtin_interface_value_1115, iequalitycomparer_as_local_dispatches) 
         std::string(EQC) +
         "class App public static method Main(): int "
         "  using var cmp := new Cmp(); var c: IEqualityComparer<int> := cmp; "
-        "  return (3 if c.Equals(4, 4) else 0) "                   // 3
-        "       + (9 if c.Equals(4, 8) else 0) "                   // + 0 (false)
+        "  return (if c.Equals(4, 4) then 3 else 0) "                   // 3
+        "       + (if c.Equals(4, 8) then 9 else 0) "                   // + 0 (false)
         "       + c.GetHashCode(6); "                              // + 12 -> 15
         "end Main; end App;"), 15);
 }
@@ -166,7 +166,7 @@ BEZEL_TEST(builtin_interface_value_1115, iequalitycomparer_as_field_type) {
         "  public constructor() cmp := new Cmp(); end constructor; "
         "  public static method Main(): int "
         "    using var b := new Box(); "
-        "    return (8 if b.cmp.Equals(2, 2) else 0) + b.cmp.GetHashCode(3); " // 8 + 6
+        "    return (if b.cmp.Equals(2, 2) then 8 else 0) + b.cmp.GetHashCode(3); " // 8 + 6
         "  end Main; end Box;"), 14);
 }
 
@@ -203,8 +203,8 @@ BEZEL_TEST(builtin_interface_value_1183, iequatable_string_t_dispatches) {
         "end SC; "
         "class App public static method Main(): int "
         "  using var s := new SC(); var e: IEquatable<string> := s; "
-        "  return (7 if e.Equals(\"hello\") else 0) "  // 7
-        "       + (3 if e.Equals(\"world\") else 0); "  // +0 → 7
+        "  return (if e.Equals(\"hello\") then 7 else 0) "  // 7
+        "       + (if e.Equals(\"world\") then 3 else 0); "  // +0 → 7
         "end Main; end App;"), 7);
 }
 
@@ -216,7 +216,7 @@ BEZEL_TEST(builtin_interface_value_1183, icomparable_long_t_dispatches) {
         "  private _v: long; "
         "  public constructor(v: long) _v := v; end constructor; "
         "  public method CompareTo(other: long): int => "
-        "    (5 if _v > other else (-1 if _v < other else 0)); "
+        "    (if _v > other then 5 else (if _v < other then -1 else 0)); "
         "end LC; "
         "class App public static method Main(): int "
         "  using var c := new LC(100L); var x: IComparable<long> := c; "
@@ -235,7 +235,7 @@ BEZEL_TEST(builtin_interface_value_1183, iequalitycomparer_record_t_dispatches) 
         "end PtCmp; "
         "class App public static method Main(): int "
         "  using var cmp := new PtCmp(); var c: IEqualityComparer<Pt> := cmp; "
-        "  return (10 if c.Equals(new Pt(3, 0), new Pt(3, 9)) else 0) "  // 10
+        "  return (if c.Equals(new Pt(3, 0), new Pt(3, 9)) then 10 else 0) "  // 10
         "       + c.GetHashCode(new Pt(7, 0)); "                          // + 7 = 17
         "end Main; end App;"), 17);
 }
@@ -250,7 +250,7 @@ BEZEL_TEST(builtin_interface_value_1183, iequalitycomparer_string_t_dispatches) 
         "end SCmp; "
         "class App public static method Main(): int "
         "  using var cmp := new SCmp(); var c: IEqualityComparer<string> := cmp; "
-        "  return (10 if c.Equals(\"x\", \"x\") else 0) "  // 10
+        "  return (if c.Equals(\"x\", \"x\") then 10 else 0) "  // 10
         "       + c.GetHashCode(\"z\"); "                   // + 42 = 52
         "end Main; end App;"), 52);
 }

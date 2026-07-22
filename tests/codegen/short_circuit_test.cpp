@@ -58,5 +58,5 @@ BEZEL_TEST(codegen_sc, and_rhs_divide_would_throw_if_eager) {
     BEZEL_EXPECT_EQ(run(
         "var z := 0; var ok := false; "
         "var r := ok and (10 / z = 0); "
-        "return (1 if r else 11);"), 11);
+        "return (if r then 1 else 11);"), 11);
 }

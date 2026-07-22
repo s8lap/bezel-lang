@@ -38,7 +38,7 @@ BEZEL_TEST(reference_equals_null_nullable_1579, null_int_nullable_vs_null_litera
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x: int? := null; "
-        "  return (1 if Object.ReferenceEquals(x, null) else 0); "
+        "  return (if Object.ReferenceEquals(x, null) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -47,7 +47,7 @@ BEZEL_TEST(reference_equals_null_nullable_1579, null_literal_vs_null_int_nullabl
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x: int? := null; "
-        "  return (1 if Object.ReferenceEquals(null, x) else 0); "
+        "  return (if Object.ReferenceEquals(null, x) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -58,7 +58,7 @@ BEZEL_TEST(reference_equals_null_nullable_1579, two_null_nullables_true) {
         "module M; class C public static method Main(): int "
         "  var x: int? := null; "
         "  var y: double? := null; "
-        "  return (1 if Object.ReferenceEquals(x, y) else 0); "
+        "  return (if Object.ReferenceEquals(x, y) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -68,7 +68,7 @@ BEZEL_TEST(reference_equals_null_nullable_1579, present_nullable_vs_null_false) 
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x: int? := 5; "
-        "  return (1 if Object.ReferenceEquals(x, null) else 0); "
+        "  return (if Object.ReferenceEquals(x, null) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -80,7 +80,7 @@ BEZEL_TEST(reference_equals_null_nullable_1579, two_present_equal_nullables_fals
         "module M; class C public static method Main(): int "
         "  var x: int? := 5; "
         "  var y: int? := 5; "
-        "  return (1 if Object.ReferenceEquals(x, y) else 0); "
+        "  return (if Object.ReferenceEquals(x, y) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -90,7 +90,7 @@ BEZEL_TEST(reference_equals_null_nullable_1579, two_present_equal_nullables_fals
 BEZEL_TEST(reference_equals_null_nullable_1579, nonnullable_value_vs_null_false) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  return (1 if Object.ReferenceEquals(5, null) else 0); "
+        "  return (if Object.ReferenceEquals(5, null) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -99,7 +99,7 @@ BEZEL_TEST(reference_equals_null_nullable_1579, nonnullable_value_vs_null_false)
 BEZEL_TEST(reference_equals_null_nullable_1579, two_null_literals_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  return (1 if Object.ReferenceEquals(null, null) else 0); "
+        "  return (if Object.ReferenceEquals(null, null) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -110,6 +110,6 @@ BEZEL_TEST(reference_equals_null_nullable_1579, same_class_instance_true) {
         "module M; class N public v: int := 0; end N; "
         "class C public static method Main(): int "
         "  using var a := new N(); "
-        "  return (1 if Object.ReferenceEquals(a, a) else 0); "
+        "  return (if Object.ReferenceEquals(a, a) then 1 else 0); "
         "end Main; end C;"), 1);
 }

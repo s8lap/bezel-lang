@@ -44,7 +44,7 @@ BEZEL_TEST(primitive_box_builtin_iface_1311, int_boxes_into_icomparable) {
         "module M; "
         "class C public static method Main(): int "
         "  var c: IComparable<int> := 5; "
-        "  return (100 if c.CompareTo(3) > 0 else 200); "
+        "  return (if c.CompareTo(3) > 0 then 100 else 200); "
         "end Main; end C;"), 100);
 }
 
@@ -58,7 +58,7 @@ BEZEL_TEST(primitive_box_builtin_iface_1311, int_boxes_into_iequatable) {
         "module M; "
         "class C public static method Main(): int "
         "  var e: IEquatable<int> := 7; "
-        "  return (10 if e.Equals(7) else 0) + (0 if e.Equals(9) else 1); "
+        "  return (if e.Equals(7) then 10 else 0) + (if e.Equals(9) then 0 else 1); "
         "end Main; end C;"), 11);
 }
 
@@ -70,7 +70,7 @@ BEZEL_TEST(primitive_box_builtin_iface_1311, long_boxes_into_icomparable) {
         "module M; "
         "class C public static method Main(): int "
         "  var l: IComparable<long> := 10L; "
-        "  return (5 if l.CompareTo(3L) > 0 else 0) + l.CompareTo(10L); "
+        "  return (if l.CompareTo(3L) > 0 then 5 else 0) + l.CompareTo(10L); "
         "end Main; end C;"), 5);
 }
 
@@ -82,8 +82,8 @@ BEZEL_TEST(primitive_box_builtin_iface_1311, char_and_double_box_into_icomparabl
         "class C public static method Main(): int "
         "  var ch: IComparable<char> := 'b'; "
         "  var d: IComparable<double> := 2.5; "
-        "  return (1 if ch.CompareTo('a') > 0 else 0) "
-        "       + (1 if d.CompareTo(3.0) < 0 else 0); "
+        "  return (if ch.CompareTo('a') > 0 then 1 else 0) "
+        "       + (if d.CompareTo(3.0) < 0 then 1 else 0); "
         "end Main; end C;"), 2);
 }
 
@@ -97,7 +97,7 @@ BEZEL_TEST(primitive_box_builtin_iface_1311, bool_boxes_into_iequatable) {
         "module M; "
         "class C public static method Main(): int "
         "  var b: IEquatable<bool> := true; "
-        "  return (8 if b.Equals(true) else 0) + (9 if b.Equals(false) else 0); "
+        "  return (if b.Equals(true) then 8 else 0) + (if b.Equals(false) then 9 else 0); "
         "end Main; end C;"), 8);
 }
 
@@ -121,7 +121,7 @@ BEZEL_TEST(primitive_box_builtin_iface_1311, user_class_icomparable_unchanged) {
         "class UC: IComparable<int> "
         "  private _v: int; "
         "  public constructor(v: int) _v := v; end constructor; "
-        "  public method CompareTo(other: int): int => (2 if _v > other else 0); "
+        "  public method CompareTo(other: int): int => (if _v > other then 2 else 0); "
         "end UC; "
         "class C public static method Main(): int "
         "  using var u := new UC(5); var x: IComparable<int> := u; "

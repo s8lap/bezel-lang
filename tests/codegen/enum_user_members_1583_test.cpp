@@ -30,8 +30,8 @@ int run(const std::string& program) {
 // An enum whose user `ToString` maps High → "high".
 const char* kPriorityToStr =
     "enum Priority Low, Medium, High; "
-    "  public method ToString(): string => case this of "
-    "    Low => \"low\", Medium => \"medium\", High => \"high\" end; "
+    "  public method ToString(): string => (case this of "
+    "    Low => \"low\", Medium => \"medium\", High => \"high\"); "
     "end Priority; ";
 
 // An enum whose user `Equals` treats all values as equal and whose user
@@ -55,7 +55,7 @@ BEZEL_TEST(codegen_enum_user_1583, tostring_direct_call) {
     BEZEL_EXPECT_EQ(run(std::string("module M; ") + kPriorityToStr +
         "class C public static method Main(): int "
         "  var p: Priority := Priority.High; "
-        "  return (1 if p.ToString() = \"high\" else 0); "
+        "  return (if p.ToString() = \"high\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -64,7 +64,7 @@ BEZEL_TEST(codegen_enum_user_1583, tostring_interpolation) {
     BEZEL_EXPECT_EQ(run(std::string("module M; ") + kPriorityToStr +
         "class C public static method Main(): int "
         "  var p: Priority := Priority.High; "
-        "  return (1 if $\"{p}\" = \"high\" else 0); "
+        "  return (if $\"{p}\" = \"high\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -73,7 +73,7 @@ BEZEL_TEST(codegen_enum_user_1583, tostring_interpolation_aligned) {
     BEZEL_EXPECT_EQ(run(std::string("module M; ") + kPriorityToStr +
         "class C public static method Main(): int "
         "  var p: Priority := Priority.Medium; "
-        "  return (1 if $\"{p,8}\" = \"  medium\" else 0); "
+        "  return (if $\"{p,8}\" = \"  medium\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -83,7 +83,7 @@ BEZEL_TEST(codegen_enum_user_1583, tostring_boxed_dispatch) {
     BEZEL_EXPECT_EQ(run(std::string("module M; ") + kPriorityToStr +
         "class C public static method Main(): int "
         "  var o: Object := Priority.High; "
-        "  return (1 if o.ToString() = \"high\" else 0); "
+        "  return (if o.ToString() = \"high\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -97,7 +97,7 @@ BEZEL_TEST(codegen_enum_user_1583, equals_boxed_dispatch) {
         "class C public static method Main(): int "
         "  var a: Object := Priority.Low; "
         "  var b: Object := Priority.High; "
-        "  return (1 if a.Equals(b) else 0); "
+        "  return (if a.Equals(b) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -143,7 +143,7 @@ BEZEL_TEST(codegen_enum_user_1583, default_tostring_interpolation) {
     BEZEL_EXPECT_EQ(run(std::string("module M; ") + kColor +
         "class C public static method Main(): int "
         "  var g: Color := Color.Green; "
-        "  return (1 if $\"{g}\" = \"Color\" else 0); "
+        "  return (if $\"{g}\" = \"Color\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -152,7 +152,7 @@ BEZEL_TEST(codegen_enum_user_1583, default_tostring_boxed_dispatch) {
     BEZEL_EXPECT_EQ(run(std::string("module M; ") + kColor +
         "class C public static method Main(): int "
         "  var o: Object := Color.Green; "
-        "  return (1 if o.ToString() = \"Color\" else 0); "
+        "  return (if o.ToString() = \"Color\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

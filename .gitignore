@@ -14,6 +14,7 @@
 compile_commands.json
 .vscode/
 .idea/
+__pycache__/
 
 # Blessed root scratch dir for probes / experiments / one-off investigations.
 # Put ad-hoc .bz probes and compiled probe binaries HERE (or in

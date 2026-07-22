@@ -74,7 +74,7 @@ BEZEL_TEST(codegen_bug481, abstract_property_via_base_method) {
         "  public static method Main(): int "
         "    using var c := new Child(); "
         "    var n := c.GetName(); "
-        "    return (1 if n = \"ChildName\" else 0); "
+        "    return (if n = \"ChildName\" then 1 else 0); "
         "  end Main; "
         "end C;"), 1);
 }
@@ -123,7 +123,7 @@ BEZEL_TEST(codegen_bug481, interface_property_string) {
         "  destructor end destructor; end Widget; "
         "class C "
         "  public static method NameOf(n: INamed): int "
-        "    var s := n.Name; return (1 if s = \"W\" else 0); "
+        "    var s := n.Name; return (if s = \"W\" then 1 else 0); "
         "  end NameOf; "
         "  public static method Main(): int "
         "    using var w := new Widget(); return NameOf(w); "

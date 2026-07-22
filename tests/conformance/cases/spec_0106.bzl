@@ -1,2 +1,2 @@
-var max := a if a > b else b;
-var status := "adult" if age >= 18 else "minor";
+var max := (if a > b then a else b);
+var status := (if age >= 18 then "adult" else "minor");

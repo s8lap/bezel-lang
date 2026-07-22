@@ -55,14 +55,13 @@ BEZEL_TEST(codegen_cg28_573, nullable_result_value_arm_nonnull_spec_19_2_7_1) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
         "  public static method Try(n: int): int? "
-        "    return case n of "
+        "    return (case n of "
         "      1 => 100, "
-        "      _ => null "
-        "    end; "
+        "      _ => null); "
         "  end Try; "
         "  public static method Main(): int "
         "    var x := C.Try(1); "
-        "    return 1 if x = null else 0; "
+        "    return (if x = null then 1 else 0); "
         "  end Main; "
         "end C;"), 0);
 }
@@ -73,14 +72,13 @@ BEZEL_TEST(codegen_cg28_573, nullable_result_null_arm_is_null_spec_19_2_7_2) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
         "  public static method Try(n: int): int? "
-        "    return case n of "
+        "    return (case n of "
         "      1 => 100, "
-        "      _ => null "
-        "    end; "
+        "      _ => null); "
         "  end Try; "
         "  public static method Main(): int "
         "    var y := C.Try(99); "
-        "    return 0 if y = null else 1; "
+        "    return (if y = null then 0 else 1); "
         "  end Main; "
         "end C;"), 0);
 }
@@ -91,14 +89,13 @@ BEZEL_TEST(codegen_cg28_573, nullable_result_value_correct_spec_19_2_7_5) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
         "  public static method Try(n: int): int? "
-        "    return case n of "
+        "    return (case n of "
         "      1 => 100, "
-        "      _ => null "
-        "    end; "
+        "      _ => null); "
         "  end Try; "
         "  public static method Main(): int "
         "    var x := C.Try(1); "
-        "    return 0 if x = null else (1 if x <> 100 else 0); "
+        "    return (if x = null then 0 else (if x <> 100 then 1 else 0)); "
         "  end Main; "
         "end C;"), 0);
 }
@@ -109,11 +106,10 @@ BEZEL_TEST(codegen_cg28_573, nullable_result_multi_value_arms_spec_19_2) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
         "  public static method Pick(n: int): int? "
-        "    return case n of "
+        "    return (case n of "
         "      1 => 10, "
         "      2 => 20, "
-        "      _ => null "
-        "    end; "
+        "      _ => null); "
         "  end Pick; "
         "  public static method Main(): int "
         "    var a := C.Pick(1); var b := C.Pick(2); var c := C.Pick(9); "
@@ -130,14 +126,13 @@ BEZEL_TEST(codegen_cg28_573, nullable_result_all_null_arms_spec_19_2) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
         "  public static method Always(n: int): int? "
-        "    return case n of "
+        "    return (case n of "
         "      1 => null, "
-        "      _ => null "
-        "    end; "
+        "      _ => null); "
         "  end Always; "
         "  public static method Main(): int "
         "    var x := C.Always(1); "
-        "    return 0 if x = null else 1; "
+        "    return (if x = null then 0 else 1); "
         "  end Main; "
         "end C;"), 0);
 }
@@ -158,14 +153,13 @@ BEZEL_TEST(codegen_cg28_573, nullable_result_all_null_arms_aot_1767_spec_19_2) {
     BEZEL_EXPECT_EQ(runFullAot(
         "module M; class C "
         "  public static method Always(n: int): int? "
-        "    return case n of "
+        "    return (case n of "
         "      1 => null, "
-        "      _ => null "
-        "    end; "
+        "      _ => null); "
         "  end Always; "
         "  public static method Main(): int "
         "    var x := C.Always(1); "
-        "    return 0 if x = null else 1; "
+        "    return (if x = null then 0 else 1); "
         "  end Main; "
         "end C;"), 0);
 }
@@ -176,11 +170,10 @@ BEZEL_TEST(codegen_cg28_573, nullable_bool_result_spec_19_2_7_5) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
         "  public static method Flag(n: int): bool? "
-        "    return case n of "
+        "    return (case n of "
         "      1 => true, "
         "      2 => false, "
-        "      _ => null "
-        "    end; "
+        "      _ => null); "
         "  end Flag; "
         "  public static method Main(): int "
         "    var a := C.Flag(1); "
@@ -202,10 +195,9 @@ BEZEL_TEST(codegen_cg28_573, nullable_record_result_spec_19_2_7_1) {
         "record Point(x: int, y: int); "
         "class C "
         "  public static method Get(n: int): Point? "
-        "    return case n of "
+        "    return (case n of "
         "      1 => new Point(3, 4), "
-        "      _ => null "
-        "    end; "
+        "      _ => null); "
         "  end Get; "
         "  public static method Main(): int "
         "    var p := C.Get(1); "
@@ -223,14 +215,13 @@ BEZEL_TEST(codegen_cg28_573, regression_nonnullable_case_expr_spec_19_2) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
         "  public static method Map(n: int): int "
-        "    return case n of "
+        "    return (case n of "
         "      1 => 10, "
         "      2 => 20, "
-        "      _ => 99 "
-        "    end; "
+        "      _ => 99); "
         "  end Map; "
         "  public static method Main(): int "
-        "    return 0 if C.Map(2) = 20 else 1; "
+        "    return (if C.Map(2) = 20 then 0 else 1); "
         "  end Main; "
         "end C;"), 0);
 }
@@ -244,11 +235,10 @@ BEZEL_TEST(codegen_cg28_573, regression_nullable_scrutinee_int_result_spec_19_7_
         "module M; class C "
         "  public static method Main(): int "
         "    var x: int? := 42; "
-        "    return case x of "
+        "    return (case x of "
         "      42 => 0, "
         "      null => 1, "
-        "      _ => 2 "
-        "    end; "
+        "      _ => 2); "
         "  end Main; "
         "end C;"), 0);
 }

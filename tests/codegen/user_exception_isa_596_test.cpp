@@ -135,7 +135,7 @@ BEZEL_TEST(codegen_596, is_builtin_base_exception_spec_21_12) {
         "  try "
         "    throw new ErrA(); "
         "  catch var e: ErrA => "
-        "    return (1 if e is Exception else 0); "
+        "    return (if e is Exception then 1 else 0); "
         "  end; "
         "  return 0; "
         "end Main; end C;"),
@@ -154,7 +154,7 @@ BEZEL_TEST(codegen_596, is_not_builtin_base_exception_spec_21_12) {
         "  try "
         "    throw new ErrA(); "
         "  catch var e: ErrA => "
-        "    return (1 if e is not Exception else 0); "
+        "    return (if e is not Exception then 1 else 0); "
         "  end; "
         "  return 0; "
         "end Main; end C;"),
@@ -176,7 +176,7 @@ BEZEL_TEST(codegen_596, as_builtin_base_exception_nonnull_spec_21_12) {
         "  try "
         "    throw new ErrA(); "
         "  catch var e: ErrA => "
-        "    return (1 if (e as Exception) is not null else 0); "
+        "    return (if (e as Exception) is not null then 1 else 0); "
         "  end; "
         "  return 0; "
         "end Main; end C;"),
@@ -222,7 +222,7 @@ BEZEL_TEST(codegen_596, two_level_user_is_builtin_base_spec_21_12) {
         "  try "
         "    throw new ErrB(\"chain\"); "
         "  catch var e: ErrB => "
-        "    return (1 if e is Exception else 0); "
+        "    return (if e is Exception then 1 else 0); "
         "  end; "
         "  return 0; "
         "end Main; end C;"),
@@ -307,7 +307,7 @@ BEZEL_TEST(codegen_596, regression_user_to_user_is_spec_21_12) {
         "class Dog: Animal end Dog; "
         "class C public static method Main(): int "
         "  var d := new Dog(); "
-        "  return (1 if d is Animal else 0); "
+        "  return (if d is Animal then 1 else 0); "
         "end Main; end C;"),
         1);
 }
@@ -322,7 +322,7 @@ BEZEL_TEST(codegen_596, regression_user_to_user_as_spec_21_12) {
         "class C public static method Main(): int "
         "  var d := new Dog(); "
         "  var a := d as Animal; "
-        "  return (1 if a is not null else 0); "
+        "  return (if a is not null then 1 else 0); "
         "end Main; end C;"),
         1);
 }

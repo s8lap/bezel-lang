@@ -35,7 +35,7 @@ BEZEL_TEST(indexer_overload_774, dispatch_same_return_type) {
         "end MultiIndex; "
         "class C public static method Main(): int "
         "  using var m := new MultiIndex(); "
-        "  return 0 if m[5] = \"int\" and m[true] = \"bool\" else 1; "
+        "  return (if m[5] = \"int\" and m[true] = \"bool\" then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -48,13 +48,13 @@ BEZEL_TEST(indexer_overload_774, dispatch_different_return_types) {
         "module M; "
         "class MultiIndex "
         "  public property [i: int]: int => i * 10; "
-        "  public property [b: bool]: string => \"yes\" if b else \"no\"; "
+        "  public property [b: bool]: string => (if b then \"yes\" else \"no\"); "
         "end MultiIndex; "
         "class C public static method Main(): int "
         "  using var m := new MultiIndex(); "
         "  var n := m[5]; "
         "  var s := m[true]; "
-        "  return 0 if n = 50 and s = \"yes\" else 1; "
+        "  return (if n = 50 and s = \"yes\" then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -66,7 +66,7 @@ BEZEL_TEST(indexer_overload_774, single_indexer_unaffected) {
         "class Box public property [i: int]: int => i + 100; end Box; "
         "class C public static method Main(): int "
         "  using var b := new Box(); "
-        "  return 0 if b[5] = 105 else 1; "
+        "  return (if b[5] = 105 then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -105,7 +105,7 @@ BEZEL_TEST(indexer_overload_1172, full_param_list_distinguishes_second_param) {
         "end Grid; "
         "class C public static method Main(): int "
         "  using var g := new Grid(); "
-        "  return 0 if g[3, \"xy\"] = 2032 and g[3, 5] = 1035 else 1; "
+        "  return (if g[3, \"xy\"] = 2032 and g[3, 5] = 1035 then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -122,7 +122,7 @@ BEZEL_TEST(indexer_overload_1172, arity_selects_two_param_over_leading_one) {
         "end Grid; "
         "class C public static method Main(): int "
         "  using var g := new Grid(); "
-        "  return 0 if g[7, 9] = 5709 and g[7] = 107 else 1; "
+        "  return (if g[7, 9] = 5709 and g[7] = 107 then 0 else 1); "
         "end Main; end C;"), 0);
 }
 

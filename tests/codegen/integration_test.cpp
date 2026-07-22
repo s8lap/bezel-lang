@@ -93,7 +93,7 @@ BEZEL_TEST(integration, case_expression) {
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; class C public static method Main(): int "
         "  var x := 2; "
-        "  var r := case x of 1 => 1, 2 => 22, _ => 0 end; "
+        "  var r := (case x of 1 => 1, 2 => 22, _ => 0); "
         "  return r; "
         "end Main; end C;"), 22);
 }
@@ -121,8 +121,8 @@ BEZEL_TEST(integration, record_structural_equality) {
         "class C public static method Main(): int "
         "  var a := new Point(3, 4); "
         "  var b := new Point(3, 4); "
-        "  var c := a with x := 9 end; "
-        "  return (1 if a = b else 0) + (1 if a <> c else 0); "
+        "  var c := a with(x := 9); "
+        "  return (if a = b then 1 else 0) + (if a <> c then 1 else 0); "
         "end Main; end C;"), 2);
 }
 
@@ -192,9 +192,9 @@ BEZEL_TEST(integration, grade_classifier_with_range_patterns) {
         "module M; record Score(value: int); "
         "class C "
         "  public static method Grade(s: Score): int "
-        "    return case s.value of "
+        "    return (case s.value of "
         "      90..100 => 4, 80..89 => 3, 70..79 => 2, "
-        "      60..69 => 1, _ => 0 end; "
+        "      60..69 => 1, _ => 0); "
         "  end Grade; "
         "  public static method Main(): int "
         "    var scores: [5]int; "
@@ -242,7 +242,7 @@ BEZEL_TEST(integration, range_case_pattern_classification) {
         "  a[0] := 95; a[1] := 85; a[2] := 75; a[3] := 65; a[4] := 55; "
         "  var s := 0; "
         "  for var x in a do "
-        "    var g := case x of 90..100 => 4, 80..89 => 3, 70..79 => 2, 60..69 => 1, _ => 0 end; "
+        "    var g := (case x of 90..100 => 4, 80..89 => 3, 70..79 => 2, 60..69 => 1, _ => 0); "
         "    s := s + g; "
         "  end; "
         "  return s; "
@@ -344,7 +344,7 @@ BEZEL_TEST(integration, string_replace_and_case) {
         "module M; class C public static method Main(): int "
         "  var s := \"hello world\"; "
         "  var t := s.Replace(\"world\", \"bezel\").ToUpper(); "
-        "  return (1 if t = \"HELLO BEZEL\" else 0); "
+        "  return (if t = \"HELLO BEZEL\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -353,7 +353,7 @@ BEZEL_TEST(integration, math_pow_and_sqrt) {
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; class C public static method Main(): int "
         "  var area := Math.PI * Math.Pow(5.0, 2.0); "
-        "  return (1 if area > 78.0 else 0); "
+        "  return (if area > 78.0 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -450,7 +450,7 @@ BEZEL_TEST(integration, record_operators_and_pattern_matching) {
         "record Pair(x: int, y: int); "
         "class C "
         "  public static method Sum(p: Pair): int "
-        "    return case p of Pair(a, b) => a + b, _ => 0 end; "
+        "    return (case p of Pair(a, b) => a + b, _ => 0); "
         "  end Sum; "
         "  public static method Main(): int "
         "    var p := new Pair(10, 20); "
@@ -464,10 +464,10 @@ BEZEL_TEST(integration, binding_pattern_with_guard) {
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; class C public static method Main(): int "
         "  var n := 42; "
-        "  return case n of "
+        "  return (case n of "
         "    var x when x > 100 => 1, "
         "    var x when x > 10  => 2, "
-        "    _ => 3 end; "
+        "    _ => 3); "
         "end Main; end C;"), 2);
 }
 
@@ -477,7 +477,7 @@ BEZEL_TEST(integration, string_operations_chain) {
         "module M; class C public static method Main(): int "
         "  var s := \"  Hello, World!  \"; "
         "  var t := s.Trim().ToLower().Replace(\",\", \"\"); "
-        "  return (1 if t.StartsWith(\"hello\") else 0); "
+        "  return (if t.StartsWith(\"hello\") then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

@@ -189,7 +189,7 @@ BEZEL_TEST(codegen_encoding_526, control_roundtrip_ascii_spec_3_2) {
         "var s := \"Hello, World\"; "
         "using var b := Encoding.UTF8.GetBytes(s); "
         "using var back: string := Encoding.UTF8.GetString(b); "
-        "return (1 if back = s else 0); ")), 1);
+        "return (if back = s then 1 else 0); ")), 1);
 }
 
 // Control: explicit typed annotation (Array<byte>) still resolves Count (§3.2).

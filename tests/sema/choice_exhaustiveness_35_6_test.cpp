@@ -79,11 +79,10 @@ BEZEL_TEST(choice_exhaustiveness_35_6,
         "module M; choice Color Red, Green, Blue; end Color; "
         "class C public static method Main(): int "
         "  var x: Color := Color.Red; "
-        "  return case x of "
+        "  return (case x of "
         "    Red   => 1, "
         "    Green => 2, "
-        "    Blue  => 3 "
-        "  end; "
+        "    Blue  => 3); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(lacksExhaustiveWarn(r));
 }
@@ -96,10 +95,9 @@ BEZEL_TEST(choice_exhaustiveness_35_6,
         "module M; choice Opt Some(value: int), None; end Opt; "
         "class C public static method Main(): int "
         "  var x: Opt := Opt.None; "
-        "  return case x of "
+        "  return (case x of "
         "    Some(var v) => v, "
-        "    None        => 0 "
-        "  end; "
+        "    None        => 0); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(lacksExhaustiveWarn(r));
 }
@@ -111,10 +109,9 @@ BEZEL_TEST(choice_exhaustiveness_35_6,
         "module M; choice Opt Some(value: int), None; end Opt; "
         "class C public static method Main(): int "
         "  var x: Opt := Opt.None; "
-        "  return case x of "
+        "  return (case x of "
         "    Some(_) => 1, "
-        "    None    => 0 "
-        "  end; "
+        "    None    => 0); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(lacksExhaustiveWarn(r));
 }
@@ -126,10 +123,9 @@ BEZEL_TEST(choice_exhaustiveness_35_6,
         "module M; choice Pair First(a: int, b: int), Zero; end Pair; "
         "class C public static method Main(): int "
         "  var x: Pair := Pair.Zero; "
-        "  return case x of "
+        "  return (case x of "
         "    First(a, b) => a + b, "
-        "    Zero         => 0 "
-        "  end; "
+        "    Zero         => 0); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(lacksExhaustiveWarn(r));
 }
@@ -142,10 +138,9 @@ BEZEL_TEST(choice_exhaustiveness_35_6,
         "module M; choice Opt Some(value: int), None; end Opt; "
         "class C public static method Main(): int "
         "  var x: Opt := Opt.None; "
-        "  return case x of "
+        "  return (case x of "
         "    Some(var v) => v, "
-        "    _           => 0 "
-        "  end; "
+        "    _           => 0); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(lacksExhaustiveWarn(r));
 }
@@ -159,9 +154,8 @@ BEZEL_TEST(choice_exhaustiveness_35_6,
         "module M; choice Opt Some(value: int), None; end Opt; "
         "class C public static method Main(): int "
         "  var x: Opt := Opt.None; "
-        "  return case x of "
-        "    Some(var v) => v "
-        "  end; "
+        "  return (case x of "
+        "    Some(var v) => v); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(hasExhaustiveWarn(r, "Opt", " None"));
 }
@@ -173,9 +167,8 @@ BEZEL_TEST(choice_exhaustiveness_35_6,
         "module M; choice Opt Some(value: int), None; end Opt; "
         "class C public static method Main(): int "
         "  var x: Opt := Opt.None; "
-        "  return case x of "
-        "    None => 0 "
-        "  end; "
+        "  return (case x of "
+        "    None => 0); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(hasExhaustiveWarn(r, "Opt", " Some"));
 }
@@ -187,10 +180,9 @@ BEZEL_TEST(choice_exhaustiveness_35_6,
         "module M; choice Tri A, B, C; end Tri; "
         "class D public static method Main(): int "
         "  var x: Tri := Tri.A; "
-        "  return case x of "
+        "  return (case x of "
         "    A => 1, "
-        "    B => 2 "
-        "  end; "
+        "    B => 2); "
         "end Main; end D;");
     BEZEL_EXPECT_TRUE(hasExhaustiveWarn(r, "Tri", " C"));
 }
@@ -205,10 +197,9 @@ BEZEL_TEST(choice_exhaustiveness_35_6,
         "module M; choice Opt Some(value: int), None; end Opt; "
         "class C public static method Main(): int "
         "  var x: Opt := Opt.None; "
-        "  return case x of "
+        "  return (case x of "
         "    Some(var v) when v > 0 => v, "
-        "    None                   => 0 "
-        "  end; "
+        "    None                   => 0); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(hasExhaustiveWarn(r, "Opt", " Some"));
 }

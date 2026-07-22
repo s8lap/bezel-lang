@@ -1,1 +1,1 @@
-trueValue if condition else falseValue
+(if condition then trueValue else falseValue)

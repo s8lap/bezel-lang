@@ -31,7 +31,7 @@ BEZEL_TEST(codegen_cg37, default_bool_is_false) {
 
 BEZEL_TEST(codegen_cg37, default_double_is_zero) {
     BEZEL_EXPECT_EQ(run(
-        "var d := default(double); return (5 if d = 0.0 else 0);"), 5);
+        "var d := default(double); return (if d = 0.0 then 5 else 0);"), 5);
 }
 
 BEZEL_TEST(codegen_cg37, default_reference_is_null) {

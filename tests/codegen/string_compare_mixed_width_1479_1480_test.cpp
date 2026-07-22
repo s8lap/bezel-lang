@@ -37,7 +37,7 @@ BEZEL_TEST(codegen_cg27b_mixed_width, eq_w2_slice_vs_w1_lit_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var src := \"helloĀ\"; var sliced := src[0..4]; var lit := \"hello\"; "
-        "  return (1 if sliced = lit else 0); "
+        "  return (if sliced = lit then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -46,7 +46,7 @@ BEZEL_TEST(codegen_cg27b_mixed_width, neq_w2_slice_vs_w1_lit_false) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var src := \"helloĀ\"; var sliced := src[0..4]; var lit := \"hello\"; "
-        "  return (1 if sliced <> lit else 0); "
+        "  return (if sliced <> lit then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -55,7 +55,7 @@ BEZEL_TEST(codegen_cg27b_mixed_width, eq_w1_lit_vs_w2_slice_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var src := \"helloĀ\"; var sliced := src[0..4]; var lit := \"hello\"; "
-        "  return (1 if lit = sliced else 0); "
+        "  return (if lit = sliced then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -65,7 +65,7 @@ BEZEL_TEST(codegen_cg27b_mixed_width, eq_w2_slice_abc_vs_w1_abc_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var src := \"abcĀ\"; var sliced := src[0..2]; var lit := \"abc\"; "
-        "  return (1 if sliced = lit else 0); "
+        "  return (if sliced = lit then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -75,7 +75,7 @@ BEZEL_TEST(codegen_cg27b_mixed_width, eq_w2_slice_abc_vs_w1_abd_false) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var src := \"abcĀ\"; var sliced := src[0..2]; var lit := \"abd\"; "
-        "  return (1 if sliced = lit else 0); "
+        "  return (if sliced = lit then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -85,7 +85,7 @@ BEZEL_TEST(codegen_cg27b_mixed_width, eq_w4_slice_vs_w1_lit_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var src := \"abc\U00010000\"; var sliced := src[0..2]; var lit := \"abc\"; "
-        "  return (1 if sliced = lit else 0); "
+        "  return (if sliced = lit then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -95,7 +95,7 @@ BEZEL_TEST(codegen_cg27b_mixed_width, eq_w4_slice_vs_w2_lit_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var src := \"Ābc\U00010000\"; var sliced := src[0..2]; var lit := \"Ābc\"; "
-        "  return (1 if sliced = lit else 0); "
+        "  return (if sliced = lit then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -104,7 +104,7 @@ BEZEL_TEST(codegen_cg27b_mixed_width, eq_w1_same_width_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := \"hello\"; var b := \"hello\"; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -113,7 +113,7 @@ BEZEL_TEST(codegen_cg27b_mixed_width, eq_w1_same_width_false) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := \"hello\"; var b := \"world\"; "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -125,7 +125,7 @@ BEZEL_TEST(codegen_cg27b_mixed_width, ord_lt_w2_ac_vs_w1_ab_false) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var w2 := \"Āac\"; var sliced := w2[1..2]; var lit := \"ab\"; "
-        "  return (1 if sliced < lit else 0); "
+        "  return (if sliced < lit then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -134,7 +134,7 @@ BEZEL_TEST(codegen_cg27b_mixed_width, ord_gt_w2_ac_vs_w1_ab_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var w2 := \"Āac\"; var sliced := w2[1..2]; var lit := \"ab\"; "
-        "  return (1 if sliced > lit else 0); "
+        "  return (if sliced > lit then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -144,7 +144,7 @@ BEZEL_TEST(codegen_cg27b_mixed_width, ord_lt_w2_aa_vs_w1_ab_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var w2 := \"Āaa\"; var sliced := w2[1..2]; var lit := \"ab\"; "
-        "  return (1 if sliced < lit else 0); "
+        "  return (if sliced < lit then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -153,7 +153,7 @@ BEZEL_TEST(codegen_cg27b_mixed_width, ord_le_w2_abc_vs_w1_abc_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var src := \"abcĀ\"; var sliced := src[0..2]; var lit := \"abc\"; "
-        "  return (1 if sliced <= lit else 0); "
+        "  return (if sliced <= lit then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -161,7 +161,7 @@ BEZEL_TEST(codegen_cg27b_mixed_width, ord_ge_w2_abc_vs_w1_abc_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var src := \"abcĀ\"; var sliced := src[0..2]; var lit := \"abc\"; "
-        "  return (1 if sliced >= lit else 0); "
+        "  return (if sliced >= lit then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -171,7 +171,7 @@ BEZEL_TEST(codegen_cg27b_mixed_width, ord_lt_w2_shorter_prefix) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var src := \"Āab\"; var sliced := src[1..2]; var lit := \"abc\"; "
-        "  return (1 if sliced < lit else 0); "
+        "  return (if sliced < lit then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -182,7 +182,7 @@ BEZEL_TEST(codegen_cg27b_mixed_width, ord_lt_w1_a_vs_w4_supplementary_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var src := \"\U00010000\"; var sliced := src[0..0]; var lit := \"z\"; "
-        "  return (1 if lit < sliced else 0); "
+        "  return (if lit < sliced then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -191,7 +191,7 @@ BEZEL_TEST(codegen_cg27b_mixed_width, ord_lt_w1_same_width_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := \"abc\"; var b := \"abd\"; "
-        "  return (1 if a < b else 0); "
+        "  return (if a < b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -200,7 +200,7 @@ BEZEL_TEST(codegen_cg27b_mixed_width, ord_lt_w2_same_width_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := \"abcĀ\"; var b := \"abdĀ\"; "
-        "  return (1 if a < b else 0); "
+        "  return (if a < b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

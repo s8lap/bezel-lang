@@ -73,7 +73,7 @@ BEZEL_TEST(box_constructor_function_type_2056,
     auto r = parseSemaAll(
         std::string(kBoxDecl) +
         "class C "
-        "  public static method Id(x: bool): int return (1 if x else 0); end Id; "
+        "  public static method Id(x: bool): int return (if x then 1 else 0); end Id; "
         "  public static method Main(): int "
         "    var f: (bool) -> int := Id; "
         "    using var b := new Box<(int) -> int>(f); "

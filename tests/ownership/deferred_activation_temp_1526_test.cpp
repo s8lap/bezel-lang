@@ -382,7 +382,7 @@ BEZEL_TEST(deferred_activation_temp, task_from_exception_owned_arg_clean) {
         "  public static method Main(): int "
         "    using var tf := Task.FromException<int>("
         "        new InvalidOperationException(\"x\")); "
-        "    return (1 if tf.IsFaulted else 0); "
+        "    return (if tf.IsFaulted then 1 else 0); "
         "  end Main; "
         "end C;");
     bool sawDeferredActivationError = false;

@@ -48,12 +48,11 @@ BEZEL_TEST(record_pattern_constants_615, enum_subpat_red_matches) {
     BEZEL_EXPECT_EQ(runProg(std::string(kColorEnum) +
         "class C public static method Main(): int "
         "  var p := new Colored(1, Color.Red); "
-        "  return case p of "
+        "  return (case p of "
         "    Colored(n, Color.Red)   => 10, "
         "    Colored(n, Color.Green) => 20, "
         "    Colored(n, Color.Blue)  => 30, "
-        "    _ => -1 "
-        "  end; "
+        "    _ => -1); "
         "end Main; end C;"), 10);
 }
 
@@ -63,12 +62,11 @@ BEZEL_TEST(record_pattern_constants_615, enum_subpat_green_matches) {
     BEZEL_EXPECT_EQ(runProg(std::string(kColorEnum) +
         "class C public static method Main(): int "
         "  var p := new Colored(1, Color.Green); "
-        "  return case p of "
+        "  return (case p of "
         "    Colored(n, Color.Red)   => 10, "
         "    Colored(n, Color.Green) => 20, "
         "    Colored(n, Color.Blue)  => 30, "
-        "    _ => -1 "
-        "  end; "
+        "    _ => -1); "
         "end Main; end C;"), 20);
 }
 
@@ -77,12 +75,11 @@ BEZEL_TEST(record_pattern_constants_615, enum_subpat_blue_matches) {
     BEZEL_EXPECT_EQ(runProg(std::string(kColorEnum) +
         "class C public static method Main(): int "
         "  var p := new Colored(1, Color.Blue); "
-        "  return case p of "
+        "  return (case p of "
         "    Colored(n, Color.Red)   => 10, "
         "    Colored(n, Color.Green) => 20, "
         "    Colored(n, Color.Blue)  => 30, "
-        "    _ => -1 "
-        "  end; "
+        "    _ => -1); "
         "end Main; end C;"), 30);
 }
 
@@ -91,11 +88,10 @@ BEZEL_TEST(record_pattern_constants_615, enum_subpat_discard_fallthrough) {
     BEZEL_EXPECT_EQ(runProg(std::string(kColorEnum) +
         "class C public static method Main(): int "
         "  var p := new Colored(1, Color.Blue); "
-        "  return case p of "
+        "  return (case p of "
         "    Colored(n, Color.Red)   => 10, "
         "    Colored(n, Color.Green) => 20, "
-        "    _ => 99 "
-        "  end; "
+        "    _ => 99); "
         "end Main; end C;"), 99);
 }
 
@@ -106,10 +102,9 @@ BEZEL_TEST(record_pattern_constants_615, string_subpat_matches_foo) {
     BEZEL_EXPECT_EQ(runProg(std::string(kNamedRec) +
         "class C public static method Main(): int "
         "  var p := new Named(\"foo\", 7); "
-        "  return case p of "
+        "  return (case p of "
         "    Named(\"foo\", v) => v, "
-        "    _ => -1 "
-        "  end; "
+        "    _ => -1); "
         "end Main; end C;"), 7);
 }
 
@@ -118,11 +113,10 @@ BEZEL_TEST(record_pattern_constants_615, string_subpat_matches_bar) {
     BEZEL_EXPECT_EQ(runProg(std::string(kNamedRec) +
         "class C public static method Main(): int "
         "  var p := new Named(\"bar\", 42); "
-        "  return case p of "
+        "  return (case p of "
         "    Named(\"foo\", v) => 1, "
         "    Named(\"bar\", v) => v, "
-        "    _ => -1 "
-        "  end; "
+        "    _ => -1); "
         "end Main; end C;"), 42);
 }
 
@@ -131,11 +125,10 @@ BEZEL_TEST(record_pattern_constants_615, string_subpat_no_match_falls_through) {
     BEZEL_EXPECT_EQ(runProg(std::string(kNamedRec) +
         "class C public static method Main(): int "
         "  var p := new Named(\"other\", 5); "
-        "  return case p of "
+        "  return (case p of "
         "    Named(\"foo\", v) => 1, "
         "    Named(\"bar\", v) => 2, "
-        "    _ => 99 "
-        "  end; "
+        "    _ => 99); "
         "end Main; end C;"), 99);
 }
 
@@ -148,10 +141,9 @@ BEZEL_TEST(record_pattern_constants_615, int_subpat_regression) {
         "record IntPair(a: int, b: int); "
         "class C public static method Main(): int "
         "  var p := new IntPair(0, 5); "
-        "  return case p of "
+        "  return (case p of "
         "    IntPair(0, b) => b, "
-        "    _ => -1 "
-        "  end; "
+        "    _ => -1); "
         "end Main; end C;"), 5);
 }
 
@@ -163,10 +155,9 @@ BEZEL_TEST(record_pattern_constants_615, int_subpat_no_match_regression) {
         "record IntPair(a: int, b: int); "
         "class C public static method Main(): int "
         "  var p := new IntPair(1, 5); "
-        "  Console.WriteLine(case p of "
+        "  Console.WriteLine((case p of "
         "    IntPair(0, b) => b, "
-        "    _ => -1 "
-        "  end); "
+        "    _ => -1)); "
         "  return 0; "
         "end Main; end C;"), "-1");
 }
@@ -179,10 +170,9 @@ BEZEL_TEST(record_pattern_constants_615, enum_constant_and_binding_mixed) {
     BEZEL_EXPECT_EQ(runProg(std::string(kColorEnum) +
         "class C public static method Main(): int "
         "  var p := new Colored(42, Color.Red); "
-        "  return case p of "
+        "  return (case p of "
         "    Colored(n, Color.Red) => n, "
-        "    _ => -1 "
-        "  end; "
+        "    _ => -1); "
         "end Main; end C;"), 42);
 }
 
@@ -192,10 +182,9 @@ BEZEL_TEST(record_pattern_constants_615, enum_constant_and_binding_no_match) {
     BEZEL_EXPECT_EQ(runAotOut(std::string(kColorEnum) +
         "class C public static method Main(): int "
         "  var p := new Colored(42, Color.Green); "
-        "  Console.WriteLine(case p of "
+        "  Console.WriteLine((case p of "
         "    Colored(n, Color.Red) => n, "
-        "    _ => -1 "
-        "  end); "
+        "    _ => -1)); "
         "  return 0; "
         "end Main; end C;"), "-1");
 }
@@ -212,11 +201,10 @@ BEZEL_TEST(record_pattern_constants_615, nested_record_enum_subpat) {
         "record Step(n: int, d: Dir); "
         "class C public static method Main(): int "
         "  var s := new Step(3, Dir.Down); "
-        "  return case s of "
+        "  return (case s of "
         "    Step(n, Dir.Up)   => n, "
         "    Step(n, Dir.Down) => n + 10, "
-        "    _ => -1 "
-        "  end; "
+        "    _ => -1); "
         "end Main; end C;"), 13);
 }
 
@@ -242,10 +230,9 @@ BEZEL_TEST(record_pattern_constants_615, qualified_const_nonfinal_slot_matches) 
         "record TwoColor(a: Color, b: Color); "
         "class C public static method Main(): int "
         "  var p := new TwoColor(Color.Red, Color.Blue); "
-        "  return case p of "
+        "  return (case p of "
         "    TwoColor(Color.Red, Color.Blue) => 1, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 1);
 }
 
@@ -257,10 +244,9 @@ BEZEL_TEST(record_pattern_constants_615, qualified_const_nonfinal_slot_no_match)
         "record TwoColor(a: Color, b: Color); "
         "class C public static method Main(): int "
         "  var p := new TwoColor(Color.Green, Color.Blue); "
-        "  return case p of "
+        "  return (case p of "
         "    TwoColor(Color.Red, Color.Blue) => 1, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 0);
 }
 
@@ -273,10 +259,9 @@ BEZEL_TEST(record_pattern_constants_615, qualified_const_nonfinal_then_binding) 
         "record ColorInt(c: Color, n: int); "
         "class C public static method Main(): int "
         "  var p := new ColorInt(Color.Red, 42); "
-        "  return case p of "
+        "  return (case p of "
         "    ColorInt(Color.Red, n) => n, "
-        "    _ => -1 "
-        "  end; "
+        "    _ => -1); "
         "end Main; end C;"), 42);
 }
 
@@ -290,10 +275,9 @@ BEZEL_TEST(record_pattern_constants_615, qualified_const_nonfinal_then_binding_n
         "record ColorInt(c: Color, n: int); "
         "class C public static method Main(): int "
         "  var p := new ColorInt(Color.Green, 42); "
-        "  Console.WriteLine(case p of "
+        "  Console.WriteLine((case p of "
         "    ColorInt(Color.Red, n) => n, "
-        "    _ => -1 "
-        "  end); "
+        "    _ => -1)); "
         "  return 0; "
         "end Main; end C;"), "-1");
 }
@@ -307,10 +291,9 @@ BEZEL_TEST(record_pattern_constants_615, qualified_const_two_nonfinal_slots) {
         "record Triple(a: Color, b: Color, c: Color); "
         "class C public static method Main(): int "
         "  var p := new Triple(Color.Red, Color.Green, Color.Blue); "
-        "  return case p of "
+        "  return (case p of "
         "    Triple(Color.Red, Color.Green, Color.Blue) => 7, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 7);
 }
 
@@ -323,9 +306,8 @@ BEZEL_TEST(record_pattern_constants_615, qualified_const_arm_alternatives_still_
         "enum Color Red, Green, Blue; end Color; "
         "class C public static method Main(): int "
         "  var c := Color.Green; "
-        "  return case c of "
+        "  return (case c of "
         "    Color.Red | Color.Green => 5, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 5);
 }

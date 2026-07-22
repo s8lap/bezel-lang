@@ -100,7 +100,7 @@ BEZEL_TEST(selectmany_range_selector_775, typed_element_select_lambda) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; "
         "class C public static method Main(): int "
-        "  return (0 if (1L..3L).Select(lambda(x) => x * 2L).Sum() = 12L else 1); "  // 2+4+6=12
+        "  return (if (1L..3L).Select(lambda(x) => x * 2L).Sum() = 12L then 0 else 1); "  // 2+4+6=12
         "end Main; end C;"), 0);
 }
 

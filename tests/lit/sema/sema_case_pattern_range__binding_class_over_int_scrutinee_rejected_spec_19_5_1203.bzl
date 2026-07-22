@@ -7,7 +7,7 @@
 // primitive is never a class (a heap object). Was previously a SIGABRT in
 // codegen (emitIsA called on an i32, not a pointer).
 
-module M; class Dog end Dog; class C public static method M(x: int): int return case x of var d: Dog => 1, _ => 2 end; end M; end C;
+module M; class Dog end Dog; class C public static method M(x: int): int return (case x of var d: Dog => 1, _ => 2); end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: binding pattern type is incompatible with the scrutinee's static type — a value-type scrutinee can never match a reference-typed binding
 // CHECK-SAME: (§19.5)

@@ -74,10 +74,10 @@ BEZEL_TEST(case_type_test_instantiation_1913,
            expr_descendant_wrong_instantiation_rejected) {
     auto r = parseSemaAll(prog(
         "  public method M(r: Result<int>): int\n"
-        "    var n := case r of\n"
+        "    var n := (case r of\n"
         "      var x: Ok<string> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_TRUE(hasInstantiationError(r));
@@ -105,10 +105,10 @@ BEZEL_TEST(case_type_test_instantiation_1913,
            same_declaration_wrong_instantiation_rejected) {
     auto r = parseSemaAll(prog(
         "  public method M(r: Result<int>): int\n"
-        "    var n := case r of\n"
+        "    var n := (case r of\n"
         "      var x: Result<string> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_TRUE(hasInstantiationError(r));
@@ -121,10 +121,10 @@ BEZEL_TEST(case_type_test_instantiation_1913,
            upcast_wrong_instantiation_rejected) {
     auto r = parseSemaAll(prog(
         "  public method M(o: Ok<int>): int\n"
-        "    var n := case o of\n"
+        "    var n := (case o of\n"
         "      var x: Result<string> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_TRUE(hasInstantiationError(r));
@@ -138,11 +138,11 @@ BEZEL_TEST(case_type_test_instantiation_1913,
            exact_descendant_instantiation_accepted) {
     auto r = parseSemaAll(prog(
         "  public method M(r: Result<int>): int\n"
-        "    var n := case r of\n"
+        "    var n := (case r of\n"
         "      var x: Ok<int> => 1,\n"
         "      var y: Err<int> => 2,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasInstantiationError(r));
@@ -155,10 +155,10 @@ BEZEL_TEST(case_type_test_instantiation_1913,
            upcast_correct_instantiation_accepted) {
     auto r = parseSemaAll(prog(
         "  public method M(o: Ok<int>): int\n"
-        "    var n := case o of\n"
+        "    var n := (case o of\n"
         "      var x: Result<int> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasInstantiationError(r));
@@ -171,10 +171,10 @@ BEZEL_TEST(case_type_test_instantiation_1913,
            same_declaration_exact_accepted) {
     auto r = parseSemaAll(prog(
         "  public method M(r: Result<int>): int\n"
-        "    var n := case r of\n"
+        "    var n := (case r of\n"
         "      var x: Result<int> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasInstantiationError(r));
@@ -190,10 +190,10 @@ BEZEL_TEST(case_type_test_instantiation_1913,
            rigid_scrutinee_param_not_over_rejected) {
     auto r = parseSemaAll(prog(
         "  public method Rig<U>(r: Result<U>): int\n"
-        "    var n := case r of\n"
+        "    var n := (case r of\n"
         "      var x: Ok<int> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end Rig;\n"));
     BEZEL_EXPECT_FALSE(hasInstantiationError(r));
@@ -211,10 +211,10 @@ BEZEL_TEST(case_type_test_instantiation_1913,
         "sealed class Square : Shape end Square;\n"
         "class Program\n"
         "  public method M(s: Shape): int\n"
-        "    var n := case s of\n"
+        "    var n := (case s of\n"
         "      var c: Circle => 1,\n"
         "      var q: Square => 2\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"
         "end Program;\n");

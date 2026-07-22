@@ -10,7 +10,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck %s
 
-module M; enum Color Red, Green, Blue; end Color; class C public method M(c: Color): int return case c of Red => 1, Green => 2 end; end M; end C;
+module M; enum Color Red, Green, Blue; end Color; class C public method M(c: Color): int return (case c of Red => 1, Green => 2); end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: non-exhaustive `case`: enum `Color` is missing constant(s): Blue (add a `_` arm or cover the remaining value(s))
 // CHECK-SAME: (§19.6)

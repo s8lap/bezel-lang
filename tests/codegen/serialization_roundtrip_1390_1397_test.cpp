@@ -197,7 +197,7 @@ BEZEL_TEST(serialization_roundtrip_1397, binary_long_roundtrip) {
         "  using var buf := ser.ToBytes(); "
         "  using var d := new BinaryDeserializer(buf.AsReadOnlySpan()); "
         "  var ok: bool := d.ReadInt() = big; "
-        "  return (55 if ok else 11); "
+        "  return (if ok then 55 else 11); "
         "end Main; end C;"), 55);
 }
 
@@ -223,7 +223,7 @@ BEZEL_TEST(serialization_roundtrip_1397, binary_bool_roundtrip) {
         "  ser.WriteBool(true); "
         "  using var buf := ser.ToBytes(); "
         "  using var d := new BinaryDeserializer(buf.AsReadOnlySpan()); "
-        "  return (7 if d.ReadBool() else 9); "
+        "  return (if d.ReadBool() then 7 else 9); "
         "end Main; end C;"), 7);
 }
 
@@ -237,7 +237,7 @@ BEZEL_TEST(serialization_roundtrip_1397, binary_string_roundtrip) {
         "  using var buf := ser.ToBytes(); "
         "  using var d := new BinaryDeserializer(buf.AsReadOnlySpan()); "
         "  var got := d.ReadString(); "
-        "  return (77 if got = \"hello\" else 13); "
+        "  return (if got = \"hello\" then 77 else 13); "
         "end Main; end C;"), 77);
 }
 
@@ -304,7 +304,7 @@ const char* kHandWrittenSerialize =
     "  using var s := new BinarySerializer(); "
     "  b.Serialize(s); "
     "  using var bytes := s.ToBytes(); "
-    "  return (42 if bytes.Count > 0 else 91); "
+    "  return (if bytes.Count > 0 then 42 else 91); "
     "end Main; end C;";
 
 BEZEL_TEST(serialization_iserializer_ptr_1390, hand_written_serialize_aot_no_truncation) {

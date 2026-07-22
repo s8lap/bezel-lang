@@ -52,7 +52,7 @@ BEZEL_TEST(decimal_format_1412, P1_issue_repro_spec_2_18) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
   var d: decimal := 1.5m;
-  return 1 if $"{d:P1}" = "150.0%" else 0;
+  return (if $"{d:P1}" = "150.0%" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -99,7 +99,7 @@ end Main; end C;
 BEZEL_TEST(decimal_format_1412, P_negative_spec_2_18) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
-  return 1 if $"{-0.15m:P2}" = "-15.00%" else 0;
+  return (if $"{-0.15m:P2}" = "-15.00%" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -125,7 +125,7 @@ BEZEL_TEST(decimal_format_1412, E2_issue_repro_spec_2_18) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
   var d: decimal := 1.5m;
-  return 1 if $"{d:E2}" = "1.50E+000" else 0;
+  return (if $"{d:E2}" = "1.50E+000" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -134,7 +134,7 @@ end Main; end C;
 BEZEL_TEST(decimal_format_1412, E_default_prec_spec_2_18) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
-  return 1 if $"{1.5m:E}" = "1.500000E+000" else 0;
+  return (if $"{1.5m:E}" = "1.500000E+000" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -143,7 +143,7 @@ end Main; end C;
 BEZEL_TEST(decimal_format_1412, E_positive_exponent_spec_2_18) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
-  return 1 if $"{1500.0m:E2}" = "1.50E+003" else 0;
+  return (if $"{1500.0m:E2}" = "1.50E+003" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -152,7 +152,7 @@ end Main; end C;
 BEZEL_TEST(decimal_format_1412, E_zero_exponent_spec_2_18) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
-  return 1 if $"{1.0m:E4}" = "1.0000E+000" else 0;
+  return (if $"{1.0m:E4}" = "1.0000E+000" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -161,7 +161,7 @@ end Main; end C;
 BEZEL_TEST(decimal_format_1412, E_negative_exponent_spec_2_18) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
-  return 1 if $"{0.015m:E2}" = "1.50E-002" else 0;
+  return (if $"{0.015m:E2}" = "1.50E-002" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -170,7 +170,7 @@ end Main; end C;
 BEZEL_TEST(decimal_format_1412, E_negative_value_spec_2_18) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
-  return 1 if $"{-0.015m:E2}" = "-1.50E-002" else 0;
+  return (if $"{-0.015m:E2}" = "-1.50E-002" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -179,7 +179,7 @@ end Main; end C;
 BEZEL_TEST(decimal_format_1412, E_zero_value_spec_2_18) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
-  return 1 if $"{0m:E2}" = "0.00E+000" else 0;
+  return (if $"{0m:E2}" = "0.00E+000" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -188,7 +188,7 @@ end Main; end C;
 BEZEL_TEST(decimal_format_1412, e_lowercase_spec_2_18) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
-  return 1 if $"{1.5m:e2}" = "1.50e+000" else 0;
+  return (if $"{1.5m:e2}" = "1.50e+000" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }
@@ -197,7 +197,7 @@ end Main; end C;
 BEZEL_TEST(decimal_format_1412, E_rounding_spec_2_18) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
-  return 1 if $"{1.2345679m:E5}" = "1.23457E+000" else 0;
+  return (if $"{1.2345679m:E5}" = "1.23457E+000" then 1 else 0);
 end Main; end C;
 )BZ"), 1);
 }

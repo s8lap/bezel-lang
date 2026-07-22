@@ -9,7 +9,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; record MyRec private property Secret: int; public constructor(s: int) Secret := s; end constructor; public method WithSecret(x: int): MyRec return this with Secret := x end; end WithSecret; end MyRec; class C public static method Main(): int var r := new MyRec(42); var r2 := r.WithSecret(99); return 0; end Main; end C;
+module M; record MyRec private property Secret: int; public constructor(s: int) Secret := s; end constructor; public method WithSecret(x: int): MyRec return this with(Secret := x); end WithSecret; end MyRec; class C public static method Main(): int var r := new MyRec(42); var r2 := r.WithSecret(99); return 0; end Main; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

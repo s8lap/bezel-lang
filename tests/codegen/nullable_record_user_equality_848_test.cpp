@@ -110,7 +110,7 @@ BEZEL_TEST(nullable_record_user_equality_848, mixed_nullable_nonnullable) {
         "  var a := new Point(3, 3); "
         "  var b: Point? := new Point(3, 3); "
         "  var c: Point? := null; "
-        "  if a = b then return (6 if not (a = c) else 0); end; "
+        "  if a = b then return (if not (a = c) then 6 else 0); end; "
         "  return 0; "
         "end Main; end C;"), 6);
 }
@@ -149,7 +149,7 @@ BEZEL_TEST(nullable_record_user_equality_1248, both_nullable_eq_custom_op_dispat
         "class C public static method Main(): int "
         "  var a: Pt? := new Pt(1, 99); "
         "  var b: Pt? := new Pt(1, 42); "
-        "  return (1 if a = b else 0); "
+        "  return (if a = b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -162,7 +162,7 @@ BEZEL_TEST(nullable_record_user_equality_1248, both_nullable_neq_custom_op_dispa
         "class C public static method Main(): int "
         "  var a: Pt? := new Pt(1, 99); "
         "  var b: Pt? := new Pt(1, 42); "
-        "  return (1 if a <> b else 0); "
+        "  return (if a <> b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 

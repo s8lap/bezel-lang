@@ -79,7 +79,7 @@ std::string kIfExprOwnedMeetUsingVar =
     std::string(kResClass) +
     "  public static method Main(): int "
     "    var useFresh := true; "
-    "    using var x := new Res(1) if useFresh else Make(2); "
+    "    using var x := (if useFresh then new Res(1) else Make(2)); "
     "    Console.WriteLine(\"body\"); "
     "    return 0; "
     "  end Main; "
@@ -91,7 +91,7 @@ std::string kCaseExprOwnedMeetUsingVar =
     std::string(kResClass) +
     "  public static method Main(): int "
     "    var n := 2; "
-    "    using var x := case n of 1 => new Res(1), _ => Make(7) end; "
+    "    using var x := (case n of 1 => new Res(1), _ => Make(7)); "
     "    Console.WriteLine(\"body\"); "
     "    return 0; "
     "  end Main; "
@@ -109,7 +109,7 @@ std::string kTypedBorrowedMeetUsingVarPins =
     "    using var owner := new Res(7); "
     "    var b1 := owner; "
     "    var b2 := owner; "
-    "    using var x: Res := b1 if c else b2; "
+    "    using var x: Res := (if c then b1 else b2); "
     "    Console.WriteLine(\"body\"); "
     "    return 0; "
     "  end Main; "
@@ -123,7 +123,7 @@ std::string kPlainVarOwnedMeetExplicitDispose =
     std::string(kResClass) +
     "  public static method Main(): int "
     "    var c := true; "
-    "    var x := new Res(1) if c else Make(2); "
+    "    var x := (if c then new Res(1) else Make(2)); "
     "    x.Dispose(); "
     "    Console.WriteLine(\"body\"); "
     "    return 0; "

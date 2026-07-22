@@ -61,7 +61,7 @@ BEZEL_TEST(codegen_2001, direct_is_wrong_size_is_false) {
         "var a: [4]int; a[0] := 100; a[1] := 101; a[2] := 102; a[3] := 103; "
         "using var b := new Box<[4]int>(a); "
         "var o: Object := b; "
-        "return (1 if o is Box<[3]int> else 0);"), 0);
+        "return (if o is Box<[3]int> then 1 else 0);"), 0);
 }
 
 // The genuinely-matching size still matches.
@@ -70,7 +70,7 @@ BEZEL_TEST(codegen_2001, direct_is_right_size_is_true) {
         "var a: [4]int; a[0] := 100; a[1] := 101; a[2] := 102; a[3] := 103; "
         "using var b := new Box<[4]int>(a); "
         "var o: Object := b; "
-        "return (1 if o is Box<[4]int> else 0);"), 1);
+        "return (if o is Box<[4]int> then 1 else 0);"), 1);
 }
 
 // `as` to the wrong size yields null (§17.4) — no reinterpretation. (The result
@@ -84,7 +84,7 @@ BEZEL_TEST(codegen_2001, direct_as_wrong_size_is_null) {
         "using var b := new Box<[4]int>(a); "
         "var o: Object := b; "
         "var w := o as Box<[3]int>; "
-        "return (1 if w = null else 0);"), 1);
+        "return (if w = null then 1 else 0);"), 1);
 }
 
 // `as` to the correct size succeeds (non-null).
@@ -94,7 +94,7 @@ BEZEL_TEST(codegen_2001, direct_as_right_size_non_null) {
         "using var b := new Box<[4]int>(a); "
         "var o: Object := b; "
         "var w := o as Box<[4]int>; "
-        "return (1 if w <> null else 0);"), 1);
+        "return (if w <> null then 1 else 0);"), 1);
 }
 
 // ---- MEMORY SAFETY (the headline): the false-positive `as` enabled an OOB write.
@@ -138,7 +138,7 @@ BEZEL_TEST(codegen_2001, nested_is_wrong_size_is_false) {
     BEZEL_EXPECT_EQ(runProg(
         "using var outer := new Wrap<Box<[4]int>>(5); "
         "var o: Object := outer; "
-        "return (1 if o is Wrap<Box<[3]int>> else 0);"), 0);
+        "return (if o is Wrap<Box<[3]int>> then 1 else 0);"), 0);
 }
 
 // Nested, matching size → TRUE.
@@ -146,7 +146,7 @@ BEZEL_TEST(codegen_2001, nested_is_right_size_is_true) {
     BEZEL_EXPECT_EQ(runProg(
         "using var outer := new Wrap<Box<[4]int>>(5); "
         "var o: Object := outer; "
-        "return (1 if o is Wrap<Box<[4]int>> else 0);"), 1);
+        "return (if o is Wrap<Box<[4]int>> then 1 else 0);"), 1);
 }
 
 // ---- CONTROL: element precision preserved (must not regress) ------------------
@@ -156,7 +156,7 @@ BEZEL_TEST(codegen_2001, control_element_wrong_is_false) {
     BEZEL_EXPECT_EQ(runProg(
         "using var b := new Box<int>(7); "
         "var o: Object := b; "
-        "return (1 if o is Box<string> else 0);"), 0);
+        "return (if o is Box<string> then 1 else 0);"), 0);
 }
 
 // `Box<int> is Box<int>` — same element → still TRUE.
@@ -164,7 +164,7 @@ BEZEL_TEST(codegen_2001, control_element_right_is_true) {
     BEZEL_EXPECT_EQ(runProg(
         "using var b := new Box<int>(7); "
         "var o: Object := b; "
-        "return (1 if o is Box<int> else 0);"), 1);
+        "return (if o is Box<int> then 1 else 0);"), 1);
 }
 
 // ---- CONTROL: genuine dedup preserved — two `Box<[3]int>` share ONE descriptor.
@@ -179,8 +179,8 @@ BEZEL_TEST(codegen_2001, control_same_size_dedup_is_true) {
         "var o1: Object := b1; "
         "var o2: Object := b2; "
         // b1 is Box<[3]int> AND b2 is Box<[3]int> — both share the descriptor.
-        "var m1 := 1 if o1 is Box<[3]int> else 0; "
-        "var m2 := 1 if o2 is Box<[3]int> else 0; "
+        "var m1 := (if o1 is Box<[3]int> then 1 else 0); "
+        "var m2 := (if o2 is Box<[3]int> then 1 else 0); "
         "return m1 * 10 + m2;"), 11);
 }
 
@@ -200,10 +200,10 @@ BEZEL_TEST(codegen_2001, specialization_split_both_used_no_collision) {
         "  using var b4 := new Box<[4]int>(a4, 9); "
         "  var s := b3.GetLabel() + b4.GetLabel(); "   // 16
         "  var o3: Object := b3; var o4: Object := b4; "
-        "  var t1 := 1 if o3 is Box<[3]int> else 0; "  // 1
-        "  var t2 := 1 if o3 is Box<[4]int> else 0; "  // 0
-        "  var t3 := 1 if o4 is Box<[4]int> else 0; "  // 1
-        "  var t4 := 1 if o4 is Box<[3]int> else 0; "  // 0
+        "  var t1 := (if o3 is Box<[3]int> then 1 else 0); "  // 1
+        "  var t2 := (if o3 is Box<[4]int> then 1 else 0); "  // 0
+        "  var t3 := (if o4 is Box<[4]int> then 1 else 0); "  // 1
+        "  var t4 := (if o4 is Box<[3]int> then 1 else 0); "  // 0
         "  return s + 10*t1 + 20*t2 + 30*t3 + 40*t4; "  // 16+10+0+30+0 = 56
         "end Main; end C;"), 56);
 }
@@ -221,10 +221,9 @@ BEZEL_TEST(codegen_2001, iface_bind_inline_array_admitted_matches) {
         "class Program public static method Main(): int "
         "  var c := new C<[3]int>(42); "
         "  var m: IMarker<int> := c; "
-        "  var n := case m of "
+        "  var n := (case m of "
         "    var x: C<[3]int> => x.Val, "
-        "    _ => -1 "
-        "  end; "
+        "    _ => -1); "
         "  return n; "   // 42 (admitted + matches)
         "end Main; end Program;"), 42);
 }

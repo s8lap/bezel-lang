@@ -121,7 +121,7 @@ BEZEL_TEST(codegen_array, array_of_records_equality) {
         "class C public static method Main(): int "
         "  var ps: [2]P; "
         "  ps[0] := new P(1, 2); ps[1] := new P(1, 2); "
-        "  return (1 if ps[0] = ps[1] else 0); "
+        "  return (if ps[0] = ps[1] then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

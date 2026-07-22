@@ -58,7 +58,7 @@ BEZEL_TEST(codegen_serialization_edges_638, nullable_int_null_roundtrip_spec_9_8
         "  using var b := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(b.AsReadOnlySpan()); "
         "  var r2 := R.Deserialize(d); "
-        "  return (42 if r2.Y = null else 91); "
+        "  return (if r2.Y = null then 42 else 91); "
         "end Main; end C;"), 42);
 }
 
@@ -74,7 +74,7 @@ BEZEL_TEST(codegen_serialization_edges_638, nullable_int_nonnull_roundtrip_spec_
         "  using var b := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(b.AsReadOnlySpan()); "
         "  var r2 := R.Deserialize(d); "
-        "  return (42 if r2.Y = 7 else 91); "
+        "  return (if r2.Y = 7 then 42 else 91); "
         "end Main; end C;"), 42);
 }
 
@@ -90,7 +90,7 @@ BEZEL_TEST(codegen_serialization_edges_638, nullable_bool_null_roundtrip_spec_9_
         "  using var b := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(b.AsReadOnlySpan()); "
         "  var r2 := R.Deserialize(d); "
-        "  return (42 if r2.F = null else 91); "
+        "  return (if r2.F = null then 42 else 91); "
         "end Main; end C;"), 42);
 }
 
@@ -105,7 +105,7 @@ BEZEL_TEST(codegen_serialization_edges_638, nullable_bool_true_roundtrip_spec_9_
         "  using var b := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(b.AsReadOnlySpan()); "
         "  var r2 := R.Deserialize(d); "
-        "  return (42 if r2.F = true else 91); "
+        "  return (if r2.F = true then 42 else 91); "
         "end Main; end C;"), 42);
 }
 
@@ -145,7 +145,7 @@ BEZEL_TEST(codegen_serialization_edges_637, nullable_string_null_roundtrip_spec_
         "  using var b := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(b.AsReadOnlySpan()); "
         "  var r2 := R.Deserialize(d); "
-        "  return (42 if r2.Y = null else 91); "
+        "  return (if r2.Y = null then 42 else 91); "
         "end Main; end C;"), 42);
 }
 
@@ -161,7 +161,7 @@ BEZEL_TEST(codegen_serialization_edges_637, nullable_string_nonnull_roundtrip_sp
         "  using var b := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(b.AsReadOnlySpan()); "
         "  var r2 := R.Deserialize(d); "
-        "  return (42 if r2.Y = \"hello\" else 91); "
+        "  return (if r2.Y = \"hello\" then 42 else 91); "
         "end Main; end C;"), 42);
 }
 
@@ -181,7 +181,7 @@ BEZEL_TEST(codegen_serialization_edges_637, serialized_optional_missing_field_is
         "  using var d := new BinaryDeserializer(b.AsReadOnlySpan()); "
         "  var back := Item.Deserialize(d); "
         "  if back.Name <> \"thing\" then return 91; end; "
-        "  return (42 if back.Tag = null else 92); "
+        "  return (if back.Tag = null then 42 else 92); "
         "end Main; end C;"), 42);
 }
 
@@ -202,7 +202,7 @@ BEZEL_TEST(codegen_serialization_edges_635, cjk_string_roundtrip_spec_9_8_issue_
         "  using var b := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(b.AsReadOnlySpan()); "
         "  var back := Msg.Deserialize(d); "
-        "  return (42 if back.Text = \"\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\xE3\x83\x86\xE3\x82\xB9\xE3\x83\x88\" else 91); " // 日本語テスト
+        "  return (if back.Text = \"\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\xE3\x83\x86\xE3\x82\xB9\xE3\x83\x88\" then 42 else 91); " // 日本語テスト
         "end Main; end C;"), 42);
 }
 
@@ -218,7 +218,7 @@ BEZEL_TEST(codegen_serialization_edges_635, ascii_string_roundtrip_still_correct
         "  using var b := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(b.AsReadOnlySpan()); "
         "  var back := Msg.Deserialize(d); "
-        "  return (42 if back.Text = \"hello world\" else 91); "
+        "  return (if back.Text = \"hello world\" then 42 else 91); "
         "end Main; end C;"), 42);
 }
 
@@ -235,7 +235,7 @@ BEZEL_TEST(codegen_serialization_edges_635, mixed_ascii_multibyte_roundtrip_spec
         "  using var b := s.ToBytes(); "
         "  using var d := new BinaryDeserializer(b.AsReadOnlySpan()); "
         "  var r2 := R.Deserialize(d); "
-        "  return (42 if r2.S = \"a\xE6\x97\xA5" "b\" else 91); "
+        "  return (if r2.S = \"a\xE6\x97\xA5" "b\" then 42 else 91); "
         "end Main; end C;"), 42);
 }
 
@@ -262,6 +262,6 @@ BEZEL_TEST(codegen_serialization_edges_combined, all_three_fixes_combined_spec_9
         "  var a2 := All.Deserialize(d); "
         "  if a2.Tag <> null then return 91; end; "
         "  if a2.Label <> null then return 92; end; "
-        "  return (42 if a2.Name = \"\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\" else 93); " // 日本語
+        "  return (if a2.Name = \"\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\" then 42 else 93); " // 日本語
         "end Main; end C;"), 42);
 }

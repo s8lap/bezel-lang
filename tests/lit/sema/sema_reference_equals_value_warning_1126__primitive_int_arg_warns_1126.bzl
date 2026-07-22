@@ -8,7 +8,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck %s
 
-module M; class C public static method Main(): int return (1 if Object.ReferenceEquals(5, 6) else 0); end Main; end C;
+module M; class C public static method Main(): int return (if Object.ReferenceEquals(5, 6) then 1 else 0); end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: `Object.ReferenceEquals` is called with a value-type argument; a non-null value is boxed into a fresh object on every call, so the comparison is always false for it — a null nullable value boxes to a null reference instead and compares true only against another null
 // CHECK-SAME: (§8.4/§8.6)

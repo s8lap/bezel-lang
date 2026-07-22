@@ -28,7 +28,7 @@ int run(const std::string& prog) {
 std::string decCase(const std::string& init, const std::string& arm) {
     return std::string("module M; class App public static method Main(): int "
                        "  var x: decimal := ") + init + "; "
-           "  return case x of " + arm + ", _ => 4 end; end Main; end App;";
+           "  return (case x of " + arm + ", _ => 4); end Main; end App;";
 }
 }  // namespace
 
@@ -94,7 +94,7 @@ BEZEL_TEST(case_decimal_pattern_1152, nullable_range_present_matches) {
     BEZEL_EXPECT_EQ(run(
         "module M; class App public static method Main(): int "
         "  var x: decimal? := 1.5m; "
-        "  return case x of 0m..<2m => 2, null => 6, _ => 4 end; end Main; end App;"),
+        "  return (case x of 0m..<2m => 2, null => 6, _ => 4); end Main; end App;"),
         2);
 }
 
@@ -103,7 +103,7 @@ BEZEL_TEST(case_decimal_pattern_1152, nullable_null_falls_to_null_arm) {
     BEZEL_EXPECT_EQ(run(
         "module M; class App public static method Main(): int "
         "  var x: decimal? := null; "
-        "  return case x of 0m..<2m => 2, null => 6, _ => 4 end; end Main; end App;"),
+        "  return (case x of 0m..<2m => 2, null => 6, _ => 4); end Main; end App;"),
         6);
 }
 
@@ -112,7 +112,7 @@ BEZEL_TEST(case_decimal_pattern_1152, nullable_relational_then_constant) {
     BEZEL_EXPECT_EQ(run(
         "module M; class App public static method Main(): int "
         "  var x: decimal? := 3.5m; "
-        "  return case x of < 2m => 1, 3.5m => 7, _ => 4 end; end Main; end App;"),
+        "  return (case x of < 2m => 1, 3.5m => 7, _ => 4); end Main; end App;"),
         7);
 }
 
@@ -121,6 +121,6 @@ BEZEL_TEST(case_decimal_pattern_1152, int_scrutinee_unaffected) {
     BEZEL_EXPECT_EQ(run(
         "module M; class App public static method Main(): int "
         "  var x: int := 5; "
-        "  return case x of 0..<2 => 2, 5 => 3, _ => 4 end; end Main; end App;"),
+        "  return (case x of 0..<2 => 2, 5 => 3, _ => 4); end Main; end App;"),
         3);
 }

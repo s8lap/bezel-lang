@@ -7,7 +7,7 @@ public class OwningArray<T>: IOwningList<T> where T: class
   end constructor;
 
   public constructor(capacity: int)
-    _storage := new OwningBuffer<T>(if capacity > 0 then capacity else 1);
+    _storage := new OwningBuffer<T>((if capacity > 0 then capacity else 1));
   end constructor;
 
   public property Count: int => _count;

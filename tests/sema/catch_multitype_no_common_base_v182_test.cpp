@@ -454,8 +454,8 @@ BEZEL_TEST(catch_multitype_no_common_base_v182,
     const std::string src =
         "module M; class C "
         "  public static method Pick(cond: bool): Exception "
-        "    return new OverflowException(\"of\") if cond else "
-        "           new ArgumentException(\"ae\"); "
+        "    return (if cond then new OverflowException(\"of\") else "
+        "            new ArgumentException(\"ae\")); "
         "  end Pick; "
         "  public static method Main(): int return 0; end Main; "
         "end C;";
@@ -479,8 +479,8 @@ BEZEL_TEST(catch_multitype_no_common_base_v182,
         "end MyIoErr; "
         "class C "
         "  public static method Pick(cond: bool): IOException "
-        "    return new MyIoErr(\"custom\") if cond else "
-        "           new IOException(\"plain\"); "
+        "    return (if cond then new MyIoErr(\"custom\") else "
+        "            new IOException(\"plain\")); "
         "  end Pick; "
         "  public static method Main(): int "
         "    var e := Pick(true); "

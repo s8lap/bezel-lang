@@ -366,7 +366,7 @@ BEZEL_TEST(typed_signed_unsigned_compare_rejected_1204,
     auto r = parseSema(
         "module M; class C public static method Main(): int "
         "  var a: int := 0 - 1; var b: uint := 1; "
-        "  return (1 if a < b else 0); end Main; end C;");
+        "  return (if a < b then 1 else 0); end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
@@ -376,7 +376,7 @@ BEZEL_TEST(typed_signed_unsigned_compare_rejected_1204,
     auto r = parseSema(
         "module M; class C public static method Main(): int "
         "  var a: uint := 1; var b: int := 0 - 1; "
-        "  return (1 if a > b else 0); end Main; end C;");
+        "  return (if a > b then 1 else 0); end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
@@ -386,7 +386,7 @@ BEZEL_TEST(typed_signed_unsigned_compare_rejected_1204,
     auto r = parseSema(
         "module M; class C public static method Main(): int "
         "  var a: long := 5; var b: ulong := 5; "
-        "  return (1 if a = b else 0); end Main; end C;");
+        "  return (if a = b then 1 else 0); end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
@@ -396,7 +396,7 @@ BEZEL_TEST(float_decimal_compare_rejected_1204,
     auto r = parseSema(
         "module M; class C public static method Main(): int "
         "  var x: double := 1.5; var y: decimal := 2.0m; "
-        "  return (1 if x < y else 0); end Main; end C;");
+        "  return (if x < y then 1 else 0); end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
@@ -408,7 +408,7 @@ BEZEL_TEST(uint_vs_literal_compare_still_ok_1204,
     auto r = parseSema(
         "module M; class C public static method Main(): int "
         "  var u: uint := 3000000000; "
-        "  return (1 if u > 1000 else 0); end Main; end C;");
+        "  return (if u > 1000 then 1 else 0); end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
@@ -419,7 +419,7 @@ BEZEL_TEST(uint_vs_literal_compare_still_ok_1204,
     auto r = parseSema(
         "module M; class C public static method Main(): int "
         "  var u: ulong := 10; "
-        "  return (1 if u > 0 - 5 else 0); end Main; end C;");
+        "  return (if u > 0 - 5 then 1 else 0); end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
@@ -429,7 +429,7 @@ BEZEL_TEST(uint_vs_literal_compare_still_ok_1204,
     auto r = parseSema(
         "module M; class C public static method Main(): int "
         "  var a: int := 5; var b: int := 10; "
-        "  return (1 if a < b else 0); end Main; end C;");
+        "  return (if a < b then 1 else 0); end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
@@ -439,7 +439,7 @@ BEZEL_TEST(uint_vs_literal_compare_still_ok_1204,
     auto r = parseSema(
         "module M; class C public static method Main(): int "
         "  var a: int := 5; var b: long := 10; "
-        "  return (1 if a < b else 0); end Main; end C;");
+        "  return (if a < b then 1 else 0); end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 

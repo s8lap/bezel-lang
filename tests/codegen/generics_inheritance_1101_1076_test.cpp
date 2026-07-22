@@ -122,7 +122,7 @@ BEZEL_TEST(generics_inheritance_1101, inherited_generic_method_bare_call_null) {
         "end WidgetFactory; "
         "class C public static method Main(): int "
         "  using var f := new WidgetFactory(); var w := f.Create(); "
-        "  return (1 if w = null else 0); "
+        "  return (if w = null then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -145,7 +145,7 @@ BEZEL_TEST(generics_inheritance_1101, inherited_generic_method_bare_call_value) 
         "  using var w := new Widget(7); "
         "  var f := new WidgetFactory(w); "
         "  var got := f.Create(); "
-        "  var r := (got!._id if got <> null else -1); "       // 7
+        "  var r := (if got <> null then got!._id else -1); "       // 7
         "  f.Dispose(); return r; "
         "end Main; end C;"), 7);
 }
@@ -161,7 +161,7 @@ BEZEL_TEST(generics_inheritance_1101, inherited_generic_method_explicit_this) {
         "end WidgetFactory; "
         "class C public static method Main(): int "
         "  using var f := new WidgetFactory(); var w := f.Create(); "
-        "  return (1 if w = null else 0); "
+        "  return (if w = null then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

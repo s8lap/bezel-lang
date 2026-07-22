@@ -3,7 +3,7 @@
 // Ported from tests/sema/bool_condition_test.cpp
 //   (BEZEL_TEST sema_cond, if_expression_int_condition_diagnoses).
 
-module M; class C public method M(flag: bool, n: int) n := 1 if n else 2; end M; end C;
+module M; class C public method M(flag: bool, n: int) n := (if n then 1 else 2); end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: the if-expression condition must be `bool`
 // CHECK-SAME: (§21.2)

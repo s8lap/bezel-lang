@@ -23,7 +23,7 @@ BEZEL_TEST(char_is_control, newline_is_control_letter_is_not) {
         "module M; class C public static method Main(): int "
         "  var ctrl: bool := char.IsControl('\\n'); "    // true
         "  var notctrl: bool := char.IsControl('a'); "   // false
-        "  return (10 if ctrl else 0) + (1 if not notctrl else 0); "  // 11
+        "  return (if ctrl then 10 else 0) + (if not notctrl then 1 else 0); "  // 11
         "end Main; end C;"), 11);
 }
 
@@ -32,6 +32,6 @@ BEZEL_TEST(char_is_control, tab_and_space) {
         "module M; class C public static method Main(): int "
         "  var t: bool := char.IsControl('\\t'); "   // true (tab is a control char)
         "  var sp: bool := char.IsControl(' '); "    // false (space is not a control char)
-        "  return (10 if t else 0) + (1 if not sp else 0); "  // 11
+        "  return (if t then 10 else 0) + (if not sp then 1 else 0); "  // 11
         "end Main; end C;"), 11);
 }

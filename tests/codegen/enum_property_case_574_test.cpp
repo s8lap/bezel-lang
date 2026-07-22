@@ -27,9 +27,9 @@ const char* kColorEnum =
     "module M; "
     "enum Color Red, Green, Blue; "
     "  public property Code: int => "
-    "    case this of Red => 1, Green => 2, _ => 3 end; "
+    "    (case this of Red => 1, Green => 2, _ => 3); "
     "  public method Rank(): int "
-    "    return case this of Color.Red => 10, Color.Green => 20, Color.Blue => 30, end; "
+    "    return (case this of Color.Red => 10, Color.Green => 20, Color.Blue => 30,); "
     "  end Rank; "
     "end Color; ";
 } // namespace
@@ -76,7 +76,7 @@ BEZEL_TEST(codegen_574_enum_prop_case, all_arms_explicit) {
     BEZEL_EXPECT_EQ(runProg(
         "module M; "
         "enum Dir North, South, East; "
-        "  public property Val: int => case this of North => 1, South => 2, East => 3, end; "
+        "  public property Val: int => (case this of North => 1, South => 2, East => 3,); "
         "end Dir; "
         "class App "
         "  public static method Main(): int "

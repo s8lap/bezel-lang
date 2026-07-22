@@ -179,7 +179,7 @@ BEZEL_TEST(fresh_owned_receiver_1039, multiple_fresh_receivers_disposed) {
 BEZEL_TEST(fresh_owned_receiver_1039, conditional_arm_fresh_receiver_disposed) {
     expectDisposedAndLeakFree(
         prog("do var c: bool := true; "
-             "var v: int := (new Cell().V if c else 0); end; return Cell.n;"),
+             "var v: int := (if c then new Cell().V else 0); end; return Cell.n;"),
         0);
 }
 

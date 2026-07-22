@@ -26,49 +26,49 @@ int runProg(const std::string& program) {
 } // namespace
 
 BEZEL_TEST(codegen_cg4, less_than_true_branch) {
-    BEZEL_EXPECT_EQ(run("5 if 1 < 2 else 9"), 5);
+    BEZEL_EXPECT_EQ(run("(if 1 < 2 then 5 else 9)"), 5);
 }
 
 BEZEL_TEST(codegen_cg4, less_than_false_branch) {
-    BEZEL_EXPECT_EQ(run("5 if 2 < 1 else 9"), 9);
+    BEZEL_EXPECT_EQ(run("(if 2 < 1 then 5 else 9)"), 9);
 }
 
 BEZEL_TEST(codegen_cg4, equality) {
-    BEZEL_EXPECT_EQ(run("1 if 3 = 3 else 0"), 1);
+    BEZEL_EXPECT_EQ(run("(if 3 = 3 then 1 else 0)"), 1);
 }
 
 BEZEL_TEST(codegen_cg4, inequality) {
-    BEZEL_EXPECT_EQ(run("1 if 3 <> 3 else 0"), 0);
+    BEZEL_EXPECT_EQ(run("(if 3 <> 3 then 1 else 0)"), 0);
 }
 
 BEZEL_TEST(codegen_cg4, ge_le) {
-    BEZEL_EXPECT_EQ(run("7 if (4 >= 4) else 8"), 7);
+    BEZEL_EXPECT_EQ(run("(if (4 >= 4) then 7 else 8)"), 7);
 }
 
 BEZEL_TEST(codegen_cg4, bool_literal_condition) {
-    BEZEL_EXPECT_EQ(run("1 if true else 2"), 1);
-    BEZEL_EXPECT_EQ(run("1 if false else 2"), 2);
+    BEZEL_EXPECT_EQ(run("(if true then 1 else 2)"), 1);
+    BEZEL_EXPECT_EQ(run("(if false then 1 else 2)"), 2);
 }
 
 BEZEL_TEST(codegen_cg4, logical_and) {
-    BEZEL_EXPECT_EQ(run("1 if (1 < 2) and (3 < 4) else 0"), 1);
-    BEZEL_EXPECT_EQ(run("1 if (1 < 2) and (4 < 3) else 0"), 0);
+    BEZEL_EXPECT_EQ(run("(if (1 < 2) and (3 < 4) then 1 else 0)"), 1);
+    BEZEL_EXPECT_EQ(run("(if (1 < 2) and (4 < 3) then 1 else 0)"), 0);
 }
 
 BEZEL_TEST(codegen_cg4, logical_or) {
-    BEZEL_EXPECT_EQ(run("1 if (2 < 1) or (3 < 4) else 0"), 1);
+    BEZEL_EXPECT_EQ(run("(if (2 < 1) or (3 < 4) then 1 else 0)"), 1);
 }
 
 BEZEL_TEST(codegen_cg4, logical_not) {
-    BEZEL_EXPECT_EQ(run("1 if not (2 < 1) else 0"), 1);
+    BEZEL_EXPECT_EQ(run("(if not (2 < 1) then 1 else 0)"), 1);
 }
 
 BEZEL_TEST(codegen_cg4, nested_conditional) {
-    BEZEL_EXPECT_EQ(run("1 if 1 > 2 else (2 if 3 > 4 else 3)"), 3);
+    BEZEL_EXPECT_EQ(run("(if 1 > 2 then 1 else (if 3 > 4 then 2 else 3))"), 3);
 }
 
 BEZEL_TEST(codegen_cg4, conditional_branches_compute) {
-    BEZEL_EXPECT_EQ(run("(10 * 2) if 1 < 2 else (10 + 2)"), 20);
+    BEZEL_EXPECT_EQ(run("(if 1 < 2 then (10 * 2) else (10 + 2))"), 20);
 }
 
 // --- §20 + §17.12: a conditional with a diverging (`throw`) branch. ---
@@ -82,7 +82,7 @@ BEZEL_TEST(codegen_cg4, conditional_throw_else_arm_value_path) {
     BEZEL_EXPECT_EQ(runProg(
         "module M; class C "
         "  public static method Main(): int => "
-        "    42 if 1 < 2 else throw new Exception(\"boom\"); "
+        "    (if 1 < 2 then 42 else throw new Exception(\"boom\")); "
         "end C;"), 42);
 }
 
@@ -92,7 +92,7 @@ BEZEL_TEST(codegen_cg4, conditional_throw_else_arm_throw_path) {
     BEZEL_EXPECT_EQ(runProg(
         "module M; class C "
         "  public static method Helper(c: bool): int => "
-        "    42 if c else throw new Exception(\"boom\"); "
+        "    (if c then 42 else throw new Exception(\"boom\")); "
         "  public static method Main(): int "
         "    try return Helper(false); catch Exception => return 7; end; "
         "    return 0; "
@@ -106,7 +106,7 @@ BEZEL_TEST(codegen_cg4, return_conditional_throw_else_value_path) {
     BEZEL_EXPECT_EQ(runProg(
         "module M; class C "
         "  public static method Main(): int "
-        "    return 5 if 2 > 1 else throw new Exception(\"boom\"); "
+        "    return (if 2 > 1 then 5 else throw new Exception(\"boom\")); "
         "  end Main; "
         "end C;"), 5);
 }
@@ -117,7 +117,7 @@ BEZEL_TEST(codegen_cg4, conditional_throw_then_arm_value_path) {
     BEZEL_EXPECT_EQ(runProg(
         "module M; class C "
         "  public static method Main(): int => "
-        "    (throw new Exception(\"boom\")) if 1 > 2 else 9; "
+        "    (if 1 > 2 then (throw new Exception(\"boom\")) else 9); "
         "end C;"), 9);
 }
 
@@ -130,8 +130,8 @@ BEZEL_TEST(codegen_cg4, conditional_both_arms_throw_diverges) {
     BEZEL_EXPECT_EQ(runProg(
         "module M; class C "
         "  public static method Helper(c: bool): int "
-        "    return (throw new Exception(\"a\")) if c "
-        "           else (throw new Exception(\"b\")); "
+        "    return (if c then (throw new Exception(\"a\")) "
+        "            else (throw new Exception(\"b\"))); "
         "  end Helper; "
         "  public static method Main(): int "
         "    try return Helper(true); "
@@ -150,8 +150,8 @@ BEZEL_TEST(codegen_cg4, conditional_numeric_widening_to_long) {
     BEZEL_EXPECT_EQ(runProg(
         "module M; class C "
         "  public static method Main(): int "
-        "    var hi: long := 5 if 1 > 2 else 9000000000L; "
-        "    return 1 if hi = 9000000000L else 0; "
+        "    var hi: long := (if 1 > 2 then 5 else 9000000000L); "
+        "    return (if hi = 9000000000L then 1 else 0); "
         "  end Main; "
         "end C;"), 1);
 }
@@ -162,8 +162,8 @@ BEZEL_TEST(codegen_cg4, conditional_numeric_widening_int_branch) {
     BEZEL_EXPECT_EQ(runProg(
         "module M; class C "
         "  public static method Main(): int "
-        "    var v: long := 5 if 1 < 2 else 9000000000L; "
-        "    return 1 if v = 5L else 0; "
+        "    var v: long := (if 1 < 2 then 5 else 9000000000L); "
+        "    return (if v = 5L then 1 else 0); "
         "  end Main; "
         "end C;"), 1);
 }
@@ -177,7 +177,7 @@ BEZEL_TEST(codegen_cg4, throw_of_incompatible_conditional_is_type_error) {
     JitResult r = runAot(
         "module M; class C "
         "  public static method Main(): int => "
-        "    throw new Exception(\"e\") if 1 < 2 else 5; "
+        "    (if 1 < 2 then throw new Exception(\"e\") else 5); "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(r.ran);
@@ -189,7 +189,7 @@ BEZEL_TEST(codegen_cg4, incompatible_branches_is_type_error) {
         "module M; class N end N; class C "
         "  public static method Main(): int "
         "    var x := new N(); "
-        "    var y := 5 if 1 < 2 else x; "
+        "    var y := (if 1 < 2 then 5 else x); "
         "    return 0; "
         "  end Main; "
         "end C;");

@@ -36,7 +36,7 @@ BEZEL_TEST(codegen_issue575, this_with_single_field) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Pt(X: int, Y: int) "
-        "  public method ShiftX(dx: int): Pt => this with X := X + dx end; "
+        "  public method ShiftX(dx: int): Pt => this with(X := X + dx); "
         "end Pt; "
         "class C public static method Main(): int "
         "  var p := new Pt(3, 4); var q := p.ShiftX(10); "
@@ -50,7 +50,7 @@ BEZEL_TEST(codegen_issue575, this_with_does_not_mutate_source) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Pt(X: int, Y: int) "
-        "  public method ShiftX(dx: int): Pt => this with X := X + dx end; "
+        "  public method ShiftX(dx: int): Pt => this with(X := X + dx); "
         "end Pt; "
         "class C public static method Main(): int "
         "  var p := new Pt(3, 4); var q := p.ShiftX(10); "
@@ -65,7 +65,7 @@ BEZEL_TEST(codegen_issue575, this_with_two_fields) {
         "module M; "
         "record Pt(X: int, Y: int) "
         "  public method Shift(dx: int, dy: int): Pt "
-        "    => this with X := X + dx, Y := Y + dy end; "
+        "    => this with(X := X + dx, Y := Y + dy); "
         "end Pt; "
         "class C public static method Main(): int "
         "  var p := new Pt(1, 2); var q := p.Shift(10, 20); "
@@ -80,7 +80,7 @@ BEZEL_TEST(codegen_issue575, this_with_field_reads_other_original) {
         "module M; "
         "record Pt(X: int, Y: int) "
         "  public method Swap(): Pt "
-        "    => this with X := Y, Y := X end; "
+        "    => this with(X := Y, Y := X); "
         "end Pt; "
         "class C public static method Main(): int "
         "  var p := new Pt(3, 7); var q := p.Swap(); "
@@ -93,7 +93,7 @@ BEZEL_TEST(codegen_issue575, this_with_chained_calls) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Pt(X: int, Y: int) "
-        "  public method ShiftX(dx: int): Pt => this with X := X + dx end; "
+        "  public method ShiftX(dx: int): Pt => this with(X := X + dx); "
         "end Pt; "
         "class C public static method Main(): int "
         "  var p := new Pt(1, 4); "
@@ -108,7 +108,7 @@ BEZEL_TEST(codegen_issue575, out_of_method_with_regression) {
     BEZEL_EXPECT_EQ(run(
         "module M; record P(x: int, y: int); "
         "class C public static method Main(): int "
-        "  var a := new P(1, 2); var b := a with x := 9 end; "
+        "  var a := new P(1, 2); var b := a with(x := 9); "
         "  return b.x * 10 + b.y; "
         "end Main; end C;"), 92);
 }

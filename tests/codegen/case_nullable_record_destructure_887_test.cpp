@@ -40,10 +40,9 @@ BEZEL_TEST(case_nullable_record_destructure_887, present_value_destructures) {
         "record Point(X: int, Y: int); "
         "class C public static method Main(): int "
         "  var p: Point? := new Point(3, 4); "
-        "  return case p of "
+        "  return (case p of "
         "    Point(x, y) => x + y, "  // 7
-        "    _ => 99 "
-        "  end; "
+        "    _ => 99); "
         "end Main; end C;"), 7);
 }
 
@@ -55,10 +54,10 @@ BEZEL_TEST(case_nullable_record_destructure_887, null_value_falls_to_wildcard) {
         "record Point(X: int, Y: int); "
         "class C public static method Main(): int "
         "  var p: Point? := null; "
-        "  return case p of "
+        "  return (case p of "
         "    Point(x, y) => x + y, "
         "    _ => 42 "  // 42
-        "  end; "
+        "); "
         "end Main; end C;"), 42);
 }
 
@@ -69,10 +68,9 @@ BEZEL_TEST(case_nullable_record_destructure_887, three_field_record) {
         "record Triple(A: int, B: int, C: int); "
         "class C public static method Main(): int "
         "  var t: Triple? := new Triple(10, 20, 5); "
-        "  return case t of "
+        "  return (case t of "
         "    Triple(a, b, c) => a + b + c, "  // 35
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 35);
 }
 
@@ -112,10 +110,9 @@ BEZEL_TEST(case_nullable_record_destructure_887, generic_record_destructure_1254
         "class C public static method Main(): int "
         "  using var item := new Item(99); "
         "  var w := new Wrapper<Item>(item); "
-        "  return case w of "
+        "  return (case w of "
         "    Wrapper(x) => x.v, "  // 99
-        "    _ => -1 "
-        "  end; "
+        "    _ => -1); "
         "end Main; end C;"), 99);
 }
 
@@ -136,9 +133,8 @@ BEZEL_TEST(case_nullable_record_destructure_887, generic_record_two_fields_1254)
         "  using var a := new Box(10); "
         "  using var b := new Box(32); "
         "  var p := new Pair<Box, Box>(a, b); "
-        "  return case p of "
+        "  return (case p of "
         "    Pair(x, y) => x.n + y.n, "  // 42
-        "    _ => -1 "
-        "  end; "
+        "    _ => -1); "
         "end Main; end C;"), 42);
 }

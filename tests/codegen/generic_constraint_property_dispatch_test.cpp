@@ -61,7 +61,7 @@ BEZEL_TEST(generic_constraint_property_dispatch, interface_constraint_string_pro
         "class C public static method Main(): int "
         "  using var p := new Person(\"Alice\"); "
         "  var n := Namer.GetName(p); "
-        "  return (1 if n = \"Alice\" else 0); "
+        "  return (if n = \"Alice\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -83,7 +83,7 @@ BEZEL_TEST(generic_constraint_property_dispatch, interface_constraint_expr_body_
         "class C public static method Main(): int "
         "  using var p := new Person(\"Bob\"); "
         "  var n := Namer.GetName(p); "
-        "  return (1 if n = \"Bob\" else 0); "
+        "  return (if n = \"Bob\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -236,7 +236,7 @@ BEZEL_TEST(generic_constraint_property_dispatch, interface_constraint_int_proper
         "end Tag; "
         "static class Check "
         "  public static method IsFortyTwo<T>(x: T): int where T: ICode "
-        "    return (1 if x.Code = 42 else 0); "
+        "    return (if x.Code = 42 then 1 else 0); "
         "  end IsFortyTwo; "
         "end Check; "
         "class C public static method Main(): int "

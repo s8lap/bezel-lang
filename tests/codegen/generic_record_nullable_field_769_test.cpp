@@ -42,7 +42,7 @@ BEZEL_TEST(generic_record_nullable_field_769, null_value_is_null) {
         "module M; record Box<T>(V: T?); "
         "class P public static method Main(): int "
         "  var b := new Box<int>(null); "
-        "  return 0 if b.V = null else 1; "
+        "  return (if b.V = null then 0 else 1); "
         "end Main; end P;"), 0);
 }
 

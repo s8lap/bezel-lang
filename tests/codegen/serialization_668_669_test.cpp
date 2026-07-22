@@ -181,7 +181,7 @@ BEZEL_TEST(codegen_serialization_668,
         "      caught := 0; "
         "    catch SerializationException => caught := 1; "
         "    end; "
-        "    return (42 if caught = 1 else 1); "
+        "    return (if caught = 1 then 42 else 1); "
         "  end Main; "
         "end Program;"), 42);
 }
@@ -207,7 +207,7 @@ BEZEL_TEST(codegen_serialization_668,
         "      var bad := ThreeFR.Deserialize(de); "
         "    catch SerializationException => caught := 1; "
         "    end; "
-        "    return (42 if caught = 1 else 1); "
+        "    return (if caught = 1 then 42 else 1); "
         "  end Main; "
         "end Program;"), 42);
 }
@@ -240,7 +240,7 @@ BEZEL_TEST(codegen_serialization_668,
         "    var caught := 0; "
         "    using var ext := Extended.Deserialize(de); "
         "    if ext.V <> 99 then return 91; end; "
-        "    return (42 if ext.Note = null else 92); "
+        "    return (if ext.Note = null then 42 else 92); "
         "  end Main; "
         "end Program;"), 42);
 }
@@ -279,7 +279,7 @@ BEZEL_TEST(codegen_serialization_668,
         "      caught := 0; "
         "    catch SerializationException => caught := 1; "
         "    end; "
-        "    return (42 if caught = 1 else 1); "
+        "    return (if caught = 1 then 42 else 1); "
         "  end Main; "
         "end Program;"), 42);
 }
@@ -323,7 +323,7 @@ BEZEL_TEST(codegen_serialization_669,
         "    using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "    using var p2 := Parent.Deserialize(d); "
         "    if p2.Tag <> 5 then return 91; end; "
-        "    return (42 if p2.OptChild = null else 92); "
+        "    return (if p2.OptChild = null then 42 else 92); "
         "  end Main; "
         "end C;";
     // AOT run: must return 42 without SIGSEGV (rc=139).
@@ -358,7 +358,7 @@ BEZEL_TEST(codegen_serialization_669,
         "    if p2.Tag <> 7 then return 91; end; "
         "    var oc := p2.OptChild; "
         "    if oc = null then return 92; end; "
-        "    return (42 if oc.V = 99 else 93); "
+        "    return (if oc.V = 99 then 42 else 93); "
         "  end Main; "
         "end C;";
     BEZEL_EXPECT_EQ(compileAndRun668(src), 42);
@@ -390,7 +390,7 @@ BEZEL_TEST(codegen_serialization_669,
         "    using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "    using var p2 := Parent.Deserialize(d); "
         "    if p2.Tag <> 5 then return 91; end; "
-        "    return (42 if p2.OptChild = null else 92); "
+        "    return (if p2.OptChild = null then 42 else 92); "
         "  end Main; "
         "end C;";
     int asan = runUnderLeakSanitizer668(src, /*detectLeaks=*/true);
@@ -432,7 +432,7 @@ BEZEL_TEST(codegen_serialization_669,
         "      return 0; "
         "    catch SerializationException => caught := true; "
         "    end; "
-        "    return (42 if caught else 1); "
+        "    return (if caught then 42 else 1); "
         "  end Main; "
         "end C;";
     // JIT: exception is caught → 42.

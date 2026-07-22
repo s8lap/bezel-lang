@@ -49,7 +49,7 @@ BEZEL_TEST(case_typed_binding_value_scrutinee_1473, int_scrut_bool_binding_no_ma
     BEZEL_EXPECT_EQ(run(
         "module M; class App public static method Main(): int "
         "  var x: int := 5; "
-        "  return case x of var b: bool => 1, _ => 0 end; "
+        "  return (case x of var b: bool => 1, _ => 0); "
         "end Main; end App;"), 0);
 }
 
@@ -59,7 +59,7 @@ BEZEL_TEST(case_typed_binding_value_scrutinee_1473, int_scrut_double_binding_no_
     BEZEL_EXPECT_EQ(run(
         "module M; class App public static method Main(): int "
         "  var x: int := 5; "
-        "  return case x of var d: double => 1, _ => 0 end; "
+        "  return (case x of var d: double => 1, _ => 0); "
         "end Main; end App;"), 0);
 }
 
@@ -70,7 +70,7 @@ BEZEL_TEST(case_typed_binding_value_scrutinee_1473, int_scrut_int_binding_matche
     BEZEL_EXPECT_EQ(run(
         "module M; class App public static method Main(): int "
         "  var x: int := 5; "
-        "  return case x of var n: int when n = 5 => 42, _ => 1 end; "
+        "  return (case x of var n: int when n = 5 => 42, _ => 1); "
         "end Main; end App;"), 42);
 }
 
@@ -80,7 +80,7 @@ BEZEL_TEST(case_typed_binding_value_scrutinee_1473, bool_scrut_bool_binding_matc
     BEZEL_EXPECT_EQ(run(
         "module M; class App public static method Main(): int "
         "  var x: bool := true; "
-        "  return case x of var b: bool when b => 7, _ => 1 end; "
+        "  return (case x of var b: bool when b => 7, _ => 1); "
         "end Main; end App;"), 7);
 }
 
@@ -94,7 +94,7 @@ BEZEL_TEST(case_typed_binding_value_scrutinee_1473, generic_scrut_matches_only_i
         "class Kind<T> "
         "  private v: T; "
         "  public constructor(x: T) v := x; end; "
-        "  public method Code(): int => case v of var b: int => 1, _ => 0 end; "
+        "  public method Code(): int => (case v of var b: int => 1, _ => 0); "
         "end Kind; "
         "public static class P public static method Main(): int "
         "  return new Kind<int>(5).Code() * 10 + new Kind<char>('z').Code(); "
@@ -108,6 +108,6 @@ BEZEL_TEST(case_typed_binding_value_scrutinee_1473, int_scrut_string_binding_sti
     BEZEL_EXPECT_EQ(compileErrored(
         "module M; class App public static method Main(): int "
         "  var x: int := 5; "
-        "  return case x of var s: string => 1, _ => 0 end; "
+        "  return (case x of var s: string => 1, _ => 0); "
         "end Main; end App;"), true);
 }

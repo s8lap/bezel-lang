@@ -37,7 +37,7 @@ BEZEL_TEST(generic_unconstrained_objmethod_1091, string_gethashcode_nonzero) {
     BEZEL_EXPECT_EQ(run(
         "module M; class U public static method H<T>(x: T): int => x.GetHashCode(); end U; "
         "class C public static method Main(): int "
-        "  var h := U.H(\"hi\"); return (1 if h <> 0 else 0); "
+        "  var h := U.H(\"hi\"); return (if h <> 0 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -47,7 +47,7 @@ BEZEL_TEST(generic_unconstrained_objmethod_1091, record_gethashcode_nonzero) {
         "module M; record Pt(X: int, Y: int); "
         "class U public static method H<T>(x: T): int => x.GetHashCode(); end U; "
         "class C public static method Main(): int "
-        "  var h := U.H(new Pt(3, 4)); return (1 if h <> 0 else 0); "
+        "  var h := U.H(new Pt(3, 4)); return (if h <> 0 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -56,7 +56,7 @@ BEZEL_TEST(generic_unconstrained_objmethod_1091, value_equals) {
     BEZEL_EXPECT_EQ(run(
         "module M; class U public static method Eq<T>(x: T, y: T): bool => x.Equals(y); end U; "
         "class C public static method Main(): int "
-        "  return (1 if U.Eq(5, 5) else 0) + (10 if U.Eq(5, 9) else 0); "  // 5==5 →1, 5==9 →0
+        "  return (if U.Eq(5, 5) then 1 else 0) + (if U.Eq(5, 9) then 10 else 0); "  // 5==5 →1, 5==9 →0
         "end Main; end C;"), 1);
 }
 
@@ -67,7 +67,7 @@ BEZEL_TEST(generic_unconstrained_objmethod_1091, class_equals_ref_identity) {
         "class U public static method Eq<T>(x: T, y: T): bool => x.Equals(y); end U; "
         "class C public static method Main(): int "
         "  using var a := new K(); using var b := new K(); "
-        "  return (10 if U.Eq(a, a) else 0) + (1 if U.Eq(a, b) else 0); "  // self →10, distinct →0
+        "  return (if U.Eq(a, a) then 10 else 0) + (if U.Eq(a, b) then 1 else 0); "  // self →10, distinct →0
         "end Main; end C;"), 10);
 }
 

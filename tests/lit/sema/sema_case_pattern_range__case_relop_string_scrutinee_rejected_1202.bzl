@@ -6,7 +6,7 @@
 // `case x > 5` over a `string` scrutinee — an integer operand over a string
 // scrutinee; reject (the symmetric direction). #1202.
 
-module M; class C public static method M(x: string): int return case x of > 5 => 1, _ => 0 end; end M; end C;
+module M; class C public static method M(x: string): int return (case x of > 5 => 1, _ => 0); end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: case pattern operand type is not compatible with the scrutinee type
 // CHECK-SAME: (§19)

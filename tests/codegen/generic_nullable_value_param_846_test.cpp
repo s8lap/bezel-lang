@@ -59,7 +59,7 @@ BEZEL_TEST(generic_nullable_value_param_846, force_unwrap_long_arg) {
         "class C\n"
         "  public static method Main(): int\n"
         "    var r: long := U.ForceUnwrap<long>(5000000000L);\n"
-        "    return (1 if r = 5000000000L else 0);\n"  // 1
+        "    return (if r = 5000000000L then 1 else 0);\n"  // 1
         "  end Main;\n"
         "end C;\n"), 1);
 }

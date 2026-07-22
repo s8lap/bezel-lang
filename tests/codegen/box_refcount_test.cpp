@@ -291,7 +291,7 @@ const char* kClassInstanceInObjectDisposedOnce =
     "class C "
     "  public static method Main(): int "
     "    using var d: Object := new Dog(); "
-    "    return (7 if d is Animal else 0); "   // 7
+    "    return (if d is Animal then 7 else 0); "   // 7
     "  end Main; "
     "end C;";
 

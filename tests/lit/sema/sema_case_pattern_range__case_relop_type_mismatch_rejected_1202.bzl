@@ -6,7 +6,7 @@
 // `case x > "hi"` over an `int` scrutinee — a string operand cannot be
 // compared to an integer; reject (was a compiler abort). #1202.
 
-module M; class C public static method M(x: int): int return case x of > "hi" => 1, _ => 0 end; end M; end C;
+module M; class C public static method M(x: int): int return (case x of > "hi" => 1, _ => 0); end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: case pattern operand type is not compatible with the scrutinee type
 // CHECK-SAME: (§19)

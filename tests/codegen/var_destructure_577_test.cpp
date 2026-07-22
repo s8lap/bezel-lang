@@ -35,10 +35,9 @@ BEZEL_TEST(codegen_577_var_destructure, var_bindings_both_visible_spec_19_3) {
         "record Pt(X: int, Y: int); "
         "class C public static method Main(): int "
         "  var p := new Pt(10, 20); "
-        "  return case p of "
+        "  return (case p of "
         "    Pt(var a, var b) => a + b, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 30);
 }
 
@@ -50,10 +49,9 @@ BEZEL_TEST(codegen_577_var_destructure, var_binding_first_field_spec_19_3) {
         "record Pt(X: int, Y: int); "
         "class C public static method Main(): int "
         "  var p := new Pt(10, 20); "
-        "  return case p of "
+        "  return (case p of "
         "    Pt(var a, var b) => a, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 10);
 }
 
@@ -65,10 +63,9 @@ BEZEL_TEST(codegen_577_var_destructure, var_binding_second_field_spec_19_3) {
         "record Pt(X: int, Y: int); "
         "class C public static method Main(): int "
         "  var p := new Pt(10, 20); "
-        "  return case p of "
+        "  return (case p of "
         "    Pt(var a, var b) => b, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 20);
 }
 
@@ -83,10 +80,9 @@ BEZEL_TEST(codegen_577_var_destructure, mixed_var_and_naked_binding_spec_19_3) {
         "record Pair(A: int, B: int); "
         "class C public static method Main(): int "
         "  var p := new Pair(3, 4); "
-        "  return case p of "
+        "  return (case p of "
         "    Pair(var a, b) => a + b, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 7);
 }
 
@@ -98,10 +94,9 @@ BEZEL_TEST(codegen_577_var_destructure, naked_then_var_binding_spec_19_3) {
         "record Pair(A: int, B: int); "
         "class C public static method Main(): int "
         "  var p := new Pair(3, 5); "
-        "  return case p of "
+        "  return (case p of "
         "    Pair(a, var b) => b, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 5);
 }
 
@@ -116,10 +111,9 @@ BEZEL_TEST(codegen_577_var_destructure, bare_form_regression_spec_19_3) {
         "record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var p := new Point(3, 4); "
-        "  return case p of "
+        "  return (case p of "
         "    Point(x, y) => x + y, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "end Main; end C;"), 7);
 }
 
@@ -153,10 +147,9 @@ BEZEL_TEST(codegen_577_var_destructure, const_then_var_binding_spec_19_3) {
         "record Pair(A: int, B: int); "
         "class C public static method Main(): int "
         "  var p := new Pair(0, 7); "
-        "  return case p of "
+        "  return (case p of "
         "    Pair(0, var b) => b, "
-        "    _ => -1 "
-        "  end; "
+        "    _ => -1); "
         "end Main; end C;"), 7);
 }
 
@@ -168,10 +161,9 @@ BEZEL_TEST(codegen_577_var_destructure, const_then_var_binding_no_match_spec_19_
         "record Pair(A: int, B: int); "
         "class C public static method Main(): int "
         "  var p := new Pair(5, 7); "
-        "  return case p of "
+        "  return (case p of "
         "    Pair(0, var b) => b, "
-        "    _ => -1 "
-        "  end; "
+        "    _ => -1); "
         "end Main; end C;"), -1);
 }
 
@@ -186,10 +178,9 @@ BEZEL_TEST(codegen_577_var_destructure, nested_destructuring_case_expr_726) {
         "record Outer(A: Inner, B: int); "
         "class C public static method Main(): int "
         "  var o := new Outer(new Inner(7), 3); "
-        "  var r := case o of "
+        "  var r := (case o of "
         "    Outer(Inner(v), b) => v + b, "
-        "    _ => 0 "
-        "  end; "
+        "    _ => 0); "
         "  return r; "  // 7 + 3 = 10
         "end Main; end C;"), 10);
 }
@@ -224,10 +215,9 @@ BEZEL_TEST(codegen_577_var_destructure, method_call_on_naked_binding_no_crash_12
         "record Box(V: int); "
         "class C public static method Main(): int "
         "  var b := new Box(41); "
-        "  return case b of "
+        "  return (case b of "
         "    Box(a) => a.ToString().Length + a, "  // "41".Length(2) + 41 = 43
-        "    _ => 0, "
-        "  end; "
+        "    _ => 0,); "
         "end Main; end C;"), 43);
 }
 
@@ -247,7 +237,7 @@ BEZEL_TEST(codegen_577_var_destructure, nested_class_binding_member_access_expr_
         "class C public static method Main(): int "
         "  using var w := new Widget(9); "
         "  var inner := new Inner(w); var o := new Outer(inner); "
-        "  return case o of Outer(Inner(x)) => x.Id, _ => -1, end; "  // 9
+        "  return (case o of Outer(Inner(x)) => x.Id, _ => -1,); "  // 9
         "end Main; end C;"), 9);
 }
 

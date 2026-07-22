@@ -34,7 +34,7 @@ BEZEL_TEST(codegen_value_semantics, record_tostring_format_spec_9_1) {
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var p := new Point(1, 2); "
-        "  return (1 if p.ToString() = \"Point(x: 1, y: 2)\" else 0); "
+        "  return (if p.ToString() = \"Point(x: 1, y: 2)\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -46,7 +46,7 @@ BEZEL_TEST(codegen_value_semantics, record_tostring_string_field_spec_9_1) {
         "module M; record Person(Name: string, Age: int); "
         "class C public static method Main(): int "
         "  var p := new Person(\"Ann\", 30); "
-        "  return (1 if p.ToString() = \"Person(Name: Ann, Age: 30)\" else 0); "
+        "  return (if p.ToString() = \"Person(Name: Ann, Age: 30)\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -56,7 +56,7 @@ BEZEL_TEST(codegen_value_semantics, record_tostring_zero_field_spec_9_2) {
         "module M; record Unit(); "
         "class C public static method Main(): int "
         "  var u := new Unit(); "
-        "  return (1 if u.ToString() = \"Unit()\" else 0); "
+        "  return (if u.ToString() = \"Unit()\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -66,7 +66,7 @@ BEZEL_TEST(codegen_value_semantics, record_tostring_nested_spec_9_1) {
         "module M; record Inner(a: int, b: int); record Outer(p: Inner, z: int); "
         "class C public static method Main(): int "
         "  var o := new Outer(new Inner(3, 4), 5); "
-        "  return (1 if o.ToString() = \"Outer(p: Inner(a: 3, b: 4), z: 5)\" else 0); "
+        "  return (if o.ToString() = \"Outer(p: Inner(a: 3, b: 4), z: 5)\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -77,7 +77,7 @@ BEZEL_TEST(codegen_value_semantics, record_user_tostring_wins) {
         "record Tagged(x: int) public method ToString(): string => \"TAG\"; end Tagged; "
         "class C public static method Main(): int "
         "  var t := new Tagged(7); "
-        "  return (1 if t.ToString() = \"TAG\" else 0); "
+        "  return (if t.ToString() = \"TAG\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -87,7 +87,7 @@ BEZEL_TEST(codegen_value_semantics, record_equal_hash_spec_8_3) {
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var a := new Point(1, 2); var b := new Point(1, 2); "
-        "  return (1 if a.GetHashCode() = b.GetHashCode() else 0); "
+        "  return (if a.GetHashCode() = b.GetHashCode() then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -98,7 +98,7 @@ BEZEL_TEST(codegen_value_semantics, record_distinct_hash_order_spec_8_3) {
         "module M; record Pair(a: int, b: int); "
         "class C public static method Main(): int "
         "  var x := new Pair(1, 2); var y := new Pair(2, 1); "
-        "  return (1 if x.GetHashCode() <> y.GetHashCode() else 0); "
+        "  return (if x.GetHashCode() <> y.GetHashCode() then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -109,7 +109,7 @@ BEZEL_TEST(codegen_value_semantics, record_string_field_hash_consistent_spec_8_3
         "module M; record Person(Name: string, Age: int); "
         "class C public static method Main(): int "
         "  var a := new Person(\"Ann\", 30); var b := new Person(\"Ann\", 30); "
-        "  return (1 if a.GetHashCode() = b.GetHashCode() else 0); "
+        "  return (if a.GetHashCode() = b.GetHashCode() then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -119,7 +119,7 @@ BEZEL_TEST(codegen_value_semantics, record_equals_structural_spec_9_1) {
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var a := new Point(1, 2); var b := new Point(1, 2); "
-        "  return (1 if a.Equals(b) else 0); "
+        "  return (if a.Equals(b) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -129,7 +129,7 @@ BEZEL_TEST(codegen_value_semantics, record_equals_unequal_spec_9_1) {
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var a := new Point(1, 2); var b := new Point(1, 9); "
-        "  return (1 if a.Equals(b) else 0); "
+        "  return (if a.Equals(b) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -139,7 +139,7 @@ BEZEL_TEST(codegen_value_semantics, enum_tostring_type_name_spec_8_5) {
         "module M; enum Priority Low, Medium, High; end Priority; "
         "class C public static method Main(): int "
         "  var p := Priority.High; "
-        "  return (1 if p.ToString() = \"Priority\" else 0); "
+        "  return (if p.ToString() = \"Priority\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -160,8 +160,8 @@ BEZEL_TEST(codegen_value_semantics, enum_hash_distinguishes_spec_8_3) {
         "module M; enum Color Red, Green, Blue; end Color; "
         "class C public static method Main(): int "
         "  var a := Color.Green; var b := Color.Green; var c := Color.Blue; "
-        "  return (1 if (a.GetHashCode() = b.GetHashCode()) "
-        "             and (a.GetHashCode() <> c.GetHashCode()) else 0); "
+        "  return (if (a.GetHashCode() = b.GetHashCode()) "
+        "             and (a.GetHashCode() <> c.GetHashCode()) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -171,7 +171,7 @@ BEZEL_TEST(codegen_value_semantics, enum_equals_spec_8_4) {
         "module M; enum Color Red, Green, Blue; end Color; "
         "class C public static method Main(): int "
         "  var a := Color.Green; var b := Color.Green; "
-        "  return (1 if a.Equals(b) else 0); "
+        "  return (if a.Equals(b) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -182,7 +182,7 @@ BEZEL_TEST(codegen_value_semantics, enum_interpolation_type_name_spec_8_5) {
         "module M; enum Priority Low, Medium, High; end Priority; "
         "class C public static method Main(): int "
         "  var p := Priority.Low; "
-        "  return (1 if $\"{p}\" = \"Priority\" else 0); "
+        "  return (if $\"{p}\" = \"Priority\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -192,6 +192,6 @@ BEZEL_TEST(codegen_value_semantics, record_interpolation_format_spec_9_1) {
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  var p := new Point(4, 5); "
-        "  return (1 if $\"{p}\" = \"Point(x: 4, y: 5)\" else 0); "
+        "  return (if $\"{p}\" = \"Point(x: 4, y: 5)\" then 1 else 0); "
         "end Main; end C;"), 1);
 }

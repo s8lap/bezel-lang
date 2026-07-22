@@ -9,7 +9,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class C public static method M(n: int): int return case n of 1 => 10, 2 => 20, _ => 0 end; end M; end C;
+module M; class C public static method M(n: int): int return (case n of 1 => 10, 2 => 20, _ => 0); end M; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

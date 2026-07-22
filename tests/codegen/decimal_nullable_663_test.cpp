@@ -256,7 +256,7 @@ BEZEL_TEST(codegen_663_record_field, decimal_nullable_field_in_record_spec_7_1_9
     BEZEL_EXPECT_EQ(run(
         "module M; record Box(val: decimal?); "
         "class C public static method Main(): int "
-        "  return (1 if new Box(null) <> new Box(1.5m) else 0); "
+        "  return (if new Box(null) <> new Box(1.5m) then 1 else 0); "
         "end Main; end C;"),
         1);
 }

@@ -104,7 +104,7 @@ BEZEL_TEST(math_convert, math_pi_constant_spec_2_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var p := Math.Pi; "
-        "  return (1 if p > 3.14 and p < 3.15 else 0); "
+        "  return (if p > 3.14 and p < 3.15 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -115,7 +115,7 @@ BEZEL_TEST(math_convert, math_tau_constant_spec_2_2) {
         "module M; class C public static method Main(): int "
         "  var t := Math.Tau; "
         "  var d := t - 2.0 * Math.Pi; "
-        "  return (1 if t > 6.28 and t < 6.29 and Math.Abs(d) < 0.0001 else 0); "
+        "  return (if t > 6.28 and t < 6.29 and Math.Abs(d) < 0.0001 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -159,7 +159,7 @@ BEZEL_TEST(math_convert, math_round_digits_spec_2_2) {
         "module M; class C public static method Main(): int "
         "  var a := Math.Round(3.14159, 2); "
         "  var b := Math.Round(3.14159, 4); "
-        "  return (1 if a > 3.139 and a < 3.141 and b > 3.1415 and b < 3.1417 else 0); "
+        "  return (if a > 3.139 and a < 3.141 and b > 3.1415 and b < 3.1417 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -170,7 +170,7 @@ BEZEL_TEST(math_convert, math_round_digits_bankers_spec_2_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := Math.Round(2.125, 2); "
-        "  return (1 if a > 2.119 and a < 2.121 else 0); "
+        "  return (if a > 2.119 and a < 2.121 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -182,7 +182,7 @@ BEZEL_TEST(math_convert, convert_tryto_int32_ok_spec_2_3) {
         "module M; class C public static method Main(): int "
         "  var n: int := 0; "
         "  var ok := Convert.TryToInt32(\"42\", out n); "
-        "  return (1 if ok and n = 42 else 0); "
+        "  return (if ok and n = 42 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -193,7 +193,7 @@ BEZEL_TEST(math_convert, convert_tryto_int32_fail_spec_2_3) {
         "module M; class C public static method Main(): int "
         "  var n: int := 0; "
         "  var ok := Convert.TryToInt32(\"abc\", out n); "
-        "  return (1 if not ok else 0); "
+        "  return (if not ok then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -204,7 +204,7 @@ BEZEL_TEST(math_convert, convert_tryto_int32_trailing_junk_spec_2_3) {
         "module M; class C public static method Main(): int "
         "  var n: int := 0; "
         "  var ok := Convert.TryToInt32(\"12x\", out n); "
-        "  return (1 if not ok else 0); "
+        "  return (if not ok then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -223,7 +223,7 @@ const char* kMoney =
     "module M; import System; "
     "record Money(cents: int): IComparable<Money> "
     "  public method CompareTo(other: Money): int => "
-    "    (1 if cents > other.cents else (-1 if cents < other.cents else 0)); "
+    "    (if cents > other.cents then 1 else (if cents < other.cents then -1 else 0)); "
     "end Money; ";
 std::string moneyMain(const std::string& body) {
     return std::string(kMoney) +
@@ -308,7 +308,7 @@ const char* kBox =
     "module M; import System; "
     "class Box(v: int): IComparable<Box> "
     "  public method CompareTo(other: Box): int => "
-    "    (1 if v > other.v else (-1 if v < other.v else 0)); "
+    "    (if v > other.v then 1 else (if v < other.v then -1 else 0)); "
     "end Box; ";
 std::string boxMain(const std::string& body) {
     return std::string(kBox) +
@@ -725,7 +725,7 @@ BEZEL_TEST(convert_strict_1238, toint64_valid_large_regression_spec_2_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var n := Convert.ToInt64(\"9999999999\"); "
-        "  return (1 if n = 9999999999L else 0); "
+        "  return (if n = 9999999999L then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -747,7 +747,7 @@ BEZEL_TEST(convert_strict_1238, todouble_valid_regression_spec_2_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var d := Convert.ToDouble(\"3.5\"); "
-        "  return (1 if d > 3.4 and d < 3.6 else 0); "
+        "  return (if d > 3.4 and d < 3.6 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -758,7 +758,7 @@ BEZEL_TEST(convert_strict_1238, tryto_int32_overflow_returns_false_spec_2_3) {
         "module M; class C public static method Main(): int "
         "  var result: int := 99; "
         "  var ok := Convert.TryToInt32(\"9999999999\", out result); "
-        "  return (1 if ok else 0); "
+        "  return (if ok then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -779,7 +779,7 @@ BEZEL_TEST(convert_strict_1238, tryto_int32_leading_space_returns_false_spec_2_3
         "module M; class C public static method Main(): int "
         "  var result: int := 0; "
         "  var ok := Convert.TryToInt32(\" 42\", out result); "
-        "  return (1 if not ok else 0); "
+        "  return (if not ok then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -789,6 +789,6 @@ BEZEL_TEST(convert_strict_1238, tryto_int32_valid_regression_spec_2_3) {
         "module M; class C public static method Main(): int "
         "  var r: int := 0; "
         "  var ok := Convert.TryToInt32(\"42\", out r); "
-        "  return (1 if ok and r = 42 else 0); "
+        "  return (if ok and r = 42 then 1 else 0); "
         "end Main; end C;"), 1);
 }

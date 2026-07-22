@@ -151,7 +151,7 @@ BEZEL_TEST(codegen_writeline_nullable_581, bool_nullable_jit_does_not_crash) {
 BEZEL_TEST(codegen_writeline_nullable_double_regression, double_nullable_non_null_still_works) {
     BEZEL_EXPECT_EQ(run(wrap(
         "var d: double? := 3.5; "
-        "var ok := 1 if d <> null else 0; return ok;")), 1);
+        "var ok := (if d <> null then 1 else 0); return ok;")), 1);
 }
 
 // --- non-nullable int regression: must remain correct (§7) ---

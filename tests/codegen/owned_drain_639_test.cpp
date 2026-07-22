@@ -531,7 +531,7 @@ BEZEL_TEST(owned_drain_639, r27_repro_r25b_ownedarray_drain) {
         "      using var it := item; "
         "      sum := sum + it.N; "
         "    end; "
-        "    return (42 if sum = 60 else 91); "
+        "    return (if sum = 60 then 42 else 91); "
         "  end Main; "
         "end Program;");
     BEZEL_EXPECT_TRUE(r.ran);
@@ -557,7 +557,7 @@ BEZEL_TEST(owned_drain_639, r27_repro_r25c_ownedlinkedlist_drain) {
         "      using var it := item; "
         "      sum := sum + it.N; "
         "    end; "
-        "    return (42 if sum = 15 else 91); "
+        "    return (if sum = 15 then 42 else 91); "
         "  end Main; "
         "end Program;");
     BEZEL_EXPECT_TRUE(r.ran);
@@ -583,7 +583,7 @@ BEZEL_TEST(owned_drain_639, r27_repro_r25d_ownedstack_drain) {
         "      using var it := item; "
         "      sum := sum + it.N; "
         "    end; "
-        "    return (42 if sum = 15 else 91); "
+        "    return (if sum = 15 then 42 else 91); "
         "  end Main; "
         "end Program;");
     BEZEL_EXPECT_TRUE(r.ran);

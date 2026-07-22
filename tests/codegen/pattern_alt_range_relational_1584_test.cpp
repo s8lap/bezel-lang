@@ -38,11 +38,10 @@ int classify(const std::string& scrut) {
     return runProg(
         std::string("module M; class C public static method Main(): int ") +
         "  var x := " + scrut + "; "
-        "  return case x of "
+        "  return (case x of "
         "    1..5 | 10 => 1, "     // range OR singleton constant
         "    < 0 | > 100 => 2, "   // two relational members
-        "    _ => 0 "
-        "  end; end Main; end C;");
+        "    _ => 0); end Main; end C;");
 }
 
 } // namespace
@@ -89,7 +88,7 @@ BEZEL_TEST(codegen_alt_range_1584, half_open_member_excludes_upper) {
     const std::string prog =
         "module M; class C public static method Main(): int "
         "  var x := 5; "
-        "  return case x of 1..<5 | 20 => 1, _ => 0 end; "  // [1,5) excludes 5
+        "  return (case x of 1..<5 | 20 => 1, _ => 0); "  // [1,5) excludes 5
         "end Main; end C;";
     BEZEL_EXPECT_EQ(runProg(prog), 0);
 }
@@ -100,7 +99,7 @@ BEZEL_TEST(codegen_alt_range_1584, open_ended_member_with_constant) {
     // `..<0 | 100`: everything below 0, or exactly 100.
     const std::string base =
         "module M; class C public static method Grade(x: int): int "
-        "  return case x of ..<0 | 100 => 9, _ => 0 end; "
+        "  return (case x of ..<0 | 100 => 9, _ => 0); "
         "end Grade; public static method Main(): int return ";
     BEZEL_EXPECT_EQ(runProg(base + "Grade(0 - 7); end Main; end C;"), 9);   // <0
     BEZEL_EXPECT_EQ(runProg(base + "Grade(100); end Main; end C;"), 9);     // 100
@@ -115,7 +114,7 @@ BEZEL_TEST(codegen_alt_range_1584, null_or_range_matches_null) {
     const std::string prog =
         "module M; class C public static method Main(): int "
         "  var x: int? := null; "
-        "  return case x of null | 1..5 => 8, _ => 0 end; "
+        "  return (case x of null | 1..5 => 8, _ => 0); "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(runProg(prog), 8);
 }
@@ -124,7 +123,7 @@ BEZEL_TEST(codegen_alt_range_1584, null_or_range_matches_in_range_present) {
     const std::string prog =
         "module M; class C public static method Main(): int "
         "  var x: int? := 3; "
-        "  return case x of null | 1..5 => 8, _ => 0 end; "
+        "  return (case x of null | 1..5 => 8, _ => 0); "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(runProg(prog), 8);
 }
@@ -133,7 +132,7 @@ BEZEL_TEST(codegen_alt_range_1584, null_or_range_falls_through_out_of_range) {
     const std::string prog =
         "module M; class C public static method Main(): int "
         "  var x: int? := 99; "
-        "  return case x of null | 1..5 => 8, _ => 0 end; "
+        "  return (case x of null | 1..5 => 8, _ => 0); "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(runProg(prog), 0);
 }
@@ -146,7 +145,7 @@ BEZEL_TEST(codegen_alt_range_1584, binding_member_still_rejected) {
     auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var x := 3; "
-        "  return case x of var y | 1..5 => y, _ => 0 end; "
+        "  return (case x of var y | 1..5 => y, _ => 0); "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -163,7 +162,7 @@ BEZEL_TEST(codegen_alt_range_1584, pure_constant_alternatives_regression) {
     const std::string prog =
         "module M; class C public static method Main(): int "
         "  var x := 8; "
-        "  return case x of 1 | 2 | 3 => 10, 7 | 8 | 9 => 20, _ => 30 end; "
+        "  return (case x of 1 | 2 | 3 => 10, 7 | 8 | 9 => 20, _ => 30); "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(runProg(prog), 20);
 }

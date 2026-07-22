@@ -69,7 +69,7 @@ BEZEL_TEST(class_object_method_dispatch_1106, default_equals_distinct_false) {
         "module M; class Plain public _v: int := 0; end Plain; "
         "class C public static method Main(): int "
         "  using var a := new Plain(); using var b := new Plain(); "
-        "  return (10 if a.Equals(a) else 0) + (1 if a.Equals(b) else 0); "  // 10
+        "  return (if a.Equals(a) then 10 else 0) + (if a.Equals(b) then 1 else 0); "  // 10
         "end Main; end C;"), 10);
 }
 
@@ -80,7 +80,7 @@ BEZEL_TEST(class_object_method_dispatch_1106, eq_operator_uses_override) {
         std::string("module M; ") + kP +
         "class C public static method Main(): int "
         "  using var a := new P(5); using var b := new P(5); using var c := new P(9); "
-        "  return (10 if a = b else 0) + (1 if a <> c else 0); "  // 5==5 →10, 5<>9 →1 = 11
+        "  return (if a = b then 10 else 0) + (if a <> c then 1 else 0); "  // 5==5 →10, 5<>9 →1 = 11
         "end Main; end C;"), 11);
 }
 
@@ -91,7 +91,7 @@ BEZEL_TEST(class_object_method_dispatch_1106, eq_operator_override_unequal) {
         std::string("module M; ") + kP +
         "class C public static method Main(): int "
         "  using var a := new P(5); using var c := new P(9); "
-        "  return (1 if a = c else 0) + (10 if a <> c else 0); "  // 0 + 10 = 10
+        "  return (if a = c then 1 else 0) + (if a <> c then 10 else 0); "  // 0 + 10 = 10
         "end Main; end C;"), 10);
 }
 
@@ -102,7 +102,7 @@ BEZEL_TEST(class_object_method_dispatch_1106, eq_operator_no_override_ref_identi
         "module M; class Plain public _v: int := 0; end Plain; "
         "class C public static method Main(): int "
         "  using var a := new Plain(); using var b := new Plain(); "
-        "  return (10 if a = a else 0) + (1 if a = b else 0); "  // 10
+        "  return (if a = a then 10 else 0) + (if a = b then 1 else 0); "  // 10
         "end Main; end C;"), 10);
 }
 
@@ -113,7 +113,7 @@ BEZEL_TEST(class_object_method_dispatch_1106, direct_equals_override_call) {
         std::string("module M; ") + kP +
         "class C public static method Main(): int "
         "  using var a := new P(5); using var b := new P(5); "
-        "  return (1 if a.Equals(b) else 0); "             // 1
+        "  return (if a.Equals(b) then 1 else 0); "             // 1
         "end Main; end C;"), 1);
 }
 
@@ -190,7 +190,7 @@ BEZEL_TEST(class_object_method_dispatch_1106, base_equals_object_same_ref_true_1
         "end A; "
         "class C public static method Main(): int "
         "  using var a := new A(); "
-        "  return (1 if a.Equals(a) else 0); "  // ref-identity true → 1
+        "  return (if a.Equals(a) then 1 else 0); "  // ref-identity true → 1
         "end Main; end C;"), 1);
 }
 
@@ -205,7 +205,7 @@ BEZEL_TEST(class_object_method_dispatch_1106, base_equals_object_distinct_false_
         "end A; "
         "class C public static method Main(): int "
         "  using var a := new A(); using var b := new A(); "
-        "  return (1 if a.Equals(a) else 0) + (10 if a.Equals(b) else 0); "
+        "  return (if a.Equals(a) then 1 else 0) + (if a.Equals(b) then 10 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -220,7 +220,7 @@ BEZEL_TEST(class_object_method_dispatch_1106, base_gethashcode_object_consistent
         "class C public static method Main(): int "
         "  using var a := new A(); "
         "  var h1 := a.GetHashCode(); var h2 := a.GetHashCode(); "
-        "  return (1 if h1 = h2 else 0); "
+        "  return (if h1 = h2 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -247,7 +247,7 @@ BEZEL_TEST(class_object_method_dispatch_1106, base_equals_explicit_base_override
         "end A; "
         "class C public static method Main(): int "
         "  using var a := new A(5); using var b := new A(5); "
-        "  return (1 if a.Equals(b) else 0); "
+        "  return (if a.Equals(b) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

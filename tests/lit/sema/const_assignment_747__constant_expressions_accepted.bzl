@@ -9,7 +9,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class C public const A: int := 40; public const B: int := A * 2 + 1; public const S: string := "hi"; public const F: bool := true; public const G: int := A if F else B; public static method Main(): int return A + B; end Main; end C;
+module M; class C public const A: int := 40; public const B: int := A * 2 + 1; public const S: string := "hi"; public const F: bool := true; public const G: int := (if F then A else B); public static method Main(): int return A + B; end Main; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

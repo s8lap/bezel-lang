@@ -48,7 +48,7 @@ BEZEL_TEST(generic_record_this_with_method, box_int_with_value_returns_updated) 
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Box<T>(value: T) "
-        "  public method WithValue(v: T): Box<T> => this with value := v end; "
+        "  public method WithValue(v: T): Box<T> => this with(value := v); "
         "end Box; "
         "class C public static method Main(): int "
         "  var b := new Box<int>(1); "
@@ -62,7 +62,7 @@ BEZEL_TEST(generic_record_this_with_method, box_int_with_does_not_mutate_source)
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Box<T>(value: T) "
-        "  public method WithValue(v: T): Box<T> => this with value := v end; "
+        "  public method WithValue(v: T): Box<T> => this with(value := v); "
         "end Box; "
         "class C public static method Main(): int "
         "  var b := new Box<int>(1); "
@@ -82,7 +82,7 @@ BEZEL_TEST(generic_record_this_with_method, box_string_with_value_length) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Box<T>(value: T) "
-        "  public method WithValue(v: T): Box<T> => this with value := v end; "
+        "  public method WithValue(v: T): Box<T> => this with(value := v); "
         "end Box; "
         "class C public static method Main(): int "
         "  var b := new Box<string>(\"hi\"); "
@@ -97,7 +97,7 @@ BEZEL_TEST(generic_record_this_with_method, box_string_with_source_unchanged) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Box<T>(value: T) "
-        "  public method WithValue(v: T): Box<T> => this with value := v end; "
+        "  public method WithValue(v: T): Box<T> => this with(value := v); "
         "end Box; "
         "class C public static method Main(): int "
         "  var b := new Box<string>(\"hi\"); "
@@ -111,12 +111,12 @@ BEZEL_TEST(generic_record_this_with_method, box_string_with_roundtrips_content) 
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Box<T>(value: T) "
-        "  public method WithValue(v: T): Box<T> => this with value := v end; "
+        "  public method WithValue(v: T): Box<T> => this with(value := v); "
         "end Box; "
         "class C public static method Main(): int "
         "  var b := new Box<string>(\"hi\"); "
         "  var b2 := b.WithValue(\"planet\"); "
-        "  return (1 if b2.value = \"planet\" else 0); "
+        "  return (if b2.value = \"planet\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -132,7 +132,7 @@ BEZEL_TEST(generic_record_this_with_method, pair_int_string_replace_first) {
         "module M; "
         "record Pair<A, B>(first: A, second: B) "
         "  public method WithFirst(v: A): Pair<A, B> "
-        "    => this with first := v end; "
+        "    => this with(first := v); "
         "end Pair; "
         "class C public static method Main(): int "
         "  var p := new Pair<int, string>(1, \"hello\"); "
@@ -148,7 +148,7 @@ BEZEL_TEST(generic_record_this_with_method, pair_int_string_replace_second) {
         "module M; "
         "record Pair<A, B>(first: A, second: B) "
         "  public method WithSecond(v: B): Pair<A, B> "
-        "    => this with second := v end; "
+        "    => this with(second := v); "
         "end Pair; "
         "class C public static method Main(): int "
         "  var p := new Pair<int, string>(3, \"hello\"); "
@@ -165,7 +165,7 @@ BEZEL_TEST(generic_record_this_with_method, pair_string_int_replace_int) {
         "module M; "
         "record Pair<A, B>(first: A, second: B) "
         "  public method WithSecond(v: B): Pair<A, B> "
-        "    => this with second := v end; "
+        "    => this with(second := v); "
         "end Pair; "
         "class C public static method Main(): int "
         "  var p := new Pair<string, int>(\"hi\", 1); "
@@ -185,7 +185,7 @@ BEZEL_TEST(generic_record_this_with_method, box_int_chained_with_calls) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Box<T>(value: T) "
-        "  public method WithValue(v: T): Box<T> => this with value := v end; "
+        "  public method WithValue(v: T): Box<T> => this with(value := v); "
         "end Box; "
         "class C public static method Main(): int "
         "  var b := new Box<int>(1); "
@@ -199,7 +199,7 @@ BEZEL_TEST(generic_record_this_with_method, box_string_chained_with_calls) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Box<T>(value: T) "
-        "  public method WithValue(v: T): Box<T> => this with value := v end; "
+        "  public method WithValue(v: T): Box<T> => this with(value := v); "
         "end Box; "
         "class C public static method Main(): int "
         "  var b := new Box<string>(\"hi\"); "
@@ -218,7 +218,7 @@ BEZEL_TEST(generic_record_this_with_method, box_int_and_box_string_coexist) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; "
         "record Box<T>(value: T) "
-        "  public method WithValue(v: T): Box<T> => this with value := v end; "
+        "  public method WithValue(v: T): Box<T> => this with(value := v); "
         "end Box; "
         "class C public static method Main(): int "
         "  var bi := new Box<int>(1); "
@@ -252,12 +252,12 @@ BEZEL_TEST(generic_record_this_with_method, box_string_asan_clean_roundtrip_1855
     auto r = runAotChecked(
         "module M; "
         "record Box<T>(value: T) "
-        "  public method WithValue(v: T): Box<T> => this with value := v end; "
+        "  public method WithValue(v: T): Box<T> => this with(value := v); "
         "end Box; "
         "class C public static method Main(): int "
         "  var b := new Box<string>(\"hi\"); "
         "  var b2 := b.WithValue(\"planet\"); "
-        "  return (1 if b2.value = \"planet\" else 0); "
+        "  return (if b2.value = \"planet\" then 1 else 0); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);        // ASan-clean: no stack-buffer-overflow WRITE
     BEZEL_EXPECT_EQ(r.exitCode, 1);  // string field round-trips
@@ -271,7 +271,7 @@ BEZEL_TEST(generic_record_this_with_method, pair_int_string_asan_clean_1855) {
         "module M; "
         "record Pair<A, B>(first: A, second: B) "
         "  public method WithSecond(v: B): Pair<A, B> "
-        "    => this with second := v end; "
+        "    => this with(second := v); "
         "end Pair; "
         "class C public static method Main(): int "
         "  var p := new Pair<int, string>(3, \"hi\"); "

@@ -6,7 +6,7 @@
 // §19.3 (#1399): char constant pattern against a Range scrutinee is also
 // rejected — char is a scalar and Range is a struct.
 
-module M; class C public static method Main(): int var r := 1..10; return case r of 'a' => 0, _ => 1 end; end Main; end C;
+module M; class C public static method Main(): int var r := 1..10; return (case r of 'a' => 0, _ => 1); end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: constant pattern is not compatible with a Range-typed scrutinee — a Range value is a struct, not a scalar; use `_` or `var x` to match
 // CHECK-SAME: (§19.3)

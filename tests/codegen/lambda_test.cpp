@@ -388,7 +388,7 @@ BEZEL_TEST(codegen_cg60, array_element_string_return) {
         "module M; class C "
         "  public static method Main(): int "
         "    var fns: [2](int) -> string; "
-        "    fns[0] := lambda(n: int) => (\"abc\" if n > 0 else \"xy\"); "
+        "    fns[0] := lambda(n: int) => (if n > 0 then \"abc\" else \"xy\"); "
         "    fns[1] := lambda(n: int) => \"hello\"; "
         "    var r0 := fns[0](5); "   // = "abc", length 3
         "    var r1 := fns[1](0); "   // = "hello", length 5

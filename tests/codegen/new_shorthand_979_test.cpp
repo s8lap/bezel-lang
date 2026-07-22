@@ -89,7 +89,7 @@ BEZEL_TEST(new_shorthand_979, class_named_arg_constructs) {
         std::string("module M; ") + kConfig +
         "class C public static method Main(): int "
         "  using var cfg: Config := new(verbose := true); "
-        "  return (1 if cfg.V else 0); "
+        "  return (if cfg.V then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -99,7 +99,7 @@ BEZEL_TEST(new_shorthand_979, class_positional_arg_constructs) {
         std::string("module M; ") + kConfig +
         "class C public static method Main(): int "
         "  using var cfg: Config := new(true); "
-        "  return (1 if cfg.V else 0); "
+        "  return (if cfg.V then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -149,7 +149,7 @@ BEZEL_TEST(new_shorthand_979, field_init_class_constructs) {
         "end Holder; "
         "class C public static method Main(): int "
         "  using var h: Holder := new Holder(); "
-        "  return (1 if h.cfg.V else 0); "
+        "  return (if h.cfg.V then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

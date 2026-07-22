@@ -103,7 +103,7 @@ BEZEL_TEST(codegen_float_pascal_1241, Float_NaN_constant_is_nan_1241) {
     // stdlib §9.2: Float.NaN constant — when tested with float.IsNaN → true.
     BEZEL_EXPECT_EQ(run(
         "var n := Float.NaN; "
-        "return (1 if float.IsNaN(n) else 0);"), 1);
+        "return (if float.IsNaN(n) then 1 else 0);"), 1);
 }
 
 // ── §9.2 Float constant: MaxValue ────────────────────────────────────────────
@@ -111,7 +111,7 @@ BEZEL_TEST(codegen_float_pascal_1241, Float_NaN_constant_is_nan_1241) {
 BEZEL_TEST(codegen_float_pascal_1241, Float_MaxValue_greater_than_million_1241) {
     // stdlib §9.2: Float.MaxValue is the largest finite float (~3.4e38).
     BEZEL_EXPECT_EQ(run(
-        "return (1 if Float.MaxValue > float(1000000.0) else 0);"), 1);
+        "return (if Float.MaxValue > float(1000000.0) then 1 else 0);"), 1);
 }
 
 // ── §9.2 Float constant: Epsilon ─────────────────────────────────────────────
@@ -119,7 +119,7 @@ BEZEL_TEST(codegen_float_pascal_1241, Float_MaxValue_greater_than_million_1241) 
 BEZEL_TEST(codegen_float_pascal_1241, Float_Epsilon_positive_1241) {
     // stdlib §9.2: Float.Epsilon is the smallest positive float — must be > 0.
     BEZEL_EXPECT_EQ(run(
-        "return (1 if Float.Epsilon > float(0.0) else 0);"), 1);
+        "return (if Float.Epsilon > float(0.0) then 1 else 0);"), 1);
 }
 
 // ── §9.2 Float.IeeeEquals ────────────────────────────────────────────────────
@@ -163,7 +163,7 @@ BEZEL_TEST(codegen_float_pascal_1241, Float_as_type_annotation_1241) {
     // Primitive/Float, so Float.IsFinite(x) works correctly.
     BEZEL_EXPECT_EQ(run(
         "var x: Float := float(3.14); "
-        "return (1 if Float.IsFinite(x) else 0);"), 1);
+        "return (if Float.IsFinite(x) then 1 else 0);"), 1);
 }
 
 // ── Regression: lowercase float.IsNaN / double.IsNaN still work ──────────────
@@ -187,5 +187,5 @@ BEZEL_TEST(codegen_float_pascal_1241, Double_IsNaN_regression_1241) {
 BEZEL_TEST(codegen_float_pascal_1241, Int32_MaxValue_regression_1241) {
     // Regression: Int32.MaxValue still resolves — other PascalCase aliases unaffected.
     BEZEL_EXPECT_EQ(run(
-        "return (1 if Int32.MaxValue > 2000000000 else 0);"), 1);
+        "return (if Int32.MaxValue > 2000000000 then 1 else 0);"), 1);
 }

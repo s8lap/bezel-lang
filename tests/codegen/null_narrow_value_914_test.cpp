@@ -75,7 +75,7 @@ BEZEL_TEST(null_narrow_value_914, store_pre_declared) {
 BEZEL_TEST(null_narrow_value_914, bool_nullable_narrowed) {
     BEZEL_EXPECT_EQ(run(
         "var b: bool? := true; "
-        "if b is not null then var v: bool := b; return (1 if v else 0); end; "
+        "if b is not null then var v: bool := b; return (if v then 1 else 0); end; "
         "return 9;"), 1);
 }
 
@@ -158,7 +158,7 @@ BEZEL_TEST(null_narrow_value_914, arithmetic_narrowed_to_nullable_target) {
     BEZEL_EXPECT_EQ(run(
         "var n: int? := 100; "
         "if n is not null then var y: int? := n + 1; "
-        "  return (y! if y is not null else 0); end; return 0;"), 101);
+        "  return (if y is not null then y! else 0); end; return 0;"), 101);
 }
 
 // §10 / §7.4 (#914): a narrowed `enum?` is a value-type nullable laid out as the

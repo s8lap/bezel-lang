@@ -163,7 +163,7 @@ BEZEL_TEST(codegen_687_json_options, serializer_with_options_ctor_compiles_spec_
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var p2 := P.Deserialize(d); "
-        "  return (42 if p2.X = 3 and p2.Y = 7 else 0); "
+        "  return (if p2.X = 3 and p2.Y = 7 then 42 else 0); "
         "end Main; end C;"), 42);
 }
 
@@ -180,7 +180,7 @@ BEZEL_TEST(codegen_687_json_options, deserializer_with_options_ctor_compiles_spe
         "  var opts := new JsonOptions(false, 2, false, false, 64); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan(), opts); "
         "  var p2 := P.Deserialize(d); "
-        "  return (42 if p2.X = 10 else 0); "
+        "  return (if p2.X = 10 then 42 else 0); "
         "end Main; end C;"), 42);
 }
 
@@ -199,7 +199,7 @@ BEZEL_TEST(codegen_687_json_options, ignore_unknown_fields_true_skips_field_spec
         "  var opts := new JsonOptions(false, 2, false, true, 64); "
         "  using var d := new JsonDeserializer(\"{\\\"X\\\":5,\\\"Z\\\":99}\", opts); "
         "  var r := R.Deserialize(d); "
-        "  return (42 if r.X = 5 else 0); "
+        "  return (if r.X = 5 then 42 else 0); "
         "end Main; end C;"), 42);
 }
 
@@ -238,7 +238,7 @@ BEZEL_TEST(codegen_687_json_options, indented_true_output_contains_newlines_spec
         "  var r := new R(1); "
         "  r.Serialize(s); "
         "  var json := s.ToString(); "
-        "  return (42 if json.Contains(\"\\n\") else 0); "
+        "  return (if json.Contains(\"\\n\") then 42 else 0); "
         "end Main; end C;"), 42);
 }
 
@@ -253,7 +253,7 @@ BEZEL_TEST(codegen_687_json_options, indented_false_compact_output_spec_2_15) {
         "  var r := new R(1); "
         "  r.Serialize(s); "
         "  var json := s.ToString(); "
-        "  return (42 if not json.Contains(\"\\n\") else 0); "
+        "  return (if not json.Contains(\"\\n\") then 42 else 0); "
         "end Main; end C;"), 42);
 }
 
@@ -271,7 +271,7 @@ BEZEL_TEST(codegen_687_json_options, indented_true_roundtrip_spec_2_15) {
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var p2 := P.Deserialize(d); "
-        "  return (42 if p2.X = 11 and p2.Y = 22 else 0); "
+        "  return (if p2.X = 11 and p2.Y = 22 then 42 else 0); "
         "end Main; end C;"), 42);
 }
 
@@ -313,7 +313,7 @@ BEZEL_TEST(codegen_687_json_options, max_depth_default_allows_typical_nesting_sp
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan()); "
         "  var o2 := Outer.Deserialize(d); "
-        "  return (42 if o2.N.V = 7 else 0); "
+        "  return (if o2.N.V = 7 then 42 else 0); "
         "end Main; end C;"), 42);
 }
 
@@ -331,7 +331,7 @@ BEZEL_TEST(codegen_687_json_options, allow_trailing_commas_true_tolerates_spec_2
         "  var opts := new JsonOptions(false, 2, true, false, 64); "
         "  using var d := new JsonDeserializer(\"{\\\"X\\\":5,}\", opts); "
         "  var r := R.Deserialize(d); "
-        "  return (42 if r.X = 5 else 0); "
+        "  return (if r.X = 5 then 42 else 0); "
         "end Main; end C;"), 42);
 }
 
@@ -368,7 +368,7 @@ BEZEL_TEST(codegen_687_json_options, asan_options_roundtrip_no_leaks_spec_2_15) 
         "  using var bytes := s.ToBytes(); "
         "  using var d := new JsonDeserializer(bytes.AsReadOnlySpan(), opts); "
         "  var p2 := P.Deserialize(d); "
-        "  return (42 if p2.X = 3 and p2.Y = 7 else 0); "
+        "  return (if p2.X = 3 and p2.Y = 7 then 42 else 0); "
         "end Main; end C;",
         /*detectLeaks=*/true);
     BEZEL_EXPECT_TRUE(rc == 0 || rc == 42 || rc == -1);
@@ -383,7 +383,7 @@ BEZEL_TEST(codegen_687_json_options, asan_ignore_unknown_no_leaks_spec_2_15) {
         "  var opts := new JsonOptions(false, 2, false, true, 64); "
         "  using var d := new JsonDeserializer(\"{\\\"X\\\":5,\\\"Z\\\":99}\", opts); "
         "  var r := R.Deserialize(d); "
-        "  return (42 if r.X = 5 else 0); "
+        "  return (if r.X = 5 then 42 else 0); "
         "end Main; end C;",
         /*detectLeaks=*/true);
     BEZEL_EXPECT_TRUE(rc == 0 || rc == 42 || rc == -1);

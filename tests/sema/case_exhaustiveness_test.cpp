@@ -98,10 +98,10 @@ BEZEL_TEST(sema_case_exhaust, enum_missing_constant_warns_spec_19_6) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public method M(c: Color): int "
-        "    var n := case c of "
+        "    var n := (case c of "
         "      Red => 1, "
         "      Green => 2 "  // Blue uncovered, no `_`
-        "    end; "
+        "); "
         "    return n; "
         "  end M; "
         "end C;");
@@ -116,11 +116,10 @@ BEZEL_TEST(sema_case_exhaust, enum_all_constants_ok_spec_19_6) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public method M(c: Color): int "
-        "    var n := case c of "
+        "    var n := (case c of "
         "      Red => 1, "
         "      Green => 2, "
-        "      Blue => 3 "
-        "    end; "
+        "      Blue => 3); "
         "    return n; "
         "  end M; "
         "end C;");
@@ -136,10 +135,9 @@ BEZEL_TEST(sema_case_exhaust, enum_missing_with_discard_ok_spec_19_6) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public method M(c: Color): int "
-        "    var n := case c of "
+        "    var n := (case c of "
         "      Red => 1, "
-        "      _ => 0 "
-        "    end; "
+        "      _ => 0); "
         "    return n; "
         "  end M; "
         "end C;");
@@ -155,10 +153,9 @@ BEZEL_TEST(sema_case_exhaust, enum_comma_alternatives_ok_spec_10_6) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public method M(c: Color): int "
-        "    var n := case c of "
+        "    var n := (case c of "
         "      Red | Green => 1, "
-        "      Blue => 2 "
-        "    end; "
+        "      Blue => 2); "
         "    return n; "
         "  end M; "
         "end C;");
@@ -174,10 +171,9 @@ BEZEL_TEST(sema_case_exhaust, enum_untyped_var_is_catchall_spec_19_3) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public method M(c: Color): int "
-        "    var n := case c of "
+        "    var n := (case c of "
         "      Red => 1, "
-        "      var other => 0 "
-        "    end; "
+        "      var other => 0); "
         "    return n; "
         "  end M; "
         "end C;");
@@ -193,11 +189,11 @@ BEZEL_TEST(sema_case_exhaust, enum_guarded_arm_does_not_cover_spec_19_4) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public method M(c: Color, b: bool): int "
-        "    var n := case c of "
+        "    var n := (case c of "
         "      Red => 1, "
         "      Green => 2, "
         "      Blue when b => 3 "  // guarded — coverage of Blue not assured
-        "    end; "
+        "); "
         "    return n; "
         "  end M; "
         "end C;");
@@ -216,11 +212,11 @@ BEZEL_TEST(sema_case_exhaust, nullable_enum_no_null_arm_warns_spec_19_6) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public method M(c: Color?): int "
-        "    var n := case c of "
+        "    var n := (case c of "
         "      Red => 1, "
         "      Green => 2, "
         "      Blue => 3 "  // every constant covered, but no `null` arm
-        "    end; "
+        "); "
         "    return n; "
         "  end M; "
         "end C;");
@@ -235,12 +231,11 @@ BEZEL_TEST(sema_case_exhaust, nullable_enum_with_null_arm_ok_spec_19_6) {
         "enum Color Red, Green, Blue; end Color; "
         "class C "
         "  public method M(c: Color?): int "
-        "    var n := case c of "
+        "    var n := (case c of "
         "      Red => 1, "
         "      Green => 2, "
         "      Blue => 3, "
-        "      null => 0 "
-        "    end; "
+        "      null => 0); "
         "    return n; "
         "  end M; "
         "end C;");
@@ -255,10 +250,9 @@ BEZEL_TEST(sema_case_exhaust, bool_both_covered_ok_spec_19_6) {
         "module M; "
         "class C "
         "  public method M(b: bool): int "
-        "    var n := case b of "
+        "    var n := (case b of "
         "      true => 1, "
-        "      false => 0 "
-        "    end; "
+        "      false => 0); "
         "    return n; "
         "  end M; "
         "end C;");
@@ -271,9 +265,9 @@ BEZEL_TEST(sema_case_exhaust, bool_one_missing_warns_spec_19_6) {
         "module M; "
         "class C "
         "  public method M(b: bool): int "
-        "    var n := case b of "
+        "    var n := (case b of "
         "      true => 1 "  // false uncovered, no `_`
-        "    end; "
+        "); "
         "    return n; "
         "  end M; "
         "end C;");
@@ -291,11 +285,10 @@ BEZEL_TEST(sema_case_exhaust, nullable_bool_null_true_false_ok_spec_19_6) {
         "module M; "
         "class C "
         "  public method M(b: bool?): int "
-        "    var n := case b of "
+        "    var n := (case b of "
         "      null => 2, "
         "      true => 1, "
-        "      false => 0 "
-        "    end; "
+        "      false => 0); "
         "    return n; "
         "  end M; "
         "end C;");
@@ -310,10 +303,9 @@ BEZEL_TEST(sema_case_exhaust, nullable_bool_no_null_arm_warns_spec_19_6) {
         "module M; "
         "class C "
         "  public method M(b: bool?): int "
-        "    var n := case b of "
+        "    var n := (case b of "
         "      true => 1, "
-        "      false => 0 "
-        "    end; "
+        "      false => 0); "
         "    return n; "
         "  end M; "
         "end C;");
@@ -328,10 +320,9 @@ BEZEL_TEST(sema_case_exhaust, nullable_bool_missing_false_warns_spec_19_6) {
         "module M; "
         "class C "
         "  public method M(b: bool?): int "
-        "    var n := case b of "
+        "    var n := (case b of "
         "      null => 2, "
-        "      true => 1 "
-        "    end; "
+        "      true => 1); "
         "    return n; "
         "  end M; "
         "end C;");
@@ -362,11 +353,10 @@ BEZEL_TEST(sema_case_exhaust, sealed_hierarchy_all_leaves_ok_spec_19_6) {
         "end Triangle; "
         "class Calc "
         "  public method M(shape: Shape): int "
-        "    var a := case shape of "
+        "    var a := (case shape of "
         "      var c: Circle => c.Area(), "
         "      var s: Square => s.Area(), "
-        "      var t: Triangle => t.Area() "
-        "    end; "
+        "      var t: Triangle => t.Area()); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -392,10 +382,10 @@ BEZEL_TEST(sema_case_exhaust, sealed_hierarchy_missing_leaf_warns_spec_19_6) {
         "end Triangle; "
         "class Calc "
         "  public method M(shape: Shape): int "
-        "    var a := case shape of "
+        "    var a := (case shape of "
         "      var c: Circle => c.Area(), "
         "      var s: Square => s.Area() "  // Triangle uncovered, no `_`
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -413,10 +403,9 @@ BEZEL_TEST(sema_case_exhaust, sealed_hierarchy_bare_type_patterns_ok_spec_19_3) 
         "sealed class Square : Shape end Square; "
         "class Calc "
         "  public method M(shape: Shape): int "
-        "    var a := case shape of "
+        "    var a := (case shape of "
         "      Circle => 1, "
-        "      Square => 2 "
-        "    end; "
+        "      Square => 2); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -447,9 +436,9 @@ BEZEL_TEST(sema_case_exhaust, generic_ground_mismatch_leaf_exempt_spec_19_6) {
         "sealed class StrBox : Box<string> end StrBox; "
         "class Calc "
         "  public method M(b: Box<string>): int "
-        "    var a := case b of "
+        "    var a := (case b of "
         "      var s: StrBox => 0 "  // IntBox is uninhabited at Box<string>
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -471,10 +460,10 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Triangle : Shape end Triangle; "
         "class Calc "
         "  public method M(s: Shape): int "
-        "    var a := case s of "
+        "    var a := (case s of "
         "      var c: Circle => 1, "
         "      var q: Square => 2 "  // Triangle genuinely missing, no `_`
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -510,10 +499,10 @@ BEZEL_TEST(sema_case_exhaust, determined_idiom_stays_exhaustive_spec_19_6) {
         "sealed class Err<T> : Result<T> end Err; "
         "class Calc "
         "  public method M(r: Result<int>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var o: Ok<int> => 1, "   // T := int — the sole solution
         "      var e: Err<int> => 2 "   // T := int — the sole solution
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -540,9 +529,9 @@ BEZEL_TEST(sema_case_exhaust, repeated_param_inconsistent_leaf_exempt_spec_19_6)
         "sealed class P : D<int, string> end P; "  // ground — the required arm
         "class Calc "
         "  public method M(d: D<int, string>): int "
-        "    var a := case d of "
+        "    var a := (case d of "
         "      var p: P => 1 "  // L is uninhabited at D<int, string>
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -564,9 +553,9 @@ BEZEL_TEST(sema_case_exhaust, determined_missing_leaf_still_warns_spec_19_6) {
         "sealed class Err<T> : Result<T> end Err; "
         "class Calc "
         "  public method M(r: Result<int>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var o: Ok<int> => 1 "  // Err<int> determined but omitted
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -597,10 +586,10 @@ BEZEL_TEST(sema_case_exhaust, no_occurrence_param_undetermined_spec_19_6) {
         "sealed class Tagged<U> : Message end Tagged; "  // U free — Message non-generic
         "class Calc "
         "  public method M(m: Message): int "
-        "    var a := case m of "
+        "    var a := (case m of "
         "      var t: Text => 1, "
         "      var g: Tagged<int> => 2 "  // one instantiation — not the leaf
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -619,11 +608,10 @@ BEZEL_TEST(sema_case_exhaust, no_occurrence_param_undetermined_spec_19_6) {
         "sealed class Tagged<U> : Message end Tagged; "
         "class Calc "
         "  public method M(m: Message): int "
-        "    var a := case m of "
+        "    var a := (case m of "
         "      var t: Text => 1, "
         "      var g: Tagged<int> => 2, "
-        "      _ => 0 "
-        "    end; "
+        "      _ => 0); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -665,10 +653,10 @@ BEZEL_TEST(sema_case_exhaust, rigid_result_leaf_never_exempt_spec_19_6) {
         "sealed class IntError : Result<int> end IntError; "  // int ≡ T undecidable
         "class Handle<T> "
         "  public method h(r: Result<T>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var o: Ok<T> => 1, "        // Ok determined and covered
         "      var x: IntError => 2 "      // one instantiation — does NOT cover
-        "    end; "
+        "); "
         "    return a; "
         "  end h; "
         "end Handle;");
@@ -686,11 +674,10 @@ BEZEL_TEST(sema_case_exhaust, rigid_result_leaf_never_exempt_spec_19_6) {
         "sealed class IntError : Result<int> end IntError; "
         "class Handle<T> "
         "  public method h(r: Result<T>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var o: Ok<T> => 1, "
         "      var x: IntError => 2, "
-        "      _ => 0 "
-        "    end; "
+        "      _ => 0); "
         "    return a; "
         "  end h; "
         "end Handle;");
@@ -716,10 +703,10 @@ BEZEL_TEST(sema_case_exhaust, rigid_determined_leaf_stays_exhaustive_spec_19_6) 
         "sealed class Err<Y> : Result<Y> end Err; "
         "class Handle<T> "
         "  public method h(r: Result<T>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var o: Ok<T> => 1, "        // T := T — the sole solution
         "      var e: Err<T> => 2 "        // T := T — the sole solution
-        "    end; "
+        "); "
         "    return a; "
         "  end h; "
         "end Handle;");
@@ -756,10 +743,10 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Err<T> : Result<T> end Err; "
         "class Calc "
         "  public method M(r: Result<int>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var a2: Ok<string> => 1, "  // WRONG inst — does NOT cover Ok<int>
         "      var e: Err<int> => 2 "      // T := int — covers Err<int>
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -787,10 +774,10 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Err<Y> : Result<Y> end Err; "
         "class Handle<T> "
         "  public method h(r: Result<T>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var o: Ok<int> => 1, "   // WRONG inst — does NOT cover Ok<T>
         "      var e: Err<T> => 2 "     // Y := T — covers Err<T>
-        "    end; "
+        "); "
         "    return a; "
         "  end h; "
         "end Handle;");
@@ -814,10 +801,10 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Err<T> : Result<T> end Err; "
         "class Calc "
         "  public method M(r: Result<int>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var o: Ok<int> => 1, "   // T := int — covers Ok<int>
         "      var e: Err<int> => 2 "   // T := int — covers Err<int>
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -855,9 +842,9 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Err<T> : Result<T> end Err; "
         "class Calc "
         "  public method M(r: Result<int>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var x: Result<string> => 0 "  // WRONG-inst ANCESTOR — covers nothing
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -885,9 +872,9 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Err<T> : Result<T> end Err; "
         "class Calc "
         "  public method M(r: Result<int>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var x: Result<int> => 0 "  // CORRECT-inst ANCESTOR — covers all
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -912,9 +899,9 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Err<T> : Wrap<T> end Err; "
         "class Calc "
         "  public method M(r: Result<int>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var w: Wrap<string> => 0 "  // WRONG-inst INTERMEDIATE — covers nothing
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -943,9 +930,9 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Err<Y> : Result<Y> end Err; "
         "class Handle<T> "
         "  public method h(r: Result<T>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var x: Result<int> => 0 "  // one instantiation — not the rigid family
-        "    end; "
+        "); "
         "    return a; "
         "  end h; "
         "end Handle;");
@@ -966,9 +953,9 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Err<Y> : Result<Y> end Err; "
         "class Handle<T> "
         "  public method h(r: Result<T>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var x: Result<T> => 0 "  // SAME rigid family — covers all
-        "    end; "
+        "); "
         "    return a; "
         "  end h; "
         "end Handle;");
@@ -988,9 +975,9 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Square : Shape end Square; "
         "class Calc "
         "  public method M(s: Shape): int "
-        "    var a := case s of "
+        "    var a := (case s of "
         "      var x: Shape => 0 "  // base binding — covers all non-null values
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1034,9 +1021,9 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Err<T> : Wrap<T> end Err; "
         "class Calc "
         "  public method M(w: Wrap<int>): int "
-        "    var a := case w of "
+        "    var a := (case w of "
         "      var x: Result<string> => 0 "  // WRONG-inst cross-decl ANCESTOR
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1063,9 +1050,9 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Err<T> : Wrap<T> end Err; "
         "class Calc "
         "  public method M(w: Wrap<int>): int "
-        "    var a := case w of "
+        "    var a := (case w of "
         "      var x: Result<int> => 0 "  // CORRECT-inst cross-decl ANCESTOR
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1092,9 +1079,9 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Err<Y> : Wrap<Y> end Err; "
         "class Handle<T> "
         "  public method h(w: Wrap<T>): int "
-        "    var a := case w of "
+        "    var a := (case w of "
         "      var x: Result<string> => 0 "  // one instantiation — not the family
-        "    end; "
+        "); "
         "    return a; "
         "  end h; "
         "end Handle;");
@@ -1117,9 +1104,9 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Err<Y> : Wrap<Y> end Err; "
         "class Handle<T> "
         "  public method h(w: Wrap<T>): int "
-        "    var a := case w of "
+        "    var a := (case w of "
         "      var x: Result<T> => 0 "  // SAME rigid family — covers all
-        "    end; "
+        "); "
         "    return a; "
         "  end h; "
         "end Handle;");
@@ -1153,9 +1140,9 @@ BEZEL_TEST(sema_case_exhaust, leaf_where_value_filters_solutions_spec_19_6) {
         "sealed class R : B<string> end R; "               // ground — the arm
         "class Calc "
         "  public method M(b: B<string>): int "
-        "    var a := case b of "
+        "    var a := (case b of "
         "      var r: R => 1 "  // L exempt: string is not a value type
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1179,9 +1166,9 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class R : B<string> end R; "
         "class Calc "
         "  public method M(b: B<string>): int "
-        "    var a := case b of "
+        "    var a := (case b of "
         "      var r: R => 1 "  // L still required: string satisfies `class`
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1225,9 +1212,9 @@ BEZEL_TEST(sema_case_exhaust, type_bound_filters_solved_param_spec_19_6) {
         "sealed class R : B<Square> end R; "                // ground leaf — arm
         "class Calc "
         "  public method M(b: B<Square>): int "
-        "    var a := case b of "
+        "    var a := (case b of "
         "      var r: R => 1 "  // L<Square> NOT covered → required
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1244,9 +1231,9 @@ BEZEL_TEST(sema_case_exhaust, type_bound_filters_solved_param_spec_19_6) {
         "sealed class Ri : B<int> end Ri; "                 // ground leaf at B<int>
         "class Calc "
         "  public method M(b: B<int>): int "
-        "    var a := case b of "
+        "    var a := (case b of "
         "      var r: Ri => 1 "  // L exempt: int is not a subtype of IShape
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1278,9 +1265,9 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class L<Z>(z: Z) : Message where Z: SealedC end L; "  // Z free
         "class Calc "
         "  public method M(m: Message): int "
-        "    var a := case m of "
+        "    var a := (case m of "
         "      var t: Text => 1 "  // L undetermined: Z never reaches the root
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1324,10 +1311,10 @@ BEZEL_TEST(sema_case_exhaust, qmark_split_unconstrained_undetermined_spec_19_6) 
         "sealed class R : B<int?> end R; "    // ground leaf — determined, covered
         "class Calc "
         "  public method M(b: B<int?>): int "
-        "    var a := case b of "
+        "    var a := (case b of "
         "      var r: R => 1, "
         "      var l: L<int> => 2 "  // one instantiation — does NOT cover the leaf
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1345,11 +1332,10 @@ BEZEL_TEST(sema_case_exhaust, qmark_split_unconstrained_undetermined_spec_19_6) 
         "sealed class R : B<int?> end R; "
         "class Calc "
         "  public method M(b: B<int?>): int "
-        "    var a := case b of "
+        "    var a := (case b of "
         "      var r: R => 1, "
         "      var l: L<int> => 2, "
-        "      _ => 0 "
-        "    end; "
+        "      _ => 0); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1382,10 +1368,10 @@ BEZEL_TEST(sema_case_exhaust, qmark_split_constraint_suppresses_nullable_spec_19
         "sealed class R : B<int?> end R; "
         "class Calc "
         "  public method M(b: B<int?>): int "
-        "    var a := case b of "
+        "    var a := (case b of "
         "      var r: R => 1, "
         "      var l: L<int> => 2 "  // covers the sole (determined) obligation
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1403,9 +1389,9 @@ BEZEL_TEST(sema_case_exhaust, qmark_split_constraint_suppresses_nullable_spec_19
         "sealed class R : B<int?> end R; "                    // the only obligation
         "class Calc "
         "  public method M(b: B<int?>): int "
-        "    var a := case b of "
+        "    var a := (case b of "
         "      var r: R => 1 "  // L exempt: neither pre-image satisfies IShape
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1454,10 +1440,10 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Tagged<U> : Result<int> end Tagged; "     // U free -> undetermined
         "class Calc "
         "  public method M(r: Result<int>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var o: Ok<int> => 1, "        // Ok determined and covered
         "      var g: Tagged<int> => 2 "     // one instantiation — does NOT cover Tagged
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1478,11 +1464,10 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Tagged<U> : Result<int> end Tagged; "
         "class Calc "
         "  public method M(r: Result<int>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var o: Ok<int> => 1, "
         "      var g: Tagged<int> => 2, "
-        "      _ => 0 "
-        "    end; "
+        "      _ => 0); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1513,11 +1498,11 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Nullable<Y> : Result<Y?> where Y: notnull end Nullable; "
         "class Calc "
         "  public method M(r: Result<int?>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var o: Ok<int?> => 1, "      // T:=int? — the sole solution
         "      var e: Err<int?> => 2, "     // T:=int? — the sole solution
         "      var n: Nullable<int> => 3 "  // Y:=int — the sole surviving pre-image
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1547,10 +1532,10 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Shapely<Y> : Result<Y> where Y: IShape end Shapely; "  // exempt
         "class Calc "
         "  public method M(r: Result<int>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var o: Ok<int> => 1, "
         "      var e: Err<int> => 2 "  // Shapely exempt — int is not IShape
-        "    end; "
+        "); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1607,10 +1592,9 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Err<T> : Result<T> end Err; "
         "class Calc "
         "  public method M(r: Result<int>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var o: Ok<int> => 1, "
-        "      var e: Err<int> => 2 "
-        "    end; "
+        "      var e: Err<int> => 2); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1628,10 +1612,9 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Pending<T> : Result<T> end Pending; "  // upstream addition
         "class Calc "
         "  public method M(r: Result<int>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var o: Ok<int> => 1, "
-        "      var e: Err<int> => 2 "
-        "    end; "
+        "      var e: Err<int> => 2); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1670,10 +1653,9 @@ BEZEL_TEST(sema_case_exhaust,
         "sealed class Ok<T> : Result<T> end Ok; "             // declared LAST this time
         "class Calc "
         "  public method M(r: Result<int>): int "
-        "    var a := case r of "
+        "    var a := (case r of "
         "      var o: Ok<int> => 1, "
-        "      var e: Err<int> => 2 "
-        "    end; "
+        "      var e: Err<int> => 2); "
         "    return a; "
         "  end M; "
         "end Calc;");
@@ -1699,10 +1681,10 @@ BEZEL_TEST(sema_case_exhaust, open_hierarchy_warns_spec_19_6) {
         "class Cat : Animal end Cat; "
         "class Calc "
         "  public method M(a: Animal): int "
-        "    var n := case a of "
+        "    var n := (case a of "
         "      Dog => 1, "
         "      Cat => 2 "  // open base: more subclasses could exist
-        "    end; "
+        "); "
         "    return n; "
         "  end M; "
         "end Calc;");
@@ -1719,11 +1701,10 @@ BEZEL_TEST(sema_case_exhaust, open_hierarchy_with_discard_ok_spec_19_6) {
         "class Cat : Animal end Cat; "
         "class Calc "
         "  public method M(a: Animal): int "
-        "    var n := case a of "
+        "    var n := (case a of "
         "      Dog => 1, "
         "      Cat => 2, "
-        "      _ => 0 "
-        "    end; "
+        "      _ => 0); "
         "    return n; "
         "  end M; "
         "end Calc;");
@@ -1740,10 +1721,10 @@ BEZEL_TEST(sema_case_exhaust, int_scrutinee_no_discard_warns_spec_19_6) {
         "module M; "
         "class C "
         "  public method M(score: int): int "
-        "    var n := case score of "
+        "    var n := (case score of "
         "      90..100 => 1, "
         "      80..89 => 2 "  // no `_`: rest of the int range uncovered
-        "    end; "
+        "); "
         "    return n; "
         "  end M; "
         "end C;");
@@ -1757,12 +1738,11 @@ BEZEL_TEST(sema_case_exhaust, int_scrutinee_with_discard_ok_spec_19_1) {
         "module M; "
         "class C "
         "  public method M(score: int): string "
-        "    var grade := case score of "
+        "    var grade := (case score of "
         "      90..100 => \"A\", "
         "      80..89 => \"B\", "
         "      70..<80 => \"C\", "
-        "      _ => \"F\" "
-        "    end; "
+        "      _ => \"F\"); "
         "    return grade; "
         "  end M; "
         "end C;");
@@ -1801,7 +1781,7 @@ BEZEL_TEST(sema_case_exhaust, nullable_typed_binding_plus_null_ok_spec_19_5) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int?): int "
-        "    return case x of null => 0, var n: int => n end; "
+        "    return (case x of null => 0, var n: int => n); "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
@@ -1813,7 +1793,7 @@ BEZEL_TEST(sema_case_exhaust, nonnullable_typed_binding_is_exhaustive_spec_19_5)
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int): int "
-        "    return case x of var n: int => n end; "
+        "    return (case x of var n: int => n); "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
@@ -1824,7 +1804,7 @@ BEZEL_TEST(sema_case_exhaust, nullable_typed_binding_no_null_arm_warns_spec_19_6
     auto r = parseSemaAll(
         "module M; class C "
         "  public static method M(x: int?): int "
-        "    return case x of var n: int => n end; "
+        "    return (case x of var n: int => n); "
         "  end M; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
@@ -1839,7 +1819,7 @@ BEZEL_TEST(sema_case_exhaust, narrower_typed_binding_still_warns_spec_19_5) {
         "class Dog: Animal end Dog; "
         "class Cat: Animal end Cat; "
         "class C public static method M(a: Animal): int "
-        "  return case a of var d: Dog => 1 end; "
+        "  return (case a of var d: Dog => 1); "
         "end M; end C;");
     BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
 }

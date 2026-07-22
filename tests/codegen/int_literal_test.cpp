@@ -69,7 +69,7 @@ BEZEL_TEST(codegen_cg1, int_max_value) {
     // int.MaxValue = 2^31 - 1; return 1 to fit in exit code.
     auto r = runAot(
         "module M; class C public static method Main(): int "
-        "  return (1 if int.MaxValue > 0 else 0); end Main; end C;");
+        "  return (if int.MaxValue > 0 then 1 else 0); end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
@@ -78,7 +78,7 @@ BEZEL_TEST(codegen_cg1, int_min_value) {
     // int.MinValue = -2^31; must be negative.
     auto r = runAot(
         "module M; class C public static method Main(): int "
-        "  return (1 if int.MinValue < 0 else 0); end Main; end C;");
+        "  return (if int.MinValue < 0 then 1 else 0); end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
@@ -97,7 +97,7 @@ BEZEL_TEST(codegen_cg1, long_min_value_literal_exact_bits) {
     auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var m := -9223372036854775808L; "
-        "  return (0 if BitConverter.Reinterpret<ulong>(m) = 9223372036854775808UL else 1); "
+        "  return (if BitConverter.Reinterpret<ulong>(m) = 9223372036854775808UL then 0 else 1); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -108,7 +108,7 @@ BEZEL_TEST(codegen_cg1, long_min_value_literal_exact_bits) {
 BEZEL_TEST(codegen_cg1, long_min_value_literal_is_smallest) {
     auto r = runAot(
         "module M; class C public static method Main(): int "
-        "  return (0 if -9223372036854775808L < -9223372036854775807L else 1); "
+        "  return (if -9223372036854775808L < -9223372036854775807L then 0 else 1); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -138,7 +138,7 @@ BEZEL_TEST(codegen_cg1, suffixed_long_over_max_rejected_1155) {
     auto r = runAot(
         "module M; class App public static method Main(): int "
         "  var a: long := 9223372036854775808L; "
-        "  return (1 if a < 0 else 0); end Main; end App;");
+        "  return (if a < 0 then 1 else 0); end Main; end App;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(anyErrorContains(r, "does not fit in `long`"));
@@ -150,7 +150,7 @@ BEZEL_TEST(codegen_cg1, suffixed_uint_over_max_rejected_1155) {
     auto r = runAot(
         "module M; class App public static method Main(): int "
         "  var a: uint := 5000000000U; "
-        "  return (1 if a < 100 else 0); end Main; end App;");
+        "  return (if a < 100 then 1 else 0); end Main; end App;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(anyErrorContains(r, "does not fit in `uint`"));
@@ -162,7 +162,7 @@ BEZEL_TEST(codegen_cg1, suffixed_long_at_max_accepted_1155) {
     auto r = runAot(
         "module M; class App public static method Main(): int "
         "  var a: long := 9223372036854775807L; "
-        "  return (1 if a > 0 else 0); end Main; end App;");
+        "  return (if a > 0 then 1 else 0); end Main; end App;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
@@ -172,7 +172,7 @@ BEZEL_TEST(codegen_cg1, suffixed_uint_in_range_accepted_1155) {
     auto r = runAot(
         "module M; class App public static method Main(): int "
         "  var a: uint := 4000000000U; "
-        "  return (1 if a > 0 else 0); end Main; end App;");
+        "  return (if a > 0 then 1 else 0); end Main; end App;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
@@ -184,7 +184,7 @@ BEZEL_TEST(codegen_cg1, long_min_value_negation_still_accepted_1155) {
     auto r = runAot(
         "module M; class App public static method Main(): int "
         "  var a: long := -9223372036854775808L; "
-        "  return (1 if a < 0 else 0); end Main; end App;");
+        "  return (if a < 0 then 1 else 0); end Main; end App;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);
 }

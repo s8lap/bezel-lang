@@ -29,7 +29,7 @@ BEZEL_TEST(nullable_lifted_widening_840, int_q_to_double_q) {
     BEZEL_EXPECT_EQ(run(mainOf(
         "var n: int? := 5; var d: double? := n; "
         "if d = null then return 99; end; "
-        "return (1 if d! > 4.0 else 0);")), 1);
+        "return (if d! > 4.0 then 1 else 0);")), 1);
 }
 
 // int? → long?: integer widening (SExt) preserves the value.

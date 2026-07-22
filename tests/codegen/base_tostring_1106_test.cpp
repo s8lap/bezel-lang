@@ -81,7 +81,7 @@ BEZEL_TEST(base_tostring_1106, default_tostring_nonempty) {
         "module M; class Widget public _v: int := 0; end Widget; "
         "class C public static method Main(): int "
         "  using var w := new Widget(); var s := w.ToString(); "
-        "  return (1 if s.Length > 0 else 0); "            // "Widget" → 1
+        "  return (if s.Length > 0 then 1 else 0); "            // "Widget" → 1
         "end Main; end C;"), 1);
 }
 

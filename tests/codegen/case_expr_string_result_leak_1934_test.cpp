@@ -66,10 +66,9 @@ bool wasSkipped(const JitResult& r) {
 const char* kReturnProducerArm =
     "module M; class C "
     "  public static method Pick(n: int): string "
-    "    return case n of "
+    "    return (case n of "
     "      1 => \"a\" + \"b\", "   // fresh owned string minted in the arm
-    "      _ => \"other\" "
-    "    end; "
+    "      _ => \"other\"); "
     "  end Pick; "
     "  public static method Main(): int "
     "    Console.WriteLine(C.Pick(1)); "   // consumes one returned +1
@@ -86,10 +85,10 @@ const char* kReturnProducerArm =
 const char* kMixedBorrowAndProducerArms =
     "module M; class C "
     "  public static method Pick(n: int, p: string): string "
-    "    return case n of "
+    "    return (case n of "
     "      1 => \"a\" + \"b\", "   // producer arm (+1)
     "      _ => p "                // borrow arm (+0) — must be retained
-    "    end; "
+    "); "
     "  end Pick; "
     "  public static method Main(): int "
     "    var p := \"borrowed\"; "
@@ -106,10 +105,9 @@ const char* kMixedBorrowAndProducerArms =
 const char* kBindThenReturn =
     "module M; class C "
     "  public static method Pick(n: int): string "
-    "    var s := case n of "
+    "    var s := (case n of "
     "      1 => \"a\" + \"b\", "
-    "      _ => \"other\" "
-    "    end; "
+    "      _ => \"other\"); "
     "    return s; "
     "  end Pick; "
     "  public static method Main(): int "
@@ -123,10 +121,9 @@ const char* kBindThenReturn =
 const char* kWhenProducerArm =
     "module M; class C "
     "  public static method Pick(n: int): string "
-    "    return when "
+    "    return (when "
     "      n = 1 => \"a\" + \"b\", "
-    "      _ => \"other\" "
-    "    end; "
+    "      _ => \"other\"); "
     "  end Pick; "
     "  public static method Main(): int "
     "    Console.WriteLine(C.Pick(1)); "

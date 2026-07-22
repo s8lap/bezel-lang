@@ -9,7 +9,7 @@
 // and compiled `x > 44` — a wrong match (matched x in 45..255 instead of
 // never). Reject it with the same §5.1 narrowing diagnostic. #1156.
 
-module M; class C public static method M(x: byte): int return case x of > 300 => 1, _ => 0 end; end M; end C;
+module M; class C public static method M(x: byte): int return (case x of > 300 => 1, _ => 0); end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: the `case` pattern constant `300` has a type that is not implicitly convertible to the scrutinee type
 // CHECK-SAME: (§5.1)

@@ -22,10 +22,10 @@ class W
     var n := 1;
     using var owner := new Res(9);
     var borrowed := owner;
-    using var x := case n of
+    using var x := (case n of
       1 => new Res(1),
       _ => borrowed
-    end;
+    );
     return 0;
   end Main;
 end W;

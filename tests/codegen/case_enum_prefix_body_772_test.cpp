@@ -32,13 +32,12 @@ BEZEL_TEST(case_enum_prefix_body_772, case_expr_bare_enum_body) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; enum Color Red, Green, Blue; end Color; "
         "class C "
-        "  public static method Toggle(c: Color): Color => case c of "
+        "  public static method Toggle(c: Color): Color => (case c of "
         "    Red => Green, "
         "    Green => Blue, "
-        "    Blue => Red "
-        "  end; "
+        "    Blue => Red); "
         "  public static method Main(): int "
-        "    return 0 if Toggle(Color.Red) = Color.Green else 1; "
+        "    return (if Toggle(Color.Red) = Color.Green then 0 else 1); "
         "  end Main; "
         "end C;"), 0);
 }
@@ -55,7 +54,7 @@ BEZEL_TEST(case_enum_prefix_body_772, case_stmt_bare_enum_body) {
         "    Green => do picked := Blue; end, "
         "    Blue => do picked := Red; end "
         "  end; "
-        "  return 0 if picked = Color.Green else 1; "
+        "  return (if picked = Color.Green then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -66,11 +65,11 @@ BEZEL_TEST(case_enum_prefix_body_772, binding_arm_body_resolves_bare_enum) {
         "module M; enum Color Red, Green, Blue; end Color; "
         "class C public static method Main(): int "
         "  var c := Color.Blue; "
-        "  var r := case c of "
+        "  var r := (case c of "
         "    Red => Green, "
         "    var other => other "  // binds the value; body unaffected
-        "  end; "
-        "  return 0 if r = Color.Blue else 1; "
+        "); "
+        "  return (if r = Color.Blue then 0 else 1); "
         "end Main; end C;"), 0);
 }
 
@@ -81,7 +80,7 @@ BEZEL_TEST(case_enum_prefix_body_772, unknown_name_in_arm_body_still_rejected) {
         "module M; enum Color Red, Green, Blue; end Color; "
         "class C public static method Main(): int "
         "  var c := Color.Red; "
-        "  return case c of Red => Nonexistent, Green => 2, Blue => 3 end; "
+        "  return (case c of Red => Nonexistent, Green => 2, Blue => 3); "
         "end Main; end C;"));
 }
 

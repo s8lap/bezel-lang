@@ -207,18 +207,18 @@ BEZEL_TEST(sema_expr_lit, literal_widens_to_uint_method_arg_1051) {
     BEZEL_EXPECT_FALSE(semaHasErrors(
         "module M; class C public static method Id(x: uint): uint return x; end Id; "
         "public static method Main(): int var u: uint := Id(4000000000); "
-        "return (1 if (u > 1000) else 0); end Main; end C;"));
+        "return (if (u > 1000) then 1 else 0); end Main; end C;"));
 }
 BEZEL_TEST(sema_expr_lit, literal_widens_to_long_method_arg_1051) {
     BEZEL_EXPECT_FALSE(semaHasErrors(
         "module M; class C public static method Id(x: long): long return x; end Id; "
         "public static method Main(): int var l: long := Id(5000000000); "
-        "return (1 if (l > 1000) else 0); end Main; end C;"));
+        "return (if (l > 1000) then 1 else 0); end Main; end C;"));
 }
 BEZEL_TEST(sema_expr_lit, literal_widens_to_positional_record_uint_field_1051) {
     BEZEL_EXPECT_FALSE(semaHasErrors(
         "module M; record P(V: uint); class C public static method Main(): int "
-        "var p := new P(4000000000); return (1 if (p.V > 1000) else 0); end Main; end C;"));
+        "var p := new P(4000000000); return (if (p.V > 1000) then 1 else 0); end Main; end C;"));
 }
 BEZEL_TEST(sema_expr_lit, literal_too_large_for_int_param_still_rejected_1051) {
     BEZEL_EXPECT_TRUE(semaHasErrors(
@@ -234,12 +234,12 @@ BEZEL_TEST(sema_expr_lit, literal_too_large_for_int_param_still_rejected_1051) {
 BEZEL_TEST(sema_expr_lit, literal_widens_to_generic_record_uint_arg_1052) {
     BEZEL_EXPECT_FALSE(semaHasErrors(
         "module M; record Box<T>(V: T); class C public static method Main(): int "
-        "var b := new Box<uint>(4000000000); return (1 if (b.V > 1000) else 0); end Main; end C;"));
+        "var b := new Box<uint>(4000000000); return (if (b.V > 1000) then 1 else 0); end Main; end C;"));
 }
 BEZEL_TEST(sema_expr_lit, literal_widens_to_generic_record_long_arg_1052) {
     BEZEL_EXPECT_FALSE(semaHasErrors(
         "module M; record Box<T>(V: T); class C public static method Main(): int "
-        "var b := new Box<long>(5000000000); return (1 if (b.V > 1000) else 0); end Main; end C;"));
+        "var b := new Box<long>(5000000000); return (if (b.V > 1000) then 1 else 0); end Main; end C;"));
 }
 BEZEL_TEST(sema_expr_lit, literal_too_large_for_generic_int_arg_rejected_1052) {
     BEZEL_EXPECT_TRUE(semaHasErrors(

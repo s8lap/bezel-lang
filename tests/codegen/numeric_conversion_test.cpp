@@ -54,7 +54,7 @@ BEZEL_TEST(codegen_numeric_conv, int_plus_double_is_9_5_spec_6_2) {
 }
 
 BEZEL_TEST(codegen_numeric_conv, int_plus_double_compares_equal_9_5) {
-    BEZEL_EXPECT_EQ(run("var r := 7 + 2.5; return (1 if r = 9.5 else 0);"), 1);
+    BEZEL_EXPECT_EQ(run("var r := 7 + 2.5; return (if r = 9.5 then 1 else 0);"), 1);
 }
 
 // Symmetry: `double + int` (double on the left) must also be 9.5.
@@ -186,11 +186,11 @@ BEZEL_TEST(codegen_numeric_conv, int_init_double_field) {
 // ordered FP compare (§6.2). `7 > 6.5` is true; `7 < 6.5` is false.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(codegen_numeric_conv, mixed_int_double_comparison) {
-    BEZEL_EXPECT_EQ(run("var n := 7; return (1 if n > 6.5 else 0);"), 1);
+    BEZEL_EXPECT_EQ(run("var n := 7; return (if n > 6.5 then 1 else 0);"), 1);
 }
 
 BEZEL_TEST(codegen_numeric_conv, mixed_double_int_comparison_false) {
-    BEZEL_EXPECT_EQ(run("var n := 7; return (1 if 6.5 > n else 0);"), 0);
+    BEZEL_EXPECT_EQ(run("var n := 7; return (if 6.5 > n then 1 else 0);"), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -235,7 +235,7 @@ BEZEL_TEST(codegen_numeric_conv, uint_init_double_field_uitofp_spec_5_1) {
         "end P; "
         "class C public static method Main(): int "
         "  using var p := new P(); "
-        "  return (1 if p.d > 2000000000.0 else 0); "  // +3e9 > 2e9 → 1
+        "  return (if p.d > 2000000000.0 then 1 else 0); "  // +3e9 > 2e9 → 1
         "end Main; end C;"), 1);
 }
 
@@ -251,7 +251,7 @@ BEZEL_TEST(codegen_numeric_conv, uint_init_long_field_zext_spec_5_1) {
         "end P; "
         "class C public static method Main(): int "
         "  using var p := new P(); "
-        "  return (1 if p.n > 2000000000L else 0); "  // +3e9 > 2e9 → 1
+        "  return (if p.n > 2000000000L then 1 else 0); "  // +3e9 > 2e9 → 1
         "end Main; end C;"), 1);
 }
 
@@ -266,7 +266,7 @@ BEZEL_TEST(codegen_numeric_conv, negative_int_init_double_field_sitofp) {
         "end P; "
         "class C public static method Main(): int "
         "  using var p := new P(); "
-        "  return (1 if p.d < 0.0 else 0); "  // −7.0 < 0 → 1
+        "  return (if p.d < 0.0 then 1 else 0); "  // −7.0 < 0 → 1
         "end Main; end C;"), 1);
 }
 
@@ -301,21 +301,21 @@ BEZEL_TEST(codegen_numeric_conv, positive_int_init_double_field_value) {
 BEZEL_TEST(codegen_numeric_conv, uint_init_double_local_uitofp_421) {
     BEZEL_EXPECT_EQ(run(
         "var u: uint := 3000000000u; var d: double := u; "
-        "return (1 if d > 2000000000.0 else 0);"), 1);  // +3e9 > 2e9 → 1
+        "return (if d > 2000000000.0 then 1 else 0);"), 1);  // +3e9 > 2e9 → 1
 }
 
 // Local declaration site, widen uint → long (ZExt, not SExt).
 BEZEL_TEST(codegen_numeric_conv, uint_init_long_local_zext_421) {
     BEZEL_EXPECT_EQ(run(
         "var u: uint := 3000000000u; var n: long := u; "
-        "return (1 if n > 2000000000L else 0);"), 1);  // +3e9 > 2e9 → 1
+        "return (if n > 2000000000L then 1 else 0);"), 1);  // +3e9 > 2e9 → 1
 }
 
 // Plain assignment site (LlvmBackend_Stmts): `d := someUint`.
 BEZEL_TEST(codegen_numeric_conv, uint_assigned_to_double_local_uitofp_421) {
     BEZEL_EXPECT_EQ(run(
         "var u: uint := 3000000000u; var d := 0.0; d := u; "
-        "return (1 if d > 2000000000.0 else 0);"), 1);  // +3e9 > 2e9 → 1
+        "return (if d > 2000000000.0 then 1 else 0);"), 1);  // +3e9 > 2e9 → 1
 }
 
 // Method-argument binding site (LlvmBackend_Calls): a uint argument bound to a
@@ -326,7 +326,7 @@ BEZEL_TEST(codegen_numeric_conv, uint_arg_to_double_param_uitofp_421) {
         "public static method Use(x: double): double => x; "
         "public static method Main(): int "
         "  var u: uint := 3000000000u; var r := Use(u); "
-        "  return (1 if r > 2000000000.0 else 0); "  // +3e9 > 2e9 → 1
+        "  return (if r > 2000000000.0 then 1 else 0); "  // +3e9 > 2e9 → 1
         "end Main; end C;"), 1);
 }
 
@@ -335,7 +335,7 @@ BEZEL_TEST(codegen_numeric_conv, uint_arg_to_double_param_uitofp_421) {
 BEZEL_TEST(codegen_numeric_conv, negative_int_assigned_to_double_local_sitofp_421) {
     BEZEL_EXPECT_EQ(run(
         "var n: int := -7; var d := 0.0; d := n; "
-        "return (1 if d < 0.0 else 0);"), 1);  // −7.0 < 0 → 1
+        "return (if d < 0.0 then 1 else 0);"), 1);  // −7.0 < 0 → 1
 }
 
 // ---------------------------------------------------------------------------
@@ -395,7 +395,7 @@ BEZEL_TEST(codegen_numeric_conv, double_int_max_boundary_739) {
         "var over: double := 2147483648.0; "
         "var v := int(ok); "  // valid: int.MaxValue
         "try var w := int(over); return 1; "
-        "catch OverflowException => return (1 if v = 2147483647 else 2); end;"),
+        "catch OverflowException => return (if v = 2147483647 then 1 else 2); end;"),
         1);
 }
 
@@ -412,7 +412,7 @@ BEZEL_TEST(codegen_numeric_conv, double_to_byte_range_739) {
 BEZEL_TEST(codegen_numeric_conv, double_to_long_range_739) {
     BEZEL_EXPECT_EQ(run(
         "var a: double := 9.0e18; var b: long := long(a); "
-        "var inrange := (1 if b > 8999999000000000000L else 0); "
+        "var inrange := (if b > 8999999000000000000L then 1 else 0); "
         "try var c: long := long(1.0e19); return 1; "
         "catch OverflowException => return inrange; end;"),  // 1
         1);

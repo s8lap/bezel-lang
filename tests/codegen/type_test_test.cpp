@@ -36,27 +36,27 @@ int runHier(const std::string& mainBody) {
 
 BEZEL_TEST(codegen_cg19, is_exact_type) {
     BEZEL_EXPECT_EQ(runHier(
-        "var d := new Dog(); return (1 if d is Dog else 0);"), 1);
+        "var d := new Dog(); return (if d is Dog then 1 else 0);"), 1);
 }
 
 BEZEL_TEST(codegen_cg19, is_base_class) {
     BEZEL_EXPECT_EQ(runHier(
-        "var d := new Dog(); return (1 if d is Animal else 0);"), 1);
+        "var d := new Dog(); return (if d is Animal then 1 else 0);"), 1);
 }
 
 BEZEL_TEST(codegen_cg19, is_false_for_subclass_on_base_instance) {
     BEZEL_EXPECT_EQ(runHier(
-        "var a := new Animal(); return (1 if a is Dog else 0);"), 0);
+        "var a := new Animal(); return (if a is Dog then 1 else 0);"), 0);
 }
 
 BEZEL_TEST(codegen_cg19, is_interface) {
     BEZEL_EXPECT_EQ(runHier(
-        "var s := new Square(); return (1 if s is IShape else 0);"), 1);
+        "var s := new Square(); return (if s is IShape then 1 else 0);"), 1);
 }
 
 BEZEL_TEST(codegen_cg19, is_not_operator) {
     BEZEL_EXPECT_EQ(runHier(
-        "var a := new Animal(); return (1 if a is not Dog else 0);"), 1);
+        "var a := new Animal(); return (if a is not Dog then 1 else 0);"), 1);
 }
 
 BEZEL_TEST(codegen_cg19, is_via_base_typed_parameter) {
@@ -67,7 +67,7 @@ BEZEL_TEST(codegen_cg19, is_via_base_typed_parameter) {
         "class Dog : Animal end Dog; "
         "class C "
         "  public static method Check(a: Animal): int "
-        "    => (1 if a is Dog else 0); "
+        "    => (if a is Dog then 1 else 0); "
         "  public static method Main(): int "
         "    var d := new Dog(); return Check(d); "
         "  end Main; "
@@ -77,13 +77,13 @@ BEZEL_TEST(codegen_cg19, is_via_base_typed_parameter) {
 BEZEL_TEST(codegen_cg19, as_valid_yields_object) {
     // `d as Animal` yields d (a Dog); `(...) is Dog` then holds.
     BEZEL_EXPECT_EQ(runHier(
-        "var d := new Dog(); return (1 if (d as Animal) is Dog else 0);"), 1);
+        "var d := new Dog(); return (if (d as Animal) is Dog then 1 else 0);"), 1);
 }
 
 BEZEL_TEST(codegen_cg19, as_invalid_yields_null) {
     // `a as Dog` yields null (a is only an Animal); `null is Dog` is false.
     BEZEL_EXPECT_EQ(runHier(
-        "var a := new Animal(); return (1 if (a as Dog) is Dog else 0);"), 0);
+        "var a := new Animal(); return (if (a as Dog) is Dog then 1 else 0);"), 0);
 }
 
 // ── §12.7 / §7 / issues #447 + #448: `is` on nullable VALUE types ────────────
@@ -95,7 +95,7 @@ BEZEL_TEST(codegen_cg19, as_invalid_yields_null) {
 BEZEL_TEST(codegen_cg19_nullable_value_is, int_nullable_present_is_true_spec_12_7_issue_448) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var x: int? := 42; return (1 if x is int else 0); "
+        "  var x: int? := 42; return (if x is int then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -103,7 +103,7 @@ BEZEL_TEST(codegen_cg19_nullable_value_is, int_nullable_present_is_true_spec_12_
 BEZEL_TEST(codegen_cg19_nullable_value_is, int_nullable_null_is_false_spec_12_7_issue_448) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var x: int? := null; return (1 if x is int else 0); "
+        "  var x: int? := null; return (if x is int then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -111,7 +111,7 @@ BEZEL_TEST(codegen_cg19_nullable_value_is, int_nullable_null_is_false_spec_12_7_
 BEZEL_TEST(codegen_cg19_nullable_value_is, int_nullable_present_is_not_false_spec_12_7_issue_448) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var x: int? := 42; return (1 if x is not int else 0); "
+        "  var x: int? := 42; return (if x is not int then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -119,7 +119,7 @@ BEZEL_TEST(codegen_cg19_nullable_value_is, int_nullable_present_is_not_false_spe
 BEZEL_TEST(codegen_cg19_nullable_value_is, int_nullable_null_is_not_true_spec_12_7_issue_448) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var x: int? := null; return (1 if x is not int else 0); "
+        "  var x: int? := null; return (if x is not int then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -129,7 +129,7 @@ BEZEL_TEST(codegen_cg19_nullable_value_is, enum_nullable_present_is_true_spec_12
         "module M; "
         "enum Color Red := 0, Green := 1, Blue := 2; end Color; "
         "class C public static method Main(): int "
-        "  var c: Color? := Color.Green; return (1 if c is Color else 0); "
+        "  var c: Color? := Color.Green; return (if c is Color then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -139,7 +139,7 @@ BEZEL_TEST(codegen_cg19_nullable_value_is, enum_nullable_null_is_false_spec_12_7
         "module M; "
         "enum Color Red := 0, Green := 1, Blue := 2; end Color; "
         "class C public static method Main(): int "
-        "  var c: Color? := null; return (1 if c is Color else 0); "
+        "  var c: Color? := null; return (if c is Color then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -152,14 +152,14 @@ BEZEL_TEST(codegen_cg19_nullable_value_is, nullable_class_present_is_true_regres
         "class Animal end Animal; "
         "class Dog : Animal end Dog; "
         "class C public static method Main(): int "
-        "  var d: Dog? := new Dog(); return (1 if d is Dog else 0); "
+        "  var d: Dog? := new Dog(); return (if d is Dog then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
 // REGRESSION: non-nullable class `is` check still works (no struct path taken).
 BEZEL_TEST(codegen_cg19_nullable_value_is, nonnull_class_is_true_regression) {
     BEZEL_EXPECT_EQ(runHier(
-        "var d := new Dog(); return (1 if d is Dog else 0);"), 1);
+        "var d := new Dog(); return (if d is Dog then 1 else 0);"), 1);
 }
 
 // REGRESSION #1071 (§8.6 / §12.7): an Object/interface operand may hold a bare
@@ -170,14 +170,14 @@ BEZEL_TEST(codegen_cg19_nullable_value_is, nonnull_class_is_true_regression) {
 BEZEL_TEST(codegen_cg19_string_operand_1071, is_value_target_on_string_is_false) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var o: Object := \"hello\"; return (1 if o is int else 0); "
+        "  var o: Object := \"hello\"; return (if o is int then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
 BEZEL_TEST(codegen_cg19_string_operand_1071, is_not_value_target_on_string_is_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var o: Object := \"hello\"; return (1 if o is not int else 0); "
+        "  var o: Object := \"hello\"; return (if o is not int then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -185,7 +185,7 @@ BEZEL_TEST(codegen_cg19_string_operand_1071, is_class_target_on_string_is_false)
     BEZEL_EXPECT_EQ(run(
         "module M; class Foo public x: int := 0; end Foo; "
         "class C public static method Main(): int "
-        "  var o: Object := \"hello\"; return (1 if o is Foo else 0); "
+        "  var o: Object := \"hello\"; return (if o is Foo then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -202,14 +202,14 @@ BEZEL_TEST(codegen_cg19_string_operand_1071, as_value_target_on_string_is_null) 
 BEZEL_TEST(codegen_cg19_string_operand_1071, boxed_int_is_int_still_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var o: Object := 42; return (1 if o is int else 0); "
+        "  var o: Object := 42; return (if o is int then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
 BEZEL_TEST(codegen_cg19_string_operand_1071, object_holding_string_is_string_still_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var o: Object := \"hello\"; return (1 if o is string else 0); "
+        "  var o: Object := \"hello\"; return (if o is string then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -226,7 +226,7 @@ BEZEL_TEST(codegen_cg19_unbox_nullable_target_1154, object_as_int_nullable_match
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var o: Object := 7; var x := o as int?; "
-        "  return (x! if x <> null else -1); "
+        "  return (if x <> null then x! else -1); "
         "end Main; end C;"), 7);
 }
 
@@ -235,7 +235,7 @@ BEZEL_TEST(codegen_cg19_unbox_nullable_target_1154, object_as_int_nullable_nomat
     BEZEL_EXPECT_EQ(run(
         "module M; record Rec(v: int); class C public static method Main(): int "
         "  var o: Object := new Rec(5); var x := o as int?; "
-        "  return (1 if x = null else 0); "
+        "  return (if x = null then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -244,7 +244,7 @@ BEZEL_TEST(codegen_cg19_unbox_nullable_target_1154, object_as_record_nullable_ma
     BEZEL_EXPECT_EQ(run(
         "module M; record Rec(v: int); class C public static method Main(): int "
         "  var o: Object := new Rec(9); var r := o as Rec?; "
-        "  return (r!.v if r <> null else -1); "
+        "  return (if r <> null then r!.v else -1); "
         "end Main; end C;"), 9);
 }
 
@@ -253,7 +253,7 @@ BEZEL_TEST(codegen_cg19_unbox_nullable_target_1154, object_as_record_nullable_no
     BEZEL_EXPECT_EQ(run(
         "module M; record Rec(v: int); class C public static method Main(): int "
         "  var o: Object := 7; var r := o as Rec?; "
-        "  return (1 if r = null else 0); "
+        "  return (if r = null then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -264,6 +264,6 @@ BEZEL_TEST(codegen_cg19_unbox_nullable_target_1154, object_as_class_nullable_sti
         "module M; class Animal end Animal; class Dog : Animal end Dog; "
         "class C public static method Main(): int "
         "  var d := new Dog(); var o: Object := d; var dd := o as Dog?; "
-        "  return (1 if dd <> null else 0); "
+        "  return (if dd <> null then 1 else 0); "
         "end Main; end C;"), 1);
 }

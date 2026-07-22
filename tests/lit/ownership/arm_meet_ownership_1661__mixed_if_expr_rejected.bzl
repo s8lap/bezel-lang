@@ -25,7 +25,7 @@ class W
     var c := true;
     using var owner := new Res(9);
     var borrowed := owner;
-    using var x := new Res(1) if c else borrowed;
+    using var x := (if c then new Res(1) else borrowed);
     return 0;
   end Main;
 end W;

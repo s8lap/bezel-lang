@@ -12,7 +12,7 @@
 // exercised on the accepted §22.11 class object-initializer form, now
 // retired — the source-type rejection fires ADDITIONALLY here).
 
-module M; class Box public property V: int; public constructor() V := 0; end constructor; destructor end destructor; end Box; class C public static method Main(): int using var b := new Box() with V := 3, V := 4 end; return b.V; end Main; end C;
+module M; class Box public property V: int; public constructor() V := 0; end constructor; destructor end destructor; end Box; class C public static method Main(): int using var b := new Box() with(V := 3, V := 4); return b.V; end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: `with` requires a record-typed source; this source is class-typed
 // CHECK-SAME: (§9.5, v0.188)

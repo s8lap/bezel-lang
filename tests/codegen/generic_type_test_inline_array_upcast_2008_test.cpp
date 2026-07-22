@@ -70,7 +70,7 @@ BEZEL_TEST(codegen_2008, base_class_inline_array_is_true) {
     BEZEL_EXPECT_EQ(runProg(
         "using var d := new D<[3]int>(7); "
         "var o: Object := d; "
-        "return (1 if o is B<[3]int> else 0);"), 1);
+        "return (if o is B<[3]int> then 1 else 0);"), 1);
 }
 
 // Companion for a GENERIC INTERFACE: `K<[3]int> is IMarker<[3]int>` == TRUE.
@@ -79,7 +79,7 @@ BEZEL_TEST(codegen_2008, base_iface_inline_array_is_true) {
     BEZEL_EXPECT_EQ(runProg(
         "using var k := new K<[3]int>(7); "
         "var o: Object := k; "
-        "return (1 if o is IMarker<[3]int> else 0);"), 1);
+        "return (if o is IMarker<[3]int> then 1 else 0);"), 1);
 }
 
 // The SELF type-test was already correct (top-level gate, #2001) and stays TRUE.
@@ -87,7 +87,7 @@ BEZEL_TEST(codegen_2008, self_inline_array_is_true) {
     BEZEL_EXPECT_EQ(runProg(
         "using var d := new D<[3]int>(7); "
         "var o: Object := d; "
-        "return (1 if o is D<[3]int> else 0);"), 1);
+        "return (if o is D<[3]int> then 1 else 0);"), 1);
 }
 
 // ---- #2001 MEMORY-SAFETY PRESERVED: the wrong-size upcast stays FALSE (the key
@@ -97,7 +97,7 @@ BEZEL_TEST(codegen_2008, base_class_wrong_size_is_false) {
     BEZEL_EXPECT_EQ(runProg(
         "using var d := new D<[3]int>(7); "
         "var o: Object := d; "
-        "return (1 if o is B<[4]int> else 0);"), 0);
+        "return (if o is B<[4]int> then 1 else 0);"), 0);
 }
 
 // The self wrong-size test also stays FALSE (unchanged #2001 behavior).
@@ -105,7 +105,7 @@ BEZEL_TEST(codegen_2008, self_wrong_size_is_false) {
     BEZEL_EXPECT_EQ(runProg(
         "using var d := new D<[3]int>(7); "
         "var o: Object := d; "
-        "return (1 if o is D<[4]int> else 0);"), 0);
+        "return (if o is D<[4]int> then 1 else 0);"), 0);
 }
 
 // And the interface wrong-size upcast stays FALSE.
@@ -113,7 +113,7 @@ BEZEL_TEST(codegen_2008, base_iface_wrong_size_is_false) {
     BEZEL_EXPECT_EQ(runProg(
         "using var k := new K<[3]int>(7); "
         "var o: Object := k; "
-        "return (1 if o is IMarker<[4]int> else 0);"), 0);
+        "return (if o is IMarker<[4]int> then 1 else 0);"), 0);
 }
 
 // ---- CONTROL: concrete (non-inline-array) base args are UNCHANGED — these
@@ -122,7 +122,7 @@ BEZEL_TEST(codegen_2008, base_class_concrete_arg_is_true) {
     BEZEL_EXPECT_EQ(runProg(
         "using var d := new D<int>(7); "
         "var o: Object := d; "
-        "return (1 if o is B<int> else 0);"), 1);
+        "return (if o is B<int> then 1 else 0);"), 1);
 }
 
 // And a wrong concrete base arg stays FALSE (invariance, §12.9).
@@ -130,7 +130,7 @@ BEZEL_TEST(codegen_2008, base_class_concrete_wrong_arg_is_false) {
     BEZEL_EXPECT_EQ(runProg(
         "using var d := new D<int>(7); "
         "var o: Object := d; "
-        "return (1 if o is B<string> else 0);"), 0);
+        "return (if o is B<string> then 1 else 0);"), 0);
 }
 
 // Concrete interface arg control: `K<int> is IMarker<int>` == TRUE.
@@ -138,7 +138,7 @@ BEZEL_TEST(codegen_2008, base_iface_concrete_arg_is_true) {
     BEZEL_EXPECT_EQ(runProg(
         "using var k := new K<int>(7); "
         "var o: Object := k; "
-        "return (1 if o is IMarker<int> else 0);"), 1);
+        "return (if o is IMarker<int> then 1 else 0);"), 1);
 }
 
 // ---- DEEPER CHAIN (E<T> : D<T> : B<T>): an E<[3]int> value tests TRUE against
@@ -151,10 +151,10 @@ BEZEL_TEST(codegen_2008, deep_chain_all_ancestors_inline_array) {
     BEZEL_EXPECT_EQ(runProg(
         "using var e := new E<[3]int>(7); "
         "var o: Object := e; "
-        "var isE := 1 if o is E<[3]int> else 0; "   // self  -> bit0
-        "var isD := 1 if o is D<[3]int> else 0; "   // base  -> bit1
-        "var isB := 1 if o is B<[3]int> else 0; "   // grand -> bit2
-        "var bad := 1 if o is B<[4]int> else 0; "   // wrong -> bit3 (0)
+        "var isE := (if o is E<[3]int> then 1 else 0); "   // self  -> bit0
+        "var isD := (if o is D<[3]int> then 1 else 0); "   // base  -> bit1
+        "var isB := (if o is B<[3]int> then 1 else 0); "   // grand -> bit2
+        "var bad := (if o is B<[4]int> then 1 else 0); "   // wrong -> bit3 (0)
         "return isE + isD * 2 + isB * 4 + bad * 8;"), 7);
 }
 
@@ -164,8 +164,8 @@ BEZEL_TEST(codegen_2008, nested_inline_array_base_is_true_wrong_false) {
     BEZEL_EXPECT_EQ(runProg(
         "using var d := new D<Box<[3]int>>(7); "
         "var o: Object := d; "
-        "var good := 1 if o is B<Box<[3]int>> else 0; "  // 1
-        "var bad := 1 if o is B<Box<[4]int>> else 0; "   // 0
+        "var good := (if o is B<Box<[3]int>> then 1 else 0); "  // 1
+        "var bad := (if o is B<Box<[4]int>> then 1 else 0); "   // 0
         "return good * 10 + bad;"), 10);
 }
 
@@ -179,10 +179,10 @@ BEZEL_TEST(codegen_2008, specialization_split_base_descriptors_no_collision) {
         "using var d4 := new D<[4]int>(9); "
         "var tags := d3.GetTag() + d4.GetTag(); "        // 14
         "var o3: Object := d3; var o4: Object := d4; "
-        "var a := 1 if o3 is B<[3]int> else 0; "         // 1
-        "var b := 1 if o3 is B<[4]int> else 0; "         // 0
-        "var c := 1 if o4 is B<[4]int> else 0; "         // 1
-        "var e := 1 if o4 is B<[3]int> else 0; "         // 0
+        "var a := (if o3 is B<[3]int> then 1 else 0); "         // 1
+        "var b := (if o3 is B<[4]int> then 1 else 0); "         // 0
+        "var c := (if o4 is B<[4]int> then 1 else 0); "         // 1
+        "var e := (if o4 is B<[3]int> then 1 else 0); "         // 0
         // 14 + 10 + 0 + 40 + 0 = 64 (kept < 256 for the 8-bit exit code).
         "return tags + 10*a + 20*b + 40*c + 80*e;"), 64);
 }

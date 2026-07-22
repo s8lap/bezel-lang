@@ -45,7 +45,7 @@ BEZEL_TEST(codegen_cg27e, string_index_last_char) {
 BEZEL_TEST(codegen_cg27e, string_index_equals_char_literal) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var s := \"Hello\"; return (1 if s[0] = 'H' else 0); "
+        "  var s := \"Hello\"; return (if s[0] = 'H' then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

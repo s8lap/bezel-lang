@@ -52,7 +52,7 @@ BEZEL_TEST(value_builtin_box_type_test_1945, case_boxed_datetime_matches) {
         "  public static method Main(): int "
         "    var dt: DateTime := DateTime.UtcNow; "
         "    var o: Object := dt; "
-        "    return case o of DateTime => 1, _ => 0 end; "
+        "    return (case o of DateTime => 1, _ => 0); "
         "  end Main; end Program;"), 1);
 }
 
@@ -64,7 +64,7 @@ BEZEL_TEST(value_builtin_box_type_test_1945, case_boxed_datetime_not_guid) {
         "  public static method Main(): int "
         "    var dt: DateTime := DateTime.UtcNow; "
         "    var o: Object := dt; "
-        "    return case o of Guid => 1, _ => 0 end; "
+        "    return (case o of Guid => 1, _ => 0); "
         "  end Main; end Program;"), 0);
 }
 
@@ -78,7 +78,7 @@ BEZEL_TEST(value_builtin_box_type_test_1945, boxed_datetime_object_argument_matc
     BEZEL_EXPECT_EQ(run(
         "module M; class Program "
         "  public static method Kind(o: Object): int "
-        "    return case o of DateTime => 2, _ => 9 end; "
+        "    return (case o of DateTime => 2, _ => 9); "
         "  end Kind; "
         "  public static method Main(): int "
         "    var dt: DateTime := DateTime.UtcNow; "
@@ -132,8 +132,8 @@ BEZEL_TEST(value_builtin_box_type_test_1945, case_boxed_guid_matches_not_datetim
         "  public static method Main(): int "
         "    var g: Guid := Guid.NewGuid(); "
         "    var o: Object := g; "
-        "    var a: int := case o of Guid => 10, _ => 0 end; "
-        "    var b: int := case o of DateTime => 1, _ => 0 end; "
+        "    var a: int := (case o of Guid => 10, _ => 0); "
+        "    var b: int := (case o of DateTime => 1, _ => 0); "
         "    return a + b; "
         "  end Main; end Program;"), 10);
 }
@@ -145,7 +145,7 @@ BEZEL_TEST(value_builtin_box_type_test_1945, case_boxed_timespan_matches) {
         "  public static method Main(): int "
         "    var t: TimeSpan := TimeSpan.FromSeconds(5.0); "
         "    var o: Object := t; "
-        "    return case o of TimeSpan => 7, _ => 0 end; "
+        "    return (case o of TimeSpan => 7, _ => 0); "
         "  end Main; end Program;"), 7);
 }
 
@@ -161,7 +161,7 @@ BEZEL_TEST(value_builtin_box_type_test_1945, type_param_datetime_matches) {
         "module M; "
         "class Box<T> "
         "  public method Kind(o: Object): int "
-        "    return case o of T => 2, _ => 9 end; "
+        "    return (case o of T => 2, _ => 9); "
         "  end Kind; "
         "end Box; "
         "class Program public static method Main(): int "
@@ -180,7 +180,7 @@ BEZEL_TEST(value_builtin_box_type_test_1945, type_param_guid_rejects_datetime) {
         "module M; "
         "class Box<T> "
         "  public method Kind(o: Object): int "
-        "    return case o of T => 2, _ => 9 end; "
+        "    return (case o of T => 2, _ => 9); "
         "  end Kind; "
         "end Box; "
         "class Program public static method Main(): int "

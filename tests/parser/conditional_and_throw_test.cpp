@@ -74,28 +74,28 @@ BEZEL_TEST(parser_throw, throw_inside_if_branch) {
 // --- Conditional expression (§17.1 L15) ------------------------------------
 
 BEZEL_TEST(parser_conditional, simple) {
-    BEZEL_EXPECT_EQ(parseInitText("a if cond else b"),
-                    std::string("(a if cond else b)"));
+    BEZEL_EXPECT_EQ(parseInitText("(if cond then a else b)"),
+                    std::string("(if cond then a else b)"));
 }
 
 BEZEL_TEST(parser_conditional, with_complex_branches) {
-    BEZEL_EXPECT_EQ(parseInitText("a + 1 if cond else b * 2"),
-                    std::string("((a + 1) if cond else (b * 2))"));
+    BEZEL_EXPECT_EQ(parseInitText("(if cond then a + 1 else b * 2)"),
+                    std::string("(if cond then (a + 1) else (b * 2))"));
 }
 
 // §17.1: conditional is right-associative.
 BEZEL_TEST(parser_conditional, right_associative) {
     BEZEL_EXPECT_EQ(
-        parseInitText("a if c1 else b if c2 else d"),
-        std::string("(a if c1 else (b if c2 else d))"));
+        parseInitText("(if c1 then a elif c2 then b else d)"),
+        std::string("(if c1 then a else (if c2 then b else d))"));
 }
 
 BEZEL_TEST(parser_conditional, throw_as_else_branch) {
     BEZEL_EXPECT_EQ(
         parseInitText(
-            "value if value <> null else throw new Exception(\"nil\")"),
+            "(if value <> null then value else throw new Exception(\"nil\"))"),
         std::string(
-            "(value if (value <> null) else "
+            "(if (value <> null) then value else "
             "(throw new Exception(\"nil\")))"));
 }
 

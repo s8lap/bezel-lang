@@ -23,7 +23,7 @@ BEZEL_TEST(extension_property_primitive, int_bool_scalar_extension_properties) {
         "extension bool public property Flipped: bool => not this; end; "
         "class C public static method Main(): int "
         "  var x: int := 21; var z: int := 0; var b: bool := false; "
-        "  return x.Doubled + (10 if z.IsZero else 0) + (1 if b.Flipped else 0); "  // 42+10+1=53
+        "  return x.Doubled + (if z.IsZero then 10 else 0) + (if b.Flipped then 1 else 0); "  // 42+10+1=53
         "end Main; end C;"), 53);
 }
 

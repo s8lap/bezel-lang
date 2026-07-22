@@ -124,11 +124,11 @@ BEZEL_TEST(bool_int_conversion_1322, bool_literal_and_condition_unaffected) {
 
 BEZEL_TEST(bool_int_conversion_1322, comparison_to_bool_unaffected_spec_5_1) {
     // `n <> 0` is the spec-recommended idiom — it yields bool without any cast.
-    auto r = check("var n := 5; var b := n <> 0; return (1 if b else 0);");
+    auto r = check("var n := 5; var b := n <> 0; return (if b then 1 else 0);");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 BEZEL_TEST(bool_int_conversion_1322, bool_in_conditional_expr_unaffected) {
-    auto r = check("var n := 3; return (1 if n > 0 else 0);");
+    auto r = check("var n := 3; return (if n > 0 then 1 else 0);");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

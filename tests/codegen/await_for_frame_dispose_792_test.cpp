@@ -49,7 +49,7 @@ BEZEL_TEST(await_for_frame_dispose_792, body_throw_disposes_frame) {
         "      await for var x in Gen() do throw new Exception(\"boom\"); end; "
         "    catch Exception => do caught := true; end "
         "    end; "
-        "    return 1 if T.cleaned else 0; "   // 1: frame disposed on the throw
+        "    return (if T.cleaned then 1 else 0); "   // 1: frame disposed on the throw
         "  end Main; end C;"), 1);
 }
 
@@ -61,7 +61,7 @@ BEZEL_TEST(await_for_frame_dispose_792, break_disposes_frame) {
         "    await for var x in Gen() do "
         "      if x = 1 then break; end; "
         "    end; "
-        "    return 1 if T.cleaned else 0; "   // 1: frame disposed on break
+        "    return (if T.cleaned then 1 else 0); "   // 1: frame disposed on break
         "  end Main; end C;"), 1);
 }
 
@@ -74,6 +74,6 @@ BEZEL_TEST(await_for_frame_dispose_792, normal_completion_disposes_and_iterates)
         "  public static async method Main(): Task<int> "
         "    var sum := 0; "
         "    await for var x in Gen() do sum := sum + x; end; "
-        "    return sum + (100 if T.cleaned else 0); "  // 6 + 100 = 106
+        "    return sum + (if T.cleaned then 100 else 0); "  // 6 + 100 = 106
         "  end Main; end C;"), 106);
 }

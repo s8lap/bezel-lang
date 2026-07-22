@@ -11,7 +11,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; record R public property X: int private set; public readonly property Y: int; public constructor(x: int, y: int) X := x; Y := y; end constructor; end R; class C public static method Main(): int var r := new R(1, 2); var r2 := r with X := 42 end; return r2.X; end Main; end C;
+module M; record R public property X: int private set; public readonly property Y: int; public constructor(x: int, y: int) X := x; Y := y; end constructor; end R; class C public static method Main(): int var r := new R(1, 2); var r2 := r with(X := 42); return r2.X; end Main; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

@@ -49,40 +49,40 @@ std::string render(const std::string& expr) {
 
 BEZEL_TEST(parser_with_suffix, single_init_assign) {
     BEZEL_EXPECT_EQ(
-        render("p with X := 1 end"),
-        std::string("p with X := 1 end"));
+        render("p with(X := 1)"),
+        std::string("p with(X := 1)"));
 }
 
 BEZEL_TEST(parser_with_suffix, multiple_init_assigns) {
     BEZEL_EXPECT_EQ(
-        render("p with X := 1, Y := 2, Z := 3 end"),
-        std::string("p with X := 1, Y := 2, Z := 3 end"));
+        render("p with(X := 1, Y := 2, Z := 3)"),
+        std::string("p with(X := 1, Y := 2, Z := 3)"));
 }
 
 BEZEL_TEST(parser_with_suffix, on_new_expression) {
     // Object initializer block: `with` after `new C(...)` — same syntactic
     // shape as record copy-with.
     BEZEL_EXPECT_EQ(
-        render("new Point(0, 0) with X := 5, Y := 7 end"),
-        std::string("new Point(0, 0) with X := 5, Y := 7 end"));
+        render("new Point(0, 0) with(X := 5, Y := 7)"),
+        std::string("new Point(0, 0) with(X := 5, Y := 7)"));
 }
 
 BEZEL_TEST(parser_with_suffix, value_is_expression) {
     BEZEL_EXPECT_EQ(
-        render("p with X := a + b end"),
-        std::string("p with X := (a + b) end"));
+        render("p with(X := a + b)"),
+        std::string("p with(X := (a + b))"));
 }
 
 BEZEL_TEST(parser_with_suffix, trailing_comma_allowed) {
     BEZEL_EXPECT_EQ(
-        render("p with X := 1, Y := 2, end"),
-        std::string("p with X := 1, Y := 2 end"));
+        render("p with(X := 1, Y := 2,)"),
+        std::string("p with(X := 1, Y := 2)"));
 }
 
 BEZEL_TEST(parser_with_suffix, chained_after_call) {
     BEZEL_EXPECT_EQ(
-        render("MakePoint() with X := 5 end"),
-        std::string("MakePoint() with X := 5 end"));
+        render("MakePoint() with(X := 5)"),
+        std::string("MakePoint() with(X := 5)"));
 }
 
 BEZEL_TEST(parser_unit_value, bare_unit) {

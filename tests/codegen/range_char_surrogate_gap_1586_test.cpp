@@ -63,7 +63,7 @@ BEZEL_TEST(range_char_surrogate_gap_1586, spec_16_3_never_yields_a_surrogate) {
             "for var c in '\\uD7F0'..'\\uE010' step 4 do "
             "  if int(c) >= 0xD800 and int(c) <= 0xDFFF then hitGap := true; end; "
             "end; "
-            "return (1 if hitGap else 0);"),
+            "return (if hitGap then 1 else 0);"),
         0);
 }
 
@@ -94,7 +94,7 @@ BEZEL_TEST(range_char_surrogate_gap_1586, descending_step_lands_on_lower_bound) 
     BEZEL_EXPECT_EQ(
         run("var last := char(0); "
             "for var c in '\\uE002'..'\\uD7FE' step -1 do last := c; end; "
-            "return (1 if last = '\\uD7FE' else 0);"),
+            "return (if last = '\\uD7FE' then 1 else 0);"),
         1);
 }
 

@@ -29,7 +29,7 @@ BEZEL_TEST(codegen_cg44, double_to_int_truncates) {
 
 BEZEL_TEST(codegen_cg44, int_to_double) {
     BEZEL_EXPECT_EQ(run("var n := 7; var d := double(n); "
-                        "return (1 if d = 7.0 else 0);"), 1);
+                        "return (if d = 7.0 then 1 else 0);"), 1);
 }
 
 BEZEL_TEST(codegen_cg44, long_to_int) {
@@ -99,7 +99,7 @@ BEZEL_TEST(codegen_cg44, enum_of_int_roundtrips_through_case) {
     BEZEL_EXPECT_EQ(runAot(
         "module M; enum E Red, Green, Blue; end E; "
         "class C public static method Main(): int "
-        "  var e := E(2); return case e of E.Blue => 9, _ => 0, end; "
+        "  var e := E(2); return (case e of E.Blue => 9, _ => 0,); "
         "end Main; end C;").exitCode, 9);
 }
 

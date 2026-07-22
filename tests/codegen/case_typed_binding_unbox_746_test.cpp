@@ -28,7 +28,7 @@ BEZEL_TEST(case_typed_binding_746, int_binding_unboxed) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x: Object? := 42; "
-        "  return case x of var n: int => n + 1, _ => 0 end; "  // 43
+        "  return (case x of var n: int => n + 1, _ => 0); "  // 43
         "end Main; end C;"), 43);
 }
 
@@ -37,7 +37,7 @@ BEZEL_TEST(case_typed_binding_746, bool_binding_unboxed) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x: Object? := true; "
-        "  return case x of var n: bool => 1 if n else 0, _ => 99 end; "
+        "  return (case x of var n: bool => (if n then 1 else 0), _ => 99); "
         "end Main; end C;"), 1);
 }
 
@@ -46,7 +46,7 @@ BEZEL_TEST(case_typed_binding_746, long_binding_unboxed) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x: Object? := 100L; "
-        "  return case x of var n: long => int(n mod 256L), _ => 0 end; "
+        "  return (case x of var n: long => int(n mod 256L), _ => 0); "
         "end Main; end C;"), 100);
 }
 
@@ -55,7 +55,7 @@ BEZEL_TEST(case_typed_binding_746, int_binding_in_when_guard) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x: Object? := 42; "
-        "  return case x of var n: int when n > 10 => 1, _ => 0 end; "
+        "  return (case x of var n: int when n > 10 => 1, _ => 0); "
         "end Main; end C;"), 1);
 }
 
@@ -66,7 +66,7 @@ BEZEL_TEST(case_typed_binding_746, record_binding_unboxed) {
         "class C public static method Main(): int "
         "  var p := new Point(3, 7); "
         "  var q: Object? := p; "
-        "  return case q of var pt: Point => pt.px + pt.py, _ => 0 end; "  // 10
+        "  return (case q of var pt: Point => pt.px + pt.py, _ => 0); "  // 10
         "end Main; end C;"), 10);
 }
 
@@ -76,7 +76,7 @@ BEZEL_TEST(case_typed_binding_746, int_binding_does_not_match_boxed_string) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x: Object? := \"hello\"; "
-        "  return case x of var n: int => n + 1, _ => 77 end; "
+        "  return (case x of var n: int => n + 1, _ => 77); "
         "end Main; end C;"), 77);
 }
 
@@ -85,7 +85,7 @@ BEZEL_TEST(case_typed_binding_746, int_binding_does_not_match_null) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x: Object? := null; "
-        "  return case x of var n: int => n + 1, _ => 55 end; "
+        "  return (case x of var n: int => n + 1, _ => 55); "
         "end Main; end C;"), 55);
 }
 
@@ -95,6 +95,6 @@ BEZEL_TEST(case_typed_binding_746, record_binding_does_not_match_boxed_int) {
         "module M; record Point(px: int, py: int); "
         "class C public static method Main(): int "
         "  var q: Object? := 5; "
-        "  return case q of var pt: Point => pt.px, _ => 88 end; "
+        "  return (case q of var pt: Point => pt.px, _ => 88); "
         "end Main; end C;"), 88);
 }

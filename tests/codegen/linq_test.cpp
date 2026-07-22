@@ -221,7 +221,7 @@ BEZEL_TEST(linq, min_max_selector_class_result_type_1901) {
         "module M; import System; "
         "class Box(v: int): IComparable<Box> "
         "  public method CompareTo(other: Box): int => "
-        "    (1 if v > other.v else (-1 if v < other.v else 0)); "
+        "    (if v > other.v then 1 else (if v < other.v then -1 else 0)); "
         "end Box; "
         "class C public static method Main(): int "
         "  using var a := new OwningArray<Box>(); "

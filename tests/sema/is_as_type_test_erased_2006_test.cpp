@@ -73,7 +73,7 @@ std::string wrap(const std::string& body) {
 BEZEL_TEST(is_as_type_test_erased_2006, is_function_arg_rejected) {
     auto r = parseSemaAll(wrap(
         "  public method M(o: Object): int\n"
-        "    return (1 if o is Wrap<(int) -> int> else 0);\n"
+        "    return (if o is Wrap<(int) -> int> then 1 else 0);\n"
         "  end M;\n"));
     BEZEL_EXPECT_TRUE(hasPlainErasedError(r));
 }
@@ -84,7 +84,7 @@ BEZEL_TEST(is_as_type_test_erased_2006, as_function_arg_rejected) {
     auto r = parseSemaAll(wrap(
         "  public method M(o: Object): int\n"
         "    var x := o as Wrap<(int) -> int>;\n"
-        "    return (1 if x = null else 0);\n"
+        "    return (if x = null then 1 else 0);\n"
         "  end M;\n"));
     BEZEL_EXPECT_TRUE(hasPlainErasedError(r));
 }
@@ -95,7 +95,7 @@ BEZEL_TEST(is_as_type_test_erased_2006, as_function_arg_rejected) {
 BEZEL_TEST(is_as_type_test_erased_2006, is_nested_function_arg_rejected) {
     auto r = parseSemaAll(wrap(
         "  public method M(o: Object): int\n"
-        "    return (1 if o is Wrap<Wrap<(int) -> int>> else 0);\n"
+        "    return (if o is Wrap<Wrap<(int) -> int>> then 1 else 0);\n"
         "  end M;\n"));
     BEZEL_EXPECT_TRUE(hasPlainErasedError(r));
 }
@@ -107,7 +107,7 @@ BEZEL_TEST(is_as_type_test_erased_2006, is_nested_function_arg_rejected) {
 BEZEL_TEST(is_as_type_test_erased_2006, is_primitive_arg_accepted) {
     auto r = parseSemaAll(wrap(
         "  public method M(o: Object): int\n"
-        "    return (1 if o is Wrap<int> else 0);\n"
+        "    return (if o is Wrap<int> then 1 else 0);\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasPlainErasedError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -117,7 +117,7 @@ BEZEL_TEST(is_as_type_test_erased_2006, is_primitive_arg_accepted) {
 BEZEL_TEST(is_as_type_test_erased_2006, is_named_class_arg_accepted) {
     auto r = parseSemaAll(wrap(
         "  public method M(o: Object): int\n"
-        "    return (1 if o is Wrap<Foo> else 0);\n"
+        "    return (if o is Wrap<Foo> then 1 else 0);\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasPlainErasedError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -128,7 +128,7 @@ BEZEL_TEST(is_as_type_test_erased_2006, is_named_class_arg_accepted) {
 BEZEL_TEST(is_as_type_test_erased_2006, is_nested_reified_arg_accepted) {
     auto r = parseSemaAll(wrap(
         "  public method M(o: Object): int\n"
-        "    return (1 if o is Wrap<Wrap<int>> else 0);\n"
+        "    return (if o is Wrap<Wrap<int>> then 1 else 0);\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasPlainErasedError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -141,7 +141,7 @@ BEZEL_TEST(is_as_type_test_erased_2006, is_nested_reified_arg_accepted) {
 BEZEL_TEST(is_as_type_test_erased_2006, is_inline_array_arg_accepted) {
     auto r = parseSemaAll(wrap(
         "  public method M(o: Object): int\n"
-        "    return (1 if o is Wrap<[3]int> else 0);\n"
+        "    return (if o is Wrap<[3]int> then 1 else 0);\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasPlainErasedError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -152,7 +152,7 @@ BEZEL_TEST(is_as_type_test_erased_2006, as_reified_arg_accepted) {
     auto r = parseSemaAll(wrap(
         "  public method M(o: Object): int\n"
         "    var x := o as Wrap<int>;\n"
-        "    return (1 if x = null else 0);\n"
+        "    return (if x = null then 1 else 0);\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasPlainErasedError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -162,7 +162,7 @@ BEZEL_TEST(is_as_type_test_erased_2006, as_reified_arg_accepted) {
 BEZEL_TEST(is_as_type_test_erased_2006, is_nongeneric_accepted) {
     auto r = parseSemaAll(wrap(
         "  public method M(o: Object): int\n"
-        "    return (1 if o is Foo else 0);\n"
+        "    return (if o is Foo then 1 else 0);\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasPlainErasedError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -176,7 +176,7 @@ BEZEL_TEST(is_as_type_test_erased_2006, is_nongeneric_accepted) {
 BEZEL_TEST(is_as_type_test_erased_2006, is_bare_type_parameter_accepted) {
     auto r = parseSemaAll(wrap(
         "  public method Chk<T>(o: Object): int\n"
-        "    return (1 if o is Wrap<Wrap<T>> else 0);\n"
+        "    return (if o is Wrap<Wrap<T>> then 1 else 0);\n"
         "  end Chk;\n"));
     BEZEL_EXPECT_FALSE(hasPlainErasedError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

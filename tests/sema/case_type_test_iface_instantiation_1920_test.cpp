@@ -71,10 +71,10 @@ BEZEL_TEST(case_type_test_iface_instantiation_1920,
         "interface IBox<T>\nend IBox;\n"
         "sealed class Box<T> : IBox<T>\nend Box;\n",
         "  public method M(b: IBox<int>): int\n"
-        "    var n := case b of\n"
+        "    var n := (case b of\n"
         "      var x: Box<string> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_TRUE(hasIfaceInstantiationError(r));
@@ -107,10 +107,10 @@ BEZEL_TEST(case_type_test_iface_instantiation_1920,
         "class Mid<T> : IBox<T>\nend Mid;\n"
         "sealed class Box<T> : Mid<T>\nend Box;\n",
         "  public method M(b: IBox<int>): int\n"
-        "    var n := case b of\n"
+        "    var n := (case b of\n"
         "      var x: Box<string> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_TRUE(hasIfaceInstantiationError(r));
@@ -126,10 +126,10 @@ BEZEL_TEST(case_type_test_iface_instantiation_1920,
         "interface IBox<T>\nend IBox;\n"
         "sealed class IntBox : IBox<int>\nend IntBox;\n",
         "  public method M(b: IBox<string>): int\n"
-        "    var n := case b of\n"
+        "    var n := (case b of\n"
         "      var x: IntBox => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_TRUE(hasIfaceInstantiationError(r));
@@ -146,10 +146,10 @@ BEZEL_TEST(case_type_test_iface_instantiation_1920,
         "interface IBox<T>\nend IBox;\n"
         "sealed class Box<T> : IBox<T>\nend Box;\n",
         "  public method M(b: IBox<int>): int\n"
-        "    var n := case b of\n"
+        "    var n := (case b of\n"
         "      var x: Box<int> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasIfaceInstantiationError(r));
@@ -170,10 +170,10 @@ BEZEL_TEST(case_type_test_iface_instantiation_1920,
         "interface IMarker<T>\nend IMarker;\n"
         "sealed class C<T> : IMarker<T>, IMarker<int>\nend C;\n",
         "  public method M(m: IMarker<int>): int\n"
-        "    var n := case m of\n"
+        "    var n := (case m of\n"
         "      var x: C<string> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasIfaceInstantiationError(r));
@@ -192,10 +192,10 @@ BEZEL_TEST(case_type_test_iface_instantiation_1920,
         "sealed class Dog : Animal\nend Dog;\n"
         "sealed class Box<T> : IReadOnly<T>\nend Box;\n",
         "  public method M(b: IReadOnly<Animal>): int\n"
-        "    var n := case b of\n"
+        "    var n := (case b of\n"
         "      var x: Box<Dog> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_FALSE(hasIfaceInstantiationError(r));
@@ -218,10 +218,10 @@ BEZEL_TEST(case_type_test_iface_instantiation_1920,
         "interface IBox<T>\nend IBox;\n"
         "class Box<T> : IBox<T>\nend Box;\n",
         "  public method M(b: IBox<int>): int\n"
-        "    var n := case b of\n"
+        "    var n := (case b of\n"
         "      var x: Box<string> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end M;\n"));
     BEZEL_EXPECT_TRUE(hasIfaceInstantiationError(r));
@@ -238,10 +238,10 @@ BEZEL_TEST(case_type_test_iface_instantiation_1920,
         "interface IBox<T>\nend IBox;\n"
         "sealed class Box<T> : IBox<T>\nend Box;\n",
         "  public method Rig<U>(b: IBox<U>): int\n"
-        "    var n := case b of\n"
+        "    var n := (case b of\n"
         "      var x: Box<int> => 1,\n"
         "      _ => 0\n"
-        "    end;\n"
+        "    );\n"
         "    return n;\n"
         "  end Rig;\n"));
     BEZEL_EXPECT_FALSE(hasIfaceInstantiationError(r));

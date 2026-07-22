@@ -22,7 +22,7 @@ BEZEL_TEST(codegen_cg27b, string_less_than_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := \"abc\"; var b := \"abd\"; "
-        "  return (1 if a < b else 0); "
+        "  return (if a < b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -31,7 +31,7 @@ BEZEL_TEST(codegen_cg27b, string_less_than_false) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := \"abd\"; var b := \"abc\"; "
-        "  return (1 if a < b else 0); "
+        "  return (if a < b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -40,7 +40,7 @@ BEZEL_TEST(codegen_cg27b, string_less_than_equal_false) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := \"abc\"; "
-        "  return (1 if a < a else 0); "
+        "  return (if a < a then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -49,7 +49,7 @@ BEZEL_TEST(codegen_cg27b, string_greater_than_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := \"xyz\"; var b := \"abc\"; "
-        "  return (1 if a > b else 0); "
+        "  return (if a > b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -58,7 +58,7 @@ BEZEL_TEST(codegen_cg27b, string_less_equal_same) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := \"abc\"; "
-        "  return (1 if a <= a else 0); "
+        "  return (if a <= a then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -67,7 +67,7 @@ BEZEL_TEST(codegen_cg27b, string_greater_equal_less) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := \"abc\"; var b := \"abd\"; "
-        "  return (1 if a >= b else 0); "
+        "  return (if a >= b then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -77,7 +77,7 @@ BEZEL_TEST(codegen_cg27b, string_less_than_shorter_prefix) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a := \"abc\"; var b := \"abcd\"; "
-        "  return (1 if a < b else 0); "
+        "  return (if a < b then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -86,7 +86,7 @@ BEZEL_TEST(codegen_cg27b, case_string_match_first_arm) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"hello\"; "
-        "  var r := case s of \"hello\" => 1, \"world\" => 2, _ => 0 end; "
+        "  var r := (case s of \"hello\" => 1, \"world\" => 2, _ => 0); "
         "  return r; "
         "end Main; end C;"), 1);
 }
@@ -96,7 +96,7 @@ BEZEL_TEST(codegen_cg27b, case_string_match_second_arm) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"world\"; "
-        "  var r := case s of \"hello\" => 1, \"world\" => 2, _ => 0 end; "
+        "  var r := (case s of \"hello\" => 1, \"world\" => 2, _ => 0); "
         "  return r; "
         "end Main; end C;"), 2);
 }
@@ -106,7 +106,7 @@ BEZEL_TEST(codegen_cg27b, case_string_discard_fallback) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"other\"; "
-        "  var r := case s of \"hello\" => 1, \"world\" => 2, _ => 0 end; "
+        "  var r := (case s of \"hello\" => 1, \"world\" => 2, _ => 0); "
         "  return r; "
         "end Main; end C;"), 0);
 }
@@ -116,7 +116,7 @@ BEZEL_TEST(codegen_cg27b, case_string_alternative_pattern) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"yes\"; "
-        "  var r := case s of \"yes\" | \"ok\" | \"true\" => 1, _ => 0 end; "
+        "  var r := (case s of \"yes\" | \"ok\" | \"true\" => 1, _ => 0); "
         "  return r; "
         "end Main; end C;"), 1);
 }

@@ -120,7 +120,7 @@ BEZEL_TEST(codegen_stdlib_648_datetime_tostring, format_yyyy_MM_dd) {
     BEZEL_EXPECT_EQ(run(prog(
         "var dt := new DateTime(2024, 3, 15); "
         "var s := dt.ToString(\"yyyy-MM-dd\"); "
-        "return (1 if s = \"2024-03-15\" else 0); ")), 1);
+        "return (if s = \"2024-03-15\" then 1 else 0); ")), 1);
 }
 
 // stdlib §2.5: ToString("yyyy-MM-ddTHH:mm:ss") — full ISO-8601.
@@ -128,7 +128,7 @@ BEZEL_TEST(codegen_stdlib_648_datetime_tostring, format_iso8601) {
     BEZEL_EXPECT_EQ(run(prog(
         "var dt := new DateTime(2024, 3, 15, 13, 45, 30); "
         "var s := dt.ToString(\"yyyy-MM-ddTHH:mm:ss\"); "
-        "return (1 if s = \"2024-03-15T13:45:30\" else 0); ")), 1);
+        "return (if s = \"2024-03-15T13:45:30\" then 1 else 0); ")), 1);
 }
 
 // stdlib §2.5: ToString("yyyy") — year only.
@@ -136,7 +136,7 @@ BEZEL_TEST(codegen_stdlib_648_datetime_tostring, format_year_only) {
     BEZEL_EXPECT_EQ(run(prog(
         "var dt := new DateTime(2024, 3, 15); "
         "var s := dt.ToString(\"yyyy\"); "
-        "return (1 if s = \"2024\" else 0); ")), 1);
+        "return (if s = \"2024\" then 1 else 0); ")), 1);
 }
 
 // stdlib §2.5: ToString("MM/dd/yyyy") — US date format (/ emitted verbatim).
@@ -144,7 +144,7 @@ BEZEL_TEST(codegen_stdlib_648_datetime_tostring, format_us_date) {
     BEZEL_EXPECT_EQ(run(prog(
         "var dt := new DateTime(2024, 3, 15); "
         "var s := dt.ToString(\"MM/dd/yyyy\"); "
-        "return (1 if s = \"03/15/2024\" else 0); ")), 1);
+        "return (if s = \"03/15/2024\" then 1 else 0); ")), 1);
 }
 
 // stdlib §2.5: ToString("HH:mm:ss") — time only.
@@ -152,7 +152,7 @@ BEZEL_TEST(codegen_stdlib_648_datetime_tostring, format_time_only) {
     BEZEL_EXPECT_EQ(run(prog(
         "var dt := new DateTime(2024, 3, 15, 13, 45, 30); "
         "var s := dt.ToString(\"HH:mm:ss\"); "
-        "return (1 if s = \"13:45:30\" else 0); ")), 1);
+        "return (if s = \"13:45:30\" then 1 else 0); ")), 1);
 }
 
 // stdlib §2.5: Parse round-trip — Parse(ToString("yyyy-MM-dd")).Year.
@@ -188,7 +188,7 @@ BEZEL_TEST(codegen_stdlib_648_datetime_tryparse, valid_input_returns_true) {
     BEZEL_EXPECT_EQ(run(prog(
         "var result: DateTime; "
         "var ok := DateTime.TryParse(\"2024-03-15\", out result); "
-        "return (1 if ok else 0); ")), 1);
+        "return (if ok then 1 else 0); ")), 1);
 }
 
 // stdlib §2.5: TryParse valid input → out param Year == 2024.
@@ -205,7 +205,7 @@ BEZEL_TEST(codegen_stdlib_648_datetime_tryparse, invalid_input_returns_false) {
     BEZEL_EXPECT_EQ(run(prog(
         "var result: DateTime; "
         "var ok := DateTime.TryParse(\"not-a-date\", out result); "
-        "return (0 if ok else 1); ")), 1);
+        "return (if ok then 0 else 1); ")), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -287,7 +287,7 @@ BEZEL_TEST(codegen_stdlib_652_domain_name, name_matches_ctor_arg) {
     BEZEL_EXPECT_EQ(run(prog(
         "var d := new Domain(\"test\"); "
         "var n := d.Name; "
-        "var ok := (1 if n = \"test\" else 0); "
+        "var ok := (if n = \"test\" then 1 else 0); "
         "d.Dispose(); "
         "return ok; ")), 1);
 }
@@ -307,7 +307,7 @@ BEZEL_TEST(codegen_stdlib_652_domain_name, empty_name) {
     BEZEL_EXPECT_EQ(run(prog(
         "var d := new Domain(\"\"); "
         "var n := d.Name; "
-        "var ok := (1 if n = \"\" else 0); "
+        "var ok := (if n = \"\" then 1 else 0); "
         "d.Dispose(); "
         "return ok; ")), 1);
 }
@@ -320,7 +320,7 @@ BEZEL_TEST(codegen_stdlib_652_domain_name, two_domains_distinct_names) {
         "var d2 := new Domain(\"beta\"); "
         "var n1 := d1.Name; "
         "var n2 := d2.Name; "
-        "var ok := (1 if n1 = \"alpha\" and n2 = \"beta\" else 0); "
+        "var ok := (if n1 = \"alpha\" and n2 = \"beta\" then 1 else 0); "
         "d1.Dispose(); "
         "d2.Dispose(); "
         "return ok; ")), 1);

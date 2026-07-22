@@ -69,7 +69,7 @@ BEZEL_TEST(codegen_enum_operators_1582, unary_minus_spec_10_4) {
         "class C public static method Main(): int "
         "  var s: Sign := Sign.Pos; "
         "  var t: Sign := -s; "
-        "  return (1 if t = Sign.Neg else 0); "
+        "  return (if t = Sign.Neg then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -89,7 +89,7 @@ BEZEL_TEST(codegen_enum_operators_1582,
         "  public static method operator >=(a: Priority, b: Priority): bool => int(a) <= int(b); "
         "end Priority; "
         "class C public static method Main(): int "
-        "  return (1 if Priority.Low < Priority.High else 0); "
+        "  return (if Priority.Low < Priority.High then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -109,7 +109,7 @@ BEZEL_TEST(codegen_enum_operators_1582,
         "  public method GetHashCode(): int => 1; "
         "end Priority; "
         "class C public static method Main(): int "
-        "  return (1 if Priority.Low = Priority.High else 0); "
+        "  return (if Priority.Low = Priority.High then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -143,6 +143,6 @@ BEZEL_TEST(codegen_enum_operators_1582, operator_coexists_with_instance_method_s
         "class C public static method Main(): int "
         "  var p: Priority := Priority.Low; "
         "  var q: Priority := p + 2; "
-        "  return (1 if q.IsUrgent() else 0); "
+        "  return (if q.IsUrgent() then 1 else 0); "
         "end Main; end C;"), 1);
 }

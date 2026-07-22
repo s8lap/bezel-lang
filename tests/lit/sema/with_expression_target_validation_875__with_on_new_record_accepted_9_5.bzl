@@ -12,7 +12,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; record Point(X: int, Y: int); class C public static method Main(): int var p := new Point(1, 2) with Y := 9 end; return p.X + p.Y; end Main; end C;
+module M; record Point(X: int, Y: int); class C public static method Main(): int var p := new Point(1, 2) with(Y := 9); return p.X + p.Y; end Main; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

@@ -34,7 +34,7 @@ BEZEL_TEST(case_range_dotdot_1472, expr_bare_dotdot_matches) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class App public static method Main(): int "
         "  var x := 999; "
-        "  return case x of .. => 7 end; "
+        "  return (case x of .. => 7); "
         "end Main; end App;"), 7);
 }
 
@@ -56,7 +56,7 @@ BEZEL_TEST(case_range_dotdot_1472, dotdot_matches_any_value) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class App public static method Main(): int "
         "  var x := -7; "
-        "  return case x of .. => 3, _ => 4 end; "
+        "  return (case x of .. => 3, _ => 4); "
         "end Main; end App;"), 3);
 }
 
@@ -66,7 +66,7 @@ BEZEL_TEST(case_range_dotdot_1472, nullable_present_value_matches_dotdot) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class App public static method Main(): int "
         "  var x: int? := 5; "
-        "  return case x of .. => 7, null => 9 end; "
+        "  return (case x of .. => 7, null => 9); "
         "end Main; end App;"), 7);
 }
 
@@ -76,6 +76,6 @@ BEZEL_TEST(case_range_dotdot_1472, nullable_null_value_does_not_match_dotdot) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class App public static method Main(): int "
         "  var x: int? := null; "
-        "  return case x of .. => 7, null => 9 end; "
+        "  return (case x of .. => 7, null => 9); "
         "end Main; end App;"), 9);
 }

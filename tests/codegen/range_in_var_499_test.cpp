@@ -102,7 +102,7 @@ BEZEL_TEST(codegen_range_in_var_499, is_empty_inverted_true) {
         "module M; class C public static method Main(): int "
         "  var r := 5..1; "
         "  var e := r.IsEmpty; "
-        "  return (1 if e else 0); "
+        "  return (if e then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -112,7 +112,7 @@ BEZEL_TEST(codegen_range_in_var_499, is_empty_normal_false) {
         "module M; class C public static method Main(): int "
         "  var r := 1..5; "
         "  var e := r.IsEmpty; "
-        "  return (0 if e else 1); "
+        "  return (if e then 0 else 1); "
         "end Main; end C;"), 1);
 }
 
@@ -122,7 +122,7 @@ BEZEL_TEST(codegen_range_in_var_499, is_empty_halfopen_equal_bounds) {
         "module M; class C public static method Main(): int "
         "  var r := 5..<5; "
         "  var e := r.IsEmpty; "
-        "  return (1 if e else 0); "
+        "  return (if e then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -149,7 +149,7 @@ BEZEL_TEST(codegen_range_in_var_499, is_end_inclusive_dotdot) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r := 1..10; "
-        "  return (1 if r.IsEndInclusive else 0); "
+        "  return (if r.IsEndInclusive then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -158,7 +158,7 @@ BEZEL_TEST(codegen_range_in_var_499, is_end_inclusive_halfopen) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r := 1..<10; "
-        "  return (1 if r.IsEndInclusive else 0); "
+        "  return (if r.IsEndInclusive then 1 else 0); "
         "end Main; end C;"), 0);
 }
 

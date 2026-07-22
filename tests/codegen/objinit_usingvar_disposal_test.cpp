@@ -209,7 +209,7 @@ const char* kRecordWith_Control =
     "module M; record Point(x: int, y: int); "
     "class Runner public static method Main(): int "
     "  var a := new Point(1, 2); "
-    "  var b := a with x := 9 end; "
+    "  var b := a with(x := 9); "
     "  return b.x * 10 + b.y; "
     "end Main; end Runner;";
 

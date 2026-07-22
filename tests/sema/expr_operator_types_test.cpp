@@ -93,20 +93,20 @@ BEZEL_TEST(sema_ops, or_nonbool_operand_rejected_1040) {
 BEZEL_TEST(sema_ops, not_nonbool_operand_rejected_1040) {
     auto r = parseSema(
         "module M; class C public method M(): int "
-        "  var u: uint := 5; return (1 if (not u) else 0); end M; end C;");
+        "  var u: uint := 5; return (if (not u) then 1 else 0); end M; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 // Positive controls — valid bool logical operators must STILL be accepted.
 BEZEL_TEST(sema_ops, and_bool_operands_still_accepted_1040) {
     auto r = parseSema(
         "module M; class C public method M(): int "
-        "  var x: int := 5; return (1 if (x > 0 and x < 10) else 0); end M; end C;");
+        "  var x: int := 5; return (if (x > 0 and x < 10) then 1 else 0); end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 BEZEL_TEST(sema_ops, not_bool_operand_still_accepted_1040) {
     auto r = parseSema(
         "module M; class C public method M(): int "
-        "  return (1 if (not true) else 0); end M; end C;");
+        "  return (if (not true) then 1 else 0); end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
@@ -231,7 +231,7 @@ BEZEL_TEST(sema_ops, null_conditional_member_is_nullable) {
 BEZEL_TEST(sema_ops, conditional_expression_takes_branch_type) {
     auto r = parseSema(
         "module M; "
-        "class C public method M(a: N, b: N, c: bool) _ := (a if c else b); "
+        "class C public method M(a: N, b: N, c: bool) _ := (if c then a else b); "
         "end M; end C; class N end N;");
     auto* t = typeOf(r);
     BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named && !t->nullable);
@@ -273,7 +273,7 @@ BEZEL_TEST(sema_ops, is_test_is_bool) {
 BEZEL_TEST(sema_ops, case_expression_takes_arm_type) {
     auto r = parseSema(
         "module M; class C public method M(k: int, a: N, b: N) "
-        "  _ := case k of 1 => a, _ => b, end; "
+        "  _ := (case k of 1 => a, _ => b,); "
         "end M; end C; class N end N;");
     auto* t = typeOf(r);
     BEZEL_EXPECT_TRUE(t && t->kind == TypeRef::Kind::Named && !t->nullable);

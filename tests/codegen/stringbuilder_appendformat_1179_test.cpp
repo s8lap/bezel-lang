@@ -56,7 +56,7 @@ BEZEL_TEST(codegen_sb_appendformat_spec_3_1, single_placeholder) {
         "  using var args := new Array<Object>(); "
         "  args.Add(42); "
         "  sb.AppendFormat(\"v={0}\", args); "
-        "  return (1 if sb.ToString() = \"v=42\" else 0); "
+        "  return (if sb.ToString() = \"v=42\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -68,7 +68,7 @@ BEZEL_TEST(codegen_sb_appendformat_spec_3_1, multiple_placeholders) {
         "  args.Add(1); "
         "  args.Add(2); "
         "  sb.AppendFormat(\"{0}+{1}=3\", args); "
-        "  return (1 if sb.ToString() = \"1+2=3\" else 0); "
+        "  return (if sb.ToString() = \"1+2=3\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -85,7 +85,7 @@ BEZEL_TEST(codegen_sb_appendformat_spec_3_1, chaining_returns_this) {
         "  using var args := new Array<Object>(); "
         "  args.Add(9); "
         "  var r := sb.Append(\"a\").AppendFormat(\"{0}\", args).Append(\"b\"); "
-        "  return (1 if r.ToString() = \"a9b\" else 0); "
+        "  return (if r.ToString() = \"a9b\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -101,7 +101,7 @@ BEZEL_TEST(codegen_sb_appendformat_spec_3_1, escaped_braces_and_literal_text) {
         "  using var args := new Array<Object>(); "
         "  args.Add(9); "
         "  sb.AppendFormat(\"{{x}}={0}\", args); "
-        "  return (1 if sb.ToString() = \"{x}=9\" else 0); "
+        "  return (if sb.ToString() = \"{x}=9\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

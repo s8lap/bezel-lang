@@ -30,7 +30,7 @@ BEZEL_TEST(range_descending_step_1092, descending_range_not_empty) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r: Range<int> := 10..0 step -1; "
-        "  return 1 if r.IsEmpty else 0; "                // 0 (non-empty)
+        "  return (if r.IsEmpty then 1 else 0); "                // 0 (non-empty)
         "end Main; end C;"), 0);
 }
 
@@ -39,7 +39,7 @@ BEZEL_TEST(range_descending_step_1092, direction_mismatch_is_empty) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r: Range<int> := 0..10 step -1; "
-        "  return 1 if r.IsEmpty else 0; "                // 1 (empty)
+        "  return (if r.IsEmpty then 1 else 0); "                // 1 (empty)
         "end Main; end C;"), 1);
 }
 
@@ -49,7 +49,7 @@ BEZEL_TEST(range_descending_step_1092, contains_start_of_descending) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r: Range<int> := 10..0 step -1; "
-        "  return 1 if 10 in r else 0; "                  // 1 (Start, inclusive)
+        "  return (if 10 in r then 1 else 0); "                  // 1 (Start, inclusive)
         "end Main; end C;"), 1);
 }
 
@@ -59,9 +59,9 @@ BEZEL_TEST(range_descending_step_1092, contains_endpoints_and_interior) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r: Range<int> := 10..0 step -1; "
-        "  var a := 1 if 0 in r else 0; "                 // End, inclusive → 1
-        "  var b := 1 if 7 in r else 0; "                 // interior → 1
-        "  var c := 1 if 11 in r else 0; "                // outside → 0
+        "  var a := (if 0 in r then 1 else 0); "                 // End, inclusive → 1
+        "  var b := (if 7 in r then 1 else 0); "                 // interior → 1
+        "  var c := (if 11 in r then 1 else 0); "                // outside → 0
         "  return a + b * 2 + c * 4; "                    // 1 + 2 + 0 = 3
         "end Main; end C;"), 3);
 }
@@ -71,9 +71,9 @@ BEZEL_TEST(range_descending_step_1092, half_open_descending_excludes_end) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r: Range<int> := 10..<0 step -1; "
-        "  var a := 1 if 10 in r else 0; "                // Start → 1
-        "  var b := 1 if 0 in r else 0; "                 // End excluded → 0
-        "  var c := 1 if 5 in r else 0; "                 // interior → 1
+        "  var a := (if 10 in r then 1 else 0); "                // Start → 1
+        "  var b := (if 0 in r then 1 else 0); "                 // End excluded → 0
+        "  var c := (if 5 in r then 1 else 0); "                 // interior → 1
         "  return a + b * 2 + c * 4; "                    // 1 + 0 + 4 = 5
         "end Main; end C;"), 5);
 }
@@ -83,10 +83,10 @@ BEZEL_TEST(range_descending_step_1092, ascending_unchanged) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r: Range<int> := 0..10; "
-        "  var a := 1 if 5 in r else 0; "                 // 1
-        "  var b := 1 if r.IsEmpty else 0; "              // 0 (non-empty)
+        "  var a := (if 5 in r then 1 else 0); "                 // 1
+        "  var b := (if r.IsEmpty then 1 else 0); "              // 0 (non-empty)
         "  var r2: Range<int> := 0..<10; "
-        "  var c := 1 if 10 in r2 else 0; "               // half-open excl → 0
+        "  var c := (if 10 in r2 then 1 else 0); "               // half-open excl → 0
         "  return a + b * 2 + c * 4; "                    // 1 + 0 + 0 = 1
         "end Main; end C;"), 1);
 }

@@ -52,7 +52,7 @@ BEZEL_TEST(lambda_inferred_param_operator_829, vardecl_record_less_than) {
     BEZEL_EXPECT_EQ(run(std::string(kCmp) +
         "public static method Main(): int "
         "  var f: (Val, Val) -> bool := lambda(a, b) => a < b; "
-        "  var r := f(new Val(3), new Val(5)); return (1 if r else 0); "
+        "  var r := f(new Val(3), new Val(5)); return (if r then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

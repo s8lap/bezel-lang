@@ -50,7 +50,7 @@ BEZEL_TEST(codegen_body_record, equals_true_for_equal_spec_9_2) {
         std::string("module M; ") + kPt +
         "class C public static method Main(): int "
         "  var a := new Pt(1, 2); var b := new Pt(1, 2); "
-        "  return (1 if a.Equals(b) else 0); "
+        "  return (if a.Equals(b) then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -60,7 +60,7 @@ BEZEL_TEST(codegen_body_record, equals_false_for_differing_spec_9_2) {
         std::string("module M; ") + kPt +
         "class C public static method Main(): int "
         "  var a := new Pt(1, 2); var b := new Pt(1, 9); "
-        "  return (1 if a.Equals(b) else 0); "
+        "  return (if a.Equals(b) then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -71,7 +71,7 @@ BEZEL_TEST(codegen_body_record, gethashcode_equal_for_equal_spec_9_2) {
         std::string("module M; ") + kPt +
         "class C public static method Main(): int "
         "  var a := new Pt(1, 2); var b := new Pt(1, 2); "
-        "  return (1 if a.GetHashCode() = b.GetHashCode() else 0); "
+        "  return (if a.GetHashCode() = b.GetHashCode() then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -83,7 +83,7 @@ BEZEL_TEST(codegen_body_record, tostring_format_spec_8_5) {
         std::string("module M; ") + kPt +
         "class C public static method Main(): int "
         "  var a := new Pt(1, 2); "
-        "  return (1 if a.ToString() = \"Pt(X: 1, Y: 2)\" else 0); "
+        "  return (if a.ToString() = \"Pt(X: 1, Y: 2)\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -102,9 +102,9 @@ BEZEL_TEST(codegen_body_record, rectangle_example_eligible_spec_9_2) {
         "end Rectangle; "
         "class C public static method Main(): int "
         "  var r := new Rectangle(3, 4); var s := new Rectangle(3, 4); "
-        "  return (1 if r.Equals(s) "
+        "  return (if r.Equals(s) "
         "             and r.ToString() = \"Rectangle(Width: 3, Height: 4)\" "
-        "             and r.Area() = 12 else 0); "
+        "             and r.Area() = 12 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -125,9 +125,9 @@ BEZEL_TEST(codegen_body_record, string_auto_property_spec_9_2) {
         "end Person; "
         "class C public static method Main(): int "
         "  var a := new Person(\"Ann\", 30); var b := new Person(\"Ann\", 30); "
-        "  return (1 if a.GetHashCode() = b.GetHashCode() "
+        "  return (if a.GetHashCode() = b.GetHashCode() "
         "             and a.ToString() = \"Person(Name: Ann, Age: 30)\" "
-        "             else 0); "
+        "             then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -145,8 +145,8 @@ BEZEL_TEST(codegen_body_record, non_equality_operator_eligible_spec_9_2) {
         "end V; "
         "class C public static method Main(): int "
         "  var a := new V(2, 3); var b := new V(2, 3); "
-        "  return (1 if a.Equals(b) and a.ToString() = \"V(X: 2, Y: 3)\" "
-        "             else 0); "
+        "  return (if a.Equals(b) and a.ToString() = \"V(X: 2, Y: 3)\" "
+        "             then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -163,7 +163,7 @@ BEZEL_TEST(codegen_body_record, manual_equals_ineligible_user_wins_spec_9_2) {
         "end Tagged; "
         "class C public static method Main(): int "
         "  var a := new Tagged(1); var b := new Tagged(9); "
-        "  return (1 if a.Equals(b) else 0); "  // user Equals → true
+        "  return (if a.Equals(b) then 1 else 0); "  // user Equals → true
         "end Main; end C;"), 1);
 }
 
@@ -179,7 +179,7 @@ BEZEL_TEST(codegen_body_record, manual_equals_tostring_type_name_spec_8_5) {
         "end Tagged; "
         "class C public static method Main(): int "
         "  var a := new Tagged(7); "
-        "  return (1 if a.ToString() = \"Tagged\" else 0); "
+        "  return (if a.ToString() = \"Tagged\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -197,7 +197,7 @@ BEZEL_TEST(codegen_body_record, explicit_field_ineligible_spec_9_2) {
         "end HasField; "
         "class C public static method Main(): int "
         "  var a := new HasField(5); "
-        "  return (1 if a.ToString() = \"HasField\" and a.X = 5 else 0); "
+        "  return (if a.ToString() = \"HasField\" and a.X = 5 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -208,7 +208,7 @@ BEZEL_TEST(codegen_body_record, interpolation_eligible_spec_8_5) {
         std::string("module M; ") + kPt +
         "class C public static method Main(): int "
         "  var a := new Pt(4, 5); "
-        "  return (1 if $\"{a}\" = \"Pt(X: 4, Y: 5)\" else 0); "
+        "  return (if $\"{a}\" = \"Pt(X: 4, Y: 5)\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -224,7 +224,7 @@ BEZEL_TEST(codegen_body_record, interpolation_ineligible_type_name_spec_8_5) {
         "end HasField; "
         "class C public static method Main(): int "
         "  var a := new HasField(5); "
-        "  return (1 if $\"{a}\" = \"HasField\" else 0); "
+        "  return (if $\"{a}\" = \"HasField\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -314,7 +314,7 @@ BEZEL_TEST(codegen_body_record, body_inline_array_autoprop_with_literal_fix1382)
         "end Pt; "
         "class C public static method Main(): int "
         "  var pt := new Pt([10, 20, 30]); "
-        "  var pt2 := pt with P := [1, 2, 9] end; "
+        "  var pt2 := pt with(P := [1, 2, 9]); "
         "  return pt2.P[0] + pt2.P[1] + pt2.P[2]; "
         "end Main; end C;"), 12);
 }
@@ -328,7 +328,7 @@ BEZEL_TEST(codegen_body_record, positional_inline_array_with_literal_fix1382) {
         "record R(A: [3]int); "
         "class C public static method Main(): int "
         "  var r := new R([10, 20, 30]); "
-        "  var r2 := r with A := [1, 2, 9] end; "
+        "  var r2 := r with(A := [1, 2, 9]); "
         "  return r2.A[0] + r2.A[1] + r2.A[2]; "
         "end Main; end C;"), 12);
 }

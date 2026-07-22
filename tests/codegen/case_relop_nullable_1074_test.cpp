@@ -24,7 +24,7 @@ int run(const std::string& prog) {
 std::string caseProg(const std::string& init, const std::string& arm) {
     return std::string("module M; class C public static method Main(): int "
                        "  var n: int? := ") + init + "; "
-           "  var r := case n of " + arm + ", _ => 2 end; "
+           "  var r := (case n of " + arm + ", _ => 2); "
            "  return r; end Main; end C;";
 }
 }  // namespace
@@ -61,7 +61,7 @@ BEZEL_TEST(case_relop_nullable_1074, relational_then_constant_arm) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var n: int? := 10; "
-        "  var r := case n of > 100 => 1, 10 => 5, _ => 2 end; "
+        "  var r := (case n of > 100 => 1, 10 => 5, _ => 2); "
         "  return r; end Main; end C;"), 5);  // 10 not >100; matches constant 10
 }
 
@@ -78,14 +78,14 @@ BEZEL_TEST(case_relop_nullable_1074, relational_then_constant_arm) {
 BEZEL_TEST(case_relop_nullable_1074, narrow_nullable_eq_int_literal_1113) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var a: byte? := 5; return (1 if a = 5 else 0); end Main; end C;"), 1);
+        "  var a: byte? := 5; return (if a = 5 then 1 else 0); end Main; end C;"), 1);
 }
 
 // byte? <> <int-literal>: present value not-equal (was a compiler crash).
 BEZEL_TEST(case_relop_nullable_1074, narrow_nullable_ne_int_literal_1113) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var a: byte? := 5; return (1 if a <> 6 else 0); end Main; end C;"), 1);
+        "  var a: byte? := 5; return (if a <> 6 then 1 else 0); end Main; end C;"), 1);
 }
 
 // Out-of-range literal: `byte?(5) = 261` — 261 & 0xFF == 5, so a TRUNCATING fix
@@ -93,26 +93,26 @@ BEZEL_TEST(case_relop_nullable_1074, narrow_nullable_ne_int_literal_1113) {
 BEZEL_TEST(case_relop_nullable_1074, narrow_nullable_eq_out_of_range_literal_1113) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var a: byte? := 5; return (1 if a = 261 else 0); end Main; end C;"), 0);
+        "  var a: byte? := 5; return (if a = 261 then 1 else 0); end Main; end C;"), 0);
 }
 
 // sbyte? signed: the payload sign-extends so a negative literal compares by value.
 BEZEL_TEST(case_relop_nullable_1074, narrow_signed_nullable_eq_negative_literal_1113) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var a: sbyte? := -5; return (1 if a = -5 else 0); end Main; end C;"), 1);
+        "  var a: sbyte? := -5; return (if a = -5 then 1 else 0); end Main; end C;"), 1);
 }
 
 // short? = <int-literal> with the literal LHS (operand order swapped).
 BEZEL_TEST(case_relop_nullable_1074, narrow_nullable_eq_literal_lhs_1113) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var a: short? := 300; return (1 if 300 = a else 0); end Main; end C;"), 1);
+        "  var a: short? := 300; return (if 300 = a then 1 else 0); end Main; end C;"), 1);
 }
 
 // null narrow-nullable = literal → not equal (null is never equal to a value).
 BEZEL_TEST(case_relop_nullable_1074, null_narrow_nullable_eq_literal_1113) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var a: byte? := null; return (1 if a = 5 else 0); end Main; end C;"), 0);
+        "  var a: byte? := null; return (if a = 5 then 1 else 0); end Main; end C;"), 0);
 }

@@ -38,7 +38,7 @@ BEZEL_TEST(default_tostring_inline_array_unit_1579, inline_array_int_tostring) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var arr: [3]int := [1, 2, 3]; "
-        "  return (1 if arr.ToString() = \"[3]int\" else 0); "
+        "  return (if arr.ToString() = \"[3]int\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -48,7 +48,7 @@ BEZEL_TEST(default_tostring_inline_array_unit_1579, inline_array_nullable_elemen
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var arr: [2]string? := [null, null]; "
-        "  return (1 if arr.ToString() = \"[2]string?\" else 0); "
+        "  return (if arr.ToString() = \"[2]string?\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -58,7 +58,7 @@ BEZEL_TEST(default_tostring_inline_array_unit_1579, inline_array_tostring_not_el
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var arr: [3]int := [9, 8, 7]; "
-        "  return (1 if arr.ToString() = \"[3]int\" else 0); "
+        "  return (if arr.ToString() = \"[3]int\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -67,7 +67,7 @@ BEZEL_TEST(default_tostring_inline_array_unit_1579, unit_tostring) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var u := (); "
-        "  return (1 if u.ToString() = \"()\" else 0); "
+        "  return (if u.ToString() = \"()\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -77,7 +77,7 @@ BEZEL_TEST(default_tostring_inline_array_unit_1579, inline_array_bool_tostring) 
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var arr: [5]bool := [true, false, true, false, true]; "
-        "  return (1 if arr.ToString() = \"[5]bool\" else 0); "
+        "  return (if arr.ToString() = \"[5]bool\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -88,6 +88,6 @@ BEZEL_TEST(default_tostring_inline_array_unit_1579, inline_array_tostring_concat
         "module M; class C public static method Main(): int "
         "  var arr: [3]int := [1, 2, 3]; "
         "  var s := \"n=\" + arr.ToString(); "
-        "  return (1 if s = \"n=[3]int\" else 0); "
+        "  return (if s = \"n=[3]int\" then 1 else 0); "
         "end Main; end C;"), 1);
 }

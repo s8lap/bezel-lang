@@ -23,7 +23,7 @@ std::string sign(int n) {
     return std::string(
         "module M; static class F public static method Main(): int "
         "  var n := ") + std::to_string(n) + "; "
-        "  var s := when n > 0 => 1, n < 0 => 2, _ => 3 end; "
+        "  var s := (when n > 0 => 1, n < 0 => 2, _ => 3); "
         "  return s; end Main; end F;";
 }
 }  // namespace
@@ -48,11 +48,10 @@ BEZEL_TEST(when_expr_744, multiline_layout_independent) {
     BEZEL_EXPECT_EQ(run(
         "module M; static class F public static method Main(): int "
         "  var n := 7; "
-        "  var r := when "
+        "  var r := (when "
         "    n > 100 => 10, "
         "    n > 5 => 20, "
-        "    _ => 30 "
-        "  end; "
+        "    _ => 30); "
         "  return r; end Main; end F;"), 20);
 }
 

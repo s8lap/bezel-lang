@@ -8,7 +8,7 @@
 // as an unconditional match (rc=1 instead of rc=2), leading to wrong-value
 // results and IR_FAIL when the bound `s` was used as a string.
 
-module M; class C public static method M(x: int): int return case x of var s: string => 1, _ => 2 end; end M; end C;
+module M; class C public static method M(x: int): int return (case x of var s: string => 1, _ => 2); end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: binding pattern type is incompatible with the scrutinee's static type — a value-type scrutinee can never match a reference-typed binding
 // CHECK-SAME: (§19.5)

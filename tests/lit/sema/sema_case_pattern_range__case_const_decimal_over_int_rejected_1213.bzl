@@ -6,7 +6,7 @@
 // `case x 1.0m` over an `int` scrutinee — decimal constant over int is also
 // an ICmp type mismatch; must be rejected with the same §19 diagnostic. #1213.
 
-module M; class C public static method M(x: int): int return case x of 1.0m => 1, _ => 0 end; end M; end C;
+module M; class C public static method M(x: int): int return (case x of 1.0m => 1, _ => 0); end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: case pattern operand type is not compatible with the scrutinee type
 // CHECK-SAME: (§19)

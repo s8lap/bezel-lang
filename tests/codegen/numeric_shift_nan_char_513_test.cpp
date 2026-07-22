@@ -102,57 +102,57 @@ BEZEL_TEST(codegen_cg_513, long_shift_left_count_65_wraps_to_1_spec_6_5) {
 
 // §4.3.1 (L308): "NaN = NaN is true" — reflexive equality.
 BEZEL_TEST(codegen_cg_514, nan_equals_nan_is_true_spec_4_3_1) {
-    BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; return (1 if nan = nan else 0);"), 1);
+    BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; return (if nan = nan then 1 else 0);"), 1);
 }
 
 // §4.3.1: `nan <> nan` is false (negation of `=` which is true).
 BEZEL_TEST(codegen_cg_514, nan_not_equal_nan_is_false_spec_4_3_1) {
-    BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; return (1 if nan <> nan else 0);"), 0);
+    BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; return (if nan <> nan then 1 else 0);"), 0);
 }
 
 // §4.3.1: `1.0 = nan` is false (only same-NaN is reflexively true).
 BEZEL_TEST(codegen_cg_514, value_equals_nan_is_false_spec_4_3_1) {
-    BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; return (1 if 1.0 = nan else 0);"), 0);
+    BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; return (if 1.0 = nan then 1 else 0);"), 0);
 }
 
 // §4.3.1: `nan = 1.0` is false.
 BEZEL_TEST(codegen_cg_514, nan_equals_value_is_false_spec_4_3_1) {
-    BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; return (1 if nan = 1.0 else 0);"), 0);
+    BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; return (if nan = 1.0 then 1 else 0);"), 0);
 }
 
 // §4.3.1: `1.0 = 1.0` is still true (non-NaN equality unaffected).
 BEZEL_TEST(codegen_cg_514, normal_equality_unaffected_spec_4_3_1) {
-    BEZEL_EXPECT_EQ(run("return (1 if 1.0 = 1.0 else 0);"), 1);
+    BEZEL_EXPECT_EQ(run("return (if 1.0 = 1.0 then 1 else 0);"), 1);
 }
 
 // §4.3.1: `1.0 <> 2.0` is true (normal inequality unaffected).
 BEZEL_TEST(codegen_cg_514, normal_inequality_unaffected_spec_4_3_1) {
-    BEZEL_EXPECT_EQ(run("return (1 if 1.0 <> 2.0 else 0);"), 1);
+    BEZEL_EXPECT_EQ(run("return (if 1.0 <> 2.0 then 1 else 0);"), 1);
 }
 
 // §4.3.1: CONTROL — relational `nan < nan` remains false (IEEE).
 BEZEL_TEST(codegen_cg_514, nan_less_than_nan_is_false_ieee_spec_4_3_1) {
-    BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; return (1 if nan < nan else 0);"), 0);
+    BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; return (if nan < nan then 1 else 0);"), 0);
 }
 
 // §4.3.1: CONTROL — relational `nan <= nan` remains false (IEEE).
 BEZEL_TEST(codegen_cg_514, nan_leq_nan_is_false_ieee_spec_4_3_1) {
-    BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; return (1 if nan <= nan else 0);"), 0);
+    BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; return (if nan <= nan then 1 else 0);"), 0);
 }
 
 // §4.3.1: CONTROL — relational `nan > nan` remains false (IEEE).
 BEZEL_TEST(codegen_cg_514, nan_greater_than_nan_is_false_ieee_spec_4_3_1) {
-    BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; return (1 if nan > nan else 0);"), 0);
+    BEZEL_EXPECT_EQ(run("var nan := 0.0 / 0.0; return (if nan > nan then 1 else 0);"), 0);
 }
 
 // §4.3.1: float variant — `nan = nan` is true for float (f32) too.
 BEZEL_TEST(codegen_cg_514, float_nan_equals_nan_is_true_spec_4_3_1) {
-    BEZEL_EXPECT_EQ(run("var nan := float(0.0 / 0.0); return (1 if nan = nan else 0);"), 1);
+    BEZEL_EXPECT_EQ(run("var nan := float(0.0 / 0.0); return (if nan = nan then 1 else 0);"), 1);
 }
 
 // §4.3.1: float variant — `nan <> nan` is false for float (f32).
 BEZEL_TEST(codegen_cg_514, float_nan_not_equal_nan_is_false_spec_4_3_1) {
-    BEZEL_EXPECT_EQ(run("var nan := float(0.0 / 0.0); return (1 if nan <> nan else 0);"), 0);
+    BEZEL_EXPECT_EQ(run("var nan := float(0.0 / 0.0); return (if nan <> nan then 1 else 0);"), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -313,5 +313,5 @@ BEZEL_TEST(codegen_cg_1094, nullable_byte_shr_logical) {
 BEZEL_TEST(codegen_cg_1094, nullable_byte_shl_null_propagates) {
     BEZEL_EXPECT_EQ(run(
         "var a: byte? := null; var n: int := 1; var c: byte? := a << n; "
-        "return (0 if c = null else 99);"), 0);
+        "return (if c = null then 0 else 99);"), 0);
 }

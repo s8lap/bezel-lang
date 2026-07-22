@@ -81,7 +81,7 @@ BEZEL_TEST(codegen_2057, substituted_base_arg_matches) {
         "class MainClass public static method Main(): int "
         "  using var c := new C<int>(); "
         "  var o: Object := c; "
-        "  return (1 if o is Base<Array<int>> else 0); "
+        "  return (if o is Base<Array<int>> then 1 else 0); "
         "end Main; end MainClass;"), 1);
 }
 
@@ -99,7 +99,7 @@ BEZEL_TEST(codegen_2057, mismatching_base_arg_still_false) {
         "class MainClass public static method Main(): int "
         "  using var c := new C<int>(); "
         "  var o: Object := c; "
-        "  return (1 if o is Base<Array<string>> else 0); "
+        "  return (if o is Base<Array<string>> then 1 else 0); "
         "end Main; end MainClass;"), 0);
 }
 
@@ -121,10 +121,10 @@ BEZEL_TEST(codegen_2057, combined_is_as_substituted_base) {
         "class MainClass public static method Main(): int "
         "  using var c := new C<int>(); "
         "  var o: Object := c; "
-        "  var r1 := (1 if o is Base<Array<int>> else 0); "
-        "  var r2 := (1 if o is Base<Array<string>> else 0); "
+        "  var r1 := (if o is Base<Array<int>> then 1 else 0); "
+        "  var r2 := (if o is Base<Array<string>> then 1 else 0); "
         "  var x := o as Base<Array<int>>; "
-        "  var r3 := (1 if x <> null else 0); "
+        "  var r3 := (if x <> null then 1 else 0); "
         "  return r1 * 100 + r2 * 10 + r3; "
         "end Main; end MainClass;"), 101);
 }
@@ -150,7 +150,7 @@ BEZEL_TEST(codegen_2057, nested_null_decl_builtin_in_base_arg) {
         "class MainClass public static method Main(): int "
         "  using var c := new C<int>(); "
         "  var o: Object := c; "
-        "  return (1 if o is Base<Array<Array<int>>> else 0); "
+        "  return (if o is Base<Array<Array<int>>> then 1 else 0); "
         "end Main; end MainClass;"), 1);
 }
 
@@ -173,7 +173,7 @@ BEZEL_TEST(codegen_2057, control_bare_placeholder_substitution_unaffected) {
         "class MainClass public static method Main(): int "
         "  using var c := new C<int>(); "
         "  var o: Object := c; "
-        "  return (1 if o is Base<int> else 0); "
+        "  return (if o is Base<int> then 1 else 0); "
         "end Main; end MainClass;"), 1);
 }
 
@@ -200,8 +200,8 @@ BEZEL_TEST(codegen_2057, control_declared_generic_base_arg_unaffected) {
         "class MainClass public static method Main(): int "
         "  using var c := new C<int>(); "
         "  var o: Object := c; "
-        "  var r1 := (1 if o is Base<List<int>> else 0); "
-        "  var r2 := (1 if o is Base<List<string>> else 0); "
+        "  var r1 := (if o is Base<List<int>> then 1 else 0); "
+        "  var r2 := (if o is Base<List<string>> then 1 else 0); "
         "  return r1 * 10 + r2; "
         "end Main; end MainClass;"), 10);
 }

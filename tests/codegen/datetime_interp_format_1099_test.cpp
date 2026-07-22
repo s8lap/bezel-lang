@@ -43,7 +43,7 @@ BEZEL_TEST(datetime_interp_format_1099, agrees_with_explicit_tostring) {
         "  var d := new DateTime(2024, 3, 15); "
         "  var a := $\"{d:yyyy-MM-dd}\"; "
         "  var b := d.ToString(\"yyyy-MM-dd\"); "
-        "  return 1 if a = b else 0; "                     // 1
+        "  return (if a = b then 1 else 0); "                     // 1
         "end Main; end C;"), 1);
 }
 
@@ -53,7 +53,7 @@ BEZEL_TEST(datetime_interp_format_1099, no_format_unchanged) {
         "module M; class C public static method Main(): int "
         "  var d := new DateTime(2024, 3, 15); "
         "  var s := $\"{d}\"; "
-        "  return 1 if s.Length > 10 else 0; "             // full form > 10 chars
+        "  return (if s.Length > 10 then 1 else 0); "             // full form > 10 chars
         "end Main; end C;"), 1);
 }
 
@@ -81,7 +81,7 @@ BEZEL_TEST(datetime_interp_format_1099, time_format_with_colons) {
         "module M; class C public static method Main(): int "
         "  var d := new DateTime(2024, 3, 15); "
         "  var s := $\"{d:HH:mm:ss}\"; "
-        "  return (3 if s.Length = 8 and s = \"00:00:00\" else 0); "
+        "  return (if s.Length = 8 and s = \"00:00:00\" then 3 else 0); "
         "end Main; end C;"), 3);
 }
 
@@ -90,7 +90,7 @@ BEZEL_TEST(datetime_interp_format_1099, combined_date_time_format) {
         "module M; class C public static method Main(): int "
         "  var d := new DateTime(2024, 3, 15); "
         "  var s := $\"{d:yyyy-MM-dd HH:mm:ss}\"; "
-        "  return (3 if s.Length = 19 and s = \"2024-03-15 00:00:00\" else 0); "
+        "  return (if s.Length = 19 and s = \"2024-03-15 00:00:00\" then 3 else 0); "
         "end Main; end C;"), 3);
 }
 
@@ -99,7 +99,7 @@ BEZEL_TEST(datetime_interp_format_1099, slash_date_format) {
         "module M; class C public static method Main(): int "
         "  var d := new DateTime(2024, 3, 15); "
         "  var s := $\"{d:yyyy/MM/dd}\"; "
-        "  return (1 if s = \"2024/03/15\" else 0); "
+        "  return (if s = \"2024/03/15\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -111,7 +111,7 @@ BEZEL_TEST(datetime_interp_format_1099, decimal_fixed_format_in_interpolation) {
         "module M; class C public static method Main(): int "
         "  var x: decimal := 1.5m; "
         "  var s := $\"{x:F2}\"; "
-        "  return (3 if s.Length = 4 and s = \"1.50\" else 0); "
+        "  return (if s.Length = 4 and s = \"1.50\" then 3 else 0); "
         "end Main; end C;"), 3);
 }
 
@@ -125,7 +125,7 @@ BEZEL_TEST(datetime_interp_format_1099, hex_64bit_no_truncation_1123) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var v: long := 4294967296L; "
-        "  return (1 if $\"{v:X}\" = \"100000000\" else 0); "
+        "  return (if $\"{v:X}\" = \"100000000\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -134,7 +134,7 @@ BEZEL_TEST(datetime_interp_format_1099, hex_ulong_max_full_width_1123) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var u: ulong := 18446744073709551615; "
-        "  return (1 if $\"{u:X}\" = \"FFFFFFFFFFFFFFFF\" else 0); "
+        "  return (if $\"{u:X}\" = \"FFFFFFFFFFFFFFFF\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -143,7 +143,7 @@ BEZEL_TEST(datetime_interp_format_1099, decimal_D_64bit_no_truncation_1123) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var d: long := 1000000000000L; "
-        "  return (1 if $\"{d:D}\" = \"1000000000000\" else 0); "
+        "  return (if $\"{d:D}\" = \"1000000000000\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -153,7 +153,7 @@ BEZEL_TEST(datetime_interp_format_1099, hex_unsigned_byte_no_sext_1123) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var b: byte := 255; "
-        "  return (1 if $\"{b:X2}\" = \"FF\" else 0); "
+        "  return (if $\"{b:X2}\" = \"FF\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

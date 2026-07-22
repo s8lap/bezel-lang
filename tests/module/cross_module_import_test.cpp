@@ -1098,11 +1098,10 @@ BEZEL_TEST(cross_module_import, imported_enum_case_arm_selects_spec_19) {
         "public class Program "
         "  public static method Main(): int "
         "    var c := Color.Green; "
-        "    return case c of "
+        "    return (case c of "
         "      Color.Red => 11, "
         "      Color.Green => 22, "
-        "      Color.Blue => 33, "
-        "    end; "
+        "      Color.Blue => 33,); "
         "  end Main; "
         "end Program;");
 
@@ -1889,7 +1888,7 @@ BEZEL_TEST(cross_module_import, imported_generic_record_with_update_native_spec_
         "public class Program "
         "  public static method Main(): int "
         "    var b := new Box<int>(1); "
-        "    var b2 := b with value := 99 end; "
+        "    var b2 := b with(value := 99); "
         "    return b2.value; "
         "  end Main; "
         "end Program;");
@@ -2261,7 +2260,7 @@ BEZEL_TEST(cross_module_import,
         "  public static method Main(): int "
         "    var b := new Box<string>(\"bezel\"); "
         "    var p := new Pair<int, double>(40, 2.5); "
-        "    var b2 := b with Value := \"ok\" end; "
+        "    var b2 := b with(Value := \"ok\"); "
         "    if b2.Value = \"ok\" and b.Value.Length = 5 then "
         "      return p.First + int(p.Second); "  // 40 + 2 = 42
         "    end; "

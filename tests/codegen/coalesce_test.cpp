@@ -66,7 +66,7 @@ BEZEL_TEST(codegen_cg39, right_not_evaluated_when_left_non_null) {
         "  end Boom; "
         "  public static method Main(): int "
         "    var x := new T(); x.V := 5; var a: T? := x; "
-        "    var r := a!.V if a <> null else Boom().V; "
+        "    var r := (if a <> null then a!.V else Boom().V); "
         "    return r; "
         "  end Main; "
         "end C;"), 5);

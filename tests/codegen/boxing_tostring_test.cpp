@@ -34,7 +34,7 @@ int run(const std::string& program) {
 BEZEL_TEST(codegen_boxing_tostring_417, boxed_int_tostring_via_object) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var o: Object := 42; return (1 if o.ToString() = \"42\" else 0); "
+        "  var o: Object := 42; return (if o.ToString() = \"42\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -51,7 +51,7 @@ BEZEL_TEST(codegen_boxing_tostring_417, boxed_int_tostring_length) {
 BEZEL_TEST(codegen_boxing_tostring_417, boxed_bool_tostring_via_object) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var o: Object := true; return (1 if o.ToString() = \"True\" else 0); "
+        "  var o: Object := true; return (if o.ToString() = \"True\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -72,7 +72,7 @@ BEZEL_TEST(codegen_boxing_tostring_417, boxed_record_tostring_via_object) {
         "module M; record Point(X: int, Y: int); "
         "class C public static method Main(): int "
         "  var o: Object := new Point(3, 4); "
-        "  return (1 if o.ToString() = \"Point(X: 3, Y: 4)\" else 0); "
+        "  return (if o.ToString() = \"Point(X: 3, Y: 4)\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -85,7 +85,7 @@ BEZEL_TEST(codegen_boxing_tostring_417, boxed_record_tostring_via_interface) {
         "  public method Area(): int => w * h; end Rect; "
         "class C public static method Main(): int "
         "  var s: IShape := new Rect(2, 5); "
-        "  return (1 if s.ToString() = \"Rect(w: 2, h: 5)\" else 0); "
+        "  return (if s.ToString() = \"Rect(w: 2, h: 5)\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -98,7 +98,7 @@ BEZEL_TEST(codegen_boxing_tostring_417, boxed_enum_tostring_via_object) {
         "module M; enum Color Red := 0, Green := 1, Blue := 2; end Color; "
         "class C public static method Main(): int "
         "  var o: Object := Color.Green; "
-        "  return (1 if o.ToString() = \"Color\" else 0); "
+        "  return (if o.ToString() = \"Color\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -113,7 +113,7 @@ BEZEL_TEST(codegen_boxing_tostring_417, class_override_tostring_via_object) {
         "end Widget; "
         "class C public static method Main(): int "
         "  using var w: Object := new Widget(); "
-        "  return (1 if w.ToString() = \"W!\" else 0); "
+        "  return (if w.ToString() = \"W!\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -124,7 +124,7 @@ BEZEL_TEST(codegen_boxing_tostring_417, class_default_tostring_via_object) {
         "class Gadget end Gadget; "
         "class C public static method Main(): int "
         "  using var g: Object := new Gadget(); "
-        "  return (1 if g.ToString() = \"Gadget\" else 0); "
+        "  return (if g.ToString() = \"Gadget\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -160,7 +160,7 @@ BEZEL_TEST(codegen_boxing_tostring_417, boxed_record_user_override_via_object) {
         "end Temp; "
         "class C public static method Main(): int "
         "  var o: Object := new Temp(99); "
-        "  return (1 if o.ToString() = \"hot\" else 0); "
+        "  return (if o.ToString() = \"hot\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -175,7 +175,7 @@ BEZEL_TEST(codegen_boxing_tostring_417, class_override_tostring_via_interface) {
         "end Square; "
         "class C public static method Main(): int "
         "  using var s: IShape := new Square(); "
-        "  return (1 if s.ToString() = \"sq\" else 0); "
+        "  return (if s.ToString() = \"sq\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -185,7 +185,7 @@ BEZEL_TEST(codegen_boxing_tostring_417, string_in_object_tostring_identity) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var o: Object := \"hello\"; "
-        "  return (1 if o.ToString() = \"hello\" else 0); "
+        "  return (if o.ToString() = \"hello\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -195,7 +195,7 @@ BEZEL_TEST(codegen_boxing_tostring_417, string_in_object_tostring_identity) {
 BEZEL_TEST(codegen_boxing_isas_417, is_string_via_object_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var o: Object := \"hi\"; return (1 if o is string else 0); "
+        "  var o: Object := \"hi\"; return (if o is string then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -203,7 +203,7 @@ BEZEL_TEST(codegen_boxing_isas_417, is_string_via_object_true) {
 BEZEL_TEST(codegen_boxing_isas_417, is_string_on_boxed_int_false) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var o: Object := 42; return (1 if o is string else 0); "
+        "  var o: Object := 42; return (if o is string then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -213,7 +213,7 @@ BEZEL_TEST(codegen_boxing_isas_417, is_string_on_class_false) {
         "module M; class Animal end Animal; "
         "class C public static method Main(): int "
         "  using var o: Object := new Animal(); "
-        "  return (1 if o is string else 0); "
+        "  return (if o is string then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -223,7 +223,7 @@ BEZEL_TEST(codegen_boxing_isas_417, is_string_on_boxed_record_false) {
         "module M; record Point(X: int, Y: int); "
         "class C public static method Main(): int "
         "  var o: Object := new Point(1, 2); "
-        "  return (1 if o is string else 0); "
+        "  return (if o is string then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
@@ -231,14 +231,14 @@ BEZEL_TEST(codegen_boxing_isas_417, is_string_on_boxed_record_false) {
 BEZEL_TEST(codegen_boxing_isas_417, is_not_string_on_string_false) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var o: Object := \"x\"; return (1 if o is not string else 0); "
+        "  var o: Object := \"x\"; return (if o is not string then 1 else 0); "
         "end Main; end C;"), 0);
 }
 
 BEZEL_TEST(codegen_boxing_isas_417, is_not_string_on_boxed_int_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var o: Object := 7; return (1 if o is not string else 0); "
+        "  var o: Object := 7; return (if o is not string then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -256,7 +256,7 @@ BEZEL_TEST(codegen_boxing_isas_417, as_string_on_boxed_int_null) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var o: Object := 42; var s: string? := o as string; "
-        "  return (1 if s = null else 0); "
+        "  return (if s = null then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -265,7 +265,7 @@ BEZEL_TEST(codegen_boxing_isas_417, as_string_on_boxed_int_null) {
 BEZEL_TEST(codegen_boxing_isas_417, is_object_on_string_true) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var o: Object := \"y\"; return (1 if o is Object else 0); "
+        "  var o: Object := \"y\"; return (if o is Object then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -274,13 +274,13 @@ BEZEL_TEST(codegen_boxing_isas_417, is_object_on_class_true) {
         "module M; class Animal end Animal; "
         "class C public static method Main(): int "
         "  using var o: Object := new Animal(); "
-        "  return (1 if o is Object else 0); "
+        "  return (if o is Object then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
 BEZEL_TEST(codegen_boxing_isas_417, is_object_on_null_false) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var o: Object? := null; return (1 if o is Object else 0); "
+        "  var o: Object? := null; return (if o is Object then 1 else 0); "
         "end Main; end C;"), 0);
 }
