@@ -12,6 +12,10 @@
 #     SHARD_COUNT  number of parallel shards (default: min(16, nproc))
 #     BINARY       path to bezel_tests   (default: build/tests/bezel_tests)
 #   BEZEL_TEST_FILTER=<substr> is passed through to each shard.
+#   BEZEL_TEST_LIST=<file> (exact suite.name lines, #2100) likewise inherits
+#   into every shard; the binary then reports an explicit "N selected" field
+#   and the integrity accounting below compares ran against the SELECTED count
+#   (see the subset block after the harvest loop) instead of the registry total.
 #
 # Exit status is 0 only if every shard exited 0 and no test failed.
 set -u
@@ -94,6 +98,8 @@ total_fail=0
 expected_total=0
 summaries_seen=0
 missing_summary_shards=()
+subset_mode=0
+selected_total=0
 for (( i = 0; i < shards; i++ )); do
     line="$(grep -E '^[0-9]+ passed, [0-9]+ failed' "$logdir/shard.$i.log" | tail -1)"
     if [[ -n "$line" ]]; then
@@ -107,8 +113,30 @@ for (( i = 0; i < shards; i++ )); do
     total_pass=$(( total_pass + ${p:-0} ))
     total_fail=$(( total_fail + ${f:-0} ))
     [[ "${t:-0}" -gt "$expected_total" ]] && expected_total="$t"
+    # Subset marker (#2100): a BEZEL_TEST_LIST run reports ", N selected".
+    # Like the registry total, the selected count is identical across shards
+    # (each re-walks the whole registry with the same list) — max is harvest.
+    if [[ "$line" == *" selected"* ]]; then
+        subset_mode=1
+        s="$(grep -oE '[0-9]+ selected' <<<"$line" | grep -oE '^[0-9]+')"
+        [[ "${s:-0}" -gt "$selected_total" ]] && selected_total="$s"
+    fi
 done
 ran=$(( total_pass + total_fail ))
+
+# Subset accounting (#2100): under BEZEL_TEST_LIST the drop-detection contract
+# is "every SELECTED test ran" — the registry total would mechanically
+# false-fail any subset. The full-suite path (no "selected" field) is
+# untouched. An EMPTY selection is never a pass: a subset run that selected 0
+# tests validated nothing, so it fails loudly instead of reading "0 failed".
+registry_total=$expected_total
+expected_what="registered"
+subset_empty=0
+if [[ "$subset_mode" -eq 1 ]]; then
+    expected_total=$selected_total
+    expected_what="selected"
+    [[ "$selected_total" -eq 0 ]] && subset_empty=1
+fi
 
 end=$(date +%s)
 
@@ -118,6 +146,12 @@ if [[ -n "$fail_lines" ]]; then
     echo "--- failing tests ---"
     echo "$fail_lines"
 fi
+
+# Surface the binary's phantom-name warning (BEZEL_TEST_LIST names that matched
+# no registered test, printed by shard 0 — test_main.cpp, #2100). Without this
+# forward it would die with the private $logdir on EXIT and the gate/agent_check
+# tripwires could never see it.
+grep -h 'WARNING: only' "$logdir"/shard.*.log 2>/dev/null | head -1 || true
 
 # GATE INTEGRITY: a crashed shard (uncaught exception -> runtime exit(70), or a
 # segfault) kills the host process and silently drops its remaining tests. Detect
@@ -137,10 +171,13 @@ summary_ok=1
 if [[ "$summaries_seen" -ne "$shards" ]]; then
     summary_ok=0
 fi
-if [[ "${#crashed_shards[@]}" -gt 0 || "$count_ok" -eq 0 || "$summary_ok" -eq 0 ]]; then
+if [[ "${#crashed_shards[@]}" -gt 0 || "$count_ok" -eq 0 || "$summary_ok" -eq 0 || "$subset_empty" -eq 1 ]]; then
     echo "############################################################"
     echo "## GATE FAILURE: shard crash / undercount — result is NOT trustworthy"
-    echo "##   ran $ran of $expected_total registered tests ($(( expected_total - ran )) unaccounted)"
+    echo "##   ran $ran of $expected_total $expected_what tests ($(( expected_total - ran )) unaccounted)"
+    if [[ "$subset_empty" -eq 1 ]]; then
+        echo "##   SUBSET run selected 0 tests (empty/unmatched BEZEL_TEST_LIST) — nothing was validated"
+    fi
     if [[ "$summary_ok" -eq 0 ]]; then
         echo "##   $(( shards - summaries_seen )) of $shards shards printed NO completion summary (slice not validated): shard(s) ${missing_summary_shards[*]}"
     fi
@@ -159,10 +196,12 @@ for (( i = 0; i < shards; i++ )); do
 done
 
 echo "============================================================"
-echo "TOTAL: $total_pass passed, $total_fail failed  (across $shards shards, $((end - start))s)"
+subset_note=""
+[[ "$subset_mode" -eq 1 ]] && subset_note="  [SUBSET: $selected_total selected of $registry_total registered]"
+echo "TOTAL: $total_pass passed, $total_fail failed  (across $shards shards, $((end - start))s)$subset_note"
 echo "============================================================"
 
-if [[ "$shard_rc" -ne 0 || "$total_fail" -ne 0 || "$count_ok" -eq 0 || "$summary_ok" -eq 0 ]]; then
+if [[ "$shard_rc" -ne 0 || "$total_fail" -ne 0 || "$count_ok" -eq 0 || "$summary_ok" -eq 0 || "$subset_empty" -eq 1 ]]; then
     exit 1
 fi
 exit 0
