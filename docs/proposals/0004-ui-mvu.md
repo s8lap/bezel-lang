@@ -4,6 +4,7 @@
 |---|---|
 | **Status** | Early draft — **proposal-only by owner decision (2026-07-03): no implementation until a future explicit go**; architecture + code shape only, deliberately *not* a full API surface |
 | **Origin** | exploration-ui.md's "fits like a glove" finding; owner asked for construction/control examples (2026-07-03) |
+| **Written against** | spec v0.216 (owner-directed currency refresh 2026-07-22 — the draft predated `choice` and the v0.208 expression forms; §3's "honest sum-type gap" is now closed by the language and the examples use current syntax. Architecture unchanged.) |
 | **Design influences** | Elm (the architecture), iced/Rust (MVU without a VM), **not** SwiftUI's property wrappers, **not** React hooks (exploration-ui.md records why) |
 | **The one-line pitch** | The Elm runtime's defining constraint — updates are strictly serial — *is* Bezel's domain model; every piece of MVU maps to an existing language feature, and messages-as-data is exactly what sendability wants |
 
@@ -11,10 +12,10 @@
 
 | Elm piece | Bezel spelling |
 |---|---|
-| `Model` | a record (immutable; updates via `with`) |
-| `Msg` | records implementing a marker interface (see §3 — the honest sum-type gap) |
-| `update : Msg -> Model -> Model` | a static method, `case`-of over message kinds |
-| `view : Model -> Html Msg` | a pure static method producing an **owned node tree** |
+| `Model` | a record (immutable; updates via `with(…)`, §9.5) |
+| `Msg` | a **`choice`** — a closed nominal sum with per-case payloads (§35, v0.200; see §3) |
+| `update : Msg -> Model -> Model` | a static method, a `case` over the message cases — **statically exhaustive** (§19.6/§35.5), and `pure`-declarable (§22.15, v0.202) under the Cmd-return effects shape (§4) |
+| `view : Model -> Html Msg` | a static method producing an **owned node tree** (not `pure`-declarable — §22.15's records-only allocation excludes class-node construction; "pure by architecture" is the claim, not the keyword) |
 | The Elm runtime | **one domain**: the loop below, serial by construction (§30.13) |
 
 ```
@@ -34,32 +35,31 @@ module CounterApp;
 // ---- Model ------------------------------------------------------------
 record CounterModel(Count: int);
 
-// ---- Messages: plain data, one record per kind (see §3) ----------------
-interface Msg end Msg;
-record Increment(): Msg;
-record Decrement(): Msg;
-record SetTo(Value: int): Msg;
+// ---- Messages: one closed sum (§35, v0.200) ----------------------------
+public choice Msg
+  Increment,
+  Decrement,
+  SetTo(value: int);
+end Msg;
 
-// ---- Update: pure, total over the kinds it knows ------------------------
+// ---- Update: pure, statically total over the message set ----------------
 class Counter
-  public static method Update(model: CounterModel, msg: Msg): CounterModel
-    return case msg of
-      Increment      => model with Count := model.Count + 1,
-      Decrement      => model with Count := model.Count - 1,
-      SetTo(var v)   => model with Count := v,
-      _              => model            // open interface ⇒ a `_` arm (see §3)
-    end;
+  public static pure method Update(model: CounterModel, msg: Msg): CounterModel
+    return (case msg of
+      Increment    => model with(Count := model.Count + 1),
+      Decrement    => model with(Count := model.Count - 1),
+      SetTo(var v) => model with(Count := v));
   end Update;
 
-  // ---- View: pure Model -> owned node tree ------------------------------
+  // ---- View: Model -> owned node tree ------------------------------------
   public static method View(model: CounterModel): owned Node
     return Ui.Column([
       Ui.Text($"Count: {model.Count}"),
       Ui.Row([
-        Ui.Button("−", new Decrement()),      // a button CARRIES its message
-        Ui.Button("+", new Increment()),
-        Ui.Button("reset", new SetTo(0))
-      ])
+        Ui.Button("−", Msg.Decrement),        // a button CARRIES its message
+        Ui.Button("+", Msg.Increment),
+        Ui.Button("reset", Msg.SetTo(0)),
+      ]),
     ]);
   end View;
 
@@ -74,62 +74,67 @@ end Counter;
 
 Things this example is deliberately showing:
 
-- **A button carries its message as a value**, Elm-style — `Ui.Button("+", new Increment())` — *not* a callback closure. This is not just aesthetics: a `Msg` record is a **sendable value**, so the backend (which may live near an OS event thread) can carry it across domains legally; a closure capturing `model` could not cross, and the compiler would say so. Elm's design and §30.14 turn out to want the same thing.
-- **`update` is the only place state changes**, and it is `case`-of + `with` — pattern matching and record updates, no framework state cells.
+- **A button carries its message as a value**, Elm-style — `Ui.Button("+", Msg.Increment)` — *not* a callback closure. This is not just aesthetics: this `Msg` is a **value-like choice over value payloads, hence sendable** (§35.12 — it crosses as a copy), so the backend (which may live near an OS event thread) can carry it across domains legally; a closure capturing `model` could not cross, and the compiler would say so. Elm's design and §30.14 turn out to want the same thing.
+- **`update` has no `_` arm and needs none** — a choice scrutinee is exhaustive by case coverage (§19.6/§35.5). Adding a `Reset` case to `Msg` makes every non-exhaustive `update` in the program a compile-time miss, which is the Elm guarantee the original draft could not express (see §3).
+- **`update` is declared `pure`** (§22.15): record `with(…)` copies are records-only allocation, so the no-effects rule Elm holds by convention is compiler-checked here. (This is the effects-shape tiebreaker §4 records.)
+- **`update` is the only place state changes**, and it is a `(case …)` atom + `with(…)` — pattern matching and record updates (§19, §9.5, both in their v0.208 paren forms), no framework state cells.
 - **`view` returns an `owned Node`** — a fresh tree per render, consumed Pattern-B style by the reconciler (§5).
 - `Ui.Run` never returns until quit; it *is* the UI domain's life. Method references wire it exactly like 0002's route handlers.
 
-## 3. `Msg` and the honest sum-type gap
+## 3. `Msg` is a `choice` — the sum-type gap is closed (v0.200)
 
-Elm's `Msg` is a closed tagged union. Bezel has no unions; the spelling above — a marker interface + one record (or, for collection payloads, one sealed sendable class — cost 3) per kind + type/destructure patterns — is the idiomatic encoding, and it works today. Three honest costs, recorded rather than hidden:
+Elm's `Msg` is a closed tagged union, and since v0.200 **so is Bezel's**: proposal 0041 graduated as the `choice` kind (§35) — a closed nominal sum with per-case payloads, qualified construction, positional destructuring, and full static exhaustiveness. The original draft's marker-interface encoding, and two of its three recorded costs, dissolve:
 
-1. **No static exhaustiveness**: an interface scrutinee is an open set (§19.6), so `update` needs the `_ => model` arm, and forgetting a new message kind is a silent no-op rather than a compile error. This is the strongest argument this proposal generates for a future **closed-set construct** (`sealed interface` / union) — noted as a language keep-in-mind, *not* proposed here.
-2. Message records with payloads are one line each (`record SetTo(Value: int): Msg;`) — mild ceremony, acceptable.
-3. **Collection payloads cannot be records.** A record with a class-typed field (an `Array<string>`, any collection) is *borrow-bearing* (§9.7) and therefore **not sendable** (§30.14's value rule), and records cannot declare `owned` fields (§14.4) — so no record can *own* a collection to carry it across a domain. A message whose payload is a collection must be a **sealed sendable class with an `owned` field** (§30.14 class rule 2), as `UsersLoaded` is in §4. Scalar / `string` / value payloads stay records; only collection-bearing messages pay this cost.
+1. **Static exhaustiveness — gone as a cost.** A choice scrutinee is matched by case coverage (§19.6/§35.5): `update` needs no `_` arm, and forgetting a new message case is a **compile error at every match**, not a silent no-op. The draft's "strongest argument for a future closed-set construct" was answered by the language (twice over — `sealed abstract` closed class hierarchies, §11.7/§19.6, are the second closed set; see cost 3 for where each fits).
+2. **Ceremony — reduced.** A payload case is part of one declaration (`SetTo(value: int),`), payload-free kinds are bare case names, and message construction is a qualified value (`Msg.Increment`), not a `new`.
+3. **Collection payloads — the cost survives in a narrower, choice-shaped form.** A case that *owns* a collection (`UsersLoaded(owned names: Array<string>)`) makes the whole choice **owning-classified** (§35.4) and therefore **not directly sendable** (§35.12) — the same underlying rule that made collection-bearing records inadmissible in the original draft. Two spellings exist now, both closed-set and both exhaustively matchable, and choosing between them is this draft's refreshed open question 3:
+   - **(a) Split the message set.** UI-local messages stay one value-like sendable choice; effect-completion messages with owned collection payloads are leaves of a **`sealed abstract` hierarchy** of sealed sendable classes with `owned` fields (§11.7; §30.14 class rule 2 — the draft's original `UsersLoaded` shape, now under a *closed* root, so the update match over completions is exhaustive too, by leaf coverage §19.6).
+   - **(b) One owning choice, enveloped at the boundary.** Keep every message in a single `choice Msg` and cross domains inside a transfer-closed carrier class — §35.12's recorded rule-2 admission: an owning-choice-typed field whose `owned` payload classes are sendable crosses inside its owner's ownership tree. One closed sum for `update` (the purest Elm reading), one envelope type on the wire.
 
 ## 4. Control beyond clicks: async effects as messages
 
 The Elm rule: `update` never performs effects; it *requests* them, and completions come back as messages. In Bezel the request is simply a task whose result is a `Msg` — and the loop enforces the rest:
 
 ```bezel
-record FetchUsers(): Msg;
-sealed class UsersLoaded: Msg                        // collection payload ⇒ sealed sendable CLASS with an owned field (§30.14), *not* a record — see §3, cost 3
-  public readonly property Names: Array<string>;    //   the message owns its collection and transfers it across the domain boundary
-  public constructor(owned names: Array<string>);
-end UsersLoaded;
-record FetchFailed(Reason: string): Msg;            // string payload: sendable
+public choice Msg
+  FetchUsers,
+  UsersLoaded(owned names: Array<string>),  // owning case ⇒ the choice is owning-classified (§35.4)
+  FetchFailed(reason: string);              //   and crosses domains enveloped (§3, spelling b)
+end Msg;
 
 public static method Update(model: AppModel, msg: Msg, fx: Effects): AppModel
-  return case msg of
-    FetchUsers => do
+  case owned msg of                         // owning match (§35.5): the active case's
+    FetchUsers => do                        //   owned payload transfers into its binding
       // Effects.Run: spawn the task on a worker domain; when it completes,
       // its Msg result is POSTED back into this loop (a channel underneath —
-      // the §30.14 sendable-result rule is checked at this call).
+      // the boundary carriage is §3's spelling (b); with spelling (a) the
+      // §30.14 sendable-result rule is checked directly at this call).
       fx.Run(async () => do
         try
           using var resp := await Http.Get("https://api.example.com/users");
-          return new UsersLoaded(await resp.JsonOwned<Array<string>>());
-        catch var e: HttpException => return new FetchFailed(e.Message);
+          return Msg.UsersLoaded(await resp.JsonOwned<Array<string>>());
+        catch var e: HttpException => return Msg.FetchFailed(e.Message);
         end;
       end);
-      return model with Loading := true;
+      return model with(Loading := true);
     end,
-    var m: UsersLoaded => model with Loading := false, Users := m.Names,
-    FetchFailed(var why)   => model with Loading := false, Error := why,
-    _ => model
-  end;
+    UsersLoaded(var names) => return model with(Loading := false, Users := names),
+    FetchFailed(var why)   => return model with(Loading := false, Error := why),
+  end case;                                 // exhaustive by case coverage — no `_` arm
 end Update;
 ```
 
-- The effect closure runs on a **worker** domain; the only thing that crosses back is the returned `Msg` — checked sendable. There is no way to mutate `model` from the fetch; the type system closes the door Elm closes by purity convention.
-- Timers/subscriptions follow the same shape (`fx.Every(TimeSpan.FromSeconds(1), () => new Tick())`) — deferred detail.
-- Whether effects are requested via an `fx` handle (shown) or by `update` returning `(Model, Cmd)` Elm-style is **open question 2** — the handle avoids inventing a tuple-ish return; the Elm shape is purer. Early days.
+- The effect closure runs on a **worker** domain; the only thing that crosses back is the returned `Msg` — checked at the boundary. There is no way to mutate `model` from the fetch; the type system closes the door Elm closes by purity convention.
+- The multi-statement `FetchUsers` arm rides the **statement-position** `case` (grammar A.6 CaseStmt — `do … end` arm bodies are statement-form only, §19.2/v0.208); a one-armed helper extraction would let `update` stay an expression, which is §19.2's standing doctrine for arm bodies that grow.
+- **The `Users := names` slot is deliberately glossed** (the original draft glossed it silently; this refresh names it): a record field cannot *own* the transferred array (K1.7/§28.5), so a real `AppModel` either carries the collection as a borrow-bearing record (fine domain-locally, fights nothing until it crosses) or is itself a class. This is the model half of open question 1's representation decision.
+- Timers/subscriptions follow the same shape (`fx.Every(TimeSpan.FromSeconds(1), () => Msg.Tick)`) — deferred detail.
+- Whether effects are requested via an `fx` handle (shown) or by `update` returning `(Model, Cmd)` Elm-style is **open question 2** — the handle avoids inventing a tuple-ish return; the Elm shape is purer. **v0.202's `pure` sharpens this question into a real tiebreaker**: under the Cmd-return shape `update` can be *declared* `pure` (§22.15 — effects become returned data; §2's counter already is), while an `fx`-handle `update` structurally cannot. The draft now leans Cmd-shaped; the tuple-ish return it needs (a `(Model, Cmd)` product — a record can carry both when Cmd is a value-like choice of effect *descriptions*) is the concrete design to work out.
 
 ## 5. Ownership of the node tree (the Bezel-specific part)
 
 `view` builds a fresh **owned** tree each render. The reconciler is its single consumer:
 
-- It diffs the fresh tree against the retained previous tree (kind + properties per node; §9.2 record equality where nodes carry record props), emits patches to the retained **backend widget tree** (an owning tree — teardown is the §28.4 cascade), then the fresh tree *becomes* the previous (the old previous is disposed).
+- It diffs the fresh tree against the retained previous tree (kind + properties per node; §9.2's auto-generated record equality where nodes carry record props), emits patches to the retained **backend widget tree** (an owning tree — teardown is the §28.4 cascade), then the fresh tree *becomes* the previous (the old previous is disposed).
 - Every node the view allocates is therefore disposed exactly once, by the machinery the language already has — the render loop cannot leak by construction, which no mainstream VDOM can claim.
 - **Open question 1** (the main representational decision): nodes as an owning **class** tree (natural children lists via `OwningArray<Node>`, diffing by per-kind compare) vs **records** (free structural equality, but class-typed/collection children make records borrow-bearing — fights the value-tree story). The sketch assumes the class tree; a hybrid (class nodes carrying record *prop bags* for equality-cheap diffing) looks promising and needs a design pass.
 
@@ -139,9 +144,9 @@ No hooks, no property wrappers, no hidden per-component state, no auto-tracked s
 
 ## 7. Open questions (deliberately few, this is early)
 
-1. **Node representation** — class tree vs record tree vs hybrid (§5).
-2. **Effects shape** — `fx` handle vs Elm-style `(Model, Cmd)` return (§4).
-3. **Closed unions** — does the `Msg` exhaustiveness gap (§3) justify a `sealed interface`-class language feature on its own, or does it wait for more use cases? (Language question; out of this proposal's scope to answer.)
+1. **Node representation** — class tree vs record tree vs hybrid (§5), now explicitly including the *model* half (§4: where do a model's collections live once messages can transfer them in).
+2. **Effects shape** — `fx` handle vs Elm-style `(Model, Cmd)` return (§4). Refreshed lean: Cmd-return, because v0.202 `pure` then applies to `update` as a checked declaration rather than a convention.
+3. ~~**Closed unions** — does the `Msg` exhaustiveness gap justify a `sealed interface`-class feature?~~ **Answered by the language** (2026-07-22 refresh): `choice` graduated in v0.200 (proposal 0041) and `sealed abstract` closed hierarchies already existed — §3 now uses them. The narrowed successor question: for messages that own collections, split-set-with-hierarchy vs one-owning-choice-plus-envelope (§3's spellings (a)/(b), §35.12).
 4. **First backend** — immediate-mode-style software renderer (self-contained, testable) vs GTK/webview FFI (real widgets sooner, drags the FFI callback machinery §32.8/§32.10 forward). The exploration doc leans: software/canvas first for the reconciler's development, FFI backend second.
 
 ## 8. Sequencing
