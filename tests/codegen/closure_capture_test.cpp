@@ -33,7 +33,7 @@ BEZEL_TEST(codegen_closures_27_5, mutation_inside_visible_outside) {
         "module M; class C "
         "  public static method Main(): int "
         "    var x := 0; "
-        "    var setX := () => do x := 5; return x; end; "
+        "    var setX := lambda() => do x := 5; return x; end; "
         "    var _ := setX(); "
         "    return x; "          // sees the lambda's write through the shared cell
         "  end Main; "
@@ -50,7 +50,7 @@ BEZEL_TEST(codegen_closures_27_5, outer_mutation_seen_inside) {
         "  end Apply; "
         "  public static method Main(): int "
         "    var x := 1; "
-        "    var f := () => x; "
+        "    var f := lambda() => x; "
         "    x := 7; "            // written after capture
         "    return Apply(f); "   // lambda observes 7, not the captured-time 1
         "  end Main; "
@@ -65,7 +65,7 @@ BEZEL_TEST(codegen_closures_27_5, counter_observed_from_outside) {
         "module M; class C "
         "  public static method Main(): int "
         "    var count := 0; "
-        "    var inc := () => do count := count + 1; return count; end; "
+        "    var inc := lambda() => do count := count + 1; return count; end; "
         "    var _ := inc(); "
         "    var __ := inc(); "
         "    return count; "      // both increments hit the shared cell
@@ -81,7 +81,7 @@ BEZEL_TEST(codegen_closures_27_5, make_counter_spec_example) {
         "module M; class C "
         "  public static method MakeCounter(): () -> int "
         "    var count := 0; "
-        "    return () => do "
+        "    return lambda() => do "
         "      count := count + 1; "
         "      return count; "
         "    end; "
@@ -100,8 +100,8 @@ BEZEL_TEST(codegen_closures_27_5, two_lambdas_share_one_variable) {
         "module M; class C "
         "  public static method Main(): int "
         "    var x := 10; "
-        "    var bump := () => do x := x + 2; return x; end; "
-        "    var read := () => x; "
+        "    var bump := lambda() => do x := x + 2; return x; end; "
+        "    var read := lambda() => x; "
         "    var _ := bump(); "   // x := 12 through the shared cell
         "    return read(); "     // the other lambda sees 12
         "  end Main; "
@@ -115,7 +115,7 @@ BEZEL_TEST(codegen_closures_27_5, independent_counters) {
         "module M; class C "
         "  public static method MakeCounter(): () -> int "
         "    var count := 0; "
-        "    return () => do count := count + 1; return count; end; "
+        "    return lambda() => do count := count + 1; return count; end; "
         "  end MakeCounter; "
         "  public static method Main(): int "
         "    var a := MakeCounter(); "
@@ -137,7 +137,7 @@ BEZEL_TEST(codegen_closures_27_5, loop_variable_fresh_binding) {
         "  public static method Main(): int "
         "    var fns: [3]() -> int; "
         "    for var i in 1..3 do "
-        "      fns[i - 1] := () => i; "  // captures THIS iteration's i
+        "      fns[i - 1] := lambda() => i; "  // captures THIS iteration's i
         "    end; "
         "    return fns[0]() + fns[1]() + fns[2](); "  // 1 + 2 + 3 = 6
         "  end Main; "
@@ -154,7 +154,7 @@ BEZEL_TEST(codegen_closures_27_5, loop_capture_not_all_final_value) {
         "  public static method Main(): int "
         "    var fns: [3]() -> int; "
         "    for var i in 1..3 do "
-        "      fns[i - 1] := () => i; "
+        "      fns[i - 1] := lambda() => i; "
         "    end; "
         "    return fns[0]() + fns[1]() + fns[2](); "
         "  end Main; "
@@ -167,7 +167,7 @@ BEZEL_TEST(codegen_closures_27_5, captured_parameter_is_shared) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Bump(n: int): int "
-        "    var f := () => do n := n + 100; return n; end; "
+        "    var f := lambda() => do n := n + 100; return n; end; "
         "    var _ := f(); "
         "    return n; "          // the param's shared cell now holds n + 100
         "  end Bump; "
@@ -184,7 +184,7 @@ BEZEL_TEST(codegen_closures_27_5, reference_typed_capture_shared) {
         "module M; class C "
         "  public static method Main(): int "
         "    var s := \"hi\"; "
-        "    var setter := () => do s := \"hello\"; return 0; end; "
+        "    var setter := lambda() => do s := \"hello\"; return 0; end; "
         "    var _ := setter(); "
         "    return s.Length; "   // s now \"hello\" → length 5
         "  end Main; "
@@ -198,8 +198,8 @@ BEZEL_TEST(codegen_closures_27_5, nested_lambda_capture) {
         "module M; class C "
         "  public static method Main(): int "
         "    var x := 10; "
-        "    var outer := () => do "
-        "      var inner := () => x; "
+        "    var outer := lambda() => do "
+        "      var inner := lambda() => x; "
         "      x := x + 1; "       // mutate between defining and calling inner
         "      return inner(); "   // inner sees the updated x (shared cell)
         "    end; "
@@ -222,7 +222,7 @@ BEZEL_TEST(codegen_closures_27_5, for_var_capture_then_reassign_spec_27_5) {
         "  public static method Main(): int "
         "    var total: int := 0; "
         "    for var k in 0..2 do "
-        "      var f: () -> int := () => k; "
+        "      var f: () -> int := lambda() => k; "
         "      k := k + 1; "          // reassign the for-var loop variable
         "      total := total + f(); " // f sees the updated k
         "    end; "
@@ -247,9 +247,9 @@ BEZEL_TEST(codegen_closures_27_5, while_var_capture_and_loop_increment_spec_27_5
         "module M; class C "
         "  public static method Main(): int "
         "    var k: int := 0; "
-        "    var f: () -> int := () => 0; "
+        "    var f: () -> int := lambda() => 0; "
         "    while k < 3 do "
-        "      f := () => k; "   // capture k via shared cell (guarded boxing)
+        "      f := lambda() => k; "   // capture k via shared cell (guarded boxing)
         "      k := k + 1; "     // writes to cell AND syncs to original alloca
         "    end; "
         "    return f(); "       // cell holds 3 after 3 increments
@@ -271,7 +271,7 @@ BEZEL_TEST(codegen_closures_27_5, while_iife_capture_and_loop_increment_spec_27_
         "    var k: int := 0; "
         "    var total: int := 0; "
         "    while k < 5 do "
-        "      total := total + (() => k * k)(); " // IIFE captures k
+        "      total := total + (lambda() => k * k)(); " // IIFE captures k
         "      k := k + 1; "                        // sync keeps condBB in sync
         "    end; "
         "    return total; "    // 0+1+4+9+16 = 30
@@ -288,7 +288,7 @@ BEZEL_TEST(codegen_closures_27_5, ref_param_captured_by_lambda_1207) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Bump(ref x: int): int "
-        "    var f := () => do x := x + 100; return 0; end; "
+        "    var f := lambda() => do x := x + 100; return 0; end; "
         "    var i := f(); "
         "    return x; "   // must see the lambda's write: 10 + 100 = 110
         "  end Bump; "
@@ -306,7 +306,7 @@ BEZEL_TEST(codegen_closures_27_5, out_param_captured_by_lambda_1207) {
         "module M; class C "
         "  public static method Produce(out x: int): int "
         "    x := 3; "
-        "    var f := () => do x := x + 7; return 0; end; "
+        "    var f := lambda() => do x := x + 7; return 0; end; "
         "    var i := f(); "
         "    return x; "   // must see the lambda's write: 3 + 7 = 10
         "  end Produce; "
@@ -324,7 +324,7 @@ BEZEL_TEST(codegen_closures_27_5, ref_param_capture_visible_to_caller_1207) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method BumpRef(ref x: int): int "
-        "    var f := () => do x := x + 100; return 0; end; "
+        "    var f := lambda() => do x := x + 100; return 0; end; "
         "    var i := f(); "
         "    return 0; "
         "  end BumpRef; "
@@ -350,7 +350,7 @@ BEZEL_TEST(codegen_closures_27_5_1135,
         "module M; class C "
         "  public static method Make(): () -> int "
         "    var x := 3; "
-        "    var outer := () => () => x; "   // inner captures grandparent x
+        "    var outer := lambda() => lambda() => x; "   // inner captures grandparent x
         "    return outer(); "               // inner lambda escapes Make
         "  end Make; "
         "  public static method Main(): int "
@@ -369,7 +369,7 @@ BEZEL_TEST(codegen_closures_27_5_1135,
         "module M; class C "
         "  public static method Make(): () -> int "
         "    var x := 7; "
-        "    var a := () => () => () => x; "  // 3-level nest; x is grandgrand-parent
+        "    var a := lambda() => lambda() => lambda() => x; "  // 3-level nest; x is grandgrand-parent
         "    var b := a(); "                  // b = () => () => x
         "    return b(); "                    // returns inner () => x, escapes
         "  end Make; "
@@ -389,7 +389,7 @@ BEZEL_TEST(codegen_closures_27_5_1135,
         "  public static method Make(): () -> int "
         "    var a := 10; "
         "    var b := 5; "
-        "    var outer := () => () => a - b; "
+        "    var outer := lambda() => lambda() => a - b; "
         "    return outer(); "
         "  end Make; "
         "  public static method Main(): int "
@@ -408,7 +408,7 @@ BEZEL_TEST(codegen_closures_27_5_1135,
         "module M; class C "
         "  public static method Make(): () -> int "
         "    var x := 42; "
-        "    var f := () => x; "
+        "    var f := lambda() => x; "
         "    return f; "           // single-level escape — pre-existing, must work
         "  end Make; "
         "  public static method Main(): int "
@@ -427,8 +427,8 @@ BEZEL_TEST(codegen_closures_27_5_1135,
         "module M; class C "
         "  public static method Main(): int "
         "    var x := 9; "
-        "    var outer := () => do "
-        "      var inner := () => x; "
+        "    var outer := lambda() => do "
+        "      var inner := lambda() => x; "
         "      return inner(); "    // inner is invoked locally, not escaped
         "    end; "
         "    return outer(); "      // expected 9
@@ -443,7 +443,7 @@ BEZEL_TEST(codegen_closures_27_5_1135,
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Make(n: int): () -> int "
-        "    var outer := () => () => n; "
+        "    var outer := lambda() => lambda() => n; "
         "    return outer(); "
         "  end Make; "
         "  public static method Main(): int "

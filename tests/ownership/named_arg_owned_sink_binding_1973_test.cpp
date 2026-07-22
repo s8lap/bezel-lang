@@ -206,7 +206,7 @@ BEZEL_TEST(named_arg_owned_sink_1973, closure_owned_reorder_consume_rejected_28_
     auto r = parseAndCheckOwnership(wrap(
         "public static method Main(): int "
         "  using var r := new R(); "
-        "  var f := () => do return C.Sink3(b := r, a := 7); end; "
+        "  var f := lambda() => do return C.Sink3(b := r, a := 7); end; "
         "  return f(); "
         "end Main;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -222,7 +222,7 @@ BEZEL_TEST(named_arg_owned_sink_1973, closure_borrow_reorder_to_borrow_param_acc
     auto r = parseAndCheckOwnership(wrap(
         "public static method Main(): int "
         "  using var r := new R(); "
-        "  var f := () => do return C.Peek2(b := r, a := 7); end; "
+        "  var f := lambda() => do return C.Peek2(b := r, a := 7); end; "
         "  return f(); "
         "end Main;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

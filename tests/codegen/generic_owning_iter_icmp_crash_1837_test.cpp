@@ -121,7 +121,7 @@ const char* kInstantiatedManualProtocol =
     "    yield return make(); "
     "  end Gen; "
     "  public static method Main(): int "
-    "    using var source := Gen<R>(() => new R()); "
+    "    using var source := Gen<R>(lambda() => new R()); "
     "    using var en := source.GetOwningEnumerator(); "
     "    var sum := 0; "
     "    while en.MoveNext() do "

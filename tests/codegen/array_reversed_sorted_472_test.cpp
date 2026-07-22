@@ -220,7 +220,7 @@ BEZEL_TEST(array_reversed_sorted_472, sorted_comparer_copy_correct_spec_3) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(3); a.Add(1); a.Add(2); "
-        "  using var s := a.Sorted((x: int, y: int) => x - y); "
+        "  using var s := a.Sorted(lambda(x: int, y: int) => x - y); "
         "  return s.Get(0) * 49 + s.Get(1) * 7 + s.Get(2); "  // 1*49+2*7+3=66
         "end Main; end C;", 66);
 }
@@ -231,7 +231,7 @@ BEZEL_TEST(array_reversed_sorted_472, sorted_comparer_original_unchanged_spec_3)
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(3); a.Add(1); a.Add(2); "
-        "  using var s := a.Sorted((x: int, y: int) => x - y); "
+        "  using var s := a.Sorted(lambda(x: int, y: int) => x - y); "
         "  return a.Get(0) * 49 + a.Get(1) * 7 + a.Get(2); "  // 3*49+1*7+2=156
         "end Main; end C;", 156);
 }
@@ -243,7 +243,7 @@ BEZEL_TEST(array_reversed_sorted_472, sorted_comparer_descending_spec_3) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  using var s := a.Sorted((x: int, y: int) => y - x); "
+        "  using var s := a.Sorted(lambda(x: int, y: int) => y - x); "
         "  return s.Get(0) * 49 + s.Get(1) * 7 + s.Get(2); "  // 3*49+2*7+1=162
         "end Main; end C;", 162);
 }
@@ -253,7 +253,7 @@ BEZEL_TEST(array_reversed_sorted_472, sorted_comparer_single_element_spec_3) {
     expectValueAndAsanClean(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); a.Add(42); "
-        "  using var s := a.Sorted((x: int, y: int) => x - y); "
+        "  using var s := a.Sorted(lambda(x: int, y: int) => x - y); "
         "  return s.Length * 100 + s.Get(0); "  // 1*100+42=142
         "end Main; end C;", 142);
 }
@@ -264,7 +264,7 @@ BEZEL_TEST(array_reversed_sorted_472, sorted_comparer_chained_length_spec_3) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(9); a.Add(1); a.Add(5); "
-        "  using var s := a.Sorted((x: int, y: int) => x - y); "
+        "  using var s := a.Sorted(lambda(x: int, y: int) => x - y); "
         "  return s.Length; "  // 3
         "end Main; end C;"), 3);
 }
@@ -378,7 +378,7 @@ BEZEL_TEST(array_reversed_sorted_472, inplace_sort_comparer_still_mutates_spec_3
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(3); a.Add(1); a.Add(2); "
-        "  a.Sort((x: int, y: int) => y - x); "
+        "  a.Sort(lambda(x: int, y: int) => y - x); "
         "  return a.Get(0) * 49 + a.Get(1) * 7 + a.Get(2); "  // 3*49+2*7+1=162
         "end Main; end C;", 162);
 }

@@ -8,7 +8,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class Main public static async method Go(): Task using var t := Domain.Spawn(() => ()); await t; end Go; end Main;
+module M; class Main public static async method Go(): Task using var t := Domain.Spawn(lambda() => ()); await t; end Go; end Main;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

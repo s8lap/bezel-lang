@@ -92,7 +92,7 @@ BEZEL_TEST(linq_single_consumption_1226,
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  var filtered := a.Where((x) => x mod 2 = 0); "
+        "  var filtered := a.Where(lambda(x) => x mod 2 = 0); "
         "  var s1 := 0; for var x in filtered do s1 := s1 + x; end; "
         "  var caught := 0; "
         "  try "
@@ -111,7 +111,7 @@ BEZEL_TEST(linq_single_consumption_1226,
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  var filtered := a.Where((x) => x mod 2 = 0); "
+        "  var filtered := a.Where(lambda(x) => x mod 2 = 0); "
         "  var s := 0; for var x in filtered do s := s + x; end; "
         "  return s; "
         "end Main; end C;"), 6);
@@ -128,7 +128,7 @@ BEZEL_TEST(linq_single_consumption_1226,
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
         "  var s := 0; "
-        "  for var x in a.Where((x) => x mod 2 = 0) do s := s + x; end; "
+        "  for var x in a.Where(lambda(x) => x mod 2 = 0) do s := s + x; end; "
         "  return s; "
         "end Main; end C;"), 6);
 }
@@ -143,7 +143,7 @@ BEZEL_TEST(linq_single_consumption_1226,
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  using var ys: Array<int> := a.Where((x) => x mod 2 = 0).ToArray(); "
+        "  using var ys: Array<int> := a.Where(lambda(x) => x mod 2 = 0).ToArray(); "
         "  var s1 := 0; for var x in ys do s1 := s1 + x; end; "
         "  var s2 := 0; for var x in ys do s2 := s2 + x; end; "
         "  return s1 * 100 + s2; "
@@ -160,8 +160,8 @@ BEZEL_TEST(linq_single_consumption_1226,
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  var f1 := a.Where((x) => x mod 2 = 0); "
-        "  var f2 := a.Where((x) => x mod 2 = 1); "
+        "  var f1 := a.Where(lambda(x) => x mod 2 = 0); "
+        "  var f2 := a.Where(lambda(x) => x mod 2 = 1); "
         "  var s1 := 0; for var x in f1 do s1 := s1 + x; end; "
         "  var s2 := 0; for var x in f2 do s2 := s2 + x; end; "
         "  return s1 * 10 + s2; "
@@ -179,7 +179,7 @@ BEZEL_TEST(linq_single_consumption_1226,
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  var filtered := a.Where((x) => x mod 2 = 0); "
+        "  var filtered := a.Where(lambda(x) => x mod 2 = 0); "
         "  var s1 := 0; for var x in filtered do s1 := s1 + x; end; "
         "  var s2 := 0; for var x in filtered do s2 := s2 + x; end; "
         "  return s1 * 100 + s2; "
@@ -193,7 +193,7 @@ BEZEL_TEST(linq_single_consumption_1226,
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); "
-        "  var filtered := a.Where((x) => x > 0); "
+        "  var filtered := a.Where(lambda(x) => x > 0); "
         "  var s1 := 0; for var x in filtered do s1 := s1 + x; end; "
         "  var s2 := 0; for var x in filtered do s2 := s2 + x; end; "
         "  return s1 + s2; "
@@ -209,7 +209,7 @@ BEZEL_TEST(linq_single_consumption_1226,
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  var filtered := a.Where((x) => x mod 2 = 0); "
+        "  var filtered := a.Where(lambda(x) => x mod 2 = 0); "
         "  var s := 0; for var x in filtered do s := s + x; end; "
         "  return s; "
         "end Main; end C;"), false);
@@ -226,7 +226,7 @@ BEZEL_TEST(linq_single_consumption_1226,
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  var filtered := a.Where((x) => x mod 2 = 0); "
+        "  var filtered := a.Where(lambda(x) => x mod 2 = 0); "
         "  var s1 := 0; "
         "  if a.Length > 0 then "
         "    for var x in filtered do s1 := s1 + x; end; "
@@ -247,7 +247,7 @@ BEZEL_TEST(linq_single_consumption_1226,
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  var filtered := a.Where((x) => x mod 2 = 0); "
+        "  var filtered := a.Where(lambda(x) => x mod 2 = 0); "
         "  var s := 0; "
         "  if a.Length > 2 then "
         "    for var x in filtered do s := s + x; end; "
@@ -270,7 +270,7 @@ BEZEL_TEST(linq_single_consumption_1226,
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  var q := a.Where((x) => x > 1); "
+        "  var q := a.Where(lambda(x) => x > 1); "
         "  var n := q.Count(); "
         "  var caught := 0; "
         "  try "
@@ -291,7 +291,7 @@ BEZEL_TEST(linq_single_consumption_1226,
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  var q := a.Where((x) => x > 1); "
+        "  var q := a.Where(lambda(x) => x > 1); "
         "  var n := q.Count(); "
         "  var r := 0; "
         "  try "
@@ -311,7 +311,7 @@ BEZEL_TEST(linq_single_consumption_1226,
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  var q := a.Where((x) => x > 1); "
+        "  var q := a.Where(lambda(x) => x > 1); "
         "  return q.Count(); "
         "end Main; end C;"), 2);
 }
@@ -324,7 +324,7 @@ BEZEL_TEST(linq_single_consumption_1226,
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  return a.Where((x) => x > 1).Count(); "
+        "  return a.Where(lambda(x) => x > 1).Count(); "
         "end Main; end C;"), 2);
 }
 
@@ -338,8 +338,8 @@ BEZEL_TEST(linq_single_consumption_1226,
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  var q := a.Where((x) => x > 0); "
-        "  var q2 := q.Select((x) => x * 2); "  // consumes q
+        "  var q := a.Where(lambda(x) => x > 0); "
+        "  var q2 := q.Select(lambda(x) => x * 2); "  // consumes q
         "  var s := 0; "
         "  for var x in q do s := s + x; end; "  // DA error: q consumed
         "  return s; "
@@ -354,8 +354,8 @@ BEZEL_TEST(linq_single_consumption_1226,
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  var q := a.Where((x) => x > 0); "
-        "  var q2 := q.Select((x) => x * 2); "  // q consumed, q2 fresh
+        "  var q := a.Where(lambda(x) => x > 0); "
+        "  var q2 := q.Select(lambda(x) => x * 2); "  // q consumed, q2 fresh
         "  var s := 0; "
         "  for var x in q2 do s := s + x; end; "  // OK: q2 consumed once
         "  return s; "
@@ -370,8 +370,8 @@ BEZEL_TEST(linq_single_consumption_1226,
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  var q := a.Where((x) => x > 0); "
-        "  var q2 := q.Select((x) => x * 2); "  // q consumed
+        "  var q := a.Where(lambda(x) => x > 0); "
+        "  var q2 := q.Select(lambda(x) => x * 2); "  // q consumed
         "  var q3 := q.Skip(1); "               // DA error: q already consumed
         "  var s := 0; "
         "  for var x in q3 do s := s + x; end; "
@@ -394,7 +394,7 @@ BEZEL_TEST(linq_single_consumption_1226,
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  var q := a.Where((x) => x > 0); "
+        "  var q := a.Where(lambda(x) => x > 0); "
         "  var b := new Array<int>(); "
         "  var merged := b.Concat(q); "  // q passed as IEnumerable<int> arg → consumed
         "  var s := 0; "
@@ -410,7 +410,7 @@ BEZEL_TEST(linq_single_consumption_1226,
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  var q := a.Where((x) => x > 0); "
+        "  var q := a.Where(lambda(x) => x > 0); "
         "  var b := new Array<int>(); "
         "  var merged := b.Concat(q); "  // q consumed (first use, OK)
         "  var s := 0; "

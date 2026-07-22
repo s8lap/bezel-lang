@@ -57,7 +57,7 @@ BEZEL_TEST(codegen_events_24, subscribe_lambda_then_raise_runs_handler) {
     BEZEL_EXPECT_EQ(run(prog(
         "var box := new Box(); "
         "var b := new Button(); "
-        "var s := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "var s := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "b.Fire(5); b.Fire(7); "
         "return box.V; ")), 12);  // 5 + 7
 }
@@ -75,8 +75,8 @@ BEZEL_TEST(codegen_events_24, multiple_handlers_all_fire) {
     BEZEL_EXPECT_EQ(run(prog(
         "var box := new Box(); "
         "var b := new Button(); "
-        "var s1 := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
-        "var s2 := b.Clicked.Subscribe((e) => do box.Add(e.N * 10); end); "
+        "var s1 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "var s2 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N * 10); end); "
         "b.Fire(2); "
         "return box.V; ")), 22);  // 2 + 20
 }
@@ -87,7 +87,7 @@ BEZEL_TEST(codegen_events_24, dispose_subscription_unsubscribes_handler) {
     BEZEL_EXPECT_EQ(run(prog(
         "var box := new Box(); "
         "var b := new Button(); "
-        "var s := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "var s := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "b.Fire(5); "          // box.V = 5
         "s.Dispose(); "        // remove the handler (§2.11)
         "b.Fire(100); "        // no handler left — no-op
@@ -109,7 +109,7 @@ BEZEL_TEST(codegen_events_24, plus_equals_adds_handler_inside_class) {
         "  public V: int := 0; "
         "  public event Clicked: Ev; "
         "  public method Hook() "
-        "    Clicked += (e) => do V := V + e.N; end; "  // captures `this` (§28.14 form 4)
+        "    Clicked += lambda(e) => do V := V + e.N; end; "  // captures `this` (§28.14 form 4)
         "  end Hook; "
         "  public method Fire(n: int) Clicked.Raise(new Ev(n)); end Fire; "
         "end Button; "
@@ -184,7 +184,7 @@ BEZEL_TEST(codegen_events_24, no_payload_event_raise_and_subscribe) {
         "end App; "
         "class C public static method Main(): int "
         "  var box := new Box(); var a := new App(); "
-        "  var s := a.Ping.Subscribe(() => do box.Bump(); end); "
+        "  var s := a.Ping.Subscribe(lambda() => do box.Bump(); end); "
         "  a.Fire(); a.Fire(); a.Fire(); "
         "  return box.V; "
         "end Main; end C;"), 3);
@@ -206,7 +206,7 @@ BEZEL_TEST(codegen_events_24, handler_reads_payload_record_fields) {
         "end Emitter; "
         "class C public static method Main(): int "
         "  var box := new Box(); var em := new Emitter(); "
-        "  var s := em.Moved.Subscribe((e) => do box.Add(e.X + e.Y); end); "
+        "  var s := em.Moved.Subscribe(lambda(e) => do box.Add(e.X + e.Y); end); "
         "  em.Fire(3, 4); "
         "  return box.V; "
         "end Main; end C;"), 7);  // 3 + 4
@@ -219,7 +219,7 @@ BEZEL_TEST(codegen_events_24, event_backing_field_is_per_instance) {
         "var box := new Box(); "
         "var b1 := new Button(); "
         "var b2 := new Button(); "
-        "var s := b1.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "var s := b1.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "b2.Fire(99); "      // b2 has no subscribers — does not touch box
         "b1.Fire(4); "       // b1's handler fires
         "return box.V; ")), 4);
@@ -236,12 +236,12 @@ BEZEL_TEST(codegen_events_24, subscribe_past_capacity_grows_all_fire_24_5) {
     BEZEL_EXPECT_EQ(run(prog(
         "var box := new Box(); "
         "var b := new Button(); "
-        "var s1 := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
-        "var s2 := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
-        "var s3 := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
-        "var s4 := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
-        "var s5 := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "  // grows past 4
-        "var s6 := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "var s1 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "var s2 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "var s3 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "var s4 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "var s5 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "  // grows past 4
+        "var s6 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "b.Fire(5); "
         "return box.V; ")), 30);  // 6 handlers * 5
 }
@@ -264,7 +264,7 @@ BEZEL_TEST(codegen_events_24, dispose_method_returned_subscription_unsubscribes)
         "  public event Clicked: Ev; "
         "  public method Fire(n: int) Clicked.Raise(new Ev(n)); end Fire; "
         "  public method Wire(box: Box): Subscription "         // returns Subscription
-        "    return Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "    return Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "  end Wire; "
         "end Button; "
         "class C public static method Main(): int "
@@ -297,7 +297,7 @@ BEZEL_TEST(codegen_events_24, using_var_subscription_scope_end_auto_disposes) {
         "class C public static method Main(): int "
         "  using var box := new Box(); using var b := new Button(); "
         "  do "
-        "    using var s := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "    using var s := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "    b.Fire(5); "                       // handler live → +5
         "  end; "                               // §28.3: s disposes here
         "  b.Fire(100); "                       // handler gone — no-op
@@ -326,7 +326,7 @@ BEZEL_TEST(codegen_events_24, dispose_parameter_subscription_unsubscribes) {
         "end Helper; "
         "class C public static method Main(): int "
         "  var box := new Box(); var b := new Button(); "
-        "  var s := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "  var s := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "  Helper.Kill(s); "                    // dispose through a parameter
         "  b.Fire(7); "                         // handler gone — no-op
         "  return box.V; "
@@ -356,7 +356,7 @@ BEZEL_TEST(codegen_events_24, dispose_field_subscription_unsubscribes) {
         "class C public static method Main(): int "
         "  using var box := new Box(); using var b := new Button(); "
         "  using var h := new Holder(); "
-        "  h.sub := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "  h.sub := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "  h.Stop(); "                          // dispose through a field
         "  b.Fire(9); "                         // handler gone — no-op
         "  return box.V; "
@@ -370,7 +370,7 @@ BEZEL_TEST(codegen_events_24, dispose_field_subscription_unsubscribes) {
 BEZEL_TEST(codegen_events_24, dispose_literal_declarator_subscription_still_works) {
     BEZEL_EXPECT_EQ(run(prog(
         "var box := new Box(); var b := new Button(); "
-        "var s := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "var s := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "b.Fire(5); "                           // handler live → +5
         "s.Dispose(); "                         // literal declarator dispose
         "b.Fire(100); "                         // handler gone — no-op
@@ -387,7 +387,7 @@ BEZEL_TEST(codegen_events_24, subscription_in_size1_inline_array_runs_d5) {
         "var total := 0; "
         "var b := new Button(); "
         "var subs: [1]Subscription; "
-        "subs[0] := b.Clicked.Subscribe((e) => do total := total + e.N; end); "
+        "subs[0] := b.Clicked.Subscribe(lambda(e) => do total := total + e.N; end); "
         "return 42; ")), 42);
 }
 
@@ -398,7 +398,7 @@ BEZEL_TEST(codegen_events_24, dispose_size1_inline_array_subscription_element) {
     BEZEL_EXPECT_EQ(run(prog(
         "var box := new Box(); var b := new Button(); "
         "var subs: [1]Subscription; "
-        "subs[0] := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "subs[0] := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "b.Fire(3); "                           // handler live → +3
         "subs[0].Dispose(); "                   // dispose the array element
         "b.Fire(40); "                          // handler gone — no-op
@@ -419,7 +419,7 @@ BEZEL_TEST(codegen_events, unit_static_event_raise_unit_literal_737) {
         "  public static method Fire() Tick.Raise(()); end Fire; "
         "end App; "
         "class C public static method Main(): int "
-        "  var sub := App.Tick.Subscribe((_) => do App.count := App.count + 1; end); "
+        "  var sub := App.Tick.Subscribe(lambda(_) => do App.count := App.count + 1; end); "
         "  App.Fire(); App.Fire(); "
         "  return App.count; "  // 2
         "end Main; end C;"), 2);
@@ -435,7 +435,7 @@ BEZEL_TEST(codegen_events, unit_static_event_raise_no_arg_737) {
         "  public static method Fire() Tick.Raise(); end Fire; "
         "end App; "
         "class C public static method Main(): int "
-        "  var sub := App.Tick.Subscribe((_) => do App.count := App.count + 1; end); "
+        "  var sub := App.Tick.Subscribe(lambda(_) => do App.count := App.count + 1; end); "
         "  App.Fire(); App.Fire(); "
         "  return App.count; "  // 2
         "end Main; end C;"), 2);
@@ -454,8 +454,8 @@ BEZEL_TEST(codegen_events, throwing_handler_aborts_dispatch_747) {
         "  public static second: int := 0; "
         "  public static method Main(): int "
         "    using var s := new Src(); "
-        "    using var s1 := s.Changed.Subscribe((e) => do throw new Exception(\"x\"); end); "
-        "    using var s2 := s.Changed.Subscribe((e) => do second := 1; end); "
+        "    using var s1 := s.Changed.Subscribe(lambda(e) => do throw new Exception(\"x\"); end); "
+        "    using var s2 := s.Changed.Subscribe(lambda(e) => do second := 1; end); "
         "    try s.Fire(1); catch var ex: Exception => second := second + 0; end; "
         "    return second; "  // 0 — the second handler never ran
         "  end Main; end C;"), 0);
@@ -472,8 +472,8 @@ BEZEL_TEST(codegen_events, all_handlers_run_when_no_throw_747) {
         "  public static total: int := 0; "
         "  public static method Main(): int "
         "    using var s := new Src(); "
-        "    using var s1 := s.Changed.Subscribe((e) => do total := total + e.N; end); "
-        "    using var s2 := s.Changed.Subscribe((e) => do total := total + 10; end); "
+        "    using var s1 := s.Changed.Subscribe(lambda(e) => do total := total + e.N; end); "
+        "    using var s2 := s.Changed.Subscribe(lambda(e) => do total := total + 10; end); "
         "    s.Fire(5); return total; "  // 15
         "  end Main; end C;"), 15);
 }

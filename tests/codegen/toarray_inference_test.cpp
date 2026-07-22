@@ -41,7 +41,7 @@ BEZEL_TEST(toarray_inference, int_elem_get0_spec_14_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(5); a.Add(2); a.Add(8); "
-        "  using var b := a.Where((x) => x > 0).ToArray(); "
+        "  using var b := a.Where(lambda(x) => x > 0).ToArray(); "
         "  return b.Get(0); "  // expected 5
         "end Main; end C;"), 5);
 }
@@ -52,7 +52,7 @@ BEZEL_TEST(toarray_inference, int_elem_length_spec_14_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  using var b := a.Where((x) => x > 2).ToArray(); "
+        "  using var b := a.Where(lambda(x) => x > 2).ToArray(); "
         "  return b.Length; "  // 2 elements > 2: {3,4}
         "end Main; end C;"), 2);
 }
@@ -72,7 +72,7 @@ BEZEL_TEST(toarray_inference, record_elem_field_read_spec_14_5) {
         "class C public static method Main(): int "
         "  using var a := new Array<R>(); "
         "  a.Add(new R(\"hello\", 1)); a.Add(new R(\"world\", 2)); "
-        "  using var b := a.Where((x) => x.N > 0).ToArray(); "
+        "  using var b := a.Where(lambda(x) => x.N > 0).ToArray(); "
         "  var t := b.Get(0); var s := t.S; "
         "  return int(s = \"hello\"); "  // expected 1
         "end Main; end C;"), 1);
@@ -86,7 +86,7 @@ BEZEL_TEST(toarray_inference, record_elem_length_spec_14_5) {
         "class C public static method Main(): int "
         "  using var a := new Array<R>(); "
         "  a.Add(new R(1, 2)); a.Add(new R(3, 4)); a.Add(new R(5, 6)); "
-        "  using var b := a.Where((r) => r.X > 1).ToArray(); "
+        "  using var b := a.Where(lambda(r) => r.X > 1).ToArray(); "
         "  return b.Length; "  // 2 elements: (3,4) and (5,6)
         "end Main; end C;"), 2);
 }
@@ -100,7 +100,7 @@ BEZEL_TEST(toarray_inference, chain_where_orderby_spec_14_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(5); a.Add(2); a.Add(8); a.Add(1); "
-        "  using var b := a.Where((x) => x > 1).OrderBy((x: int) => x).ToArray(); "
+        "  using var b := a.Where(lambda(x) => x > 1).OrderBy(lambda(x: int) => x).ToArray(); "
         "  return b.Get(0); "  // sorted {2,5,8} → first = 2
         "end Main; end C;"), 2);
 }
@@ -135,7 +135,7 @@ BEZEL_TEST(toarray_inference, for_in_inferred_array_spec_14_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  using var b := a.Where((x) => x mod 2 = 0).ToArray(); "
+        "  using var b := a.Where(lambda(x) => x mod 2 = 0).ToArray(); "
         "  var s := 0; "
         "  for var x in b do s := s + x; end; "
         "  return s; "  // 2 + 4 = 6
@@ -152,7 +152,7 @@ BEZEL_TEST(toarray_inference, control_annotated_still_works_spec_14_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(5); a.Add(2); a.Add(8); "
-        "  using var b: Array<int> := a.Where((x) => x > 0).ToArray(); "
+        "  using var b: Array<int> := a.Where(lambda(x) => x > 0).ToArray(); "
         "  return b.Get(0); "  // 5 — same as the un-annotated case
         "end Main; end C;"), 5);
 }
@@ -180,7 +180,7 @@ BEZEL_TEST(toarray_inference, string_elem_spec_14_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<string>(); "
         "  a.Add(\"hello\"); a.Add(\"world\"); a.Add(\"hi\"); "
-        "  using var b := a.Where((s) => s.Length > 3).ToArray(); "
+        "  using var b := a.Where(lambda(s) => s.Length > 3).ToArray(); "
         "  return b.Length; "  // "hello" and "world" — 2 elements
         "end Main; end C;"), 2);
 }
@@ -190,7 +190,7 @@ BEZEL_TEST(toarray_inference, string_elem_get0_spec_14_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<string>(); "
         "  a.Add(\"hello\"); a.Add(\"world\"); "
-        "  using var b := a.Where((s) => s.Length > 3).ToArray(); "
+        "  using var b := a.Where(lambda(s) => s.Length > 3).ToArray(); "
         "  return int(b.Get(0) = \"hello\"); "
         "end Main; end C;"), 1);
 }

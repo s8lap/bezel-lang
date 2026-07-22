@@ -41,7 +41,7 @@ const char* kCmp =
 BEZEL_TEST(lambda_inferred_param_operator_829, vardecl_record_plus) {
     BEZEL_EXPECT_EQ(run(std::string(kAdd) +
         "public static method Main(): int "
-        "  var f: (Val, Val) -> Val := (a, b) => a + b; "
+        "  var f: (Val, Val) -> Val := lambda(a, b) => a + b; "
         "  var r := f(new Val(10), new Val(5)); return r.N; "
         "end Main; end C;"), 15);
 }
@@ -51,7 +51,7 @@ BEZEL_TEST(lambda_inferred_param_operator_829, vardecl_record_plus) {
 BEZEL_TEST(lambda_inferred_param_operator_829, vardecl_record_less_than) {
     BEZEL_EXPECT_EQ(run(std::string(kCmp) +
         "public static method Main(): int "
-        "  var f: (Val, Val) -> bool := (a, b) => a < b; "
+        "  var f: (Val, Val) -> bool := lambda(a, b) => a < b; "
         "  var r := f(new Val(3), new Val(5)); return (1 if r else 0); "
         "end Main; end C;"), 1);
 }
@@ -60,8 +60,8 @@ BEZEL_TEST(lambda_inferred_param_operator_829, vardecl_record_less_than) {
 BEZEL_TEST(lambda_inferred_param_operator_829, assign_rhs_record_plus) {
     BEZEL_EXPECT_EQ(run(std::string(kAdd) +
         "public static method Main(): int "
-        "  var f: (Val, Val) -> Val := (p, q) => new Val(0); "
-        "  f := (a, b) => a + b; "
+        "  var f: (Val, Val) -> Val := lambda(p, q) => new Val(0); "
+        "  f := lambda(a, b) => a + b; "
         "  var r := f(new Val(10), new Val(5)); return r.N; "
         "end Main; end C;"), 15);
 }
@@ -73,7 +73,7 @@ BEZEL_TEST(lambda_inferred_param_operator_829, call_arg_record_plus) {
         "public static method Apply(g: (Val, Val) -> Val, a: Val, b: Val): Val "
         "  => g(a, b); "
         "public static method Main(): int "
-        "  var r := Apply((a, b) => a + b, new Val(10), new Val(5)); "
+        "  var r := Apply(lambda(a, b) => a + b, new Val(10), new Val(5)); "
         "  return r.N; "
         "end Main; end C;"), 15);
 }
@@ -82,7 +82,7 @@ BEZEL_TEST(lambda_inferred_param_operator_829, call_arg_record_plus) {
 BEZEL_TEST(lambda_inferred_param_operator_829, mixed_explicit_and_inferred) {
     BEZEL_EXPECT_EQ(run(std::string(kAdd) +
         "public static method Main(): int "
-        "  var f: (Val, Val) -> Val := (a: Val, b) => a + b; "
+        "  var f: (Val, Val) -> Val := lambda(a: Val, b) => a + b; "
         "  var r := f(new Val(10), new Val(5)); return r.N; "
         "end Main; end C;"), 15);
 }
@@ -91,7 +91,7 @@ BEZEL_TEST(lambda_inferred_param_operator_829, mixed_explicit_and_inferred) {
 BEZEL_TEST(lambda_inferred_param_operator_829, primitive_inferred_regression) {
     BEZEL_EXPECT_EQ(run(std::string(kAdd) +
         "public static method Main(): int "
-        "  var f: (int, int) -> int := (a, b) => a + b; return f(3, 4); "
+        "  var f: (int, int) -> int := lambda(a, b) => a + b; return f(3, 4); "
         "end Main; end C;"), 7);
 }
 
@@ -99,7 +99,7 @@ BEZEL_TEST(lambda_inferred_param_operator_829, primitive_inferred_regression) {
 BEZEL_TEST(lambda_inferred_param_operator_829, member_access_inferred) {
     BEZEL_EXPECT_EQ(run(std::string(kAdd) +
         "public static method Main(): int "
-        "  var f: (Val) -> int := (a) => a.N; return f(new Val(7)); "
+        "  var f: (Val) -> int := lambda(a) => a.N; return f(new Val(7)); "
         "end Main; end C;"), 7);
 }
 
@@ -119,7 +119,7 @@ BEZEL_TEST(lambda_inferred_param_operator_829, aggregate_inferred_int_acc_1124) 
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var xs := new Array<int>(); xs.Add(1); xs.Add(2); "
-        "  return xs.Aggregate(0, (acc, x) => acc + x.ToString().Length); "
+        "  return xs.Aggregate(0, lambda(acc, x) => acc + x.ToString().Length); "
         "end Main; end C;"), 2);
 }
 
@@ -130,7 +130,7 @@ BEZEL_TEST(lambda_inferred_param_operator_829, aggregate_inferred_string_acc_112
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var xs := new Array<int>(); xs.Add(1); xs.Add(2); "
-        "  var s := xs.Aggregate(\"\", (acc, x) => acc + x.ToString()); "
+        "  var s := xs.Aggregate(\"\", lambda(acc, x) => acc + x.ToString()); "
         "  return s.Length; "
         "end Main; end C;"), 2);
 }
@@ -141,7 +141,7 @@ BEZEL_TEST(lambda_inferred_param_operator_829, aggregate_inferred_nonzero_seed_1
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var xs := new Array<int>(); xs.Add(2); xs.Add(3); "
-        "  return xs.Aggregate(100, (acc, x) => acc + x); "
+        "  return xs.Aggregate(100, lambda(acc, x) => acc + x); "
         "end Main; end C;"), 105);
 }
 
@@ -151,7 +151,7 @@ BEZEL_TEST(lambda_inferred_param_operator_829, aggregate_explicit_params_1124) {
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var xs := new Array<int>(); xs.Add(5); xs.Add(10); "
-        "  return xs.Aggregate(0, (acc: int, x: int) => acc + x); "
+        "  return xs.Aggregate(0, lambda(acc: int, x: int) => acc + x); "
         "end Main; end C;"), 15);
 }
 
@@ -177,7 +177,7 @@ BEZEL_TEST(lambda_inferred_param_operator_829, class_recv_tp_in_func_param_1140)
         "class App "
         "  public static method Main(): int "
         "    using var b := new Box<int>(10); "
-        "    return b.Map((x) => x * 3); "
+        "    return b.Map(lambda(x) => x * 3); "
         "  end Main; "
         "end App;"), 30);
 }
@@ -195,7 +195,7 @@ BEZEL_TEST(lambda_inferred_param_operator_829, class_recv_two_tp_in_func_param_1
         "class App "
         "  public static method Main(): int "
         "    using var b := new Box2<int, int>(10); "
-        "    return b.Map2((x) => x * 2); "
+        "    return b.Map2(lambda(x) => x * 2); "
         "  end Main; "
         "end App;"), 20);
 }
@@ -212,7 +212,7 @@ BEZEL_TEST(lambda_inferred_param_operator_829, class_recv_explicit_ann_still_wor
         "class App "
         "  public static method Main(): int "
         "    using var b := new Box<int>(10); "
-        "    return b.Map((x: int) => x * 3); "
+        "    return b.Map(lambda(x: int) => x * 3); "
         "  end Main; "
         "end App;"), 30);
 }

@@ -117,7 +117,7 @@ BEZEL_TEST(minmax_minting_selector_launder_1915,
         "module M; import System.Collections.Linq; " + std::string(kBox) +
         "class C public static method Main(): int "
         "  using var xs: Array<int> := [1, 2, 3]; "
-        "  var winner: Box := xs.Max((o) => new Box(o)); "
+        "  var winner: Box := xs.Max(lambda(o) => new Box(o)); "
         "  return winner.Get(); "
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(compileErrored(src));
@@ -132,7 +132,7 @@ BEZEL_TEST(minmax_minting_selector_launder_1915,
         "module M; import System.Collections.Linq; " + std::string(kBox) +
         "class C public static method Main(): int "
         "  using var xs: Array<int> := [1, 2, 3]; "
-        "  var winner: Box := xs.Min((o) => new Box(o)); "
+        "  var winner: Box := xs.Min(lambda(o) => new Box(o)); "
         "  return winner.Get(); "
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(saysMintingMinMax(src));
@@ -146,7 +146,7 @@ BEZEL_TEST(minmax_minting_selector_launder_1915,
         "module M; import System.Collections.Linq; "
         "class C public static method Main(): int "
         "  using var words: Array<string> := [\"a\", \"bb\", \"ccc\"]; "
-        "  var w: string := words.Max((s) => s + \"!\"); "
+        "  var w: string := words.Max(lambda(s) => s + \"!\"); "
         "  return w.Length; "
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(saysMintingMinMax(src));
@@ -161,7 +161,7 @@ BEZEL_TEST(minmax_minting_selector_launder_1915,
         "module M; import System.Collections.Linq; "
         "class C public static method Main(): int "
         "  using var words: Array<string> := [\"a\", \"bb\"]; "
-        "  var w: string := words.Max((s) => $\"[{s}]\"); "
+        "  var w: string := words.Max(lambda(s) => $\"[{s}]\"); "
         "  return w.Length; "
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(compileErrored(src));
@@ -176,7 +176,7 @@ BEZEL_TEST(minmax_minting_selector_launder_1915,
         "module M; import System.Collections.Linq; " + std::string(kBox) +
         "class C "
         "  public static method Pick(xs: Array<int>): int "
-        "    return xs.Max((o) => new Box(o)).Get(); "
+        "    return xs.Max(lambda(o) => new Box(o)).Get(); "
         "  end Pick; "
         "  public static method Main(): int "
         "    using var xs: Array<int> := [1, 2, 3]; "
@@ -195,7 +195,7 @@ BEZEL_TEST(minmax_minting_selector_launder_1915,
         "module M; import System.Collections.Linq; " + std::string(kBox) +
         "class C public static method Main(): int "
         "  using var xs: Array<int> := [1, 2, 3]; "
-        "  var winner: Box := xs.Max((o) => do return new Box(o); end); "
+        "  var winner: Box := xs.Max(lambda(o) => do return new Box(o); end); "
         "  return winner.Get(); "
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(saysMintingMinMax(src));
@@ -229,7 +229,7 @@ BEZEL_TEST(minmax_minting_selector_launder_1915,
         "end Outer; "
         "class C public static method Main(): int "
         "  using var xs: OwningArray<Outer> := [new Outer(3), new Outer(4)]; "
-        "  var best: Inner := xs.Max((o) => o.GetChild()); "
+        "  var best: Inner := xs.Max(lambda(o) => o.GetChild()); "
         "  return best.N; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(src), 4);
@@ -243,7 +243,7 @@ BEZEL_TEST(minmax_minting_selector_launder_1915,
         "module M; import System.Collections.Linq; "
         "class C public static method Main(): int "
         "  using var xs: Array<int> := [1, 2, 3]; "
-        "  var m: int := xs.Max((o) => o * 2); "
+        "  var m: int := xs.Max(lambda(o) => o * 2); "
         "  return m; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(src), 6);
@@ -257,7 +257,7 @@ BEZEL_TEST(minmax_minting_selector_launder_1915,
         "module M; import System.Collections.Linq; "
         "class C public static method Main(): int "
         "  using var xs: Array<int> := [1, 2, 3]; "
-        "  var m: int := xs.Max((o) => o); "
+        "  var m: int := xs.Max(lambda(o) => o); "
         "  return m; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(src), 3);
@@ -272,7 +272,7 @@ BEZEL_TEST(minmax_minting_selector_launder_1915,
         "module M; import System.Collections.Linq; "
         "class C public static method Main(): int "
         "  using var words: Array<string> := [\"a\", \"bb\", \"ccc\"]; "
-        "  var w: string := words.Max((s) => s); "
+        "  var w: string := words.Max(lambda(s) => s); "
         "  return w.Length; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(src), 3);

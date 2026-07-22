@@ -68,7 +68,7 @@ const char* kForInGroupByLambdaSelector =
     "    strings.Add(\"1\"); strings.Add(\"1\"); strings.Add(\"2\"); "
     "    var n := 0; "
     "    var keys := 0; "
-    "    for var g in strings.GroupBy((s) => int.Parse(s)) do "
+    "    for var g in strings.GroupBy(lambda(s) => int.Parse(s)) do "
     "      n := n + 1; "
     "      keys := keys + g.Key * g.Count(); "   // reads a live grouping — UAF if freed early
     "    end; "
@@ -89,7 +89,7 @@ const char* kForInGroupByValueUse =
     "    using var xs := new Array<int>(); "
     "    xs.Add(1); xs.Add(3); xs.Add(2); xs.Add(4); xs.Add(6); "
     "    var total := 0; "
-    "    for var g in xs.GroupBy((x: int) => x mod 2) do "
+    "    for var g in xs.GroupBy(lambda(x: int) => x mod 2) do "
     "      total := total + g.Key + g.Count(); "
     "    end; "
     "    Console.WriteLine(\"total=\" + total.ToString()); "

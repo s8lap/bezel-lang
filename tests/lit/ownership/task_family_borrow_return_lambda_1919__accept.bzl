@@ -22,15 +22,15 @@ class C
 
   public static method Main(): int
     // ADMIT: forward a fresh task-returning call (the dominant shape).
-    var fresh: () -> Task<int> := () => Producer();
+    var fresh: () -> Task<int> := lambda() => Producer();
     // ADMIT: an `async` lambda — body is the awaited value, not a task.
-    var asyncl: () -> Task<int> := async () => await Producer();
+    var asyncl: () -> Task<int> := async lambda() => await Producer();
     // ADMIT: a completed-task factory (§30.10).
-    var factory: () -> Task<int> := () => Task.FromResult<int>(5);
+    var factory: () -> Task<int> := lambda() => Task.FromResult<int>(5);
     // ADMIT: an `owned` parameter returned through a plain-`Task` return.
-    var ownedp: (owned Task<int>) -> Task<int> := (owned t) => t;
+    var ownedp: (owned Task<int>) -> Task<int> := lambda(owned t) => t;
     // UNAFFECTED: a NON-`Task` (value-typed) identity lambda.
-    var id: (int) -> int := (x) => x;
+    var id: (int) -> int := lambda(x) => x;
     return 0;
   end Main;
 end C;

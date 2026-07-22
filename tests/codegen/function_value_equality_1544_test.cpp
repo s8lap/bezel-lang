@@ -67,7 +67,7 @@ BEZEL_TEST(function_value_equality_1544,
           lambda_equals_itself_via_shared_binding_spec_27_7_1) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var f := () => 1; "
+        "  var f := lambda() => 1; "
         "  var g := f; "
         "  return 1 if f = g else 0; "
         "end Main; end C;"), 1);
@@ -79,8 +79,8 @@ BEZEL_TEST(function_value_equality_1544,
           distinct_lambdas_identical_source_not_equal_spec_27_7_1) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var f := () => 1; "
-        "  var g := () => 1; "
+        "  var f := lambda() => 1; "
+        "  var g := lambda() => 1; "
         "  return 1 if f = g else 0; "
         "end Main; end C;"), 0);
 }
@@ -139,7 +139,7 @@ BEZEL_TEST(function_value_equality_1544,
         "  public static method M1(): int return 1; end M1; "
         "  public static method Main(): int "
         "    var f: () -> int := C.M1; "
-        "    var g: () -> int := () => 1; "
+        "    var g: () -> int := lambda() => 1; "
         "    return 1 if f = g else 0; "
         "  end Main; "
         "end C;"), 0);
@@ -218,7 +218,7 @@ BEZEL_TEST(function_value_equality_1544,
           same_site_lambdas_distinct_cells_not_equal_spec_27_7_1) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
-        "  public static method MakeL(): () -> int return () => 42; end MakeL; "
+        "  public static method MakeL(): () -> int return lambda() => 42; end MakeL; "
         "  public static method Main(): int "
         "    var f := MakeL(); "
         "    var g := MakeL(); "
@@ -234,7 +234,7 @@ BEZEL_TEST(function_value_equality_1544,
           same_site_lambda_stored_once_equals_itself_spec_27_7_1) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
-        "  public static method MakeL(): () -> int return () => 42; end MakeL; "
+        "  public static method MakeL(): () -> int return lambda() => 42; end MakeL; "
         "  public static method Main(): int "
         "    var f := MakeL(); "
         "    var g := f; "
@@ -296,7 +296,7 @@ BEZEL_TEST(function_value_equality_1544,
         "class Obj public method M1(): int return 1; end M1; end Obj; "
         "class C public static method Main(): int "
         "  using var o := new Obj(); "
-        "  var f: () -> int := () => 1; "
+        "  var f: () -> int := lambda() => 1; "
         "  var g: () -> int := o.M1; "
         "  return 1 if f = g else 0; "
         "end Main; end C;"), 0);

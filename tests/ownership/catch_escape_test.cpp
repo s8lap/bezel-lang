@@ -230,9 +230,9 @@ BEZEL_TEST(catch_escape_closure, return_closure_capturing_binding_diagnosed_31_1
     auto r = parseAndCheckOwnership(wrap(
         "public method Handle(): () -> int "
         "  try DoWork(); "
-        "  catch var ex: Exception => return () => Use(ex); "
+        "  catch var ex: Exception => return lambda() => Use(ex); "
         "  end; "
-        "  return () => 0; "
+        "  return lambda() => 0; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
@@ -245,11 +245,11 @@ BEZEL_TEST(catch_escape_closure, return_holder_closure_capturing_binding_diagnos
         "public method Handle(): () -> int "
         "  try DoWork(); "
         "  catch var ex: Exception => do "
-        "    var f := () => Use(ex); "
+        "    var f := lambda() => Use(ex); "
         "    return f; "
         "  end; "
         "  end; "
-        "  return () => 0; "
+        "  return lambda() => 0; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
@@ -265,7 +265,7 @@ BEZEL_TEST(catch_escape_closure, local_closure_capturing_binding_invoked_locally
         "  var n: int := 0; "
         "  try DoWork(); "
         "  catch var ex: Exception => do "
-        "    var f := () => Use(ex); "
+        "    var f := lambda() => Use(ex); "
         "    n := f(); "
         "  end; "
         "  end; "

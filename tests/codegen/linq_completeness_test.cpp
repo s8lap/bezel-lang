@@ -46,7 +46,7 @@ BEZEL_TEST(linq_complete, aggregate_sum_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  return a.Aggregate(0, (acc: int, x: int) => acc + x); "
+        "  return a.Aggregate(0, lambda(acc: int, x: int) => acc + x); "
         "end Main; end C;"), 10);
 }
 
@@ -56,7 +56,7 @@ BEZEL_TEST(linq_complete, aggregate_product_seed_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  return a.Aggregate(1, (acc: int, x: int) => acc * x); "
+        "  return a.Aggregate(1, lambda(acc: int, x: int) => acc * x); "
         "end Main; end C;"), 24);
 }
 
@@ -65,7 +65,7 @@ BEZEL_TEST(linq_complete, aggregate_empty_returns_seed_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
-        "  return a.Aggregate(42, (acc: int, x: int) => acc + x); "
+        "  return a.Aggregate(42, lambda(acc: int, x: int) => acc + x); "
         "end Main; end C;"), 42);
 }
 
@@ -96,7 +96,7 @@ BEZEL_TEST(linq_complete, average_selector_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(10); a.Add(20); a.Add(30); "
-        "  var avg: double := a.Average((x: int) => x); "
+        "  var avg: double := a.Average(lambda(x: int) => x); "
         "  return int(avg); "
         "end Main; end C;"), 20);
 }
@@ -157,7 +157,7 @@ BEZEL_TEST(linq_complete, takewhile_spec_5) {
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(1); "
         "  var s := 0; var n := 0; "
-        "  for var x in a.TakeWhile((x) => x < 4) do s := s + x; n := n + 1; end; "
+        "  for var x in a.TakeWhile(lambda(x) => x < 4) do s := s + x; n := n + 1; end; "
         "  return int(s = 6 and n = 3); "  // 1+2+3, stops at 4
         "end Main; end C;"), 1);
 }
@@ -170,7 +170,7 @@ BEZEL_TEST(linq_complete, skipwhile_spec_5) {
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(1); "
         "  var s := 0; var n := 0; "
-        "  for var x in a.SkipWhile((x) => x < 4) do s := s + x; n := n + 1; end; "
+        "  for var x in a.SkipWhile(lambda(x) => x < 4) do s := s + x; n := n + 1; end; "
         "  return int(s = 5 and n = 2); "  // 4+1
         "end Main; end C;"), 1);
 }
@@ -184,7 +184,7 @@ BEZEL_TEST(linq_complete, selectmany_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); a.Add(1); a.Add(2); a.Add(3); "
         "  var s := 0; var n := 0; "
-        "  for var y in a.SelectMany((x: int) => do "
+        "  for var y in a.SelectMany(lambda(x: int) => do "
         "      var inner := new Array<int>(); inner.Add(x); inner.Add(x * 10); "
         "      return inner; end) do s := s + y; n := n + 1; end; "
         "  return int(s = 66 and n = 6); "
@@ -201,7 +201,7 @@ BEZEL_TEST(linq_complete, zip_spec_5) {
         "  using var a := new Array<int>(); a.Add(1); a.Add(2); a.Add(3); "
         "  using var b := new Array<int>(); b.Add(10); b.Add(20); "
         "  var s := 0; var n := 0; "
-        "  for var z in a.Zip(b, (x: int, y: int) => x + y) do s := s + z; n := n + 1; end; "
+        "  for var z in a.Zip(b, lambda(x: int, y: int) => x + y) do s := s + z; n := n + 1; end; "
         "  return int(s = 33 and n = 2); "  // 11 + 22, length 2 (shorter)
         "end Main; end C;"), 1);
 }
@@ -229,7 +229,7 @@ BEZEL_TEST(linq_complete, zip_string_receiver_int_result_no_overflow_spec_5) {
         "  using var a: Array<string> := [\"aa\"]; "
         "  using var b: Array<string> := [\"x\"]; "
         "  var s := 0; "
-        "  for var v in a.Zip(b, (p, q) => p.Length + q.Length) do s := s + v; end; "
+        "  for var v in a.Zip(b, lambda(p, q) => p.Length + q.Length) do s := s + v; end; "
         "  return s; "
         "end Main; end C;"), 3);
 }
@@ -252,7 +252,7 @@ BEZEL_TEST(linq_complete, zip_string_result_combiner_compiles_spec_5) {
         "  using var a: Array<string> := [\"aa\"]; "
         "  using var b: Array<string> := [\"x\"]; "
         "  var n := 0; "
-        "  for var v in a.Zip(b, (p, q) => p + q) do n := n + v.Length; end; "
+        "  for var v in a.Zip(b, lambda(p, q) => p + q) do n := n + v.Length; end; "
         "  return n; "
         "end Main; end C;"), 3);
 }
@@ -268,7 +268,7 @@ BEZEL_TEST(linq_complete, zip_value_result_inferred_params_no_regression_spec_5)
         "  using var a: Array<int> := [1, 2, 3]; "
         "  using var b: Array<int> := [10, 20]; "
         "  var s := 0; "
-        "  for var v in a.Zip(b, (p, q) => p + q) do s := s + v; end; "
+        "  for var v in a.Zip(b, lambda(p, q) => p + q) do s := s + v; end; "
         "  return s; "
         "end Main; end C;"), 33);
 }
@@ -284,7 +284,7 @@ BEZEL_TEST(linq_complete, concat_chained_lazy_spec_5) {
         "  using var a := new Array<int>(); a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
         "  using var b := new Array<int>(); b.Add(5); b.Add(6); "
         "  var s := 0; "
-        "  for var x in a.Where((x) => x mod 2 = 0).Concat(b).Take(3) do s := s + x; end; "
+        "  for var x in a.Where(lambda(x) => x mod 2 = 0).Concat(b).Take(3) do s := s + x; end; "
         "  return s; "  // evens of a = [2,4], concat [5,6] = [2,4,5,6], take 3 = [2,4,5] = 11
         "end Main; end C;"), 11);
 }

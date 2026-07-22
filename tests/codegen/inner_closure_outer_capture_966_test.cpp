@@ -42,7 +42,7 @@ BEZEL_TEST(inner_closure_outer_capture_966, value_readable_after_inner_block) {
         std::string("module M; ") + kR +
         "class C public static method Main(): int "
         "  using var r := new R(55); "
-        "  do var g: () -> int := () => r.V; end; "
+        "  do var g: () -> int := lambda() => r.V; end; "
         "  return r.V; "  // 55
         "end Main; end C;"), 55);
 }
@@ -55,7 +55,7 @@ BEZEL_TEST(inner_closure_outer_capture_966, disposed_exactly_once) {
         "class C public static method Main(): int "
         "  do "
         "    using var r := new R(55); "
-        "    do var g: () -> int := () => r.V; end; "
+        "    do var g: () -> int := lambda() => r.V; end; "
         "  end; "
         "  return R.n; "  // 0
         "end Main; end C;"), 0);
@@ -67,7 +67,7 @@ BEZEL_TEST(inner_closure_outer_capture_966, inner_closure_call_works) {
         std::string("module M; ") + kR +
         "class C public static method Main(): int "
         "  using var r := new R(7); "
-        "  do var g: () -> int := () => r.V; var k := g(); end; "
+        "  do var g: () -> int := lambda() => r.V; var k := g(); end; "
         "  return r.V; "  // 7
         "end Main; end C;"), 7);
 }
@@ -79,7 +79,7 @@ BEZEL_TEST(inner_closure_outer_capture_966, same_scope_capture_unaffected) {
         std::string("module M; ") + kR +
         "class C public static method Main(): int "
         "  using var r := new R(99); "
-        "  var f: () -> int := () => r.V; "
+        "  var f: () -> int := lambda() => r.V; "
         "  return f(); "  // 99
         "end Main; end C;"), 99);
 }

@@ -23,7 +23,7 @@ import System.Threading;
 class Prog
   public async method Gen(): IAsyncEnumerable<int>
     await using var scope := new TaskScope();
-    scope.Spawn(async () => do await Task.Delay(2); end);
+    scope.Spawn(async lambda() => do await Task.Delay(2); end);
     yield return 1;
     await scope.Join();
   end Gen;

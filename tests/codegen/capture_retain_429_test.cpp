@@ -201,7 +201,7 @@ const char* kStringCaptureInvokedOnce =
     "module M; class C "
     "  public static method Main(): int "
     "    var s: string := \"he\" + \"llo\"; "   // +1 producer, rc=1
-    "    var f: () -> int := () => s.Length; "   // capture; scope-end suppressed; envdtor will release
+    "    var f: () -> int := lambda() => s.Length; "   // capture; scope-end suppressed; envdtor will release
     "    var r: int := f(); "                     // invoke: r=5
     "    if r > 0 then return 0; end; return 1; "
     "  end Main; "
@@ -221,7 +221,7 @@ const char* kStringCaptureLoop =
     "    var i: int := 0; var total: int := 0; "
     "    while i < 50000 do "
     "      var s: string := \"x\" + \"y\"; "    // fresh +1 string each iter
-    "      var f: () -> int := () => s.Length; " // capture+retain
+    "      var f: () -> int := lambda() => s.Length; " // capture+retain
     "      total := total + f(); "               // invoke (result=2)
     "      i := i + 1; "
     "    end; "
@@ -244,7 +244,7 @@ const char* kStringCaptureLoop =
 // ===========================================================================
 const char* kStringCaptureStoredInField =
     "module M; class H "
-    "  public fn: () -> int := () => 0; "
+    "  public fn: () -> int := lambda() => 0; "
     "  public static _n: int := 0; "
     "  destructor _n := _n + 1; end destructor; "
     "  public static method Main(): int "
@@ -252,7 +252,7 @@ const char* kStringCaptureStoredInField =
     "    do "
     "      using var h := new H(); "
     "      var s: string := \"stored\" + \"!\"; "  // +1 producer
-    "      h.fn := () => s.Length; "               // capture+retain; field-store releases old (()=>0), retains new
+    "      h.fn := lambda() => s.Length; "               // capture+retain; field-store releases old (()=>0), retains new
     "      result := h.fn(); "                      // invoke: 8
     "    end; "
     "    if result > 0 then return 0; end; return 1; "
@@ -269,8 +269,8 @@ const char* kStringCaptureStoredInField =
 const char* kClosureCaptureByLambda =
     "module M; class C "
     "  public static method Main(): int "
-    "    var inner: (int) -> int := (x: int) => x * 2; "  // inner closure
-    "    var outer: (int) -> int := (x: int) => inner(x) + 1; "  // captures inner
+    "    var inner: (int) -> int := lambda(x: int) => x * 2; "  // inner closure
+    "    var outer: (int) -> int := lambda(x: int) => inner(x) + 1; "  // captures inner
     "    var r: int := outer(3); "  // inner(3)=6, outer=7
     "    if r = 7 then return 0; end; return 1; "
     "  end Main; "
@@ -287,8 +287,8 @@ const char* kClosureCaptureLoop =
     "    var k: int := 0; var total: int := 0; "
     "    while k < 10000 do "
     "      var n: int := k; "                                  // snapshot — no reassignment in body
-    "      var inner: (int) -> int := (x: int) => x + n; "   // captures n (int borrow — no retain)
-    "      var outer: (int) -> int := (x: int) => inner(x); " // captures inner (closure — envdtor releases)
+    "      var inner: (int) -> int := lambda(x: int) => x + n; "   // captures n (int borrow — no retain)
+    "      var outer: (int) -> int := lambda(x: int) => inner(x); " // captures inner (closure — envdtor releases)
     "      total := total + outer(1); "
     "      k := k + 1; "
     "    end; "
@@ -315,7 +315,7 @@ const char* kClassCaptureBorrow =
     "  public static method Main(): int "
     "    do "
     "      using var r := new R(); "
-    "      var f: () -> int := () => r.Tag(); "  // borrow capture — no retain/release
+    "      var f: () -> int := lambda() => r.Tag(); "  // borrow capture — no retain/release
     "      var _ := f(); "                        // invoke
     "    end; "                                   // using-var disposes r exactly once
     "    return _n; "   // must be exactly 1
@@ -334,7 +334,7 @@ const char* kClassCaptureBorrowLoop =
     "    while i < 5000 do "
     "      do "
     "        using var r := new R(); "
-    "        var f: () -> int := () => r.Tag(); "
+    "        var f: () -> int := lambda() => r.Tag(); "
     "        var _ := f(); "
     "      end; "
     "      i := i + 1; "
@@ -357,7 +357,7 @@ const char* kValueCaptureIntBool =
     "  public static method Main(): int "
     "    var k: int := 7; "
     "    var flag: bool := true; "
-    "    var f: (int) -> int := (x: int) => (x + k) if flag else 0; "
+    "    var f: (int) -> int := lambda(x: int) => (x + k) if flag else 0; "
     "    var r: int := f(3); "  // 3 + 7 = 10
     "    if r = 10 then return 0; end; return 1; "
     "  end Main; "
@@ -375,7 +375,7 @@ const char* kMixedStringAndIntCapture =
     "  public static method Main(): int "
     "    var s: string := \"mix\" + \"ed\"; "  // +1 producer
     "    var n: int := 3; "
-    "    var f: () -> int := () => s.Length + n; "  // captures s (retain) + n (skip)
+    "    var f: () -> int := lambda() => s.Length + n; "  // captures s (retain) + n (skip)
     "    var r: int := f(); "  // \"mixed\".Length=5 + 3 = 8
     "    if r = 8 then return 0; end; return 1; "
     "  end Main; "
@@ -389,7 +389,7 @@ const char* kMixedCaptureLoop =
     "    while i < 50000 do "
     "      var s: string := \"a\" + \"b\"; "       // +1 string each iter
     "      var n: int := 2; "
-    "      var f: () -> int := () => s.Length + n; "  // s retained+released; n skipped
+    "      var f: () -> int := lambda() => s.Length + n; "  // s retained+released; n skipped
     "      total := total + f(); "  // 2+2=4 each iter
     "      i := i + 1; "
     "    end; "
@@ -411,7 +411,7 @@ const char* kStringCaptureDiscarded =
     "    var i: int := 0; "
     "    while i < 50000 do "
     "      var s: string := \"discard\" + \"me\"; "  // +1 producer
-    "      var _f: () -> int := () => s.Length; "    // capture+retain; never invoked
+    "      var _f: () -> int := lambda() => s.Length; "    // capture+retain; never invoked
     "      i := i + 1; "
     "    end; "
     "    return 0; "
@@ -524,8 +524,8 @@ const char* kStringTwoLambdaCapture =
     "module M; class C "
     "  public static method Main(): int "
     "    var s: string := \"he\" + \"llo\"; "
-    "    var f: () -> int := () => s.Length; "
-    "    var g: () -> int := () => s.Length + 1; "
+    "    var f: () -> int := lambda() => s.Length; "
+    "    var g: () -> int := lambda() => s.Length + 1; "
     "    return f() + g(); "
     "  end Main; "
     "end C;";
@@ -534,9 +534,9 @@ const char* kStringThreeLambdaCapture =
     "module M; class C "
     "  public static method Main(): int "
     "    var s: string := \"he\" + \"llo\"; "
-    "    var f: () -> int := () => s.Length; "
-    "    var g: () -> int := () => s.Length + 1; "
-    "    var h: () -> int := () => s.Length + 2; "
+    "    var f: () -> int := lambda() => s.Length; "
+    "    var g: () -> int := lambda() => s.Length + 1; "
+    "    var h: () -> int := lambda() => s.Length + 2; "
     "    return f() + g() + h(); "
     "  end Main; "
     "end C;";

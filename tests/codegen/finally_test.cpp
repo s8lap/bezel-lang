@@ -112,7 +112,7 @@ BEZEL_TEST(codegen_cg21b_546, finally_function_return_compiles_and_runs) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method GetFn(): () -> int "
-        "    try return () => 42; finally var _x: int := 0; end; "
+        "    try return lambda() => 42; finally var _x: int := 0; end; "
         "  end GetFn; "
         "  public static method Main(): int "
         "    var f: () -> int := C.GetFn(); "
@@ -129,7 +129,7 @@ BEZEL_TEST(codegen_cg21b_546, finally_runs_then_function_value_returned) {
         "module M; class C "
         "  public static _n: int := 0; "
         "  public static method GetFn(): () -> int "
-        "    try return () => _n; finally _n := 7; end; "
+        "    try return lambda() => _n; finally _n := 7; end; "
         "  end GetFn; "
         "  public static method Main(): int "
         "    var f: () -> int := C.GetFn(); "

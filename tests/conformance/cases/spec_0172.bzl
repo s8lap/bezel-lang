@@ -1,2 +1,2 @@
-var double := (x: int) => x * 2;
-var greet := (name: string) => $"Hello, {name}!";
+var double := lambda(x: int) => x * 2;
+var greet := lambda(name: string) => $"Hello, {name}!";

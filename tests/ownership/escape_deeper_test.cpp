@@ -222,7 +222,7 @@ BEZEL_TEST(own_outparam_escape, write_closure_capturing_using_var_through_out_di
     auto r = parseAndCheckOwnership(wrap(
         "public static method Leak(out f: () -> int) "
         "  using var r := new R(); "
-        "  f := () => r.V; "
+        "  f := lambda() => r.V; "
         "end Leak;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
@@ -404,7 +404,7 @@ BEZEL_TEST(own_param_source, return_holder_borrowing_param_clean_9_7) {
 BEZEL_TEST(own_param_source, return_closure_capturing_param_clean_28_9) {
     auto r = parseAndCheckOwnership(wrap(
         "public static method Make(src: R): () -> int "
-        "  return () => src.V; "
+        "  return lambda() => src.V; "
         "end Make;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

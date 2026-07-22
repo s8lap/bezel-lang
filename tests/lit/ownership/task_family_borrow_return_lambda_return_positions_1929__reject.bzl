@@ -20,16 +20,16 @@ import System.Threading;
 
 class C
   // REJECT: an expression-bodied METHOD whose body IS the identity lambda.
-  public static method MakeExpr(): (Task<int>) -> Task<int> => (t) => t;
+  public static method MakeExpr(): (Task<int>) -> Task<int> => lambda(t) => t;
 
   // REJECT: a block method body that RETURNS the identity lambda.
   public static method MakeBlock(): (Task<int>) -> Task<int>
-    return (t) => t;
+    return lambda(t) => t;
   end MakeBlock;
 
   // REJECT: a BLOCK getter accessor that RETURNS the identity lambda.
   public property Echo: (Task<int>) -> Task<int>
-    get => do return (t) => t; end;
+    get => do return lambda(t) => t; end;
   end Echo;
 
   public static method Main(): int return 0; end Main;

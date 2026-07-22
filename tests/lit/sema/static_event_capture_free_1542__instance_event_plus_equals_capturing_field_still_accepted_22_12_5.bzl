@@ -10,7 +10,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; record Ev(N: int); class Src public Total: int := 0; public event Signal: Ev; public method Hook() Signal += (e) => do Total := Total + e.N; end; end Hook; end Src;
+module M; record Ev(N: int); class Src public Total: int := 0; public event Signal: Ev; public method Hook() Signal += lambda(e) => do Total := Total + e.N; end; end Hook; end Src;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

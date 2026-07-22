@@ -96,7 +96,7 @@ std::string syncMain(const std::string& body) {
 // code. Pre-fix (missing async static-init prologue): 0.
 BEZEL_TEST(codegen_static_event_async_1502, async_subscribe_capture_free_handler_observes_mutations) {
     BEZEL_EXPECT_EQ(run(asyncMain(
-        "using var sub := Bus.Ticked.Subscribe((e) => do Bus.Total := Bus.Total + e.N; end); "
+        "using var sub := Bus.Ticked.Subscribe(lambda(e) => do Bus.Total := Bus.Total + e.N; end); "
         "Bus.Fire(5); "
         "Bus.Fire(7); "
         "return Bus.Total; "     // expect 12
@@ -109,7 +109,7 @@ BEZEL_TEST(codegen_static_event_async_1502, async_subscribe_capture_free_handler
 // handler is capture-free, mutating `Bus.Total`.
 BEZEL_TEST(codegen_static_event_async_1502, async_subscribe_mutation_visible_before_await) {
     BEZEL_EXPECT_EQ(run(asyncMain(
-        "using var sub := Bus.Ticked.Subscribe((e) => do Bus.Total := Bus.Total + e.N; end); "
+        "using var sub := Bus.Ticked.Subscribe(lambda(e) => do Bus.Total := Bus.Total + e.N; end); "
         "Bus.Fire(5); "                 // before any await
         "var before := Bus.Total; "
         "await Bus.Nop(); "
@@ -122,7 +122,7 @@ BEZEL_TEST(codegen_static_event_async_1502, async_subscribe_mutation_visible_bef
 // field. §22.12 rule 5 (#1542): capture-free handler mutating `Bus.Total`.
 BEZEL_TEST(codegen_static_event_async_1502, async_subscribe_accumulates_across_await) {
     BEZEL_EXPECT_EQ(run(asyncMain(
-        "using var sub := Bus.Ticked.Subscribe((e) => do Bus.Total := Bus.Total + e.N; end); "
+        "using var sub := Bus.Ticked.Subscribe(lambda(e) => do Bus.Total := Bus.Total + e.N; end); "
         "Bus.Fire(5); "
         "await Bus.Nop(); "
         "Bus.Fire(7); "
@@ -149,8 +149,8 @@ BEZEL_TEST(codegen_static_event_async_1502, async_subscribe_static_method_ref_ha
 // are capture-free (distinct multipliers into `Bus.Total`).
 BEZEL_TEST(codegen_static_event_async_1502, async_subscribe_two_handlers_both_fire) {
     BEZEL_EXPECT_EQ(run(asyncMain(
-        "using var s1 := Bus.Ticked.Subscribe((e) => do Bus.Total := Bus.Total + e.N; end); "
-        "using var s2 := Bus.Ticked.Subscribe((e) => do Bus.Total := Bus.Total + e.N * 10; end); "
+        "using var s1 := Bus.Ticked.Subscribe(lambda(e) => do Bus.Total := Bus.Total + e.N; end); "
+        "using var s2 := Bus.Ticked.Subscribe(lambda(e) => do Bus.Total := Bus.Total + e.N * 10; end); "
         "Bus.Fire(2); "
         "return Bus.Total; "     // expect 2 + 20 = 22
     )), 22);
@@ -162,7 +162,7 @@ BEZEL_TEST(codegen_static_event_async_1502, async_subscribe_two_handlers_both_fi
 // capture-free handler mutating `Bus.Total`.
 BEZEL_TEST(codegen_static_event_async_1502, sync_subscribe_capture_free_handler_baseline) {
     BEZEL_EXPECT_EQ(run(syncMain(
-        "using var sub := Bus.Ticked.Subscribe((e) => do Bus.Total := Bus.Total + e.N; end); "
+        "using var sub := Bus.Ticked.Subscribe(lambda(e) => do Bus.Total := Bus.Total + e.N; end); "
         "Bus.Fire(5); "
         "Bus.Fire(7); "
         "return Bus.Total; "     // expect 12
@@ -175,7 +175,7 @@ BEZEL_TEST(codegen_static_event_async_1502, sync_subscribe_capture_free_handler_
 BEZEL_TEST(codegen_static_event_async_1502, async_direct_closure_captured_local_control) {
     BEZEL_EXPECT_EQ(run(asyncMain(
         "var total := 0; "
-        "var bump := (n: int) => do total := total + n; end; "
+        "var bump := lambda(n: int) => do total := total + n; end; "
         "bump(5); "
         "return total; "     // expect 5
     )), 5);

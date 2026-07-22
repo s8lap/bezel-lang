@@ -15,7 +15,7 @@ class Prog
   public async method Gen(): IAsyncEnumerable<int>
     do
       await using var scope := new TaskScope();
-      scope.Spawn(async () => do await Task.Delay(1); end);
+      scope.Spawn(async lambda() => do await Task.Delay(1); end);
       await scope.Join();
     end;
     yield return 1;

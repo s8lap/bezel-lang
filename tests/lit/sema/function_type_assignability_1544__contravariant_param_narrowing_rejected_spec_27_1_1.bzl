@@ -7,7 +7,7 @@
 // where (Animal) -> () is expected — calling the result with a non-Dog
 // Animal would call the Dog-only handler on the wrong receiver shape.
 
-module M; class Animal end Animal; class Dog: Animal end Dog; class C public static method Main(): int var f: (Dog) -> () := (d: Dog) => do end; var g: (Animal) -> () := f; return 0; end Main; end C;
+module M; class Animal end Animal; class Dog: Animal end Dog; class C public static method Main(): int var f: (Dog) -> () := lambda(d: Dog) => do end; var g: (Animal) -> () := f; return 0; end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: the initializer for `g` has a type that is not implicitly convertible to the target type
 // CHECK-SAME: (§5.1)

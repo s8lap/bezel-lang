@@ -195,7 +195,7 @@ BEZEL_TEST(codegen_inline_owned_747, closure_capture_disposes_via_cell_782) {
         "var got: int := 0; "
         "do "
         "  var a: [2 owned]Cell? := [new Cell(1), new Cell(2)]; "
-        "  var f := () => a[0]!.V; "  // captures a (capture-boxed)
+        "  var f := lambda() => a[0]!.V; "  // captures a (capture-boxed)
         "  got := f(); "
         "end; "
         "return Cell.n;")), 0);  // got==1 read OK; both cells disposed via cell
@@ -208,7 +208,7 @@ BEZEL_TEST(codegen_inline_owned_747, captured_array_multi_closure_disposes_once_
     BEZEL_EXPECT_EQ(run(prog(
         "do "
         "  var a: [2 owned]Cell? := [new Cell(1), new Cell(2)]; "
-        "  var f := () => a[0]!.V; var g := () => a[1]!.V; "
+        "  var f := lambda() => a[0]!.V; var g := lambda() => a[1]!.V; "
         "  var s := f() + g(); "
         "end; "
         "return Cell.n;")), 0);  // both disposed exactly once
@@ -220,7 +220,7 @@ BEZEL_TEST(codegen_inline_owned_747, captured_array_null_slot_skipped_782) {
     BEZEL_EXPECT_EQ(run(prog(
         "do "
         "  var a: [2 owned]Cell? := [new Cell(1), null]; "
-        "  var f := () => a.Length; var n := f(); "
+        "  var f := lambda() => a.Length; var n := f(); "
         "end; "
         "return Cell.n;")), 0);  // the one Cell disposed; null slot a no-op
 }
@@ -232,10 +232,10 @@ BEZEL_TEST(codegen_inline_owned_747, captured_array_null_slot_skipped_782) {
 // would drive the live counter negative). The escaped closure reads valid memory.
 BEZEL_TEST(codegen_inline_owned_747, captured_array_escaping_not_disposed_782) {
     BEZEL_EXPECT_EQ(run(prog(
-        "var captured: () -> int := () => 0; "
+        "var captured: () -> int := lambda() => 0; "
         "do "
         "  var a: [2 owned]Cell? := [new Cell(1), new Cell(2)]; "
-        "  captured := () => a.Length; "
+        "  captured := lambda() => a.Length; "
         "end; "
         "var n := captured(); "
         "return Cell.n;")), 2);  // leaked (escaping), no double-free
@@ -256,7 +256,7 @@ BEZEL_TEST(codegen_inline_owned_747, captured_array_in_loop_disposed_806) {
         "for var i in 1 .. 2 do "
         "  do "
         "    var a: [2 owned]Cell? := [new Cell(1), new Cell(2)]; "
-        "    var f := () => a.Length; var n := f(); "
+        "    var f := lambda() => a.Length; var n := f(); "
         "  end; "
         "end; "
         "return Cell.n;")), 0);  // #806: per-iteration fresh cell → all disposed
@@ -272,7 +272,7 @@ BEZEL_TEST(codegen_inline_owned_747, captured_array_in_loop_read_disposed_806) {
         "for var i in 1 .. 3 do "
         "  do "
         "    var a: [2 owned]Cell? := [new Cell(i), new Cell(i)]; "
-        "    var f := () => a[0]!.V; acc := acc + f(); "
+        "    var f := lambda() => a[0]!.V; acc := acc + f(); "
         "  end; "
         "end; "
         "return Cell.n;")), 0);  // each iteration's pair disposed; nothing leaks

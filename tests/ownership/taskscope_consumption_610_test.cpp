@@ -115,7 +115,7 @@ BEZEL_TEST(taskscope_consumption_610, spawn_capture_sources_before_admitted) {
     auto r = parseAndCheckOwnership(asyncMain(
         "    var count := 0; "
         "    await using var scope := new TaskScope(); "
-        "    scope.Spawn(async () => do count := count + 1; end); "
+        "    scope.Spawn(async lambda() => do count := count + 1; end); "
         "    await scope.Join(); "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -133,7 +133,7 @@ BEZEL_TEST(taskscope_consumption_610, spawn_capture_source_after_rejected) {
         "  public static async method Main(): Task<int> "
         "    await using var scope := new TaskScope(); "
         "    using var res := new Res(); "
-        "    scope.Spawn(async () => do res.Ping(); end); "
+        "    scope.Spawn(async lambda() => do res.Ping(); end); "
         "    await scope.Join(); "
         "    return 0; "
         "  end Main; "

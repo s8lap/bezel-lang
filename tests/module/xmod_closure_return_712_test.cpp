@@ -283,7 +283,7 @@ BEZEL_TEST(xmod_closure_return_712, c1_imported_instance_method_closure_lsan_28_
         "module MakerLib; "
         "public class Maker "
         "  public constructor() end constructor; "
-        "  public method MakeAdder(n: int): () -> int return () => n + 1; end MakeAdder; "
+        "  public method MakeAdder(n: int): () -> int return lambda() => n + 1; end MakeAdder; "
         "  destructor end destructor; "
         "end Maker;");
 
@@ -324,7 +324,7 @@ BEZEL_TEST(xmod_closure_return_712, c1_imported_instance_method_closure_lsan_28_
         "module App; "
         "public class Maker "
         "  public constructor() end constructor; "
-        "  public method MakeAdder(n: int): () -> int return () => n + 1; end MakeAdder; "
+        "  public method MakeAdder(n: int): () -> int return lambda() => n + 1; end MakeAdder; "
         "  destructor end destructor; "
         "end Maker; "
         "public class Program "
@@ -358,7 +358,7 @@ BEZEL_TEST(xmod_closure_return_712, c2_single_module_baseline_lsan_28_9) {
         "module App; "
         "public class Maker "
         "  public constructor() end constructor; "
-        "  public method MakeAdder(n: int): () -> int return () => n + 1; end MakeAdder; "
+        "  public method MakeAdder(n: int): () -> int return lambda() => n + 1; end MakeAdder; "
         "  destructor end destructor; "
         "end Maker; "
         "public class Program "

@@ -78,7 +78,7 @@ BEZEL_TEST(inline_array_linq_reject_1100, all_predicate_rejected) {
     auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var arr: [4]int := [2,4,6,8]; "
-        "  if arr.All((x: int) => x mod 2 = 0) then return 1; else return 0; end; "
+        "  if arr.All(lambda(x: int) => x mod 2 = 0) then return 1; else return 0; end; "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(has1512Error(r));
@@ -90,7 +90,7 @@ BEZEL_TEST(inline_array_linq_reject_1100, where_rejected) {
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  var arr: [5]int := [1,2,3,4,5]; "
-        "  using var r: Array<int> := arr.Where((x: int) => x > 2).ToArray(); "
+        "  using var r: Array<int> := arr.Where(lambda(x: int) => x > 2).ToArray(); "
         "  return r.Length; "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);

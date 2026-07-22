@@ -33,7 +33,7 @@ BEZEL_TEST(inner_closure_value_capture_969, value_local_intact_after_inner_block
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x := 55; "
-        "  do var g: () -> int := () => x; var k := g(); end; "
+        "  do var g: () -> int := lambda() => x; var k := g(); end; "
         "  return x; "  // 55
         "end Main; end C;"), 55);
 }
@@ -43,7 +43,7 @@ BEZEL_TEST(inner_closure_value_capture_969, doubly_nested_value_capture) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x := 40; "
-        "  do do var g: () -> int := () => x; var k := g(); end; end; "
+        "  do do var g: () -> int := lambda() => x; var k := g(); end; end; "
         "  return x + 2; "  // 42
         "end Main; end C;"), 42);
 }
@@ -55,7 +55,7 @@ BEZEL_TEST(inner_closure_value_capture_969, captured_value_correct_inside_and_af
         "module M; class C public static method Main(): int "
         "  var x := 33; "
         "  var sum := 0; "
-        "  do var g: () -> int := () => x; sum := g(); end; "
+        "  do var g: () -> int := lambda() => x; sum := g(); end; "
         "  return x + sum; "  // 66
         "end Main; end C;"), 66);
 }
@@ -66,7 +66,7 @@ BEZEL_TEST(inner_closure_value_capture_969, same_scope_value_capture_unaffected)
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var x := 21; "
-        "  var f: () -> int := () => x; "
+        "  var f: () -> int := lambda() => x; "
         "  return f() + x; "  // 42
         "end Main; end C;"), 42);
 }

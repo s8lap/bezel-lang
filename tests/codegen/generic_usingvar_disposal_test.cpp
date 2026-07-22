@@ -404,7 +404,7 @@ BEZEL_TEST(codegen_generic_usingvar_disposal_28_3_14_2,
         "class Res public static D: int := 0; "
         "  destructor Res.D := Res.D + 1; end destructor; end Res; "
         "class C public static method Main(): int "
-        "  var mk: () -> owned Res := () => new Res(); "
+        "  var mk: () -> owned Res := lambda() => new Res(); "
         "  do using var made := mk(); end; "
         "  return Res.D; end Main; "
         "end C;");
@@ -421,7 +421,7 @@ BEZEL_TEST(codegen_generic_usingvar_disposal_28_3_14_2,
         "class Res public static D: int := 0; "
         "  destructor Res.D := Res.D + 1; end destructor; end Res; "
         "class C public static method Main(): int "
-        "  var mk: () -> owned Res := () => new Res(); "
+        "  var mk: () -> owned Res := lambda() => new Res(); "
         "  do var made := mk(); end; "
         "  return Res.D; end Main; "
         "end C;");

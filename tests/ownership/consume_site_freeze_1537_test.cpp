@@ -187,7 +187,7 @@ BEZEL_TEST(consume_site_freeze, transfer_after_dead_borrow_accepted_spec_28_3) {
 BEZEL_TEST(consume_site_freeze, closure_held_borrow_live_spec_28_3) {
     auto r = parseAndCheckOwnership(mod(
         "    var s := new Res(5); "
-        "    var f := () => s.N(); "
+        "    var f := lambda() => s.N(); "
         "    Take(owned s); "
         "    var y := f(); "
         "    _ := y; "));

@@ -203,7 +203,7 @@ const char* k841CapturingHandlerRepro =
     "  using var box := new Box(); "
     "  using var b := new Button(); "
     "  do "
-    "    using var sub := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+    "    using var sub := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
     "    b.Fire(2); "
     "  end; "
     "  b.Fire(5); "   // sub disposed → no handler → box unchanged
@@ -223,7 +223,7 @@ const char* k841NonCapturingHandler =
     "class C public static method Main(): int "
     "  using var src := new Src(); "
     "  do "
-    "    using var sub := src.Fired.Subscribe(() => do Cnt.hits := Cnt.hits + 1; end); "
+    "    using var sub := src.Fired.Subscribe(lambda() => do Cnt.hits := Cnt.hits + 1; end); "
     "    src.Fire(); "
     "  end; "
     "  if Cnt.hits = 1 then return 7; end; "
@@ -244,7 +244,7 @@ const char* k841DoubleDisposeIdempotency =
     "end Src; "
     "class C public static method Main(): int "
     "  using var src := new Src(); "
-    "  var sub := src.Ev.Subscribe((v) => do Acc.sum := Acc.sum + v; end); "
+    "  var sub := src.Ev.Subscribe(lambda(v) => do Acc.sum := Acc.sum + v; end); "
     "  src.Fire(3); "
     "  sub.Dispose(); "   // first dispose: releases closure, deactivates
     "  sub.Dispose(); "   // second dispose: live-set miss → safe no-op
@@ -265,7 +265,7 @@ const char* k841PostDisposeNoHandlerInvoked =
     "end Src; "
     "class C public static method Main(): int "
     "  using var src := new Src(); "
-    "  var sub := src.Ev.Subscribe(() => do Box.V := Box.V + 1; end); "
+    "  var sub := src.Ev.Subscribe(lambda() => do Box.V := Box.V + 1; end); "
     "  sub.Dispose(); "   // dispose before any Fire
     "  src.Fire(); "      // must not invoke the disposed handler
     "  return Box.V; "    // 0 (handler was not called)
@@ -286,7 +286,7 @@ const char* k841BoundLocalNonCapturing =
     "end Src; "
     "class C public static method Main(): int "
     "  using var src := new Src(); "
-    "  var h := () => do Cnt.hits := Cnt.hits + 1; end; "
+    "  var h := lambda() => do Cnt.hits := Cnt.hits + 1; end; "
     "  do "
     "    using var sub := src.Fired.Subscribe(h); "
     "    src.Fire(); "
@@ -309,7 +309,7 @@ const char* k841BoundLocalCapturing =
     "class C public static method Main(): int "
     "  using var box := new Box(); "
     "  using var src := new Src(); "
-    "  var h := (v) => do box.Add(v); end; "
+    "  var h := lambda(v) => do box.Add(v); end; "
     "  do "
     "    using var sub := src.Ev.Subscribe(h); "
     "    src.Fire(4); "

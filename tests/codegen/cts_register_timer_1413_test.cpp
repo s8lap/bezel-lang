@@ -156,7 +156,7 @@ BEZEL_TEST(codegen_cts_register_1413, register_fires_on_cancel) {
         "using var box := new Box(); "
         "using var cts := new CancellationTokenSource(); "
         "var tok := cts.Token; "
-        "using var sub := tok.Register(() => do box.Bump(); end); "
+        "using var sub := tok.Register(lambda() => do box.Bump(); end); "
         "cts.Cancel(); "
         "return box.V; ")), 1);
 }
@@ -168,9 +168,9 @@ BEZEL_TEST(codegen_cts_register_1413, multiple_callbacks_each_fire_once) {
         "using var box := new Box(); "
         "using var cts := new CancellationTokenSource(); "
         "var tok := cts.Token; "
-        "using var s1 := tok.Register(() => do box.Add(1); end); "
-        "using var s2 := tok.Register(() => do box.Add(10); end); "
-        "using var s3 := tok.Register(() => do box.Add(100); end); "
+        "using var s1 := tok.Register(lambda() => do box.Add(1); end); "
+        "using var s2 := tok.Register(lambda() => do box.Add(10); end); "
+        "using var s3 := tok.Register(lambda() => do box.Add(100); end); "
         "cts.Cancel(); "
         "return box.V; ")), 111);
 }
@@ -182,7 +182,7 @@ BEZEL_TEST(codegen_cts_register_1413, cancel_idempotent_callback_fires_once) {
         "using var box := new Box(); "
         "using var cts := new CancellationTokenSource(); "
         "var tok := cts.Token; "
-        "using var sub := tok.Register(() => do box.Bump(); end); "
+        "using var sub := tok.Register(lambda() => do box.Bump(); end); "
         "cts.Cancel(); cts.Cancel(); "
         "return box.V; ")), 1);
 }
@@ -195,7 +195,7 @@ BEZEL_TEST(codegen_cts_register_1413, dispose_before_cancel_does_not_fire) {
         "using var box := new Box(); "
         "using var cts := new CancellationTokenSource(); "
         "var tok := cts.Token; "
-        "do using var sub := tok.Register(() => do box.Bump(); end); end; "
+        "do using var sub := tok.Register(lambda() => do box.Bump(); end); end; "
         "cts.Cancel(); "
         "return box.V; ")), 0);
 }
@@ -208,7 +208,7 @@ BEZEL_TEST(codegen_cts_register_1413, register_on_already_cancelled_fires_synchr
         "using var cts := new CancellationTokenSource(); "
         "cts.Cancel(); "
         "var tok := cts.Token; "
-        "using var sub := tok.Register(() => do box.Bump(); end); "
+        "using var sub := tok.Register(lambda() => do box.Bump(); end); "
         "return box.V; ")), 1);
 }
 
@@ -233,7 +233,7 @@ BEZEL_TEST(codegen_cts_register_1413, noop_subscription_dispose_is_safe) {
         "using var box := new Box(); "
         "using var cts := new CancellationTokenSource(); "
         "cts.Cancel(); "
-        "using var sub := cts.Token.Register(() => do box.Bump(); end); "
+        "using var sub := cts.Token.Register(lambda() => do box.Bump(); end); "
         "sub.Dispose(); sub.Dispose(); "
         "return box.V; ")), 1);
 }
@@ -245,7 +245,7 @@ BEZEL_TEST(codegen_cts_register_1413, register_on_none_never_fires) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var box := new Box(); "
         "var none := CancellationToken.None; "
-        "using var sub := none.Register(() => do box.Bump(); end); "
+        "using var sub := none.Register(lambda() => do box.Bump(); end); "
         "return box.V; ")), 0);
 }
 
@@ -263,7 +263,7 @@ BEZEL_TEST(codegen_cts_register_1413, linked_child_callback_fires_on_parent_canc
         "using var a := new CancellationTokenSource(); "
         "using var b := new CancellationTokenSource(); "
         "using var child := CancellationTokenSource.CreateLinked(a.Token, b.Token); "
-        "using var sub := child.Token.Register(() => do box.Bump(); end); "
+        "using var sub := child.Token.Register(lambda() => do box.Bump(); end); "
         "a.Cancel(); "
         "return box.V; ")), 1);
 }
@@ -276,7 +276,7 @@ BEZEL_TEST(codegen_cts_register_1413, linked_child_callback_fires_on_other_paren
         "using var a := new CancellationTokenSource(); "
         "using var b := new CancellationTokenSource(); "
         "using var child := CancellationTokenSource.CreateLinked(a.Token, b.Token); "
-        "using var sub := child.Token.Register(() => do box.Bump(); end); "
+        "using var sub := child.Token.Register(lambda() => do box.Bump(); end); "
         "b.Cancel(); "
         "return box.V; ")), 1);
 }
@@ -323,7 +323,7 @@ BEZEL_TEST(codegen_cts_timer_1413, callback_fires_on_timer_thread) {
     BEZEL_EXPECT_EQ(run(progAsync(
         "using var box := new Box(); "
         "using var cts := new CancellationTokenSource(); "
-        "using var sub := cts.Token.Register(() => do box.Bump(); end); "
+        "using var sub := cts.Token.Register(lambda() => do box.Bump(); end); "
         "cts.CancelAfter(TimeSpan.FromMilliseconds(20)); "
         "await Task.Delay(80); "
         "return box.V; ")), 1);
@@ -336,7 +336,7 @@ BEZEL_TEST(codegen_cts_timer_1413, cancel_before_timer_no_double_effect) {
     BEZEL_EXPECT_EQ(run(progAsync(
         "using var box := new Box(); "
         "using var cts := new CancellationTokenSource(); "
-        "using var sub := cts.Token.Register(() => do box.Bump(); end); "
+        "using var sub := cts.Token.Register(lambda() => do box.Bump(); end); "
         "cts.CancelAfter(TimeSpan.FromMilliseconds(30)); "
         "cts.Cancel(); "
         "await Task.Delay(70); "
@@ -382,9 +382,9 @@ BEZEL_TEST(codegen_cts_register_1413_asan, full_register_lifecycle_no_leak) {
         "using var box := new Box(); "
         "using var cts := new CancellationTokenSource(); "
         "var tok := cts.Token; "
-        "using var s1 := tok.Register(() => do box.Add(1); end); "
-        "using var s2 := tok.Register(() => do box.Add(2); end); "
-        "do using var s3 := tok.Register(() => do box.Add(4); end); end; "
+        "using var s1 := tok.Register(lambda() => do box.Add(1); end); "
+        "using var s2 := tok.Register(lambda() => do box.Add(2); end); "
+        "do using var s3 := tok.Register(lambda() => do box.Add(4); end); end; "
         "cts.Cancel(); "
         "return box.V; "));
     if (r < 0) return;  // toolchain unavailable — SKIP
@@ -401,7 +401,7 @@ BEZEL_TEST(codegen_cts_timer_1413_asan, dispose_before_timer_no_leak_no_uaf) {
         "do "
         "  using var cts := CancellationTokenSource.WithCancelAfter("
         "      TimeSpan.FromMilliseconds(1000)); "
-        "  using var sub := cts.Token.Register(() => do box.Bump(); end); "
+        "  using var sub := cts.Token.Register(lambda() => do box.Bump(); end); "
         "end; "
         "return box.V; "));
     if (r < 0) return;  // toolchain unavailable — SKIP

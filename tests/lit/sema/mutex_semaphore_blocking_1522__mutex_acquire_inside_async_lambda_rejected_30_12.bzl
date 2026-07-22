@@ -7,7 +7,7 @@
 // (c) Mutex.Acquire() lexically inside an `async` lambda — rejected.
 // ---------------------------------------------------------------------------
 
-module M; class C public static method Go(m: Mutex) var f := async () => do using var guard := m.Acquire(); end; end Go; end C;
+module M; class C public static method Go(m: Mutex) var f := async lambda() => do using var guard := m.Acquire(); end; end Go; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: use `await m.AcquireAsync()` — blocking Mutex acquisition is not available in async code
 // CHECK-SAME: (§30.12)

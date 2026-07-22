@@ -30,7 +30,7 @@ BEZEL_TEST(async_lambda_infer_block_800, inferred_block_awaitable) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
         "  public static async method Main(): Task<int> "
-        "    var f := async () => do return 21; end; "
+        "    var f := async lambda() => do return 21; end; "
         "    var v := await f(); "
         "    return v * 2; "    // 42
         "  end Main; end C;"), 42);
@@ -42,7 +42,7 @@ BEZEL_TEST(async_lambda_infer_block_800, inferred_block_with_inner_await) {
         "module M; class C "
         "  public static async method Producer(): Task<int> return 20; end Producer; "
         "  public static async method Main(): Task<int> "
-        "    var f := async () => do return await Producer() + 1; end; "
+        "    var f := async lambda() => do return await Producer() + 1; end; "
         "    return await f() + 21; "    // 21 + 21 = 42
         "  end Main; end C;"), 42);
 }
@@ -53,8 +53,8 @@ BEZEL_TEST(async_lambda_infer_block_800, explicit_type_block_and_expr) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
         "  public static async method Main(): Task<int> "
-        "    var g: () -> Task<int> := async () => do return 2; end; "
-        "    var h: () -> Task<int> := async () => 40; "
+        "    var g: () -> Task<int> := async lambda() => do return 2; end; "
+        "    var h: () -> Task<int> := async lambda() => 40; "
         "    return await g() + await h(); "  // 2 + 40 = 42
         "  end Main; end C;"), 42);
 }
@@ -66,7 +66,7 @@ BEZEL_TEST(async_lambda_infer_block_800, inferred_expr_awaitable) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C "
         "  public static async method Main(): Task<int> "
-        "    var f := async () => 21; "
+        "    var f := async lambda() => 21; "
         "    var v := await f(); "
         "    return v * 2; "    // 42
         "  end Main; end C;"), 42);
@@ -79,7 +79,7 @@ BEZEL_TEST(async_lambda_infer_block_800, inferred_expr_with_await) {
         "module M; class C "
         "  public static async method Producer(): Task<int> => 20; "
         "  public static async method Main(): Task<int> "
-        "    var f := async () => await Producer() + 1; "
+        "    var f := async lambda() => await Producer() + 1; "
         "    return await f() + 21; "    // 21 + 21 = 42
         "  end Main; end C;"), 42);
 }
@@ -93,7 +93,7 @@ BEZEL_TEST(async_lambda_infer_block_800, inferred_expr_class_result) {
         "class Res public _v: int; public constructor(v: int) _v := v; end constructor; end Res; "
         "class C "
         "  public static async method Main(): Task<int> "
-        "    var f := async () => new Res(42); "
+        "    var f := async lambda() => new Res(42); "
         "    using var r := await f(); "
         "    return r._v; "    // 42
         "  end Main; end C;"), 42);

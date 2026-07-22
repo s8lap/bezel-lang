@@ -27,7 +27,7 @@ BEZEL_TEST(codegen_cg60, lambda_apply_basic) {
         "    return f(n); "
         "  end Apply; "
         "  public static method Main(): int "
-        "    return Apply(5, (x: int) => x * 2); "
+        "    return Apply(5, lambda(x: int) => x * 2); "
         "  end Main; "
         "end C;"), 10);
 }
@@ -39,7 +39,7 @@ BEZEL_TEST(codegen_cg60, lambda_expression_body) {
         "    return f(n); "
         "  end Map; "
         "  public static method Main(): int "
-        "    return Map(7, (x: int) => x + 3); "
+        "    return Map(7, lambda(x: int) => x + 3); "
         "  end Main; "
         "end C;"), 10);
 }
@@ -52,7 +52,7 @@ BEZEL_TEST(codegen_cg60, lambda_stored_in_local) {
         "    return f(n); "
         "  end Apply; "
         "  public static method Main(): int "
-        "    var sq := (a: int) => a * a; "
+        "    var sq := lambda(a: int) => a * a; "
         "    return Apply(4, sq); "
         "  end Main; "
         "end C;"), 16);
@@ -66,7 +66,7 @@ BEZEL_TEST(codegen_cg60, lambda_multi_param) {
         "    return f(a, b); "
         "  end Combine; "
         "  public static method Main(): int "
-        "    return Combine(3, 4, (x: int, y: int) => x + y); "
+        "    return Combine(3, 4, lambda(x: int, y: int) => x + y); "
         "  end Main; "
         "end C;"), 7);
 }
@@ -80,7 +80,7 @@ BEZEL_TEST(codegen_cg60, lambda_uses_outer_constant) {
         "    return f(n); "
         "  end Apply; "
         "  public static method Main(): int "
-        "    return Apply(6, (x: int) => x * 3); "
+        "    return Apply(6, lambda(x: int) => x * 3); "
         "  end Main; "
         "end C;"), 18);
 }
@@ -93,7 +93,7 @@ BEZEL_TEST(codegen_cg60, lambda_passed_twice) {
         "    return f(n); "
         "  end Apply; "
         "  public static method Main(): int "
-        "    var dbl := (x: int) => x * 2; "
+        "    var dbl := lambda(x: int) => x * 2; "
         "    return Apply(3, dbl) + Apply(4, dbl); "
         "  end Main; "
         "end C;"), 14);
@@ -108,7 +108,7 @@ BEZEL_TEST(codegen_cg60, closure_captures_param) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method MakeAdder(n: int): (int) -> int "
-        "    return (x: int) => x + n; "
+        "    return lambda(x: int) => x + n; "
         "  end MakeAdder; "
         "  public static method Main(): int "
         "    var add5 := MakeAdder(5); "
@@ -126,7 +126,7 @@ BEZEL_TEST(codegen_cg60, closure_captures_local) {
         "  end Apply; "
         "  public static method Main(): int "
         "    var offset := 7; "
-        "    return Apply((x: int) => x + offset); "
+        "    return Apply(lambda(x: int) => x + offset); "
         "  end Main; "
         "end C;"), 17);
 }
@@ -137,7 +137,7 @@ BEZEL_TEST(codegen_cg60, closure_independent_captured_value) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method MakeMul(n: int): (int) -> int "
-        "    return (x: int) => x * n; "
+        "    return lambda(x: int) => x * n; "
         "  end MakeMul; "
         "  public static method Apply(f: (int) -> int, v: int): int "
         "    return f(v); "
@@ -156,7 +156,7 @@ BEZEL_TEST(codegen_cg60, closure_call_through_local) {
         "module M; class C "
         "  public static method Main(): int "
         "    var n := 7; "
-        "    var f := (x: int) => x + n; "
+        "    var f := lambda(x: int) => x + n; "
         "    return f(3); "
         "  end Main; "
         "end C;"), 10);
@@ -173,7 +173,7 @@ BEZEL_TEST(codegen_cg60, closure_in_loop) {
         "    var k := 3; "
         "    var total := 0; "
         "    for var i in 1..3 do "
-        "      var fi := (x: int) => x * k; "
+        "      var fi := lambda(x: int) => x * k; "
         "      total := total + fi(i); "
         "    end; "
         "    return total; "
@@ -230,7 +230,7 @@ BEZEL_TEST(codegen_cg60, block_body_result_in_local) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    var f := (n: int) => do "
+        "    var f := lambda(n: int) => do "
         "      var r := n * 2; return r; "
         "    end; "
         "    var result := f(5); "
@@ -243,7 +243,7 @@ BEZEL_TEST(codegen_cg60, block_body_lambda_with_for_and_capture) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    var f := (threshold: int) => do "
+        "    var f := lambda(threshold: int) => do "
         "      var c := 0; "
         "      for var i in 0..4 do "
         "        if i > threshold then c := c + 1; end; "
@@ -261,7 +261,7 @@ BEZEL_TEST(codegen_cg60, curried_add) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    var adder := (x: int) => (y: int) => x + y; "
+        "    var adder := lambda(x: int) => lambda(y: int) => x + y; "
         "    var add5 := adder(5); "
         "    return add5(3); "
         "  end Main; end C;"), 8);
@@ -273,9 +273,9 @@ BEZEL_TEST(codegen_cg60, array_element_call) {
         "module M; class C "
         "  public static method Main(): int "
         "    var fns: [3](int) -> int; "
-        "    fns[0] := (x: int) => x + 1; "
-        "    fns[1] := (x: int) => x * 2; "
-        "    fns[2] := (x: int) => x - 1; "
+        "    fns[0] := lambda(x: int) => x + 1; "
+        "    fns[1] := lambda(x: int) => x * 2; "
+        "    fns[2] := lambda(x: int) => x - 1; "
         "    return fns[0](3) + fns[1](4) + fns[2](5); "
         "  end Main; end C;"), 16);
 }
@@ -289,7 +289,7 @@ BEZEL_TEST(codegen_cg60, once_pattern) {
         "class Acc public _c: int := 0; destructor end destructor; end Acc; "
         "class C "
         "  public static method Once(f: () -> int, ca: Cache): () -> int "
-        "    return () => do "
+        "    return lambda() => do "
         "      if ca._done then return ca._v; end; "
         "      ca._v := f(); ca._done := true; return ca._v; "
         "    end; "
@@ -297,7 +297,7 @@ BEZEL_TEST(codegen_cg60, once_pattern) {
         "  public static method Main(): int "
         "    using var ca := new Cache(); "
         "    using var acc := new Acc(); "
-        "    var f := Once(() => do acc._c := acc._c + 1; return 99; end, ca); "
+        "    var f := Once(lambda() => do acc._c := acc._c + 1; return 99; end, ca); "
         "    var r1 := f(); var r2 := f(); var r3 := f(); "
         "    return r1 + r2 + r3 - acc._c; "
         "  end Main; "
@@ -309,10 +309,10 @@ BEZEL_TEST(codegen_cg60, partial_application) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Partial(f: (int, int) -> int, a: int): (int) -> int "
-        "    return (b: int) => f(a, b); "
+        "    return lambda(b: int) => f(a, b); "
         "  end Partial; "
         "  public static method Main(): int "
-        "    var add := (x: int, y: int) => x + y; "
+        "    var add := lambda(x: int, y: int) => x + y; "
         "    var add10 := Partial(add, 10); "
         "    return add10(5) + add10(3); "
         "  end Main; "
@@ -335,7 +335,7 @@ BEZEL_TEST(codegen_cg60, function_typed_field_call) {
         "end T; "
         "class C public static method Main(): int "
         "  using var acc := new Acc(); "
-        "  using var t := new T((x: int) => do acc._v := acc._v + x; return acc._v; end); "
+        "  using var t := new T(lambda(x: int) => do acc._v := acc._v + x; return acc._v; end); "
         "  var r1 := t._cb(10); "
         "  var r2 := t._cb(5); "
         "  return r1 + r2; "
@@ -352,7 +352,7 @@ BEZEL_TEST(codegen_cg60, positional_record_fn_field_call_747) {
         "module M; "
         "record Box(fn: () -> int); "
         "class C public static method Main(): int "
-        "  var b := new Box(() => 42); "
+        "  var b := new Box(lambda() => 42); "
         "  return b.fn(); "
         "end Main; end C;"), 42);
 }
@@ -363,7 +363,7 @@ BEZEL_TEST(codegen_cg60, positional_record_fn_field_with_args_747) {
         "module M; "
         "record Box(fn: (int) -> int); "
         "class C public static method Main(): int "
-        "  var b := new Box((x: int) => x * 7); "
+        "  var b := new Box(lambda(x: int) => x * 7); "
         "  return b.fn(6); "  // 42
         "end Main; end C;"), 42);
 }
@@ -375,7 +375,7 @@ BEZEL_TEST(codegen_cg60, positional_record_fn_field_second_slot_747) {
         "module M; "
         "record Pair(n: int, fn: (int) -> int); "
         "class C public static method Main(): int "
-        "  var p := new Pair(10, (x: int) => x + 5); "
+        "  var p := new Pair(10, lambda(x: int) => x + 5); "
         "  return p.fn(p.n); "  // 15
         "end Main; end C;"), 15);
 }
@@ -388,8 +388,8 @@ BEZEL_TEST(codegen_cg60, array_element_string_return) {
         "module M; class C "
         "  public static method Main(): int "
         "    var fns: [2](int) -> string; "
-        "    fns[0] := (n: int) => (\"abc\" if n > 0 else \"xy\"); "
-        "    fns[1] := (n: int) => \"hello\"; "
+        "    fns[0] := lambda(n: int) => (\"abc\" if n > 0 else \"xy\"); "
+        "    fns[1] := lambda(n: int) => \"hello\"; "
         "    var r0 := fns[0](5); "   // = "abc", length 3
         "    var r1 := fns[1](0); "   // = "hello", length 5
         "    return r0.Length + r1.Length; "  // 3+5=8
@@ -447,7 +447,7 @@ BEZEL_TEST(codegen_cg60, lambda_body_throw_is_caught_719) {
     BEZEL_EXPECT_EQ(run(
         "module M; class AppErr end AppErr; "
         "class C public static method Main(): int "
-        "  var fn: () -> int := () => throw new AppErr(); "
+        "  var fn: () -> int := lambda() => throw new AppErr(); "
         "  try "
         "    var v := fn(); "
         "    return v; "
@@ -460,7 +460,7 @@ BEZEL_TEST(codegen_cg60, lambda_body_throw_is_caught_719) {
 BEZEL_TEST(codegen_cg60, lambda_body_no_throw_returns_value_719) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var fn: () -> int := () => 42; "
+        "  var fn: () -> int := lambda() => 42; "
         "  return fn(); "
         "end Main; end C;"), 42);
 }
@@ -473,7 +473,7 @@ BEZEL_TEST(codegen_cg60, lambda_body_no_throw_returns_value_719) {
 BEZEL_TEST(codegen_cg60, nested_higher_order_lambda_annotation_731) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var f: (int) -> (int) -> int := (x: int) => (y: int) => x + y; "
+        "  var f: (int) -> (int) -> int := lambda(x: int) => lambda(y: int) => x + y; "
         "  var g := f(10); "
         "  return g(5); "  // 15
         "end Main; end C;"), 15);

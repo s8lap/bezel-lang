@@ -22,43 +22,43 @@ class C
   public static async method Producer(): Task<int> return 5; end Producer;
 
   // ADMIT (expr method): forward a fresh task-returning call.
-  public static method MkFwdExpr(): () -> Task<int> => () => Producer();
+  public static method MkFwdExpr(): () -> Task<int> => lambda() => Producer();
 
   // ADMIT (block method): forward a fresh task-returning call from a `return`.
   public static method MkFwdBlock(): () -> Task<int>
-    return () => Producer();
+    return lambda() => Producer();
   end MkFwdBlock;
 
   // ADMIT (block getter): forward a fresh task-returning call from a `return`.
   public property Echo: () -> Task<int>
-    get => do return () => Producer(); end;
+    get => do return lambda() => Producer(); end;
   end Echo;
 
   // ADMIT (block method): an `async` returned lambda.
   public static method MkAsync(): () -> Task<int>
-    return async () => await Producer();
+    return async lambda() => await Producer();
   end MkAsync;
 
   // ADMIT (block method): a completed-task factory (§30.10).
   public static method MkFactory(): () -> Task<int>
-    return () => Task.FromResult<int>(5);
+    return lambda() => Task.FromResult<int>(5);
   end MkFactory;
 
   // ADMIT (expr method): an `owned` parameter returned through an `owned` return.
   public static method MkOwned(): (owned Task<int>) -> owned Task<int>
-    => (owned t) => t;
+    => lambda(owned t) => t;
 
   // UNAFFECTED (block method): a NON-`Task` (value-typed) identity lambda.
   public static method MkId(): (int) -> int
-    return (x) => x;
+    return lambda(x) => x;
   end MkId;
 
   // SURGICAL (block method): a non-return-direct local lambda in a
   // `Task`-returning method must NOT inherit the declared return type.
   public static method MkSurgical(): () -> Task<int>
-    var g := (x: int) => x;
+    var g := lambda(x: int) => x;
     var h: int := g(3);
-    return () => Task.FromResult<int>(5);
+    return lambda() => Task.FromResult<int>(5);
   end MkSurgical;
 
   public static method Main(): int return 0; end Main;

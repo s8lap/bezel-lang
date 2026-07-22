@@ -109,7 +109,7 @@ BEZEL_TEST(lazy_select_minting_selector_launder_1917,
         "class C public static method Main(): int "
         "  using var xs: Array<int> := [1, 2, 3]; "
         "  var sum: int := 0; "
-        "  for var b in xs.Select((x) => new Box(x)) do "
+        "  for var b in xs.Select(lambda(x) => new Box(x)) do "
         "    sum := sum + b.Get(); "
         "  end for; "
         "  return sum; "
@@ -126,7 +126,7 @@ BEZEL_TEST(lazy_select_minting_selector_launder_1917,
         "class C public static method Main(): int "
         "  using var words: Array<string> := [\"a\", \"bb\", \"ccc\"]; "
         "  var total: int := 0; "
-        "  for var w in words.Select((s) => s + \"!\") do "
+        "  for var w in words.Select(lambda(s) => s + \"!\") do "
         "    total := total + w.Length; "
         "  end for; "
         "  return total; "
@@ -143,7 +143,7 @@ BEZEL_TEST(lazy_select_minting_selector_launder_1917,
         "module M; import System.Collections.Linq; " + std::string(kBox) +
         "class C public static method Main(): int "
         "  using var xs: Array<int> := [1, 2, 3]; "
-        "  using var arr: Array<Box> := xs.Select((x) => new Box(x)).ToArray(); "
+        "  using var arr: Array<Box> := xs.Select(lambda(x) => new Box(x)).ToArray(); "
         "  return arr.Length; "
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(saysMintingSelect(src));
@@ -157,7 +157,7 @@ BEZEL_TEST(lazy_select_minting_selector_launder_1917,
         "module M; import System.Collections.Linq; " + std::string(kBox) +
         "class C public static method Main(): int "
         "  using var xs: Array<int> := [1, 2, 3]; "
-        "  var boxes: IEnumerable<Box> := xs.Select((x) => new Box(x)); "
+        "  var boxes: IEnumerable<Box> := xs.Select(lambda(x) => new Box(x)); "
         "  var n: int := 0; "
         "  for var b in boxes do n := n + 1; end for; "
         "  return n; "
@@ -174,7 +174,7 @@ BEZEL_TEST(lazy_select_minting_selector_launder_1917,
         "class C public static method Main(): int "
         "  using var words: Array<string> := [\"a\", \"bb\"]; "
         "  var total: int := 0; "
-        "  for var w in words.Select((s) => $\"[{s}]\") do "
+        "  for var w in words.Select(lambda(s) => $\"[{s}]\") do "
         "    total := total + w.Length; "
         "  end for; "
         "  return total; "
@@ -210,7 +210,7 @@ BEZEL_TEST(lazy_select_minting_selector_launder_1917,
         "class C public static method Main(): int "
         "  using var xs: OwningArray<Outer> := [new Outer(3), new Outer(4)]; "
         "  var sum: int := 0; "
-        "  for var ch in xs.Select((o) => o.GetChild()) do "
+        "  for var ch in xs.Select(lambda(o) => o.GetChild()) do "
         "    sum := sum + ch.N; "
         "  end for; "
         "  return sum; "
@@ -227,7 +227,7 @@ BEZEL_TEST(lazy_select_minting_selector_launder_1917,
         "class C public static method Main(): int "
         "  using var xs: Array<int> := [1, 2, 3]; "
         "  var sum: int := 0; "
-        "  for var y in xs.Select((x) => x * 2) do sum := sum + y; end for; "
+        "  for var y in xs.Select(lambda(x) => x * 2) do sum := sum + y; end for; "
         "  return sum; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(src), 12);
@@ -243,7 +243,7 @@ BEZEL_TEST(lazy_select_minting_selector_launder_1917,
         "class C public static method Main(): int "
         "  using var words: Array<string> := [\"a\", \"bb\", \"ccc\"]; "
         "  var total: int := 0; "
-        "  for var w in words.Select((s) => s) do total := total + w.Length; "
+        "  for var w in words.Select(lambda(s) => s) do total := total + w.Length; "
         "  end for; "
         "  return total; "
         "end Main; end C;";

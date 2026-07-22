@@ -89,7 +89,7 @@ int runApplyNullableIntConditional(const std::string& mainBody) {
 // x=5 → has-value, value=5.
 BEZEL_TEST(lambda_nullable_cases_543, bug1_expr_conditional_nonnull_int_spec_7_17) {
     BEZEL_EXPECT_EQ(runApplyNullableIntConditional(
-        "  var r: int? := Apply(5, (x: int) => (x if x > 0 else null)); "
+        "  var r: int? := Apply(5, lambda(x: int) => (x if x > 0 else null)); "
         "  if r = null then return -1; end; "
         "  return r!;"),
         5);
@@ -98,7 +98,7 @@ BEZEL_TEST(lambda_nullable_cases_543, bug1_expr_conditional_nonnull_int_spec_7_1
 // Same conditional lambda, null path: x=-1 → null.
 BEZEL_TEST(lambda_nullable_cases_543, bug1_expr_conditional_null_int_spec_7_17) {
     BEZEL_EXPECT_EQ(runApplyNullableIntConditional(
-        "  var r: int? := Apply(-1, (x: int) => (x if x > 0 else null)); "
+        "  var r: int? := Apply(-1, lambda(x: int) => (x if x > 0 else null)); "
         "  if r <> null then return -1; end; "
         "  return 0;"),
         0);
@@ -112,7 +112,7 @@ BEZEL_TEST(lambda_nullable_cases_543, bug1_expr_conditional_bool_nullable_spec_7
         "    return f(x); "
         "  end Apply; "
         "  public static method Main(): int "
-        "    var r: bool? := Apply(1, (x: int) => (true if x > 0 else null)); "
+        "    var r: bool? := Apply(1, lambda(x: int) => (true if x > 0 else null)); "
         "    if r = null then return -1; end; "
         "    return int(r!); "
         "  end Main; end C;"),
@@ -127,7 +127,7 @@ BEZEL_TEST(lambda_nullable_cases_543, bug1_expr_conditional_long_nullable_spec_7
         "    return f(x); "
         "  end Apply; "
         "  public static method Main(): int "
-        "    var r: long? := Apply(7, (x: int) => (long(x) if x > 0 else null)); "
+        "    var r: long? := Apply(7, lambda(x: int) => (long(x) if x > 0 else null)); "
         "    if r = null then return -1; end; "
         "    return int(r!); "
         "  end Main; end C;"),
@@ -138,7 +138,7 @@ BEZEL_TEST(lambda_nullable_cases_543, bug1_expr_conditional_long_nullable_spec_7
 // This exercises the lowerLocalDecl path (fix #541) combined with BUG-1.
 BEZEL_TEST(lambda_nullable_cases_543, bug1_expr_conditional_local_var_spec_17) {
     BEZEL_EXPECT_EQ(runMain(
-        "  var f: (int) -> int? := (x: int) => (x * 2 if x > 0 else null); "
+        "  var f: (int) -> int? := lambda(x: int) => (x * 2 if x > 0 else null); "
         "  var r: int? := f(4); "
         "  if r = null then return -1; end; "
         "  return r!;"),
@@ -157,7 +157,7 @@ BEZEL_TEST(lambda_nullable_cases_543, bug1_expr_conditional_local_var_spec_17) {
 // x=5 → has-value path, X+Y = 10.
 BEZEL_TEST(lambda_nullable_cases_543, bug2_block_nullable_record_nonnull_spec_7_17) {
     BEZEL_EXPECT_EQ(runPoint(
-        "  var f: (int) -> Point? := (x: int) => do "
+        "  var f: (int) -> Point? := lambda(x: int) => do "
         "    if x > 0 then return new Point(x, x); end; "
         "    return null; "
         "  end; "
@@ -170,7 +170,7 @@ BEZEL_TEST(lambda_nullable_cases_543, bug2_block_nullable_record_nonnull_spec_7_
 // x=-1 → null path.
 BEZEL_TEST(lambda_nullable_cases_543, bug2_block_nullable_record_null_spec_7_17) {
     BEZEL_EXPECT_EQ(runPoint(
-        "  var f: (int) -> Point? := (x: int) => do "
+        "  var f: (int) -> Point? := lambda(x: int) => do "
         "    if x > 0 then return new Point(x, x); end; "
         "    return null; "
         "  end; "
@@ -184,7 +184,7 @@ BEZEL_TEST(lambda_nullable_cases_543, bug2_block_nullable_record_null_spec_7_17)
 // §7.1 / §17.14: block-body return of primitive in nullable context.
 BEZEL_TEST(lambda_nullable_cases_543, bug2_block_nullable_int_primitive_spec_7_1) {
     BEZEL_EXPECT_EQ(runMain(
-        "  var f: (int) -> int? := (x: int) => do "
+        "  var f: (int) -> int? := lambda(x: int) => do "
         "    if x > 0 then return x * 3; end; "
         "    return null; "
         "  end; "
@@ -208,7 +208,7 @@ BEZEL_TEST(lambda_nullable_cases_543, control_541_int_literal_still_works_spec_7
         "    return f(k); "
         "  end Apply; "
         "  public static method Main(): int "
-        "    var r: int? := Apply(\"k\", (k: string) => 7); "
+        "    var r: int? := Apply(\"k\", lambda(k: string) => 7); "
         "    if r = null then return -1; end; "
         "    return r!; "
         "  end Main; end C;"),
@@ -218,7 +218,7 @@ BEZEL_TEST(lambda_nullable_cases_543, control_541_int_literal_still_works_spec_7
 // §541 control: lambda stored in local var typed (string)->int?.
 BEZEL_TEST(lambda_nullable_cases_543, control_541_stored_lambda_still_works_spec_17) {
     BEZEL_EXPECT_EQ(runMain(
-        "  var fn: (string) -> int? := (k: string) => 42; "
+        "  var fn: (string) -> int? := lambda(k: string) => 42; "
         "  var r: int? := fn(\"x\"); "
         "  if r = null then return -1; end; "
         "  return r!;"),
@@ -233,7 +233,7 @@ BEZEL_TEST(lambda_nullable_cases_543, control_non_nullable_lambda_unaffected_spe
         "    return f(n); "
         "  end Apply; "
         "  public static method Main(): int "
-        "    return Apply(5, (x: int) => x * 2); "
+        "    return Apply(5, lambda(x: int) => x * 2); "
         "  end Main; end C;"),
         10);
 }

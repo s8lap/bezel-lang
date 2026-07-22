@@ -7,7 +7,7 @@
 // invoked inside the block, then dereferenced. Before the fix this compiled
 // clean and SIGSEGV'd at run time; it must now be rejected (re-narrow required).
 
-module M; class C public static method Run(): int var s: string? := "hi"; var f := () => do s := null; end; if s <> null then f(); return s.Length; end; return -1; end Run; end C;
+module M; class C public static method Run(): int var s: string? := "hi"; var f := lambda() => do s := null; end; if s <> null then f(); return s.Length; end; return -1; end Run; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: member access `.Length` on a nullable value requires narrowing it to non-null first
 // CHECK-SAME: (§7.4)

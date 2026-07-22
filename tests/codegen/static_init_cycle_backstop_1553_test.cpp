@@ -50,7 +50,7 @@ const char* kIntCycle =
     "  private static method Seed(): int => 1; "
     "end A; "
     "class B "
-    "  private static _f: () -> int := () => A.Y; "
+    "  private static _f: () -> int := lambda() => A.Y; "
     "  public static method GetX(): int => _f() + 100; "
     "end B; ";
 
@@ -64,7 +64,7 @@ const char* kStrCycle =
     "  private static method Make(): string => \"world\"; "
     "end A; "
     "class B "
-    "  private static _f: () -> string := () => A.Y; "
+    "  private static _f: () -> string := lambda() => A.Y; "
     "  public static method GetX(): string => _f(); "
     "end B; ";
 }  // namespace

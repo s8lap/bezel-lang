@@ -26,7 +26,7 @@ class Cache
   // REJECT: a lambda capturing and returning a `Task`-family field read (a
   // borrow of its storage) through a plain-`Task` return.
   public method Make(): () -> Task<int>
-    var f: () -> Task<int> := () => _cachedTask;
+    var f: () -> Task<int> := lambda() => _cachedTask;
     return f;
   end Make;
 end Cache;
@@ -34,9 +34,9 @@ end Cache;
 class C
   public static method Main(): int
     // REJECT: expression-bodied identity lambda `(t) => t` — the issue's repro.
-    var echo: (Task<int>) -> Task<int> := (t) => t;
+    var echo: (Task<int>) -> Task<int> := lambda(t) => t;
     // REJECT: the block-body sibling.
-    var echo2: (Task<int>) -> Task<int> := (t) => do return t; end;
+    var echo2: (Task<int>) -> Task<int> := lambda(t) => do return t; end;
     return 0;
   end Main;
 end C;

@@ -47,7 +47,7 @@ BEZEL_TEST(sum_selector_result_type_1757, long_selector_not_truncated) {
         "  public static method Main(): int "
         "    using var a := new Array<int>(); "
         "    a.Add(1); a.Add(2); "
-        "    var total := a.Sum((x: int) => x * 3000000000L); "
+        "    var total := a.Sum(lambda(x: int) => x * 3000000000L); "
         "    Console.WriteLine(total); return 0; "
         "  end Main; "
         "end C;"), "9000000000");
@@ -64,7 +64,7 @@ BEZEL_TEST(sum_selector_result_type_1757, double_selector_result_is_double) {
         "  public static method Main(): int "
         "    using var a := new Array<int>(); "
         "    a.Add(3); a.Add(7); "
-        "    var total := a.Sum((x: int) => x * 0.25); "
+        "    var total := a.Sum(lambda(x: int) => x * 0.25); "
         "    Console.WriteLine(total); return 0; "
         "  end Main; "
         "end C;"), "2.5");
@@ -81,7 +81,7 @@ BEZEL_TEST(sum_selector_result_type_1757, uint_selector_result_is_uint) {
         "  public static method Main(): int "
         "    using var a := new Array<int>(); "
         "    a.Add(1); a.Add(2); a.Add(3); "
-        "    var total := a.Sum((x: int) => 4000000000U); "
+        "    var total := a.Sum(lambda(x: int) => 4000000000U); "
         "    Console.WriteLine(total); return 0; "
         "  end Main; "
         "end C;"), "3410065408");
@@ -99,7 +99,7 @@ BEZEL_TEST(sum_selector_result_type_1757, byte_selector_is_ambiguous) {
         "  public static method Main(): int "
         "    using var a := new Array<byte>(); "
         "    a.Add(1); a.Add(2); "
-        "    var total := a.Sum((x: byte) => x); "
+        "    var total := a.Sum(lambda(x: byte) => x); "
         "    Console.WriteLine(total); return 0; "
         "  end Main; "
         "end C;");
@@ -124,7 +124,7 @@ BEZEL_TEST(sum_selector_result_type_1757, byte_selector_cast_disambiguates) {
         "  public static method Main(): int "
         "    using var a := new Array<byte>(); "
         "    a.Add(1); a.Add(2); a.Add(3); "
-        "    return a.Sum((x: byte) => int(x)); "
+        "    return a.Sum(lambda(x: byte) => int(x)); "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.ran);
@@ -140,7 +140,7 @@ BEZEL_TEST(sum_selector_result_type_1757, int_selector_unchanged) {
         "  public static method Main(): int "
         "    using var a := new Array<int>(); "
         "    a.Add(3); a.Add(1); a.Add(4); "
-        "    return a.Sum((x: int) => x * x); "
+        "    return a.Sum(lambda(x: int) => x * x); "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.ran);

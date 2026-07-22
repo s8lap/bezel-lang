@@ -108,7 +108,7 @@ BEZEL_TEST(negative_capacity_aoor_1396, owning_buffer_negative_length_raises) {
 
 BEZEL_TEST(negative_capacity_aoor_1396, owning_buffer_negative_length_init_raises) {
     BEZEL_EXPECT_EQ(run(
-        "try var b := new OwningBuffer<int>(-1, (i) => i); return 0; "
+        "try var b := new OwningBuffer<int>(-1, lambda(i) => i); return 0; "
         "catch ArgumentOutOfRangeException => return 42; end;"), 42);
 }
 

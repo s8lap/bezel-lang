@@ -10,7 +10,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class Val end Val; class C public method M( d: Dictionary<string, int>, od: OwningDictionary<string, Val>, arr: Array<int>, n: int) var v: Val := od.GetOrAdd("a", (k) => new Val()); end M; end C;
+module M; class Val end Val; class C public method M( d: Dictionary<string, int>, od: OwningDictionary<string, Val>, arr: Array<int>, n: int) var v: Val := od.GetOrAdd("a", lambda(k) => new Val()); end M; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

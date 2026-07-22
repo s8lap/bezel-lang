@@ -69,7 +69,7 @@ bool compileFails(const std::string& source) {
 BEZEL_TEST(groupby_store_gate_755, bare_groupby_stored_in_var_rejected) {
     BEZEL_EXPECT_TRUE(compileFails(prog(
         "var n := 0; "
-        "var groups := a.GroupBy((x: int) => x mod 2); "
+        "var groups := a.GroupBy(lambda(x: int) => x mod 2); "
         "for var g in groups do n := n + 1; end; "
         "return n;")));
 }
@@ -79,7 +79,7 @@ BEZEL_TEST(groupby_store_gate_755, bare_groupby_stored_in_var_rejected) {
 BEZEL_TEST(groupby_store_gate_755, annotated_groupby_store_rejected) {
     BEZEL_EXPECT_TRUE(compileFails(prog(
         "var groups: IEnumerable<IGrouping<int, int>> := "
-        "  a.GroupBy((x: int) => x mod 2); "
+        "  a.GroupBy(lambda(x: int) => x mod 2); "
         "return 0;")));
 }
 
@@ -88,7 +88,7 @@ BEZEL_TEST(groupby_store_gate_755, annotated_groupby_store_rejected) {
 BEZEL_TEST(groupby_store_gate_755, inline_for_over_groupby_accepted) {
     BEZEL_EXPECT_EQ(compileAndRun(prog(
         "var n := 0; "
-        "for var g in a.GroupBy((x: int) => x mod 2) do n := n + 1; end; "
+        "for var g in a.GroupBy(lambda(x: int) => x mod 2) do n := n + 1; end; "
         "return n;")), 2);
 }
 
@@ -96,7 +96,7 @@ BEZEL_TEST(groupby_store_gate_755, inline_for_over_groupby_accepted) {
 // not the bare lazy enumerable) stored in a `using var` still works — 2 groups.
 BEZEL_TEST(groupby_store_gate_755, groupby_toarray_store_accepted) {
     BEZEL_EXPECT_EQ(compileAndRun(prog(
-        "using var groups := a.GroupBy((x: int) => x mod 2).ToArray(); "
+        "using var groups := a.GroupBy(lambda(x: int) => x mod 2).ToArray(); "
         "return groups.Count;")), 2);
 }
 
@@ -104,12 +104,12 @@ BEZEL_TEST(groupby_store_gate_755, groupby_toarray_store_accepted) {
 // reduces to a scalar (not the bare lazy enumerable) and still works — 2 groups.
 BEZEL_TEST(groupby_store_gate_755, groupby_count_terminal_accepted) {
     BEZEL_EXPECT_EQ(compileAndRun(prog(
-        "return a.GroupBy((x: int) => x mod 2).Count();")), 2);
+        "return a.GroupBy(lambda(x: int) => x mod 2).Count();")), 2);
 }
 
 // #755 (no false positive): `.Any()` directly on a GroupBy result works — true.
 BEZEL_TEST(groupby_store_gate_755, groupby_any_terminal_accepted) {
     BEZEL_EXPECT_EQ(compileAndRun(prog(
-        "if a.GroupBy((x: int) => x mod 2).Any() then return 1; "
+        "if a.GroupBy(lambda(x: int) => x mod 2).Any() then return 1; "
         "else return 0; end;")), 1);
 }

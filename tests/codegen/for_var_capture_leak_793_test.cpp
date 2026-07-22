@@ -157,7 +157,7 @@ BEZEL_TEST(for_var_capture_leak_793, single_non_escaping_capture_lsan_clean) {
     expectValueAndLeakFree(
         "module M; class C public static method Main(): int "
         "  var acc: int := 0; "
-        "  for var i in 1 .. 4 do var f: () -> int := () => i; acc := acc + f(); end; "
+        "  for var i in 1 .. 4 do var f: () -> int := lambda() => i; acc := acc + f(); end; "
         "  return acc; "
         "end Main; end C;", 10);
 }
@@ -169,7 +169,7 @@ BEZEL_TEST(for_var_capture_leak_793, nested_loops_capture_lsan_clean) {
         "module M; class C public static method Main(): int "
         "  var acc: int := 0; "
         "  for var i in 1 .. 3 do for var j in 1 .. 3 do "
-        "    var f: () -> int := () => i * j; acc := acc + f(); end; end; "
+        "    var f: () -> int := lambda() => i * j; acc := acc + f(); end; end; "
         "  return acc; "
         "end Main; end C;", 36);
 }
@@ -181,7 +181,7 @@ BEZEL_TEST(for_var_capture_leak_793, break_frees_current_cell_lsan_clean) {
     expectValueAndLeakFree(
         "module M; class C public static method Main(): int "
         "  var acc: int := 0; "
-        "  for var i in 0 .. 100 do var f: () -> int := () => i; acc := acc + f(); "
+        "  for var i in 0 .. 100 do var f: () -> int := lambda() => i; acc := acc + f(); "
         "    if i = 3 then break; end; end; "
         "  return acc; "
         "end Main; end C;", 6);
@@ -194,7 +194,7 @@ BEZEL_TEST(for_var_capture_leak_793, continue_frees_cell_lsan_clean) {
         "module M; class C public static method Main(): int "
         "  var acc: int := 0; "
         "  for var i in 0 .. 4 do if i < 2 then continue; end; "
-        "    var f: () -> int := () => i; acc := acc + f(); end; "
+        "    var f: () -> int := lambda() => i; acc := acc + f(); end; "
         "  return acc; "
         "end Main; end C;", 9);
 }
@@ -207,7 +207,7 @@ BEZEL_TEST(for_var_capture_leak_793, multi_capture_shared_cell_lsan_clean) {
         "module M; class C public static method Main(): int "
         "  var acc: int := 0; "
         "  for var i in 1 .. 3 do "
-        "    var f: () -> int := () => i; var g: () -> int := () => i * 2; "
+        "    var f: () -> int := lambda() => i; var g: () -> int := lambda() => i * 2; "
         "    acc := acc + f() + g(); end; "
         "  return acc; "
         "end Main; end C;", 18);
@@ -221,8 +221,8 @@ BEZEL_TEST(for_var_capture_leak_793, multi_capture_shared_cell_lsan_clean) {
 BEZEL_TEST(for_var_capture_leak_793, escaping_capture_no_corruption) {
     expectValueAndNoCorruption(
         "module M; class C public static method Main(): int "
-        "  var captured: () -> int := () => 0; "
-        "  for var i in 0 .. 4 do captured := () => i; end; "
+        "  var captured: () -> int := lambda() => 0; "
+        "  for var i in 0 .. 4 do captured := lambda() => i; end; "
         "  return captured(); "
         "end Main; end C;", 4);
 }

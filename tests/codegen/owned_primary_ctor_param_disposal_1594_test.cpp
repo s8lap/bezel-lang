@@ -179,7 +179,7 @@ BEZEL_TEST(codegen_owned_primary_ctor_param_1594, subscription_captured_param_di
         "class C public static method Main(): int "
         "  do "
         "    using var cts := new CancellationTokenSource(); "
-        "    var h := new Holder(cts.Token.Register(() => ())); "
+        "    var h := new Holder(cts.Token.Register(lambda() => ())); "
         "    h.Dispose(); "
         "    h.Dispose(); "
         "  end; "

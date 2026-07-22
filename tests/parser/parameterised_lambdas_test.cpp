@@ -1,15 +1,16 @@
-// Spec-derived parser tests for parameterised lambdas — §A.7:
+// Spec-derived parser tests for parameterised lambdas — §A.7 (v0.217,
+// keyword-led spelling; migrated at the #2101 cutover):
 //
-//   LambdaExpr   ::= "async"? "(" LambdaParams? ")" "=>" LambdaBody
-//   LambdaParams ::= LambdaParam ("," LambdaParam)*
+//   LambdaExpr   ::= "async"? "lambda" "(" LambdaParams? ")"
+//                    (":" Type)? "=>" LambdaBody
+//   LambdaParams ::= LambdaParam ("," LambdaParam)* ","?
 //   LambdaParam  ::= FuncParamMods? Identifier (":" Type)?
 //   LambdaBody   ::= Expression | "do" Statement* "end"
 //
-// Slice 28 covered only the empty-params form `() => …`. This slice adds
-// parameterised lambdas, the `async` prefix, the typed-param form, and the
-// FuncParamMods modifiers on lambda parameters. Disambiguation from a
-// parenthesised expression uses buffered lookahead: any `(...)` whose
-// matching `)` is followed by `=>` parses as a lambda.
+// Slice 28 covered only the empty-params form `lambda() => …`. This slice
+// adds parameterised lambdas, the `async lambda` prefix, the typed-param
+// form, and the FuncParamMods modifiers on lambda parameters. Since v0.217
+// the reserved keyword commits the parse at its first token — no lookahead.
 
 #include <string>
 
@@ -48,64 +49,64 @@ std::string exprFromStmt(const std::string& exprSrc) {
 
 BEZEL_TEST(parser_lambda, single_untyped_param) {
     BEZEL_EXPECT_EQ(
-        exprFromStmt("(x) => x"),
-        std::string("((x) => x)"));
+        exprFromStmt("lambda(x) => x"),
+        std::string("(lambda(x) => x)"));
 }
 
 BEZEL_TEST(parser_lambda, single_typed_param) {
     BEZEL_EXPECT_EQ(
-        exprFromStmt("(x: int) => x"),
-        std::string("((x: int) => x)"));
+        exprFromStmt("lambda(x: int) => x"),
+        std::string("(lambda(x: int) => x)"));
 }
 
 BEZEL_TEST(parser_lambda, multiple_typed_params) {
     BEZEL_EXPECT_EQ(
-        exprFromStmt("(a: int, b: int) => a + b"),
-        std::string("((a: int, b: int) => (a + b))"));
+        exprFromStmt("lambda(a: int, b: int) => a + b"),
+        std::string("(lambda(a: int, b: int) => (a + b))"));
 }
 
 BEZEL_TEST(parser_lambda, mixed_typed_untyped_params) {
     BEZEL_EXPECT_EQ(
-        exprFromStmt("(a, b: int) => a"),
-        std::string("((a, b: int) => a)"));
+        exprFromStmt("lambda(a, b: int) => a"),
+        std::string("(lambda(a, b: int) => a)"));
 }
 
 BEZEL_TEST(parser_lambda, async_with_params) {
     BEZEL_EXPECT_EQ(
-        exprFromStmt("async (token) => await token"),
-        std::string("(async (token) => (await token))"));
+        exprFromStmt("async lambda(token) => await token"),
+        std::string("(async lambda(token) => (await token))"));
 }
 
 BEZEL_TEST(parser_lambda, ref_param_modifier) {
     BEZEL_EXPECT_EQ(
-        exprFromStmt("(ref x: int) => x"),
-        std::string("((ref x: int) => x)"));
+        exprFromStmt("lambda(ref x: int) => x"),
+        std::string("(lambda(ref x: int) => x)"));
 }
 
 BEZEL_TEST(parser_lambda, owned_param_modifier) {
     BEZEL_EXPECT_EQ(
-        exprFromStmt("(owned r: Resource) => r"),
-        std::string("((owned r: Resource) => r)"));
+        exprFromStmt("lambda(owned r: Resource) => r"),
+        std::string("(lambda(owned r: Resource) => r)"));
 }
 
 BEZEL_TEST(parser_lambda, out_owned_param_modifier) {
     BEZEL_EXPECT_EQ(
-        exprFromStmt("(out owned r: Resource) => r"),
-        std::string("((out owned r: Resource) => r)"));
+        exprFromStmt("lambda(out owned r: Resource) => r"),
+        std::string("(lambda(out owned r: Resource) => r)"));
 }
 
 BEZEL_TEST(parser_lambda, block_body_with_params) {
     BEZEL_EXPECT_EQ(
-        exprFromStmt("(x: int) => do return x; end"),
-        std::string("((x: int) => do { return x; } end)"));
+        exprFromStmt("lambda(x: int) => do return x; end"),
+        std::string("(lambda(x: int) => do { return x; } end)"));
 }
 
 BEZEL_TEST(parser_lambda, empty_params_still_work) {
     // Regression: the new buffered-lookahead path must still admit the
     // empty-params form from slice 28.
     BEZEL_EXPECT_EQ(
-        exprFromStmt("() => 42"),
-        std::string("(() => 42)"));
+        exprFromStmt("lambda() => 42"),
+        std::string("(lambda() => 42)"));
 }
 
 BEZEL_TEST(parser_lambda, paren_expr_is_not_lambda) {
@@ -130,12 +131,12 @@ BEZEL_TEST(parser_lambda, nested_lambda_in_call_argument) {
     // The scanner must correctly skip an inner lambda's parens when looking
     // for an outer `)`. Here the outer `f(...)` is a call, not a lambda.
     BEZEL_EXPECT_EQ(
-        exprFromStmt("f((x) => x + 1)"),
-        std::string("f(((x) => (x + 1)))"));
+        exprFromStmt("f(lambda(x) => x + 1)"),
+        std::string("f((lambda(x) => (x + 1)))"));
 }
 
 BEZEL_TEST(parser_lambda, lambda_returning_lambda) {
     BEZEL_EXPECT_EQ(
-        exprFromStmt("(x: int) => (y: int) => x + y"),
-        std::string("((x: int) => ((y: int) => (x + y)))"));
+        exprFromStmt("lambda(x: int) => lambda(y: int) => x + y"),
+        std::string("(lambda(x: int) => (lambda(y: int) => (x + y)))"));
 }

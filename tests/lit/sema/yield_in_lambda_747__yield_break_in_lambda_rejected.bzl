@@ -5,7 +5,7 @@
 //
 // §29.9: `yield break` inside a lambda is equally rejected.
 
-module M; static class F public static method Main(): int var g: () -> IEnumerable<int> := () => do yield break; end; return 0; end Main; end F;
+module M; static class F public static method Main(): int var g: () -> IEnumerable<int> := lambda() => do yield break; end; return 0; end Main; end F;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: `yield` is not allowed in a lambda — it is a method-level construct only
 // CHECK-SAME: (§29.9)

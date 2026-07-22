@@ -6,7 +6,7 @@
 // §7.4 (#1593): a user-defined indexer access `g[i]` invokes the indexer getter
 // (also an "accessor" per §7.4) — it invalidates a mutably-captured local too.
 
-module M; class Grid public property [i: int]: int get => i; end; end Grid; class C public static method Run(g: Grid): int var s: string? := "hi"; var f := () => do s := null; end; if s <> null then _ := g[3]; return s.Length; end; return -1; end Run; end C;
+module M; class Grid public property [i: int]: int get => i; end; end Grid; class C public static method Run(g: Grid): int var s: string? := "hi"; var f := lambda() => do s := null; end; if s <> null then _ := g[3]; return s.Length; end; return -1; end Run; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: member access `.Length` on a nullable value requires narrowing it to non-null first
 // CHECK-SAME: (§7.4)

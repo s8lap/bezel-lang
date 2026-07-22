@@ -66,7 +66,7 @@ BEZEL_TEST(own_closure_escape, return_lambda_capturing_using_var_diagnosed_28_9)
         "public static method MakeEscaping(): () -> int "
         "  using var r := new R(); "
         "  r.V := 7; "
-        "  return () => r.V; "
+        "  return lambda() => r.V; "
         "end MakeEscaping;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
@@ -78,7 +78,7 @@ BEZEL_TEST(own_closure_escape, return_lambda_capturing_owned_local_diagnosed_28_
     auto r = parseAndCheckOwnership(wrapClosure(
         "public static method MakeEscaping(): () -> int "
         "  var r := new R(); "
-        "  return () => r.V; "
+        "  return lambda() => r.V; "
         "end MakeEscaping;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
@@ -92,7 +92,7 @@ BEZEL_TEST(own_closure_escape, return_lambda_capturing_value_local_clean_28_9) {
     auto r = parseAndCheckOwnership(wrapClosure(
         "public static method MakeValue(): () -> int "
         "  var n := 5; "
-        "  return () => n; "
+        "  return lambda() => n; "
         "end MakeValue;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -104,7 +104,7 @@ BEZEL_TEST(own_closure_escape, capture_owned_local_invoked_locally_clean_28_9) {
     auto r = parseAndCheckOwnership(wrapClosure(
         "public static method UseLocally(): int "
         "  using var r := new R(); "
-        "  var f := () => r.V; "
+        "  var f := lambda() => r.V; "
         "  return f(); "
         "end UseLocally;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -117,7 +117,7 @@ BEZEL_TEST(own_closure_escape, return_value_from_captured_owned_local_clean_28_9
     auto r = parseAndCheckOwnership(wrapClosure(
         "public static method ReturnValue(): int "
         "  using var r := new R(); "
-        "  return (() => r.V)(); "
+        "  return (lambda() => r.V)(); "
         "end ReturnValue;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -127,7 +127,7 @@ BEZEL_TEST(own_closure_escape, return_value_from_captured_owned_local_clean_28_9
 BEZEL_TEST(own_closure_escape, return_non_capturing_lambda_clean_28_9) {
     auto r = parseAndCheckOwnership(wrapClosure(
         "public static method Const(): () -> int "
-        "  return () => 42; "
+        "  return lambda() => 42; "
         "end Const;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -282,7 +282,7 @@ BEZEL_TEST(own_indirect_escape, return_closure_holder_capturing_using_var_diagno
     auto r = parseAndCheckOwnership(wrapClosure(
         "public static method Leak(): () -> int "
         "  using var r := new R(); "
-        "  var f := () => r.V; "
+        "  var f := lambda() => r.V; "
         "  return f; "
         "end Leak;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -368,7 +368,7 @@ BEZEL_TEST(own_indirect_escape, closure_holder_invoked_locally_clean_28_9) {
     auto r = parseAndCheckOwnership(wrapClosure(
         "public static method Use(): int "
         "  using var r := new R(); "
-        "  var f := () => r.V; "
+        "  var f := lambda() => r.V; "
         "  return f(); "
         "end Use;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

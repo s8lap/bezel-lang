@@ -194,7 +194,7 @@ void expectValueAndNoCorruption(const std::string& source,
 const char* kReturnFreshLambdaLoop =
     "module M; class C "
     "  public static method Make(): () -> int "
-    "    return () => 7; "
+    "    return lambda() => 7; "
     "  end Make; "
     "  public static method Main(): int "
     "    var i: int := 0; var total: int := 0; "
@@ -217,7 +217,7 @@ const char* kReturnFreshLambdaLoop =
 const char* kReturnProducerLocalLoopNoDouble =
     "module M; class C "
     "  public static method Build(): () -> int "
-    "    var t: () -> int := () => 42; "   // producer local owns +1
+    "    var t: () -> int := lambda() => 42; "   // producer local owns +1
     "    return t; "                        // TRANSFER its +1 (no retain)
     "  end Build; "
     "  public static method Main(): int "
@@ -244,7 +244,7 @@ const char* kReturnProducerLocalLoopNoDouble =
 const char* kReturnCapturingLambdaNoUaf =
     "module M; class C "
     "  public static method Adder(offset: int): (int) -> int "
-    "    return (x: int) => x + offset; "    // offset is a param, captured by value into env
+    "    return lambda(x: int) => x + offset; "    // offset is a param, captured by value into env
     "  end Adder; "
     "  public static method Main(): int "
     "    var i: int := 0; var total: int := 0; "
@@ -264,8 +264,8 @@ const char* kReturnCapturingLambdaNoUaf =
 const char* kReturnInIfEarlyReturnLoop =
     "module M; class C "
     "  public static method Pick(b: bool): () -> int "
-    "    if b then return () => 1; end; "
-    "    return () => 2; "
+    "    if b then return lambda() => 1; end; "
+    "    return lambda() => 2; "
     "  end Pick; "
     "  public static method Main(): int "
     "    var i: int := 0; var total: int := 0; "
@@ -312,10 +312,10 @@ const char* kReturnMethodRefLoop =
 // Looped → steady-state.
 const char* kReturnVirtualOverrideLoop =
     "module M; class Base "
-    "  public virtual method GetFn(): () -> int return () => 1; end GetFn; "
+    "  public virtual method GetFn(): () -> int return lambda() => 1; end GetFn; "
     "end Base; "
     "class Derived : Base "
-    "  public override method GetFn(): () -> int return () => 2; end GetFn; "
+    "  public override method GetFn(): () -> int return lambda() => 2; end GetFn; "
     "end Derived; "
     "class C public static method Main(): int "
     "  var i: int := 0; var total: int := 0; "
@@ -337,7 +337,7 @@ const char* kReturnInterfaceDispatchLoop =
     "  method GetFn(): () -> int; "
     "end IFnSource; "
     "class Thing : IFnSource "
-    "  public method GetFn(): () -> int return () => 5; end GetFn; "
+    "  public method GetFn(): () -> int return lambda() => 5; end GetFn; "
     "end Thing; "
     "class C public static method Main(): int "
     "  var i: int := 0; var total: int := 0; "
@@ -361,7 +361,7 @@ const char* kNonEscapingControlUnaffected =
     "  public static method Main(): int "
     "    var i: int := 0; var acc: int := 0; "
     "    while i < 200000 do "
-    "      var f: () -> int := () => 3; "   // non-escaping: released at scope end
+    "      var f: () -> int := lambda() => 3; "   // non-escaping: released at scope end
     "      acc := acc + f(); "
     "      i := i + 1; "
     "    end; "
@@ -385,7 +385,7 @@ const char* kNonEscapingControlUnaffected =
 const char* kFieldStoreCtorProducerLoop =
     "module M; class Holder "
     "  public Fn: () -> int; "
-    "  public constructor() this.Fn := () => 11; end constructor; "
+    "  public constructor() this.Fn := lambda() => 11; end constructor; "
     "end Holder; "
     "class C public static method Main(): int "
     "  var i: int := 0; var total: int := 0; "
@@ -428,7 +428,7 @@ const char* kFieldReassignLoop =
     "module M; class Holder "
     "  public Fn: () -> int; "
     "  public _last: int := 0; "
-    "  public constructor() this.Fn := () => 0; end constructor; "
+    "  public constructor() this.Fn := lambda() => 0; end constructor; "
     "  public method CallAndStore(): int "
     "    this._last := this.Fn(); "   // invoke and record result in a field
     "    return this._last; "
@@ -438,7 +438,7 @@ const char* kFieldReassignLoop =
     "  var i: int := 0; "
     "  using var h := new Holder(); "
     "  while i < 200000 do "
-    "    h.Fn := () => 42; "          // each store releases the previous cell; constant lambda
+    "    h.Fn := lambda() => 42; "          // each store releases the previous cell; constant lambda
     "    i := i + 1; "
     "  end; "
     "  var r := h.CallAndStore(); "   // invoke the final lambda via instance method
@@ -461,7 +461,7 @@ const char* kFieldOverwriteNoUaf =
     "module M; class Holder "
     "  public Fn: () -> int; "
     "  public _last: int := 0; "
-    "  public constructor() this.Fn := () => 0; end constructor; "
+    "  public constructor() this.Fn := lambda() => 0; end constructor; "
     "  public method Call(): int "
     "    this._last := this.Fn(); "
     "    return this._last; "
@@ -471,8 +471,8 @@ const char* kFieldOverwriteNoUaf =
     "  var i: int := 0; "
     "  using var h := new Holder(); "
     "  while i < 50000 do "
-    "    h.Fn := () => 77; "           // overwrite → retain-new, release-old
-    "    h.Fn := () => 77; "           // overwrite again (retain-before-release)
+    "    h.Fn := lambda() => 77; "           // overwrite → retain-new, release-old
+    "    h.Fn := lambda() => 77; "           // overwrite again (retain-before-release)
     "    i := i + 1; "
     "  end; "
     "  var r := h.Call(); "
@@ -487,7 +487,7 @@ const char* kClosureAndStringFieldLoop =
     "  public Fn: () -> int; "
     "  public Name: string; "
     "  public constructor() "
-    "    this.Fn := () => 3; "
+    "    this.Fn := lambda() => 3; "
     "    this.Name := \"he\" + \"llo\"; "
     "  end constructor; "
     "end Holder; "
@@ -507,7 +507,7 @@ const char* kClosureAndStringFieldLoop =
 // disposal releases it → reclaimed.  Looped → steady-state LSan-clean.
 const char* kReturnIntoFieldStoreLoop =
     "module M; class Maker "
-    "  public static method Make(): () -> int return () => 7; end Make; "
+    "  public static method Make(): () -> int return lambda() => 7; end Make; "
     "end Maker; "
     "class Holder "
     "  public Fn: () -> int; "
@@ -531,7 +531,7 @@ const char* kReturnIntoFieldStoreLoop =
 const char* kExplicitDisposeClosureLoop =
     "module M; class Holder : IDisposable "
     "  public Fn: () -> int; "
-    "  public constructor() this.Fn := () => 4; end constructor; "
+    "  public constructor() this.Fn := lambda() => 4; end constructor; "
     "end Holder; "
     "class C public static method Main(): int "
     "  var i: int := 0; var total: int := 0; "
@@ -551,11 +551,11 @@ const char* kExplicitDisposeClosureLoop =
 const char* kInheritedClosureFieldsLoop =
     "module M; class Base "
     "  public BaseFn: () -> int; "
-    "  public constructor() this.BaseFn := () => 10; end constructor; "
+    "  public constructor() this.BaseFn := lambda() => 10; end constructor; "
     "end Base; "
     "class Derived : Base "
     "  public DerivedFn: () -> int; "
-    "  public constructor() this.DerivedFn := () => 20; end constructor; "
+    "  public constructor() this.DerivedFn := lambda() => 20; end constructor; "
     "end Derived; "
     "class C public static method Main(): int "
     "  var i: int := 0; var total: int := 0; "

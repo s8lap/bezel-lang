@@ -100,7 +100,7 @@ BEZEL_TEST(event_add_scoped_1541, self_capture_named_method_ref_admitted) {
 // field (implicit `this`) is ADMITTED.
 BEZEL_TEST(event_add_scoped_1541, self_capture_lambda_this_field_admitted) {
     auto r = parseAndCheckOwnership(
-        selfProg("    Clicked += (e) => do V := V + e.N; end; "));
+        selfProg("    Clicked += lambda(e) => do V := V + e.N; end; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
@@ -110,7 +110,7 @@ BEZEL_TEST(event_add_scoped_1541, self_capture_lambda_this_field_admitted) {
 BEZEL_TEST(event_add_scoped_1541, plus_equals_captures_using_var_rejected) {
     auto r = parseAndCheckOwnership(selfProg(
         "    using var s := new Sink(); "
-        "    Clicked += (e) => do s.Add(e.N); end; "));
+        "    Clicked += lambda(e) => do s.Add(e.N); end; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(diagContains(r, "`s`"));
     BEZEL_EXPECT_TRUE(diagContains(r, "is not `this`"));
@@ -121,7 +121,7 @@ BEZEL_TEST(event_add_scoped_1541, plus_equals_captures_using_var_rejected) {
 BEZEL_TEST(event_add_scoped_1541, explicit_add_captures_using_var_rejected) {
     auto r = parseAndCheckOwnership(selfProg(
         "    using var s := new Sink(); "
-        "    this.Clicked.Add((e) => do s.Add(e.N); end); "));
+        "    this.Clicked.Add(lambda(e) => do s.Add(e.N); end); "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(diagContains(r, "is not `this`"));
 }
@@ -139,7 +139,7 @@ BEZEL_TEST(event_add_scoped_1541, plus_equals_captures_parameter_rejected) {
         "class Widget "
         "  public event Clicked: Ev; "
         "  public method Hook(target: Sink) "
-        "    Clicked += (e) => do target.Add(e.N); end; "
+        "    Clicked += lambda(e) => do target.Add(e.N); end; "
         "  end Hook; "
         "end Widget; "
         "class Prog public static method Main(): int return 0; end Main; "
@@ -161,7 +161,7 @@ BEZEL_TEST(event_add_scoped_1541, form4_local_head_source_before_admitted) {
     auto r = parseAndCheckOwnership(pubLocalProg(
         "    using var early := new Sink(); "
         "    using var pub := new Pub(); "
-        "    pub.Clicked += (e) => do early.Add(e.N); end; "
+        "    pub.Clicked += lambda(e) => do early.Add(e.N); end; "
         "    return 0; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -172,7 +172,7 @@ BEZEL_TEST(event_add_scoped_1541, form4_local_head_source_after_rejected) {
     auto r = parseAndCheckOwnership(pubLocalProg(
         "    using var pub := new Pub(); "
         "    using var late := new Sink(); "
-        "    pub.Clicked += (e) => do late.Add(e.N); end; "
+        "    pub.Clicked += lambda(e) => do late.Add(e.N); end; "
         "    return 0; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(diagContains(r, "`late`"));
@@ -195,7 +195,7 @@ BEZEL_TEST(event_add_scoped_1541, form3_owned_subscription_field_admits_this) {
         "  private owned _sub: Subscription; "
         "  private _count: int := 0; "
         "  public constructor(ticks: IEvent<Tick>) "
-        "    _sub := ticks.Subscribe((e) => do OnTick(e); end); "
+        "    _sub := ticks.Subscribe(lambda(e) => do OnTick(e); end); "
         "  end constructor; "
         "  private method OnTick(e: Tick) _count := _count + 1; end OnTick; "
         "end Observer; "
@@ -225,7 +225,7 @@ BEZEL_TEST(event_add_scoped_1541, form2_subscribe_using_var_wins_over_form4) {
         "    using var pub := new Pub(); "
         "    using var early := new Sink(); "
         "    using var sub := "
-        "        pub.Clicked.Subscribe((e) => do early.Add(e.N); end); "
+        "        pub.Clicked.Subscribe(lambda(e) => do early.Add(e.N); end); "
         "    return 0; "
         "  end Main; "
         "end Prog;"));

@@ -11,7 +11,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class C public static method Foo(): int var n := 0; try n := n + 1; finally var f := () => do var total := 0; while total < 10 do total := total + 1; if total = 3 then break; end; end; return total; end; n := n + f(); end; return n; end Foo; end C;
+module M; class C public static method Foo(): int var n := 0; try n := n + 1; finally var f := lambda() => do var total := 0; while total < 10 do total := total + 1; if total = 3 then break; end; end; return total; end; n := n + f(); end; return n; end Foo; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

@@ -27,7 +27,7 @@ int runFull(const std::string& program) {
 BEZEL_TEST(owned_buffer_init_778, two_arg_init_fills_slots) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwningBuffer<int>(3, (i) => i + 1); "
+        "  using var buf := new OwningBuffer<int>(3, lambda(i) => i + 1); "
         "  return int(buf[0]) + int(buf[1]) + int(buf[2]); "  // 1+2+3
         "end Main; end C;"), 6);
 }
@@ -36,7 +36,7 @@ BEZEL_TEST(owned_buffer_init_778, two_arg_init_fills_slots) {
 BEZEL_TEST(owned_buffer_init_778, init_receives_the_index) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwningBuffer<int>(3, (i) => i * i); "
+        "  using var buf := new OwningBuffer<int>(3, lambda(i) => i * i); "
         "  return int(buf[0]) + int(buf[1]) + int(buf[2]); "  // 0+1+4
         "end Main; end C;"), 5);
 }
@@ -47,7 +47,7 @@ BEZEL_TEST(owned_buffer_init_778, capturing_init_closure) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C public static method Main(): int "
         "  var k := 10; "
-        "  using var buf := new OwningBuffer<int>(3, (i) => i + k); "
+        "  using var buf := new OwningBuffer<int>(3, lambda(i) => i + k); "
         "  return int(buf[0]) + int(buf[1]) + int(buf[2]); "  // 10+11+12
         "end Main; end C;"), 33);
 }

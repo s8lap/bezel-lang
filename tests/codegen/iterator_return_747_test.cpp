@@ -115,7 +115,7 @@ BEZEL_TEST(iterator_return_747, return_in_nested_lambda_still_legal) {
 module M;
 static class F
   public static method Nums(): IEnumerable<int>
-    var f: (int) -> int := (x) => do return x + 1; end;
+    var f: (int) -> int := lambda(x) => do return x + 1; end;
     yield return f(4);
     yield break;
   end Nums;

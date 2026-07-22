@@ -134,7 +134,7 @@ BEZEL_TEST(ienumerable_vtable_linq_995, sum_on_interface_typed_local) {
     BEZEL_EXPECT_EQ(run(std::string(kSeq) +
         "  public static method Main(): int "
         "    var e: IEnumerable<int> := P.Seq(); "
-        "    return e.Sum((x) => x); "
+        "    return e.Sum(lambda(x) => x); "
         "  end Main; end P;"), 6);
 }
 
@@ -171,7 +171,7 @@ BEZEL_TEST(ienumerable_vtable_linq_995, for_in_over_where) {
     BEZEL_EXPECT_EQ(run(std::string(kSeq) +
         "  public static method Main(): int "
         "    var sum := 0; "
-        "    for var x in P.Seq().Where((n) => n > 1) do sum := sum + x; end; "
+        "    for var x in P.Seq().Where(lambda(n) => n > 1) do sum := sum + x; end; "
         "    return sum; "
         "  end Main; end P;"), 5);
 }
@@ -182,7 +182,7 @@ BEZEL_TEST(ienumerable_vtable_linq_995, for_in_over_select) {
         "  public static method Main(): int "
         "    var e: IEnumerable<int> := P.Seq(); "
         "    var sum := 0; "
-        "    for var x in e.Select((n) => n * 10) do sum := sum + x; end; "
+        "    for var x in e.Select(lambda(n) => n * 10) do sum := sum + x; end; "
         "    return sum; "
         "  end Main; end P;"), 60);
 }
@@ -191,7 +191,7 @@ BEZEL_TEST(ienumerable_vtable_linq_995, for_in_over_select) {
 BEZEL_TEST(ienumerable_vtable_linq_995, where_then_count) {
     BEZEL_EXPECT_EQ(run(std::string(kSeq) +
         "  public static method Main(): int "
-        "    return P.Seq().Where((n) => n > 1).Count(); "
+        "    return P.Seq().Where(lambda(n) => n > 1).Count(); "
         "  end Main; end P;"), 2);
 }
 
@@ -199,7 +199,7 @@ BEZEL_TEST(ienumerable_vtable_linq_995, where_then_count) {
 BEZEL_TEST(ienumerable_vtable_linq_995, select_then_sum) {
     BEZEL_EXPECT_EQ(run(std::string(kSeq) +
         "  public static method Main(): int "
-        "    return P.Seq().Select((n) => n * 10).Sum((x) => x); "
+        "    return P.Seq().Select(lambda(n) => n * 10).Sum(lambda(x) => x); "
         "  end Main; end P;"), 60);
 }
 

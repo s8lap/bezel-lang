@@ -91,7 +91,7 @@ BEZEL_TEST(where_toarray_result_site_1615,
         "module M; "
         "class C "
         "  public method Run(xs: Array<int>) "
-        "    var ys := xs.Where((v) => v > 2).ToArray(); "
+        "    var ys := xs.Where(lambda(v) => v > 2).ToArray(); "
         "  end Run; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -106,7 +106,7 @@ BEZEL_TEST(where_toarray_result_site_1615,
         "module M; class C public static method Main(): int "
         "  using var xs := new Array<int>(); "
         "  xs.Add(1); xs.Add(2); xs.Add(3); xs.Add(4); "
-        "  using var ys: Array<int> := xs.Where((v) => v > 2).ToArray(); "
+        "  using var ys: Array<int> := xs.Where(lambda(v) => v > 2).ToArray(); "
         "  var s := 0; "
         "  for var y in ys do s := s + y; end; "
         "  return s; "

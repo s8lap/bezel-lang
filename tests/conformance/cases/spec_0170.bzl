@@ -1,1 +1,1 @@
-var attach: (owned EventHandler) -> () := (owned h) => _handlers.Add(h);
+var attach: (owned EventHandler) -> () := lambda(owned h) => _handlers.Add(h);

@@ -46,7 +46,7 @@ BEZEL_TEST(codegen_recursive_lambda_27_5, counter_self_reference_579) {
         "module M; class C "
         "  public static method Main(): int "
         "    var counter: (int) -> int; "
-        "    counter := (n: int) => do "
+        "    counter := lambda(n: int) => do "
         "      if n <= 0 then return 0; end; "
         "      return counter(n - 1) + 1; "
         "    end; "
@@ -62,7 +62,7 @@ BEZEL_TEST(codegen_recursive_lambda_27_5, counter_deeper_recursion) {
         "module M; class C "
         "  public static method Main(): int "
         "    var counter: (int) -> int; "
-        "    counter := (n: int) => do "
+        "    counter := lambda(n: int) => do "
         "      if n <= 0 then return 0; end; "
         "      return counter(n - 1) + 1; "
         "    end; "
@@ -78,7 +78,7 @@ BEZEL_TEST(codegen_recursive_lambda_27_5, factorial_self_reference) {
         "module M; class C "
         "  public static method Main(): int "
         "    var fact: (int) -> int; "
-        "    fact := (n: int) => do "
+        "    fact := lambda(n: int) => do "
         "      if n <= 1 then return 1; end; "
         "      return n * fact(n - 1); "
         "    end; "
@@ -94,7 +94,7 @@ BEZEL_TEST(codegen_recursive_lambda_27_5, base_case_only) {
         "module M; class C "
         "  public static method Main(): int "
         "    var counter: (int) -> int; "
-        "    counter := (n: int) => do "
+        "    counter := lambda(n: int) => do "
         "      if n <= 0 then return 0; end; "
         "      return counter(n - 1) + 1; "
         "    end; "
@@ -114,7 +114,7 @@ BEZEL_TEST(codegen_recursive_lambda_27_5, recursive_sum) {
         "module M; class C "
         "  public static method Main(): int "
         "    var sum: (int) -> int; "
-        "    sum := (n: int) => do "
+        "    sum := lambda(n: int) => do "
         "      if n <= 0 then return 0; end; "
         "      return n + sum(n - 1); "
         "    end; "
@@ -132,7 +132,7 @@ BEZEL_TEST(codegen_recursive_lambda_27_5, non_recursive_lambda_unchanged) {
         "module M; class C "
         "  public static method Main(): int "
         "    var addOne: (int) -> int; "
-        "    addOne := (n: int) => n + 1; "
+        "    addOne := lambda(n: int) => n + 1; "
         "    return addOne(41); "
         "  end Main; "
         "end C;"), 42);
@@ -146,7 +146,7 @@ BEZEL_TEST(codegen_recursive_lambda_27_5, capture_normal_local_unchanged) {
         "  public static method Main(): int "
         "    var offset := 100; "
         "    var add: (int) -> int; "
-        "    add := (n: int) => n + offset; "  // captures `offset`, not `add`
+        "    add := lambda(n: int) => n + offset; "  // captures `offset`, not `add`
         "    return add(23); "                 // 123
         "  end Main; "
         "end C;"), 123);
@@ -161,7 +161,7 @@ BEZEL_TEST(codegen_recursive_lambda_27_5, outer_mutation_after_assign_seen) {
         "  public static method Main(): int "
         "    var x := 1; "
         "    var f: () -> int; "
-        "    f := () => x; "         // captures x by reference
+        "    f := lambda() => x; "         // captures x by reference
         "    x := 7; "              // written after the lambda is assigned
         "    return f(); "          // observes 7, not the assign-time 1
         "  end Main; "

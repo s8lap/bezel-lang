@@ -26,7 +26,7 @@ class R
 
   // `owned` on a LAMBDA parameter with an explicit primitive type.
   public method G(): ()
-    var f := (owned x: int) => x;
+    var f := lambda(owned x: int) => x;
     // CHECK: :[[@LINE-1]]:{{[0-9]+}}: `owned` is not admissible on a lambda parameter of type a primitive value type
     // CHECK-SAME: (§28.1)
     return;

@@ -33,7 +33,7 @@ BEZEL_TEST(selectmany_range_selector_775, flatten_inclusive_count) {
         "class C public static method Main(): int "
         "  using var arr: Array<int> := new Array<int>(2); "
         "  arr.Add(1); arr.Add(3); "
-        "  var total: int := arr.SelectMany((n) => (1..n + 1)).Count(); "
+        "  var total: int := arr.SelectMany(lambda(n) => (1..n + 1)).Count(); "
         "  return total mod 100; "  // {1,2} ∪ {1,2,3,4} = 6
         "end Main; end C;"), 6);
 }
@@ -46,7 +46,7 @@ BEZEL_TEST(selectmany_range_selector_775, flatten_value_flow_sum) {
         "class C public static method Main(): int "
         "  using var arr: Array<int> := new Array<int>(2); "
         "  arr.Add(1); arr.Add(3); "
-        "  return arr.SelectMany((n) => (1..n)).Sum(); "  // 1 + 6 = 7
+        "  return arr.SelectMany(lambda(n) => (1..n)).Sum(); "  // 1 + 6 = 7
         "end Main; end C;"), 7);
 }
 
@@ -58,7 +58,7 @@ BEZEL_TEST(selectmany_range_selector_775, flatten_half_open) {
         "class C public static method Main(): int "
         "  using var arr: Array<int> := new Array<int>(2); "
         "  arr.Add(2); arr.Add(3); "
-        "  return arr.SelectMany((n) => (1..<n)).Count(); "  // 3
+        "  return arr.SelectMany(lambda(n) => (1..<n)).Count(); "  // 3
         "end Main; end C;"), 3);
 }
 
@@ -77,7 +77,7 @@ BEZEL_TEST(selectmany_range_selector_775, receiver_where_select_sum) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; "
         "class C public static method Main(): int "
-        "  return (1..10).Where((x) => x mod 2 = 0).Select((x) => x).Sum(); "
+        "  return (1..10).Where(lambda(x) => x mod 2 = 0).Select(lambda(x) => x).Sum(); "
         "end Main; end C;"), 30);
 }
 
@@ -100,7 +100,7 @@ BEZEL_TEST(selectmany_range_selector_775, typed_element_select_lambda) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; "
         "class C public static method Main(): int "
-        "  return (0 if (1L..3L).Select((x) => x * 2L).Sum() = 12L else 1); "  // 2+4+6=12
+        "  return (0 if (1L..3L).Select(lambda(x) => x * 2L).Sum() = 12L else 1); "  // 2+4+6=12
         "end Main; end C;"), 0);
 }
 

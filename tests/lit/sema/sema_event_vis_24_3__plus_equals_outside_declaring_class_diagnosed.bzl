@@ -6,7 +6,7 @@
 // §24.3 / §24.4: the `+=` desugaring (→ Add) is available only when the static
 // type is EventSource<T>; from outside it is IEvent<T>, so it is forbidden.
 
-module M; record Ev(N: int); class Button public event Clicked: Ev; public method Inside() var _ := this; end Inside; end Button; class Other public method Outside(b: Button) b.Clicked += (e) => do end; end Outside; end Other;
+module M; record Ev(N: int); class Button public event Clicked: Ev; public method Inside() var _ := this; end Inside; end Button; class Other public method Outside(b: Button) b.Clicked += lambda(e) => do end; end Outside; end Other;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: event `Clicked` is accessed from outside its declaring class `Button`, where its static type is the subscribe-only interface `IEvent<T>` — the `+=` form (which desugars to `Add`) is not available; only `.Subscribe` may be used here
 // CHECK-SAME: (§24.3)

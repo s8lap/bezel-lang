@@ -219,7 +219,7 @@ BEZEL_TEST(array_reverse_chain_466, direct_sort_toarray_is_rejected_spec_3) {
     BEZEL_EXPECT_TRUE(rejectedAtCompile(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); a.Add(3); a.Add(1); "
-        "  using var s: Array<int> := a.Sort((x: int, y: int) => x - y).ToArray(); "
+        "  using var s: Array<int> := a.Sort(lambda(x: int, y: int) => x - y).ToArray(); "
         "  return s.Length; "
         "end Main; end C;"));
 }
@@ -284,7 +284,7 @@ BEZEL_TEST(array_reverse_chain_466, chained_where_reverse_toarray_still_works_sp
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); "
         "  using var rev: Array<int> := "
-        "    a.Where((x) => x mod 2 = 1).Reverse().ToArray(); "
+        "    a.Where(lambda(x) => x mod 2 = 1).Reverse().ToArray(); "
         "  return rev.Get(0) * 36 + rev.Get(1) * 6 + rev.Get(2); "  // 199
         "end Main; end C;", 199);
 }
@@ -296,7 +296,7 @@ BEZEL_TEST(array_reverse_chain_466, chained_where_reverse_single_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); a.Add(9); "
         "  using var rev: Array<int> := "
-        "    a.Where((x) => x > 0).Reverse().ToArray(); "
+        "    a.Where(lambda(x) => x > 0).Reverse().ToArray(); "
         "  return rev.Length * 10 + rev.Get(0); "
         "end Main; end C;", 19);
 }
@@ -312,7 +312,7 @@ BEZEL_TEST(array_reverse_chain_466, source_array_intact_after_lazy_reverse_spec_
         "  using var a := new Array<int>(); "
         "  a.Add(4); a.Add(5); a.Add(6); "
         "  using var rev: Array<int> := "
-        "    a.Where((x) => x > 0).Reverse().ToArray(); "
+        "    a.Where(lambda(x) => x > 0).Reverse().ToArray(); "
         "  return a.Get(0) * 36 + a.Get(1) * 6 + a.Get(2); "  // 180
         "end Main; end C;", 180);
 }

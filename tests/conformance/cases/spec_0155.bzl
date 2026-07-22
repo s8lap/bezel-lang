@@ -1,4 +1,4 @@
-connection.DataReceived += async (e) => do
+connection.DataReceived += async lambda(e) => do
   try
     await ProcessPayloadAsync(e.Payload);
   catch

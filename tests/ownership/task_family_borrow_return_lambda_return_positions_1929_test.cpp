@@ -88,7 +88,7 @@ std::string wrapMember(const std::string& member) {
 BEZEL_TEST(task_family_borrow_return_lambda_return_positions_1929,
            expr_bodied_method_identity_lambda_rejected) {
     auto r = parseAndCheckOwnership(wrapMember(
-        "public static method Make(): (Task<int>) -> Task<int> => (t) => t; "));
+        "public static method Make(): (Task<int>) -> Task<int> => lambda(t) => t; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasLambdaSb01Reject(r));
 }
@@ -99,7 +99,7 @@ BEZEL_TEST(task_family_borrow_return_lambda_return_positions_1929,
            block_method_return_identity_lambda_rejected) {
     auto r = parseAndCheckOwnership(wrapMember(
         "public static method Make(): (Task<int>) -> Task<int> "
-        "  return (t) => t; end Make; "));
+        "  return lambda(t) => t; end Make; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasLambdaSb01Reject(r));
 }
@@ -110,7 +110,7 @@ BEZEL_TEST(task_family_borrow_return_lambda_return_positions_1929,
            block_getter_return_identity_lambda_rejected) {
     auto r = parseAndCheckOwnership(wrapMember(
         "public property Echo: (Task<int>) -> Task<int> "
-        "  get => do return (t) => t; end; end Echo; "));
+        "  get => do return lambda(t) => t; end; end Echo; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasLambdaSb01Reject(r));
 }
@@ -121,8 +121,8 @@ BEZEL_TEST(task_family_borrow_return_lambda_return_positions_1929,
            block_method_return_under_if_identity_lambda_rejected) {
     auto r = parseAndCheckOwnership(wrapMember(
         "public static method Make(flag: bool): (Task<int>) -> Task<int> "
-        "  if flag then return (t) => t; end "
-        "  return (u) => u; end Make; "));
+        "  if flag then return lambda(t) => t; end "
+        "  return lambda(u) => u; end Make; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasLambdaSb01Reject(r));
 }
@@ -136,7 +136,7 @@ BEZEL_TEST(task_family_borrow_return_lambda_return_positions_1929,
     auto r = parseAndCheckOwnership(wrapMember(
         "public static async method Producer(): Task<int> return 5; "
         "  end Producer; "
-        "public static method Make(): () -> Task<int> => () => Producer(); "));
+        "public static method Make(): () -> Task<int> => lambda() => Producer(); "));
     BEZEL_EXPECT_FALSE(hasLambdaSb01Reject(r));
 }
 
@@ -147,7 +147,7 @@ BEZEL_TEST(task_family_borrow_return_lambda_return_positions_1929,
         "public static async method Producer(): Task<int> return 5; "
         "  end Producer; "
         "public static method Make(): () -> Task<int> "
-        "  return () => Producer(); end Make; "));
+        "  return lambda() => Producer(); end Make; "));
     BEZEL_EXPECT_FALSE(hasLambdaSb01Reject(r));
 }
 
@@ -158,7 +158,7 @@ BEZEL_TEST(task_family_borrow_return_lambda_return_positions_1929,
         "public static async method Producer(): Task<int> return 5; "
         "  end Producer; "
         "public property Echo: () -> Task<int> "
-        "  get => do return () => Producer(); end; end Echo; "));
+        "  get => do return lambda() => Producer(); end; end Echo; "));
     BEZEL_EXPECT_FALSE(hasLambdaSb01Reject(r));
 }
 
@@ -170,7 +170,7 @@ BEZEL_TEST(task_family_borrow_return_lambda_return_positions_1929,
         "public static async method Producer(): Task<int> return 5; "
         "  end Producer; "
         "public static method Make(): () -> Task<int> "
-        "  return async () => await Producer(); end Make; "));
+        "  return async lambda() => await Producer(); end Make; "));
     BEZEL_EXPECT_FALSE(hasLambdaSb01Reject(r));
 }
 
@@ -179,7 +179,7 @@ BEZEL_TEST(task_family_borrow_return_lambda_return_positions_1929,
            block_method_return_completed_task_factory_accepted) {
     auto r = parseAndCheckOwnership(wrapMember(
         "public static method Make(): () -> Task<int> "
-        "  return () => Task.FromResult<int>(5); end Make; "));
+        "  return lambda() => Task.FromResult<int>(5); end Make; "));
     BEZEL_EXPECT_FALSE(hasLambdaSb01Reject(r));
 }
 
@@ -189,7 +189,7 @@ BEZEL_TEST(task_family_borrow_return_lambda_return_positions_1929,
            expr_method_owned_param_owned_return_accepted) {
     auto r = parseAndCheckOwnership(wrapMember(
         "public static method Make(): (owned Task<int>) -> owned Task<int> "
-        "  => (owned t) => t; "));
+        "  => lambda(owned t) => t; "));
     BEZEL_EXPECT_FALSE(hasLambdaSb01Reject(r));
 }
 
@@ -199,7 +199,7 @@ BEZEL_TEST(task_family_borrow_return_lambda_return_positions_1929,
            block_method_return_non_task_identity_unaffected) {
     auto r = parseAndCheckOwnership(wrapMember(
         "public static method Make(): (int) -> int "
-        "  return (x) => x; end Make; "));
+        "  return lambda(x) => x; end Make; "));
     BEZEL_EXPECT_FALSE(hasLambdaSb01Reject(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -212,9 +212,9 @@ BEZEL_TEST(task_family_borrow_return_lambda_return_positions_1929,
            non_return_direct_local_lambda_not_over_rejected) {
     auto r = parseAndCheckOwnership(wrapMember(
         "public static method Make(): () -> Task<int> "
-        "  var g := (x: int) => x; "
+        "  var g := lambda(x: int) => x; "
         "  var h: int := g(3); "
-        "  return () => Task.FromResult<int>(5); end Make; "));
+        "  return lambda() => Task.FromResult<int>(5); end Make; "));
     BEZEL_EXPECT_FALSE(hasLambdaSb01Reject(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -230,7 +230,7 @@ BEZEL_TEST(task_family_borrow_return_lambda_return_positions_1929,
         "  public static async method Producer(): Task<int> return 7; "
         "  end Producer; "
         "  public static method MakeFactory(): () -> Task<int> "
-        "    return () => Producer(); end MakeFactory; "
+        "    return lambda() => Producer(); end MakeFactory; "
         "  public static async method Main(): Task<int> "
         "    var mk := C.MakeFactory(); "
         "    using var t := mk(); "

@@ -66,8 +66,8 @@ const char* kCountAndAny =
     "  public static method Main(): int "
     "    using var xs := new Array<int>(); "
     "    xs.Add(1); xs.Add(3); xs.Add(2); "
-    "    var c := xs.GroupBy((x: int) => x mod 2).Count(); "
-    "    if xs.GroupBy((x: int) => x mod 2).Any() then c := c + 10; end; "
+    "    var c := xs.GroupBy(lambda(x: int) => x mod 2).Count(); "
+    "    if xs.GroupBy(lambda(x: int) => x mod 2).Any() then c := c + 10; end; "
     "    Console.WriteLine(\"c=\" + c.ToString()); "   // trailing stmt — surfaces the leak
     "    return c; "                                    // 2 + 10
     "  end Main; "
@@ -85,8 +85,8 @@ const char* kAggregateSeed =
     "  public static method Main(): int "
     "    using var xs := new Array<int>(); "
     "    xs.Add(1); xs.Add(3); xs.Add(2); xs.Add(4); xs.Add(6); "
-    "    var total := xs.GroupBy((x: int) => x mod 2)"
-    "                   .Aggregate(0, (acc, g) => acc + g.Key + g.Count()); "
+    "    var total := xs.GroupBy(lambda(x: int) => x mod 2)"
+    "                   .Aggregate(0, lambda(acc, g) => acc + g.Key + g.Count()); "
     "    Console.WriteLine(\"total=\" + total.ToString()); "
     "    return total; "                                // 0 + (1+2) + (0+3) = 6
     "  end Main; "
@@ -104,7 +104,7 @@ const char* kLazySourceCount =
     "  public static method Main(): int "
     "    using var xs := new Array<int>(); "
     "    xs.Add(1); xs.Add(3); xs.Add(2); xs.Add(4); xs.Add(5); "
-    "    var n := xs.Where((x: int) => x > 1).GroupBy((x: int) => x mod 2).Count(); "
+    "    var n := xs.Where(lambda(x: int) => x > 1).GroupBy(lambda(x: int) => x mod 2).Count(); "
     "    Console.WriteLine(\"n=\" + n.ToString()); "
     "    return n; "                                    // 2 groups
     "  end Main; "

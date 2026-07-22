@@ -8,7 +8,7 @@
 // and exited, must still be rejected — verifies `finallyDepth_` is restored
 // (not left at 0) once the lambda visit completes.
 
-module M; class C public static method Foo(): int var n := 0; try n := n + 1; finally var f := () => do return 1; end; n := n + f(); return n; end; return n; end Foo; end C;
+module M; class C public static method Foo(): int var n := 0; try n := n + 1; finally var f := lambda() => do return 1; end; n := n + f(); return n; end; return n; end Foo; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: `return` inside a `finally` block is a compile error
 // CHECK-SAME: (§31.2)

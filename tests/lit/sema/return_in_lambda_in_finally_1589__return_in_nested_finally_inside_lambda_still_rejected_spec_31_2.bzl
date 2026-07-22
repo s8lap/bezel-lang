@@ -10,7 +10,7 @@
 // so a `return` in THAT nested finally is still an escape from a finally
 // (the lambda's own finally, not the outer method's).
 
-module M; class C public static method Foo(): int var n := 0; try n := n + 1; finally var f := () => do try var x := 1; finally return x; end; end; n := n + f(); end; return n; end Foo; end C;
+module M; class C public static method Foo(): int var n := 0; try n := n + 1; finally var f := lambda() => do try var x := 1; finally return x; end; end; n := n + f(); end; return n; end Foo; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: `return` inside a `finally` block is a compile error
 // CHECK-SAME: (§31.2)

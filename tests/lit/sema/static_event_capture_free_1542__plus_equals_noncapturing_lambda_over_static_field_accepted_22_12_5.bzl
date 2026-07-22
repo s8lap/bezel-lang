@@ -11,7 +11,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; record Ev(N: int); class Bus public static Total: int := 0; public static event Signal: Ev; public static method Hook() Signal += (e) => do Bus.Total := Bus.Total + e.N; end; end Hook; end Bus;
+module M; record Ev(N: int); class Bus public static Total: int := 0; public static event Signal: Ev; public static method Hook() Signal += lambda(e) => do Bus.Total := Bus.Total + e.N; end; end Hook; end Bus;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

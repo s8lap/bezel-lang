@@ -39,7 +39,7 @@ BEZEL_TEST(async_forgotten_await_777, lambda_forgotten_await_rejected) {
         "  public static method GetSeven(): Task<int> "
         "    return Task.FromResult<int>(7); end GetSeven; "
         "  public static async method Main(): Task<int> "
-        "    var f: () -> Task<int> := async () => GetSeven(); "  // forgot await
+        "    var f: () -> Task<int> := async lambda() => GetSeven(); "  // forgot await
         "    return await f(); "
         "  end Main; "
         "end C;"), true);
@@ -71,7 +71,7 @@ BEZEL_TEST(async_forgotten_await_777, lambda_with_await_accepted) {
         "  public static method GetSeven(): Task<int> "
         "    return Task.FromResult<int>(7); end GetSeven; "
         "  public static async method Main(): Task<int> "
-        "    var f: () -> Task<int> := async () => await GetSeven(); "
+        "    var f: () -> Task<int> := async lambda() => await GetSeven(); "
         "    return await f(); "
         "  end Main; "
         "end C;"), 7);
@@ -84,7 +84,7 @@ BEZEL_TEST(async_forgotten_await_777, lambda_literal_body_accepted) {
         "module M; "
         "class C "
         "  public static async method Main(): Task<int> "
-        "    var f: () -> Task<int> := async () => 7; "
+        "    var f: () -> Task<int> := async lambda() => 7; "
         "    return await f(); "
         "  end Main; "
         "end C;"), 7);
@@ -118,7 +118,7 @@ BEZEL_TEST(async_forgotten_await_777, call_argument_forgotten_await_rejected) {
         "  public static async method Run(f: () -> Task<int>): Task<int> "
         "    return await f(); end Run; "
         "  public static async method Main(): Task<int> "
-        "    return await Run(async () => GetSeven()); "          // forgot await
+        "    return await Run(async lambda() => GetSeven()); "          // forgot await
         "  end Main; "
         "end C;"), true);
 }
@@ -133,7 +133,7 @@ BEZEL_TEST(async_forgotten_await_777, call_argument_with_await_accepted) {
         "  public static async method Run(f: () -> Task<int>): Task<int> "
         "    return await f(); end Run; "
         "  public static async method Main(): Task<int> "
-        "    return await Run(async () => await GetSeven()); "
+        "    return await Run(async lambda() => await GetSeven()); "
         "  end Main; "
         "end C;"), 7);
 }

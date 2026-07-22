@@ -300,7 +300,7 @@ BEZEL_TEST(runtime_const_locals_2049, mutable_capture_const_rejected) {
         "module M; class C "
         "  public static method Main(): int "
         "    const K := 5; "
-        "    var f := () => do K := 10; end; "
+        "    var f := lambda() => do K := 10; end; "
         "    return K; "
         "  end Main; "
         "end C;"));
@@ -315,7 +315,7 @@ BEZEL_TEST(runtime_const_locals_2049, read_capture_const_ok) {
         "  public static method Main(): int "
         "    var n := 40; "
         "    const K := n + 2; "            // runtime const: 42
-        "    var f := () => K; "            // capture by read
+        "    var f := lambda() => K; "            // capture by read
         "    return f(); "                  // 42
         "  end Main; "
         "end C;"), 42);

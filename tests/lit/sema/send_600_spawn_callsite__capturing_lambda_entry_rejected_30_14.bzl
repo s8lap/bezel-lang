@@ -7,6 +7,6 @@
 // "A capturing lambda or an instance method reference is rejected — captures
 // and receivers are borrows of the origin domain."
 
-module M; class Main public static async method Go(): Task var x: int := 10; using var t := Domain.Spawn(() => x := x + 1); await t; end Go; end Main;
+module M; class Main public static async method Go(): Task var x: int := 10; using var t := Domain.Spawn(lambda() => x := x + 1); await t; end Go; end Main;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: expected ')' to close call argument list

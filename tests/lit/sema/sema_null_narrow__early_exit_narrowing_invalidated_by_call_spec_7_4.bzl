@@ -8,7 +8,7 @@
 // surviving path is narrowed by `if s = null then return; end;`, then a call
 // invalidates the mutably-captured local before the use.
 
-module M; class C public static method Touch() end Touch; public static method Run(): int var s: string? := "hi"; var f := () => do s := null; end; if s = null then return -1; end; Touch(); return s.Length; end Run; end C;
+module M; class C public static method Touch() end Touch; public static method Run(): int var s: string? := "hi"; var f := lambda() => do s := null; end; if s = null then return -1; end; Touch(); return s.Length; end Run; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: member access `.Length` on a nullable value requires narrowing it to non-null first
 // CHECK-SAME: (§7.4)

@@ -63,7 +63,7 @@ const char* kFirstBound =
     "  public static method Main(): int "
     "    using var xs := new Array<int>(); "
     "    xs.Add(1); xs.Add(3); xs.Add(2); "
-    "    var g := xs.GroupBy((x: int) => x mod 2).First(); "
+    "    var g := xs.GroupBy(lambda(x: int) => x mod 2).First(); "
     "    Console.WriteLine(\"k=\" + g.Key.ToString()); "  // trailing use — surfaces the leak
     "    return g.Key * 100 + g.Count(); "                // 1*100 + 2
     "  end Main; "
@@ -79,7 +79,7 @@ const char* kLastBound =
     "  public static method Main(): int "
     "    using var xs := new Array<int>(); "
     "    xs.Add(1); xs.Add(3); xs.Add(2); "
-    "    var g := xs.GroupBy((x: int) => x mod 2).Last(); "
+    "    var g := xs.GroupBy(lambda(x: int) => x mod 2).Last(); "
     "    Console.WriteLine(\"c=\" + g.Count().ToString()); "
     "    return g.Key * 100 + g.Count(); "                // 0*100 + 1
     "  end Main; "
@@ -94,7 +94,7 @@ const char* kElementAtBound =
     "  public static method Main(): int "
     "    using var xs := new Array<int>(); "
     "    xs.Add(1); xs.Add(3); xs.Add(2); "
-    "    var g := xs.GroupBy((x: int) => x mod 2).ElementAt(0); "
+    "    var g := xs.GroupBy(lambda(x: int) => x mod 2).ElementAt(0); "
     "    Console.WriteLine(\"c=\" + g.Count().ToString()); "
     "    return g.Key * 100 + g.Count(); "                // 1*100 + 2
     "  end Main; "
@@ -111,7 +111,7 @@ const char* kSingleBound =
     "  public static method Main(): int "
     "    using var xs := new Array<int>(); "
     "    xs.Add(2); xs.Add(4); xs.Add(6); "
-    "    var g := xs.GroupBy((x: int) => x mod 2).Single(); "
+    "    var g := xs.GroupBy(lambda(x: int) => x mod 2).Single(); "
     "    Console.WriteLine(\"k=\" + g.Key.ToString()); "
     "    return g.Count(); "                              // 3
     "  end Main; "
@@ -129,7 +129,7 @@ const char* kFirstOrNullBound =
     "  public static method Main(): int "
     "    using var xs := new Array<int>(); "
     "    xs.Add(2); xs.Add(4); xs.Add(2); "
-    "    var g := xs.GroupBy((x: int) => x mod 2).FirstOrNull(); "
+    "    var g := xs.GroupBy(lambda(x: int) => x mod 2).FirstOrNull(); "
     "    if g <> null then return g!.Count(); end; "      // 3
     "    return -1; "
     "  end Main; "
@@ -151,8 +151,8 @@ const char* kFirstIntoOwningArray =
     "  public static method Main(): int "
     "    using var xs := new Array<int>(); "
     "    xs.Add(1); xs.Add(3); xs.Add(2); "
-    "    var arr := xs.GroupBy((x: int) => x mod 2).ToArray(); "
-    "    arr.Add(xs.GroupBy((x: int) => x mod 2).First()); "
+    "    var arr := xs.GroupBy(lambda(x: int) => x mod 2).ToArray(); "
+    "    arr.Add(xs.GroupBy(lambda(x: int) => x mod 2).First()); "
     "    Console.WriteLine(\"n=\" + arr.Count.ToString()); "
     "    return arr.Count; "                              // 2 + 1
     "  end Main; "

@@ -147,7 +147,7 @@ BEZEL_TEST(codegen_cg42, value_bool_returning_call_non_null) {
 BEZEL_TEST(null_cond_call, function_value_present_invokes_738) {
     BEZEL_EXPECT_EQ(runProg(
         "module M; class C public static method Main(): int "
-        "  var f: ((int) -> int)? := (x: int) => x * 2; "
+        "  var f: ((int) -> int)? := lambda(x: int) => x * 2; "
         "  var r := f?(5); "  // 10, as int?
         "  if r is null then return 2; end; "
         "  if r = 10 then return 0; end; "
@@ -166,7 +166,7 @@ BEZEL_TEST(null_cond_call, function_value_null_skips_738) {
 BEZEL_TEST(null_cond_call, function_value_reference_return_738) {
     BEZEL_EXPECT_EQ(runProg(
         "module M; class C public static method Main(): int "
-        "  var f: ((int) -> string)? := (x: int) => \"v\"; "
+        "  var f: ((int) -> string)? := lambda(x: int) => \"v\"; "
         "  var r := f?(3); "
         "  if r is null then return 2; end; "
         "  return r!.Length; "  // 'v'.Length = 1
@@ -200,7 +200,7 @@ BEZEL_TEST(null_cond_call, void_function_value_present_runs_747) {
         "end Box; "
         "class C public static method Main(): int "
         "  using var b := new Box(); "
-        "  var h: ((int) -> ())? := (n) => b.Add(n); "
+        "  var h: ((int) -> ())? := lambda(n) => b.Add(n); "
         "  h?(5); "
         "  h?(7); "
         "  var none: ((int) -> ())? := null; "

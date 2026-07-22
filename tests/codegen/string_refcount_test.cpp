@@ -408,7 +408,7 @@ const char* kCaptureStringMethodReceiver =
     "module M; class C "
     "  public static method Main(): int "
     "    var msg: string := \"hello\" + \"world\"; "
-    "    var f := () => msg.Length; "
+    "    var f := lambda() => msg.Length; "
     "    var r := f(); "
     "    return r; "                  // "helloworld".Length => 10
     "  end Main; "
@@ -419,7 +419,7 @@ const char* kCaptureStringConcatOperand =
     "module M; class C "
     "  public static method Main(): int "
     "    var msg: string := \"hello\" + \"world\"; "
-    "    var f := () => (msg + \"!\").Length; "
+    "    var f := lambda() => (msg + \"!\").Length; "
     "    var r := f(); "
     "    return r; "                  // "helloworld!".Length => 11
     "  end Main; "
@@ -430,7 +430,7 @@ const char* kCaptureStringInterpolation =
     "module M; class C "
     "  public static method Main(): int "
     "    var msg: string := \"hello\" + \"world\"; "
-    "    var f := () => $\"[{msg}]\".Length; "
+    "    var f := lambda() => $\"[{msg}]\".Length; "
     "    var r := f(); "              // "[helloworld]".Length => 12
     "    return r; "
     "  end Main; "
@@ -443,7 +443,7 @@ const char* kCaptureStringBareIdent =
     "module M; class C "
     "  public static method Main(): int "
     "    var msg: string := \"hello\" + \"world\"; "
-    "    var f := () => msg; "
+    "    var f := lambda() => msg; "
     "    var r := f().Length; "       // "helloworld".Length => 10
     "    return r; "
     "  end Main; "
@@ -707,7 +707,7 @@ const char* kJoinLazyResultReclaimed_1184 =
     "class C public static method Main(): int "
     "  using var xs := new Array<string>(); "
     "  xs.Add(\"ab\"); xs.Add(\"\"); xs.Add(\"cd\"); "
-    "  var s := string.Join(\",\", xs.Where((x: string) => x.Length > 0)); "
+    "  var s := string.Join(\",\", xs.Where(lambda(x: string) => x.Length > 0)); "
     "  return s.Length; "                              // "ab,cd" -> 5
     "end Main; end C;";
 BEZEL_TEST(codegen_string_refcount_1184, join_lazy_result_reclaimed) {

@@ -62,8 +62,8 @@ std::string exprFromDiscard(const std::string& exprSrc) {
 // §20 / §27.3: simple conditional body — `0 if n <= 0 else n`.
 BEZEL_TEST(parser_lambda_cond_589, conditional_body_basic_spec_20_27_3) {
     BEZEL_EXPECT_EQ(
-        exprFromDiscard("(n: int) => 0 if n <= 0 else n"),
-        std::string("((n: int) => (0 if (n <= 0) else n))"));
+        exprFromDiscard("lambda(n: int) => 0 if n <= 0 else n"),
+        std::string("(lambda(n: int) => (0 if (n <= 0) else n))"));
 }
 
 // §20 / §27.3: conditional body as an assignment RHS (#589 primary case).
@@ -73,7 +73,7 @@ BEZEL_TEST(parser_lambda_cond_589, conditional_body_as_assignment_rhs_spec_20_27
         "module M; class C "
         "  public method run() "
         "    var f: (int) -> int; "
-        "    f := (n: int) => 0 if n <= 0 else n; "
+        "    f := lambda(n: int) => 0 if n <= 0 else n; "
         "  end run; "
         "end C;";
     auto r = parseAll(src);
@@ -86,7 +86,7 @@ BEZEL_TEST(parser_lambda_cond_589, conditional_body_as_var_decl_init_spec_21_1_2
     const std::string src =
         "module M; class C "
         "  public method run() "
-        "    var f: (int) -> int := (n: int) => 0 if n <= 0 else n; "
+        "    var f: (int) -> int := lambda(n: int) => 0 if n <= 0 else n; "
         "  end run; "
         "end C;";
     auto r = parseAll(src);
@@ -100,7 +100,7 @@ BEZEL_TEST(parser_lambda_cond_589, conditional_body_as_call_arg_spec_27_3_27_4) 
         "module M; class C "
         "  public method Apply(f: (int) -> int): int return f(1); end Apply; "
         "  public method run() "
-        "    _ := Apply((n: int) => 0 if n <= 0 else n); "
+        "    _ := Apply(lambda(n: int) => 0 if n <= 0 else n); "
         "  end run; "
         "end C;";
     auto r = parseAll(src);
@@ -113,9 +113,9 @@ BEZEL_TEST(parser_lambda_cond_589, conditional_body_as_call_arg_spec_27_3_27_4) 
 BEZEL_TEST(parser_lambda_cond_589, chained_conditional_body_spec_20) {
     BEZEL_EXPECT_EQ(
         exprFromDiscard(
-            "(n: int) => \"A\" if n > 90 else \"B\" if n > 80 else \"C\""),
+            "lambda(n: int) => \"A\" if n > 90 else \"B\" if n > 80 else \"C\""),
         std::string(
-            "((n: int) => (\"A\" if (n > 90) else "
+            "(lambda(n: int) => (\"A\" if (n > 90) else "
             "(\"B\" if (n > 80) else \"C\")))"));
 }
 
@@ -127,7 +127,7 @@ BEZEL_TEST(parser_lambda_cond_589, recursive_self_ref_conditional_body_spec_27_5
         "module M; class C "
         "  public method run() "
         "    var sum: (int) -> int; "
-        "    sum := (n: int) => 0 if n <= 0 else n + sum(n - 1); "
+        "    sum := lambda(n: int) => 0 if n <= 0 else n + sum(n - 1); "
         "  end run; "
         "end C;";
     auto r = parseAll(src);
@@ -137,13 +137,13 @@ BEZEL_TEST(parser_lambda_cond_589, recursive_self_ref_conditional_body_spec_27_5
 // Regression: block-bodied lambda must still parse correctly.
 BEZEL_TEST(parser_lambda_cond_589, block_body_regression_spec_27_3) {
     BEZEL_EXPECT_EQ(
-        exprFromDiscard("(x: int) => do return x; end"),
-        std::string("((x: int) => do { return x; } end)"));
+        exprFromDiscard("lambda(x: int) => do return x; end"),
+        std::string("(lambda(x: int) => do { return x; } end)"));
 }
 
 // Regression: simple expression body (no conditional) must still work.
 BEZEL_TEST(parser_lambda_cond_589, simple_expr_body_regression_spec_27_3) {
     BEZEL_EXPECT_EQ(
-        exprFromDiscard("(x: int) => x + 1"),
-        std::string("((x: int) => (x + 1))"));
+        exprFromDiscard("lambda(x: int) => x + 1"),
+        std::string("(lambda(x: int) => (x + 1))"));
 }

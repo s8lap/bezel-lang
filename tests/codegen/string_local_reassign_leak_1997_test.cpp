@@ -260,8 +260,8 @@ const char* kDictAliasReassignDoubleFree =
     "    do "
     "      using var src := new Array<int>(); "
     "      src.Add(1); src.Add(2); src.Add(3); "
-    "      using var u := src.ToDictionary((x: int) => x); "
-    "      var d := src.ToDictionary((x: int) => x); "
+    "      using var u := src.ToDictionary(lambda(x: int) => x); "
+    "      var d := src.ToDictionary(lambda(x: int) => x); "
     "      d := u; "                     // alias onto the using-owned dict
     "      n := d.Count; "               // 3
     "    end; "
@@ -281,9 +281,9 @@ const char* kDictTwoAliasReassignDoubleFree =
     "    do "
     "      using var src := new Array<int>(); "
     "      src.Add(1); src.Add(2); "
-    "      using var keep := src.ToDictionary((x: int) => x); "
-    "      var d := src.ToDictionary((x: int) => x); "
-    "      var e := src.ToDictionary((x: int) => x); "
+    "      using var keep := src.ToDictionary(lambda(x: int) => x); "
+    "      var d := src.ToDictionary(lambda(x: int) => x); "
+    "      var e := src.ToDictionary(lambda(x: int) => x); "
     "      d := keep; "
     "      e := keep; "
     "      n := d.Count + e.Count; "     // 2 + 2
@@ -309,8 +309,8 @@ const char* kGroupingAliasReassignDoubleFree =
     "    do "
     "      using var xs := new Array<int>(); "
     "      xs.Add(1); xs.Add(3); xs.Add(2); "
-    "      using var arr := xs.GroupBy((x: int) => x mod 2).ToArray(); "
-    "      var g := xs.GroupBy((x: int) => x mod 2).First(); "
+    "      using var arr := xs.GroupBy(lambda(x: int) => x mod 2).ToArray(); "
+    "      var g := xs.GroupBy(lambda(x: int) => x mod 2).First(); "
     "      g := arr[0]; "                // alias onto a grouping arr owns
     "      total := g.Count(); "         // key-1 group {1,3} → 2
     "    end; "

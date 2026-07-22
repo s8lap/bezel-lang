@@ -94,7 +94,7 @@ BEZEL_TEST(codegen_cg50, by_value_param_unchanged) {
 BEZEL_TEST(codegen_cg50, ref_lambda_param_writes_back_747) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var modify: (ref int) -> () := (ref n: int) => do n := n * 2; end; "
+        "  var modify: (ref int) -> () := lambda(ref n: int) => do n := n * 2; end; "
         "  var x := 21; "
         "  modify(ref x); "
         "  return x; "  // 42
@@ -105,7 +105,7 @@ BEZEL_TEST(codegen_cg50, ref_lambda_param_writes_back_747) {
 BEZEL_TEST(codegen_cg50, ref_lambda_param_reads_and_writes_747) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var dbl: (ref int) -> () := (ref n: int) => do n := n + n; end; "
+        "  var dbl: (ref int) -> () := lambda(ref n: int) => do n := n + n; end; "
         "  var x := 15; "
         "  dbl(ref x); dbl(ref x); "
         "  return x; "  // 15 → 30 → 60
@@ -116,7 +116,7 @@ BEZEL_TEST(codegen_cg50, ref_lambda_param_reads_and_writes_747) {
 BEZEL_TEST(codegen_cg50, out_lambda_param_writes_back_747) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var init: (out int) -> () := (out n: int) => do n := 99; end; "
+        "  var init: (out int) -> () := lambda(out n: int) => do n := 99; end; "
         "  var x: int; "
         "  init(out x); "
         "  return x; "  // 99
@@ -133,7 +133,7 @@ BEZEL_TEST(codegen_cg50, ref_lambda_passed_to_higher_order_747) {
         "  end Apply; "
         "  public static method Main(): int "
         "    var x := 20; "
-        "    C.Apply((ref n: int) => do n := n + 5; end, ref x); "
+        "    C.Apply(lambda(ref n: int) => do n := n + 5; end, ref x); "
         "    return x; "  // 25
         "  end Main; "
         "end C;"), 25);
@@ -144,7 +144,7 @@ BEZEL_TEST(codegen_cg50, ref_lambda_passed_to_higher_order_747) {
 BEZEL_TEST(codegen_cg50, value_lambda_param_unchanged_747) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var bump: (int) -> () := (n: int) => do n := n + 100; end; "
+        "  var bump: (int) -> () := lambda(n: int) => do n := n + 100; end; "
         "  var x := 7; "
         "  bump(x); "
         "  return x; "  // 7 — unchanged

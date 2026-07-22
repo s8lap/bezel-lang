@@ -21,20 +21,20 @@ class C
   public static async method Producer(): Task<int> return 5; end Producer;
 
   // ADMIT (field): forward a fresh task-returning call.
-  public fwd: () -> Task<int> := () => Producer();
+  public fwd: () -> Task<int> := lambda() => Producer();
   // ADMIT (field): an `async` lambda — body is the awaited value, not a task.
-  public asyncl: () -> Task<int> := async () => await Producer();
+  public asyncl: () -> Task<int> := async lambda() => await Producer();
   // ADMIT (field): a completed-task factory (§30.10).
-  public factory: () -> Task<int> := () => Task.FromResult<int>(5);
+  public factory: () -> Task<int> := lambda() => Task.FromResult<int>(5);
   // UNAFFECTED (field): a NON-`Task` (value-typed) identity lambda.
-  public id: (int) -> int := (x) => x;
+  public id: (int) -> int := lambda(x) => x;
 
   // ADMIT (getter): forward a fresh task-returning call from a getter body.
-  public property Echo: () -> Task<int> => () => Producer();
+  public property Echo: () -> Task<int> => lambda() => Producer();
 
   // ADMIT (operator): an `owned` parameter returned through a plain-`Task`
   // return.
-  public static method operator +(a: C, b: C): (owned Task<int>) -> Task<int> => (owned t) => t;
+  public static method operator +(a: C, b: C): (owned Task<int>) -> Task<int> => lambda(owned t) => t;
 
   public static method Main(): int return 0; end Main;
 end C;

@@ -54,7 +54,7 @@ const char* kStringKeyIntValueInferred =
     "class C "
     "  public static method Main(): int "
     "    using var a: Array<string> := [\"al\", \"bob\"]; "
-    "    using var d := a.ToDictionary((s) => s, (s) => s.Length); "
+    "    using var d := a.ToDictionary(lambda(s) => s, lambda(s) => s.Length); "
     "    Console.WriteLine(d[\"al\"].ToString()); "   // 2
     "    Console.WriteLine(d[\"bob\"].ToString()); "  // 3
     "    return d[\"al\"] + d[\"bob\"]; "             // 2 + 3 = 5
@@ -68,7 +68,7 @@ const char* kAbsentKeyThrowsCleanly =
     "class C "
     "  public static method Main(): int "
     "    using var a: Array<string> := [\"al\", \"bob\"]; "
-    "    using var d := a.ToDictionary((s) => s, (s) => s.Length); "
+    "    using var d := a.ToDictionary(lambda(s) => s, lambda(s) => s.Length); "
     "    try "
     "      Console.WriteLine(d[\"zz\"].ToString()); "
     "    catch "
@@ -87,7 +87,7 @@ const char* kLazySourceStringKeyIntValue =
     "  public static method Main(): int "
     "    using var a: Array<string> := [\"al\", \"bob\", \"c\", \"dddd\"]; "
     "    using var d := "
-    "        a.Where((s) => s.Length > 1).ToDictionary((s) => s, (s) => s.Length); "
+    "        a.Where(lambda(s) => s.Length > 1).ToDictionary(lambda(s) => s, lambda(s) => s.Length); "
     "    Console.WriteLine(d[\"al\"].ToString()); "    // 2
     "    Console.WriteLine(d[\"dddd\"].ToString()); "  // 4
     "    return d[\"al\"] + d[\"dddd\"]; "             // 2 + 4 = 6

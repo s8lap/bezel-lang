@@ -488,7 +488,7 @@ const char* kLocalArgInsideLambdaStaysEscaped =
     "  public static method Consume(s: string): int return s.Length; end Consume; "
     "  public static method Main(): int "
     "    var s := \"ab\" + \"cd\"; "
-    "    var f := () => C.Consume(s); "   // env captures s
+    "    var f := lambda() => C.Consume(s); "   // env captures s
     "    var n := f(); "
     "    if n = 4 then return 0; end; return 1; "
     "  end Main; "

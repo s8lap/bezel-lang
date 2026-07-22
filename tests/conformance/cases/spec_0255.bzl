@@ -1,7 +1,7 @@
 public async method WaitForKeyPressAsync(): Task<char>
   using var tcs := new TaskCompletionSource<char>();
 
-  Keyboard.OnKeyPress((key) => do
+  Keyboard.OnKeyPress(lambda(key) => do
     tcs.TrySetResult(key);
   end);
 

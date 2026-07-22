@@ -31,7 +31,7 @@ class R
   public method A2<T>(cb: () -> owned T): () where T: class return; end A2;
   // explicitly-typed LAMBDA parameter.
   public method A3<T>(): () where T: class
-    var f := (owned x: T) => x;
+    var f := lambda(owned x: T) => x;
     return;
   end A3;
 
@@ -43,7 +43,7 @@ class R
   public method C1<T>(cb: (owned T) -> ()): () return; end C1;
   public method C2<T>(cb: () -> owned T): () return; end C2;
   public method C3<T>(): ()
-    var f := (owned x: T) => x;
+    var f := lambda(owned x: T) => x;
     return;
   end C3;
 end R;

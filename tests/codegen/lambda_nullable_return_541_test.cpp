@@ -77,7 +77,7 @@ int runApplyNullableDouble(const std::string& mainBody) {
 // with value 7 → unwrap with `!` → Main returns 7.
 BEZEL_TEST(lambda_nullable_return_541, int_literal_in_nullable_int_context_spec_7_17) {
     BEZEL_EXPECT_EQ(runApplyNullableInt(
-        "  var r: int? := Apply(\"k\", (k: string) => 7); "
+        "  var r: int? := Apply(\"k\", lambda(k: string) => 7); "
         "  if r = null then return -1; end; "
         "  return r!;"),
         7);
@@ -89,7 +89,7 @@ BEZEL_TEST(lambda_nullable_return_541, int_literal_in_nullable_int_context_spec_
 // lambda return is int?.
 BEZEL_TEST(lambda_nullable_return_541, expr_body_in_nullable_int_context_spec_7_17) {
     BEZEL_EXPECT_EQ(runApplyNullableInt(
-        "  var r: int? := Apply(\"hello\", (k: string) => k.Length); "
+        "  var r: int? := Apply(\"hello\", lambda(k: string) => k.Length); "
         "  if r = null then return -1; end; "
         "  return r!;"),
         5);
@@ -105,7 +105,7 @@ BEZEL_TEST(lambda_nullable_return_541, expr_body_in_nullable_int_context_spec_7_
 // declaration context.
 BEZEL_TEST(lambda_nullable_return_541, lambda_stored_in_nullable_fn_var_spec_17) {
     BEZEL_EXPECT_EQ(runMain(
-        "  var fn: (string) -> int? := (k: string) => 42; "
+        "  var fn: (string) -> int? := lambda(k: string) => 42; "
         "  var r: int? := fn(\"x\"); "
         "  if r = null then return -1; end; "
         "  return r!;"),
@@ -122,7 +122,7 @@ BEZEL_TEST(lambda_nullable_return_541, lambda_stored_in_nullable_fn_var_spec_17)
 // all-zero tagged struct (hasValue=0).
 BEZEL_TEST(lambda_nullable_return_541, null_literal_in_nullable_int_context_spec_7_2) {
     BEZEL_EXPECT_EQ(runApplyNullableInt(
-        "  var r: int? := Apply(\"k\", (k: string) => null); "
+        "  var r: int? := Apply(\"k\", lambda(k: string) => null); "
         "  if r <> null then return -1; end; "
         "  return 0;"),
         0);
@@ -137,7 +137,7 @@ BEZEL_TEST(lambda_nullable_return_541, null_literal_in_nullable_int_context_spec
 // We test by returning 0 on success (value non-null) or -1 if null.
 BEZEL_TEST(lambda_nullable_return_541, int_literal_in_nullable_double_context_spec_7_17) {
     BEZEL_EXPECT_EQ(runApplyNullableDouble(
-        "  var r: double? := Apply(() => 3); "
+        "  var r: double? := Apply(lambda() => 3); "
         "  if r = null then return -1; end; "
         "  return 0;"),
         0);
@@ -156,7 +156,7 @@ BEZEL_TEST(lambda_nullable_return_541, dict_getOrAdd_nullable_int_factory_spec_4
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int?>(); "
-        "  var v: int? := d.GetOrAdd(\"key\", (k: string) => 7); "
+        "  var v: int? := d.GetOrAdd(\"key\", lambda(k: string) => 7); "
         "  if v = null then return -1; end; "
         "  return v!; "
         "end Main; end C;"),
@@ -176,7 +176,7 @@ BEZEL_TEST(lambda_nullable_return_541, control_non_nullable_lambda_unaffected_sp
         "    return f(n); "
         "  end Apply; "
         "  public static method Main(): int "
-        "    return Apply(5, (x: int) => x * 2); "
+        "    return Apply(5, lambda(x: int) => x * 2); "
         "  end Main; end C;"),
         10);
 }

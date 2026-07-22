@@ -8,7 +8,7 @@
 // reached indirectly. A call to an unrelated method between the test and the use
 // invalidates a mutably-captured local just the same.
 
-module M; class C public static method Touch() end Touch; public static method Run(): int var s: string? := "hi"; var f := () => do s := null; end; if s <> null then Touch(); return s.Length; end; return -1; end Run; end C;
+module M; class C public static method Touch() end Touch; public static method Run(): int var s: string? := "hi"; var f := lambda() => do s := null; end; if s <> null then Touch(); return s.Length; end; return -1; end Run; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: member access `.Length` on a nullable value requires narrowing it to non-null first
 // CHECK-SAME: (§7.4)

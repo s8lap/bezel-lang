@@ -94,7 +94,7 @@ BEZEL_TEST(bug454_linked_list_lazy_linq, where_count_454) {
         "module M; class C public static method Main(): int "
         "  using var l := new LinkedList<int>(); "
         "  l.AddLast(1); l.AddLast(2); l.AddLast(3); l.AddLast(4); "
-        "  return l.Where((x: int) => x > 2).Count(); "  // 3,4 → 2
+        "  return l.Where(lambda(x: int) => x > 2).Count(); "  // 3,4 → 2
         "end Main; end C;"), 2);
 }
 
@@ -104,7 +104,7 @@ BEZEL_TEST(bug454_linked_list_lazy_linq, select_count_454) {
         "module M; class C public static method Main(): int "
         "  using var l := new LinkedList<int>(); "
         "  l.AddLast(10); l.AddLast(20); l.AddLast(30); "
-        "  return l.Select((x: int) => x * 2).Count(); "  // 3 projected elements
+        "  return l.Select(lambda(x: int) => x * 2).Count(); "  // 3 projected elements
         "end Main; end C;"), 3);
 }
 
@@ -117,8 +117,8 @@ BEZEL_TEST(bug454_linked_list_lazy_linq, where_toarray_sum_454) {
         "module M; class C public static method Main(): int "
         "  using var l := new LinkedList<int>(); "
         "  l.AddLast(1); l.AddLast(2); l.AddLast(3); l.AddLast(4); l.AddLast(5); "
-        "  using var arr: Array<int> := l.Where((x: int) => x mod 2 = 1).ToArray(); "  // 1,3,5
-        "  return arr.Sum((x: int) => x); "  // 9
+        "  using var arr: Array<int> := l.Where(lambda(x: int) => x mod 2 = 1).ToArray(); "  // 1,3,5
+        "  return arr.Sum(lambda(x: int) => x); "  // 9
         "end Main; end C;"), 9);
 }
 
@@ -129,7 +129,7 @@ BEZEL_TEST(bug454_linked_list_lazy_linq, select_where_chained_454) {
         "module M; class C public static method Main(): int "
         "  using var l := new LinkedList<int>(); "
         "  l.AddLast(1); l.AddLast(2); l.AddLast(3); "
-        "  var lazy := l.Where((x: int) => x > 1); "  // 2,3 (lazy)
+        "  var lazy := l.Where(lambda(x: int) => x > 1); "  // 2,3 (lazy)
         "  return lazy.Count(); "  // 2
         "end Main; end C;"), 2);
 }
@@ -140,7 +140,7 @@ BEZEL_TEST(bug454_linked_list_lazy_linq, regression_aggregate_still_works_454) {
         "module M; class C public static method Main(): int "
         "  using var l := new LinkedList<int>(); "
         "  l.AddLast(10); l.AddLast(20); l.AddLast(30); "
-        "  return l.Sum((x: int) => x); "  // 60 (fix #450 path, unchanged)
+        "  return l.Sum(lambda(x: int) => x); "  // 60 (fix #450 path, unchanged)
         "end Main; end C;"), 60);
 }
 

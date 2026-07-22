@@ -35,7 +35,7 @@ BEZEL_TEST(loop_var_capture_nested_if_754, range_for_nested_if_capture) {
         "    var hits := 0; "
         "    for var i in 5 .. 7 do "
         "      if i = 5 then "
-        "        var f := () => i; "       // captures the loop variable
+        "        var f := lambda() => i; "       // captures the loop variable
         "        hits := hits + 1; "
         "      end; "
         "      if i = 6 then "             // must still run on the i=6 iteration
@@ -56,7 +56,7 @@ BEZEL_TEST(loop_var_capture_nested_if_754, capture_value_correct) {
         "    var result := 0; "
         "    for var i in 1 .. 5 do "
         "      if i = 5 then "
-        "        var f := () => i; "
+        "        var f := lambda() => i; "
         "        result := f(); "          // 5
         "      end; "
         "    end; "
@@ -73,8 +73,8 @@ BEZEL_TEST(loop_var_capture_nested_if_754, two_captures_distinct) {
         "  public static method Main(): int "
         "    var sum := 0; "
         "    for var i in 1 .. 6 do "
-        "      if i = 5 then var f := () => i; sum := sum + f(); end; "
-        "      if i = 6 then var g := () => i; sum := sum + g(); end; "
+        "      if i = 5 then var f := lambda() => i; sum := sum + f(); end; "
+        "      if i = 6 then var g := lambda() => i; sum := sum + g(); end; "
         "    end; "
         "    return sum; "                 // 11
         "  end Main; "
@@ -92,7 +92,7 @@ BEZEL_TEST(loop_var_capture_nested_if_754, array_for_nested_if_capture) {
         "    var arr: [3]int := [5, 6, 7]; "
         "    for var i in arr do "
         "      if i = 5 then "
-        "        var f := () => i; "
+        "        var f := lambda() => i; "
         "        hits := hits + 1; "
         "      end; "
         "      if i = 6 then "
@@ -114,7 +114,7 @@ BEZEL_TEST(loop_var_capture_nested_if_754, non_capturing_control) {
         "    var hits := 0; "
         "    for var i in 5 .. 7 do "
         "      if i = 5 then "
-        "        var f := () => 9; "       // does NOT capture i
+        "        var f := lambda() => 9; "       // does NOT capture i
         "        hits := hits + 1; "
         "      end; "
         "      if i = 6 then "

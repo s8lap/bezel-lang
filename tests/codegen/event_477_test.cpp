@@ -62,7 +62,7 @@ BEZEL_TEST(codegen_events_477, static_event_subscribe_then_raise_twice_b6) {
         "  public static method Raise() Signal.Raise(); end Raise; "
         "end App; "
         "class C public static method Main(): int "
-        "  var sub := App.Signal.Subscribe(() => do App.Total := App.Total + 1; end); "
+        "  var sub := App.Signal.Subscribe(lambda() => do App.Total := App.Total + 1; end); "
         "  App.Raise(); App.Raise(); "
         "  sub.Dispose(); "
         "  return App.Total; "                            // expect 2
@@ -83,7 +83,7 @@ BEZEL_TEST(codegen_events_477, static_event_dispose_unsubscribes_b6) {
         "  public static method Fire() Signal.Raise(); end Fire; "
         "end App; "
         "class C public static method Main(): int "
-        "  var sub := App.Signal.Subscribe(() => do App.Total := App.Total + 1; end); "
+        "  var sub := App.Signal.Subscribe(lambda() => do App.Total := App.Total + 1; end); "
         "  App.Fire(); "                                  // Total = 1
         "  sub.Dispose(); "
         "  App.Fire(); "                                  // handler gone — no-op
@@ -105,7 +105,7 @@ BEZEL_TEST(codegen_events_477, static_event_plus_equals_inside_class_b6) {
         "  public static Total: int := 0; "
         "  public static event Signal: Ev; "
         "  public static method Hook() "
-        "    Signal += (e) => do Total := Total + e.N; end; "  // capture-free (static field)
+        "    Signal += lambda(e) => do Total := Total + e.N; end; "  // capture-free (static field)
         "  end Hook; "
         "  public static method Fire(n: int) Signal.Raise(new Ev(n)); end Fire; "
         "end App; "
@@ -131,7 +131,7 @@ BEZEL_TEST(codegen_events_477, static_event_with_payload_b6) {
         "  public static method Fire(n: int) Signal.Raise(new Ev(n)); end Fire; "
         "end App; "
         "class C public static method Main(): int "
-        "  var sub := App.Signal.Subscribe((e) => do App.Total := App.Total + e.N; end); "
+        "  var sub := App.Signal.Subscribe(lambda(e) => do App.Total := App.Total + e.N; end); "
         "  App.Fire(5); App.Fire(7); "
         "  return App.Total; "                            // expect 12
         "end Main; end C;"), 12);
@@ -153,8 +153,8 @@ BEZEL_TEST(codegen_events_477, static_event_multiple_subscribers_b6) {
         "  public static method Fire(n: int) Signal.Raise(new Ev(n)); end Fire; "
         "end App; "
         "class C public static method Main(): int "
-        "  var s1 := App.Signal.Subscribe((e) => do App.Total := App.Total + e.N; end); "
-        "  var s2 := App.Signal.Subscribe((e) => do App.Total := App.Total + e.N * 10; end); "
+        "  var s1 := App.Signal.Subscribe(lambda(e) => do App.Total := App.Total + e.N; end); "
+        "  var s2 := App.Signal.Subscribe(lambda(e) => do App.Total := App.Total + e.N * 10; end); "
         "  App.Fire(2); "
         "  return App.Total; "                            // expect 22 (2 + 20)
         "end Main; end C;"), 22);
@@ -186,9 +186,9 @@ BEZEL_TEST(codegen_events_477, interface_local_event_subscribe_b7) {
         "class C public static method Main(): int "
         "  var acc := new Acc(); "
         "  var src := new Source(); "
-        "  var sub1 := src.Ready.Subscribe((e) => do acc.Add(e.V); end); "
+        "  var sub1 := src.Ready.Subscribe(lambda(e) => do acc.Add(e.V); end); "
         "  var i: ISource := src; "
-        "  var sub2 := i.Ready.Subscribe((e) => do acc.Add(e.V * 10); end); "
+        "  var sub2 := i.Ready.Subscribe(lambda(e) => do acc.Add(e.V * 10); end); "
         "  src.Trigger(1); "
         "  return acc.V; "                                // expect 11
         "end Main; end C;"), 11);
@@ -214,14 +214,14 @@ BEZEL_TEST(codegen_events_477, interface_parameter_event_subscribe_b7) {
         "end Acc; "
         "class Helper "
         "  public static method Wire(i: ISource, acc: Acc): Subscription "
-        "    return i.Ready.Subscribe((e) => do acc.Add(e.V * 10); end); "
+        "    return i.Ready.Subscribe(lambda(e) => do acc.Add(e.V * 10); end); "
         "  end Wire; "
         "end Helper; "
         "class C public static method Main(): int "
         "  var acc := new Acc(); "
         "  var src := new Source(); "
         "  var sub2 := Helper.Wire(src, acc); "
-        "  var sub1 := src.Ready.Subscribe((e) => do acc.Add(e.V); end); "
+        "  var sub1 := src.Ready.Subscribe(lambda(e) => do acc.Add(e.V); end); "
         "  src.Trigger(1); "
         "  return acc.V; "                                // expect 11
         "end Main; end C;"), 11);
@@ -247,7 +247,7 @@ BEZEL_TEST(codegen_events_477, concrete_event_subscribe_regression_b7) {
         "class C public static method Main(): int "
         "  var acc := new Acc(); "
         "  var src := new Source(); "
-        "  var sub1 := src.Ready.Subscribe((e) => do acc.Add(e.V); end); "
+        "  var sub1 := src.Ready.Subscribe(lambda(e) => do acc.Add(e.V); end); "
         "  src.Trigger(5); "
         "  return acc.V; "                                // expect 5
         "end Main; end C;"), 5);
@@ -275,7 +275,7 @@ BEZEL_TEST(codegen_events_477, interface_local_dispose_unsubscribes_b7) {
         "  var acc := new Acc(); "
         "  var src := new Source(); "
         "  var i: ISource := src; "
-        "  var sub2 := i.Ready.Subscribe((e) => do acc.Add(e.V * 10); end); "
+        "  var sub2 := i.Ready.Subscribe(lambda(e) => do acc.Add(e.V * 10); end); "
         "  src.Trigger(1); "                              // acc.V = 10
         "  sub2.Dispose(); "                              // unsubscribe via interface-local sub
         "  src.Trigger(1); "                              // handler gone — no-op

@@ -70,7 +70,7 @@ BEZEL_TEST(codegen_lazy_linq_ienumerable_local_forin_1911,
         "import System.Collections.Linq; "
         "class C public static method Main(): int "
         "  using var strings: Array<string> := [\"ab\", \"cde\"]; "
-        "  var lens: IEnumerable<int> := strings.Select((s) => s.Length); "
+        "  var lens: IEnumerable<int> := strings.Select(lambda(s) => s.Length); "
         "  var sum: int := 0; "
         "  for var x in lens do sum := sum + x; end for; "
         "  return sum; "                     // 2 + 3 = 5
@@ -88,7 +88,7 @@ BEZEL_TEST(codegen_lazy_linq_ienumerable_local_forin_1911,
         "import System.Collections.Linq; "
         "class C public static method Main(): int "
         "  using var nums: Array<int> := [1, 2, 3, 4]; "
-        "  var big: IEnumerable<int> := nums.Where((n) => n > 2); "
+        "  var big: IEnumerable<int> := nums.Where(lambda(n) => n > 2); "
         "  var sum: int := 0; "
         "  for var x in big do sum := sum + x; end for; "
         "  return sum; "                     // 3 + 4 = 7
@@ -110,7 +110,7 @@ BEZEL_TEST(codegen_lazy_linq_ienumerable_local_forin_1911,
         "class C public static method Main(): int "
         "  using var nums: Array<int> := [10, 20, 30]; "
         "  using var v: IEnumerable<int> := "
-        "      nums.Where((n) => n > 15).Select((n) => n / 5); "
+        "      nums.Where(lambda(n) => n > 15).Select(lambda(n) => n / 5); "
         "  var sum: int := 0; "
         "  for var x in v do sum := sum + x; end for; "
         "  return sum; "                     // 20/5 + 30/5 = 4 + 6 = 10
@@ -132,7 +132,7 @@ BEZEL_TEST(codegen_lazy_linq_ienumerable_local_forin_1911,
         "import System.Collections.Linq; "
         "class C public static method Main(): int "
         "  using var strings: Array<string> := [\"ab\", \"cde\"]; "
-        "  var lens: IEnumerable<int> := strings.Select((s) => s.Length); "
+        "  var lens: IEnumerable<int> := strings.Select(lambda(s) => s.Length); "
         "  var sum: int := 0; "
         "  for var x in lens do sum := sum + x; end for; "
         "  for var y in lens do sum := sum + y; end for; "

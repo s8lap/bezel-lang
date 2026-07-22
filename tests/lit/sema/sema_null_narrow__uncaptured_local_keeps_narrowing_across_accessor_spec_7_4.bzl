@@ -10,7 +10,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class Box public property Val: int => 42; end Box; class C public static method Run(box: Box): int var s: string? := "hi"; var other: string? := "x"; var f := () => do other := null; end; if s <> null then _ := box.Val; return s.Length; end; return -1; end Run; end C;
+module M; class Box public property Val: int => 42; end Box; class C public static method Run(box: Box): int var s: string? := "hi"; var other: string? := "x"; var f := lambda() => do other := null; end; if s <> null then _ := box.Val; return s.Length; end; return -1; end Run; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

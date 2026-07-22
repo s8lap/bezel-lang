@@ -178,7 +178,7 @@ BEZEL_TEST(linq_int, any) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  return int(a.Any((x) => x > 2) and not a.Any((x) => x > 10)); "
+        "  return int(a.Any(lambda(x) => x > 2) and not a.Any(lambda(x) => x > 10)); "
         "end Main; end C;"), 1);
 }
 
@@ -187,7 +187,7 @@ BEZEL_TEST(linq_int, all) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  return int(a.All((x) => x > 0) and not a.All((x) => x > 2)); "
+        "  return int(a.All(lambda(x) => x > 0) and not a.All(lambda(x) => x > 2)); "
         "end Main; end C;"), 1);
 }
 
@@ -196,7 +196,7 @@ BEZEL_TEST(linq_int, count) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  return a.Count((x) => x mod 2 = 0); "
+        "  return a.Count(lambda(x) => x mod 2 = 0); "
         "end Main; end C;"), 2);
 }
 
@@ -207,7 +207,7 @@ BEZEL_TEST(linq_int, where) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); "
-        "  using var evens: Array<int> := a.Where((x) => x mod 2 = 0).ToArray(); "
+        "  using var evens: Array<int> := a.Where(lambda(x) => x mod 2 = 0).ToArray(); "
         "  return int(evens.Length = 2 and evens.Get(0) = 2 and evens.Get(1) = 4); "
         "end Main; end C;"), 1);
 }
@@ -220,7 +220,7 @@ BEZEL_TEST(linq_int, where_lazy_foreach) {
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); "
         "  var s := 0; var n := 0; "
-        "  for var x in a.Where((x) => x mod 2 = 0) do s := s + x; n := n + 1; end; "
+        "  for var x in a.Where(lambda(x) => x mod 2 = 0) do s := s + x; n := n + 1; end; "
         "  return int(s = 6 and n = 2); "
         "end Main; end C;"), 1);
 }
@@ -239,7 +239,7 @@ BEZEL_TEST(linq_int, first) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  var f := a.First((x) => x > 2); "
+        "  var f := a.First(lambda(x) => x > 2); "
         "  return f; "
         "end Main; end C;"), 3);
 }
@@ -252,7 +252,7 @@ BEZEL_TEST(linq_int, foreach_and_select) {
         "    using var a := new Array<int>(); "
         "    a.Add(1); a.Add(2); a.Add(3); "
         // stdlib §5: Select is LAZY — materialize with ToArray() to observe.
-        "    using var doubled: Array<int> := a.Select((x: int) => x * 2).ToArray(); "
+        "    using var doubled: Array<int> := a.Select(lambda(x: int) => x * 2).ToArray(); "
         "    return int(doubled.Length = 3 and doubled.Get(0) = 2 and doubled.Get(2) = 6); "
         "  end Main; end C;"), 1);
 }
@@ -264,9 +264,9 @@ BEZEL_TEST(linq_string, any_all_count) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<string>(); "
         "  a.Add(\"apple\"); a.Add(\"banana\"); a.Add(\"avocado\"); "
-        "  var hasA := a.Any((s) => s[0] = 'a'); "
-        "  var allNE := a.All((s) => s.Length > 0); "
-        "  var aCount := a.Count((s) => s[0] = 'a'); "
+        "  var hasA := a.Any(lambda(s) => s[0] = 'a'); "
+        "  var allNE := a.All(lambda(s) => s.Length > 0); "
+        "  var aCount := a.Count(lambda(s) => s[0] = 'a'); "
         "  return int(hasA and allNE and aCount = 2); "
         "end Main; end C;"), 1);
 }
@@ -277,7 +277,7 @@ BEZEL_TEST(linq_string, where) {
         "  using var a := new Array<string>(); "
         "  a.Add(\"hi\"); a.Add(\"hello\"); a.Add(\"hey\"); "
         // stdlib §5: Where is LAZY — materialize with ToArray() to observe.
-        "  using var long2: Array<string> := a.Where((s) => s.Length > 2).ToArray(); "
+        "  using var long2: Array<string> := a.Where(lambda(s) => s.Length > 2).ToArray(); "
         "  return int(long2.Length = 2 and long2.Get(0) = \"hello\"); "
         "end Main; end C;"), 1);
 }

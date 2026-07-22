@@ -43,7 +43,7 @@ BEZEL_TEST(codegen_lambda_method_call_on_param_747, method_no_args_returns_int) 
         "  end Apply; "
         "  public static method Main(): int "
         "    using var foo := new Foo(); "
-        "    return C.Apply((x) => x.N(), foo); "
+        "    return C.Apply(lambda(x) => x.N(), foo); "
         "  end Main; "
         "end C;"), 42);
 }
@@ -61,7 +61,7 @@ BEZEL_TEST(codegen_lambda_method_call_on_param_747, method_with_args) {
         "  end Apply; "
         "  public static method Main(): int "
         "    using var foo := new Foo(); "
-        "    return C.Apply((x) => x.Bump(5), foo); "
+        "    return C.Apply(lambda(x) => x.Bump(5), foo); "
         "  end Main; "
         "end C;"), 105);
 }
@@ -80,7 +80,7 @@ BEZEL_TEST(codegen_lambda_method_call_on_param_747, generic_apply_method_call) {
         "  end Apply; "
         "  public static method Main(): int "
         "    using var foo := new Foo(); "
-        "    return C.Apply<int>((x) => x.N(), foo); "
+        "    return C.Apply<int>(lambda(x) => x.N(), foo); "
         "  end Main; "
         "end C;"), 7);
 }
@@ -99,7 +99,7 @@ BEZEL_TEST(codegen_lambda_method_call_on_param_747, control_no_method_call) {
         "  end Apply; "
         "  public static method Main(): int "
         "    using var foo := new Foo(); "
-        "    return C.Apply((x) => 42, foo); "
+        "    return C.Apply(lambda(x) => 42, foo); "
         "  end Main; "
         "end C;"), 42);
 }

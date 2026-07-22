@@ -76,7 +76,7 @@ BEZEL_TEST(codegen_events_479, two_events_subscribe_a_raise_b_fires_nothing_479a
         "class C public static method Main(): int "
         "  var acc := new Acc(); "
         "  var w := new Widget(); "
-        "  var sa := w.A.Subscribe((e) => do acc.Add(e.N); end); "
+        "  var sa := w.A.Subscribe(lambda(e) => do acc.Add(e.N); end); "
         "  w.FireB(99); "   // B has no subscriber
         "  return acc.V; "  // expect 0
         "end Main; end C;"), 0);
@@ -106,7 +106,7 @@ BEZEL_TEST(codegen_events_479, two_events_subscribe_b_raise_b_fires_479b) {
         "class C public static method Main(): int "
         "  var acc := new Acc(); "
         "  var w := new Widget(); "
-        "  var sb := w.B.Subscribe((e) => do acc.Add(e.N); end); "
+        "  var sb := w.B.Subscribe(lambda(e) => do acc.Add(e.N); end); "
         "  w.FireA(100); "  // A has no subscriber
         "  w.FireB(7); "    // B subscriber fires → +7
         "  w.FireB(3); "    // again → +3
@@ -139,8 +139,8 @@ BEZEL_TEST(codegen_events_479, two_events_both_subscribed_each_fires_correctly_4
         "class C public static method Main(): int "
         "  var acc := new Acc(); "
         "  var w := new Widget(); "
-        "  var sa := w.A.Subscribe((e) => do acc.Add(e.N); end); "
-        "  var sb := w.B.Subscribe((e) => do acc.Add(e.N); end); "
+        "  var sa := w.A.Subscribe(lambda(e) => do acc.Add(e.N); end); "
+        "  var sb := w.B.Subscribe(lambda(e) => do acc.Add(e.N); end); "
         "  w.FireA(1); "    // A's handler adds 1 → acc.V = 1
         "  w.FireB(100); "  // B's handler adds 100 → acc.V = 101
         "  return acc.V; "  // expect 101
@@ -167,8 +167,8 @@ BEZEL_TEST(codegen_events_479, two_events_subscribe_both_distinct_payloads_479c2
         "class C public static method Main(): int "
         "  var acc := new Acc(); "
         "  var w := new Widget(); "
-        "  var sa := w.A.Subscribe((e) => do acc.Add(e.N); end); "
-        "  var sb := w.B.Subscribe((e) => do acc.Add(e.N * 10); end); "
+        "  var sa := w.A.Subscribe(lambda(e) => do acc.Add(e.N); end); "
+        "  var sb := w.B.Subscribe(lambda(e) => do acc.Add(e.N * 10); end); "
         "  w.FireA(3); "    // A: +3
         "  w.FireB(3); "    // B: +30
         "  return acc.V; "  // expect 33
@@ -203,9 +203,9 @@ BEZEL_TEST(codegen_events_479, three_events_each_fires_independently_479d) {
         "class Main public static method Main(): int "
         "  var acc := new Acc(); "
         "  var w := new Widget(); "
-        "  var s1 := w.Ev1.Subscribe((e) => do acc.Add(e.N); end); "
-        "  var s2 := w.Ev2.Subscribe((e) => do acc.Add(e.N * 10); end); "
-        "  var s3 := w.Ev3.Subscribe((e) => do acc.Add(e.N * 100); end); "
+        "  var s1 := w.Ev1.Subscribe(lambda(e) => do acc.Add(e.N); end); "
+        "  var s2 := w.Ev2.Subscribe(lambda(e) => do acc.Add(e.N * 10); end); "
+        "  var s3 := w.Ev3.Subscribe(lambda(e) => do acc.Add(e.N * 100); end); "
         "  w.FireEv1(1); "  // Ev1: +1
         "  w.FireEv2(1); "  // Ev2: +10
         "  w.FireEv3(1); "  // Ev3: +100
@@ -233,7 +233,7 @@ BEZEL_TEST(codegen_events_479, three_events_only_ev3_subscribed_479d2) {
         "class Main public static method Main(): int "
         "  var acc := new Acc(); "
         "  var w := new Widget(); "
-        "  var s3 := w.Ev3.Subscribe((e) => do acc.Add(e.N); end); "
+        "  var s3 := w.Ev3.Subscribe(lambda(e) => do acc.Add(e.N); end); "
         "  w.FireEv1(50); "  // no subscriber → no-op
         "  w.FireEv2(50); "  // no subscriber → no-op
         "  w.FireEv3(7); "   // Ev3 subscriber fires → +7
@@ -267,8 +267,8 @@ BEZEL_TEST(codegen_events_479, two_events_different_payload_types_479e) {
         "class C public static method Main(): int "
         "  var acc := new Acc(); "
         "  var em := new Emitter(); "
-        "  var sm := em.Moved.Subscribe((e) => do acc.Add(e.X); end); "
-        "  var sr := em.Resized.Subscribe((e) => do acc.Add(e.Y + e.Z); end); "
+        "  var sm := em.Moved.Subscribe(lambda(e) => do acc.Add(e.X); end); "
+        "  var sr := em.Resized.Subscribe(lambda(e) => do acc.Add(e.Y + e.Z); end); "
         "  em.Move(3); "             // Moved fires → +3
         "  em.Resize(10, 2); "       // Resized fires → +12
         "  return acc.V; "           // expect 15
@@ -299,8 +299,8 @@ BEZEL_TEST(codegen_events_479, two_static_events_independent_479f) {
         "  public static method FireY(n: int) Y.Raise(new Ev(n)); end FireY; "
         "end App; "
         "class C public static method Main(): int "
-        "  var sx := App.X.Subscribe((e) => do App.Total := App.Total + e.N; end); "
-        "  var sy := App.Y.Subscribe((e) => do App.Total := App.Total + e.N * 10; end); "
+        "  var sx := App.X.Subscribe(lambda(e) => do App.Total := App.Total + e.N; end); "
+        "  var sy := App.Y.Subscribe(lambda(e) => do App.Total := App.Total + e.N * 10; end); "
         "  App.FireX(1); "   // X fires → +1
         "  App.FireY(1); "   // Y fires → +10
         "  return App.Total; "   // expect 11
@@ -322,7 +322,7 @@ BEZEL_TEST(codegen_events_479, two_static_events_only_y_subscribed_479f2) {
         "  public static method FireY(n: int) Y.Raise(new Ev(n)); end FireY; "
         "end App; "
         "class C public static method Main(): int "
-        "  var sy := App.Y.Subscribe((e) => do App.Total := App.Total + e.N; end); "
+        "  var sy := App.Y.Subscribe(lambda(e) => do App.Total := App.Total + e.N; end); "
         "  App.FireX(99); "  // X has no subscriber → no-op
         "  App.FireY(5); "   // Y fires → +5
         "  return App.Total; "   // expect 5
@@ -345,8 +345,8 @@ BEZEL_TEST(codegen_events_479, two_static_events_dispose_y_does_not_affect_x_479
         "  public static method FireY(n: int) Y.Raise(new Ev(n)); end FireY; "
         "end App; "
         "class C public static method Main(): int "
-        "  var sx := App.X.Subscribe((e) => do App.Total := App.Total + e.N; end); "
-        "  var sy := App.Y.Subscribe((e) => do App.Total := App.Total + e.N * 10; end); "
+        "  var sx := App.X.Subscribe(lambda(e) => do App.Total := App.Total + e.N; end); "
+        "  var sy := App.Y.Subscribe(lambda(e) => do App.Total := App.Total + e.N * 10; end); "
         "  App.FireX(1); "   // X: +1
         "  App.FireY(1); "   // Y: +10 → Total = 11
         "  sy.Dispose(); "   // unsubscribe Y only
@@ -375,7 +375,7 @@ BEZEL_TEST(codegen_events_479, single_event_regression_479g) {
         "class C public static method Main(): int "
         "  var box := new Box(); "
         "  var b := new Button(); "
-        "  var s := b.Clicked.Subscribe((e) => do box.Add(e.N); end); "
+        "  var s := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "  b.Fire(5); b.Fire(7); "
         "  return box.V; "   // expect 12
         "end Main; end C;"), 12);
@@ -406,8 +406,8 @@ BEZEL_TEST(codegen_events_479, two_events_dispose_b_only_a_survives_479h) {
         "class C public static method Main(): int "
         "  var acc := new Acc(); "
         "  var w := new Widget(); "
-        "  var sa := w.A.Subscribe((e) => do acc.Add(e.N); end); "
-        "  var sb := w.B.Subscribe((e) => do acc.Add(e.N * 10); end); "
+        "  var sa := w.A.Subscribe(lambda(e) => do acc.Add(e.N); end); "
+        "  var sb := w.B.Subscribe(lambda(e) => do acc.Add(e.N * 10); end); "
         "  w.FireA(1); "    // +1
         "  w.FireB(1); "    // +10 → acc.V = 11
         "  sb.Dispose(); "  // unsubscribe B only
@@ -443,8 +443,8 @@ BEZEL_TEST(codegen_events_479, two_events_two_instances_independent_479i) {
         "  var acc := new Acc(); "
         "  var w1 := new Widget(); "
         "  var w2 := new Widget(); "
-        "  var s1a := w1.A.Subscribe((e) => do acc.Add(e.N); end); "
-        "  var s2b := w2.B.Subscribe((e) => do acc.Add(e.N * 100); end); "
+        "  var s1a := w1.A.Subscribe(lambda(e) => do acc.Add(e.N); end); "
+        "  var s2b := w2.B.Subscribe(lambda(e) => do acc.Add(e.N * 100); end); "
         "  w1.FireA(1); "   // w1.A fires → +1
         "  w1.FireB(50); "  // w1.B: no subscriber
         "  w2.FireA(50); "  // w2.A: no subscriber
@@ -485,8 +485,8 @@ BEZEL_TEST(codegen_events_479, events_interleaved_with_fields_479j) {
         "class C public static method Main(): int "
         "  var acc := new Acc(); "
         "  var s := new Sensor(); "
-        "  var su := s.Updated.Subscribe((e) => do acc.Add(e.N); end); "
-        "  var sa := s.Alerted.Subscribe((e) => do acc.Add(e.N * 100); end); "
+        "  var su := s.Updated.Subscribe(lambda(e) => do acc.Add(e.N); end); "
+        "  var sa := s.Alerted.Subscribe(lambda(e) => do acc.Add(e.N * 100); end); "
         "  s.TriggerUpdate(1); "   // Updated fires → +1
         "  s.TriggerAlert(1); "    // Alerted fires → +100
         "  return acc.V; "         // expect 101
@@ -519,8 +519,8 @@ BEZEL_TEST(codegen_events_479, base_and_derived_each_have_event_479k) {
         "class C public static method Main(): int "
         "  var acc := new Acc(); "
         "  var d := new Derived(); "
-        "  var sb := d.BaseEvt.Subscribe((e) => do acc.Add(e.N); end); "
-        "  var sd := d.DerivedEvt.Subscribe((e) => do acc.Add(e.N * 10); end); "
+        "  var sb := d.BaseEvt.Subscribe(lambda(e) => do acc.Add(e.N); end); "
+        "  var sd := d.DerivedEvt.Subscribe(lambda(e) => do acc.Add(e.N * 10); end); "
         "  d.FireBase(1); "    // BaseEvt fires → +1
         "  d.FireDerived(1); " // DerivedEvt fires → +10
         "  return acc.V; "     // expect 11
@@ -560,7 +560,7 @@ BEZEL_TEST(codegen_events_479, interface_two_events_subscribe_second_via_iface_4
         "  var acc := new Acc(); "
         "  var src := new Source(); "
         "  var i: ISource := src; "
-        "  var sp := i.Pong.Subscribe((e) => do acc.Add(e.N); end); "
+        "  var sp := i.Pong.Subscribe(lambda(e) => do acc.Add(e.N); end); "
         "  src.FirePing(99); "  // Ping has no subscriber → no-op
         "  src.FirePong(7); "   // Pong fires → +7
         "  return acc.V; "      // expect 7
@@ -591,8 +591,8 @@ BEZEL_TEST(codegen_events_479, interface_two_events_both_subscribed_via_iface_47
         "  var acc := new Acc(); "
         "  var src := new Source(); "
         "  var i: ISource := src; "
-        "  var s1 := i.Ping.Subscribe((e) => do acc.Add(e.N); end); "
-        "  var s2 := i.Pong.Subscribe((e) => do acc.Add(e.N * 10); end); "
+        "  var s1 := i.Ping.Subscribe(lambda(e) => do acc.Add(e.N); end); "
+        "  var s2 := i.Pong.Subscribe(lambda(e) => do acc.Add(e.N * 10); end); "
         "  src.FirePing(1); "   // Ping fires → +1
         "  src.FirePong(1); "   // Pong fires → +10
         "  return acc.V; "      // expect 11

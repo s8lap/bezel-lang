@@ -30,8 +30,8 @@ BEZEL_TEST(event_raise_reentrant_dispose_908, handler_disposes_later_subscriptio
         "class C public static method Main(): int "
         "  using var src := new Src(); "
         "  var sub2: Subscription; "
-        "  var sub1 := src.Ev.Subscribe((v) => do sub2.Dispose(); end); "
-        "  sub2 := src.Ev.Subscribe((v) => do var x := v; end); "
+        "  var sub1 := src.Ev.Subscribe(lambda(v) => do sub2.Dispose(); end); "
+        "  sub2 := src.Ev.Subscribe(lambda(v) => do var x := v; end); "
         "  src.Fire(1); "  // must not crash
         "  return 42; "
         "end Main; end C;"), 42);
@@ -45,9 +45,9 @@ BEZEL_TEST(event_raise_reentrant_dispose_908, all_handlers_fire_normally) {
         "class Src public event Ev: int; public method Fire(v: int) Ev.Raise(v); end Fire; end Src; "
         "class C public static method Main(): int "
         "  using var src := new Src(); "
-        "  var s1 := src.Ev.Subscribe((v) => do Acc.sum := Acc.sum + v; end); "
-        "  var s2 := src.Ev.Subscribe((v) => do Acc.sum := Acc.sum + v * 10; end); "
-        "  var s3 := src.Ev.Subscribe((v) => do Acc.sum := Acc.sum + v * 100; end); "
+        "  var s1 := src.Ev.Subscribe(lambda(v) => do Acc.sum := Acc.sum + v; end); "
+        "  var s2 := src.Ev.Subscribe(lambda(v) => do Acc.sum := Acc.sum + v * 10; end); "
+        "  var s3 := src.Ev.Subscribe(lambda(v) => do Acc.sum := Acc.sum + v * 100; end); "
         "  src.Fire(1); "
         "  return Acc.sum; "  // 1 + 10 + 100 = 111
         "end Main; end C;"), 111);

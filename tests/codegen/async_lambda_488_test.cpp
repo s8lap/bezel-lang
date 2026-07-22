@@ -171,7 +171,7 @@ BEZEL_TEST(async_lambda_30_6, expr_body_awaited) {
         "    return n * 10; "
         "  end Producer; "
         "  public static async method Main(): Task<int> "
-        "    var f: (int) -> Task<int> := async (x) => await Producer(x); "
+        "    var f: (int) -> Task<int> := async lambda(x) => await Producer(x); "
         "    using var t := f(3); "
         "    var r := await t; "
         "    return r + 1; "
@@ -188,7 +188,7 @@ BEZEL_TEST(async_lambda_30_6, block_body_awaited) {
         "    return n * 10; "
         "  end Producer; "
         "  public static async method Main(): Task<int> "
-        "    var f: (int) -> Task<int> := async (x) => do "
+        "    var f: (int) -> Task<int> := async lambda(x) => do "
         "      var p := await Producer(x); "
         "      return p + 2; "
         "    end; "
@@ -211,7 +211,7 @@ BEZEL_TEST(async_lambda_30_6, captures_outer_local) {
         "  end Producer; "
         "  public static async method Main(): Task<int> "
         "    var seed := 100; "
-        "    var f: (int) -> Task<int> := async (x) => do "
+        "    var f: (int) -> Task<int> := async lambda(x) => do "
         "      var d := await Producer(x); "
         "      return seed + d; "
         "    end; "
@@ -238,7 +238,7 @@ BEZEL_TEST(async_lambda_30_6, passed_as_function_argument) {
         "    return r + 3; "
         "  end Apply; "
         "  public static async method Main(): Task<int> "
-        "    return await Apply(async (x) => await Producer(x), 5); "
+        "    return await Apply(async lambda(x) => await Producer(x), 5); "
         "  end Main; end C;",
         53);
 }
@@ -253,7 +253,7 @@ BEZEL_TEST(async_lambda_30_6, no_value_task_lambda) {
         "    return; "
         "  end DoWork; "
         "  public static async method Main(): Task<int> "
-        "    var f: () -> Task := async () => await DoWork(); "
+        "    var f: () -> Task := async lambda() => await DoWork(); "
         "    using var t := f(); "
         "    await t; "
         "    return 7; "
@@ -268,7 +268,7 @@ BEZEL_TEST(async_lambda_30_6, synchronous_body_no_await) {
     expectValueLeakFree(
         "module M; class C "
         "  public static async method Main(): Task<int> "
-        "    var f: () -> Task<int> := async () => 42; "
+        "    var f: () -> Task<int> := async lambda() => 42; "
         "    using var t := f(); "
         "    return await t; "
         "  end Main; end C;",

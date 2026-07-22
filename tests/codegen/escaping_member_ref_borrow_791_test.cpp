@@ -96,7 +96,7 @@ BEZEL_TEST(escaping_member_ref_borrow_791, method_ref_store_to_field_rejected) {
         "class Box public method GetN(): int return 5; end GetN; end Box; "
         "class Holder "
         "  public f: () -> int; "
-        "  public constructor() f := () => 0; end constructor; "
+        "  public constructor() f := lambda() => 0; end constructor; "
         "end Holder; "
         "class P "
         "  public static method Main(): int "

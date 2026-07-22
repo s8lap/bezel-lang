@@ -1,4 +1,4 @@
-private _onClicked: (ClickedEvent) -> () := (e) => UpdateStatus(e.X, e.Y);
+private _onClicked: (ClickedEvent) -> () := lambda(e) => UpdateStatus(e.X, e.Y);
 // ...
 button.Clicked += _onClicked;
 // later:

@@ -48,7 +48,7 @@ BEZEL_TEST(codegen_event_ievent_var_747, stored_var_subscribe_fires) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var box := new Box(); using var b := new Bell(); "
         "var ev: IEvent<Ev> := b.Clicked; "
-        "using var s := ev.Subscribe((e: Ev) => do box.Add(e.N); end); "
+        "using var s := ev.Subscribe(lambda(e: Ev) => do box.Add(e.N); end); "
         "b.Fire(5); b.Fire(7); "
         "return box.total;")), 12);
 }
@@ -59,7 +59,7 @@ BEZEL_TEST(codegen_event_ievent_var_747, stored_var_untyped_lambda_fires) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var box := new Box(); using var b := new Bell(); "
         "var ev: IEvent<Ev> := b.Clicked; "
-        "using var s := ev.Subscribe((e) => do box.Add(e.N); end); "
+        "using var s := ev.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "b.Fire(5); b.Fire(7); "
         "return box.total;")), 12);
 }
@@ -70,7 +70,7 @@ BEZEL_TEST(codegen_event_ievent_var_747, method_returned_ievent_subscribe_fires)
     BEZEL_EXPECT_EQ(run(prog(
         "using var box := new Box(); using var b := new Bell(); "
         "var ev := b.GetEvent(); "
-        "using var s := ev.Subscribe((e: Ev) => do box.Add(e.N); end); "
+        "using var s := ev.Subscribe(lambda(e: Ev) => do box.Add(e.N); end); "
         "b.Fire(5); b.Fire(7); "
         "return box.total;")), 12);
 }
@@ -81,7 +81,7 @@ BEZEL_TEST(codegen_event_ievent_var_747, stored_var_subscription_disposes) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var box := new Box(); using var b := new Bell(); "
         "var ev: IEvent<Ev> := b.Clicked; "
-        "do using var s := ev.Subscribe((e: Ev) => do box.Add(e.N); end); "
+        "do using var s := ev.Subscribe(lambda(e: Ev) => do box.Add(e.N); end); "
         "   b.Fire(5); end; "
         "b.Fire(7); "
         "return box.total;")), 5);
@@ -91,7 +91,7 @@ BEZEL_TEST(codegen_event_ievent_var_747, stored_var_subscription_disposes) {
 BEZEL_TEST(codegen_event_ievent_var_747, direct_subscribe_unregressed) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var box := new Box(); using var b := new Bell(); "
-        "using var s := b.Clicked.Subscribe((e: Ev) => do box.Add(e.N); end); "
+        "using var s := b.Clicked.Subscribe(lambda(e: Ev) => do box.Add(e.N); end); "
         "b.Fire(5); b.Fire(7); "
         "return box.total;")), 12);
 }

@@ -399,7 +399,7 @@ const char* kCaptureBoxIsOperand =
     "module M; class C "
     "  public static method Main(): int "
     "    var o: Object := 5; "
-    "    var f := () => (o is int); "
+    "    var f := lambda() => (o is int); "
     "    var b := f(); "
     "    if b then return 7; end; "    // o is int => true => 7
     "    return 0; "
@@ -413,7 +413,7 @@ const char* kCaptureBoxBareIdent =
     "module M; class C "
     "  public static method Main(): int "
     "    var o: Object := 5; "
-    "    var f := () => o; "          // outer lambda forwards o
+    "    var f := lambda() => o; "          // outer lambda forwards o
     "    var got: Object := f(); "
     "    if got is int then return 7; end; "  // 7
     "    return 0; "

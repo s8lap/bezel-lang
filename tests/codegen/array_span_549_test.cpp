@@ -222,7 +222,7 @@ BEZEL_TEST(array_span_549, ownedarray_todictionary_rejected_1022) {
         "import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var a := new OwningArray<int>(); a.Add(1); a.Add(2); "
-        "  _ := a.ToDictionary((x) => x); "
+        "  _ := a.ToDictionary(lambda(x) => x); "
         "  return 0; "
         "end Main; end C;"));
 }
@@ -240,7 +240,7 @@ BEZEL_TEST(array_span_549, ownedarray_linq_then_toarray_valid_1022) {
         "class C public static method Main(): int "
         "  using var a := new OwningArray<Cell>(); "
         "  a.Add(new Cell(7)); a.Add(new Cell(8)); a.Add(new Cell(9)); "
-        "  using var e: Array<Cell> := a.Where((x) => x.V > 7).ToArray(); "
+        "  using var e: Array<Cell> := a.Where(lambda(x) => x.V > 7).ToArray(); "
         "  return e.Length; "  // 2 (8 and 9)
         "end Main; end C;", 2);
 }
@@ -279,7 +279,7 @@ BEZEL_TEST(array_span_549, ownedarray_real_surface_accepted_1103b) {
         "class C public static method Main(): int "
         "  using var a := new OwningArray<Cell>(); "
         "  a.Add(new Cell(7)); a.Add(new Cell(9)); "
-        "  var hi := a.Where((c) => c._v > 8).Count(); "  // 1
+        "  var hi := a.Where(lambda(c) => c._v > 8).Count(); "  // 1
         "  return a.Get(1)._v + a.Count + hi; "           // 9 + 2 + 1 = 12
         "end Main; end C;", 12);
 }
@@ -956,7 +956,7 @@ BEZEL_TEST(array_span_549, array_and_dict_real_surface_still_accepted_920) {
         "  using var d := new Dictionary<string,int>(); "
         "  d.Add(\"k\", 1); d[\"k\"] := 42; "
         "  var v: int? := null; d.TryGetValue(\"k\", out v); "  // v0.171 (#1336): out is V?
-        "  return a.Count + a.Where((x) => x > 10).Count() + v!; "
+        "  return a.Count + a.Where(lambda(x) => x > 10).Count() + v!; "
         // a=[99,20] after a[0]:=99; both >10; 2 + 2 + 42 = 46
         "end Main; end C;", 46);
 }
@@ -985,7 +985,7 @@ BEZEL_TEST(codegen_span549, span_start_field_read_1277) {
     // AsSpan(2, 4) → Start=2, Length=4; Start+Length = 6.
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwningBuffer<int>(8, (i) => i + 1); "
+        "  using var buf := new OwningBuffer<int>(8, lambda(i) => i + 1); "
         "  var sp := buf.AsSpan(2, 4); "
         "  return sp.Start + sp.Length; "  // 2 + 4 = 6
         "end Main; end C;"), 6);
@@ -995,7 +995,7 @@ BEZEL_TEST(codegen_span549, span_start_field_read_1277) {
 BEZEL_TEST(codegen_span549, span_start_alone_1277) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwningBuffer<int>(8, (i) => i + 1); "
+        "  using var buf := new OwningBuffer<int>(8, lambda(i) => i + 1); "
         "  var sp := buf.AsSpan(3, 2); "
         "  return sp.Start; "  // 3
         "end Main; end C;"), 3);
@@ -1005,7 +1005,7 @@ BEZEL_TEST(codegen_span549, span_start_alone_1277) {
 BEZEL_TEST(codegen_span549, readonly_span_start_field_read_1277) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwningBuffer<int>(8, (i) => i + 1); "
+        "  using var buf := new OwningBuffer<int>(8, lambda(i) => i + 1); "
         "  var sp := buf.AsReadOnlySpan(2, 3); "
         "  return sp.Start + sp.Length; "  // 2 + 3 = 5
         "end Main; end C;"), 5);
@@ -1065,7 +1065,7 @@ BEZEL_TEST(codegen_span549, arrayspan_ctor_direct_1275) {
 BEZEL_TEST(codegen_span549, span_ctor_length_oob_throws_1275) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwningBuffer<int>(4, (i) => i + 1); "
+        "  using var buf := new OwningBuffer<int>(4, lambda(i) => i + 1); "
         "  try var sp := new Span<int>(buf, 0, 100); return sp[50]; "
         "  catch IndexOutOfRangeException => return 88; end; "
         "end Main; end C;"), 88);
@@ -1075,7 +1075,7 @@ BEZEL_TEST(codegen_span549, span_ctor_length_oob_throws_1275) {
 BEZEL_TEST(codegen_span549, span_ctor_start_oob_throws_1275) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwningBuffer<int>(4, (i) => i + 1); "
+        "  using var buf := new OwningBuffer<int>(4, lambda(i) => i + 1); "
         "  try var sp := new Span<int>(buf, 9, 1); return sp[0]; "
         "  catch IndexOutOfRangeException => return 77; end; "
         "end Main; end C;"), 77);
@@ -1088,7 +1088,7 @@ BEZEL_TEST(codegen_span549, span_ctor_start_oob_throws_1275) {
 BEZEL_TEST(codegen_span549, ownedbuffer_init_closure_not_leaked_1286) {
     expectValueAndAsanClean(
         "module M; class C public static method Main(): int "
-        "  using var buf := new OwningBuffer<int>(4, (i) => i + 1); "
+        "  using var buf := new OwningBuffer<int>(4, lambda(i) => i + 1); "
         "  return buf[3]; "  // 4 — and the init closure is freed (ASan-clean)
         "end Main; end C;", 4);
 }

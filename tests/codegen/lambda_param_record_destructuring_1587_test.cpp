@@ -43,7 +43,7 @@ BEZEL_TEST(codegen_1587_lambda_destructure, linq_select_headline_example_spec_27
         "  var entries: Array<Entry> := "
         "    [new Entry(1, 10), new Entry(2, 20), new Entry(3, 30)]; "
         "  var sums: Array<int> := "
-        "    entries.Select((Entry(k, v)) => k + v).ToArray(); "
+        "    entries.Select(lambda(Entry(k, v)) => k + v).ToArray(); "
         "  return sums[0] + sums[1] + sums[2]; "  // 11 + 22 + 33 = 66
         "end Main; end C;"), 66);
 }
@@ -58,7 +58,7 @@ BEZEL_TEST(codegen_1587_lambda_destructure, target_type_from_typed_local_spec_27
         "module M; "
         "record Entry(K: int, V: int); "
         "class C public static method Main(): int "
-        "  var f: (Entry) -> int := (Entry(k, v)) => k + v; "
+        "  var f: (Entry) -> int := lambda(Entry(k, v)) => k + v; "
         "  var e := new Entry(7, 35); "
         "  return f(e); "  // 42
         "end Main; end C;"), 42);
@@ -71,7 +71,7 @@ BEZEL_TEST(codegen_1587_lambda_destructure, reads_second_field_only_spec_27_4) {
         "module M; "
         "record Entry(K: int, V: int); "
         "class C public static method Main(): int "
-        "  var f: (Entry) -> int := (Entry(k, v)) => v; "
+        "  var f: (Entry) -> int := lambda(Entry(k, v)) => v; "
         "  var e := new Entry(100, 9); "
         "  return f(e); "  // 9
         "end Main; end C;"), 9);
@@ -87,7 +87,7 @@ BEZEL_TEST(codegen_1587_lambda_destructure, inferred_head_no_target_type_spec_27
         "module M; "
         "record Entry(K: int, V: int); "
         "class C public static method Main(): int "
-        "  var f := (Entry(k, v)) => k + v; "
+        "  var f := lambda(Entry(k, v)) => k + v; "
         "  var e := new Entry(7, 35); "
         "  return f(e); "  // 42
         "end Main; end C;"), 42);
@@ -101,7 +101,7 @@ BEZEL_TEST(codegen_1587_lambda_destructure, discard_slot_spec_27_4) {
         "module M; "
         "record Point(X: int, Y: int); "
         "class C public static method Main(): int "
-        "  var f: (Point) -> int := (Point(_, y)) => y; "
+        "  var f: (Point) -> int := lambda(Point(_, y)) => y; "
         "  var p := new Point(1000, 17); "
         "  return f(p); "  // 17
         "end Main; end C;"), 17);
@@ -117,7 +117,7 @@ BEZEL_TEST(codegen_1587_lambda_destructure, nested_destructuring_spec_27_4) {
         "record Inner(A: int, B: int); "
         "record Outer(I: Inner, C: int); "
         "class C public static method Main(): int "
-        "  var f: (Outer) -> int := (Outer(Inner(a, b), c)) => a + b + c; "
+        "  var f: (Outer) -> int := lambda(Outer(Inner(a, b), c)) => a + b + c; "
         "  var o := new Outer(new Inner(3, 4), 5); "
         "  return f(o); "  // 3 + 4 + 5 = 12
         "end Main; end C;"), 12);
@@ -132,7 +132,7 @@ BEZEL_TEST(codegen_1587_lambda_destructure, argument_not_consumed_spec_27_4) {
         "module M; "
         "record Entry(K: int, V: int); "
         "class C public static method Main(): int "
-        "  var f: (Entry) -> int := (Entry(k, v)) => k + v; "
+        "  var f: (Entry) -> int := lambda(Entry(k, v)) => k + v; "
         "  var e := new Entry(2, 3); "
         "  var first := f(e); "
         "  var second := f(e); "  // same `e`, called twice
@@ -153,7 +153,7 @@ BEZEL_TEST(codegen_1587_lambda_destructure, class_typed_field_binding_spec_27_4)
         "record Holder(W: Widget, Tag: int); "
         "class C public static method Main(): int "
         "  using var w := new Widget(9); "
-        "  var f: (Holder) -> int := (Holder(widget, tag)) => widget.Id + tag; "
+        "  var f: (Holder) -> int := lambda(Holder(widget, tag)) => widget.Id + tag; "
         "  var h := new Holder(w, 4); "
         "  return f(h); "  // 9 + 4 = 13
         "end Main; end C;"), 13);

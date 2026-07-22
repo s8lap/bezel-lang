@@ -79,7 +79,7 @@ BEZEL_TEST(scoped_builtin_1420, subscribe_using_var_capture_admitted) {
     auto r = parseAndCheckOwnership(prog(
         "    using var res := new Res(); "
         "    var b := new Button(); "
-        "    using var sub := b.Clicked.Subscribe((n) => res.Ping()); "
+        "    using var sub := b.Clicked.Subscribe(lambda(n) => res.Ping()); "
         "    b.Fire(); "
         "    return 0; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -91,7 +91,7 @@ BEZEL_TEST(scoped_builtin_1420, subscribe_plain_var_capture_rejected) {
     auto r = parseAndCheckOwnership(prog(
         "    using var res := new Res(); "
         "    var b := new Button(); "
-        "    var sub := b.Clicked.Subscribe((n) => res.Ping()); "
+        "    var sub := b.Clicked.Subscribe(lambda(n) => res.Ping()); "
         "    sub.Dispose(); "
         "    return 0; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -103,7 +103,7 @@ BEZEL_TEST(scoped_builtin_1420, subscribe_plain_var_capture_rejected) {
 BEZEL_TEST(scoped_builtin_1420, subscribe_plain_var_capture_free_admitted) {
     auto r = parseAndCheckOwnership(prog(
         "    var b := new Button(); "
-        "    var sub := b.Clicked.Subscribe((n) => ()); "
+        "    var sub := b.Clicked.Subscribe(lambda(n) => ()); "
         "    b.Fire(); "
         "    sub.Dispose(); "
         "    return 0; "));
@@ -116,7 +116,7 @@ BEZEL_TEST(scoped_builtin_1420, subscribe_value_typed_capture_admitted) {
     auto r = parseAndCheckOwnership(prog(
         "    var total := 0; "
         "    var b := new Button(); "
-        "    var sub := b.Clicked.Subscribe((n) => do total := total + n; end); "
+        "    var sub := b.Clicked.Subscribe(lambda(n) => do total := total + n; end); "
         "    b.Fire(); "
         "    sub.Dispose(); "
         "    return total; "));
@@ -128,13 +128,13 @@ BEZEL_TEST(scoped_builtin_1420, subscribe_value_typed_capture_admitted) {
 BEZEL_TEST(scoped_builtin_1420, subscribe_declaration_order_rejected) {
     auto r = parseAndCheckOwnership(prog(
         "    var b := new Button(); "
-        "    using var sub := b.Clicked.Subscribe(() => ()); "
+        "    using var sub := b.Clicked.Subscribe(lambda() => ()); "
         "    return 0; "));
     // Control: capture-free is fine even with nothing declared before.
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     auto r2 = parseAndCheckOwnership(prog(
         "    var b := new Button(); "
-        "    using var sub := b.Clicked.Subscribe((n) => res.Ping()); "
+        "    using var sub := b.Clicked.Subscribe(lambda(n) => res.Ping()); "
         "    using var res := new Res(); "
         "    return 0; "));
     BEZEL_EXPECT_TRUE(r2.diagnostics.hasErrors());
@@ -147,7 +147,7 @@ BEZEL_TEST(scoped_builtin_1420, subscribe_discarded_capture_rejected) {
     auto r = parseAndCheckOwnership(prog(
         "    using var res := new Res(); "
         "    var b := new Button(); "
-        "    b.Clicked.Subscribe((n) => res.Ping()); "
+        "    b.Clicked.Subscribe(lambda(n) => res.Ping()); "
         "    return 0; "));
     BEZEL_EXPECT_TRUE(hasErrorContaining(r, "capture-free"));
 }
@@ -158,7 +158,7 @@ BEZEL_TEST(scoped_builtin_1420, subscribe_freeze_dispose_rejected) {
     auto r = parseAndCheckOwnership(prog(
         "    var res := new Res(); "
         "    var b := new Button(); "
-        "    using var sub := b.Clicked.Subscribe((n) => res.Ping()); "
+        "    using var sub := b.Clicked.Subscribe(lambda(n) => res.Ping()); "
         "    res.Dispose(); "
         "    return 0; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -193,7 +193,7 @@ BEZEL_TEST(scoped_builtin_1420, subscribe_via_ievent_value_rejected) {
         "    using var res := new Res(); "
         "    var b := new Button(); "
         "    var ev: IEvent<int> := b.Clicked; "
-        "    var sub := ev.Subscribe((n) => res.Ping()); "
+        "    var sub := ev.Subscribe(lambda(n) => res.Ping()); "
         "    sub.Dispose(); "
         "    return 0; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -210,7 +210,7 @@ BEZEL_TEST(scoped_builtin_1420, async_subscribe_using_var_capture_admitted) {
     auto r = parseAndCheckOwnership(prog(
         "    using var res := new Res(); "
         "    var bc := new Beacon(); "
-        "    using var sub := bc.Pulsed.Subscribe(async (n) => do res.Ping(); end); "
+        "    using var sub := bc.Pulsed.Subscribe(async lambda(n) => do res.Ping(); end); "
         "    return 0; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -221,7 +221,7 @@ BEZEL_TEST(scoped_builtin_1420, async_subscribe_plain_var_capture_rejected) {
     auto r = parseAndCheckOwnership(prog(
         "    using var res := new Res(); "
         "    var bc := new Beacon(); "
-        "    var sub := bc.Pulsed.Subscribe(async (n) => do res.Ping(); end); "
+        "    var sub := bc.Pulsed.Subscribe(async lambda(n) => do res.Ping(); end); "
         "    sub.Dispose(); "
         "    return 0; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -238,7 +238,7 @@ BEZEL_TEST(scoped_builtin_1420, register_using_var_capture_admitted) {
     auto r = parseAndCheckOwnership(prog(
         "    using var res := new Res(); "
         "    using var cts := new CancellationTokenSource(); "
-        "    using var sub := cts.Token.Register(() => res.Ping()); "
+        "    using var sub := cts.Token.Register(lambda() => res.Ping()); "
         "    cts.Cancel(); "
         "    return 0; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -250,7 +250,7 @@ BEZEL_TEST(scoped_builtin_1420, register_plain_var_capture_rejected) {
     auto r = parseAndCheckOwnership(prog(
         "    using var res := new Res(); "
         "    using var cts := new CancellationTokenSource(); "
-        "    var sub := cts.Token.Register(() => res.Ping()); "
+        "    var sub := cts.Token.Register(lambda() => res.Ping()); "
         "    sub.Dispose(); "
         "    return 0; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -261,7 +261,7 @@ BEZEL_TEST(scoped_builtin_1420, register_plain_var_capture_rejected) {
 BEZEL_TEST(scoped_builtin_1420, register_capture_free_admitted) {
     auto r = parseAndCheckOwnership(prog(
         "    using var cts := new CancellationTokenSource(); "
-        "    var sub := cts.Token.Register(() => ()); "
+        "    var sub := cts.Token.Register(lambda() => ()); "
         "    sub.Dispose(); "
         "    return 0; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -279,7 +279,7 @@ BEZEL_TEST(scoped_builtin_1420, subscribe_lambda_literal_local_admitted) {
     auto r = parseAndCheckOwnership(prog(
         "    using var res := new Res(); "
         "    var b := new Button(); "
-        "    var h := (n: int) => res.Ping(); "
+        "    var h := lambda(n: int) => res.Ping(); "
         "    using var sub := b.Clicked.Subscribe(h); "
         "    b.Fire(); "
         "    return 0; "));
@@ -293,7 +293,7 @@ BEZEL_TEST(scoped_builtin_1420,
     auto r = parseAndCheckOwnership(prog(
         "    using var res := new Res(); "
         "    var b := new Button(); "
-        "    var h := (n: int) => res.Ping(); "
+        "    var h := lambda(n: int) => res.Ping(); "
         "    var sub := b.Clicked.Subscribe(h); "
         "    sub.Dispose(); "
         "    return 0; "));
@@ -307,8 +307,8 @@ BEZEL_TEST(scoped_builtin_1420,
            subscribe_reassigned_function_local_rejected) {
     auto r = parseAndCheckOwnership(prog(
         "    var b := new Button(); "
-        "    var h := (n: int) => (); "
-        "    h := (n: int) => (); "
+        "    var h := lambda(n: int) => (); "
+        "    h := lambda(n: int) => (); "
         "    using var sub := b.Clicked.Subscribe(h); "
         "    return 0; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -331,7 +331,7 @@ BEZEL_TEST(scoped_builtin_1420, event_add_this_capture_admitted) {
         "  public event Ticked: int; "
         "  private _total: int; "
         "  public method Wire() "
-        "    Ticked += (n) => do _total := _total + n; end; "
+        "    Ticked += lambda(n) => do _total := _total + n; end; "
         "  end Wire; "
         "end Counter;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

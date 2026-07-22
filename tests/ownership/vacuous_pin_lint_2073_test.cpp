@@ -495,7 +495,7 @@ BEZEL_TEST(vacuous_pin_lint_2073,
         "class C "
         "  public method M(): int "
         "    using var src := new EventSource<int>(); "
-        "    using var sub := src.Subscribe((x) => do return (); end); "
+        "    using var sub := src.Subscribe(lambda(x) => do return (); end); "
         "    return 0; "
         "  end M; "
         "  public static method Main(): int return 0; end Main; "

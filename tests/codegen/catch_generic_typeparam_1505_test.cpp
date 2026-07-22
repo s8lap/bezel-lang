@@ -68,7 +68,7 @@ std::string program(const char* typeArg, const char* thrownType) {
         "end H; "
         "class C public static method Main(): int "
         "  return H.Throws<") + typeArg +
-        ">(() => do throw new " + thrownType +
+        ">(lambda() => do throw new " + thrownType +
         "(\"boom\"); end); "
         "end Main; end C;";
 }

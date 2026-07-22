@@ -61,7 +61,7 @@ BEZEL_TEST(codegen_iife_507, iife_single_unannotated_param_27_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    var r := ((x) => x * 2)(5); "
+        "    var r := (lambda(x) => x * 2)(5); "
         "    return r; "
         "  end Main; "
         "end C;"), 10);
@@ -72,7 +72,7 @@ BEZEL_TEST(codegen_iife_507, iife_single_annotated_param_27_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    var r := ((x: int) => x * 2)(5); "
+        "    var r := (lambda(x: int) => x * 2)(5); "
         "    return r; "
         "  end Main; "
         "end C;"), 10);
@@ -84,7 +84,7 @@ BEZEL_TEST(codegen_iife_507, iife_single_unannotated_param_return_direct_27_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    return ((x) => x + 3)(7); "
+        "    return (lambda(x) => x + 3)(7); "
         "  end Main; "
         "end C;"), 10);
 }
@@ -99,7 +99,7 @@ BEZEL_TEST(codegen_iife_507, iife_no_arg_27_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    return (() => 42)(); "
+        "    return (lambda() => 42)(); "
         "  end Main; "
         "end C;"), 42);
 }
@@ -110,7 +110,7 @@ BEZEL_TEST(codegen_iife_507, iife_no_arg_via_local_27_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    var f := (() => 42); "
+        "    var f := (lambda() => 42); "
         "    return f(); "
         "  end Main; "
         "end C;"), 42);
@@ -127,7 +127,7 @@ BEZEL_TEST(codegen_iife_507, iife_captures_outer_local_27_3_27_5) {
         "module M; class C "
         "  public static method Main(): int "
         "    var n := 5; "
-        "    return ((x: int) => x * n)(3); "
+        "    return (lambda(x: int) => x * n)(3); "
         "  end Main; "
         "end C;"), 15);
 }
@@ -138,7 +138,7 @@ BEZEL_TEST(codegen_iife_507, iife_no_arg_captures_outer_local_27_3_27_5) {
         "module M; class C "
         "  public static method Main(): int "
         "    var n := 7; "
-        "    return (() => n)(); "
+        "    return (lambda() => n)(); "
         "  end Main; "
         "end C;"), 7);
 }
@@ -152,7 +152,7 @@ BEZEL_TEST(codegen_iife_507, iife_two_annotated_params_27_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    return ((a: int, b: int) => a + b)(3, 4); "
+        "    return (lambda(a: int, b: int) => a + b)(3, 4); "
         "  end Main; "
         "end C;"), 7);
 }
@@ -162,7 +162,7 @@ BEZEL_TEST(codegen_iife_507, iife_two_unannotated_params_27_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    return ((a, b) => a + b)(3, 4); "
+        "    return (lambda(a, b) => a + b)(3, 4); "
         "  end Main; "
         "end C;"), 7);
 }
@@ -173,7 +173,7 @@ BEZEL_TEST(codegen_iife_507, iife_two_params_with_capture_27_3_27_5) {
         "module M; class C "
         "  public static method Main(): int "
         "    var n := 1; "
-        "    return ((a: int, b: int) => a * b + n)(2, 3); "
+        "    return (lambda(a: int, b: int) => a * b + n)(2, 3); "
         "  end Main; "
         "end C;"), 7);
 }
@@ -188,7 +188,7 @@ BEZEL_TEST(codegen_iife_507, iife_returns_string_27_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    return (() => \"hello\")().Length; "
+        "    return (lambda() => \"hello\")().Length; "
         "  end Main; "
         "end C;"), 5);
 }
@@ -203,7 +203,7 @@ BEZEL_TEST(codegen_iife_507, iife_nested_27_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    return ((x: int) => x * 2)(((y: int) => y + 1)(4)); "
+        "    return (lambda(x: int) => x * 2)((lambda(y: int) => y + 1)(4)); "
         "  end Main; "
         "end C;"), 10);
 }
@@ -219,7 +219,7 @@ BEZEL_TEST(codegen_iife_507, control_lambda_in_local_27_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    var f := (x: int) => x * 2; "
+        "    var f := lambda(x: int) => x * 2; "
         "    return f(5); "
         "  end Main; "
         "end C;"), 10);
@@ -234,7 +234,7 @@ BEZEL_TEST(codegen_iife_507, control_lambda_passed_to_function_27_3) {
         "    return f(n); "
         "  end Apply; "
         "  public static method Main(): int "
-        "    return Apply((x: int) => x * 2, 5); "
+        "    return Apply(lambda(x: int) => x * 2, 5); "
         "  end Main; "
         "end C;"), 10);
 }
@@ -245,7 +245,7 @@ BEZEL_TEST(codegen_iife_507, control_no_arg_lambda_in_local_27_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
         "  public static method Main(): int "
-        "    var f := () => 99; "
+        "    var f := lambda() => 99; "
         "    return f(); "
         "  end Main; "
         "end C;"), 99);

@@ -164,7 +164,7 @@ BEZEL_TEST(codegen_666_linq_decimal, sum_selector_single_element_stdlib_5) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<decimal>(); "
         "a.Add(1.5m); "
-        "var s := a.Sum((x: decimal) => x); "
+        "var s := a.Sum(lambda(x: decimal) => x); "
         "if s = 1.5m then return 42; end; "
         "return 1; ")), 42);
 }
@@ -194,7 +194,7 @@ BEZEL_TEST(codegen_666_linq_decimal, sum_no_selector_empty_returns_zero_stdlib_5
 BEZEL_TEST(codegen_666_linq_decimal, sum_selector_empty_returns_zero_stdlib_5) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<decimal>(); "
-        "var s := a.Sum((x: decimal) => x); "
+        "var s := a.Sum(lambda(x: decimal) => x); "
         "if s = 0m then return 42; end; "
         "return 1; ")), 42);
 }
@@ -206,7 +206,7 @@ BEZEL_TEST(codegen_666_linq_decimal, sum_selector_multiple_elements_stdlib_5) {
         "a.Add(1.0m); "
         "a.Add(2.0m); "
         "a.Add(3.0m); "
-        "var s := a.Sum((x: decimal) => x); "
+        "var s := a.Sum(lambda(x: decimal) => x); "
         "if s = 6m then return 42; end; "
         "return 1; ")), 42);
 }
@@ -256,7 +256,7 @@ BEZEL_TEST(codegen_666_linq_decimal, average_selector_decimal_stdlib_5) {
         "a.Add(1.0m); "
         "a.Add(2.0m); "
         "a.Add(3.0m); "
-        "var avg := a.Average((x: decimal) => x); "
+        "var avg := a.Average(lambda(x: decimal) => x); "
         "if avg = 2.0m then return 42; end; "
         "return 1; ")), 42);
 }

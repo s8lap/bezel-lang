@@ -252,7 +252,7 @@ BEZEL_TEST(dict_entry_iter_548, linq_where_value_predicate_1220) {
         "  using var d := new Dictionary<string, int>(); "
         "  d[\"a\"] := 1; d[\"b\"] := 5; "
         "  var n := 0; "
-        "  for var kv in d.Where((kv) => kv.Value > 2) do n := n + 1; end; "
+        "  for var kv in d.Where(lambda(kv) => kv.Value > 2) do n := n + 1; end; "
         "  return n; "
         "end Main; end C;"), 1);
 }
@@ -265,7 +265,7 @@ BEZEL_TEST(dict_entry_iter_548, linq_where_key_predicate_1220) {
         "  using var d := new Dictionary<string, int>(); "
         "  d[\"a\"] := 1; d[\"b\"] := 5; "
         "  var n := 0; "
-        "  for var kv in d.Where((kv) => kv.Key = \"a\") do n := n + 1; end; "
+        "  for var kv in d.Where(lambda(kv) => kv.Key = \"a\") do n := n + 1; end; "
         "  return n; "
         "end Main; end C;"), 1);
 }

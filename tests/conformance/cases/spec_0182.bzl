@@ -1,3 +1,3 @@
-button.Clicked += (e) => UpdateStatus(e.X, e.Y);
+button.Clicked += lambda(e) => UpdateStatus(e.X, e.Y);
 // later:
-button.Clicked -= (e) => UpdateStatus(e.X, e.Y);   // a different lambda, no match
+button.Clicked -= lambda(e) => UpdateStatus(e.X, e.Y);   // a different lambda, no match

@@ -34,7 +34,7 @@ BEZEL_TEST(closure_loop_capture_823, nested_for_loop) {
         "for var i in 1..3 do "
         "  var s := i; "
         "  for var j in 1..1 do end; "
-        "  var f := () => s; "
+        "  var f := lambda() => s; "
         "  total := total + f(); "
         "end; "
         "return total;")), 6);
@@ -47,7 +47,7 @@ BEZEL_TEST(closure_loop_capture_823, nested_if_then) {
         "for var i in 1..3 do "
         "  var s := i; "
         "  if i > 0 then var z := 1; end; "
-        "  var f := () => s; "
+        "  var f := lambda() => s; "
         "  total := total + f(); "
         "end; "
         "return total;")), 6);
@@ -61,7 +61,7 @@ BEZEL_TEST(closure_loop_capture_823, nested_while) {
         "  var s := i; "
         "  var k := 0; "
         "  while k < 1 do k := k + 1; end; "
-        "  var f := () => s; "
+        "  var f := lambda() => s; "
         "  total := total + f(); "
         "end; "
         "return total;")), 6);
@@ -73,7 +73,7 @@ BEZEL_TEST(closure_loop_capture_823, simple_loop_capture_unaffected) {
         "var total := 0; "
         "for var i in 1..3 do "
         "  var s := i; "
-        "  var f := () => s; "
+        "  var f := lambda() => s; "
         "  total := total + f(); "
         "end; "
         "return total;")), 6);
@@ -85,7 +85,7 @@ BEZEL_TEST(closure_loop_capture_823, simple_loop_capture_unaffected) {
 BEZEL_TEST(closure_loop_capture_823, accumulator_outside_loop_shares_cell) {
     BEZEL_EXPECT_EQ(run(mainOf(
         "var acc := 0; "
-        "var add := () => acc; "
+        "var add := lambda() => acc; "
         "for var i in 1..3 do "
         "  acc := acc + i; "
         "end; "

@@ -92,7 +92,7 @@ BEZEL_TEST(codegen_string_linq_1220, string_where_char_count) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"aAbBcC\"; var n := 0; "
-        "  for var c in s.Where((c) => c = 'A') do n := n + 1; end; "
+        "  for var c in s.Where(lambda(c) => c = 'A') do n := n + 1; end; "
         "  return n; "
         "end Main; end C;"), 1);
 }
@@ -103,7 +103,7 @@ BEZEL_TEST(codegen_string_linq_1220, string_where_multiple) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"Hello\"; var n := 0; "
-        "  for var c in s.Where((c) => c = 'l') do n := n + 1; end; "
+        "  for var c in s.Where(lambda(c) => c = 'l') do n := n + 1; end; "
         "  return n; "
         "end Main; end C;"), 2);
 }
@@ -124,7 +124,7 @@ BEZEL_TEST(codegen_string_linq_1220, string_any_pred) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var s := \"Hello\"; "
-        "  return int(s.Any((c) => c = 'x')); "
+        "  return int(s.Any(lambda(c) => c = 'x')); "
         "end Main; end C;"), 0);
 }
 
@@ -159,7 +159,7 @@ BEZEL_TEST(codegen_string_linq_1856, string_any_pred_no_match_asan_clean) {
     auto r = runAotChecked(
         "module M; class C public static method Main(): int "
         "  var s := \"Hello\"; "
-        "  return int(s.Any((c) => c = 'x')); "
+        "  return int(s.Any(lambda(c) => c = 'x')); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);        // ASan-clean: no read past the char array
     BEZEL_EXPECT_EQ(r.exitCode, 0);  // no 'x' in "Hello" → false
@@ -172,7 +172,7 @@ BEZEL_TEST(codegen_string_linq_1856, string_any_pred_match_asan_clean) {
     auto r = runAotChecked(
         "module M; class C public static method Main(): int "
         "  var s := \"Hello\"; "
-        "  return int(s.Any((c) => c = 'e')); "
+        "  return int(s.Any(lambda(c) => c = 'e')); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);        // ASan-clean
     BEZEL_EXPECT_EQ(r.exitCode, 1);  // 'e' is in "Hello" → true
@@ -184,7 +184,7 @@ BEZEL_TEST(codegen_string_linq_1856, string_count_pred_asan_clean) {
     auto r = runAotChecked(
         "module M; class C public static method Main(): int "
         "  var s := \"Hello\"; "
-        "  return s.Count((c) => c = 'l'); "
+        "  return s.Count(lambda(c) => c = 'l'); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);        // ASan-clean
     BEZEL_EXPECT_EQ(r.exitCode, 2);  // two 'l' in "Hello"

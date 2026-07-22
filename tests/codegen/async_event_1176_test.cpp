@@ -77,7 +77,7 @@ BEZEL_TEST(codegen_async_event_1176, single_handler_invoked_spec_24_5) {
     BEZEL_EXPECT_EQ(run(prog(
         "var src := new Src(); "
         "var box := new Box(); "
-        "var sub := src.E.Subscribe(async (ev) => do box.Add(ev.N); end); "
+        "var sub := src.E.Subscribe(async lambda(ev) => do box.Add(ev.N); end); "
         "await src.Fire(3); "
         "sub.Dispose(); "
         "return box.V; "   // expect 3
@@ -90,7 +90,7 @@ BEZEL_TEST(codegen_async_event_1176, two_fires_accumulate_spec_24_5) {
     BEZEL_EXPECT_EQ(run(prog(
         "var src := new Src(); "
         "var box := new Box(); "
-        "var sub := src.E.Subscribe(async (ev) => do box.Add(ev.N); end); "
+        "var sub := src.E.Subscribe(async lambda(ev) => do box.Add(ev.N); end); "
         "await src.Fire(3); "
         "await src.Fire(4); "
         "sub.Dispose(); "
@@ -104,8 +104,8 @@ BEZEL_TEST(codegen_async_event_1176, two_handlers_both_invoked_spec_24_5) {
     BEZEL_EXPECT_EQ(run(prog(
         "var src := new Src(); "
         "var box := new Box(); "
-        "var sub1 := src.E.Subscribe(async (ev) => do box.Add(ev.N); end); "
-        "var sub2 := src.E.Subscribe(async (ev) => do box.Add(ev.N * 10); end); "
+        "var sub1 := src.E.Subscribe(async lambda(ev) => do box.Add(ev.N); end); "
+        "var sub2 := src.E.Subscribe(async lambda(ev) => do box.Add(ev.N * 10); end); "
         "await src.Fire(2); "
         "sub1.Dispose(); sub2.Dispose(); "
         "return box.V; "   // expect 2 + 20 = 22
@@ -129,7 +129,7 @@ BEZEL_TEST(codegen_async_event_1176, dispose_unsubscribes_spec_24_4) {
     BEZEL_EXPECT_EQ(run(prog(
         "var src := new Src(); "
         "var box := new Box(); "
-        "var sub := src.E.Subscribe(async (ev) => do box.Add(ev.N); end); "
+        "var sub := src.E.Subscribe(async lambda(ev) => do box.Add(ev.N); end); "
         "await src.Fire(3); "   // box.V = 3
         "sub.Dispose(); "       // unsubscribe
         "await src.Fire(4); "   // handler gone — no-op
@@ -154,7 +154,7 @@ BEZEL_TEST(codegen_async_event_1176, suspending_handler_no_deadlock_spec_24_5_30
     BEZEL_EXPECT_EQ(run(prog(
         "var src := new Src(); "
         "var box := new Box(); "
-        "var sub := src.E.Subscribe(async (ev) => do "
+        "var sub := src.E.Subscribe(async lambda(ev) => do "
         "  await Task.Delay(1); "
         "  box.Add(ev.N); "
         "end); "
@@ -171,11 +171,11 @@ BEZEL_TEST(codegen_async_event_1176, two_suspending_handlers_order_spec_24_5) {
     BEZEL_EXPECT_EQ(run(prog(
         "var src := new Src(); "
         "var box := new Box(); "
-        "var sub1 := src.E.Subscribe(async (ev) => do "
+        "var sub1 := src.E.Subscribe(async lambda(ev) => do "
         "  await Task.Delay(1); "
         "  box.Add(ev.N); "
         "end); "
-        "var sub2 := src.E.Subscribe(async (ev) => do "
+        "var sub2 := src.E.Subscribe(async lambda(ev) => do "
         "  await Task.Delay(1); "
         "  box.Add(ev.N * 10); "
         "end); "
@@ -192,11 +192,11 @@ BEZEL_TEST(codegen_async_event_1176, first_error_wins_suspending_spec_24_5) {
     BEZEL_EXPECT_EQ(run(prog(
         "var src := new Src(); "
         "var box := new Box(); "
-        "var sub1 := src.E.Subscribe(async (ev) => do "
+        "var sub1 := src.E.Subscribe(async lambda(ev) => do "
         "  await Task.Delay(1); "
         "  throw new InvalidOperationException(); "
         "end); "
-        "var sub2 := src.E.Subscribe(async (ev) => do "
+        "var sub2 := src.E.Subscribe(async lambda(ev) => do "
         "  box.Add(100); "
         "end); "
         "var caught := 0; "

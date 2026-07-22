@@ -158,7 +158,7 @@ BEZEL_TEST(sema_gettype_chain_511, lambda_gettype_diagnosed_8_2_17_5) {
         "record Point(x: int, y: int); "
         "class C "
         "  public method M(p: Point) "
-        "    var f := () => p.GetType().Name; "
+        "    var f := lambda() => p.GetType().Name; "
         "    _ := f; "
         "  end M; "
         "end C;");

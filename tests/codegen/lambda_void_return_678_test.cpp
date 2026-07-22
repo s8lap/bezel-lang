@@ -47,7 +47,7 @@ BEZEL_TEST(codegen_678_lambda_void, explicit_typed_param_void_body_spec_27_2) {
     JitResult r = runAot(
         "module M; class C "
         "  public static method Main() "
-        "    var log := (msg: string) => Console.WriteLine(msg); "
+        "    var log := lambda(msg: string) => Console.WriteLine(msg); "
         "    log(\"hello\"); "
         "  end Main; "
         "end C;");
@@ -61,7 +61,7 @@ BEZEL_TEST(codegen_678_lambda_void, no_param_void_body_spec_27_2) {
     JitResult r = runAot(
         "module M; class C "
         "  public static method Main() "
-        "    var f := () => Console.WriteLine(\"x\"); "
+        "    var f := lambda() => Console.WriteLine(\"x\"); "
         "    f(); "
         "  end Main; "
         "end C;");
@@ -75,7 +75,7 @@ BEZEL_TEST(codegen_678_lambda_void, iife_void_body_spec_27_2) {
     JitResult r = runAot(
         "module M; class C "
         "  public static method Main() "
-        "    (() => Console.WriteLine(\"y\"))(); "
+        "    (lambda() => Console.WriteLine(\"y\"))(); "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.ran);
@@ -91,7 +91,7 @@ BEZEL_TEST(codegen_678_lambda_void, void_lambda_called_twice_spec_27_2) {
         "module M; class C "
         "  public static method Main(): int "
         "    var n := 0; "
-        "    var bump := () => do n := n + 1; end; "
+        "    var bump := lambda() => do n := n + 1; end; "
         "    bump(); bump(); "
         "    return n; "
         "  end Main; "
@@ -104,7 +104,7 @@ BEZEL_TEST(codegen_678_lambda_void, regression_int_returning_lambda_spec_27_2) {
     BEZEL_EXPECT_EQ(runProg(
         "module M; class C "
         "  public static method Main(): int "
-        "    var sq := (x: int) => x * x; "
+        "    var sq := lambda(x: int) => x * x; "
         "    return sq(7); "
         "  end Main; "
         "end C;"), 49);
@@ -116,7 +116,7 @@ BEZEL_TEST(codegen_678_lambda_void, regression_string_returning_lambda_spec_27_2
     BEZEL_EXPECT_EQ(runProg(
         "module M; class C "
         "  public static method Main(): int "
-        "    var greet := (name: string) => $\"hi {name}\"; "
+        "    var greet := lambda(name: string) => $\"hi {name}\"; "
         "    return greet(\"x\").Length; "
         "  end Main; "
         "end C;"), 4);
@@ -130,7 +130,7 @@ BEZEL_TEST(codegen_678_lambda_void, regression_block_body_void_lambda_spec_27_2)
     JitResult r = runAot(
         "module M; class C "
         "  public static method Main() "
-        "    var f := () => do Console.WriteLine(\"ok\"); end; "
+        "    var f := lambda() => do Console.WriteLine(\"ok\"); end; "
         "    f(); "
         "  end Main; "
         "end C;");
@@ -149,7 +149,7 @@ BEZEL_TEST(codegen_678_lambda_void, void_lambda_as_typed_param_spec_27_2) {
         "  end Apply; "
         "  public static method Main(): int "
         "    var n := 0; "
-        "    Apply((msg) => do n := n + 1; end, \"x\"); "
+        "    Apply(lambda(msg) => do n := n + 1; end, \"x\"); "
         "    return n; "
         "  end Main; "
         "end C;"), 1);

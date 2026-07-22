@@ -58,7 +58,7 @@ BEZEL_TEST(sorted_comparer_record_533, sorted_copy_by_x_ascending_spec_4_4) {
         "  a.Add(new Point(3, 1)); "
         "  a.Add(new Point(1, 2)); "
         "  a.Add(new Point(2, 0)); "
-        "  using var s := a.Sorted((p, q) => p.X - q.X); "
+        "  using var s := a.Sorted(lambda(p, q) => p.X - q.X); "
         "  return s.Get(0).X * 100 + s.Get(1).X * 10 + s.Get(2).X; "  // 123
         "end Main; end C;"), 123);
 }
@@ -73,7 +73,7 @@ BEZEL_TEST(sorted_comparer_record_533, sorted_original_unchanged_spec_4_4) {
         "  a.Add(new Point(3, 1)); "
         "  a.Add(new Point(1, 2)); "
         "  a.Add(new Point(2, 0)); "
-        "  using var s := a.Sorted((p, q) => p.X - q.X); "
+        "  using var s := a.Sorted(lambda(p, q) => p.X - q.X); "
         "  Console.WriteLine(a.Get(0).X * 100 + a.Get(1).X * 10 + a.Get(2).X); return 0; "  // 312
         "end Main; end C;"), "312");
 }
@@ -87,7 +87,7 @@ BEZEL_TEST(sorted_comparer_record_533, sorted_result_length_spec_4_4) {
         "  a.Add(new Point(3, 1)); "
         "  a.Add(new Point(1, 2)); "
         "  a.Add(new Point(2, 0)); "
-        "  using var s := a.Sorted((p, q) => p.X - q.X); "
+        "  using var s := a.Sorted(lambda(p, q) => p.X - q.X); "
         "  return s.Length; "  // 3
         "end Main; end C;"), 3);
 }
@@ -102,7 +102,7 @@ BEZEL_TEST(sorted_comparer_record_533, sorted_annotated_params_spec_4_4) {
         "  a.Add(new Point(3, 1)); "
         "  a.Add(new Point(1, 2)); "
         "  a.Add(new Point(2, 0)); "
-        "  using var s := a.Sorted((p: Point, q: Point) => p.X - q.X); "
+        "  using var s := a.Sorted(lambda(p: Point, q: Point) => p.X - q.X); "
         "  return s.Get(0).X * 100 + s.Get(1).X * 10 + s.Get(2).X; "  // 123
         "end Main; end C;"), 123);
 }
@@ -122,7 +122,7 @@ BEZEL_TEST(sorted_comparer_record_533, sort_inplace_by_x_ascending_spec_4_4) {
         "  a.Add(new Point(3, 1)); "
         "  a.Add(new Point(1, 2)); "
         "  a.Add(new Point(2, 0)); "
-        "  a.Sort((p, q) => p.X - q.X); "
+        "  a.Sort(lambda(p, q) => p.X - q.X); "
         "  return a.Get(0).X * 100 + a.Get(1).X * 10 + a.Get(2).X; "  // 123
         "end Main; end C;"), 123);
 }
@@ -138,7 +138,7 @@ BEZEL_TEST(sorted_comparer_record_533, sort_inplace_by_y_descending_spec_4_4) {
         "  a.Add(new Point(3, 1)); "
         "  a.Add(new Point(1, 2)); "
         "  a.Add(new Point(2, 0)); "
-        "  a.Sort((p, q) => q.Y - p.Y); "  // descending Y
+        "  a.Sort(lambda(p, q) => q.Y - p.Y); "  // descending Y
         "  return a.Get(0).Y * 100 + a.Get(1).Y * 10 + a.Get(2).Y; "  // 210
         "end Main; end C;"), 210);
 }
@@ -152,7 +152,7 @@ BEZEL_TEST(sorted_comparer_record_533, sort_inplace_annotated_params_spec_4_4) {
         "  a.Add(new Point(3, 1)); "
         "  a.Add(new Point(1, 2)); "
         "  a.Add(new Point(2, 0)); "
-        "  a.Sort((p: Point, q: Point) => p.X - q.X); "
+        "  a.Sort(lambda(p: Point, q: Point) => p.X - q.X); "
         "  return a.Get(0).X * 100 + a.Get(1).X * 10 + a.Get(2).X; "  // 123
         "end Main; end C;"), 123);
 }
@@ -174,7 +174,7 @@ BEZEL_TEST(sorted_comparer_record_533, sort_record_three_fields_spec_4_4) {
         "  a.Add(new Pt3(9, 0, 3)); "
         "  a.Add(new Pt3(9, 0, 1)); "
         "  a.Add(new Pt3(9, 0, 2)); "
-        "  a.Sort((p, q) => p.C - q.C); "
+        "  a.Sort(lambda(p, q) => p.C - q.C); "
         "  return a.Get(0).C * 100 + a.Get(1).C * 10 + a.Get(2).C; "  // 123
         "end Main; end C;"), 123);
 }
@@ -191,7 +191,7 @@ BEZEL_TEST(sorted_comparer_record_533, sorted_copy_four_elements_desc_spec_4_4) 
         "  a.Add(new Point(2, 0)); "
         "  a.Add(new Point(8, 0)); "
         "  a.Add(new Point(1, 0)); "
-        "  using var s := a.Sorted((p, q) => q.X - p.X); "  // descending
+        "  using var s := a.Sorted(lambda(p, q) => q.X - p.X); "  // descending
         "  Console.WriteLine(s.Get(0).X * 1000 + s.Get(1).X * 100 + "
         "         s.Get(2).X * 10 + s.Get(3).X); return 0; "  // 8521
         "end Main; end C;"), "8521");
@@ -209,7 +209,7 @@ BEZEL_TEST(sorted_comparer_record_533, control_int_sorted_comparer_spec_4_4) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(3); a.Add(1); a.Add(2); "
-        "  using var s := a.Sorted((x, y) => x - y); "
+        "  using var s := a.Sorted(lambda(x, y) => x - y); "
         "  return s.Get(0) * 49 + s.Get(1) * 7 + s.Get(2); "  // 66
         "end Main; end C;"), 66);
 }
@@ -221,7 +221,7 @@ BEZEL_TEST(sorted_comparer_record_533, control_int_sort_comparer_spec_4_4) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(3); a.Add(1); a.Add(2); "
-        "  a.Sort((x, y) => x - y); "
+        "  a.Sort(lambda(x, y) => x - y); "
         "  return a.Get(0) * 49 + a.Get(1) * 7 + a.Get(2); "  // 66
         "end Main; end C;"), 66);
 }
@@ -234,7 +234,7 @@ BEZEL_TEST(sorted_comparer_record_533, control_string_sorted_comparer_spec_4_4) 
         "module M; class C public static method Main(): int "
         "  using var a := new Array<string>(); "
         "  a.Add(\"cc\"); a.Add(\"a\"); a.Add(\"bb\"); "
-        "  using var s := a.Sorted((x, y) => x.Length - y.Length); "
+        "  using var s := a.Sorted(lambda(x, y) => x.Length - y.Length); "
         "  return s.Get(0).Length * 49 + s.Get(1).Length * 7 + s.Get(2).Length; "
         // 1*49+2*7+2 = 49+14+2 = 65
         "end Main; end C;"), 65);

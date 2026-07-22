@@ -32,8 +32,8 @@ BEZEL_TEST(linq, any_all_int) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  return int(a.Any((x) => x > 2) and a.All((x) => x > 0) and "
-        "             not a.Any((x) => x > 10)); "
+        "  return int(a.Any(lambda(x) => x > 2) and a.All(lambda(x) => x > 0) and "
+        "             not a.Any(lambda(x) => x > 10)); "
         "end Main; end C;"), 1);
 }
 
@@ -42,7 +42,7 @@ BEZEL_TEST(linq, any_all_string) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<string>(); "
         "  a.Add(\"hello\"); a.Add(\"hi\"); "
-        "  return int(a.Any((s) => s.Length > 4) and a.All((s) => s.Length > 0)); "
+        "  return int(a.Any(lambda(s) => s.Length > 4) and a.All(lambda(s) => s.Length > 0)); "
         "end Main; end C;"), 1);
 }
 
@@ -54,8 +54,8 @@ BEZEL_TEST(linq, count_where) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); "
-        "  using var evens: Array<int> := a.Where((x) => x mod 2 = 0).ToArray(); "
-        "  return int(a.Count((x) => x mod 2 = 0) = 2 and evens.Length = 2 "
+        "  using var evens: Array<int> := a.Where(lambda(x) => x mod 2 = 0).ToArray(); "
+        "  return int(a.Count(lambda(x) => x mod 2 = 0) = 2 and evens.Length = 2 "
         "    and evens.Get(0) = 2 and evens.Get(1) = 4); "
         "end Main; end C;"), 1);
 }
@@ -67,7 +67,7 @@ BEZEL_TEST(linq, where_deferred_foreach) {
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); "
         "  var s := 0; "
-        "  for var x in a.Where((x) => x mod 2 = 0) do s := s + x; end; "
+        "  for var x in a.Where(lambda(x) => x mod 2 = 0) do s := s + x; end; "
         "  return s; "  // 2 + 4 = 6
         "end Main; end C;"), 6);
 }
@@ -80,7 +80,7 @@ BEZEL_TEST(linq, sum_min_max) {
         "  using var a := new Array<int>(); "
         "  a.Add(3); a.Add(1); a.Add(4); a.Add(1); a.Add(5); "
         "  var s := a.Sum(); var mn := a.Min(); var mx := a.Max(); "
-        "  var ss := a.Sum((x: int) => x * x); "
+        "  var ss := a.Sum(lambda(x: int) => x * x); "
         "  return int(s = 14 and mn = 1 and mx = 5 and ss = 52); "
         "end Main; end C;"), 1);
 }
@@ -185,8 +185,8 @@ BEZEL_TEST(linq, min_max_selector_non_icomparable_accepted_1198) {
         "class C public static method Main(): int "
         "  using var a := new Array<Box>(); "
         "  a.Add(new Box(3)); a.Add(new Box(9)); a.Add(new Box(5)); "
-        "  var mx := a.Max((b) => b.val); "
-        "  var mn := a.Min((b) => b.val); "
+        "  var mx := a.Max(lambda(b) => b.val); "
+        "  var mn := a.Min(lambda(b) => b.val); "
         "  return int(mx = 9 and mn = 3); "
         "end Main; end C;"), 1);
 }
@@ -203,8 +203,8 @@ BEZEL_TEST(linq, min_max_selector_double_result_type_1901) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(9); a.Add(5); "
-        "  var mx: double := a.Max((x) => x + 0.5); "   // U = double -> 9.5
-        "  var mn: double := a.Min((x) => x + 0.5); "   // U = double -> 1.5
+        "  var mx: double := a.Max(lambda(x) => x + 0.5); "   // U = double -> 9.5
+        "  var mn: double := a.Min(lambda(x) => x + 0.5); "   // U = double -> 1.5
         "  return int(mx > 9.4 and mx < 9.6 and mn > 1.4 and mn < 1.6); "
         "end Main; end C;"), 1);
 }
@@ -226,7 +226,7 @@ BEZEL_TEST(linq, min_max_selector_class_result_type_1901) {
         "class C public static method Main(): int "
         "  using var a := new OwningArray<Box>(); "
         "  a.Add(new Box(3)); a.Add(new Box(9)); a.Add(new Box(5)); "
-        "  var top := a.Max((o) => o); "   // U = Box (borrow of receiver element)
+        "  var top := a.Max(lambda(o) => o); "   // U = Box (borrow of receiver element)
         "  return top.v; "                 // resolves only if result types as Box
         "end Main; end C;"), 9);
 }
@@ -238,7 +238,7 @@ BEZEL_TEST(linq, first) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(5); a.Add(3); a.Add(7); "
-        "  return a.First((x) => x > 4); "
+        "  return a.First(lambda(x) => x > 4); "
         "end Main; end C;"), 5);
 }
 
@@ -278,8 +278,8 @@ BEZEL_TEST(linq, orderby_int) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(5); a.Add(2); a.Add(8); a.Add(1); "
-        "  using var asc: Array<int> := a.OrderBy((x: int) => x).ToArray(); "
-        "  using var desc: Array<int> := a.OrderByDescending((x: int) => x).ToArray(); "
+        "  using var asc: Array<int> := a.OrderBy(lambda(x: int) => x).ToArray(); "
+        "  using var desc: Array<int> := a.OrderByDescending(lambda(x: int) => x).ToArray(); "
         "  return int(asc.Get(0) = 1 and asc.Get(3) = 8 and "
         "             desc.Get(0) = 8 and desc.Get(3) = 1); "
         "end Main; end C;"), 1);
@@ -290,7 +290,7 @@ BEZEL_TEST(linq, orderby_string_by_length) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<string>(); "
         "  a.Add(\"cherry\"); a.Add(\"a\"); a.Add(\"bb\"); "
-        "  using var sorted: Array<string> := a.OrderBy((s) => s.Length).ToArray(); "
+        "  using var sorted: Array<string> := a.OrderBy(lambda(s) => s.Length).ToArray(); "
         "  return int(sorted.Get(0) = \"a\" and sorted.Get(2) = \"cherry\"); "
         "end Main; end C;"), 1);
 }
@@ -338,7 +338,7 @@ BEZEL_TEST(linq, chaining) {
         "  using var a := new Array<int>(); "
         "  for var i in 1..10 do a.Add(i); end; "
         "  using var r: Array<int> := "
-        "    a.Where((x) => x mod 2 = 0).OrderBy((x: int) => x).Skip(1).Take(3).ToArray(); "
+        "    a.Where(lambda(x) => x mod 2 = 0).OrderBy(lambda(x: int) => x).Skip(1).Take(3).ToArray(); "
         "  return int(r.Length = 3 and r.Get(0) = 4 and r.Get(2) = 8); "
         "end Main; end C;"), 1);
 }
@@ -350,7 +350,7 @@ BEZEL_TEST(linq, chaining_deferred_foreach) {
         "  using var a := new Array<int>(); "
         "  for var i in 1..10 do a.Add(i); end; "
         "  var s := 0; var n := 0; "
-        "  for var x in a.Where((x) => x mod 2 = 0).OrderBy((x: int) => x).Skip(1).Take(3) do "
+        "  for var x in a.Where(lambda(x) => x mod 2 = 0).OrderBy(lambda(x: int) => x).Skip(1).Take(3) do "
         "    s := s + x; n := n + 1; "
         "  end; "
         "  return int(n = 3 and s = 18); "  // 4 + 6 + 8 = 18
@@ -366,7 +366,7 @@ BEZEL_TEST(linq, select_projection) {
         "    using var a := new Array<int>(); "
         "    a.Add(1); a.Add(2); a.Add(3); "
         // Select is lazy; materialize with ToArray() to observe the projection.
-        "    using var doubled: Array<int> := a.Select((x: int) => x * 2).ToArray(); "
+        "    using var doubled: Array<int> := a.Select(lambda(x: int) => x * 2).ToArray(); "
         "    return int(doubled.Get(0) = 2 and doubled.Get(2) = 6); "
         "  end Main; end C;"), 1);
 }
@@ -386,7 +386,7 @@ BEZEL_TEST(linq, count_predicate_record_field_spec_5) {
         "class C public static method Main(): int "
         "  using var a := new Array<Point>(); "
         "  a.Add(new Point(5, 0)); a.Add(new Point(3, 9)); a.Add(new Point(5, 7)); "
-        "  return a.Count((p) => p.x = 5); "
+        "  return a.Count(lambda(p) => p.x = 5); "
         "end Main; end C;"), 2);
 }
 
@@ -397,8 +397,8 @@ BEZEL_TEST(linq, any_all_record_field_spec_5) {
         "class C public static method Main(): int "
         "  using var a := new Array<Point>(); "
         "  a.Add(new Point(5, 0)); a.Add(new Point(7, 0)); "
-        "  return int(a.Any((p) => p.x = 5) and a.All((p) => p.y = 0) and "
-        "             not a.Any((p) => p.x = 99)); "
+        "  return int(a.Any(lambda(p) => p.x = 5) and a.All(lambda(p) => p.y = 0) and "
+        "             not a.Any(lambda(p) => p.x = 99)); "
         "end Main; end C;"), 1);
 }
 
@@ -412,7 +412,7 @@ BEZEL_TEST(linq, first_predicate_record_field_spec_5) {
         "class C public static method Main(): int "
         "  using var a := new Array<Point>(); "
         "  a.Add(new Point(1, 10)); a.Add(new Point(2, 20)); a.Add(new Point(3, 30)); "
-        "  var p: Point := a.First((q) => q.x = 2); "
+        "  var p: Point := a.First(lambda(q) => q.x = 2); "
         "  return p.y; "
         "end Main; end C;"), 20);
 }
@@ -424,7 +424,7 @@ BEZEL_TEST(linq, where_record_field_spec_5) {
         "class C public static method Main(): int "
         "  using var a := new Array<Point>(); "
         "  a.Add(new Point(5, 1)); a.Add(new Point(2, 2)); a.Add(new Point(5, 3)); "
-        "  using var w: Array<Point> := a.Where((p) => p.x = 5).ToArray(); "
+        "  using var w: Array<Point> := a.Where(lambda(p) => p.x = 5).ToArray(); "
         "  return int(w.Length = 2 and w.Get(0).y = 1 and w.Get(1).y = 3); "
         "end Main; end C;"), 1);
 }
@@ -436,7 +436,7 @@ BEZEL_TEST(linq, select_record_field_spec_5) {
         "class C public static method Main(): int "
         "  using var a := new Array<Point>(); "
         "  a.Add(new Point(4, 0)); a.Add(new Point(6, 0)); "
-        "  using var xs: Array<int> := a.Select((p) => p.x).ToArray(); "
+        "  using var xs: Array<int> := a.Select(lambda(p) => p.x).ToArray(); "
         "  return int(xs.Get(0) = 4 and xs.Get(1) = 6); "
         "end Main; end C;"), 1);
 }
@@ -448,7 +448,7 @@ BEZEL_TEST(linq, orderby_record_field_spec_5) {
         "class C public static method Main(): int "
         "  using var a := new Array<Point>(); "
         "  a.Add(new Point(5, 1)); a.Add(new Point(2, 2)); a.Add(new Point(8, 3)); "
-        "  using var s: Array<Point> := a.OrderBy((p) => p.x).ToArray(); "
+        "  using var s: Array<Point> := a.OrderBy(lambda(p) => p.x).ToArray(); "
         "  return int(s.Get(0).x = 2 and s.Get(1).x = 5 and s.Get(2).x = 8 and "
         "             s.Get(0).y = 2); "  // payload travels with the sort
         "end Main; end C;"), 1);
@@ -492,7 +492,7 @@ BEZEL_TEST(linq, lazy_record_pipeline_foreach_spec_5) {
         "  a.Add(new Point(1, 10)); a.Add(new Point(2, 20)); "
         "  a.Add(new Point(3, 30)); a.Add(new Point(4, 40)); "
         "  var s := 0; var n := 0; "
-        "  for var p in a.Where((q) => q.x mod 2 = 0) do "
+        "  for var p in a.Where(lambda(q) => q.x mod 2 = 0) do "
         "    s := s + p.y; n := n + 1; "
         "  end; "
         "  return int(n = 2 and s = 60); "  // Point(2,20).y + Point(4,40).y
@@ -516,7 +516,7 @@ BEZEL_TEST(linq, first_predicate_record_inferred_spec_5) {
         "class C public static method Main(): int "
         "  using var a := new Array<Point>(); "
         "  a.Add(new Point(1, 10)); a.Add(new Point(2, 20)); a.Add(new Point(3, 30)); "
-        "  var p := a.First((q) => q.x = 2); "
+        "  var p := a.First(lambda(q) => q.x = 2); "
         "  return p.y; "
         "end Main; end C;"), 20);
 }
@@ -530,7 +530,7 @@ BEZEL_TEST(linq, first_predicate_record_member_on_call_spec_5) {
         "class C public static method Main(): int "
         "  using var a := new Array<Point>(); "
         "  a.Add(new Point(1, 10)); a.Add(new Point(2, 20)); a.Add(new Point(3, 30)); "
-        "  return a.First((q) => q.x = 2).y; "
+        "  return a.First(lambda(q) => q.x = 2).y; "
         "end Main; end C;"), 20);
 }
 
@@ -609,7 +609,7 @@ BEZEL_TEST(linq, lazy_select_then_count_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  return a.Select((x: int) => x * 2).Count(); "  // 3 elements
+        "  return a.Select(lambda(x: int) => x * 2).Count(); "  // 3 elements
         "end Main; end C;"), 3);
 }
 
@@ -619,7 +619,7 @@ BEZEL_TEST(linq, lazy_where_then_count_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  return a.Where((x: int) => x > 1).Count(); "  // {2,3} -> 2
+        "  return a.Where(lambda(x: int) => x > 1).Count(); "  // {2,3} -> 2
         "end Main; end C;"), 2);
 }
 
@@ -629,7 +629,7 @@ BEZEL_TEST(linq, lazy_where_then_any_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  return int(a.Where((x: int) => x > 1).Any()); "  // true
+        "  return int(a.Where(lambda(x: int) => x > 1).Any()); "  // true
         "end Main; end C;"), 1);
 }
 
@@ -639,7 +639,7 @@ BEZEL_TEST(linq, lazy_where_then_any_empty_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  return int(a.Where((x: int) => x > 99).Any()); "  // false
+        "  return int(a.Where(lambda(x: int) => x > 99).Any()); "  // false
         "end Main; end C;"), 0);
 }
 
@@ -649,7 +649,7 @@ BEZEL_TEST(linq, lazy_where_then_first_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  return a.Where((x: int) => x > 1).First(); "  // first match = 2
+        "  return a.Where(lambda(x: int) => x > 1).First(); "  // first match = 2
         "end Main; end C;"), 2);
 }
 
@@ -659,7 +659,7 @@ BEZEL_TEST(linq, lazy_select_then_aggregate_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  return a.Select((x: int) => x * 2).Aggregate(0, (acc: int, x: int) => acc + x); "
+        "  return a.Select(lambda(x: int) => x * 2).Aggregate(0, lambda(acc: int, x: int) => acc + x); "
         "end Main; end C;"), 12);  // 2+4+6
 }
 
@@ -669,7 +669,7 @@ BEZEL_TEST(linq, lazy_select_then_sum_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  return a.Select((x: int) => x * 2).Sum(); "  // 2+4+6 = 12
+        "  return a.Select(lambda(x: int) => x * 2).Sum(); "  // 2+4+6 = 12
         "end Main; end C;"), 12);
 }
 
@@ -679,7 +679,7 @@ BEZEL_TEST(linq, lazy_takewhile_then_aggregate_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(5); a.Add(3); "
-        "  return a.TakeWhile((x: int) => x < 5).Aggregate(0, (acc: int, x: int) => acc + x); "
+        "  return a.TakeWhile(lambda(x: int) => x < 5).Aggregate(0, lambda(acc: int, x: int) => acc + x); "
         "end Main; end C;"), 3);  // {1,2} -> 1+2 = 3 (stops at 5)
 }
 
@@ -691,8 +691,8 @@ BEZEL_TEST(linq, lazy_zip_then_aggregate_spec_5) {
         "  using var b := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
         "  b.Add(10); b.Add(20); b.Add(30); "
-        "  return a.Zip(b, (x: int, y: int) => x * y)"
-        "          .Aggregate(0, (acc: int, p: int) => acc + p); "
+        "  return a.Zip(b, lambda(x: int, y: int) => x * y)"
+        "          .Aggregate(0, lambda(acc: int, p: int) => acc + p); "
         "end Main; end C;"), 140);  // 10 + 40 + 90 = 140
 }
 
@@ -702,7 +702,7 @@ BEZEL_TEST(linq, lazy_where_select_then_count_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  return a.Where((x: int) => x mod 2 = 0).Select((x: int) => x * 10).Count(); "
+        "  return a.Where(lambda(x: int) => x mod 2 = 0).Select(lambda(x: int) => x * 10).Count(); "
         "end Main; end C;"), 2);  // {2,4} -> {20,40} -> 2
 }
 
@@ -724,7 +724,7 @@ BEZEL_TEST(linq, lazy_where_then_all_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  return int(a.Where((x: int) => x > 1).All((x: int) => x > 1)); "  // true
+        "  return int(a.Where(lambda(x: int) => x > 1).All(lambda(x: int) => x > 1)); "  // true
         "end Main; end C;"), 1);
 }
 
@@ -734,7 +734,7 @@ BEZEL_TEST(linq, lazy_where_then_count_pred_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  return a.Where((x: int) => x > 1).Count((x: int) => x mod 2 = 0); "  // {2,3,4} even -> {2,4} -> 2
+        "  return a.Where(lambda(x: int) => x > 1).Count(lambda(x: int) => x mod 2 = 0); "  // {2,3,4} even -> {2,4} -> 2
         "end Main; end C;"), 2);
 }
 
@@ -744,7 +744,7 @@ BEZEL_TEST(linq, control_concrete_aggregate_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  return a.Aggregate(0, (acc: int, x: int) => acc + x); "  // 6
+        "  return a.Aggregate(0, lambda(acc: int, x: int) => acc + x); "  // 6
         "end Main; end C;"), 6);
 }
 
@@ -754,7 +754,7 @@ BEZEL_TEST(linq, control_lazy_toarray_length_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  using var m: Array<int> := a.Select((x: int) => x * 2).ToArray(); "
+        "  using var m: Array<int> := a.Select(lambda(x: int) => x * 2).ToArray(); "
         "  return m.Length; "  // 3
         "end Main; end C;"), 3);
 }
@@ -766,7 +766,7 @@ BEZEL_TEST(linq, control_for_over_lazy_spec_5) {
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
         "  var s := 0; "
-        "  for var x in a.Select((x: int) => x * 2) do s := s + x; end; "
+        "  for var x in a.Select(lambda(x: int) => x * 2) do s := s + x; end; "
         "  return s; "  // 2+4+6 = 12
         "end Main; end C;"), 12);
 }
@@ -783,7 +783,7 @@ BEZEL_TEST(linq, string_join_lazy_query_arg_1182) {
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  var xs := new Array<string>(); xs.Add(\"ab\"); xs.Add(\"cd\"); "
-        "  var s := string.Join(\",\", xs.Where((x: string) => x.Length > 0)); "
+        "  var s := string.Join(\",\", xs.Where(lambda(x: string) => x.Length > 0)); "
         "  return s.Length; "  // "ab,cd" -> 5
         "end Main; end C;"), 5);
 }
@@ -795,7 +795,7 @@ BEZEL_TEST(linq, string_join_lazy_query_content_1182) {
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  var xs := new Array<string>(); xs.Add(\"ab\"); xs.Add(\"cd\"); "
-        "  var s := string.Join(\",\", xs.Where((x: string) => x.Length > 0)); "
+        "  var s := string.Join(\",\", xs.Where(lambda(x: string) => x.Length > 0)); "
         "  return int(s[2]) + (int(s[0]) - 97) + (int(s[4]) - 100); "
         "end Main; end C;"), 44);
 }
@@ -806,7 +806,7 @@ BEZEL_TEST(linq, string_join_lazy_select_arg_1182) {
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  var xs := new Array<string>(); xs.Add(\"ab\"); xs.Add(\"cd\"); "
-        "  var s := string.Join(\",\", xs.Select((x: string) => x)); "
+        "  var s := string.Join(\",\", xs.Select(lambda(x: string) => x)); "
         "  return s.Length; "  // "ab,cd" -> 5
         "end Main; end C;"), 5);
 }
@@ -828,7 +828,7 @@ BEZEL_TEST(linq, string_join_lazy_empty_1182) {
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  var xs := new Array<string>(); xs.Add(\"ab\"); xs.Add(\"cd\"); "
-        "  var s := string.Join(\",\", xs.Where((x: string) => x.Length > 9)); "
+        "  var s := string.Join(\",\", xs.Where(lambda(x: string) => x.Length > 9)); "
         "  return s.Length; "  // "" -> 0
         "end Main; end C;"), 0);
 }
@@ -839,7 +839,7 @@ BEZEL_TEST(linq, string_join_lazy_single_1182) {
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  var xs := new Array<string>(); xs.Add(\"ab\"); xs.Add(\"cd\"); "
-        "  var s := string.Join(\",\", xs.Where((x: string) => x = \"ab\")); "
+        "  var s := string.Join(\",\", xs.Where(lambda(x: string) => x = \"ab\")); "
         "  return s.Length; "  // "ab" -> 2 (no trailing ',')
         "end Main; end C;"), 2);
 }

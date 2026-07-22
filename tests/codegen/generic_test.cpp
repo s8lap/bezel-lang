@@ -412,7 +412,7 @@ BEZEL_TEST(codegen_generic, closure_captures_this_field) {
         "  public Total: int := 0; "
         "  public constructor() end constructor; "
         "  public method MakeAdder(w: int): (int) -> () "
-        "    return (x: int) => do Total := Total + x * w; end; "
+        "    return lambda(x: int) => do Total := Total + x * w; end; "
         "  end MakeAdder; "
         "  destructor end destructor; "
         "end Acc; "

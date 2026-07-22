@@ -45,7 +45,7 @@ BEZEL_TEST(codegen_686_nullable_decimal_linq, sum_selector_nullable_both_nonnull
         "using var a := new Array<decimal?>(); "
         "a.Add(1.5m); "
         "a.Add(2.5m); "
-        "var s := a.Sum((x: decimal?) => x ?? 0.0m); "
+        "var s := a.Sum(lambda(x: decimal?) => x ?? 0.0m); "
         "if s = 4.0m then return 42; end; "
         // Encode actual result for diagnostics if wrong.
         "var enc := int(s * 10.0m); "
@@ -59,7 +59,7 @@ BEZEL_TEST(codegen_686_nullable_decimal_linq, sum_selector_nullable_with_null_el
         "a.Add(1.0m); "
         "a.Add(null); "
         "a.Add(3.0m); "
-        "var s := a.Sum((x: decimal?) => x ?? 0.0m); "
+        "var s := a.Sum(lambda(x: decimal?) => x ?? 0.0m); "
         "if s = 4.0m then return 42; end; "
         "var enc := int(s * 10.0m); "
         "return enc; ")), 42);
@@ -69,7 +69,7 @@ BEZEL_TEST(codegen_686_nullable_decimal_linq, sum_selector_nullable_with_null_el
 BEZEL_TEST(codegen_686_nullable_decimal_linq, sum_selector_nullable_empty_stdlib_5) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<decimal?>(); "
-        "var s := a.Sum((x: decimal?) => x ?? 0.0m); "
+        "var s := a.Sum(lambda(x: decimal?) => x ?? 0.0m); "
         "if s = 0.0m then return 42; end; "
         "return 1; ")), 42);
 }
@@ -84,7 +84,7 @@ BEZEL_TEST(codegen_686_nullable_decimal_linq, sum_selector_nullable_five_element
         "a.Add(30.0m); "
         "a.Add(null); "
         "a.Add(40.0m); "
-        "var s := a.Sum((x: decimal?) => x ?? 0.0m); "
+        "var s := a.Sum(lambda(x: decimal?) => x ?? 0.0m); "
         "if s = 100.0m then return 42; end; "
         "var enc := int(s); "
         "return enc; ")), 42);
@@ -97,7 +97,7 @@ BEZEL_TEST(codegen_686_nullable_decimal_linq, sum_selector_nonnullable_decimal_u
         "using var a := new Array<decimal>(); "
         "a.Add(1.5m); "
         "a.Add(2.5m); "
-        "var s := a.Sum((x: decimal) => x); "
+        "var s := a.Sum(lambda(x: decimal) => x); "
         "if s = 4.0m then return 42; end; "
         "var enc := int(s * 10.0m); "
         "return enc; ")), 42);
@@ -115,7 +115,7 @@ BEZEL_TEST(codegen_686_nullable_decimal_linq, min_selector_nullable_decimal_stdl
         "a.Add(5.0m); "
         "a.Add(2.0m); "
         "a.Add(8.0m); "
-        "var m := a.Min((x: decimal?) => x ?? 9999.0m); "
+        "var m := a.Min(lambda(x: decimal?) => x ?? 9999.0m); "
         "if m = 2.0m then return 42; end; "
         "var enc := int(m); "
         "return enc; ")), 42);
@@ -128,7 +128,7 @@ BEZEL_TEST(codegen_686_nullable_decimal_linq, max_selector_nullable_decimal_stdl
         "a.Add(5.0m); "
         "a.Add(2.0m); "
         "a.Add(8.0m); "
-        "var m := a.Max((x: decimal?) => x ?? -9999.0m); "
+        "var m := a.Max(lambda(x: decimal?) => x ?? -9999.0m); "
         "if m = 8.0m then return 42; end; "
         "var enc := int(m); "
         "return enc; ")), 42);
@@ -142,7 +142,7 @@ BEZEL_TEST(codegen_686_nullable_decimal_linq, average_selector_nullable_decimal_
         "a.Add(3.0m); "
         "a.Add(null); "
         "a.Add(9.0m); "
-        "var avg := a.Average((x: decimal?) => x ?? 0.0m); "
+        "var avg := a.Average(lambda(x: decimal?) => x ?? 0.0m); "
         "if avg = 4.0m then return 42; end; "
         "var enc := int(avg * 10.0m); "
         "return enc; ")), 42);

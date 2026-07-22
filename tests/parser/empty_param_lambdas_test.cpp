@@ -1,6 +1,6 @@
 // Spec-derived parser tests for the empty-params lambda subset of A.7
-// LambdaExpr. Parameterised lambdas (`(x) => …`, `(x: T) => …`,
-// `async (...) => …`) need multi-token lookahead and are deferred.
+// LambdaExpr — `lambda() => …` since the v0.217 keyword-led cutover (#2101).
+// Parameterised lambdas live in parameterised_lambdas_test.cpp.
 
 #include <string>
 
@@ -22,28 +22,28 @@ static std::string parseInitText(const std::string& expr) {
 }
 
 BEZEL_TEST(parser_lambda, empty_params_expression_body) {
-    BEZEL_EXPECT_EQ(parseInitText("() => 42"),
-                    std::string("(() => 42)"));
+    BEZEL_EXPECT_EQ(parseInitText("lambda() => 42"),
+                    std::string("(lambda() => 42)"));
 }
 
 BEZEL_TEST(parser_lambda, empty_params_call_body) {
-    BEZEL_EXPECT_EQ(parseInitText("() => f(x)"),
-                    std::string("(() => f(x))"));
+    BEZEL_EXPECT_EQ(parseInitText("lambda() => f(x)"),
+                    std::string("(lambda() => f(x))"));
 }
 
 BEZEL_TEST(parser_lambda, empty_params_block_body) {
     BEZEL_EXPECT_EQ(
-        parseInitText("() => do x := 1; y := 2; end"),
-        std::string("(() => do { x := 1; y := 2; } end)"));
+        parseInitText("lambda() => do x := 1; y := 2; end"),
+        std::string("(lambda() => do { x := 1; y := 2; } end)"));
 }
 
 BEZEL_TEST(parser_lambda, empty_params_empty_block_body) {
-    BEZEL_EXPECT_EQ(parseInitText("() => do end"),
-                    std::string("(() => do {  } end)"));
+    BEZEL_EXPECT_EQ(parseInitText("lambda() => do end"),
+                    std::string("(lambda() => do {  } end)"));
 }
 
 // Lambda as argument to a call — common pattern.
 BEZEL_TEST(parser_lambda, lambda_as_call_argument) {
-    BEZEL_EXPECT_EQ(parseInitText("subscribe(() => handle())"),
-                    std::string("subscribe((() => handle()))"));
+    BEZEL_EXPECT_EQ(parseInitText("subscribe(lambda() => handle())"),
+                    std::string("subscribe((lambda() => handle()))"));
 }

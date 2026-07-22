@@ -6,7 +6,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; record Entry(K: int, V: int); class C public static method Main(): int var f: (Entry) -> int := (Entry(_, v)) => v; return 0; end Main; end C;
+module M; record Entry(K: int, V: int); class C public static method Main(): int var f: (Entry) -> int := lambda(Entry(_, v)) => v; return 0; end Main; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

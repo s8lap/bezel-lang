@@ -73,7 +73,7 @@ std::string wrap(const std::string& body) {
 BEZEL_TEST(task_family_borrow_return_lambda_1919,
            identity_expr_body_lambda_rejected) {
     auto r = parseAndCheckOwnership(wrap(
-        "var echo: (Task<int>) -> Task<int> := (t) => t;"));
+        "var echo: (Task<int>) -> Task<int> := lambda(t) => t;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasLambdaSb01Reject(r));
 }
@@ -83,7 +83,7 @@ BEZEL_TEST(task_family_borrow_return_lambda_1919,
 BEZEL_TEST(task_family_borrow_return_lambda_1919,
            identity_block_body_lambda_rejected) {
     auto r = parseAndCheckOwnership(wrap(
-        "var echo: (Task<int>) -> Task<int> := (t) => do return t; end;"));
+        "var echo: (Task<int>) -> Task<int> := lambda(t) => do return t; end;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasLambdaSb01Reject(r));
 }
@@ -98,7 +98,7 @@ BEZEL_TEST(task_family_borrow_return_lambda_1919,
         "  private _cachedTask: Task<int>; "
         "  public constructor(t: Task<int>) _cachedTask := t; end constructor; "
         "  public method Make(): () -> Task<int> "
-        "    var f: () -> Task<int> := () => _cachedTask; "
+        "    var f: () -> Task<int> := lambda() => _cachedTask; "
         "    return f; "
         "  end Make; "
         "end Cache; "
@@ -119,7 +119,7 @@ BEZEL_TEST(task_family_borrow_return_lambda_1919,
         "  public static async method Producer(): Task<int> return 5; "
         "  end Producer; "
         "  public static method Main(): int "
-        "    var f: () -> Task<int> := () => Producer(); return 0; "
+        "    var f: () -> Task<int> := lambda() => Producer(); return 0; "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasLambdaSb01Reject(r));
@@ -136,7 +136,7 @@ BEZEL_TEST(task_family_borrow_return_lambda_1919,
         "  public static async method Producer(): Task<int> return 5; "
         "  end Producer; "
         "  public static method Main(): int "
-        "    var f: () -> Task<int> := async () => await Producer(); return 0; "
+        "    var f: () -> Task<int> := async lambda() => await Producer(); return 0; "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasLambdaSb01Reject(r));
@@ -146,7 +146,7 @@ BEZEL_TEST(task_family_borrow_return_lambda_1919,
 BEZEL_TEST(task_family_borrow_return_lambda_1919,
            completed_task_factory_lambda_accepted) {
     auto r = parseAndCheckOwnership(wrap(
-        "var f: () -> Task<int> := () => Task.FromResult<int>(5);"));
+        "var f: () -> Task<int> := lambda() => Task.FromResult<int>(5);"));
     BEZEL_EXPECT_FALSE(hasLambdaSb01Reject(r));
 }
 
@@ -155,7 +155,7 @@ BEZEL_TEST(task_family_borrow_return_lambda_1919,
 BEZEL_TEST(task_family_borrow_return_lambda_1919,
            owned_param_lambda_accepted) {
     auto r = parseAndCheckOwnership(wrap(
-        "var echo: (owned Task<int>) -> Task<int> := (owned t) => t;"));
+        "var echo: (owned Task<int>) -> Task<int> := lambda(owned t) => t;"));
     BEZEL_EXPECT_FALSE(hasLambdaSb01Reject(r));
 }
 
@@ -164,7 +164,7 @@ BEZEL_TEST(task_family_borrow_return_lambda_1919,
 BEZEL_TEST(task_family_borrow_return_lambda_1919,
            non_task_identity_lambda_unaffected) {
     auto r = parseAndCheckOwnership(wrap(
-        "var id: (int) -> int := (x) => x;"));
+        "var id: (int) -> int := lambda(x) => x;"));
     BEZEL_EXPECT_FALSE(hasLambdaSb01Reject(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -180,7 +180,7 @@ BEZEL_TEST(task_family_borrow_return_lambda_1919,
         "  public static async method Producer(): Task<int> return 9; "
         "  end Producer; "
         "  public static async method Main(): Task<int> "
-        "    var f: () -> Task<int> := () => Producer(); "
+        "    var f: () -> Task<int> := lambda() => Producer(); "
         "    var t := f(); "
         "    var x := await t; "
         "    return x; "

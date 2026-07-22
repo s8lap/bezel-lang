@@ -207,7 +207,7 @@ BEZEL_TEST(dict_nullable_read_544, get_or_add_record_nullable_hit_spec_4_8_7_9) 
         "  using var d := new Dictionary<string, Point?>(); "
         "  var p: Point? := new Point(5, 6); "
         "  d.Add(\"p\", p); "
-        "  var result: Point? := d.GetOrAdd(\"p\", (k) => new Point(9, 9)); "
+        "  var result: Point? := d.GetOrAdd(\"p\", lambda(k) => new Point(9, 9)); "
         "  if result = null then return -1; end; "
         "  return result!.X * 10 + result!.Y; "  // 56 (hit, factory not called)
         "end Main; end C;"), 56);

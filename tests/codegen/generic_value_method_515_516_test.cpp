@@ -100,7 +100,7 @@ BEZEL_TEST(codegen_generic_value_method_516, apply_string_lambda_return_no_irfai
         std::string(kApply) +
         "class C "
         "  public static method GetStr(): string "
-        "    return Helper.Apply<string>(42, (x) => x.ToString()); "
+        "    return Helper.Apply<string>(42, lambda(x) => x.ToString()); "
         "  end GetStr; "
         "  public static method Main(): int "
         "    var s := C.GetStr(); "
@@ -117,7 +117,7 @@ BEZEL_TEST(codegen_generic_value_method_516, apply_int_control_still_works_14_1_
         std::string(kApply) +
         "class C "
         "  public static method Main(): int "
-        "    var v: int := Helper.Apply<int>(5, (x) => x * 2); "
+        "    var v: int := Helper.Apply<int>(5, lambda(x) => x * 2); "
         "    return v; "
         "  end Main; "
         "end C;"), 10);
@@ -129,7 +129,7 @@ BEZEL_TEST(codegen_generic_value_method_516, apply_bool_lambda_return_14_1_27_3)
         std::string(kApply) +
         "class C "
         "  public static method GetBool(): bool "
-        "    return Helper.Apply<bool>(3, (x) => x > 0); "
+        "    return Helper.Apply<bool>(3, lambda(x) => x > 0); "
         "  end GetBool; "
         "  public static method Main(): int "
         "    if C.GetBool() then return 1; end; "
@@ -156,7 +156,7 @@ BEZEL_TEST(codegen_generic_value_method_516, apply_class_ref_type_U_still_works_
         "end Helper; "
         "class C "
         "  public static method GetBox(): owned Box "
-        "    return Helper.Apply<Box>(7, (x) => new Box(x)); "
+        "    return Helper.Apply<Box>(7, lambda(x) => new Box(x)); "
         "  end GetBox; "
         "  public static method Main(): int "
         "    using var b := C.GetBox(); "
@@ -182,7 +182,7 @@ BEZEL_TEST(codegen_generic_value_method_516, original_505_shape_regression_guard
         "class C "
         "  public static method Main(): int "
         "    using var a := new A(); "
-        "    return Util.GetV(a, (x) => x.v); "
+        "    return Util.GetV(a, lambda(x) => x.v); "
         "  end Main; "
         "end C;"), 7);
 }
@@ -285,7 +285,7 @@ BEZEL_TEST(codegen_generic_value_method_515_516, combined_lambda_and_tostring_14
         "end Helper; "
         "class C "
         "  public static method Main(): int "
-        "    var s := Helper.Transform<int>(7, (x) => x * 6); "
+        "    var s := Helper.Transform<int>(7, lambda(x) => x * 6); "
         "    if s = \"42\" then return 1; end; "
         "    return 0; "
         "  end Main; "
@@ -340,7 +340,7 @@ BEZEL_TEST(codegen_generic_value_method_515_516, original_505_lambda_regression_
         "end Util; "
         "class C "
         "  public static method Main(): int "
-        "    return Util.Apply(5, (x) => x * 2); "
+        "    return Util.Apply(5, lambda(x) => x * 2); "
         "  end Main; "
         "end C;"), 10);
 }

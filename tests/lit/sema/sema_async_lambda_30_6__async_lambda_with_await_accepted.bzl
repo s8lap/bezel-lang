@@ -9,7 +9,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class C public static async method Producer(): Task<int> return 42; end Producer; public static async method Main(): Task<int> var f: () -> Task<int> := async () => await Producer(); using var t := f(); return await t; end Main; end C;
+module M; class C public static async method Producer(): Task<int> return 42; end Producer; public static async method Main(): Task<int> var f: () -> Task<int> := async lambda() => await Producer(); using var t := f(); return await t; end Main; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

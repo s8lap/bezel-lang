@@ -22,13 +22,13 @@ import System.Threading;
 
 class C
   // REJECT: a field-initializer identity lambda.
-  public echo: (Task<int>) -> Task<int> := (t) => t;
+  public echo: (Task<int>) -> Task<int> := lambda(t) => t;
 
   // REJECT: an expression-bodied getter whose body is the identity lambda.
-  public property Echo: (Task<int>) -> Task<int> => (t) => t;
+  public property Echo: (Task<int>) -> Task<int> => lambda(t) => t;
 
   // REJECT: an expression-bodied operator whose body is the identity lambda.
-  public static method operator +(a: C, b: C): (Task<int>) -> Task<int> => (t) => t;
+  public static method operator +(a: C, b: C): (Task<int>) -> Task<int> => lambda(t) => t;
 
   public static method Main(): int return 0; end Main;
 end C;

@@ -153,7 +153,7 @@ BEZEL_TEST(parser_trailing_comma_param_list, indexer_params) {
 
 BEZEL_TEST(parser_trailing_comma_lambda_params, simple_lambda) {
     const std::string src =
-        "module M; class C public method M() _ := (a, b,) => a + b;"
+        "module M; class C public method M() _ := lambda(a, b,) => a + b;"
         " end M; end C;";
     auto r = parseAll(src);
     BEZEL_EXPECT_FALSE(hasParseErrors(r));
@@ -161,13 +161,13 @@ BEZEL_TEST(parser_trailing_comma_lambda_params, simple_lambda) {
     BEZEL_EXPECT_TRUE(e != nullptr);
     if (e) {
         BEZEL_EXPECT_EQ(exprToString(*e),
-                        std::string("((a, b) => (a + b))"));
+                        std::string("(lambda(a, b) => (a + b))"));
     }
 }
 
 BEZEL_TEST(parser_trailing_comma_lambda_params, typed_lambda) {
     const std::string src =
-        "module M; class C public method M() _ := (a: int, b: int,) => a;"
+        "module M; class C public method M() _ := lambda(a: int, b: int,) => a;"
         " end M; end C;";
     auto r = parseAll(src);
     BEZEL_EXPECT_FALSE(hasParseErrors(r));
@@ -175,7 +175,7 @@ BEZEL_TEST(parser_trailing_comma_lambda_params, typed_lambda) {
 
 BEZEL_TEST(parser_trailing_comma_lambda_params, async_lambda) {
     const std::string src =
-        "module M; class C public method M() _ := async (a, b,) => a;"
+        "module M; class C public method M() _ := async lambda(a, b,) => a;"
         " end M; end C;";
     auto r = parseAll(src);
     BEZEL_EXPECT_FALSE(hasParseErrors(r));
@@ -188,7 +188,7 @@ BEZEL_TEST(parser_trailing_comma_lambda_params, async_lambda) {
 BEZEL_TEST(parser_trailing_comma_lambda_destructure, pair_destructure) {
     const std::string src =
         "module M; class C public method M() _ :="
-        " (Pair(a, b,)) => a + b; end M; end C;";
+        " lambda(Pair(a, b,)) => a + b; end M; end C;";
     auto r = parseAll(src);
     BEZEL_EXPECT_FALSE(hasParseErrors(r));
 }

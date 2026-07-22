@@ -99,6 +99,6 @@ BEZEL_TEST(parser_unit_value, unit_lambda_still_works) {
     // Regression: `() => 42` continues to take the empty-params lambda
     // path, not the unit-value path. The lambda discriminator runs first.
     BEZEL_EXPECT_EQ(
-        render("() => 42"),
-        std::string("(() => 42)"));
+        render("lambda() => 42"),
+        std::string("(lambda() => 42)"));
 }

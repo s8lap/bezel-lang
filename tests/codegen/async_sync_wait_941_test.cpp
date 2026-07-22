@@ -358,7 +358,7 @@ BEZEL_TEST(async_sync_wait_941, wait_inside_async_lambda_rejected_30_3_v0162) {
     BEZEL_EXPECT_EQ(compileFails941(
         "module M; class C "
         "  public static method Main(): int "
-        "    var f := async () => do "
+        "    var f := async lambda() => do "
         "      using var t := Task.Delay(1); "
         "      t.Wait(); "        // ERROR: blocking wait inside async lambda
         "    end; "

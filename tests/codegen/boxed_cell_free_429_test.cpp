@@ -234,7 +234,7 @@ const char* kNonEscapingIntCaptureSimple =
     "module M; class C "
     "  public static method Main(): int "
     "    var k: int := 7; "
-    "    var f: () -> int := () => k * 2; "  // captures k (non-escaping)
+    "    var f: () -> int := lambda() => k * 2; "  // captures k (non-escaping)
     "    var r: int := f(); "                 // r = 14
     "    if r = 14 then return 0; end; return 1; "
     "  end Main; "
@@ -253,7 +253,7 @@ const char* kNonEscapingStringCapture =
     "module M; class C "
     "  public static method Main(): int "
     "    var s: string := \"ab\" + \"cd\"; "     // +1 producer, rc=1
-    "    var f: () -> int := () => s.Length; "    // captures s (non-escaping)
+    "    var f: () -> int := lambda() => s.Length; "    // captures s (non-escaping)
     "    var r: int := f(); "                      // r = 4
     "    if r = 4 then return 0; end; return 1; "
     "  end Main; "
@@ -275,8 +275,8 @@ const char* kTwoNonEscapingLambdasSameCell =
     "module M; class C "
     "  public static method Main(): int "
     "    var n: int := 5; "
-    "    var f: () -> int := () => n + 1; "     // first to box n
-    "    var g: () -> int := () => n * 2; "     // also captures n (already-boxed)
+    "    var f: () -> int := lambda() => n + 1; "     // first to box n
+    "    var g: () -> int := lambda() => n * 2; "     // also captures n (already-boxed)
     "    var r: int := f() + g(); "             // (5+1)+(5*2)=16
     "    if r = 16 then return 0; end; return 1; "
     "  end Main; "
@@ -298,7 +298,7 @@ const char* kNonEscapingCaptureInDoBlock =
     "    var total: int := 0; "
     "    do "
     "      var x: int := 42; "
-    "      var f: () -> int := () => x; "   // non-escaping inside do-block
+    "      var f: () -> int := lambda() => x; "   // non-escaping inside do-block
     "      total := total + f(); "
     "    end; "
     "    if total = 42 then return 0; end; return 1; "
@@ -317,7 +317,7 @@ const char* kNonEscapingCaptureInDoBlock =
 const char* kParamCaptureNonEscaping =
     "module M; class C "
     "  public static method Doubled(p: int): int "
-    "    var f: () -> int := () => p * 2; "    // captures param p (non-escaping)
+    "    var f: () -> int := lambda() => p * 2; "    // captures param p (non-escaping)
     "    return f(); "
     "  end Doubled; "
     "  public static method Main(): int "
@@ -341,7 +341,7 @@ const char* kNonEscapingChurnLoop =
     "    var i: int := 0; var total: int := 0; "
     "    while i < 5000 do "
     "      var n: int := i; "                     // fresh n each iter
-    "      var f: () -> int := () => n + 1; "     // non-escaping capture
+    "      var f: () -> int := lambda() => n + 1; "     // non-escaping capture
     "      total := total + f(); "
     "      i := i + 1; "
     "    end; "
@@ -367,7 +367,7 @@ const char* kEscapingLambdaReturned =
     "module M; class C "
     "  public static method Make(v: int): () -> int "
     "    var tag: int := v * 3; "
-    "    return () => tag; "          // escaping: returned from method
+    "    return lambda() => tag; "          // escaping: returned from method
     "  end Make; "
     "  public static method Main(): int "
     "    var f := C.Make(4); "        // f holds escaping closure; tag cell leaks
@@ -389,14 +389,14 @@ const char* kEscapingLambdaReturned =
 // ===========================================================================
 const char* kEscapingLambdaStoredInField =
     "module M; class H "
-    "  public fn: () -> int := () => 0; "
+    "  public fn: () -> int := lambda() => 0; "
     "  destructor end destructor; "
     "  public static method Main(): int "
     "    var result: int := 0; "
     "    do "
     "      using var h := new H(); "
     "      var x: int := 99; "
-    "      h.fn := () => x; "         // lambda escapes via field-store; cell leaks
+    "      h.fn := lambda() => x; "         // lambda escapes via field-store; cell leaks
     "      result := h.fn(); "         // result = 99
     "    end; "
     "    if result = 99 then return 0; end; return 1; "

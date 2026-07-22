@@ -81,7 +81,7 @@ BEZEL_TEST(codegen_stdlib_650_firstornull_pred, firstornull_pred_no_match_return
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
         "a.Add(1); a.Add(2); a.Add(3); "
-        "var r := a.FirstOrNull((x: int) => x > 100); "
+        "var r := a.FirstOrNull(lambda(x: int) => x > 100); "
         "if r = null then return 0; end; "
         "return 1; ")), 0);
 }
@@ -91,7 +91,7 @@ BEZEL_TEST(codegen_stdlib_650_firstornull_pred, firstornull_pred_match_returns_f
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
         "a.Add(5); a.Add(15); a.Add(25); "
-        "var r := a.FirstOrNull((x: int) => x > 10); "
+        "var r := a.FirstOrNull(lambda(x: int) => x > 10); "
         "if r <> null then return r!; end; "
         "return -1; ")), 15);
 }
@@ -100,7 +100,7 @@ BEZEL_TEST(codegen_stdlib_650_firstornull_pred, firstornull_pred_match_returns_f
 BEZEL_TEST(codegen_stdlib_650_firstornull_pred, firstornull_pred_empty_returns_null) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
-        "var r := a.FirstOrNull((x: int) => x > 0); "
+        "var r := a.FirstOrNull(lambda(x: int) => x > 0); "
         "if r = null then return 0; end; "
         "return 1; ")), 0);
 }
@@ -111,7 +111,7 @@ BEZEL_TEST(codegen_stdlib_650_firstornull_pred, firstornull_pred_returns_first_n
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
         "a.Add(3); a.Add(7); a.Add(11); a.Add(19); "
-        "var r := a.FirstOrNull((x: int) => x > 5); "
+        "var r := a.FirstOrNull(lambda(x: int) => x > 5); "
         "if r <> null then return r!; end; "
         "return -1; ")), 7);
 }
@@ -150,7 +150,7 @@ BEZEL_TEST(codegen_stdlib_650_firstornull_pred, firstornull_pred_on_lazy_source)
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
         "a.Add(2); a.Add(4); a.Add(6); a.Add(8); "
-        "var r := a.Where((x: int) => x > 4).FirstOrNull((x: int) => x > 5); "
+        "var r := a.Where(lambda(x: int) => x > 4).FirstOrNull(lambda(x: int) => x > 5); "
         "if r <> null then return r!; end; "
         "return -1; ")), 6);
 }
@@ -167,7 +167,7 @@ BEZEL_TEST(codegen_stdlib_661_singleornull_pred, singleornull_pred_no_match_retu
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
         "a.Add(10); a.Add(20); a.Add(30); "
-        "var r := a.SingleOrNull((x: int) => x > 100); "
+        "var r := a.SingleOrNull(lambda(x: int) => x > 100); "
         "if r = null then return 0; end; "
         "return 1; ")), 0);
 }
@@ -177,7 +177,7 @@ BEZEL_TEST(codegen_stdlib_661_singleornull_pred, singleornull_pred_one_match_ret
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
         "a.Add(10); a.Add(20); a.Add(30); "
-        "var r := a.SingleOrNull((x: int) => x = 20); "
+        "var r := a.SingleOrNull(lambda(x: int) => x = 20); "
         "if r <> null then return r!; end; "
         "return -1; ")), 20);
 }
@@ -187,7 +187,7 @@ BEZEL_TEST(codegen_stdlib_661_singleornull_pred, singleornull_pred_two_matches_r
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
         "a.Add(10); a.Add(20); a.Add(20); a.Add(30); "
-        "var r := a.SingleOrNull((x: int) => x = 20); "
+        "var r := a.SingleOrNull(lambda(x: int) => x = 20); "
         "if r = null then return 0; end; "
         "return 1; ")), 0);
 }
@@ -196,7 +196,7 @@ BEZEL_TEST(codegen_stdlib_661_singleornull_pred, singleornull_pred_two_matches_r
 BEZEL_TEST(codegen_stdlib_661_singleornull_pred, singleornull_pred_empty_returns_null) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
-        "var r := a.SingleOrNull((x: int) => x > 0); "
+        "var r := a.SingleOrNull(lambda(x: int) => x > 0); "
         "if r = null then return 0; end; "
         "return 1; ")), 0);
 }
@@ -207,7 +207,7 @@ BEZEL_TEST(codegen_stdlib_661_singleornull_pred, singleornull_pred_match_at_end)
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
         "a.Add(1); a.Add(2); a.Add(99); "
-        "var r := a.SingleOrNull((x: int) => x = 99); "
+        "var r := a.SingleOrNull(lambda(x: int) => x = 99); "
         "if r <> null then return r!; end; "
         "return -1; ")), 99);
 }
@@ -218,9 +218,9 @@ BEZEL_TEST(codegen_stdlib_661_singleornull_pred, singleornull_pred_probe_071b_ca
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
         "a.Add(10); a.Add(20); a.Add(30); "
-        "var f: int? := a.FirstOrNull((x: int) => x > 15); "
+        "var f: int? := a.FirstOrNull(lambda(x: int) => x > 15); "
         "var l: int? := a.LastOrNull(); "
-        "var s: int? := a.SingleOrNull((x: int) => x = 20); "
+        "var s: int? := a.SingleOrNull(lambda(x: int) => x = 20); "
         "if f! = 20 and l! = 30 and s! = 20 then return 1; end; "
         "return 0; ")), 1);
 }
@@ -252,7 +252,7 @@ BEZEL_TEST(codegen_stdlib_651_groupby_oftype, oftype_chained_with_where) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
         "a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "using var b := a.OfType<int>().Where((x: int) => x > 2).ToArray(); "
+        "using var b := a.OfType<int>().Where(lambda(x: int) => x > 2).ToArray(); "
         "return b.Count; ")), 2);
 }
 
@@ -260,7 +260,7 @@ BEZEL_TEST(codegen_stdlib_651_groupby_oftype, oftype_chained_with_where) {
 BEZEL_TEST(codegen_stdlib_651_groupby_oftype, groupby_empty_source_returns_empty) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
-        "using var groups := a.GroupBy((x: int) => x).ToArray(); "
+        "using var groups := a.GroupBy(lambda(x: int) => x).ToArray(); "
         "return groups.Count; ")), 0);
 }
 
@@ -270,7 +270,7 @@ BEZEL_TEST(codegen_stdlib_651_groupby_oftype, groupby_int_identity_two_distinct_
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
         "a.Add(1); a.Add(2); a.Add(1); "
-        "using var groups := a.GroupBy((x: int) => x).ToArray(); "
+        "using var groups := a.GroupBy(lambda(x: int) => x).ToArray(); "
         "return groups.Count; ")), 2);
 }
 
@@ -280,7 +280,7 @@ BEZEL_TEST(codegen_stdlib_651_groupby_oftype, groupby_group_element_count) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
         "a.Add(10); a.Add(20); a.Add(10); a.Add(30); "
-        "using var groups := a.GroupBy((x: int) => x).ToArray(); "
+        "using var groups := a.GroupBy(lambda(x: int) => x).ToArray(); "
         "if groups.Count <> 3 then return -1; end; "
         "var total := 0; "
         "var i := 0; "
@@ -297,7 +297,7 @@ BEZEL_TEST(codegen_stdlib_651_groupby_oftype, groupby_key_property_correct) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
         "a.Add(5); a.Add(5); a.Add(5); "
-        "using var groups := a.GroupBy((x: int) => x).ToArray(); "
+        "using var groups := a.GroupBy(lambda(x: int) => x).ToArray(); "
         "if groups.Count <> 1 then return -1; end; "
         "return groups[0].Key; ")), 5);
 }
@@ -312,19 +312,19 @@ BEZEL_TEST(codegen_stdlib_752_groupby_lazy, groupby_count_composes) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
         "a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "return a.GroupBy((x: int) => x mod 2).Count(); ")), 2);
+        "return a.GroupBy(lambda(x: int) => x mod 2).Count(); ")), 2);
 }
 BEZEL_TEST(codegen_stdlib_752_groupby_lazy, groupby_any_composes) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
         "a.Add(1); a.Add(2); "
-        "if a.GroupBy((x: int) => x mod 2).Any() then return 1; else return 0; end; ")),
+        "if a.GroupBy(lambda(x: int) => x mod 2).Any() then return 1; else return 0; end; ")),
         1);
 }
 BEZEL_TEST(codegen_stdlib_752_groupby_lazy, groupby_any_empty_is_false) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var a := new Array<int>(); "
-        "if a.GroupBy((x: int) => x mod 2).Any() then return 1; else return 0; end; ")),
+        "if a.GroupBy(lambda(x: int) => x mod 2).Any() then return 1; else return 0; end; ")),
         0);
 }
 BEZEL_TEST(codegen_stdlib_752_groupby_lazy, groupby_for_in_sums_group_counts) {
@@ -333,7 +333,7 @@ BEZEL_TEST(codegen_stdlib_752_groupby_lazy, groupby_for_in_sums_group_counts) {
         "using var a := new Array<int>(); "
         "a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); a.Add(6); "
         "var total := 0; "
-        "for var g in a.GroupBy((x: int) => x mod 3) do total := total + g.Count(); end; "
+        "for var g in a.GroupBy(lambda(x: int) => x mod 3) do total := total + g.Count(); end; "
         "return total; ")), 6);
 }
 BEZEL_TEST(codegen_stdlib_752_groupby_lazy, groupby_for_in_keys_correct) {
@@ -343,7 +343,7 @@ BEZEL_TEST(codegen_stdlib_752_groupby_lazy, groupby_for_in_keys_correct) {
         "using var a := new Array<int>(); "
         "a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); a.Add(6); "
         "var keysum := 0; "
-        "for var g in a.GroupBy((x: int) => x mod 3) do keysum := keysum + g.Key; end; "
+        "for var g in a.GroupBy(lambda(x: int) => x mod 3) do keysum := keysum + g.Key; end; "
         "return keysum; ")), 3);
 }
 

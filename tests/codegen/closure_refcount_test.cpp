@@ -234,7 +234,7 @@ const char* kLoopThisCapturingChurnSteadyState =
     "  public method Run(): int "
     "    var acc: int := 0; var i: int := 0; "
     "    while i < 200000 do "
-    "      var f: (int) -> int := (x: int) => x + this._base; "
+    "      var f: (int) -> int := lambda(x: int) => x + this._base; "
     "      acc := acc + f(1); "
     "      i := i + 1; "
     "    end; "
@@ -255,7 +255,7 @@ const char* kLoopNonCapturingChurnSteadyState =
     "  public static method Main(): int "
     "    var i: int := 0; var acc: int := 0; "
     "    while i < 200000 do "
-    "      var f: (int) -> int := (x: int) => x * 2; "
+    "      var f: (int) -> int := lambda(x: int) => x * 2; "
     "      acc := acc + f(1); "
     "      i := i + 1; "
     "    end; "
@@ -280,7 +280,7 @@ const char* kCapturingIntChurn =
     "    var i: int := 0; var acc: int := 0; "
     "    while i < 5000 do "
     "      var k: int := i; "
-    "      var f: (int) -> int := (x: int) => x + k; "
+    "      var f: (int) -> int := lambda(x: int) => x + k; "
     "      acc := acc + f(1); "
     "      i := i + 1; "
     "    end; "
@@ -306,7 +306,7 @@ const char* kCapturedOwnedDisposedOnce =
     "  public static method Main(): int "
     "    do "
     "      using var r := new R(); "
-    "      var f: () -> int := () => r.Tag(); "
+    "      var f: () -> int := lambda() => r.Tag(); "
     "      var _ := f(); "
     "    end; "
     "    return _n; "                 // exactly one disposal → 1
@@ -332,7 +332,7 @@ const char* kCapturedOwnedLoopDisposedOnce =
     "    while i < 5000 do "
     "      do "
     "        using var r := new R(); "
-    "        var f: () -> int := () => r.Tag(); "
+    "        var f: () -> int := lambda() => r.Tag(); "
     "        var _ := f(); "
     "      end; "
     "      i := i + 1; "
@@ -351,7 +351,7 @@ const char* kEscapingClosureReturned =
     "module M; class C "
     "  public static method MakeCounter(): () -> int "
     "    var count := 0; "
-    "    return () => do "
+    "    return lambda() => do "
     "      count := count + 1; "
     "      return count; "
     "    end; "
@@ -374,7 +374,7 @@ const char* kAliasedClosureSharedFreedOnce =
     "  end Apply; "
     "  public static method Main(): int "
     "    var k := 10; "
-    "    var f: (int) -> int := (x: int) => x + k; "
+    "    var f: (int) -> int := lambda(x: int) => x + k; "
     "    var g: (int) -> int := f; "
     "    return Apply(f, 1) + Apply(g, 1); "  // (1+10)+(1+10) = 22
     "  end Main; "
@@ -416,8 +416,8 @@ const char* kMethodRefChurnSteadyState =
 const char* kCaptureClosureCalled =
     "module M; class C "
     "  public static method Main(): int "
-    "    var g: () -> int := () => 7; "
-    "    var f: () -> int := () => g(); "
+    "    var g: () -> int := lambda() => 7; "
+    "    var f: () -> int := lambda() => g(); "
     "    var r := f(); "             // g() => 7
     "    return r; "
     "  end Main; "
@@ -429,8 +429,8 @@ const char* kCaptureClosureCalled =
 const char* kCaptureClosureBareIdent =
     "module M; class C "
     "  public static method Main(): int "
-    "    var g: () -> int := () => 7; "
-    "    var f := () => g; "         // outer lambda forwards g (inferred type)
+    "    var g: () -> int := lambda() => 7; "
+    "    var f := lambda() => g; "         // outer lambda forwards g (inferred type)
     "    var inner := f(); "
     "    return inner(); "           // g() => 7
     "  end Main; "

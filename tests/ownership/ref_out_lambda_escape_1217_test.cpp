@@ -70,7 +70,7 @@ BEZEL_TEST(ref_out_lambda_escape_1217,
            return_lambda_capturing_ref_param_rejected_27_5) {
     auto r = parseAndCheckOwnership(wrapMethod(
         "public static method MakeAdder(ref x: int): () -> int "
-        "  return () => x; "
+        "  return lambda() => x; "
         "end MakeAdder;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(rejectsRefOutEscape(r, "x"));
@@ -84,7 +84,7 @@ BEZEL_TEST(ref_out_lambda_escape_1217,
     auto r = parseAndCheckOwnership(wrapMethod(
         "public static method MakeWriter(out x: int): () -> int "
         "  x := 0; "
-        "  return () => x; "
+        "  return lambda() => x; "
         "end MakeWriter;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(rejectsRefOutEscape(r, "x"));
@@ -96,7 +96,7 @@ BEZEL_TEST(ref_out_lambda_escape_1217,
            store_lambda_in_field_capturing_ref_param_rejected_27_5) {
     auto r = parseAndCheckOwnership(wrapWithField(
         "public method SetHandler(ref x: int) "
-        "  _handler := () => x; "
+        "  _handler := lambda() => x; "
         "end SetHandler;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(rejectsRefOutEscape(r, "x"));
@@ -108,7 +108,7 @@ BEZEL_TEST(ref_out_lambda_escape_1217,
     auto r = parseAndCheckOwnership(wrapWithField(
         "public method SetProducer(out x: int) "
         "  x := 0; "
-        "  _handler := () => x; "
+        "  _handler := lambda() => x; "
         "end SetProducer;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(rejectsRefOutEscape(r, "x"));
@@ -127,7 +127,7 @@ BEZEL_TEST(ref_out_lambda_escape_1217,
            local_invocation_ref_capturing_lambda_clean_27_5) {
     auto r = parseAndCheckOwnership(wrapMethod(
         "public static method Bump(ref x: int): int "
-        "  var f := () => do x := x + 1; return x; end; "
+        "  var f := lambda() => do x := x + 1; return x; end; "
         "  return f(); "    // returns the int result, not the closure
         "end Bump;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -140,7 +140,7 @@ BEZEL_TEST(ref_out_lambda_escape_1217,
     auto r = parseAndCheckOwnership(wrapMethod(
         "public static method Write(out x: int): int "
         "  x := 0; "
-        "  var f := () => do x := x + 7; return x; end; "
+        "  var f := lambda() => do x := x + 7; return x; end; "
         "  return f(); "    // returns the int result, not the closure
         "end Write;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -156,7 +156,7 @@ BEZEL_TEST(ref_out_lambda_escape_1217,
            return_lambda_capturing_value_local_unaffected_27_5) {
     auto r = parseAndCheckOwnership(wrapMethod(
         "public static method MakeAdder(n: int): () -> int "
-        "  return () => n; "    // n is a plain value param — legal escape
+        "  return lambda() => n; "    // n is a plain value param — legal escape
         "end MakeAdder;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -166,7 +166,7 @@ BEZEL_TEST(ref_out_lambda_escape_1217,
            return_non_capturing_lambda_clean_27_5) {
     auto r = parseAndCheckOwnership(wrapMethod(
         "public static method MakeConst(): () -> int "
-        "  return () => 42; "
+        "  return lambda() => 42; "
         "end MakeConst;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

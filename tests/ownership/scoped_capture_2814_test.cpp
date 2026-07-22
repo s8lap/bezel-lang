@@ -74,7 +74,7 @@ std::string prog(const std::string& body) {
 BEZEL_TEST(scoped_capture_2814, ctor_form_sources_before_scope_admitted) {
     auto r = parseAndCheckOwnership(prog(
         "    using var res := new Res(); "
-        "    using var run := new Runner(() => res.Ping()); "
+        "    using var run := new Runner(lambda() => res.Ping()); "
         "    run.Fire(); "
         "    return 0; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -85,8 +85,8 @@ BEZEL_TEST(scoped_capture_2814, ctor_form_sources_before_scope_admitted) {
 BEZEL_TEST(scoped_capture_2814, receiver_form_sources_before_scope_admitted) {
     auto r = parseAndCheckOwnership(prog(
         "    using var res := new Res(); "
-        "    using var run := new Runner(() => ()); "
-        "    run.Install(() => res.Ping()); "
+        "    using var run := new Runner(lambda() => ()); "
+        "    run.Install(lambda() => res.Ping()); "
         "    return 0; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -95,9 +95,9 @@ BEZEL_TEST(scoped_capture_2814, receiver_form_sources_before_scope_admitted) {
 // bounding local, so it dies before the drain; rejected NAMING the capture.
 BEZEL_TEST(scoped_capture_2814, declaration_order_violation_rejected) {
     auto r = parseAndCheckOwnership(prog(
-        "    using var run := new Runner(() => ()); "
+        "    using var run := new Runner(lambda() => ()); "
         "    using var res := new Res(); "
-        "    run.Install(() => res.Ping()); "
+        "    run.Install(lambda() => res.Ping()); "
         "    return 0; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(diagContains(r, "`res`"));
@@ -109,8 +109,8 @@ BEZEL_TEST(scoped_capture_2814, declaration_order_violation_rejected) {
 BEZEL_TEST(scoped_capture_2814, non_using_var_bounding_rejects_captures) {
     auto r = parseAndCheckOwnership(prog(
         "    using var res := new Res(); "
-        "    var run := new Runner(() => ()); "
-        "    run.Install(() => res.Ping()); "
+        "    var run := new Runner(lambda() => ()); "
+        "    run.Install(lambda() => res.Ping()); "
         "    run.Dispose(); "
         "    return 0; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -121,8 +121,8 @@ BEZEL_TEST(scoped_capture_2814, non_using_var_bounding_rejects_captures) {
 // var bounding shape with a capture-free callback is clean.
 BEZEL_TEST(scoped_capture_2814, capture_free_admitted_without_bounding) {
     auto r = parseAndCheckOwnership(prog(
-        "    var run := new Runner(() => ()); "
-        "    run.Install(() => ()); "
+        "    var run := new Runner(lambda() => ()); "
+        "    run.Install(lambda() => ()); "
         "    run.Dispose(); "
         "    return 0; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -133,7 +133,7 @@ BEZEL_TEST(scoped_capture_2814, capture_free_admitted_without_bounding) {
 BEZEL_TEST(scoped_capture_2814, freeze_move_of_captured_source_rejected) {
     auto r = parseAndCheckOwnership(prog(
         "    var res := new Res(); "
-        "    using var run := new Runner(() => res.Ping()); "
+        "    using var run := new Runner(lambda() => res.Ping()); "
         "    Prog.Sink(owned res); "
         "    return 0; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -145,7 +145,7 @@ BEZEL_TEST(scoped_capture_2814, freeze_move_of_captured_source_rejected) {
 BEZEL_TEST(scoped_capture_2814, freeze_dispose_of_captured_source_rejected) {
     auto r = parseAndCheckOwnership(prog(
         "    var res := new Res(); "
-        "    using var run := new Runner(() => res.Ping()); "
+        "    using var run := new Runner(lambda() => res.Ping()); "
         "    res.Dispose(); "
         "    return 0; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -156,7 +156,7 @@ BEZEL_TEST(scoped_capture_2814, freeze_dispose_of_captured_source_rejected) {
 BEZEL_TEST(scoped_capture_2814, freeze_reassign_of_captured_source_rejected) {
     auto r = parseAndCheckOwnership(prog(
         "    var res := new Res(); "
-        "    using var run := new Runner(() => res.Ping()); "
+        "    using var run := new Runner(lambda() => res.Ping()); "
         "    res := new Res(); "
         "    return 0; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -172,7 +172,7 @@ BEZEL_TEST(scoped_capture_2814, move_before_admission_not_frozen) {
         "    var res := new Res(); "
         "    Prog.Sink(owned res); "
         "    var res2 := new Res(); "
-        "    using var run := new Runner(() => res2.Ping()); "
+        "    using var run := new Runner(lambda() => res2.Ping()); "
         "    run.Fire(); "
         "    return 0; "));
     BEZEL_EXPECT_TRUE(!diagContains(r, "frozen"));
@@ -185,9 +185,9 @@ BEZEL_TEST(scoped_capture_2814, move_before_admission_not_frozen) {
 // binding.)
 BEZEL_TEST(scoped_capture_2814, function_value_arg_rejected_unverifiable) {
     auto r = parseAndCheckOwnership(prog(
-        "    var f := () => (); "
-        "    f := () => (); "
-        "    using var run := new Runner(() => ()); "
+        "    var f := lambda() => (); "
+        "    f := lambda() => (); "
+        "    using var run := new Runner(lambda() => ()); "
         "    run.Install(f); "
         "    return 0; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -198,8 +198,8 @@ BEZEL_TEST(scoped_capture_2814, function_value_arg_rejected_unverifiable) {
 // verifiable — the literal is capture-free, so it is admitted.
 BEZEL_TEST(scoped_capture_2814, lambda_literal_local_capture_free_admitted) {
     auto r = parseAndCheckOwnership(prog(
-        "    var f := () => (); "
-        "    using var run := new Runner(() => ()); "
+        "    var f := lambda() => (); "
+        "    using var run := new Runner(lambda() => ()); "
         "    run.Install(f); "
         "    return 0; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -209,11 +209,11 @@ BEZEL_TEST(scoped_capture_2814, lambda_literal_local_capture_free_admitted) {
 // stored callback (the runtime disposes it when the arm completes).
 BEZEL_TEST(scoped_capture_2814, catch_borrow_capture_rejected) {
     auto r = parseAndCheckOwnership(prog(
-        "    using var run := new Runner(() => ()); "
+        "    using var run := new Runner(lambda() => ()); "
         "    try "
         "      Prog.Sink(new Res()); "
         "    catch "
-        "      var ex: Exception => run.Install(() => ex.Message.Length); "
+        "      var ex: Exception => run.Install(lambda() => ex.Message.Length); "
         "    end; "
         "    return 0; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -334,7 +334,7 @@ BEZEL_TEST(scoped_capture_2814, scoped_field_assign_arbitrary_lambda_rejected) {
         "  private scoped _cb: (() -> ())?; "
         "  private _n: int; "
         "  public method Bad() "
-        "    _cb := () => _n; "
+        "    _cb := lambda() => _n; "
         "  end Bad; "
         "  destructor end; "
         "end C;");

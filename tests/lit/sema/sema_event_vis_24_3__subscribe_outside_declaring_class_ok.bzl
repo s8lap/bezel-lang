@@ -10,7 +10,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; record Ev(N: int); class Button public event Clicked: Ev; public method Inside() var _ := this; end Inside; end Button; class Other public method Outside(b: Button) var s := b.Clicked.Subscribe((e) => do end); end Outside; end Other;
+module M; record Ev(N: int); class Button public event Clicked: Ev; public method Inside() var _ := this; end Inside; end Button; class Other public method Outside(b: Button) var s := b.Clicked.Subscribe(lambda(e) => do end); end Outside; end Other;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

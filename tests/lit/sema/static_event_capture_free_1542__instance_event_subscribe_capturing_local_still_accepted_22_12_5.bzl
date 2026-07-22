@@ -10,7 +10,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; record Ev(N: int); class Src public event Ticked: Ev; end Src; class C public method Use() var total := 0; using var src := new Src(); using var sub := src.Ticked.Subscribe((e) => do total := total + e.N; end); end Use; end C;
+module M; record Ev(N: int); class Src public event Ticked: Ev; end Src; class C public method Use() var total := 0; using var src := new Src(); using var sub := src.Ticked.Subscribe(lambda(e) => do total := total + e.N; end); end Use; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

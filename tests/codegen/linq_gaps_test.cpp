@@ -92,7 +92,7 @@ BEZEL_TEST(linq_gaps, union_chained_where_count_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); a.Add(1); a.Add(2); a.Add(3); "
         "  using var b := new Array<int>(); b.Add(3); b.Add(4); b.Add(5); "
-        "  return a.Union(b).Where((x) => x mod 2 = 0).Count(); "  // {2,4} = 2
+        "  return a.Union(b).Where(lambda(x) => x mod 2 = 0).Count(); "  // {2,4} = 2
         "end Main; end C;"), 2);
 }
 
@@ -205,8 +205,8 @@ BEZEL_TEST(linq_gaps, thenby_basic_spec_5) {
         "  using var a := new Array<Point>(); "
         "  a.Add(new Point(2, 4)); a.Add(new Point(1, 5)); "
         "  a.Add(new Point(2, 1)); a.Add(new Point(1, 3)); "
-        "  using var r: Array<Point> := a.OrderBy((p) => p.x)"
-        "                               .ThenBy((p) => p.y)"
+        "  using var r: Array<Point> := a.OrderBy(lambda(p) => p.x)"
+        "                               .ThenBy(lambda(p) => p.y)"
         "                               .ToArray(); "
         "  return int(r.Get(0).x = 1 and r.Get(0).y = 3 and "
         "             r.Get(1).x = 1 and r.Get(1).y = 5 and "
@@ -224,8 +224,8 @@ BEZEL_TEST(linq_gaps, thenby_descending_spec_5) {
         "  using var a := new Array<Point>(); "
         "  a.Add(new Point(2, 4)); a.Add(new Point(1, 5)); "
         "  a.Add(new Point(2, 1)); a.Add(new Point(1, 3)); "
-        "  using var r: Array<Point> := a.OrderBy((p) => p.x)"
-        "                               .ThenByDescending((p) => p.y)"
+        "  using var r: Array<Point> := a.OrderBy(lambda(p) => p.x)"
+        "                               .ThenByDescending(lambda(p) => p.y)"
         "                               .ToArray(); "
         "  return int(r.Get(0).x = 1 and r.Get(0).y = 5 and "
         "             r.Get(1).x = 1 and r.Get(1).y = 3 and "
@@ -241,8 +241,8 @@ BEZEL_TEST(linq_gaps, thenby_single_element_spec_5) {
         "class C public static method Main(): int "
         "  using var a := new Array<Point>(); "
         "  a.Add(new Point(7, 3)); "
-        "  using var r: Array<Point> := a.OrderBy((p) => p.x)"
-        "                               .ThenBy((p) => p.y)"
+        "  using var r: Array<Point> := a.OrderBy(lambda(p) => p.x)"
+        "                               .ThenBy(lambda(p) => p.y)"
         "                               .ToArray(); "
         "  return r.Length; "
         "end Main; end C;"), 1);
@@ -256,7 +256,7 @@ BEZEL_TEST(linq_gaps, thenby_chained_count_spec_5) {
         "  using var a := new Array<Point>(); "
         "  a.Add(new Point(2, 4)); a.Add(new Point(1, 5)); "
         "  a.Add(new Point(2, 1)); a.Add(new Point(1, 3)); "
-        "  return a.OrderBy((p) => p.x).ThenBy((p) => p.y).Count(); "
+        "  return a.OrderBy(lambda(p) => p.x).ThenBy(lambda(p) => p.y).Count(); "
         "end Main; end C;"), 4);
 }
 
@@ -270,7 +270,7 @@ BEZEL_TEST(linq_gaps, reverse_basic_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); "
-        "  using var r: Array<int> := a.Where((x) => x > 0).Reverse().ToArray(); "
+        "  using var r: Array<int> := a.Where(lambda(x) => x > 0).Reverse().ToArray(); "
         "  return int(r.Length = 5 and r.Get(0) = 5 and r.Get(4) = 1); "
         "end Main; end C;"), 1);
 }
@@ -280,7 +280,7 @@ BEZEL_TEST(linq_gaps, reverse_empty_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
-        "  using var r: Array<int> := a.Where((x) => x > 0).Reverse().ToArray(); "
+        "  using var r: Array<int> := a.Where(lambda(x) => x > 0).Reverse().ToArray(); "
         "  return r.Length; "
         "end Main; end C;"), 0);
 }
@@ -290,7 +290,7 @@ BEZEL_TEST(linq_gaps, reverse_single_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); a.Add(42); "
-        "  using var r: Array<int> := a.Where((x) => x > 0).Reverse().ToArray(); "
+        "  using var r: Array<int> := a.Where(lambda(x) => x > 0).Reverse().ToArray(); "
         "  return r.Get(0); "
         "end Main; end C;"), 42);
 }
@@ -302,7 +302,7 @@ BEZEL_TEST(linq_gaps, reverse_chained_where_spec_5) {
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
         // Evens reversed: Where(even) = [2,4]; Reverse = [4,2]; Sum = 6
-        "  return a.Where((x) => x mod 2 = 0).Reverse().Sum(); "
+        "  return a.Where(lambda(x) => x mod 2 = 0).Reverse().Sum(); "
         "end Main; end C;"), 6);
 }
 
@@ -313,7 +313,7 @@ BEZEL_TEST(linq_gaps, reverse_for_loop_spec_5) {
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
         "  var s := 0; "
-        "  for var x in a.Where((x) => x > 0).Reverse() do s := s + x; end; "
+        "  for var x in a.Where(lambda(x) => x > 0).Reverse() do s := s + x; end; "
         "  return s; "  // 1+2+3 = 6 (order doesn't affect sum)
         "end Main; end C;"), 6);
 }
@@ -328,7 +328,7 @@ BEZEL_TEST(linq_gaps, toset_basic_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(1); a.Add(3); a.Add(2); "
-        "  using var s: Set<int> := a.Where((x) => x > 0).ToSet(); "
+        "  using var s: Set<int> := a.Where(lambda(x) => x > 0).ToSet(); "
         "  return s.Count; "  // 3
         "end Main; end C;"), 3);
 }
@@ -364,7 +364,7 @@ BEZEL_TEST(linq_gaps, todict_basic_count_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(10); a.Add(20); a.Add(30); "
-        "  using var d: Dictionary<int, int> := a.ToDictionary((x: int) => x); "
+        "  using var d: Dictionary<int, int> := a.ToDictionary(lambda(x: int) => x); "
         "  return d.Count; "  // 3
         "end Main; end C;"), 3);
 }
@@ -375,7 +375,7 @@ BEZEL_TEST(linq_gaps, todict_lookup_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(10); a.Add(20); a.Add(30); "
-        "  using var d: Dictionary<int, int> := a.ToDictionary((x: int) => x); "
+        "  using var d: Dictionary<int, int> := a.ToDictionary(lambda(x: int) => x); "
         "  return int(d.ContainsKey(20)); "  // 1
         "end Main; end C;"), 1);
 }
@@ -387,7 +387,7 @@ BEZEL_TEST(linq_gaps, todict_from_lazy_spec_5) {
         "  using var a := new Array<int>(); "
         "  for var i in 1..5 do a.Add(i); end; "
         "  using var d: Dictionary<int, int> := "
-        "    a.Where((x) => x mod 2 = 0).ToDictionary((x: int) => x); "
+        "    a.Where(lambda(x) => x mod 2 = 0).ToDictionary(lambda(x: int) => x); "
         "  return d.Count; "  // {2,4} → 2
         "end Main; end C;"), 2);
 }
@@ -401,7 +401,7 @@ BEZEL_TEST(linq_gaps, todict_scalar_value_indexed_read_738) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var a: Array<int> := [3, 5, 7]; "
-        "  using var d: Dictionary<int, int> := a.ToDictionary((x: int) => x); "
+        "  using var d: Dictionary<int, int> := a.ToDictionary(lambda(x: int) => x); "
         "  return d[3] + d[5] + d[7]; "  // 15
         "end Main; end C;"), 15);
 }
@@ -414,7 +414,7 @@ BEZEL_TEST(linq_gaps, todict_two_selector_applies_value_747) {
         "module M; class C public static method Main(): int "
         "  using var a: Array<int> := [5, 7]; "
         "  using var d: Dictionary<int, int> := "
-        "    a.ToDictionary((x: int) => x, (x: int) => x * 10); "
+        "    a.ToDictionary(lambda(x: int) => x, lambda(x: int) => x * 10); "
         "  return d[5] + d[7]; "  // 50 + 70 = 120
         "end Main; end C;"), 120);
 }
@@ -425,8 +425,8 @@ BEZEL_TEST(linq_gaps, todict_two_selector_lazy_source_747) {
         "module M; class C public static method Main(): int "
         "  using var a: Array<int> := [5, 6, 7]; "
         "  using var d: Dictionary<int, int> := "
-        "    a.Where((x: int) => x > 5).ToDictionary((x: int) => x, "
-        "                                             (x: int) => x * 10); "
+        "    a.Where(lambda(x: int) => x > 5).ToDictionary(lambda(x: int) => x, "
+        "                                             lambda(x: int) => x * 10); "
         "  return d[6] + d[7]; "  // 60 + 70 = 130
         "end Main; end C;"), 130);
 }
@@ -438,7 +438,7 @@ BEZEL_TEST(linq_gaps, todict_two_selector_distinct_key_value_747) {
         "module M; class C public static method Main(): int "
         "  using var a: Array<int> := [1, 2]; "
         "  using var d: Dictionary<int, int> := "
-        "    a.ToDictionary((x: int) => x, (x: int) => x + 100); "
+        "    a.ToDictionary(lambda(x: int) => x, lambda(x: int) => x + 100); "
         "  return d[1] + d[2]; "  // 101 + 102 = 203
         "end Main; end C;"), 203);
 }
@@ -451,7 +451,7 @@ BEZEL_TEST(linq_gaps, todict_unannotated_key_lambda_inferred_local_738) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var arr: Array<int> := [3, 5, 7]; "
-        "  using var d := arr.ToDictionary((x) => x); "  // un-annotated, inferred local
+        "  using var d := arr.ToDictionary(lambda(x) => x); "  // un-annotated, inferred local
         "  return d[3] + d[5]; "  // 8
         "end Main; end C;"), 8);
 }
@@ -464,7 +464,7 @@ BEZEL_TEST(linq_gaps, todict_record_value_indexed_read_738) {
         "module M; record Pt(X: int, Y: int); "
         "class C public static method Main(): int "
         "  using var a: Array<Pt> := [new Pt(3, 4), new Pt(10, 20)]; "
-        "  using var d: Dictionary<int, Pt> := a.ToDictionary((p: Pt) => p.X); "
+        "  using var d: Dictionary<int, Pt> := a.ToDictionary(lambda(p: Pt) => p.X); "
         "  var got := d[10]; return got.X + got.Y; "  // 30
         "end Main; end C;"), 30);
 }
@@ -489,7 +489,7 @@ BEZEL_TEST(linq_gaps, todict_string_key_lookup_via_lambda_1692) {
         "module M; class C public static method Main(): int "
         "  using var xs := new Array<int>(); "
         "  xs.Add(1); xs.Add(2); xs.Add(3); "
-        "  using var d := xs.ToDictionary((x) => $\"k{x}\"); "
+        "  using var d := xs.ToDictionary(lambda(x) => $\"k{x}\"); "
         "  return d[\"k1\"] + d[\"k2\"] + d[\"k3\"]; "  // 1+2+3 = 6
         "end Main; end C;"), 6);
 }
@@ -507,7 +507,7 @@ BEZEL_TEST(linq_gaps, todict_string_key_containskey_and_count_1692) {
         "module M; class C public static method Main(): int "
         "  using var xs := new Array<int>(); "
         "  xs.Add(1); xs.Add(2); xs.Add(3); "
-        "  using var d := xs.ToDictionary((x) => $\"k{x}\"); "
+        "  using var d := xs.ToDictionary(lambda(x) => $\"k{x}\"); "
         "  if not d.ContainsKey(\"k1\") then return -1; end; "
         "  if d.ContainsKey(\"k9\") then return -2; end; "
         "  return d.Count; "  // 3
@@ -529,7 +529,7 @@ BEZEL_TEST(linq_gaps, todict_inferred_var_count_459) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(10); a.Add(20); a.Add(30); "
-        "  using var d := a.ToDictionary((x: int) => x); "
+        "  using var d := a.ToDictionary(lambda(x: int) => x); "
         "  return d.Count; "  // 3 — explicit-annotation form already works
         "end Main; end C;"), 3);
 }
@@ -540,7 +540,7 @@ BEZEL_TEST(linq_gaps, todict_inferred_var_lazy_source_459) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  for var i in 1..5 do a.Add(i); end; "
-        "  using var d := a.Where((x) => x mod 2 = 0).ToDictionary((x: int) => x); "
+        "  using var d := a.Where(lambda(x) => x mod 2 = 0).ToDictionary(lambda(x: int) => x); "
         "  return d.Count; "  // {2,4} → 2
         "end Main; end C;"), 2);
 }
@@ -551,7 +551,7 @@ BEZEL_TEST(linq_gaps, todict_inferred_var_containskey_459) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(10); a.Add(20); a.Add(30); "
-        "  using var d := a.ToDictionary((x: int) => x); "
+        "  using var d := a.ToDictionary(lambda(x: int) => x); "
         "  return int(d.ContainsKey(20)); "  // 1
         "end Main; end C;"), 1);
 }
@@ -587,7 +587,7 @@ BEZEL_TEST(linq_gaps, first_or_null_lazy_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(4); a.Add(2); "
-        "  var n: int? := a.Where((x) => x > 3).FirstOrNull(); "
+        "  var n: int? := a.Where(lambda(x) => x > 3).FirstOrNull(); "
         "  return n ?? -1; "  // first element > 3 = 4
         "end Main; end C;"), 4);
 }
@@ -598,7 +598,7 @@ BEZEL_TEST(linq_gaps, first_or_null_lazy_no_match_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
-        "  var n: int? := a.Where((x) => x > 99).FirstOrNull(); "
+        "  var n: int? := a.Where(lambda(x) => x > 99).FirstOrNull(); "
         "  return n ?? -1; "  // no match → null → -1
         "end Main; end C;"), -1);
 }
@@ -634,7 +634,7 @@ BEZEL_TEST(linq_gaps, last_or_null_lazy_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(4); a.Add(2); a.Add(6); "
-        "  var n: int? := a.Where((x) => x > 3).LastOrNull(); "
+        "  var n: int? := a.Where(lambda(x) => x > 3).LastOrNull(); "
         "  return n ?? -1; "  // evens > 3: [4, 6]; last = 6
         "end Main; end C;"), 6);
 }
@@ -681,7 +681,7 @@ BEZEL_TEST(linq_gaps, single_or_null_lazy_one_match_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(5); a.Add(3); "
-        "  var n: int? := a.Where((x) => x > 4).SingleOrNull(); "
+        "  var n: int? := a.Where(lambda(x) => x > 4).SingleOrNull(); "
         "  return n ?? -1; "  // only 5 > 4 → 5
         "end Main; end C;"), 5);
 }
@@ -697,7 +697,7 @@ BEZEL_TEST(linq_gaps, union_orderby_take_chain_spec_5) {
         "  using var a := new Array<int>(); a.Add(5); a.Add(1); a.Add(3); "
         "  using var b := new Array<int>(); b.Add(3); b.Add(4); b.Add(2); "
         // Union = {5,1,3,4,2}; OrderBy = {1,2,3,4,5}; Take(3) = {1,2,3}; Sum=6
-        "  return a.Union(b).OrderBy((x: int) => x).Take(3).Sum(); "
+        "  return a.Union(b).OrderBy(lambda(x: int) => x).Take(3).Sum(); "
         "end Main; end C;"), 6);
 }
 
@@ -709,7 +709,7 @@ BEZEL_TEST(linq_gaps, except_reverse_count_chain_spec_5) {
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); "
         "  using var b := new Array<int>(); b.Add(2); b.Add(4); "
         // {1,3,5} reversed → {5,3,1}; Count = 3
-        "  return a.Except(b).Where((x) => x > 0).Reverse().Count(); "
+        "  return a.Except(b).Where(lambda(x) => x > 0).Reverse().Count(); "
         "end Main; end C;"), 3);
 }
 
@@ -720,7 +720,7 @@ BEZEL_TEST(linq_gaps, intersect_select_sum_chain_spec_5) {
         "  using var a := new Array<int>(); a.Add(1); a.Add(2); a.Add(3); "
         "  using var b := new Array<int>(); b.Add(2); b.Add(3); b.Add(4); "
         // {2,3} * 10 = {20,30}; Sum = 50
-        "  return a.Intersect(b).Select((x: int) => x * 10).Sum(); "
+        "  return a.Intersect(b).Select(lambda(x: int) => x * 10).Sum(); "
         "end Main; end C;"), 50);
 }
 
@@ -772,7 +772,7 @@ BEZEL_TEST(linq_gaps_issue449, lazy_reverse_after_where_still_correct_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); "
-        "  using var r: Array<int> := a.Where((x) => x mod 2 = 1).Reverse().ToArray(); "
+        "  using var r: Array<int> := a.Where(lambda(x) => x mod 2 = 1).Reverse().ToArray(); "
         // Where(odd) = [1,3,5]; Reverse = [5,3,1]
         "  return r.Get(0) * 100 + r.Get(1) * 10 + r.Get(2); "
         "end Main; end C;"), 531);
@@ -798,7 +798,7 @@ BEZEL_TEST(linq_gaps_issue1218, bound_lazy_iterated_twice_raises_ioe_spec_29_11)
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  var filtered := a.Where((x) => x mod 2 = 0); "
+        "  var filtered := a.Where(lambda(x) => x mod 2 = 0); "
         "  var s1 := 0; for var x in filtered do s1 := s1 + x; end; "
         "  var caught := 0; "
         "  try "
@@ -818,7 +818,7 @@ BEZEL_TEST(linq_gaps_issue1218, fresh_inline_lazy_still_disposes_correctly_spec_
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
         "  var s := 0; "
-        "  for var x in a.Where((x) => x mod 2 = 0) do s := s + x; end; "
+        "  for var x in a.Where(lambda(x) => x mod 2 = 0) do s := s + x; end; "
         "  return s; "
         "end Main; end C;"), 6);
 }
@@ -836,7 +836,7 @@ BEZEL_TEST(linq_gaps_issue1218, bound_lazy_passed_across_call_no_double_free_spe
         "  public static method Main(): int "
         "    using var a := new Array<int>(); "
         "    a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "    var filtered := a.Where((x) => x mod 2 = 0); "
+        "    var filtered := a.Where(lambda(x) => x mod 2 = 0); "
         "    var s1 := 0; for var x in filtered do s1 := s1 + x; end; "
         "    return s1; "
         "  end Main; "

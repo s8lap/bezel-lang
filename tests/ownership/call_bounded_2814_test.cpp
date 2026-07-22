@@ -53,7 +53,7 @@ BEZEL_TEST(call_bounded_2814, invoke_only_callee_and_capturing_caller_clean) {
         "  end Apply; "
         "  public static method Main(): int "
         "    using var res := new Res(); "
-        "    return C.Apply(() => res.Val()); "
+        "    return C.Apply(lambda() => res.Val()); "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -105,7 +105,7 @@ BEZEL_TEST(call_bounded_2814, capturing_closure_invoked_locally_clean) {
     auto r = parseAndCheckOwnership(
         "module M; class C "
         "  public static method Run(f: () -> int): int "
-        "    var h := () => f(); "
+        "    var h := lambda() => f(); "
         "    return h(); "
         "  end Run; "
         "end C;");
@@ -140,7 +140,7 @@ BEZEL_TEST(call_bounded_2814, return_lazy_query_capturing_owned_still_rejected) 
         "class C "
         "  public static method Bad(xs: Array<int>): IEnumerable<int> "
         "    using var res := new Res(); "
-        "    return xs.Where((x) => x > res.Limit()); "
+        "    return xs.Where(lambda(x) => x > res.Limit()); "
         "  end Bad; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -250,7 +250,7 @@ BEZEL_TEST(call_bounded_2814, capturing_closure_into_field_collection_rejected) 
         "module M; class C "
         "  private _handlers: Array<() -> int> := []; "
         "  public method Register(f: () -> int) "
-        "    _handlers.Add(() => f()); "
+        "    _handlers.Add(lambda() => f()); "
         "  end Register; "
         "  destructor end; "
         "end C;");
@@ -282,7 +282,7 @@ BEZEL_TEST(call_bounded_2814, escaping_capturing_closure_rejected) {
         "module M; class C "
         "  public static method Compose(f: (int) -> int, g: (int) -> int)"
         ": (int) -> int "
-        "    return (x: int) => g(f(x)); "
+        "    return lambda(x: int) => g(f(x)); "
         "  end Compose; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -295,7 +295,7 @@ BEZEL_TEST(call_bounded_2814, escaping_closure_via_local_alias_rejected) {
     auto r = parseAndCheckOwnership(
         "module M; class C "
         "  public static method Sneak(f: () -> int): () -> int "
-        "    var h := () => f(); "
+        "    var h := lambda() => f(); "
         "    return h; "
         "  end Sneak; "
         "end C;");
@@ -346,7 +346,7 @@ BEZEL_TEST(call_bounded_2814, capturing_closure_to_scoped_param_rejected) {
         "  private scoped _cb: (() -> ())?; "
         "  public method Install(scoped cb: () -> ()) _cb := cb; end Install; "
         "  public method Relay(f: () -> ()) "
-        "    Install(() => f()); "
+        "    Install(lambda() => f()); "
         "  end Relay; "
         "  destructor end; "
         "end C;");
@@ -459,7 +459,7 @@ BEZEL_TEST(call_bounded_2814, frame_over_callback_via_escaping_closure_rejected)
         "  public static method Leak(xs: Array<int>, f: (int) -> bool)"
         ": () -> int "
         "    var q := xs.Where(f); "
-        "    return () => q.Count(); "
+        "    return lambda() => q.Count(); "
         "  end Leak; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());

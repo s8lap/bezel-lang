@@ -21,5 +21,5 @@ public class Person: INotifyPropertyChanged
 end Person;
 
 var p: INotifyPropertyChanged := new Person();
-using var sub := p.PropertyChanged.Subscribe((e) =>
+using var sub := p.PropertyChanged.Subscribe(lambda(e) =>
   Console.WriteLine($"Changed: {e.PropertyName}"));

@@ -113,7 +113,7 @@ bool sawCaptureSetError(const bezel::test::OwnershipResult& r) {
 BEZEL_TEST(deferred_activation_capture_1818, bind_then_return_owned_local_rejected) {
     auto r = parseAndCheckOwnership(wrap(
         "using var scale := new Scaler(); "
-        "var q := Doubled(nums, (x) => scale.Apply(x)); "
+        "var q := Doubled(nums, lambda(x) => scale.Apply(x)); "
         "return q;",
         "method M(nums: Array<int>): IEnumerable<int>"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -127,7 +127,7 @@ BEZEL_TEST(deferred_activation_capture_1818, bind_then_return_owned_local_reject
 BEZEL_TEST(deferred_activation_capture_1818, bind_then_forin_owned_local_rejected) {
     auto r = parseAndCheckOwnership(wrap(
         "using var scale := new Scaler(); "
-        "var q := Doubled(nums, (x) => scale.Apply(x)); "
+        "var q := Doubled(nums, lambda(x) => scale.Apply(x)); "
         "var total := 0; "
         "for var v in q do total := total + v; end; "
         "return total;",
@@ -142,7 +142,7 @@ BEZEL_TEST(deferred_activation_capture_1818, bind_then_forin_owned_local_rejecte
 BEZEL_TEST(deferred_activation_capture_1818, direct_return_owned_local_rejected) {
     auto r = parseAndCheckOwnership(wrap(
         "using var scale := new Scaler(); "
-        "return Doubled(nums, (x) => scale.Apply(x));",
+        "return Doubled(nums, lambda(x) => scale.Apply(x));",
         "method M(nums: Array<int>): IEnumerable<int>"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(sawCaptureSetError(r));
@@ -155,7 +155,7 @@ BEZEL_TEST(deferred_activation_capture_1818, direct_return_owned_local_rejected)
 // load-bearing diagnostic pinned here.) // per §28.3, §28.14
 BEZEL_TEST(deferred_activation_capture_1818, owned_param_capture_rejected) {
     auto r = parseAndCheckOwnership(wrap(
-        "var q := Doubled(nums, (x) => s.Apply(x)); "
+        "var q := Doubled(nums, lambda(x) => s.Apply(x)); "
         "return q;",
         "method M(nums: Array<int>, owned s: Scaler): IEnumerable<int>"));
     BEZEL_EXPECT_TRUE(sawCaptureSetError(r));
@@ -175,7 +175,7 @@ BEZEL_TEST(deferred_activation_capture_1818, owned_param_capture_rejected) {
 BEZEL_TEST(deferred_activation_capture_1818, capture_nothing_owned_accepted) {
     auto r = parseAndCheckOwnership(wrap(
         "var bump: int := 5; "
-        "var q := Doubled(nums, (x) => this.Scale(x) + bump + Program.Factor); "
+        "var q := Doubled(nums, lambda(x) => this.Scale(x) + bump + Program.Factor); "
         "return q;",
         "method M(nums: Array<int>): IEnumerable<int>"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -191,7 +191,7 @@ BEZEL_TEST(deferred_activation_capture_1818, direct_for_source_not_escaped_accep
     auto r = parseAndCheckOwnership(wrap(
         "using var scale := new Scaler(); "
         "var total := 0; "
-        "for var v in Doubled(nums, (x) => scale.Apply(x)) do "
+        "for var v in Doubled(nums, lambda(x) => scale.Apply(x)) do "
         "  total := total + v; "
         "end; "
         "return total;",
@@ -205,7 +205,7 @@ BEZEL_TEST(deferred_activation_capture_1818, direct_for_source_not_escaped_accep
 // against over-rejecting the spec's admitted parameter-sourced case. // per §28.3
 BEZEL_TEST(deferred_activation_capture_1818, borrow_param_capture_accepted) {
     auto r = parseAndCheckOwnership(wrap(
-        "var q := Doubled(nums, (x) => s.Apply(x)); "
+        "var q := Doubled(nums, lambda(x) => s.Apply(x)); "
         "return q;",
         "method M(nums: Array<int>, s: Scaler): IEnumerable<int>"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -219,7 +219,7 @@ BEZEL_TEST(deferred_activation_capture_1818, borrow_param_capture_accepted) {
 BEZEL_TEST(deferred_activation_capture_1818, borrow_local_capture_accepted) {
     auto r = parseAndCheckOwnership(wrap(
         "var b := s; "
-        "var q := Doubled(nums, (x) => b.Apply(x)); "
+        "var q := Doubled(nums, lambda(x) => b.Apply(x)); "
         "return q;",
         "method M(nums: Array<int>, s: Scaler): IEnumerable<int>"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -425,7 +425,7 @@ BEZEL_TEST(deferred_activation_capture_1818, traced_local_methodref_return_owned
 BEZEL_TEST(deferred_activation_capture_1818, traced_local_lambda_return_owned_local_rejected) {
     auto r = parseAndCheckOwnership(wrap(
         "using var scale := new Scaler(); "
-        "var f := (x: int) => scale.Apply(x); "
+        "var f := lambda(x: int) => scale.Apply(x); "
         "return Doubled(nums, f);",
         "method M(nums: Array<int>): IEnumerable<int>"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -440,7 +440,7 @@ BEZEL_TEST(deferred_activation_capture_1818, traced_local_lambda_return_owned_lo
 BEZEL_TEST(deferred_activation_capture_1818, traced_local_lambda_capture_nothing_owned_accepted) {
     auto r = parseAndCheckOwnership(wrap(
         "var bump: int := 5; "
-        "var f := (x: int) => this.Scale(x) + bump + Program.Factor; "
+        "var f := lambda(x: int) => this.Scale(x) + bump + Program.Factor; "
         "return Doubled(nums, f);",
         "method M(nums: Array<int>): IEnumerable<int>"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -668,7 +668,7 @@ BEZEL_TEST(deferred_activation_capture_1818, async_carried_source_return_rejecte
     auto r = parseAndCheckOwnership(asyncWrap(
         "method Trouble(nums: Array<int>): Task<int> "
         "  using var scale := new Scaler(); "
-        "  return SumAsync(nums, (x) => scale.Apply(x)); "
+        "  return SumAsync(nums, lambda(x) => scale.Apply(x)); "
         "end Trouble;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(sawCaptureSetError(r));
@@ -683,7 +683,7 @@ BEZEL_TEST(deferred_activation_capture_1818, async_carried_source_bind_then_retu
     auto r = parseAndCheckOwnership(asyncWrap(
         "method Trouble(nums: Array<int>): Task<int> "
         "  using var scale := new Scaler(); "
-        "  var t := SumAsync(nums, (x) => scale.Apply(x)); "
+        "  var t := SumAsync(nums, lambda(x) => scale.Apply(x)); "
         "  return t; "
         "end Trouble;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -701,7 +701,7 @@ BEZEL_TEST(deferred_activation_capture_1818, async_awaited_in_scope_accepted) {
     auto r = parseAndCheckOwnership(asyncWrap(
         "async method Report(nums: Array<int>): Task<int> "
         "  using var scale := new Scaler(); "
-        "  var total := await SumAsync(nums, (x) => scale.Apply(x)); "
+        "  var total := await SumAsync(nums, lambda(x) => scale.Apply(x)); "
         "  return total; "
         "end Report;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -768,7 +768,7 @@ std::string exprWrap(const std::string& exprBody, const std::string& sig) {
 // contribution, v0.196
 BEZEL_TEST(deferred_activation_capture_1818, exprbody_owned_param_capture_returned_rejected) {
     auto r = parseAndCheckOwnership(exprWrap(
-        "Doubled(nums, (x) => s.Apply(x))",
+        "Doubled(nums, lambda(x) => s.Apply(x))",
         "method M(nums: Array<int>, owned s: Scaler): IEnumerable<int>"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(sawCaptureSetError(r));

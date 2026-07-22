@@ -54,7 +54,7 @@ int runMain(const std::string& body) {
 BEZEL_TEST(closure_call_nullable_param_557,
            literal_int_arg_to_nullable_int_param_spec_7_5) {
     BEZEL_EXPECT_EQ(runMain(
-        "  var fn: (int?) -> int := (x: int?) => x ?? -1; "
+        "  var fn: (int?) -> int := lambda(x: int?) => x ?? -1; "
         "  var result: int := fn(5); "
         "  return result;"),
         5);
@@ -65,7 +65,7 @@ BEZEL_TEST(closure_call_nullable_param_557,
 BEZEL_TEST(closure_call_nullable_param_557,
            variable_int_arg_to_nullable_int_param_spec_7_5) {
     BEZEL_EXPECT_EQ(runMain(
-        "  var fn: (int?) -> int := (x: int?) => x ?? -1; "
+        "  var fn: (int?) -> int := lambda(x: int?) => x ?? -1; "
         "  var n: int := 42; "
         "  var result: int := fn(n); "
         "  return result;"),
@@ -82,7 +82,7 @@ BEZEL_TEST(closure_call_nullable_param_557,
     BEZEL_EXPECT_EQ(runAotOut(
         "module P36; class Program "
         "  public static method Main(): int "
-        "  var fn: (int?) -> int := (x: int?) => x ?? -1; "
+        "  var fn: (int?) -> int := lambda(x: int?) => x ?? -1; "
         "  var result: int := fn(null); "
         "  Console.WriteLine(result); return 0;"
         " end Main; end Program;"),
@@ -98,7 +98,7 @@ BEZEL_TEST(closure_call_nullable_param_557,
            multi_arg_mixed_nullable_nonnullable_spec_7_5_22_1) {
     BEZEL_EXPECT_EQ(runMain(
         "  var fn: (int?, int, bool?) -> int := "
-        "    (a: int?, b: int, c: bool?) => do "
+        "    lambda(a: int?, b: int, c: bool?) => do "
         "      var sum: int := a ?? 0; "
         "      var extra: int := (b if c ?? false else 0); "
         "      return sum + extra; "
@@ -114,7 +114,7 @@ BEZEL_TEST(closure_call_nullable_param_557,
 BEZEL_TEST(closure_call_nullable_param_557,
            non_nullable_param_unaffected_regression_spec_22_1) {
     BEZEL_EXPECT_EQ(runMain(
-        "  var fn: (int) -> int := (x: int) => x * 2; "
+        "  var fn: (int) -> int := lambda(x: int) => x * 2; "
         "  return fn(3);"),
         6);
 }
@@ -124,7 +124,7 @@ BEZEL_TEST(closure_call_nullable_param_557,
 BEZEL_TEST(closure_call_nullable_param_557,
            bool_literal_arg_to_nullable_bool_param_spec_7_5) {
     BEZEL_EXPECT_EQ(runMain(
-        "  var fn: (bool?) -> int := (x: bool?) => (1 if x ?? false else 0); "
+        "  var fn: (bool?) -> int := lambda(x: bool?) => (1 if x ?? false else 0); "
         "  return fn(true);"),
         1);
 }

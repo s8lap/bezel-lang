@@ -76,7 +76,7 @@ BEZEL_TEST(generic_owned_field_string_reject_1107, function_type_rejected) {
     auto r = runAot(
         std::string("module M; ") + kBoxOwned +
         "class C public static method Main(): int "
-        "  var f: ()->int := () => 1; "
+        "  var f: ()->int := lambda() => 1; "
         "  using var b := new Box<()->int>(f); return 0; "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);

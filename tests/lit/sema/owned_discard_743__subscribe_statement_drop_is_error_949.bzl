@@ -5,7 +5,7 @@
 //
 // REJECT: bare-statement drop of a Subscribe result (§21.9).
 
-module M; public class Button public event Clicked: int; public method Click(v: int) Clicked.Raise(v); end Click; end Button; public class C public static method Main(): int using var btn: Button := new Button(); btn.Clicked.Subscribe((v) => do end); return 0; end Main; end C;
+module M; public class Button public event Clicked: int; public method Click(v: int) Clicked.Raise(v); end Click; end Button; public class C public static method Main(): int using var btn: Button := new Button(); btn.Clicked.Subscribe(lambda(v) => do end); return 0; end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: this expression produces an owned value that requires disposal (a non-trivial-dispose class or a move-only owning array); discarding it as a statement leaks the resource — bind it (`using var _ := expression;`), call `.Dispose()`, or transfer it (`move`/`return`)
 // CHECK-SAME: (§21.9)

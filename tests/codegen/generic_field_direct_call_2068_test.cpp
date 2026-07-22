@@ -79,7 +79,7 @@ BEZEL_TEST(generic_field_direct_call_2068, record_box_lambda_call_43) {
         "module M; record Box<U>(V: U); "
         "class C "
         "  public static method Main(): int "
-        "    using var b := new Box<(int) -> int>((x) => x + 1); "
+        "    using var b := new Box<(int) -> int>(lambda(x) => x + 1); "
         "    return b.V(42); "
         "  end Main; "
         "end C; "), 43);

@@ -208,7 +208,7 @@ BEZEL_TEST(set_algebra_389, set_record_linq_where_count_spec_5) {
         "class C public static method Main(): int "
         "  using var s := new Set<P>(); "
         "  s.Add(new P(1, 2)); s.Add(new P(3, 4)); s.Add(new P(5, 6)); "
-        "  using var r: Array<P> := s.Where((p: P) => p.x > 2).ToArray(); "
+        "  using var r: Array<P> := s.Where(lambda(p: P) => p.x > 2).ToArray(); "
         "  return r.Count; "                              // 2
         "end Main; end C;"), 2);
 }
@@ -221,7 +221,7 @@ BEZEL_TEST(set_algebra_389, set_record_linq_select_sum_spec_5) {
         "class C public static method Main(): int "
         "  using var s := new Set<P>(); "
         "  s.Add(new P(1, 2)); s.Add(new P(3, 4)); s.Add(new P(5, 6)); "
-        "  using var xs: Array<int> := s.Select((p: P) => p.x).ToArray(); "
+        "  using var xs: Array<int> := s.Select(lambda(p: P) => p.x).ToArray(); "
         "  var total := 0; "
         "  for var i in 0..<xs.Count do total := total + xs.Get(i); end; "
         "  return total; "                                // 9
@@ -238,7 +238,7 @@ BEZEL_TEST(set_algebra_389, set_record_linq_toarray_all_elements_spec_5) {
         "  using var s := new Set<P>(); "
         "  s.Add(new P(1, 2)); s.Add(new P(3, 4)); s.Add(new P(5, 6)); "
         "  s.Add(new P(3, 4)); "                          // dup → collapsed
-        "  using var r: Array<P> := s.Select((p: P) => p).ToArray(); "
+        "  using var r: Array<P> := s.Select(lambda(p: P) => p).ToArray(); "
         "  return r.Count; "                              // 3
         "end Main; end C;"), 3);
 }
@@ -248,7 +248,7 @@ BEZEL_TEST(set_algebra_389, set_int_linq_where_select_sum_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var s := new Set<int>(); s.Add(10); s.Add(20); s.Add(30); "
-        "  using var xs: Array<int> := s.Where((x: int) => x > 15).ToArray(); "
+        "  using var xs: Array<int> := s.Where(lambda(x: int) => x > 15).ToArray(); "
         "  var total := 0; "
         "  for var i in 0..<xs.Count do total := total + xs.Get(i); end; "
         "  return total; "                                // 50

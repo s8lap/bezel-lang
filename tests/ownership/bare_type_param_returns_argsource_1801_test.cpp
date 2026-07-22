@@ -354,7 +354,7 @@ BEZEL_TEST(bare_type_param_returns_argsource,
     auto r = parseAndCheckOwnership(prog(
         "var arr: Array<int> := [1, 2, 3]; "
         "var seed := new C(); "
-        "var m := arr.Aggregate(seed, (acc: C, x: int) => acc); "
+        "var m := arr.Aggregate(seed, lambda(acc: C, x: int) => acc); "
         "var _ := Util.Sink(owned seed); "  // consume the seed while `m` is live
         "var p := m.Poke(); "
         "return p; "));
@@ -370,7 +370,7 @@ BEZEL_TEST(bare_type_param_returns_argsource,
     auto r = parseAndCheckOwnership(prog(
         "var arr: Array<int> := [1, 2, 3]; "
         "var seed := new C(); "
-        "var m := arr.Aggregate(seed, (acc: C, x: int) => acc); "
+        "var m := arr.Aggregate(seed, lambda(acc: C, x: int) => acc); "
         "var p := m.Poke(); "               // last use of the result
         "var _ := Util.Sink(owned seed); "  // now safe — the borrow is dead
         "return p; "));
@@ -556,7 +556,7 @@ BEZEL_TEST(bare_type_param_returns_argsource,
     auto r = parseAndCheckOwnership(linqProg(
         "var arr := new OwningArray<Obj>(); "
         "arr.Add(new Obj()); "
-        "var e := arr.First((o: Obj) => true); "
+        "var e := arr.First(lambda(o: Obj) => true); "
         "var _ := Sink.Arr(owned arr); "
         "var p := e.Poke(); "
         "return p; "));

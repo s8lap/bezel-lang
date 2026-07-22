@@ -1,1 +1,1 @@
-var log := (msg: string) => Console.WriteLine(msg);
+var log := lambda(msg: string) => Console.WriteLine(msg);

@@ -13,7 +13,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module Probe; import System.Threading; class Ev public N: int := 0; end Ev; public class Counter public event Ticked: Ev; end Counter; public class Outside public method Watch(c: Counter) using var sub := c.Ticked.Subscribe((e: Ev) => do end); end Watch; end Outside;
+module Probe; import System.Threading; class Ev public N: int := 0; end Ev; public class Counter public event Ticked: Ev; end Counter; public class Outside public method Watch(c: Counter) using var sub := c.Ticked.Subscribe(lambda(e: Ev) => do end); end Watch; end Outside;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

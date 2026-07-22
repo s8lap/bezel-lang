@@ -232,7 +232,7 @@ BEZEL_TEST(sema_await, await_inside_async_lambda_ok) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public method F(t: Task<int>) "
-        "    var f := async () => await t; "
+        "    var f := async lambda() => await t; "
         "    _ := f; "
         "  end F; "
         "end C;");
@@ -245,7 +245,7 @@ BEZEL_TEST(sema_await, await_inside_sync_lambda_diagnosed) {
     auto r = parseSemaAll(
         "module M; class C "
         "  public async method F(t: Task<int>): Task "
-        "    var f := () => await t; "
+        "    var f := lambda() => await t; "
         "    _ := f; return; "
         "  end F; "
         "end C;");

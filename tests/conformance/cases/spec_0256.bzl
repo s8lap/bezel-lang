@@ -1,7 +1,7 @@
 public async method LoadResourceAsync(path: string): OwningTask<Resource>
   using var tcs := new OwningTaskCompletionSource<Resource>();
 
-  StartLoadInBackground(path, (loaded: owned Resource) => do
+  StartLoadInBackground(path, lambda(loaded: owned Resource) => do
     tcs.TrySetResult(loaded);                      // ownership moves into tcs's task
   end);
 

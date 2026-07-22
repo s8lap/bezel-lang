@@ -8,7 +8,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; type Pred := (int) -> bool; class C public method M() var isEven: Pred := (x) => x mod 2 = 0; end M; end C;
+module M; type Pred := (int) -> bool; class C public method M() var isEven: Pred := lambda(x) => x mod 2 = 0; end M; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

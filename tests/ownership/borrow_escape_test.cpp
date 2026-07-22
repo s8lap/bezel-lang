@@ -417,7 +417,7 @@ BEZEL_TEST(own_escape, return_value_typed_fn_field_call_on_using_var_clean_1136)
         "module M; "
         "class Holder "
         "  public _fn: () -> int; "
-        "  public constructor() _fn := () => 7; end constructor; "
+        "  public constructor() _fn := lambda() => 7; end constructor; "
         "end Holder; "
         "class C public static method Main(): int "
         "  using var h := new Holder(); "

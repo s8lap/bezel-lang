@@ -6,7 +6,7 @@
 // §7.4 (#1566): a constructor (`new`) is likewise a control transfer, so it
 // invalidates a mutably-captured local's narrowing.
 
-module M; class Thing public constructor() end; end Thing; class C public static method Run(): int var s: string? := "hi"; var f := () => do s := null; end; if s <> null then _ := new Thing(); return s.Length; end; return -1; end Run; end C;
+module M; class Thing public constructor() end; end Thing; class C public static method Run(): int var s: string? := "hi"; var f := lambda() => do s := null; end; if s <> null then _ := new Thing(); return s.Length; end; return -1; end Run; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: member access `.Length` on a nullable value requires narrowing it to non-null first
 // CHECK-SAME: (§7.4)

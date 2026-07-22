@@ -85,7 +85,7 @@ BEZEL_TEST(selectmany_literal_selector_1693, selectmany_literal_body_rejected_15
         "module M; class C public static method Main(): int "
         "  var xs: Array<int> := [1, 2]; "
         "  var n := 0; "
-        "  for var y in xs.SelectMany((x) => [x, x + 10]) do n := n + 1; end; "
+        "  for var y in xs.SelectMany(lambda(x) => [x, x + 10]) do n := n + 1; end; "
         "  return n; "
         "end Main; end C;"), true);
 }
@@ -98,7 +98,7 @@ BEZEL_TEST(selectmany_literal_selector_1693, selectmany_literal_body_cites_15_4)
         "module M; class C public static method Main(): int "
         "  var xs: Array<int> := [1, 2]; "
         "  var n := 0; "
-        "  for var y in xs.SelectMany((x) => [x, x + 10]) do n := n + 1; end; "
+        "  for var y in xs.SelectMany(lambda(x) => [x, x + 10]) do n := n + 1; end; "
         "  return n; "
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(diagContains(src, "\xC2\xA7""15.4"));
@@ -113,7 +113,7 @@ BEZEL_TEST(selectmany_literal_selector_1693, select_literal_body_rejected_15_4) 
         "module M; class C public static method Main(): int "
         "  var xs: Array<int> := [1, 2]; "
         "  var n := 0; "
-        "  for var row in xs.Select((x) => [x, x + 10]) do n := n + 1; end; "
+        "  for var row in xs.Select(lambda(x) => [x, x + 10]) do n := n + 1; end; "
         "  return n; "
         "end Main; end C;"), true);
 }
@@ -132,7 +132,7 @@ BEZEL_TEST(selectmany_literal_selector_1693, block_body_typed_local_flattens_15_
         "module M; class C public static method Main(): int "
         "  using var xs := new Array<int>(); xs.Add(1); xs.Add(2); "
         "  var s := 0; var n := 0; "
-        "  for var y in xs.SelectMany((x) => do "
+        "  for var y in xs.SelectMany(lambda(x) => do "
         "      var inner: Array<int> := [x, x + 10]; return inner; end) do "
         "    s := s + y; n := n + 1; "
         "  end; "
@@ -153,7 +153,7 @@ BEZEL_TEST(selectmany_literal_selector_1693, method_returning_array_selector_fla
         "  public static method Main(): int "
         "    using var xs := new Array<int>(); xs.Add(1); xs.Add(2); "
         "    var s := 0; var n := 0; "
-        "    for var y in xs.SelectMany((x) => C.Pair(x)) do s := s + y; n := n + 1; end; "
+        "    for var y in xs.SelectMany(lambda(x) => C.Pair(x)) do s := s + y; n := n + 1; end; "
         "    return int(s = 26 and n = 4); "                   // 1 + 11 + 2 + 12
         "  end Main; end C;"), 1);
 }
@@ -166,7 +166,7 @@ BEZEL_TEST(selectmany_literal_selector_1693, lazy_inner_selector_flattens) {
         "module M; class C public static method Main(): int "
         "  using var arr := new Array<int>(); arr.Add(1); arr.Add(2); arr.Add(3); "
         "  var s := 0; "
-        "  for var x in arr.SelectMany((n) => arr.Where((m) => m <= n)) do s := s + x; end; "
+        "  for var x in arr.SelectMany(lambda(n) => arr.Where(lambda(m) => m <= n)) do s := s + x; end; "
         "  return s; "                                         // 1 + (1+2) + (1+2+3) = 10
         "end Main; end C;"), 10);
 }

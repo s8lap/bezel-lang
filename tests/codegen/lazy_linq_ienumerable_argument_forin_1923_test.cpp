@@ -86,7 +86,7 @@ BEZEL_TEST(codegen_lazy_linq_ienumerable_argument_forin_1923,
         "  public static method Main(): int "
         "    using var xs: Array<int> := new Array<int>(); "
         "    xs.Add(2); xs.Add(3); "
-        "    return Sum(xs.Select((n) => n + 1)); "  // 3 + 4 = 7
+        "    return Sum(xs.Select(lambda(n) => n + 1)); "  // 3 + 4 = 7
         "  end Main; "
         "end C;";
     BEZEL_EXPECT_EQ(run(src), 7);
@@ -107,7 +107,7 @@ BEZEL_TEST(codegen_lazy_linq_ienumerable_argument_forin_1923,
         "  end Sum; "
         "  public static method Main(): int "
         "    using var xs: Array<int> := [1, 2, 3, 4]; "
-        "    return Sum(xs.Where((n) => n > 2)); "  // 3 + 4 = 7
+        "    return Sum(xs.Where(lambda(n) => n > 2)); "  // 3 + 4 = 7
         "  end Main; "
         "end C;";
     BEZEL_EXPECT_EQ(run(src), 7);
@@ -130,7 +130,7 @@ BEZEL_TEST(codegen_lazy_linq_ienumerable_argument_forin_1923,
         "  end Sum; "
         "  public static method Main(): int "
         "    using var xs: Array<int> := [1, 2, 3]; "
-        "    return Sum(xs.Where((n) => n > 1).Select((n) => n * 10)); "  // 20 + 30 = 50
+        "    return Sum(xs.Where(lambda(n) => n > 1).Select(lambda(n) => n * 10)); "  // 20 + 30 = 50
         "  end Main; "
         "end C;";
     BEZEL_EXPECT_EQ(run(src), 50);
@@ -154,7 +154,7 @@ BEZEL_TEST(codegen_lazy_linq_ienumerable_argument_forin_1923,
         "  end Sum; "
         "  public static method Main(): int "
         "    using var strings: Array<string> := [\"ab\", \"cde\"]; "
-        "    return Sum(strings.Select((s) => s.Length)); "  // 2 + 3 = 5
+        "    return Sum(strings.Select(lambda(s) => s.Length)); "  // 2 + 3 = 5
         "  end Main; "
         "end C;";
     BEZEL_EXPECT_EQ(run(src), 5);
@@ -183,7 +183,7 @@ BEZEL_TEST(codegen_lazy_linq_ienumerable_argument_forin_1923,
         "    xs.Add(1); xs.Add(2); xs.Add(3); "
         "    var caught: bool := false; "
         "    try "
-        "      var r: int := SumOrThrow(xs.Select((n) => n + 1)); "
+        "      var r: int := SumOrThrow(xs.Select(lambda(n) => n + 1)); "
         "    catch Exception => do caught := true; end "
         "    end; "
         "    return 42 if caught else 0; "
@@ -219,7 +219,7 @@ BEZEL_TEST(codegen_lazy_linq_ienumerable_argument_forin_1923,
         "    xs.Add(2); xs.Add(3); "
         "    var caught: bool := false; "
         "    try "
-        "      var r: int := Sum2(xs.Select((n) => n + 1), Boom()); "
+        "      var r: int := Sum2(xs.Select(lambda(n) => n + 1), Boom()); "
         "    catch Exception => do caught := true; end "
         "    end; "
         "    return 42 if caught else 0; "
@@ -249,7 +249,7 @@ BEZEL_TEST(codegen_lazy_linq_ienumerable_argument_forin_1923,
         "  public static method Main(): int "
         "    using var xs: Array<int> := new Array<int>(); "
         "    xs.Add(2); xs.Add(3); "
-        "    var q := xs.Select((n) => n + 1); "
+        "    var q := xs.Select(lambda(n) => n + 1); "
         "    return Sum(q); "  // 3 + 4 = 7
         "  end Main; "
         "end C;";

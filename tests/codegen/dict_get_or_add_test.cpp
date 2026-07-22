@@ -176,7 +176,7 @@ BEZEL_TEST(dict_get_or_add_4_8, str_key_int_value_miss_invokes_factory_and_store
         "module M; class F public static _n: int := 0; end F; "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  var got := d.GetOrAdd(\"a\", (k: string) => do F._n := F._n + 1; return 7; end); "
+        "  var got := d.GetOrAdd(\"a\", lambda(k: string) => do F._n := F._n + 1; return 7; end); "
         "  Console.WriteLine(got * 100 + F._n * 10 + d.Count); return 0; "
         "end Main; end C;"), "711");
 }
@@ -192,7 +192,7 @@ BEZEL_TEST(dict_get_or_add_4_8, str_key_int_value_hit_returns_existing_no_factor
         "class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
         "  d.Add(\"a\", 5); "
-        "  var got := d.GetOrAdd(\"a\", (k: string) => do F._n := F._n + 1; return 99; end); "
+        "  var got := d.GetOrAdd(\"a\", lambda(k: string) => do F._n := F._n + 1; return 99; end); "
         "  Console.WriteLine(got * 100 + F._n * 10 + d.Count); return 0; "
         "end Main; end C;"), "501");
 }
@@ -205,7 +205,7 @@ BEZEL_TEST(dict_get_or_add_4_8, str_key_miss_stored_value_is_readable_afterward)
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, int>(); "
-        "  var got := d.GetOrAdd(\"a\", (k: string) => 42); "
+        "  var got := d.GetOrAdd(\"a\", lambda(k: string) => 42); "
         "  Console.WriteLine(got * 10 + d[\"a\"]); return 0; "
         "end Main; end C;"), "462");
 }
@@ -219,7 +219,7 @@ BEZEL_TEST(dict_get_or_add_4_8, generic_key_miss_invokes_factory_and_stores) {
         "module M; class F public static _n: int := 0; end F; "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
-        "  var got := d.GetOrAdd(3, (k: int) => do F._n := F._n + 1; return 8; end); "
+        "  var got := d.GetOrAdd(3, lambda(k: int) => do F._n := F._n + 1; return 8; end); "
         "  Console.WriteLine(got * 100 + F._n * 10 + d.Count); return 0; "
         "end Main; end C;"), "811");
 }
@@ -233,7 +233,7 @@ BEZEL_TEST(dict_get_or_add_4_8, generic_key_hit_returns_existing_no_factory) {
         "class C public static method Main(): int "
         "  using var d := new Dictionary<int, int>(); "
         "  d.Add(3, 6); "
-        "  var got := d.GetOrAdd(3, (k: int) => do F._n := F._n + 1; return 77; end); "
+        "  var got := d.GetOrAdd(3, lambda(k: int) => do F._n := F._n + 1; return 77; end); "
         "  Console.WriteLine(got * 100 + F._n * 10 + d.Count); return 0; "
         "end Main; end C;"), "601");
 }
@@ -245,7 +245,7 @@ BEZEL_TEST(dict_get_or_add_4_8, str_value_miss_stores_and_reads_back) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var d := new Dictionary<string, string>(); "
-        "  var got := d.GetOrAdd(\"k\", (k: string) => \"hello\"); "
+        "  var got := d.GetOrAdd(\"k\", lambda(k: string) => \"hello\"); "
         "  return got.Length * 10 + d[\"k\"].Length; "
         "end Main; end C;"), 55);
 }
@@ -263,7 +263,7 @@ BEZEL_TEST(dict_get_or_add_4_8, record_value_miss_boxes_and_reads_back) {
         "module M; record P(X: int, Y: int); "
         "class C public static method Main(): int "
         "  using var d := new Dictionary<string, P>(); "
-        "  var got := d.GetOrAdd(\"a\", (k: string) => new P(3, 4)); "
+        "  var got := d.GetOrAdd(\"a\", lambda(k: string) => new P(3, 4)); "
         "  var again := d[\"a\"]; "
         "  Console.WriteLine(got.X * 1000 + got.Y * 100 + again.X * 10 + again.Y); return 0; "
         "end Main; end C;", "3434");
@@ -285,7 +285,7 @@ BEZEL_TEST(owned_dict_get_or_add_4_9, str_key_miss_stores_owned_and_returns_borr
         "var tag := -1; var inside := -1; "
         "do "
         "  using var d := new OwningDictionary<string, R>(); "
-        "  var got := d.GetOrAdd(\"a\", (k: string) => move (new R(7))); "
+        "  var got := d.GetOrAdd(\"a\", lambda(k: string) => move (new R(7))); "
         "  tag := got.Tag(); "
         "  inside := R._n; "
         "end; "
@@ -304,7 +304,7 @@ BEZEL_TEST(owned_dict_get_or_add_4_9, str_key_hit_no_factory_returns_existing_bo
         "do "
         "  using var d := new OwningDictionary<string, R>(); "
         "  d.Add(\"a\", move (new R(3))); "
-        "  var got := d.GetOrAdd(\"a\", (k: string) => do F._n := F._n + 1; return move (new R(9)); end); "
+        "  var got := d.GetOrAdd(\"a\", lambda(k: string) => do F._n := F._n + 1; return move (new R(9)); end); "
         "  tag := got.Tag(); "
         "end; "
         "Console.WriteLine(tag * 100 + F._n * 10 + R._n); return 0;"), "301");
@@ -319,7 +319,7 @@ BEZEL_TEST(owned_dict_get_or_add_4_9, generic_key_miss_stores_owned_and_returns_
         "var tag := -1; var inside := -1; "
         "do "
         "  using var d := new OwningDictionary<int, R>(); "
-        "  var got := d.GetOrAdd(2, (k: int) => move (new R(5))); "
+        "  var got := d.GetOrAdd(2, lambda(k: int) => move (new R(5))); "
         "  tag := got.Tag(); "
         "  inside := R._n; "
         "end; "
@@ -337,9 +337,9 @@ BEZEL_TEST(owned_dict_get_or_add_4_9, second_call_same_key_is_hit_no_second_valu
         "var tag1 := -1; var tag2 := -1; "
         "do "
         "  using var d := new OwningDictionary<string, R>(); "
-        "  var g1 := d.GetOrAdd(\"a\", (k: string) => move (new R(4))); "
+        "  var g1 := d.GetOrAdd(\"a\", lambda(k: string) => move (new R(4))); "
         "  tag1 := g1.Tag(); "
-        "  var g2 := d.GetOrAdd(\"a\", (k: string) => do F._n := F._n + 1; return move (new R(9)); end); "
+        "  var g2 := d.GetOrAdd(\"a\", lambda(k: string) => do F._n := F._n + 1; return move (new R(9)); end); "
         "  tag2 := g2.Tag(); "
         "end; "
         "Console.WriteLine(tag1 * 100 + tag2 * 10 + R._n); return 0;"), "441");

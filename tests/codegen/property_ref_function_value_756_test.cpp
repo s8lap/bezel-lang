@@ -145,7 +145,7 @@ BEZEL_TEST(property_ref_function_value_756, assignment_position) {
         "end Box; "
         "class Program public static method Main(): int "
         "  using var b := new Box(8); "
-        "  var fn: () -> int := () => 0; "
+        "  var fn: () -> int := lambda() => 0; "
         "  fn := b.Count; "
         "  return fn(); "  // 8
         "end Main; end Program;"), 8);
@@ -160,7 +160,7 @@ BEZEL_TEST(property_ref_function_value_756, assignment_position) {
 BEZEL_TEST(property_ref_function_value_756, function_typed_property_read_static_1187) {
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; class C "
-        "  public static property Fn: (int) -> int => (x: int) => x * 3; "
+        "  public static property Fn: (int) -> int => lambda(x: int) => x * 3; "
         "  public static method Main(): int "
         "    var f := C.Fn; "
         "    return f(10); "  // 30
@@ -174,7 +174,7 @@ BEZEL_TEST(property_ref_function_value_756, function_typed_property_read_static_
 BEZEL_TEST(property_ref_function_value_756, function_typed_property_read_instance_1187) {
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; class C "
-        "  public property Fn: (int) -> int => (x: int) => x * 3; "
+        "  public property Fn: (int) -> int => lambda(x: int) => x * 3; "
         "  public static method Main(): int "
         "    using var c := new C(); "
         "    var f := c.Fn; "

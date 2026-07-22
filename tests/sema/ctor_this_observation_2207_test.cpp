@@ -294,7 +294,7 @@ BEZEL_TEST(sema_ctor_obs_2207, this_capturing_closure_not_gated_clean) {
         "sealed class W "
         "  private _name: string; "
         "  public constructor() "
-        "    var g := () => do Helper(); end; "  // captures `this`, not gated
+        "    var g := lambda() => do Helper(); end; "  // captures `this`, not gated
         "    _ := g; "
         "    _name := \"x\"; "
         "  end constructor; "
@@ -318,7 +318,7 @@ BEZEL_TEST(sema_ctor_obs_2207, tick_observer_subscription_not_gated) {
         "  private owned _sub: Subscription; "
         "  private _count: int := 0; "
         "  public constructor(ticks: IEvent<TickEvent>) "
-        "    _sub := ticks.Subscribe((e) => do OnTick(e); end); "
+        "    _sub := ticks.Subscribe(lambda(e) => do OnTick(e); end); "
         "  end constructor; "
         "  private method OnTick(e: TickEvent) "
         "    _count := _count + 1; "

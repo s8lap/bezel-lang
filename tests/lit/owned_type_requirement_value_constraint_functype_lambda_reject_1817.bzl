@@ -45,7 +45,7 @@ class R
   // `owned` on an explicitly-typed LAMBDA parameter whose type is the enclosing
   // method's `where T: value` parameter.
   public method G<T>(): () where T: value
-    var f := (owned x: T) => x;
+    var f := lambda(owned x: T) => x;
     // CHECK: :[[@LINE-1]]:{{[0-9]+}}: `owned` is not admissible on a lambda parameter of type a type parameter that can never be a class or interface (`where T: value`)
     // CHECK-SAME: (§28.1)
     return;

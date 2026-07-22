@@ -28,7 +28,7 @@ BEZEL_TEST(linq_last_single_predicate_789, last_predicate) {
     BEZEL_EXPECT_EQ(runFull(
         std::string("module M; class C public static method Main(): int ") +
         arr123 +
-        "  return arr.Last((x) => x < 3); "  // 2
+        "  return arr.Last(lambda(x) => x < 3); "  // 2
         "end Main; end C;"), 2);
 }
 
@@ -37,7 +37,7 @@ BEZEL_TEST(linq_last_single_predicate_789, single_predicate) {
     BEZEL_EXPECT_EQ(runFull(
         std::string("module M; class C public static method Main(): int ") +
         arr123 +
-        "  return arr.Single((x) => x = 2); "  // 2
+        "  return arr.Single(lambda(x) => x = 2); "  // 2
         "end Main; end C;"), 2);
 }
 
@@ -48,7 +48,7 @@ BEZEL_TEST(linq_last_single_predicate_789, single_predicate_multiple_throws) {
         "module M; class C public static method Main(): int "
         "  using var arr: Array<int> := new Array<int>(3); arr.Add(2); arr.Add(2); arr.Add(3); "
         "  try "
-        "    var v: int := arr.Single((x) => x = 2); "
+        "    var v: int := arr.Single(lambda(x) => x = 2); "
         "    return (7 if v = v else 8); "
         "  catch var ex: InvalidOperationException => do return 0; end "
         "  end; "
@@ -61,7 +61,7 @@ BEZEL_TEST(linq_last_single_predicate_789, single_predicate_none_throws) {
         std::string("module M; class C public static method Main(): int ") +
         arr123 +
         "  try "
-        "    var v: int := arr.Single((x) => x = 9); "
+        "    var v: int := arr.Single(lambda(x) => x = 9); "
         "    return (7 if v = v else 8); "
         "  catch var ex: InvalidOperationException => do return 0; end "
         "  end; "
@@ -74,7 +74,7 @@ BEZEL_TEST(linq_last_single_predicate_789, last_predicate_none_throws) {
         std::string("module M; class C public static method Main(): int ") +
         arr123 +
         "  try "
-        "    var v: int := arr.Last((x) => x > 9); "
+        "    var v: int := arr.Last(lambda(x) => x > 9); "
         "    return (7 if v = v else 8); "
         "  catch var ex: InvalidOperationException => do return 0; end "
         "  end; "
@@ -86,7 +86,7 @@ BEZEL_TEST(linq_last_single_predicate_789, last_or_null_predicate_match) {
     BEZEL_EXPECT_EQ(runFull(
         std::string("module M; class C public static method Main(): int ") +
         arr123 +
-        "  return (arr.LastOrNull((x) => x < 3) ?? -1); "  // 2
+        "  return (arr.LastOrNull(lambda(x) => x < 3) ?? -1); "  // 2
         "end Main; end C;"), 2);
 }
 
@@ -97,7 +97,7 @@ BEZEL_TEST(linq_last_single_predicate_789, last_or_null_predicate_none) {
     BEZEL_EXPECT_EQ(runAotOut(
         std::string("module M; class C public static method Main(): int ") +
         arr123 +
-        "  Console.WriteLine(arr.LastOrNull((x) => x > 9) ?? -1); "  // null → -1
+        "  Console.WriteLine(arr.LastOrNull(lambda(x) => x > 9) ?? -1); "  // null → -1
         "  return 0; "
         "end Main; end C;"), "-1");
 }
@@ -107,7 +107,7 @@ BEZEL_TEST(linq_last_single_predicate_789, last_or_null_predicate_none) {
 BEZEL_TEST(linq_last_single_predicate_789, last_predicate_over_range) {
     BEZEL_EXPECT_EQ(runFull(
         "module M; class C public static method Main(): int "
-        "  return (1..5).Last((x) => x < 4); "  // 3
+        "  return (1..5).Last(lambda(x) => x < 4); "  // 3
         "end Main; end C;"), 3);
 }
 
@@ -117,6 +117,6 @@ BEZEL_TEST(linq_last_single_predicate_789, first_vs_last_distinct) {
     BEZEL_EXPECT_EQ(runFull(
         std::string("module M; class C public static method Main(): int ") +
         arr123 +
-        "  return arr.First((x) => x < 3) * 10 + arr.Last((x) => x < 3); "  // 1*10+2 = 12
+        "  return arr.First(lambda(x) => x < 3) * 10 + arr.Last(lambda(x) => x < 3); "  // 1*10+2 = 12
         "end Main; end C;"), 12);
 }

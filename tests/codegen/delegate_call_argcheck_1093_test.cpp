@@ -27,8 +27,8 @@ int run(const std::string& prog) {
 BEZEL_TEST(delegate_call_argcheck_1093, wrong_typed_arg_rejected) {
     auto r = runAot(
         "module M; class C public static method Main(): int "
-        "  var f: (int)->int := (a: int) => a + 100; "
-        "  var g: (int)->int := (b: int) => b * 7; "
+        "  var f: (int)->int := lambda(a: int) => a + 100; "
+        "  var g: (int)->int := lambda(b: int) => b * 7; "
         "  return f(g); "                                  // g is (int)->int, not int
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);
@@ -39,7 +39,7 @@ BEZEL_TEST(delegate_call_argcheck_1093, wrong_typed_arg_rejected) {
 BEZEL_TEST(delegate_call_argcheck_1093, wrong_arity_rejected) {
     auto r = runAot(
         "module M; class C public static method Main(): int "
-        "  var f: (int)->int := (a: int) => a + 100; "
+        "  var f: (int)->int := lambda(a: int) => a + 100; "
         "  return f(); "                                   // 0 args, expects 1
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);
@@ -50,7 +50,7 @@ BEZEL_TEST(delegate_call_argcheck_1093, wrong_arity_rejected) {
 BEZEL_TEST(delegate_call_argcheck_1093, wrong_scalar_type_rejected) {
     auto r = runAot(
         "module M; class C public static method Main(): int "
-        "  var f: (int)->int := (a: int) => a + 100; "
+        "  var f: (int)->int := lambda(a: int) => a + 100; "
         "  return f(\"hi\"); "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);
@@ -61,7 +61,7 @@ BEZEL_TEST(delegate_call_argcheck_1093, wrong_scalar_type_rejected) {
 BEZEL_TEST(delegate_call_argcheck_1093, correct_call_unchanged) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var f: (int)->int := (a: int) => a + 100; "
+        "  var f: (int)->int := lambda(a: int) => a + 100; "
         "  return f(5); "                                  // 105
         "end Main; end C;"), 105);
 }
@@ -72,7 +72,7 @@ BEZEL_TEST(delegate_call_argcheck_1093, higher_order_param_ok) {
         "module M; class C "
         "  public static method Apply(fn: (int)->int, x: int): int => fn(x); "
         "  public static method Main(): int "
-        "    return Apply((a: int) => a + 1, 41); "        // 42
+        "    return Apply(lambda(a: int) => a + 1, 41); "        // 42
         "  end Main; end C;"), 42);
 }
 
@@ -80,7 +80,7 @@ BEZEL_TEST(delegate_call_argcheck_1093, higher_order_param_ok) {
 BEZEL_TEST(delegate_call_argcheck_1093, widening_arg_accepted) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var f: (long)->long := (a: long) => a + 1; "
+        "  var f: (long)->long := lambda(a: long) => a + 1; "
         "  return int(f(41)); "                            // 42
         "end Main; end C;"), 42);
 }
@@ -89,7 +89,7 @@ BEZEL_TEST(delegate_call_argcheck_1093, widening_arg_accepted) {
 BEZEL_TEST(delegate_call_argcheck_1093, nullary_func_unchanged) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var f: ()->int := () => 42; "
+        "  var f: ()->int := lambda() => 42; "
         "  return f(); "                                   // 42
         "end Main; end C;"), 42);
 }
@@ -104,7 +104,7 @@ BEZEL_TEST(delegate_call_argcheck_1093, field_func_record_result_1138) {
         "module M; record Pt(x: int, y: int); "
         "class Holder "
         "  public _fn: () -> Pt; "
-        "  public constructor() _fn := () => new Pt(3, 4); end constructor; "
+        "  public constructor() _fn := lambda() => new Pt(3, 4); end constructor; "
         "end Holder; "
         "class C public static method Main(): int "
         "  using var h := new Holder(); "
@@ -119,7 +119,7 @@ BEZEL_TEST(delegate_call_argcheck_1093, field_func_args_record_result_1138) {
         "module M; record Pt(x: int, y: int); "
         "class Holder "
         "  public _mk: (int, int) -> Pt; "
-        "  public constructor() _mk := (a, b) => new Pt(a, b); end constructor; "
+        "  public constructor() _mk := lambda(a, b) => new Pt(a, b); end constructor; "
         "end Holder; "
         "class C public static method Main(): int "
         "  using var h := new Holder(); "
@@ -134,7 +134,7 @@ BEZEL_TEST(delegate_call_argcheck_1093, field_func_int_result_1138) {
         "module M; "
         "class Holder "
         "  public _fn: () -> int; "
-        "  public constructor() _fn := () => 42; end constructor; "
+        "  public constructor() _fn := lambda() => 42; end constructor; "
         "end Holder; "
         "class C public static method Main(): int "
         "  using var h := new Holder(); "

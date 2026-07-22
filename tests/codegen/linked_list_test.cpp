@@ -371,7 +371,7 @@ BEZEL_TEST(linked_list_4_6, linq_sum_spec_5_fix450) {
         "module M; class C public static method Main(): int "
         "  using var l := new LinkedList<int>(); "
         "  l.AddLast(10); l.AddLast(20); l.AddLast(30); "
-        "  return l.Sum((x: int) => x); "   // 10+20+30 = 60
+        "  return l.Sum(lambda(x: int) => x); "   // 10+20+30 = 60
         "end Main; end C;"), 60);
 }
 
@@ -381,7 +381,7 @@ BEZEL_TEST(linked_list_4_6, linq_min_spec_5_fix450) {
         "module M; class C public static method Main(): int "
         "  using var l := new LinkedList<int>(); "
         "  l.AddLast(5); l.AddLast(2); l.AddLast(8); l.AddLast(1); "
-        "  return l.Min((x: int) => x); "   // min = 1
+        "  return l.Min(lambda(x: int) => x); "   // min = 1
         "end Main; end C;"), 1);
 }
 
@@ -391,7 +391,7 @@ BEZEL_TEST(linked_list_4_6, linq_max_spec_5_fix450) {
         "module M; class C public static method Main(): int "
         "  using var l := new LinkedList<int>(); "
         "  l.AddLast(5); l.AddLast(2); l.AddLast(8); l.AddLast(1); "
-        "  return l.Max((x: int) => x); "   // max = 8
+        "  return l.Max(lambda(x: int) => x); "   // max = 8
         "end Main; end C;"), 8);
 }
 
@@ -401,7 +401,7 @@ BEZEL_TEST(linked_list_4_6, linq_count_pred_spec_5_fix450) {
         "module M; class C public static method Main(): int "
         "  using var l := new LinkedList<int>(); "
         "  l.AddLast(1); l.AddLast(2); l.AddLast(3); l.AddLast(4); l.AddLast(5); "
-        "  return l.Count((x: int) => x mod 2 = 0); "  // even: 2,4 → 2
+        "  return l.Count(lambda(x: int) => x mod 2 = 0); "  // even: 2,4 → 2
         "end Main; end C;"), 2);
 }
 
@@ -411,7 +411,7 @@ BEZEL_TEST(linked_list_4_6, linq_any_pred_spec_5_fix450) {
         "module M; class C public static method Main(): int "
         "  using var l := new LinkedList<int>(); "
         "  l.AddLast(1); l.AddLast(3); l.AddLast(5); "
-        "  return int(l.Any((x: int) => x > 4)); "  // 5 > 4 → true → 1
+        "  return int(l.Any(lambda(x: int) => x > 4)); "  // 5 > 4 → true → 1
         "end Main; end C;"), 1);
 }
 
@@ -421,7 +421,7 @@ BEZEL_TEST(linked_list_4_6, linq_sum_single_element_spec_5_fix450) {
         "module M; class C public static method Main(): int "
         "  using var l := new LinkedList<int>(); "
         "  l.AddLast(42); "
-        "  return l.Sum((x: int) => x); "  // 42
+        "  return l.Sum(lambda(x: int) => x); "  // 42
         "end Main; end C;"), 42);
 }
 

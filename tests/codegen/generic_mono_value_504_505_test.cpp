@@ -73,7 +73,7 @@ BEZEL_TEST(codegen_generic_mono_505, closure_param_typed_as_class_14_2_27_3) {
         "class C "
         "  public static method Main(): int "
         "    using var a := new A(); "
-        "    return Util.GetV(a, (x) => x.v); "
+        "    return Util.GetV(a, lambda(x) => x.v); "
         "  end Main; "
         "end C;"), 7);
 }
@@ -97,7 +97,7 @@ BEZEL_TEST(codegen_generic_mono_505, closure_reads_second_field_14_2_27_3) {
         "class C "
         "  public static method Main(): int "
         "    using var b := new B(); "
-        "    return Util.GetV(b, (x) => x.v2); "
+        "    return Util.GetV(b, lambda(x) => x.v2); "
         "  end Main; "
         "end C;"), 3);
 }
@@ -138,7 +138,7 @@ BEZEL_TEST(codegen_generic_mono_505, control_T_int_closure_still_works_14_2_27_3
         "end Util; "
         "class C "
         "  public static method Main(): int "
-        "    return Util.Apply(5, (x) => x * 2); "
+        "    return Util.Apply(5, lambda(x) => x * 2); "
         "  end Main; "
         "end C;"), 10);
 }
