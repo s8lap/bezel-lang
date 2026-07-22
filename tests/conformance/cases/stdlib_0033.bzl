@@ -12,7 +12,8 @@ public interface ICollection<T>: IReadOnlyCollection<T>
   method Clear();
   method Contains(item: T): bool;
   method Remove(item: T): bool;
-  method DisposeElements();
+  // (§28.11 v0.213, #2081: `DisposeElements()` removed from ICollection<T> with
+  // axiom A8 — a borrowing collection never disposes its elements.)
 end ICollection;
 
 public interface IList<T>: IReadOnlyList<T>, ICollection<T>

@@ -3690,6 +3690,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 "`coll[i] := v` to update a slot in an "
                                 "array/stack/queue, or `dict[key] := value` to "
                                 "add-or-update a dictionary entry");
+                        // §28.6 / §28.11 (v0.213, axiom A8 retired, #2081):
+                        // targeted hint for the removed `.DisposeElements()`. The
+                        // bulk element-disposal escape hatch — and its per-element
+                        // manual form — were retired with axiom A8 (the #2075
+                        // corpus sweep found no load-bearing client); a borrowing
+                        // collection never disposes its elements.
+                        } else if (m == "DisposeElements") {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("`.DisposeElements()` was removed from "
+                                "the collection surface (§28.6 / §28.11, v0.213 — "
+                                "axiom A8, the transit exception, is retired): a "
+                                "borrowing collection is a transit point and never "
+                                "disposes its elements. If `") +
+                                std::string(colName) +
+                                "<T>` semantically owns its elements, declare the "
+                                "owning family (OwningArray/OwningDictionary/…) and "
+                                "let `Dispose()` cascade; for selective cleanup take "
+                                "each element out first (`Drain()`, the `Pop*` "
+                                "family, or `move coll[i]`) into an owned binding");
                         } else {
                         auto allowedNonOwningMethod = [](std::string_view mm) -> bool {
                             return
@@ -3727,7 +3747,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 mm == "AsSpan" || mm == "AsReadOnlySpan" ||
                                 // stdlib §4.4 / §16.3 (v0.182, #1579): Array<T>.Slice(r).
                                 mm == "Slice" ||
-                                mm == "DisposeElements" ||
+                                // (§28.11 v0.213: `DisposeElements` retired with
+                                // axiom A8 — handled by the targeted hint above.)
                                 // universal Object members (§8.1) + IDisposable.
                                 mm == "ToString" || mm == "Equals" ||
                                 mm == "GetHashCode" || mm == "GetType" ||

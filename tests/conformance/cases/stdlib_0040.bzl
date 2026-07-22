@@ -17,7 +17,7 @@ public class LinkedList<T>: ICollection<T>
   public method RemoveNode(node: LinkedListNode<T>);
   public method Find(item: T): LinkedListNode<T>?;
   // Plus the standard ICollection<T> operations: Add, Clear, Contains, Remove,
-  // IsReadOnly, DisposeElements.
+  // IsReadOnly. (§28.11 v0.213, #2081: `DisposeElements()` removed with axiom A8.)
 end LinkedList;
 
 public class LinkedListNode<T>

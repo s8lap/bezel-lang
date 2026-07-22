@@ -75,8 +75,10 @@ void bz_array_insert_at(void* arr, int64_t idx, const void* elem,
 void bz_array_clear(void* arr);
 
 // stdlib §4.5: dispose every (non-null) class-typed element, then set length to
-// 0. Used by OwningArray<T>.Clear() and Array<T>.DisposeElements() where the
-// element type is a class. `dispose_elem` is null-safe per element. Treats each
+// 0. Used by the OwningArray<T>.Clear()/Dispose() element cascade where the
+// element type is a class. (The borrowing-family `Array<T>.DisposeElements()`
+// that formerly shared this helper was retired with axiom A8, §28.11 v0.213,
+// #2081.) `dispose_elem` is null-safe per element. Treats each
 // element as a pointer-sized object reference (owning collections constrain
 // `where T: class`, so elements are always object pointers). The slots are
 // nulled as they are disposed so a subsequent Dispose finds nothing to redo.

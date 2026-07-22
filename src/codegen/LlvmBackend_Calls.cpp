@@ -705,6 +705,30 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                      !recvTy->astNode->name->parts.empty() &&
                      recvTy->headName() == "StringBuilder");
 
+    // §28.6 / §28.11 (v0.213, axiom A8 retired, #2081): `.DisposeElements()` is
+    // gone from the collection surface. Sema (ExprTypecheck_Calls) rejects it on
+    // a CONCRETE collection receiver, but an INTERFACE-typed receiver
+    // (IList/IReadOnlyList/ICollection/IReadOnlyCollection/IOwningList/
+    // IOwningCollection) slips past that concrete-only check and would otherwise
+    // mislower here — the borrowing-list-iface bridge to the (now-deleted) array
+    // lowering, or the polymorphic-interface diagnostic below. Reject it for
+    // every collection-interface receiver so no `.DisposeElements()` compiles.
+    bool listIfaceForDispElem = false;
+    if (m == "DisposeElements" &&
+        (isListInterfaceName(recvTy, &listIfaceForDispElem) ||
+         isCollectionInterfaceName(recvTy))) {
+        ctx_.diagnostics().report(
+            Severity::Error, call.span.begin,
+            "`.DisposeElements()` was removed from the collection surface "
+            "(\xC2\xA7""28.6 / \xC2\xA7""28.11, v0.213 \xE2\x80\x94 axiom A8, the "
+            "transit exception, is retired): a borrowing collection is a transit "
+            "point and never disposes its elements. Declare the owning family "
+            "(OwningArray/OwningDictionary/\xE2\x80\xA6) and let `Dispose()` "
+            "cascade, or take each element out first (`Drain()`, the `Pop*` "
+            "family, or `move coll[i]`) into an owned binding.");
+        return llvm::ConstantInt::get(i32(), 0);  // unit; compile already failed
+    }
+
     // FINDING [5] / stdlib §5: an EAGER terminal LINQ operator (Count / Sum /
     // Aggregate / Any / All / First / …) chained DIRECTLY onto a LAZY pipeline
     // (Select/Where/Concat/TakeWhile/SkipWhile/Zip/SelectMany — each returns
@@ -779,7 +803,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             (isListInterfaceName(recvTy, &ownerOnly) && ownerOnly);  // IOwningList
         bool isBuiltinCollMember =
             m == "Add" || m == "Clear" || m == "Contains" || m == "Remove" ||
-            m == "Insert" || m == "IndexOf" || m == "DisposeElements";
+            m == "Insert" || m == "IndexOf";
         if (isPolyCollIface && isBuiltinCollMember) {
             ctx_.diagnostics().report(
                 Severity::Error, call.span.begin,
@@ -801,7 +825,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // must type-match to avoid a spurious IR-verification error masking
             // the real (clean) diagnostic. The result type is fixed by the
             // stdlib §4.1 interface signatures: Contains → bool (i1); IndexOf →
-            // int (i32); Add / Clear / Insert / Remove / DisposeElements → unit
+            // int (i32); Add / Clear / Insert / Remove → unit
             // (i32). (`Remove` is bool in the spec but its result is unused at the
             // diagnosed call sites; i32 poison is harmless since the compile
             // already failed — and exprType, when resolved, overrides it.)
@@ -4598,25 +4622,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(fn, {recv});
             return llvm::ConstantInt::get(i32(), 0);
         }
-        // .DisposeElements() — stdlib §4.5: dispose each class-typed element,
-        // then clear. For value-only element types it is equivalent to Clear().
-        // Unlike Add/Clear on an OWNING array, this is the explicit en-masse
-        // disposal a BORROWING Array<T> exposes; the disposer thunk is keyed on
-        // the element being a class, not on the collection being owning.
-        // #602 / §28.11 v0.135 fix #619: use arrElemIsClass (derived from
-        // arrElemPol — now covers Class|Interface per §28.11 / §14.4).
-        if (m == "DisposeElements" && call.args.empty()) {
-            if (arrElemIsClass) {
-                auto* fn = declareC("bz_array_clear_disposing",
-                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-                builder_.CreateCall(fn, {recv, elementDisposerThunk()});
-                return llvm::ConstantInt::get(i32(), 0);
-            }
-            auto* fn = declareC("bz_array_clear", llvm::Type::getVoidTy(llvm_),
-                                {ptrTy()});
-            builder_.CreateCall(fn, {recv});
-            return llvm::ConstantInt::get(i32(), 0);
-        }
+        // (§28.11 v0.213, #2081: `.DisposeElements()` was retired with axiom A8
+        // and is now a sema-time error — no lowering reaches here.)
         // .IsEmpty(): bool
         if (m == "IsEmpty" && call.args.empty()) {
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});

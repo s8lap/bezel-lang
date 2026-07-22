@@ -3,10 +3,12 @@
 // whose class elements are array-backed and already disposed via #362.
 //
 // stdlib §4.9: "Owning hash-based map. Owns its values; keys are value-like."
-// And: "There is no `DisposeElements()` on `OwningDictionary<K, V>` — the
-// dictionary's `Dispose()` cascade handles every value disposal." Keys are NOT
-// owned ("`OwningDictionary` does not support owned keys"), so only the values
-// (V, constrained `V: class`) are disposed at scope end.
+// The dictionary's `Dispose()` cascade handles every value disposal — there is
+// no manual element pass (the borrowing `Dictionary<K, V>.DisposeElements()`
+// escape hatch was retired with axiom A8, §28.11 v0.213, #2081; owning
+// collections never had one). Keys are NOT owned ("`OwningDictionary` does not
+// support owned keys"), so only the values (V, constrained `V: class`) are
+// disposed at scope end.
 //
 // stdlib §4.10: "`OwningSet<T>` ... where T: class" — owns its elements; each
 // surviving element is disposed once at scope end.

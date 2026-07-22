@@ -2,15 +2,21 @@
 //
 // stdlib §4.5: "`OwningArray<T>` owns each element. `Add`, `Insert`, and the
 // indexer setter take ownership; `RemoveAt`, `Remove`, `Clear`, and the array's
-// own `Dispose()` dispose the affected elements." And: "`Array<T>` stores
-// borrows … The array's `Dispose()` … does not dispose the elements. To dispose
-// owned class instances … call `DisposeElements()` (which disposes each
-// class-typed element then clears)."
+// own `Dispose()` dispose the affected elements." A borrowing `Array<T>` stores
+// borrows and never disposes its elements.
+//
+// (v0.213, §28.11, axiom A8 retired, #2081: the borrowing-family
+// `Array<T>.DisposeElements()` en-masse element dispose — and its per-element
+// manual form — were retired with axiom A8. A holder that owns its elements
+// declares the owning family, whose `Dispose()`/`Clear()` cascades; selective
+// cleanup takes elements out first via `Drain()`/`Pop*`/`move coll[i]`. The two
+// former `DisposeElements()` runtime cases below were migrated to that owning-
+// family cascade / take-out coverage.)
 //
 // Each test makes element disposal observable through a static counter bumped by
 // the element class's destructor; the counter is returned as the exit code.
-// Without the fix every Dispose/Clear/RemoveAt/DisposeElements case returns 0
-// (the element destructors never run) — so these are load-bearing.
+// Without the disposal the destructors never run (return 0) — so these are
+// load-bearing.
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
@@ -103,14 +109,19 @@ BEZEL_TEST(owned_coll_dispose_4_5, owned_array_remove_at_disposes_only_removed) 
         "return afterRemove * 10 + R._n;"), 13);
 }
 
-// stdlib §4.5: Array<T>.DisposeElements() disposes each class-typed element
-// then clears. Array<T> is borrowing, so this is the explicit en-masse dispose.
-BEZEL_TEST(owned_coll_dispose_4_5, array_dispose_elements_disposes_each) {
+// v0.213 (§28.11, axiom A8 retired, #2081) — migrated from the retired
+// `Array<T>.DisposeElements()` case. The sound replacement for selective /
+// take-out element disposal is `Drain()`: it yields each element as OWNED, and
+// the loop body disposes it (`using var u := owned item;`). Both elements'
+// destructors run exactly once → 2.
+BEZEL_TEST(owned_coll_dispose_4_5, owning_array_drain_disposes_each) {
     BEZEL_EXPECT_EQ(runResource(
-        "using var a := new Array<R>(); "
-        "a.Add(new R()); "
-        "a.Add(new R()); "
-        "a.DisposeElements(); "
+        "using var a := new OwningArray<R>(); "
+        "a.Add(move (new R())); "
+        "a.Add(move (new R())); "
+        "for var item in a.Drain() do "
+        "  using var u := owned item; "
+        "end; "
         "return R._n;"), 2);
 }
 
@@ -128,15 +139,17 @@ BEZEL_TEST(owned_coll_dispose_4_5, borrowing_array_dispose_skips_elements) {
 }
 
 // Safety: a null element must be skipped (no use-after-free / null deref).
-// A borrowing Array<R?> holds a null between two live instances;
-// DisposeElements must dispose the two live ones and skip the null → 2.
+// Migrated from the retired `Array<R?>.DisposeElements()` case to the owning-
+// family cascade that still shares the same null-safe runtime helper
+// (bz_array_clear_disposing): an `OwningArray<R?>` holds a null between two live
+// instances; `Clear()` disposes the two live ones and skips the null → 2.
 BEZEL_TEST(owned_coll_dispose_4_5, null_element_is_skipped_safely) {
     BEZEL_EXPECT_EQ(runResource(
-        "using var a := new Array<R?>(); "
-        "a.Add(new R()); "
+        "using var a := new OwningArray<R?>(); "
+        "a.Add(move (new R())); "
         "a.Add(null); "
-        "a.Add(new R()); "
-        "a.DisposeElements(); "
+        "a.Add(move (new R())); "
+        "a.Clear(); "
         "return R._n;"), 2);
 }
 

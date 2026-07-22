@@ -19,8 +19,9 @@ public class Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>
   public method GetOrAdd(key: K, factory: (K) -> V): V;
 
   public method Clear();
-  public method DisposeElements();                  // disposes class-typed
-                                                    //   keys and values
+  // (§28.11 v0.213, #2081: `DisposeElements()` removed from Dictionary<K, V> with
+  // axiom A8 — values a holder owns belong in OwningDictionary<K, V>, whose
+  // Clear()/Dispose() cascades over the values.)
 end Dictionary;
 
 public record DictionaryEntry<K, V>(Key: K, Value: V);

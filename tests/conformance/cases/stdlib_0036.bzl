@@ -22,7 +22,8 @@ public class Array<T>: IList<T>
   public method Reversed(): owned Array<T>;                       // fresh reversed copy
 
   public method ToArray(): owned Array<T>;      // fresh heap-array copy
-  public method DisposeElements();              // disposes each class-typed element
+  // (§28.11 v0.213, #2081: `DisposeElements()` removed from Array<T> with axiom
+  // A8 — declare OwningArray<T> for the cascade, or take elements out first.)
 
   // Span views (v0.107)
   public method AsSpan(): ArraySpan<T>;                          // full array, writable

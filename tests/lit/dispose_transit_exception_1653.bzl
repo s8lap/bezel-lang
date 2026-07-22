@@ -1,26 +1,27 @@
-// Clean-compile ACCEPT control for issue #1653 — the KEYED-TRANSIT EXCEPTION.
+// REJECT test — the #1653 keyed-transit exception, FLIPPED for v0.213 (#2081).
 //
-// Spec §28.6 (anchor sec-who-may-dispose, v0.184) "The transit exception
-// (recorded)": an element borrow obtained from a BORROWING-family collection —
-// an indexer-get, a default-iteration variable, dictionary-entry fields, or any
-// other element read in the transit-point regime of §28.11 — MAY be disposed. A
-// borrowing collection is a transit point whose elements' true owner is
-// structurally unknowable, so disposing semantically-owned elements through it
-// is the recorded escape hatch (the manual form of `DisposeElements()`). The
-// exception is keyed on the SOURCE expression's static type: only an element
-// read whose receiver is statically a borrowing-family collection
-// (Array/Dictionary/Set/Stack/Queue/LinkedList) is in the transit regime.
+// History: through spec v0.212 this was an ACCEPT control. Spec §28.6 (v0.184)
+// carried a "transit exception" (axiom A8): an element borrow obtained from a
+// BORROWING-family collection — an indexer-get, a default-iteration variable,
+// dictionary-entry fields — MAY be disposed (the manual form of the also-retired
+// `DisposeElements()`). v0.213 RETIRES axiom A8 (spec §28.6/§28.11, the A8
+// tombstone; the #2075 corpus sweep found zero load-bearing clients): only an
+// owner disposes, with no exception. `Dispose()` through any borrow — including
+// a borrowing-family collection element — is now a compile error.
 //
-// Here `arr` has static type `Array<Resource>` (a borrowing-family collection),
-// so both the default-iteration variable `e` and the bare indexer-get `arr[0]`
-// are transit-eligible: `e.Dispose()` and `arr[0].Dispose()` must compile clean.
-// This is the carve-out that keeps the §28.6 receiver check from over-rejecting
-// the legitimate transit pattern — the counterpart to the lazy-query REJECT the
-// issue cites (`for var x in xs.Where(p) do x.Dispose()`), whose source is an
-// IEnumerable<T> and is NOT keyed.
+// The very source #1653 once accepted must therefore now be REJECTED. `arr` has
+// static type `Array<Resource>` (a borrowing-family collection), so the default-
+// iteration variable `e` and the bare indexer-get `arr[0]` are element borrows
+// the caller does not own; both `e.Dispose()` and `arr[0].Dispose()` are errors.
+// The sound replacements: declare the OWNING family and let `Dispose()` cascade,
+// or take each element out first (`Drain()`/`Pop*`/`move coll[i]`) — exercised by
+// the behavior test tests/codegen/dispose_transit_retired_2081_test.cpp.
 //
-// RUN: %bezelc -c -o %t.o %s
-// RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
+// STRUCTURAL POINT (as dispose_borrow_receiver_1653.bzl): this rejection comes
+// from the OWNERSHIP pass, which runs after sema; only the REAL `bezelc` (which
+// lit drives) runs it, so the §28.6 diagnostic is always in the observed output.
+//
+// RUN: %not %bezelc -c %s 2>&1 | FileCheck %s
 module M;
 class Resource public method Ping(): () end Ping; end Resource;
 class Program
@@ -35,5 +36,9 @@ class Program
   end Main;
 end Program;
 
-// NODIAG-NOT: error
-// NODIAG-NOT: §
+// Both element-borrow disposals are rejected by the ownership pass with the
+// v0.213 A8-retirement diagnostic. bezelc emits `file:line:col: message` with no
+// "error:" severity word, so we anchor on the `:line:col:` shape and the rule.
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: cannot call `Dispose()` on an element borrow read from a borrowing-family collection
+// CHECK-SAME: §28.6
+// CHECK-SAME: axiom A8
