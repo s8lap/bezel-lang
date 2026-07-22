@@ -831,22 +831,36 @@ inline CompileStatus forkedCompile(const std::string& srcPath,
 // real compiler would have produced, fork+exec-isolated EXACTLY as today.
 //
 // KEY (SHA-256 over):
-//   (a) COMPILER IDENTITY — the test binary itself (/proc/self/exe). The
-//       compile runs IN-PROCESS (Driver::compileFile) inside bezel_tests, so
-//       the running binary's own bytes are the soundest identity: any change to
-//       the front-end, codegen, or the whole-archived bezel_runtime relinks
-//       bezel_tests and changes this hash. Conservative — a test-only edit also
-//       relinks bezel_tests and invalidates the whole cache — but it can NEVER
-//       yield a stale hit. Soundness first (a refinement that hashes only the
-//       compiler libs is possible follow-up, not done here).
+//   (a) COMPILER IDENTITY — libbezel_core.a (BEZEL_CORE_LIB_PATH), the k2
+//       refinement (#2100) of the original whole-binary hash. The compile runs
+//       IN-PROCESS (Driver::compileFile) inside bezel_tests, and every byte of
+//       that path — front-end, sema, codegen, emitObjectFile, AND the driver's
+//       clang→ld link recipe — is linked out of bezel_core; if the archive's
+//       bytes are unchanged, the compiler code path is byte-identical
+//       regardless of which TEST objects were relinked into bezel_tests. So a
+//       test-only edit (every "fix + regression test" iteration) keeps the
+//       cache WARM, where the old /proc/self/exe key went cold on ANY relink.
+//       STALE-CORE GUARD: if core.a on disk is NEWER than the running binary,
+//       the in-process compiler may predate it (e.g. `--target bezelc` rebuilt
+//       core.a without relinking bezel_tests, or a relink replaced the binary
+//       mid-run) — keying THIS process's products under the new archive's hash
+//       could hand a future, really-rebuilt bezel_tests a stale hit. The
+//       identity then falls back to /proc/self/exe (the k1 behaviour):
+//       conservative, never stale. Same fallback when the macro is undefined
+//       or the archive unreadable. Known gaps, UNCHANGED from k1: neither key
+//       hashes the external clang/ld toolchain nor the dynamically-linked
+//       libLLVM.so — a system toolchain update should be paired with a cache
+//       wipe (gc_scratch.sh reaps the dir anyway).
 //   (b) RUNTIME-LIBRARY IDENTITY — libbezel_runtime.a (BEZEL_RUNTIME_LIB_PATH),
-//       what the driver's link actually consumes. Redundant with (a) in a
-//       normal build (the archive is whole-archived INTO bezel_tests), but it
-//       closes the window where the .a is rebuilt WITHOUT relinking the running
-//       bezel_tests: then (a) is unchanged yet a fresh link would pull a
-//       DIFFERENT runtime. Hashing the .a directly keeps that from ever being a
-//       stale hit. (If the macro is somehow undefined, (a) still covers the
-//       whole-archived runtime, so the key stays sound — just one layer thinner.)
+//       what the driver's link actually consumes. Under k2 this is LOAD-BEARING
+//       (the runtime is whole-archived into bezel_tests, not into core.a, so
+//       (a) no longer covers it): a runtime-only rebuild must invalidate cached
+//       link products, and hashing the .a directly guarantees it. Because it
+//       is load-bearing, an UNREADABLE archive fails CLOSED — the cache
+//       disables itself for the process instead of minting under-keyed
+//       entries. (If the macro is somehow undefined, the core branch is
+//       compiled out entirely and the identity is the whole test binary,
+//       which contains the archived runtime — sound, just coarser.)
 //   (c) COMPILE/LINK MODE — the CodegenOptions bits that change the emitted
 //       object AND the link line: sanitizeAddress (plain vs --sanitize=address
 //       → -fsanitize=address -g), checkedDisposal (§28.2 guards), isMainModule.
@@ -920,22 +934,69 @@ inline bool sha256File(const std::string& path, std::array<uint8_t, 32>& out) {
 }
 
 // SHA-256(compiler-identity ‖ runtime-library-identity), computed ONCE per
-// process (hashing /proc/self/exe is a few hundred ms; amortized over the whole
-// shard it is negligible). Returns nullptr if the test binary cannot be hashed
-// — with no sound compiler identity the cache DISABLES itself rather than risk a
-// stale hit.
+// process (hashing the ~100 MB core archive or the test binary is a few
+// hundred ms; amortized over the whole shard it is negligible). Returns
+// nullptr if no identity input can be hashed — with no sound compiler identity
+// the cache DISABLES itself rather than risk a stale hit.
 inline const std::array<uint8_t, 32>* combinedIdentity() {
     static std::array<uint8_t, 32> out{};
     static const bool ok = [] {
-        std::array<uint8_t, 32> exeHash;
-        if (!sha256File("/proc/self/exe", exeHash)) return false;
         llvm::SHA256 h;
-        h.update(llvm::ArrayRef<uint8_t>(exeHash.data(), exeHash.size()));
+#ifdef BEZEL_RUNTIME_LIB_PATH
+        // (b) the runtime archive is hashed FIRST and its readability is
+        // REQUIRED: under the k2 identity it is load-bearing (core.a does not
+        // contain the runtime), and even under the exe fallback the product's
+        // link consumes the on-disk .a — so an unreadable archive (e.g. the
+        // ENOENT window of ninja's `rm -f lib && ar qc` rebuild) means no
+        // sound identity exists for products linked NOW. Fail CLOSED (cache
+        // disabled for this process) rather than mint under-keyed entries a
+        // different runtime could later stale-hit.
+        std::array<uint8_t, 32> rtHash;
+        if (!sha256File(BEZEL_RUNTIME_LIB_PATH, rtHash)) return false;
+#endif
+        bool haveIdentity = false;
+#if defined(BEZEL_CORE_LIB_PATH) && defined(BEZEL_RUNTIME_LIB_PATH)
+        // (a) k2: the compiler archive, guarded — only trusted when the
+        // running binary is at least as new as the archive, i.e. it was linked
+        // FROM these bytes (see the STALE-CORE GUARD note in the KEY comment).
+        // /proc/self/exe resolves to the on-disk binary's inode even after a
+        // mid-run relink replaced the path (the magic link pins the deleted
+        // inode, whose old mtime then correctly trips this guard). The branch
+        // requires BOTH archive macros: with the runtime path unknown a
+        // core-only identity would leave the runtime entirely unkeyed, so the
+        // exe fallback (which contains the whole-archived runtime) is used
+        // instead. TOCTOU hardening: core.a is re-stat'ed AFTER hashing — a
+        // rebuild that began mid-hash changes the mtime and drops us to the
+        // exe fallback rather than keying a torn/new archive under a passed
+        // guard.
+        {
+            std::error_code ecCore, ecExe, ecCore2;
+            const auto coreTime =
+                fs::last_write_time(BEZEL_CORE_LIB_PATH, ecCore);
+            const auto exeTime = fs::last_write_time("/proc/self/exe", ecExe);
+            if (!ecCore && !ecExe && coreTime <= exeTime) {
+                std::array<uint8_t, 32> coreHash;
+                if (sha256File(BEZEL_CORE_LIB_PATH, coreHash) &&
+                    fs::last_write_time(BEZEL_CORE_LIB_PATH, ecCore2) ==
+                        coreTime &&
+                    !ecCore2) {
+                    h.update(llvm::ArrayRef<uint8_t>(coreHash.data(),
+                                                     coreHash.size()));
+                    haveIdentity = true;
+                }
+            }
+        }
+#endif
+        if (!haveIdentity) {
+            // k1 fallback: the whole test binary (which contains the
+            // whole-archived runtime). Conservative, never stale.
+            std::array<uint8_t, 32> exeHash;
+            if (!sha256File("/proc/self/exe", exeHash)) return false;
+            h.update(llvm::ArrayRef<uint8_t>(exeHash.data(), exeHash.size()));
+        }
 #ifdef BEZEL_RUNTIME_LIB_PATH
         // (b): fold in the runtime archive the driver's link consumes.
-        std::array<uint8_t, 32> rtHash;
-        if (sha256File(BEZEL_RUNTIME_LIB_PATH, rtHash))
-            h.update(llvm::ArrayRef<uint8_t>(rtHash.data(), rtHash.size()));
+        h.update(llvm::ArrayRef<uint8_t>(rtHash.data(), rtHash.size()));
 #endif
         out = h.final();
         return true;
@@ -944,10 +1005,12 @@ inline const std::array<uint8_t, 32>* combinedIdentity() {
 }
 
 // The mode component of the key (c): every CodegenOptions bit that alters the
-// emitted object or the link line. The "k1;" schema tag is bumped if the key
-// composition ever changes, so old entries fall out cleanly.
+// emitted object or the link line. The schema tag is bumped if the key
+// composition ever changes, so old entries fall out cleanly — "k1;"→"k2;" with
+// the core-archive identity refinement (#2100): a k1 entry (exe-hash identity)
+// must never be served under a k2 key or vice versa.
 inline std::string modeString(const codegen::CodegenOptions& opts) {
-    std::string s = "k1;";
+    std::string s = "k2;";
     s += "sa=";  s += opts.sanitizeAddress ? '1' : '0';
     s += ";cd="; s += opts.checkedDisposal ? '1' : '0';
     s += ";mm="; s += opts.isMainModule ? '1' : '0';

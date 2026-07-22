@@ -49,8 +49,14 @@ target_link_libraries(bezel_tests PRIVATE bezel_core bezel_warnings)
 # into the cache key (constraint (b)/(d)): a runtime rebuilt WITHOUT relinking
 # bezel_tests must invalidate cached link products. Mirrors the same definition
 # on bezel_core (which is where Driver.cpp reads it to drive the actual link).
+# BEZEL_CORE_LIB_PATH is the k2 compiler-identity refinement (#2100): the cache
+# keys on the COMPILER archive (everything Driver::compileFile executes is
+# linked out of bezel_core), not the whole test binary, so a test-only relink
+# of bezel_tests no longer invalidates the cache. Soundness guard + fallback
+# live in aot_support.hpp combinedIdentity().
 target_compile_definitions(bezel_tests PRIVATE
-    BEZEL_RUNTIME_LIB_PATH="$<TARGET_FILE:bezel_runtime>")
+    BEZEL_RUNTIME_LIB_PATH="$<TARGET_FILE:bezel_runtime>"
+    BEZEL_CORE_LIB_PATH="$<TARGET_FILE:bezel_core>")
 # Force all bezel_runtime object files into bezel_tests, then export-dynamic
 # so the JIT (DynamicLibrarySearchGenerator::GetForCurrentProcess) can resolve
 # bz_array_*, bz_dict_*, etc. from the process symbol table at JIT run time.

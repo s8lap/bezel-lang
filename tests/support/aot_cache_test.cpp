@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 
 #include "support/aot_support.hpp"
@@ -98,6 +99,29 @@ BEZEL_TEST(aot_cache, key_is_mode_sensitive) {
     BEZEL_EXPECT_TRUE(kp != aot::computeCacheKey(a, disp));
     BEZEL_EXPECT_TRUE(aot::computeCacheKey(a, asan) !=
                       aot::computeCacheKey(a, disp));
+}
+
+// Property 1c (#2100 k2 refinement): the key schema is "k2;" and the compiler
+// archive the refined identity hashes is actually wired in. Fail-without /
+// pass-with: reverting the identity refinement without bumping the schema tag
+// back would leave "k2;" false here ("k1;" reappears); dropping the
+// BEZEL_CORE_LIB_PATH definition from tests/CMakeLists.txt (which would
+// silently degrade every gate to the coarse exe-hash identity, i.e. cold on
+// every relink) fails the wiring assertions.
+BEZEL_TEST(aot_cache, key_schema_is_k2_and_core_lib_wired) {
+    CodegenOptions plain;
+    const std::string mode = aot::modeString(plain);
+    // The schema tag must be "k2;…" — a k1 entry (whole-binary identity) must
+    // never be served under a k2 key or vice versa.
+    BEZEL_EXPECT_TRUE(mode.rfind("k2;", 0) == 0);
+#ifdef BEZEL_CORE_LIB_PATH
+    // The refined identity's input exists on disk for this build.
+    BEZEL_EXPECT_TRUE(std::filesystem::exists(BEZEL_CORE_LIB_PATH));
+#else
+    // The definition is load-bearing for the k2 refinement; its absence is a
+    // build-wiring regression (tests/CMakeLists.txt), not an environment fact.
+    BEZEL_EXPECT_TRUE(false);
+#endif
 }
 
 // Property 2: end-to-end miss -> hit -> (flip source) miss, with identical
