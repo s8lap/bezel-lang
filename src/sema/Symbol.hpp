@@ -268,6 +268,14 @@ struct LocalSymbol : Symbol {
     // binding whose references are NOT constant expressions. Meaningful only
     // when `isConst` is true.
     bool isCompileTimeConst = false;
+    // §17.15 (v0.216, #2098): this local is a CLAUSE binding of a binding
+    // atom `(var x := E; body)`. Like a runtime `const` (§21.1), the binding
+    // is single-assignment and NOT an assignable location: assignment,
+    // compound assignment, `++`/`--`, and binding to a `ref`/`out` parameter
+    // are compile errors naming §17.15 — including through a `do`-bodied
+    // lambda inside the atom that captures the binding. Set by visitExpr's
+    // BindExpr arm right after the clause's visitStmt registration.
+    bool isBindAtomClause = false;
     // §28.3 / #1387: set by the ownership pass on an `out owned var` INLINE local
     // (ls->decl is IdentifierExpr, not LocalDecl) that is never discharged on ANY
     // path — a never-moved genuine owner. Codegen (ensureOutVarSlots) registers a

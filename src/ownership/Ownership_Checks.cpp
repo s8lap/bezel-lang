@@ -1185,6 +1185,14 @@ static bool isOwnedRelevantLocal(sema::Symbol* sym) {
 }
 
 void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
+    // §17.15 (v0.216, #2098): a binding atom reached in ANY read position is
+    // processed exactly once per block visit (clauses → body → boundary);
+    // handleDischarge's fallback routes here too, so this one arm covers
+    // every expression position the walkers reach.
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
+        processBindAtom(*bx);
+        return;
+    }
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
         if (selfTarget) return;  // tolerated for discharge target
         // Find the tracked local by name so we can also inspect its
@@ -3944,6 +3952,11 @@ bool MethodOwnership::checkIndexerSetBorrowStoreEscape(
 const ast::IdentifierExpr* MethodOwnership::identifierRoot(const ast::Expr& e) {
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e))
         return id;
+    // §17.15 (v0.216, #2098): a binding atom's value is its BODY's — peel so
+    // a borrow root does not launder through the atom (`return (var n := 1;
+    // u);` is a borrow of `u` exactly as `return u.M()` is of `u`).
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e))
+        return bx->body ? identifierRoot(*bx->body) : nullptr;
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e))
         return ma->target ? identifierRoot(*ma->target) : nullptr;
     if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e))
@@ -11622,6 +11635,287 @@ void MethodOwnership::checkTaskScopeConsumption(
     };
     for (const auto& s : body)
         if (s) scan(*s);
+}
+
+// §17.15 / K8.5 (v0.216, #2098): process a binding atom in evaluation order.
+// See the declaration comment (Ownership_impl.hpp) for the once-per-block
+// guard's rationale.
+void MethodOwnership::processBindAtom(const ast::BindExpr& bx) {
+    if (!bindAtomsProcessed_.insert(&bx).second) return;
+    for (const auto& cl : bx.clauses) {
+        if (!cl) continue;
+        // Each clause IS a §21.1 declaration: handleLocalDecl runs the
+        // classification (producerState — peeling nested atoms), the K3.4
+        // marker validation (`var y := owned x;` moves the outer source),
+        // the dangling-borrow/temporary checks, and the states_
+        // registration, verbatim.
+        handleLocalDecl(*cl);
+    }
+    // §28.3 v0.184 (#1958): a closure inside the atom that CONSUMES a
+    // captured clause binding must be rejected here — the statement-level
+    // prologue (checkCapturedOwnedConsumeInStmt) ran before the clauses
+    // were registered, so it could not see them; and the shared
+    // consumed-in-atom scan (common::bindClauseConsumedInAtom) deliberately
+    // skips lambda bodies on the strength of this rejection.
+    if (!suppressDiag_ && bx.body)
+        scanCapturedOwnedConsumeExpr(*bx.body, /*insideLambda=*/false);
+    if (bx.body) handleDischarge(*bx.body);
+    finishBindAtom(bx);
+}
+
+void MethodOwnership::finishBindAtom(const ast::BindExpr& bx) {
+    // K8.4 at the atom boundary: the body's value may not borrow an owned
+    // atom binding (self-contained — also run by the expression-body path).
+    if (!suppressDiag_) checkBindAtomBodyEscape(bx);
+    const common::TypeParamResolver identity =
+        [](const sema::TypeRef* t) { return t; };
+    for (std::size_t i = bx.clauses.size(); i-- > 0;) {
+        const auto& cl = bx.clauses[i];
+        if (!cl) continue;
+        sema::LocalSymbol* lsym = findLocalSymbol(*cl);
+        if (!lsym) continue;
+        auto it = states_.find(lsym);
+        const bool ownedProduction =
+            common::bindClauseIsOwnedProduction(*cl, ctx_, identity);
+        const bool consumedByScan = common::bindClauseConsumedInAtom(bx, i);
+        // A Poisoned binding already carried its own error (a read of a
+        // moved-from/disposed value inside the atom); skip the boundary
+        // cross-check to avoid cascading a second diagnostic.
+        if (it != states_.end() &&
+            it->second.state == OwnershipState::Poisoned) {
+            states_.erase(it);
+            everOwnedPlainLocals_.erase(lsym);
+            continue;
+        }
+        if (it != states_.end()) {
+            const bool flowOwnedAtEnd =
+                it->second.state == OwnershipState::Owned;
+            const bool everDischargedHere = everDischarged_.count(lsym) > 0;
+            if (ownedProduction) {
+                if (consumedByScan && flowOwnedAtEnd && everDischargedHere) {
+                    // Discharged on SOME path but Owned at the atom's end —
+                    // a CONDITIONAL consume (an owned argument inside one
+                    // if/case arm). K7.4's per-path scope-end disposal is
+                    // not implemented for the atom boundary in this first
+                    // landing; reject rather than pick a wrong single-path
+                    // lowering (leak or double-free). // per §17.15, K7.4
+                    report(
+                        Severity::Error, cl->initializer
+                            ? cl->initializer->span.begin : bx.span.begin,
+                        std::string("binding-atom binding `") +
+                        std::string(cl->name) +
+                        "` is consumed on only some paths inside the atom — "
+                        "per-path boundary disposal (K7.4) is not supported "
+                        "for a binding atom in this version; consume it "
+                        "unconditionally, or bind it at statement level "
+                        "(§17.15 / §28.3 K8.5, v0.216)");
+                } else if (consumedByScan != (everDischargedHere ||
+                                              !flowOwnedAtEnd)) {
+                    // The dataflow and the shared structural predicate
+                    // disagree on whether a K3 position discharged the
+                    // binding. Codegen lowers by the predicate, so a
+                    // disagreement would split into a leak or double-free
+                    // — reject conservatively instead. // per §17.15, #2098
+                    report(
+                        Severity::Error, cl->initializer
+                            ? cl->initializer->span.begin : bx.span.begin,
+                        std::string("this consume of binding-atom binding `") +
+                        std::string(cl->name) +
+                        "` is not supported inside the atom in this version "
+                        "— consume it through a call-site `owned` argument, "
+                        "an explicit `Dispose()`, a `throw`, or a marked "
+                        "clause transfer, or bind it at statement level "
+                        "(§17.15 / §28.3 K8.5, v0.216)");
+                }
+            } else if (flowOwnedAtEnd) {
+                // The dataflow classified the binding OWNED but the shared
+                // disposal predicate does not claim it — an owned-producer
+                // form outside the decidable set (a Task-family mint, a
+                // `move` transfer, a `??`-owned). Codegen would register no
+                // boundary disposal — a silent leak; decline with reasons
+                // instead. // per §17.15 / §28.3 K8.5 (#2098)
+                report(
+                    Severity::Error, cl->initializer
+                        ? cl->initializer->span.begin : bx.span.begin,
+                    std::string("this owned initializer form is not "
+                    "supported for a binding-atom clause (`") +
+                    std::string(cl->name) +
+                    "`) in this version — bind it at statement level "
+                    "(`using var`, §28.10) (§17.15 / §28.3 K8.5, v0.216)");
+            }
+            // The atom is the binding's boundary (K8.5): nothing outside the
+            // atom ever sees it — the end-of-method machinery must not
+            // (no must-use warning attaches; disposal is the atom's).
+            states_.erase(it);
+        }
+        everOwnedPlainLocals_.erase(lsym);
+    }
+}
+
+void MethodOwnership::checkBindAtomBodyEscape(const ast::BindExpr& bx) {
+    if (!bx.body) return;
+    // Clause classification is the SHARED structural predicate (not the
+    // dataflow), so the expression-body path — where the dataflow never ran
+    // — can call this too.
+    const common::TypeParamResolver identity =
+        [](const sema::TypeRef* t) { return t; };
+    std::unordered_map<const sema::Symbol*, const ast::LocalDecl*> clauseOf;
+    std::unordered_set<const sema::Symbol*> ownedClauses;
+    for (const auto& cl : bx.clauses) {
+        if (!cl) continue;
+        sema::LocalSymbol* lsym = findLocalSymbol(*cl);
+        if (!lsym) continue;
+        clauseOf[lsym] = cl.get();
+        if (common::bindClauseIsOwnedProduction(*cl, ctx_, identity))
+            ownedClauses.insert(lsym);
+    }
+    if (clauseOf.empty()) return;
+
+    // Resolve the borrow ROOTS of the body's value, transitively through
+    // this atom's BORROW clauses (a borrow clause carries its initializer's
+    // source set, K2.2 — so `(var c := new C(); var w := c; w)` roots at
+    // `c`). Depth-bounded against pathological nesting.
+    std::function<void(const ast::Expr*, int,
+                       std::vector<const sema::Symbol*>&)> rootsOf =
+        [&](const ast::Expr* e, int depth,
+            std::vector<const sema::Symbol*>& out) {
+            if (!e || depth > 16) return;
+            e = common::peelBindAtomToBody(e);
+            if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+                rootsOf(pb->operand.get(), depth + 1, out);
+                return;
+            }
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+                if (sema::Symbol* sym = ctx_.exprSymbol(*id)) out.push_back(sym);
+                return;
+            }
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+                rootsOf(ma->target.get(), depth + 1, out);
+                return;
+            }
+            if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+                rootsOf(nm->target.get(), depth + 1, out);
+                return;
+            }
+            if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+                rootsOf(ix->target.get(), depth + 1, out);
+                return;
+            }
+            if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+                if (tt->op == "as") rootsOf(tt->operand.get(), depth + 1, out);
+                return;
+            }
+            if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+                rootsOf(cd->thenValue.get(), depth + 1, out);
+                rootsOf(cd->elseValue.get(), depth + 1, out);
+                return;
+            }
+            if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+                for (const auto& arm : ce->arms)
+                    if (arm.bodyKind == ast::CaseArmBodyKind::Expression)
+                        rootsOf(arm.exprBody.get(), depth + 1, out);
+                return;
+            }
+            if (auto* call = dynamic_cast<const ast::CallExpr*>(e)) {
+                // A fresh owned production carries no borrow; a plain
+                // (non-`owned`) instance-call result is a borrow of its
+                // receiver (K1.5) — root through the receiver chain.
+                if (producerState(*e) == OwnershipState::Owned) return;
+                if (auto* cma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        call->callee.get()))
+                    rootsOf(cma->target.get(), depth + 1, out);
+                return;
+            }
+            // new/literals/lambda (capture handled separately)/etc.: no
+            // named borrow root.
+        };
+
+    const ast::Expr* body = common::peelBindAtomToBody(bx.body.get());
+
+    // (1) Capture escape: the body's VALUE is (or selects) a lambda that
+    // captures a clause binding — the closure outlives the atom while its
+    // captured borrow's source is disposed at the atom's completion.
+    {
+        std::vector<const ast::LambdaExpr*> lambdas;
+        std::function<void(const ast::Expr*)> findValueLambdas =
+            [&](const ast::Expr* e) {
+                if (!e) return;
+                e = common::peelBindAtomToBody(e);
+                if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+                    lambdas.push_back(lam);
+                    return;
+                }
+                if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+                    findValueLambdas(cd->thenValue.get());
+                    findValueLambdas(cd->elseValue.get());
+                }
+            };
+        findValueLambdas(body);
+        for (const ast::LambdaExpr* lam : lambdas) {
+            std::vector<const ast::IdentifierExpr*> ids;
+            collectLambdaIdentifiers(*lam, ids);
+            for (const ast::IdentifierExpr* id : ids) {
+                sema::Symbol* sym = ctx_.exprSymbol(*id);
+                if (sym && clauseOf.count(sym)) {
+                    report(
+                        Severity::Error, id->span.begin,
+                        std::string("this closure captures binding-atom "
+                        "binding `") + std::string(id->name) +
+                        "` and escapes as the atom's value — a borrow "
+                        "sourced by an atom binding may not leave the atom "
+                        "(K8.4 at the atom boundary, §17.15 / §28.3, "
+                        "v0.216); bind at statement level (`using var`, "
+                        "§28.10) when the value must outlive the "
+                        "expression");
+                    return;
+                }
+            }
+        }
+    }
+
+    // (2) Borrow-root escape: only a borrow-CARRYING result can dangle — a
+    // class/interface reference, a heap collection, or a borrow-bearing
+    // record/span view (§9.7). Value results are copies.
+    const sema::TypeRef* rt = ctx_.exprType(*bx.body);
+    bool resultCarriesBorrow = isBorrowableType(rt);
+    if (!resultCarriesBorrow && rt && rt->kind == sema::TypeRef::Kind::Named &&
+        !rt->declaration && rt->astNode && rt->astNode->name &&
+        !rt->astNode->name->parts.empty() &&
+        (isBorrowingCollectionNameHead(rt->headName()) ||
+         isOwningCollectionNameHead(rt->headName())))
+        resultCarriesBorrow = true;
+    if (!resultCarriesBorrow &&
+        common::isBorrowBearingRecordOrSpan(rt, ctx_))
+        resultCarriesBorrow = true;
+    if (!resultCarriesBorrow) return;
+
+    std::vector<const sema::Symbol*> roots;
+    rootsOf(body, 0, roots);
+    // Transitive resolution through this atom's borrow clauses.
+    std::unordered_set<const sema::Symbol*> seen;
+    for (std::size_t i = 0; i < roots.size(); ++i) {
+        const sema::Symbol* sym = roots[i];
+        if (!sym || !seen.insert(sym).second) continue;
+        auto cit = clauseOf.find(sym);
+        if (cit == clauseOf.end()) continue;  // an outer binding — bounded there
+        if (ownedClauses.count(sym)) {
+            report(
+                Severity::Error, bx.body->span.begin,
+                std::string("the binding atom's body value borrows atom "
+                "binding `") + std::string(sym->name) +
+                "`, which is disposed at the atom's completion — a borrow "
+                "sourced by an atom binding may not escape the atom (K8.4 "
+                "at the atom boundary, §17.15 / §28.3, v0.216); the body is "
+                "not a transfer position, so bind at statement level "
+                "(`using var`, §28.10) when the value must outlive the "
+                "expression");
+            return;
+        }
+        // A borrow clause: its binding carries the initializer's sources
+        // (K2.2) — resolve them.
+        if (cit->second->initializer)
+            rootsOf(cit->second->initializer.get(), 0, roots);
+    }
 }
 
 } // namespace bezel::ownership

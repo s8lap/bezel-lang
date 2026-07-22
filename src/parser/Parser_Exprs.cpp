@@ -722,6 +722,12 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
         if (isKeyword("when")) {
             return parseWhenExpr(/*parenAtom=*/true);
         }
+        // §17.15 / A.7 BindExpr (v0.216, #2098): "(" followed by the reserved
+        // `var` — which begins no other expression — commits the binding-atom
+        // reading at the second token, like the other paren atoms.
+        if (isKeyword("var")) {
+            return parseBindExprAtom();
+        }
         // §A.7 unit value `()` — empty parens at PrimaryAtom level.
         if (consumePunctuator(")")) {
             return std::unique_ptr<ast::Expr>(
@@ -1624,6 +1630,86 @@ std::unique_ptr<ast::Expr> Parser::parseIfExprAtom() {
         tail = std::unique_ptr<ast::Expr>(c.release());
     }
     return tail;
+}
+
+// §17.15 / A.7 BindExpr (v0.216, #2098): `"(" BindClause+ Expression ")"`,
+// `BindClause ::= "var" Identifier (":" Type)? ":=" Expression ";"`. The
+// caller consumed the `(`; current_ is `var` (so at least one clause is
+// guaranteed). Each clause is represented as an embedded plain-`var`
+// LocalDecl (isBindAtomClause set) so sema's §21.1 declaration typing and
+// codegen's lowerLocalDecl are reused verbatim; the `;` terminates the
+// clause (no expression contains a top-level `;`, so the extent is
+// unambiguous). Clause initializers admit the `owned` binding-position
+// transfer marker (K3.4 / §28.3, the same consumeKeyword("owned") hook the
+// A.6 LocalDecl statement uses); the body is one full Expression and the
+// atom supplies its own `)`.
+std::unique_ptr<ast::Expr> Parser::parseBindExprAtom() {
+    auto bx = std::make_unique<ast::BindExpr>();
+    while (isKeyword("var")) {
+        auto clause = std::make_unique<ast::LocalDecl>();
+        clause->isBindAtomClause = true;
+        clause->span.begin = current_.location;
+        advance();  // past `var`
+        if (current_.kind != TokenKind::Identifier) {
+            // Appendix B.1 / #2090 sibling: a keyword in the clause-name slot
+            // is almost certainly an attempted binding name; diagnose the
+            // cause directly so one typo does not cascade.
+            if (current_.kind == TokenKind::Keyword) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    std::string("`") + std::string(current_.text) +
+                        "` is a reserved keyword and cannot be used as an "
+                        "identifier (Appendix B.1); rename it");
+                clause->name = current_.text;
+                advance();
+            } else {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected a binding name after `var` in the "
+                    "`(var \xe2\x80\xa6)` binding atom (\xc2\xa7""17.15, "
+                    "v0.216)");
+            }
+        } else {
+            clause->name = current_.text;
+            advance();
+        }
+        if (consumePunctuator(":")) {
+            clause->type = parseType();
+        }
+        if (!consumePunctuator(":=")) {
+            // §17.15: a clause's initializer is mandatory (A.7 BindClause has
+            // no initializer-less form — a binding is initialized exactly
+            // once, at its clause).
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected `:=` \xe2\x80\x94 a binding-atom clause requires "
+                "an initializer (`var x := E;`) (\xc2\xa7""17.15, v0.216)");
+        } else {
+            // §28.3 / §17.15: the `owned` binding-position transfer marker —
+            // `var y := owned x;` is K3.4's marked binding transfer inside
+            // the atom exactly as at statement level (#1962).
+            if (consumeKeyword("owned"))
+                clause->initializerHasOwnedMarker = true;
+            clause->initializer = parseExpression();
+        }
+        if (!consumePunctuator(";")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected `;` to terminate this binding-atom clause "
+                "(\xc2\xa7""17.15, v0.216)");
+        }
+        clause->span.end = current_.location;
+        bx->clauses.push_back(std::move(clause));
+    }
+    // The body is one full Expression supplying the atom's value and type.
+    bx->body = parseExpression();
+    if (!consumePunctuator(")")) {
+        diagnostics_.report(
+            Severity::Error, current_.location,
+            "expected ')' to close the `(var \xe2\x80\xa6)` binding atom "
+            "(\xc2\xa7""17.15, v0.216)");
+    }
+    return std::unique_ptr<ast::Expr>(bx.release());
 }
 
 // §20 (v0.208, #2079): see Parser.hpp — the retired postfix conditional

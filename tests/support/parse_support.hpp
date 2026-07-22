@@ -440,6 +440,27 @@ inline std::string exprToString(const ast::Expr& e) {
         if (!t->operand) return std::string("(throw)");
         return "(throw " + exprToString(*t->operand) + ")";
     }
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
+        // §17.15 / A.7 BindExpr (v0.216, #2098): rendered as written —
+        // `(var x: T := owned E; body)`.
+        std::string out = "(";
+        for (const auto& cl : bx->clauses) {
+            out += "var ";
+            out += cl ? std::string(cl->name) : std::string("<null>");
+            if (cl && cl->type) {
+                out += ": ";
+                out += typeToString(*cl->type);
+            }
+            out += " := ";
+            if (cl && cl->initializerHasOwnedMarker) out += "owned ";
+            out += (cl && cl->initializer) ? exprToString(*cl->initializer)
+                                           : std::string("<null>");
+            out += "; ";
+        }
+        out += bx->body ? exprToString(*bx->body) : std::string("<null>");
+        out += ')';
+        return out;
+    }
     if (auto* tof = dynamic_cast<const ast::TypeOfExpr*>(&e)) {
         return "typeof(" + (tof->queriedType
                                 ? typeToString(*tof->queriedType)

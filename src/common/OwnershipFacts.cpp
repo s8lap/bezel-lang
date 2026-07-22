@@ -735,4 +735,244 @@ std::vector<sema::Symbol*> bareTypeParamCallSourceRoots(
     return roots;
 }
 
+// §17.15 (v0.216, #2098): peel a binding atom to its body, transitively —
+// the atom's value/type/ownership classification is the body's (§28.3
+// producers row; the atom is not a join). See the header.
+const ast::Expr* peelBindAtomToBody(const ast::Expr* e) {
+    while (const auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
+        if (!bx->body) break;
+        e = bx->body.get();
+    }
+    return e;
+}
+
+bool bindClauseIsOwnedProduction(const ast::LocalDecl& clause,
+                                 const sema::SemaContext& ctx,
+                                 const TypeParamResolver& resolveParam) {
+    // K3.4: the marked binding transfer `var y := owned x;` — the binding
+    // adopts the moved source's obligation (§28.3 v0.180 #1962, admitted
+    // inside the atom per §17.15).
+    if (clause.initializerHasOwnedMarker) return true;
+    const ast::Expr* init = peelBindAtomToBody(clause.initializer.get());
+    if (!init) return false;
+    // A `new T(...)` of a non-value kind. Mirrors producerState's NewExpr arm
+    // (Ownership.cpp): a record/enum/choice construction is a plain value
+    // with no obligation; the value builtins (DateTime/TimeSpan/Guid/
+    // CancellationToken/DateOnly/TimeOnly) likewise; every other `new` —
+    // user classes AND the builtin heap types registerUsingDisposal knows
+    // (collections, Channel, Stopwatch, CTS, …) — is a fresh owned
+    // production. // per §28.3
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(init)) {
+        const sema::TypeRef* rt =
+            ne->type ? ctx.resolvedType(*ne->type) : ctx.exprType(*init);
+        if (rt && rt->kind == sema::TypeRef::Kind::Named) {
+            if (rt->declaration &&
+                rt->declaration->kind != ast::TypeDeclKind::Class &&
+                rt->declaration->kind != ast::TypeDeclKind::Interface)
+                return false;  // value kind: no obligation
+            if (rt->declaration && rt->declaration->isValueBuiltin)
+                return false;
+            if (!rt->declaration && rt->astNode && rt->astNode->name &&
+                rt->astNode->name->parts.size() == 1) {
+                std::string_view n = rt->headName();
+                if (n == "DateTime" || n == "TimeSpan" || n == "Guid" ||
+                    n == "CancellationToken" || n == "DateOnly" ||
+                    n == "TimeOnly")
+                    return false;  // value builtin (§2.5 / #434 / #1357)
+            }
+        }
+        return true;
+    }
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        // An `owned`-returning user call whose result is a heap class
+        // (#1817's value-erasure gate holds: isFreshOwnedClassProducer
+        // requires a class-declared result), or a builtin owned-transfer
+        // call (Pop/Dequeue/TakeCurrent/… on an owning receiver).
+        if (isFreshOwnedClassProducer(init, ctx, resolveParam)) return true;
+        if (isBuiltinOwnedTransferCall(*call, ctx)) return true;
+        return false;
+    }
+    // An owned-meet if/case expression (§28.3 arm-meet, #1661).
+    if (dynamic_cast<const ast::ConditionalExpr*>(init) ||
+        dynamic_cast<const ast::CaseExpr*>(init))
+        return conditionalCaseArmMeetIsOwned(*init, ctx, resolveParam);
+    return false;
+}
+
+namespace {
+
+// §17.15 (#2098): does `e` contain a K3 consume of the visible binding
+// `name`? See bindClauseConsumedInAtom's header comment for the closed
+// shape set and the shadowing/lambda rules.
+bool exprConsumesBinding(const ast::Expr* e, std::string_view name);
+
+// True when `e` is (possibly a `!`-wrapped) identifier naming `name`.
+bool isBindingIdent(const ast::Expr* e, std::string_view name) {
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
+        e = pb->operand.get();
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+    return id && id->name == name;
+}
+
+bool argsConsumeBinding(const std::vector<ast::CallArgument>& args,
+                        std::string_view name) {
+    for (const auto& a : args) {
+        if (!a.value) continue;
+        // The call-site transfer marker `M(owned x)` (§22.3 / K3.3).
+        if (a.modifier == "owned" && isBindingIdent(a.value.get(), name))
+            return true;
+        if (exprConsumesBinding(a.value.get(), name)) return true;
+    }
+    return false;
+}
+
+bool exprConsumesBinding(const ast::Expr* e, std::string_view name) {
+    if (!e) return false;
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(e)) {
+        // Explicit `x.Dispose()` (K3.10; the `x!.Dispose()` spelling too).
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call->callee.get())) {
+            if (ma->member == "Dispose" && isBindingIdent(ma->target.get(), name))
+                return true;
+        }
+        if (call->callee && exprConsumesBinding(call->callee.get(), name))
+            return true;
+        return argsConsumeBinding(call->args, name);
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        // `x?.Dispose()` — callee is a NullCondMemberExpr.
+        if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                nc->callee.get())) {
+            if (nm->member == "Dispose" && isBindingIdent(nm->target.get(), name))
+                return true;
+        }
+        if (nc->callee && exprConsumesBinding(nc->callee.get(), name))
+            return true;
+        return argsConsumeBinding(nc->args, name);
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(e))
+        return argsConsumeBinding(ne->args, name);
+    if (auto* te = dynamic_cast<const ast::ThrowExpr*>(e)) {
+        // `throw x` in expression position (K3.8 / K4.2's announced kill).
+        if (isBindingIdent(te->operand.get(), name)) return true;
+        return exprConsumesBinding(te->operand.get(), name);
+    }
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
+        // `move x` — the owning-collection whole transfer (§28.6/#1107).
+        if (ue->op == "move" && isBindingIdent(ue->operand.get(), name))
+            return true;
+        return exprConsumesBinding(ue->operand.get(), name);
+    }
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
+        // A nested atom: a clause's marked transfer `var y := owned x;`
+        // consumes the outer binding; a nested clause REBINDING the name
+        // shadows it for the remainder of that nested atom.
+        for (const auto& cl : bx->clauses) {
+            if (!cl) continue;
+            if (cl->initializerHasOwnedMarker &&
+                isBindingIdent(cl->initializer.get(), name))
+                return true;
+            if (exprConsumesBinding(cl->initializer.get(), name)) return true;
+            if (cl->name == name) return false;  // shadowed from here on
+        }
+        return exprConsumesBinding(bx->body.get(), name);
+    }
+    if (dynamic_cast<const ast::LambdaExpr*>(e)) {
+        // A closure consuming a captured owned binding is rejected by the
+        // §28.3 v0.184 (#1958) machinery (wired for atom clauses in
+        // processBindAtom), so it cannot occur in an accepted program — and
+        // a lambda parameter of the same name shadows its body anyway.
+        return false;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e))
+        return exprConsumesBinding(be->left.get(), name) ||
+               exprConsumesBinding(be->right.get(), name);
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e))
+        return exprConsumesBinding(cd->condition.get(), name) ||
+               exprConsumesBinding(cd->thenValue.get(), name) ||
+               exprConsumesBinding(cd->elseValue.get(), name);
+    if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+        if (exprConsumesBinding(ce->scrutinee.get(), name)) return true;
+        for (const auto& arm : ce->arms) {
+            if (arm.guard && exprConsumesBinding(arm.guard.get(), name))
+                return true;
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression &&
+                exprConsumesBinding(arm.exprBody.get(), name))
+                return true;
+        }
+        return false;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e))
+        return exprConsumesBinding(ma->target.get(), name);
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e))
+        return exprConsumesBinding(nm->target.get(), name);
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+        if (exprConsumesBinding(ix->target.get(), name)) return true;
+        for (const auto& a : ix->indices)
+            if (a.value && exprConsumesBinding(a.value.get(), name))
+                return true;
+        return false;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
+        return exprConsumesBinding(pb->operand.get(), name);
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e))
+        return exprConsumesBinding(tt->operand.get(), name);
+    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+        for (const auto& p : is->parts)
+            if (p.expr && exprConsumesBinding(p.expr.get(), name)) return true;
+        return false;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
+        if (exprConsumesBinding(we->source.get(), name)) return true;
+        for (const auto& ia : we->assigns)
+            if (ia.value && exprConsumesBinding(ia.value.get(), name))
+                return true;
+        return false;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        for (const auto& k : cl->keys)
+            if (k && exprConsumesBinding(k.get(), name)) return true;
+        for (const auto& v : cl->elements)
+            if (v && exprConsumesBinding(v.get(), name)) return true;
+        return false;
+    }
+    if (auto* re = dynamic_cast<const ast::RangeExpr*>(e))
+        return exprConsumesBinding(re->lo.get(), name) ||
+               exprConsumesBinding(re->hi.get(), name) ||
+               exprConsumesBinding(re->step.get(), name);
+    // Literals / identifiers / typeof / nameof / default — no consume.
+    return false;
+}
+
+}  // namespace
+
+bool bindClauseConsumedInAtom(const ast::BindExpr& bx, std::size_t clauseIdx) {
+    if (clauseIdx >= bx.clauses.size() || !bx.clauses[clauseIdx]) return false;
+    std::string_view name = bx.clauses[clauseIdx]->name;
+    if (name.empty()) return false;
+    // The binding scopes over the LATER clauses' initializers and the body
+    // (§17.15); a later clause rebinding the name shadows it from the end of
+    // that clause on.
+    for (std::size_t i = clauseIdx + 1; i < bx.clauses.size(); ++i) {
+        const auto& cl = bx.clauses[i];
+        if (!cl) continue;
+        if (cl->initializerHasOwnedMarker &&
+            isBindingIdent(cl->initializer.get(), name))
+            return true;
+        if (exprConsumesBinding(cl->initializer.get(), name)) return true;
+        if (cl->name == name) return false;  // shadowed from here on
+    }
+    return exprConsumesBinding(bx.body.get(), name);
+}
+
+bool bindClauseNeedsAtomDisposal(const ast::BindExpr& bx,
+                                 std::size_t clauseIdx,
+                                 const sema::SemaContext& ctx,
+                                 const TypeParamResolver& resolveParam) {
+    if (clauseIdx >= bx.clauses.size() || !bx.clauses[clauseIdx]) return false;
+    return bindClauseIsOwnedProduction(*bx.clauses[clauseIdx], ctx,
+                                       resolveParam) &&
+           !bindClauseConsumedInAtom(bx, clauseIdx);
+}
+
 }  // namespace bezel::common

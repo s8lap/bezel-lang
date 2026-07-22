@@ -3559,6 +3559,20 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
                 "` — a const local is a single-assignment binding (§21.1)");
             return;
         }
+        // §17.15 (v0.216, #2098): a binding-atom binding is not an
+        // assignable location (the §21.1 runtime-`const` rule). Assignment
+        // forms are statements, so this fires only through a `do`-bodied
+        // lambda inside the atom that captures the binding — exactly the
+        // hole the spec names.
+        if (ls->isBindAtomClause) {
+            ctx_.diagnostics().report(
+                Severity::Error, as.span.begin,
+                std::string("cannot assign to binding-atom binding `") +
+                std::string(ls->name) +
+                "` — a `(var …)` binding is a single-assignment binding and "
+                "not an assignable location (§17.15, v0.216)");
+            return;
+        }
     }
     if (inConstructor_) return;
     // §22.8 (#747 R42): a readonly field may be assigned only in a field
@@ -3690,6 +3704,18 @@ void ExprTC::checkRefOutOperandCategory(const ast::CallArgument& a) {
                     "const local `" + std::string(id->name) +
                     "` — a const local is a single-assignment binding "
                     "(§22.3 / §21.1)");
+                return;
+            }
+            // §17.15 (v0.216, #2098): a binding-atom binding is not an
+            // assignable location — binding it to `ref`/`out` is a compile
+            // error naming the rule (the §21.1 runtime-`const` mirror).
+            if (ls->isBindAtomClause) {
+                ctx_.diagnostics().report(
+                    Severity::Error, target.span.begin,
+                    std::string("a `") + kind + "` argument may not be a "
+                    "binding-atom binding `" + std::string(id->name) +
+                    "` — a `(var …)` binding is a single-assignment binding "
+                    "and not an assignable location (§17.15, v0.216)");
                 return;
             }
             // §28.10's pin: a `using var` binding's disposal is scope-bound;
@@ -9403,6 +9429,19 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 "local `") + std::string(id->name) +
                                 "` — a const local is a single-assignment "
                                 "binding (§21.1)");
+                        // §17.15 (v0.216, #2098): `++`/`--` reassign; a
+                        // binding-atom binding is not an assignable location
+                        // (the §21.1 runtime-`const` mirror; reachable only
+                        // through a `do`-bodied lambda inside the atom).
+                        else if (loc->isBindAtomClause)
+                            ctx_.diagnostics().report(
+                                Severity::Error, is->target->span.begin,
+                                std::string("cannot increment/decrement "
+                                "binding-atom binding `") +
+                                std::string(id->name) +
+                                "` — a `(var …)` binding is a "
+                                "single-assignment binding and not an "
+                                "assignable location (§17.15, v0.216)");
                         else if (loc->isUsing)
                             ctx_.diagnostics().report(
                                 Severity::Error, is->target->span.begin,

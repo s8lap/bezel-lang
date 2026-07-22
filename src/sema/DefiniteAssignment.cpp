@@ -1011,6 +1011,19 @@ private:
             if (cd->elseValue) visitExpr(*cd->elseValue);
             return;
         }
+        // §17.15 (v0.216, #2098): the binding atom `(var x := E; body)` —
+        // clauses evaluate first (each initializer is a read position), the
+        // body last. A clause binding is definitely assigned by its own
+        // clause (A.7 BindClause mandates the initializer), so no
+        // declared-unassigned state ever arises for it; the walk exists so
+        // reads of ENCLOSING unassigned locals inside the atom are still
+        // diagnosed.
+        if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
+            for (const auto& cl : bx->clauses)
+                if (cl && cl->initializer) visitExpr(*cl->initializer);
+            if (bx->body) visitExpr(*bx->body);
+            return;
+        }
         if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
             if (te->operand) visitExpr(*te->operand);
             return;

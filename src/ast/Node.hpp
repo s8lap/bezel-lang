@@ -214,6 +214,18 @@ struct LocalDecl : Stmt {
     // pass (handleLocalDecl), which validates the source is a named owned
     // binding and records the move.
     bool initializerHasOwnedMarker = false;
+    // §17.15 (v0.216, #2098): this LocalDecl is a CLAUSE of a binding atom
+    // `(var x := E; body)` (a BindExpr child, A.7 BindClause), not a statement.
+    // Set by the parser. A clause binding is single-assignment and not an
+    // assignable location (the §21.1 runtime-`const` rule; sema mirrors the
+    // const-local rejections), and its ownership boundary is the ATOM (K8.5),
+    // not the enclosing scope — the end-of-method scope machinery must skip
+    // it. The atom-boundary disposal decision itself carries no AST flag: both
+    // the ownership pass and codegen consult the ONE shared predicate
+    // (common::bindClauseNeedsAtomDisposal), so an expression-bodied member —
+    // whose body the ownership dataflow does not run on — gets the identical
+    // disposal (the #1661 no-drift pattern).
+    bool isBindAtomClause = false;
     std::string_view name;
     std::unique_ptr<Type> type;        // null when no `: Type`
     std::unique_ptr<Expr> initializer; // null only when plain `var x;`
@@ -1178,6 +1190,21 @@ struct CaseArm {
 struct CaseExpr : Expr {
     std::unique_ptr<Expr> scrutinee;   // null when bare `case CaseArm*`
     std::vector<CaseArm> arms;
+};
+
+// A.7 `BindExpr ::= "(" BindClause+ Expression ")"`,
+//     `BindClause ::= "var" Identifier (":" Type)? ":=" Expression ";"`.
+// §17.15 (v0.216, #2098): the binding atom `(var x := E; body)` — a
+// PrimaryAtom; "(" + reserved `var` commits the reading at the second token
+// like the other paren atoms. Clauses are represented as embedded plain-`var`
+// LocalDecl nodes (isBindAtomClause set) so sema's LocalDecl typing and
+// codegen's lowerLocalDecl are reused verbatim inside the atom's child scope;
+// the body is one full Expression supplying the atom's value, type, and
+// ownership classification (the atom is not a K7 join — clauses and body
+// evaluate unconditionally).
+struct BindExpr : Expr {
+    std::vector<std::unique_ptr<LocalDecl>> clauses;  // at least one
+    std::unique_ptr<Expr> body;
 };
 
 // A.6 statement-position case. Same shape as CaseExpr but trailed by `;` and

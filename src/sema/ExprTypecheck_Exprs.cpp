@@ -526,6 +526,43 @@ TypeRef* ExprTC::bindLambdaDestructure(const ast::DestructuringPattern& dp,
 }
 
 void ExprTC::visitExpr(const ast::Expr& e) {
+    // §17.15 (v0.216, #2098): the binding atom `(var x := E; body)`. Handled
+    // before visitChildren — the clauses are §21.1 declaration statements
+    // typed verbatim by visitStmt's LocalDecl arm inside a child Scope, so
+    // each binding scopes over the later clauses' initializers and the body
+    // only (its own initializer does not see it: visitStmt evaluates the
+    // initializer before registering the name); nothing outside the atom
+    // ever sees a binding (the scope is restored on exit). The atom's type
+    // is the body's, so member access on the atom result resolves.
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
+        Scope atomScope;
+        atomScope.parent = currentScope_;
+        Scope* savedScope = currentScope_;
+        currentScope_ = &atomScope;
+        bool savedInBindAtom = inBindAtom_;
+        inBindAtom_ = true;  // §17.15/§30.5 await-in-atom targeted rejection
+        for (const auto& cl : bx->clauses) {
+            if (!cl) continue;
+            visitStmt(*cl);
+            // §17.15 decision (2) / §21.1: a binding is NOT an assignable
+            // location — flag the clause's LocalSymbol so the assignment /
+            // increment / ref-out rejection sites (the runtime-`const`
+            // mirrors) fire on it, including through a `do`-bodied lambda
+            // inside the atom that captures the binding.
+            auto it = atomScope.names.find(cl->name);
+            if (it != atomScope.names.end())
+                if (auto* ls = dynamic_cast<LocalSymbol*>(it->second))
+                    ls->isBindAtomClause = true;
+        }
+        if (bx->body) {
+            visitExpr(*bx->body);
+            if (TypeRef* bt = ctx_.exprType(*bx->body))
+                ctx_.setExprType(&e, bt);
+        }
+        inBindAtom_ = savedInBindAtom;
+        currentScope_ = savedScope;
+        return;
+    }
     // Slice 3b: IdentifierExpr name lookup. `this` / `base` are
     // implicit-meaning identifiers — leave them unresolved
     // (typecheck handles their semantics in a future slice).
@@ -3875,6 +3912,21 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                 "lambda (§30.2)");
             // Fall through and still produce the result type so downstream
             // typing of the awaited value doesn't cascade unrelated errors.
+        } else if (inBindAtom_) {
+            // §17.15 / §30.5 (v0.216, #2098): TARGETED REJECTION — `await`
+            // inside a binding atom in an async body is not yet supported:
+            // the async lowering's frame-local scan is statement-level, so an
+            // atom binding would stay alloca-backed across the suspension (a
+            // silent miscompile, not a missing diagnostic). Reject cleanly
+            // until the state-machine scan learns BindExpr (#2122); the
+            // remedy is a statement-level binding (`var t := await …;`)
+            // before the atom.
+            ctx_.diagnostics().report(
+                Severity::Error, ue.span.begin,
+                "`await` inside a `(var \xe2\x80\xa6)` binding atom is not "
+                "supported in this version \xe2\x80\x94 bind the awaited "
+                "value in a statement-level `var` before the atom "
+                "(\xc2\xa7""17.15 / \xc2\xa7""30.5, v0.216)");
         }
         // Result type (§30.3 / §30.5):
         //   await Task          -> unit  (no result value)
@@ -5047,6 +5099,12 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // regardless of the enclosing method's async-ness.
         bool saveAsync = inAsyncContext_;
         inAsyncContext_ = lam->isAsync;
+        // §17.15 (#2098): a lambda body is its own function — an `await` in a
+        // nested async lambda suspends the lambda's own state machine, not
+        // the frame the enclosing binding atom lives in, so the await-in-atom
+        // targeted rejection does not apply across the boundary.
+        bool saveInBindAtom = inBindAtom_;
+        inBindAtom_ = false;
         // #721: a lambda inside an iterator method is its own callable, not an
         // iterator — `return;` in it is governed by the lambda's own rules.
         bool saveIter = inIteratorMethod_;
@@ -5193,6 +5251,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         currentReturnType_ = saveRetTy;
         currentOutPostconds_ = std::move(saveOutPostconds);  // §22.4 (#1585)
         inAsyncContext_ = saveAsync;
+        inBindAtom_ = saveInBindAtom;  // §17.15 (#2098)
         inIteratorMethod_ = saveIter;
         inLambda_ = saveInLambda;
         loopDepth_ = saveLoop;

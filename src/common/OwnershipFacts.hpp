@@ -41,6 +41,8 @@ namespace bezel::ast {
 struct Expr;
 struct CallExpr;
 struct MethodDecl;
+struct BindExpr;
+struct LocalDecl;
 }  // namespace bezel::ast
 
 namespace bezel::sema {
@@ -233,5 +235,77 @@ bool declaredReturnIsBareTypeParam(const ast::MethodDecl& md,
 std::vector<sema::Symbol*> bareTypeParamCallSourceRoots(
     const ast::CallExpr& ce, const ast::MethodDecl& md,
     const sema::SemaContext& ctx);
+
+// §17.15 (v0.216, #2098): peel a binding atom `(var x := E; body)` to the
+// expression that supplies its value, type, and ownership classification —
+// its body, transitively through nested atoms (§28.3 producers row: "The
+// body's classification, transparently — the atom is not a join"). Every
+// initializer-form classification site (the ownership pass's producerState,
+// codegen's unwindOwnedLocalClass / usingVarOwnsClassObjectDynamically
+// family) peels through this one helper so the two passes cannot diverge on
+// what a BindExpr-initialized binding's obligation is — the #1661 pattern.
+// Null-safe; a non-atom expression is returned unchanged.
+const ast::Expr* peelBindAtomToBody(const ast::Expr* e);
+
+// §17.15 / §28.3 / K8.5 (v0.216, #2098): is `clause`'s initializer an OWNED
+// production, making the clause binding a named unbound owned temporary
+// bounded by the atom? The decidable shape set of this first landing:
+//   * the marked binding transfer `var y := owned x;` (K3.4 — the binding
+//     adopts the obligation);
+//   * a `new T(...)` of a non-value kind (user class/interface and the
+//     builtin heap types registerUsingDisposal knows how to dispose; value
+//     records/enums/choices and the value builtins are excluded, mirroring
+//     producerState's NewExpr arm);
+//   * an `owned`-returning user call with a class result
+//     (isFreshOwnedClassProducer) or a builtin owned-transfer call
+//     (isBuiltinOwnedTransferCall);
+//   * an owned-meet if/case expression (conditionalCaseArmMeetIsOwned);
+//   * a nested binding atom, classified by its peeled body.
+// Owned producer forms OUTSIDE this set (a Task-family mint, a `move`, a
+// `??`-owned) are NOT claimed here — the ownership pass rejects such clause
+// initializers with a targeted diagnostic instead of silently leaking
+// (decline-with-reasons, #2098). Both the ownership pass (finishBindAtom)
+// and codegen (lowerBindExpr) consult THIS predicate for the disposal
+// decision, so an expression-bodied member — whose body the ownership
+// dataflow does not run on — gets the identical atom-boundary disposal.
+bool bindClauseIsOwnedProduction(const ast::LocalDecl& clause,
+                                 const sema::SemaContext& ctx,
+                                 const TypeParamResolver& resolveParam);
+
+// §17.15 / K3 (v0.216, #2098): is clause `clauseIdx`'s binding CONSUMED by a
+// K3 position spelled inside the atom (a later clause's initializer or the
+// body)? The closed structural shape set — each a genuine K3 consuming
+// position for a named owned binding, so a hit is a real discharge in every
+// program the ownership pass accepts:
+//   * a call/ctor argument `M(owned x)` / `new T(owned x)` naming it;
+//   * an explicit `x.Dispose()` (incl. `x?.Dispose()` / `x!.Dispose()`);
+//   * a `throw x` (expression position);
+//   * a later clause's marked transfer `var y := owned x;`;
+//   * `move x` (an owning-collection whole transfer).
+// A consume spelled inside a nested LAMBDA body is deliberately NOT counted
+// — the ownership pass rejects a closure consuming a captured owned binding
+// (§28.3 v0.184, #1958; wired for atom clauses in processBindAtom), so it
+// cannot occur in an accepted program. Shadowing is honored: a nested atom
+// clause rebinding the same name ends the outer binding's visibility for
+// the remainder of that nested atom, and a lambda parameter of the name
+// shadows its body. The scan finds a consume ANYWHERE in the later
+// clauses/body, including conditionally-evaluated arms — the ownership pass
+// separately rejects a CONDITIONAL consume of an atom binding (its
+// dataflow-vs-scan cross-check in finishBindAtom), so where this predicate
+// governs an accepted program the consume is unconditional.
+bool bindClauseConsumedInAtom(const ast::BindExpr& bx, std::size_t clauseIdx);
+
+// §17.15 / K8.5 (v0.216, #2098): the one shared atom-boundary disposal
+// decision — clause `clauseIdx` needs the disposal at the atom's completion
+// iff its initializer is an owned production (bindClauseIsOwnedProduction)
+// AND no K3 position inside the atom discharges it
+// (bindClauseConsumedInAtom). Codegen's lowerBindExpr registers exactly the
+// clauses this returns true for; the ownership pass's finishBindAtom
+// cross-checks its dataflow against the same predicate and rejects on
+// disagreement, so the two can never split into a leak or a double-free.
+bool bindClauseNeedsAtomDisposal(const ast::BindExpr& bx,
+                                 std::size_t clauseIdx,
+                                 const sema::SemaContext& ctx,
+                                 const TypeParamResolver& resolveParam);
 
 }  // namespace bezel::common

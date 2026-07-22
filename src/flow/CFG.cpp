@@ -125,6 +125,18 @@ void recordAwaitsInExpr(CFG& cfg, CFGBlock* block, const ast::Expr* e) {
         for (const auto& p : is->parts) recordAwaitsInExpr(cfg, block, p.expr.get());
         return;
     }
+    // §17.15 (v0.216, #2098): the binding atom — clause initializers and the
+    // body are synchronous sub-expressions of the enclosing statement.
+    // (Sema currently REJECTS `await` inside a binding atom in an async body
+    // — the targeted §17.15/§30.5 rejection, #2122 — so a recorded site here
+    // is defensive bookkeeping, kept so the CFG walk never silently
+    // under-counts if that rejection is later lifted.)
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
+        for (const auto& cl : bx->clauses)
+            if (cl) recordAwaitsInExpr(cfg, block, cl->initializer.get());
+        recordAwaitsInExpr(cfg, block, bx->body.get());
+        return;
+    }
     // LambdaExpr: not descended (separate async scope — see note above).
     // Literals, identifiers, This/Base/TypeOf/NameOf/Default, UnitExpr,
     // CaseExpr: no `await`-bearing child reachable along a synchronous

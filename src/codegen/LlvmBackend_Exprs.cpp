@@ -1528,6 +1528,10 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
         return lowerCaseExpr(*ce);
     }
+    // §17.15 (v0.216, #2098): the binding atom `(var x := E; body)`.
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
+        return lowerBindExpr(*bx);
+    }
     // CG60: lambda expression `(params) => body` — emitted as a
     // nested LLVM function; the lambda value is its function pointer.
     // Non-capturing only (per §A.7, captures are a later slice).

@@ -254,6 +254,17 @@ private:
     // constructors are never async, so an `await` there is rejected by this
     // gate without special-casing (Appendix C.6).
     bool inAsyncContext_ = false;
+    // §17.15 / §30.5 (v0.216, #2098): true while visiting the clauses/body of
+    // a binding atom `(var x := E; body)`. Consulted by the `await` typing arm
+    // to reject `await` INSIDE a binding atom in an async body — the async
+    // lowering's hand-rolled state machine performs a statement-level
+    // frame-local scan, so an atom binding would stay alloca-backed across
+    // the suspension (a silent miscompile); until the scan learns BindExpr
+    // (#2122) the conservative targeted rejection stands. Reset to false
+    // across a lambda boundary (a nested lambda's body is its own function —
+    // an await there suspends the lambda's state machine, not the atom's
+    // enclosing frame).
+    bool inBindAtom_ = false;
     // #721/§29.5: true while visiting an iterator method body (sync or async,
     // i.e. it contains `yield`). A plain `return;` in an iterator is forbidden
     // (use `yield break`); for an ASYNC iterator §21.7 does not catch it (it is

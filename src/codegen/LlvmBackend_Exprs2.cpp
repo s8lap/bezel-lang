@@ -1,5 +1,7 @@
 #include "codegen/LlvmBackend_impl.hpp"
 
+#include "common/OwnershipFacts.hpp"  // #2098: bindClauseNeedsAtomDisposal (§17.15/K8.5)
+
 // This translation unit continues the definitions of Emitter's expression-lowering
 // member functions begun in LlvmBackend_Exprs.cpp.  It was split off mechanically
 // (definition-motion only, no behavior change; #1414 stage 5-replacement) to halve
@@ -5475,6 +5477,76 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
                                    incomings.size());
     for (auto& [v, bb] : incomings) phi->addIncoming(v, bb);
     return phi;
+}
+
+
+// §17.15 / K8.5 (v0.216, #2098): the binding atom `(var x := E; body)`.
+// Evaluation is straight-line and textual: clauses first (each a §21.1
+// declaration lowered by the shared lowerLocalDecl — alloca + init store +
+// locals_ registration, keyed by the clause's own LocalDecl node so an outer
+// same-named local's slot is never clobbered), body last, then the atom's OWN
+// disposal boundary. The atom pushes a dedicated dispose scope: a clause the
+// ownership pass flagged bindAtomDisposeAtEnd (an owned production left
+// undischarged inside the atom) is registered there right after its
+// establishment, so
+//   * the NORMAL edge disposes at the atom's completion, after the body's
+//     value is computed, in reverse clause order (emitDisposals iterates the
+//     scope in reverse registration order — K8.5's "after the body's
+//     evaluation, in reverse clause order");
+//   * the EXCEPTION edge gets K3.15 parity for free — the scope sits on
+//     disposeStack_, so every emitPendingCheck emitted while lowering later
+//     clauses or the body disposes it during unwinding on the same
+//     establishment-ordered cleanup stack;
+//   * a clause CONSUMED inside the atom (a K3 position discharged it) is
+//     never flagged, so the boundary disposal does not run for it — the
+//     consume-site machinery is the sole discharge (no double-free).
+// The body's value is computed BEFORE the boundary disposals run; a body
+// whose value would borrow an owned atom binding is rejected in the
+// ownership pass (K8.4 at the atom boundary), so the returned value never
+// dangles on the disposed bindings.
+llvm::Value* Emitter::lowerBindExpr(const ast::BindExpr& bx) {
+    disposeStack_.push_back({});
+    for (std::size_t i = 0; i < bx.clauses.size(); ++i) {
+        const auto& cl = bx.clauses[i];
+        if (!cl) continue;
+        lowerLocalDecl(cl.get(), cl->initializer.get(), cl->type.get());
+        if (diverged_) {
+            // A diverging clause initializer (a `throw` form): the unwind
+            // edge disposed the scope's registered entries; nothing more
+            // evaluates.
+            disposeStack_.pop_back();
+            return llvm::PoisonValue::get(ptrTy());
+        }
+        // K8.5: the atom-boundary disposal, registered at establishment so
+        // the unwind edge covers the window between this clause and the
+        // atom's completion. The decision is the ONE shared predicate the
+        // ownership pass cross-checks (common::bindClauseNeedsAtomDisposal
+        // — owned production, not discharged by a K3 position inside the
+        // atom), so the two passes cannot split into a leak or a
+        // double-free; registerUsingDisposal then selects the correct
+        // Disposal kind for the clause's value (class/interface dynamic
+        // dispatch, owning collection cascade, …) exactly as a `using var`
+        // would be registered — the K8.5 boundary is the atom's scope
+        // instead of the statement's.
+        if (common::bindClauseNeedsAtomDisposal(
+                bx, i, ctx_,
+                [this](const sema::TypeRef* t) { return resolveTypeParamRef(t); }))
+            registerUsingDisposal(cl.get());
+    }
+    llvm::Value* v = bx.body ? lowerExpr(*bx.body) : nullptr;
+    if (diverged_) {
+        // A diverging body (`(var s := new X(); throw e)`): the throw's
+        // unwind edge already disposed this scope's entries during
+        // unwinding (K3.15) — pop without a normal-edge emission and
+        // propagate the divergence.
+        disposeStack_.pop_back();
+        return v ? v : llvm::PoisonValue::get(ptrTy());
+    }
+    // The atom's completion: dispose undischarged owned bindings on the
+    // normal edge, after the body's evaluation, in reverse clause order.
+    emitDisposals(disposeStack_.back(), /*isUnwind=*/false);
+    disposeStack_.pop_back();
+    return v;
 }
 
 

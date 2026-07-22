@@ -204,6 +204,16 @@ private:
     // retired postfix spelling produced, so sema/ownership/codegen are
     // unchanged (v0.208: semantics untouched).
     std::unique_ptr<ast::Expr> parseIfExprAtom();
+    // §17.15 / A.7 BindExpr (v0.216, #2098): the binding atom
+    // `(var x := E; var y := E2; body)`. The caller consumed the opening `(`
+    // and current_ is the reserved `var` — which begins no other expression,
+    // so the reading is committed at the second token like the other paren
+    // atoms. Clauses `var x (":" Type)? ":=" Expr ";"` chain while the next
+    // token is `var` (at least one is guaranteed by the dispatch); the body
+    // is one full Expression; the atom supplies its own `)`. Clause
+    // initializers admit the `owned` binding-position transfer marker
+    // (K3.4, §28.3); the body position does not (§17.15).
+    std::unique_ptr<ast::Expr> parseBindExprAtom();
     // §20 (v0.208, #2079): retired-postfix-conditional diagnostic — the
     // sibling of checkRetiredParenLambda for `x if c else y`. Called at the
     // same generic-error sites; when the unexpected token is `if` and an

@@ -555,6 +555,55 @@ private:
 
     void handleLocalDecl(const ast::LocalDecl& ld);
 
+    // §17.15 / K8.5 (v0.216, #2098): process a binding atom `(var x := E;
+    // body)` in evaluation order — each clause through handleLocalDecl (the
+    // clause IS a §21.1 declaration: classification, marker validation,
+    // dangling-borrow checks, states_ registration), then the body through
+    // handleDischarge (so K3 consuming positions inside the atom discharge
+    // clause bindings), then finishBindAtom (the K8.5 boundary). Guarded by
+    // bindAtomsProcessed_ so exactly ONE walker processes a given atom per
+    // block visit — checkRead and handleDischarge both dispatch here, and a
+    // statement's transfer functions may reach the same expression through
+    // either; the guard is cleared per processBlock so the fixpoint
+    // iterations re-run the transfer (states must be recomputed per visit).
+    void processBindAtom(const ast::BindExpr& bx);
+
+    // §17.15 / K8.5 / K8.4 (v0.216, #2098): the atom's boundary. For each
+    // clause (reverse order is codegen's job; this is the decision):
+    //   * cross-check the dataflow's end-state against the SHARED disposal
+    //     predicate (common::bindClauseNeedsAtomDisposal — the one authority
+    //     codegen also consults) and reject on any disagreement: a
+    //     CONDITIONAL consume (discharged on some path, Owned at the atom's
+    //     end — K7.4's per-path disposal is not implemented for atoms in
+    //     this version), or an owned-producer form outside the shared
+    //     predicate's decidable set (a Task-family mint, a `move`, a
+    //     `??`-owned — decline-with-reasons rather than a silent leak);
+    //   * run the K8.4 escape check (checkBindAtomBodyEscape);
+    //   * erase the clause bindings from states_ / everOwnedPlainLocals_ —
+    //     the atom is their boundary; the end-of-method scope machinery
+    //     must never see them (no must-use warning attaches, §17.15).
+    void finishBindAtom(const ast::BindExpr& bx);
+
+    // §17.15 / K8.4 (v0.216, #2098): reject a body whose VALUE borrows an
+    // owned binding of the atom — "a borrow sourced by an atom binding may
+    // not escape the atom — not in the body's value, not by store, not by
+    // capture in an escaping closure — rejected, never lifetime-extended"
+    // (§28.3 named-temporaries, K8.4 applied at the atom boundary). Covers
+    // the peeled body value's borrow roots (a bare clause read, a member/
+    // index chain rooted at a clause, a borrow-returning instance call on a
+    // clause receiver, if/case arms thereof — resolved TRANSITIVELY through
+    // this atom's borrow clauses) and a body-value lambda capturing a
+    // clause. Self-contained (classifies clauses via the shared
+    // bindClauseIsOwnedProduction, not the dataflow), so the
+    // expression-body path can run it too. Gated on suppressDiag_ by the
+    // caller.
+    void checkBindAtomBodyEscape(const ast::BindExpr& bx);
+
+    // §17.15 (#2098): per-block-visit dedup for processBindAtom (see above).
+    // Cleared at the start of every processBlock so fixpoint iterations
+    // re-run the atom's transfer functions.
+    std::unordered_set<const ast::Expr*> bindAtomsProcessed_;
+
     // Walk an expression and side-effect any `move` operations it
     // contains. Used by handleLocalDecl so `move`-in-initializer
     // properly transitions the source's state.

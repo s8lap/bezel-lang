@@ -900,6 +900,34 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
         // Intentionally do not recurse into the lambda body.
         return;
     }
+    // §17.15 / §22.16 (v0.216, #2098): the binding atom is ADMITTED in
+    // contract clauses — it is the form's motivating position (§22.16: "its
+    // bindings are clause-internal names, letting a clause name a subresult
+    // instead of recomputing it"). Clause initializers and the body are
+    // checked under this walker's rules expression-wise. One clause-specific
+    // rejection: an atom clause spelled as a MARKED TRANSFER (`var y :=
+    // owned x;` — a K3.4 consuming position elsewhere) would break §22.16's
+    // borrow-only guarantee and is rejected in a contract clause (§17.15;
+    // owned productions cannot arise in the pure fragment, so clause atoms
+    // never carry disposals).
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
+        for (const auto& cl : bx->clauses) {
+            if (!cl) continue;
+            if (clauseMode_ && cl->initializerHasOwnedMarker) {
+                reportPureViolation(
+                    cl->initializer ? cl->initializer->span.begin
+                                    : bx->span.begin,
+                    "marked binding transfer",
+                    "a binding-atom clause spelled `var y := owned x;` is a "
+                    "K3.4 consuming position and would break the contract "
+                    "clause's borrow-only guarantee (§22.16 / §17.15, "
+                    "v0.216)");
+            }
+            if (cl->initializer) checkExpr(cl->initializer.get());
+        }
+        if (bx->body) checkExpr(bx->body.get());
+        return;
+    }
     if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
         checkExpr(we->source.get());
         for (const auto& a : we->assigns)

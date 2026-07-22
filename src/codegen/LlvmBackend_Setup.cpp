@@ -8441,6 +8441,39 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
     if (ld->type && isSubscriptionType(ctx_.resolvedType(*ld->type)))
         return nullptr;
     if (isSubscriptionExpr(*ld->initializer)) return nullptr;
+    // (a-1) §17.15 (v0.216, #2098): a plain `var x := (var w := E; BODY);` —
+    // a binding-ATOM initializer classifies by its peeled BODY (§28.3
+    // producers row: the atom's classification is the body's,
+    // transparently; common::peelBindAtomToBody is the shared peel). An
+    // owned-class body (`new C(w)`, an `owned`-returning call, an owned
+    // arm-meet) makes x an ordinary owned local needing the §28.3
+    // unwind/reclaim coverage; a borrow body carries no obligation and
+    // returns null. The atom's INTERNAL clause disposals are lowerBindExpr's
+    // own scope and are independent of this statement-level classification.
+    if (auto* bxInit =
+            dynamic_cast<const ast::BindExpr*>(ld->initializer.get())) {
+        const ast::Expr* atomBody = common::peelBindAtomToBody(bxInit);
+        if (!atomBody) return nullptr;
+        bool bodyOwned = isFreshOwnedClassProducer(atomBody);
+        if (!bodyOwned &&
+            (dynamic_cast<const ast::ConditionalExpr*>(atomBody) ||
+             dynamic_cast<const ast::CaseExpr*>(atomBody)))
+            bodyOwned = common::conditionalCaseArmMeetIsOwned(
+                *atomBody, ctx_,
+                [this](const sema::TypeRef* t) { return resolveTypeParamRef(t); });
+        if (!bodyOwned) return nullptr;
+        const sema::TypeRef* initTy = ctx_.exprType(*atomBody);
+        if (isClassOrInterfaceRef(initTy) ||
+            isClassOrInterfaceRef(resolveTypeParamRef(initTy))) {
+            if (initTy && initTy->kind == sema::TypeRef::Kind::Named &&
+                initTy->declaration &&
+                initTy->declaration->kind == ast::TypeDeclKind::Class &&
+                disposerFns_.find(initTy->declaration) != disposerFns_.end())
+                return initTy->declaration;
+            return reinterpret_cast<const sema::TypeSymbol*>(1);
+        }
+        return nullptr;
+    }
     // (a0) §28.3 arm-meet (v0.184, #1661): a plain `var x := new T() if c else
     // Make();` (owned-meet if/case). The initializer is neither a NewExpr nor a
     // call, so (a)/(b) below miss it — the owned value was never reclaimed on an
@@ -13725,6 +13758,33 @@ static bool isClassOrInterfaceRef(const sema::TypeRef* rt) {
 
 
 bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
+    // (a-1) §17.15 (v0.216, #2098): a binding-ATOM initializer classifies by
+    // its peeled BODY (§28.3 producers row; the shared peel). An owned
+    // class/interface body — a fresh producer or an owned arm-meet — makes
+    // the binding own the atom's value; dispose dynamically (the concrete
+    // class is the body's runtime type). A borrow body was flagged
+    // usingVarSourceIsBorrow by the ownership pass and never reaches here
+    // (registerUsingDisposal returns first); returning false for it anyway
+    // keeps this classifier sound on the plain-`var` auto-drop path.
+    if (ld->initializer) {
+        if (auto* bxInit =
+                dynamic_cast<const ast::BindExpr*>(ld->initializer.get())) {
+            const ast::Expr* atomBody = common::peelBindAtomToBody(bxInit);
+            if (!atomBody) return false;
+            bool bodyOwned = isFreshOwnedClassProducer(atomBody);
+            if (!bodyOwned &&
+                (dynamic_cast<const ast::ConditionalExpr*>(atomBody) ||
+                 dynamic_cast<const ast::CaseExpr*>(atomBody)))
+                bodyOwned = common::conditionalCaseArmMeetIsOwned(
+                    *atomBody, ctx_, [this](const sema::TypeRef* t) {
+                        return resolveTypeParamRef(t);
+                    });
+            if (!bodyOwned) return false;
+            const sema::TypeRef* bt = ctx_.exprType(*atomBody);
+            return isClassOrInterfaceRef(bt) ||
+                   isClassOrInterfaceRef(resolveTypeParamRef(bt));
+        }
+    }
     // (a) Interface-typed slot. classOfLocal returns the interface symbol but
     // an interface has no disposerFns_ entry; the concrete object behind it
     // still has a vtable, so dispose it dynamically. An interface-typed slot

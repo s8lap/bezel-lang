@@ -2146,6 +2146,20 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
         }
         return;
     }
+    // §17.15 (v0.216, #2098): the binding atom — each clause's optional
+    // ascription is a Type node (`var x: T := E;`, resolved exactly as the
+    // §21.1 declaration's), each clause initializer and the body are
+    // ordinary expression positions (a `new T(...)` initializer's Type node
+    // is resolved by the NewExpr arm above through this recursion).
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
+        for (const auto& cl : bx->clauses) {
+            if (!cl) continue;
+            if (cl->type) resolveType(*cl->type, scope);
+            if (cl->initializer) resolveTypesInExpr(*cl->initializer, scope);
+        }
+        if (bx->body) resolveTypesInExpr(*bx->body, scope);
+        return;
+    }
     if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
         for (const auto& k : cl->keys) {
             if (k) resolveTypesInExpr(*k, scope);

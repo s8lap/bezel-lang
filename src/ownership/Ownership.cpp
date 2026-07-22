@@ -927,6 +927,65 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // left un-inferred in this position. // per §28.3 SB01-B (v0.190)
     checkLambdaTaskFamilyBorrowReturnsExpr(
         exprBody, returnType_ ? ctx_.resolvedType(*returnType_) : nullptr);
+    // §17.15 / K8.4 (v0.216, #2098): the `=>` sibling of finishBindAtom's
+    // escape check. The full ownership dataflow does not run on expression
+    // bodies, but checkBindAtomBodyEscape is deliberately self-contained
+    // (clauses classify via the shared common::bindClauseIsOwnedProduction,
+    // not the dataflow) — so a `method Ex(): owned Res => (var c := new
+    // Res(4); c);` body, whose value borrows the atom's own owned binding
+    // (dangling after the K8.5 boundary disposal), is rejected exactly as
+    // the block-body form is. Walks the body for every BindExpr (the atom
+    // may be nested inside the returned expression). // per §17.15, K8.4
+    {
+        std::function<void(const ast::Expr*)> walkAtoms =
+            [&](const ast::Expr* x) {
+                if (!x) return;
+                if (auto* bx = dynamic_cast<const ast::BindExpr*>(x)) {
+                    checkBindAtomBodyEscape(*bx);
+                    for (const auto& cl : bx->clauses)
+                        if (cl) walkAtoms(cl->initializer.get());
+                    walkAtoms(bx->body.get());
+                    return;
+                }
+                if (auto* be = dynamic_cast<const ast::BinaryExpr*>(x)) {
+                    walkAtoms(be->left.get());
+                    walkAtoms(be->right.get());
+                    return;
+                }
+                if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(x)) {
+                    walkAtoms(ue->operand.get());
+                    return;
+                }
+                if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(x)) {
+                    walkAtoms(cd->condition.get());
+                    walkAtoms(cd->thenValue.get());
+                    walkAtoms(cd->elseValue.get());
+                    return;
+                }
+                if (auto* call = dynamic_cast<const ast::CallExpr*>(x)) {
+                    walkAtoms(call->callee.get());
+                    for (const auto& a : call->args)
+                        if (a.value) walkAtoms(a.value.get());
+                    return;
+                }
+                if (auto* ne = dynamic_cast<const ast::NewExpr*>(x)) {
+                    for (const auto& a : ne->args)
+                        if (a.value) walkAtoms(a.value.get());
+                    return;
+                }
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(x)) {
+                    walkAtoms(ma->target.get());
+                    return;
+                }
+                if (auto* ix = dynamic_cast<const ast::IndexExpr*>(x)) {
+                    walkAtoms(ix->target.get());
+                    for (const auto& a : ix->indices)
+                        if (a.value) walkAtoms(a.value.get());
+                    return;
+                }
+            };
+        walkAtoms(&exprBody);
+    }
 }
 
 namespace {
@@ -1748,6 +1807,12 @@ FlowState MethodOwnership::runDataflow(
 }
 
 void MethodOwnership::processBlock(const flow::CFGBlock& block) {
+    // §17.15 (#2098): re-arm the binding-atom dedup for this block visit —
+    // the fixpoint re-runs a block's transfer functions, and each visit must
+    // recompute the atoms' state transitions (a marked clause transfer moves
+    // an OUTER binding, which the block's exit state must reflect on every
+    // iteration).
+    bindAtomsProcessed_.clear();
     // §29.2 (#834) "Iterator yield ownership": when this block is the
     // body-entry of a `for`/`await for` loop whose iterable is an owning
     // enumerable (`IOwningEnumerable<T>` / `IOwningAsyncEnumerable<T>`), the
@@ -2737,6 +2802,14 @@ bool MethodOwnership::checkBareBorrowLoopCarriedEscape(
 }
 
 OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
+    // §17.15 / §28.3 producers row (v0.216, #2098): a binding atom's
+    // classification is its BODY's, transparently — the atom is not a join
+    // (clauses and body evaluate unconditionally; no K7 meet arises). Peel
+    // through the shared helper so this classifier and codegen's
+    // classification sites can never diverge on an atom initializer.
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
+        return bx->body ? producerState(*bx->body) : OwnershipState::Borrowed;
+    }
     // `new T(...)` is the canonical producer of Owned values — but only
     // for reference types (classes). §9: a record is a value type with
     // no disposal obligation (§9.7 forbids record destructors and owned
@@ -3385,6 +3458,22 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
                         }
                     }
                 }
+            } else if (dynamic_cast<const ast::BindExpr*>(
+                           ld.initializer.get())) {
+                // §17.15 / §28.10 (v0.216, #2098): a `using var` bound to a
+                // binding ATOM classifies by the atom's BODY (producerState
+                // peels — §28.3 producers row). An owned body (`using var x
+                // := (var w := E; new C(w));`) stays the ordinary
+                // Owned+implicitDischarge adoption above; a BORROW body
+                // (`(var n := 1; outerRef)`) is a §28.10 borrow-pin — its
+                // real owner disposes it, so codegen must not (the same
+                // double-free the #1661 borrowed-meet fix closed for
+                // if/case initializers). The atom-INTERNAL machinery
+                // (checkRead's processBindAtom) already ran on this
+                // initializer at the top of handleLocalDecl.
+                if (producerState(*ld.initializer) != OwnershipState::Owned)
+                    const_cast<ast::LocalDecl&>(ld).usingVarSourceIsBorrow =
+                        true;
             } else if (dynamic_cast<const ast::ConditionalExpr*>(
                            ld.initializer.get()) ||
                        dynamic_cast<const ast::CaseExpr*>(

@@ -8246,6 +8246,20 @@ private:
 
     llvm::Value* lowerCaseExpr(const ast::CaseExpr& ce);
 
+    // §17.15 / K8.5 (v0.216, #2098): the binding atom `(var x := E; body)`.
+    // Pushes a dedicated dispose scope (the ATOM boundary), lowers each
+    // clause via lowerLocalDecl (alloca + init + locals_ registration —
+    // clause decl nodes key locals_ uniquely, so no shadow save/restore is
+    // needed), registers the atom-boundary disposal for every clause the
+    // ownership pass flagged (bindAtomDisposeAtEnd — an owned production
+    // left undischarged in the atom; registerUsingDisposal picks the right
+    // Disposal kind), lowers the body, then emits the scope's disposals on
+    // the normal edge (reverse registration order per K8.5) and pops. The
+    // exception edge is covered by the shared unwind machinery — the atom
+    // scope sits on disposeStack_, so every emitPendingCheck inside the atom
+    // disposes it during unwinding (K3.15 parity). Returns the body's value.
+    llvm::Value* lowerBindExpr(const ast::BindExpr& bx);
+
     // CG28: does `pattern` match `scrut`? Returns an i1.
     // scrutTy: the resolved TypeRef of the scrutinee, used to detect nullable
     // value types ({i8 hasValue; T value} struct — per §7 / issues #447/#448).
