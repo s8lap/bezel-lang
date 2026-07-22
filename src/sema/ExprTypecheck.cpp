@@ -3038,6 +3038,32 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
                 return;
             }
         }
+        // §27.3 (v0.217, #2101): a fresh lambda's param/return SHAPES stay
+        // target-typed (the skipShapeCheck carve above) — EXCEPT that a
+        // return-type ASCRIPTION, when written, must agree with the target's
+        // return slot under §27.1.1's covariant return rule: identity, or a
+        // reference conversion for class/interface returns. The ascription
+        // behaves as a declared return type and never bridges a conversion
+        // the function value itself could not (no numeric widening, no
+        // boxing).
+        if (freshLambda) {
+            auto* lamFrom = dynamic_cast<const ast::LambdaExpr*>(fromExpr);
+            if (lamFrom && lamFrom->retType && from->funcReturn &&
+                !functionSlotConvertible(from->funcReturn, to->funcReturn,
+                                         isSubtype)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("the ") + what + " is a lambda whose "
+                    "return-type ascription does not agree with the target "
+                    "function type's return slot \xe2\x80\x94 the ascription "
+                    "behaves as a declared return type and must satisfy "
+                    "\xc2\xa7""27.1.1's covariant return rule (identity, or "
+                    "a reference conversion for a class/interface return); "
+                    "it never bridges a conversion (\xc2\xa7""27.3 v0.217, "
+                    "\xc2\xa7""27.1.1)");
+                return;
+            }
+        }
         if (!skipShapeCheck) {
             // Parameter slots are CONTRAVARIANT (§27.1.1 first bullet): the
             // TARGET's declared param type must convert to the VALUE's — a

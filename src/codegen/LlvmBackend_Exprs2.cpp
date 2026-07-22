@@ -743,7 +743,22 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // the async result-element typing inconsistent with the block case (the
     // no-annotation fallback's `retTy != i32()` gate then dropped an int element →
     // null result slot → SIGSEGV).
-    if (lam.exprBody && lam.isAsync) {
+    if (lam.retType) {
+        // §27.3 (v0.217, #2101): a return-type ASCRIPTION is the declared
+        // return type — sema stored it as the lambda's funcReturn, and it is
+        // authoritative over the body-derived type for BOTH body kinds (an
+        // expression body of a narrower/nullable-underlying type is coerced
+        // by the emit paths below, exactly as the expectedFunctionType_
+        // override case). A unit ascription lowers to void (the §27.3
+        // discarded-result procedure form).
+        if (sema::TypeRef* lamTy = ctx_.exprType(lam)) {
+            if (lamTy->kind == sema::TypeRef::Kind::Function &&
+                lamTy->funcReturn) {
+                retTy = lowerTypeRef(lamTy->funcReturn);
+                retSemaTy = lamTy->funcReturn;
+            }
+        }
+    } else if (lam.exprBody && lam.isAsync) {
         if (sema::TypeRef* lamTy = ctx_.exprType(lam)) {
             if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn) {
                 retTy = lowerTypeRef(lamTy->funcReturn);

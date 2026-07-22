@@ -244,9 +244,11 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
         }
         lc->value = parseExpression();
         if (!consumePunctuator(";")) {
-            diagnostics_.report(
-                Severity::Error, current_.location,
-                "expected ';' after local const declaration");
+            // v0.217 (§27.3, #2101): retired `(params) => body` spelling.
+            if (!checkRetiredParenLambda() || !consumePunctuator(";"))
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ';' after local const declaration");
         }
         return std::unique_ptr<ast::Stmt>(lc.release());
     }
@@ -326,8 +328,12 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                     : "`using var` requires an initializer (A.6 LocalDecl)");
         }
         if (!consumePunctuator(";")) {
-            diagnostics_.report(Severity::Error, current_.location,
-                                "expected ';' after local declaration");
+            // v0.217 (§27.3, #2101): `var f := (x) => …;` — the retired
+            // lambda spelling parses its head as a parenthesized expression
+            // and trips here on the `=>`; name the migration instead.
+            if (!checkRetiredParenLambda() || !consumePunctuator(";"))
+                diagnostics_.report(Severity::Error, current_.location,
+                                    "expected ';' after local declaration");
         }
         return std::unique_ptr<ast::Stmt>(decl.release());
     }
@@ -819,8 +825,10 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
             ret->value = parseExpression();
         }
         if (!consumePunctuator(";")) {
-            diagnostics_.report(Severity::Error, current_.location,
-                                "expected ';' after return statement");
+            // v0.217 (§27.3, #2101): retired `(params) => body` spelling.
+            if (!checkRetiredParenLambda() || !consumePunctuator(";"))
+                diagnostics_.report(Severity::Error, current_.location,
+                                    "expected ';' after return statement");
         }
         return std::unique_ptr<ast::Stmt>(ret.release());
     }
@@ -873,9 +881,12 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                     auto d = std::make_unique<ast::DiscardStmt>();
                     d->value = parseExpression();
                     if (!consumePunctuator(";")) {
-                        diagnostics_.report(
-                            Severity::Error, current_.location,
-                            "expected ';' after discard statement");
+                        // v0.217 (§27.3, #2101): retired lambda spelling.
+                        if (!checkRetiredParenLambda() ||
+                            !consumePunctuator(";"))
+                            diagnostics_.report(
+                                Severity::Error, current_.location,
+                                "expected ';' after discard statement");
                     }
                     return std::unique_ptr<ast::Stmt>(d.release());
                 }
@@ -897,8 +908,10 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
             a->valueHasOwnedMarker = true;
         a->value = parseExpression();
         if (!consumePunctuator(";")) {
-            diagnostics_.report(Severity::Error, current_.location,
-                                "expected ';' after assignment");
+            // v0.217 (§27.3, #2101): retired `(params) => body` spelling.
+            if (!checkRetiredParenLambda() || !consumePunctuator(";"))
+                diagnostics_.report(Severity::Error, current_.location,
+                                    "expected ';' after assignment");
         }
         return std::unique_ptr<ast::Stmt>(a.release());
     }

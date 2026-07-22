@@ -4912,6 +4912,34 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // Consumed once so nested lambdas don't inherit it.
         TypeRef* lamRetHint = pendingLambdaReturnType_;
         pendingLambdaReturnType_ = nullptr;
+        // §27.3 (v0.217, #2101): the optional return-type ascription. When
+        // present it behaves exactly as a method's declared return type —
+        // each `return e;` (and an expression body) is checked against it
+        // under §5.1 including implicit widening, the v0.159 typed-context
+        // literal widening applies (`lambda(): long => 3_000_000_000`), and
+        // a declared nullable return admits null-producing arms (§20). A
+        // unit ascription (`: ()`) declares a procedure lambda. When absent,
+        // all §27.3/§27.4 inference below is UNCHANGED.
+        TypeRef* ascribedRet =
+            lam->retType ? ctx_.resolvedType(*lam->retType) : nullptr;
+        const bool hasAscription = ascribedRet != nullptr;
+        const bool ascriptionIsUnit =
+            hasAscription && ascribedRet->kind == TypeRef::Kind::Unit;
+        // §30.6/§30.1 (v0.217): an `async` lambda's ascription is its
+        // declared task-family return type — `Task`, `Task<T>`, or
+        // `OwningTask<T>` — exactly as an async method's declared return
+        // (§30.1). Anything else (including the unit ascription) is a
+        // compile error; the async-iterator interfaces are method-level
+        // forms (§30.7, `yield` is rejected in lambda bodies) and do not
+        // apply here.
+        if (hasAscription && lam->isAsync && !isTaskShapedRef(ascribedRet)) {
+            ctx_.diagnostics().report(
+                Severity::Error, lam->span.begin,
+                "an `async` lambda's return-type ascription must be `Task`, "
+                "`Task<T>`, or `OwningTask<T>` \xe2\x80\x94 the async form's "
+                "function type has a task-family return (\xc2\xa7""30.6, "
+                "\xc2\xa7""30.1; \xc2\xa7""27.3 v0.217)");
+        }
         Scope lamScope;
         lamScope.parent = currentScope_;
         std::vector<sema::Symbol*> lamParamSyms;
@@ -5025,13 +5053,56 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         auto saveOutPostconds = std::move(currentOutPostconds_);
         currentOutPostconds_.clear();
         currentScope_ = &lamScope;
-        returnCtx_ = ReturnCtx::None;
-        currentReturnType_ = nullptr;
+        // §27.3 (v0.217, #2101): with a return-type ascription the body is
+        // checked exactly as a method body against a declared return type —
+        // returnCtx_/currentReturnType_ drive the existing ReturnStmt
+        // machinery (§5.1 assignability, §21.7 return-form rules, the §4.2
+        // wider-integer literal hint, the §22.4 postcondition plumbing).
+        // Without one the lambda keeps its no-return-context inference
+        // posture unchanged.
+        if (hasAscription && lam->isAsync && isTaskShapedRef(ascribedRet)) {
+            // per §30.1/§30.6: peel the task wrapper — `Task` behaves as a
+            // void-method context; `Task<T>`/`OwningTask<T>` as a value-
+            // method context whose result type is the element T.
+            asyncReturnCtxAndType(lam->retType.get(), returnCtx_,
+                                  currentReturnType_);
+            // issue #777: the ascribed element also serves as the forgotten-
+            // `await` hint when no target-threaded hint exists.
+            if (!lamRetHint) lamRetHint = currentReturnType_;
+        } else if (hasAscription && !lam->isAsync) {
+            returnCtx_ = ascriptionIsUnit ? ReturnCtx::VoidMethod
+                                          : ReturnCtx::ValueMethod;
+            currentReturnType_ = ascriptionIsUnit ? nullptr : ascribedRet;
+        } else {
+            returnCtx_ = ReturnCtx::None;
+            currentReturnType_ = nullptr;
+        }
         loopDepth_ = 0;
         catchDepth_ = 0;
         finallyLoopBoundary_ = -1;
         finallyDepth_ = 0;  // per §21.7 (#1589)
+        // per §4.2/§5.1 (v0.159, v0.217): a value ascription of a wider
+        // integer type is an admitting typed context for the expression
+        // body — an unsuffixed literal exceeding `int`'s range widens to it
+        // (`lambda(): long => 3_000_000_000`), mirroring the declared-
+        // return-type hint at a method's `return` (§4.2, v0.182). Block-body
+        // `return` statements get the same hint from the ReturnStmt visitor
+        // via returnCtx_/currentReturnType_ set above.
+        PrimitiveType saveLamWideningHint = currentLiteralWideningHint_;
+        if (hasAscription && returnCtx_ == ReturnCtx::ValueMethod &&
+            currentReturnType_ &&
+            currentReturnType_->kind == TypeRef::Kind::Primitive) {
+            using P = PrimitiveType;
+            switch (currentReturnType_->primitive) {
+                case P::Long: case P::ULong: case P::UInt:
+                    currentLiteralWideningHint_ =
+                        currentReturnType_->primitive;
+                    break;
+                default: break;
+            }
+        }
         if (lam->exprBody) visitExpr(*lam->exprBody);
+        currentLiteralWideningHint_ = saveLamWideningHint;
         // per §15.4 (#1693): a collection literal has no standalone type — it is
         // well-typed only where a *determinable, admissible concrete* target
         // exists (the §15.4 closed list: an inline array, or one of
@@ -5084,6 +5155,30 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 "`Task` value; add `await` (e.g. `async () => await Producer()`)"
                 " (§30.6)");
         }
+        // §27.3 (v0.217, #2101): an ascribed EXPRESSION body must satisfy the
+        // ascription under §5.1, exactly as a method's expression body
+        // satisfies its declared return type (for an async lambda the peeled
+        // element type is the check target, §30.1/§30.6). A unit ascription's
+        // expression body is §27.3's discarded-result procedure form — no
+        // check.
+        if (hasAscription && !ascriptionIsUnit && lam->exprBody &&
+            returnCtx_ == ReturnCtx::ValueMethod && currentReturnType_) {
+            checkAssignable(ctx_.exprType(*lam->exprBody), currentReturnType_,
+                            lam->exprBody->span.begin, "returned value",
+                            lam->exprBody.get());
+        }
+        // §27.3/§21.7 (v0.217): a value-ascribed BLOCK body must return a
+        // value on every path — the same totality rule as a method with a
+        // declared return type (and as §27.3's own "return is required on
+        // every exit path").
+        if (hasAscription && lam->isBlockBody &&
+            returnCtx_ == ReturnCtx::ValueMethod &&
+            !bodyAlwaysExits(lam->stmts)) {
+            ctx_.diagnostics().report(
+                Severity::Error, lam->span.begin,
+                "lambda has a return-type ascription but does not return a "
+                "value on every path (\xc2\xa7""27.3, \xc2\xa7""21.7)");
+        }
         currentScope_ = saveScope;
         returnCtx_ = saveRet;
         currentReturnType_ = saveRetTy;
@@ -5130,8 +5225,14 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             }
             // Infer the return type: from exprBody for expression lambdas,
             // or by scanning block-body stmts for the first `return expr`.
+            // §27.3 (v0.217, #2101): a return-type ASCRIPTION overrides both —
+            // it is the declared return type, carried in the function type as
+            // written (the task-family type itself for an async lambda,
+            // §30.6; the Unit type for a `: ()` procedure ascription).
             TypeRef* inferredReturn = nullptr;
-            if (lam->exprBody) {
+            if (hasAscription) {
+                inferredReturn = ascribedRet;
+            } else if (lam->exprBody) {
                 inferredReturn = ctx_.exprType(*lam->exprBody);
             } else {
                 // Scan stmts (flat, not recursive) for a `return EXPR`.
@@ -5177,7 +5278,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // derives the closure's async result type from the lambda's exprType
             // funcReturn when it is async), so the body's value is wrapped into the
             // outer Task instead of returned raw.
-            if (lam->isAsync && inferredReturn) {
+            // §27.3 (v0.217): an ascribed async lambda already states its
+            // task-family type — no wrap (hasAscription excluded below).
+            if (!hasAscription && lam->isAsync && inferredReturn) {
                 bool ownedResult =
                     inferredReturn->kind == TypeRef::Kind::Named &&
                     inferredReturn->declaration &&

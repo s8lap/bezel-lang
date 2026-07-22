@@ -1051,12 +1051,17 @@ struct CollectionLiteralExpr : Expr {
                                                   // sequence form
 };
 
-// A.7 `LambdaExpr ::= "async"? "(" LambdaParams? ")" "=>" LambdaBody`. Slices
-// 28 and 36 together cover the full form; the buffered-lookahead
-// discriminator is in parsePrimaryExpression.
+// A.7 `LambdaExpr ::= "async"? "lambda" "(" LambdaParams? ")" (":" Type)?
+// "=>" LambdaBody` (§27.3, v0.217). Keyword-led: the reserved `lambda`
+// commits the parse at its first token, so no lookahead discriminator
+// exists any more (the pre-v0.217 scan-to-`)` lookahead is deleted).
 struct LambdaExpr : Expr {
     bool isAsync = false;
     std::vector<Param> params;
+    // §27.3 (v0.217): the optional return-type ascription between the
+    // parameter list and `=>`. Null when absent (all pre-v0.217 inference
+    // unchanged); a Unit type here declares a procedure lambda.
+    std::unique_ptr<Type> retType;
     bool isBlockBody = false;
     std::unique_ptr<Expr> exprBody;  // populated when !isBlockBody
     std::vector<std::unique_ptr<Stmt>> stmts; // populated when isBlockBody

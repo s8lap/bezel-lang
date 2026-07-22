@@ -448,9 +448,11 @@ inline std::string exprToString(const ast::Expr& e) {
                                       : std::string("<null>")) + ")";
     }
     if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // §27.3 / A.7 (v0.217): keyword-led form, rendered as written —
+        // `lambda(params): T => body`, `async lambda(...) => ...`.
         std::string out = "(";
         if (lam->isAsync) out += "async ";
-        out += '(';
+        out += "lambda(";
         for (std::size_t i = 0; i < lam->params.size(); ++i) {
             if (i > 0) out += ", ";
             const auto& p = lam->params[i];
@@ -472,7 +474,13 @@ inline std::string exprToString(const ast::Expr& e) {
                 out += typeToString(*p.type);
             }
         }
-        out += ") => ";
+        out += ')';
+        // §27.3 (v0.217): the optional return-type ascription.
+        if (lam->retType) {
+            out += ": ";
+            out += typeToString(*lam->retType);
+        }
+        out += " => ";
         if (lam->isBlockBody) {
             out += "do { ";
             for (std::size_t i = 0; i < lam->stmts.size(); ++i) {

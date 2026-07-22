@@ -2114,6 +2114,10 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
                                        "a lambda parameter");
             }
         }
+        // §27.3 (v0.217, #2101): the optional return-type ascription is a
+        // Type too — resolve it so ExprTypecheck can read it via
+        // resolvedType() and treat it as the lambda's declared return type.
+        if (lam->retType) resolveType(*lam->retType, scope);
         if (lam->exprBody) resolveTypesInExpr(*lam->exprBody, scope);
         for (const auto& s : lam->stmts) {
             if (s) resolveTypesInStmt(*s, scope);

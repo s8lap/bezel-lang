@@ -212,10 +212,30 @@ private:
     // §9.8 v0.141 (P6): class-body `polymorphic("disc": Type, ...);` member
     // clause — populates decl.serializedClass->polyCases.
     void parsePolymorphicMember(ast::TypeDecl& decl);
-    // Slice 36: peeks the matching `)` for the `(` at peekAt(startK) and
-    // returns true iff a `=>` follows. Used to distinguish
-    // `( LambdaParams? ) => …` from a parenthesised expression `( EXPR )`.
-    bool tokensLookLikeLambda(std::size_t startK);
+    // §27.3 / A.7 (v0.217, #2101): retired-lambda-spelling diagnostics. The
+    // keyword-led form needs NO lookahead (the pre-v0.217
+    // `tokensLookLikeLambda` scan-to-`)` — the parser's one unbounded
+    // buffered lookahead — is deleted with the old spelling); these helpers
+    // exist purely to turn the parse errors an old-spelling `(params) =>
+    // body` now produces into one targeted "insert `lambda`" diagnostic.
+    //
+    // checkRetiredParenLambda: called at generic-error sites (a missing `;`
+    // after a statement, a missing `,`/`)` after a call argument) — if the
+    // unexpected token is `=>`, report the targeted diagnostic, swallow the
+    // arrow and the lambda body, and return true (the caller then skips its
+    // generic error). Never called from arm/guard contexts, where an
+    // expression legitimately precedes `=>`.
+    bool checkRetiredParenLambda();
+    // retiredLambdaHeadAhead: ERROR-PATH-ONLY scan — from inside an already-
+    // failed parenthesized expression, peek to the matching `)` and test for
+    // `=>`. Runs only when the paren-expression parse has already failed at
+    // `,`/`:` (a multi-param or type-ascribed retired head), so it is a
+    // diagnostic-quality aid, not a dispatch lookahead.
+    bool retiredLambdaHeadAhead();
+    // skipRetiredLambdaBody: consume and discard the body after a retired
+    // `=>` (an expression, or `do … end`), so one old lambda yields one
+    // diagnostic instead of a cascade.
+    void skipRetiredLambdaBody();
     // per §14.1: disambiguates `Method<T>(…)` (method-level type args) from
     // `expr < T > (expr)` (relational comparison chain). peekAt(0) is the `<`
     // token. Returns true iff the `<` starts a generic-arg list that closes
@@ -260,13 +280,10 @@ private:
     // `with EXPR` cancellation-token clause (§30.7) stays available to the
     // for-statement parser.
     bool disableWithSuffix_ = false;
-    // §19.4/§17 (#1256): when true, the very next call to
-    // parsePrimaryExpressionImpl suppresses top-level `(…)=>` lambda
-    // detection.  The flag is consumed (cleared) immediately on entry to
-    // parsePrimaryExpressionImpl so that nested lambdas in call-argument
-    // position (e.g. `xs.Any((y) => y > 0)` inside a when-guard) are
-    // unaffected.  Set by parseCaseArm while parsing a when-guard expression.
-    bool suppressTopLevelLambda_ = false;
+    // (The pre-v0.217 `suppressTopLevelLambda_` when-guard carve (#1256) is
+    // deleted: a keyword-led lambda (§27.3, v0.217) commits at `lambda`, so
+    // a parenthesized guard followed by the arm `=>` can never be mis-read
+    // as a lambda head.)
 };
 
 } // namespace bezel

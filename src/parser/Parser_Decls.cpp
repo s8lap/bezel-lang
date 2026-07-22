@@ -1426,8 +1426,11 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         field->initializer = parseExpression();
     }
     if (!consumePunctuator(";")) {
-        diagnostics_.report(Severity::Error, current_.location,
-                            "expected ';' after field declaration");
+        // v0.217 (§27.3, #2101): retired `(params) => body` spelling in a
+        // field initializer.
+        if (!checkRetiredParenLambda() || !consumePunctuator(";"))
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after field declaration");
     }
 
     // Reseat the raw pointer explicitly (Node's deleted move blocks the
@@ -2401,6 +2404,11 @@ std::vector<ast::CallArgument> Parser::parseArgList() {
             advance();
         } else {
             a.value = parseExpression();
+            // v0.217 (§27.3, #2101): `Foo((x) => …)` — a retired-spelling
+            // lambda argument parses its head as a parenthesized expression
+            // and leaves the `=>` here (where `,` or the closer is
+            // expected); name the migration instead of a generic error.
+            checkRetiredParenLambda();
         }
         return a;
     };

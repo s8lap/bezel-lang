@@ -334,13 +334,6 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpression() {
 }
 
 std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
-    // §19.4/§17 (#1256): consume the flag immediately so only the outermost
-    // primary of the when-guard is affected; nested sub-expressions (e.g.
-    // lambda arguments inside a call) enter this function with the flag
-    // already cleared and therefore parse lambdas normally.
-    const bool suppressLambda = suppressTopLevelLambda_;
-    suppressTopLevelLambda_ = false;
-
     // Literals from the lexer (§18 forms covered in lexer slices 3 and 4).
     if (current_.kind == TokenKind::IntLiteral) {
         auto e = std::make_unique<ast::IntLiteralExpr>();
@@ -623,31 +616,60 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
         return std::unique_ptr<ast::Expr>(n.release());
     }
 
-    // Lambda: `async? "(" LambdaParams? ")" "=>" LambdaBody` (A.7). The
-    // discriminator is "what follows the matching `)`?": `=>` means lambda,
-    // anything else means parenthesised expression. We need to scan past the
-    // matching `)` before deciding — that is the parser's one use of
-    // unbounded buffered lookahead (peekAt).
-    // per §19.4/§17 (#1256): if suppressLambda is set, the `(…)=>` pattern
-    // at this level is the guard-expression followed by the case-arm `=>`
-    // separator, not a lambda — skip lambda detection so `(t > 0)` is parsed
-    // as a parenthesised guard and `=>` remains available to parseCaseArm.
+    // Lambda: `"async"? "lambda" "(" LambdaParams? ")" (":" Type)? "=>"
+    // LambdaBody` (§27.3 / A.7, v0.217). Keyword-led: the reserved `lambda`
+    // begins no other expression or statement, so the reading commits at its
+    // first token (the second, after `async`) — no scan to the matching `)`
+    // is ever needed, and a parenthesized construct followed by `=>` (a
+    // when-guard arm, a grouped expression) can never be read as a lambda
+    // prefix. This cutover deleted the pre-v0.217 `tokensLookLikeLambda`
+    // buffered lookahead and the #1256 `suppressTopLevelLambda_` carve.
     const bool asyncLambdaCandidate =
-        !suppressLambda &&
         isKeyword("async") &&
-        peekAt(1).kind == TokenKind::Punctuator && peekAt(1).text == "(" &&
-        tokensLookLikeLambda(1);
-    const bool plainLambdaCandidate =
-        !suppressLambda && isPunctuator("(") && tokensLookLikeLambda(0);
+        peekAt(1).kind == TokenKind::Keyword && peekAt(1).text == "lambda";
+    // v0.217 hard cutover: the retired `async (params) => body` spelling is
+    // recognized here only to issue the targeted migration diagnostic; it is
+    // then parsed AS a lambda so one old spelling yields one error.
+    const bool retiredAsyncLambda =
+        isKeyword("async") &&
+        peekAt(1).kind == TokenKind::Punctuator && peekAt(1).text == "(";
 
-    if (asyncLambdaCandidate || plainLambdaCandidate) {
+    if (asyncLambdaCandidate || retiredAsyncLambda || isKeyword("lambda")) {
         auto lam = std::make_unique<ast::LambdaExpr>();
-        if (asyncLambdaCandidate) {
+        if (asyncLambdaCandidate || retiredAsyncLambda) {
             lam->isAsync = true;
+            if (retiredAsyncLambda) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "`async (params) => body` is the retired pre-v0.217 "
+                    "lambda spelling \xe2\x80\x94 a lambda is keyword-led: "
+                    "insert `lambda` after `async` "
+                    "(`async lambda(...) => ...`) (\xc2\xa7""27.3, v0.217)");
+            }
             advance(); // past `async`
         }
-        consumePunctuator("("); // confirmed by lookahead
-        if (!consumePunctuator(")")) {
+        // Past `lambda` (absent in the retired `async (…)` spelling).
+        if (isKeyword("lambda")) advance();
+        if (!consumePunctuator("(")) {
+            // §27.3 (v0.217): "a parenthesized parameter list (the empty
+            // pair for zero parameters; there is no paren-free form)".
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected '(' after `lambda` \xe2\x80\x94 the parameter "
+                "list is parenthesized and there is no paren-free form; "
+                "zero parameters spell the empty pair (`lambda() => ...`) "
+                "(\xc2\xa7""27.3, v0.217)");
+            // Recovery: absorb the paren-free one-param shape (`lambda x =>`)
+            // so a single diagnostic is produced instead of a cascade.
+            if (current_.kind == TokenKind::Identifier &&
+                peekAt(1).kind == TokenKind::Punctuator &&
+                peekAt(1).text == "=>") {
+                ast::Param p;
+                p.name = current_.text;
+                advance();
+                lam->params.push_back(std::move(p));
+            }
+        } else if (!consumePunctuator(")")) {
             // Non-empty LambdaParams.
             lam->params.push_back(parseLambdaParam());
             while (consumePunctuator(",")) {
@@ -661,6 +683,13 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
                     Severity::Error, current_.location,
                     "expected ')' to close lambda parameter list");
             }
+        }
+        // §27.3 (v0.217): the optional return-type ascription `":" Type`
+        // between the parameter list and `=>`. No Type production contains
+        // `=>` (function types use `->`, A.5), so the ascription ends
+        // deterministically before the arrow.
+        if (consumePunctuator(":")) {
+            lam->retType = parseType();
         }
         if (!consumePunctuator("=>")) {
             diagnostics_.report(Severity::Error, current_.location,
@@ -698,8 +727,42 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
         // resulting tree shape encodes the grouping directly. See Node.hpp.
         auto inner = parseExpression();
         if (!consumePunctuator(")")) {
-            diagnostics_.report(Severity::Error, current_.location,
-                                "expected ')' to close parenthesized expression");
+            // v0.217 cutover (§27.3, #2101): a multi-parameter or type-
+            // ascribed head of the RETIRED lambda spelling reaches here as a
+            // failed parenthesized expression (`(x, y) => …`, `(x: int) =>
+            // …`). On this already-failed path only, scan to the matching
+            // `)` and test for `=>` so the diagnostic names the migration
+            // instead of a bare "expected ')'". (Error-path aid only — the
+            // grammar itself needs no lookahead; see Parser.hpp.)
+            if ((isPunctuator(",") || isPunctuator(":")) &&
+                retiredLambdaHeadAhead()) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "`(params) => body` is the retired pre-v0.217 lambda "
+                    "spelling \xe2\x80\x94 a lambda is keyword-led: insert "
+                    "`lambda` before the parameter list "
+                    "(`lambda(...) => ...`) (\xc2\xa7""27.3, v0.217)");
+                // Recover: swallow the rest of the head, the arrow, and the
+                // body, so one retired lambda yields one diagnostic.
+                std::size_t depth = 1;
+                while (current_.kind != TokenKind::EndOfFile) {
+                    if (current_.kind == TokenKind::Punctuator) {
+                        if (current_.text == "(") {
+                            ++depth;
+                        } else if (current_.text == ")") {
+                            if (--depth == 0) break;
+                        }
+                    }
+                    advance();
+                }
+                consumePunctuator(")");
+                consumePunctuator("=>");
+                skipRetiredLambdaBody();
+            } else {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "expected ')' to close parenthesized expression");
+            }
         }
         // §17.1 (#1086): mark the group so the mandatory-parenthesization check
         // treats `(a & 1) = 0` as explicitly parenthesized (legal) rather than a
@@ -713,14 +776,13 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
     return nullptr;
 }
 
-bool Parser::tokensLookLikeLambda(std::size_t startK) {
-    // peekAt(startK) must be `(`. Scan forward through balanced parens to
-    // find the matching `)`, then return true iff `=>` follows. Brackets
-    // `[]` and angles `<>` need not be balanced separately: they nest
-    // *inside* the outer `(...)` regardless, and we only care about which
-    // `)` matches the leading `(`. Bails out on EOF.
+// §27.3 (v0.217, #2101): see Parser.hpp — error-path-only scan for the
+// retired `(params) => body` spelling. current_ is inside an already-failed
+// parenthesized expression at depth 1; peek to the matching `)` and test for
+// `=>`. Bails out on EOF.
+bool Parser::retiredLambdaHeadAhead() {
     std::size_t depth = 1;
-    std::size_t k = startK + 1;
+    std::size_t k = 0;
     for (;;) {
         const Token& t = peekAt(k);
         if (t.kind == TokenKind::EndOfFile) return false;
@@ -736,6 +798,37 @@ bool Parser::tokensLookLikeLambda(std::size_t startK) {
         }
         ++k;
     }
+}
+
+// §27.3 (v0.217, #2101): consume and discard the body of a retired-spelling
+// lambda after its `=>` has been consumed, so one old lambda yields one
+// targeted diagnostic instead of a cascade of generic ones.
+void Parser::skipRetiredLambdaBody() {
+    if (consumeKeyword("do")) {
+        while (!isKeyword("end") && current_.kind != TokenKind::EndOfFile) {
+            auto s = parseStatement();
+            if (!s && current_.kind != TokenKind::EndOfFile) advance();
+        }
+        consumeKeyword("end");
+    } else {
+        parseExpression();
+    }
+}
+
+// §27.3 (v0.217, #2101): see Parser.hpp — called at generic-error sites when
+// the unexpected token may be the `=>` of a retired-spelling lambda whose
+// head parsed as an ordinary parenthesized expression (`(x) => …`,
+// `() => …`, i.e. the shapes the paren-expression grammar accepts cleanly).
+bool Parser::checkRetiredParenLambda() {
+    if (!isPunctuator("=>")) return false;
+    diagnostics_.report(
+        Severity::Error, current_.location,
+        "`(params) => body` is the retired pre-v0.217 lambda spelling "
+        "\xe2\x80\x94 a lambda is keyword-led: insert `lambda` before the "
+        "parameter list (`lambda(...) => ...`) (\xc2\xa7""27.3, v0.217)");
+    advance(); // past `=>`
+    skipRetiredLambdaBody();
+    return true;
 }
 
 // per §14.1 (issue #509): disambiguate `Method<T>(…)` (explicit method type
@@ -1334,17 +1427,12 @@ ast::CaseArm Parser::parseCaseArm(bool scrutineeLess) {
         arm.pattern = parsePattern();
     }
     if (consumeKeyword("when")) {
-        // per §19.4/§17 (#1256): a parenthesised guard like `(t > 0)` must
-        // not be mistaken for a lambda-parameter list even though the token
-        // sequence `(…)=>` matches the lambda pattern — the `=>` here is the
-        // case-arm separator, not a lambda arrow.  The flag is consumed
-        // (cleared) on the very first entry to parsePrimaryExpressionImpl, so
-        // lambdas nested inside a call arg (e.g. `xs.Any((y) => y > 0)`) are
-        // unaffected.
-        const bool prevSuppress = suppressTopLevelLambda_;
-        suppressTopLevelLambda_ = true;
+        // §19.4/§17: a parenthesised guard like `(t > 0)` is followed by the
+        // case-arm `=>` separator. Since v0.217 (§27.3) a lambda is keyword-
+        // led (`lambda(...)`), so the guard's `(…) =>` token sequence can no
+        // longer be mis-read as a lambda head — the #1256 suppression flag
+        // this site used to set is deleted with the old spelling.
         arm.guard = parseExpression();
-        suppressTopLevelLambda_ = prevSuppress;
     }
     if (!consumePunctuator("=>")) {
         diagnostics_.report(Severity::Error, current_.location,
