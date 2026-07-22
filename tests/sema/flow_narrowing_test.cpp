@@ -11,6 +11,11 @@
 //   * `is T` does not narrow in the else branch;
 //   * two `is` tests joined with `and` are both in effect in the true block.
 //
+// §7.4/§17.4 (v0.210 ruling) additionally states that `not`-composition
+// never establishes type-classification narrowing (only null facts swap
+// under `not`) — `not (x is T)` narrows neither branch, unlike the direct
+// `x is not T` operator.
+//
 // These tests inspect the resolved member symbol / type the sema pass
 // attaches to a member-access expression, so they verify the narrowing
 // analysis directly (codegen JIT coverage lives in
@@ -304,6 +309,40 @@ BEZEL_TEST(sema_narrow, is_T_does_not_narrow_in_else) {
     BEZEL_EXPECT_TRUE(ma != nullptr);
     if (ma) {
         // No narrowing in the else of `is T`: stays unresolved.
+        BEZEL_EXPECT_TRUE(r.ctx->exprSymbol(*ma) == nullptr);
+    }
+}
+
+// §7.4 / §17.4 (v0.210 ruling): "the `not`-swap applies to null facts... a
+// type-classification fact is established only by the `is`/`is not`
+// operators and typed patterns directly, never by `not`-composition —
+// `not (x is T)` has the same truth value as `x is not T` but narrows
+// neither branch." Contrast with `is_not_narrows_in_else_branch` above,
+// which uses the DIRECT `is not` operator and DOES narrow its else branch:
+// here the semantically-equivalent `not (animal is Dog)` must NOT narrow
+// its else branch (where `animal` is in fact a Dog), so `animal.Bark`
+// stays unresolved.
+BEZEL_TEST(sema_narrow, not_composition_of_is_does_not_narrow_either_branch) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Animal public virtual method Legs(): int => 0; end Animal; "
+        "class Dog : Animal "
+        "  public method Bark(): int => 100; "
+        "end Dog; "
+        "class C "
+        "  public static method Run(animal: Animal): int "
+        "    if not (animal is Dog) then "
+        "      return -1; "
+        "    else "
+        "      return animal.Bark(); "
+        "    end; "
+        "  end Run; "
+        "end C;");
+    auto* ma = findIn(r, "Run", "animal", "Bark");
+    BEZEL_EXPECT_TRUE(ma != nullptr);
+    if (ma) {
+        // `not`-composition never establishes type-classification narrowing:
+        // the else branch (where `animal` actually is a Dog) stays unresolved.
         BEZEL_EXPECT_TRUE(r.ctx->exprSymbol(*ma) == nullptr);
     }
 }
