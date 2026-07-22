@@ -245,7 +245,7 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
         lc->value = parseExpression();
         if (!consumePunctuator(";")) {
             // v0.217 (§27.3, #2101): retired `(params) => body` spelling.
-            if (!checkRetiredParenLambda() || !consumePunctuator(";"))
+            if (!checkRetiredExprSpelling() || !consumePunctuator(";"))
                 diagnostics_.report(
                     Severity::Error, current_.location,
                     "expected ';' after local const declaration");
@@ -331,7 +331,7 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
             // v0.217 (§27.3, #2101): `var f := (x) => …;` — the retired
             // lambda spelling parses its head as a parenthesized expression
             // and trips here on the `=>`; name the migration instead.
-            if (!checkRetiredParenLambda() || !consumePunctuator(";"))
+            if (!checkRetiredExprSpelling() || !consumePunctuator(";"))
                 diagnostics_.report(Severity::Error, current_.location,
                                     "expected ';' after local declaration");
         }
@@ -713,9 +713,11 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected 'in' in for statement");
         }
-        // Disable the postfix `with` suffix here so the for-stmt sees its
-        // own `with EXPR` cancellation-token clause rather than letting the
-        // expression parser consume it as a WithExpr (slice 50).
+        // §9.5/§30.7 (v0.208, #2079): in this header, `with` followed by
+        // `( Identifier :=` is the record-update suffix on the source (the
+        // expression parser consumes it even under this flag); any other
+        // `with` is the cancellation-token clause and is left here for the
+        // for-statement (the content-based resolution the spec states).
         const bool prevDisable = disableWithSuffix_;
         disableWithSuffix_ = true;
         stmt->iterable = parseExpression();
@@ -826,7 +828,7 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
         }
         if (!consumePunctuator(";")) {
             // v0.217 (§27.3, #2101): retired `(params) => body` spelling.
-            if (!checkRetiredParenLambda() || !consumePunctuator(";"))
+            if (!checkRetiredExprSpelling() || !consumePunctuator(";"))
                 diagnostics_.report(Severity::Error, current_.location,
                                     "expected ';' after return statement");
         }
@@ -882,7 +884,7 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                     d->value = parseExpression();
                     if (!consumePunctuator(";")) {
                         // v0.217 (§27.3, #2101): retired lambda spelling.
-                        if (!checkRetiredParenLambda() ||
+                        if (!checkRetiredExprSpelling() ||
                             !consumePunctuator(";"))
                             diagnostics_.report(
                                 Severity::Error, current_.location,
@@ -909,7 +911,7 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
         a->value = parseExpression();
         if (!consumePunctuator(";")) {
             // v0.217 (§27.3, #2101): retired `(params) => body` spelling.
-            if (!checkRetiredParenLambda() || !consumePunctuator(";"))
+            if (!checkRetiredExprSpelling() || !consumePunctuator(";"))
                 diagnostics_.report(Severity::Error, current_.location,
                                     "expected ';' after assignment");
         }

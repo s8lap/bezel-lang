@@ -1428,7 +1428,7 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
     if (!consumePunctuator(";")) {
         // v0.217 (§27.3, #2101): retired `(params) => body` spelling in a
         // field initializer.
-        if (!checkRetiredParenLambda() || !consumePunctuator(";"))
+        if (!checkRetiredExprSpelling() || !consumePunctuator(";"))
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ';' after field declaration");
     }
@@ -2408,7 +2408,7 @@ std::vector<ast::CallArgument> Parser::parseArgList() {
             // lambda argument parses its head as a parenthesized expression
             // and leaves the `=>` here (where `,` or the closer is
             // expected); name the migration instead of a generic error.
-            checkRetiredParenLambda();
+            checkRetiredExprSpelling();
         }
         return a;
     };

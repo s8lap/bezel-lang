@@ -974,11 +974,14 @@ struct TypeTestExpr : Expr {
     std::unique_ptr<Type> testType;
 };
 
-// §17.1 L15 conditional: `X if cond else Y`. Right-associative.
+// §20 / A.7 IfExpr (v0.208): the conditional atom `(if cond then X elif c2
+// then Y else Z)` — an elif chain right-nests (elseValue is the next
+// ConditionalExpr). The retired postfix spelling produced this same node, so
+// sema/ownership/codegen are unchanged by the v0.208 respelling.
 struct ConditionalExpr : Expr {
     std::unique_ptr<Expr> thenValue;  // X
     std::unique_ptr<Expr> condition;  // cond
-    std::unique_ptr<Expr> elseValue;  // Y
+    std::unique_ptr<Expr> elseValue;  // Y (or the nested elif chain)
 };
 
 // §A.7 ThrowExpr: `throw Expression?`. Bare `throw` is valid only inside a
@@ -1021,11 +1024,11 @@ struct RangeExpr : Expr {
 // the unit-type form (slice 46) which is `()` in a type context.
 struct UnitExpr : Expr {};
 
-// A.7 `with` PrimarySuffix: `EXPR "with" InitAssign ("," InitAssign)* ","?
-// "end"` where `InitAssign ::= Identifier ":=" Expression`. Source-type
-// determines the semantic: record copy-with-overrides or object initializer
-// block on a freshly-constructed class (§22.11). The parser stores both
-// shapes in the same node — sema dispatches by the source's type.
+// §9.5 / A.7 `with` PrimarySuffix (v0.208): `EXPR "with" "(" InitAssign (","
+// InitAssign)* ","? ")"` where `InitAssign ::= Identifier ":=" Expression`.
+// Source-type determines the semantic: record copy-with-overrides or object
+// initializer block on a freshly-constructed class (§22.11). The parser
+// stores both shapes in the same node — sema dispatches by the source's type.
 struct WithExpr : Expr {
     struct InitAssign {
         std::string_view name;

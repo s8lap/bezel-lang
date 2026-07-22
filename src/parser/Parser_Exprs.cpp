@@ -129,8 +129,12 @@ std::unique_ptr<ast::Expr> Parser::parseExpression() {
 }
 
 std::unique_ptr<ast::Expr> Parser::parseExpressionImpl() {
-    // §A.7 ConditionalExpr ::= LogicalOr ("if" Expression "else" Expression)?
-    //                         | ThrowExpr | CaseExpr (later slice)
+    // A.7 `Expression ::= LogicalOr | ThrowExpr` (v0.208): the conditional is
+    // the parenthesized `(if …)` PrimaryAtom (§20) — the postfix
+    // `x if c else y` spelling is retired and no conditional level exists in
+    // the operator table (§17.1). The retired spelling's stray `if` surfaces
+    // at the caller's terminator check; checkRetiredPostfixConditional names
+    // the migration there.
     if (isKeyword("throw")) {
         advance();
         auto te = std::make_unique<ast::ThrowExpr>();
@@ -145,27 +149,7 @@ std::unique_ptr<ast::Expr> Parser::parseExpressionImpl() {
         }
         return std::unique_ptr<ast::Expr>(te.release());
     }
-    auto left = parseBinaryExpression(1);
-    // Conditional suffix. Now that statement constructs that contain an
-    // Expression-followed-by-Statement (`if cond then …`, `while cond do …`,
-    // `for var x in expr do …`) have body-start keywords, naive `if`-suffix
-    // parsing here can't gobble a statement's `if` — it'd just fail to find
-    // `else` and report a parse error.
-    if (consumeKeyword("if")) {
-        auto cond = parseExpression();
-        if (!consumeKeyword("else")) {
-            diagnostics_.report(
-                Severity::Error, current_.location,
-                "expected 'else' after conditional 'if' condition");
-        }
-        auto right = parseExpression();
-        auto c = std::make_unique<ast::ConditionalExpr>();
-        c->thenValue = std::move(left);
-        c->condition = std::move(cond);
-        c->elseValue = std::move(right);
-        return std::unique_ptr<ast::Expr>(c.release());
-    }
-    return left;
+    return parseBinaryExpression(1);
 }
 
 std::unique_ptr<ast::Expr> Parser::parseBinaryExpression(int minPrecedence) {
@@ -268,11 +252,15 @@ std::unique_ptr<ast::Expr> Parser::parseBinaryExpression(int minPrecedence) {
                            current_.text == "," || current_.text == "=>";
                 }
                 if (current_.kind == TokenKind::Keyword) {
+                    // `then` joined the list at v0.208 (#2079): the `(if …)`
+                    // atom's condition may end in an open range
+                    // (`(if n in 1.. then a else b)`).
                     return current_.text == "do" || current_.text == "with" ||
                            current_.text == "when" ||
                            current_.text == "end" ||
                            current_.text == "else" ||
-                           current_.text == "elif";
+                           current_.text == "elif" ||
+                           current_.text == "then";
                 }
                 if (current_.kind == TokenKind::Identifier &&
                     current_.text == "step") return true;
@@ -396,9 +384,11 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
                        current_.text == "," || current_.text == "=>";
             }
             if (current_.kind == TokenKind::Keyword) {
+                // `then` per v0.208 (#2079) — see the twin list above.
                 return current_.text == "do" || current_.text == "with" ||
                        current_.text == "when" || current_.text == "end" ||
-                       current_.text == "else" || current_.text == "elif";
+                       current_.text == "else" || current_.text == "elif" ||
+                       current_.text == "then";
             }
             if (current_.kind == TokenKind::Identifier &&
                 current_.text == "step") return true;
@@ -581,17 +571,16 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
         return std::unique_ptr<ast::Expr>(e.release());
     }
 
-    // §A.7 CaseExpr — `"case" Expression? CaseArm ("," CaseArm)* ","? "end"`.
-    // The bare form (no scrutinee) is admitted by the grammar; slice 38
-    // requires the scrutinee form (the bare-form lookahead requires deciding
-    // "is the next token a pattern or an expression" without backtracking,
-    // which lands later).
+    // §19.1/§19.7 (v0.208, #2079): the expression form of `case`/`when` is
+    // the parenthesized atom (`(case … of …)` / `(when …)`, parsed in the
+    // paren branch below). A BARE `case`/`when` reaching expression position
+    // is the retired pre-v0.208 `end`-closed expression spelling — report the
+    // targeted migration diagnostic and parse the old form for recovery.
     if (isKeyword("case")) {
-        return parseCaseExpr();
+        return parseCaseExpr(/*parenAtom=*/false);
     }
-    // #744 / §19: `when` opens the condition-dispatch (scrutinee-less) form.
     if (isKeyword("when")) {
-        return parseWhenExpr();
+        return parseWhenExpr(/*parenAtom=*/false);
     }
 
     // §A.5 NewExpr — `new Type "(" ArgList? ")"` or shorthand `new "(" … ")"`.
@@ -718,6 +707,21 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
     }
 
     if (consumePunctuator("(")) {
+        // §20 / A.7 IfExpr (v0.208, #2079): "(" followed by the reserved
+        // `if` — which begins no other expression — commits the conditional-
+        // atom reading at the second token.
+        if (isKeyword("if")) {
+            return parseIfExprAtom();
+        }
+        // §19.1/§19.7 / A.7 CaseExpr/WhenExpr (v0.208, #2079): "(case" /
+        // "(when" likewise commit at the second token; the atom's `)` is the
+        // closer (no `end`), and arms are Expression-bodied only.
+        if (isKeyword("case")) {
+            return parseCaseExpr(/*parenAtom=*/true);
+        }
+        if (isKeyword("when")) {
+            return parseWhenExpr(/*parenAtom=*/true);
+        }
         // §A.7 unit value `()` — empty parens at PrimaryAtom level.
         if (consumePunctuator(")")) {
             return std::unique_ptr<ast::Expr>(
@@ -1467,7 +1471,19 @@ bool Parser::expectOfDelimiter() {
     return false;
 }
 
-std::unique_ptr<ast::Expr> Parser::parseCaseExpr() {
+std::unique_ptr<ast::Expr> Parser::parseCaseExpr(bool parenAtom) {
+    if (!parenAtom) {
+        // v0.208 cutover (§19.7, #2079): the retired `end`-closed expression
+        // spelling. One targeted diagnostic; the old form is then parsed for
+        // recovery so downstream sees a well-formed CaseExpr.
+        diagnostics_.report(
+            Severity::Error, current_.location,
+            "an expression-position `case \xe2\x80\xa6 of \xe2\x80\xa6 end` "
+            "is the retired pre-v0.208 spelling \xe2\x80\x94 the expression "
+            "form is the parenthesized atom: wrap it and drop `end` "
+            "(`(case \xe2\x80\xa6 of arm, \xe2\x80\xa6)`) "
+            "(\xc2\xa7""19.1/\xc2\xa7""19.7, v0.208)");
+    }
     advance(); // past `case`
     auto ce = std::make_unique<ast::CaseExpr>();
 
@@ -1484,18 +1500,29 @@ std::unique_ptr<ast::Expr> Parser::parseCaseExpr() {
     ce->scrutinee = stampSpan(parseExpression(), start, current_.location);
     expectOfDelimiter();
 
+    // §19.7 (v0.208): the atom closes with `)`; the retired recovery form
+    // with `end` (+ optional `case` tail, v0.170).
+    auto atCloser = [&]() {
+        return parenAtom ? isPunctuator(")") : isKeyword("end");
+    };
     ce->arms.push_back(parseCaseArm(/*bareForm=*/false));
     while (consumePunctuator(",")) {
-        // Trailing `","?` per the grammar — `,` followed immediately by
-        // `end` terminates the list.
-        if (isKeyword("end")) break;
+        // Trailing `","?` per the grammar — `,` followed immediately by the
+        // closer terminates the list.
+        if (atCloser()) break;
         ce->arms.push_back(parseCaseArm(/*bareForm=*/false));
     }
-    if (!consumeKeyword("end")) {
-        diagnostics_.report(Severity::Error, current_.location,
-                            "expected 'end' to close case expression");
+    if (parenAtom) {
+        if (!consumePunctuator(")")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ')' to close the `(case \xe2\x80\xa6)` expression "
+                "atom (\xc2\xa7""19.7, v0.208)");
+        }
+    } else {
+        consumeKeyword("end");
+        consumeOptionalEndKeyword("case"); // §1.6 / v0.170 (#1374)
     }
-    consumeOptionalEndKeyword("case"); // §1.6 / v0.170 (#1374)
     return std::unique_ptr<ast::Expr>(ce.release());
 }
 
@@ -1506,21 +1533,143 @@ std::unique_ptr<ast::Expr> Parser::parseCaseExpr() {
 // scrutinee-less path is reused), but with NO layout-significant disambiguation
 // — `when` is unambiguous. (Migrating bare `case` → `when` and deleting the
 // heuristic is a later stage.)
-std::unique_ptr<ast::Expr> Parser::parseWhenExpr() {
+std::unique_ptr<ast::Expr> Parser::parseWhenExpr(bool parenAtom) {
+    if (!parenAtom) {
+        // v0.208 cutover (§19.7, #2079): the retired `end`-closed expression
+        // spelling — see parseCaseExpr.
+        diagnostics_.report(
+            Severity::Error, current_.location,
+            "an expression-position `when \xe2\x80\xa6 end` is the retired "
+            "pre-v0.208 spelling \xe2\x80\x94 the expression form is the "
+            "parenthesized atom: wrap it and drop `end` "
+            "(`(when arm, \xe2\x80\xa6)`) "
+            "(\xc2\xa7""19.1/\xc2\xa7""19.7, v0.208)");
+    }
     advance();  // past `when`
     auto ce = std::make_unique<ast::CaseExpr>();
+    auto atCloser = [&]() {
+        return parenAtom ? isPunctuator(")") : isKeyword("end");
+    };
     // Scrutinee stays null: `when` is always the condition-dispatch form.
     ce->arms.push_back(parseCaseArm(/*bareForm=*/true));
     while (consumePunctuator(",")) {
-        if (isKeyword("end")) break;  // trailing `,?`
+        if (atCloser()) break;  // trailing `,?`
         ce->arms.push_back(parseCaseArm(/*bareForm=*/true));
     }
-    if (!consumeKeyword("end")) {
-        diagnostics_.report(Severity::Error, current_.location,
-                            "expected 'end' to close `when` expression");
+    if (parenAtom) {
+        if (!consumePunctuator(")")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected ')' to close the `(when \xe2\x80\xa6)` expression "
+                "atom (\xc2\xa7""19.7, v0.208)");
+        }
+    } else {
+        consumeKeyword("end");
+        consumeOptionalEndKeyword("when"); // §1.6 / v0.170 (#1374)
     }
-    consumeOptionalEndKeyword("when"); // §1.6 / v0.170 (#1374)
     return std::unique_ptr<ast::Expr>(ce.release());
+}
+
+// §20 / A.7 IfExpr (v0.208, #2079): `"(" "if" Expression "then" Expression
+// ("elif" Expression "then" Expression)* "else" Expression ")"`. The caller
+// consumed the `(`; current_ is `if`. Each condition and branch derives a
+// FULL Expression (a bare `throw` branch is admitted anywhere — parse-
+// ExpressionImpl handles the leading `throw`); `else` is mandatory. The
+// elif chain right-nests into the ConditionalExpr representation, so the
+// selection/typing/ownership semantics are the pre-v0.208 machinery
+// unchanged (v0.208: "semantics untouched").
+std::unique_ptr<ast::Expr> Parser::parseIfExprAtom() {
+    advance(); // past `if`
+    struct Seg { std::unique_ptr<ast::Expr> cond, value; };
+    std::vector<Seg> segs;
+    auto parseSeg = [&]() {
+        Seg s;
+        s.cond = parseExpression();
+        if (!consumeKeyword("then")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected 'then' after the `(if \xe2\x80\xa6)` atom's "
+                "condition (\xc2\xa7""20, v0.208)");
+        }
+        s.value = parseExpression();
+        segs.push_back(std::move(s));
+    };
+    parseSeg();
+    while (consumeKeyword("elif")) parseSeg();
+    std::unique_ptr<ast::Expr> elseValue;
+    if (!consumeKeyword("else")) {
+        // §20: "the `else` branch is mandatory (an expression produces a
+        // value on every path)".
+        diagnostics_.report(
+            Severity::Error, current_.location,
+            "expected 'else' \xe2\x80\x94 the `(if \xe2\x80\xa6)` atom's "
+            "`else` branch is mandatory: an expression produces a value on "
+            "every path (\xc2\xa7""20, v0.208)");
+    } else {
+        elseValue = parseExpression();
+    }
+    if (!consumePunctuator(")")) {
+        diagnostics_.report(
+            Severity::Error, current_.location,
+            "expected ')' to close the `(if \xe2\x80\xa6)` expression atom "
+            "(\xc2\xa7""20, v0.208)");
+    }
+    // Right-nest the elif chain.
+    std::unique_ptr<ast::Expr> tail = std::move(elseValue);
+    for (std::size_t i = segs.size(); i-- > 0;) {
+        auto c = std::make_unique<ast::ConditionalExpr>();
+        c->condition = std::move(segs[i].cond);
+        c->thenValue = std::move(segs[i].value);
+        c->elseValue = std::move(tail);
+        tail = std::unique_ptr<ast::Expr>(c.release());
+    }
+    return tail;
+}
+
+// §20 (v0.208, #2079): see Parser.hpp — the retired postfix conditional
+// `x if c else y`, detected at generic-error sites by its stray `if`. The
+// error-path scan confirms a top-level `else` before `then`/`do`/`;` so a
+// legitimate if STATEMENT after a merely-missing `;` is not mislabeled.
+bool Parser::checkRetiredPostfixConditional() {
+    if (!isKeyword("if")) return false;
+    std::size_t k = 1;
+    int depth = 0;
+    for (;;) {
+        const Token& t = peekAt(k);
+        if (t.kind == TokenKind::EndOfFile) return false;
+        if (t.kind == TokenKind::Punctuator) {
+            if (t.text == "(" || t.text == "[") ++depth;
+            else if (t.text == ")" || t.text == "]") {
+                if (depth == 0) return false;
+                --depth;
+            } else if (t.text == ";" && depth == 0) {
+                return false;
+            }
+        } else if (t.kind == TokenKind::Keyword && depth == 0) {
+            if (t.text == "then" || t.text == "do") return false;
+            if (t.text == "else") break;
+        }
+        ++k;
+    }
+    diagnostics_.report(
+        Severity::Error, current_.location,
+        "the postfix conditional `x if c else y` is the retired pre-v0.208 "
+        "spelling \xe2\x80\x94 the conditional is the condition-first "
+        "parenthesized atom `(if c then x else y)` (\xc2\xa7""20, v0.208)");
+    // Swallow `if c else y` so one retired conditional yields one diagnostic.
+    advance(); // past `if`
+    parseExpression();
+    consumeKeyword("else");
+    parseExpression();
+    return true;
+}
+
+// Umbrella for the retired-spelling checks at statement/argument error
+// sites: the v0.217 paren lambda (#2101) and the v0.208 postfix conditional
+// (#2079). At most one fires per site.
+bool Parser::checkRetiredExprSpelling() {
+    if (checkRetiredParenLambda()) return true;
+    return checkRetiredPostfixConditional();
 }
 
 // §A.7 (v0.167, #1371): helper for folding a NamedPattern into a
@@ -1689,12 +1838,23 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
             auto bang = std::make_unique<ast::PostfixBangExpr>();
             bang->operand = std::move(head);
             head = std::unique_ptr<ast::Expr>(bang.release());
-        } else if (!disableWithSuffix_ && consumeKeyword("with")) {
-            // §A.7 `with` PrimarySuffix:
-            //   "with" InitAssign ("," InitAssign)* ","? "end"
+        } else if (isKeyword("with") &&
+                   (!disableWithSuffix_ ||
+                    (peekAt(1).kind == TokenKind::Punctuator &&
+                     peekAt(1).text == "(" &&
+                     peekAt(2).kind == TokenKind::Identifier &&
+                     peekAt(3).kind == TokenKind::Punctuator &&
+                     peekAt(3).text == ":="))) {
+            // §9.5 / A.7 `with` PrimarySuffix (v0.208, #2079):
+            //   "with" "(" InitAssign ("," InitAssign)* ","? ")"
             //   InitAssign ::= Identifier ":=" Expression
             // Source-type determines the semantic (record copy-with-overrides
             // vs object initializer on `new C(...)`); sema disambiguates.
+            // In an `await for` header (disableWithSuffix_), §30.7's stated
+            // rule applies: header-`with` followed by `( Identifier :=` is
+            // this update suffix on the source; any other `with` is left for
+            // the for-statement's cancellation clause.
+            advance(); // past `with`
             auto w = std::make_unique<ast::WithExpr>();
             w->source = std::move(head);
             auto parseInitAssign = [&]() -> ast::WithExpr::InitAssign {
@@ -1715,15 +1875,36 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
                 ia.value = parseExpression();
                 return ia;
             };
-            w->assigns.push_back(parseInitAssign());
-            while (consumePunctuator(",")) {
-                if (isKeyword("end")) break; // trailing `,?`
+            if (consumePunctuator("(")) {
+                // The v0.208 keyword-attached-parentheses form.
                 w->assigns.push_back(parseInitAssign());
-            }
-            if (!consumeKeyword("end")) {
+                while (consumePunctuator(",")) {
+                    if (isPunctuator(")")) break; // trailing `,?`
+                    w->assigns.push_back(parseInitAssign());
+                }
+                if (!consumePunctuator(")")) {
+                    diagnostics_.report(
+                        Severity::Error, current_.location,
+                        "expected ')' to close the `with(\xe2\x80\xa6)` "
+                        "update suffix (\xc2\xa7""9.5, v0.208)");
+                }
+            } else {
+                // v0.208 cutover: the retired `with Name := value, \xe2\x80\xa6
+                // end` spelling. One targeted diagnostic, then the old list is
+                // parsed for recovery.
                 diagnostics_.report(
                     Severity::Error, current_.location,
-                    "expected 'end' to close `with` initializer block");
+                    "`with Name := value, \xe2\x80\xa6 end` is the retired "
+                    "pre-v0.208 record-update spelling \xe2\x80\x94 the "
+                    "suffix carries keyword-attached parentheses and no "
+                    "`end`: `with(Name := value, \xe2\x80\xa6)` "
+                    "(\xc2\xa7""9.5, v0.208)");
+                w->assigns.push_back(parseInitAssign());
+                while (consumePunctuator(",")) {
+                    if (isKeyword("end")) break; // trailing `,?`
+                    w->assigns.push_back(parseInitAssign());
+                }
+                consumeKeyword("end");
             }
             head = std::unique_ptr<ast::Expr>(w.release());
         } else {

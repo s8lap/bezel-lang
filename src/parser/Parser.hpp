@@ -177,7 +177,13 @@ private:
     ast::CaseArm parseCaseArm(bool scrutineeLess = false);
     // #744 / §19: `case` always takes a scrutinee (the scrutinee-less form is
     // now `when`); no source-line heuristic is consulted.
-    std::unique_ptr<ast::Expr> parseCaseExpr();
+    // §19.1/§19.7 (v0.208, #2079): the expression form is the parenthesized
+    // ATOM `(case … of arm, …)` — `parenAtom` true means the caller consumed
+    // the opening `(` and the closer is `)`; false means the RETIRED bare
+    // `case … end` expression spelling reached expression position — the
+    // targeted migration diagnostic is reported and the old form is parsed
+    // for recovery.
+    std::unique_ptr<ast::Expr> parseCaseExpr(bool parenAtom);
     // §19.1 / A.7 CaseExpr (v0.166, #1370): consume the `of` delimiter that
     // terminates the case scrutinee, reporting the missing-`of` diagnostic
     // otherwise. `of` is a CONTEXTUAL keyword — it is not in Appendix B's
@@ -187,8 +193,27 @@ private:
     bool expectOfDelimiter();
     // #744 / §19: `when` is the dedicated scrutinee-less condition-dispatch
     // construct (arms are boolean conditions; the first true wins). It reuses
-    // the null-scrutinee CaseExpr representation.
-    std::unique_ptr<ast::Expr> parseWhenExpr();
+    // the null-scrutinee CaseExpr representation. `parenAtom` as for
+    // parseCaseExpr (v0.208, #2079).
+    std::unique_ptr<ast::Expr> parseWhenExpr(bool parenAtom);
+    // §20 / A.7 IfExpr (v0.208, #2079): the conditional atom
+    // `(if c then a elif c2 then b else d)`. The caller consumed the opening
+    // `(` and current_ is the `if` keyword — the reading is committed ("("
+    // followed by reserved `if` begins no other expression). Produces the
+    // (right-nested, for elif chains) ConditionalExpr representation the
+    // retired postfix spelling produced, so sema/ownership/codegen are
+    // unchanged (v0.208: semantics untouched).
+    std::unique_ptr<ast::Expr> parseIfExprAtom();
+    // §20 (v0.208, #2079): retired-postfix-conditional diagnostic — the
+    // sibling of checkRetiredParenLambda for `x if c else y`. Called at the
+    // same generic-error sites; when the unexpected token is `if` and an
+    // error-path scan finds a top-level `else` before `then`/`do`/`;`, the
+    // targeted migration diagnostic is reported and the `if c else y` tail
+    // is swallowed. Returns true when it fired.
+    bool checkRetiredPostfixConditional();
+    // Umbrella for the v0.208/v0.217 retired-spelling checks at statement/
+    // argument error sites.
+    bool checkRetiredExprSpelling();
     // The positional sub-pattern of `Name(p1, p2)` destructuring. Mostly
     // delegates to parsePattern, but also admits naked-binding Identifier
     // per A.7.

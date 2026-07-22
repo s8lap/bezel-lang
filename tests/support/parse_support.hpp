@@ -422,11 +422,13 @@ inline std::string exprToString(const ast::Expr& e) {
         return out;
     }
     if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
-        std::string out = "(";
-        out += c->thenValue ? exprToString(*c->thenValue)
-                            : std::string("<null>");
-        out += " if ";
+        // §20 / A.7 IfExpr (v0.208): rendered condition-first as the atom;
+        // an elif chain prints structure-true as the right-nested form.
+        std::string out = "(if ";
         out += c->condition ? exprToString(*c->condition)
+                            : std::string("<null>");
+        out += " then ";
+        out += c->thenValue ? exprToString(*c->thenValue)
                             : std::string("<null>");
         out += " else ";
         out += c->elseValue ? exprToString(*c->elseValue)
@@ -579,9 +581,10 @@ inline std::string exprToString(const ast::Expr& e) {
         return out;
     }
     if (auto* w = dynamic_cast<const ast::WithExpr*>(&e)) {
+        // §9.5 (v0.208): the keyword-attached-parentheses spelling.
         std::string out = w->source ? exprToString(*w->source)
                                     : std::string("<null>");
-        out += " with ";
+        out += " with(";
         for (std::size_t i = 0; i < w->assigns.size(); ++i) {
             if (i > 0) out += ", ";
             out += std::string(w->assigns[i].name);
@@ -590,7 +593,7 @@ inline std::string exprToString(const ast::Expr& e) {
                        ? exprToString(*w->assigns[i].value)
                        : std::string("<null>");
         }
-        out += " end";
+        out += ')';
         return out;
     }
     if (auto* de = dynamic_cast<const ast::DefaultExpr*>(&e)) {
