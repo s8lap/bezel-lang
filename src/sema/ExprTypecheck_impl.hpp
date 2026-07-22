@@ -19,10 +19,12 @@
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "ast/Node.hpp"
@@ -111,6 +113,24 @@ private:
     // {hasValue; payload} representation of `record?`/`int?`) stays correct.
     // Block-scoped the same way `narrowings_` is (saved/restored per block).
     std::unordered_set<Symbol*> nullNarrowed_;
+
+    // §7.4 (v0.214, #2085): flow-narrowing facts for nullable `readonly` fields.
+    // A `readonly`/`static readonly` field has no writer after its construction
+    // window (§22.8's single-assignment rule), so a null-test fact about it is
+    // NEVER invalidated by a call, `await`, or closure — unlike a mutable field,
+    // whose blanket refusal (TOCTOU) still stands. The tracked path is exactly
+    // ONE field off an admitted root: `this._f` / bare `_f` (instance),
+    // `TypeName._s` / bare `_s` (static), or `local._f` where `local` is a
+    // narrowing-tracked local; any non-final field segment (`a.b._f`) is
+    // non-trackable. Keyed by (root, field): the root is the local's Symbol* for
+    // `local._f`, and nullptr for the `this`/static roots (the FieldSymbol* —
+    // instance vs static — disambiguates those). A fact rides its root:
+    // reassigning, ref/out-passing, or mutably-capturing the local root drops
+    // its facts (narrowOnAssignment / the ref-out erase / invalidateCaptured-
+    // Narrowings); nullptr-rooted (`this`/static) facts are never invalidated,
+    // which is exactly why a `readonly`-field narrowing survives calls and
+    // `await`s. Saved/restored/joined exactly like `nullNarrowed_`.
+    std::set<std::pair<const Symbol*, const FieldSymbol*>> fieldNarrowed_;
 
     // §7.4 (v0.182, #1566): the set of local/parameter NAMES that are "mutably
     // captured" — assigned, or passed `ref`/`out`, anywhere inside ANY lambda of
@@ -1033,6 +1053,37 @@ private:
     // `nullNarrowed_` (known non-null). Returns true iff a narrowing was
     // applied. (issue #418)
     bool narrowFromNullTest(const ast::Expr* cond, bool forTrueBranch);
+
+    // §7.4 (v0.214, #2085) helper: if `cond` is a `<readonly-field path> <> null`
+    // / `= null` test whose operand is a trackable readonly-field access path
+    // (see readonlyFieldPathOf), record its (root, field) key in `fieldNarrowed_`
+    // for the narrowing branch. Excluded inside the field's declaring-type
+    // construction window (the rule does not apply there — §7.4/§22.8). Returns
+    // true iff a field-narrowing fact was recorded.
+    bool narrowFromFieldNullTest(const ast::Expr* cond, bool forTrueBranch);
+
+    // §7.4 (v0.214, #2085): if `e` denotes a trackable nullable `readonly`-field
+    // access path — exactly ONE field off an admitted root (`this`/bare implicit
+    // this, a type name for a static readonly, or a local for `local._f`) — return
+    // its (root, field) narrowing key; else nullopt. The root is nullptr for the
+    // `this`/static roots and the local's Symbol* for `local._f`. Recognition
+    // only: it neither consults `fieldNarrowed_` nor the construction window. The
+    // operand must already have been visited so its symbol is resolved.
+    std::optional<std::pair<const Symbol*, const FieldSymbol*>>
+        readonlyFieldPathOf(const ast::Expr* e);
+
+    // §7.4 (v0.214, #2085): the resolved TypeRef of a field symbol (body field or
+    // positional-record parameter), or null when unresolved.
+    TypeRef* fieldTypeOf(const FieldSymbol* fs);
+
+    // §7.4 (v0.214, #2085): true iff `fs` carries the `readonly` modifier.
+    static bool isReadonlyField(const FieldSymbol* fs);
+
+    // §7.4 (v0.214, #2085): drop every readonly-field fact rooted at `root` (a
+    // local that was reassigned, passed `ref`/`out`, or mutably captured — the
+    // path's facts ride the root). A no-op for nullptr (`this`/static roots are
+    // never invalidated).
+    void dropFieldFactsRooted(const Symbol* root);
 
     // §22.4 (v0.183, #1585) caller-side narrowing: if `cond` is a call to a
     // method that declares a `when true`/`when false` out-nullability

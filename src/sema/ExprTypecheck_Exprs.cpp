@@ -4656,6 +4656,10 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 dynamic_cast<ParameterSymbol*>(asym)) {
                                 narrowings_.erase(asym);
                                 nullNarrowed_.erase(asym);
+                                // §7.4 v0.214 (#2085): the callee may rebind the
+                                // ref/out local, so any `local._f` facts riding
+                                // it no longer hold.
+                                dropFieldFactsRooted(asym);
                             }
                         }
                     }
