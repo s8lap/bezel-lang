@@ -96,15 +96,19 @@ esac
 
 SHARD_ENV=(); ARB_ENV=(); SHARD_NOTE=""; SHARD_LABEL="crash/undercount-checked"
 if [ "$ASAN" -eq 1 ]; then
-  # A COLD full-suite ASan compile is ~2-3x a plain compile per test, so the
-  # run_parallel default 300s per-shard timeout (tuned for plain compiles: warm
-  # ~45s, ~6x headroom) is too tight for the first ASan gate after any relink
-  # (the AOT bincache keys on the test-binary hash, so a relink is a full cache
-  # miss) — especially under multi-agent slice contention. Give the ASan pass the
-  # same ~6x headroom over its warm ~137s => 900s (a genuine per-test hang is
-  # still bounded by the harness's 120s compile / 30s run deadlines; this is only
-  # the coarse per-shard backstop). A caller's explicit BEZEL_SHARD_TIMEOUT wins.
-  SHARD_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address BEZEL_SHARD_TIMEOUT="${BEZEL_SHARD_TIMEOUT:-900}")
+  # The ASan per-shard ceiling is COLD-AWARE (#2100): a WARM ASan pass (k2
+  # bincache populated) fits 900s with wide margin, but a COLD one — the first
+  # after a compiler change, a fresh/evicted cache — measured 459s quiet and
+  # blew through 900s under contention/eviction (2026-07-23). The ceiling is
+  # therefore decided AFTER the build phase, when coldness is knowable: core.a
+  # rebuilt this gate (the k2 identity changed => every key is new) or a
+  # near-empty bincache => 1500s; otherwise 900s. A genuine per-test hang is
+  # still bounded by the harness's 120s compile / 30s run deadlines — this is
+  # only the coarse per-shard backstop, and the CANARY is the fail-fast layer,
+  # so a generous cold ceiling no longer delays broken-tree detection. A
+  # caller's explicit BEZEL_SHARD_TIMEOUT always wins.
+  SHARD_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address)
+  GATE_EXPLICIT_STO="${BEZEL_SHARD_TIMEOUT:-}"
   ARB_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address)
   SHARD_NOTE="asan-instrumented"
   SHARD_LABEL="crash/undercount + generated-code ASan"
@@ -254,6 +258,10 @@ arbitrate() { # $1 = sharded-run log
 }
 
 echo "== gate[1/6]: reconfigure (glob any new test files) =="
+# Snapshot the compiler-archive mtime BEFORE any build work: comparing after
+# the build phase tells us whether the k2 cache identity changed this gate
+# (core.a rebuilt => cold ASan pass guaranteed) — see the ceiling note above.
+CORE_MTIME_PRE=$(stat -c %Y build/libbezel_core.a 2>/dev/null || echo 0)
 PHASE_T0=$(now)
 "$DH" build cmake -S . -B build >"$S/gate_reconf.log" 2>&1; prc=$?
 rec_ran configure "$prc"
@@ -265,6 +273,24 @@ PHASE_T0=$(now)
 rec_ran build "$prc"
 [ "$prc" -ne 0 ] && { grep -iE 'error:|FAILED:' "$S/gate_build.log" | head -20; fail "build"; }
 echo "   binary: $(ls -la --time-style=+%H:%M:%S build/tests/bezel_tests | awk '{print $6}')"
+
+# Decide the ASan per-shard ceiling now that coldness is knowable (#2100; see
+# the SHARD_ENV note above). Cold predicate: core.a rebuilt this gate (k2
+# identity changed => every cache key new) OR a near-empty bincache (fresh box
+# or eviction — a warm full-suite state holds ~11k+ entries; the find is
+# bounded). Explicit BEZEL_SHARD_TIMEOUT wins unconditionally.
+if [ "$ASAN" -eq 1 ]; then
+  core_post=$(stat -c %Y build/libbezel_core.a 2>/dev/null || echo -1)
+  cache_n=$(find "${BEZEL_AOT_CACHE_DIR:-/var/tmp/bezel-scratch/aot-bincache}" -type f 2>/dev/null | head -2001 | wc -l)
+  GATE_COLD=0
+  { [ "$core_post" != "$CORE_MTIME_PRE" ] || [ "$cache_n" -lt 2000 ]; } && GATE_COLD=1
+  sto="$GATE_EXPLICIT_STO"
+  if [ -z "$sto" ]; then sto=900; [ "$GATE_COLD" -eq 1 ] && sto=1500; fi
+  SHARD_ENV+=(BEZEL_SHARD_TIMEOUT="$sto")
+  core_note="unchanged"; [ "$core_post" != "$CORE_MTIME_PRE" ] && core_note="rebuilt"
+  cold_note="warm-predicted"; [ "$GATE_COLD" -eq 1 ] && cold_note="cold-predicted"
+  echo "   ASan shard ceiling: ${sto}s ($cold_note: core.a $core_note, bincache entries=$cache_n)"
+fi
 
 # lit + FileCheck diagnostic track (tests/lit/): drives the REAL bezelc over .bzl
 # files and matches diagnostics with FileCheck. Fast (~0.1s/test, no JIT) and
@@ -438,6 +464,17 @@ littests=$(grep -oE 'Passed: *[0-9]+' "$S/gate_lit.log" 2>/dev/null | grep -oE '
 COV_GTESTS=${gtests:-0}; COV_LITTESTS=${littests:-0}
 if [ -n "${gtests:-}" ]; then
   echo "== gate: coverage: ${gtests} gtest + ${littests:-0} lit = $(( gtests + ${littests:-0} )) tests passing =="
+fi
+# Whole-suite-timeout acceptance is LOUD (#2100): when the sharded pass exited
+# nonzero and the gate is passing purely because every arbitrated suspect
+# cleared, a zero/absent gtest total means the shards were killed at the
+# ceiling and this run validated only the suspect suites — the pass is
+# legitimate under the shard-authoritative design (the suspects are the only
+# evidence of failure, and they cleared), but the coverage claim belongs to
+# the previous/next completed pass, and a reader scanning the log must not
+# mistake this for a full-suite validation.
+if [ "${rc:-0}" -ne 0 ] && [ "${COV_GTESTS:-0}" -eq 0 ]; then
+  echo "== gate: WARNING — accepted via flake arbitration with NO completed gtest total (whole-suite timeout shape): only the arbitrated suspect suites were validated in THIS run =="
 fi
 
 echo "== GATE PASS =="
