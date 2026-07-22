@@ -168,19 +168,28 @@ BEZEL_TEST(codegen_cg4, conditional_numeric_widening_int_branch) {
         "end C;"), 1);
 }
 
-// --- §20: branches with no common type are rejected (clean diagnostic,
-// not a codegen crash). This is the `throw E if c else x` shape: it
-// parses as `throw (E if c else x)` (the throw's operand is the whole
-// conditional; §17.12, Appendix A), whose branches are an Exception value
-// and an int — no common type exists. Sema must reject it. ---
-BEZEL_TEST(codegen_cg4, throw_of_incompatible_conditional_is_type_error) {
+// --- §20 v0.208: a bare `throw` is legal in any branch of the `(if…)` atom
+// (the arm diverges; the atom types from the remaining arm). This test's
+// PRE-v0.208 form pinned the retired postfix grammar's precedence trap
+// (`throw E if c else x` parsed as `throw (E if c else x)` → Exception vs
+// int → no common type → reject); that parse no longer exists — postfix-if
+// is retired and the migrated program is a valid diverging-arm atom. The
+// §20 no-common-type rule itself stays pinned by
+// incompatible_branches_is_type_error below. Here: the throw arm fires and
+// a caller's catch observes it. ---
+BEZEL_TEST(codegen_cg4, throw_arm_in_if_atom_is_legal_v0208) {
     JitResult r = runAot(
         "module M; class C "
-        "  public static method Main(): int => "
+        "  public static method Helper(): int => "
         "    (if 1 < 2 then throw new Exception(\"e\") else 5); "
+        "  public static method Main(): int "
+        "    try return Helper(); catch Exception => return 9; end; "
+        "    return 0; "
+        "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 9);
 }
 
 // Plain incompatible branches (no throw involved) are likewise rejected.
