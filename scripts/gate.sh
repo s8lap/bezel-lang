@@ -29,10 +29,11 @@
 # All heavy ops go through scripts/dev_heavy.sh (resource-capped slice).
 #
 # Modes (collapsed from default/--quick/--full/--fast — #1861):
-#   scripts/gate.sh            # DEFAULT: reconfigure + build + lit + tidy + ONE
-#                              #   authoritative PLAIN sharded pass. NO serial.
-#                              #   Fast + robust: plain compiles fit the per-shard
-#                              #   timeout even cold and under multi-agent load.
+#   scripts/gate.sh            # DEFAULT: reconfigure + build + lit + canary +
+#                              #   tidy + ONE authoritative PLAIN sharded pass.
+#                              #   NO serial. Fast + robust: plain compiles fit
+#                              #   the per-shard timeout even cold and under
+#                              #   multi-agent load.
 #   scripts/gate.sh --full     # + whole-suite generated-code ASan folded INTO the
 #                              #   sharded pass (delicate merges: object layout /
 #                              #   disposal / runtime). Heavier — a COLD full-suite
@@ -45,6 +46,27 @@
 # GATE_FAST_ASAN=1 forces ASan ON for any mode; GATE_FAST_ASAN=0 forces it OFF.
 # (To make ASan the every-gate default on a quiet/uncontended host, run --full or
 #  export GATE_FAST_ASAN=1 — see the ASAN block below for why it is not default.)
+#
+# CANARY tier (gate[4/6], #2100): before the authoritative sharded pass, the
+# gate runs the diff-selected subset scripts/select_tests.py maps from the
+# worktree's diff vs origin/main (issue-number cross-links, fine §N.M
+# citations, downstream-dir fallback, diagnostic-string matches). Purpose:
+# FAIL-FAST ONLY. Measured over 7 days of gate-timings, 24.8% of ALL gate wall
+# was broken trees grinding every shard to the 300/900s timeout ceiling; a red
+# canary fails the gate in minutes instead. A green canary proves NOTHING
+# beyond its subset — the full sharded pass below remains the SOLE acceptance
+# authority, unconditionally (the back-test on issue #2100: 2/9 historical
+# regressions are structurally invisible to ANY diff-derived subset). Canary
+# compiles populate the AOT bincache under the same key the full pass uses, so
+# on a green gate the canary's cost is mostly amortized (the full pass serves
+# those tests from cache, exec-only). The canary inherits the gate's ASan mode
+# and uses the same flake arbitration as the full pass. Selector/infra errors
+# SKIP the canary (fail-open to the full pass — the canary must never brick a
+# gate on its own bugs). Knobs:
+#   GATE_CANARY=0            skip the canary entirely
+#   GATE_CANARY_BASE=<ref>   selection base (default: merge-base HEAD origin/main)
+#   GATE_CANARY_MAX_PCT=<n>  skip when the selection exceeds n% of the suite
+#                            (default 50 — the full pass then does the work anyway)
 set -u
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "gate: not in a git repo" >&2; exit 2; }
 MODE="${1:-default}"
@@ -175,13 +197,69 @@ fail() { FAILED_PHASE="$1"; echo "== GATE FAIL: $1 =="; exit 1; }
 # Emit summary+JSON on EVERY exit (pass or fail), preserving the exit code exactly.
 trap 'rc=$?; gate_finish "$rc" || true; exit $rc' EXIT
 
-echo "== gate[1/5]: reconfigure (glob any new test files) =="
+# Flake arbitration over a sharded-run log — shared by the canary tier and the
+# authoritative pass (#2100; semantics unchanged from the original inline
+# block, #1861). Collect ALL suspects: shard CRASHES (died on: a program killed
+# its host) AND assertion FAILs. BOTH can be flaky under sharding — a crash, or
+# a FAIL from test-pollution (a polluter leaves global state; the round-robin
+# lands it with a snapshot/leak test). ARBITRATE uniformly: re-run each
+# suspect's SUITE alone up to 5x (ARB_ENV keeps ASan forced in ASan modes so an
+# ASan-only failure reproduces rather than being falsely cleared as flaky). A
+# DETERMINISTIC failure fails all 5; a pollution/timing flake passes at least
+# once — one run isn't enough, it shares the flake rate. Sets ARB_LAST_SUSPECTS
+# for the caller's phase note. Returns:
+#   0  every suspect passed alone within 5 tries (sharding flake) — continue
+#   1  a suspect fails alone all 5 tries (real regression)
+#   2  nonzero exit but NO crash/FAIL marker in the log (undercount/timeout)
+#   3  >8 distinct suspects (real cross-cutting regression; not arbitrated —
+#      fail fast and bound the arbitration cost)
+arbitrate() { # $1 = sharded-run log
+  local log="$1" crashed failed suspects nsus real t suite passed_alone k
+  crashed=$(grep 'died on:' "$log" | sed -E 's/.*died on: //')
+  failed=$(grep -E '^\[ FAIL' "$log" | sed -E 's/^\[ FAIL \] //' | awk '{print $1}')
+  # "died on: <none>" = a shard died before running ANY test (e.g. OOM-kill at
+  # startup). It is NOT an arbitrable suspect: re-running the literal filter
+  # "<none>" matches nothing, "passes", and would launder a dropped whole
+  # slice into a flake-ACCEPT. Strip it so the case degrades to return 2
+  # (marker-absent -> the caller treats the result as untrustworthy). #2100.
+  suspects=$(printf '%s\n%s\n' "$crashed" "$failed" | grep -v '^$' | grep -vx '<none>' | sort -u)
+  ARB_LAST_SUSPECTS=0
+  [ -z "$suspects" ] && return 2
+  nsus=$(printf '%s\n' "$suspects" | grep -c .)
+  ARB_LAST_SUSPECTS=$nsus
+  if [ "$nsus" -gt 8 ]; then
+    grep -E '^\[ FAIL' "$log" | head
+    return 3
+  fi
+  real=0
+  while IFS= read -r t; do
+    [ -z "$t" ] && continue
+    suite="${t%%.*}"
+    passed_alone=0
+    for k in 1 2 3 4 5; do
+      # ARB_ENV forces ASan on the re-run in ASan modes so an ASan-only failure
+      # reproduces (empty array in plain mode -> identical command). The re-run
+      # is by SUITE substring, deliberately unrestricted by any subset list — it
+      # may run a few MORE tests than were selected; harmless extra coverage.
+      if BEZEL_TEST_FILTER="$suite" "${ARB_ENV[@]}" timeout 180 build/tests/bezel_tests >/dev/null 2>&1; then passed_alone=1; break; fi
+    done
+    if [ "$passed_alone" -eq 1 ]; then
+      echo "   FLAKY: $t — its suite PASSES alone within 5 tries (sharding pollution/timing, not a deterministic failure)"
+    else
+      echo "   REAL: $t — fails alone all 5 tries"; real=1
+    fi
+  done <<< "$suspects"
+  [ "$real" -eq 1 ] && return 1
+  return 0
+}
+
+echo "== gate[1/6]: reconfigure (glob any new test files) =="
 PHASE_T0=$(now)
 "$DH" build cmake -S . -B build >"$S/gate_reconf.log" 2>&1; prc=$?
 rec_ran configure "$prc"
 [ "$prc" -ne 0 ] && { tail -15 "$S/gate_reconf.log"; fail "configure"; }
 
-echo "== gate[2/5]: build bezel_tests =="
+echo "== gate[2/6]: build bezel_tests =="
 PHASE_T0=$(now)
 "$DH" build cmake --build build --target bezel_tests -j16 >"$S/gate_build.log" 2>&1; prc=$?
 rec_ran build "$prc"
@@ -194,7 +272,7 @@ echo "   binary: $(ls -la --time-style=+%H:%M:%S build/tests/bezel_tests | awk '
 # surface without the sharding-pollution or wrong-harness (#1682) failure modes
 # the gtest suite is exposed to. Skipped cleanly if lit/FileCheck/not were absent
 # at configure (the site config is only generated when all three are found).
-echo "== gate[3/5]: lit diagnostic track (real bezelc + FileCheck, per-process) =="
+echo "== gate[3/6]: lit diagnostic track (real bezelc + FileCheck, per-process) =="
 if [ -f build/tests/lit/lit.site.cfg.py ]; then
   PHASE_T0=$(now)
   "$DH" build cmake --build build --target bezelc check-lit -j16 >"$S/gate_lit.log" 2>&1; lit_rc=$?
@@ -204,6 +282,75 @@ if [ -f build/tests/lit/lit.site.cfg.py ]; then
 else
   echo "   (check-lit target not configured — lit/FileCheck/not absent; skipping)"
   rec_skip lit "not configured"
+fi
+
+# CANARY tier (#2100): the diff-selected subset, run BEFORE the authoritative
+# pass. FAIL-FAST ONLY — a red canary fails the gate in minutes instead of a
+# broken tree grinding every shard to the timeout ceiling; a green canary
+# proves nothing beyond its subset and the full pass below remains the sole
+# acceptance authority. Inherits the gate's ASan mode (SHARD_ENV) and shares
+# arbitrate() with the full pass. Selector/infra problems SKIP (fail-open).
+# See the CANARY block in the header for the design and knobs.
+echo "== gate[4/6]: canary — diff-selected subset (fail-fast only; never acceptance) =="
+CANARY_LIST="$S/gate_canary.list"
+canary_skip() { echo "   (canary skipped: $1)"; rec_skip canary "$1"; }
+if [ "${GATE_CANARY:-1}" = "0" ]; then
+  canary_skip "GATE_CANARY=0"
+else
+  PHASE_T0=$(now)
+  cbase="${GATE_CANARY_BASE:-}"
+  [ -z "$cbase" ] && cbase="$(git merge-base HEAD origin/main 2>/dev/null || true)"
+  if [ -z "$cbase" ]; then
+    canary_skip "no base (origin/main unavailable and no GATE_CANARY_BASE)"
+  elif ! python3 scripts/select_tests.py --base "$cbase" -o "$CANARY_LIST" >"$S/gate_canary_select.log" 2>&1; then
+    tail -5 "$S/gate_canary_select.log"
+    canary_skip "selector failed (fail-open; see $S/gate_canary_select.log)"
+  else
+    nsel=$(grep -c . "$CANARY_LIST" 2>/dev/null); nsel=${nsel:-0}
+    nuniv=$(grep -oE 'universe: [0-9]+' "$S/gate_canary_select.log" | grep -oE '[0-9]+' | tail -1); nuniv=${nuniv:-0}
+    maxpct="${GATE_CANARY_MAX_PCT:-50}"
+    if [ "$nsel" -eq 0 ]; then
+      canary_skip "empty selection (no mapped src/test diff vs base)"
+    elif [ "$nuniv" -gt 0 ] && [ $(( 100 * nsel / nuniv )) -ge "$maxpct" ]; then
+      canary_skip "selection $nsel/$nuniv >= ${maxpct}% of suite — full pass covers it"
+    else
+      echo "   canary: $nsel of $nuniv tests selected (base $(git rev-parse --short "$cbase" 2>/dev/null || echo "$cbase"))"
+      grep -E '^signals:' "$S/gate_canary_select.log" | head -1 || true
+      "$DH" suite "${SHARD_ENV[@]}" env BEZEL_TEST_LIST="$CANARY_LIST" tests/run_parallel.sh ${GATE_SHARDS:-} >"$S/gate_canary.log" 2>&1; crc=$?
+      rec_ran canary "$crc" "$nsel/$nuniv selected${SHARD_NOTE:+, $SHARD_NOTE}"
+      grep -E 'TOTAL:|WARNING: only' "$S/gate_canary.log" || true
+      # A fired generated-code sanitizer report in the canary is DETERMINISTIC
+      # evidence, exactly as in the full pass — fail hard, no arbitration.
+      if [ "$ASAN" -eq 1 ]; then
+        c_asan=$(grep -cE 'ERROR: (Address|Leak)Sanitizer|aot-asan #1822\] sanitizer fired' "$S/gate_canary.log" 2>/dev/null)
+        if [ "${c_asan:-0}" -gt 0 ]; then
+          echo "   -- generated-code ASan fired in the canary ($c_asan report marker(s)) --"
+          grep -m3 -A18 -E 'ERROR: (Address|Leak)Sanitizer' "$S/gate_canary.log" | head -60
+          fail "canary ASan — memory error in a diff-selected test program (see $S/gate_canary.log)"
+        fi
+      fi
+      if [ "$crc" -ne 0 ]; then
+        PHASE_T0=$(now)  # canary arbitration is its own (exceptional) phase
+        arbitrate "$S/gate_canary.log"; carb=$?
+        case "$carb" in
+          0) rec_ran canary_arbitration "0" "$ARB_LAST_SUSPECTS suspects, all flaky"
+             echo "   all canary suspects flaky (pass alone within 5 tries) -> continue to the full pass";;
+          2) # No arbitrable crash/FAIL marker: an INFRA shape — all-phantom
+             # list (subset_empty), a shard dead before any test, an
+             # undercount, a launch hiccup. Per the canary contract this is
+             # FAIL-OPEN: warn loudly and continue — the authoritative full
+             # pass follows unconditionally and catches anything real. (A
+             # genuine failing/hanging selected test produces a died-on/FAIL
+             # marker and takes the arbitrated paths instead.)
+             rec_ran canary_arbitration "0" "no crash/FAIL marker — infra shape, fail-open"
+             grep -E '## GATE FAILURE|SUBSET' "$S/gate_canary.log" | head -3 || true
+             echo "   canary: nonzero exit with NO crash/FAIL marker (infra/selector shape) -> FAIL-OPEN to the full pass (see $S/gate_canary.log)";;
+          *) rec_ran canary_arbitration "1" "$ARB_LAST_SUSPECTS suspects, real"
+             fail "canary (diff-selected subset) — regression caught BEFORE the full pass (see $S/gate_canary.log)";;
+        esac
+      fi
+    fi
+  fi
 fi
 
 # clang-tidy static-analysis tier (tests/CMakeLists.txt target check-tidy;
@@ -218,7 +365,7 @@ fi
 # build, so it's a consolidation/CI cost (`cmake --build build --target
 # check-tidy`), not a per-merge one. Skips cleanly if clang-tidy /
 # run-clang-tidy are absent.
-echo "== gate[4/5]: clang-tidy static-analysis (advisory; changed TUs only) =="
+echo "== gate[5/6]: clang-tidy static-analysis (advisory; changed TUs only) =="
 if command -v clang-tidy >/dev/null 2>&1 && command -v run-clang-tidy >/dev/null 2>&1; then
   base_ref="$(git merge-base HEAD main 2>/dev/null || true)"
   [ -z "$base_ref" ] && base_ref="HEAD~1"
@@ -232,7 +379,7 @@ else
   rec_skip tidy "no clang-tidy"
 fi
 
-echo "== gate[5/5]: sharded suite ($SHARD_LABEL) — the authoritative oracle =="
+echo "== gate[6/6]: sharded suite ($SHARD_LABEL) — the authoritative oracle =="
 PHASE_T0=$(now)
 "$DH" suite "${SHARD_ENV[@]}" tests/run_parallel.sh ${GATE_SHARDS:-} >"$S/gate_shard.log" 2>&1; rc=$?
 # When ASan is on (--full), the shard phase's recorded duration INCLUDES the
@@ -265,45 +412,22 @@ if [ "$ASAN" -eq 1 ]; then
 fi
 if [ "$rc" -ne 0 ]; then
   PHASE_T0=$(now)  # the flake-arbitration re-runs are their own (exceptional) phase
-  # Collect ALL suspects: shard CRASHES (died on: a program killed its host) AND
-  # assertion FAILs. BOTH can be flaky under sharding — a crash, or a FAIL from
-  # test-pollution (a polluter leaves global state; the round-robin lands it with
-  # a snapshot/leak test). ARBITRATE uniformly: re-run each suspect's SUITE alone
-  # up to 5x. A DETERMINISTIC failure (real regression / over-rejection) fails all
-  # 5; a pollution/timing flake passes at least once. One run isn't enough — it
-  # shares the flake rate. With serial gone (#1861) THIS is the authoritative
-  # re-check: a suspect that passes alone within 5 tries is a sharding flake and
-  # the gate continues; a suspect that fails all 5 is a real regression and fails.
-  crashed=$(grep 'died on:' "$S/gate_shard.log" | sed -E 's/.*died on: //')
-  failed=$(grep -E '^\[ FAIL' "$S/gate_shard.log" | sed -E 's/^\[ FAIL \] //' | awk '{print $1}')
-  suspects=$(printf '%s\n%s\n' "$crashed" "$failed" | grep -v '^$' | sort -u)
-  [ -z "$suspects" ] && { rec_ran shard_arbitration "1" "no crash/FAIL marker"; fail "sharded suite — nonzero exit, no crash/FAIL marker (see $S/gate_shard.log)"; }
-  nsus=$(printf '%s\n' "$suspects" | grep -c .)
-  ARB_SUSPECTS=$nsus
-  # >8 distinct failing suites is a real regression, not pollution flakes; fail
-  # fast (and bound the arbitration cost).
-  if [ "$nsus" -gt 8 ]; then
-    grep -E '^\[ FAIL' "$S/gate_shard.log" | head; rec_ran shard_arbitration "1" "$nsus suspects"; fail "sharded suite — $nsus failing tests (real regression, too many to be flakes)"
-  fi
-  real=0
-  while IFS= read -r t; do
-    [ -z "$t" ] && continue
-    suite="${t%%.*}"
-    passed_alone=0
-    for k in 1 2 3 4 5; do
-      # ARB_ENV forces ASan on the re-run in the default (ASan) mode so an
-      # ASan-only failure reproduces (empty array in --no-asan -> identical command).
-      if BEZEL_TEST_FILTER="$suite" "${ARB_ENV[@]}" timeout 180 build/tests/bezel_tests >/dev/null 2>&1; then passed_alone=1; break; fi
-    done
-    if [ "$passed_alone" -eq 1 ]; then
-      echo "   FLAKY: $t — its suite PASSES alone within 5 tries (sharding pollution/timing, not a deterministic failure)"
-    else
-      echo "   REAL: $t — fails alone all 5 tries"; real=1
-    fi
-  done <<< "$suspects"
-  [ "$real" -eq 1 ] && { rec_ran shard_arbitration "1" "$nsus suspects, a real fail"; fail "sharded suite — a suspect fails alone all 5 tries (real regression)"; }
-  rec_ran shard_arbitration "0" "$nsus suspects, all flaky"
-  echo "   all sharded suspects flaky (pass alone within 5 tries) -> ACCEPT (shard-authoritative; no serial backstop)"
+  # Shared arbitrate() (see its definition above for the full rationale, #1861/
+  # #2100). With serial gone (#1861) THIS is the authoritative re-check: a
+  # suspect that passes alone within 5 tries is a sharding flake and the gate
+  # continues; a suspect that fails all 5 is a real regression and fails.
+  arbitrate "$S/gate_shard.log"; arb=$?
+  ARB_SUSPECTS=$ARB_LAST_SUSPECTS
+  case "$arb" in
+    2) rec_ran shard_arbitration "1" "no crash/FAIL marker"
+       fail "sharded suite — nonzero exit, no crash/FAIL marker (see $S/gate_shard.log)";;
+    3) rec_ran shard_arbitration "1" "$ARB_SUSPECTS suspects"
+       fail "sharded suite — $ARB_SUSPECTS failing tests (real regression, too many to be flakes)";;
+    1) rec_ran shard_arbitration "1" "$ARB_SUSPECTS suspects, a real fail"
+       fail "sharded suite — a suspect fails alone all 5 tries (real regression)";;
+    0) rec_ran shard_arbitration "0" "$ARB_SUSPECTS suspects, all flaky"
+       echo "   all sharded suspects flaky (pass alone within 5 tries) -> ACCEPT (shard-authoritative; no serial backstop)";;
+  esac
 fi
 
 # Combined coverage: the gtest behavior track and the lit diagnostic track are
