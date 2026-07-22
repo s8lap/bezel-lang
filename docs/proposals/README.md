@@ -76,6 +76,7 @@ Conventions:
 | 0061 | [Expression-form studies](0061-expression-form-studies.md) — the binding atom `(var x := E; body)` + `Result` propagation and return-position target-typing; carries the atom admission test | **§1 superseded — graduated v0.216**; §2 recorded (evidence-gated) | — |
 | 0062 | [Small-stdlib ergonomics batch](0062-stdlib-ergonomics-batch.md) — `Counter<K>`, IndexOf-from, PadCenter/Repeat(string) with pinned contracts, JSON options parity, DivRem, Environment typed getters, the corrected purity pass; + the examined-and-deferred register | **superseded — graduated v0.215** | — |
 | 0063 | [Fluent-discard exemption](0063-fluent-discard-exemption.md) — §21.9 stops warning on discarded same-type receiver-chain borrows from method calls (`sb.Append(x);`); sharpened at graduation | **superseded — graduated v0.215** | — |
+| 0064 | [Keyword-led lambdas](0064-keyword-lambdas.md) — `lambda(params): T => body`: token-one commit (retires the parser's last unbounded lookahead and the #1256 guard carve), an optional return-ascription slot (the §27.3 divergent-return fix the current form cannot host), inference otherwise unchanged; carries the cross-language survey, the verified decline of the literal Python form, and the D-0003 migration tension | draft | — |
 
 Supporting records (not numbered proposals):
 
