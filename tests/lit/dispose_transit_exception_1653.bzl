@@ -25,7 +25,7 @@ module M;
 class Resource public method Ping(): () end Ping; end Resource;
 class Program
   public static method Main(): int
-    using var arr := new Array<Resource>();
+    const arr: Array<Resource> := [new Resource()];
     arr.Add(new Resource());
     for var e in arr do
       e.Dispose();
