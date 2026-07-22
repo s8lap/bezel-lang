@@ -290,6 +290,41 @@ BEZEL_TEST(task_wheneach_2082, owned_full_consume_disposed_once) {
         "  end Main; end C;"), 0);
 }
 
+// #2096 follow-up — owning Dispose must dispose an UNCONSUMED FAULTED input's
+// owned exception object, not just bz_task_free it (bz_task_free never touches
+// error_obj, §30.9). One input faults (MakeBoom throws before producing a Cell);
+// the loop consumes the first ok element and breaks, leaving the faulted task
+// AND an ok task in the ready queue at Dispose. bz_we_dispose frees both via the
+// fault-disposing helper: the faulted task's InvalidOperationException is
+// disposed (else it leaks — 40 bytes under LSan), and the ok task's Cell is
+// disposed via its result disposer. Oracle: Cell.n == 0 (the 2 ok Cells disposed
+// exactly once) AND leak-clean (the faulted exception object disposed).
+BEZEL_TEST(task_wheneach_2082, owned_faulted_input_unconsumed_disposed_no_leak) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kCell +
+        "class C "
+        "  public static async method MakeOk(): OwningTask<Cell> "
+        "    return new Cell(); end MakeOk; "
+        "  public static async method MakeBoom(): OwningTask<Cell> "
+        "    throw new InvalidOperationException(\"boom\"); end MakeBoom; "
+        "  public static method Make(): owned OwningArray<OwningTask<Cell>> "
+        "    var arr := new OwningArray<OwningTask<Cell>>(); "
+        "    arr.Add(C.MakeOk()); "
+        "    arr.Add(C.MakeBoom()); "  // faulted, left unconsumed at Dispose
+        "    arr.Add(C.MakeOk()); "
+        "    return arr; "
+        "  end Make; "
+        "  public static async method Main(): Task<int> "
+        "    var count := 0; "
+        "    await for var tk in Task.WhenEachOwned(owned C.Make()) do "
+        "      using var x := await tk; "
+        "      count := count + 1; "
+        "      break; "  // dispose with a faulted + an ok task still queued
+        "    end; "
+        "    return Cell.n; "  // 0, and the faulted exception object disposed
+        "  end Main; end C;"), 0);
+}
+
 // §6.7 v0.212 / 0023 D5 + D7: owning EMPTY input completes immediately (no
 // iterations); Dispose frees the (empty) array container. Oracle: 0.
 BEZEL_TEST(task_wheneach_2082, owned_empty_completes_immediately) {

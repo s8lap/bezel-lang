@@ -3708,6 +3708,25 @@ static void bz_we_release(bz_task_when_each_enumerator_t* e) {
     if (e->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) delete e;
 }
 
+// #2096 follow-up: discharge an OwningTask<T> the enumerator still owns. Unlike
+// bz_task_free, this ALSO disposes the task's OWNED fault exception first —
+// bz_task_free deliberately never touches error_obj (§30.9: the fault object is
+// disposed by whoever disposes the task), so a faulted WhenEachOwned input that
+// is never consumed would otherwise leak its exception object. Mirrors
+// bz_task_fire_and_forget's slow-path continuation and WhenAllOwned's input-
+// fault handling. `fault_borrowed` is honored for symmetry (a WhenEachOwned
+// input owns its own fault, so it is normally false — but a borrowed fault must
+// never be disposed here). Only used on the owning path.
+static void bz_we_free_owned_task(void* tp) {
+    if (!tp) return;
+    auto* t = (bz_task_t*)tp;
+    if (t->error_obj && !t->fault_borrowed) {
+        bz_dispose_class_obj(t->error_obj);
+        t->error_obj = nullptr;
+    }
+    bz_task_free(t);
+}
+
 // bz_we_dispose: vtable slot 1. Idempotent. Marks the enumerator disposed,
 // wakes any MoveNextAsync waiter (which will see disposed/exhausted and
 // return false), and frees unconsumed resources.
@@ -3740,9 +3759,9 @@ static void bz_we_dispose(void* self) {
         while (!e->ready.empty()) {
             auto p = e->ready.front();
             e->ready.pop_front();
-            if (p.second) bz_task_free(p.second);
+            if (p.second) bz_we_free_owned_task(p.second);  // + fault dispose
         }
-        if (e->current_yielded) bz_task_free(e->current_yielded);
+        bz_we_free_owned_task(e->current_yielded);  // null-safe; + fault dispose
         // The input array CONTAINER is ours: WhenEachOwned took ownership of
         // the OwningArray (the §28.8 owned-sink rule moved the caller's
         // disposal obligation to us — see builtinOwnedSinkArg for
@@ -3896,20 +3915,25 @@ static void* bz_we_take_current(void* self) {
 
 static void* g_we_vtable_borrowing[4] = {nullptr, nullptr, nullptr, nullptr};
 static void* g_we_vtable_owning[4]    = {nullptr, nullptr, nullptr, nullptr};
-static int g_we_vtables_inited = 0;
+static std::once_flag g_we_vtables_once;
 
+// Thread-safe one-time vtable fill. A plain `if (inited) return; inited = 1;`
+// flag has a first-use data race: two threads constructing enumerators
+// concurrently (WhenEach on different domains) could both see inited==0 and one
+// read a half-filled vtable. std::call_once serializes the initialization and
+// publishes it with the right happens-before to every caller.
 static void bz_we_vtables_init(void) {
-    if (g_we_vtables_inited) return;
-    g_we_vtables_inited = 1;
-    // vtable[0] = self-reference (set after the address of the global is known).
-    g_we_vtable_borrowing[0] = g_we_vtable_borrowing;  // self
-    g_we_vtable_borrowing[1] = (void*)bz_we_dispose;
-    g_we_vtable_borrowing[2] = (void*)bz_we_move_next;
-    g_we_vtable_borrowing[3] = (void*)bz_we_current;
-    g_we_vtable_owning[0] = g_we_vtable_owning;
-    g_we_vtable_owning[1] = (void*)bz_we_dispose;
-    g_we_vtable_owning[2] = (void*)bz_we_move_next;
-    g_we_vtable_owning[3] = (void*)bz_we_take_current;
+    std::call_once(g_we_vtables_once, []() {
+        // vtable[0] = self-reference (set after the global's address is known).
+        g_we_vtable_borrowing[0] = g_we_vtable_borrowing;  // self
+        g_we_vtable_borrowing[1] = (void*)bz_we_dispose;
+        g_we_vtable_borrowing[2] = (void*)bz_we_move_next;
+        g_we_vtable_borrowing[3] = (void*)bz_we_current;
+        g_we_vtable_owning[0] = g_we_vtable_owning;
+        g_we_vtable_owning[1] = (void*)bz_we_dispose;
+        g_we_vtable_owning[2] = (void*)bz_we_move_next;
+        g_we_vtable_owning[3] = (void*)bz_we_take_current;
+    });
 }
 
 // Per-input-task completion helper for init. Pushes the completed task
@@ -3960,9 +3984,11 @@ static void bz_we_input_completed(void* completedTask, void* state) {
         }
     }
     if (advance) bz_task_complete(advance, &value, 1);
-    // Discharge outside the enum lock: bz_task_free may run the task's
-    // result_disposer (a user destructor), which must not run under e->mtx.
-    if (free_completed) bz_task_free(completedTask);
+    // Discharge outside the enum lock: bz_we_free_owned_task may run the task's
+    // result_disposer AND its fault exception's Dispose (user destructors),
+    // which must not run under e->mtx. Fault dispose closes the leak of a
+    // faulted-after-Dispose owning input's exception object (#2096 follow-up).
+    if (free_completed) bz_we_free_owned_task(completedTask);
     e->cv.notify_all();
     delete slot;
     bz_we_release(e);
