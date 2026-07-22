@@ -100,9 +100,20 @@ scripted by `scripts/extract_diag_to_lit.py`.
   the coordinator/gate's job.
 - Targeted, by hand: `BEZEL_TEST_FILTER=<substr> build/tests/bezel_tests` (the
   binary ignores `--gtest_filter`).
+- Exact-list subset (#2100): `BEZEL_TEST_LIST=<file>` — one `suite.name` per
+  line, exact match, composable with the filter. The summary then carries an
+  explicit `N selected` field and `run_parallel.sh` switches its drop-detection
+  to *selected == ran* (an empty/unmatched list fails loudly, never green).
+  Lists are produced by `scripts/select_tests.py` (diff → affected tests;
+  `--variant lane` for a tight lane subset, `--variant gate` for the canary;
+  `--check` self-tests its parsing invariants). Lane convenience:
+  `scripts/agent_check.sh --select [base]`.
 - Sharded (whole suite): `tests/run_parallel.sh 16`. **Serial**
   (`build/tests/bezel_tests`) is the authoritative oracle — the sharded runner can
   over-report under fork-resource contention; a real failure reproduces serially.
 - lit track: `cmake --build build --target check-lit`.
 - Full gate: `scripts/gate.sh` (`--full` adds the whole-suite ASan sweep, for
-  codegen/runtime/disposal/layout changes).
+  codegen/runtime/disposal/layout changes). The gate runs a diff-selected
+  **canary** subset before the authoritative full pass — fail-fast only, never
+  acceptance (#2100; knobs `GATE_CANARY=0`, `GATE_CANARY_BASE`,
+  `GATE_CANARY_MAX_PCT`).

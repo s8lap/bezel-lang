@@ -27,6 +27,15 @@
 #                                                     (substring match on gtest
 #                                                     suite-or-name; NOT the file
 #                                                     basename). One or more.
+#   scripts/agent_check.sh --select [BASE]            auto-derive the subset from
+#                                                     the lane's OWN diff vs BASE
+#                                                     (default: merge-base HEAD
+#                                                     main) via select_tests.py
+#                                                     --variant lane (#2100), and
+#                                                     run it via BEZEL_TEST_LIST.
+#                                                     Still a targeted lane check
+#                                                     — NOT acceptance; the gate
+#                                                     remains the authority.
 #   scripts/agent_check.sh --build-only               reconfigure + build bezel_tests
 #   scripts/agent_check.sh --probe FILE.bzl [args..]  compile ONE .bzl with bezelc
 #                                                     (output -> the scratch dir)
@@ -103,6 +112,39 @@ fi
 if [ "${1:-}" = "--build-only" ]; then
   build_target bezel_tests "$BUILD_DIR/tests/bezel_tests"
   echo "== agent_check: build OK =="
+  exit 0
+fi
+
+# --- select mode: auto-derive the lane's subset from its own diff (#2100) -----
+# The 'lane' selector variant (issue-number + fine-§ + diagnostic-string; no
+# directory fallback) is deliberately tight — median ~2.5% of the suite — so
+# this stays a targeted lane check, not a gate. Runs sharded (8) via
+# run_parallel, whose subset accounting (BEZEL_TEST_LIST -> selected==ran)
+# keeps the drop-detection contract. An EMPTY selection is a hard error: pass
+# explicit filters instead of trusting a selector that mapped nothing.
+if [ "${1:-}" = "--select" ]; then
+  shift
+  base="${1:-}"
+  if [ -z "$base" ]; then
+    base="$(git -C "$ROOT" merge-base HEAD main 2>/dev/null || true)"
+  fi
+  [ -n "$base" ] || die "--select: cannot determine a base (pass one: agent_check.sh --select <ref>)"
+  BIN="$BUILD_DIR/tests/bezel_tests"
+  build_target bezel_tests "$BIN"
+  list="$SCRATCH/select_$$.list"
+  python3 "$ROOT/scripts/select_tests.py" --repo "$ROOT" --base "$base" \
+    --variant lane -o "$list" || die "--select: selector failed"
+  n="$(grep -c . "$list" 2>/dev/null || true)"
+  [ "${n:-0}" -gt 0 ] || die "--select: selection is EMPTY for base $base — the diff mapped to no tests; pass explicit filters instead"
+  echo "== agent_check: --select: $n diff-selected tests (base $base; dev_heavy suite, 8 shards) =="
+  log="$SCRATCH/test_select.log"
+  "$DH" suite env BEZEL_TEST_LIST="$list" "$ROOT/tests/run_parallel.sh" 8 "$BIN" 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  grep -E 'WARNING: only' "$log" || true
+  if [ "$rc" -ne 0 ]; then
+    echo "agent_check: --select had failures (exit $rc)"; exit 1
+  fi
+  echo "== agent_check: --select green ($n selected) =="
   exit 0
 fi
 
