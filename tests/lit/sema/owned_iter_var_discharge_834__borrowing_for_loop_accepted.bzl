@@ -12,7 +12,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class C public static method Main(): int using var arr := new Array<int>(); arr.Add(1); arr.Add(2); var total := 0; for var x in arr do total := total + x; end; return total; end Main; end C;
+module M; class C public static method Main(): int const arr: Array<int> := [1, 2]; var total := 0; for var x in arr do total := total + x; end; return total; end Main; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

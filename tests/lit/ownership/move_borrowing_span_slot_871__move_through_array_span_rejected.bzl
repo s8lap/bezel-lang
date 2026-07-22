@@ -7,7 +7,7 @@
 // — a borrowing view whose slots are borrows. `move sp[0]` is a compile error.
 // This is the exact #871 repro that compiled and SEGFAULTED before the fix.
 
-module M; class Cell public constructor() end; destructor end; end Cell; class C public static method Main(): int using var arr := new Array<Cell>(); using var c1 := new Cell(); arr.Add(c1); var sp := arr.AsSpan(); using var taken := move sp[0]; return 42; end Main; end C;
+module M; class Cell public constructor() end; destructor end; end Cell; class C public static method Main(): int const arr: Array<Cell> := []; var c1 := new Cell(); arr.Add(move c1); var sp := arr.AsSpan(); using var taken := move sp[0]; return 42; end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: `move` is not admitted through a borrowing span slot: `ArraySpan` views a borrowing source (a non-owning `Array<T>`, `string`, or read-only buffer), so its slots hold borrows with no ownership to transfer
 // CHECK-SAME: (§28.11 / §4.15 — `move arrSpan[i]` is rejected; use the plain indexer-get to read the borrow)

@@ -8,7 +8,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class C public static method Test() using var arr := new Array<int>(); arr.Add(1); arr.Add(2); var sp := arr.AsSpan(); var _len := sp.Length; var _emp := sp.IsEmpty; var _idx := sp.IndexOf(1); var _cnt := sp.Contains(1); var _sl := sp.Slice(0, 1); var _ro := sp.AsReadOnly(); sp.Fill(0); sp.Reverse(); end Test; end C;
+module M; class C public static method Test() const arr: Array<int> := [1, 2]; var sp := arr.AsSpan(); var _len := sp.Length; var _emp := sp.IsEmpty; var _idx := sp.IndexOf(1); var _cnt := sp.Contains(1); var _sl := sp.Slice(0, 1); var _ro := sp.AsReadOnly(); sp.Fill(0); sp.Reverse(); end Test; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

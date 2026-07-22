@@ -9,7 +9,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class Foo public n: int := 0; end Foo; interface IFoo method F(): int; end IFoo; class C public static method Main(): int using var a := new Array<string>(); a.Add("x"); return 0; end Main; end C;
+module M; class Foo public n: int := 0; end Foo; interface IFoo method F(): int; end IFoo; class C public static method Main(): int const a: Array<string> := ["x"]; return 0; end Main; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

@@ -6,7 +6,7 @@
 // §15.4 / §22.7 (#599 must-fail): `new Array<string>(["a", "b"])` — same
 // issue with a string element type.
 
-module M; class C public static method M() using var arr := new Array<string>(["a", "b"]); end M; end C;
+module M; class C public static method M() new Array<string>(["a", "b"]); end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: collection literal `[..]` cannot be passed as an argument to `new Array<...>` — the constructor takes an optional `int` capacity, not a collection literal; use a typed-target declaration instead: `var x: Array<T> := [...]`
 // CHECK-SAME: (§15.4, #599)

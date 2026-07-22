@@ -5,7 +5,7 @@
 //
 // (c) inline `out var x` infers `int?` — a non-nullable use without `!` REJECTS.
 
-module M; class Cell public _v: int := 0; public constructor(v: int) _v := v; end constructor; destructor end destructor; end Cell; class C public static method Main(): int do using var s := new Stack<int>(); s.Push(1); if s.TryPop(out var x) then return x; end; end; return 0; end Main; end C;
+module M; class C public static method Main(): int do const s: Stack<int> := [1]; if s.TryPop(out var x) then return x; end; end; return 0; end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: the returned value is nullable but the target type is non-nullable
 // CHECK-SAME: (§7)

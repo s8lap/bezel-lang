@@ -6,7 +6,7 @@
 // §15.4 (#599 must-fail): a Set<int> ctor also takes an optional int
 // capacity, not a collection literal.
 
-module M; class C public static method M() using var s := new Set<int>([1, 2, 3]); end M; end C;
+module M; class C public static method M() new Set<int>([1, 2, 3]); end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: collection literal `[..]` cannot be passed as an argument to `new Set<...>` — the constructor takes an optional `int` capacity, not a collection literal; use a typed-target declaration instead: `var x: Set<T> := [...]`
 // CHECK-SAME: (§15.4, #599)

@@ -5,6 +5,6 @@
 //
 // (a) explicit NON-nullable recipient — Dictionary.TryGetValue → REJECT.
 
-module M; class Cell public _v: int := 0; public constructor(v: int) _v := v; end constructor; destructor end destructor; end Cell; class C public static method Main(): int do using var d := new Dictionary<string, int>(); d.Add("a", 1); var v: int := 0; var ok := d.TryGetValue("a", out v); end; return 0; end Main; end C;
+module M; class C public static method Main(): int do const d: Dictionary<string, int> := ["a": 1]; var v: int := 0; var ok := d.TryGetValue("a", out v); end; return 0; end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: the `out` recipient of `TryGetValue` must be nullable: every extraction Try's out parameter is `T?` and the false path assigns `null` (stdlib §1 / §22.3, v0.171 #1336). Declare the recipient nullable (`T?`) or use an inline `out var` / `out owned var` / `out using var` form.

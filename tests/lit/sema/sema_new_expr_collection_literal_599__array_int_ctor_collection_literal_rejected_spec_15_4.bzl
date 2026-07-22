@@ -8,7 +8,7 @@
 // collection literal `[10, 20, 30]` has type `Array<int>`, not `int`.
 // This must be a compile error.
 
-module M; class C public static method M() using var arr := new Array<int>([10, 20, 30]); end M; end C;
+module M; class C public static method M() new Array<int>([10, 20, 30]); end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: collection literal `[..]` cannot be passed as an argument to `new Array<...>` — the constructor takes an optional `int` capacity, not a collection literal; use a typed-target declaration instead: `var x: Array<T> := [...]`
 // CHECK-SAME: (§15.4, #599)

@@ -8,7 +8,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class Cell public _v: int := 0; public constructor(v: int) _v := v; end constructor; destructor end destructor; end Cell; class C public static method Main(): int do using var d := new Dictionary<string, int>(); d.Add("a", 1); if d.TryGetValue("a", out _) then return 1; end; end; return 0; end Main; end C;
+module M; class C public static method Main(): int do const d: Dictionary<string, int> := ["a": 1]; if d.TryGetValue("a", out _) then return 1; end; end; return 0; end Main; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §
