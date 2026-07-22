@@ -1,6 +1,7 @@
 #include "sema/TypeResolution_impl.hpp"
 
 #include "common/BuiltinRegistry.hpp"
+#include "common/OwnershipFacts.hpp"  // classifyChoiceType — §35.7 equality-bearing choice edge (#2087)
 
 #include "sema/ConstFold.hpp"
 #include "sema/Sendability.hpp"  // isSendableType — §30.14 sendability computation
@@ -1511,12 +1512,45 @@ void Resolver::checkEqualityCoDeclaration() {
 void Resolver::checkHashContainerKeys() {
     std::unordered_set<const ast::Type*> reported;
 
+    // §3.6/§8.3: the two non-equality-bearing shapes are (a) a record that
+    // neither synthesizes nor declares equality (#1338) and (b) — v0.210/
+    // v0.214, #2083/#2087 — a choice that is not value-like auto-equality-
+    // bearing (§35.7: owning / borrow-bearing, or value-like with a payload
+    // outside the recursive §9.2 admissible-component rule — the #2110
+    // key-position half). The reason clause is kind-aware so an owning-choice
+    // key does not draw the record-worded message.
+    auto reasonClause = [&](const TypeRef* keyRef) -> std::string {
+        const TypeSymbol* d = keyRef ? keyRef->declaration : nullptr;
+        if (d && d->kind == ast::TypeDeclKind::Choice) {
+            auto v = common::classifyChoiceType(keyRef, ctx_);
+            if (v && *v == common::ChoiceClassification::ValueLike)
+                // Value-like yet not equality-bearing: the RECURSIVE §35.7
+                // rule rejected a case payload (function/Object/etc.).
+                return "it is a choice that is value-like but has a case "
+                       "payload outside the \xC2\xA7""9.2 admissible-component "
+                       "rule (\xC2\xA7""35.7), so it is not "
+                       "auto-equality-bearing. Restructure the payload, or "
+                       "use an equality-bearing key type.";
+            const char* cat =
+                (v && *v == common::ChoiceClassification::Owning)
+                    ? "owning"
+                    : "borrow-bearing";
+            return std::string("it is a choice that is ") + cat +
+                   " (\xC2\xA7""35.7), not value-like auto-equality-bearing. "
+                   "Restructure it to a value-like choice, or declare custom "
+                   "equality.";
+        }
+        return "it is a record that is neither auto-equality-bearing "
+               "(\xC2\xA7""9.2) nor declares custom equality (`operator =`/`<>` "
+               "with `Equals(T)` and `override GetHashCode`, \xC2\xA7""25.2). "
+               "Give it an auto-equality-bearing form, or declare custom "
+               "equality.";
+    };
+
     // Pass 1: direct (non-generic-param) key check (the original #1338 logic).
     for (const HashContainerSite& s : hashContainerSites_) {
         if (isEqualityBearing(s.keyRef, ctx_)) continue;
         if (s.site && !reported.insert(s.site).second) continue;  // dedup per site
-        // The only non-equality-bearing case is a record that neither
-        // synthesizes equality nor declares user equality.
         const TypeSymbol* rec = s.keyRef ? s.keyRef->declaration : nullptr;
         std::string keyName =
             rec ? ("`" + std::string(rec->name) + "`") : std::string("it");
@@ -1526,11 +1560,8 @@ void Resolver::checkHashContainerKeys() {
             std::string("`") + std::string(s.container) +
             "` requires an equality-bearing " + std::string(s.property) +
             " type, but the type argument " + keyName +
-            " is not equality-bearing (\xC2\xA7""3.6/\xC2\xA7""8.3): it is a "
-            "record that is neither auto-equality-bearing (\xC2\xA7""9.2) nor "
-            "declares custom equality (`operator =`/`<>` with `Equals(T)` and "
-            "`override GetHashCode`, \xC2\xA7""25.2). Give it an "
-            "auto-equality-bearing form, or declare custom equality.");
+            " is not equality-bearing (\xC2\xA7""3.6/\xC2\xA7""8.3): " +
+            reasonClause(s.keyRef));
     }
 
     // Pass 2 (#1384): per-instantiation check for sites whose key is a generic
@@ -1580,11 +1611,8 @@ void Resolver::checkHashContainerKeys() {
                 std::string("`") + std::string(s.container) +
                 "` requires an equality-bearing " + std::string(s.property) +
                 " type, but the type argument " + keyName +
-                " is not equality-bearing (\xC2\xA7""3.6/\xC2\xA7""8.3): it is a "
-                "record that is neither auto-equality-bearing (\xC2\xA7""9.2) nor "
-                "declares custom equality (`operator =`/`<>` with `Equals(T)` and "
-                "`override GetHashCode`, \xC2\xA7""25.2). Give it an "
-                "auto-equality-bearing form, or declare custom equality.");
+                " is not equality-bearing (\xC2\xA7""3.6/\xC2\xA7""8.3): " +
+                reasonClause(concreteKey));
         }
     }
 }
@@ -3470,6 +3498,28 @@ void Resolver::checkOneConstraint(const ast::Type& t,
         if (arg->kind == TypeRef::Kind::Error) return;
         if (!isSendableType(arg, ctx_))
             report("sendable", sendableFailureComponentPath(arg, ctx_));
+        return;
+    }
+    if (item.kind == "hashable") {
+        // §14.2 "Derived-property constraints" (v0.214, #2087): the constraint
+        // names the §3.6 **equality-bearing** derived-property (the keyword
+        // names the capability site — hash-container keys/elements — while the
+        // property keeps its §3.6 name). Satisfaction is decided per
+        // instantiation, after substitution, by the property's defining
+        // computation — isEqualityBearing, the SAME evaluation the §3.6 rule-2
+        // hash-container-key check (checkHashContainerKeys) and the use-site
+        // `=`/`<>` equality error perform; the constraint adds no second
+        // definition of the property. The diagnostic at the instantiation site
+        // replaces the interior one the caller would otherwise hit (§14.2).
+        // Defer on an Error TypeRef (an upstream failure is already reported).
+        //
+        // §3.6 rule 4: the diagnostic NAMES the structural reason as a
+        // component path — the offending record/choice + the failing §9.2/§35.7
+        // reason (appended only when the type is that record/choice failure
+        // shape; falls back to the flat message otherwise).
+        if (arg->kind == TypeRef::Kind::Error) return;
+        if (!isEqualityBearing(arg, ctx_))
+            report("hashable", hashableFailureComponentPath(arg, ctx_));
         return;
     }
     if (item.kind == "type") {

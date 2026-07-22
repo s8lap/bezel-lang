@@ -457,6 +457,24 @@ bool recordHasUserDeclaredEquality(const TypeSymbol* rec);
 // equality), is an auto-equality-bearing body record (§9.2), or declares
 // `operator =`/`<>`. A null or unresolved type is treated as equality-bearing
 // (conservative — never over-rejects at an instantiation site).
+// v0.214 (#2087): a **choice** is equality-bearing iff it is value-like
+// auto-equality-bearing (§35.7); owning and borrow-bearing choices are not,
+// decided by the same §35.4 classifier the use-site `=`/`<>` error consults.
 bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx);
+
+// §14.2 (v0.214, #2087): given a type that has just FAILED isEqualityBearing,
+// return a component-path fragment naming the offending type + the §3.6/§9.2/
+// §35.7 structural reason, shaped to APPEND after the flat `where T: hashable`
+// constraint-failure diagnostic's §14.2 citation, e.g.
+//   ": record `Bad` is neither auto-equality-bearing (§9.2) nor declares custom
+//     equality (…, §25.2)"
+//   ": choice `Handle` is owning (§35.7), not value-like auto-equality-bearing"
+// The equality-bearing property surfaces its failure at the top-level type (a
+// non-auto-equality-bearing record, or a non-value-like choice), so the path is
+// the offending type itself — the analog of sendableFailureComponentPath at the
+// detail level §3.6 supports for this property. Returns empty (caller keeps the
+// flat message) for any type outside that record/choice failure shape.
+std::string hashableFailureComponentPath(const TypeRef* ty,
+                                         const SemaContext& ctx);
 
 } // namespace bezel::sema

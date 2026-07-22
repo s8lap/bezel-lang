@@ -2540,17 +2540,21 @@ std::vector<ast::GenericConstraint> Parser::parseGenericConstraints() {
         auto parseConstraintItem = [&]() -> ast::ConstraintItem {
             ast::ConstraintItem item;
             // A.3 Constraint ::= "class" | "value" | "notnull" | "sendable"
-            //                  | "new" "(" ")" | Type.
-            // `class` is reserved; `value`, `notnull`, and `sendable` are
-            // contextual (App. B.2) so the lexer produces Identifier tokens.
-            // `sendable` names the §30.14 sendable derived-property constraint
-            // (v0.201, §14.2 "Derived-property constraints").
+            //                  | "hashable" | "new" "(" ")" | Type.
+            // `class` is reserved; `value`, `notnull`, `sendable`, and
+            // `hashable` are contextual (App. B.2) so the lexer produces
+            // Identifier tokens. `sendable` names the §30.14 sendable
+            // derived-property constraint; `hashable` names the §3.6
+            // equality-bearing derived-property constraint (the keyword names
+            // the capability site, the property keeps its §3.6 name) —
+            // v0.214, §14.2 "Derived-property constraints".
             if (consumeKeyword("class")) {
                 item.kind = "class";
             } else if (current_.kind == TokenKind::Identifier &&
                        (current_.text == "value" ||
                         current_.text == "notnull" ||
-                        current_.text == "sendable")) {
+                        current_.text == "sendable" ||
+                        current_.text == "hashable")) {
                 item.kind = current_.text;
                 advance();
             } else if (consumeKeyword("new")) {
@@ -2573,9 +2577,10 @@ std::vector<ast::GenericConstraint> Parser::parseGenericConstraints() {
             // per §1.6 / proposal 0059 (v0.214): optional trailing `,` before
             // the end of the where-clause region. A ConstraintItem starts with
             // the keyword `class` / `new`, or an Identifier (a contextual
-            // constraint name like `value` / `notnull` / `sendable`, or a
-            // type name). Anything else — the next `where` keyword (next
-            // clause), the body opener `{`, the record-shorthand terminator
+            // constraint name like `value` / `notnull` / `sendable` /
+            // `hashable`, or a type name). Anything else — the next `where`
+            // keyword (next clause), the body opener `{`, the record-shorthand
+            // terminator
             // `;`, an expression-body arrow `=>`, a member visibility
             // (`public`/`private`/`protected`/`internal`) or member-kind
             // keyword — ends the region.

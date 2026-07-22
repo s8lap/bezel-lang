@@ -1983,6 +1983,28 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         report("sendable",
                                                sendableFailureComponentPath(
                                                    argRef, ctx_));
+                                } else if (item.kind == "hashable") {
+                                    // §14.2 "Derived-property constraints"
+                                    // (v0.214, #2087): names the §3.6
+                                    // equality-bearing derived-property.
+                                    // Satisfaction runs through the shared
+                                    // isEqualityBearing computation — the same
+                                    // evaluation the type-instantiation site
+                                    // (Resolver::checkOneConstraint), the
+                                    // §3.6 rule-2 hash-container-key check, and
+                                    // the use-site `=`/`<>` equality error use.
+                                    // Defer on an Error TypeRef.
+                                    //
+                                    // §3.6 rule 4: the diagnostic NAMES the
+                                    // structural reason as a component path —
+                                    // the offending record/choice + the failing
+                                    // §9.2/§35.7 reason, APPENDED when the type
+                                    // is that failure shape (else flat).
+                                    if (argRef->kind != TypeRef::Kind::Error &&
+                                        !isEqualityBearing(argRef, ctx_))
+                                        report("hashable",
+                                               hashableFailureComponentPath(
+                                                   argRef, ctx_));
                                 } else if (item.kind == "new") {
                                     // §14.2 (#864 part 2): `where T: new()`
                                     // requires an accessible parameterless ctor.

@@ -1,7 +1,7 @@
 #include "sema/SymbolCollection.hpp"
 
 #include "ast/Node.hpp"
-#include "common/OwnershipFacts.hpp"
+#include "common/OwnershipFacts.hpp"  // classifyChoiceType — §35.7 equality-bearing choice edge (#2083/#2087)
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
@@ -683,9 +683,11 @@ bool recordHasUserDeclaredEquality(const TypeSymbol* rec) {
 // interface, function, or owning-inline-array type would reach here).
 //
 // Imported choices (no ast::TypeDecl — only the body symbol) are conservatively
-// treated as auto-equality-bearing when the classification succeeds: the
-// per-payload rule operates on the AST's Param types, which are not locally
-// available across module boundaries for an imported choice. The §3.6 rule-2
+// treated as auto-equality-bearing: classifyChoiceType returns nullopt without
+// a local AST, and nullopt maps to ACCEPT here (never over-reject a type we
+// cannot inspect — the record posture, and #2087's convention). The per-payload
+// rule operates on the AST's Param types, which are not locally available
+// across module boundaries for an imported choice. The §3.6 rule-2
 // per-instantiation discipline re-checks concrete generic arguments at each
 // instantiation.
 //
@@ -703,17 +705,23 @@ bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
                                  const SemaContext& ctx) {
     if (!ch || ch->kind != ast::TypeDeclKind::Choice) return false;
     // §35.4: compute the classification. classifyChoiceType returns nullopt
-    // for non-choice types and imported choices without an AST node; the
-    // import path is handled conservatively below.
+    // precisely when it cannot see an ast::TypeDecl — for a choice-kinded
+    // symbol that means an IMPORTED choice (no local AST). Treat nullopt as
+    // conservative-ACCEPT, matching the record posture (isEqualityBearing's
+    // null/unresolved `return true`) and the #2087 convention: a constraint /
+    // key check never over-rejects on a type it cannot inspect. (The pre-
+    // rework code returned false here, which made its own imported→accept
+    // branch below dead code — the review's finding 3.)
     TypeRef rt;
     rt.kind = TypeRef::Kind::Named;
     rt.declaration = const_cast<TypeSymbol*>(ch);
     auto verdict = common::classifyChoiceType(&rt, ctx);
-    if (!verdict || *verdict != common::ChoiceClassification::ValueLike)
+    if (!verdict) return true;
+    if (*verdict != common::ChoiceClassification::ValueLike)
         return false;
-    // Imported choice: classification succeeds (in-tree) or we treat as
-    // auto-equality-bearing conservatively. If the AST is missing we cannot
-    // walk payloads — accept on the classification verdict alone.
+    // Defensive: classification succeeded, so the AST is present; if it were
+    // somehow missing we cannot walk payloads — accept on the ValueLike
+    // classification verdict alone (same conservative posture as above).
     auto* td = dynamic_cast<const ast::TypeDecl*>(ch->decl);
     if (!td) return true;
     // Every case: every payload field must be a §9.2 admissible component
@@ -737,7 +745,8 @@ bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
 }
 
 // §3.6 / §8.3 (v0.158, #1338): see Symbol.hpp. A type is equality-bearing unless
-// it is a record that neither synthesizes equality nor declares user equality.
+// it is a record that neither synthesizes equality nor declares user equality,
+// or a choice that is not value-like auto-equality-bearing (§35.7, v0.214).
 bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx) {
     if (!ty) return true;                              // unresolved: conservative
     // The underlying type carries the equality contract; a nullable key `K?`
@@ -765,17 +774,81 @@ bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx) {
         return isAutoEqualityBearingBodyRecord(ts, ctx) ||
                recordHasUserDeclaredEquality(ts);
     }
-    // §35.7 (v0.210, #2083): a CHOICE is equality-bearing exactly when it is
-    // auto-equality-bearing — i.e. value-like with all case payloads
-    // admissibly typed. A borrow-bearing or owning choice carries no value
-    // equality contract and is NOT equality-bearing (Dictionary<Outcome, _>
-    // keys fail here per §3.6). A primitive, string, class, interface,
-    // function, enum, or inline array is equality-bearing (the `return true`
-    // fall-through applies).
+    // §35.7 (v0.210/v0.214, #2083/#2087): a CHOICE is equality-bearing exactly
+    // when it is auto-equality-bearing — i.e. value-like with all case payloads
+    // admissibly typed (the RECURSIVE §35.7 rule: "this same list applied to
+    // every case's payload fields"; classification alone under-enforces — a
+    // value-like choice with a function/Object payload is value-like but not
+    // equality-bearing, the key-position half of #2110). A borrow-bearing or
+    // owning choice carries no value equality contract and is NOT
+    // equality-bearing (Dictionary<Outcome, _> keys fail here per §3.6). This
+    // one computation also decides the §14.2 `where T: hashable` constraint
+    // (#2087) — "the constraint adds no second definition of the property" —
+    // and the §3.6 rule-2 hash-container-key check, so the constraint, the
+    // key check, and the use-site `=`/`<>` error can never disagree. A
+    // primitive, string, class, interface, function, enum, or inline array is
+    // equality-bearing (the `return true` fall-through applies).
     if (ts->kind == ast::TypeDeclKind::Choice)
         return isAutoEqualityBearingChoice(ts, ctx);
     return true;  // class (reference identity), interface, enum — all bear
                   // consistent Equals/GetHashCode.
+}
+
+// §14.2 (v0.214, #2087): the component-path fragment for a FAILED
+// `where T: hashable` constraint — see Symbol.hpp. Precondition:
+// isEqualityBearing(ty, ctx) == false. The equality-bearing property surfaces
+// its failure at the top-level type (a non-auto-equality-bearing record, or a
+// non-value-like choice), so the "component path" is the offending type + the
+// §3.6/§9.2/§35.7 reason — the analog of sendableFailureComponentPath, at the
+// detail level §3.6 supports for this property. Returns empty (the caller keeps
+// the flat message) when the type is not the record/choice failure shape.
+std::string hashableFailureComponentPath(const TypeRef* ty,
+                                         const SemaContext& ctx) {
+    if (!ty || ty->kind != TypeRef::Kind::Named || !ty->declaration) return {};
+    const TypeSymbol* ts = ty->declaration;
+    // Fragment prefix — reads naturally after the parent §14.2 citation:
+    // "...does not satisfy the constraint `where T: hashable` (§14.2): ...".
+    const std::string prefix = ": ";
+    if (ts->kind == ast::TypeDeclKind::Choice) {
+        auto verdict = common::classifyChoiceType(ty, ctx);
+        if (!verdict) return {};  // unclassifiable (imported) — flat reason
+        if (*verdict == common::ChoiceClassification::ValueLike) {
+            // Value-like yet still failed isEqualityBearing → the RECURSIVE
+            // §35.7 rule rejected a payload (v0.210/#2083 merged rule; the
+            // rework's finding 3): name the offending case/payload component
+            // so the diagnostic carries the §3.6 rule-4 component path.
+            if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl)) {
+                for (const auto& cc : td->choiceCases) {
+                    for (const auto& pf : cc.payload) {
+                        if (pf.modifier != "owned" && pf.type &&
+                            isAdmissibleComponentType(
+                                ctx.resolvedType(*pf.type), ctx, 0))
+                            continue;
+                        return prefix + "choice `" + std::string(ts->name) +
+                               "` is value-like but case `" +
+                               std::string(cc.name) + "` payload `" +
+                               std::string(pf.name) +
+                               "` is not an admissible equality component "
+                               "(§35.7/§9.2)";
+                    }
+                }
+            }
+            return {};  // no offender found — flat reason (defensive)
+        }
+        return prefix + "choice `" + std::string(ts->name) + "` is " +
+               (*verdict == common::ChoiceClassification::Owning
+                    ? "owning"
+                    : "borrow-bearing") +
+               " (§35.7), not value-like auto-equality-bearing";
+    }
+    if (ts->kind == ast::TypeDeclKind::Record) {
+        return prefix + "record `" + std::string(ts->name) +
+               "` is neither auto-equality-bearing (§9.2) nor declares custom "
+               "equality (`operator =`/`<>` with `Equals(T)`/`GetHashCode`, "
+               "§25.2)";
+    }
+    return {};  // class/interface/enum/primitive are all equality-bearing —
+                // not reached under the precondition.
 }
 
 bool collectSymbols(const ast::SourceFile& src, SemaContext& ctx) {
