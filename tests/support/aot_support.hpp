@@ -885,7 +885,9 @@ inline CompileStatus forkedCompile(const std::string& srcPath,
 // KNOBS: BEZEL_AOT_CACHE=0 disables (default ON); BEZEL_AOT_CACHE_DIR overrides
 // the location; BEZEL_AOT_CACHE_STATS=1 prints a hits/misses line at process
 // (shard) exit. GC: once per process, under an flock so only one shard sweeps,
-// if the store exceeds ~5 GiB the oldest-mtime entries are deleted down to half
+// if the store exceeds the cap (BEZEL_AOT_CACHE_MAX_GB, default 64 GiB — sized
+// so full-suite ASan + plain products persist across gates, the point of the
+// k2 identity) the oldest-mtime entries are deleted down to 3/4 of the cap
 // (scripts/gc_scratch.sh may also reap the directory).
 
 // Default 0755 for an installed/stored executable.
@@ -1131,7 +1133,7 @@ inline void storeToCache(const std::string& exePath,
 
 // Size-bounded GC, run ONCE per process under a non-blocking flock so only one
 // shard sweeps (losers skip; GC is a coarse safety valve, not per-run-critical).
-// If the store exceeds ~5 GiB, delete oldest-mtime entries down to half.
+// If the store exceeds the cap, delete oldest-mtime entries down to 3/4 of it.
 inline void maybeGcCache() {
     static const bool once = [] {
         if (!cacheEnabled()) return true;
@@ -1143,8 +1145,23 @@ inline void maybeGcCache() {
         if (fd < 0) return true;
         if (::flock(fd, LOCK_EX | LOCK_NB) != 0) { ::close(fd); return true; }
 
-        const std::uintmax_t cap = static_cast<std::uintmax_t>(5) << 30;  // 5 GiB
-        const std::uintmax_t target = cap / 2;                            // 2.5 GiB
+        // Cap: BEZEL_AOT_CACHE_MAX_GB, default 64 GiB. The former 5 GiB cap
+        // predates the k2 identity (#2100): under the k1 key entries rarely
+        // outlived a relink, so the cap only bounded garbage. Under k2 entries
+        // are DESIGNED to persist across gates, and one full-suite ASan pass
+        // alone stores ~30 GiB — with a 5 GiB cap every next gate evicted the
+        // previous one wholesale (measured 2026-07-23: a should-be-warm --full
+        // re-gate ran cold-by-eviction under the mid-gate unlink storm and
+        // ground to the 900s shard ceiling). Target 3/4 of cap, not half: a
+        // sweep trims the cold tail without discarding the working set.
+        std::uintmax_t capGb = 64;
+        if (const char* e = std::getenv("BEZEL_AOT_CACHE_MAX_GB")) {
+            char* end = nullptr;
+            unsigned long v = std::strtoul(e, &end, 10);
+            if (end && *end == '\0' && v > 0) capGb = v;
+        }
+        const std::uintmax_t cap = static_cast<std::uintmax_t>(capGb) << 30;
+        const std::uintmax_t target = cap / 4 * 3;
         struct Ent { std::string path; std::uintmax_t size; fs::file_time_type mt; };
         std::vector<Ent> ents;
         std::uintmax_t total = 0;
