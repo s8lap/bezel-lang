@@ -61,7 +61,7 @@ BEZEL_TEST(choice_equality_control_flow_rework_2083,
         "class C public static method Main(): int "
         "  var w := new Wrap(Msg.Empty); "
         "  var x := new Wrap(Msg.Empty); "
-        "  return (1 if w.GetHashCode() = x.GetHashCode() else 0); "
+        "  return (if w.GetHashCode() = x.GetHashCode() then 1 else 0); "
         "end Main; end C;");
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);        // pre-rework: undef-pointer string hash → crash

@@ -139,7 +139,7 @@ BEZEL_TEST(choice_component_record_equality_v210_2083,
         "end Wrap; "
         "class C public static method Main(): int "
         "  var w := new Wrap(Outer.First(Inner.Valued(7))); "
-        "  return (1 if w.O = Outer.First(Inner.Valued(7)) else 0); "
+        "  return (if w.O = Outer.First(Inner.Valued(7)) then 1 else 0); "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(hasErrDiagWith(r, "is not auto-equality-bearing"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -164,7 +164,7 @@ BEZEL_TEST(choice_component_record_equality_v210_2083,
         "end Wrap; "
         "class D public static method Main(): int "
         "  var w := new Wrap(Box.None); "
-        "  return (1 if w = w else 0); "
+        "  return (if w = w then 1 else 0); "
         "end Main; end D;");
     BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "is not auto-equality-bearing"));
 }
@@ -185,7 +185,7 @@ BEZEL_TEST(choice_component_record_equality_v210_2083,
         "end Wrap; "
         "class D public static method Main(): int "
         "  var w := new Wrap(Fetched.NotFetched); "
-        "  return (1 if w = w else 0); "
+        "  return (if w = w then 1 else 0); "
         "end Main; end D;");
     BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "is not auto-equality-bearing"));
 }

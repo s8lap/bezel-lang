@@ -370,7 +370,7 @@ BEZEL_TEST(format_revision_812_1339, hole_generic_arg_parenthesized_2102_ok) {
     const std::string prog = std::string(kRegistry2) +
         "class C public static method Main(): int "
         "  var s := $\"{(Registry<int, string>.Make(7, \"x\"))}\"; "
-        "  return 1 if s = \"7\" else 0; "
+        "  return (if s = \"7\" then 1 else 0); "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(prog), 1);
 }
@@ -397,7 +397,7 @@ BEZEL_TEST(format_revision_812_1339, hole_nested_generic_arg_parenthesized_2102_
     const std::string prog =
         "module M; class C public static method Main(): int "
         "  var s := $\"{(new Dictionary<string, Array<int>>().Count)}\"; "
-        "  return 1 if s = \"0\" else 0; "
+        "  return (if s = \"0\" then 1 else 0); "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(prog), 1);
 }

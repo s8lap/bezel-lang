@@ -80,7 +80,7 @@ BEZEL_TEST(codegen_choice_component_record_equality_v210_2083,
         "record Wrap(C: Color); "
         "class C public static method Main(): int "
         "  var a := new Wrap(Color.Green(7)); var b := new Wrap(Color.Green(7)); "
-        "  return (1 if a.GetHashCode() = b.GetHashCode() else 0); "
+        "  return (if a.GetHashCode() = b.GetHashCode() then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -97,7 +97,7 @@ BEZEL_TEST(codegen_choice_component_record_equality_v210_2083,
         "class C public static method Main(): int "
         "  var a := new Wrap(Color.Red); "
         "  var b := new Wrap(Color.Blue); "
-        "  return (1 if a.GetHashCode() <> b.GetHashCode() else 0); "
+        "  return (if a.GetHashCode() <> b.GetHashCode() then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
