@@ -88,9 +88,16 @@ if [ "$DO_BUILDS" = 1 ]; then
   # Dropping it merely forces a re-warm — the next run recompiles on a miss.
   binc=/var/tmp/bezel-scratch/aot-bincache
   if [ -d "$binc" ]; then
+    # Runaway backstop ONLY, sized ABOVE the harness's own in-process GC cap
+    # (BEZEL_AOT_CACHE_MAX_GB, default 64 GiB — aot_support.hpp maybeGcCache,
+    # which trims oldest-first to 3/4 of cap). Under the k2 identity (#2100)
+    # cache entries are DESIGNED to persist across gates; the previous 6 GiB
+    # wholesale rm -rf here deleted the ~17-30 GiB working set after every
+    # push, forcing the next gate cold. Fire only when the in-process GC has
+    # evidently failed (dir far beyond its cap).
     szk="$(du -sk "$binc" 2>/dev/null | cut -f1)"
-    if [ -n "$szk" ] && [ "$szk" -gt $((6*1024*1024)) ]; then
-      tag "trim oversized AOT link-cache $binc ($(du -sh "$binc" 2>/dev/null | cut -f1))"
+    if [ -n "$szk" ] && [ "$szk" -gt $((72*1024*1024)) ]; then
+      tag "trim runaway AOT link-cache $binc ($(du -sh "$binc" 2>/dev/null | cut -f1) > 72G backstop)"
       [ "$APPLY" = 1 ] && rm -rf "$binc"
     fi
   fi
