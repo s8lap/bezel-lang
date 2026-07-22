@@ -1,14 +1,14 @@
-# Proposal 0061 — Expression-form studies: the binding atom and `Result` propagation (recorded, not proposed)
+# Proposal 0061 — Expression-form studies: the binding atom and `Result` propagation
 
 | | |
 |---|---|
-| **Status** | recorded — two deferred directions from the 2026-07-21 expression-forms review; neither is proposed for adoption at this writing |
-| **Tracking issue** | — (assign if either activates) |
-| **Written against** | spec v0.214 |
+| **Status** | §1 **superseded — graduated v0.216** (owner-activated 2026-07-22; spec §17.15, grammar A.7 `BindExpr`, kernel K8.5); §2 remains a recorded, evidence-gated study |
+| **Tracking issue** | — (assign if §2 activates) |
+| **Written against** | spec v0.214 (§1's pin re-verified against v0.215 at graduation; §17.15's landed text is the current rule) |
 
 *The admission test both were judged by (and which future atom candidates should meet): a new expression atom earns its place only if it (1) produces a value whose computation is inexpressible or ceremony-heavy in expression position today, (2) rides existing kernel machinery — K7 meets, K8 boundaries, zero new ownership rules — and (3) does not make a doctrine-declined path more ergonomic. The two declines this review produced under test (3) and (1) are in `DECLINED.md` (try-expression; comprehensions).*
 
-## 1. The binding atom — `(var x := E; body)` *(deferred by owner, 2026-07-21: "probably not now, worth recording")*
+## 1. The binding atom — `(var x := E; body)` *(deferred by owner 2026-07-21: "probably not now, worth recording"; activated by owner direction and **graduated v0.216** — spec §17.15; the graduation-time decisions the sketch below left open are recorded in the v0.216 changelog entry)*
 
 Names a subexpression within expression position: `(` + `var` is a unique two-token signal; `;` separates (no expression contains a top-level `;`, so the extent is trivially unambiguous — `in` collides with membership, `=>` with lambdas); bindings chain; the body is one expression. It is *binding*, not assignment-in-expression: single-assignment by construction, no mutation, unspellable by accident. Ownership rides K8 verbatim — an owned initializer is a named unbound temporary, disposed at the atom's boundary. It does **not** reopen the value-returning-`do` decline (that decline is about statement *sequencing*; this admits no statements).
 
