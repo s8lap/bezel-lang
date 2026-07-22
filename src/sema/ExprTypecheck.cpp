@@ -5919,11 +5919,6 @@ void ExprTC::narrowOnAssignment(Symbol* sym, const TypeRef* valueType) {
     // error-recovery path also wrongly invalidate the narrowing.
     if (auto* ls = dynamic_cast<LocalSymbol*>(sym); ls && ls->isConst)
         return;
-    // §7.4 (v0.214, #2085): reassigning a local root rebinds it to a possibly-
-    // different object, so any `local._f` facts riding it no longer hold (they
-    // were about the old referent). Drop them regardless of the new value's
-    // nullability.
-    dropFieldFactsRooted(sym);
     if (valueType && !valueType->nullable)
         nullNarrowed_.insert(sym);
     else
@@ -5965,131 +5960,6 @@ bool ExprTC::narrowFromNullTest(const ast::Expr* cond, bool forTrueBranch) {
         return false;
     nullNarrowed_.insert(sym);
     return true;
-}
-
-// §7.4 (v0.214, #2085): `readonly` fields narrow. Detect the modifier on a
-// field symbol.
-bool ExprTC::isReadonlyField(const FieldSymbol* fs) {
-    if (!fs) return false;
-    for (auto mod : fs->modifiers)
-        if (mod == "readonly") return true;
-    return false;
-}
-
-// §7.4 (v0.214, #2085): the resolved TypeRef of a field symbol — a body
-// `FieldDecl` (its `type`) or a positional-record parameter (its `posParam`
-// type). Null when neither is available/resolved.
-TypeRef* ExprTC::fieldTypeOf(const FieldSymbol* fs) {
-    if (!fs) return nullptr;
-    if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
-        if (fd->type) return ctx_.resolvedType(*fd->type);
-    }
-    if (fs->posParam && fs->posParam->type)
-        return ctx_.resolvedType(*fs->posParam->type);
-    return nullptr;
-}
-
-// §7.4 (v0.214, #2085): recognize a trackable nullable `readonly`-field access
-// path — exactly ONE field off an admitted root. Returns the (root, field)
-// narrowing key or nullopt. The tracked shape (spec §7.4, v0.214) is:
-//   `_f` / `this._f` / `base._f`  (instance readonly)  -> root nullptr
-//   `TypeName._s`                 (static  readonly)   -> root nullptr
-//   `local._f`                    (instance readonly)  -> root = local's Symbol*
-// Any non-final field segment (`a.b._f` — `a.b` is a mutable read) is NOT
-// trackable. The FieldSymbol* alone disambiguates the two nullptr-rooted forms
-// (an instance field vs a static field is a distinct symbol). Recognition only:
-// the caller applies the construction-window carve-out and consults
-// `fieldNarrowed_`.
-std::optional<std::pair<const Symbol*, const FieldSymbol*>>
-ExprTC::readonlyFieldPathOf(const ast::Expr* e) {
-    if (!e) return std::nullopt;
-    // Bare field identifier `_f`: an implicit-`this` instance field, or a bare
-    // static readonly field of the enclosing type.
-    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
-        if (id->name == "this" || id->name == "base") return std::nullopt;
-        auto* fs = dynamic_cast<FieldSymbol*>(lookupName(id->name));
-        if (!fs || !isReadonlyField(fs)) return std::nullopt;
-        TypeRef* ft = fieldTypeOf(fs);
-        if (!ft || !ft->nullable) return std::nullopt;
-        return std::make_pair(static_cast<const Symbol*>(nullptr),
-                              static_cast<const FieldSymbol*>(fs));
-    }
-    // A member access `<target>._f`. The member must resolve to a readonly
-    // nullable field, and the target must be an admitted root — `this`/`base`,
-    // a type name (static), or a local/parameter — NOT a further member access
-    // (that would be a non-final field segment) or any other expression.
-    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
-        auto* fs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(*ma));
-        if (!fs || !isReadonlyField(fs)) return std::nullopt;
-        TypeRef* ft = fieldTypeOf(fs);
-        if (!ft || !ft->nullable) return std::nullopt;
-        auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
-        if (!tid) return std::nullopt;  // non-final segment / non-root target
-        if (tid->name == "this" || tid->name == "base")
-            return std::make_pair(static_cast<const Symbol*>(nullptr),
-                                  static_cast<const FieldSymbol*>(fs));
-        Symbol* rs = lookupName(tid->name);
-        if (!rs) return std::nullopt;
-        // A type-name root (`TypeName._s`) is a static readonly field — root
-        // nullptr, keyed by the (unique static) FieldSymbol.
-        if (dynamic_cast<TypeSymbol*>(rs))
-            return std::make_pair(static_cast<const Symbol*>(nullptr),
-                                  static_cast<const FieldSymbol*>(fs));
-        // A local/parameter root (`local._f`): the fact rides this root.
-        if (dynamic_cast<LocalSymbol*>(rs) || dynamic_cast<ParameterSymbol*>(rs))
-            return std::make_pair(static_cast<const Symbol*>(rs),
-                                  static_cast<const FieldSymbol*>(fs));
-        return std::nullopt;
-    }
-    return std::nullopt;
-}
-
-// §7.4 (v0.214, #2085): establish a readonly-field narrowing fact from a
-// `<path> <> null` / `= null` test. `<> null` narrows the true branch, `= null`
-// the else branch (the parser desugars `is not null`/`is null` to these). The
-// rule does not apply inside the field's declaring-type construction window
-// (constructor, field initializer, static constructor, static field
-// initializer — §7.4/§22.8): a during-construction test observes either the
-// null watermark or the field's single assigned value (§22.7), so we record no
-// fact there and the member-access gate keeps requiring a guard. Elsewhere the
-// fact is never invalidated by a call, `await`, or closure — a readonly field
-// has no writer (see fieldNarrowed_'s invalidation, which rides only the root).
-bool ExprTC::narrowFromFieldNullTest(const ast::Expr* cond, bool forTrueBranch) {
-    auto* be = dynamic_cast<const ast::BinaryExpr*>(cond);
-    if (!be) return false;
-    bool narrowsThis;
-    if (be->op == "<>") narrowsThis = forTrueBranch;       // true branch
-    else if (be->op == "=") narrowsThis = !forTrueBranch;  // else branch
-    else return false;
-    if (!narrowsThis) return false;
-    const ast::Expr* varSide = nullptr;
-    if (dynamic_cast<const ast::NullLiteralExpr*>(be->right.get()))
-        varSide = be->left.get();
-    else if (dynamic_cast<const ast::NullLiteralExpr*>(be->left.get()))
-        varSide = be->right.get();
-    if (!varSide) return false;
-    auto key = readonlyFieldPathOf(varSide);
-    if (!key) return false;
-    // Construction-window carve-out (§7.4, v0.214). `inConstructor_` covers both
-    // instance and static constructors; `inFieldInitializer_` covers field and
-    // static-field initializers. Restricted to the field's OWN declaring type:
-    // a base field read in a derived constructor is already assigned (base-first
-    // construction, §22.8) and narrows soundly, and a field of an unrelated type
-    // held in a local is not in its own construction window here.
-    if ((inConstructor_ || inFieldInitializer_) &&
-        key->second->parent == currentType_)
-        return false;
-    fieldNarrowed_.insert(*key);
-    return true;
-}
-
-// §7.4 (v0.214, #2085): drop every readonly-field fact rooted at `root`.
-void ExprTC::dropFieldFactsRooted(const Symbol* root) {
-    if (!root || fieldNarrowed_.empty()) return;
-    for (auto it = fieldNarrowed_.begin(); it != fieldNarrowed_.end();) {
-        if (it->first == root) it = fieldNarrowed_.erase(it);
-        else ++it;
-    }
 }
 
 // §22.4 (v0.183, #1585): caller-side narrowing for an out-nullability
@@ -6148,12 +6018,10 @@ void ExprTC::checkOutPostcondAtReturn(const ast::Expr* returnValue,
         // and restore the flow state so this probe does not leak.
         auto savedNull = nullNarrowed_;
         auto savedNarrow = narrowings_;
-        auto savedField = fieldNarrowed_;  // §7.4 v0.214 (#2085): probe-local
         collectNarrowings(returnValue, /*forTrueBranch=*/whenTrue);
         const bool ok = isKnownNonNull(psym);
         nullNarrowed_ = std::move(savedNull);
         narrowings_ = std::move(savedNarrow);
-        fieldNarrowed_ = std::move(savedField);
         if (!ok) {
             const std::string cst = whenTrue ? "true" : "false";
             ctx_.diagnostics().report(
@@ -6178,9 +6046,6 @@ void ExprTC::collectNarrowings(const ast::Expr* cond, bool forTrueBranch) {
     if (!cond) return;
     if (narrowFromTypeTest(cond, forTrueBranch)) return;
     if (narrowFromNullTest(cond, forTrueBranch)) return;
-    // §7.4 (v0.214, #2085): a `<readonly-field path> <> null` / `= null` test
-    // narrows the field path (`this._f`, `TypeName._s`, `local._f`).
-    if (narrowFromFieldNullTest(cond, forTrueBranch)) return;
     // §22.4 (v0.183, #1585): a `Try`-style call with an out-nullability
     // postcondition narrows its out recipient on the branch matching the
     // stated constant.
@@ -6643,19 +6508,6 @@ void ExprTC::invalidateCapturedNarrowings() {
         else
             ++it;
     }
-    // §7.4 (v0.214, #2085): a `local._f` fact rides its local root; if that root
-    // is mutably captured, a closure invoked by the control-transfer operation
-    // could have rebound it, so drop the fact. `this`/static-rooted facts (root
-    // nullptr) are never dropped — a readonly field survives calls and `await`s.
-    for (auto it = fieldNarrowed_.begin(); it != fieldNarrowed_.end();) {
-        const Symbol* r = it->first;
-        if (r && mutablyCapturedNames_.count(r->name) &&
-            !(dynamic_cast<const LocalSymbol*>(r) &&
-              dynamic_cast<const LocalSymbol*>(r)->isConst))
-            it = fieldNarrowed_.erase(it);
-        else
-            ++it;
-    }
 }
 
 // Build a method scope (params on top of module scope), then visit
@@ -6686,9 +6538,6 @@ void ExprTC::runMethodBody(
     narrowings_.clear();
     // §7.4 (issue #418): nullability narrowing is likewise method-local.
     nullNarrowed_.clear();
-    // §7.4 (v0.214, #2085): readonly-field narrowing facts are likewise
-    // method-local.
-    fieldNarrowed_.clear();
     // §7.4 (v0.182, #1566): precompute which locals/params are mutably captured
     // by a lambda anywhere in THIS body, so a control-transfer operation inside a
     // controlled block can invalidate their narrowing (invalidateCapturedNarrowings).
@@ -9067,29 +8916,20 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // applies after early return").
         auto savedNarrowings = narrowings_;
         auto entryNullNarrowed = nullNarrowed_;
-        // §7.4 (v0.214, #2085): readonly-field facts flow through the branches
-        // and join exactly like `nullNarrowed_` — reset per branch alongside it,
-        // snapshot on each fall-through, intersected at the after-if join.
-        auto entryFieldNarrowed = fieldNarrowed_;
         // Collected exit sets of each fall-through path; null pointer means "no
         // path here" (always-exits). We intersect the non-null ones.
         std::vector<std::unordered_set<Symbol*>> fallThroughExits;
-        std::vector<std::set<std::pair<const Symbol*, const FieldSymbol*>>>
-            fieldExits;
         if (ifs->ifBranch.condition) {
             visitExpr(*ifs->ifBranch.condition);
             checkConditionIsBool(*ifs->ifBranch.condition, "if");
         }
         nullNarrowed_ = entryNullNarrowed;
-        fieldNarrowed_ = entryFieldNarrowed;
         collectNarrowings(ifs->ifBranch.condition.get(), /*forTrueBranch=*/true);
         for (const auto& bs : ifs->ifBranch.body) {
             if (bs) visitStmt(*bs);
         }
-        if (!bodyAlwaysExits(ifs->ifBranch.body)) {
+        if (!bodyAlwaysExits(ifs->ifBranch.body))
             fallThroughExits.push_back(nullNarrowed_);
-            fieldExits.push_back(fieldNarrowed_);
-        }
         narrowings_ = savedNarrowings;
         for (std::size_t i = 0; i < ifs->elifBranches.size(); ++i) {
             const auto& el = ifs->elifBranches[i];
@@ -9100,7 +8940,6 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // This elif is reached only when every preceding condition was
             // false (their else-narrowings hold) and this condition is true.
             nullNarrowed_ = entryNullNarrowed;
-            fieldNarrowed_ = entryFieldNarrowed;
             collectNarrowings(ifs->ifBranch.condition.get(),
                               /*forTrueBranch=*/false);
             for (std::size_t j = 0; j < i; ++j)
@@ -9108,32 +8947,26 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                   /*forTrueBranch=*/false);
             collectNarrowings(el.condition.get(), /*forTrueBranch=*/true);
             for (const auto& bs : el.body) if (bs) visitStmt(*bs);
-            if (!bodyAlwaysExits(el.body)) {
+            if (!bodyAlwaysExits(el.body))
                 fallThroughExits.push_back(nullNarrowed_);
-                fieldExits.push_back(fieldNarrowed_);
-            }
             narrowings_ = savedNarrowings;
         }
         // The else body (explicit or implicit fall-through): all preceding
         // guards were false, so each contributes its else-branch narrowing.
         nullNarrowed_ = entryNullNarrowed;
-        fieldNarrowed_ = entryFieldNarrowed;
         collectNarrowings(ifs->ifBranch.condition.get(), /*forTrueBranch=*/false);
         for (const auto& el : ifs->elifBranches)
             collectNarrowings(el.condition.get(), /*forTrueBranch=*/false);
         for (const auto& bs : ifs->elseBody) if (bs) visitStmt(*bs);
         // The else path falls through unless an explicit else body always exits.
-        if (!ifs->hasElse || !bodyAlwaysExits(ifs->elseBody)) {
+        if (!ifs->hasElse || !bodyAlwaysExits(ifs->elseBody))
             fallThroughExits.push_back(nullNarrowed_);
-            fieldExits.push_back(fieldNarrowed_);
-        }
         narrowings_ = savedNarrowings;
         // After-if nullability = intersection of all fall-through exit sets.
         if (fallThroughExits.empty()) {
             // Every path exits the method; the after-if point is unreachable.
             // Keep the entry set (harmless — nothing follows).
             nullNarrowed_ = entryNullNarrowed;
-            fieldNarrowed_ = entryFieldNarrowed;
         } else {
             std::unordered_set<Symbol*> joined = fallThroughExits.front();
             for (std::size_t i = 1; i < fallThroughExits.size(); ++i) {
@@ -9143,16 +8976,6 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 joined = std::move(next);
             }
             nullNarrowed_ = std::move(joined);
-            // §7.4 (v0.214, #2085): the same intersection over the field facts.
-            std::set<std::pair<const Symbol*, const FieldSymbol*>>
-                joinedFields = fieldExits.front();
-            for (std::size_t i = 1; i < fieldExits.size(); ++i) {
-                std::set<std::pair<const Symbol*, const FieldSymbol*>> next;
-                for (const auto& k : joinedFields)
-                    if (fieldExits[i].count(k)) next.insert(k);
-                joinedFields = std::move(next);
-            }
-            fieldNarrowed_ = std::move(joinedFields);
         }
     } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
         if (ws->condition) {
