@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace bezel {
 
@@ -18,6 +19,100 @@ bool isPrimitiveTypeKeyword(std::string_view text) {
            text == "uint"   || text == "long"  || text == "ulong" ||
            text == "float"  || text == "double" || text == "decimal" ||
            text == "char"   || text == "string";
+}
+
+// Best-effort recognizer for the §18.5 hole-delimitation sharp edge (#2102):
+// an unparenthesized generic-argument list at the top level of a hole —
+// `Identifier<T1, T2>.Member` / `Identifier<T1, T2>(args)`, the Appendix A.7
+// `Identifier GenericArgs` atom, disambiguated the same way §14.1/§22.12
+// disambiguate it everywhere else it appears (`Parser::tokensLookLikeReceiverTypeArgs`
+// / `Parser::tokensLookLikeMethodTypeArgs`: a bare `<` right after a name,
+// followed only by TypeArgToken-shaped tokens, closing on a bare `>`/`>>`
+// immediately followed by `.` or `(`) — has its top-level comma or colon cut
+// by the normative hole-delimitation rule (§18.5, v0.172, #1339). That rule's
+// tracked nesting set is `()[]{}` only and does not extend to `<...>`: this is
+// the CURRENT spec text, read literally, and is not changed here (`<` doubles
+// as the relational/`<>`/`<<` operator family, and generic-vs-relational is
+// only resolvable with this same lookahead — seeing this as a plain
+// character-nesting rule like the others is exactly the tension #2102 records
+// and defers to a spec ruling). So this recognizer does NOT change which
+// programs compile — the cut, and the resulting error, remain exactly today's
+// spec-conformant behavior. It exists purely so a clear, on-point diagnostic
+// can be raised at the cut, instead of leaving a confusingly-unrelated
+// downstream type error (e.g. "operator '<' is not defined for type ...") to
+// describe the mistake alone.
+//
+// Re-lexes `exprText` with a throwaway Lexer/DiagnosticEngine (discarded —
+// this is advisory only and must never influence real diagnostics or the
+// actual split) and reports whether `cutOffset` (the byte offset, within
+// exprText, of the `,`/`:` the real rule cut on) falls strictly inside a
+// confirmed generic-argument-list's token span.
+bool holeCutInsideGenericArgList(std::string_view exprText,
+                                  std::size_t cutOffset) {
+    DiagnosticEngine scratchDiag;
+    Lexer lex(exprText, scratchDiag);
+    std::vector<Token> toks;
+    for (;;) {
+        Token t = lex.next();
+        bool atEnd = t.kind == TokenKind::EndOfFile;
+        toks.push_back(t);
+        if (atEnd) break;
+    }
+    auto isName = [](const Token& t) {
+        return t.kind == TokenKind::Identifier ||
+               (t.kind == TokenKind::Keyword && isPrimitiveTypeKeyword(t.text));
+    };
+    auto isTypeArgToken = [](const Token& t) {
+        if (t.kind == TokenKind::Identifier) return true;
+        if (t.kind == TokenKind::Keyword) return isPrimitiveTypeKeyword(t.text);
+        if (t.kind == TokenKind::Punctuator)
+            return t.text == "," || t.text == "?" ||
+                   t.text == "[" || t.text == "]";
+        return false;
+    };
+    for (std::size_t i = 1; i + 1 < toks.size(); ++i) {
+        const Token& open = toks[i];
+        if (open.kind != TokenKind::Punctuator || open.text != "<") continue;
+        if (!isName(toks[i - 1])) continue;  // §A.7: needs an `Identifier` receiver
+
+        std::size_t depth = 1;
+        std::size_t j = i + 1;
+        bool closed = false;
+        for (; j < toks.size(); ++j) {
+            const Token& u = toks[j];
+            if (u.kind == TokenKind::EndOfFile) break;
+            if (u.kind == TokenKind::Punctuator && u.text == "<") {
+                ++depth;
+                continue;
+            }
+            if (u.kind == TokenKind::Punctuator && u.text == ">>") {
+                // Mirrors tokensLookLikeMethodTypeArgs: `>>` closes two
+                // levels at once; closing exactly the outstanding two is a
+                // match, closing just one (depth==1) is malformed (bail).
+                if (depth <= 2) {
+                    if (depth == 2) closed = true;
+                    break;
+                }
+                depth -= 2;
+                continue;
+            }
+            if (u.kind == TokenKind::Punctuator && u.text == ">") {
+                if (--depth == 0) { closed = true; break; }
+                continue;
+            }
+            if (!isTypeArgToken(u)) break;  // not a type-arg list after all
+        }
+        if (!closed || j + 1 >= toks.size()) continue;
+        const Token& after = toks[j + 1];
+        bool followedByAccess = after.kind == TokenKind::Punctuator &&
+            (after.text == "." || after.text == "(");
+        if (!followedByAccess) continue;
+
+        std::size_t spanStart = open.location.offset;
+        std::size_t spanEnd = toks[j].location.offset + toks[j].text.size();
+        if (cutOffset > spanStart && cutOffset < spanEnd) return true;
+    }
+    return false;
 }
 
 } // namespace
@@ -106,6 +201,8 @@ void Parser::splitInterpolation(ast::InterpolatedStringExpr& e) {
             std::string fmtSpec;
             {
                 int d = 0; // paren/bracket/brace depth
+                std::size_t cutOffset = std::string_view::npos;
+                char cutChar = '\0';
                 for (size_t k = 0; k < exprText.size(); ++k) {
                     char ek = exprText[k];
                     // Skip a nested string literal as a unit.
@@ -135,14 +232,40 @@ void Parser::splitInterpolation(ast::InterpolatedStringExpr& e) {
                     if (ek == ':') {
                         actualExpr = exprText.substr(0, k);
                         fmtSpec = std::string(exprText.substr(k + 1));
+                        cutOffset = k;
+                        cutChar = ':';
                         break;
                     }
                     // Top-level `,` begins the alignment; `,WIDTH[:FORMAT]`.
                     if (ek == ',') {
                         actualExpr = exprText.substr(0, k);
                         fmtSpec = "," + std::string(exprText.substr(k + 1));
+                        cutOffset = k;
+                        cutChar = ',';
                         break;
                     }
+                }
+                // §18.5 (v0.172, #1339) sharp edge (#2102): the hole-delimitation
+                // rule's tracked nesting set is `()[]{}` only, so a top-level
+                // `,`/`:` inside an unparenthesized generic-argument list
+                // (`Identifier<T1, T2>.Member` / `(...)`) is still cut here —
+                // that acceptance behavior is unchanged. When it is, name the
+                // actual construct instead of leaving a downstream, unrelated
+                // type error (e.g. an `operator '<' is not defined` on the
+                // truncated fragment) to describe the mistake alone.
+                if (cutOffset != std::string_view::npos &&
+                    holeCutInsideGenericArgList(exprText, cutOffset)) {
+                    diagnostics_.report(
+                        Severity::Error, e.span.begin,
+                        std::string("interpolation hole's `") + cutChar +
+                        "` falls inside what looks like an unparenthesized "
+                        "generic-argument list (`Identifier<...>`) rather than "
+                        "starting the alignment/format spec — \xC2\xA7"
+                        "18.5's hole-delimitation rule nests `()[]{}` only, not "
+                        "`<...>`; parenthesize the expression, e.g. "
+                        "`{(Expr<T1, T2>.Member)}`, so the whole call sits "
+                        "inside the hole's top nesting level (\xC2\xA7"
+                        "18.5, v0.172, #1339)");
                 }
                 // §18.5 (v0.172, #1339): the format spec is brace-free — a `{`
                 // in it is a compile error. Check the FORMAT portion (after any

@@ -34,6 +34,13 @@ bool hasCompileError(const std::string& prog) {
     auto r = runAot(prog);
     return !r.ran && r.diagnostics.hasErrors();
 }
+// True iff at least one reported diagnostic message contains `needle`.
+bool diagContains(const std::string& prog, const std::string& needle) {
+    auto r = runAot(prog);
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(needle) != std::string::npos) return true;
+    return false;
+}
 }  // namespace
 
 // ── Integer specifiers: D/Dn, X/x/Xn, B/Bn (stdlib §2.18) ────────────────────
@@ -316,4 +323,98 @@ module M; class C public static method Main(): int
   return 0;
 end Main; end C;
 )BZ"));
+}
+
+// ── #2102: the hole-delimitation sharp edge on generic-argument commas ──────
+//
+// §18.5's hole-delimitation rule (normative, v0.172, #1339) tracks nesting of
+// `()[]{}` only — NOT `<...>` (the current spec text is a closed, literal
+// enumeration; see the spec's "Hole delimitation" paragraph). A hole whose
+// top level contains a generic-argument-list comma — `Identifier<T1, T2>...`,
+// the Appendix A.7 `Identifier GenericArgs` atom — is therefore STILL cut at
+// that comma today: this is defined, spec-conformant behavior, not something
+// this fix changes (see #2102's discussion for the design tension around
+// extending the tracked-nesting set to `<...>`, left to a future spec
+// ruling). What this fix DOES change is the diagnostic: instead of a
+// confusing downstream type error on the truncated fragment (e.g. "operator
+// '<' is not defined for type ..."), the compiler now names the actual
+// mistake and cites the documented §18.5 remedy (parenthesize).
+const char* kRegistry2 =
+    "module M; "
+    "class Registry<T, U> "
+    "  public static method Make(a: T, b: U): T "
+    "    return a; "
+    "  end Make; "
+    "end Registry; ";
+
+// The exact reported repro shape: `Registry<int, string>.Make(...)` unparenthesized
+// inside a hole is a compile error whose message names the generic-argument-list
+// construct (not a spurious `operator '<'` complaint about the truncated fragment).
+BEZEL_TEST(format_revision_812_1339, hole_generic_arg_comma_2102_diagnosed) {
+    const std::string prog = std::string(kRegistry2) +
+        "class C public static method Main(): int "
+        "  var s := $\"{Registry<int, string>.Make(7, \"x\")}\"; "
+        "  return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasCompileError(prog));
+    BEZEL_EXPECT_TRUE(diagContains(prog, "generic-argument list"));
+    BEZEL_EXPECT_TRUE(diagContains(prog, "\xC2\xA7""18.5"));
+    // The confusing downstream message must NOT be what the user sees instead.
+    BEZEL_EXPECT_FALSE(diagContains(prog, "operator `<` is not defined"));
+}
+
+// §18.5's documented remedy — parenthesizing the whole call so it sits inside
+// the hole's top nesting level — still compiles and runs correctly; this fix
+// must not disturb the existing, spec-sanctioned workaround.
+BEZEL_TEST(format_revision_812_1339, hole_generic_arg_parenthesized_2102_ok) {
+    const std::string prog = std::string(kRegistry2) +
+        "class C public static method Main(): int "
+        "  var s := $\"{(Registry<int, string>.Make(7, \"x\"))}\"; "
+        "  return 1 if s = \"7\" else 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(run(prog), 1);
+}
+
+// Nested generics (`Dictionary<string, Array<int>>`, exercising the lexer's
+// `>>` merge — a real Punctuator, `Lexer.cpp`'s maximal munch — closing BOTH
+// levels at once) are recognized the same way: the top-level comma between
+// the outer and inner type args still falls inside the confirmed
+// generic-argument-list span, so the diagnostic still fires for it (builtin
+// collection types, stdlib §4.9/§4.11 — no invented API).
+BEZEL_TEST(format_revision_812_1339, hole_nested_generic_arg_comma_2102_diagnosed) {
+    const std::string prog =
+        "module M; class C public static method Main(): int "
+        "  var s := $\"{new Dictionary<string, Array<int>>().Count}\"; "
+        "  return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasCompileError(prog));
+    BEZEL_EXPECT_TRUE(diagContains(prog, "generic-argument list"));
+}
+
+// Parenthesizing the nested-generic construction fixes it, same as the
+// simple case.
+BEZEL_TEST(format_revision_812_1339, hole_nested_generic_arg_parenthesized_2102_ok) {
+    const std::string prog =
+        "module M; class C public static method Main(): int "
+        "  var s := $\"{(new Dictionary<string, Array<int>>().Count)}\"; "
+        "  return 1 if s = \"0\" else 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(run(prog), 1);
+}
+
+// A relational `<`/`>` comparison with a top-level comma (NOT a generic-arg
+// list — there is no `.`/`(` after the `>`) must NOT be misdiagnosed as one;
+// this exact shape already compiles today (the malformed "alignment" is
+// silently ignored, §18.5's alignment grammar notwithstanding — a pre-existing,
+// separate leniency this fix leaves untouched) and must keep compiling
+// identically after this fix.
+BEZEL_TEST(format_revision_812_1339, hole_relational_chain_not_misdiagnosed_2102) {
+    const std::string prog =
+        "module M; class C public static method Main(): int "
+        "  var a := 3; var b := 1; var c := 5; var d := 2; "
+        "  var s := $\"{a < b, c > d}\"; "
+        "  return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_FALSE(diagContains(prog, "generic-argument list"));
+    BEZEL_EXPECT_EQ(run(prog), 0);
 }
