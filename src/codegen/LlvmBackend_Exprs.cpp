@@ -6568,16 +6568,38 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     // scalar integer path (ICmp doesn't accept struct operands). Recover the
     // record's declared type from either operand so per-field comparison knows
     // the Bezel field types (string fields compare by content — per §8.3).
+    // §35.7 (v0.210, #2083 rework finding 2): a BARE CHOICE operand
+    // (`Color.Green(7) = Color.Green(7)`, sema-legal for value-like choices
+    // per the §35.7 use-site rule) is ALSO a struct-typed operand and must
+    // dispatch emitChoiceEquality — the record-only scan let it fall through
+    // to emitStructEquality's null-recTy shape-compare, which compares every
+    // payload slot including the inactive-case `undef` slots (spurious
+    // inequality, and an undef-read for pointer payloads).
     if ((op == "=" || op == "<>") && l->getType()->isStructTy()) {
         const sema::TypeSymbol* recTy = nullptr;
         const sema::TypeRef* recTyRef = nullptr;
+        const sema::TypeSymbol* choTy = nullptr;
+        const sema::TypeRef* choTyRef = nullptr;
         for (const ast::Expr* side : {bin.left.get(), bin.right.get()}) {
             if (!side) continue;
             if (auto* t = ctx_.exprType(*side))
-                if (t->kind == sema::TypeRef::Kind::Named && t->declaration &&
-                    t->declaration->kind == ast::TypeDeclKind::Record) {
-                    recTy = t->declaration; recTyRef = t; break;
+                if (t->kind == sema::TypeRef::Kind::Named && t->declaration) {
+                    if (t->declaration->kind == ast::TypeDeclKind::Record) {
+                        recTy = t->declaration; recTyRef = t; break;
+                    }
+                    if (t->declaration->kind == ast::TypeDeclKind::Choice) {
+                        choTy = t->declaration; choTyRef = t; break;
+                    }
                 }
+        }
+        if (choTy) {
+            // (No RecordSubstGuard here: it is a Record-gated no-op for a
+            // choice TypeRef. The payload types resolve through the case
+            // Params' resolved AST types — the same discipline the
+            // record-field dispatch from emitValueEquality uses.)
+            (void)choTyRef;
+            llvm::Value* eq = emitChoiceEquality(l, r, choTy);
+            return op == "=" ? eq : builder_.CreateNot(eq);
         }
         // issue #462 / §8.3 / §14.1: for a GENERIC record (`Box<string> =
         // Box<string>`) install the operand's concrete type args so the

@@ -1677,7 +1677,11 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
                  concrete->primitive != P::Object) ||
                 (concrete->kind == K::Named && concrete->declaration &&
                  (concrete->declaration->kind == ast::TypeDeclKind::Record ||
-                  concrete->declaration->kind == ast::TypeDeclKind::Enum));
+                  concrete->declaration->kind == ast::TypeDeclKind::Enum ||
+                  // §35.7/§14.2 (#2083 rework): T bound to a value-like
+                  // choice (`where T: hashable` admits one, #2087) routes
+                  // to the choice branch of lowerValueSemMethodOn.
+                  concrete->declaration->kind == ast::TypeDeclKind::Choice));
             bool concreteRefSem =
                 (concrete->kind == K::Named && concrete->declaration &&
                  (concrete->declaration->kind == ast::TypeDeclKind::Class ||
@@ -1717,7 +1721,16 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
         recvTy->declaration &&
         (recvTy->declaration->kind == ast::TypeDeclKind::Record ||
          recvTy->declaration->kind == ast::TypeDeclKind::Enum);
-    if (!primValueSem && !namedValueSem) return nullptr;
+    // §35.7 (v0.210, #2083 rework finding 2): a CHOICE receiver's direct
+    // `.Equals(other)` / `.GetHashCode()` — sema-legal for value-like choices
+    // (the §35.7 use-site rule rejects the rest) — dispatches the synthesized
+    // §35.7 tag+active-payload forms. ToString on a choice is NOT intercepted
+    // (stays nullptr here so the receiver is not lowered twice, #1075).
+    bool choiceValueSem = recvTy->kind == sema::TypeRef::Kind::Named &&
+        recvTy->declaration &&
+        recvTy->declaration->kind == ast::TypeDeclKind::Choice &&
+        (isEquals || isGetHashCode);
+    if (!primValueSem && !namedValueSem && !choiceValueSem) return nullptr;
 
     llvm::Value* recv = lowerExpr(*ma->target);
     if (!recv) return nullptr;
@@ -1778,6 +1791,28 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
     const sema::TypeSymbol* ts = recvTy->declaration;
     bool isRecord = ts->kind == ast::TypeDeclKind::Record;
     bool isEnum   = ts->kind == ast::TypeDeclKind::Enum;
+    // §35.7 (v0.210, #2083 rework finding 2): a CHOICE receiver — dispatch
+    // the synthesized §35.7 equality/hash over the choice struct (tag first,
+    // then the ACTIVE case's payload only; emitChoiceEquality/HashCode).
+    // Sema admits these calls only on value-like choices (the §35.7 use-site
+    // rejection, 80e59dc). ToString is not intercepted (nullptr → the
+    // ordinary path, matching the outer gate).
+    if (ts->kind == ast::TypeDeclKind::Choice) {
+        if (!isEquals && !isGetHashCode) return nullptr;
+        llvm::StructType* st = choiceStruct(ts);
+        if (!st) return nullptr;
+        if (recv->getType()->isPointerTy())
+            recv = builder_.CreateLoad(st, recv);
+        if (!recv->getType()->isStructTy()) return nullptr;
+        if (isGetHashCode) return emitChoiceHashCode(recv, ts);
+        if (!call.args[0].value) return nullptr;
+        llvm::Value* other = lowerExpr(*call.args[0].value);
+        if (!other) return nullptr;
+        if (other->getType()->isPointerTy())
+            other = builder_.CreateLoad(st, other);
+        if (!other->getType()->isStructTy()) return nullptr;
+        return emitChoiceEquality(recv, other, ts);
+    }
     if (!isRecord && !isEnum) return nullptr;
 
     if (isEnum) {

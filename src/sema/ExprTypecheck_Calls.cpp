@@ -1341,6 +1341,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         }
     }
     Symbol* calleeSym = ctx_.exprSymbol(*ce.callee);
+    // §35.3 (v0.200, #2044; typed here per the #2083 rework): a
+    // payload-carrying case CONSTRUCTION `Opt.Some(42)` — the callee resolves
+    // to a ChoiceCaseSymbol; the call's result is the CHOICE type. Stamp the
+    // CallExpr with a declaration-bearing TypeRef so a local inferred from
+    // the construction (`var a := Opt.Some(42)`) carries the choice
+    // declaration, and downstream consumers that scan operand types (the
+    // §35.7 use-site `=`/`<>` check; codegen's CG29b equality dispatch) see
+    // it. Previously only the CALLEE MemberAccess was stamped
+    // (resolveMemberAccess), leaving the CallExpr itself untyped — so
+    // `a = b` over two call-constructed choice values fell through codegen's
+    // operand scan to an unsound whole-struct shape compare.
+    if (auto* ccs = dynamic_cast<ChoiceCaseSymbol*>(calleeSym)) {
+        if (auto* cts = dynamic_cast<TypeSymbol*>(ccs->parent);
+            cts && cts->kind == ast::TypeDeclKind::Choice) {
+            TypeRef* ct = ctx_.makeTypeRef();
+            ct->kind = TypeRef::Kind::Named;
+            ct->declaration = cts;
+            ctx_.setExprType(&ce, ct);
+        }
+    }
     // §5.4: an enum cast `E(i)` — the callee is an enum type name; the
     // call produces a value of that enum type. (Records are NOT
     // call-constructible: per §9.5 a record is built with `new Record(...)`

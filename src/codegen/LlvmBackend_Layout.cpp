@@ -3357,138 +3357,158 @@ llvm::Value* Emitter::emitInlineArrayEquality(llvm::Value* l, llvm::Value* r,
 // active case and every corresponding payload compares equal", so the
 // sound implementation here matches.
 //
-// We use a tag-match branch: when tags differ, the result is false and
-// we skip the payload compare; when tags match, we descend into the
-// matching case's payload via a switch on the tag value to select the
-// payload type list, then loop over the case's payload fields in
-// declaration order. A "default" arm of the switch yields true (a
-// payload-free case) and a defensive fallback for an out-of-range tag
-// (which sema should have rejected, but tag is i32 and a runtime value
-// could in principle be malformed in some sanity-skipped path).
+// REAL CONTROL FLOW, not a select chain (#2083 rework): the payload compare
+// of case ci must execute ONLY when ci is the active case. Inactive-case
+// payload slots hold `undef` (construction fills only tag + the active
+// payload, LlvmBackend_Calls2.cpp), so a straight-line emit that runs every
+// case's compare and merely SELECTs the result still *executes* the side
+// effects — a string payload's emitStringEq walks an undef pointer, a
+// record/nested-choice payload recurses into loads through undef — which is
+// UB and an ASan crash, regardless of the select masking the result. The
+// shape mirrors emitOwningChoiceActiveCaseDisposal (§35.4): switch on the
+// tag, one basic block per payload-bearing case, PHI join. The switch
+// default (payload-free cases and, defensively, an out-of-range tag) yields
+// true — a payload-free case is equal to itself by tag alone.
 llvm::Value* Emitter::emitChoiceEquality(llvm::Value* l, llvm::Value* r,
                                          const sema::TypeSymbol* choiceTy) {
     llvm::Value* lTag = builder_.CreateExtractValue(l, {0u}, "cheq.ltag");
     llvm::Value* rTag = builder_.CreateExtractValue(r, {0u}, "cheq.rtag");
     llvm::Value* tagsEq = builder_.CreateICmpEQ(lTag, rTag, "cheq.tag");
-    // Build the result: false when tags differ; tag-equal case's payload
-    // compare when tags match. The straightforward emit is "tags-eq AND
-    // (case-payload eq OR payload-free case)" per tag value.
     auto* entryBB = builder_.GetInsertBlock();
-    auto* cmpBB  = llvm::BasicBlock::Create(llvm_, "cheq.cmp",  currentFn_);
-    auto* endBB  = llvm::BasicBlock::Create(llvm_, "cheq.end", currentFn_);
-    builder_.CreateCondBr(tagsEq, cmpBB, endBB);
-    builder_.SetInsertPoint(cmpBB);
-    // Default: true (matches when no case-specific arm sets the value;
-    // an out-of-range tag is defensive — sema should reject any choice
-    // tag construction beyond the declared case count).
-    llvm::Value* payloadEq = builder_.getInt1(true);
+    auto* swBB  = llvm::BasicBlock::Create(llvm_, "cheq.sw",  currentFn_);
+    auto* endBB = llvm::BasicBlock::Create(llvm_, "cheq.end", currentFn_);
+    builder_.CreateCondBr(tagsEq, swBB, endBB);
+
+    // Join incomings: (pred block, i1 value). Different tags → false from
+    // the entry block; the switch default → true (payload-free / defensive
+    // out-of-range); each payload-bearing arm → its per-payload AND.
+    std::vector<std::pair<llvm::BasicBlock*, llvm::Value*>> incoming;
+    incoming.emplace_back(entryBB, builder_.getInt1(false));
+
+    builder_.SetInsertPoint(swBB);
     auto cases = choiceCasesOf(choiceTy);
+    auto* sw = builder_.CreateSwitch(lTag, endBB,
+                                     static_cast<unsigned>(cases.size()));
+    incoming.emplace_back(swBB, builder_.getInt1(true));
     for (std::size_t ci = 0; ci < cases.size(); ++ci) {
         const sema::ChoiceCaseSymbol* cc = cases[ci];
-        if (!cc || !cc->caseDecl || cc->caseDecl->payload.empty()) {
-            // payload-free case — equal to itself regardless of payload
-            // bits (which are an i8 placeholder). Leave payloadEq = true
-            // (the default).
-            continue;
-        }
-        // Build an arm: if lTag == ci, compute per-payload equal and
-        // merge. We thread this as a SELECT chain per-case to keep the
-        // IR simple and avoid fan-out: payloadEq_i = case-payload-eq;
-        // when tag==ci, payloadEq := payloadEq_i.
-        std::vector<llvm::Value*> lFields;
-        std::vector<llvm::Value*> rFields;
-        lFields.reserve(cc->caseDecl->payload.size());
-        rFields.reserve(cc->caseDecl->payload.size());
-        for (std::size_t pi = 0; pi < cc->caseDecl->payload.size(); ++pi) {
-            // field index in the choice struct: payload slot of ci-th
-            // case lives at struct field 1+ci; its pi-th payload field
-            // lives at {1+ci, pi} within that struct.
-            lFields.push_back(builder_.CreateExtractValue(
-                l, {static_cast<unsigned>(1 + ci),
-                    static_cast<unsigned>(pi)}, "cheq.lf"));
-            rFields.push_back(builder_.CreateExtractValue(
-                r, {static_cast<unsigned>(1 + ci),
-                    static_cast<unsigned>(pi)}, "cheq.rf"));
-        }
+        if (!cc || !cc->caseDecl || cc->caseDecl->payload.empty())
+            continue;  // payload-free — arm collapses to the default (true).
+        auto* armBB = llvm::BasicBlock::Create(llvm_, "cheq.arm", currentFn_);
+        sw->addCase(builder_.getInt32(static_cast<int>(ci)), armBB);
+        builder_.SetInsertPoint(armBB);
+        // Active case ci: compare its payload fields pairwise. The field
+        // index in the choice struct: the ci-th case's payload slot is
+        // struct field 1+ci; its pi-th payload field is {1+ci, pi}. The
+        // extracts and the per-field equality (which may itself emit
+        // control flow — a string compare, a nested record/choice recurse)
+        // are all emitted inside this arm, so they run ONLY under tag==ci.
         llvm::Value* caseEq = builder_.getInt1(true);
         for (std::size_t pi = 0; pi < cc->caseDecl->payload.size(); ++pi) {
             const ast::Param& pf = cc->caseDecl->payload[pi];
+            llvm::Value* lf = builder_.CreateExtractValue(
+                l, {static_cast<unsigned>(1 + ci),
+                    static_cast<unsigned>(pi)}, "cheq.lf");
+            llvm::Value* rf = builder_.CreateExtractValue(
+                r, {static_cast<unsigned>(1 + ci),
+                    static_cast<unsigned>(pi)}, "cheq.rf");
             sema::TypeRef pTy;  // resolved payload type for emitValueEquality
-            if (pf.type) pTy = *ctx_.resolvedType(*pf.type);
-            caseEq = builder_.CreateAnd(
-                caseEq, emitValueEquality(lFields[pi], rFields[pi], &pTy));
+            if (pf.type)
+                if (const sema::TypeRef* rt = ctx_.resolvedType(*pf.type))
+                    pTy = *rt;
+            caseEq = builder_.CreateAnd(caseEq,
+                                        emitValueEquality(lf, rf, &pTy));
         }
-        // SELECT on tag — emit caseEq when matching, fall-through default
-        // for non-matching (the default is the current payloadEq, which
-        // has been seeded true; subsequent arms refine it). Because
-        // branch-on-tag-clean switch isn't structured, use a Select with
-        // an equality test per case.
-        llvm::Value* isThis = builder_.CreateICmpEQ(
-            lTag, builder_.getInt32(static_cast<int>(ci)), "cheq.case");
-        payloadEq = builder_.CreateSelect(isThis, caseEq, payloadEq,
-                                          "cheq.merge");
+        // The per-field equality may have opened nested blocks — the arm's
+        // terminator belongs on the CURRENT block, and that block is the
+        // PHI's predecessor.
+        auto* armEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+        incoming.emplace_back(armEnd, caseEq);
     }
-    auto* cmpEnd = builder_.GetInsertBlock();
-    builder_.CreateBr(endBB);
     builder_.SetInsertPoint(endBB);
-    auto* phi = builder_.CreatePHI(i1(), 2, "cheq");
-    // Different tags → false. Same tag → payloadEq (which may be true for
-    // a payload-free case, or a per-payload AND for a payload case, or a
-    // SELECT chain when there are multiple cases).
-    phi->addIncoming(builder_.getInt1(false), entryBB);
-    phi->addIncoming(payloadEq, cmpEnd);
+    auto* phi = builder_.CreatePHI(i1(), static_cast<unsigned>(incoming.size()),
+                                   "cheq");
+    for (auto& [bb, v] : incoming) phi->addIncoming(v, bb);
     return phi;
 }
 
 // §35.7 (v0.210, #2083): choice hash. The choice struct's i32 tag is
-// hashed first, then the active case's payload fields are folded in
-// (h = h*31 + fieldHash). For a payload-free case the payload contributes
-// nothing beyond the tag. Per §35.7 the discriminant is part of the hash
-// (so two values in different cases never collide). The case-switch
-// dispatches by i32 tag value (the same path as emitChoiceEquality's
-// per-case selection) — we use SELECTs to thread through value-level
-// fold so we can fall back to the seed when the tag selects a different
-// case. This keeps the IR straight-line (no basic-block fan-out for
-// per-case payload folds) and consistent with emitChoiceEquality.
+// hashed first (h = 17*31 + tag), then the ACTIVE case's payload fields
+// are folded in (h = h*31 + fieldHash). For a payload-free case the
+// payload contributes nothing beyond the tag. Per §35.7 the discriminant
+// is part of the hash (so two values in different cases never collide),
+// and ONLY the active case's payload participates — equal values must
+// hash equal even when their inactive (undef) slots differ.
+//
+// REAL CONTROL FLOW, not a select chain (#2083 rework): the per-case
+// payload hash of case ci must EXECUTE only when ci is the active case.
+// A straight-line emit ran every case's fold unconditionally — for a
+// string-bearing choice in a payload-free active case, emitValueHashCode
+// deterministically walked the string-hash loop through an undef pointer
+// (there was no tag precondition at all), a guaranteed crash. Switch on
+// the tag, one basic block per payload-bearing case, PHI join — the same
+// shape as emitChoiceEquality / emitOwningChoiceActiveCaseDisposal. The
+// switch default (payload-free cases and, defensively, an out-of-range
+// tag) yields the tag-only hash.
 llvm::Value* Emitter::emitChoiceHashCode(llvm::Value* val,
                                          const sema::TypeSymbol* choiceTy) {
     llvm::Value* tag = builder_.CreateExtractValue(val, {0u}, "ch.tag");
     // Seed: hash the tag with a non-zero starting point, so a payload-free
     // choice variant still has a meaningful hash (mirrors the record seed
     // in emitRecordHashCode).
-    llvm::Value* h = builder_.getInt32(17);
     llvm::Value* tagMix = builder_.CreateAdd(
-        builder_.CreateMul(h, builder_.getInt32(31)), tag);
+        builder_.CreateMul(builder_.getInt32(17), builder_.getInt32(31)),
+        tag, "ch.tagmix");
     auto cases = choiceCasesOf(choiceTy);
-    llvm::Value* folded = tagMix;
+    bool anyPayload = false;
+    for (const sema::ChoiceCaseSymbol* cc : cases)
+        if (cc && cc->caseDecl && !cc->caseDecl->payload.empty())
+            anyPayload = true;
+    if (!anyPayload) return tagMix;  // all cases payload-free — tag-only hash,
+                                     // no control flow needed.
+    auto* entryBB = builder_.GetInsertBlock();
+    auto* endBB = llvm::BasicBlock::Create(llvm_, "ch.end", currentFn_);
+    auto* sw = builder_.CreateSwitch(tag, endBB,
+                                     static_cast<unsigned>(cases.size()));
+    // Join incomings: default (payload-free / out-of-range) → tag-only hash;
+    // each payload-bearing arm → its per-payload fold.
+    std::vector<std::pair<llvm::BasicBlock*, llvm::Value*>> incoming;
+    incoming.emplace_back(entryBB, tagMix);
     for (std::size_t ci = 0; ci < cases.size(); ++ci) {
         const sema::ChoiceCaseSymbol* cc = cases[ci];
-        if (!cc || !cc->caseDecl || cc->caseDecl->payload.empty()) {
-            // payload-free — nothing extra to fold; SELECT keeps the seed
-            // path active.
-            continue;
-        }
-        llvm::Value* caseH = tagMix;  // base: tag has been folded in once.
+        if (!cc || !cc->caseDecl || cc->caseDecl->payload.empty())
+            continue;  // payload-free — arm collapses to the default.
+        auto* armBB = llvm::BasicBlock::Create(llvm_, "ch.arm", currentFn_);
+        sw->addCase(builder_.getInt32(static_cast<int>(ci)), armBB);
+        builder_.SetInsertPoint(armBB);
+        llvm::Value* caseH = tagMix;  // base: tag folded in once.
         for (std::size_t pi = 0; pi < cc->caseDecl->payload.size(); ++pi) {
             const ast::Param& pf = cc->caseDecl->payload[pi];
             sema::TypeRef pTy;
-            if (pf.type) pTy = *ctx_.resolvedType(*pf.type);
+            if (pf.type)
+                if (const sema::TypeRef* rt = ctx_.resolvedType(*pf.type))
+                    pTy = *rt;
             llvm::Value* pfVal = builder_.CreateExtractValue(
                 val, {static_cast<unsigned>(1 + ci),
                       static_cast<unsigned>(pi)}, "ch.pf");
+            // The payload hash (which may itself emit control flow — a
+            // string content hash, a nested record/choice fold) is emitted
+            // inside this arm, so it runs ONLY under tag==ci.
             llvm::Value* pfH = emitValueHashCode(pfVal, &pTy);
-            caseH = builder_.CreateAdd(builder_.CreateMul(caseH,
-                                                          builder_.getInt32(31)),
-                                       pfH);
+            caseH = builder_.CreateAdd(
+                builder_.CreateMul(caseH, builder_.getInt32(31)), pfH);
         }
-        // SELECT: when this case is active, take the per-case fold,
-        // otherwise keep the prior `folded` (which is tagMix unless a
-        // prior arm already replaced it).
-        llvm::Value* isThis = builder_.CreateICmpEQ(
-            tag, builder_.getInt32(static_cast<int>(ci)), "ch.case");
-        folded = builder_.CreateSelect(isThis, caseH, folded, "ch.merge");
+        auto* armEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+        incoming.emplace_back(armEnd, caseH);
     }
-    return folded;
+    builder_.SetInsertPoint(endBB);
+    auto* phi = builder_.CreatePHI(i32(),
+                                   static_cast<unsigned>(incoming.size()),
+                                   "ch.hash");
+    for (auto& [bb, v] : incoming) phi->addIncoming(v, bb);
+    return phi;
 }
 
 
