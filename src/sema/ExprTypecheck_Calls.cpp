@@ -5398,6 +5398,70 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ownedTaskTy->genericArgs.push_back(arrTy);
                             ctx_.setExprType(&ce, ownedTaskTy);
                         }
+                        // stdlib §6.7 v0.212 / proposal 0023 D1, D2, D5, D6:
+                        // Task.WhenEach(tasks: Array<Task>): IAsyncEnumerable<Task>
+                        // and Task.WhenEach<T>(tasks: Array<Task<T>>):
+                        // IAsyncEnumerable<Task<T>>. The returned IAsyncEnumerable<T>
+                        // is a single-consumption lazy query (§29.11) that yields
+                        // already-completed tasks in completion order; the consumer
+                        // awaits each yielded task to obtain the result or re-raise
+                        // a fault. The borrowing variant takes a borrowed array.
+                        // Detect T from the input element type:
+                        //   - Array<Task>      → IAsyncEnumerable<Task>
+                        //   - Array<Task<T>>   → IAsyncEnumerable<Task<T>>
+                        if (m == "WhenEach") {
+                            // Build IAsyncEnumerable<Task> or IAsyncEnumerable<Task<T>>.
+                            TypeRef* elemTaskTy = nullptr;  // Task or Task<T>
+                            if (!ce.args.empty() && ce.args[0].value) {
+                                TypeRef* argTy = ctx_.exprType(*ce.args[0].value);
+                                if (argTy && argTy->kind == TypeRef::Kind::Named &&
+                                    !argTy->genericArgs.empty() &&
+                                    argTy->genericArgs[0]) {
+                                    elemTaskTy = argTy->genericArgs[0];
+                                }
+                            }
+                            auto* asyncEnumTy = ctx_.makeTypeRef();
+                            asyncEnumTy->kind = TypeRef::Kind::Named;
+                            asyncEnumTy->nullable = false;
+                            auto* aeAnn = new ast::Type();
+                            aeAnn->kind = ast::TypeKind::Named;
+                            auto* aeNm = new ast::QualifiedName();
+                            aeNm->parts.push_back("IAsyncEnumerable");
+                            aeAnn->name.reset(aeNm);
+                            asyncEnumTy->astNode = aeAnn;
+                            if (elemTaskTy) asyncEnumTy->genericArgs.push_back(elemTaskTy);
+                            ctx_.setExprType(&ce, asyncEnumTy);
+                        }
+                        // stdlib §6.7 v0.212 / proposal 0023 D7: Task.WhenEachOwned<T>(
+                        //   owned tasks: OwningArray<OwningTask<T>>
+                        // ): IOwningAsyncEnumerable<OwningTask<T>> where T: class.
+                        // The owning variant takes ownership of the input array;
+                        // unconsumed OwningTask<T> tasks are disposed by the
+                        // enumerator (per §30.5, bz_task_free cascades to the
+                        // produced class value via the task's result_disposer).
+                        if (m == "WhenEachOwned") {
+                            // Detect T from OwningArray<OwningTask<T>>.
+                            TypeRef* elemTaskTy = nullptr;
+                            if (!ce.args.empty() && ce.args[0].value) {
+                                TypeRef* argTy = ctx_.exprType(*ce.args[0].value);
+                                if (argTy && argTy->kind == TypeRef::Kind::Named &&
+                                    !argTy->genericArgs.empty() &&
+                                    argTy->genericArgs[0]) {
+                                    elemTaskTy = argTy->genericArgs[0];
+                                }
+                            }
+                            auto* oaeTy = ctx_.makeTypeRef();
+                            oaeTy->kind = TypeRef::Kind::Named;
+                            oaeTy->nullable = false;
+                            auto* oaeAnn = new ast::Type();
+                            oaeAnn->kind = ast::TypeKind::Named;
+                            auto* oaeNm = new ast::QualifiedName();
+                            oaeNm->parts.push_back("IOwningAsyncEnumerable");
+                            oaeAnn->name.reset(oaeNm);
+                            oaeTy->astNode = oaeAnn;
+                            if (elemTaskTy) oaeTy->genericArgs.push_back(elemTaskTy);
+                            ctx_.setExprType(&ce, oaeTy);
+                        }
                         // stdlib §6.7 (line 2885): Task.FireAndForget(owned task):
                         // void/unit. Ownership of the task transfers; the caller
                         // does not need the return value. No TypeRef set → unit.

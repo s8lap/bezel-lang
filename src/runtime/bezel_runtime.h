@@ -867,6 +867,36 @@ void  bz_task_fire_and_forget(void* task);
 // vtable global; only emitted when compiled with --checked-disposal.
 void  bz_task_fire_and_forget_checked(void* task, void* disposedAccessVtable);
 
+// stdlib §6.7 (v0.212) / proposal 0023 D1-D7: Task.WhenEach streaming fan-in.
+// `bz_task_when_each_init_borrowing` builds the runtime backing for
+// `Task.WhenEach(tasks: Array<Task>)` and `Task.WhenEach<T>(tasks:
+// Array<Task<T>>)`. The returned pointer is a vtable-backed object that
+// implements IAsyncEnumerable<Task> / IAsyncEnumerable<Task<T>> via vtable
+// slots [0]=self, [1]=Dispose, [2]=MoveNextAsync, [3]=Current. The input
+// array is BORROWED (the caller is responsible for its lifetime — the
+// §28.3 deferred-activation frame carriage binds the borrow to the returned
+// iterable so the compiler enforces source-outlives-settlement). `is_typed`
+// selects the typed variant (Task<T> element vs. plain Task). Yielded
+// elements are already-completed task pointers; faulted/cancelled tasks are
+// yielded (not skipped) and surface when the caller awaits the yielded
+// element. Empty input -> enumerator that completes immediately (MoveNextAsync
+// returns false on first call). Affine per §29.11: a second GetAsyncEnumerator
+// raises InvalidOperationException.
+void* bz_task_when_each_init_borrowing(void* task_arr, int32_t is_typed);
+
+// stdlib §6.7 (v0.212) / proposal 0023 D7: Task.WhenEachOwned<T> for class T.
+// Takes ownership of the OwningArray<OwningTask<T>>; on dispose, any
+// unconsumed OwningTask<T> tasks are freed (via bz_task_free - their result
+// disposer cascades to dispose the produced class value per §30.5). Yields
+// each completed OwningTask<T> through IOwningAsyncEnumerable<OwningTask<T>>.
+// Otherwise identical semantics to the borrowing variant. `result_disposer`
+// is T's destructor thunk (codegen-synthesized), attached to every input
+// task so an UNCONSUMED task's produced class value is disposed exactly once
+// on Dispose (#2096: a Task.FromOwnedResult task carries no disposer of its
+// own once moved into the array). Null when there is nothing to dispose.
+void* bz_task_when_each_init_owning(void* owning_task_arr,
+                                    void (*result_disposer)(void*));
+
 // ---------------------------------------------------------------------------
 // stdlib §6.10 / spec §28.14 (v0.175, #808): TaskScope — the structured-
 // concurrency nursery. See the implementation block comment for the full

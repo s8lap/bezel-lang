@@ -5094,6 +5094,16 @@ bool MethodOwnership::builtinOwnedSinkArg(const ast::Expr* callee,
         // whose identifier carries no exprType, so match it syntactically.
         if (tid->name == "Task" && ma->member == "WhenAllOwned")
             return argPos == 0;
+        // stdlib §6.7 v0.212 / proposal 0023 D7 (#2082/#2096): the streaming
+        // dual Task.WhenEachOwned<T>(owned tasks: OwningArray<OwningTask<T>>)
+        // likewise takes ownership of the input array and its tasks — the
+        // enumerator (not the caller) frees the OwningArray on Dispose. The
+        // owned-arg position (0) is an owned sink, so passing a bare owned
+        // local (`Task.WhenEachOwned(owned tasks)`) discharges its §28.3
+        // disposal obligation; without this the caller ALSO disposes the
+        // array the enumerator already freed — a container double-free.
+        if (tid->name == "Task" && ma->member == "WhenEachOwned")
+            return argPos == 0;
         // stdlib §6.7 / §30.10 (#1890): Task.FireAndForget(owned task: Task)
         // relinquishes ownership of the task to the runtime, which supervises it
         // and disposes it on completion. The owned-arg position (0) is an owned

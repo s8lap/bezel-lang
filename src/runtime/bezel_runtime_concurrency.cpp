@@ -3573,4 +3573,491 @@ void bz_task_take_result(void* tp) {
 // for a task that settles later, via bz_task_fire_and_forget's completion
 // continuation (#1503).
 
-} // extern "C" (bz_task_take_result)
+// ---------------------------------------------------------------------------
+// stdlib §6.7 (v0.212) / proposal 0023 D1-D7: Task.WhenEach streaming fan-in.
+// ---------------------------------------------------------------------------
+//
+// A vtable-backed runtime object that implements IAsyncEnumerable<Task> /
+// IAsyncEnumerable<Task<T>> (borrowing) and IOwningAsyncEnumerable<OwningTask<T>>
+// (owning) directly. Layout matches the compiler-generated async-iterator
+// state machine (see emitAsyncIteratorMethod in LlvmBackend_Async.cpp):
+//
+//   vtable[0] = self (the enumerator address; the iterator shape's
+//             GetAsyncEnumerator() returns it)
+//   vtable[1] = Dispose
+//   vtable[2] = MoveNextAsync
+//   vtable[3] = Current (borrowing: returns the current Task<T> pointer;
+//              owning: TakeCurrent — transfers ownership, nulls the slot,
+//              raises IOE on miss)
+//
+// The struct itself lives at the address the vtable points back to. The
+// bz_we_* functions below are the vtable-slot implementations.
+//
+// ===========================================================================
+// OWNERSHIP / LIFETIME INVARIANTS  (#2095 item 5, #2096; spec §6.7 v0.212)
+// ===========================================================================
+//
+// (1) CONTEXT LIFETIME — refcount, not raw pointer (closes #2095 defect 1,
+//     the UAF-after-dispose). `refs` starts at 1 (the owner: the returned
+//     enumerator) and gains +1 for EACH per-input observer registered via
+//     bz_task_then (bz_we_input_completed holds it). Every observer releases
+//     its ref when it fires; bz_we_dispose releases the owner ref. The struct
+//     is deleted only when the last ref drops, so a completion callback that
+//     fires AFTER DisposeAsync still dereferences a live context (it observes
+//     `disposed` and does nothing harmful) instead of freed memory. This is
+//     option (b) of the #2095 audit — chosen over a bz_task_then cancel/
+//     unregister API (option a) because bz_task_free never drains a task's
+//     continuation list, so there is no safe unregister seam; refcounting
+//     needs no change to the task core and mirrors BzWhenAnyCtx.
+//
+// (2) AT-MOST-ONCE ENQUEUE — the per-index `observed[]` once-flag (checked/set
+//     under `mtx`) makes each input task transition un-observed -> observed
+//     exactly once, closing every #2095 duplicate-enqueue window (mirrors
+//     BzWhenAnyCtx's `fired` CAS). A task is therefore pushed to `ready` OR
+//     delivered to a parked advance at most once.
+//
+// (3) SINGLE READY-SIGNAL — MoveNextAsync (bz_we_move_next) never re-registers
+//     observers; the observers are registered ONCE at init. A call either
+//     consumes a `ready` entry synchronously or parks ONE `pending_advance`
+//     task that the next observer completes. (#2095 item 3.)
+//
+// (4) PER-TASK OWNERSHIP (owning variant; borrowing owns nothing). Each input
+//     OwningTask<T> is owned by exactly one location at all times, so it is
+//     freed exactly once (closes #2096):
+//       a. un-observed / still running  -> discharged by its own observer when
+//          it completes (frees it directly if `disposed`, else routes it to b/c);
+//       b. observed, awaiting a consumer -> owned by the `ready` deque;
+//       c. yielded, not yet taken        -> owned by `current_yielded`;
+//       d. taken by the consumer         -> owned by the caller's `owned`
+//          iteration variable (TakeCurrent transferred it out).
+//     bz_we_dispose frees exactly the tasks in states (b) and (c) plus the
+//     array CONTAINER; it never sweeps input-array elements — that is what
+//     kept states (a) and (b) disjoint and is why the old input-sweep +
+//     ready-drain double-freed. Residual: a still-running task that NEVER
+//     completes leaks (its observer never fires) — the accepted fire-and-
+//     forget degenerate case, not a double-free.
+// ===========================================================================
+
+struct bz_task_when_each_enumerator_t {
+    void* vtable;                         // slot 0 (self-reference for GetAsyncEnumerator)
+    std::atomic<int64_t> refs{1};         // owner + one ref per registered observer
+    std::mutex mtx;                       // guards ready/current_yielded/disposed
+    std::condition_variable cv;           // wakes MoveNextAsync on new completion / dispose
+    std::deque<std::pair<int64_t, void*>> ready;  // FIFO of (input_arr_index, task pointer)
+                                          // in completion order; ties broken in registration
+                                          // order (spec §6.7 D1). The index lets TakeCurrent
+                                          // (owning variant) null the input array slot so
+                                          // dispose doesn't double-free the task the consumer
+                                          // now owns.
+    void* input_arr;                      // bz_array_t* (borrowing) or OwningArray pointer
+                                          //   (owning; treated as bz_array_t* for free if
+                                          //   empty-on-entry is the fast path; non-empty
+                                          //   owning case is freed by the enumerator on
+                                          //   dispose per §30.5)
+    void* empty_oa;                       // bz_array_t* of zero elements — when the input
+                                          //   is an OwningArray that we've already drained,
+                                          //   we replace it with this empty sentinel so the
+                                          //   eventual bz_array_free on dispose is safe
+                                          //   (no double-dispose of the input slot's
+                                          //   elements). Always nullptr for borrowing.
+    int64_t n;                            // number of input task slots
+    int64_t completed;                    // count of input tasks that have completed
+    std::vector<uint8_t> observed;        // per-index at-most-once enqueue guard
+    void* current_yielded;                // most recently yielded task pointer
+                                          //   (nullptr if none, or after TakeCurrent)
+    int64_t current_yielded_idx;          // index in input_arr of the yielded task
+                                          //   (-1 if none). On TakeCurrent (owning), the
+                                          //   input_arr slot is nulled so dispose doesn't
+                                          //   double-free the task the consumer now owns.
+    int32_t is_typed;                     // 0 = Task (no result), 1 = Task<T> (ptr-sized result)
+    int32_t is_owning;                    // 0 = borrowing (do not free input_arr), 1 = owning
+                                          //   (free input_arr on dispose; bz_task_free any
+                                          //   unconsumed task — its result_disposer cascades
+                                          //   to the produced class value per §30.5)
+    int32_t disposed;                     // 0 = live, 1 = disposed
+    int32_t exhausted;                    // 0 = elements possible, 1 = all yielded
+    int32_t get_enum_called;              // §29.11 affine guard: 0 first call, 1 IOE after
+    bz_task_t* pending_advance;           // non-null when a MoveNextAsync is waiting for the
+                                          //   next input task to complete; advanced to
+                                          //   current_yielded by the per-input completion
+                                          //   callback (single-pending-advance discipline;
+                                          //   `await for` desugaring produces at most one)
+};
+
+// Forward declarations for the vtable functions (the C ABI takes a single
+// `void* self` argument and returns the appropriate type).
+static void bz_we_dispose(void* self);
+static void* bz_we_get_enumerator(void* self);
+static void* bz_we_move_next(void* self);
+static void* bz_we_current(void* self);
+static void* bz_we_take_current(void* self);
+
+// Per-variant vtable globals. The compiler doesn't see these — codegen
+// calls bz_task_when_each_init_borrowing / bz_task_when_each_init_owning
+// and treats the returned pointer as the appropriate IAsyncEnumerable<T>* /
+// IOwningAsyncEnumerable<OwningTask<T>>*. The async-iterator vtable protocol
+// (slot 1=Dispose, slot 2=MoveNextAsync, slot 3=Current/TakeCurrent) is what
+// the consumer's `await for` desugaring dispatches through
+// (LlvmBackend_Stmts.cpp lowerAwaitFor).
+//
+// The vtable[0] self-reference is set lazily by the init function (we don't
+// know the vtable's own address until the global is created). We use a
+// pattern of "vtable->slot0 == vtable" as the standard runtime trick.
+
+static void bz_we_release(bz_task_when_each_enumerator_t* e) {
+    if (e->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) delete e;
+}
+
+// bz_we_dispose: vtable slot 1. Idempotent. Marks the enumerator disposed,
+// wakes any MoveNextAsync waiter (which will see disposed/exhausted and
+// return false), and frees unconsumed resources.
+static void bz_we_dispose(void* self) {
+    auto* e = (bz_task_when_each_enumerator_t*)self;
+    if (!e) return;
+    std::unique_lock<std::mutex> lk(e->mtx);
+    if (e->disposed) return;  // idempotent
+    e->disposed = 1;
+    // #2096 owning-variant teardown (D7 / §30.5). Discharge every
+    // OwningTask<T> the ENUMERATOR still owns — and ONLY those — so each
+    // input task is freed exactly once across the whole system (see the
+    // OWNERSHIP / LIFETIME INVARIANTS block above the struct). The
+    // enumerator owns a task iff it sits in `ready` (observed, not yet
+    // yielded) or in `current_yielded` (yielded, not yet taken). It does
+    // NOT own, and must NOT free:
+    //   * un-observed / still-running input tasks — their registered
+    //     observer (bz_we_input_completed) discharges them when they
+    //     complete (it sees `disposed` and, for the owning variant, calls
+    //     bz_task_free). Freeing them here would bz_task_free a live task
+    //     whose completion continuation is still registered on it — a UAF
+    //     when that continuation later fires. This is why we NEVER sweep
+    //     the input array's elements on dispose (the old code did, and a
+    //     completed task lived in BOTH input_arr[i] and `ready` because the
+    //     observer never nulled the slot — that was the #2096 double-free).
+    //   * tasks already taken by the consumer — TakeCurrent transferred
+    //     ownership out and cleared `current_yielded`; the consumer's owned
+    //     iteration variable discharges them.
+    if (e->is_owning) {
+        while (!e->ready.empty()) {
+            auto p = e->ready.front();
+            e->ready.pop_front();
+            if (p.second) bz_task_free(p.second);
+        }
+        if (e->current_yielded) bz_task_free(e->current_yielded);
+        // The input array CONTAINER is ours: WhenEachOwned took ownership of
+        // the OwningArray (the §28.8 owned-sink rule moved the caller's
+        // disposal obligation to us — see builtinOwnedSinkArg for
+        // Task.WhenEachOwned). Free the container ONLY, never its elements
+        // (they are discharged via ready/current/observer above); the
+        // nullptr element-disposer keeps bz_array_free from touching them.
+        if (e->input_arr) {
+            bz_array_free(e->input_arr, nullptr);
+            e->input_arr = nullptr;
+        }
+    } else {
+        // Borrowing variant: the enumerator owns nothing. Entries in `ready`
+        // and `current_yielded` are borrows of tasks the CALLER owns; drop
+        // the references without freeing. input_arr is the caller's array —
+        // never freed, never nulled (the caller still borrows those slots).
+        e->ready.clear();
+    }
+    e->current_yielded = nullptr;
+    e->current_yielded_idx = -1;
+    bz_task_t* pending = e->pending_advance;
+    e->pending_advance = nullptr;
+    e->cv.notify_all();
+    lk.unlock();
+    if (pending) {
+        uint8_t zero = 0;
+        bz_task_complete(pending, &zero, 1);
+    }
+    // Observers retain the context until their task has settled.
+    bz_we_release(e);
+}
+
+// bz_we_get_enumerator: vtable slot 0. The compiler-generated iterator
+// sets vtable[0] = address_of_vtable_global (so vtable[0] == vtable). The
+// `await for` desugaring calls GetAsyncEnumerator through some path; this
+// is a vtable[0] function pointer lookup, but in the standard pattern
+// vtable[0] is the self-reference, so loading it gives us back the
+// enumerator pointer. (Looking at emitAsyncIteratorMethod: vtElems[0] is
+// set to the vtable global itself — the codegen dereferences vtable[0]
+// only when explicitly reading the vtable, not as a function call.)
+//
+// In the runtime builtin IAsyncEnumerable<T> shape, the codegen path for
+// `src.GetAsyncEnumerator()` (LlvmBackend_Calls2.cpp) recognizes the
+// builtin interface and short-circuits the call by returning the
+// receiver unchanged — GetAsyncEnumerator is never actually invoked at
+// runtime. This vtable[0] entry therefore exists only to match the
+// async-iterator vtable layout (and to keep the runtime object
+// self-describing); the affine check is enforced at the MoveNextAsync
+// level below.
+// `bz_we_get_enumerator` enforces the affine activation rule. The builtin
+// codegen currently treats the source object as its own enumerator and does
+// not dispatch this slot; direct runtime users still get a deterministic
+// single-use guard here (a repeated call returns null for the pending-check
+// path to convert to InvalidOperationException).
+static void* bz_we_get_enumerator(void* self) {
+    auto* e = (bz_task_when_each_enumerator_t*)self;
+    if (!e) return nullptr;
+    std::lock_guard<std::mutex> lk(e->mtx);
+    if (e->get_enum_called) return nullptr;
+    e->get_enum_called = 1;
+    return self;
+}
+
+// bz_we_move_next: vtable slot 2. Returns a Task<bool>. If a ready task is
+// available, set current_yielded and complete the task with true
+// synchronously (the `await` in the consumer takes the fast path).
+// Otherwise, if all input tasks are done and the queue is empty, complete
+// with false (exhausted). Otherwise, register a continuation that
+// completes the per-advance task when the next input completes or the
+// enumerator is disposed.
+static void* bz_we_move_next(void* self) {
+    auto* e = (bz_task_when_each_enumerator_t*)self;
+    bz_task_t* adv = (bz_task_t*)bz_task_alloc();
+    std::unique_lock<std::mutex> lk(e->mtx);
+    if (e->disposed) {
+        uint8_t zero = 0;
+        bz_task_complete(adv, &zero, 1);
+        return adv;
+    }
+    if (!e->ready.empty()) {
+        auto p = e->ready.front();
+        e->ready.pop_front();
+        e->current_yielded = p.second;
+        e->current_yielded_idx = p.first;
+        uint8_t one = 1;
+        bz_task_complete(adv, &one, 1);
+        return adv;
+    }
+    if (e->exhausted || e->completed >= e->n) {
+        uint8_t zero = 0;
+        bz_task_complete(adv, &zero, 1);
+        e->exhausted = 1;
+        return adv;
+    }
+    if (e->pending_advance) {
+        uint8_t zero = 0;
+        bz_task_complete(adv, &zero, 1);
+        return adv;
+    }
+    // Init-time observers are the sole completion registrations. They deliver
+    // one completion directly to this pending advance, avoiding duplicate
+    // enqueue and the bz_task_then-under-lock race (#2095; proposal 0023 D1).
+    e->pending_advance = adv;
+    return adv;
+}
+
+// bz_we_current: vtable slot 3 (borrowing variant). Returns the
+// most-recently-yielded task pointer (a borrow of the task — the caller's
+// `await t` reads through it). The current_yielded slot is cleared by
+// TakeCurrent for the owning variant; for the borrowing variant the
+// pointer stays valid until the next MoveNextAsync (the consumer's
+// `for var t in Task.WhenEach(tasks) do await t; end` naturally drops
+// the borrow before the next iteration).
+static void* bz_we_current(void* self) {
+    auto* e = (bz_task_when_each_enumerator_t*)self;
+    std::lock_guard<std::mutex> lk(e->mtx);
+    return e->current_yielded;
+}
+
+// bz_we_take_current: vtable slot 3 (owning variant). Transfers ownership
+// of current_yielded to the caller; nulls the slot. The IOE-on-miss check
+// (mirroring the compiler-generated TakeCurrent for IOwningAsyncEnumerable<T>)
+// is performed by codegen in `emitPendingCheck()` AFTER the vtable dispatch —
+// this runtime helper just returns null when no value is pending, which
+// codegen treats as a TakeCurrent-miss. The IOE raise itself is a
+// follow-up tightening (one ioe_vtable plumbing point).
+static void* bz_we_take_current(void* self) {
+    auto* e = (bz_task_when_each_enumerator_t*)self;
+    std::lock_guard<std::mutex> lk(e->mtx);
+    void* t = e->current_yielded;
+    e->current_yielded = nullptr;
+    // Owning variant: null the input array slot so the enumerator's
+    // Dispose doesn't free the task the consumer now owns. The slot
+    // corresponds to current_yielded_idx (the (idx, task) pair recorded
+    // when the task was pushed onto the ready queue). For the borrowing
+    // variant, the slot is NOT owned by us, so we MUST NOT null it —
+    // the caller still borrows the same task pointer.
+    if (e->is_owning && t && e->current_yielded_idx >= 0 && e->input_arr) {
+        void* nullPtr = nullptr;
+        bz_array_set(e->input_arr, e->current_yielded_idx,
+                     &nullPtr, sizeof(void*));
+    }
+    e->current_yielded_idx = -1;
+    return t;  // null when no pending value; codegen handles the IOE
+}
+
+// Two vtable globals: borrowing (slot 3 = Current) and owning (slot 3 =
+// TakeCurrent). They share slot 0/1/2 (self/Dispose/MoveNextAsync).
+//
+// We use a static initializer trick: declare them as raw globals filled in
+// by bz_task_when_each_vtables_init, called lazily from the init funcs.
+
+static void* g_we_vtable_borrowing[4] = {nullptr, nullptr, nullptr, nullptr};
+static void* g_we_vtable_owning[4]    = {nullptr, nullptr, nullptr, nullptr};
+static int g_we_vtables_inited = 0;
+
+static void bz_we_vtables_init(void) {
+    if (g_we_vtables_inited) return;
+    g_we_vtables_inited = 1;
+    // vtable[0] = self-reference (set after the address of the global is known).
+    g_we_vtable_borrowing[0] = g_we_vtable_borrowing;  // self
+    g_we_vtable_borrowing[1] = (void*)bz_we_dispose;
+    g_we_vtable_borrowing[2] = (void*)bz_we_move_next;
+    g_we_vtable_borrowing[3] = (void*)bz_we_current;
+    g_we_vtable_owning[0] = g_we_vtable_owning;
+    g_we_vtable_owning[1] = (void*)bz_we_dispose;
+    g_we_vtable_owning[2] = (void*)bz_we_move_next;
+    g_we_vtable_owning[3] = (void*)bz_we_take_current;
+}
+
+// Per-input-task completion helper for init. Pushes the completed task
+// onto the enumerator's ready queue, increments `completed`, and wakes
+// any MoveNextAsync waiter. (The waiter's continuation registered above
+// does the actual wake + advance-complete; this is the per-input
+// observer.)
+struct BzWeInitSlot {
+    bz_task_when_each_enumerator_t* e;
+    int64_t idx;
+};
+
+static void bz_we_input_completed(void* completedTask, void* state) {
+    auto* slot = (BzWeInitSlot*)state;
+    auto* e = slot->e;
+    bz_task_t* advance = nullptr;
+    uint8_t value = 0;
+    bool free_completed = false;  // owning + disposed: enumerator frees it here
+    {
+        std::lock_guard<std::mutex> lk(e->mtx);
+        // #2095 (dup-enqueue): the per-index once-flag guarantees a given
+        // input task transitions from "un-observed" to "observed" exactly
+        // once, so it is enqueued/delivered at most once no matter how many
+        // times its completion fires.
+        if (!e->observed[slot->idx]) {
+            e->observed[slot->idx] = 1;
+            e->completed++;
+            if (e->disposed) {
+                // #2096: the enumerator was disposed before this task
+                // completed. For the OWNING variant the enumerator owns the
+                // task and the consumer will never take it, so discharge it
+                // here — exactly once (a disposed enumerator never pushes to
+                // `ready` and never sets `current_yielded`, and bz_we_dispose
+                // deliberately does NOT sweep input-array elements, precisely
+                // so a task with a still-registered observer is freed by that
+                // observer and not by dispose). For the BORROWING variant the
+                // caller owns the task; the enumerator frees nothing.
+                if (e->is_owning) free_completed = true;
+            } else if (e->pending_advance) {
+                advance = e->pending_advance;
+                e->pending_advance = nullptr;
+                e->current_yielded = completedTask;
+                e->current_yielded_idx = slot->idx;
+                value = 1;
+            } else {
+                e->ready.push_back({slot->idx, completedTask});
+            }
+        }
+    }
+    if (advance) bz_task_complete(advance, &value, 1);
+    // Discharge outside the enum lock: bz_task_free may run the task's
+    // result_disposer (a user destructor), which must not run under e->mtx.
+    if (free_completed) bz_task_free(completedTask);
+    e->cv.notify_all();
+    delete slot;
+    bz_we_release(e);
+}
+
+// bz_task_when_each_init_borrowing: build a borrowing enumerator for
+// Task.WhenEach(tasks: Array<Task>) and Task.WhenEach<T>(tasks: Array<Task<T>>).
+// `is_typed` selects the typed variant — both share the same runtime
+// shape (the yielded element is a Task<T> pointer; the consumer awaits
+// it to get the result). `task_arr` is BORROWED — the caller retains
+// ownership (the §28.3 deferred-activation frame carriage binds the
+// borrow to the returned iterable so the compiler enforces
+// source-outlives-settlement).
+void* bz_task_when_each_init_borrowing(void* task_arr, int32_t is_typed) {
+    bz_we_vtables_init();
+    auto* arr = (bz_array_t*)task_arr;
+    int64_t n = arr ? bz_array_len(arr) : 0;
+    auto* e = new bz_task_when_each_enumerator_t();
+    e->vtable = g_we_vtable_borrowing;
+    e->input_arr = arr;
+    e->empty_oa = nullptr;
+    e->n = n;
+    e->completed = 0;
+    e->observed.assign(static_cast<size_t>(n), 0);
+    e->current_yielded = nullptr;
+    e->current_yielded_idx = -1;
+    e->is_typed = is_typed;
+    e->is_owning = 0;
+    e->disposed = 0;
+    e->exhausted = (n == 0) ? 1 : 0;
+    e->get_enum_called = 0;
+    e->pending_advance = nullptr;
+    // Register a per-input observer. The observer pushes the completed
+    // task onto the ready queue under the enum's lock and notifies the cv.
+    // Note: we register the observer on each input task even if the task
+    // is already done — bz_task_then's already-done fast path (above)
+    // runs the continuation synchronously, which is correct.
+    for (int64_t i = 0; i < n; ++i) {
+        void* t = nullptr;
+        bz_array_get(arr, i, &t, sizeof(void*));
+        if (!t) continue;
+        auto* slot = new BzWeInitSlot{e, i};
+        e->refs.fetch_add(1, std::memory_order_relaxed);
+        bz_task_then(t, bz_we_input_completed, slot);
+    }
+    return e;
+}
+
+// bz_task_when_each_init_owning: build an owning enumerator for
+// Task.WhenEachOwned<T>(owned tasks: OwningArray<OwningTask<T>>).
+// Takes ownership of the input array. Unconsumed tasks are freed by
+// bz_we_dispose (per §30.5: bz_task_free runs the result_disposer on
+// the produced class value, then frees the task struct).
+//
+// `result_disposer` is T's destructor thunk (codegen-synthesized from
+// OwningTask<T>'s T; null when the runtime already knows how). #2096/§30.5:
+// a bz_task_from_result task (Task.FromOwnedResult) carries NO disposer of
+// its own — that is normally attached at the producing local's scope-end
+// drop, which never runs once the task is moved into the array. Attach the
+// disposer to every input task here so bz_we_dispose can cascade disposal
+// of each UNCONSUMED OwningTask<T>'s produced class value (D7). A task whose
+// result is later CONSUMED via TakeCurrent+await has its result slot nulled,
+// so bz_task_free skips the disposer — no double-dispose.
+void* bz_task_when_each_init_owning(void* owning_task_arr,
+                                    void (*result_disposer)(void*)) {
+    bz_we_vtables_init();
+    auto* arr = (bz_array_t*)owning_task_arr;
+    int64_t n = arr ? bz_array_len(arr) : 0;
+    auto* e = new bz_task_when_each_enumerator_t();
+    e->vtable = g_we_vtable_owning;
+    e->input_arr = arr;
+    e->empty_oa = nullptr;
+    e->n = n;
+    e->completed = 0;
+    e->observed.assign(static_cast<size_t>(n), 0);
+    e->current_yielded = nullptr;
+    e->current_yielded_idx = -1;
+    e->is_typed = 1;  // OwningTask<T> is always typed
+    e->is_owning = 1;
+    e->disposed = 0;
+    e->exhausted = (n == 0) ? 1 : 0;
+    e->get_enum_called = 0;
+    e->pending_advance = nullptr;
+    for (int64_t i = 0; i < n; ++i) {
+        void* t = nullptr;
+        bz_array_get(arr, i, &t, sizeof(void*));
+        if (!t) continue;
+        // Attach T's result disposer so an unconsumed task's class result is
+        // disposed exactly once when bz_we_dispose frees it (§30.5 / D7).
+        if (result_disposer) bz_task_set_result_disposer(t, result_disposer);
+        auto* slot = new BzWeInitSlot{e, i};
+        e->refs.fetch_add(1, std::memory_order_relaxed);
+        bz_task_then(t, bz_we_input_completed, slot);
+    }
+    return e;
+}
+
+} // extern "C" (bz_task_take_result / Task.WhenEach)

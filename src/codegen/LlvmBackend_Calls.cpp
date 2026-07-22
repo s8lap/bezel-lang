@@ -7935,6 +7935,88 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             return builder_.CreateCall(whenAllOwnedFn, {arr},
                                        "task.when_all_owned");
         }
+        // stdlib §6.7 v0.212 / proposal 0023 D1-D7: Task.WhenEach streaming
+        // fan-in. Returns an IAsyncEnumerable<Task> / IAsyncEnumerable<Task<T>>
+        // (a vtable-backed runtime object — see the comment at
+        // bz_task_when_each_init_borrowing in bezel_runtime_concurrency.cpp).
+        // The input array is BORROWED (per §28.3 deferred-activation frame
+        // carriage: the returned iterable is a borrow-carrying value whose
+        // source is the argument array, and the borrow tracker enforces that
+        // the array outlives the `await for` loop). The #1813 input seam —
+        // the named-binding discipline that avoids `tasks.Add(freshCall())`
+        // abandoning the freshly-minted task at end of statement — is
+        // documented in the stdlib text; tests build the borrowed array over
+        // named task bindings.
+        if (m == "WhenEach" && !call.args.empty() && call.args[0].value) {
+            // The arg is either Array<Task> (no-result) or Array<Task<T>>.
+            // Both share the same runtime shape: ptr-sized task elements, a
+            // borrowed bz_array_t* of the same layout. `is_typed` is a marker
+            // for the runtime (1 = Task<T> element, 0 = Task element); both
+            // yield already-completed task pointers to the consumer.
+            auto [arr, isLiteralTemp] = lowerTaskArrayArg(*call.args[0].value);
+            if (!arr) return nullptr;
+            auto* arrTy = ctx_.exprType(*call.args[0].value);
+            int32_t isTyped = 0;
+            if (arrTy && arrTy->kind == sema::TypeRef::Kind::Named &&
+                !arrTy->genericArgs.empty() && arrTy->genericArgs[0]) {
+                auto* elemTaskTy = arrTy->genericArgs[0];
+                auto elemName = builtinTypeName(elemTaskTy);
+                if ((elemName == "Task" || elemName == "OwningTask") &&
+                    !elemTaskTy->genericArgs.empty() &&
+                    elemTaskTy->genericArgs[0]) {
+                    isTyped = 1;
+                }
+            }
+            auto* whenEachFn = declareC("bz_task_when_each_init_borrowing",
+                                        ptrTy(), {ptrTy(), i32()});
+            llvm::Value* result = builder_.CreateCall(
+                whenEachFn, {arr, builder_.getInt32(isTyped)},
+                "task.when_each");
+            // The runtime copies task pointers into its observer registrations;
+            // it never retains the array container itself. Match WhenAll/WhenAny:
+            // release an intrinsic-only literal materialization synchronously.
+            if (isLiteralTemp) freeTaskArrayArgTemp(arr);
+            return result;
+        }
+        // stdlib §6.7 v0.212 / proposal 0023 D7: Task.WhenEachOwned<T>(
+        //   owned tasks: OwningArray<OwningTask<T>>
+        // ): IOwningAsyncEnumerable<OwningTask<T>> where T: class.
+        // Takes ownership of the OwningArray<OwningTask<T>> (Pattern B);
+        // unconsumed tasks are freed by the enumerator's Dispose via
+        // bz_task_free, whose result_disposer cascades to the produced
+        // class value per §30.5. The runtime object has the
+        // IOwningAsyncEnumerable<OwningTask<T>> vtable (slot 3 =
+        // TakeCurrent, transferring ownership of the yielded
+        // OwningTask<T> and nulling the slot).
+        if (m == "WhenEachOwned" && !call.args.empty() && call.args[0].value) {
+            llvm::Value* arr = lowerExpr(*call.args[0].value);
+            if (!arr) return nullptr;
+            // #2096 / §30.5 / proposal 0023 D7: derive the per-element result
+            // disposer for T from OwningArray<OwningTask<T>>. The runtime is
+            // type-erased and a bare `bz_task_from_result` (Task.FromOwnedResult)
+            // task carries NO result_disposer of its own — its result disposer
+            // is normally attached at the caller's scope-end drop, which never
+            // runs once the task is moved into the array. So the enumerator's
+            // Dispose (which frees tasks not consumed before enumeration ends)
+            // would leak each unconsumed OwningTask<T>'s produced class value.
+            // Thread T's destructor thunk to the runtime, which attaches it to
+            // every input task so bz_task_free cascades disposal per §30.5.
+            llvm::Value* resultDisposer =
+                llvm::ConstantPointerNull::get(ptrTy());
+            if (auto* argTy = ctx_.exprType(*call.args[0].value)) {
+                if (argTy->kind == sema::TypeRef::Kind::Named &&
+                    !argTy->genericArgs.empty() && argTy->genericArgs[0]) {
+                    auto* taskTy = argTy->genericArgs[0];  // OwningTask<T>
+                    if (!taskTy->genericArgs.empty() && taskTy->genericArgs[0])
+                        resultDisposer = elementDisposerArg(
+                            taskTy->genericArgs[0], /*owningFamily=*/true);
+                }
+            }
+            auto* whenEachOwnedFn = declareC("bz_task_when_each_init_owning",
+                                              ptrTy(), {ptrTy(), ptrTy()});
+            return builder_.CreateCall(whenEachOwnedFn, {arr, resultDisposer},
+                                       "task.when_each_owned");
+        }
         // stdlib §6.7 (line 2885): Task.FireAndForget(owned task: Task): void.
         // Registers a continuation that frees the task on completion; ownership
         // transfers. Returns unit (nullptr from codegen → discarded).
