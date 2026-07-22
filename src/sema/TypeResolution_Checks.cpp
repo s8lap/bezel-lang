@@ -4427,6 +4427,7 @@ void Resolver::checkVarianceMarkerScope() {
 static bool isSerializationEligibleType(
         const TypeRef* tr,
         std::unordered_set<const TypeSymbol*>& visited,
+        const SemaContext& ctx,
         bool forRecordComponent = false) {
     if (!tr) return false;
     using K = TypeRef::Kind;
@@ -4435,7 +4436,7 @@ static bool isSerializationEligibleType(
         // Peel the nullable wrapper and check the inner type.
         TypeRef inner = *tr;
         inner.nullable = false;
-        return isSerializationEligibleType(&inner, visited, forRecordComponent);
+        return isSerializationEligibleType(&inner, visited, ctx, forRecordComponent);
     }
     if (tr->kind == K::Primitive) {
         // All primitives except Object are eligible.
@@ -4478,7 +4479,7 @@ static bool isSerializationEligibleType(
             // cannot hold a `Shared<T>` identity participant or a `Weak<T>`
             // back-edge — only a class can.
             if (forRecordComponent) return false;
-            return isSerializationEligibleType(tr->genericArgs[0], visited,
+            return isSerializationEligibleType(tr->genericArgs[0], visited, ctx,
                                                 forRecordComponent);
         }
     }
@@ -4513,6 +4514,40 @@ static bool isSerializationEligibleType(
         // the compiler will check IT at its own conformance declaration.
         // This avoids deep recursion and mirrors how auto-equality treats nested
         // records (it trusts them, checks each at its own declaration site).
+        return true;
+    }
+
+    // Choice: §9.8 choice serialization (v0.200, #2046). A value-like choice is
+    // value-shaped storage throughout (its payloads are value/string/runtime-
+    // managed — no owning tree, no class-typed owner), so it is admissible as a
+    // choice payload and as a record component alike; the same "trust the nested
+    // declaration, checked at its own conformance site" posture as records. An
+    // owning or borrow-bearing choice is never eligible (the Deserialize-has-no-
+    // owner argument — §9.8/§35.4), matching the classifyChoiceType verdict.
+    // (Whether a value-like choice is formally in §9.8's record-admissible list
+    // is a documentation seam noted as a filed issue; the value-shaped reading is
+    // taken here, consistent with §9.2's admission of value-like choices as
+    // record equality components.)
+    if (ts->kind == ast::TypeDeclKind::Choice) {
+        if (visited.count(ts)) return true;  // cycle → assume eligible
+        auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
+        if (!td) return false;
+        bool declSer = false, declDeser = false;
+        for (const auto& bt : td->baseTypes) {
+            if (!bt || !bt->name || bt->name->parts.empty()) continue;
+            auto n = bt->name->parts.back();
+            if (n == "ISerializable")   declSer   = true;
+            if (n == "IDeserializable") declDeser = true;
+        }
+        if (!declSer && !declDeser) return false;
+        // Only value-like choices are eligible (§9.8 choice subsection).
+        TypeRef rt;
+        rt.kind = TypeRef::Kind::Named;
+        rt.declaration = const_cast<TypeSymbol*>(ts);
+        auto verdict = common::classifyChoiceType(&rt, ctx);
+        if (verdict && *verdict != common::ChoiceClassification::ValueLike)
+            return false;
+        visited.insert(ts);
         return true;
     }
 
@@ -4710,7 +4745,8 @@ void Resolver::checkSerializationEligibility() {
         bool isRecord = t->kind == ast::TypeDeclKind::Record;
         bool isEnum   = t->kind == ast::TypeDeclKind::Enum;
         bool isClass  = t->kind == ast::TypeDeclKind::Class;
-        if (!isRecord && !isEnum && !isClass) continue;
+        bool isChoice = t->kind == ast::TypeDeclKind::Choice;
+        if (!isRecord && !isEnum && !isClass && !isChoice) continue;
 
         auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
         if (!td) continue;
@@ -4721,6 +4757,151 @@ void Resolver::checkSerializationEligibility() {
 
         // Enums are always serialization-eligible (§9.8).
         if (isEnum) continue;  // no further check needed
+
+        // §9.8 choice serialization (v0.200, #2046): a choice is serialization-
+        // eligible when it is value-like (§35.4) and every payload field's type
+        // is serialization-eligible and record-admissible.  An ineligible
+        // conformance declaration is a compile error at the conformance
+        // declaration, naming the first offending payload — the same discipline
+        // as the record rule below.
+        if (isChoice) {
+            bool hwS = typeHasHandWrittenMethod(t, "Serialize");
+            bool hwD = typeHasHandWrittenMethod(t, "Deserialize");
+            bool needSer   = wantsIS && !hwS;
+            bool needDeser = wantsID && !hwD;
+            if (!needSer && !needDeser) continue;  // fully hand-written
+
+            bool foundError = false;
+
+            // Case-level and payload-level `serialized` clause validation (§9.8):
+            //  - the `serialized` clause on a CASE admits the rename form only
+            //    (a case is not omittable — the enum-constant rule): `skip` and
+            //    `optional` on a case are compile errors;
+            //  - a case rename, or a payload rename, beginning with `$` is
+            //    reserved for the JSON $-set (stdlib §2.15, including `$case`).
+            for (const auto& cc : td->choiceCases) {
+                if (cc.serialized) {
+                    if (cc.serialized->isSkip || cc.serialized->isOptional) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "choice `" + std::string(t->name) + "`: the "
+                            "`serialized` clause on case `" + std::string(cc.name) +
+                            "` admits the rename form only — a case is not "
+                            "omittable (§9.8; the enum-constant rule). Remove "
+                            "`skip`/`optional`.");
+                        foundError = true;
+                        break;
+                    }
+                    if (!cc.serialized->name.empty() &&
+                        cc.serialized->name.front() == '$') {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "choice `" + std::string(t->name) + "`: `serialized` "
+                            "rename `" + std::string(cc.serialized->name) +
+                            "` for case `" + std::string(cc.name) +
+                            "` begins with `$`, which is reserved for the JSON "
+                            "$-set (`$case`/`$type`/`$id`/`$ref`, stdlib §2.15); "
+                            "choose a name that does not start with `$`");
+                        foundError = true;
+                        break;
+                    }
+                }
+                for (const auto& pf : cc.payload) {
+                    if (pf.serialized && !pf.serialized->name.empty() &&
+                        pf.serialized->name.front() == '$') {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "choice `" + std::string(t->name) + "`: `serialized` "
+                            "rename `" + std::string(pf.serialized->name) +
+                            "` for payload `" + std::string(cc.name) + "." +
+                            std::string(pf.name) + "` begins with `$`, which is "
+                            "reserved for the JSON $-set (stdlib §2.15); choose a "
+                            "name that does not start with `$`");
+                        foundError = true;
+                        break;
+                    }
+                    // §9.8/§35.10: `serialized skip` supplies default(T); a
+                    // non-nullable choice-typed payload has no default (§17.11),
+                    // so `skip` on it requires the nullable form.
+                    if (positionalFieldIsSkip(pf) && pf.type) {
+                        const TypeRef* ptr = ctx_.resolvedType(*pf.type);
+                        if (ptr && !ptr->nullable && ptr->kind == TypeRef::Kind::Named &&
+                            ptr->declaration &&
+                            ptr->declaration->kind == ast::TypeDeclKind::Choice) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, t->declLoc,
+                                "choice `" + std::string(t->name) + "`: "
+                                "`serialized skip` on payload `" +
+                                std::string(cc.name) + "." + std::string(pf.name) +
+                                "` reconstructs with `default(T)`, but a choice "
+                                "type has no default (§17.11/§35.10) — make the "
+                                "payload nullable (`C?`) or remove `skip`");
+                            foundError = true;
+                            break;
+                        }
+                    }
+                }
+                if (foundError) break;
+            }
+            if (foundError) continue;
+
+            // §9.8/§35.4: only value-like choices are eligible — an owning or
+            // borrow-bearing choice is never eligible (the Deserialize-has-no-
+            // owner argument, same as class-typed record fields).
+            TypeRef rt;
+            rt.kind = TypeRef::Kind::Named;
+            rt.declaration = t;
+            auto verdict = common::classifyChoiceType(&rt, ctx_);
+            if (verdict &&
+                *verdict != common::ChoiceClassification::ValueLike) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    "choice `" + std::string(t->name) + "` declares "
+                    "`ISerializable`/`IDeserializable` but is not serialization-"
+                    "eligible (§9.8): the choice is " +
+                    (*verdict == common::ChoiceClassification::Owning
+                         ? std::string("owning")
+                         : std::string("borrow-bearing")) +
+                    " (§35.4), and only a value-like choice is eligible — a "
+                    "class-, interface-, or `owned`-payload choice has no owner "
+                    "for the synthesized `Deserialize` to construct against. "
+                    "Remove the conformance declaration, restructure to a "
+                    "value-like choice, or hand-write `Serialize`/`Deserialize`.");
+                continue;
+            }
+
+            // Every non-skip payload field must itself be serialization-eligible
+            // and record-admissible (value-shaped storage throughout, §9.8).
+            std::unordered_set<const TypeSymbol*> visited;
+            visited.insert(t);
+            for (const auto& cc : td->choiceCases) {
+                bool broke = false;
+                for (const auto& pf : cc.payload) {
+                    if (positionalFieldIsSkip(pf)) continue;  // excluded
+                    if (!pf.type) continue;
+                    const TypeRef* tr = ctx_.resolvedType(*pf.type);
+                    if (!tr) continue;
+                    if (!isSerializationEligibleType(tr, visited, ctx_,
+                                                     /*forRecordComponent=*/true)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "choice `" + std::string(t->name) + "` declares "
+                            "`ISerializable`/`IDeserializable` but is not "
+                            "serialization-eligible (§9.8): payload `" +
+                            std::string(cc.name) + "." + std::string(pf.name) +
+                            "` has a type that is not serialization-eligible and "
+                            "record-admissible; remove the conformance "
+                            "declaration, mark the payload `serialized skip` (if "
+                            "defaultable), make the payload type serializable, or "
+                            "hand-write `Serialize`/`Deserialize`");
+                        broke = true;
+                        break;
+                    }
+                }
+                if (broke) break;
+            }
+            continue;
+        }
 
         // Classes: §9.8 tier-2 eligibility checking.
         if (isClass) {
@@ -4930,7 +5111,7 @@ void Resolver::checkSerializationEligibility() {
                         // Valid back-edge under graph/cyclic — continue.
                         continue;
                     }
-                    if (!isSerializationEligibleType(tr, visited)) {
+                    if (!isSerializationEligibleType(tr, visited, ctx_)) {
                         reportIneligible(fs->name,
                             "has a type that is not serialization-eligible");
                         break;
@@ -4960,7 +5141,7 @@ void Resolver::checkSerializationEligibility() {
                 if (!pd->type) continue;
                 const TypeRef* tr = ctx_.resolvedType(*pd->type);
                 if (!tr) continue;
-                if (!isSerializationEligibleType(tr, visited)) {
+                if (!isSerializationEligibleType(tr, visited, ctx_)) {
                     reportIneligible(m->name,
                         "has a type that is not serialization-eligible");
                     break;
@@ -5192,7 +5373,7 @@ void Resolver::checkSerializationEligibility() {
                 // §9.8 v0.182: checked as a RECORD component — class-,
                 // interface-, `Shared<T>`-, and `Weak<T>`-typed fields are
                 // never eligible here, only within a class.
-                if (!isSerializationEligibleType(tr, visited,
+                if (!isSerializationEligibleType(tr, visited, ctx_,
                                                   /*forRecordComponent=*/true)) {
                     reportIneligible(pf.name,
                         "has a type that is not serialization-eligible");
@@ -5229,7 +5410,7 @@ void Resolver::checkSerializationEligibility() {
                 if (!tr) continue;
                 // §9.8 v0.182: checked as a RECORD component (see the
                 // positional-field case above).
-                if (!isSerializationEligibleType(tr, visited,
+                if (!isSerializationEligibleType(tr, visited, ctx_,
                                                   /*forRecordComponent=*/true)) {
                     reportIneligible(m->name,
                         "has a type that is not serialization-eligible");

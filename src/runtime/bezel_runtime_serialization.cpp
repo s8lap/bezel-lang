@@ -788,7 +788,13 @@ struct bz_binder_t {
     // the next bz_binder_begin_object call returns this value instead of reading
     // from the stream (the opening '{' and `$type` field have already been consumed).
     // For JSON: json_obj_preread is also set to 1 alongside this.
-    int32_t  poly_preread_count;  // 0 = not set; >0 = preread field count
+    int32_t  poly_preread_count;  // preread field count when poly_preread_active
+    // §9.8 choice serialization (v0.200, #2046): a payload-free choice case has
+    // ZERO remaining fields, so `poly_preread_count > 0` cannot gate the preread
+    // (0 is indistinguishable from "unset").  This companion flag makes a preread
+    // of 0 honoured: when set, the next bz_binder_begin_object returns
+    // poly_preread_count (possibly 0) without re-reading the object header.
+    int8_t   poly_preread_active;  // 0 = unset; 1 = preread_count is authoritative
 };
 
 static int bz_binder_read_byte_impl(bz_binder_t* d, uint8_t* out) {
@@ -1598,12 +1604,16 @@ static int32_t bz_jder_count_object_fields(bz_binder_t* d) {
 int32_t bz_binder_begin_object(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
 
-    // §9.8 tier-4 polymorphic: poly_preread_count is set by
-    // bz_binder_read_poly_discriminator after consuming '{' and the "$type"
-    // field.  Use it directly without reading the stream again.
-    if (d->poly_preread_count > 0) {
+    // §9.8 tier-4 polymorphic / choice ($case): poly_preread_count is set by
+    // bz_binder_read_poly_discriminator / bz_binder_read_case_discriminator after
+    // consuming '{' and the "$type"/"$case" field.  Use it directly without
+    // reading the stream again.  The active flag (not `count > 0`) gates the
+    // preread so a ZERO remaining-field count — a payload-free choice case — is
+    // honoured (§9.8, #2046).
+    if (d->poly_preread_active) {
         int32_t n = d->poly_preread_count;
         d->poly_preread_count = 0;
+        d->poly_preread_active = 0;
         d->in_object = true;
         // For JSON: json_obj_preread is already set to 1 by
         // bz_binder_read_poly_discriminator ('{' already consumed).
@@ -2062,6 +2072,7 @@ void* bz_binder_read_poly_discriminator(void* derp) {
 
         // Set preread_count so concrete's begin_object returns total_count-1.
         d->poly_preread_count = total_count - 1;
+        d->poly_preread_active = 1;  // honour a zero remaining-field count (#2046)
         // Note: do NOT set json_obj_preread here — poly_preread_count gates the
         // begin_object path directly without going through the JSON preread path.
         return disc;
@@ -2103,6 +2114,138 @@ void* bz_binder_read_poly_discriminator(void* derp) {
     }
     // Set preread_count so concrete's begin_object returns field_count-1.
     d->poly_preread_count = (int32_t)(field_count - 1);
+    d->poly_preread_active = 1;  // honour a zero remaining-field count (#2046)
+    d->in_object = true;
+    return disc;
+}
+
+// §9.8 choice serialization (v0.200): read the leading "$case" discriminator of a
+// choice's serialized object form and set up poly_preread_count so the following
+// bz_binder_begin_object returns the remaining (payload) field count without
+// re-reading the object header.  Structurally identical to
+// bz_binder_read_poly_discriminator, but the reserved key it requires is "$case"
+// (stdlib §2.15's $-reserved set) instead of "$type".
+//
+// Per §9.8: the discriminator is read FIRST, consumed by case dispatch before
+// any payload binding; an object that does not lead with "$case" (or is empty)
+// raises SerializationException.  The returned bz_string* (rc=1) holds the case
+// discriminator value (the case's declared name or its `serialized "<name>"`
+// rename); the caller dispatches on it and must bz_string_release it.
+void* bz_binder_read_case_discriminator(void* derp) {
+    auto* d = static_cast<bz_binder_t*>(derp);
+
+    if (d->kind >= 1) {
+        // JSON path.  (A value-like choice is a value type — it never carries a
+        // "$id" identity tag — so the graph-marker preread does not apply here;
+        // we still honour json_obj_preread defensively, mirroring the poly path.)
+        bool preread = (d->json_obj_preread != 0);
+        if (preread) {
+            d->json_obj_preread = 0;  // consumed
+            d->in_object = true;
+        } else {
+            bz_jder_skip_ws(d);
+            if (d->pos >= d->len || d->data[d->pos] != '{') {
+                bz_ser_throw("Choice deserialize: expected '{' (§9.8)", nullptr);
+                return nullptr;
+            }
+            ++d->pos;  // consume '{'
+            d->in_object = true;
+        }
+
+        int32_t total_count = bz_jder_count_object_fields(d);
+        if (total_count <= 0) {
+            bz_ser_throw("Choice deserialize: empty object, missing \"$case\" "
+                         "discriminator (§9.8)", nullptr);
+            return nullptr;
+        }
+
+        bz_jder_skip_ws(d);
+        if (d->pos < d->len && d->data[d->pos] == ',') ++d->pos;
+        bz_jder_skip_ws(d);
+        if (d->pos >= d->len || d->data[d->pos] == '}') {
+            bz_ser_throw("Choice deserialize: missing \"$case\" discriminator (§9.8)",
+                         nullptr);
+            return nullptr;
+        }
+        if (d->data[d->pos] != '"') {
+            bz_ser_throw("Choice deserialize: expected '\"' for field name (§9.8)",
+                         nullptr);
+            return nullptr;
+        }
+        ++d->pos;  // skip opening '"'
+        const int64_t kStart = d->pos;
+        while (d->pos < d->len && d->data[d->pos] != '"') ++d->pos;
+        const int64_t kLen = d->pos - kStart;
+        if (d->pos < d->len) ++d->pos;  // skip closing '"'
+        bool isCaseKey = (kLen == 5 &&
+                          d->data[kStart+0] == '$' &&
+                          d->data[kStart+1] == 'c' &&
+                          d->data[kStart+2] == 'a' &&
+                          d->data[kStart+3] == 's' &&
+                          d->data[kStart+4] == 'e');
+        if (!isCaseKey) {
+            // §9.8: dispatch must select the case before component binding can
+            // begin — an object that does not lead with the discriminator faults.
+            bz_ser_throw("Choice deserialize: object does not lead with the "
+                         "\"$case\" discriminator (§9.8)", nullptr);
+            return nullptr;
+        }
+        if (!bz_jder_expect_char(d, ':')) {
+            bz_ser_throw("Choice deserialize: expected ':' after \"$case\" (§9.8)",
+                         nullptr);
+            return nullptr;
+        }
+        void* disc = bz_jder_parse_string(d);
+        if (!disc) {
+            bz_ser_throw("Choice deserialize: failed to read \"$case\" value (§9.8)",
+                         nullptr);
+            return nullptr;
+        }
+        bz_jder_skip_ws(d);
+        if (d->pos < d->len && d->data[d->pos] == ',') ++d->pos;
+
+        d->poly_preread_count = total_count - 1;
+        d->poly_preread_active = 1;  // honour a zero remaining-field count (#2046)
+        return disc;
+    }
+
+    // Binary path.
+    uint32_t field_count = 0;
+    if (!bz_binder_read_le32_impl(d, &field_count)) {
+        bz_ser_throw("Choice deserialize: truncated binary object header (§9.8)",
+                     nullptr);
+        return nullptr;
+    }
+    if (field_count == 0) {
+        bz_ser_throw("Choice deserialize: empty object, missing \"$case\" "
+                     "discriminator (§9.8)", nullptr);
+        return nullptr;
+    }
+    void* keyStr = bz_binder_read_bz_string(d);
+    if (!keyStr) {
+        bz_ser_throw("Choice deserialize: missing field name (§9.8)", nullptr);
+        return nullptr;
+    }
+    const auto* kbz = static_cast<const bz_string_struct*>(keyStr);
+    bool isCaseKey = (kbz->len == 5 && kbz->width == 1);
+    if (isCaseKey) {
+        const uint8_t* kd = static_cast<const uint8_t*>(kbz->data);
+        isCaseKey = (kd[0]=='$' && kd[1]=='c' && kd[2]=='a' && kd[3]=='s' && kd[4]=='e');
+    }
+    bz_string_release(keyStr);
+    if (!isCaseKey) {
+        bz_ser_throw("Choice deserialize: object does not lead with the \"$case\" "
+                     "discriminator (§9.8)", nullptr);
+        return nullptr;
+    }
+    void* disc = bz_binder_read_bz_string(d);
+    if (!disc) {
+        bz_ser_throw("Choice deserialize: failed to read \"$case\" binary value (§9.8)",
+                     nullptr);
+        return nullptr;
+    }
+    d->poly_preread_count = (int32_t)(field_count - 1);
+    d->poly_preread_active = 1;  // honour a zero remaining-field count (#2046)
     d->in_object = true;
     return disc;
 }

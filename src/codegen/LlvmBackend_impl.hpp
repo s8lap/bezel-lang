@@ -2510,6 +2510,21 @@ private:
     llvm::Value* emitEnumDeserialize(const sema::TypeSymbol* ts,
                                      llvm::Value* derPtr);
 
+    // §9.8 choice serialization (v0.200, #2046) — the `$case`-discriminated
+    // object form for a value-like choice.
+    // Serialize: switch on the active-case tag; each arm writes an object whose
+    // leading field is `"$case"` (the case's declared name or its `serialized
+    // "<name>"` rename), followed by the active case's payload fields by name.
+    // `choiceVal` is a loaded choice struct value.
+    void emitChoiceSerialize(const sema::TypeSymbol* ts,
+                             llvm::Value* choiceVal,
+                             llvm::Value* serPtr);
+    // Deserialize: read the `$case` discriminator FIRST (bz_binder_read_case_
+    // discriminator), dispatch to select the case, read the payload fields, and
+    // build the choice struct.  Returns the constructed choice struct value.
+    llvm::Value* emitChoiceDeserialize(const sema::TypeSymbol* ts,
+                                       llvm::Value* derPtr);
+
     // §9.8 tier 2 — class synthesis (tree shape).
     // Emit the Serialize body for a `serialized tree`/`graph`/`cyclic` class.
     // `polyDiscriminator`: when non-empty, adds a leading "$type" field with

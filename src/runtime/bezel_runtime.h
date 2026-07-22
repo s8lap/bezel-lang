@@ -1755,6 +1755,15 @@ void*   bz_binder_graph_resolve_tag(void* der, int32_t tag_id);
 // Raises SerializationException if the first field is not "$type" or input is truncated.
 void* bz_binder_read_poly_discriminator(void* der);
 
+// §9.8 choice serialization (v0.200): choice-dispatch deserialization entry point.
+// Reads the opening object and the leading "$case" discriminator field; sets up
+// poly_preread_count so the following bz_binder_begin_object returns the remaining
+// payload field count without re-consuming the object header.  Returns a
+// newly-allocated bz_string* (rc=1) holding the case discriminator value.
+// Raises SerializationException if the object does not lead with "$case", is
+// empty, or the input is truncated.
+void* bz_binder_read_case_discriminator(void* der);
+
 // SerializationException throw helper — called by synthesized code on bad input.
 // `msg` is a NUL-terminated C string describing the fault (for diagnostics).
 // Stores a built-in SerializationException in the global exception slot (bz_exc)

@@ -89,6 +89,17 @@ static std::string_view enumConstWireName(const ast::EnumConstant& ec) {
     return ec.name;
 }
 
+// §9.8 choice serialization (v0.200): the `$case` discriminator value written for
+// a choice case — the case's `serialized "<name>"` rename if present, else its
+// declared name.  The `serialized` clause on a case admits the rename form only
+// (a case is not omittable — the enum-constant rule), enforced in sema.
+static std::string_view choiceCaseWireName(const sema::ChoiceCaseSymbol* cc) {
+    if (cc && cc->caseDecl && cc->caseDecl->serialized &&
+        !cc->caseDecl->serialized->name.empty())
+        return cc->caseDecl->serialized->name;
+    return cc ? cc->name : std::string_view{};
+}
+
 // ---------------------------------------------------------------------------
 // Class serialization helpers (§9.8 tier 2, v0.136)
 // ---------------------------------------------------------------------------
@@ -580,6 +591,19 @@ void Emitter::emitSerializeField(llvm::Value* val,
             if (recVal->getType()->isPointerTy())
                 recVal = builder_.CreateLoad(st, recVal);
             emitRecordSerialize(fieldTs, recVal, serPtr);
+            return;
+        }
+
+        if (fieldTs->kind == ast::TypeDeclKind::Choice) {
+            // §9.8 choice serialization (v0.200, #2046): a nested value-like
+            // choice component (a choice payload of a choice, or a choice-typed
+            // record component) recurses into the `$case` object form.  The
+            // value is a choice struct (value type); load if it is a slot ptr.
+            llvm::StructType* st = choiceStruct(fieldTs);
+            llvm::Value* chVal = val;
+            if (chVal->getType()->isPointerTy())
+                chVal = builder_.CreateLoad(st, chVal);
+            emitChoiceSerialize(fieldTs, chVal, serPtr);
             return;
         }
 
@@ -1272,6 +1296,11 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
         if (fieldTs->kind == ast::TypeDeclKind::Record)
             return emitRecordDeserialize(fieldTs, derPtr);
 
+        // §9.8 choice serialization (v0.200, #2046): a nested value-like choice
+        // component reconstructs via the `$case` object form.
+        if (fieldTs->kind == ast::TypeDeclKind::Choice)
+            return emitChoiceDeserialize(fieldTs, derPtr);
+
         if (fieldTs->kind == ast::TypeDeclKind::Class) {
             // §9.8 tier 2/tier 4: deserialize a class-typed component.
             // Returns an owned ptr.
@@ -1387,6 +1416,383 @@ llvm::Value* Emitter::emitEnumDeserialize(const TypeSymbol* ts,
 
     builder_.SetInsertPoint(endBB);
     return builder_.CreateLoad(uTy, resultSlot, "enum.deser.v");
+}
+
+// ---------------------------------------------------------------------------
+// Emitter::emitChoiceSerialize  §9.8 choice serialization (v0.200, #2046)
+//
+// The `$case`-discriminated object form for a value-like choice.  The choice
+// struct is `{ i32 tag, case0_payload, case1_payload, ... }` (choiceStruct);
+// `choiceVal` is a loaded struct value.  Switch on the active-case tag; each arm
+// writes an object whose distinguished leading field is `"$case"` (the case's
+// declared name, or its `serialized "<name>"` rename), followed by that case's
+// payload fields by name in declaration order.  A payload-free case writes the
+// object with only the discriminator.  Mirrors emitChoiceEquality's switch shape
+// so the per-case payload writes run only under the matching tag.
+// ---------------------------------------------------------------------------
+void Emitter::emitChoiceSerialize(const TypeSymbol* ts,
+                                  llvm::Value* choiceVal,
+                                  llvm::Value* serPtr) {
+    if (!ts || !ts->decl) return;
+    llvm::Type* voidTy = llvm::Type::getVoidTy(llvm_);
+    auto cases = choiceCasesOf(ts);
+    if (cases.empty()) return;
+
+    // Active-case tag (field 0 of the choice struct).
+    llvm::Value* tag = builder_.CreateExtractValue(choiceVal, {0u}, "chser.tag");
+
+    auto* endBB = llvm::BasicBlock::Create(llvm_, "chser.end", currentFn_);
+    // Switch default → end (writes nothing; unreachable for a valid value, whose
+    // tag is always an in-range case index).
+    auto* sw = builder_.CreateSwitch(tag, endBB,
+                                     static_cast<unsigned>(cases.size()));
+
+    auto* beginFn     = declareC("bz_binser_begin_object", voidTy, {ptrTy(), i32()});
+    auto* endFn       = declareC("bz_binser_end_object", voidTy, {ptrTy()});
+    auto* writeNameFn = declareC("bz_binser_write_field_name", voidTy,
+                                 {ptrTy(), ptrTy()});
+    auto* writeStrFn  = declareC("bz_binser_write_string", voidTy, {ptrTy(), ptrTy()});
+
+    for (std::size_t ci = 0; ci < cases.size(); ++ci) {
+        const sema::ChoiceCaseSymbol* cc = cases[ci];
+        auto* armBB = llvm::BasicBlock::Create(llvm_, "chser.case", currentFn_);
+        sw->addCase(builder_.getInt32(static_cast<int>(ci)), armBB);
+        builder_.SetInsertPoint(armBB);
+
+        // §9.8: field count = 1 ($case) + the active case's non-skip payloads.
+        int32_t nonSkip = 0;
+        if (cc && cc->caseDecl)
+            for (const auto& pf : cc->caseDecl->payload)
+                if (!positionalFieldIsSkip(pf)) ++nonSkip;
+
+        builder_.CreateCall(beginFn, {serPtr, builder_.getInt32(1 + nonSkip)});
+        // §2.15 / #687: begin_object can set bz_exc (MaxDepth guard).
+        emitPendingCheck();
+
+        // Leading discriminator: "$case" → the case's wire name.
+        llvm::Value* caseKey = lowerStringLiteral("\"$case\"", false);
+        builder_.CreateCall(writeNameFn, {serPtr, caseKey});
+        std::string caseWire(choiceCaseWireName(cc));
+        llvm::Value* caseVal = lowerStringLiteral("\"" + caseWire + "\"", false);
+        builder_.CreateCall(writeStrFn, {serPtr, caseVal});
+
+        // Active case's payload fields (declaration order, skip excluded).
+        if (cc && cc->caseDecl) {
+            for (std::size_t pi = 0; pi < cc->caseDecl->payload.size(); ++pi) {
+                const ast::Param& pf = cc->caseDecl->payload[pi];
+                if (positionalFieldIsSkip(pf)) continue;
+                llvm::Value* fv = builder_.CreateExtractValue(
+                    choiceVal, {static_cast<unsigned>(1 + ci),
+                                static_cast<unsigned>(pi)}, "chser.pf");
+                std::string wn(positionalFieldWireName(pf));
+                llvm::Value* nameStr = lowerStringLiteral("\"" + wn + "\"", false);
+                builder_.CreateCall(writeNameFn, {serPtr, nameStr});
+                const sema::TypeRef* pty =
+                    pf.type ? ctx_.resolvedType(*pf.type) : nullptr;
+                emitSerializeField(fv, pty, serPtr);
+            }
+        }
+
+        builder_.CreateCall(endFn, {serPtr});
+        builder_.CreateBr(endBB);
+    }
+
+    builder_.SetInsertPoint(endBB);
+}
+
+// ---------------------------------------------------------------------------
+// Emitter::emitChoiceDeserialize  §9.8 choice serialization (v0.200, #2046)
+//
+// Reads the `$case` discriminator FIRST (bz_binder_read_case_discriminator,
+// which sets poly_preread_count so the per-case begin_object below returns the
+// payload field count), dispatches on the discriminator string to select the
+// case, reads the payload fields under the standard missing/duplicate/unknown
+// rules, and builds the choice struct.  An undeclared discriminator string, or
+// an object that does not lead with the discriminator, raises
+// SerializationException (the leading-field faults live in the runtime helper;
+// the undeclared-case fault is the no-match branch here).  Returns the
+// constructed choice struct value.
+// ---------------------------------------------------------------------------
+llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
+                                            llvm::Value* derPtr) {
+    if (!ts || !ts->decl) return nullptr;
+    llvm::Type* voidTy = llvm::Type::getVoidTy(llvm_);
+    llvm::StructType* st = choiceStruct(ts);
+    auto cases = choiceCasesOf(ts);
+
+    // Result slot — the constructed choice value (each case block stores here).
+    llvm::AllocaInst* resultSlot = entryAlloca(st);
+    builder_.CreateStore(llvm::ConstantAggregateZero::get(st), resultSlot);
+
+    // §9.8: read the leading "$case" discriminator FIRST (before any payload
+    // binding).  The helper faults on a missing / mis-placed discriminator and
+    // sets poly_preread_count = remaining-field-count.
+    auto* readDiscFn = declareC("bz_binder_read_case_discriminator", ptrTy(),
+                                {ptrTy()});
+    llvm::Value* discPtr = builder_.CreateCall(readDiscFn, {derPtr}, "chdes.disc");
+    emitPendingCheck();
+
+    // Null discriminator → truncated / missing-discriminator fault.
+    {
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            discPtr, llvm::ConstantPointerNull::get(ptrTy()), "chdes.disc.null");
+        auto* nullBB = llvm::BasicBlock::Create(llvm_, "chdes.disc.nullbb", currentFn_);
+        auto* liveBB = llvm::BasicBlock::Create(llvm_, "chdes.disc.livebb", currentFn_);
+        builder_.CreateCondBr(isNull, nullBB, liveBB);
+        builder_.SetInsertPoint(nullBB);
+        emitThrowBuiltin("SerializationException");
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateUnreachable();
+        builder_.SetInsertPoint(liveBB);
+    }
+
+    // Register discPtr for exception cleanup (mirrors emitPolyClassDeserialize).
+    llvm::AllocaInst* discSlot = entryAlloca(ptrTy());
+    {
+        llvm::BasicBlock& eb = currentFn_->getEntryBlock();
+        llvm::IRBuilder<> eb_b(&eb, std::next(discSlot->getIterator()));
+        eb_b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), discSlot);
+    }
+    builder_.CreateStore(discPtr, discSlot);
+    if (!disposeStack_.empty()) {
+        Disposal nd{discSlot, nullptr};
+        nd.stringRelease = true;
+        disposeStack_.back().push_back(nd);
+    }
+
+    // One shared per-iteration field-name cleanup slot for the payload loops
+    // (mirrors emitRecordDeserialize's namePtrSlot, #1635).  Only one case block
+    // runs at run time, so a single shared slot is correct.
+    llvm::AllocaInst* namePtrSlot = entryAlloca(ptrTy());
+    {
+        llvm::BasicBlock& eb = currentFn_->getEntryBlock();
+        llvm::IRBuilder<> eb_b(&eb, std::next(namePtrSlot->getIterator()));
+        eb_b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), namePtrSlot);
+    }
+    if (!disposeStack_.empty()) {
+        Disposal nd{namePtrSlot, nullptr};
+        nd.stringRelease = true;
+        disposeStack_.back().push_back(nd);
+    }
+
+    auto* doneBB  = llvm::BasicBlock::Create(llvm_, "chdes.done",   currentFn_);
+    auto* throwBB = llvm::BasicBlock::Create(llvm_, "chdes.badcase", currentFn_);
+
+    auto* cmpFn = declareC("bz_string_compare", i32(),
+                           {ptrTy(), i64(), ptrTy(), i64(), i32()});
+    auto* relFn = declareC("bz_string_release", voidTy, {ptrTy()});
+    auto* strTy = stringType();
+
+    // Extract disc (data,len) once — valid until discPtr is released, which only
+    // happens inside a matched case block (terminal → doneBB).
+    llvm::Value* discData = builder_.CreateLoad(ptrTy(),
+        builder_.CreateStructGEP(strTy, discPtr, 0), "chdes.disc.data");
+    llvm::Value* discLen  = builder_.CreateLoad(i64(),
+        builder_.CreateStructGEP(strTy, discPtr, 1), "chdes.disc.len");
+
+    for (std::size_t ci = 0; ci < cases.size(); ++ci) {
+        const sema::ChoiceCaseSymbol* cc = cases[ci];
+        std::string wire(choiceCaseWireName(cc));
+        llvm::Value* litStr = lowerStringLiteral("\"" + wire + "\"", false);
+        llvm::Value* litData = builder_.CreateLoad(ptrTy(),
+            builder_.CreateStructGEP(strTy, litStr, 0), "chdes.lit.data");
+        llvm::Value* litLen  = builder_.CreateLoad(i64(),
+            builder_.CreateStructGEP(strTy, litStr, 1), "chdes.lit.len");
+        llvm::Value* cmpRes = builder_.CreateCall(cmpFn,
+            {discData, discLen, litData, litLen, builder_.getInt32(0)}, "chdes.cmp");
+        llvm::Value* isMatch = builder_.CreateICmpEQ(
+            cmpRes, builder_.getInt32(0), "chdes.match");
+        auto* caseBB = llvm::BasicBlock::Create(llvm_, "chdes.case", currentFn_);
+        auto* nextBB = llvm::BasicBlock::Create(llvm_, "chdes.next", currentFn_);
+        builder_.CreateCondBr(isMatch, caseBB, nextBB);
+
+        builder_.SetInsertPoint(caseBB);
+        {
+            // Discriminator selected; release it before reading payloads (a
+            // payload read may throw — the discSlot cleanup covers the throw
+            // window; nulling the slot prevents a double release on the normal
+            // path).
+            builder_.CreateCall(relFn, {discPtr});
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), discSlot);
+
+            // begin_object consumes poly_preread_count → the payload field count.
+            auto* beginFn = declareC("bz_binder_begin_object", i32(), {ptrTy()});
+            llvm::Value* payloadCount =
+                builder_.CreateCall(beginFn, {derPtr}, "chdes.pcount");
+            emitPendingCheck();
+
+            unsigned payloadFieldIdx = static_cast<unsigned>(1 + ci);
+            llvm::Type* payloadTy = st->getElementType(payloadFieldIdx);
+            auto* payloadStruct = llvm::dyn_cast<llvm::StructType>(payloadTy);
+
+            std::size_t np = (cc && cc->caseDecl) ? cc->caseDecl->payload.size() : 0;
+            std::vector<llvm::AllocaInst*> slots(np, nullptr);
+            std::vector<const sema::TypeRef*> ptys(np, nullptr);
+            std::vector<std::string> wireNames(np);
+            std::vector<bool> skip(np, false);
+            struct SeenEntry { std::size_t pi; llvm::AllocaInst* seenSlot; };
+            std::vector<SeenEntry> seenFlags;
+
+            for (std::size_t pi = 0; pi < np; ++pi) {
+                const ast::Param& pf = cc->caseDecl->payload[pi];
+                skip[pi] = positionalFieldIsSkip(pf);
+                wireNames[pi] = std::string(positionalFieldWireName(pf));
+                ptys[pi] = pf.type ? ctx_.resolvedType(*pf.type) : nullptr;
+                if (skip[pi]) continue;
+                if (!payloadStruct || pi >= payloadStruct->getNumElements()) continue;
+                llvm::Type* et = payloadStruct->getElementType(
+                    static_cast<unsigned>(pi));
+                slots[pi] = entryAlloca(et);
+                builder_.CreateStore(llvm::Constant::getNullValue(et), slots[pi]);
+                // §9.8 / §serialized optional: a `serialized optional` payload is
+                // exempt from the required-field check (missing → default(T)).
+                bool optional = pf.serialized && pf.serialized->isOptional;
+                if (!optional) {
+                    llvm::AllocaInst* sf = entryAlloca(i8());
+                    builder_.CreateStore(builder_.getInt8(0), sf);
+                    seenFlags.push_back({pi, sf});
+                }
+            }
+
+            // Payload-read loop (payloadCount iterations).
+            auto* loopHdr  = llvm::BasicBlock::Create(llvm_, "chdes.loop.hdr",  currentFn_);
+            auto* loopBody = llvm::BasicBlock::Create(llvm_, "chdes.loop.body", currentFn_);
+            auto* loopEnd  = llvm::BasicBlock::Create(llvm_, "chdes.loop.end",  currentFn_);
+            llvm::AllocaInst* idxSlot = entryAlloca(i32());
+            builder_.CreateStore(builder_.getInt32(0), idxSlot);
+            builder_.CreateBr(loopHdr);
+
+            builder_.SetInsertPoint(loopHdr);
+            llvm::Value* idx = builder_.CreateLoad(i32(), idxSlot, "chdes.idx");
+            llvm::Value* more = builder_.CreateICmpSLT(idx, payloadCount, "chdes.more");
+            builder_.CreateCondBr(more, loopBody, loopEnd);
+
+            builder_.SetInsertPoint(loopBody);
+            auto* readNameFn = declareC("bz_binder_read_field_name", ptrTy(), {ptrTy()});
+            llvm::Value* namePtr = builder_.CreateCall(readNameFn, {derPtr}, "chdes.fname");
+            emitPendingCheck();
+            builder_.CreateStore(namePtr, namePtrSlot);
+
+            auto* skipBB  = llvm::BasicBlock::Create(llvm_, "chdes.skip",  currentFn_);
+            auto* afterBB = llvm::BasicBlock::Create(llvm_, "chdes.after", currentFn_);
+
+            for (std::size_t pi = 0; pi < np; ++pi) {
+                if (skip[pi] || !slots[pi]) continue;
+                llvm::Value* litStr2 = lowerStringLiteral(
+                    "\"" + wireNames[pi] + "\"", false);
+                llvm::Value* litData2 = builder_.CreateLoad(ptrTy(),
+                    builder_.CreateStructGEP(strTy, litStr2, 0), "chdes.plit.data");
+                llvm::Value* litLen2  = builder_.CreateLoad(i64(),
+                    builder_.CreateStructGEP(strTy, litStr2, 1), "chdes.plit.len");
+                llvm::Value* nameData = builder_.CreateLoad(ptrTy(),
+                    builder_.CreateStructGEP(strTy, namePtr, 0), "chdes.name.data");
+                llvm::Value* nameLen  = builder_.CreateLoad(i64(),
+                    builder_.CreateStructGEP(strTy, namePtr, 1), "chdes.name.len");
+                llvm::Value* cmpR = builder_.CreateCall(cmpFn,
+                    {nameData, nameLen, litData2, litLen2, builder_.getInt32(0)},
+                    "chdes.pcmp");
+                llvm::Value* isM = builder_.CreateICmpEQ(
+                    cmpR, builder_.getInt32(0), "chdes.pmatch");
+                auto* rdBB = llvm::BasicBlock::Create(llvm_, "chdes.rd", currentFn_);
+                auto* ndBB = llvm::BasicBlock::Create(llvm_, "chdes.nd", currentFn_);
+                builder_.CreateCondBr(isM, rdBB, ndBB);
+
+                builder_.SetInsertPoint(rdBB);
+                llvm::Value* fv = emitDeserializeField(ptys[pi], derPtr);
+                if (fv && slots[pi] && payloadStruct &&
+                    pi < payloadStruct->getNumElements() &&
+                    fv->getType() == payloadStruct->getElementType(
+                        static_cast<unsigned>(pi)))
+                    builder_.CreateStore(fv, slots[pi]);
+                emitPendingCheck();
+                for (const auto& se : seenFlags)
+                    if (se.pi == pi) {
+                        builder_.CreateStore(builder_.getInt8(1), se.seenSlot);
+                        break;
+                    }
+                builder_.CreateCall(relFn, {namePtr});
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), namePtrSlot);
+                builder_.CreateBr(afterBB);
+
+                builder_.SetInsertPoint(ndBB);
+            }
+            // Unknown field → SkipValue (unknown-field policy in the deserializer).
+            builder_.CreateBr(skipBB);
+            builder_.SetInsertPoint(skipBB);
+            auto* skipFn = declareC("bz_binder_skip_value", voidTy, {ptrTy()});
+            builder_.CreateCall(skipFn, {derPtr});
+            emitPendingCheck();
+            builder_.CreateCall(relFn, {namePtr});
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), namePtrSlot);
+            builder_.CreateBr(afterBB);
+
+            builder_.SetInsertPoint(afterBB);
+            llvm::Value* nidx = builder_.CreateAdd(idx, builder_.getInt32(1),
+                                                   "chdes.idx1");
+            builder_.CreateStore(nidx, idxSlot);
+            builder_.CreateBr(loopHdr);
+
+            builder_.SetInsertPoint(loopEnd);
+            auto* endObjFn = declareC("bz_binder_end_object", voidTy, {ptrTy()});
+            builder_.CreateCall(endObjFn, {derPtr});
+            emitPendingCheck();
+
+            // §9.8: a required payload field (present neither in the input nor as
+            // `serialized optional`) that was not seen is a structural fault.
+            for (const auto& se : seenFlags) {
+                llvm::Value* seen = builder_.CreateLoad(i8(), se.seenSlot, "chdes.seen");
+                llvm::Value* miss = builder_.CreateICmpEQ(
+                    seen, builder_.getInt8(0), "chdes.nseen");
+                auto* missBB = llvm::BasicBlock::Create(llvm_, "chdes.miss", currentFn_);
+                auto* okBB   = llvm::BasicBlock::Create(llvm_, "chdes.mok",  currentFn_);
+                builder_.CreateCondBr(miss, missBB, okBB);
+                builder_.SetInsertPoint(missBB);
+                emitThrowBuiltin("SerializationException");
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateUnreachable();
+                builder_.SetInsertPoint(okBB);
+            }
+
+            // Build the choice value: tag = ci, payload assembled from the slots.
+            llvm::Value* payloadVal = llvm::Constant::getNullValue(payloadTy);
+            if (payloadStruct) {
+                for (std::size_t pi = 0; pi < np; ++pi) {
+                    if (pi >= payloadStruct->getNumElements()) break;
+                    llvm::Value* fv;
+                    if (slots[pi])
+                        fv = builder_.CreateLoad(
+                            payloadStruct->getElementType(static_cast<unsigned>(pi)),
+                            slots[pi]);
+                    else  // skip / no slot → default(T).
+                        fv = llvm::Constant::getNullValue(
+                            payloadStruct->getElementType(static_cast<unsigned>(pi)));
+                    payloadVal = builder_.CreateInsertValue(
+                        payloadVal, fv, {static_cast<unsigned>(pi)});
+                }
+            }
+            llvm::Value* whole = llvm::Constant::getNullValue(st);
+            whole = builder_.CreateInsertValue(
+                whole, builder_.getInt32(static_cast<int>(ci)), {0u});
+            whole = builder_.CreateInsertValue(whole, payloadVal, {payloadFieldIdx});
+            builder_.CreateStore(whole, resultSlot);
+            builder_.CreateBr(doneBB);
+        }
+
+        builder_.SetInsertPoint(nextBB);
+    }
+
+    // No case matched: undeclared discriminator → SerializationException (§9.8).
+    builder_.CreateBr(throwBB);
+    builder_.SetInsertPoint(throwBB);
+    builder_.CreateCall(relFn, {discPtr});
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), discSlot);
+    emitThrowBuiltin("SerializationException");
+    if (!builder_.GetInsertBlock()->getTerminator())
+        builder_.CreateUnreachable();
+
+    builder_.SetInsertPoint(doneBB);
+    return builder_.CreateLoad(st, resultSlot, "chdes.result");
 }
 
 // ---------------------------------------------------------------------------
@@ -2890,7 +3296,8 @@ bool Emitter::isSerializationCall(const ast::CallExpr& call,
         if (recvTy2 && recvTy2->declaration) {
             const TypeSymbol* ts = recvTy2->declaration;
             if ((ts->kind == ast::TypeDeclKind::Record ||
-                 ts->kind == ast::TypeDeclKind::Enum) &&
+                 ts->kind == ast::TypeDeclKind::Enum ||
+                 ts->kind == ast::TypeDeclKind::Choice) &&  // §9.8 v0.200 #2046
                 declaresConformance(ts, "ISerializable") &&
                 !hasHandWrittenMethod(ts, "Serialize"))
                 return true;
@@ -2909,7 +3316,8 @@ bool Emitter::isSerializationCall(const ast::CallExpr& call,
         const sema::Symbol* sym = ctx_.exprSymbol(*ma.target);
         if (auto* ts = dynamic_cast<const TypeSymbol*>(sym)) {
             if ((ts->kind == ast::TypeDeclKind::Record ||
-                 ts->kind == ast::TypeDeclKind::Enum) &&
+                 ts->kind == ast::TypeDeclKind::Enum ||
+                 ts->kind == ast::TypeDeclKind::Choice) &&  // §9.8 v0.200 #2046
                 declaresConformance(ts, "IDeserializable") &&
                 !hasHandWrittenMethod(ts, "Deserialize"))
                 return true;
@@ -3336,7 +3744,8 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
             bool isRecord = ts->kind == ast::TypeDeclKind::Record;
             bool isEnum   = ts->kind == ast::TypeDeclKind::Enum;
             bool isClass  = ts->kind == ast::TypeDeclKind::Class;
-            if ((isRecord || isEnum || isClass) &&
+            bool isChoice = ts->kind == ast::TypeDeclKind::Choice;
+            if ((isRecord || isEnum || isClass || isChoice) &&
                 declaresConformance(ts, "ISerializable") &&
                 !hasHandWrittenMethod(ts, "Serialize")) {
 
@@ -3355,6 +3764,14 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
                     if (recv->getType()->isPointerTy())
                         recv = builder_.CreateLoad(st, recv);
                     emitRecordSerialize(ts, recv, serArg);
+                } else if (isChoice) {
+                    // §9.8 choice serialization (v0.200, #2046): the `$case`-
+                    // discriminated object form.  `recv` is a value-type choice
+                    // struct; load it if it came through as a slot pointer.
+                    llvm::StructType* st = choiceStruct(ts);
+                    if (recv->getType()->isPointerTy())
+                        recv = builder_.CreateLoad(st, recv);
+                    emitChoiceSerialize(ts, recv, serArg);
                 } else if (isEnum) {
                     // §10.3 (#740): hand emitEnumSerialize the value at the
                     // enum's underlying width (it now compares at that width).
@@ -3389,11 +3806,15 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
             if (ts && declaresConformance(ts, "IDeserializable") &&
                 !hasHandWrittenMethod(ts, "Deserialize")) {
                 if (ts->kind == ast::TypeDeclKind::Record ||
-                    ts->kind == ast::TypeDeclKind::Enum) {
+                    ts->kind == ast::TypeDeclKind::Enum ||
+                    ts->kind == ast::TypeDeclKind::Choice) {
                     llvm::Value* derArg = lowerExpr(*call.args[0].value);
                     if (!derArg) return nullptr;
                     if (ts->kind == ast::TypeDeclKind::Record)
                         return emitRecordDeserialize(ts, derArg);
+                    else if (ts->kind == ast::TypeDeclKind::Choice)
+                        // §9.8 choice serialization (v0.200, #2046).
+                        return emitChoiceDeserialize(ts, derArg);
                     else
                         return emitEnumDeserialize(ts, derArg);
                 }
