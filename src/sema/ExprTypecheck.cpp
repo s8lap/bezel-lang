@@ -8833,9 +8833,19 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         }
         // §7.4 (issue #418): a plain `:=` of a non-null value to a simple
         // variable proves it non-null from here; assigning a (possibly-)null
-        // value clears that knowledge. (Compound ops keep the existing value's
-        // nullability, so they don't change the analysis.)
-        if (as->op == ":=" && as->target && as->value) {
+        // value clears that knowledge.
+        //
+        // §7.4 v0.210 (issue #2104): `x ??= expr;` establishes the same
+        // narrowing as `x := expr;` — "on every path `x` then holds a non-null
+        // value" (§7.7): on the was-null path `x` becomes `expr`, on the
+        // was-non-null path `x` is unchanged and already non-null — so `x` is
+        // non-null after the statement exactly when `expr`'s static type is
+        // non-nullable. A nullable RHS does not narrow (the was-null-then-null
+        // path leaves `x` null), which `narrowOnAssignment` handles by clearing.
+        // The arithmetic/bitwise compound family (`+=`, `-=`, `*=`, `/=`, `&=`,
+        // `|=`, `^=`, `<<=`, `>>=`) is NOT included: those keep the LHS's
+        // existing nullability, so they don't change the analysis.
+        if ((as->op == ":=" || as->op == "??=") && as->target && as->value) {
             if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                     as->target.get())) {
                 if (tid->name != "this" && tid->name != "base") {
