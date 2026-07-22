@@ -3197,6 +3197,23 @@ bool Emitter::lowerForBody(const ast::ForStmt& fs) {
                     iterElemTy = resolveTypeParamRef(itTy->genericArgs[0]);
         }
         bool iterVarIsTask = isTaskTypeName(iterElemTy);
+        // #628 / stdlib §4.9 v0.135: a `for var entry in d.Drain() do` iter var
+        // is a DrainedEntry<K,V> struct {K key; V* value}, NOT a class object —
+        // its slot is a struct alloca, and reading the first 8 bytes as a class
+        // vtable (the dynamicDispose path) would dispatch through whatever bytes
+        // happen to be at field[0] (for string keys, a bz_string_t's data ptr —
+        // bogus, crash). The DrainedEntry disposal path (LlvmBackend_Disposal.cpp
+        // emitDisposals's `drainedEntry` arm) loads V* from field[1], disposes it
+        // via emitDisposeAndReclaim, and (for string keys) releases the bz_string_t
+        // at field[0]. The fields drainedEntryKeyType / drainedEntryValType /
+        // drainedEntryKeyIsString / drainedEntryValDisposer carry the LLVM types
+        // and the optional vtable-static disposer thunk.
+        bool iterVarIsDrainedEntry = iterElemTy &&
+            iterElemTy->kind == sema::TypeRef::Kind::Named &&
+            !iterElemTy->declaration &&
+            iterElemTy->importedName == "DrainedEntry" &&
+            iterElemTy->genericArgs.size() >= 2 &&
+            iterElemTy->genericArgs[0] && iterElemTy->genericArgs[1];
         // Push outermost scope: per-iteration iter-var disposal.
         disposeStack_.emplace_back();
         Disposal id{iterVarSlot, nullptr};
@@ -3211,6 +3228,21 @@ bool Emitter::lowerForBody(const ast::ForStmt& fs) {
                     id.taskOwnedResultDisposer =
                         pol.disposerThunk;
             }
+        } else if (iterVarIsDrainedEntry) {
+            // DrainedEntry<K,V>: dispose V (the owned class at field[1]) and
+            // release the key string at field[0] when K is string. The slot is
+            // a struct alloca {K key; V* value} matching the lowerDictDrainFor
+            // entry layout, so the same field GEPs work.
+            const sema::TypeRef* kTy = iterElemTy->genericArgs[0];
+            const sema::TypeRef* vTy = iterElemTy->genericArgs[1];
+            id.drainedEntry = true;
+            id.drainedEntryKeyIsString =
+                kTy->kind == sema::TypeRef::Kind::Primitive &&
+                kTy->primitive == sema::PrimitiveType::String;
+            id.drainedEntryKeyType = lowerTypeRef(kTy);
+            id.drainedEntryValType = lowerTypeRef(vTy);
+            id.drainedEntryValDisposer =
+                elementPolicyFor(vTy, /*owning=*/true).disposerThunk;
         } else {
             id.dynamicDispose = true;
         }
