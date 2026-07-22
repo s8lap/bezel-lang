@@ -140,6 +140,44 @@ BEZEL_TEST(lambda_ascription_2101, spec_30_6_async_lambda) {
         "end Main; end C;"), 42);
 }
 
+// §30.6/§27.3 v0.217 ASCRIBED-async ACCEPT forms (spine review F1: the reject
+// side was pinned but no positive `: Task<T>` ascription ever compiled).
+// Expression body: the ascription names the Task family; the body types
+// against the peeled element.
+BEZEL_TEST(lambda_ascription_2101, spec_30_6_async_ascribed_task_expr_body) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "public static async method Run(): Task<int> "
+        "  var f: () -> Task<int> := async lambda(): Task<int> => 21; "
+        "  using var t := f(); "
+        "  return await t * 2; "
+        "end Run; "
+        "public static method Main(): int "
+        "  using var t := Run(); "
+        "  return t.Result; "
+        "end Main; end C;"), 42);
+}
+
+// Block (`do`) body with the ascription — the codegen path the review noted
+// never existed pre-v0.217 (the old override was expr-body-async only).
+BEZEL_TEST(lambda_ascription_2101, spec_30_6_async_ascribed_task_block_body) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "public static async method Produce(): Task<int> return 21; end Produce; "
+        "public static async method Run(): Task<int> "
+        "  var f: () -> Task<int> := async lambda(): Task<int> => do "
+        "    using var t := Produce(); "
+        "    return await t * 2; "
+        "  end; "
+        "  using var t2 := f(); "
+        "  return await t2; "
+        "end Run; "
+        "public static method Main(): int "
+        "  using var t := Run(); "
+        "  return t.Result; "
+        "end Main; end C;"), 42);
+}
+
 // §27.4 (v0.183, #1408) under the v0.217 spelling: a destructuring head in a
 // target-typed position — `lambda(Entry(_, v)) => v`.
 BEZEL_TEST(lambda_ascription_2101, spec_27_4_destructuring_head) {
