@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.216 — July 2026**
+**Version 0.217 — July 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -2541,11 +2541,11 @@ choice.
 ```bezel
 var xs: Array<int> := [1, 2, 3];
 
-var doubled := xs.Select((x) => x * 2);      // block T = int from the receiver (§26.5);
+var doubled := xs.Select(lambda(x) => x * 2);      // block T = int from the receiver (§26.5);
                                              //   phase 2: lambda param x : int, body int ⇒ U = int
-var byKey := xs.OrderBy((x) => x mod 3);     // TKey = int (phase 2); the §14.2 constraint
+var byKey := xs.OrderBy(lambda(x) => x mod 3);     // TKey = int (phase 2); the §14.2 constraint
                                              //   check (IComparable<int>) runs after inference
-var total := xs.Aggregate(0L, (acc, x) => acc + x);
+var total := xs.Aggregate(0L, lambda(acc, x) => acc + x);
                                              // TAccum = long from the seed (phase 1);
                                              //   lambda checks as (long, int) -> long (phase 2)
 var empty: Array<string> := Util.Empty();    // T = string from the target (phase 3)
@@ -3027,7 +3027,7 @@ Because `Range<T>` implements `IEnumerable<T>`, ranges compose with all IEnumera
 
 ```bezel
 import System.Collections.Linq;
-var evenSquares := (1..20).Where((x) => x mod 2 = 0).Select((x) => x * x);
+var evenSquares := (1..20).Where(lambda(x) => x mod 2 = 0).Select(lambda(x) => x * x);
 ```
 
 <a id="sec-compiler-optimization"></a>
@@ -4554,12 +4554,12 @@ free type parameter); for a procedure slot (`-> ()`),
 [§27.3](#sec-lambda-expressions)'s value/procedure classification decides
 instead. The candidate is **exact** at the position when the inferred return
 type equals the return slot after type-argument substitution, and *converting*
-otherwise — which is how `xs.Sum((x) => x * 2)` over an `Array<int>` selects
+otherwise — which is how `xs.Sum(lambda(x) => x * 2)` over an `Array<int>` selects
 the `(T) -> int` overload of the stdlib `Sum` family: the `int`-returning
 candidate is exact and the others convert. When no candidate is exact, the
-co-equal rule above applies unchanged: `bytes.Sum((x) => x)` over an
+co-equal rule above applies unchanged: `bytes.Sum(lambda(x) => x)` over an
 `Array<byte>` is ambiguous — every candidate converts the `byte` body
-result — remedied by widening in the body (`(x) => int(x)`).
+result — remedied by widening in the body (`lambda(x) => int(x)`).
 
 A candidate is **unambiguously better** than another when it is better-or-equal on every argument position and strictly better (an exact match where the other converts) on at least one. The call resolves to a candidate that is unambiguously better than every other applicable candidate.
 
@@ -5740,7 +5740,7 @@ Assignability under this rule preserves **identity**: the value is the same func
 Lambda parameters may carry the same modifiers when the target function type expects them:
 
 ```bezel
-var attach: (owned EventHandler) -> () := (owned h) => _handlers.Add(h);
+var attach: (owned EventHandler) -> () := lambda(owned h) => _handlers.Add(h);
 ```
 
 When the target type is known from context, the lambda's parameter modifiers may be omitted in source — the compiler infers them from the target. When inferring is not possible (a `var` introduction with no target context), the modifier must be written explicitly to produce a function value of the modified type.
@@ -5758,15 +5758,17 @@ The parentheses around the function type are required before `?`. Without them, 
 <a id="sec-lambda-expressions"></a>
 ### 27.3 Lambda expressions
 
+A lambda expression is **keyword-led** (grammar A.7 `LambdaExpr`, v0.217): the reserved word `lambda` — preceded by `async` for the asynchronous form ([§30.6](#sec-async-lambdas)) — then a parenthesized parameter list (the empty pair for zero parameters; there is no paren-free form), an optional **return-type ascription**, `=>`, and the body. The keyword commits the parse at its first token — `lambda` begins no other expression or statement — the same committed-reading property the paren atoms have ([§17.1](#sec-precedence) note, v0.208/v0.216); in particular, a parenthesized construct followed by `=>` (a `when`-guard arm, a grouped expression) can never be read as a lambda prefix.
+
 Expression body:
 ```bezel
-var twice := (x: int) => x * 2;
-var greet := (name: string) => $"Hello, {name}!";
+var twice := lambda(x: int) => x * 2;
+var greet := lambda(name: string) => $"Hello, {name}!";
 ```
 
 Block body:
 ```bezel
-var processItem := (item: Item) => do
+var processItem := lambda(item: Item) => do
   var normalized := Normalize(item);
   var enriched := Enrich(normalized);
   return enriched;
@@ -5777,11 +5779,23 @@ Inside a value-returning block-bodied lambda, `return` is required on every exit
 
 **Which block-bodied lambdas return a value (v0.183).** A block-bodied lambda is a **procedure lambda** — its type is `(…) -> ()` — exactly when no path through its body executes a value-carrying `return e;`: its exits are bare `return;` and falling off the end. A body where one path returns a value and another exits without one is a compile error, the same totality rule as for methods. A target type, when present, is checked against this classification — a procedure-bodied lambda does not convert to a value-returning function type, nor the reverse.
 
-**Return-type inference without a target (v0.183).** In a context with no target type, a value-returning block-bodied lambda's return type is inferred only when **every** `return e;` expression in the body has the *same* type; otherwise the lambda is a compile error asking for a target type or an ascribed variable type. The compiler does not unify divergent return types to a common supertype — an inference that silently computed `Animal` from `return dog;` and `return cat;` would make the lambda's type sensitive to distant hierarchy edits; the programmer states the intended type instead (the explicit-over-implicit stance of [§22.6](#sec-implicit-conversion-ranking)). Expression-bodied lambdas need no rule: the body expression's type is the return type, and a body of type `()` makes a procedure lambda.
+**The return-type ascription (v0.217).** Between the parameter list and `=>`, a lambda may ascribe its return type: `lambda(x: int): long => x * 2`. The ascription is **optional everywhere inference succeeds** — it is never a new obligation — and when present it behaves exactly as a method's declared return type: each `return e;` (and an expression body) is checked against it under [§5.1](#sec-implicit-conversions), including implicit widening (`return dog;` under `: Animal`); the typed-context literal widening of [§5.1](#sec-implicit-conversions) (v0.159) applies to it (`lambda(): long => 3_000_000_000`); and a declared nullable return is the target that admits `null`-producing arms ([§20](#sec-the-if-expression), v0.210). A unit ascription (`: ()`) declares a procedure lambda. When both a target type and an ascription are present, they must agree under [§27.1.1](#sec-function-type-assignability)'s return rule — the ascription never bridges a conversion the value itself could not.
+
+**Return-type inference without a target (v0.183).** In a context with no target type, a value-returning block-bodied lambda's return type is inferred only when **every** `return e;` expression in the body has the *same* type; otherwise the lambda is a compile error asking for a target type, a return-type ascription (this section, v0.217), or an ascribed variable type. The compiler does not unify divergent return types to a common supertype — an inference that silently computed `Animal` from `return dog;` and `return cat;` would make the lambda's type sensitive to distant hierarchy edits; the programmer states the intended type instead (the explicit-over-implicit stance of [§22.6](#sec-implicit-conversion-ranking)). The ascription is the on-site spelling of that statement:
+
+```bezel
+var classify := lambda(score: int): string? => do
+  if score < 0 then return null; end;
+  if score >= 90 then return "A"; end;
+  return "pass";
+end;
+```
+
+Expression-bodied lambdas need no inference rule: the body expression's type is the return type, and a body of type `()` makes a procedure lambda.
 
 For procedure lambdas, the body may also be a single expression whose result is discarded:
 ```bezel
-var log := (msg: string) => Console.WriteLine(msg);
+var log := lambda(msg: string) => Console.WriteLine(msg);
 ```
 
 <a id="sec-parameter-type-inference"></a>
@@ -5790,11 +5804,11 @@ var log := (msg: string) => Console.WriteLine(msg);
 When the lambda's target type is known from context, parameter type annotations may be omitted:
 
 ```bezel
-var doubled := numbers.Select((x) => x * 2);
-var positives := numbers.Where((x) => x > 0);
+var doubled := numbers.Select(lambda(x) => x * 2);
+var positives := numbers.Where(lambda(x) => x > 0);
 ```
 
-In top-level contexts with no target type (`var f := (x) => x * 2;`), parameter types must be specified.
+In top-level contexts with no target type (`var f := lambda(x) => x * 2;`), parameter types must be specified.
 
 <a id="sec-lambda-parameter-destructuring"></a>
 #### Lambda-parameter record destructuring (v0.183, #1408)
@@ -5802,17 +5816,17 @@ In top-level contexts with no target type (`var f := (x) => x * 2;`), parameter 
 A lambda parameter may be a positional record **destructuring** in place of an identifier:
 
 ```bezel
-var labels := entries.Select((Entry(k, v)) => $"{k}: {v}");
-var positives := points.Where((Point(x, _)) => x > 0);
+var labels := entries.Select(lambda(Entry(k, v)) => $"{k}: {v}");
+var positives := points.Where(lambda(Point(x, _)) => x > 0);
 ```
 
 The form reuses [§19.3](#sec-patterns)'s positional-destructuring spelling with parameter-position restrictions. A destructuring parameter is a **binding form, not a test**, so only irrefutable elements are admitted:
 
-- The head must name a **positional record type**, and it must be *exactly* the parameter's type: when a target type supplies the parameter type, a head naming any other type is a compile error (no subtype test, nothing to fail at runtime); when no target type is available, the head *is* the annotation — `(Entry(k, v)) => …` alone types the parameter as `Entry`.
+- The head must name a **positional record type**, and it must be *exactly* the parameter's type: when a target type supplies the parameter type, a head naming any other type is a compile error (no subtype test, nothing to fail at runtime); when no target type is available, the head *is* the annotation — `lambda(Entry(k, v)) => …` alone types the parameter as `Entry`.
 - Each slot is a naked identifier binding, a discard `_`, or a nested destructuring meeting the same rules; the slot count must equal the record's positional-field count. Constants, ranges, relationals, type tests, `var`-form bindings, and alternatives are compile errors in parameter position — they are refutable, and a parameter list is not a `case`.
 - The destructuring parameter admits no modifiers (`ref`, `scoped`) and no separate type annotation — the head carries the type.
 
-Semantics are by desugaring: `(Entry(k, v)) => body` behaves exactly as `(p: Entry) => do var k := p.«first field»; var v := p.«second field»; …body… end` — each binding is an ordinary read of the corresponding positional field at body entry, with the standard ownership meaning ([§28.3](#sec-local-variables-ownership-and-borrows)): a copy for value-typed fields, a **borrow** of the argument's field for class-typed fields, a shared reference for runtime-managed fields. Nothing is consumed: the record argument is untouched, the bindings own nothing, and the lambda's function type is unchanged by the spelling (`(Entry) -> R`).
+Semantics are by desugaring: `lambda(Entry(k, v)) => body` behaves exactly as `lambda(p: Entry) => do var k := p.«first field»; var v := p.«second field»; …body… end` — each binding is an ordinary read of the corresponding positional field at body entry, with the standard ownership meaning ([§28.3](#sec-local-variables-ownership-and-borrows)): a copy for value-typed fields, a **borrow** of the argument's field for class-typed fields, a shared reference for runtime-managed fields. Nothing is consumed: the record argument is untouched, the bindings own nothing, and the lambda's function type is unchanged by the spelling (`(Entry) -> R`).
 
 <a id="sec-closures"></a>
 ### 27.5 Closures
@@ -5822,7 +5836,7 @@ A lambda may reference variables from its enclosing scope. Captured variables ar
 ```bezel
 public method MakeCounter(): () -> int
   var count := 0;
-  return () => do
+  return lambda() => do
     count := count + 1;
     return count;
   end;
@@ -5883,7 +5897,7 @@ converting overloads lose to it.
 
 When no target type is available (e.g., `var f := Math.Abs;` with no annotation), the reference is ambiguous and the compiler reports an error pointing to the candidate overloads. The user disambiguates by adding a type annotation: `var f: (int) -> int := Math.Abs;`.
 
-When a name `T.M` could resolve to either a *static* member of `T` or an *instance method reference* of `T` (a method requiring a receiver), the static member wins. The instance form has no separate syntax in this version — if both interpretations apply and the programmer wants the instance form, the disambiguation is to use a lambda: `(t: T) => t.M(...)`. This case is rare in practice; it arises only when `T` declares an instance method named `M` and a static member also named `M`, which is unusual style.
+When a name `T.M` could resolve to either a *static* member of `T` or an *instance method reference* of `T` (a method requiring a receiver), the static member wins. The instance form has no separate syntax in this version — if both interpretations apply and the programmer wants the instance form, the disambiguation is to use a lambda: `lambda(t: T) => t.M(...)`. This case is rare in practice; it arises only when `T` declares an instance method named `M` and a static member also named `M`, which is unusual style.
 
 <a id="sec-calling-function-values"></a>
 ### 27.7 Calling function values
@@ -5920,15 +5934,15 @@ _clicked -= OnButtonClicked;   // same method, same receiver: matches and unsubs
 For a **lambda** handler, deterministic unsubscription goes through `Subscribe` and the owned `Subscription` (stdlib [§6.5](Bezel_Standard_Library.md#sec-events-ievent-eventsource)). A lambda equals only itself, and the store-once spelling that would preserve the single closure instance — a function-typed field or local passed to `+=` — is **not admissible** at the subscription site: `Add` is a `scoped` (storing) position, and [§28.14](#sec-scoped-callback-parameters)'s admission bound 3 rejects function-typed locals and field reads as unverifiable argument forms (the verified forms are lambda literals and method references). The anti-pattern below therefore also silently fails to unsubscribe — each lambda is a fresh closure object:
 
 ```bezel
-_clicked += (e) => UpdateStatus(e.X, e.Y);
+_clicked += lambda(e) => UpdateStatus(e.X, e.Y);
 // later:
-_clicked -= (e) => UpdateStatus(e.X, e.Y);   // a different lambda, no match
+_clicked -= lambda(e) => UpdateStatus(e.X, e.Y);   // a different lambda, no match
 ```
 
 ```bezel
 // The lambda form with deterministic teardown — and the form that also works
 // anywhere, since Subscribe is on the IEvent<T> face:
-using var sub := button.Clicked.Subscribe((e) => UpdateStatus(e.X, e.Y));
+using var sub := button.Clicked.Subscribe(lambda(e) => UpdateStatus(e.X, e.Y));
 // disposing sub severs the registration (stdlib §6.5)
 ```
 
@@ -6033,7 +6047,7 @@ The `owned` modifier appears in specific declaration positions. It is **admissib
 - **`out` parameter declarations.** `out owned p: T` — the parameter is an out-position that produces an owned reference for the caller to take.
 - **Function-type parameter slots.** `(owned T) -> ()` — the parameter slot of a function type may carry `owned`. The modifier is part of the function type's identity (see [§27.1](#sec-function-types)); `(T) -> ()` and `(owned T) -> ()` are distinct types.
 - **Function-type return slots.** `() -> owned Connection` — the return slot of a function type may carry `owned`. The same identity rule applies.
-- **Lambda parameters.** `(owned x) => ...` or `(owned x: T) => ...` — a lambda's parameter list carries the same modifiers as the target function type expects.
+- **Lambda parameters.** `lambda(owned x) => ...` or `lambda(owned x: T) => ...` — a lambda's parameter list carries the same modifiers as the target function type expects.
 - **Choice payload fields.** `Fetched(owned response: Response)` — the payload slot takes ownership at construction and the active case's owned payloads are disposed with the value ([§35.1](#sec-choice-declaration), [§35.4](#sec-choice-classification)); admissibility and the bare-type-parameter erasure follow the type requirement below.
 - **Inline-array slot marker.** `[N owned]T` and `[N owned]T?` — the `owned` keyword placed between the size and the closing bracket marks the inline array's slots as owned (see [§15.1.1](#sec-owning-inline-arrays)). The array becomes a move-only value type ([§15.3](#sec-move-only-value-types)). This is the type-level position for owning inline arrays; an owning-inline-array field on a class does **not** additionally carry the `owned` field modifier (the slot marker already conveys the obligation).
 
@@ -6469,7 +6483,7 @@ This rule is uniform across the source of the temporary: it applies identically 
 **Deferred-activation callees (v0.179; derives: [K2.4](#sec-kernel-k2) + [K6](#sec-kernel-k6)).** A call can defer its use of a borrowed argument past the full expression: an iterator or async-iterator factory ([§29.3](#sec-iterator-methods), [§30.7](#sec-asynchronous-programming-async-iterators)) captures its plain reference-typed arguments into a state machine that runs later, and a lazy query operator ([§29.11](#sec-multiple-enumeration)) retains its source until enumeration. The returned **deferred-activation frame carries its arguments' borrows**: it is treated as a borrow-carrying value whose sources are the call's receiver, its plain reference-typed arguments, and the **capture-set contribution** of each plain function-typed argument (v0.196, below), and the ordinary rule that a borrow may not outlive its source applies to it. **The capture-set contribution (v0.196).** A function value is runtime-managed ([§28.9](#sec-runtime-managed-types)) and is itself no borrow — but the borrows its closure captures are, and they ride the frame exactly as long as the callback does ([§28.14](#sec-scoped-callback-parameters)'s frame residence, v0.196): a plain function-typed argument contributes its captured borrows' **sources** to the frame's source set, **transitively** — a captured value that is itself a function value or a deferred-activation frame contributes *its* sources by this same rule — the tracing the consume-site freeze (above) already performs through "a closure value that is itself still live", and the transitive judgment the [§28.14](#sec-scoped-callback-parameters) sink checks already apply. The contribution is computed from the argument's statically-known value provenance: a lambda literal — or a local the flow analysis traces to lambda literals, method references, or plain function-typed parameters of the enclosing body, in any mix (a join contributes the union of the traced forms' contributions per this table) — contributes its captured borrows' sources (a value-typed capture contributes nothing, living in its heap capture cell; a runtime-managed capture contributes only what this rule assigns it — a `string` nothing, a function value or frame its sources); a method reference contributes its receiver's source (a static method reference, nothing); a plain function-typed **parameter** of the enclosing body — the one statically opaque form that can carry borrow captures — contributes **itself** as a carried source, and every caller re-establishes the contribution against its own actual argument by this same rule, the signature-level re-establishment this classification already uses for receivers and arguments. A function value read from anywhere else — a field, a collection element, a call result — contributes nothing, and soundly so: the closure-escape rules (the *Borrow lifetime rules* above) admit a borrow-capturing closure into none of those locations, so such values are borrow-free by construction. The one storing location that does hold capture-bearing callbacks — a `scoped` field ([§28.14](#sec-scoped-callback-parameters)) — is no counterexample, because its value cannot reach this position at all: passing a `scoped` field's value to a deferred-activation callee's plain function-typed parameter would let the stored callback ride a frame beyond the bounding object's control, and is rejected as exactly the escaping read-out [§28.14](#sec-scoped-callback-parameters) bars (v0.196 — frame residence announces retention for call-site arguments; it opens no read-out for stored callbacks). And a `scoped` parameter has no admitted path into a plain function-typed argument position either ([§28.14](#sec-scoped-callback-parameters)'s callee-side rights — `scoped`-field store, same-bound `scoped` forwarding, invocation — include none). In particular, an unbound owned temporary passed as a plain argument to such a callee — or reached through a plain function-typed argument's capture-set contribution (a method reference over a fresh receiver, v0.196) — is admissible only when the returned frame is itself fully consumed **within the same full expression**; where the frame outlives the expression — bound to a name, returned, stored, or used as a `for`/`await for` source (whose desugaring binds it, [§29.2](#sec-desugaring-of-for)) — the program is rejected, the same reject-not-extend posture as [§9.7](#sec-records-and-disposal)'s no-temporary-source rule for records. The remedy names the source first: `var src := Source(3); await for var line in Shout(src) do … end;`. The callee classification is signature-level and decidable: a callee whose return type is one of the [§29.3](#sec-iterator-methods)/[§30.7](#sec-asynchronous-programming-async-iterators) iterable or enumerator interfaces, or a lazy query — or a **`Task`-family type** (`Task`, `Task<T>`, `OwningTask<T>`): an async callee's state-machine frame holds its plain reference-typed arguments' borrows until *settlement* ([§30.1](#sec-async-methods)), so an unbound owned temporary argument is admissible only when the returned task is consumed to settlement within the same full expression — awaited there, or blocked on outside a domain ([§30.3](#sec-the-task-taskt-and-ownedtaskt-types)). A task that instead escapes the full expression (bound — `using var t := SumAsync(Nums(3));` — returned, stored, or passed to `Task.FireAndForget`) is rejected: the temporary dies at the full expression's end, so the violation of [§30.1](#sec-async-methods)'s source-outlives-settlement obligation is statically certain, and the reject posture — not [§30.1](#sec-async-methods)'s trust posture, which covers only sources whose lifetimes the checker cannot compare — applies. The classification is deliberately conservative: it is by declared return type, so a callee returning an already-materialized collection typed as `IEnumerable<T>`, or an async callee that happens to complete before returning, is treated as borrow-carrying/escaping all the same; the remedy is always the same one line — bind the source first.
 
 <a id="sec-returning-a-deferred-activation-frame"></a>
-**Returning a deferred-activation frame (v0.184; derives: [K6.2](#sec-kernel-k6) + [K2.4](#sec-kernel-k2)).** The callee-side borrow-return prohibition (*Borrow lifetime rules* above) does not apply to a return whose declared type is one of the deferred-activation kinds — the [§29.3](#sec-iterator-methods)/[§30.7](#sec-asynchronous-programming-async-iterators) iterable and enumerator interfaces, a lazy query, or a `Task`-family type: the declared return type itself announces the borrow-carrying classification, and every caller re-establishes the returned frame's constraints against **its own** receiver and arguments by the signature-level rule above. A non-iterator method may therefore compose and return such a frame — `public method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` — provided every borrow the returned frame carries is sourced from the method's own parameters or receiver (directly or through the receiver's fields, the receiver-sourced notion of [§28.6](#sec-leak-prevention)); an iterator method is the canonical instance, its returned state machine carrying exactly its parameters' borrows ([§29.4](#sec-lazy-evaluation)). A returned frame carrying a borrow of anything else — a scope-bound local, a `using var`, a temporary — is rejected at the return site, since the frame would outlive the source; the remedy is to materialize instead (return an `owned` collection — the materializers above). The callee-side check is structural over the returned expression's construction: the frame's carried sources are the receivers, the plain reference-typed arguments, and the plain function-typed arguments' capture-set contributions (*Deferred-activation callees* above, v0.196) of the deferred-activation calls that built it, followed transitively through intermediate frames. A returned frame whose capture-set contribution reaches a scope-bound local, a `using var`, or a temporary is rejected at the return site exactly as a directly-carried borrow of one is — `return Doubled(nums, (x) => scale.Apply(x));` over a `using var scale` is the canonical reject: the consumer would enumerate into a closure over a disposed object. A contribution that is the method's own plain function-typed parameter, or a capture sourced from its parameters or receiver, is admitted under the same parameter-/receiver-sourced admission as any other carried borrow. The classification stays deliberately by declared return type: a method returning an already-materialized collection typed as `IEnumerable<T>` is treated as borrow-carrying all the same — sound and conservative (the caller over-constrains its own arguments); declare the return `owned Array<T>` to advertise the stronger contract. This exception lifts only the borrow-return prohibition, and for a `Task`-family method or lambda return it governs the *carried* borrows only: the task container itself transfers under *Task-family calls produce owned frames* above (v0.190) — fresh or owned on every return path, a borrowed container rejected. For the iterable and lazy-query kinds the owned-escape rules of [§28.6](#sec-leak-prevention) are unaffected — a freshly-produced owned value (a materialized collection, a `move` result) still requires an `owned` return type, whatever the declared interface type.
+**Returning a deferred-activation frame (v0.184; derives: [K6.2](#sec-kernel-k6) + [K2.4](#sec-kernel-k2)).** The callee-side borrow-return prohibition (*Borrow lifetime rules* above) does not apply to a return whose declared type is one of the deferred-activation kinds — the [§29.3](#sec-iterator-methods)/[§30.7](#sec-asynchronous-programming-async-iterators) iterable and enumerator interfaces, a lazy query, or a `Task`-family type: the declared return type itself announces the borrow-carrying classification, and every caller re-establishes the returned frame's constraints against **its own** receiver and arguments by the signature-level rule above. A non-iterator method may therefore compose and return such a frame — `public method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` — provided every borrow the returned frame carries is sourced from the method's own parameters or receiver (directly or through the receiver's fields, the receiver-sourced notion of [§28.6](#sec-leak-prevention)); an iterator method is the canonical instance, its returned state machine carrying exactly its parameters' borrows ([§29.4](#sec-lazy-evaluation)). A returned frame carrying a borrow of anything else — a scope-bound local, a `using var`, a temporary — is rejected at the return site, since the frame would outlive the source; the remedy is to materialize instead (return an `owned` collection — the materializers above). The callee-side check is structural over the returned expression's construction: the frame's carried sources are the receivers, the plain reference-typed arguments, and the plain function-typed arguments' capture-set contributions (*Deferred-activation callees* above, v0.196) of the deferred-activation calls that built it, followed transitively through intermediate frames. A returned frame whose capture-set contribution reaches a scope-bound local, a `using var`, or a temporary is rejected at the return site exactly as a directly-carried borrow of one is — `return Doubled(nums, lambda(x) => scale.Apply(x));` over a `using var scale` is the canonical reject: the consumer would enumerate into a closure over a disposed object. A contribution that is the method's own plain function-typed parameter, or a capture sourced from its parameters or receiver, is admitted under the same parameter-/receiver-sourced admission as any other carried borrow. The classification stays deliberately by declared return type: a method returning an already-materialized collection typed as `IEnumerable<T>` is treated as borrow-carrying all the same — sound and conservative (the caller over-constrains its own arguments); declare the return `owned Array<T>` to advertise the stronger contract. This exception lifts only the borrow-return prohibition, and for a `Task`-family method or lambda return it governs the *carried* borrows only: the task container itself transfers under *Task-family calls produce owned frames* above (v0.190) — fresh or owned on every return path, a borrowed container rejected. For the iterable and lazy-query kinds the owned-escape rules of [§28.6](#sec-leak-prevention) are unaffected — a freshly-produced owned value (a materialized collection, a `move` result) still requires an `owned` return type, whatever the declared interface type.
 
 <a id="sec-diagnostics"></a>
 #### Diagnostics
@@ -7308,7 +7322,7 @@ The closure-capture rules ([§28.3](#sec-local-variables-ownership-and-borrows))
   The forms are tested **in order; the first that resolves determines the bounding object** — `using var sub := pub.Clicked.Subscribe(h)` bounds by `sub` (form 2, the tightest bound; `Clicked` being the stdlib §6.5 pattern's getter-faced property, no later form would resolve a bound at all — an off-idiom discharge of the `Subscription` admits capture-free handlers only, with the `using var`/owned-field discharges of forms 2/3 as the admitted capture-bearing spellings).
 
   A closure argument capturing locals or parameters is admitted **iff** the bounding object resolves to one of:
-  - a `using var`/`await using var` local `L` (directly, through the initializer resolution of forms 1/2, or as the chain head / receiver of forms 4/5), where every captured **local** source is declared **before** `L` in the same or an enclosing scope (`this` and the enclosing method's parameters count as declared before every local), **or is `L` itself, or is a value whose borrow provably originates from `L`** (v0.180 — self-capture: `scope.Spawn(() => Work(scope.Token))` and the bound intermediate `var tok := scope.Token;` are both admitted; `L` outlives every invocation of what it stores, and the quiescence rule below plus [§28.12](#sec-asynchronous-disposal)'s logical-before-physical ordering guarantee no stored callback observes a reclaimed `L`); or
+  - a `using var`/`await using var` local `L` (directly, through the initializer resolution of forms 1/2, or as the chain head / receiver of forms 4/5), where every captured **local** source is declared **before** `L` in the same or an enclosing scope (`this` and the enclosing method's parameters count as declared before every local), **or is `L` itself, or is a value whose borrow provably originates from `L`** (v0.180 — self-capture: `scope.Spawn(lambda() => Work(scope.Token))` and the bound intermediate `var tok := scope.Token;` are both admitted; `L` outlives every invocation of what it stores, and the quiescence rule below plus [§28.12](#sec-asynchronous-disposal)'s logical-before-physical ordering guarantee no stored callback observes a reclaimed `L`); or
   - **`this`** (per forms 3/4, v0.180), where every captured source is `this` itself or a value whose borrow provably originates from `this` — the only things the stored callback can dangle on are then the very object whose teardown bounds the storage.
 
   Until `L`'s scope exits, the captured local sources are **frozen** (derives: [K5.7](#sec-kernel-k5)): they may not be moved from, reassigned, or disposed — the consume-site freeze ([§28.3](#sec-consume-site-freeze)) **plus explicit disposal**. The storage freeze is deliberately *stronger* than the consume-site rule it extends — K5.7's strengthening: a stored callback's later invocation is invisible at a `Dispose()` site, and this admission promises a fully static bound, so §28.3's announced-kill carve-out does not apply to admitted captures. A bounding object that is none of the admitted resolutions — a plain expression, a parameter, a returned value that reaches no admitted slot — admits **no** capture-bearing arguments (capture-free callbacks are always admitted).
@@ -7341,7 +7355,7 @@ The caller side is correspondingly unrestricted: **any** closure — capture-bea
 
 Note the deliberate asymmetry with ordinary borrows: a parameter-sourced *object* borrow may be stored into a field under §28.3's borrowed-field rule — a structural check whose residual is the caller's trust — but a call-bounded *function* value may not be stored at all — frame residence (*Call-bounded × deferred activation* above, v0.196) is not a store but the retention the deferred-activation return type itself announces. A closure's true bound is its capture set, which a plain signature does not carry, so neither party is positioned to accept the trust; `scoped` is exactly the signature-carried form of it, and the deferred-activation case needs neither: there the capture set rides the frame as carried sources ([§28.3](#sec-unbound-owned-temporaries), v0.196), visible to the caller's own flow analysis.
 
-*Known v1 limitation (recorded, deferred — #1427):* combinators that compose received callbacks into a returned **function value** (`Compose(f, g)` returning `(x) => g(f(x))`) are not expressible over call-bounded parameters — the returned closure would capture them beyond the call, and no bounding frame exists. The missing third tier is an *unbounded* marker (admitting only capture-free or transitively unbounded arguments, which the callee may then retain freely); it is deferred until evidence demands it. Combinators that compose received callbacks into a returned **deferred-activation frame** — an iterator method over a callback parameter, a body returning `xs.Where(f)` — are the expressible neighbors: there the frame bounds the retention (*Call-bounded × deferred activation* above, v0.196).
+*Known v1 limitation (recorded, deferred — #1427):* combinators that compose received callbacks into a returned **function value** (`Compose(f, g)` returning `lambda(x) => g(f(x))`) are not expressible over call-bounded parameters — the returned closure would capture them beyond the call, and no bounding frame exists. The missing third tier is an *unbounded* marker (admitting only capture-free or transitively unbounded arguments, which the callee may then retain freely); it is deferred until evidence demands it. Combinators that compose received callbacks into a returned **deferred-activation frame** — an iterator method over a callback parameter, a body returning `xs.Where(f)` — are the expressible neighbors: there the frame bounds the retention (*Call-bounded × deferred activation* above, v0.196).
 
 **v1 admission bounds (v0.180 — #1421 ratified; axiom [A11](#sec-axiom-register)).** The v0.175 implementation chose conservatively at eight corners the original text left silent; those choices are **normative** as of this revision. Bounds marked *liftable* may be widened by a future revision with more analysis; the rest are settled. (The first recorded choice — self-capture of the bounding local — is promoted into the admission text above rather than listed here.)
 
@@ -7993,15 +8007,15 @@ The owned-result task expresses the intent directly; no separate synchronous all
 ### 30.6 Async lambdas
 
 ```bezel
-var fetcher: (string) -> Task<string> := async (url) => do
+var fetcher: (string) -> Task<string> := async lambda(url) => do
   using var client := new HttpClient();
   using var task := client.GetAsync(url);
   return await task;
 end;
 
-var quick: (string) -> Task<int> := async (url) => await CountBytesAsync(url);
+var quick: (string) -> Task<int> := async lambda(url) => await CountBytesAsync(url);
 
-var loader: (string) -> OwningTask<Resource> := async (path) => do
+var loader: (string) -> OwningTask<Resource> := async lambda(path) => do
   return await LoadResourceAsync(path);     // Pattern B return; the lambda's
                                              //   state machine forwards the
                                              //   owned Resource through.
@@ -8255,7 +8269,7 @@ Pattern — wrapping a **one-shot** callback API (the registration invokes the c
 public async method ReadSectorAsync(dev: BlockDevice, lba: long): Task<int>
   using var tcs := new TaskCompletionSource<int>();
 
-  dev.BeginRead(lba, (status) => do        // BeginRead invokes the callback ONCE
+  dev.BeginRead(lba, lambda(status) => do        // BeginRead invokes the callback ONCE
     tcs.TrySetResult(status);
   end);
 
@@ -8271,7 +8285,7 @@ Pattern — wrapping a class-typed result with ownership transfer:
 public async method LoadResourceAsync(path: string): OwningTask<Resource>
   using var tcs := new OwningTaskCompletionSource<Resource>();
 
-  StartLoadInBackground(path, (loaded: owned Resource) => do
+  StartLoadInBackground(path, lambda(loaded: owned Resource) => do
     tcs.TrySetResult(owned loaded);                      // ownership moves into tcs's task
   end);
 
@@ -9178,7 +9192,7 @@ public class RowCollector
 end RowCollector;
 ```
 
-Trace: `this.OnRow` captures the receiver; the receiver trivially outlives the synchronous `sqlite3_exec` call (it is the frame's `this`); every `OnRow` invocation happens inside the call, on the calling thread, inside the calling continuation; the field writes are ordinary writes of that continuation. A `qsort_r` call with a capturing comparator (`(a, b) => Compare(key, a, b)`) traces identically.
+Trace: `this.OnRow` captures the receiver; the receiver trivially outlives the synchronous `sqlite3_exec` call (it is the frame's `this`); every `OnRow` invocation happens inside the call, on the calling thread, inside the calling continuation; the field writes are ordinary writes of that continuation. A `qsort_r` call with a capturing comparator (`lambda(a, b) => Compare(key, a, b)`) traces identically.
 
 **Scope, honestly.** The `env` clause covers externs where the function-pointer parameter and the user-data parameter appear **in the same declaration** and native's invocations are bracketed by that call — `qsort_r`, `sqlite3_exec`, `nftw`, `glob`-with-errfunc. It deliberately does **not** cover split registration — libcurl's `CURLOPT_WRITEFUNCTION`/`CURLOPT_WRITEDATA` are *stored* by `curl_easy_setopt` and invoked later inside `curl_easy_perform`: the registering call returns with the pointers retained, so no frame bounds the environment and the call-bounded admission would be unsound. Retained shapes use the registry idiom below.
 
@@ -10741,7 +10755,22 @@ NewExpr         ::= "new" Type "(" ArgList? ")"
                                  (v0.188). */
 InitAssign      ::= Identifier ":=" Expression
 
-LambdaExpr      ::= "async"? "(" LambdaParams? ")" "=>" LambdaBody
+LambdaExpr      ::= "async"? "lambda" "(" LambdaParams? ")"
+                    (":" Type)? "=>" LambdaBody
+                              /* Keyword-led (§27.3, v0.217): `lambda` is
+                                 reserved and begins no other expression or
+                                 statement, so the reading commits at the
+                                 first token (the second, after `async`) —
+                                 no scan to the matching `)` is ever needed,
+                                 and a parenthesized construct followed by
+                                 `=>` (a when-guard arm, a grouped
+                                 expression) is never a lambda prefix. The
+                                 parameter parens are mandatory, including
+                                 the empty pair. The optional `":" Type` is
+                                 the return-type ascription (§27.3); no Type
+                                 production contains `=>` (function types
+                                 use `->`), so the ascription ends
+                                 deterministically before the arrow. */
 LambdaParams    ::= LambdaParam ("," LambdaParam)* ","?
 LambdaParam     ::= FuncParamMods? Identifier (":" Type)?
                   | LambdaDestructure
@@ -10951,7 +10980,7 @@ The following identifiers are keywords. Most are reserved unconditionally and ma
 
 **Unconditionally reserved:**
 
-`abstract`, `and`, `as`, `async`, `await`, `base`, `bool`, `break`, `byte`, `case`, `catch`, `char`, `choice`, `class`, `const`, `constructor`, `continue`, `decimal`, `default`, `destructor`, `do`, `double`, `elif`, `else`, `end`, `enum`, `extension`, `extern`, `false`, `finally`, `float`, `for`, `if`, `import`, `in`, `int`, `interface`, `internal`, `is`, `long`, `method`, `mod`, `module`, `move`, `nameof`, `new`, `not`, `null`, `or`, `out`, `owned`, `override`, `private`, `property`, `protected`, `public`, `readonly`, `record`, `ref`, `return`, `sbyte`, `sealed`, `short`, `static`, `string`, `then`, `this`, `throw`, `true`, `try`, `type`, `typeof`, `uint`, `ulong`, `ushort`, `using`, `var`, `virtual`, `when`, `where`, `while`, `with`, `yield`.
+`abstract`, `and`, `as`, `async`, `await`, `base`, `bool`, `break`, `byte`, `case`, `catch`, `char`, `choice`, `class`, `const`, `constructor`, `continue`, `decimal`, `default`, `destructor`, `do`, `double`, `elif`, `else`, `end`, `enum`, `extension`, `extern`, `false`, `finally`, `float`, `for`, `if`, `import`, `in`, `int`, `interface`, `internal`, `is`, `lambda`, `long`, `method`, `mod`, `module`, `move`, `nameof`, `new`, `not`, `null`, `or`, `out`, `owned`, `override`, `private`, `property`, `protected`, `public`, `readonly`, `record`, `ref`, `return`, `sbyte`, `sealed`, `short`, `static`, `string`, `then`, `this`, `throw`, `true`, `try`, `type`, `typeof`, `uint`, `ulong`, `ushort`, `using`, `var`, `virtual`, `when`, `where`, `while`, `with`, `yield`.
 
 **Contextual (see [§B.2](#sec-contextual-keywords)):**
 
