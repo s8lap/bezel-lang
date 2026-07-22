@@ -568,7 +568,16 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             }
             return;
         }
-        Symbol* sym = lookupName(id->name);
+        // §2.7 rule 1 (#2097): in VALUE position — a bare name that is NOT the
+        // head of a dotted access (`&e != maTargetHint_`, which is set only
+        // while visiting a MemberAccessExpr's target) — an enclosing-type
+        // member outranks a same-named top-level type (the implicit-`this`
+        // reading). A dotted head keeps the historical type-first order so
+        // `Color.Red` / `Data.M()`-style static access still resolves its head
+        // to the top-level type.
+        Symbol* sym =
+            lookupName(id->name,
+                       /*memberBeforeModuleType=*/&e != maTargetHint_);
         if (sym) {
             ctx_.setExprSymbol(&e, sym);
             // §10.6 (#772): a bare enum constant `Green` resolved via the

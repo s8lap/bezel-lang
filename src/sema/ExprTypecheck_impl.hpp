@@ -960,7 +960,17 @@ private:
     void resolveExtensionMember(const ast::MemberAccessExpr& ma,
                                 Symbol* member);
 
-    Symbol* lookupName(std::string_view name);
+    // §2.7 rule 1 (#2097): resolve a bare name. When `memberBeforeModuleType`
+    // is set, an accessible instance member of the enclosing type outranks a
+    // same-named MODULE-level declaration (a top-level type) — the implicit-
+    // `this.member` reading, used only in VALUE position; locals/params still
+    // shadow the member. The default (false) keeps the historical order
+    // (lexical scopes, incl. module, then the enclosing-type member as a
+    // fallback), which the member-access-HEAD and pattern callers rely on so a
+    // dotted head like `Color.Red` / `Data.M()` still resolves its head to the
+    // top-level type.
+    Symbol* lookupName(std::string_view name,
+                       bool memberBeforeModuleType = false);
 
     // §16.4 / §19.6 (issue #738): per-`case` pattern legality checks shared by
     // the expression and statement case forms — reject `step` in a range

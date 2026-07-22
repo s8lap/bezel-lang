@@ -5387,8 +5387,36 @@ MethodSymbol* ExprTC::findConstraintStaticOperator(std::string_view paramName,
     return groupWitness;
 }
 
-Symbol* ExprTC::lookupName(std::string_view name) {
+Symbol* ExprTC::lookupName(std::string_view name, bool memberBeforeModuleType) {
     for (Scope* s = currentScope_; s; s = s->parent) {
+        // §2.7 rule 1 (v0.217, #2097): resolving the leftmost bare name walks
+        // "local scope, then the current module's declarations". Its value
+        // result set is "(a local, field, or property)" — so an accessible
+        // instance member of the enclosing type (an implicit-`this.member`
+        // reference) precedes the module's top-level TYPE declarations. Apply
+        // that precedence just before the MODULE scope is consulted, so the
+        // order is local/param (inner scopes walked first) > enclosing-type
+        // member > top-level type. Only VALUE position requests this
+        // (`memberBeforeModuleType`): the caller passes it for a bare name that
+        // is NOT the head of a dotted access. Without it, a record/class whose
+        // auto-property or field shares a name with a top-level type — e.g.
+        // `property C` inside a program that also declares `class C` — resolved
+        // the bare `C := v` assignment target to the TYPE, so codegen's
+        // implicitFieldAddr found no storage member and the constructor's field
+        // store was silently dropped (the record kept its zero-initialized
+        // field, and two distinct constructions compared equal, #2097). A
+        // dotted HEAD (`Color.Red`, `Data.M()`) does NOT request it — that head
+        // keeps resolving to the top-level type (the historical order below),
+        // because §2.7's "type-wins, no backtracking" chain reading is served
+        // by the existing exprType-based member-access resolution and flipping
+        // the head would break static access through a same-named field whose
+        // own type cannot host the accessed name. (Whether §2.7 rule 1's
+        // "local scope" is intended to place enclosing-type members explicitly,
+        // and how the unrelated-typed-member head shape should read, is raised
+        // as a spec-clarification issue.)
+        if (memberBeforeModuleType && s == moduleScope_.get() && currentType_) {
+            if (Symbol* m = lookupMember(currentType_, name)) return m;
+        }
         auto it = s->names.find(name);
         if (it != s->names.end()) {
             // §22.5 (issue #1160): a default-value expression may read only
@@ -5409,6 +5437,8 @@ Symbol* ExprTC::lookupName(std::string_view name) {
     // reference — search the enclosing type AND its base types
     // (§12 inheritance), mirroring lookupMember's transitive walk so
     // an inherited field/method is reachable without `this.`/`base.`.
+    // (Reached when the current scope chain did not include `moduleScope_`, so
+    // the in-loop member check above never fired.)
     if (currentType_) {
         if (Symbol* m = lookupMember(currentType_, name)) return m;
     }
