@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.216 — July 2026**
+**Companion to the Bezel Language Specification, v0.217 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -3040,7 +3040,7 @@ The predicate overloads of `First`, `Last`, and `Single` (and their `*OrNull` fo
 
 **Element-level semantics (v0.195).** `Zip` ends when either input ends. `Take`/`Skip` **clamp**: a negative count behaves as `0`, and a count beyond the source takes everything / skips everything — they are range operations, not magnitude constructors, so §1's negative-magnitude fault rule deliberately does not apply. `Distinct` and `Union` yield first occurrences in encounter order (`Union`: first input, then the second); `Intersect` and `Except` yield the retained elements, made distinct, in first-input order.
 
-**`GroupBy` semantics (v0.195).** `GroupBy` is lazy until its first enumeration, then **materializes fully** — no complete group can exist before the source is exhausted, so the operator buffers; its §29.11 consumption of the source happens at that point. Groups appear in first-occurrence-of-key order; elements within a group in source order. Each `IGrouping<TKey, T>` is independently single-consumption (spec §29.11) and remains valid after the outer sequence advances past it. When a group is aggregated more than once, materialize it — `for var g in logs.GroupBy((r) => r.Level) do using var items := g.ToArray(); … end;` — since `g.Count()` followed by `g.Average(…)` would be a second enumeration of `g`.
+**`GroupBy` semantics (v0.195).** `GroupBy` is lazy until its first enumeration, then **materializes fully** — no complete group can exist before the source is exhausted, so the operator buffers; its §29.11 consumption of the source happens at that point. Groups appear in first-occurrence-of-key order; elements within a group in source order. Each `IGrouping<TKey, T>` is independently single-consumption (spec §29.11) and remains valid after the outer sequence advances past it. When a group is aggregated more than once, materialize it — `for var g in logs.GroupBy(lambda(r) => r.Level) do using var items := g.ToArray(); … end;` — since `g.Count()` followed by `g.Average(…)` would be a second enumeration of `g`.
 
 **`Reverse` (naming note, v0.195).** §5 keeps the .NET-heritage operator names, so the lazy `Reverse()` deliberately sits outside §4.4's imperative-mutates/participle-copies convention — recorded as a decision, not an accident (renaming to `Reversed()` was declined: §4.4's participle promises a fresh owned *copy*, which a lazy sequence is not). No call-site ambiguity arises: on an `Array<T>` receiver, instance resolution commits to the in-place `Reverse()` before extensions are consulted (spec §26.4 rule 1); the lazy operator applies only where the receiver's static type has no instance `Reverse`.
 
@@ -3326,7 +3326,7 @@ public class Button
 end Button;
 
 // Subscription sites:
-using var sub := button.Clicked.Subscribe((e) => UpdateStatus(e.X, e.Y));
+using var sub := button.Clicked.Subscribe(lambda(e) => UpdateStatus(e.X, e.Y));
 ```
 
 Every piece is an existing mechanism: the field is an ordinary `owned` field (initialized during construction, disposed with the object — spec §28.5), `readonly` per spec §22.8, initialized with the spec §17.7 `new()` shorthand; the property is a spec §23.2 expression-bodied read-only property whose body is a receiver-sourced borrow (spec §28.6). A **`private` event needs no property** — the field alone is the event (one line). A **`protected` event** declares the field `protected`; derived classes raise through it. **Async events** use `AsyncEventSource<T>` / `IAsyncEvent<T>` identically. **No-payload events** use `EventSource<()>`; both `EventSource<()>` and `SharedEventSource<()>` provide a convenience `Raise()` overload that takes no arguments, equivalent to `Raise(())`. `readonly` on the field is the pattern's safety feature, not decoration: an accidental reassignment would otherwise silently dispose the source and sever every live subscription (spec §28.7 drop-on-overwrite); the producer-side `_clicked += h` spelling remains available on the `readonly` field because the subscription forms neither read nor assign the operand (spec §17.2). An observable **interface contract** is a get-only interface property of the interface face — `readonly property PropertyChanged: IEvent<PropertyChangedEvent>;` — which the pattern's property satisfies directly.
@@ -3381,7 +3381,7 @@ public class TickObserver
   private _count: int := 0;
 
   public constructor(ticks: IEvent<TickEvent>)
-    _sub := ticks.Subscribe((e) => do OnTick(e); end);   // captures `this` — admitted:
+    _sub := ticks.Subscribe(lambda(e) => do OnTick(e); end);   // captures `this` — admitted:
   end constructor;                                        //   bounding object is `this` (§28.14 form 3)
 
   private method OnTick(e: TickEvent)
@@ -3397,7 +3397,7 @@ Captured constructor parameters other than `this` are not admitted — a constru
 **Handler exceptions — first error wins (rationale §13.5).** If a synchronous handler throws, subsequent handlers are not invoked and the exception propagates out of `Raise` to the raiser. If an asynchronous handler's task faults, subsequent handlers are not invoked and the exception propagates from the awaited `RaiseAsync`. If an asynchronous handler's task is **cancelled**, the behavior is the same as a fault: subsequent handlers are not invoked and `OperationCanceledException` propagates from the awaited `RaiseAsync`. To run all handlers regardless of failures and aggregate exceptions, the raiser must implement that policy explicitly — `Raise`/`RaiseAsync` do not aggregate. Handlers that must run independently catch their own exceptions (fragment context: `_dataReceived` is the connection's own source field, so the async lambda's bare `ProcessPayloadAsync`/`Log` calls capture `this` and are admitted by spec §28.14's subscription admission):
 
 ```bezel
-_dataReceived += async (e) => do
+_dataReceived += async lambda(e) => do
   try
     await ProcessPayloadAsync(e.Payload);
   catch
@@ -3457,7 +3457,7 @@ end SharedEventSource;
   TickBus.Tap := inbox.NewSender();                          // wire: minted FROM this domain's channel
   using var fwd := TickBus.Feed.Subscribe(TickBus.Forward);  // capture-free handler ✓
   using var local := new EventSource<PriceTick>();           // local re-raise point; IEvent<T> face
-  using var sub := local.Subscribe((t) => UpdatePanel(t));   // ordinary §28.14 capture rules apply here
+  using var sub := local.Subscribe(lambda(t) => UpdatePanel(t));   // ordinary §28.14 capture rules apply here
   await for var t in inbox.ReceiveAll() do
     local.Raise(t);                                          // domain-local delivery
   end;
@@ -4621,7 +4621,7 @@ end String;
 
 `Replace`, `Trim`, `ToUpper`, etc. return new `string` values; `string` is immutable. A `StringBuilder` ([§3.1](#sec-stringbuilder)) is appropriate for accumulation.
 
-**`Split` contract (v0.195).** Splitting yields every (possibly empty) segment between separator occurrences: adjacent separators yield an empty element between them, and a leading or trailing separator yields a leading or trailing empty element. A separator that never occurs yields the one-element array `[s]`; splitting the empty string yields `[""]`. There is no remove-empty-entries option — tokenizers filter explicitly: `line.Split(seps).Where((w) => w.Length > 0)` (§5, import required). The `separators: Array<char>` form splits at any listed code point.
+**`Split` contract (v0.195).** Splitting yields every (possibly empty) segment between separator occurrences: adjacent separators yield an empty element between them, and a leading or trailing separator yields a leading or trailing empty element. A separator that never occurs yields the one-element array `[s]`; splitting the empty string yields `[""]`. There is no remove-empty-entries option — tokenizers filter explicitly: `line.Split(seps).Where(lambda(w) => w.Length > 0)` (§5, import required). The `separators: Array<char>` form splits at any listed code point.
 
 `Length` and `s[i]` are O(1) for every string (language spec [§4.6](Bezel_Language_Spec.md#sec-string)). The internal representation may be 1, 2, or 4 bytes per code point, selected per-string at construction; the choice is invisible to programmers but enables `IsAscii` for the common ASCII-only case. For char-level non-allocating substring views, use `AsSpan()` to obtain a `ReadOnlyStringSpan` ([§3.3](#sec-readonlystringspan)) — added in v0.104. For byte access to a string's contents, use `Encoding.UTF8.GetBytes` in `System.Text` ([§3.2](#sec-encoding)): the one-shot form `GetBytes(s)` returns a fresh owned `Array<byte>` and is always correct; the allocation-conscious form — repeated encoding in a loop, I/O paths reusing a buffer — is `GetByteCount(s)` with `GetBytes(s, destination: Span<byte>)` (v0.165), which encodes into a caller-reused `OwningBuffer<byte>` with zero per-call allocation, for every string, ASCII or not. (The ASCII-only zero-copy byte view of v0.106, `ReadOnlyAsciiByteSpan`, is retired — [§3.4](#sec-readonlyasciibytespan), v0.188.)
 
@@ -4660,7 +4660,7 @@ end Range;
 
 ```bezel
 import System.Collections.Linq;
-var evenSquares := (1..20).Where((x) => x mod 2 = 0).Select((x) => x * x);
+var evenSquares := (1..20).Where(lambda(x) => x mod 2 = 0).Select(lambda(x) => x * x);
 var total := (1..100).Sum();
 ```
 

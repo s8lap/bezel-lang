@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft — owner-directed 2026-07-22, distilled from the inline-function syntax review of the same date; the recommended form and the `lambda` keyword were owner-selected at drafting. Adoption is a design change (a respelling of an existing construct plus one capability addition) and follows the full `spec-change-process.md` §6 path. |
+| **Status** | **superseded — graduated v0.217** (owner-accepted 2026-07-22, same day as drafting; spec §27.3/§27.4, grammar A.7 `LambdaExpr`, Appendix B.1; rationale §3.13). Graduation decided §8's open questions — hard cutover (0057 precedent, zero external users), the widening extension in the same revision, `async lambda` order — recorded in the v0.217 changelog entry. Impl delta tracked by [#2101](https://github.com/s8lap/bezel-lang/issues/2101); the §7 hole-delimitation adjacency filed as [#2102](https://github.com/s8lap/bezel-lang/issues/2102). |
 | **Tracking issue** | — (assign at review) |
 | **Target** | spec §27 (Lambdas and Function Types), §17.1 note, Appendix A.7 `LambdaExpr`, Appendix B.1 (one keyword addition); no stdlib surface |
 | **Written against** | spec v0.216 |
