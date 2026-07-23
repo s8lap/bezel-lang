@@ -199,8 +199,10 @@ BEZEL_TEST(codegen_2140_neighbors, byte_plus_byte_overflow_unchanged) {
         "var b: byte := 200; var c: byte := 100; b += c;"), 1);
 }
 
-// Bitwise / shift compounds stay on the LHS-width path (not the narrow-check):
-// byte &= 3 → 1; byte <<= 1 → 10.
+// Bitwise / shift compound neighbor values unchanged: byte &= 3 → 1;
+// byte <<= 1 → 10. (Comment amended by #2147: `&`/`|`/`^` with a strictly
+// WIDER RHS now take the promoted-width + checked-narrow branch too — the
+// values here are in range either way; shifts alone stay LHS-width, §6.5.)
 BEZEL_TEST(codegen_2140_neighbors, byte_bitwise_shift_unchanged) {
     BEZEL_EXPECT_EQ(run("var b: byte := 5; b &= 3; return int(b);"), 1);
     BEZEL_EXPECT_EQ(run("var b: byte := 5; b <<= 1; return int(b);"), 10);

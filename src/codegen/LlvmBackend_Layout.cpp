@@ -226,19 +226,38 @@ llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
     // narrows to `byte(4)`. The result is narrowed back to the LHS type by the
     // §5.2 CHECKED narrowing (`uns`): a trunc whose sign/zero re-extension differs
     // from the wide value is out of range → OverflowException (never a silent
-    // truncation, §6.1). Bitwise and shift ops stay on the LHS-width path below:
-    // they cannot overflow the LHS width (`&`/`|`/`^` keep operand bits; `<<`/`>>`
-    // mask the count, #1041) and a shift's result already has the left operand's
-    // type (§6.5). (`mod` has no compound form, §6.6; listed for parity.)
+    // truncation, §6.1). (`mod` has no compound form, §6.6; listed for parity.)
+    //
+    // §6.6/§6.5 (#2147): the non-shift BITWISE ops (`&`/`|`/`^`) take this same
+    // branch when the RHS is strictly WIDER — they promote per §6.2 exactly like
+    // arithmetic (§3.5: "operand-type combinations follow the numeric-promotion
+    // rules in §6"), so `int & long : long` and the compound needs the §5.2
+    // checked write-back: `int(-1) &= 2^32L` is SExt(-1) & 2^32 = 2^32, out of
+    // int range → OverflowException. (The #1042 tail truncated the wide RHS
+    // FIRST and stored 0 with no raise; `|`/`^` with set high bits, and `&`
+    // against a sign-extended negative operand, likewise reached a wider-than-
+    // LHS result silently truncated.) Unlike arithmetic, `&`/`|`/`^` cannot
+    // overflow the PROMOTED width itself, so the recursed wide op is the plain
+    // And/Or/Xor — only the final narrow back to T is checked. Two differences
+    // from the arithmetic trigger: no i32 floor (a same-width pair keeps its
+    // type — `byte ^ byte : byte`, §6.6's `checksum ^= b` cell — and the exact
+    // LHS-width op needs no check), and SHIFTS stay on the LHS-width path
+    // below: a shift's result already has the left operand's type (§6.5, the
+    // count masked per #1041) and a shift never raises OverflowException.
+    bool wideBitwise = (op == "&" || op == "|" || op == "^");
     if (l->getType()->isIntegerTy() && !l->getType()->isIntegerTy(1) &&
         r->getType()->isIntegerTy() && !r->getType()->isIntegerTy(1) &&
-        (op == "+" || op == "-" || op == "*" || op == "/" || op == "mod")) {
+        (op == "+" || op == "-" || op == "*" || op == "/" || op == "mod" ||
+         wideBitwise)) {
         llvm::Type* dstTy = l->getType();
         unsigned lBits = dstTy->getIntegerBitWidth();
         unsigned rBits = r->getType()->getIntegerBitWidth();
         unsigned promo = lBits;
         if (rBits > promo) promo = rBits;
-        if (promo < 32) promo = 32;
+        // §6.2/#1043: arithmetic on a sub-i32 LHS floors at i32 (`byte + int
+        // literal` runs in int); bitwise does NOT — `byte & byte : byte` is
+        // exact at the LHS width and §6.6's write-back never applies (#2147).
+        if (promo < 32 && !wideBitwise) promo = 32;
         if (promo > lBits) {
             llvm::Type* wideTy = llvm::Type::getIntNTy(llvm_, promo);
             // §6.2: the op's type is the wider operand's — the RHS when it is
