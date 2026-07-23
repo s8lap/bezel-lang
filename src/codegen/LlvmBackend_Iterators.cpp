@@ -830,6 +830,25 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // non-throwing path. // per §28.3
         unwindIneligibleFn_ = moveNextFn;
         collectUnwindIneligible(*ci.stmts);
+        // fix #2148 / #1871 / #1003 / #1028 / #1930 / §28.9 / §28.11: the
+        // scope-end reclaim of a plain `var` borrowing-`Array<T>` LITERAL (its
+        // backing is "reclaimed with the instance"), and of a `var` fresh
+        // borrowing-array / dict / grouping MATERIALIZER, must be re-established
+        // for the MOVENEXT fn too — the registration sites in lowerLocalDecl gate
+        // on `currentFn_ == borrowingArrayFreeEligibleFn_` (and the dict/grouping
+        // analogues), but the iterator body lowers with currentFn_ == moveNextFn
+        // while emitFunctionBody left these keyed to the ENTRY (factory) fn
+        // (Setup.cpp), so every such reclaim was silently skipped and the backing
+        // leaked when the iterator ran to normal completion (the #2148 leak: an
+        // `Array<T>` literal / Split materializer local in a `yield` body — the
+        // MoveNext scope-end drop never freed it). One call re-populates all three
+        // sets; re-pin all three fn keys to moveNextFn. Mirrors emitAsyncMethod's
+        // resume-fn re-establishment (LlvmBackend_Async.cpp) and the unwind
+        // re-establishment just above. // per §28.9, §28.11
+        collectBorrowingArrayFreeEligible(*ci.stmts);
+        borrowingArrayFreeEligibleFn_ = moveNextFn;
+        dictMaterializerFreeEligibleFn_ = moveNextFn;
+        groupingFreeEligibleFn_ = moveNextFn;
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", moveNextFn);
         builder_.SetInsertPoint(entry);
 
