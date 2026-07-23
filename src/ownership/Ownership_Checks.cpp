@@ -5903,6 +5903,154 @@ bool MethodOwnership::methodReturnsOnlyWrapperReceiverBorrow(
     return sawReturn && allBorrow;
 }
 
+// §28.10 / §28.6 / §26.7 (#2137). See the header for the full contract: the
+// receiver-sourced borrow-return shapes — bare `this` (§28.6 "Methods
+// returning `this`"; for an extension body, the §26.7 receiver-parameter
+// borrow), a bare-identifier field read (implicit `this.f`, or a static
+// getter's bare static-field read — §28.3 v0.196), or a `this`-rooted
+// field-read CHAIN (each hop resolving to a FieldSymbol — §28.6 admits a
+// borrow "reached through the receiver's fields"). A NON-owned field read is
+// accepted too: §28.3's producers row makes every field read a borrow of its
+// storage, so pinning it is exactly as sound as the owned-field case. A local,
+// a parameter, a call result, a property-resolved member, or any other shape
+// is NOT receiver-sourced here (conservative → the caller keeps adoption).
+bool MethodOwnership::exprIsReceiverSourcedBorrowReturn(
+        const ast::Expr& e) const {
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        if (id->name == "this") return true;  // §28.6 / §26.7 receiver borrow
+        // Bare identifier resolving to a FIELD (implicit `this.f`, or a static
+        // field read inside a static getter — §28.3 v0.196's static-storage
+        // source). A LocalSymbol / ParameterSymbol is NOT accepted.
+        return dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(e)) != nullptr;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (!ma->target) return false;
+        if (!dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(e)))
+            return false;  // property/indexer getter hop — not a plain read
+        // The chain's root must itself be receiver-sourced (`this`, an
+        // implicit-this field, or a further field hop).
+        return exprIsReceiverSourcedBorrowReturn(*ma->target);
+    }
+    return false;
+}
+
+// #2137: the receiver-sourced twin of scanReturnsForWrapperReceiverBorrow —
+// identical statement walk (If/While/For/DoEndBlock/Try/Case are the forms
+// that can carry a nested `return`; a nested closure's body is an Expr, never
+// spliced into the Stmt list, so it is structurally never descended into),
+// with exprIsReceiverSourcedBorrowReturn as the per-return accept test.
+void MethodOwnership::scanReturnsForReceiverSourcedBorrow(
+        const ast::Stmt* s, bool& sawReturn, bool& allBorrow) const {
+    if (!s || !allBorrow) return;  // null body slot, or already disproved
+    if (const auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+        sawReturn = true;
+        if (!rs->value || !exprIsReceiverSourcedBorrowReturn(*rs->value))
+            allBorrow = false;
+        return;
+    }
+    if (const auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+        for (auto& b : is->ifBranch.body)
+            scanReturnsForReceiverSourcedBorrow(b.get(), sawReturn, allBorrow);
+        for (auto& br : is->elifBranches)
+            for (auto& b : br.body)
+                scanReturnsForReceiverSourcedBorrow(b.get(), sawReturn,
+                                                    allBorrow);
+        for (auto& b : is->elseBody)
+            scanReturnsForReceiverSourcedBorrow(b.get(), sawReturn, allBorrow);
+        return;
+    }
+    if (const auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+        for (auto& b : ws->body)
+            scanReturnsForReceiverSourcedBorrow(b.get(), sawReturn, allBorrow);
+        return;
+    }
+    if (const auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+        for (auto& b : fs->body)
+            scanReturnsForReceiverSourcedBorrow(b.get(), sawReturn, allBorrow);
+        return;
+    }
+    if (const auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+        for (auto& b : d->body)
+            scanReturnsForReceiverSourcedBorrow(b.get(), sawReturn, allBorrow);
+        return;
+    }
+    if (const auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+        for (auto& b : ts->body)
+            scanReturnsForReceiverSourcedBorrow(b.get(), sawReturn, allBorrow);
+        for (auto& c : ts->catches)
+            scanReturnsForReceiverSourcedBorrow(c.body.get(), sawReturn,
+                                                allBorrow);
+        for (auto& b : ts->finallyBody)
+            scanReturnsForReceiverSourcedBorrow(b.get(), sawReturn, allBorrow);
+        return;
+    }
+    if (const auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+        for (auto& arm : cs->arms)
+            for (auto& a : arm.stmts)
+                scanReturnsForReceiverSourcedBorrow(a.get(), sawReturn,
+                                                    allBorrow);
+        return;
+    }
+    // Other statement kinds cannot carry a nested `return` of the enclosing
+    // method (see scanReturnsForWrapperReceiverBorrow above).
+}
+
+// §28.10 / §28.6 / §26.7 (#2137). See the header for the full contract.
+bool MethodOwnership::methodReturnsOnlyReceiverSourcedBorrows(
+        const ast::MethodDecl& md) const {
+    if (md.bodyKind == ast::MethodBodyKind::Expression)
+        return md.exprBody && exprIsReceiverSourcedBorrowReturn(*md.exprBody);
+    bool sawReturn = false;
+    bool allBorrow = true;
+    for (auto& s : md.stmts)
+        scanReturnsForReceiverSourcedBorrow(s.get(), sawReturn, allBorrow);
+    return sawReturn && allBorrow;
+}
+
+// §28.10 / §28.3 / §28.6 (#2137). See the header for the full contract. §28.6
+// guarantees a USER getter is a borrow-producing position ("a property or
+// indexer getter may not return a freshly-produced owned value"); recognition
+// nevertheless stays POSITIVE and body-scanned, mirroring the call-shape
+// predicate, so a getter shape the scan cannot prove (a `??`, a conditional, a
+// chained call) conservatively keeps adoption rather than guessing.
+bool MethodOwnership::propertyGetterIsRecognizedBorrow(
+        const ast::PropertyDecl& pd) const {
+    switch (pd.bodyKind) {
+    case ast::PropertyBodyKind::Expression:
+        return pd.exprBody && exprIsReceiverSourcedBorrowReturn(*pd.exprBody);
+    case ast::PropertyBodyKind::Auto:
+        // An initializer-LESS auto-property's generated getter is a
+        // backing-field read — a borrow of storage (§28.3 producers row),
+        // exactly the FieldSymbol shape #2128 pins. An auto-property WITH an
+        // initializer is NOT recognized: its minted value's ownership story is
+        // its own open defect (#2168 — the backing field never disposes it),
+        // and pinning would change which accident wins; keep today's
+        // adoption. // per §28.3, #2137
+        return pd.autoInitializer == nullptr;
+    case ast::PropertyBodyKind::Block:
+        for (const ast::PropertyAccessor& acc : pd.accessors) {
+            if (acc.isSet) continue;
+            switch (acc.bodyKind) {
+            case ast::PropertyAccessorBodyKind::Expression:
+                return acc.exprBody &&
+                       exprIsReceiverSourcedBorrowReturn(*acc.exprBody);
+            case ast::PropertyAccessorBodyKind::Block: {
+                bool sawReturn = false;
+                bool allBorrow = true;
+                for (auto& s : acc.stmts)
+                    scanReturnsForReceiverSourcedBorrow(s.get(), sawReturn,
+                                                        allBorrow);
+                return sawReturn && allBorrow;
+            }
+            case ast::PropertyAccessorBodyKind::Abstract:
+                return false;  // interface/abstract — no body to prove
+            }
+        }
+        return false;  // no getter accessor (write-only property)
+    }
+    return false;
+}
+
 // §28.8 owned-sink check (issue #395). See the header for the full contract.
 bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     const ast::Expr* e = &argValue;

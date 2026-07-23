@@ -112,6 +112,29 @@ bool conditionalCaseArmMeetIsOwned(const ast::Expr& e,
 bool isBuiltinOwnedTransferCall(const ast::CallExpr& call,
                                 const sema::SemaContext& ctx);
 
+// §28.10 / §28.11 / stdlib §4.5 (v0.195) (#2146): a builtin owning-collection
+// `recv.Drain()` call whose receiver is a STABLE NAMED source. Stdlib §4.5:
+// "`Drain()` on `OwningArray<T>` returns the array itself at that static type
+// — no separate enumerable object" — the drain view ALIASES the receiver, so
+// no fresh frame exists for the §28.3 iterator-factory convention to hand
+// over; the receiver's owner keeps the ONE container obligation (§28.11's
+// "ownership out" row transfers ELEMENTS, never the container). Binding the
+// view therefore takes NO disposal obligation (§28.10's borrow-call row); a
+// registered second disposal double-frees the collection (the #2146 SEGV).
+//
+// Positive recognition only: the callee must be the BUILTIN Drain (no
+// resolved MethodSymbol — a user method named `Drain` is not this shape), the
+// receiver's alias-resolved type head an owning-collection, and the receiver
+// a stable named place (an identifier bound to a local/parameter/field, a
+// field member-access, or an index slot). A TEMPORARY receiver
+// (`MakeArr().Drain()`) is NOT recognized — the temporary's own obligation
+// story is separate (#2169) — and keeps its current classification. Consumed by BOTH
+// the ownership pass (producerState / the §28.10 using-var pin) and codegen
+// (the iterable-source disposal registrations), so the two can never diverge
+// on the alias fact.
+bool isOwningCollectionDrainAliasCall(const ast::CallExpr& call,
+                                      const sema::SemaContext& ctx);
+
 // §28.3 "Factory methods and sourceless returns" / Appendix C.3 (fix #1499): a
 // STATIC method returning a plain class/interface type with NO `owned`
 // annotation has no STRUCTURAL borrow source — a static call has no receiver —

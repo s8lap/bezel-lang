@@ -1904,28 +1904,81 @@ private:
     // Borrowed (returns false). // per §28.6, §28.3, §5.11
     bool methodReturnsOnlyWrapperReceiverBorrow(const ast::MethodDecl& md) const;
 
-    // §28.10 "using var initialized from a borrow" (#2128): true when a `using
-    // var` initializer is one of the borrow shapes the spec lists there beyond
-    // the bare-id / arm-meet / bind-atom / bare-T-call shapes handled inline in
-    // handleLocalDecl — "a method call without an `owned` return, an indexer
-    // access, or a field read." Such a using var is a BORROW-PIN (no disposal
-    // obligation; its real owner disposes it), so codegen must skip the scope-
-    // end dispose (registerUsingDisposal honors usingVarSourceIsBorrow). Absent
-    // this, a TYPED binding over one of these reaches classOfLocal (declared
-    // class → unconditional dispose) and DOUBLE-FREES the borrow. Recognized
+    // §28.10 / §28.6 / §26.7 (#2137): true when `e` is a RECEIVER-SOURCED
+    // borrow return shape — a bare `this` (§28.6 "Methods returning `this`";
+    // in an extension body `this` IS the receiver-parameter borrow, §26.7), a
+    // bare-identifier FIELD read (implicit `this.f`, or a static getter's bare
+    // `static owned` field read — §28.3 v0.196 static-storage-sourced borrow),
+    // or a `this`-rooted field-read chain (each hop a FieldSymbol). The
+    // superset of exprIsReceiverOwnedFieldBorrow: NON-owned field reads are
+    // borrows of their storage too (§28.3 producers), so they pin the same
+    // way. // per §28.10, §28.6, §26.7, §28.3, #2137
+    bool exprIsReceiverSourcedBorrowReturn(const ast::Expr& e) const;
+
+    // #2137: the receiver-sourced twin of scanReturnsForWrapperReceiverBorrow —
+    // same statement walk, `exprIsReceiverSourcedBorrowReturn` as the per-
+    // return accept test. // per §28.10, §28.6, #2137
+    void scanReturnsForReceiverSourcedBorrow(const ast::Stmt* s,
+                                             bool& sawReturn,
+                                             bool& allBorrow) const;
+
+    // §28.10 / §28.6 / §26.7 (#2137): true when EVERY return path of `md`'s
+    // body is a receiver-sourced borrow (bare `this`, or a receiver-rooted
+    // field-read chain — exprIsReceiverSourcedBorrowReturn). The WIDER,
+    // call-site-pin-only sibling of methodReturnsOnlyWrapperReceiverBorrow
+    // (which stays the narrower test producerState's owning-type-head and
+    // task-borrow classifications rely on): every accepted shape is a borrow
+    // whose source is the call's receiver, exactly the §28.3 producers-row
+    // classification for a non-`owned` instance/extension call. A body with no
+    // scanned return is conservatively NOT recognized. // per §28.10, §28.6,
+    // §26.7, #2137
+    bool methodReturnsOnlyReceiverSourcedBorrows(const ast::MethodDecl& md)
+        const;
+
+    // §28.10 / §28.3 / §28.6 (#2137): true when a USER property declaration's
+    // GETTER provably produces a receiver-/static-storage-sourced borrow:
+    //   - expression-bodied (`=> _w`) — the body expr passes
+    //     exprIsReceiverSourcedBorrowReturn;
+    //   - block form — the `get` accessor's expression body passes the same
+    //     test, or its `do … end` body's every return does (the scanner);
+    //   - an initializer-LESS auto-property — the generated getter is a
+    //     backing-field read, a borrow of storage per §28.3's producers row.
+    //     An auto-property WITH an initializer is NOT recognized (who owns an
+    //     initializer-minted class value is its own open defect — #2168 —
+    //     so its read keeps today's adoption).
+    // Abstract accessors (interface properties) and builtin properties have no
+    // scannable body and are not recognized (adoption, as before). // per
+    // §28.10, §28.3, §28.6, #2137
+    bool propertyGetterIsRecognizedBorrow(const ast::PropertyDecl& pd) const;
+
+    // §28.10 "using var initialized from a borrow" (#2128, extended #2137/
+    // #2146): true when a `using var` initializer is one of the borrow shapes
+    // the spec lists there beyond the bare-id / arm-meet / bind-atom /
+    // bare-T-call shapes handled inline in handleLocalDecl — "a method call
+    // without an `owned` return, an indexer access, or a field read." Such a
+    // using var is a BORROW-PIN (no disposal obligation; its real owner
+    // disposes it), so codegen must skip the scope-end dispose
+    // (registerUsingDisposal honors usingVarSourceIsBorrow). Absent this, a
+    // TYPED binding over one of these reaches classOfLocal (declared class →
+    // unconditional dispose) and DOUBLE-FREES the borrow. Recognized
     // POSITIVELY (never off producerState's unreliable `Borrowed` verdict, which
     // also covers fresh-owned producers — collection literals, `RawBytes.From`,
     // iterator/subscription returns — that MUST keep adoption):
     //   - a FIELD read (obj.f / bare implicit-this f resolving to a FieldSymbol)
-    //     — a lend; distinguished from a property/indexer GETTER (a Property/
-    //     MethodSymbol that may return owned) by symbol resolution;
+    //     — a lend (#2128);
+    //   - a USER borrow-returning PROPERTY getter read — getter-body-scanned;
+    //     §28.6 guarantees user getters are borrow-producing positions (#2137);
     //   - an INDEXER access (a bare IndexExpr) — a borrow out, source the
-    //     collection (§28.11 element-slot table); `move coll[i]` / Pop / Drain
-    //     are a UnaryExpr / call, not a bare IndexExpr, and keep adoption;
+    //     collection (§28.11 element-slot table); `move coll[i]` / Pop are a
+    //     UnaryExpr / call, not a bare IndexExpr, and keep adoption (#2128);
     //   - a concrete borrow-returning CALL — a directly-resolved user method
-    //     whose declared return is not `owned` and whose EVERY return is a bare
-    //     receiver-owned-field borrow (methodReturnsOnlyWrapperReceiverBorrow),
-    //     never a fresh/owned producer. // per §28.10, #2128
+    //     whose declared return is not `owned` and whose EVERY return is a
+    //     receiver-sourced borrow (`this`, or a receiver-rooted field read —
+    //     methodReturnsOnlyReceiverSourcedBorrows) (#2128, widened #2137);
+    //   - the builtin owning-collection Drain() ALIAS over a stable named
+    //     receiver — stdlib §4.5 v0.195: the view IS the receiver; its owner
+    //     keeps the one container obligation (#2146). // per §28.10, #2128,
+    //     #2137, #2146
     bool usingVarInitIsRecognizedBorrow(const ast::Expr& init) const;
 
     // §28.8: report the owned-sink violation for `argValue` (at `loc`) when

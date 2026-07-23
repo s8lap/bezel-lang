@@ -190,6 +190,50 @@ bool isBuiltinOwnedTransferCall(const ast::CallExpr& call,
     return false;
 }
 
+bool isOwningCollectionDrainAliasCall(const ast::CallExpr& call,
+                                      const sema::SemaContext& ctx) {
+    // See the header contract. // per §28.10, §28.11, stdlib §4.5 v0.195, #2146
+    if (!call.args.empty()) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || ma->member != "Drain" || !ma->target) return false;
+    // The BUILTIN Drain only: a USER method named `Drain` resolves a
+    // MethodSymbol on the callee and is classified by the ordinary user-call
+    // rules (returnOwned / borrow-body scan), never by the alias fact. (The
+    // `MethodSymbol` cast — not a bare non-null test — mirrors producerState's
+    // builtin-transfer guard: sema may attach non-method symbols to a callee.)
+    if (call.callee &&
+        dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*call.callee)))
+        return false;
+    // Receiver type head must be an owning-collection (alias-resolved, the
+    // same extraction as isBuiltinOwnedTransferCall above — #1462).
+    std::string_view rcn;
+    if (const sema::TypeRef* rt = ctx.exprType(*ma->target)) {
+        if (!rt->aliasResolvedHead.empty())
+            rcn = rt->aliasResolvedHead;
+        else if (rt->astNode && rt->astNode->name &&
+                 !rt->astNode->name->parts.empty())
+            rcn = rt->headName();
+        else if (!rt->importedName.empty())
+            rcn = rt->importedName;
+    }
+    if (!isOwningCollectionHead(rcn)) return false;
+    // The receiver must be a STABLE NAMED place — the alias's single owner is
+    // then that place's owner. A producer/temporary receiver keeps its own
+    // (separate) obligation story and is not recognized.
+    const ast::Expr* recv = ma->target.get();
+    if (dynamic_cast<const ast::IndexExpr*>(recv)) return true;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(recv)) {
+        sema::Symbol* s = ctx.exprSymbol(*id);
+        return dynamic_cast<sema::LocalSymbol*>(s) != nullptr ||
+               dynamic_cast<sema::ParameterSymbol*>(s) != nullptr ||
+               dynamic_cast<sema::FieldSymbol*>(s) != nullptr;
+    }
+    if (auto* rma = dynamic_cast<const ast::MemberAccessExpr*>(recv))
+        return dynamic_cast<sema::FieldSymbol*>(ctx.exprSymbol(*rma)) !=
+               nullptr;
+    return false;
+}
+
 namespace {
 
 // Recursively scan every `return EXPR;` reachable in statement `s` (the same

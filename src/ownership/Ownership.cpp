@@ -2064,6 +2064,27 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                     "`) must not take an owned production — the binding never "
                     "takes a disposal obligation; bind owned values with "
                     "`using var` (§21.1 / §28.3)");
+            } else if (auto* dce =
+                           dynamic_cast<const ast::CallExpr*>(lc->value.get());
+                       dce &&
+                       common::isOwningCollectionDrainAliasCall(*dce, ctx_)) {
+                // §21.1 (v0.201): "Rejected […]: a deferred-activation
+                // producer (a lazy query, `Drain()`, `ReceiveAll()` — affine
+                // values, §29.11)". The #2146 alias reclassification makes a
+                // named-receiver `Drain()` BORROWED in producerState (its
+                // container obligation stays with the receiver), so the
+                // Owned-production branch above no longer catches it; §21.1
+                // rejects it by name regardless — a drain view is an affine,
+                // single-consumption value no never-changing `const` binding
+                // may hold. // per §21.1 v0.201, §29.11, #2146
+                ctx_.diagnostics().report(
+                    Severity::Error, lc->value->span.begin,
+                    std::string("a `const` local (`") + std::string(lc->name) +
+                    "`) must not take a deferred-activation producer — "
+                    "`Drain()` yields an affine, single-consumption view "
+                    "(§29.11) that a `const` binding cannot hold; iterate "
+                    "`for var x in coll.Drain() do … end` directly, or bind "
+                    "with `using var` (§21.1 / §28.10)");
             }
         }
         // No state transition: a const local carries no obligation. The
@@ -3138,6 +3159,26 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
         // This is the correct classification for `var clone := sm.Clone()`
         // (Shared<T>), `var sender := ch.NewSender()` (ChannelSender<T>),
         // `var cts := CancellationTokenSource.New()`, etc. // per §28.13, §30.14
+        //
+        // §28.10 / §28.11 / stdlib §4.5 (v0.195) (#2146): carve the builtin
+        // owning-collection `recv.Drain()` over a STABLE NAMED receiver out of
+        // the IOwningEnumerable head fallback below. Stdlib §4.5: "`Drain()`
+        // on `OwningArray<T>` returns the array itself at that static type —
+        // no separate enumerable object" — the call mints NOTHING; the view
+        // ALIASES the receiver, whose owner keeps the one container obligation
+        // (§28.11 "ownership out" transfers elements, never the container).
+        // Classifying it Owned made the binding a second owner of the same
+        // object — a double-dispose (SEGV via the iterator-format disposal on
+        // a bz_array). Per §28.10's borrow-call row ("a method call without an
+        // `owned` return … is a borrow") it is BORROWED (source: the
+        // receiver). A user yield-iterator returning IOwningEnumerable<T> is a
+        // genuine fresh-frame factory (resolved MethodSymbol → excluded by the
+        // recognizer) and keeps the Owned fallback; the §21.1 `const`
+        // rejection of a Drain initializer is re-established at the
+        // LocalConstDecl site (visitStmt) since it no longer falls out of the
+        // Owned verdict here. // per §28.10, §28.11, stdlib §4.5 v0.195, #2146
+        if (common::isOwningCollectionDrainAliasCall(*ce, ctx_))
+            return OwnershipState::Borrowed;
         if (const sema::TypeRef* retTy = ctx_.exprType(e)) {
             if (retTy->kind == sema::TypeRef::Kind::Named &&
                 retTy->astNode && retTy->astNode->name &&
@@ -3376,6 +3417,27 @@ bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) cons
         dynamic_cast<const ast::IdentifierExpr*>(&init)) {
         if (dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(init)))
             return true;
+        // #2137(a) — a USER borrow-returning PROPERTY getter read. §28.3
+        // producers: "Property access `obj.Prop` | Borrowed (source: `obj`)";
+        // a user getter is additionally definition-site guaranteed
+        // borrow-producing ("a property or indexer getter may not return a
+        // freshly-produced owned value — a getter is a borrow-producing
+        // position", §28.6), and §28.3 (v0.196) admits the static getter over
+        // a bare `static owned` field read as the static-storage-sourced
+        // borrow. Recognition stays POSITIVE and body-scanned all the same
+        // (mirroring the call shape below): only a resolved PropertyDecl whose
+        // getter provably returns receiver-/static-storage-sourced borrows
+        // pins. Builtin properties (`tcs.Task`, `Task.Result` — owned-producing
+        // surfaces with no PropertyDecl) and interface-dispatched reads
+        // (PropertySymbol with no AST decl) keep adoption. Indexer
+        // PropertySymbols never arrive here (an indexer read is an IndexExpr,
+        // recognized below). // per §28.10, §28.3, §28.6, #2137
+        if (auto* ps =
+                dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(init))) {
+            if (!ps->isIndexer)
+                if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
+                    if (propertyGetterIsRecognizedBorrow(*pd)) return true;
+        }
     }
     // An INDEXER access — a bare `coll[i]` / `arr[i]`. The element-slot table
     // (§28.11) classifies indexer-get / default iteration as a BORROW out
@@ -3404,15 +3466,41 @@ bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) cons
     // async frame that MUST be disposed — pinning it would leak the frame.
     // (Sync Task-returning borrow bodies are already rejected at the
     // definition site by SB01-B/#1660, so isAsync is the whole reachable gap.)
-    // Residual under-pins tracked: #2137 (borrow-returning property getters;
-    // borrowed-parameter-returning calls). // per §28.10 v0.190, #2128
+    // The #2137 residuals (borrow-returning property getters; receiver-borrow
+    // `return this;` bodies, incl. the extension receiver-parameter) are
+    // closed by the PropertySymbol branch above and the receiver-sourced scan
+    // below. Remaining recorded residual: interface-/virtual-dispatched reads
+    // and calls (no statically resolved body → adoption, as before). // per
+    // §28.10 v0.190, #2128, #2137
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&init)) {
+        // #2146 — the builtin owning-collection `recv.Drain()` over a stable
+        // named receiver: stdlib §4.5 (v0.195) "`Drain()` on `OwningArray<T>`
+        // returns the array itself at that static type — no separate
+        // enumerable object". No fresh frame exists; the view ALIASES the
+        // receiver, whose owner keeps the one container obligation, so the
+        // `using var` is §28.10's borrow-pin ("no `Dispose()` is called,
+        // because the value is not owned by this scope") and additionally
+        // scope-pins the receiver. A user IOwningEnumerable-returning
+        // iterator call (resolved MethodSymbol) is a genuine factory and is
+        // NOT recognized — it keeps its frame adoption. // per §28.10, §28.11,
+        // stdlib §4.5 v0.195, #2146
+        if (common::isOwningCollectionDrainAliasCall(*ce, ctx_)) return true;
         if (const ast::MethodDecl* md = common::calleeMethodDecl(*ce, ctx_)) {
             bool isAsync = false;
             for (std::string_view mod : md->modifiers)
                 if (mod == "async") { isAsync = true; break; }
+            // #2137(b): the scan is the RECEIVER-SOURCED generalization — it
+            // accepts, on every return path, a bare `this` (§28.6 "Methods
+            // returning `this`"; for an extension method `this` IS the
+            // receiver-parameter borrow, §26.7 "The receiver is always a
+            // borrow") and any receiver-rooted field-read borrow, on top of
+            // the #2128 receiver-owned-field shape. A non-receiver borrowed-
+            // parameter return needs no recognition: it is rejected at the
+            // callee's definition (§28.3 "Borrow lifetime rules" — "a borrowed
+            // *local or parameter* with no source that outlives the call may
+            // not be returned"). // per §28.10, §28.6, §26.7, #2137
             if (!isAsync && !md->returnOwned &&
-                methodReturnsOnlyWrapperReceiverBorrow(*md))
+                methodReturnsOnlyReceiverSourcedBorrows(*md))
                 return true;
         }
     }
@@ -3536,8 +3624,13 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
         // returning call): those are borrow-pins whether the binding is typed
         // or untyped — the typed form previously reached codegen's
         // unconditional classOfLocal dispose and double-freed the borrow.
-        // Owned-returning property getters and borrowed-parameter-returning
-        // calls remain adopting (#2137 tracks that residual under-pin). The MARKED transfer
+        // #2137 extends the same positive recognition to user borrow-returning
+        // property getters (incl. static getters over `static owned` storage
+        // and initializer-less auto-properties), `return this;` receiver
+        // borrows (incl. §26.7 extension receivers), and #2146 adds the
+        // owning-collection Drain() receiver alias (stdlib §4.5 v0.195).
+        // Builtin/interface-dispatched property reads and calls (no resolved
+        // body) remain adopting. The MARKED transfer
         // `using var y := owned x;` is handled by the initializerHasOwnedMarker branch
         // above (its owned shape is likewise invisible to producerState). Both the pin
         // and the adoption record the binding Owned + implicitDischarge so the PIN
@@ -3726,8 +3819,20 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
         if (auto cv = common::classifyChoiceType(rhsTy, ctx_))
             rhsIsOwningChoice =
                 (*cv == common::ChoiceClassification::Owning);
+        // #2146: an owning-collection Drain() ALIAS pin is neither inert nor
+        // vacuous — it pins a scope-local owned collection (load-bearing), and
+        // the lint's `const` remedy is inapplicable (§21.1 rejects a Drain
+        // initializer as a deferred-activation producer). Its declaration-less
+        // IOwningEnumerable TypeRef would otherwise fall into Case A's
+        // "value-typed/runtime-managed" bucket. // per §28.10, §21.1, #2146
+        bool rhsIsDrainAliasPin = false;
+        if (auto* dce =
+                dynamic_cast<const ast::CallExpr*>(ld.initializer.get()))
+            rhsIsDrainAliasPin =
+                common::isOwningCollectionDrainAliasCall(*dce, ctx_);
         if (rhsTy && !isBorrowableType(rhsTy) &&
-            !rhsIsDisposableClassType(rhsTy) && !rhsIsOwningChoice) {
+            !rhsIsDisposableClassType(rhsTy) && !rhsIsOwningChoice &&
+            !rhsIsDrainAliasPin) {
             report(Severity::Warning, ld.span.begin,
                 std::string("`using var` `") + std::string(lsym->name) +
                 "` is vacuous — the RHS is a value-typed/runtime-managed "

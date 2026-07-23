@@ -7381,6 +7381,24 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
     bool isCall = dynamic_cast<const ast::CallExpr*>(ld->initializer.get()) != nullptr;
     bool isNew = dynamic_cast<const ast::NewExpr*>(ld->initializer.get()) != nullptr;
     bool ownsSource = isCall || isNew || wrappedHere;
+    // §28.10 / stdlib §4.5 v0.195 (#2146): a plain `var d := recv.Drain();`
+    // over a NAMED owning collection does NOT own a fresh source — the drain
+    // view IS the receiver at IOwningEnumerable static type ("no separate
+    // enumerable object"), and the receiver's owner keeps the one disposal.
+    // Registering the slot-1 iterator-format dispose here dispatched through a
+    // bz_array as if it were an iterator frame — type confusion (SEGV) on top
+    // of the double-dispose. Same aliasing carve as the #1294 GetEnumerator
+    // receiver-identity case in registerUsingDisposal. The shared common::
+    // recognizer keeps this in lockstep with producerState's Borrowed verdict
+    // (the ownership pass registers no auto-drop for it either). A user
+    // iterator-method call (fresh frame) is not recognized and still owns.
+    // // per §28.10, §28.11, stdlib §4.5 v0.195, #2146
+    if (isCall) {
+        if (auto* dce =
+                dynamic_cast<const ast::CallExpr*>(ld->initializer.get()))
+            if (common::isOwningCollectionDrainAliasCall(*dce, ctx_))
+                ownsSource = false;
+    }
     if (!ownsSource) return false;
 
     // The source value is the IEnumerABLE: dispose it once at scope end (the
@@ -7504,6 +7522,20 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                                 ctx_.exprType(*gma->target)))
                             ownsSource = false;
                     }
+                    // §28.10 / stdlib §4.5 v0.195 (#2146): `using var d :=
+                    // recv.Drain();` over a NAMED owning collection — the
+                    // drain view IS the receiver ("no separate enumerable
+                    // object"), the same receiver-identity aliasing as the
+                    // #1294 GetEnumerator case above; the named receiver's
+                    // owner is the sole disposer. Normally unreachable — the
+                    // ownership pass flags the decl usingVarSourceIsBorrow and
+                    // this function early-returns — but kept here so a body
+                    // the ownership pass does not annotate can never register
+                    // the slot-1 iterator dispose against a bz_array (type
+                    // confusion → SEGV). // per §28.10, stdlib §4.5, #2146
+                    if (ownsSource &&
+                        common::isOwningCollectionDrainAliasCall(*ce, ctx_))
+                        ownsSource = false;
                 }
             }
             if (ownsSource) {
