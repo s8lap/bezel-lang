@@ -28,6 +28,14 @@
 // so the open-world hole is closed. With NO conforming impl, protection cannot
 // help — a subclass would implement the interface only ONCE (no clash exists) —
 // so only `sealed` admits.
+//
+// REVIEW HOLD-OFF (#2186): the clash-protection admit is currently GATED OFF
+// (kClashProtectionAdmitEnabled=false in typeTestInterfaceBindAmbiguous): the
+// §12.5 conformance check satisfies members by NAME+arity only, so the no-
+// member subclass `D : K<(string)->string>, IM<(int)->int>` is wrongly
+// accepted and the §12.2 clash the admit relies on never fires (probe
+// exploit_1942.bzl mis-bound at runtime). Until #2186 lands the tail admit is
+// sealed-only; tests (7)/(7b) pin the gated behavior.
 
 #include "support/sema_support.hpp"
 #include "test_harness.hpp"
@@ -196,14 +204,19 @@ BEZEL_TEST(case_type_test_iface_openworld_1942,
     BEZEL_EXPECT_FALSE(hasErasedAmbiguousError(r));
 }
 
-// (7) NON-final class but CLASH-PROTECTED interface: `Get(): T?` pins T in the
-// result position with a parameter-free member, so `D : K<Q≠A>, IM<A>` would
-// declare two `Get()` members with identical (empty) parameter lists and
-// differing return types — a §12.2 hiding clash — and is rejected at its own
-// declaration. The open-world hole is closed; the unique-conformer admit is
-// sound. ACCEPTED.
+// (7) NON-final class with a CLASH-PROTECTED interface: `Get(): T?` pins T in
+// the result position with a parameter-free member — #1942's recorded
+// direction would ACCEPT this (a `D : K<Q≠A>, IM<A>` that *declares* the
+// member is rejected as §12.2 hiding). REVIEW HOLD-OFF (#2186): the §12.5
+// conformance check satisfies abstract members by NAME+arity only, so a `D`
+// that declares NO member is wrongly accepted (the inherited
+// `Get(): ((string)->string)?` is credited for `IM<(int)->int>`) — the clash
+// never fires and the admit is exploitable (a `K<(string)->string>` value
+// binds at `K<(int)->int>`; probe exploit_1942.bzl ran exit 1). Sealed-only
+// until #2186 lands: REJECTED. Flip this expectation together with the
+// kClashProtectionAdmitEnabled gate (ExprTypecheck.cpp) when re-enabling.
 BEZEL_TEST(case_type_test_iface_openworld_1942,
-           nonfinal_clash_protected_unique_conformer_accepted_12_2) {
+           nonfinal_clash_protected_gated_off_rejected_2186) {
     auto r = parseSemaAll(wrap(
         "interface IM<T>\n"
         "  method Get(): T?;\n"
@@ -219,7 +232,37 @@ BEZEL_TEST(case_type_test_iface_openworld_1942,
         "      _ => do return 0; end\n"
         "    end;\n"
         "  end M;\n"));
-    BEZEL_EXPECT_FALSE(hasErasedAmbiguousError(r));
+    BEZEL_EXPECT_TRUE(hasErasedAmbiguousError(r));
+}
+
+// (7b) The #2186 EXPLOIT shape pinned end-to-end: the same clash-protected
+// interface plus the no-member subclass `D : K<(string)->string>,
+// IM<(int)->int>` the buggy §12.5 conformance check accepts. The arm MUST be
+// rejected — with the clash-protection admit enabled it compiled and BOUND a
+// `K<(string)->string>` value at `K<(int)->int>` (the #2001/#2006 confusion
+// class). This test is the regression pin for the hold-off: when #2186 lands
+// and the gate is flipped, the `D` declaration below must itself become a
+// §12.5 error (keeping the file red until BOTH sides are consistent).
+BEZEL_TEST(case_type_test_iface_openworld_1942,
+           nonfinal_clash_protected_subclass_exploit_rejected_2186) {
+    auto r = parseSemaAll(wrap(
+        "interface IM<T>\n"
+        "  method Get(): T?;\n"
+        "end IM;\n"
+        "class K<T> : IM<T>\n"
+        "  public method Get(): T?\n"
+        "    return null;\n"
+        "  end Get;\n"
+        "end K;\n"
+        "class D : K<(string) -> string>, IM<(int) -> int>\n"
+        "end D;\n",
+        "  public method M(s: IM<(int) -> int>): int\n"
+        "    case s of\n"
+        "      var x: K<(int) -> int> => do return 1; end,\n"
+        "      _ => do return 0; end\n"
+        "    end;\n"
+        "  end M;\n"));
+    BEZEL_EXPECT_TRUE(hasErasedAmbiguousError(r));
 }
 
 // (8) REIFIED regime untouched: non-final `K<T> : IM<T>` (marker) with a

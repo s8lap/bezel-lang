@@ -5139,18 +5139,32 @@ ExprTC::IfaceBindReject ExprTC::typeTestInterfaceBindAmbiguous(
     // ERASED `is C` class-tag test (the erased argument mints no identity
     // token), and binds at `C<A>` — a wrong static type. Such a `D` is legal
     // exactly when no §12.2 member clash forbids implementing `I` twice, so
-    // admit a non-final class only when the UNIQUE conformer was proven AND the
-    // interface is clash-protected (every parameter pinned by a result-position
-    // member — a second implementation is then rejected at `D`'s declaration).
-    // With NO conforming impl, protection cannot help: a subclass would
-    // implement `I` only ONCE (nothing to clash with), so only `sealed`
-    // admits — the arm is then provably dead (#1920's domain).
+    // #1942's recorded direction admits a non-final class when the UNIQUE
+    // conformer was proven AND the interface is clash-protected (every
+    // parameter pinned by a result-position member — a second implementation
+    // would then be rejected at `D`'s declaration). With NO conforming impl,
+    // protection cannot help: a subclass would implement `I` only ONCE
+    // (nothing to clash with), so only `sealed` admits — the arm is then
+    // provably dead (#1920's domain).
+    //
+    // REVIEW HOLD-OFF (#2186): the clash-protection admit is DISABLED until
+    // the §12.5 interface-conformance defect is fixed. The conformance check
+    // (TypeResolution_Checks.cpp) satisfies abstract members by NAME+arity
+    // only, so `class D : K<(string)->string>, IM<(int)->int>` with NO new
+    // members is wrongly ACCEPTED — the inherited `Get(): ((string)->string)?`
+    // is credited for `IM<(int)->int>`'s `Get(): ((int)->int)?` — the §12.2
+    // clash the admit relies on never fires, and the probe exploit
+    // (laneE-review exploit_1942.bzl) binds a `K<(string)->string>` value at
+    // `K<(int)->int>` through this admit. Sealed-only until #2186 lands; then
+    // flip kClashProtectionAdmitEnabled and the paired test expectation
+    // (case_type_test_iface_openworld_1942).
     {
         bool sealedPd = false;
         for (std::string_view m : pd->modifiers)
             if (m == "sealed") { sealedPd = true; break; }
+        constexpr bool kClashProtectionAdmitEnabled = false;  // #2186 gate
         if (!sealedPd &&
-            !(uniqueConformer &&
+            !(kClashProtectionAdmitEnabled && uniqueConformer &&
               ifaceClashProtectedAllParams(itd, ctx_)))
             return IfaceBindReject::ErasedAmbiguous;
     }
