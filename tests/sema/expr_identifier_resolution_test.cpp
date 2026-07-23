@@ -156,15 +156,20 @@ BEZEL_TEST(sema_ident, local_in_initializer_is_outer_not_self) {
 }
 
 BEZEL_TEST(sema_ident, member_access_target_resolves) {
-    // `x.y`: the target `x` is an IdentifierExpr that we resolve;
-    // member name `y` is a string we don't resolve in slice 3b.
+    // `x.member`: the target `x` is an IdentifierExpr that must resolve to the
+    // local, and a member access on it must not emit a spurious diagnostic.
+    // This test dates from slice 3b, when member NAMES were never resolved —
+    // it originally used a bogus `x.Foo`. Since #2126 a nonexistent member on a
+    // primitive value IS diagnosed (§8.1/§26.5), so the bogus form would now
+    // (correctly) error; use a REAL member (`ToString`, §8.5) to keep this test
+    // focused on TARGET resolution rather than the member-lookup behavior the
+    // dedicated #2126 tests cover.
     auto r = parseSema(
         "module M; class C public method M() "
         "  var x: int := 1; "
-        "  _ := x.Foo; "
+        "  _ := x.ToString(); "
         "end M; end C;");
-    // x in `x.Foo` resolves to the local; no diagnostic because Foo
-    // lookup is not attempted in slice 3b.
+    // x in `x.ToString()` resolves to the local; no diagnostic.
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 

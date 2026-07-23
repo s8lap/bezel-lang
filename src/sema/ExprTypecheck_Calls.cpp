@@ -10937,6 +10937,92 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // #2126 / §8.1 / §26.5: a member access on a PRIMITIVE-typed VALUE
+        // (`var x := 5; x.NoSuchMethod()`) that matched no built-in instance
+        // member above (ToString / CompareTo / the numeric intrinsics) and no
+        // §26.5 extension has no member to resolve. The receiver being a
+        // primitive keeps `targetType` null (no user TypeSymbol), so the
+        // known-complete-user-type "no member" path (below) never fired; the
+        // access was left untyped and the enclosing call fell through to
+        // codegen's unresolved-member default → a silent `0` result rather than
+        // a diagnostic. Reject it here, mirroring the inline-array "no member"
+        // rejection (§15.1.2) above and closing the same soundness class.
+        //
+        // Exemptions:
+        //   * `string` (also Kind::Primitive): its own unrecognised-member
+        //     diagnostic already fired in the string block above, and its
+        //     LINQ-over-`IEnumerable<char>` members (§9.6) are typed by the
+        //     enclosing CallExpr (typeCall), not here — so a catch-all would
+        //     double-report or over-reject those. Left to that block.
+        //   * `Object` (also Kind::Primitive, primitive==Object): a member
+        //     access on an `Object`-typed receiver stays PERMISSIVE (§3 — the
+        //     static type carries no known-complete member set; unknown members
+        //     resolve dynamically), so it must not be rejected here.
+        //   * The universal `Object` members (§8.1) `ToString`/`Equals`/
+        //     `GetHashCode`/`GetType`: every value type (primitives via boxing,
+        //     §8.6) exposes them. `ToString` is typed above and returns;
+        //     `Equals`/`GetHashCode` are typed by the enclosing CallExpr;
+        //     `GetType` is rejected by the reflection-not-implemented gate
+        //     (§8.2). None must be shadowed by this reject.
+        if (ma.target) {
+            if (const TypeRef* recvTy = ctx_.exprType(*ma.target)) {
+                if (recvTy->kind == TypeRef::Kind::Primitive &&
+                    recvTy->primitive != PrimitiveType::String &&
+                    recvTy->primitive != PrimitiveType::Object &&
+                    recvTy->primitive != PrimitiveType::None &&
+                    !ctx_.exprType(ma)) {
+                    const auto& mbr = ma.member;
+                    bool universalObjMember =
+                        mbr == "ToString"    || mbr == "Equals" ||
+                        mbr == "GetHashCode" || mbr == "GetType";
+                    if (!universalObjMember) {
+                        // Local spelling of the primitive keyword for the
+                        // diagnostic (typeDisplayName is file-local to
+                        // Sendability.cpp).
+                        auto primName = [](PrimitiveType p) -> const char* {
+                            using P = PrimitiveType;
+                            switch (p) {
+                                case P::Bool:    return "bool";
+                                case P::Char:    return "char";
+                                case P::Int:     return "int";
+                                case P::Object:  return "Object";
+                                case P::Byte:    return "byte";
+                                case P::SByte:   return "sbyte";
+                                case P::Short:   return "short";
+                                case P::UShort:  return "ushort";
+                                case P::UInt:    return "uint";
+                                case P::Long:    return "long";
+                                case P::ULong:   return "ulong";
+                                case P::Float:   return "float";
+                                case P::Double:  return "double";
+                                case P::Decimal: return "decimal";
+                                default:         return "primitive";
+                            }
+                        };
+                        // The MemberAccessExpr span is degenerate (line 0)
+                        // when the access is a call callee (`x.M()`) — the
+                        // parser sets it only on the property form; fall back
+                        // to the receiver's span so the diagnostic points at a
+                        // real source position rather than 0:0.
+                        auto loc = ma.span.begin;
+                        if (loc.line == 0 && ma.target)
+                            loc = ma.target->span.begin;
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            std::string("no member `") + std::string(mbr) +
+                            "` on primitive type `" +
+                            primName(recvTy->primitive) +
+                            "`: primitive value types expose only their "
+                            "documented members (stdlib \xC2\xA7""9) and the "
+                            "universal `ToString`/`Equals`/`GetHashCode`/"
+                            "`GetType` (\xC2\xA7""8.1); no user member or "
+                            "\xC2\xA7""26.5 extension provides `" +
+                            std::string(mbr) + "`");
+                        return;
+                    }
+                }
+            }
+        }
         return;
     }
     // Lookup member by name. Slice S5: walks own members first,
