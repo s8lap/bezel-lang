@@ -1,6 +1,6 @@
 # Bezel Guide 1: Memory and Ownership
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.213.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.223.*
 
 Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope (with a must-use warning), and a use-after-free or double-free is rejected outright. This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 
@@ -143,14 +143,16 @@ method GetTransactions(): Array<Transaction>
 end GetTransactions;
 
 method TakeTransactions(): owned Array<Transaction>
-  return move _transactions;  // transfer: hand the caller ownership; the field is
-                              //   left moved-from and must be restored (next section).
+  var fresh := new Array<Transaction>();  // build the replacement first (next section)
+  var taken := move _transactions;        // take: the field is now moved-from
+  _transactions := fresh;                 // restore — every exit path must (spec §28.8.1)
+  return taken;                           // transfer: hand the caller ownership
 end TakeTransactions;
 ```
 
 So a caller that needs to *look at* `_transactions` gets a borrow (the bare-field-read return above, or a dedicated borrowing view); a caller that must *take* it uses `move` with an `owned` return (next section).
 
-**Returning a lazy pipeline is fine — over your own inputs.** A method may build and return a lazy query (or an iterator, or a `Task`) over its *own parameters or receiver* — `method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` — even though the returned frame borrows them. The caller re-establishes that borrow against its *own* argument and must keep it alive while it enumerates — for a returned `Task`, until the task settles (and the returned task is itself caller-owned: task calls mint, v0.190, so it is discharged like any other owned value). What you may *not* return this way is a pipeline over a local you created inside the method; that borrow would dangle — materialize it into an `owned Array<T>` instead.
+**Returning a lazy pipeline is fine — over your own inputs.** A method may build and return a lazy query (or an iterator, or a `Task`) over its *own parameters or receiver* — `static method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` (an instance form spells the same contract `owned IEnumerable<int>`, spec §28.3/§29.3, v0.223) — even though the returned frame borrows them. The caller re-establishes that borrow against its *own* argument and must keep it alive while it enumerates — for a returned `Task`, until the task settles (and the returned task is itself caller-owned: task calls mint, v0.190, so it is discharged like any other owned value). What you may *not* return this way is a pipeline over a local you created inside the method; that borrow would dangle — materialize it into an `owned Array<T>` instead.
 
 ---
 
