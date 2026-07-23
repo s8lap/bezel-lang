@@ -3407,10 +3407,14 @@ bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) cons
     // Residual under-pins tracked: #2137 (borrow-returning property getters;
     // borrowed-parameter-returning calls). // per §28.10 v0.190, #2128
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&init)) {
-        if (const ast::MethodDecl* md = common::calleeMethodDecl(*ce, ctx_))
-            if (!md->isAsync && !md->returnOwned &&
+        if (const ast::MethodDecl* md = common::calleeMethodDecl(*ce, ctx_)) {
+            bool isAsync = false;
+            for (std::string_view mod : md->modifiers)
+                if (mod == "async") { isAsync = true; break; }
+            if (!isAsync && !md->returnOwned &&
                 methodReturnsOnlyWrapperReceiverBorrow(*md))
                 return true;
+        }
     }
     return false;
 }
