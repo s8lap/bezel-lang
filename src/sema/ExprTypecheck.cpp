@@ -6514,9 +6514,16 @@ void ExprTC::collectFieldNarrowings(const ast::Expr* cond, bool forTrueBranch) {
 // returns 0 = the ambient root id, whose facts are exactly the ones this
 // function must never drop — the early return keeps that invariant).
 void ExprTC::dropFieldFactsRooted(const Symbol* root) {
-    if (!root || fieldNarrowed_.empty()) return;
+    if (!root) return;
     const std::uint32_t rootId = narrowFactIdIfTracked(root);
     if (rootId == 0) return;
+    // §7.4 #2116 (pre-gate review): record the drop EDGE even when the
+    // current working set holds no facts for the root — the try walk keeps
+    // side copies (tryJoinField) whose facts for this root must not outlive
+    // a rebinding the working set never saw (a finally-body `ref` pass of a
+    // root whose facts were established inside the try body).
+    ++fieldFactDropEpoch_;
+    if (fieldNarrowed_.empty()) return;
     fieldNarrowed_.erase(fieldNarrowed_.lower_bound({rootId, 0u}),
                          fieldNarrowed_.lower_bound({rootId + 1, 0u}));
 }
@@ -7089,6 +7096,13 @@ void ExprTC::invalidateCapturedNarrowings() {
     // calls and `await`s (§7.4 v0.214). Iteration is over the integer-keyed
     // ordered set (deterministic order), and each per-element decision is
     // independent of the others — order cannot influence the outcome (#2116).
+    // §7.4 #2116 (pre-gate review): a control-transfer op with mutable
+    // captures in scope is a drop EDGE for the try walk's epoch even when the
+    // working set holds no matching fact right now — the walk keeps side
+    // copies (tryJoinField) whose captured-root facts must not outlive a
+    // possible closure rebinding. Membership-only test: no decision depends
+    // on container iteration order.
+    if (!mutablyCapturedNames_.empty()) ++fieldFactDropEpoch_;
     for (auto it = fieldNarrowed_.begin(); it != fieldNarrowed_.end();) {
         const std::uint32_t rootId = it->first;
         const Symbol* r = (rootId != 0 && rootId < narrowFactIdSyms_.size())
@@ -7250,6 +7264,16 @@ void ExprTC::runMethodBody(
             if (s) visitStmt(*s);
         }
     }
+    // §7.4 (v0.214, #2116 pre-gate review): clear the readonly-field facts
+    // BEFORE the contract clauses are visited. Clauses evaluate at the
+    // member's BOUNDARIES — `requires` at entry (before any body guard has
+    // run), `ensures` at every return edge — so the body's FINAL flow state
+    // must not admit a nullable readonly-field access in a clause: a
+    // body-final `_f <> null` fact would let `requires(_f.M)` compile and
+    // then fault at entry on a null `_f` (probe-confirmed SEGV in the
+    // lowered requires prologue). The legacy local sets share this leak for
+    // parameters — pre-existing, filed separately from this review.
+    fieldNarrowed_.clear();
     // §22.16 (v0.203, #2053): visit each contract clause's expression in the
     // method scope (params + this + enclosing statics) — body locals are not
     // registered into `methodScope`, so they are correctly out of reach —
@@ -9708,6 +9732,24 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         narrowOnAssignment(tsym, ctx_.exprType(*as->value));
                 }
             }
+        } else if (as->target) {
+            // §7.4 (v0.214, #2116 pre-gate review): the arithmetic/bitwise
+            // compound family (`+=` …) desugars to `lhs := lhs <op> rhs`
+            // (§6.6) — a REASSIGNMENT rebinding the target to the operator's
+            // result; a user `operator +` (§25.1) can return an object whose
+            // readonly field's value differs from the old referent's. The
+            // legacy null/type sets are correctly unaffected (nullability is
+            // preserved by the family), but a `local._f` fact rides the OLD
+            // referent, so it must drop — the spec's "reassigning `local`
+            // drops it" covers every reassignment form. (Probe-confirmed
+            // SEGV without this: `+=` to an operator returning a null-field
+            // instance, then the stale-fact-admitted `a._f.M`.)
+            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    as->target.get())) {
+                if (tid->name != "this" && tid->name != "base")
+                    if (Symbol* tsym = lookupName(tid->name))
+                        dropFieldFactsRooted(tsym);
+            }
         }
     } else if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
         // per §15.4: `_ := [...]` has no target type — a compile error.
@@ -10202,14 +10244,28 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // the same pre-existing local-narrowing hole family filed from this
         // lane.)
         auto tryEntryField = fieldNarrowed_;
+        const std::uint64_t tryDropEpoch0 = fieldFactDropEpoch_;
         for (const auto& bs : trys->body) if (bs) visitStmt(*bs);
         auto afterBodyField = fieldNarrowed_;
         auto tryJoinField = afterBodyField;
-        // Catch-arm running base: entry ∩ after-body (the body's drops stay
-        // dropped, its establishments never enter), further shrunk by each
-        // earlier arm's exit (an earlier arm's GUARD may evaluate at runtime
-        // before a later arm is tried, so its drops must persist).
+        // Catch-arm running base (#2116 pre-gate review, hardened): the body
+        // can be interrupted at ANY point, and the exit-state intersection
+        // entry ∩ after-body is BLIND to an interior drop that a later
+        // re-establishment masks (`a := other; MayThrow(); if a._f = null
+        // then return; end;` — the exit state carries the fact the
+        // interrupted path lost; probe-confirmed SEGV). Entry facts are
+        // therefore carried only when NO drop edge fired during the body
+        // visit (fieldFactDropEpoch_ unchanged — then every entry fact is
+        // valid at every interrupt point); otherwise only AMBIENT entry
+        // facts (rootId 0 — never droppable) survive. Establishments inside
+        // the body never enter (a throw may precede the establishing guard);
+        // the running base is further shrunk by each earlier arm's exit (an
+        // earlier arm's GUARD may evaluate at runtime before a later arm is
+        // tried, so its drops must persist).
         auto catchRunningField = tryEntryField;
+        if (fieldFactDropEpoch_ != tryDropEpoch0)
+            catchRunningField.erase(catchRunningField.lower_bound({1u, 0u}),
+                                    catchRunningField.end());
         for (auto it = catchRunningField.begin();
              it != catchRunningField.end();) {
             if (afterBodyField.count(*it)) ++it;
@@ -10305,7 +10361,22 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 else it = catchRunningField.erase(it);
             }
         }
-        fieldNarrowed_ = std::move(tryJoinField);  // §7.4 #2116
+        // §7.4 (v0.214, #2116 pre-gate review): the FINALLY body runs on every
+        // exit from the construct — the body's normal completion, its EARLY
+        // RETURNS (a `return` inside the try runs the finally with the state
+        // at THAT return point — e.g. the null branch of the body's own
+        // guard; probe-confirmed SEGV), an unmatched-exception unwind, and
+        // each catch exit. The only facts valid on ALL of those paths are the
+        // try-ENTRY facts — all of them when no drop edge fired during the
+        // body/arm visits, only the ambient (never-droppable) ones otherwise.
+        // Never the after-body/arm-exit joins: those see establishments the
+        // interrupted and early-exit paths never made.
+        auto finallyEntryField = tryEntryField;
+        if (fieldFactDropEpoch_ != tryDropEpoch0)
+            finallyEntryField.erase(finallyEntryField.lower_bound({1u, 0u}),
+                                    finallyEntryField.end());
+        fieldNarrowed_ = std::move(finallyEntryField);
+        const std::uint64_t finDropEpoch0 = fieldFactDropEpoch_;
         // per §31.2: `return` inside a `finally` block is a compile error.
         // Track finally-body nesting so the ReturnStmt handler can reject it.
         // per §21.5/§31.2 (v0.182, #1578): also record `loopDepth_` as it
@@ -10319,6 +10390,19 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         for (const auto& bs : trys->finallyBody) if (bs) visitStmt(*bs);
         --finallyDepth_;
         finallyLoopBoundary_ = savedFinallyLoopBoundary;
+        // §7.4 (v0.214, #2116 pre-gate review): after-try state. The paths
+        // that REACH the after-try point are the completing ones — body
+        // fall-through or a catch arm's fall-through — each carrying
+        // tryJoinField (after-body ∩ every catch exit), then filtered through
+        // the finally body's own drop edges (ambient facts are immune; local
+        // facts survive only if the finally visit fired no drop edge). The
+        // finally's exit facts join in: the finally runs to completion on
+        // every path that reaches this point.
+        if (fieldFactDropEpoch_ != finDropEpoch0)
+            tryJoinField.erase(tryJoinField.lower_bound({1u, 0u}),
+                               tryJoinField.end());
+        tryJoinField.insert(fieldNarrowed_.begin(), fieldNarrowed_.end());
+        fieldNarrowed_ = std::move(tryJoinField);
     } else if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
         // §29.9: `yield` is a method-level construct only — `yield return` and
         // `yield break` are both forbidden inside a lambda. Without this the
@@ -10385,6 +10469,18 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 "` reassigns it (§28.10 / §17.6)");
                     }
                 }
+            }
+        }
+        // §7.4 (v0.214, #2116 pre-gate review): `c++`/`c--` desugars to
+        // `c := T.operator++(c)` (§17.6) — a reassignment rebinding `c` to the
+        // operator's result, so any `c._f` readonly-field facts rode the OLD
+        // referent and must drop (same edge as the compound-assign family).
+        if (is->target) {
+            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    is->target.get())) {
+                if (tid->name != "this" && tid->name != "base")
+                    if (Symbol* tsym = ctx_.exprSymbol(*is->target))
+                        dropFieldFactsRooted(tsym);
             }
         }
     } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {

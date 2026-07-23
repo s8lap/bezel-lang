@@ -168,6 +168,18 @@ private:
     std::unordered_map<const Symbol*, std::uint32_t> narrowFactIds_;
     std::vector<const Symbol*> narrowFactIdSyms_;  // [id] → symbol; [0] = null
 
+    // §7.4 / #2116 (pre-gate review): monotone counter bumped whenever a
+    // runtime DROP EDGE removes a readonly-field fact (dropFieldFactsRooted,
+    // invalidateCapturedNarrowings). The try-statement walk compares it across
+    // the body/arm visits: a try body can be interrupted at ANY point, and an
+    // exit-state intersection is blind to an interior drop that a later
+    // re-establishment masks (drop `a`, throw window, re-guard `a._f` — the
+    // exit state carries the fact the interrupted path lost). If no drop edge
+    // fired, entry facts are valid at every interrupt point; if one fired,
+    // only ambient facts (never droppable) are. A pure function of the
+    // single-threaded walk — no determinism impact.
+    std::uint64_t fieldFactDropEpoch_ = 0;
+
     // §7.4 (v0.182, #1566): the set of local/parameter NAMES that are "mutably
     // captured" — assigned, or passed `ref`/`out`, anywhere inside ANY lambda of
     // the enclosing method body. Computed once per body (computeMutablyCaptured)
