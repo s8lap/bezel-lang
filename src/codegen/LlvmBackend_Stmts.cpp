@@ -793,6 +793,90 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     }
                     return false;
                 }
+                // §7.11 / §6.6 (#1964): a nullable-VALUE compound assignment
+                // `n OP= e` where n has a nullable value type (`int?`, `char?`,
+                // `long?`, `double?`, …). The target slot is the tagged
+                // `{i8 hasValue; T}` struct, which the built-in emitCompoundOp
+                // path below CANNOT consume — feeding the struct to
+                // `llvm.*add.with.overflow` emits malformed IR
+                // (`llvm.sadd.with.overflow.sl_i8i32s`, an IR-verify abort).
+                // Lift per §7.11: the desugared `n := n OP e` yields `null` when
+                // EITHER operand is `null` (no underlying op and none of its
+                // §6.1 overflow / §5.2 char / §6.1 div-zero checks run), and
+                // otherwise applies the SAME checked arithmetic + narrow-integer
+                // / char §5.2 write-back as the non-nullable path (emitCompoundOp
+                // on the unwrapped payloads), rewrapped into `T?`. (`decimal?`,
+                // whose payload is the %bz.decimal struct rather than an int/FP
+                // scalar, is excluded here — emitCompoundOp is scalar-only.)
+                if (auto* nst = llvm::dyn_cast<llvm::StructType>(elemTy)) {
+                    const sema::TypeRef* ntgt = ctx_.exprType(*as->target);
+                    if (nst->getNumElements() == 2 &&
+                        nst->getElementType(0) == nullablePrimHasValTy() &&
+                        (nst->getElementType(1)->isIntegerTy() ||
+                         nst->getElementType(1)->isFloatingPointTy()) &&
+                        ntgt && ntgt->nullable) {
+                        llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
+                        // Operand tags/payloads. A struct RHS carries its own
+                        // hasValue tag (`c += otherNullable`); a scalar RHS
+                        // (`c += 1`, or a wrapped literal) is present always.
+                        llvm::Value* lTag = nullablePrimHasValue(cur);      // i1
+                        llvm::Value* lPay = nullablePrimValue(cur);         // T
+                        bool rNullable = rhs->getType()->isStructTy();
+                        llvm::Value* rTag = rNullable
+                            ? nullablePrimHasValue(rhs) : builder_.getTrue();
+                        llvm::Value* rPay = rNullable
+                            ? nullablePrimValue(rhs) : rhs;
+                        llvm::Value* both =
+                            builder_.CreateAnd(lTag, rTag, "ncmp.both");
+                        auto* entryBB = builder_.GetInsertBlock();
+                        auto* opBB =
+                            llvm::BasicBlock::Create(llvm_, "ncmp.op", currentFn_);
+                        auto* endBB =
+                            llvm::BasicBlock::Create(llvm_, "ncmp.end", currentFn_);
+                        builder_.CreateCondBr(both, opBB, endBB);
+                        // --- opBB: both present → run the checked op on payloads.
+                        builder_.SetInsertPoint(opBB);
+                        bool isCharU =
+                            ntgt->kind == sema::TypeRef::Kind::Primitive &&
+                            ntgt->primitive == sema::PrimitiveType::Char;
+                        // §5.1 widening of the RHS payload to the LHS payload
+                        // width (int→i64, int→double, float→double). Integer
+                        // same-width and narrowing cases are handled inside
+                        // emitCompoundOp exactly as the non-nullable path does.
+                        rPay = coerceNumericToType(
+                            rPay, nst->getElementType(1),
+                            isUnsignedTargetExpr(*as->value));
+                        llvm::Value* pay = emitCompoundOp(
+                            op, lPay, rPay,
+                            lPay->getType()->isFloatingPointTy(),
+                            isUnsignedTargetExpr(*as->target), isCharU);
+                        llvm::Value* wrapped =
+                            llvm::ConstantAggregateZero::get(elemTy);
+                        if (pay) {
+                            wrapped = builder_.CreateInsertValue(
+                                llvm::UndefValue::get(elemTy),
+                                llvm::ConstantInt::get(nullablePrimHasValTy(), 1),
+                                {0u});
+                            wrapped =
+                                builder_.CreateInsertValue(wrapped, pay, {1u});
+                        }
+                        // emitCompoundOp may have spun off guard-throw blocks, so
+                        // the current block (not opBB) is the PHI predecessor.
+                        auto* opEndBB = builder_.GetInsertBlock();
+                        builder_.CreateBr(endBB);
+                        builder_.SetInsertPoint(endBB);
+                        llvm::PHINode* res = builder_.CreatePHI(elemTy, 2,
+                                                               "ncmp.res");
+                        res->addIncoming(wrapped, opEndBB);
+                        // Null-by-null-operand path: the lifted result is `null`.
+                        res->addIncoming(
+                            llvm::ConstantAggregateZero::get(elemTy), entryBB);
+                        builder_.CreateStore(res, addr);
+                        if (llvm::AllocaInst* ns = localSlot(*as->target))
+                            syncCellToOrigSlot(ns, res);
+                        return false;
+                    }
+                }
                 // CG31: built-in numeric compound assignment — read,
                 // apply OP (overflow-checked like plain arithmetic),
                 // write back.
