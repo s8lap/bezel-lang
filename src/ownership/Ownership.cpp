@@ -3423,133 +3423,123 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
             // usingVarSourceIsBorrow flag stays clear — codegen disposes `y`).
             lo.implicitDischarge = true;
         }
-    } else if (ld.isUsing) {
-        // `using var` is always Owned and implicitly discharged.
-        lo.state = OwnershipState::Owned;
-        lo.implicitDischarge = true;
-        // §28.10 (v0.180, #2071) unmarked bare-id source. The MARKED form
-        // (`using var y := owned x;`) is an ADOPTION — handled above by the
-        // initializerHasOwnedMarker branch (checkAndMoveBindingOwnedMarker
-        // records the move, and `y` carries the obligation through
-        // implicitDischarge). The UNMARKED form (`using var y := x;` where `x`
-        // is a named owned binding) is a BORROW-PIN, not an adoption: `x`
-        // retains the obligation (auto-drop at scope end) and `y` disposes
-        // nothing. Pre-v0.180 the unmarked form adopted the obligation; that
-        // was wrong per the v0.180 ruling and produced "owned value in `x` was
-        // already moved out" on a later borrow read of `x` (issue #2071).
-        // §28.10 (#1285) covers the borrow-RHS analogue — a using var bound to
-        // a borrow pins without obligation. We unify both into the same
-        // borrow-pin regime: classify the source (Borrowed or Owned bare-id)
-        // and set usingVarSourceIsBorrow so codegen skips the disposal.
-        if (ld.initializer) {
-            if (auto* aid = dynamic_cast<const ast::IdentifierExpr*>(
-                    ld.initializer.get())) {
-                // §28.10 / §28.3 (v0.180, #2071): any bare-id source — Owned or
-                // Borrowed — yields a borrow-pin (no obligation on `y`). The
-                // MARKED branch above is the only path that transfers
-                // obligation (a real adoption), so this unmarked branch never
-                // marks the source moved. Owned sources retain the obligation
-                // and auto-dispose at scope end; a borrow read of `x` after
-                // the using var is then legal per §28.3 (v0.180). Only a
-                // positive classification (Borrowed) or a positive symbol
-                // resolved to an Owned bare-id source sets the flag; the
-                // moved-from / drain-loop element / owned-parameter source
-                // paths above the using-var use different mechanisms.
+    } else if (ld.initializer) {
+        // #2072 / §28.3 (v0.180): every initialized local's ownership STATE comes
+        // from the ONE producerState funnel — a plain `var` and a `using var` over
+        // the SAME RHS get the SAME K1 state, so the two binding forms can never
+        // diverge on it. This retires the parallel classifier that DEFAULTED every
+        // `using var` to Owned and re-derived its state independently — the drift
+        // locus where #2071 lived (an unmarked owned bare-id survived as a pre-v0.180
+        // adoption in the using-var path only). // per §28.3
+        lo.state = producerState(*ld.initializer);
+        // §28.3 arm-meet (v0.184, #1661): reject a mixed owned/borrowed arm set in
+        // an if-expression / expression-position `case`/`when` initializer — for
+        // BOTH `var` and `using var` (the diagnosis is binding-form-independent).
+        if (dynamic_cast<const ast::ConditionalExpr*>(ld.initializer.get()) ||
+            dynamic_cast<const ast::CaseExpr*>(ld.initializer.get()))
+            checkArmMeetMixed(*ld.initializer);
+        // §28.10 (v0.180): `using var` LAYERS its keyword semantics on top of that
+        // uniform state. Over an OWNED producer it is a scope-bound, implicitly-
+        // discharged ADOPTION; over a BORROW it is a §28.10 BORROW-PIN — the real
+        // owner keeps the disposal obligation and codegen registers none for the pin
+        // (usingVarSourceIsBorrow). BOTH verdicts record the binding Owned +
+        // implicitDischarge, so the PIN (axiom A5: immovable / non-reassignable /
+        // scope-bound — and the §28.3/§30.5 immovability that keys off
+        // implicitDischarge) rides the SAME downstream machinery as an adoption; the
+        // ONLY layered difference is the one usingVarSourceIsBorrow flag codegen
+        // consults to skip the pin's disposal.
+        //
+        // The borrow-pin flag is set by POSITIVE recognition of the borrow RHS
+        // shapes — NOT by `producerState != Owned` — because producerState's Borrowed
+        // verdict is not a reliable borrow signal: many fresh-OWNED producers also
+        // fall through to Borrowed (a COLLECTION LITERAL `[…]`, a bare-type-parameter
+        // `move` #572, a builtin task-family mint `Task.FromResult`, a LINQ
+        // materializer `.ToArray()`/`.ToDictionary()`, `RawBytes.From`, an
+        // owned-returning property getter like `tcs.Task.Result`, an owned-iterator /
+        // enumerable / subscription-returning method, an owning-collection factory) —
+        // pinning any of those would skip a disposal the value genuinely needs (a
+        // leak). So the flag is set for exactly the three shapes the pre-#2072
+        // classifier recognized, folded here as one decision LAYERED on the unified
+        // state funnel:
+        //   * a bare-id read of a tracked owned/borrow binding (#1285/#2071) or a
+        //     borrowing for-loop element (#1287) — always a §28.3 lend;
+        //   * a borrowed if/case ARM-MEET (#1661) — producerState is the authority
+        //     (Owned only when both arms meet owned);
+        //   * a bare-type-parameter argument-source-union CALL borrow (#1801 S4).
+        // Every other RHS — a `new`, a collection literal, a field/index read, a
+        // non-bare-`T` call, a `move`/`await`, an owned operator/`??` — ADOPTS
+        // (codegen's own class / mint / transfer recognition disposes it). A field or
+        // index read of a genuine borrow is left ADOPTING, matching pre-#2072:
+        // producerState cannot tell a field read (a lend) from an owned-returning
+        // property getter or indexer, so the disposal-safe default is adoption — the
+        // remaining var/using-var classification gap there is a recorded residual, not
+        // a regression this refactor introduces. The MARKED transfer
+        // `using var y := owned x;` is handled by the initializerHasOwnedMarker branch
+        // above (its owned shape is likewise invisible to producerState). Both the pin
+        // and the adoption record the binding Owned + implicitDischarge so the PIN
+        // (axiom A5: immovable / non-reassignable / scope-bound — and the §28.3/§30.5
+        // immovability that keys off implicitDischarge) rides the SAME downstream
+        // machinery as an adoption; the one usingVarSourceIsBorrow flag is the only
+        // layered difference (codegen skips the pin's disposal). // per §28.10, §28.3
+        if (ld.isUsing) {
+            const ast::Expr* init = ld.initializer.get();
+            if (auto* aid = dynamic_cast<const ast::IdentifierExpr*>(init)) {
+                // Bare-id: pin a tracked owned/borrow binding (#1285/#2071) or a
+                // borrowing for-loop element (#1287). A tracked Owned source keeps its
+                // own obligation (auto-drop at scope end); the pin disposes nothing. A
+                // borrowing loop var is not seeded into states_ (only owning-enumerable
+                // loops are), so detect it by its decl being a non-owning ForStmt.
+                // // per §28.10, §28.3, §29.2
                 if (sema::Symbol* srcSym = ctx_.exprSymbol(*aid)) {
                     auto it = states_.find(srcSym);
                     if (it != states_.end() &&
                         (it->second.state == OwnershipState::Borrowed ||
                          it->second.state == OwnershipState::Owned))
-                        const_cast<ast::LocalDecl&>(ld)
-                            .usingVarSourceIsBorrow = true;
-                    // §28.10 / §29.2 (#1287): a `using var u := item` whose
-                    // source is the loop variable of a BORROWING for-loop holds
-                    // no disposal obligation. Default iteration over an owning
-                    // collection (`for var item in arr` where arr: OwningArray<T>)
-                    // yields borrows (§28.11 / §29.2: default iteration is
-                    // borrowing — the collection still owns its elements), as do
-                    // all other non-owning iterables (Array<T>, IEnumerable<T>,
-                    // string, range, span). The using var is therefore a
-                    // borrow-pin (§28.10), not an adoption; disposing it would
-                    // double-free the element the source collection still owns.
-                    // A borrowing loop var is never seeded into states_
-                    // (seedOwnedIterVar only seeds IOwningEnumerable /
-                    // IOwningAsyncEnumerable loops, whose iteration transfers
-                    // ownership), so the states_.find above misses it; detect
-                    // it by the loop var's decl being a ForStmt that is NOT an
-                    // owning-enumerable loop. The owning path (Drain) IS seeded
-                    // as Owned, so this else-branch never fires for it.
+                        const_cast<ast::LocalDecl&>(ld).usingVarSourceIsBorrow = true;
                     else if (it == states_.end()) {
-                        if (auto* loc = dynamic_cast<sema::LocalSymbol*>(srcSym)) {
-                            if (auto* fs = dynamic_cast<const ast::ForStmt*>(
-                                    loc->decl)) {
+                        if (auto* loc = dynamic_cast<sema::LocalSymbol*>(srcSym))
+                            if (auto* fs =
+                                    dynamic_cast<const ast::ForStmt*>(loc->decl))
                                 if (!iterableIsOwningEnumerable(*fs))
                                     const_cast<ast::LocalDecl&>(ld)
                                         .usingVarSourceIsBorrow = true;
-                            }
-                        }
                     }
                 }
-            } else if (dynamic_cast<const ast::BindExpr*>(
-                           ld.initializer.get())) {
+            } else if (dynamic_cast<const ast::BindExpr*>(init)) {
                 // §17.15 / §28.10 (v0.216, #2098): a `using var` bound to a
-                // binding ATOM classifies by the atom's BODY (producerState
-                // peels — §28.3 producers row). An owned body (`using var x
-                // := (var w := E; new C(w));`) stays the ordinary
-                // Owned+implicitDischarge adoption above; a BORROW body
-                // (`(var n := 1; outerRef)`) is a §28.10 borrow-pin — its
-                // real owner disposes it, so codegen must not (the same
-                // double-free the #1661 borrowed-meet fix closed for
-                // if/case initializers). The atom-INTERNAL machinery
-                // (checkRead's processBindAtom) already ran on this
-                // initializer at the top of handleLocalDecl.
-                if (producerState(*ld.initializer) != OwnershipState::Owned)
-                    const_cast<ast::LocalDecl&>(ld).usingVarSourceIsBorrow =
-                        true;
-            } else if (dynamic_cast<const ast::ConditionalExpr*>(
-                           ld.initializer.get()) ||
-                       dynamic_cast<const ast::CaseExpr*>(
-                           ld.initializer.get())) {
-                // §28.3 arm-meet (v0.184, #1661): a `using var` bound to an
-                // if-expression / expression-position `case`/`when`. Reject a
-                // mixed owned/borrowed arm set; then, when the meet is a BORROW
-                // (`using var x := b1 if c else b2;` over two borrows, or a
-                // named-owned-binding arm), pin without a disposal obligation —
-                // its real owner disposes it. Without the pin flag a TYPED
-                // borrow-pin reaches classOfLocal (which returns the declared
-                // class regardless of ownership) and double-frees the borrow at
-                // scope end. An owned-meet stays Owned + implicitDischarge above
-                // and is disposed once by codegen (usingVarOwnsClassObject-
-                // Dynamically / the typed classOfLocal path). // per §28.3
-                checkArmMeetMixed(*ld.initializer);
-                if (producerState(*ld.initializer) != OwnershipState::Owned)
-                    const_cast<ast::LocalDecl&>(ld).usingVarSourceIsBorrow =
-                        true;
-            } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(
-                           ld.initializer.get())) {
-                // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S4): a
-                // `using var m := Math.Max(a, b);` over a bare-type-parameter
-                // argument-source-union borrow (a non-empty potential source set)
-                // is a §28.10 BORROW-PIN, not an owning binding — the result is a
-                // borrow of the call's receiver and arguments, whose real owners
-                // dispose them. Pin without a disposal obligation (as the
-                // borrowed-arm-meet case above does); disposing it would
-                // double-free a source the argument still owns. An EMPTY-set
-                // bare-T call (the factory case) stays the owned-with-warning
-                // binding handled above. // per §28.3 v0.194
+                // binding ATOM classifies by the atom's BODY — lo.state is
+                // producerState(init), which peels the atom (§28.3 producers
+                // row). A BORROW body is a §28.10 borrow-pin: its real owner
+                // disposes it, so codegen must not (the #2098 K8.5 hazard —
+                // adoption here double-frees). An owned body keeps the
+                // ordinary Owned+implicitDischarge adoption above. [Grafted
+                // into the #2072 funnel at landing: batch B added this branch
+                // inside the pre-funnel fork; here it is one more layered
+                // using-var decision over the unified state.]
+                if (lo.state != OwnershipState::Owned)
+                    const_cast<ast::LocalDecl&>(ld).usingVarSourceIsBorrow = true;
+            } else if (dynamic_cast<const ast::ConditionalExpr*>(init) ||
+                       dynamic_cast<const ast::CaseExpr*>(init)) {
+                // Borrowed if/case arm-meet (#1661) — producerState is the authority.
+                if (lo.state != OwnershipState::Owned)
+                    const_cast<ast::LocalDecl&>(ld).usingVarSourceIsBorrow = true;
+            } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(init)) {
+                // Bare-type-parameter argument-source-union borrow (#1801 S4).
                 BareBorrowCallInfo info = analyzeBareBorrowCall(*ce);
                 if (info.recognized && !info.sources.empty())
-                    const_cast<ast::LocalDecl&>(ld).usingVarSourceIsBorrow =
-                        true;
+                    const_cast<ast::LocalDecl&>(ld).usingVarSourceIsBorrow = true;
             }
+            lo.state = OwnershipState::Owned;
+            lo.implicitDischarge = true;
         }
-    } else if (ld.initializer) {
-        lo.state = producerState(*ld.initializer);
-        // §28.3 arm-meet (v0.184, #1661): reject a mixed owned/borrowed arm set
-        // in a plain `var x := … if … else …;` / `case`/`when` initializer too.
-        if (dynamic_cast<const ast::ConditionalExpr*>(ld.initializer.get()) ||
-            dynamic_cast<const ast::CaseExpr*>(ld.initializer.get()))
-            checkArmMeetMixed(*ld.initializer);
+    } else if (ld.isUsing) {
+        // A `using var` with NO initializer — Owned + implicit discharge, matching
+        // the pre-#2072 classification. (Normally unreachable: a `using var`
+        // requires a `:=` resource, so the parser/sema rejects the initializer-less
+        // form before the ownership pass; kept as a dedicated branch purely so the
+        // #2072 funnel refactor changes nothing for it.) // per §28.10
+        lo.state = OwnershipState::Owned;
+        lo.implicitDischarge = true;
     } else {
         lo.state = OwnershipState::Uninitialized;
     }
