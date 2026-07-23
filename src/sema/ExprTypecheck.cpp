@@ -4904,18 +4904,21 @@ ExprTC::IfaceBindReject ExprTC::typeTestInterfaceBindAmbiguous(
     if (refMentionsTypeVariable(scrutTy) || refMentionsTypeVariable(patTy))
         return IfaceBindReject::None;
 
-    // Restrict to an INVARIANT scrutinee interface. A variant (`in`/`out`)
-    // parameter admits a subtype/supertype RANGE of conforming class
-    // instantiations — a distinct erasure slice needing variance reasoning (a
-    // recorded residual, orthogonal to #1935's variance checker). Variance is
-    // read from the interface declaration's GenericParam annotations, mirroring
-    // variantGenericAssignable; when unavailable (an imported interface with no
-    // AST), conservatively treat as possibly-variant and accept.
+    // Variance of the scrutinee interface. A variant (`in`/`out`) parameter
+    // admits a subtype/supertype RANGE of conforming class instantiations
+    // (§12.9), so the invariant uniqueness reasoning below does not apply to
+    // it. Variance is read from the interface declaration's GenericParam
+    // annotations, mirroring variantGenericAssignable; when unavailable (an
+    // imported interface with no AST), conservatively treat as possibly-variant
+    // and accept (the pre-#1941 posture, kept for the no-AST case).
     const auto* itd = dynamic_cast<const ast::TypeDecl*>(sd->decl);
     if (!itd) return IfaceBindReject::None;
+    bool variantIface = false;
     for (const auto& gp : itd->genericParams)
-        if (gp.variance == "in" || gp.variance == "out")
-            return IfaceBindReject::None;
+        if (gp.variance == "in" || gp.variance == "out") {
+            variantIface = true;
+            break;
+        }
 
     // Split on runtime PRECISION (post-#1843). `is C<A>` is precise iff EVERY type
     // argument of `A` is runtime-reified (a concrete class/record/enum/primitive
@@ -4926,6 +4929,43 @@ ExprTC::IfaceBindReject ExprTC::typeTestInterfaceBindAmbiguous(
     bool allReified = true;
     for (const TypeRef* a : patTy->genericArgs)
         if (!typeArgRuntimeReified(a)) { allReified = false; break; }
+
+    // §19.3/§12.9/§14.2 (#1941): a VARIANT scrutinee interface.
+    //
+    //   * All-REIFIED pattern arguments: the post-#1843 runtime test matches
+    //     only genuine `C<A>` values (verified: a `Box<Animal>` behind a
+    //     covariant `IRead<Animal>` does NOT bind at a `Box<Dog>` arm), so the
+    //     variant arm is sound — admit, preserving the #1920/#1927 covariant
+    //     accepts. (The dead-arm refinement for variant scrutinees would need
+    //     variance-aware conformance; unreachability stays #1913/#1920's job.)
+    //
+    //   * A still-ERASED argument (a function type — appendDescKey collapses
+    //     Kind::Function, §14.2 mints no identity token for it): the runtime
+    //     test degrades to the shared class tag, and §12.9's variance range
+    //     admits sibling instantiations of `C` as values of the scrutinee
+    //     type, so the arm would bind a `C<Q≠A>` value at `C<A>` — the
+    //     #2001/#2006 memory-unsafe type-confusion class (verified live: a
+    //     `Prod<(string)->string>` behind `ISrc<(string)->string>` bound at
+    //     `Prod<(int)->int>`). The invariant-regime uniqueness proof below is
+    //     unavailable through a variant parameter (matchLeafInvariant reasons
+    //     invariantly), so REJECT — except a provably DEAD arm: a `sealed`
+    //     pattern class that implements the scrutinee interface nowhere has no
+    //     conforming value at all (structural, reliable even through erased
+    //     args), which is #1920's unreachability domain, not an erasure
+    //     ambiguity.
+    if (variantIface) {
+        if (allReified) return IfaceBindReject::None;
+        TypeRef symbolicSelfV;
+        symbolicSelfV.kind = TypeRef::Kind::Named;
+        symbolicSelfV.declaration = pd;
+        std::vector<TypeRef*> symImplsV;
+        collectAncestorInstantiationsOf(&symbolicSelfV, sd, symImplsV);
+        bool sealedPd = false;
+        for (std::string_view m : pd->modifiers)
+            if (m == "sealed") { sealedPd = true; break; }
+        if (symImplsV.empty() && sealedPd) return IfaceBindReject::None;
+        return IfaceBindReject::ErasedAmbiguous;
+    }
 
     if (allReified) {
         // (A) REIFIED. The runtime test is PRECISE: it matches only genuine `C<A>`
