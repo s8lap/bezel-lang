@@ -145,3 +145,28 @@ BEZEL_TEST(using_var_producerstate_funnel_2072, using_var_owned_param_bareid_bor
         "  end Main; "
         "end P;");
 }
+
+// ===========================================================================
+// Pair 8 (F1 graft pin, landed with #2072) — a binding ATOM (§17.15 v0.216,
+// #2098) whose BODY is a borrow classifies as a BORROW under both binding
+// forms: producerState peels the atom to its body (§28.3 producers row), so
+// `var` takes a plain borrow and `using var` takes a §28.10 borrow-pin — the
+// pinned source's real owner disposes it exactly once. This is the branch the
+// #2072 funnel landing had to GRAFT from the batch-B pre-funnel fork; without
+// it the using-var form adopts and double-frees (the #2098 K8.5 hazard the
+// batch-C review flagged as untested). // per §17.15/§28.10 v0.216
+// ===========================================================================
+BEZEL_TEST(using_var_producerstate_funnel_2072, var_bind_atom_borrow_body_disposes_once_spec_28_10) {
+    expectDisposedOnce(
+        "class P public static method Main(): int "
+        "  do using var src := new R(); var x := (var q := 1; src); var p := x.Ping(); end; "
+        "  return R.live; "                       // 0 — src disposes once, x borrows through the atom
+        "end Main; end P;");
+}
+BEZEL_TEST(using_var_producerstate_funnel_2072, using_var_bind_atom_borrow_body_pins_spec_28_10) {
+    expectDisposedOnce(
+        "class P public static method Main(): int "
+        "  do using var src := new R(); using var x := (var q := 1; src); var p := x.Ping(); end; "
+        "  return R.live; "                       // 0 — src disposes once, x PINS (no adoption)
+        "end Main; end P;");
+}
