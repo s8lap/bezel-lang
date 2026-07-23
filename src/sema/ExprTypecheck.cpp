@@ -4848,6 +4848,105 @@ static bool refMentionsTypeVariable(const TypeRef* t) {
     }
 }
 
+// §12.2/§19.3 (#1942): does `t` mention any of `names` as a bare type-variable
+// occurrence (Named, no declaration, no args, head ∈ names)? The set-restricted
+// sibling of refMentionsTypeVariable above, used by the clash-protection check.
+static bool refMentionsAnyOf(const TypeRef* t,
+                             const std::unordered_set<std::string_view>& names) {
+    if (!t || names.empty()) return false;
+    switch (t->kind) {
+        case TypeRef::Kind::Named:
+            if (!t->declaration && t->genericArgs.empty() &&
+                names.count(namedTypeSimpleName(t)))
+                return true;
+            for (const TypeRef* a : t->genericArgs)
+                if (refMentionsAnyOf(a, names)) return true;
+            return false;
+        case TypeRef::Kind::InlineArray:
+            return refMentionsAnyOf(t->arrayElement, names);
+        case TypeRef::Kind::Function:
+            for (const auto& p : t->funcParams)
+                if (refMentionsAnyOf(p.type, names)) return true;
+            return refMentionsAnyOf(t->funcReturn, names);
+        default:
+            return false;
+    }
+}
+
+// §12.2 (#1942): is the interface `itd` CLASH-PROTECTED — does every generic
+// parameter appear in the RESULT position (method return / property or indexer
+// type) of some direct member whose (index) parameters mention NO generic
+// parameter of the interface? If so, a class cannot implement the interface at
+// TWO instantiations differing in any parameter subset S: pick P ∈ S — P's
+// protecting member has an identical substituted parameter list in both
+// instantiations but a differing member type, a §12.2 hiding clash (verified in
+// #1942's record: `IMarker<T>` with `Get(): T` makes `class D : C<string>,
+// IMarker<int>` a compile error), so the second implementation is rejected at
+// its own declaration and the open-world subclass hole is closed.
+//
+// Conservative in the SOUND direction (a false "unprotected" only over-rejects):
+// only DIRECT instance methods/properties/indexers are credited (no inherited-
+// interface members — their substitution mapping is not chased here; no statics
+// or events), and a member declaring its OWN generic parameters is skipped
+// (name shadowing would make the mention test ambiguous).
+static bool ifaceClashProtectedAllParams(const ast::TypeDecl* itd,
+                                         SemaContext& ctx) {
+    if (!itd) return false;
+    std::unordered_set<std::string_view> allParams;
+    for (const auto& gp : itd->genericParams) allParams.insert(gp.name);
+    if (allParams.empty()) return false;
+    auto isStaticMember = [](const std::vector<std::string_view>& mods) {
+        for (std::string_view m : mods)
+            if (m == "static") return true;
+        return false;
+    };
+    for (const auto& gp : itd->genericParams) {
+        std::unordered_set<std::string_view> one{gp.name};
+        bool pinned = false;
+        for (const auto& mem : itd->members) {
+            if (!mem) continue;
+            if (const auto* md =
+                    dynamic_cast<const ast::MethodDecl*>(mem.get())) {
+                if (!md->genericParams.empty() || isStaticMember(md->modifiers))
+                    continue;
+                if (!md->returnType) continue;
+                const TypeRef* rt = ctx.resolvedType(*md->returnType);
+                if (!rt || !refMentionsAnyOf(rt, one)) continue;
+                bool paramsClean = true;
+                for (const auto& p : md->params) {
+                    const TypeRef* pt =
+                        p.type ? ctx.resolvedType(*p.type) : nullptr;
+                    if (!pt || refMentionsAnyOf(pt, allParams)) {
+                        paramsClean = false;
+                        break;
+                    }
+                }
+                if (paramsClean) { pinned = true; break; }
+            } else if (const auto* pdcl =
+                           dynamic_cast<const ast::PropertyDecl*>(mem.get())) {
+                if (isStaticMember(pdcl->modifiers)) continue;
+                if (!pdcl->type) continue;
+                const TypeRef* rt = ctx.resolvedType(*pdcl->type);
+                if (!rt || !refMentionsAnyOf(rt, one)) continue;
+                bool paramsClean = true;
+                if (pdcl->isIndexer) {
+                    for (const auto& p : pdcl->indexerParams) {
+                        const TypeRef* pt =
+                            p.type ? ctx.resolvedType(*p.type) : nullptr;
+                        if (!pt || refMentionsAnyOf(pt, allParams)) {
+                            paramsClean = false;
+                            break;
+                        }
+                    }
+                }
+                if (paramsClean) { pinned = true; break; }
+            }
+        }
+        if (!pinned) return false;
+    }
+    return true;
+}
+
 // §19.3/§19.5/§5.1/§12.9 (v0.197, #1927; narrowed/refined #1946): admission of a
 // typed binding `var x: C<A>` (a class pattern) against a generic-INTERFACE
 // scrutinee `I<B>`. Three-way result (see the header):
@@ -5007,6 +5106,7 @@ ExprTC::IfaceBindReject ExprTC::typeTestInterfaceBindAmbiguous(
     std::unordered_set<std::string_view> cParams;
     for (const Symbol* gp : pd->genericParams)
         if (gp) cParams.insert(gp->name);
+    bool uniqueConformer = false;
     for (TypeRef* impl : symImpls) {
         std::unordered_map<std::string_view, TypeRef*> solved;
         std::unordered_set<std::string_view> splitParams;
@@ -5030,6 +5130,29 @@ ExprTC::IfaceBindReject ExprTC::typeTestInterfaceBindAmbiguous(
                 isFullyGroundTypeRef(arg) && !typeRefEqual(pinned, arg))
                 return IfaceBindReject::ErasedAmbiguous;
         }
+        uniqueConformer = true;  // conforms, pinned exactly at the pattern args.
+    }
+    // §19.3/§12.2 (#1942): the unique-conformer (and never-conforms dead-arm)
+    // admit above is CLOSED-WORLD — it reasons over same-class instantiations
+    // only. For a NON-final pattern class a subclass `D : C<Q≠A>, I<A>` in this
+    // or another module is a `C<Q≠A>` value that IS an `I<A>`, passes the
+    // ERASED `is C` class-tag test (the erased argument mints no identity
+    // token), and binds at `C<A>` — a wrong static type. Such a `D` is legal
+    // exactly when no §12.2 member clash forbids implementing `I` twice, so
+    // admit a non-final class only when the UNIQUE conformer was proven AND the
+    // interface is clash-protected (every parameter pinned by a result-position
+    // member — a second implementation is then rejected at `D`'s declaration).
+    // With NO conforming impl, protection cannot help: a subclass would
+    // implement `I` only ONCE (nothing to clash with), so only `sealed`
+    // admits — the arm is then provably dead (#1920's domain).
+    {
+        bool sealedPd = false;
+        for (std::string_view m : pd->modifiers)
+            if (m == "sealed") { sealedPd = true; break; }
+        if (!sealedPd &&
+            !(uniqueConformer &&
+              ifaceClashProtectedAllParams(itd, ctx_)))
+            return IfaceBindReject::ErasedAmbiguous;
     }
     return IfaceBindReject::None;  // erased but the UNIQUE conformer — sound.
 }
