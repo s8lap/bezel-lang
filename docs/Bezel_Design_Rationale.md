@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.220 — July 2026**
+**Companion to the Bezel Language Specification, v0.221 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -56,6 +56,8 @@ Where Bezel looks familiar, it usually is. A great deal of the syntax and many o
 The alternative — nested names that relate to each other, as C# namespaces do — is a reliable source of confusion, because the relationship is weaker than the syntax suggests. In C#, code inside `Foo.Bar.Baz` can name types from `Foo.Bar` without qualification, and that lexical convenience trains programmers to read the dots as a containment hierarchy — so they assume `internal` scopes to the namespace (it scopes to the whole assembly, ignoring namespaces entirely) and that `using Foo` imports `Foo.Bar`'s types (it does not). The hierarchy the dots suggest is not one any visibility or import rule actually follows. Bezel removes the suggestion: the dots are spelling, and the obvious reading — no relationship — is the correct one.
 
 The cost: no sub-package privacy. Use `internal` and put related code in the same module.
+
+**Member vs type at a chain head: position, not meaning (#2097/#2125).** When a bare name inside a type's body could denote either an accessible enclosing-type member or a same-named type, Bezel resolves by the name's *syntactic position*, not by trying each meaning to see which one the rest of the chain accepts. A chain head (`Color.Red`) prefers the type, so the `property Color: Color` self-naming idiom keeps working across modules; every other head — a value read, an assignment target, a bare callee, a `?.`/`!`-continued head — prefers the member. The declined alternative is C#'s Color-Color rule, where the head's meaning depends on whether the member reading can host the next segment — that is backtracking on semantic failure, which §2.7's "leftmost-first, type-wins, no backtracking" design refuses (adding an import can un-error a chain but must never silently re-mean one). The positional split buys the idiom without the backtracking; a warning covers the one residual case where a chain head resolves to a *different*-typed shadowing type, so the safety is delivered at zero cost to idiomatic code (spec §2.7).
 
 <a id="sec-no-top-level-functions-or-fields"></a>
 ### 2.2 No top-level functions or fields
@@ -1348,6 +1350,8 @@ children running — now a compile error keyed on the same class-level fact as
 §28.12's no-destructor warning, with the degraded-destructor fallback
 recorded but not taken.
 
+**Warned value statics (v0.221, #1393).** Rule 2's v0.163 text made every non-synchronized mutable static an error; the shipped compiler never enforced it for value types, and the corpus that grew in the gap — the destructor-counter idiom, ~800 declarations in the compiler's own suite — is single-domain and correct. The ruling recorded at #1393 admits primitive-, enum-, and heap-free-inline-array-typed mutable statics with rule 4's warning rather than an error, because the category is the violation-tolerant one: no reference content means ignoring the warning risks stale (or, for the multi-word forms, torn) values, never memory unsafety — a strictly milder violation class than rule 4's own. The same ruling named the owning-inline-array static field as rule 2's form (iv) — the admission §22.13/§11.7 had made in v0.181 (the static slot-pool the exit-disposal pass exists to dispose, necessarily a mutable field since restoration is per-slot assignment), which rule 2's "exactly two forms" sentence had silently contradicted — warned like rule 4 because its owned instances are cross-domain reachable *and* slot-mutable, its violation class being full UB. `string` and record statics were declined, not deferred: a mutable string static's overwrite forces a choice between a reclamation race (UAF through the runtime's own refcounting when the obligation is violated) and an unbounded never-release leak, the same payload-scaled cost declined for the v0.186 suppression-list types; and torn record reads fabricate invariant-violating values — a hazard heap-free inline arrays, bare element sequences with no §22.16 invariant surface, do not share, which is the recorded line between the two heap-free categories. Both remain errors with the stdlib's synchronized spellings (`AtomicInteger<T>`, `Mutex`, `Locked<T>`) as the remedies, liftable only by recorded ruling. Forms (iii)/(iv) deliberately get no memory-model publication edge: the obligation, not synchronization, is what makes them sound.
+
 <a id="sec-locked-rwlocked"></a>
 ### 12.8 `Locked<T>`/`RwLocked<T>`: the lock owns the data (v0.186)
 
@@ -1464,7 +1468,7 @@ invariant change):
    projection and `Slice`-only narrowing, so buffer recovery is closed by ordinary name resolution — a helper over
    `Span<T>` cannot receive one. The interprocedural body-rule alternative was declined: it requires a
    fork-reachability classification of functions, a whole-program analysis class with no precedent here. One
-   inherited residual is named, not absorbed: §22.12 rule-4 warned statics are reachable from fork closures exactly
+   inherited residual is named, not absorbed: §22.12 rule-4 warned statics (and, v0.221, rule 2's form-(iii)/(iv) warned statics) are reachable from fork closures exactly
    as from any two domains today — sharpened at graduation: fork closures are lexically the *confining* domain's
    code, so a program honoring rule 4's one-domain confinement obligation would **newly** race if its own fork
    closures touch the static from team domains; the future landing must extend the confinement obligation (or the
