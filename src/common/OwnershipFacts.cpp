@@ -380,6 +380,20 @@ bool isBorrowBearingRecordCommon(const sema::TypeRef* rt,
 
     auto fieldIsBorrowCarrying = [&](const sema::TypeRef* ft) -> bool {
         if (!ft) return false;
+        // §9.7 transitivity / §4.14 / §4.15 (#2127): a builtin span VIEW field
+        // (Span / ReadOnlySpan / ArraySpan / ReadOnlyArraySpan) carries a borrow
+        // of its backing Array / OwningBuffer but has no user Record TypeDecl, so
+        // neither the isValueBuiltin/null-declaration bail nor the user-Record
+        // recurse below fires for it — recognize it by name-head (mirrors
+        // MethodOwnership::isBuiltinSpanTypeRef, Ownership_Checks.cpp, so the
+        // declaration-site and instantiation-site checks classify identically,
+        // #1595). // per §9.7
+        {
+            const std::string_view sn = borrowSpanNameHead(ft);
+            if (sn == "Span" || sn == "ReadOnlySpan" ||
+                sn == "ArraySpan" || sn == "ReadOnlyArraySpan")
+                return true;
+        }
         switch (ft->kind) {
             case sema::TypeRef::Kind::Named: {
                 if (!ft->declaration) return false;  // generic param

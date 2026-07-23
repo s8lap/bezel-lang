@@ -2380,6 +2380,33 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e) {
     }
 }
 
+namespace {
+// §4.14 / §4.15 (#2127): the builtin span VIEW family — Span / ReadOnlySpan
+// (over an OwningBuffer, §4.14) and ArraySpan / ReadOnlyArraySpan (over an
+// Array, §4.15). Each is a borrow of its backing reference-typed store but
+// carries NO user Record TypeDecl (it resolves to a Named TypeRef whose
+// `declaration` is null — TypeResolution_Names.cpp — or a value-builtin
+// TypeSymbol), so the TypeDecl-based record-field walk in
+// isBorrowBearingRecordImpl misses it on BOTH legs (the isValueBuiltin /
+// null-declaration bail AND the user-Record recurse, which needs a user decl).
+// Recognizing it by name-head makes a record with a span field borrow-bearing
+// (§9.7 transitivity: "another borrow-bearing record … (transitivity)" applied
+// to the span views, which are borrow-bearing records without a user TypeDecl).
+// Name-head resolution mirrors builtinTypeRefNameHead (declaration name, else
+// use-site syntactic head, else imported name). The string-backed spans
+// (ReadOnlyStringSpan / ReadOnlyAsciiByteSpan) view a runtime-managed `string`
+// and are deliberately NOT here (§9.7); CancellationToken (§30.8) is a value
+// builtin and likewise not a span. // per §9.7, §4.14, §4.15
+bool isBuiltinSpanTypeRef(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    const std::string_view n =
+        rt->declaration ? std::string_view(rt->declaration->name)
+                        : rt->headName();
+    return n == "Span" || n == "ReadOnlySpan" ||
+           n == "ArraySpan" || n == "ReadOnlyArraySpan";
+}
+}  // namespace
+
 bool MethodOwnership::isBorrowBearingRecord(const sema::TypeRef* rt) const {
     std::unordered_set<const ast::TypeDecl*> seen;
     return isBorrowBearingRecordImpl(rt, seen);
@@ -2409,6 +2436,13 @@ bool MethodOwnership::isBorrowBearingRecordImpl(
     // not make a record borrow-bearing.
     auto fieldIsBorrowCarrying = [&](const sema::TypeRef* ft) -> bool {
         if (!ft) return false;
+        // §9.7 transitivity / §4.14 / §4.15 (#2127): a builtin span VIEW field
+        // (Span / ReadOnlySpan / ArraySpan / ReadOnlyArraySpan) is a borrow of
+        // its backing Array / OwningBuffer but has no user Record TypeDecl, so
+        // neither the isValueBuiltin/null-declaration bail nor the user-Record
+        // recurse below fires for it — recognize it by name-head here so a
+        // record with a span field is classified borrow-bearing. // per §9.7
+        if (isBuiltinSpanTypeRef(ft)) return true;
         switch (ft->kind) {
             case sema::TypeRef::Kind::Named: {
                 if (!ft->declaration) return false;  // generic param
@@ -2491,6 +2525,13 @@ bool MethodOwnership::isNullSourceRecordExpr(const ast::Expr& e) const {
     if (!decl || decl->kind != ast::TypeDeclKind::Record) return false;
     auto isBorrowCarrying = [&](const sema::TypeRef* ft) -> bool {
         if (!ft) return false;
+        // §9.7 / §4.14 / §4.15 (#2127): a span-field is borrow-carrying (same as
+        // isBorrowBearingRecordImpl above). A span is never `null`, so a record
+        // with a span argument is never null-source — recognizing the span here
+        // makes this recognizer return false for it (the span arg is not a null
+        // literal), so the field/collection-store rejection is NOT bypassed by a
+        // vacuous "no borrow-carrying field" null-source verdict. // per §9.7
+        if (isBuiltinSpanTypeRef(ft)) return true;
         if (ft->kind == sema::TypeRef::Kind::Named) {
             if (!ft->declaration) return false;  // generic param
             if (ft->declaration->isValueBuiltin) return false;
@@ -2579,6 +2620,46 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
         return true;
     };
 
+    // §9.7 transitivity (#2127): report the escape of a returned record / span
+    // whose CARRIED borrow source is the escape-bound local `src` (identified by
+    // name, forked span / record / catch — the same three wordings as
+    // reportIfScopeBoundOwned above and checkIndirectEscapeOnReturn below). Used
+    // for the direct-`new` form whose constructor argument is itself a borrow-
+    // bearing local (a span var, or a nested borrow-bearing record var) — its
+    // root is not directly owned, so reportIfScopeBoundOwned misses it.
+    auto reportCarriedSource = [&](sema::Symbol* src, SourceLocation loc,
+                                   bool spanForm) {
+        if (isCatchBorrow(src)) {
+            report(
+                Severity::Error, loc,
+                std::string("returned borrow-bearing record carries a borrow of "
+                "the caught exception `") + std::string(src->name) +
+                "` — a caught exception is a borrow whose lifetime is the catch "
+                "arm body (the runtime disposes it after the arm completes), so a "
+                "value carrying it may not escape the arm (§9.7 / §31.1; copy the "
+                "data you need out of it into an owned value instead)");
+        } else if (spanForm) {
+            report(
+                Severity::Error, loc,
+                std::string("returned span views `") + std::string(src->name) +
+                "` whose backing storage is disposed at scope end — a span "
+                "(§4.14/§4.15) is a borrow of its backing Array / OwningBuffer "
+                "and may not outlive it, but returning it from this method does "
+                "(§9.7 borrow-lifetime rule; bind the source in the caller's "
+                "scope and return the span from there instead)");
+        } else {
+            report(
+                Severity::Error, loc,
+                std::string("returned borrow-bearing record carries a borrow of "
+                "`") + std::string(src->name) +
+                "` whose source is disposed at scope end — a borrow-bearing "
+                "record may not outlive the source of any borrow it carries, and "
+                "returning it from this method does (§9.7 record borrow-lifetime "
+                "rule; bind the source in the caller's scope and build the record "
+                "there instead)");
+        }
+    };
+
     if (ne) {
         // Direct construction form: `return new Rec(...);` / `return new
         // ArraySpan<int>(local, …);` — at least one constructor argument must
@@ -2586,9 +2667,31 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
         // at this method's exit).
         for (const ast::CallArgument& a : ne->args) {
             if (!a.value) continue;
-            if (reportIfScopeBoundOwned(identifierRoot(*a.value), ne->span.begin,
+            const ast::IdentifierExpr* argRoot = identifierRoot(*a.value);
+            // (a) The argument root is DIRECTLY a scope-bound owned local
+            //     (`new Holder(local.AsSpan())` — root `local`).
+            if (reportIfScopeBoundOwned(argRoot, ne->span.begin,
                                         /*spanForm=*/typeIsSpan))
                 return;  // one diagnostic per return is enough
+            // (b) §9.7 transitivity (#2127): the argument is itself a borrow-
+            //     bearing local whose CARRIED source is a live escape-bound
+            //     obligation — a span var (`var s := local.AsSpan(); return new
+            //     Holder(s);`) or a nested borrow-bearing record var (`var h :=
+            //     new Holder(local.AsSpan()); return new Outer(h);`). Its root is
+            //     not itself owned, so (a) misses it; follow the
+            //     recordBorrowLocalSource_ chain the same way
+            //     checkIndirectEscapeOnReturn does for the bare-holder form. Both
+            //     wrap a scope-bound owned local's borrow into a freshly-returned
+            //     record that outlives it → UAF. // per §9.7, §4.14, §4.15
+            if (argRoot) {
+                if (sema::Symbol* argSym = ctx_.exprSymbol(*argRoot))
+                    if (sema::Symbol* src = carriedEscapeBoundSourceLiveAt(
+                            argSym, ne->span.begin.offset)) {
+                        reportCarriedSource(src, ne->span.begin,
+                                            /*spanForm=*/typeIsSpan);
+                        return;
+                    }
+            }
         }
         return;
     }
