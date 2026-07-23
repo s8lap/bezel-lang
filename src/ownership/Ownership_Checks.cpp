@@ -2334,6 +2334,76 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e) {
                     std::string(sym->name) + "; () => snap`)");
                 return;  // one diagnostic per return is enough
             }
+            // §9.7 (#2144): "A borrow-bearing record may not be captured by a
+            // closure that escapes its source's scope." A captured local of
+            // borrow-bearing record / builtin-span type is a VALUE — never
+            // Owned in `states_`, so the §28.9 owned-capture leg below never
+            // sees it — but it carries its borrow's source set in
+            // recordBorrowLocalSource_ (collectRecordBorrowSource, the
+            // #1726/#1966 provenance machinery). Resolve the carried sources;
+            // reject when one is still a live ESCAPE-BOUND obligation (an
+            // owned scope-bound local disposed at scope end, §28.3/§28.9, or
+            // a catch binding, §31.1) — the returned closure would outlive it
+            // and read the dangling borrow. A record whose sources all
+            // outlive the frame (a PARAM-backed span, a field-backed record)
+            // resolves no escape-bound source and stays accepted, mirroring
+            // the #1966 return-path gating; a NON-escaping capture never
+            // reaches this check (it runs only on the return path), keeping
+            // §9.7's "that escapes" qualifier exact. // per §9.7
+            {
+                const sema::TypeRef* capTy = nullptr;
+                if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
+                    capTy = ls->declType;
+                if (capTy && isBorrowBearingRecordOrSpan(capTy)) {
+                    if (sema::Symbol* src = carriedEscapeBoundSourceLiveAt(
+                            sym, id->span.begin.offset)) {
+                        const bool capIsSpan = !isBorrowBearingRecord(capTy);
+                        if (isCatchBorrow(src)) {
+                            report(
+                                Severity::Error, id->span.begin,
+                                std::string("returned closure captures `") +
+                                std::string(sym->name) +
+                                "`, which carries a borrow of the caught "
+                                "exception `" + std::string(src->name) +
+                                "` — a caught exception is a borrow whose "
+                                "lifetime is the catch arm body (the runtime "
+                                "disposes it after the arm completes); a "
+                                "closure that escapes the arm would outlive "
+                                "it (§9.7 / §31.1; copy the data you need out "
+                                "of it into an owned value the closure can "
+                                "capture instead)");
+                        } else if (capIsSpan) {
+                            report(
+                                Severity::Error, id->span.begin,
+                                std::string("returned closure captures `") +
+                                std::string(sym->name) +
+                                "`, a span viewing `" + std::string(src->name) +
+                                "` whose backing storage is disposed at scope "
+                                "end — a span (§4.14/§4.15) is a borrow of its "
+                                "backing Array / OwningBuffer, and a "
+                                "borrow-bearing record may not be captured by "
+                                "a closure that escapes its source's scope "
+                                "(§9.7 closure-capture rule; copy the element "
+                                "data into an owned value the closure can "
+                                "capture, or keep the closure from escaping)");
+                        } else {
+                            report(
+                                Severity::Error, id->span.begin,
+                                std::string("returned closure captures `") +
+                                std::string(sym->name) +
+                                "`, a borrow-bearing record carrying a borrow "
+                                "of `" + std::string(src->name) +
+                                "` whose source is disposed at scope end — a "
+                                "borrow-bearing record may not be captured by "
+                                "a closure that escapes its source's scope "
+                                "(§9.7 closure-capture rule; copy the data "
+                                "you need into an owned value the closure can "
+                                "capture, or keep the closure from escaping)");
+                        }
+                        return;  // one diagnostic per return is enough
+                    }
+                }
+            }
             // Resolve against the dataflow-tracked method-scope locals. A
             // captured lambda parameter is not in `states_`, so it is
             // naturally excluded; only an enclosing-method local/owned-param
@@ -3008,18 +3078,40 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
             }
         }
     }
-    // Shape 3 — a closure capturing an Owned local (§28.9) or a catch-bound
-    // exception variable (§31.1). Capturing an owned class-typed local — or
-    // the in-flight exception — does not transfer ownership; the capture is a
-    // borrow whose source is the enclosing scope (for the catch binding, the
-    // arm body). Binding the closure to a holder local propagates that source,
-    // so a later escape of the holder is recognized.
+    // Shape 3 — a closure capturing an Owned local (§28.9), a catch-bound
+    // exception variable (§31.1), or a borrow-bearing record / span local
+    // (§9.7, #2144). Capturing an owned class-typed local — or the in-flight
+    // exception — does not transfer ownership; the capture is a borrow whose
+    // source is the enclosing scope (for the catch binding, the arm body).
+    // Binding the closure to a holder local propagates that source, so a
+    // later escape of the holder is recognized.
     if (const auto* lam = dynamic_cast<const ast::LambdaExpr*>(&rhs)) {
         std::vector<const ast::IdentifierExpr*> ids;
         collectLambdaIdentifiers(*lam, ids);
         for (const ast::IdentifierExpr* id : ids) {
             sema::Symbol* sym = ctx_.exprSymbol(*id);
             if (isEscapeBoundLocal(sym)) return sym;
+            // §9.7 (#2144): a captured local of borrow-bearing record /
+            // builtin-span type re-borrows every source the record carries
+            // (recordBorrowLocalSource_, the #1726/#1966 provenance). The
+            // closure therefore borrows the record's carried source, and its
+            // holder inherits the first still-live escape-bound one — so the
+            // existing escape checks (the #861 outer-local store, the field /
+            // out-param store, the §28.9/§9.7 indirect return) diagnose a
+            // record-capturing closure exactly as one capturing the source
+            // directly. A record whose sources all outlive the frame (a
+            // param-backed span) resolves nothing and adds no constraint.
+            // // per §9.7, §28.9
+            if (sym) {
+                const sema::TypeRef* capTy = nullptr;
+                if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
+                    capTy = ls->declType;
+                if (capTy && isBorrowBearingRecordOrSpan(capTy)) {
+                    if (sema::Symbol* src = carriedEscapeBoundSourceLiveAt(
+                            sym, id->span.begin.offset))
+                        return src;
+                }
+            }
         }
     }
     return nullptr;
