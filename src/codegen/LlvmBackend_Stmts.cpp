@@ -806,23 +806,40 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // §6.1 overflow / §5.2 char / §6.1 div-zero checks run), and
                 // otherwise applies the SAME checked arithmetic + narrow-integer
                 // / char §5.2 write-back as the non-nullable path (emitCompoundOp
-                // on the unwrapped payloads), rewrapped into `T?`. (`decimal?`,
-                // whose payload is the %bz.decimal struct rather than an int/FP
-                // scalar, is excluded here — emitCompoundOp is scalar-only.)
+                // on the unwrapped payloads), rewrapped into `T?`. §7.11 (#2141):
+                // `decimal?`, whose payload is the %bz.decimal struct rather than
+                // an int/FP scalar, lifts the SAME way — routed through the §6.4
+                // decimal intrinsic (emitDecimalArith) on the unwrapped payloads
+                // instead of the scalar emitCompoundOp; §7.11 names decimal
+                // DivideByZeroException explicitly, and that guard runs only on
+                // the both-present branch. Without this the `{i8; %bz.decimal}`
+                // struct fell to emitCompoundOp and aborted on malformed IR
+                // (`llvm.sadd.with.overflow.sl_i8s_bz.decimalss`).
                 if (auto* nst = llvm::dyn_cast<llvm::StructType>(elemTy)) {
                     const sema::TypeRef* ntgt = ctx_.exprType(*as->target);
+                    bool decimalPayload =
+                        nst->getNumElements() == 2 &&
+                        nst->getElementType(0) == nullablePrimHasValTy() &&
+                        nst->getElementType(1) == decimalStructType();
                     if (nst->getNumElements() == 2 &&
                         nst->getElementType(0) == nullablePrimHasValTy() &&
                         (nst->getElementType(1)->isIntegerTy() ||
-                         nst->getElementType(1)->isFloatingPointTy()) &&
+                         nst->getElementType(1)->isFloatingPointTy() ||
+                         decimalPayload) &&
                         ntgt && ntgt->nullable) {
                         llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
-                        // Operand tags/payloads. A struct RHS carries its own
-                        // hasValue tag (`c += otherNullable`); a scalar RHS
-                        // (`c += 1`, or a wrapped literal) is present always.
+                        // Operand tags/payloads. A nullable RHS carries its own
+                        // hasValue tag (`d += otherNullable`); a non-nullable RHS
+                        // (`d += 2.0m`, `c += 1`, or a wrapped literal) is present
+                        // always. For a scalar payload a struct-typed RHS is the
+                        // nullable form; for a `decimal?` payload the bare
+                        // %bz.decimal is ALSO a struct, so detect nullability by
+                        // the tagged-struct type (== elemTy) instead.
                         llvm::Value* lTag = nullablePrimHasValue(cur);      // i1
                         llvm::Value* lPay = nullablePrimValue(cur);         // T
-                        bool rNullable = rhs->getType()->isStructTy();
+                        bool rNullable = decimalPayload
+                            ? (rhs->getType() == elemTy)
+                            : rhs->getType()->isStructTy();
                         llvm::Value* rTag = rNullable
                             ? nullablePrimHasValue(rhs) : builder_.getTrue();
                         llvm::Value* rPay = rNullable
@@ -837,21 +854,36 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         builder_.CreateCondBr(both, opBB, endBB);
                         // --- opBB: both present → run the checked op on payloads.
                         builder_.SetInsertPoint(opBB);
-                        bool isCharU =
-                            ntgt->kind == sema::TypeRef::Kind::Primitive &&
-                            ntgt->primitive == sema::PrimitiveType::Char;
-                        // §5.1 widening of the RHS payload to the LHS payload
-                        // width (int→i64, int→double, float→double). Integer
-                        // same-width and narrowing cases are handled inside
-                        // emitCompoundOp exactly as the non-nullable path does.
-                        rPay = coerceNumericToType(
-                            rPay, nst->getElementType(1),
-                            isUnsignedTargetExpr(*as->value));
-                        llvm::Value* pay = emitCompoundOp(
-                            op, lPay, rPay,
-                            lPay->getType()->isFloatingPointTy(),
-                            isUnsignedTargetExpr(*as->target), isCharU,
-                            isUnsignedTargetExpr(*as->value));  // §6.2 #2140 rUns
+                        llvm::Value* pay = nullptr;
+                        if (decimalPayload) {
+                            // §6.4 / §5.1 (#2141): an integer RHS (`d += 5`)
+                            // §5.1-converts to `decimal`; a decimal RHS is used
+                            // as-is (a `double`/`float` RHS is a §6.2 compile
+                            // error, rejected in sema). Route through the §6.4
+                            // decimal intrinsic — its div/mod §7.11
+                            // DivideByZeroException guard runs on this present
+                            // branch only.
+                            rPay = coerceNumericToType(
+                                rPay, decimalStructType(),
+                                isUnsignedTargetExpr(*as->value));
+                            pay = emitDecimalArith(op, lPay, rPay);
+                        } else {
+                            bool isCharU =
+                                ntgt->kind == sema::TypeRef::Kind::Primitive &&
+                                ntgt->primitive == sema::PrimitiveType::Char;
+                            // §5.1 widening of the RHS payload to the LHS payload
+                            // width (int→i64, int→double, float→double). Integer
+                            // same-width and narrowing cases are handled inside
+                            // emitCompoundOp exactly as the non-nullable path.
+                            rPay = coerceNumericToType(
+                                rPay, nst->getElementType(1),
+                                isUnsignedTargetExpr(*as->value));
+                            pay = emitCompoundOp(
+                                op, lPay, rPay,
+                                lPay->getType()->isFloatingPointTy(),
+                                isUnsignedTargetExpr(*as->target), isCharU,
+                                isUnsignedTargetExpr(*as->value));  // #2140 rUns
+                        }
                         llvm::Value* wrapped =
                             llvm::ConstantAggregateZero::get(elemTy);
                         if (pay) {
