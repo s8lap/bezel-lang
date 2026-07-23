@@ -3357,6 +3357,64 @@ bool MethodOwnership::localDropOnOverwriteCovered(const sema::Symbol* sym) {
     return true;
 }
 
+// §28.10 "using var initialized from a borrow" (v0.180+, #2128). See the header
+// for the full contract: the borrow shapes a `using var` initializer can take —
+// beyond the bare-id / arm-meet / bind-atom / bare-T-call shapes handled inline
+// in handleLocalDecl — that the spec lists as borrow-pins ("a method call
+// without an `owned` return, an indexer access, or a field read"). Recognized
+// POSITIVELY, never off producerState's `Borrowed` verdict (which also covers
+// fresh-owned producers that MUST keep adoption). // per §28.10, #2128
+bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) const {
+    // A FIELD read — `obj.f` or a bare implicit-`this` `f` resolving to a
+    // FieldSymbol. Reading a field (owned or not) is a lend: ownership stays
+    // with the field's holder, which disposes it, so this scope must not. A
+    // property/indexer GETTER resolves to a Property/MethodSymbol, NOT a
+    // FieldSymbol, so it is excluded here (it may return an owned production —
+    // `tcs.Task.Result` — which keeps its adoption). Mirrors the field-read
+    // branch of checkDisposeReceiverOwnership. // per §28.10, #2128
+    if (dynamic_cast<const ast::MemberAccessExpr*>(&init) ||
+        dynamic_cast<const ast::IdentifierExpr*>(&init)) {
+        if (dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(init)))
+            return true;
+    }
+    // An INDEXER access — a bare `coll[i]` / `arr[i]`. The element-slot table
+    // (§28.11) classifies indexer-get / default iteration as a BORROW out
+    // (source: the collection, a transit point), for both borrowing and owning
+    // families. Ownership leaves a collection only through `move coll[i]`, the
+    // `Pop*` family, or `Drain()` — a UnaryExpr / call, never a bare IndexExpr —
+    // so those keep their adoption. // per §28.10, §28.11, #2128
+    if (dynamic_cast<const ast::IndexExpr*>(&init))
+        return true;
+    // A concrete borrow-returning CALL — a directly-resolved user method whose
+    // declared return is not `owned` and whose EVERY return is a bare receiver-
+    // owned-field borrow (`return this._f`). methodReturnsOnlyWrapperReceiver-
+    // Borrow is the sound, purely structural positive test (the same predicate
+    // producerState consults for owning-type-head returns, here generalized to a
+    // plain class return — the #2128 gap). An owned/Task-family/factory return,
+    // or a return that is a fresh producer, fails the test and keeps adoption.
+    // Only a DIRECT call resolves `md`; an interface/virtual/imported/function-
+    // value dispatch yields a null MethodDecl → not recognized → keeps adoption,
+    // matching producerState's own direct-only borrow downgrade. // per §28.10,
+    // §28.6, #2128
+    // Pre-gate review F1: exclude ASYNC methods (and thereby Task-family
+    // returns) — §28.10's own carve: "unless its declared return type is a
+    // Task-family type, an owned production per §28.3, v0.190". An async plain-
+    // Task<T> body returning a payload borrow (`return this._cell;`) is LEGAL
+    // and satisfies the structural scan, but the CALL mints a fresh owned
+    // async frame that MUST be disposed — pinning it would leak the frame.
+    // (Sync Task-returning borrow bodies are already rejected at the
+    // definition site by SB01-B/#1660, so isAsync is the whole reachable gap.)
+    // Residual under-pins tracked: #2137 (borrow-returning property getters;
+    // borrowed-parameter-returning calls). // per §28.10 v0.190, #2128
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&init)) {
+        if (const ast::MethodDecl* md = common::calleeMethodDecl(*ce, ctx_))
+            if (!md->isAsync && !md->returnOwned &&
+                methodReturnsOnlyWrapperReceiverBorrow(*md))
+                return true;
+    }
+    return false;
+}
+
 void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
     // #1066 / §9.7 (v0.153): `var b := new Bag([…])` from a temporary is a
     // dangling borrow. Checked before the lsym early-return so it runs for a
@@ -3466,14 +3524,16 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
         //   * a borrowed if/case ARM-MEET (#1661) — producerState is the authority
         //     (Owned only when both arms meet owned);
         //   * a bare-type-parameter argument-source-union CALL borrow (#1801 S4).
-        // Every other RHS — a `new`, a collection literal, a field/index read, a
-        // non-bare-`T` call, a `move`/`await`, an owned operator/`??` — ADOPTS
-        // (codegen's own class / mint / transfer recognition disposes it). A field or
-        // index read of a genuine borrow is left ADOPTING, matching pre-#2072:
-        // producerState cannot tell a field read (a lend) from an owned-returning
-        // property getter or indexer, so the disposal-safe default is adoption — the
-        // remaining var/using-var classification gap there is a recorded residual, not
-        // a regression this refactor introduces. The MARKED transfer
+        // Every other RHS — a `new`, a collection literal, a non-bare-`T` call,
+        // a `move`/`await`, an owned operator/`??` — ADOPTS (codegen's own
+        // class / mint / transfer recognition disposes it), EXCEPT the §28.10
+        // borrow shapes #2128 positively recognizes below (a FieldSymbol read,
+        // a bare indexer access, a concrete receiver-owned-field-borrow-
+        // returning call): those are borrow-pins whether the binding is typed
+        // or untyped — the typed form previously reached codegen's
+        // unconditional classOfLocal dispose and double-freed the borrow.
+        // Owned-returning property getters and borrowed-parameter-returning
+        // calls remain adopting (#2137 tracks that residual under-pin). The MARKED transfer
         // `using var y := owned x;` is handled by the initializerHasOwnedMarker branch
         // above (its owned shape is likewise invisible to producerState). Both the pin
         // and the adoption record the binding Owned + implicitDischarge so the PIN
@@ -3483,6 +3543,13 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
         // layered difference (codegen skips the pin's disposal). // per §28.10, §28.3
         if (ld.isUsing) {
             const ast::Expr* init = ld.initializer.get();
+            // §28.10 "using var initialized from a borrow" (#2128): positive
+            // recognition of the spec-listed borrow shapes — field read, indexer
+            // access, concrete borrow-returning call (§28.10, spec producers row).
+            // Order-independent OR into the layered decision: no branch below
+            // ever CLEARS the flag. // per §28.10, #2128
+            if (usingVarInitIsRecognizedBorrow(*init))
+                const_cast<ast::LocalDecl&>(ld).usingVarSourceIsBorrow = true;
             if (auto* aid = dynamic_cast<const ast::IdentifierExpr*>(init)) {
                 // Bare-id: pin a tracked owned/borrow binding (#1285/#2071) or a
                 // borrowing for-loop element (#1287). A tracked Owned source keeps its

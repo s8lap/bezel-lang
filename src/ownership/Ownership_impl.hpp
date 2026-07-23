@@ -1904,6 +1904,30 @@ private:
     // Borrowed (returns false). // per §28.6, §28.3, §5.11
     bool methodReturnsOnlyWrapperReceiverBorrow(const ast::MethodDecl& md) const;
 
+    // §28.10 "using var initialized from a borrow" (#2128): true when a `using
+    // var` initializer is one of the borrow shapes the spec lists there beyond
+    // the bare-id / arm-meet / bind-atom / bare-T-call shapes handled inline in
+    // handleLocalDecl — "a method call without an `owned` return, an indexer
+    // access, or a field read." Such a using var is a BORROW-PIN (no disposal
+    // obligation; its real owner disposes it), so codegen must skip the scope-
+    // end dispose (registerUsingDisposal honors usingVarSourceIsBorrow). Absent
+    // this, a TYPED binding over one of these reaches classOfLocal (declared
+    // class → unconditional dispose) and DOUBLE-FREES the borrow. Recognized
+    // POSITIVELY (never off producerState's unreliable `Borrowed` verdict, which
+    // also covers fresh-owned producers — collection literals, `RawBytes.From`,
+    // iterator/subscription returns — that MUST keep adoption):
+    //   - a FIELD read (obj.f / bare implicit-this f resolving to a FieldSymbol)
+    //     — a lend; distinguished from a property/indexer GETTER (a Property/
+    //     MethodSymbol that may return owned) by symbol resolution;
+    //   - an INDEXER access (a bare IndexExpr) — a borrow out, source the
+    //     collection (§28.11 element-slot table); `move coll[i]` / Pop / Drain
+    //     are a UnaryExpr / call, not a bare IndexExpr, and keep adoption;
+    //   - a concrete borrow-returning CALL — a directly-resolved user method
+    //     whose declared return is not `owned` and whose EVERY return is a bare
+    //     receiver-owned-field borrow (methodReturnsOnlyWrapperReceiverBorrow),
+    //     never a fresh/owned producer. // per §28.10, #2128
+    bool usingVarInitIsRecognizedBorrow(const ast::Expr& init) const;
+
     // §28.8: report the owned-sink violation for `argValue` (at `loc`) when
     // `ownedArgSourceIsBorrow` holds. Returns true when it reported (the
     // caller then skips the bogus `markMovedByName` that would silently treat
