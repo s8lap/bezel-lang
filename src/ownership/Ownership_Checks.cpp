@@ -2799,27 +2799,84 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
     if (!id) return;
     sema::Symbol* sym = ctx_.exprSymbol(*id);
 
-    // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S2). A holder bound
-    // from a bare-type-parameter call (`var m := Pick(a, b);`) carries a borrow
-    // of the UNION of the call's sources, attached into recordBorrowLocalSource_
-    // (NOT st->source) by collectBareTypeParamCallBorrowSource. Returning the
-    // bare holder lets that borrow escape every contributing source that is
-    // still a live owned scope-bound local (§28.9/§9.7) — or catch binding
-    // (§31.1) — at the return, exactly as returning a plain re-borrow holder
-    // does below; the single-source path below misses it because such a holder
-    // has no st->source. Mirror that path's guard precisely: reject only when a
-    // carried source is still a live escape-bound obligation (a parameter or a
-    // returned-through source outlives the return and is NOT escape-bound, so it
-    // is left accepted), and only while the source's view-window is open at the
-    // return (a straight-line reassignment that dropped the borrow closes it). A
-    // borrow-bearing record / span holder keeps its own §9.7 return handling
-    // (checkRecordBorrowEscapesOnReturn / the direct-return checks) — this
-    // branch is scoped to the non-record (class-typed) bare-T holder, which the
-    // record predicate never matches. // per §28.3, §28.9, §9.7, v0.194
-    if (sym && !isBorrowBearingRecordOrSpan(ctx_.exprType(e))) {
+    // A holder bound from a producer that carries a borrow attaches its source
+    // set into recordBorrowLocalSource_ (NOT st->source), so the single-source
+    // st->source path below misses it. Two disjoint producer families do so:
+    //
+    //   (1) §28.3 *Bare-type-parameter returns* (v0.194, #1801 S2): a bare-T call
+    //       (`var m := Pick(a, b);`) carries a borrow of the UNION of the call's
+    //       sources (collectBareTypeParamCallBorrowSource); the holder type is a
+    //       class, never a borrow-bearing record / span.
+    //   (2) §9.7 / §4.14 / §4.15 *indirect span / borrow-bearing-record escape*
+    //       (#1966): a span (or borrow-bearing record) bound to a local first —
+    //       `var s := local.AsSpan(); return s;`, its multi-hop (`var t := s;`),
+    //       slice (`var t := s.Slice(r);`), and record-wrapping (`var h :=
+    //       new Holder(s);`) variants — carries its backing-store source in
+    //       recordBorrowLocalSource_ (collectRecordBorrowSource). The DIRECT
+    //       projection `return local.AsSpan();` is caught by
+    //       checkRecordBorrowEscapesOnReturn, but that check consults only the
+    //       returned expression's identifierRoot, not a span/record holder's
+    //       carried provenance — so the one-hop-through-a-local form (the
+    //       explicitly-deferred residual of #1959) went unchecked and dangled at
+    //       runtime (UAF in the span accessor once `local` is disposed).
+    //
+    // Both are the same escape: returning the bare holder lets the carried borrow
+    // outlive a source that is still a live scope-bound obligation at the return —
+    // an owned scope-bound local disposed at scope end (§28.9/§9.7) or a catch
+    // binding (§31.1). Mirror the single-source path's guard precisely: reject
+    // only when a carried source is still a live escape-bound obligation (a
+    // parameter or a returned-through source outlives the return and is NOT
+    // escape-bound, so it is left accepted — this keeps a span bound from a PARAM
+    // array, `var s := a.AsSpan();`, accepted), and only while the source's view-
+    // window is open at the return. The diagnostic wording forks on the holder
+    // kind (span / borrow-bearing record vs class-typed bare-T result).
+    // // per §28.3, §28.9, §9.7, §4.14, §4.15, v0.194, #1966
+    if (sym) {
+        const sema::TypeRef* holderTy = ctx_.exprType(e);
+        const bool holderIsRecordOrSpan = isBorrowBearingRecordOrSpan(holderTy);
         if (sema::Symbol* src =
                 carriedEscapeBoundSourceLiveAt(sym, id->span.begin.offset)) {
-            if (isCatchBorrow(src)) {
+            if (holderIsRecordOrSpan) {
+                // §9.7 / §4.14 / §4.15 (#1966): the indirect span / record form.
+                // A span never carries a catch borrow (it views an Array /
+                // OwningBuffer), but a borrow-bearing record can wrap a caught
+                // exception — keep the §31.1 wording for that source kind.
+                const bool holderIsSpan = !isBorrowBearingRecord(holderTy);
+                if (isCatchBorrow(src)) {
+                    report(
+                        Severity::Error, id->span.begin,
+                        std::string("returned `") + std::string(id->name) +
+                        "` carries a borrow of the caught exception `" +
+                        std::string(src->name) +
+                        "` — a caught exception is a borrow whose lifetime is the "
+                        "catch arm body (the runtime disposes it after the arm "
+                        "completes), so a value carrying it may not escape the arm "
+                        "(§9.7 / §31.1; copy the data you need out of it into an "
+                        "owned value instead)");
+                } else if (holderIsSpan) {
+                    report(
+                        Severity::Error, id->span.begin,
+                        std::string("returned `") + std::string(id->name) +
+                        "` is a span viewing `" + std::string(src->name) +
+                        "` whose backing storage is disposed at scope end — a span "
+                        "(§4.14/§4.15) is a borrow of its backing Array / "
+                        "OwningBuffer and may not outlive it, but returning the "
+                        "local it is bound to does (§9.7 borrow-lifetime rule; bind "
+                        "the source in the caller's scope and return the span from "
+                        "there instead)");
+                } else {
+                    report(
+                        Severity::Error, id->span.begin,
+                        std::string("returned `") + std::string(id->name) +
+                        "` is a borrow-bearing record carrying a borrow of `" +
+                        std::string(src->name) +
+                        "` whose source is disposed at scope end — a borrow-bearing "
+                        "record may not outlive the source of any borrow it "
+                        "carries, and returning the local it is bound to does (§9.7 "
+                        "record borrow-lifetime rule; bind the source in the "
+                        "caller's scope and build the record there instead)");
+                }
+            } else if (isCatchBorrow(src)) {
                 report(
                     Severity::Error, id->span.begin,
                     std::string("returned `") + std::string(id->name) +
