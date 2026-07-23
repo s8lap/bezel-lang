@@ -8,6 +8,7 @@
 
 #include <cstdlib>
 
+#include "ast/Node.hpp"
 #include "codegen/CodeGen.hpp"
 #include "codegen/LlvmBackend.hpp"
 #include "lexer/Lexer.hpp"
@@ -44,6 +45,57 @@ bool readFile(const std::string& path, std::string& out) {
     buffer << stream.rdbuf();
     out = buffer.str();
     return true;
+}
+
+// stdlib §2.20 (v0.200, #2047): the auto-imported `Result<T, E>` choice. The
+// stdlib ships exactly this one choice (per §35); it is a pure Bezel choice with
+// no compiler intrinsic, so it is made available by SYNTHESIZING its declaration
+// from the verbatim stdlib §2.20 source and injecting it as a top-level decl into
+// every compilation unit. The full choice machinery — §35.4 per-instantiation
+// classification, construction, match, §35.4 disposal, §35.7 equality/hash —
+// then applies to it exactly as to a user-declared choice. Choices are not
+// embedded in module metadata, so the injected `public` decl never collides
+// across a module import boundary.
+const char kResultPreludeSource[] =
+    "module __bezel_prelude_result__;\n"
+    "public choice Result<T, E>\n"
+    "  Ok(owned value: T),\n"
+    "  Error(owned error: E);\n"
+    "\n"
+    "  public method IsOk(): bool => (case this of\n"
+    "    Ok(_)    => true,\n"
+    "    Error(_) => false);\n"
+    "\n"
+    "  public method IsError(): bool => not IsOk();\n"
+    "end Result;\n";
+
+// Parse the auto-imported stdlib prelude and PREPEND its top-level declarations
+// to `unit`. The prelude source is a program-lifetime constant, so the AST
+// string_views into it stay valid for the whole compilation; ownership of the
+// parsed nodes transfers into `unit->topDecls`. A private diagnostics sink
+// absorbs any prelude parse diagnostic (the prelude is known-valid — a
+// diagnostic here would be an internal compiler defect, never the user's fault).
+void injectStdlibPrelude(ast::SourceFile& unit) {
+    static const std::string preludeSrc(kResultPreludeSource);
+    DiagnosticEngine preludeDiags;
+    Lexer preludeLexer(preludeSrc, preludeDiags);
+    Parser preludeParser(preludeLexer, preludeDiags);
+    std::unique_ptr<ast::SourceFile> preludeUnit =
+        preludeParser.parseCompilationUnit();
+    if (!preludeUnit || preludeDiags.hasErrors()) return;  // defensive: no-op
+    // Mark each injected type decl as synthesized so codegen emits its functions
+    // with INTERNAL linkage — every module gets a private copy, so external
+    // linkage would collide when two modules link (multiple-definition).
+    for (auto& td : preludeUnit->topDecls)
+        if (auto* decl = dynamic_cast<ast::TypeDecl*>(td.get()))
+            decl->isSynthesizedPrelude = true;
+    // Prepend so the choice precedes any user decl (declaration order is not
+    // significant for type resolution, but this keeps a user forward-reference
+    // to `Result` unambiguous). Move each TopDecl's ownership into `unit`.
+    unit.topDecls.insert(
+        unit.topDecls.begin(),
+        std::make_move_iterator(preludeUnit->topDecls.begin()),
+        std::make_move_iterator(preludeUnit->topDecls.end()));
 }
 
 // Link a native object (plus any §2.5 dependency objects) into an executable
@@ -120,6 +172,10 @@ CompileResult Driver::compileFile(const std::string& path,
     // check and codegen below already gate on a clean front-end. Valid programs
     // (no parse errors) are unaffected: the block runs precisely as before.
     if (unit && !diagnostics.hasErrors()) {
+        // stdlib §2.20 (#2047): make the auto-imported `Result<T, E>` choice
+        // available by injecting its synthesized declaration before symbol
+        // collection, so user references to `Result<T, E>` resolve.
+        injectStdlibPrelude(*unit);
         // Sema milestone — runs in pass order: symbol collection,
         // type resolution, expression typecheck. Each pass annotates
         // the AST via side-tables on SemaContext.
@@ -279,6 +335,9 @@ CompileResult Driver::compileObject(const std::string& path,
     // recovery AST. See compileFile for the full rationale — the same parse-
     // gates-the-front-end rule applies to this library/object path.
     if (unit && !diagnostics.hasErrors()) {
+        // stdlib §2.20 (#2047): inject the auto-imported `Result<T, E>` choice
+        // (the library/object path mirrors compileFile).
+        injectStdlibPrelude(*unit);
         sema::SemaContext semaCtx(diagnostics);
         sema::collectSymbols(*unit, semaCtx);
         // §2.5: a library may itself import dependencies (acyclic). #1487: load

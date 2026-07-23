@@ -763,8 +763,55 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             // non-nullable form; the nullable `C?` wraps this struct in
             // nullableValueStructTy's `{ i8 hasValue, <choice struct> }`.
             if (rt->declaration &&
-                rt->declaration->kind == ast::TypeDeclKind::Choice)
+                rt->declaration->kind == ast::TypeDeclKind::Choice) {
+                // #2047: a CONCRETE generic-choice annotation (`Result<C,
+                // string>` as a local/param/field type) must lower to the SAME
+                // specialized struct construction/match/disposal produce — mirror
+                // the record branch above: install a temporary substitution from
+                // the choice's concrete type args (resolved under any outer
+                // subst) and lower under it, unless every arg is still an unbound
+                // template parameter (then the caller is the unspecialized
+                // template and must share its base struct).
+                auto* ctd = dynamic_cast<const ast::TypeDecl*>(
+                    rt->declaration->decl);
+                if (!rt->genericArgs.empty() && ctd &&
+                    ctd->genericParams.size() == rt->genericArgs.size()) {
+                    bool allUnbound = true;
+                    for (const auto& arg : rt->genericArgs) {
+                        if (!arg) { allUnbound = false; break; }
+                        if (arg->kind != sema::TypeRef::Kind::Named ||
+                            arg->declaration ||
+                            !arg->astNode || !arg->astNode->name ||
+                            arg->astNode->name->parts.size() != 1 ||
+                            !arg->genericArgs.empty() ||
+                            genericSubst_.count(arg->headName())) {
+                            allUnbound = false;
+                            break;
+                        }
+                    }
+                    if (allUnbound)
+                        return choiceStruct(rt->declaration);  // unspecialized
+                    auto savedSubst = genericSubst_;
+                    auto savedSemaTy = genericSubstSemaTy_;
+                    std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                    std::unordered_map<std::string_view, const sema::TypeRef*>
+                        newSema;
+                    for (std::size_t gi = 0;
+                         gi < ctd->genericParams.size(); ++gi) {
+                        newSubst[ctd->genericParams[gi].name] =
+                            lowerTypeRef(rt->genericArgs[gi]);
+                        newSema[ctd->genericParams[gi].name] =
+                            resolveTypeParamRef(rt->genericArgs[gi]);
+                    }
+                    genericSubst_ = std::move(newSubst);
+                    genericSubstSemaTy_ = std::move(newSema);
+                    llvm::StructType* spec = choiceStruct(rt->declaration);
+                    genericSubst_ = std::move(savedSubst);
+                    genericSubstSemaTy_ = std::move(savedSemaTy);
+                    return spec;
+                }
                 return choiceStruct(rt->declaration);
+            }
             // fix #1220 (residual) / stdlib §4.8 / §5: DictionaryEntry<K,V> is
             // the element type for a Dictionary LINQ pipeline. It is a synthetic
             // Named TypeRef (importedName="DictionaryEntry", no declaration/astNode)
@@ -1177,6 +1224,32 @@ llvm::StructType* Emitter::choiceCasePayloadStruct(
 }
 
 llvm::StructType* Emitter::choiceStruct(const sema::TypeSymbol* t) {
+    // §35.13 / §14.1 (#2047): a GENERIC choice specializes its payload layout
+    // per instantiation, exactly as recordStruct does (#460) — `Result<int,
+    // string>` lays Error's payload as {ptr} (string), `Result<int, int>` as
+    // {i32}. Without this the single `structs_` cache freezes the FIRST call's
+    // layout (the i32 placeholder when the local is allocated in a non-generic
+    // body), so a later store/load/dispose at the real instantiation reads the
+    // wrong field type — an ICmp/GEP type mismatch. Under an active substitution
+    // (installed by lowerTypeRef's concrete-choice branch or an inlined generic
+    // body), build the concrete payload structs and cache a distinct specialized
+    // struct per field-type vector. A non-generic choice keeps the single cache.
+    if (!genericSubst_.empty() && !t->genericParams.empty()) {
+        std::vector<llvm::Type*> specFieldTys;
+        specFieldTys.push_back(i32());  // tag
+        for (const sema::ChoiceCaseSymbol* cc : choiceCasesOf(t))
+            specFieldTys.push_back(choiceCasePayloadStruct(t, cc));
+        auto& specMap = specializedStructs_[t];
+        auto sit = specMap.find(specFieldTys);
+        if (sit != specMap.end()) return sit->second;
+        std::string specName = std::string("choice.") + std::string(t->name)
+            + "$spec" + std::to_string(specMap.size());
+        auto* specSt = llvm::StructType::create(llvm_, specName);
+        specSt->setBody(specFieldTys);
+        specMap[specFieldTys] = specSt;
+        return specSt;
+    }
+
     auto it = structs_.find(t);
     if (it != structs_.end()) return it->second;
     auto* st = llvm::StructType::create(
@@ -1255,8 +1328,14 @@ llvm::Value* Emitter::coerceThisRecordValue(llvm::Value* v,
 // instantiation whose arg count matches the declared param count.
 Emitter::RecordSubstGuard::RecordSubstGuard(Emitter* em, const sema::TypeRef* rt)
     : e(em) {
+    // §14.1 substitution install. Records are the original client; §35.4
+    // (v0.200, #2047) reuses the identical mechanism for a generic CHOICE
+    // instantiation (`Result<C, string>`) so its owning-disposal / layout sees
+    // the specialized payload struct — the param↔arg binding below is
+    // kind-agnostic (both carry `genericParams`).
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration ||
-        rt->declaration->kind != ast::TypeDeclKind::Record ||
+        (rt->declaration->kind != ast::TypeDeclKind::Record &&
+         rt->declaration->kind != ast::TypeDeclKind::Choice) ||
         rt->genericArgs.empty())
         return;
     auto* rtd = dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
@@ -3414,7 +3493,12 @@ llvm::Value* Emitter::emitChoiceEquality(llvm::Value* l, llvm::Value* r,
                     static_cast<unsigned>(pi)}, "cheq.rf");
             sema::TypeRef pTy;  // resolved payload type for emitValueEquality
             if (pf.type)
-                if (const sema::TypeRef* rt = ctx_.resolvedType(*pf.type))
+                // §14.1 (#2047): resolve a bare-param payload (`T`) through the
+                // active instantiation subst so a `string`/record payload of a
+                // generic choice compares by its CONCRETE type (content), not the
+                // i32-placeholder. A no-op for a concrete payload type.
+                if (const sema::TypeRef* rt =
+                        resolveTypeParamRef(ctx_.resolvedType(*pf.type)))
                     pTy = *rt;
             caseEq = builder_.CreateAnd(caseEq,
                                         emitValueEquality(lf, rf, &pTy));
@@ -3487,7 +3571,11 @@ llvm::Value* Emitter::emitChoiceHashCode(llvm::Value* val,
             const ast::Param& pf = cc->caseDecl->payload[pi];
             sema::TypeRef pTy;
             if (pf.type)
-                if (const sema::TypeRef* rt = ctx_.resolvedType(*pf.type))
+                // §14.1 (#2047): resolve a bare-param payload through the active
+                // instantiation subst so a generic choice's `string`/record
+                // payload hashes by its concrete type. A no-op for a concrete type.
+                if (const sema::TypeRef* rt =
+                        resolveTypeParamRef(ctx_.resolvedType(*pf.type)))
                     pTy = *rt;
             llvm::Value* pfVal = builder_.CreateExtractValue(
                 val, {static_cast<unsigned>(1 + ci),

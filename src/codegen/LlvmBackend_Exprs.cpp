@@ -6620,11 +6620,13 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 }
         }
         if (choTy) {
-            // (No RecordSubstGuard here: it is a Record-gated no-op for a
-            // choice TypeRef. The payload types resolve through the case
-            // Params' resolved AST types — the same discipline the
-            // record-field dispatch from emitValueEquality uses.)
-            (void)choTyRef;
+            // §35.7 / §14.1 (#2047): for a GENERIC choice (`Result<int, string>
+            // = Result<int, string>`) install the operand's concrete type args so
+            // emitChoiceEquality resolves each payload `T`/`E` → its concrete type
+            // — a `string` payload compares by CONTENT, not pointer identity.
+            // RecordSubstGuard now covers choices (broadened for #2047); a no-op
+            // for a non-generic choice.
+            RecordSubstGuard choEqSubst(this, choTyRef);
             llvm::Value* eq = emitChoiceEquality(l, r, choTy);
             return op == "=" ? eq : builder_.CreateNot(eq);
         }

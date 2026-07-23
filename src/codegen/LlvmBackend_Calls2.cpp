@@ -1799,6 +1799,11 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
     // ordinary path, matching the outer gate).
     if (ts->kind == ast::TypeDeclKind::Choice) {
         if (!isEquals && !isGetHashCode) return nullptr;
+        // §35.7 / §14.1 (#2047): install the receiver's instantiation so the
+        // specialized struct is loaded and each payload `T`/`E` resolves to its
+        // concrete type (a `string` payload compares/hashes by content). A no-op
+        // for a non-generic choice.
+        RecordSubstGuard choiceMethodSubst(this, recvTy);
         llvm::StructType* st = choiceStruct(ts);
         if (!st) return nullptr;
         if (recv->getType()->isPointerTy())
@@ -2841,6 +2846,13 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     "` not found on choice type (§35.3)");
                 return nullptr;
             }
+            // #2047 / §14.1: a GENERIC-choice construction (`Result<int,
+            // string>.Ok(5)`) must build the SPECIALIZED struct the local slot /
+            // type annotation uses — install the substitution from the
+            // construction's resolved instantiation so choiceStruct and each
+            // payload arg lower under it (otherwise the placeholder {i32} slot
+            // rejects a `ptr`/`string` payload — an InsertValue type mismatch).
+            RecordSubstGuard choiceCtorSubst(this, ctx_.exprType(call));
             auto* st = choiceStruct(choiceTy);
             // §35.3: payload arguments bind to the case's payload fields
             // as to a parameter list (per §35.3). Build the active case's
@@ -5126,7 +5138,16 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         // the store and the callee's `this` load — identical to the
         // extension-method receiver spill just above. A no-op for a
         // non-generic record (recv->getType() == recordStruct(ms->parent)).
-        if (ms->parent && ms->parent->kind == ast::TypeDeclKind::Record &&
+        //
+        // §35.2 (v0.200, #2047): a CHOICE is a value type whose instance method
+        // (`Result.IsOk`) receives `this` as a pointer to a spilled copy — the
+        // same convention as a record (its body's `case this of …` loads the
+        // struct through that pointer). Spill a value-form choice receiver the
+        // identical way, so `emitMethodCall`'s §484 non-pointer-`this` guard does
+        // not silently drop the call (which returned 0 before this fix).
+        if (ms->parent &&
+            (ms->parent->kind == ast::TypeDeclKind::Record ||
+             ms->parent->kind == ast::TypeDeclKind::Choice) &&
             !recv->getType()->isPointerTy()) {
             llvm::Value* tmp = entryAlloca(recv->getType());
             builder_.CreateStore(recv, tmp);

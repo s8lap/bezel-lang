@@ -43,6 +43,8 @@ struct CallExpr;
 struct MethodDecl;
 struct BindExpr;
 struct LocalDecl;
+struct Param;
+struct TypeDecl;
 }  // namespace bezel::ast
 
 namespace bezel::sema {
@@ -204,6 +206,34 @@ enum class ChoiceClassification {
 
 std::optional<ChoiceClassification> classifyChoiceType(
     const sema::TypeRef* rt, const sema::SemaContext& ctx);
+
+// §28.1 (v0.196) per-instantiation erasure of the `owned` payload marker, as
+// §35.4 requires for a choice's classification: given a payload field's type
+// resolved AT the choice's instantiation, is the `owned` marker MEANINGFUL —
+// an owning heap type that participates in disposal — or ERASED (a value or
+// runtime-managed type)? Owning (true): a class or interface reference, an
+// owning inline array, a transitively-owning choice, or a STILL-generic bare
+// type parameter (conservative — the uninstantiated template classifies
+// owning). Erased (false): a primitive (incl. `string`/`Object`, runtime-
+// managed), a record, an enum, a value-type builtin, and a value-like or
+// borrow-bearing choice. A null type is conservative-owning (true). This is
+// the single authority both the choice classifier and the owning-choice
+// disposal codegen consult so `Result<int, string>` (both `owned` markers
+// erased → value-like) and `Result<Connection, string>` (only the class
+// payload disposes) agree.
+bool ownedMarkerActiveOnInstantiatedType(const sema::TypeRef* ft,
+                                         const sema::SemaContext& ctx);
+
+// §28.1 / §35.4: resolve a choice case payload field's DECLARED type through a
+// concrete instantiation `rt` (whose `genericArgs` line up with the choice's
+// generic params). A bare type-parameter field type (`owned value: T`) maps to
+// the matching `rt->genericArgs[i]`; a concrete or nested-generic field type is
+// returned as resolved. Returns null when `pf` has no type. When `rt` carries no
+// generic args (the uninstantiated template), the declared type is returned
+// unchanged, so a template classifies conservatively.
+const sema::TypeRef* substitutedChoicePayloadType(
+    const ast::Param& pf, const ast::TypeDecl* decl, const sema::TypeRef* rt,
+    const sema::SemaContext& ctx);
 
 // §28.3 *Bare-type-parameter returns* (v0.194, #1801). True when `md`'s
 // DECLARED return type — read *before* generic substitution, nullability

@@ -629,6 +629,73 @@ bool payloadFieldTypeIsBorrowCarrying(
 
 }  // namespace
 
+bool ownedMarkerActiveOnInstantiatedType(const sema::TypeRef* ft,
+                                         const sema::SemaContext& ctx) {
+    if (!ft) return true;  // unknown → conservative (owning)
+    switch (ft->kind) {
+        case sema::TypeRef::Kind::InlineArray:
+            // §15.3: an owning inline array (`[N owned]T`) is a move-only
+            // owning value type; a non-owning array carrying the marker is
+            // rejected at the declaration (§28.1), so it never reaches here.
+            return ft->arrayOwned;
+        case sema::TypeRef::Kind::Named: {
+            if (!ft->declaration) {
+                // A bare generic parameter still uninstantiated, OR a builtin
+                // whose Named TypeRef carries declaration=null. Value-type
+                // builtins (DateTime/Guid/…) erase the marker; the class /
+                // interface builtins (Array<T>, Task, …) and a still-generic
+                // bare parameter are conservatively owning (§28.1's erasure is
+                // a per-INSTANTIATION property — an unresolved parameter keeps
+                // the marker's owning intent).
+                return !sema::isValueBuiltinByName(ft->headName());
+            }
+            if (ft->declaration->isValueBuiltin) return false;
+            switch (ft->declaration->kind) {
+                case ast::TypeDeclKind::Class:
+                case ast::TypeDeclKind::Interface:
+                    return true;  // owning heap reference (vtable disposal)
+                case ast::TypeDeclKind::Choice: {
+                    // A nested choice: the marker is active only when that
+                    // choice is itself owning at this instantiation.
+                    auto v = classifyChoiceType(ft, ctx);
+                    return v && *v == ChoiceClassification::Owning;
+                }
+                default:  // Record, Enum
+                    return false;
+            }
+        }
+        default:
+            // Primitive (incl. `string`/`Object`, runtime-managed), Unit,
+            // Function, Error — the marker erases to a value / runtime-managed
+            // slot.
+            return false;
+    }
+}
+
+const sema::TypeRef* substitutedChoicePayloadType(
+    const ast::Param& pf, const ast::TypeDecl* decl, const sema::TypeRef* rt,
+    const sema::SemaContext& ctx) {
+    if (!pf.type) return nullptr;
+    const sema::TypeRef* ftTemplate = ctx.resolvedType(*pf.type);
+    if (!ftTemplate) return nullptr;
+    // Substitute a BARE type-parameter payload (`T`) through the instantiation:
+    // a bare parameter resolves to a Named TypeRef with a null declaration whose
+    // head names one of the choice's generic params. Concrete or nested-generic
+    // payloads are returned as resolved (their own kind decides owning/value —
+    // an `owned Array<T>` field is owning by Array being a class, no inner-arg
+    // substitution needed for the classification).
+    if (decl && rt && !decl->genericParams.empty() &&
+        rt->genericArgs.size() == decl->genericParams.size() &&
+        ftTemplate->kind == sema::TypeRef::Kind::Named &&
+        !ftTemplate->declaration) {
+        const std::string_view h = ftTemplate->headName();
+        for (std::size_t i = 0; i < decl->genericParams.size(); ++i)
+            if (decl->genericParams[i].name == h)
+                return rt->genericArgs[i];
+    }
+    return ftTemplate;
+}
+
 std::optional<ChoiceClassification> classifyChoiceType(
     const sema::TypeRef* rt, const sema::SemaContext& ctx) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
@@ -642,16 +709,26 @@ std::optional<ChoiceClassification> classifyChoiceType(
     std::unordered_set<const ast::TypeDecl*> seen;
     if (!seen.insert(decl).second) return std::nullopt;  // defensive
 
-    // §35.4.1: OWNING — any case has a payload field marked `owned`, or a
+    // §35.4.1: OWNING — any case has a payload field whose `owned` marker is
+    // ACTIVE at this instantiation (§28.1 per-instantiation erasure: the marker
+    // erases over a value or runtime-managed substitution — `Result<int,
+    // string>` is value-like, `Result<Connection, string>` is owning), or a
     // move-only value-typed payload field (owning inline array or owning
     // choice, transitively).
     for (const auto& cc : decl->choiceCases) {
         for (const auto& pf : cc.payload) {
             if (!pf.type) continue;
-            // §28.1 / §35.3: the `owned` marker on a case payload field is
-            // the direct owning indicator. Its type-admissibility is enforced
-            // separately in sema; here we trust the marker.
-            if (pf.modifier == "owned") return ChoiceClassification::Owning;
+            // §28.1 / §35.3: the `owned` marker is the direct owning indicator,
+            // but only where §28.1 does NOT erase it — resolve the field type
+            // through the instantiation and consult the shared erasure oracle.
+            if (pf.modifier == "owned") {
+                if (ownedMarkerActiveOnInstantiatedType(
+                        substitutedChoicePayloadType(pf, decl, rt, ctx), ctx))
+                    return ChoiceClassification::Owning;
+                continue;  // erased → a value / runtime-managed slot; it
+                           // contributes to neither the owning nor the borrow
+                           // leg, so skip the move-only test for this field.
+            }
             if (payloadFieldTypeIsMoveOnly(ctx.resolvedType(*pf.type), ctx, seen))
                 return ChoiceClassification::Owning;
         }

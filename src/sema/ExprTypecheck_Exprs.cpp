@@ -3145,10 +3145,21 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             // admissibility rule, but that recursion is deferred — the
             // classification-driven rule covers the common cases.)
             if (ts && ts->kind == ast::TypeDeclKind::Choice) {
-                sema::TypeRef rt;
-                rt.kind = sema::TypeRef::Kind::Named;
-                rt.declaration = ts;
-                auto verdict = common::classifyChoiceType(&rt, ctx_);
+                // §35.7 / §28.1 (#2047): classify at the operand's INSTANTIATION
+                // so `Result<int, string>` is value-like (the `owned` markers
+                // erase over int/string) — hence auto-equality-bearing — while
+                // `Result<Connection, string>` stays owning. The operand's
+                // resolved type carries the concrete generic args; fall back to a
+                // bare declaration ref for a non-generic choice / missing type.
+                sema::TypeRef bare;
+                const sema::TypeRef* opTy = ctx_.exprType(*operand);
+                if (!opTy || opTy->kind != sema::TypeRef::Kind::Named ||
+                    opTy->declaration != ts) {
+                    bare.kind = sema::TypeRef::Kind::Named;
+                    bare.declaration = ts;
+                    opTy = &bare;
+                }
+                auto verdict = common::classifyChoiceType(opTy, ctx_);
                 if (verdict &&
                     *verdict != common::ChoiceClassification::ValueLike) {
                     ctx_.diagnostics().report(

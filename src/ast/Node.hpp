@@ -791,6 +791,13 @@ struct TypeDecl : TopDecl {
     std::vector<CallArgument> primaryBaseCtorArgs;
     // A.3 SerializedClassClause (slice 42). Null when not present.
     std::unique_ptr<SerializedClassClause> serializedClass;
+    // #2047: set for a SYNTHESIZED auto-imported stdlib decl (the `Result<T, E>`
+    // choice injected into every compilation unit — Driver::injectStdlibPrelude).
+    // Its emitted functions use INTERNAL linkage: every module carries its own
+    // private copy (choices are not in the cross-module ABI), so external linkage
+    // would collide (`multiple definition of bz$Result$IsOk`) when two modules
+    // link together.
+    bool isSynthesizedPrelude = false;
 };
 
 // A.4 `NestedTypeDecl ::= ClassDecl | InterfaceDecl | RecordDecl | EnumDecl`.

@@ -1,5 +1,7 @@
 #include "codegen/LlvmBackend_impl.hpp"
 
+#include "common/OwnershipFacts.hpp"  // §28.1 per-instantiation owned-marker erasure (#2047)
+
 // This translation unit holds the definitions of Emitter's §28 disposal /
 // unwind / auto-drop member functions, extracted mechanically from
 // LlvmBackend_Setup.cpp (definition-motion only, no behavior change;
@@ -1124,7 +1126,8 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
 
 
 void Emitter::emitOwningChoiceActiveCaseDisposal(
-        llvm::AllocaInst* slot, const sema::TypeSymbol* choiceTy) {
+        llvm::AllocaInst* slot, const sema::TypeSymbol* choiceTy,
+        const sema::TypeRef* choiceRef) {
     // §35.4 (v0.200, #2045 stage 3) "Disposal is defined by the active
     // case." Reads the runtime TAG (field 0 of the choice struct), switches
     // on it, and for each case whose payload has at least one `owned`-marked
@@ -1157,6 +1160,15 @@ void Emitter::emitOwningChoiceActiveCaseDisposal(
     // for the future; the current invariant (single fire, fresh tag)
     // means the dispose is exactly-once.
     if (!slot || !choiceTy) return;
+    // §14.1 / §28.1 (#2047): a generic owning choice (`Result<C, string>`) is
+    // disposed from a NON-generic body (Main), so no substitution is active and
+    // choiceStruct/lowerTypeRef would otherwise yield the i32-placeholder layout
+    // (a tag/payload type mismatch → an ICmp assertion). Install the
+    // instantiation's substitution so the specialized payload struct is used and
+    // each owned field's instantiated type is decidable for §28.1 erasure.
+    RecordSubstGuard choiceSubst(this, choiceRef);
+    const auto* choiceDecl =
+        dynamic_cast<const ast::TypeDecl*>(choiceTy->decl);
     auto cases = choiceCasesOf(choiceTy);
     if (cases.empty()) return;
     // The choice struct is { i32 tag, case0_payload, case1_payload, … }
@@ -1189,9 +1201,19 @@ void Emitter::emitOwningChoiceActiveCaseDisposal(
         // declaration order").
         std::vector<unsigned> ownedFieldIdxs;
         for (std::size_t j = 0; j < cc->caseDecl->payload.size(); ++j) {
-            if (cc->caseDecl->payload[j].modifier == "owned") {
-                ownedFieldIdxs.push_back(static_cast<unsigned>(j));
-            }
+            const ast::Param& pf = cc->caseDecl->payload[j];
+            if (pf.modifier != "owned") continue;
+            // §28.1 per-instantiation erasure (#2047): an `owned` field whose
+            // instantiated type is value-like or runtime-managed (e.g.
+            // `Error(owned error: string)` at `Result<C, string>`) does NOT
+            // participate in vtable disposal — disposing it would dispatch a
+            // Dispose through a non-object payload. Only fields whose
+            // instantiated type is an owning heap reference are disposed.
+            const sema::TypeRef* ftInst = common::substitutedChoicePayloadType(
+                pf, choiceDecl, choiceRef, ctx_);
+            if (!common::ownedMarkerActiveOnInstantiatedType(ftInst, ctx_))
+                continue;
+            ownedFieldIdxs.push_back(static_cast<unsigned>(j));
         }
         if (ownedFieldIdxs.empty()) continue;  // nothing to dispose — switch
                                                // arm collapses to join.
@@ -3066,7 +3088,8 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // slot value is whatever the active case holds at scope end, and
         // disposing it is the SOLE path for those payloads.
         if (it->owningChoice) {
-            emitOwningChoiceActiveCaseDisposal(it->slot, it->owningChoiceTy);
+            emitOwningChoiceActiveCaseDisposal(it->slot, it->owningChoiceTy,
+                                               it->owningChoiceRef);
             continue;
         }
         if (it->dynamicDispose) {

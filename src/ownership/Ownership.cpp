@@ -3655,7 +3655,18 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
         // would over-fire on every disposable-typed `using var` binding
         // (#2073 rework 2). // per §28.10, #2073 (rework 2)
         const sema::TypeRef* rhsTy = ctx_.exprType(*ld.initializer);
-        if (rhsTy && !isBorrowableType(rhsTy) && !rhsIsDisposableClassType(rhsTy)) {
+        // §35.4 (#2047): an OWNING choice (`Result<Connection, string>`) is a
+        // value type that DOES carry a disposal obligation — its active case's
+        // owned payloads are disposed at scope end (§35.4). It is neither
+        // borrowable nor a disposable CLASS, so exclude it explicitly, exactly as
+        // disposable class heads are excluded above; `using var` over it is the
+        // correct pattern, not vacuous.
+        bool rhsIsOwningChoice = false;
+        if (auto cv = common::classifyChoiceType(rhsTy, ctx_))
+            rhsIsOwningChoice =
+                (*cv == common::ChoiceClassification::Owning);
+        if (rhsTy && !isBorrowableType(rhsTy) &&
+            !rhsIsDisposableClassType(rhsTy) && !rhsIsOwningChoice) {
             report(Severity::Warning, ld.span.begin,
                 std::string("`using var` `") + std::string(lsym->name) +
                 "` is vacuous — the RHS is a value-typed/runtime-managed "

@@ -441,8 +441,15 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
 //
 // Returns false for non-choice types and for choices whose classification
 // is NOT ValueLike or whose payloads are not all admissible.
+//
+// #2047: `inst` is the concrete instantiation TypeRef (with genericArgs) when
+// known, so §28.1 per-instantiation erasure of `owned` payload markers applies
+// (`Result<int, string>` — markers erased — is auto-equality-bearing). Null
+// judges against the bare template (a non-generic choice, or a nested-payload
+// recursive call where no instantiation is available).
 bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
-                                 const SemaContext& ctx);
+                                 const SemaContext& ctx,
+                                 const TypeRef* inst = nullptr);
 
 // §9.2/§8.4: does this type declare its own equality member, i.e. an
 // `operator =` / `operator <>` overload, or an `Equals` / `GetHashCode`

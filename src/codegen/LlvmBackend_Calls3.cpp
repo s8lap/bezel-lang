@@ -115,6 +115,53 @@ llvm::Function* Emitter::buildRecordEqTrampoline(const sema::TypeSymbol* rec) {
     return fn;
 }
 
+// §35.7 (v0.200, #2047): choice-key hash trampoline `uint64_t(const void*)`.
+// The runtime stores the choice value's bytes; reinterpret the byte pointer as a
+// pointer to the choice struct, load it, and run the §35.7 tag + active-payload
+// hash (emitChoiceHashCode). Mirrors buildRecordHashTrampoline. The caller
+// installs the key's instantiation subst so choiceStruct here is the specialized
+// layout and emitChoiceHashCode folds each payload by its concrete type.
+llvm::Function* Emitter::buildChoiceHashTrampoline(const sema::TypeSymbol* cho) {
+    llvm::StructType* st = choiceStruct(cho);
+    auto* fty = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      "bz$chokey$hash", module_.get());
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+    llvm::Value* cv = builder_.CreateLoad(st, fn->getArg(0), "key.cho");
+    llvm::Value* h = emitChoiceHashCode(cv, cho);          // i32
+    builder_.CreateRet(builder_.CreateZExt(h, i64()));
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
+// §35.7 (v0.200, #2047): choice-key equality trampoline
+// `bool(const void* a, const void* b)`. Loads both choice values and runs the
+// §35.7 tag + active-payload equality (emitChoiceEquality — consistent with the
+// hash, and comparing a string payload by content). Mirrors
+// buildRecordEqTrampoline.
+llvm::Function* Emitter::buildChoiceEqTrampoline(const sema::TypeSymbol* cho) {
+    llvm::StructType* st = choiceStruct(cho);
+    auto* fty = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()}, false);
+    auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                      "bz$chokey$eq", module_.get());
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+    llvm::Value* a = builder_.CreateLoad(st, fn->getArg(0), "eq.a");
+    llvm::Value* b = builder_.CreateLoad(st, fn->getArg(1), "eq.b");
+    builder_.CreateRet(emitChoiceEquality(a, b, cho));  // i1
+    builder_.restoreIP(savedIP);
+    currentFn_ = savedFn;
+    return fn;
+}
+
 // issues D3 / D8 / §4.8 / §4.10: decide whether a Dictionary key / Set element
 // at generic-arg index `idx` needs the generic-key runtime backing, and if so
 // return its resolved TypeRef and the per-key byte count.
@@ -264,6 +311,12 @@ const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
     else if (!ty->nullable && ty->kind == K::Named && ty->declaration &&
              ty->declaration->kind == ast::TypeDeclKind::Enum)
         eligible = true;  // enum key/element (lowers to i32; value-compared)
+    else if (!ty->nullable && ty->kind == K::Named && ty->declaration &&
+             ty->declaration->kind == ast::TypeDeclKind::Choice)
+        // §35.7 (#2047): a value-like auto-equality-bearing choice key/element
+        // (sema rejects a non-value-like one). Stored as the choice struct's
+        // bytes; hashed/compared by tag + active payload (build*ChoiceTrampoline).
+        eligible = true;
     if (!eligible) return nullptr;
     if (byteSize) {
         llvm::Type* lt = lowerTypeRef(ty);
@@ -288,6 +341,14 @@ llvm::Function* Emitter::buildValueHashTrampoline(const sema::TypeRef* ty) {
         // the trampoline. A no-op for a non-generic record key.
         RecordSubstGuard keySubst(this, ty);
         return buildRecordHashTrampoline(rec);
+    }
+    // §35.7 (#2047): a value-like CHOICE key hashes by tag + active payload;
+    // install the instantiation subst so a generic choice key uses its
+    // specialized layout + concrete per-payload hashing (a no-op if non-generic).
+    if (ty->kind == sema::TypeRef::Kind::Named && ty->declaration &&
+        ty->declaration->kind == ast::TypeDeclKind::Choice) {
+        RecordSubstGuard keySubst(this, ty);
+        return buildChoiceHashTrampoline(ty->declaration);
     }
     llvm::Type* lt = lowerTypeRef(ty);
     auto* fty = llvm::FunctionType::get(i64(), {ptrTy()}, false);
@@ -326,6 +387,13 @@ llvm::Function* Emitter::buildValueEqTrampoline(const sema::TypeRef* ty) {
         // a non-generic record key.
         RecordSubstGuard keySubst(this, ty);
         return buildRecordEqTrampoline(rec);
+    }
+    // §35.7 (#2047): a value-like CHOICE key compares by tag + active payload,
+    // under the instantiation subst (consistent with buildChoiceHashTrampoline).
+    if (ty->kind == sema::TypeRef::Kind::Named && ty->declaration &&
+        ty->declaration->kind == ast::TypeDeclKind::Choice) {
+        RecordSubstGuard keySubst(this, ty);
+        return buildChoiceEqTrampoline(ty->declaration);
     }
     llvm::Type* lt = lowerTypeRef(ty);
     auto* fty = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()}, false);

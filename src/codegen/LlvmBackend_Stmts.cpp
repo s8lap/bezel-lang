@@ -6139,12 +6139,32 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
     const sema::TypeSymbol* enumTy = nullptr;
     bool isStr = false;
     const sema::TypeRef* scrutTy = nullptr;
+    sema::TypeRef choiceScrutStorage;  // backs a recovered `this`-choice scrutTy
     if (cs.scrutinee) {
         scrut = lowerExpr(*cs.scrutinee);
         if (!scrut) return false;
         enumTy = enumTypeOf(*cs.scrutinee);
         isStr = isStringExprType(*cs.scrutinee);
         scrutTy = ctx_.exprType(*cs.scrutinee);
+        // §35.5 (v0.200, #2047): recover a choice scrutinee whose sema exprType
+        // is absent — `this` inside a choice instance method (`case this of …`)
+        // is left untyped by sema, like a record `this`. Mirror lowerCaseExpr:
+        // load the struct through the by-pointer choice `this` and synthesize
+        // the scrutinee TypeRef the §35.5 choice-pattern branch keys on, so the
+        // arm matches instead of silently degrading to the no-match fall-through.
+        if (!scrutTy || scrutTy->kind != sema::TypeRef::Kind::Named ||
+            !scrutTy->declaration ||
+            scrutTy->declaration->kind != ast::TypeDeclKind::Choice) {
+            if (const sema::TypeSymbol* chTy = choiceTypeOf(*cs.scrutinee)) {
+                if (scrut->getType()->isPointerTy())
+                    scrut = builder_.CreateLoad(choiceStruct(chTy), scrut,
+                                                "choice.this.val");
+                choiceScrutStorage.kind = sema::TypeRef::Kind::Named;
+                choiceScrutStorage.declaration =
+                    const_cast<sema::TypeSymbol*>(chTy);
+                scrutTy = &choiceScrutStorage;
+            }
+        }
     }
     auto* endBB =
         llvm::BasicBlock::Create(llvm_, "casestmt.end", currentFn_);

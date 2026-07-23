@@ -369,12 +369,9 @@ bool isAutoPropertySymbol(const Symbol* m) {
 bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
                                         const SemaContext& ctx);
 
-// §35.7 (v0.210, #2083): forward decl. Body is below — after the
-// admissibility predicate it depends on (`isAdmissibleComponentType` calls
-// it; admit all names before any definition site, so the recursion through
-// `isAdmissibleComponentType` is defined).
-bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
-                                 const SemaContext& ctx);
+// §35.7 (v0.210, #2083): declared in Symbol.hpp (with the #2047 `inst`
+// instantiation parameter). Body is below — after the admissibility predicate
+// it depends on (`isAdmissibleComponentType` calls it).
 
 // §9.2 v0.158: resolve a record storage component (an auto-property, a body
 // field, or a §9.1 positional field) to its declared TypeRef. Returns null when
@@ -702,7 +699,8 @@ bool recordHasUserDeclaredEquality(const TypeSymbol* rec) {
 // dispatches on the body member list, but the result is identical for a
 // legal choice (every body member is benign).
 bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
-                                 const SemaContext& ctx) {
+                                 const SemaContext& ctx,
+                                 const TypeRef* inst) {
     if (!ch || ch->kind != ast::TypeDeclKind::Choice) return false;
     // §35.4: compute the classification. classifyChoiceType returns nullopt
     // precisely when it cannot see an ast::TypeDecl — for a choice-kinded
@@ -712,10 +710,16 @@ bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
     // key check never over-rejects on a type it cannot inspect. (The pre-
     // rework code returned false here, which made its own imported→accept
     // branch below dead code — the review's finding 3.)
-    TypeRef rt;
-    rt.kind = TypeRef::Kind::Named;
-    rt.declaration = const_cast<TypeSymbol*>(ch);
-    auto verdict = common::classifyChoiceType(&rt, ctx);
+    // #2047: classify at the INSTANTIATION when available so the §28.1 erasure
+    // of the `owned` markers applies (`Result<int, string>` is value-like).
+    TypeRef bare;
+    const TypeRef* rt = inst;
+    if (!rt || rt->kind != TypeRef::Kind::Named || rt->declaration != ch) {
+        bare.kind = TypeRef::Kind::Named;
+        bare.declaration = const_cast<TypeSymbol*>(ch);
+        rt = &bare;
+    }
+    auto verdict = common::classifyChoiceType(rt, ctx);
     if (!verdict) return true;
     if (*verdict != common::ChoiceClassification::ValueLike)
         return false;
@@ -724,20 +728,21 @@ bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
     // classification verdict alone (same conservative posture as above).
     auto* td = dynamic_cast<const ast::TypeDecl*>(ch->decl);
     if (!td) return true;
-    // Every case: every payload field must be a §9.2 admissible component
-    // type. The recursive call is the same `isAdmissibleComponentType` that
-    // drives the body-record rule, so "another auto-equality-bearing choice"
-    // is admitted via the K::Named/Choice branch added in v0.210 (#2083).
+    // Every case: every payload field, at THIS instantiation, must be a §9.2
+    // admissible component type. #2047 / §28.1: an `owned` marker on a value-
+    // like/runtime-managed payload (the only case that reaches here — the
+    // classification gate above already rejected an owning instantiation) has
+    // ERASED, so the payload's admissibility is decided by its instantiated
+    // type like any component (a `string`/`int` payload is admissible). The
+    // recursive `isAdmissibleComponentType` drives the body-record rule and
+    // admits "another auto-equality-bearing choice" via its K::Named/Choice
+    // branch (v0.210, #2083).
     for (const auto& cc : td->choiceCases) {
         for (const auto& pf : cc.payload) {
-            // §35.4: an `owned`-marked payload yields Owning classification
-            // (caught above), but for defensive depth the marker makes the
-            // payload unconditionally inadmissible — a structural check that
-            // parallels isAdmissibleComponentType's reference/owning rejection.
-            if (pf.modifier == "owned") return false;
             if (!pf.type) continue;  // unresolved → skip (defensive)
-            if (!isAdmissibleComponentType(ctx.resolvedType(*pf.type),
-                                           ctx, 0))
+            const TypeRef* ft =
+                common::substitutedChoicePayloadType(pf, td, rt, ctx);
+            if (!isAdmissibleComponentType(ft, ctx, 0))
                 return false;
         }
     }
@@ -789,7 +794,10 @@ bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx) {
     // primitive, string, class, interface, function, enum, or inline array is
     // equality-bearing (the `return true` fall-through applies).
     if (ts->kind == ast::TypeDeclKind::Choice)
-        return isAutoEqualityBearingChoice(ts, ctx);
+        // #2047: pass `ty` (the instantiation, with genericArgs) so a generic
+        // choice is judged at its instantiation (`Result<int, string>` is
+        // auto-equality-bearing; its `owned` markers erase per §28.1).
+        return isAutoEqualityBearingChoice(ts, ctx, ty);
     return true;  // class (reference identity), interface, enum — all bear
                   // consistent Equals/GetHashCode.
 }

@@ -1358,6 +1358,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             TypeRef* ct = ctx_.makeTypeRef();
             ct->kind = TypeRef::Kind::Named;
             ct->declaration = cts;
+            // #2047 / §14.1: carry the instantiation's type arguments from the
+            // callee's target (`Result<int, string>.Ok` → [int, string]) so the
+            // construction's type is the CONCRETE instantiation, not the bare
+            // generic choice — codegen's choiceStruct then specializes the
+            // payload layout (a `string`/class payload slot lowers correctly).
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+                if (ma->target) {
+                    const TypeRef* tgt = ctx_.exprType(*ma->target);
+                    if (tgt && tgt->declaration == cts &&
+                        !tgt->genericArgs.empty())
+                        ct->genericArgs = tgt->genericArgs;
+                }
+            }
             ctx_.setExprType(&ce, ct);
         }
     }

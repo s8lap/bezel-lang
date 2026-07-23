@@ -286,6 +286,27 @@ const sema::TypeSymbol* Emitter::enumTypeOf(const ast::Expr& e) {
 // CaseStmt/CaseExpr match lowering (to look up case tag indices) and by
 // the choice-construction path.
 const sema::TypeSymbol* Emitter::choiceTypeOf(const ast::Expr& e) {
+    // §35.2 (v0.200, #2047): `this` inside a choice instance method — sema does
+    // NOT set an exprType for `this` in a named-type method (the same posture as
+    // a record `this`), so recover the receiver choice from the method currently
+    // being emitted, mirroring enumTypeOf's `currentEnumMethod_` recovery and
+    // currentReceiverRecordType's reverse-lookup. Without this, `case this of …`
+    // in `Result.IsOk` finds no scrutinee choice type and the match arm lowers
+    // to a no-op (statement) / unterminated `case.end` (expression).
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        if (id->name == "this" || id->name == "base") {
+            if (currentFn_) {
+                for (const auto& [ms, fn] : methodFns_)
+                    if (fn == currentFn_ && ms->parent &&
+                        ms->parent->kind == ast::TypeDeclKind::Choice)
+                        return ms->parent;
+            }
+            if (currentSpecMethodSymbol_ && currentSpecMethodSymbol_->parent &&
+                currentSpecMethodSymbol_->parent->kind ==
+                    ast::TypeDeclKind::Choice)
+                return currentSpecMethodSymbol_->parent;
+        }
+    }
     const sema::TypeRef* rt = ctx_.exprType(e);
     if (!rt) {
         sema::Symbol* sym = ctx_.exprSymbol(e);
@@ -1009,9 +1030,17 @@ void Emitter::declareFunctions() {
         }
         auto* fnType = llvm::FunctionType::get(retTy, paramTys,
                                                /*isVarArg=*/false);
+        // #2047: a method of a SYNTHESIZED auto-imported decl (`Result`, injected
+        // into every unit) uses INTERNAL linkage — each module carries a private
+        // copy, so external linkage collides (`multiple definition`) when modules
+        // link. A user method keeps external linkage (the cross-module ABI).
+        auto linkage = llvm::Function::ExternalLinkage;
+        if (ms->parent)
+            if (auto* ptd = dynamic_cast<const ast::TypeDecl*>(ms->parent->decl))
+                if (ptd->isSynthesizedPrelude)
+                    linkage = llvm::Function::InternalLinkage;
         auto* fn = llvm::Function::Create(
-            fnType, llvm::Function::ExternalLinkage, functionName(ms),
-            module_.get());
+            fnType, linkage, functionName(ms), module_.get());
         methodFns_[ms] = fn;
     }
 
@@ -1262,9 +1291,17 @@ void Emitter::declareImportedFunctions() {
         }
         auto* fnType = llvm::FunctionType::get(retTy, paramTys,
                                                /*isVarArg=*/false);
+        // #2047: a method of a SYNTHESIZED auto-imported decl (`Result`, injected
+        // into every unit) uses INTERNAL linkage — each module carries a private
+        // copy, so external linkage collides (`multiple definition`) when modules
+        // link. A user method keeps external linkage (the cross-module ABI).
+        auto linkage = llvm::Function::ExternalLinkage;
+        if (ms->parent)
+            if (auto* ptd = dynamic_cast<const ast::TypeDecl*>(ms->parent->decl))
+                if (ptd->isSynthesizedPrelude)
+                    linkage = llvm::Function::InternalLinkage;
         auto* fn = llvm::Function::Create(
-            fnType, llvm::Function::ExternalLinkage, functionName(ms),
-            module_.get());
+            fnType, linkage, functionName(ms), module_.get());
         methodFns_[ms] = fn;
     }
 }
@@ -8809,6 +8846,8 @@ bool Emitter::registerOwningChoiceDisposal(const ast::LocalDecl* ld) {
     Disposal d{it->second, nullptr};
     d.owningChoice = true;
     d.owningChoiceTy = rt->declaration;
+    d.owningChoiceRef = rt;  // instantiated (genericArgs) — for §28.1 per-field
+                             // erasure + specialized-struct substitution (#2047)
     disposeStack_.back().push_back(d);
     return true;
 }

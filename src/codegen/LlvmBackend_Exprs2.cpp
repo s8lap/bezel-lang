@@ -5102,6 +5102,7 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
     const sema::TypeSymbol* enumTy = nullptr;
     bool isStr = false;
     const sema::TypeRef* scrutTy = nullptr;
+    sema::TypeRef choiceScrutStorage;  // backs a recovered `this`-choice scrutTy
     if (ce.scrutinee) {
         scrut = lowerExpr(*ce.scrutinee);
         if (!scrut) return nullptr;
@@ -5111,6 +5112,27 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
         // patternMatches can detect a nullable VALUE type and apply
         // hasValue-based matching instead of the pointer-based paths.
         scrutTy = ctx_.exprType(*ce.scrutinee);
+        // §35.5 (v0.200, #2047): recover a choice scrutinee whose sema exprType
+        // is absent — notably `this` inside a choice instance method, left
+        // untyped by sema like a record `this`. choiceTypeOf recovers the
+        // receiver choice (via the current choice method); when it fires, load
+        // the struct value if the scrutinee lowered to a POINTER (a choice `this`
+        // is passed by pointer, like a record) so patternMatches' tag
+        // ExtractValue runs on the value, and synthesize the scrutinee TypeRef
+        // the §35.5 choice-pattern branch keys on.
+        if (!scrutTy || scrutTy->kind != sema::TypeRef::Kind::Named ||
+            !scrutTy->declaration ||
+            scrutTy->declaration->kind != ast::TypeDeclKind::Choice) {
+            if (const sema::TypeSymbol* chTy = choiceTypeOf(*ce.scrutinee)) {
+                if (scrut->getType()->isPointerTy())
+                    scrut = builder_.CreateLoad(choiceStruct(chTy), scrut,
+                                                "choice.this.val");
+                choiceScrutStorage.kind = sema::TypeRef::Kind::Named;
+                choiceScrutStorage.declaration =
+                    const_cast<sema::TypeSymbol*>(chTy);
+                scrutTy = &choiceScrutStorage;
+            }
+        }
     }
     const sema::TypeRef* resultSemaTy = ctx_.exprType(ce);
     llvm::Type* resultTy = i32();

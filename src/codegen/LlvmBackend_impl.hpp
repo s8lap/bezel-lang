@@ -1012,6 +1012,14 @@ private:
         // owned payload fields; pairing these (tag == i, payload slot ==
         // 1+i) lets the dispose switch pick the right field offsets.
         const sema::TypeSymbol* owningChoiceTy = nullptr;
+        // §35.4 / §28.1 (v0.200, #2047): the INSTANTIATED choice TypeRef (with
+        // genericArgs, e.g. `Result<C, string>`) so the active-case disposal can
+        // (a) install the generic substitution → the specialized payload struct,
+        // and (b) apply §28.1 per-instantiation erasure per owned field — a
+        // `owned` field whose instantiated type is value-like / runtime-managed
+        // (e.g. `owned error: string`) is NOT vtable-disposed. Null for a
+        // non-generic owning choice (owningChoiceTy alone suffices there).
+        const sema::TypeRef* owningChoiceRef = nullptr;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // §28.3 (line 4910): owned parameters of the current function awaiting
@@ -7006,7 +7014,8 @@ private:
     // payloads (no separate `using var` registration fires for choice
     // payloads — the choice value IS the owner).
     void emitOwningChoiceActiveCaseDisposal(llvm::AllocaInst* slot,
-                                            const sema::TypeSymbol* choiceTy);
+                                            const sema::TypeSymbol* choiceTy,
+                                            const sema::TypeRef* choiceRef);
 
     // Lower a statement list into the current block; returns true if the
     // list terminated the block (so the caller stops adding to it).
@@ -7747,6 +7756,13 @@ private:
     // pointer as a record-struct pointer.
     llvm::Function* buildRecordHashTrampoline(const sema::TypeSymbol* rec);
     llvm::Function* buildRecordEqTrampoline(const sema::TypeSymbol* rec);
+    // §35.7 (v0.200, #2047): the choice-key analogues — a value-like choice used
+    // as a Dictionary/Set key hashes/compares by its §35.7 tag + active-payload
+    // form (emitChoiceHashCode / emitChoiceEquality). Call under the key's
+    // instantiation substitution so a generic choice key (`Result<int, string>`)
+    // uses the specialized struct + concrete per-payload hashing/equality.
+    llvm::Function* buildChoiceHashTrampoline(const sema::TypeSymbol* cho);
+    llvm::Function* buildChoiceEqTrampoline(const sema::TypeSymbol* cho);
 
     // issues D3 / D8 / §4.8 / §4.10: a Dictionary<K,V> key (idx=0) or Set<T>
     // element (idx=0) needs the generic-key runtime variant (bz_dict_*_gen)

@@ -323,9 +323,29 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
         // parameter NAMED `name`, so a reordered owned/borrow call maps correctly.
         const std::size_t boundPos =
             params ? boundParamIndex(args, pos, *params) : pos;
-        const bool userOwned =
+        bool userOwned =
             params && boundPos < params->size() &&
             (*params)[boundPos].modifier == "owned";
+        // §28.1 per-instantiation erasure (#2047): an `owned` marker on a CHOICE
+        // CASE payload whose type, AT THIS INSTANTIATION, is value-like or
+        // runtime-managed (`Result<int, string>.Ok(value)` — `owned value: T`
+        // with T=int) is NOT an owned sink — the marker erased, so a value/borrow
+        // argument is accepted (the canonical stdlib `ParsePort` pattern). Only a
+        // payload whose instantiated type is an owning heap reference stays an
+        // owned sink. Recover the instantiation from the callee's target type.
+        if (userOwned && calleeChoiceCase && calleeChoiceCase->caseDecl) {
+            const ast::TypeDecl* chDecl = nullptr;
+            if (auto* cts = dynamic_cast<sema::TypeSymbol*>(
+                    calleeChoiceCase->parent))
+                chDecl = dynamic_cast<const ast::TypeDecl*>(cts->decl);
+            const sema::TypeRef* inst = nullptr;
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
+                if (ma->target) inst = ctx_.exprType(*ma->target);
+            const sema::TypeRef* ft = common::substitutedChoicePayloadType(
+                (*params)[boundPos], chDecl, inst, ctx_);
+            if (!common::ownedMarkerActiveOnInstantiatedType(ft, ctx_))
+                userOwned = false;
+        }
         const bool ownedSink = userOwned || builtinOwnedSinkArg(callee, pos);
 
         // §22.3 (v0.169, #1348): the `owned` call-site marker is valid ONLY on
@@ -456,7 +476,25 @@ bool MethodOwnership::isImplicitOwned(const std::vector<ast::CallArgument>& args
     // ownership, it is not consumed here — so it must NOT be classified as
     // an implicit owned sink (that mis-marked the receiving local moved-from
     // and mis-classified an `await` in out-position as owned-consuming).
-    return mod == "owned";
+    if (mod != "owned") return false;
+    // §28.1 per-instantiation erasure (#2047): a CHOICE-CASE `owned` payload
+    // marker erases over a value-like / runtime-managed instantiation
+    // (`Result<int, string>.Ok(v)` with `owned value: T`, T=int), so the payload
+    // is NOT an owned-IN sink — a value/borrow argument is accepted. Only a
+    // payload whose instantiated type is an owning heap reference stays a sink.
+    if (auto* cc = dynamic_cast<sema::ChoiceCaseSymbol*>(sym)) {
+        const ast::TypeDecl* chDecl = nullptr;
+        if (auto* cts = dynamic_cast<sema::TypeSymbol*>(cc->parent))
+            chDecl = dynamic_cast<const ast::TypeDecl*>(cts->decl);
+        const sema::TypeRef* inst = nullptr;
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
+            if (ma->target) inst = ctx_.exprType(*ma->target);
+        const sema::TypeRef* ft = common::substitutedChoicePayloadType(
+            (*params)[boundPos], chDecl, inst, ctx_);
+        if (!common::ownedMarkerActiveOnInstantiatedType(ft, ctx_))
+            return false;
+    }
+    return true;
 }
 
 void MethodOwnership::handleDischarge(const ast::Expr& e) {
