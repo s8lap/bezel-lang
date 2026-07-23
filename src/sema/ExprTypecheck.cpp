@@ -369,19 +369,50 @@ bool ExprTC::stmtAlwaysExits(const ast::Stmt& s) {
         return bodyAlwaysExits(dob->body);
     }
     if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
-        // §19.6: a non-exhaustive case STATEMENT falls through on no
-        // match. We can only be sure it exits when there is an
-        // unguarded `_` arm (full cover) AND every arm body exits.
-        bool hasWildcard = false;
-        for (const auto& arm : cs->arms) {
+        // §21.7 / §19.6: does a case STATEMENT return on every path? Necessary
+        // for any answer of "yes": EVERY arm body diverges (return / throw /
+        // non-terminating loop). Then the no-match FALL-THROUGH edge must also be
+        // closed — in STATEMENT position an unmatched value falls through with no
+        // action (§19.6), NOT `MatchFailureException`, so it would reach the
+        // method end with no return.
+        for (const auto& arm : cs->arms)
             if (!armBodyAlwaysExits(arm)) return false;
+        // (1) An unguarded `_` catch-all closes the fall-through for ANY
+        //     scrutinee kind — the syntactic rule the analysis has always used.
+        for (const auto& arm : cs->arms)
             if (!arm.guard &&
-                dynamic_cast<const ast::DiscardPattern*>(
-                    arm.pattern.get())) {
-                hasWildcard = true;
-            }
-        }
-        return hasWildcard;
+                dynamic_cast<const ast::DiscardPattern*>(arm.pattern.get()))
+                return true;
+        // (2) §35.5 / §35.6 (#2129): a CHOICE has a closed value space (§35.1 —
+        //     a choice value is exactly one of its declared cases; no cast can
+        //     manufacture an out-of-set value), so an EXHAUSTIVE choice
+        //     case-statement whose arms all diverge has no reachable fall-through
+        //     and is total. The exhaustiveness verdict is REUSED from the
+        //     expression-form check (caseArmsExhaustive), run quietly — a
+        //     statement-position `case` is itself exempt from the §19.6
+        //     non-exhaustiveness warning.
+        //
+        //     Deliberately restricted to choices. An ENUM is NOT admitted: its
+        //     value space is the underlying integer type, and an out-of-range /
+        //     non-constant cast `E(n)` produces a "raw" value equal to no
+        //     declared constant (§5.4) that falls through — so a
+        //     constants-exhaustive enum case is genuinely non-total (accepting it
+        //     would be unsound). A BOOL and a sealed-abstract closed hierarchy are
+        //     each a closed value space and would be sound, but their statement
+        //     totality remains governed by the v0.196 "totality does not key on
+        //     the exhaustiveness proof" ruling (pinned by
+        //     tests/lit/sema/sema_ret_path__exhaustive_sealed_case_stmt_*) — a
+        //     trailing return is still required there; extending totality to them
+        //     is a separate, owner-gated decision (follow-up #2133).
+        TypeRef* scrutTy =
+            cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;
+        bool isChoice = scrutTy && scrutTy->kind == TypeRef::Kind::Named &&
+            scrutTy->declaration &&
+            scrutTy->declaration->kind == ast::TypeDeclKind::Choice;
+        if (isChoice)
+            return caseArmsExhaustive(cs->arms, cs->scrutinee.get(), scrutTy,
+                                      s.span.begin, /*quiet=*/true);
+        return false;
     }
     if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
         // A finally that always exits dominates. Otherwise the try
@@ -538,8 +569,8 @@ std::vector<EnumPatternRef> enumPatternRefs(const ast::CaseArm& arm) {
 }
 
 // §19.6: does any unguarded arm explicitly match `null` (NullPattern)?
-bool armsCoverNull(const ast::CaseExpr& ce) {
-    for (const auto& arm : ce.arms) {
+bool armsCoverNull(const std::vector<ast::CaseArm>& arms) {
+    for (const auto& arm : arms) {
         if (arm.guard) continue;
         if (dynamic_cast<const ast::NullPattern*>(arm.pattern.get()))
             return true;
@@ -1580,19 +1611,42 @@ bool ExprTC::ancestorArmCoversDeterminedLeaf(
 // prove exhaustiveness statically." The diagnostic does not fail
 // compilation (DiagnosticEngine::hasErrors counts only errors).
 void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) {
+    // Expression-position `case`: emit the §19.6 non-exhaustiveness WARNING via
+    // the shared verdict (the discarded return value carries the same fact).
+    caseArmsExhaustive(ce.arms, ce.scrutinee.get(), scrutTy, ce.span.begin,
+                       /*quiet=*/false);
+}
+
+// §19.6 / §35.6: the shared exhaustiveness VERDICT — returns true iff `arms`
+// provably cover every value of the scrutinee (the spec-listed shapes: an
+// unguarded `_`/untyped-`var x` catch-all, a total `..` range, a covering typed
+// binding, and enum / bool / choice / sealed-abstract closed-hierarchy coverage,
+// each in its nullable variant). Reused by BOTH the expression-position warning
+// (checkCaseExhaustiveness, quiet=false — emits the §19.6 warning and runs the
+// §5.1 pattern-range side-check exactly as before) and the statement-position
+// totality analysis (stmtAlwaysExits, quiet=true — §21.7 / #2129: a case
+// STATEMENT whose arms are exhaustive AND all diverge returns on every path,
+// because an unmatched value in statement position falls through (§19.6) rather
+// than raising, so only exhaustiveness closes the fall-through edge). In quiet
+// mode no diagnostic is emitted and the range side-check is skipped (the
+// statement-position caller already ran it — re-running would double-report).
+bool ExprTC::caseArmsExhaustive(
+    const std::vector<ast::CaseArm>& arms, const ast::Expr* scrutinee,
+    TypeRef* scrutTy, const SourceLocation& warnLoc, bool quiet) {
     // §5.1 / §19 (#1153): range-check integer pattern literals against the
-    // scrutinee FIRST — this is the editable hook the CaseExpr handler reaches
-    // for every expression-position `case` (it runs even when a `_` catch-all
-    // makes the exhaustiveness check below return early).
-    checkCasePatternConstantRanges(ce.arms, scrutTy);
+    // scrutinee FIRST — the editable hook every expression-position `case`
+    // reaches (it runs even when a `_` catch-all makes the check below return
+    // early).
+    if (!quiet) checkCasePatternConstantRanges(arms, scrutTy);
     // An unguarded catch-all (`_` / untyped `var x`) covers everything.
-    for (const auto& arm : ce.arms) {
-        if (isUnguardedCatchAll(arm)) return;
+    for (const auto& arm : arms) {
+        if (isUnguardedCatchAll(arm)) return true;
     }
 
     auto warn = [&](const std::string& detail) {
+        if (quiet) return;
         ctx_.diagnostics().report(
-            Severity::Warning, ce.span.begin,
+            Severity::Warning, warnLoc,
             "non-exhaustive `case`: " + detail +
             " (add a `_` arm or cover the remaining value(s)) (§19.6)");
     };
@@ -1602,7 +1656,7 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
     // pattern"). If the value can be null but no arm matches null, the
     // case is non-exhaustive regardless of the non-null coverage below.
     bool nullableUncovered =
-        scrutTy && scrutTy->nullable && !armsCoverNull(ce);
+        scrutTy && scrutTy->nullable && !armsCoverNull(arms);
 
     // §19.3 / §19.5 / §19.6 (#1472): a bare `..` RangePattern (no lo/hi/step,
     // grammar A.7) is vacuously satisfied by every value in the value domain,
@@ -1613,16 +1667,16 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
     // `null` still needs its own arm (§19.6 nullable rule). Mirrors the
     // typed-binding-covers-the-full-type logic below. Without this a valid
     // total `..` case drew a spurious non-exhaustiveness warning.
-    for (const auto& arm : ce.arms) {
+    for (const auto& arm : arms) {
         if (arm.guard) continue;
         auto* rp = dynamic_cast<const ast::RangePattern*>(arm.pattern.get());
         if (!rp) continue;
         auto* re = dynamic_cast<const ast::RangeExpr*>(rp->rangeExpr.get());
         if (re && !re->lo && !re->hi && !re->step) {
-            if (!nullableUncovered) return;  // total over the value domain
+            if (!nullableUncovered) return true;  // total over the value domain
             warn("the nullable scrutinee's non-null values are covered by a "
                  "`..` range pattern, but `null` is not");
-            return;
+            return false;
         }
     }
 
@@ -1637,7 +1691,7 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
     // spurious non-exhaustiveness warning even though it covers every value
     // (sibling of the bool? exhaustiveness fix, daa83f4).
     if (scrutTy) {
-        for (const auto& arm : ce.arms) {
+        for (const auto& arm : arms) {
             if (arm.guard) continue;
             auto* bp =
                 dynamic_cast<const ast::BindingPattern*>(arm.pattern.get());
@@ -1686,11 +1740,11 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
                 }
             }
             if (!coversNonNull) continue;
-            if (!scrutTy->nullable || armsCoverNull(ce)) return;  // exhaustive
+            if (!scrutTy->nullable || armsCoverNull(arms)) return true;  // exhaustive
             // Non-null fully covered, but null is not (§19.6 nullable rule).
             warn("the nullable scrutinee's non-null values are covered by a "
                  "typed binding, but `null` is not");
-            return;
+            return false;
         }
     }
 
@@ -1704,7 +1758,7 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
         scrutTy->kind == TypeRef::Kind::Primitive &&
         scrutTy->primitive == PrimitiveType::Bool) {
         bool t = false, f = false;
-        for (const auto& arm : ce.arms) {
+        for (const auto& arm : arms) {
             if (arm.guard) continue;
             auto scan = [&](const ast::Expr* e) {
                 if (auto* b = dynamic_cast<const ast::BoolLiteralExpr*>(e)) {
@@ -1715,11 +1769,15 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
                     dynamic_cast<const ast::ConstantPattern*>(arm.pattern.get()))
                 for (const auto& c : cp->constants) if (c) scan(c.get());
         }
-        if (!(t && f))
+        if (!(t && f)) {
             warn("bool scrutinee does not cover both `true` and `false`");
-        else if (nullableUncovered)
+            return false;
+        }
+        if (nullableUncovered) {
             warn("nullable `bool?` scrutinee has no `null` arm");
-        return;
+            return false;
+        }
+        return true;
     }
 
     // --- Enum / closed-hierarchy scrutinee both resolve to a Named type.
@@ -1730,7 +1788,7 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
     if (sub && sub->kind == ast::TypeDeclKind::Enum) {
         // §19.6: every declared enum constant must have a matching pattern.
         std::unordered_set<std::string_view> covered;
-        for (const auto& arm : ce.arms) collectEnumPatternNames(arm, covered);
+        for (const auto& arm : arms) collectEnumPatternNames(arm, covered);
         // §10.2 (issue #1577): "exhaustiveness is over the set of distinct
         // declared values, so an arm naming either alias covers both." Map
         // covered NAMES to their underlying values so a covered alias also
@@ -1773,8 +1831,9 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
                 detail += (missing.empty() ? " nullable value not covered"
                                            : " (and a `null` arm)");
             warn(detail);
+            return false;
         }
-        return;
+        return true;
     }
 
     // §35.6 (v0.200, #2045): a CHOICE scrutinee is exhaustive when every
@@ -1811,7 +1870,7 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
             }
             return true;
         };
-        for (const auto& arm : ce.arms) {
+        for (const auto& arm : arms) {
             // §19.6 / §35.6: a guarded arm contributes nothing.
             if (arm.guard) continue;
             if (auto* np = dynamic_cast<const ast::NamedPattern*>(
@@ -1859,8 +1918,9 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
                 detail += (missingCases.empty() ? " nullable value not covered"
                                                 : " (and a `null` arm)");
             warn(detail);
+            return false;
         }
-        return;
+        return true;
     }
 
     if (sub && sub->kind == ast::TypeDeclKind::Class) {
@@ -1914,7 +1974,7 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
         if (!closed) {
             warn("class hierarchy rooted at `" + std::string(sub->name) +
                  "` is open");
-            return;
+            return false;
         }
 
         // §19.6 (v0.196, #1816): generic-leaf determination. When the root or
@@ -2046,7 +2106,7 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
 
         // Collect the leaf types covered by an unguarded type-test arm.
         std::unordered_set<const TypeSymbol*> coveredLeaves;
-        for (const auto& arm : ce.arms) {
+        for (const auto& arm : arms) {
             if (arm.guard) continue;
             const ast::Pattern* p = arm.pattern.get();
             TypeSymbol* matchTy = nullptr;
@@ -2156,16 +2216,17 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
                 detail += (missing.empty() ? " nullable value not covered"
                                            : " (and a `null` arm)");
             warn(detail);
+            return false;
         }
-        return;
+        return true;
     }
 
     // --- The scrutinee-less boolean-condition form (§19.1) has no value
     // set to enumerate and no `_` (we already returned on a catch-all), so
     // it cannot be proven exhaustive (§19.6).
-    if (!ce.scrutinee) {
+    if (!scrutinee) {
         warn("scrutinee-less `case` has no catch-all `_` arm");
-        return;
+        return false;
     }
 
     // A scrutinee whose type failed to resolve (Error sentinel) or was not
@@ -2173,13 +2234,14 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
     // top of an upstream type error would be a confusing cascade (the Error
     // kind exists precisely to suppress such follow-on diagnostics —
     // TypeRef.hpp). The real diagnostic is reported by the resolution pass.
-    if (!scrutTy || scrutTy->kind == TypeRef::Kind::Error) return;
+    if (!scrutTy || scrutTy->kind == TypeRef::Kind::Error) return false;
 
     // --- Every other scrutinee shape (int / string / range / float /
     // open class) cannot be proven exhaustive (§19.6): there is no finite,
     // statically-knowable value set to enumerate. Without a catch-all arm
     // (handled above) the case is non-exhaustive.
     warn("scrutinee type cannot be proven exhaustive");
+    return false;
 }
 
 // §19.3 (#1847): validate a TOP-LEVEL bare-identifier `case`/`when` pattern.

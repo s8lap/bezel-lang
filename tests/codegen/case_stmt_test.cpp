@@ -197,3 +197,86 @@ BEZEL_TEST(codegen_cg38, compound_and_increment_arm_bodies_932) {
         "end; "
         "return r + y;"), 33);  // 25 + 8
 }
+
+// --- #2129 (§21.7 / §35.5 / §35.6): a case STATEMENT over an EXHAUSTIVE choice
+// whose every arm diverges (here: returns) is total — the method needs NO
+// trailing return. A choice value is exactly one of its declared cases
+// (§35.1 — no cast can manufacture an out-of-set value), so an exhaustive match
+// leaves no reachable no-match fall-through edge. These programs FAIL TO COMPILE
+// without the fix ("does not return a value on every path (§21.7)"), so `runAot`
+// returns .ran == false and `runFull` yields -999.
+
+namespace {
+int runFull(const std::string& src) {
+    auto r = runAot(src);
+    return r.ran ? r.exitCode : -999;
+}
+} // namespace
+
+BEZEL_TEST(codegen_case_stmt_choice_total_2129,
+           spec_21_7_exhaustive_choice_all_arms_return_is_total_payload) {
+    // The issue's repro shape: both payload cases destructured with an
+    // irrefutable slot, each arm returns; no trailing return. Ok(7) → 7.
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "choice R Ok(v: int), Error(m: int); end R; "
+        "class C public static method Main(): int "
+        "  var r: R := R.Ok(7); "
+        "  case r of "
+        "    Ok(var v)    => do return v; end, "
+        "    Error(var m) => do return m; end "
+        "  end; "
+        "end Main; end C;"), 7);
+}
+
+BEZEL_TEST(codegen_case_stmt_choice_total_2129,
+           spec_21_7_exhaustive_choice_all_arms_return_selects_error_arm) {
+    // Same total case-statement, Error arm selected: Error(4) → 4. Confirms the
+    // match still dispatches correctly (totality did not collapse a branch).
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "choice R Ok(v: int), Error(m: int); end R; "
+        "class C public static method Main(): int "
+        "  var r: R := R.Error(4); "
+        "  case r of "
+        "    Ok(var v)    => do return v; end, "
+        "    Error(var m) => do return m; end "
+        "  end; "
+        "end Main; end C;"), 4);
+}
+
+BEZEL_TEST(codegen_case_stmt_choice_total_2129,
+           spec_21_7_choice_payload_free_case_and_wildcard_total) {
+    // A payload-free case name arm plus an unguarded `_` catch-all — the `_`
+    // closes the fall-through for any kind; every arm returns; no trailing
+    // return. Pending → 9.
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "choice R Ok(v: int), Error(m: int), Pending; end R; "
+        "class C public static method Main(): int "
+        "  var r: R := R.Pending; "
+        "  case r of "
+        "    Ok(var v) => do return v; end, "
+        "    Pending   => do return 9; end, "
+        "    _         => do return 0; end "
+        "  end; "
+        "end Main; end C;"), 9);
+}
+
+BEZEL_TEST(codegen_case_stmt_choice_total_2129,
+           spec_21_7_total_choice_case_throw_arm_still_total) {
+    // §21.7 divergence includes `throw`: an exhaustive choice case-statement
+    // whose arms diverge by a mix of return and throw is total. The Ok arm is
+    // selected here, so it returns 5 (the throw arm is not taken at run time —
+    // the point is that its presence does not defeat totality at compile time).
+    BEZEL_EXPECT_EQ(runFull(
+        "module M; "
+        "choice R Ok(v: int), Error(m: int); end R; "
+        "class C public static method Main(): int "
+        "  var r: R := R.Ok(5); "
+        "  case r of "
+        "    Ok(var v)    => do return v; end, "
+        "    Error(var m) => do throw new InvalidOperationException(\"e\"); end "
+        "  end; "
+        "end Main; end C;"), 5);
+}

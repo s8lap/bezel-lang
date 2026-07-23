@@ -470,6 +470,17 @@ private:
     // catch-all that is always exhaustive.
     void checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy);
 
+    // §19.6 / §35.6 (#2129): the shared exhaustiveness VERDICT. Returns true iff
+    // `arms` provably cover every value of the scrutinee. Drives BOTH the
+    // expression-position warning (checkCaseExhaustiveness, quiet=false) and the
+    // statement-position §21.7 totality analysis (stmtAlwaysExits, quiet=true — a
+    // case STATEMENT whose arms are exhaustive AND all diverge is total, since an
+    // unmatched value in statement position falls through, §19.6). In quiet mode
+    // no diagnostic is emitted and the §5.1 pattern-range side-check is skipped.
+    bool caseArmsExhaustive(const std::vector<ast::CaseArm>& arms,
+                            const ast::Expr* scrutinee, TypeRef* scrutTy,
+                            const SourceLocation& warnLoc, bool quiet);
+
     // §19.6 (v0.196, #1816): compose a leaf class's ROOT INSTANTIATION — the
     // instantiation of the root declaration `root` that `leaf` derives from,
     // obtained by composing the base-clause substitutions along `leaf`'s
