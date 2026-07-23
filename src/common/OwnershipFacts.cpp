@@ -218,8 +218,10 @@ bool isOwningCollectionDrainAliasCall(const ast::CallExpr& call,
     }
     if (!isOwningCollectionHead(rcn)) return false;
     // The receiver must be a STABLE NAMED place — the alias's single owner is
-    // then that place's owner. A producer/temporary receiver keeps its own
-    // (separate) obligation story and is not recognized.
+    // then that place's owner. A DIRECT producer/temporary receiver keeps its
+    // own (separate) obligation story (#2169) and is not recognized; the gate
+    // is on the receiver form only — an index slot or field member-access is
+    // recognized even over a temporary chain ROOT (see the header).
     const ast::Expr* recv = ma->target.get();
     if (dynamic_cast<const ast::IndexExpr*>(recv)) return true;
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(recv)) {

@@ -126,9 +126,16 @@ bool isBuiltinOwnedTransferCall(const ast::CallExpr& call,
 // resolved MethodSymbol — a user method named `Drain` is not this shape), the
 // receiver's alias-resolved type head an owning-collection, and the receiver
 // a stable named place (an identifier bound to a local/parameter/field, a
-// field member-access, or an index slot). A TEMPORARY receiver
+// field member-access, or an index slot). A DIRECT temporary receiver
 // (`MakeArr().Drain()`) is NOT recognized — the temporary's own obligation
-// story is separate (#2169) — and keeps its current classification. Consumed by BOTH
+// story is separate (#2169) — and keeps its current classification. The
+// stability gate is on the receiver FORM only, not its chain root: a
+// CHAIN-ROOTED temporary (`Make().Items.Drain()`, `Make()[0].Drain()`) IS
+// recognized — the alias fact holds regardless (the view still aliases the
+// slot/field, and pinning registers no second disposal; pre-#2146 those
+// shapes SEGV'd on the iterator-format dispose), while the root temporary's
+// undischarged obligation remains #2169's (today it leaks, LSan-visible).
+// Consumed by BOTH
 // the ownership pass (producerState / the §28.10 using-var pin) and codegen
 // (the iterable-source disposal registrations), so the two can never diverge
 // on the alias fact.
