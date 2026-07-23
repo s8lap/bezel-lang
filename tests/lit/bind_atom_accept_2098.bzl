@@ -24,6 +24,11 @@ class C
     return x * 2;
   end F;
 
+  // #2098 review F2 control: an expression-bodied member whose atom clause
+  // is consumed UNCONDITIONALLY stays accepted (the `=>` staged rejections
+  // fire only on the mismatch / conditional / closure shapes).
+  public static method Take(): int => (var c := new Res(8); W.Sink(owned c));
+
   // §22.16: the motivating position — a clause names a subresult.
   private _capacity: int := 100;
   public method Bounded(n: int): int

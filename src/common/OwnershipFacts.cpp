@@ -808,8 +808,13 @@ namespace {
 
 // §17.15 (#2098): does `e` contain a K3 consume of the visible binding
 // `name`? See bindClauseConsumedInAtom's header comment for the closed
-// shape set and the shadowing/lambda rules.
-bool exprConsumesBinding(const ast::Expr* e, std::string_view name);
+// shape set and the shadowing/lambda rules. With `unconditionalOnly`
+// (#2080 F2 — the expression-body staged checks), only consumes on the
+// STRAIGHT-LINE evaluation count: if/case ARM positions are skipped
+// (conditions, scrutinees, and guards still evaluate unconditionally and
+// are scanned), so a conditional consume is distinguishable structurally.
+bool exprConsumesBinding(const ast::Expr* e, std::string_view name,
+                         bool unconditionalOnly = false);
 
 // True when `e` is (possibly a `!`-wrapped) identifier naming `name`.
 bool isBindingIdent(const ast::Expr* e, std::string_view name) {
@@ -820,18 +825,20 @@ bool isBindingIdent(const ast::Expr* e, std::string_view name) {
 }
 
 bool argsConsumeBinding(const std::vector<ast::CallArgument>& args,
-                        std::string_view name) {
+                        std::string_view name, bool unconditionalOnly) {
     for (const auto& a : args) {
         if (!a.value) continue;
         // The call-site transfer marker `M(owned x)` (§22.3 / K3.3).
         if (a.modifier == "owned" && isBindingIdent(a.value.get(), name))
             return true;
-        if (exprConsumesBinding(a.value.get(), name)) return true;
+        if (exprConsumesBinding(a.value.get(), name, unconditionalOnly))
+            return true;
     }
     return false;
 }
 
-bool exprConsumesBinding(const ast::Expr* e, std::string_view name) {
+bool exprConsumesBinding(const ast::Expr* e, std::string_view name,
+                         bool unconditionalOnly) {
     if (!e) return false;
     // §28.3 K3.4 (v0.209, #2080): the marked ARM transfer `owned x` — a K3
     // consuming position wherever an if/case arm admits it.
@@ -844,9 +851,10 @@ bool exprConsumesBinding(const ast::Expr* e, std::string_view name) {
             if (ma->member == "Dispose" && isBindingIdent(ma->target.get(), name))
                 return true;
         }
-        if (call->callee && exprConsumesBinding(call->callee.get(), name))
+        if (call->callee &&
+            exprConsumesBinding(call->callee.get(), name, unconditionalOnly))
             return true;
-        return argsConsumeBinding(call->args, name);
+        return argsConsumeBinding(call->args, name, unconditionalOnly);
     }
     if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
         // `x?.Dispose()` — callee is a NullCondMemberExpr.
@@ -855,22 +863,23 @@ bool exprConsumesBinding(const ast::Expr* e, std::string_view name) {
             if (nm->member == "Dispose" && isBindingIdent(nm->target.get(), name))
                 return true;
         }
-        if (nc->callee && exprConsumesBinding(nc->callee.get(), name))
+        if (nc->callee &&
+            exprConsumesBinding(nc->callee.get(), name, unconditionalOnly))
             return true;
-        return argsConsumeBinding(nc->args, name);
+        return argsConsumeBinding(nc->args, name, unconditionalOnly);
     }
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(e))
-        return argsConsumeBinding(ne->args, name);
+        return argsConsumeBinding(ne->args, name, unconditionalOnly);
     if (auto* te = dynamic_cast<const ast::ThrowExpr*>(e)) {
         // `throw x` in expression position (K3.8 / K4.2's announced kill).
         if (isBindingIdent(te->operand.get(), name)) return true;
-        return exprConsumesBinding(te->operand.get(), name);
+        return exprConsumesBinding(te->operand.get(), name, unconditionalOnly);
     }
     if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
         // `move x` — the owning-collection whole transfer (§28.6/#1107).
         if (ue->op == "move" && isBindingIdent(ue->operand.get(), name))
             return true;
-        return exprConsumesBinding(ue->operand.get(), name);
+        return exprConsumesBinding(ue->operand.get(), name, unconditionalOnly);
     }
     if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
         // A nested atom: a clause's marked transfer `var y := owned x;`
@@ -881,10 +890,12 @@ bool exprConsumesBinding(const ast::Expr* e, std::string_view name) {
             if (cl->initializerHasOwnedMarker &&
                 isBindingIdent(cl->initializer.get(), name))
                 return true;
-            if (exprConsumesBinding(cl->initializer.get(), name)) return true;
+            if (exprConsumesBinding(cl->initializer.get(), name,
+                                    unconditionalOnly))
+                return true;
             if (cl->name == name) return false;  // shadowed from here on
         }
-        return exprConsumesBinding(bx->body.get(), name);
+        return exprConsumesBinding(bx->body.get(), name, unconditionalOnly);
     }
     if (dynamic_cast<const ast::LambdaExpr*>(e)) {
         // A closure consuming a captured owned binding is rejected by the
@@ -894,68 +905,85 @@ bool exprConsumesBinding(const ast::Expr* e, std::string_view name) {
         return false;
     }
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e))
-        return exprConsumesBinding(be->left.get(), name) ||
-               exprConsumesBinding(be->right.get(), name);
-    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e))
-        return exprConsumesBinding(cd->condition.get(), name) ||
-               exprConsumesBinding(cd->thenValue.get(), name) ||
-               exprConsumesBinding(cd->elseValue.get(), name);
+        return exprConsumesBinding(be->left.get(), name, unconditionalOnly) ||
+               exprConsumesBinding(be->right.get(), name, unconditionalOnly);
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+        if (exprConsumesBinding(cd->condition.get(), name, unconditionalOnly))
+            return true;
+        if (unconditionalOnly) return false;  // arm positions are conditional
+        return exprConsumesBinding(cd->thenValue.get(), name, false) ||
+               exprConsumesBinding(cd->elseValue.get(), name, false);
+    }
     if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
-        if (exprConsumesBinding(ce->scrutinee.get(), name)) return true;
+        if (exprConsumesBinding(ce->scrutinee.get(), name, unconditionalOnly))
+            return true;
         for (const auto& arm : ce->arms) {
-            if (arm.guard && exprConsumesBinding(arm.guard.get(), name))
+            if (arm.guard &&
+                exprConsumesBinding(arm.guard.get(), name, unconditionalOnly))
                 return true;
-            if (arm.bodyKind == ast::CaseArmBodyKind::Expression &&
-                exprConsumesBinding(arm.exprBody.get(), name))
+            if (!unconditionalOnly &&
+                arm.bodyKind == ast::CaseArmBodyKind::Expression &&
+                exprConsumesBinding(arm.exprBody.get(), name, false))
                 return true;
         }
         return false;
     }
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e))
-        return exprConsumesBinding(ma->target.get(), name);
+        return exprConsumesBinding(ma->target.get(), name, unconditionalOnly);
     if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e))
-        return exprConsumesBinding(nm->target.get(), name);
+        return exprConsumesBinding(nm->target.get(), name, unconditionalOnly);
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
-        if (exprConsumesBinding(ix->target.get(), name)) return true;
+        if (exprConsumesBinding(ix->target.get(), name, unconditionalOnly))
+            return true;
         for (const auto& a : ix->indices)
-            if (a.value && exprConsumesBinding(a.value.get(), name))
+            if (a.value &&
+                exprConsumesBinding(a.value.get(), name, unconditionalOnly))
                 return true;
         return false;
     }
     if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
-        return exprConsumesBinding(pb->operand.get(), name);
+        return exprConsumesBinding(pb->operand.get(), name, unconditionalOnly);
     if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e))
-        return exprConsumesBinding(tt->operand.get(), name);
+        return exprConsumesBinding(tt->operand.get(), name, unconditionalOnly);
     if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
         for (const auto& p : is->parts)
-            if (p.expr && exprConsumesBinding(p.expr.get(), name)) return true;
+            if (p.expr &&
+                exprConsumesBinding(p.expr.get(), name, unconditionalOnly))
+                return true;
         return false;
     }
     if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
-        if (exprConsumesBinding(we->source.get(), name)) return true;
+        if (exprConsumesBinding(we->source.get(), name, unconditionalOnly))
+            return true;
         for (const auto& ia : we->assigns)
-            if (ia.value && exprConsumesBinding(ia.value.get(), name))
+            if (ia.value &&
+                exprConsumesBinding(ia.value.get(), name, unconditionalOnly))
                 return true;
         return false;
     }
     if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
         for (const auto& k : cl->keys)
-            if (k && exprConsumesBinding(k.get(), name)) return true;
+            if (k && exprConsumesBinding(k.get(), name, unconditionalOnly))
+                return true;
         for (const auto& v : cl->elements)
-            if (v && exprConsumesBinding(v.get(), name)) return true;
+            if (v && exprConsumesBinding(v.get(), name, unconditionalOnly))
+                return true;
         return false;
     }
     if (auto* re = dynamic_cast<const ast::RangeExpr*>(e))
-        return exprConsumesBinding(re->lo.get(), name) ||
-               exprConsumesBinding(re->hi.get(), name) ||
-               exprConsumesBinding(re->step.get(), name);
+        return exprConsumesBinding(re->lo.get(), name, unconditionalOnly) ||
+               exprConsumesBinding(re->hi.get(), name, unconditionalOnly) ||
+               exprConsumesBinding(re->step.get(), name, unconditionalOnly);
     // Literals / identifiers / typeof / nameof / default — no consume.
     return false;
 }
 
 }  // namespace
 
-bool bindClauseConsumedInAtom(const ast::BindExpr& bx, std::size_t clauseIdx) {
+namespace {
+bool bindClauseConsumedInAtomImpl(const ast::BindExpr& bx,
+                                  std::size_t clauseIdx,
+                                  bool unconditionalOnly) {
     if (clauseIdx >= bx.clauses.size() || !bx.clauses[clauseIdx]) return false;
     std::string_view name = bx.clauses[clauseIdx]->name;
     if (name.empty()) return false;
@@ -968,10 +996,30 @@ bool bindClauseConsumedInAtom(const ast::BindExpr& bx, std::size_t clauseIdx) {
         if (cl->initializerHasOwnedMarker &&
             isBindingIdent(cl->initializer.get(), name))
             return true;
-        if (exprConsumesBinding(cl->initializer.get(), name)) return true;
+        if (exprConsumesBinding(cl->initializer.get(), name,
+                                unconditionalOnly))
+            return true;
         if (cl->name == name) return false;  // shadowed from here on
     }
-    return exprConsumesBinding(bx.body.get(), name);
+    return exprConsumesBinding(bx.body.get(), name, unconditionalOnly);
+}
+}  // namespace
+
+bool bindClauseConsumedInAtom(const ast::BindExpr& bx, std::size_t clauseIdx) {
+    return bindClauseConsumedInAtomImpl(bx, clauseIdx,
+                                        /*unconditionalOnly=*/false);
+}
+
+// §17.15 / K7.4 (#2080 F2): the STRAIGHT-LINE variant — true only when a K3
+// consume of the clause is spelled on the atom's unconditional evaluation
+// (if/case ARM positions excluded; conditions/scrutinees/guards included).
+// consumedInAtom && !consumedUnconditionally structurally identifies a
+// CONDITIONAL consume — the shape the first landing rejects — without the
+// dataflow, so the expression-body path enforces the same bound.
+bool bindClauseConsumedUnconditionally(const ast::BindExpr& bx,
+                                       std::size_t clauseIdx) {
+    return bindClauseConsumedInAtomImpl(bx, clauseIdx,
+                                        /*unconditionalOnly=*/true);
 }
 
 bool bindClauseNeedsAtomDisposal(const ast::BindExpr& bx,

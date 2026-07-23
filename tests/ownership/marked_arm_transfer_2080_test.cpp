@@ -141,6 +141,45 @@ BEZEL_TEST(marked_arm_transfer_2080, spec_19_2_when_arm_results) {
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "R12"), 1);
 }
 
+// §28.3 K3.4 (v0.209; #2080 review F4): SHADOWING determinism — the marker
+// resolves by the SEMA symbol (the same resolution codegen's slot-nulling
+// uses), so `owned a` inside a nested block binds the INNER `a`, never the
+// same-named outer local an unordered name-scan could hit. Wrong-binding
+// resolution manifests as either a spurious discharge error on the inner
+// binding or a leak of the outer one — both caught by the exact per-instance
+// disposal counts under ASan/LSan on BOTH selections.
+BEZEL_TEST(marked_arm_transfer_2080, spec_28_3_shadowed_binding_resolves_inner) {
+    auto r = runAotChecked(std::string(kResClass) +
+        "class C "
+        "  public static method Shadow(c: bool): int "
+        "    var a := new Res(1); "
+        "    var acc := 0; "
+        "    do "
+        "      var a := new Res(2); "
+        "      var x := (if c then owned a else new Res(3)); "
+        "      acc := acc + x.Id; "
+        "      x.Dispose(); "
+        "    end; "
+        "    return acc; "
+        "  end Shadow; "
+        "  public static method Main(): int "
+        "    var r := C.Shadow(true) + C.Shadow(false); "
+        "    Console.WriteLine(\"R\" + r.ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    // Shadow(true): inner a(2) transferred+disposed (D2), outer a(1)
+    // auto-dropped (D1). Shadow(false): fresh D3, inner a(2) per-path D2,
+    // outer D1. Totals: D1 ×2, D2 ×2, D3 ×1; R = 2 + 3.
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D1"), 2);
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D2"), 2);
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D3"), 1);
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "R5"), 1);
+}
+
 // §28.3 K7 (v0.209): the SAME binding marked in both branches — owned ⊓
 // owned with one obligation; fully consumed after the construct (MovedFrom),
 // disposed exactly once via the adopting consumer on either path.

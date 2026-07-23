@@ -295,6 +295,18 @@ bool bindClauseIsOwnedProduction(const ast::LocalDecl& clause,
 // governs an accepted program the consume is unconditional.
 bool bindClauseConsumedInAtom(const ast::BindExpr& bx, std::size_t clauseIdx);
 
+// §17.15 / K7.4 (#2080 F2): the STRAIGHT-LINE variant of the scan — true
+// only when a K3 consume of clause `clauseIdx` is spelled on the atom's
+// UNCONDITIONAL evaluation (if/case ARM positions are excluded; conditions,
+// scrutinees, and guards evaluate unconditionally and are included).
+// `bindClauseConsumedInAtom && !bindClauseConsumedUnconditionally` is the
+// structural signature of a CONDITIONAL consume — the shape the first
+// landing rejects — decidable without the dataflow, so the expression-body
+// path (`=> E`, where the ownership dataflow never runs) enforces the same
+// bound the block-body finishBindAtom cross-check does.
+bool bindClauseConsumedUnconditionally(const ast::BindExpr& bx,
+                                       std::size_t clauseIdx);
+
 // §17.15 / K8.5 (v0.216, #2098): the one shared atom-boundary disposal
 // decision — clause `clauseIdx` needs the disposal at the atom's completion
 // iff its initializer is an owned production (bindClauseIsOwnedProduction)

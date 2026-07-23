@@ -1971,15 +1971,26 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
     // exactly as `Sink(owned r)` / `move r` / `r.Dispose()` are.
     if (const auto* mt = dynamic_cast<const ast::MarkedTransferExpr*>(&e)) {
         if (insideLambda) {
-            // Resolve by name against the tracked outer states — the same
-            // capture criterion isCapturedOwnedBinding applies to identifiers.
-            for (auto& [s, lo] : states_) {
-                if (s->name == mt->name && lo.state == OwnershipState::Owned) {
-                    reportCapturedOwnedConsume(mt->name, mt->span.begin,
-                                               "transfer");
-                    break;
+            // Resolve by the sema symbol first (deterministic under
+            // shadowing — the F4 discipline); the name-scan is the
+            // error-recovery fallback.
+            bool consumedCaptured = false;
+            if (sema::Symbol* resolved = ctx_.exprSymbol(*mt)) {
+                auto it = states_.find(resolved);
+                consumedCaptured = it != states_.end() &&
+                                   it->second.state == OwnershipState::Owned;
+            } else {
+                for (auto& [s, lo] : states_) {
+                    if (s->name == mt->name &&
+                        lo.state == OwnershipState::Owned) {
+                        consumedCaptured = true;
+                        break;
+                    }
                 }
             }
+            if (consumedCaptured)
+                reportCapturedOwnedConsume(mt->name, mt->span.begin,
+                                           "transfer");
         }
         return;
     }
@@ -2861,7 +2872,16 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
     // the bare-identifier shape keeps the locally-invoked-closure control
     // (`return f();`) accepted: there the returned expression is a CallExpr,
     // not the bare `f`.
-    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+    //
+    // §17.15 (v0.216, #2098): a binding ATOM's value is its body's — peel so
+    // the indirect escape does not re-launder through the atom (`return (var
+    // s := local.AsSpan(); s);` is the same one-hop holder return as
+    // `var s := local.AsSpan(); return s;` — the #1966 shape; an atom CLAUSE
+    // holder's provenance is collected by the same handleLocalDecl →
+    // collectRecordBorrowSource path, so the carried-source guard below
+    // applies verbatim).
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+        common::peelBindAtomToBody(&e));
     if (!id) return;
     sema::Symbol* sym = ctx_.exprSymbol(*id);
 
@@ -4351,6 +4371,25 @@ void MethodOwnership::recordBorrowUseExpr(const ast::Expr& e,
     }
     if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
         if (nm->target) recordBorrowUseExpr(*nm->target, attributeOffset);
+        return;
+    }
+    // §17.15 (v0.216, #2098) / §28.3 (#1726/#1966): a binding ATOM in the
+    // pre-scan. Each clause is a §21.1 declaration — record its initializer's
+    // reads AND collect a span / borrow-bearing-record clause's carried
+    // source (collectRecordBorrowSource), exactly as the statement-level
+    // LocalDecl arm of the enclosing walk does. Without this, an atom-clause
+    // span holder (`return (var s := local.AsSpan(); s);`) had no
+    // recordBorrowLocalSource_ entry, so the #1966 indirect-escape check —
+    // which resolves the returned holder's carried provenance — silently
+    // passed the re-laundered one-hop escape.
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
+        for (const auto& cl : bx->clauses) {
+            if (!cl) continue;
+            if (cl->initializer)
+                recordBorrowUseExpr(*cl->initializer, attributeOffset);
+            collectRecordBorrowSource(*cl);
+        }
+        if (bx->body) recordBorrowUseExpr(*bx->body, attributeOffset);
         return;
     }
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
@@ -11725,10 +11764,23 @@ bool MethodOwnership::exprContainsMarkedTransfer(const ast::Expr& e) {
 // ride markMovedByName.
 void MethodOwnership::handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt) {
     if (mt.name.empty()) return;
+    // Resolve the marker's binding by the SEMA-RESOLVED SYMBOL first — the
+    // same resolution codegen's lowering nulls through — so a shadowed name
+    // (two same-named locals in nested scopes) deterministically binds the
+    // inner declaration; a first-name-match scan over the unordered states_
+    // map could pick the OUTER one while codegen nulls the inner slot (a
+    // nondeterministic wrong-binding consume). The name-scan remains as the
+    // fallback for a marker sema left unresolved (error recovery only).
     sema::Symbol* sym = nullptr;
     LocalOwnership* st = nullptr;
-    for (auto& [s, lo] : states_) {
-        if (s->name == mt.name) { sym = s; st = &lo; break; }
+    if (sema::Symbol* resolved = ctx_.exprSymbol(mt)) {
+        auto it = states_.find(resolved);
+        if (it != states_.end()) { sym = resolved; st = &it->second; }
+    }
+    if (!st) {
+        for (auto& [s, lo] : states_) {
+            if (s->name == mt.name) { sym = s; st = &lo; break; }
+        }
     }
     if (!st || st->state != OwnershipState::Owned) {
         // §28.3 v0.209: the marker names a NAMED OWNED BINDING; a borrow, a
@@ -11752,6 +11804,30 @@ void MethodOwnership::handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt)
         (ls->declType->declaration->kind == ast::TypeDeclKind::Class ||
          ls->declType->declaration->kind == ast::TypeDeclKind::Interface) &&
         !ls->declType->declaration->isValueBuiltin;
+    // §28.10: a `using var` binding is scope-pinned — its disposal belongs
+    // to scope exit; transferring it out is the same rejection the `move`
+    // form draws (checked before the class gate so the message is precise).
+    if (st->implicitDischarge) {
+        report(
+            Severity::Error, mt.span.begin,
+            std::string("cannot move out of `using var` `") +
+            std::string(mt.name) +
+            "`; `using var` is scope-bound (§28.3)");
+        st->state = OwnershipState::Poisoned;
+        return;
+    }
+    // §28.3 (#1626): a maybe-consumed binding may not be consumed again
+    // (same text as markMovedByName's arm — the K7.4 loop back-edge pin).
+    if (st->maybeConsumed) {
+        report(
+            Severity::Error, mt.span.begin,
+            std::string("cannot consume `") + std::string(mt.name) +
+            "`: it may have already been consumed on another branch "
+            "(maybe-consumed join, §28.3) — confine the consume to a single "
+            "branch or equalize the branches before the merge");
+        st->state = OwnershipState::Poisoned;
+        return;
+    }
     if (!ld || !classValued) {
         // Targeted first-landing bound: per-path scope-end disposal is wired
         // for plain class/interface LOCALS (null-guarded dynamicDispose);
@@ -11767,7 +11843,16 @@ void MethodOwnership::handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt)
             "statement instead (\xc2\xa7""28.3 K3.4/K7.4, v0.209; #2080)");
         return;
     }
-    markMovedByName(mt.name, mt.span.begin);
+    // The K5.1 consume-site freeze and the scoped-callback freeze — both
+    // diagnose-only, name-keyed like every other consume site's.
+    checkScopedFreeze(mt.name, mt.span.begin, "move from");
+    checkConsumeFreeze(mt.name, mt.span.begin);
+    // The state transition is applied to the SEMA-RESOLVED symbol directly
+    // (not via the name-keyed markMovedByName, whose unordered name-scan
+    // could mutate a same-named SHADOWED sibling while codegen nulls this
+    // one's slot — the F4 nondeterminism).
+    st->state = OwnershipState::MovedFrom;
+    everDischarged_.insert(sym);
     armTransferConsumed_.push_back(sym);
 }
 
@@ -11876,6 +11961,19 @@ void MethodOwnership::processBindAtom(const ast::BindExpr& bx) {
     if (!bindAtomsProcessed_.insert(&bx).second) return;
     for (const auto& cl : bx.clauses) {
         if (!cl) continue;
+        // §28.3 v0.184 (#1958): a closure inside a CLAUSE INITIALIZER that
+        // consumes a captured owned binding — an EARLIER clause's or an
+        // outer local's — must be rejected exactly as one in the body: the
+        // statement-level prologue never walks atom internals, so without
+        // this per-clause scan `(var c := new Res(1); var k := Run(lambda()
+        // => do Sink(owned c); end); …)` was silently accepted, and the
+        // closure's dispose plus the K8.5 boundary/scope-end disposal
+        // double-freed. Runs BEFORE this clause's handleLocalDecl, so the
+        // scan sees exactly the bindings in scope at the closure's creation
+        // (earlier clauses + outer locals; never the clause's own name).
+        if (!suppressDiag_ && cl->initializer)
+            scanCapturedOwnedConsumeExpr(*cl->initializer,
+                                         /*insideLambda=*/false);
         // Each clause IS a §21.1 declaration: handleLocalDecl runs the
         // classification (producerState — peeling nested atoms), the K3.4
         // marker validation (`var y := owned x;` moves the outer source),
@@ -11883,7 +11981,7 @@ void MethodOwnership::processBindAtom(const ast::BindExpr& bx) {
         // registration, verbatim.
         handleLocalDecl(*cl);
     }
-    // §28.3 v0.184 (#1958): a closure inside the atom that CONSUMES a
+    // §28.3 v0.184 (#1958): a closure inside the atom's BODY that CONSUMES a
     // captured clause binding must be rejected here — the statement-level
     // prologue (checkCapturedOwnedConsumeInStmt) ran before the clauses
     // were registered, so it could not see them; and the shared
@@ -11981,6 +12079,141 @@ void MethodOwnership::finishBindAtom(const ast::BindExpr& bx) {
             states_.erase(it);
         }
         everOwnedPlainLocals_.erase(lsym);
+    }
+}
+
+// §17.15 / K8.5 (#2098, review F2): see the declaration comment — the
+// `=>`-body structural siblings of finishBindAtom's staged rejections.
+void MethodOwnership::checkBindAtomExprBodyStaged(const ast::BindExpr& bx) {
+    const common::TypeParamResolver identity =
+        [](const sema::TypeRef* t) { return t; };
+    std::vector<const sema::Symbol*> ownedClauseSyms;
+    for (std::size_t i = 0; i < bx.clauses.size(); ++i) {
+        const auto& cl = bx.clauses[i];
+        if (!cl || !cl->initializer) continue;
+        const bool ownedProduction =
+            common::bindClauseIsOwnedProduction(*cl, ctx_, identity);
+        // (a) producerState-vs-predicate mismatch: an owned producer the
+        // shared disposal predicate does not claim — codegen registers no
+        // boundary disposal, so accepting it here would silently leak
+        // (the `=> (var t := C.Get(); 0)` Task-frame shape).
+        if (!ownedProduction &&
+            producerState(*cl->initializer) == OwnershipState::Owned) {
+            report(
+                Severity::Error, cl->initializer->span.begin,
+                std::string("this owned initializer form is not "
+                "supported for a binding-atom clause (`") +
+                std::string(cl->name) +
+                "`) in this version — bind it at statement level "
+                "(`using var`, §28.10) (§17.15 / §28.3 K8.5, v0.216)");
+            continue;
+        }
+        if (!ownedProduction) continue;
+        if (sema::LocalSymbol* lsym = findLocalSymbol(*cl))
+            ownedClauseSyms.push_back(lsym);
+        // (b) conditional consume: spelled somewhere in the atom but not on
+        // the straight-line evaluation — the same K7.4 bound the block-body
+        // dataflow cross-check enforces, derived structurally.
+        if (common::bindClauseConsumedInAtom(bx, i) &&
+            !common::bindClauseConsumedUnconditionally(bx, i)) {
+            report(
+                Severity::Error, cl->initializer->span.begin,
+                std::string("binding-atom binding `") +
+                std::string(cl->name) +
+                "` is consumed on only some paths inside the atom — "
+                "per-path boundary disposal (K7.4) is not supported "
+                "for a binding atom in this version; consume it "
+                "unconditionally, or bind it at statement level "
+                "(§17.15 / §28.3 K8.5, v0.216)");
+        }
+    }
+    if (ownedClauseSyms.empty()) return;
+    // (c) closures referencing owned clause bindings — conservative in `=>`
+    // position (the precise #1958 captured-consume scan needs the dataflow;
+    // a block body keeps read captures legal).
+    std::vector<const ast::LambdaExpr*> lambdas;
+    std::function<void(const ast::Expr*)> findLambdas =
+        [&](const ast::Expr* e) {
+            if (!e) return;
+            if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+                lambdas.push_back(lam);
+                return;
+            }
+            if (auto* nb = dynamic_cast<const ast::BindExpr*>(e)) {
+                for (const auto& c : nb->clauses)
+                    if (c) findLambdas(c->initializer.get());
+                findLambdas(nb->body.get());
+                return;
+            }
+            if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
+                findLambdas(be->left.get());
+                findLambdas(be->right.get());
+                return;
+            }
+            if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
+                findLambdas(ue->operand.get());
+                return;
+            }
+            if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+                findLambdas(cd->condition.get());
+                findLambdas(cd->thenValue.get());
+                findLambdas(cd->elseValue.get());
+                return;
+            }
+            if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+                findLambdas(ce->scrutinee.get());
+                for (const auto& arm : ce->arms) {
+                    findLambdas(arm.guard.get());
+                    if (arm.bodyKind == ast::CaseArmBodyKind::Expression)
+                        findLambdas(arm.exprBody.get());
+                }
+                return;
+            }
+            if (auto* call = dynamic_cast<const ast::CallExpr*>(e)) {
+                findLambdas(call->callee.get());
+                for (const auto& a : call->args)
+                    if (a.value) findLambdas(a.value.get());
+                return;
+            }
+            if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+                for (const auto& a : ne->args)
+                    if (a.value) findLambdas(a.value.get());
+                return;
+            }
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+                findLambdas(ma->target.get());
+                return;
+            }
+            if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+                findLambdas(ix->target.get());
+                for (const auto& a : ix->indices)
+                    if (a.value) findLambdas(a.value.get());
+                return;
+            }
+        };
+    for (const auto& cl : bx.clauses)
+        if (cl) findLambdas(cl->initializer.get());
+    findLambdas(bx.body.get());
+    for (const ast::LambdaExpr* lam : lambdas) {
+        std::vector<const ast::IdentifierExpr*> ids;
+        collectLambdaIdentifiers(*lam, ids);
+        for (const ast::IdentifierExpr* id : ids) {
+            sema::Symbol* sym = ctx_.exprSymbol(*id);
+            if (!sym) continue;
+            for (const sema::Symbol* oc : ownedClauseSyms) {
+                if (sym == oc) {
+                    report(
+                        Severity::Error, id->span.begin,
+                        std::string("a closure inside a binding atom may "
+                        "not reference the atom's owned binding `") +
+                        std::string(id->name) +
+                        "` in an expression-bodied member in this version "
+                        "— use a block body (§17.15 / §28.3 K8.5 / §28.3 "
+                        "v0.184, v0.216)");
+                    return;
+                }
+            }
+        }
     }
 }
 

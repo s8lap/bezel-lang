@@ -956,6 +956,13 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
                 if (!x) return;
                 if (auto* bx = dynamic_cast<const ast::BindExpr*>(x)) {
                     checkBindAtomBodyEscape(*bx);
+                    // Review F2 (#2098): the `=>`-body structural siblings
+                    // of finishBindAtom's staged rejections — mismatched
+                    // owned producers, conditional consumes, closures
+                    // referencing owned clause bindings. Codegen lowers the
+                    // K8.5 boundary via the shared predicate regardless of
+                    // body kind, so these bounds must hold here too.
+                    checkBindAtomExprBodyStaged(*bx);
                     for (const auto& cl : bx->clauses)
                         if (cl) walkAtoms(cl->initializer.get());
                     walkAtoms(bx->body.get());

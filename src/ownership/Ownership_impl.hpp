@@ -599,6 +599,30 @@ private:
     // caller.
     void checkBindAtomBodyEscape(const ast::BindExpr& bx);
 
+    // §17.15 / K8.5 (#2098, review F2): the `=>`-body STRUCTURAL siblings of
+    // finishBindAtom's staged rejections. An expression-bodied member runs
+    // no ownership dataflow, but codegen lowers the K8.5 boundary
+    // unconditionally via the shared predicate — so the three staged bounds
+    // must hold there too, decidable without states_:
+    //   (a) an owned producer OUTSIDE the shared predicate's decidable set
+    //       (producerState says Owned, bindClauseIsOwnedProduction does not
+    //       claim it — a Task-family mint, a `move`, a `??`-owned): codegen
+    //       would register no boundary disposal — a silent leak; reject.
+    //   (b) a CONDITIONAL consume (consumed per the scan but not on the
+    //       straight-line evaluation — bindClauseConsumedUnconditionally):
+    //       codegen would suppress the boundary disposal while the
+    //       not-selected path leaks (or an IIFE-selected path double-frees);
+    //       reject.
+    //   (c) a closure ANYWHERE inside the atom that references an
+    //       owned-production clause binding (collectLambdaIdentifiers,
+    //       symbol-resolved): the dataflow's #1958 captured-consume scan
+    //       cannot run here, so the reference is conservatively rejected in
+    //       `=>` position (a read capture is legal in a BLOCK body, where
+    //       the precise scan runs; the remedy is a block body).
+    // Called from runExprBodyOwningReturnCheck's atom walk only — block
+    // bodies keep finishBindAtom's precise dataflow cross-check.
+    void checkBindAtomExprBodyStaged(const ast::BindExpr& bx);
+
     // §17.15 (#2098): per-block-visit dedup for processBindAtom (see above).
     // Cleared at the start of every processBlock so fixpoint iterations
     // re-run the atom's transfer functions.

@@ -98,7 +98,18 @@ class C
     return v;
   end H;
 
-  // (8) K7.4 loop back-edge: a marked binding consumed inside a loop body is
+  // (8) §28.10 (review note): a `using var` binding is scope-pinned — the
+  // arm transfer marker draws the same rejection the `move` form does.
+  public static method K(): int
+    using var u := new Res(1);
+    var x := (if C.T() then owned u else new Res(2));
+    // CHECK: :[[@LINE-1]]:{{[0-9]+}}: cannot move out of `using var` `u`
+    // CHECK-SAME: scope-bound (§28.3)
+    x.Dispose();
+    return 0;
+  end K;
+
+  // (9) K7.4 loop back-edge: a marked binding consumed inside a loop body is
   // maybe-consumed around the back edge — the second iteration's consume
   // (and any read) is rejected ("no flow around a back edge into a use").
   public static method J(n: int): int
