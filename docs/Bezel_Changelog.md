@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.219 — July 2026**
+**Companion to the Bezel Language Specification, v0.220 — July 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -7022,3 +7022,9 @@ Rationale §3.3 is rewritten as the recorded reversal it is: the #1373 ruling's 
 **Clarification — §17.6's indexer-increment advice corrected ([#2134](https://github.com/s8lap/bezel-lang/issues/2134); verified 2026-07-22, owner-directed fix).** The advisory paragraph after the indexer desugaring recommended "writing the read and write explicitly" for collections where the getter+setter cost matters — a self-refuting remedy: the explicit spelling performs the same one getter and one setter (the same two hash lookups on `Dictionary<K, int>`) and, for non-trivial collection/index expressions, re-evaluates them where the desugaring binds `__coll`/`__idx` once. The corrected text states the truth the rationale's §18 ref-returning-indexers deferral already implied — the two-access cost is inherent to indexer-mediated read-modify-write, and no rewrite of the statement changes it — and routes the tally case to `Counter<K>` (stdlib §4.20, v0.215), aligning §17.6 with stdlib §4.8's existing single-lookup-upsert note. The desugaring itself, the no-deduplication rule, and the ownership split on class-element collections are unchanged — the defect was advisory prose only. Classified a clarification (the rule is genuinely unchanged); the reviewer confirmation is the #2134 verification record.
 
 **Migration.** None — advisory wording only. #2134 closes at this landing.
+
+### v0.220 changelog (v0.219 → v0.220)
+
+**Clarification — §18.5's hole delimitation names its `<…>` edge and the decision to keep it ([#2102](https://github.com/s8lap/bezel-lang/issues/2102), owner-directed).** The 0064 audits surfaced that a multi-argument generic-arguments list at a hole's top level is cut at its comma (`{Cache<int, string>.Default}` — the alignment rule severs it; loud error, wrong-construct diagnostic). Decided: the rule stands as designed. Extending hole nesting to balanced `<…>` was **declined with reasons**: the generic-arguments reading of `<` is a parser-level commitment (§22.12's balanced-scan-plus-continuation rule), and v0.172's hole delimitation is deliberately a lexer-level boundary a tool can implement without a parser — importing the generic scan would destroy that property, and a naive balance-only test would silently re-cut legal holes (`{x < y,8}`, a comparison with an alignment). §18.5 now names the edge next to its existing parenthesization examples, states the remedy (`{(Cache<int, string>.Default)}`), and notes that single-argument forms are unaffected. Behavior is genuinely unchanged — the paragraph documents what the v0.172 rule already did — hence clarification class; the decision record is this entry. #2102 closes at this landing; the impl-side targeted diagnostic (a hole fragment ending mid-`<…>` should name this rule and the paren remedy) is tracked separately.
+
+**Migration.** None — doc-only; the edge always behaved this way.

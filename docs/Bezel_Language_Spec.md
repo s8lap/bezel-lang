@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.219 — July 2026**
+**Version 0.220 — July 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -3727,7 +3727,7 @@ x := 3.0;
 Console.WriteLine($"[{x,8:F2}]");      // prints: [    3.00] — present value: ordinary dispatch
 ```
 
-**Hole delimitation (normative, v0.172, #1339).** Inside `{…}` the lexer tracks nesting of `(` `)` `[` `]` `{` `}` and skips nested string/char literals (recognized by their own opening quote and parsed as complete literals; they do not terminate the outer string). The alignment `,` and the format-spec `:` are recognized only at the **top nesting level** of the hole; the first top-level `,` begins the alignment, the first top-level `:` begins the format spec. Consequently `{d[k]:F2}` needs no parenthesization tricks (`[…]` nests its colon) and `{(if c then a else b),8}` aligns the conditional. The format spec runs from its `:` to the hole's closing `}`; braces do not appear inside a format spec (a `{` there is a compile error).
+**Hole delimitation (normative, v0.172, #1339).** Inside `{…}` the lexer tracks nesting of `(` `)` `[` `]` `{` `}` and skips nested string/char literals (recognized by their own opening quote and parsed as complete literals; they do not terminate the outer string). The alignment `,` and the format-spec `:` are recognized only at the **top nesting level** of the hole; the first top-level `,` begins the alignment, the first top-level `:` begins the format spec. Consequently `{d[k]:F2}` needs no parenthesization tricks (`[…]` nests its colon) and `{(if c then a else b),8}` aligns the conditional. The tracked pairs are exactly `()`, `[]`, `{}` — balanced `<…>` is **deliberately not tracked** (v0.220): the generic-arguments reading of `<` is a parser-level commitment ([§22.12](#sec-static-members)'s balanced-scan-plus-continuation rule), and this boundary rule stays implementable without a parser; a lexer-level `<`-balance test would also re-cut legal holes like `{x < y,8}`, a comparison with an alignment. A **multi-argument** generic-arguments list at the hole's top level is therefore cut at its comma — `{Cache<int, string>.Default}` is a compile error at the mis-cut fragment — and the remedy is the same parenthesization as for the conditional above: `{(Cache<int, string>.Default)}`. Single-argument forms (`{Cache<string>.Default}`) contain no top-level `,` and need nothing. The format spec runs from its `:` to the hole's closing `}`; braces do not appear inside a format spec (a `{` there is a compile error).
 
 **Literal braces (v0.172, #1339).** In interpolated strings (`$"…"` and `$@"…"`), a doubled brace denotes a literal brace: `{{` produces `{`, `}}` produces `}`. An unescaped `}` that does not close a hole is a compile error; write `}}` for a literal closing brace. Non-interpolated strings are unaffected (braces are ordinary characters there).
 
