@@ -23,6 +23,11 @@
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
 
+namespace bezel::common {
+struct RecordSubstEnv;  // §9.7/#2145 instantiation-site substitution env
+                        // (common/OwnershipFacts.hpp); pointer-only here
+}  // namespace bezel::common
+
 namespace bezel::ownership {
 
 // Per-method ownership analyzer.
@@ -1529,13 +1534,32 @@ private:
     bool isBorrowBearingRecord(const sema::TypeRef* rt) const;
 
     // Recursive worker for isBorrowBearingRecord (#1611). `seen` accumulates
-    // the record TypeDecls already being visited on this call chain so a
+    // the record TypeRefs already being visited on this call chain so a
     // self- or mutually-referential record type (e.g. a legal §9.2
     // `Origin`-style static field whose type is the enclosing record) is
-    // visited at most once instead of recursing without bound. // per §9.7
+    // visited at most once instead of recursing without bound (keyed on the
+    // TypeRef, not the TypeDecl: two instantiations of one generic record on
+    // a chain — `Wrap<Wrap<ArraySpan<int>>>`, #2145 — are distinct subjects,
+    // while a genuinely cyclic chain revisits the SAME cached field TypeRef).
+    // `env` is the §9.7/#2145 instantiation-site substitution environment for
+    // a generic record's bare-parameter fields; null = declaration-site
+    // behaviour. Mirrors common::isBorrowBearingRecordCommon exactly (#1595
+    // lockstep). // per §9.7
     bool isBorrowBearingRecordImpl(
         const sema::TypeRef* rt,
-        std::unordered_set<const ast::TypeDecl*>& seen) const;
+        std::unordered_set<const sema::TypeRef*>& seen,
+        const common::RecordSubstEnv* env) const;
+
+    // §9.7's borrow-carrying-field kinds applied to ONE resolved field type in
+    // substitution environment `env` (the split-out former field lambda of
+    // isBorrowBearingRecordImpl, #2145 — a substituted field type must be
+    // re-classified in the environment carried by its substitution entry).
+    // Also the single field predicate isNullSourceRecordExpr consults, so the
+    // null-source recognizer and the classifier cannot drift. // per §9.7
+    bool recordFieldIsBorrowCarrying(
+        const sema::TypeRef* ft,
+        std::unordered_set<const sema::TypeRef*>& seen,
+        const common::RecordSubstEnv* env) const;
 
     // §9.7 (v0.180, #1540): true when `e` is provably the **null-source
     // form** of a borrow-bearing record — a direct `new Rec(...)`

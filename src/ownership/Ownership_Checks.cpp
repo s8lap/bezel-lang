@@ -2408,72 +2408,103 @@ bool isBuiltinSpanTypeRef(const sema::TypeRef* rt) {
 }  // namespace
 
 bool MethodOwnership::isBorrowBearingRecord(const sema::TypeRef* rt) const {
-    std::unordered_set<const ast::TypeDecl*> seen;
-    return isBorrowBearingRecordImpl(rt, seen);
+    std::unordered_set<const sema::TypeRef*> seen;
+    return isBorrowBearingRecordImpl(rt, seen, /*env=*/nullptr);
+}
+
+// §9.7's borrow-carrying-field kinds for one resolved field type (see header;
+// mirrors common::recordFieldTypeIsBorrowCarryingCommon, #1595 lockstep): a
+// class/interface reference field (nullable or not), an inline array whose
+// element is a reference type, or another borrow-bearing record
+// (transitivity). string / function / boxed and value-typed fields do not
+// make a record borrow-bearing.
+bool MethodOwnership::recordFieldIsBorrowCarrying(
+        const sema::TypeRef* ft,
+        std::unordered_set<const sema::TypeRef*>& seen,
+        const common::RecordSubstEnv* env) const {
+    if (!ft) return false;
+    // §9.7 transitivity / §4.14 / §4.15 (#2127): a builtin span VIEW field
+    // (Span / ReadOnlySpan / ArraySpan / ReadOnlyArraySpan) is a borrow of
+    // its backing Array / OwningBuffer but has no user Record TypeDecl, so
+    // neither the isValueBuiltin/null-declaration bail nor the user-Record
+    // recurse below fires for it — recognize it by name-head here so a
+    // record with a span field is classified borrow-bearing. // per §9.7
+    if (isBuiltinSpanTypeRef(ft)) return true;
+    switch (ft->kind) {
+        case sema::TypeRef::Kind::Named: {
+            if (!ft->declaration) {
+                // §9.7 / §30.1 (#2145): a bare type-parameter field of a
+                // generic record — resolve through the instantiation-site
+                // environment and classify the SUBSTITUTED type in its own
+                // environment. Unresolvable (no env / uninstantiated / a
+                // null-declaration builtin head) stays not-borrow-carrying:
+                // the declaration-site conservative reading, deferred to the
+                // §30.1 instantiation-site re-check.
+                const common::RecordSubstEnv::Entry sub =
+                    common::resolveRecordFieldSubst(ft, env);
+                if (sub.ty && sub.ty != ft)
+                    return recordFieldIsBorrowCarrying(sub.ty, seen, sub.env);
+                return false;  // generic param (uninstantiated)
+            }
+            // §2.5 / §2.6 / §6.1 / §28 (issue #434): value-type builtins
+            // are scalars/structs; they never carry a borrow. // per §28
+            if (ft->declaration->isValueBuiltin) return false;
+            if (ft->declaration->kind == ast::TypeDeclKind::Class ||
+                ft->declaration->kind == ast::TypeDeclKind::Interface)
+                return true;
+            if (ft->declaration->kind == ast::TypeDeclKind::Record)
+                return isBorrowBearingRecordImpl(ft, seen, env);  // transitive
+            return false;  // enum
+        }
+        case sema::TypeRef::Kind::InlineArray: {
+            if (!ft->arrayElement || ft->arrayOwned) return false;
+            // §9.7: "an inline array whose element type is a reference type"
+            // — resolve a bare-parameter ELEMENT through the environment
+            // first (`[N]T` at `T := C` is an array of references). // #2145
+            const sema::TypeRef* el =
+                common::resolveRecordFieldSubst(ft->arrayElement, env).ty;
+            return isBorrowableType(el ? el : ft->arrayElement);
+        }
+        case sema::TypeRef::Kind::Primitive:
+            // string / Object / numeric: runtime-managed or value type;
+            // never a borrow source. (Object is boxed when holding a
+            // value; the §9.7 list excludes boxed value types.)
+            return false;
+        default:
+            return false;  // Unit, Function (runtime-managed), Error
+    }
 }
 
 // per §9.7, #1611: see header for the visited-set rationale.
 bool MethodOwnership::isBorrowBearingRecordImpl(
         const sema::TypeRef* rt,
-        std::unordered_set<const ast::TypeDecl*>& seen) const {
+        std::unordered_set<const sema::TypeRef*>& seen,
+        const common::RecordSubstEnv* env) const {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return false;
     const auto* decl =
         dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
     if (!decl || decl->kind != ast::TypeDeclKind::Record) return false;
-    // #1611: a record already being visited on this call chain (reached only
-    // through a self- or mutually-referential STATIC field, since an
-    // instance-field cycle is already rejected earlier by
+    // #1611: a record TypeRef already being visited on this call chain
+    // (reached only through a self- or mutually-referential STATIC field,
+    // since an instance-field cycle is already rejected earlier by
     // Resolver::recordValueContainsSelf) contributes no new information —
     // stop here rather than recurse without bound. // per §9.7
-    if (!seen.insert(decl).second) return false;
+    if (!seen.insert(rt).second) return false;
 
-    // §9.7: a record is borrow-bearing when it holds at least one
-    // borrow-carrying field of a non-runtime-managed type: a class/
-    // interface reference field (nullable or not), an inline array whose
-    // element is a reference type, or another borrow-bearing record
-    // (transitivity). string / function / boxed and value-typed fields do
-    // not make a record borrow-bearing.
-    auto fieldIsBorrowCarrying = [&](const sema::TypeRef* ft) -> bool {
-        if (!ft) return false;
-        // §9.7 transitivity / §4.14 / §4.15 (#2127): a builtin span VIEW field
-        // (Span / ReadOnlySpan / ArraySpan / ReadOnlyArraySpan) is a borrow of
-        // its backing Array / OwningBuffer but has no user Record TypeDecl, so
-        // neither the isValueBuiltin/null-declaration bail nor the user-Record
-        // recurse below fires for it — recognize it by name-head here so a
-        // record with a span field is classified borrow-bearing. // per §9.7
-        if (isBuiltinSpanTypeRef(ft)) return true;
-        switch (ft->kind) {
-            case sema::TypeRef::Kind::Named: {
-                if (!ft->declaration) return false;  // generic param
-                // §2.5 / §2.6 / §6.1 / §28 (issue #434): value-type builtins
-                // are scalars/structs; they never carry a borrow. // per §28
-                if (ft->declaration->isValueBuiltin) return false;
-                if (ft->declaration->kind == ast::TypeDeclKind::Class ||
-                    ft->declaration->kind == ast::TypeDeclKind::Interface)
-                    return true;
-                if (ft->declaration->kind == ast::TypeDeclKind::Record)
-                    return isBorrowBearingRecordImpl(ft, seen);  // transitive
-                return false;  // enum
-            }
-            case sema::TypeRef::Kind::InlineArray:
-                return ft->arrayElement &&
-                       !ft->arrayOwned &&
-                       isBorrowableType(ft->arrayElement);
-            case sema::TypeRef::Kind::Primitive:
-                // string / Object / numeric: runtime-managed or value type;
-                // never a borrow source. (Object is boxed when holding a
-                // value; the §9.7 list excludes boxed value types.)
-                return false;
-            default:
-                return false;  // Unit, Function (runtime-managed), Error
-        }
-    };
+    // §9.7 / §30.1 (#2145): this instantiation's substitution environment for
+    // the field walk below (empty → declaration-site behaviour).
+    common::RecordSubstEnv myEnv;
+    common::seedRecordSubstEnv(*decl, *rt, env, myEnv);
+    const common::RecordSubstEnv* fieldEnv =
+        myEnv.map.empty() ? nullptr : &myEnv;
 
     // Positional record fields (§9.1) — never static, so no exclusion needed.
     for (const ast::Param& f : decl->positionalFields) {
         if (!f.type) continue;
-        if (fieldIsBorrowCarrying(ctx_.resolvedType(*f.type))) return true;
+        if (recordFieldIsBorrowCarrying(ctx_.resolvedType(*f.type), seen,
+                                        fieldEnv))
+            return true;
     }
     // Body-record reference fields (§9.2).
     for (const auto& m : decl->members) {
@@ -2492,7 +2523,8 @@ bool MethodOwnership::isBorrowBearingRecordImpl(
                 if (mod == "static") { isStatic = true; break; }
             if (isStatic) continue;
             if (fd->type &&
-                fieldIsBorrowCarrying(ctx_.resolvedType(*fd->type)))
+                recordFieldIsBorrowCarrying(ctx_.resolvedType(*fd->type),
+                                            seen, fieldEnv))
                 return true;
         }
     }
@@ -2500,19 +2532,24 @@ bool MethodOwnership::isBorrowBearingRecordImpl(
 }
 
 // §9.7 (v0.180, #1540): see header for the null-source-form contract. Uses
-// the SAME borrow-carrying-field notion as isBorrowBearingRecordImpl's own
-// `fieldIsBorrowCarrying` closure above (a class/interface reference field,
-// an inline array of reference elements, or a transitively borrow-bearing
-// record field) — deliberately NOT fieldTypeIsBorrowCarrying, which also
-// counts builtin heap collections (Array<T>, …) by name and is scoped to
-// checkRecordFromTemporary's own (broader) construction-from-temporary rule.
-// Using a mismatched predicate here would let this recognizer demand a
-// builtin-collection field be `null` even when isBorrowBearingRecord (the
-// gate every caller applies first) never considered that field a borrow in
-// the first place. Only recognizes a direct `new Rec(...)` construction
-// (positional fields); a record value read back from a local/parameter/
-// field is never null-source here, matching the reject-not-trust posture
-// documented on the header.
+// the SAME borrow-carrying-field notion as isBorrowBearingRecordImpl — the
+// shared recordFieldIsBorrowCarrying helper (a class/interface reference
+// field, an inline array of reference elements, a span field, or a
+// transitively borrow-bearing record field), with the #2145 substitution env
+// so a generic record's substituted fields classify identically here and in
+// the classifier (a vacuous "no borrow-carrying field" verdict would bypass
+// the §9.7 field/collection-store rejection for `new Wrap<Res>(res)`) —
+// deliberately NOT fieldTypeIsBorrowCarrying, which also counts builtin heap
+// collections (Array<T>, …) by name and is scoped to checkRecordFromTemporary's
+// own (broader) construction-from-temporary rule. Using a mismatched predicate
+// here would let this recognizer demand a builtin-collection field be `null`
+// even when isBorrowBearingRecord (the gate every caller applies first) never
+// considered that field a borrow in the first place. (A span field stays
+// borrow-carrying here too: a span is never `null`, so a record with a span
+// argument is never null-source, #2127.) Only recognizes a direct
+// `new Rec(...)` construction (positional fields); a record value read back
+// from a local/parameter/field is never null-source here, matching the
+// reject-not-trust posture documented on the header.
 bool MethodOwnership::isNullSourceRecordExpr(const ast::Expr& e) const {
     const auto* ne = dynamic_cast<const ast::NewExpr*>(&e);
     if (!ne) return false;
@@ -2523,29 +2560,14 @@ bool MethodOwnership::isNullSourceRecordExpr(const ast::Expr& e) const {
     const auto* decl =
         dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
     if (!decl || decl->kind != ast::TypeDeclKind::Record) return false;
+    // §9.7 / #2145: the instantiation-site substitution env for this record's
+    // field walk (empty for a non-generic record).
+    common::RecordSubstEnv env;
+    common::seedRecordSubstEnv(*decl, *rt, /*incoming=*/nullptr, env);
+    const common::RecordSubstEnv* fieldEnv = env.map.empty() ? nullptr : &env;
     auto isBorrowCarrying = [&](const sema::TypeRef* ft) -> bool {
-        if (!ft) return false;
-        // §9.7 / §4.14 / §4.15 (#2127): a span-field is borrow-carrying (same as
-        // isBorrowBearingRecordImpl above). A span is never `null`, so a record
-        // with a span argument is never null-source — recognizing the span here
-        // makes this recognizer return false for it (the span arg is not a null
-        // literal), so the field/collection-store rejection is NOT bypassed by a
-        // vacuous "no borrow-carrying field" null-source verdict. // per §9.7
-        if (isBuiltinSpanTypeRef(ft)) return true;
-        if (ft->kind == sema::TypeRef::Kind::Named) {
-            if (!ft->declaration) return false;  // generic param
-            if (ft->declaration->isValueBuiltin) return false;
-            if (ft->declaration->kind == ast::TypeDeclKind::Class ||
-                ft->declaration->kind == ast::TypeDeclKind::Interface)
-                return true;
-            if (ft->declaration->kind == ast::TypeDeclKind::Record)
-                return isBorrowBearingRecord(ft);  // transitive
-            return false;  // enum
-        }
-        if (ft->kind == sema::TypeRef::Kind::InlineArray)
-            return ft->arrayElement && !ft->arrayOwned &&
-                   isBorrowableType(ft->arrayElement);
-        return false;
+        std::unordered_set<const sema::TypeRef*> seen;
+        return recordFieldIsBorrowCarrying(ft, seen, fieldEnv);
     };
     const auto& fields = decl->positionalFields;
     for (std::size_t i = 0; i < ne->args.size() && i < fields.size(); ++i) {

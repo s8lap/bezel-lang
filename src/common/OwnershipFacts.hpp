@@ -35,6 +35,8 @@
 
 #include <functional>
 #include <optional>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace bezel::ast {
@@ -198,6 +200,50 @@ bool staticFactoryReturnsFreshOwned(const ast::MethodDecl& md,
 // two checks from drifting apart.
 bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt,
                                  const sema::SemaContext& ctx);
+
+// §9.7 / §30.1 (v0.220, #2145): the INSTANTIATION-SITE substitution
+// environment for the borrow-bearing-record field walk. A generic record's
+// field type resolves to the UNINSTANTIATED bare type parameter (`V: T` in
+// `record Wrap<T>(V: T)` resolves to a declaration-less Named `T`), so the
+// field walk alone cannot see that `Wrap<ArraySpan<int>>` / `Wrap<Res>`
+// substitutes a borrow-carrying type there. Each record frame of the walk
+// builds one environment from the record declaration's generic params and the
+// visited TypeRef's `genericArgs`, mapping each param NAME to the substituted
+// TypeRef *and* the environment in which THAT TypeRef's own bare-parameter
+// mentions resolve (so `Outer<Res>` → `Inner<T>` → `V: U := T := Res`
+// composes through nesting). An empty/absent environment reproduces the
+// declaration-site behaviour exactly: a bare parameter classifies
+// not-borrow-carrying, deferring to the §30.1 instantiation-site re-check.
+// Both copies of the walk (common::isBorrowBearingRecordCommon and
+// MethodOwnership::isBorrowBearingRecordImpl, #1595 lockstep) share this type.
+struct RecordSubstEnv {
+    struct Entry {
+        const sema::TypeRef* ty = nullptr;   // the substituted type argument
+        const RecordSubstEnv* env = nullptr; // env for ty's own bare params
+    };
+    // Lookup-only (never iterated), so the unordered map cannot introduce
+    // #2116-class ordering nondeterminism.
+    std::unordered_map<std::string_view, Entry> map;
+};
+
+// Seed `out` for one record frame of the field walk: each of `decl`'s generic
+// params maps to the corresponding `rt->genericArgs` entry (paired with
+// `incoming` as that argument's own resolution environment); an argument that
+// is ITSELF a bare parameter of the enclosing frame is resolved through
+// `incoming` immediately (one composition hop), so chains of generic records
+// (`Outer<T>` wrapping `Inner<T>`) resolve to the outermost concrete argument.
+// Leaves `out` empty for a non-generic record or an uninstantiated use (no
+// genericArgs) — the declaration-site conservative behaviour. // per §9.7 #2145
+void seedRecordSubstEnv(const ast::TypeDecl& decl, const sema::TypeRef& rt,
+                        const RecordSubstEnv* incoming, RecordSubstEnv& out);
+
+// Resolve `ft` through `env` when it is a BARE type-parameter reference (a
+// declaration-less, argument-less Named TypeRef whose head names an entry).
+// Returns the substituted entry, or {ft, env} unchanged when no substitution
+// applies (concrete type, no env, or an unknown head — a null-declaration
+// builtin like `Array` is never a key, so it passes through). // per §9.7 #2145
+RecordSubstEnv::Entry resolveRecordFieldSubst(const sema::TypeRef* ft,
+                                              const RecordSubstEnv* env);
 
 // §35.4 (v0.200, #2045): the three-way **choice classification** — a derived
 // type property computed over ALL of the choice's cases' payload fields. The
