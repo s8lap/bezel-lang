@@ -8580,6 +8580,46 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
         }
         return nullptr;
     }
+    // (a-move) §28.8.1 / §28.11 (#2119): a plain `var x := move coll[i]` — the
+    // slot-TAKE form on an OWNING collection (`OwningArray<C>` / the value of an
+    // `OwningDictionary<K,C>`, and the owning-Span / inline-owned-array element
+    // slots that share lowerMoveFromCollectionSlot). The moved-out element is a
+    // class/interface object the binding now SOLELY owns; the move NULLS the
+    // source slot, so the collection's scope-end cascade skips it (no double-
+    // free). The initializer is a UnaryExpr("move", IndexExpr), matched by
+    // NEITHER (a) NewExpr NOR (b) CallExpr below — so it fell through to null:
+    // an explicit `x.Dispose()` only DISPATCHED the destructor
+    // (explicitDisposeOwnedReceiverSlot returned null) and never RECLAIMED the
+    // block, and registerUnwindOwnedLocal registered no exception-edge disposal
+    // — the element's storage LEAKED though its destructor ran (the #2119
+    // finding; the `Pop*`/`Drain()` take-out forms reclaim via case (b3)
+    // isBuiltinOwnedTransferCall and are already clean). The ownership pass
+    // ALREADY classifies this Owned (producerState's generic `move <class/
+    // interface>` rule), so recognizing the same shape here restores parity: the
+    // explicit-dispose reclaim+null and the §28.3 unwind disposal both fire,
+    // exactly-once. Dispatch is dynamic (vtable slot 2), so the concrete class is
+    // returned only when it carries a disposer (for the disposerFns_ lookup);
+    // otherwise a sentinel drives dynamic dispatch. A value-typed / Shared / Weak
+    // element yields no class/interface result and falls through to null — its
+    // reclaim is a different runtime path (bz_shared_release / value copy), not
+    // this class-vtable dispatch. The affine AUTO-DROP variant (no explicit
+    // discharge, ld->autoDropAtScopeEnd) is unaffected — it routes through the
+    // TYPE-keyed registerUsingDisposal and was already leak-free. // per §28.11
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(ld->initializer.get())) {
+        if (ue->op == "move" && ue->operand &&
+            dynamic_cast<const ast::IndexExpr*>(ue->operand.get())) {
+            const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
+            if (isClassOrInterfaceRef(initTy) ||
+                isClassOrInterfaceRef(resolveTypeParamRef(initTy))) {
+                if (initTy && initTy->kind == sema::TypeRef::Kind::Named &&
+                    initTy->declaration &&
+                    initTy->declaration->kind == ast::TypeDeclKind::Class &&
+                    disposerFns_.find(initTy->declaration) != disposerFns_.end())
+                    return initTy->declaration;
+                return reinterpret_cast<const sema::TypeSymbol*>(1);
+            }
+        }
+    }
     // (a) `new ClassType(...)` — an owned class instance.
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(ld->initializer.get())) {
         const sema::TypeSymbol* cls = classOfLocal(ld);

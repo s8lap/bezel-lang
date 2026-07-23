@@ -246,3 +246,108 @@ BEZEL_TEST(move_coll_slot_28_11, owned_dict_move_slot_disposes_once) {
         "end; "
         "return afterX * 10 + R._n;"), 12);   // dict disposed the other -> 2
 }
+
+// ===========================================================================
+// #2119 / §28.11 / §28.8.1 — a `move coll[i]` take-out bound to a PLAIN `var`
+// (not a `using var`) and discharged by an explicit `.Dispose()` reclaims the
+// extracted element's STORAGE, not just its destructor.
+//
+// Root cause: the disposal-registration for a plain-`var` owned local gates on
+// codegen's `unwindOwnedLocalClass`, which classifies the initializer SHAPE
+// (`new C(...)`, an owned-returning / `Pop*`/`Drain` call, an arm-meet, …). It
+// had NO case for a `move <IndexExpr>` initializer, so `var taken := move a[i]`
+// was not recognized as an owned class local: the explicit `taken.Dispose()`
+// only DISPATCHED the destructor (explicitDisposeOwnedReceiverSlot returned
+// null) and never RECLAIMED the 16-byte block, and no exception-edge disposal
+// was registered — the destructor ran (disposal count correct) but the storage
+// LEAKED under LeakSanitizer. The `using var x := move a[i]` form above never
+// exercised this: a using-var reclaims through the TYPE-keyed
+// registerUsingDisposal / usingVar reclaim, which is why those stayed clean.
+// The `Pop*`/`Drain()` blessed take-out forms reclaim via case (b3)
+// isBuiltinOwnedTransferCall (builtin_owned_transfer_leak_1388_test.cpp) and
+// were also clean — `move coll[i]` was the sole leaking blessed form.
+//
+// runAotChecked compiles with generated-code ASan and runs under LSan, so a
+// leaked block FAILS the run (ran=false -> -999) — the value assertion and the
+// leak/double-free verdict ride the same check. Before the fix these programs
+// leak 16 bytes (LSan) while returning the correct disposal count; after, they
+// are leak-clean AND disposal-correct.
+
+// §28.11 (#2119): the exact issue repro — `var taken := move a[0]` (PLAIN var)
+// then `taken.Dispose()`. `taken` disposes the taken element (R._n -> 1); the
+// array's scope-end cascade disposes the untouched a[1] (-> 2). Encoded
+// <afterTake>*10 + <total> = 12. Pre-fix: exit 12 BUT a 16-byte LSan leak of the
+// taken element's storage → runAotChecked reports ran=false.
+BEZEL_TEST(move_coll_slot_leak_2119, plainvar_move_array_slot_dispose_reclaims_no_leak) {
+    BEZEL_EXPECT_EQ(runResource(
+        "var afterTake := -1; "
+        "do "
+        "  using var a := new OwningArray<R>(); "
+        "  a.Add(move (new R())); "
+        "  a.Add(move (new R())); "
+        "  var taken := move a[0]; "          // PLAIN var (the #2119 gap)
+        "  taken.Dispose(); "                 // reclaims the block, not just the dtor
+        "  afterTake := R._n; "               // 1
+        "end; "                                // cascade disposes a[1] -> 2
+        "return afterTake * 10 + R._n;"), 12);
+}
+
+// §28.11 / §4.9 (#2119): the same plain-`var` + explicit-`.Dispose()` take-out
+// on an OwningDictionary VALUE (`var taken := move d[k]`). The dictionary's
+// value slot is the owned thing; the same leak and the same fix apply. Pre-fix:
+// 16-byte LSan leak of the taken value's storage.
+BEZEL_TEST(move_coll_slot_leak_2119, plainvar_move_dict_value_dispose_reclaims_no_leak) {
+    BEZEL_EXPECT_EQ(runResource(
+        "var afterTake := -1; "
+        "do "
+        "  using var d := new OwningDictionary<string, R>(); "
+        "  d[\"a\"] := move (new R()); "
+        "  d[\"b\"] := move (new R()); "
+        "  var taken := move d[\"a\"]; "       // PLAIN var
+        "  taken.Dispose(); "
+        "  afterTake := R._n; "               // 1
+        "end; "                                // cascade disposes d[\"b\"] -> 2
+        "return afterTake * 10 + R._n;"), 12);
+}
+
+// §28.3 / §28.11 (#2119, unwind edge): a plain-`var` `move a[i]` local discharged
+// by an explicit `.Dispose()` on the NORMAL path, with an exception thrown
+// BEFORE the dispose is reached. Because `taken` is discharged on some path it is
+// NOT auto-drop-flagged, so its scope-end coverage is the exception-edge-only
+// `unwindOnly` disposal registered via unwindOwnedLocalClass — the same code the
+// fix taught to recognize the `move <IndexExpr>` shape. On the throwing path the
+// unwind disposes `taken` (its slot still live) exactly once, and the array's
+// cascade disposes the untouched a[1] — both destructors run once, no leak and
+// no double-free of the moved-from slot 0. R._n after the catch == 2.
+BEZEL_TEST(move_coll_slot_leak_2119, plainvar_move_slot_unwind_disposes_once_no_leak) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class R "
+        "  public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; "
+        "end R; "
+        "class C "
+        "  public static method Sink(b: bool): int "
+        "    if b then throw new InvalidOperationException(\"x\"); end; "
+        "    return 0; "
+        "  end Sink; "
+        "  public static method Run(): int "
+        "    do "
+        "      using var a := new OwningArray<R>(); "
+        "      a.Add(move (new R())); "
+        "      a.Add(move (new R())); "
+        "      var taken := move a[0]; "        // plain var, discharged below
+        "      var z := Sink(true); "           // throws -> unwind before Dispose
+        "      taken.Dispose(); "               // normal-path discharge (unreached)
+        "    end; "
+        "    return 0; "
+        "  end Run; "
+        "  public static method Main(): int "
+        "    var ok := 0; "
+        "    try "
+        "      var r := Run(); "
+        "    catch InvalidOperationException => ok := R._n; "  // both disposed -> 2
+        "    end; "
+        "    return ok; "
+        "  end Main; end C;"), 2);
+}
