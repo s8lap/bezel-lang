@@ -2572,6 +2572,20 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 descNode = resolved->astNode;
             llvm::GlobalVariable* desc =
                 descriptorForTypeName(resolved, descNode);
+            // §31.2.1/§12.9 (#1939 leg 3): a CONSTRUCTED generic arm type
+            // (`catch var e: MyExc<string>`, or `MyExc<T>` under the active
+            // substitution) must test against its per-monomorphization
+            // descriptor — the same resolution `is`/`as` (lowerTypeTest) and
+            // case patterns use. The shared per-declaration descriptor is NOT
+            // in a per-instantiation object's chain (#1843 mints the chain
+            // from per-inst elements), so the shared target silently never
+            // matched a directly-thrown MyExc<string> (wrong-arm selection, a
+            // false negative) — and would erased-match every sibling if it
+            // did. perInstDescriptorForTarget substitutes type parameters
+            // recursively and returns null for a non-generic / non-concrete
+            // target, keeping the shared resolution for those.
+            if (llvm::GlobalVariable* pid = perInstDescriptorForTarget(resolved))
+                desc = pid;
             if (!desc) continue;
             matched = builder_.CreateOr(matched, emitIsA(exc, desc));
         }

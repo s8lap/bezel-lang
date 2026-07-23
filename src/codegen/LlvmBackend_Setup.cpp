@@ -2058,6 +2058,18 @@ void Emitter::declareVtables() {
     // #596: builtin ancestor-chain names per user-class TypeSymbol.
     std::unordered_map<const sema::TypeSymbol*,
                        std::vector<std::string>> builtinChainOf;
+    // #1939 (§12.7/§12.9/§31.2.1): per-instantiation descriptors of CONCRETE
+    // constructed generic ancestors (class SubExc : MyExc<string>, class C2 :
+    // IM<int>), appended to the shared chain in Pass C — without them the
+    // chain lists only the SHARED base descriptors while precise targets
+    // (`is MyExc<string>`, a catch arm) resolve the per-instantiation global
+    // (#1843), so the walk never matched: a §12.7 false negative. Counted here
+    // so Pass B sizes the global before creation.
+    std::unordered_map<
+        const sema::TypeSymbol*,
+        std::vector<std::pair<const sema::TypeSymbol*,
+                              std::vector<const sema::TypeRef*>>>>
+        extraInstOf;
     for (const auto& sym : ctx_.symbols()) {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
         if (!ts) continue;
@@ -2080,8 +2092,10 @@ void Emitter::declareVtables() {
             bn = (pit != builtinParent.end()) ? pit->second : std::string{};
         }
         builtinChainOf[ts] = builtinChain;
+        extraInstOf[ts] = collectConcreteGenericBaseInsts(ts);
         auto* arrTy = llvm::ArrayType::get(
-            ptrTy(), supers.size() + builtinChain.size() + 1);
+            ptrTy(), supers.size() + builtinChain.size() +
+                         extraInstOf[ts].size() + 1);
         // §2.5 / §2.6 / §12 (issue #328 / #103): a PUBLIC, non-generic class or
         // interface's type DESCRIPTOR (`td$<Type>`) is part of its cross-module
         // surface. A LOCAL class deriving from an IMPORTED base must embed the
@@ -2157,6 +2171,25 @@ void Emitter::declareVtables() {
             elems.push_back(bit != builtinDesc_.end()
                                 ? llvm::cast<llvm::Constant>(bit->second)
                                 : llvm::ConstantPointerNull::get(ptrTy()));
+        }
+        // #1939 (§12.7/§12.9/§31.2.1): append the PER-INSTANTIATION descriptors
+        // of the concrete constructed generic ancestors, so a SubExc value
+        // matches the precise `MyExc<string>` catch/`is` target (§12.7 — it IS
+        // an instance) while still not matching a sibling `MyExc<int>` (§12.9
+        // invariance: distinct per-instantiation globals). The shared base
+        // element stays in the chain (indices and existing matches unchanged).
+        // A mint failure falls back to the shared base descriptor (a harmless
+        // duplicate) — never a null, which would truncate emitIsA's walk.
+        for (const auto& [bsym, bargs] : extraInstOf[ts]) {
+            llvm::GlobalVariable* pid = instanceDescriptorFor(bsym, bargs);
+            llvm::Constant* el = pid ? llvm::cast<llvm::Constant>(pid) : nullptr;
+            if (!el) {
+                auto bit = descArray_.find(bsym);
+                el = bit != descArray_.end()
+                         ? llvm::cast<llvm::Constant>(bit->second)
+                         : llvm::cast<llvm::Constant>(descArray_[ts]);
+            }
+            elems.push_back(el);
         }
         elems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
         auto* arrTy = llvm::cast<llvm::ArrayType>(
@@ -4058,8 +4091,14 @@ llvm::GlobalVariable* Emitter::perInstDescriptorForTarget(
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return nullptr;
     const sema::TypeSymbol* ts = rt->declaration;
+    // #1939 leg 2 (§12.7/§12.9/§17.4): RECORD targets too — a constructed
+    // generic record boxed into Object carries a per-monomorphization box
+    // chain (specializedBoxVtableFor) whose identity element is the same
+    // instanceDescriptorFor global resolved here, so `o is Pair<int,string>`
+    // distinguishes sibling instantiations exactly as classes do (#1843).
     if ((ts->kind != ast::TypeDeclKind::Class &&
-         ts->kind != ast::TypeDeclKind::Interface) ||
+         ts->kind != ast::TypeDeclKind::Interface &&
+         ts->kind != ast::TypeDeclKind::Record) ||
         ts->genericParams.empty() ||
         rt->genericArgs.size() != ts->genericParams.size())
         return nullptr;
@@ -4085,6 +4124,77 @@ llvm::GlobalVariable* Emitter::perInstDescriptorForTarget(
     llvm::GlobalVariable* sharedDesc =
         dit != descArray_.end() ? dit->second : nullptr;
     return (pid && pid != sharedDesc) ? pid : nullptr;
+}
+
+// #1939 leg 3 (§12.7/§12.9/§31.2.1): the CONCRETE constructed generic ancestor
+// instantiations of `ts`. A NON-generic type with a concrete generic base
+// (`class SubExc : MyExc<string>`, `class C2 : IM<int>`, `record R : IM<int>`)
+// keeps the SHARED descriptor chain, which lists only the SHARED (erased) base
+// descriptors — while a precise target (`is MyExc<string>`, a catch arm, `is
+// IM<int>`) resolves the PER-instantiation global (#1843). The chain walk then
+// silently never matches: a FALSE NEGATIVE (§12.7 — the value IS an instance).
+// This walk yields each (base symbol, transitively-substituted concrete args)
+// pair so the chain builders can append the per-instantiation descriptors.
+// Edge-recorded (a diamond reaching one interface at TWO instantiations —
+// `D : K<string>, IM<int>` with `K<T> : IM<T>` — records both), deduped by the
+// structural descIdentityKey, cycle-capped (error-recovery base cycles survive
+// into codegen — the #1624 lesson). Mints nothing, so it is usable for sizing
+// a descriptor global before Pass C fills it.
+std::vector<std::pair<const sema::TypeSymbol*,
+                      std::vector<const sema::TypeRef*>>>
+Emitter::collectConcreteGenericBaseInsts(const sema::TypeSymbol* ts) {
+    std::vector<std::pair<const sema::TypeSymbol*,
+                          std::vector<const sema::TypeRef*>>> out;
+    if (!ts) return out;
+    struct Pending {
+        const sema::TypeSymbol* sym;
+        std::unordered_map<std::string_view, const sema::TypeRef*> subst;
+    };
+    std::vector<Pending> frontier;
+    frontier.push_back(Pending{ts, {}});
+    std::unordered_set<const sema::TypeSymbol*> seenPlain{ts};
+    std::unordered_set<std::string> seenInst;  // structural (sym, args) key
+    const std::size_t kMaxWalk = 4096;         // defensive bound (#1624 class)
+    for (std::size_t i = 0; i < frontier.size() && i < kMaxWalk; ++i) {
+        const sema::TypeSymbol* sym = frontier[i].sym;
+        auto subst = frontier[i].subst;  // copy — frontier reallocates below
+        for (std::size_t bi = 0; bi < sym->baseTypes.size(); ++bi) {
+            const sema::TypeSymbol* b = sym->baseTypes[bi];
+            if (!b) continue;
+            const sema::TypeRef* bref =
+                bi < sym->baseTypeRefs.size() ? sym->baseTypeRefs[bi] : nullptr;
+            std::unordered_map<std::string_view, const sema::TypeRef*> bm;
+            if (bref && b->genericParams.size() == bref->genericArgs.size())
+                for (std::size_t gi = 0; gi < b->genericParams.size(); ++gi)
+                    bm[b->genericParams[gi]->name] =
+                        substituteTypeRefLocal(bref->genericArgs[gi], subst);
+            bool fullConcrete = !b->genericParams.empty() &&
+                                bm.size() == b->genericParams.size();
+            std::vector<const sema::TypeRef*> args;
+            if (fullConcrete) {
+                args.reserve(b->genericParams.size());
+                for (const sema::Symbol* gp : b->genericParams) {
+                    auto ai = bm.find(gp->name);
+                    const sema::TypeRef* a =
+                        ai != bm.end() ? ai->second : nullptr;
+                    args.push_back(a);
+                    if (!a) fullConcrete = false;
+                }
+                if (fullConcrete && !descArgsConcrete(args))
+                    fullConcrete = false;
+            }
+            if (fullConcrete) {
+                std::string key = descIdentityKey(b, args);
+                if (seenInst.insert(std::move(key)).second) {
+                    out.emplace_back(b, args);
+                    frontier.push_back(Pending{b, std::move(bm)});
+                }
+            } else if (seenPlain.insert(b).second) {
+                frontier.push_back(Pending{b, std::move(bm)});
+            }
+        }
+    }
+    return out;
 }
 
 
@@ -15468,6 +15578,14 @@ void Emitter::setupBoxDescriptors() {
     // baseTypes, so `o is IShape` on a boxed Rect works too.
     std::unordered_map<const sema::TypeSymbol*,
                        std::vector<const sema::TypeSymbol*>> supersOf;
+    // #1939 (§12.7/§12.9): per-instantiation descriptors of CONCRETE generic
+    // interfaces a record implements (`record R : IM<int>`) — the shared-chain
+    // enrichment mirroring declareVtables' (see collectConcreteGenericBaseInsts).
+    std::unordered_map<
+        const sema::TypeSymbol*,
+        std::vector<std::pair<const sema::TypeSymbol*,
+                              std::vector<const sema::TypeRef*>>>>
+        extraInstOf;
     for (const auto& sym : ctx_.symbols()) {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
         if (!ts) continue;
@@ -15478,7 +15596,9 @@ void Emitter::setupBoxDescriptors() {
         std::vector<const sema::TypeSymbol*> supers;
         collectTypeAndBases(ts, supers);
         supersOf[ts] = supers;
-        auto* arrTy = llvm::ArrayType::get(ptrTy(), supers.size() + 1);
+        extraInstOf[ts] = collectConcreteGenericBaseInsts(ts);
+        auto* arrTy = llvm::ArrayType::get(
+            ptrTy(), supers.size() + extraInstOf[ts].size() + 1);
         descArray_[ts] = new llvm::GlobalVariable(
             *module_, arrTy, /*isConstant=*/true,
             llvm::GlobalValue::InternalLinkage, nullptr,
@@ -15495,6 +15615,22 @@ void Emitter::setupBoxDescriptors() {
                 ? llvm::cast<llvm::Constant>(it->second)
                 : llvm::ConstantPointerNull::get(ptrTy());
             elems.push_back(d);
+        }
+        // #1939 (§12.7/§12.9): append the PER-INSTANTIATION descriptors of the
+        // concrete generic interfaces this record/enum implements, so a boxed
+        // `R : IM<int>` matches the precise `is IM<int>` target (§12.7) and not
+        // a sibling `IM<string>` (§12.9). Fallback mirrors declareVtables':
+        // never a null before the terminator.
+        for (const auto& [bsym, bargs] : extraInstOf[ts]) {
+            llvm::GlobalVariable* pid = instanceDescriptorFor(bsym, bargs);
+            llvm::Constant* el = pid ? llvm::cast<llvm::Constant>(pid) : nullptr;
+            if (!el) {
+                auto bit = descArray_.find(bsym);
+                el = bit != descArray_.end()
+                         ? llvm::cast<llvm::Constant>(bit->second)
+                         : llvm::cast<llvm::Constant>(descArray_[ts]);
+            }
+            elems.push_back(el);
         }
         elems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
         auto* arrTy = llvm::cast<llvm::ArrayType>(
@@ -16292,9 +16428,17 @@ llvm::Constant* Emitter::boxRecordEqualsThunk(const sema::TypeSymbol* ts) {
         builder_.SetInsertPoint(notNullBB);
         llvm::Value* otherVtbl = builder_.CreateLoad(ptrTy(), other, "beq.ovtbl");
         llvm::Value* otherDesc = builder_.CreateLoad(ptrTy(), otherVtbl, "beq.odesc");
-        // Compare with descArray_[ts] — the descriptor for this exact type.
-        llvm::Value* myDesc = llvm::ConstantExpr::getPointerCast(
-            llvm::cast<llvm::Constant>(descArray_.at(ts)), ptrTy());
+        // #1939 leg 2 (§9.1/§12.9): compare against SELF's own loaded
+        // descriptor, not the static shared `descArray_[ts]`. A constructed
+        // generic record box carries a per-monomorphization slot-0 chain
+        // (specializedBoxVtableFor, cached per instantiation), so
+        // same-instantiation boxes compare equal-typed and SIBLING
+        // instantiations do not — pre-#1939 the shared descriptor gate
+        // erased-matched siblings and then compared bytes of MISMATCHED
+        // layouts. For a non-generic record/enum both loads yield the shared
+        // descriptor: behavior unchanged.
+        llvm::Value* selfVtbl = builder_.CreateLoad(ptrTy(), self, "beq.svtbl");
+        llvm::Value* myDesc = builder_.CreateLoad(ptrTy(), selfVtbl, "beq.sdesc");
         builder_.CreateCondBr(
             builder_.CreateICmpEQ(otherDesc, myDesc), checkBB, endBB);
 
@@ -17218,6 +17362,111 @@ llvm::GlobalVariable* Emitter::boxDescriptorFor(const sema::TypeRef* rt) {
 }
 
 
+// §12.7/§12.9/§17.4 (#1939 leg 2): the per-monomorphization BOX vtable for a
+// constructed generic RECORD with concrete type arguments. The shared box
+// vtable (boxVtable_, keyed by TypeSymbol) carries ONE descriptor chain per
+// declaration, so every instantiation of `Pair<A,B>` boxed into Object was
+// runtime-indistinguishable: `o is Pair<string,int>` false-positive-matched a
+// boxed `Pair<int,string>` and the follow-on `as` unboxed a wrong layout — the
+// #1843/#2001 erasure class on the record surface. This mints a copy of the
+// shared vtable whose slot 0 is a chain of:
+//   [the per-instantiation chain elements (instanceDescriptorFor — the self
+//    identity + substituted interface instantiations), then the SHARED chain
+//    elements]
+// so a precise target (`is Pair<int,string>`, `is IM<int>`;
+// perInstDescriptorForTarget) matches exactly, while the name-resolved SHARED
+// descriptor keeps matching (record destructuring `case o of Pair(a,b)`
+// resolves by name — §19.3's admitted form on a boxed record). All other
+// slots (itmap, Dispose, ToString, Equals, GetHashCode) are the shared
+// thunks, unchanged. Cached per descIdentityKey — two boxes of one
+// instantiation share the vtable global, which is what boxRecordEqualsThunk's
+// self-descriptor comparison keys on. Registered in allVtables_ so
+// bz_obj_is_string recognizes the box (§8.6 #417). Returns null for a
+// non-record, a non-generic record, or an instantiation with a non-concrete
+// (erased) argument — the caller keeps the shared vtable, and the sema
+// erasure guards (#2006/#2012/#2018) reject the corresponding tests.
+llvm::GlobalVariable* Emitter::specializedBoxVtableFor(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return nullptr;
+    const sema::TypeSymbol* ts = rt->declaration;
+    if (ts->kind != ast::TypeDeclKind::Record || ts->genericParams.empty() ||
+        rt->genericArgs.size() != ts->genericParams.size())
+        return nullptr;
+    // Resolve type parameters through the active substitution (a box site
+    // inside a monomorphized body sees `Pair<T,int>`), mirroring
+    // perInstDescriptorForTarget so box and target resolve the SAME global.
+    std::vector<const sema::TypeRef*> args;
+    args.reserve(rt->genericArgs.size());
+    for (const sema::TypeRef* a : rt->genericArgs)
+        args.push_back(substituteTypeRefLocal(a, genericSubstSemaTy_));
+    if (!descArgsConcrete(args)) return nullptr;
+    std::string key = descIdentityKey(ts, args);
+    auto cached = specBoxVtable_.find(key);
+    if (cached != specBoxVtable_.end()) return cached->second;
+
+    auto sharedVtIt = boxVtable_.find(ts);
+    auto sharedDescIt = descArray_.find(ts);
+    if (sharedVtIt == boxVtable_.end() || sharedDescIt == descArray_.end())
+        return nullptr;
+    llvm::GlobalVariable* sharedVt = sharedVtIt->second;
+    llvm::GlobalVariable* sharedDesc = sharedDescIt->second;
+    if (!sharedVt->hasInitializer() || !sharedDesc->hasInitializer())
+        return nullptr;
+    llvm::GlobalVariable* pid = instanceDescriptorFor(ts, args);
+    if (!pid || pid == sharedDesc || !pid->hasInitializer()) return nullptr;
+
+    std::string readable;
+    {
+        auto tmp = std::make_unique<sema::TypeRef>();
+        tmp->kind = sema::TypeRef::Kind::Named;
+        tmp->declaration = const_cast<sema::TypeSymbol*>(ts);
+        for (const sema::TypeRef* a : args)
+            tmp->genericArgs.push_back(const_cast<sema::TypeRef*>(a));
+        readable = descReadableMangle(tmp.get());
+        descArena_.push_back(std::move(tmp));
+    }
+
+    // The box chain: per-inst elements first, then the shared elements, then
+    // the terminator. Copying stops at each source's own terminator (a null
+    // element ends emitIsA's walk, so none may appear mid-array).
+    std::vector<llvm::Constant*> chain;
+    auto appendElems = [&](llvm::GlobalVariable* src) {
+        auto* arr =
+            llvm::dyn_cast<llvm::ConstantArray>(src->getInitializer());
+        if (!arr) return;
+        for (unsigned i = 0; i < arr->getNumOperands(); ++i) {
+            llvm::Constant* el = arr->getOperand(i);
+            if (el->isNullValue()) break;
+            chain.push_back(el);
+        }
+    };
+    appendElems(pid);
+    appendElems(sharedDesc);
+    chain.push_back(llvm::ConstantPointerNull::get(ptrTy()));
+    auto* chainTy = llvm::ArrayType::get(ptrTy(), chain.size());
+    auto* chainGV = new llvm::GlobalVariable(
+        *module_, chainTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(chainTy, chain), "btd$box$" + readable);
+
+    auto* vtArr =
+        llvm::dyn_cast<llvm::ConstantArray>(sharedVt->getInitializer());
+    if (!vtArr || vtArr->getNumOperands() == 0) return nullptr;
+    std::vector<llvm::Constant*> vtElems;
+    vtElems.reserve(vtArr->getNumOperands());
+    for (unsigned i = 0; i < vtArr->getNumOperands(); ++i)
+        vtElems.push_back(vtArr->getOperand(i));
+    vtElems[0] = chainGV;
+    auto* vtTy = llvm::ArrayType::get(ptrTy(), vtElems.size());
+    auto* vtGV = new llvm::GlobalVariable(
+        *module_, vtTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(vtTy, vtElems), "bvt$box$" + readable);
+    allVtables_.push_back(vtGV);  // §8.6 #417: bz_obj_is_string discriminator
+    specBoxVtable_[key] = vtGV;
+    return vtGV;
+}
+
 // §8.6: the box vtable for a boxable value type.
 llvm::GlobalVariable* Emitter::boxVtableFor(const sema::TypeRef* rt) {
     if (!rt) return nullptr;
@@ -17231,6 +17480,9 @@ llvm::GlobalVariable* Emitter::boxVtableFor(const sema::TypeRef* rt) {
         return it != primBoxVtable_.end() ? it->second : nullptr;
     }
     if (rt->kind == K::Named && rt->declaration) {
+        // #1939 leg 2: a constructed generic record boxes with its
+        // per-monomorphization vtable (precise slot-0 chain); shared otherwise.
+        if (llvm::GlobalVariable* sv = specializedBoxVtableFor(rt)) return sv;
         auto it = boxVtable_.find(rt->declaration);
         return it != boxVtable_.end() ? it->second : nullptr;
     }

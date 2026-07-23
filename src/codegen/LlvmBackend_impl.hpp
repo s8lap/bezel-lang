@@ -4536,6 +4536,24 @@ private:
     // real identity token, not an unbound generic parameter placeholder?
     bool descArgsConcrete(const std::vector<const sema::TypeRef*>& args);
 
+    // #1939 leg 2 (§12.7/§12.9/§17.4): per-monomorphization BOX vtables for
+    // constructed generic RECORDS with concrete args, keyed by descIdentityKey.
+    // Slot 0 is a chain of [per-inst descriptor elements, shared chain
+    // elements] so precise targets AND the name-resolved shared descriptor
+    // (record destructuring) both match. Minted lazily at the box site
+    // (boxVtableFor) and registered in allVtables_ (bz_obj_is_string).
+    std::unordered_map<std::string, llvm::GlobalVariable*> specBoxVtable_;
+    llvm::GlobalVariable* specializedBoxVtableFor(const sema::TypeRef* rt);
+    // #1939 leg 3 (§12.7/§31.2.1): every CONCRETE constructed generic ancestor
+    // instantiation of `ts` — (base symbol, transitively-substituted concrete
+    // args) pairs reached through baseTypeRefs. Used to enrich a SHARED
+    // descriptor chain with the per-instantiation base descriptors so a
+    // non-generic type deriving/implementing `K<string>` matches the precise
+    // `is K<string>` / catch-arm target. Mints nothing (usable for sizing).
+    std::vector<std::pair<const sema::TypeSymbol*,
+                          std::vector<const sema::TypeRef*>>>
+    collectConcreteGenericBaseInsts(const sema::TypeSymbol* ts);
+
     // #816: per-instantiation CORE disposer (unguarded destructor body + owned-
     // field disposal + base chain) for a class reached as a BASE of a specialized
     // derived class. emitBaseDisposeChain calls this (instead of the shared,

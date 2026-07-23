@@ -9872,6 +9872,33 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
     } else if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
         for (const auto& bs : trys->body) if (bs) visitStmt(*bs);
         for (const auto& arm : trys->catches) {
+            // §31.2.1/§12.9/§14.2 (#1939): the CATCH-surface copy of the
+            // #2006/#2012/#2018 erasure guard. §31.2.1: an arm "matches any
+            // thrown exception that is an instance of the type" — but a
+            // constructed generic arm type whose argument is a still-ERASED
+            // kind (a function type; appendDescKey mints no identity token)
+            // reaches the COLLAPSED shared descriptor at dispatch, so the arm
+            // would match a sibling instantiation and bind the exception at a
+            // wrong static type (the #2001/#2006 confusion class). Reject the
+            // ground erased-argument form; hold OFF a type-variable-mentioning
+            // arm (`var ex: TEx`, `MyExc<T>` — #1505's admitted forms, resolved
+            // per instantiation; the T-pinned-to-erased residual is the
+            // design-gated #2012/#2069 scope), matching every other surface.
+            for (const auto& armTy : arm.types) {
+                if (!armTy) continue;
+                TypeRef* rt = ctx_.resolvedType(*armTy);
+                if (rt && rt->kind == TypeRef::Kind::Named &&
+                    !rt->genericArgs.empty() &&
+                    !refMentionsTypeVariable(rt) && !typeArgRuntimeReified(rt))
+                    ctx_.diagnostics().report(
+                        Severity::Error, armTy->span.begin,
+                        "the type argument of this `catch` arm type is not "
+                        "runtime-distinguishable — it is a still-erased type "
+                        "kind (e.g. a function type), which the runtime type "
+                        "descriptor collapses, so the arm could match a "
+                        "different instantiation and bind the exception at a "
+                        "wrong static type (§31.2.1/§12.9/§14.2)");
+            }
             // §31.2: a `catch var e: T` arm binds the caught exception
             // to `e` (a borrow of the caught type) in the guard and
             // body scope. The binding's decl anchors on the arm body so
