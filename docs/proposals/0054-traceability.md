@@ -1,6 +1,6 @@
 # 0054 — Traceability conventions: contract-to-code citations
 
-**Status:** draft
+**Status:** accepted (phase 1; 2026-07-24, delegated ruling #2041 — S0–S2 accepted, phase 2/S3 deferred; the five §8 open questions ruled and the `guide3` id-scheme currency fix recorded in #2041's record)
 **Tracking issue:** [#2041](https://github.com/s8lap/bezel-lang/issues/2041)
 **Target:** tooling + convention (phase 1: zero normative change — rides spec §34's preserved-verbatim rule; phase 2, optional: a one-sentence addition to §34's recognized-tag list). Phase 1 spans implementation stages S0–S2 (§6); phase 2 is S3.
 **Written against:** spec v0.197 (stdlib/rationale at the same revision)
