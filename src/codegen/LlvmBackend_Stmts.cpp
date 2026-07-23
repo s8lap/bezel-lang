@@ -247,7 +247,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         llvm::Value* res = emitCompoundOp(
                             op, cur, rhs, cur->getType()->isFloatingPointTy(),
                             isUnsignedTargetExpr(*as->target),
-                            isCharTargetExpr(*as->target));  // §6.6/§5.2 #1961
+                            isCharTargetExpr(*as->target),      // §6.6/§5.2 #1961
+                            isUnsignedTargetExpr(*as->value));  // §6.2 #2140 rUns
                         if (res && lowerVirtualPropertySet(*as->target, res))
                             return false;
                     }
@@ -849,7 +850,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         llvm::Value* pay = emitCompoundOp(
                             op, lPay, rPay,
                             lPay->getType()->isFloatingPointTy(),
-                            isUnsignedTargetExpr(*as->target), isCharU);
+                            isUnsignedTargetExpr(*as->target), isCharU,
+                            isUnsignedTargetExpr(*as->value));  // §6.2 #2140 rUns
                         llvm::Value* wrapped =
                             llvm::ConstantAggregateZero::get(elemTy);
                         if (pay) {
@@ -884,7 +886,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 llvm::Value* res = emitCompoundOp(
                     op, cur, rhs, elemTy->isFloatingPointTy(),
                     isUnsignedTargetExpr(*as->target),
-                    isCharTargetExpr(*as->target));  // §6.6/§5.2 #1961
+                    isCharTargetExpr(*as->target),      // §6.6/§5.2 #1961
+                    isUnsignedTargetExpr(*as->value));  // §6.2/§6.6 #2140 rUns
                 if (res) {
                     builder_.CreateStore(res, addr);
                     // §27.5 / #673: sync back to original alloca.

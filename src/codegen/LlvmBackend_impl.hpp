@@ -2622,9 +2622,16 @@ private:
     // operator (op without the trailing `=`). Integer `+ - *` and `/ mod`
     // are overflow/zero-checked exactly as in lowerBinary; bitwise/shift
     // are exact; floats use IEEE ops.
+    // `rUns` (#2140) is the RHS operand's OWN signedness — needed only when the
+    // §6.2-promoted result is WIDER than the LHS (`int += long`, `byte += long`,
+    // `uint += ulong`): the arithmetic runs in the wider operand's type, so each
+    // operand extends to that width by its own signedness and the op takes the
+    // wider operand's. Defaults to the LHS signedness's role being sufficient
+    // (callers whose RHS is never wider than the LHS — `++`/`--`, an already-
+    // width-matched RHS — leave it), so existing call sites are unaffected.
     llvm::Value* emitCompoundOp(const std::string& op, llvm::Value* l,
                                 llvm::Value* r, bool fp, bool uns,
-                                bool charTarget = false);
+                                bool charTarget = false, bool rUns = false);
 
     // §5.2 (#1961): apply the char code-point narrowing check to an integer
     // value — valid U+0000–U+10FFFF excluding the surrogate range

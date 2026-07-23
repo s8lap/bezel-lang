@@ -139,7 +139,8 @@ llvm::Value* Emitter::lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy) {
 
 
 llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
-                            llvm::Value* r, bool fp, bool uns, bool charTarget) {
+                            llvm::Value* r, bool fp, bool uns, bool charTarget,
+                            bool rUns) {
     // §6.6/§5.2 (#1961): a `char` LHS compound assignment/increment desugars to
     // `c := char(c OP e)` — the arithmetic runs at int width with the §6.1/§6.2
     // checked posture (as for any integer), and the result is narrowed back to
@@ -203,35 +204,66 @@ llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
         if (op == "/") return builder_.CreateFDiv(l, r);
         return nullptr;
     }
-    // #1043: an ARITHMETIC compound assignment on a SUB-i32 integer LHS
-    // (`byte`/`sbyte`/`short`/`ushort`) is `b = subInt(b OP v)` with CHECKED
-    // narrowing (§6.1). #1042 truncated the RHS to the LHS width and ran the op
-    // there, which was correct for an in-range RHS but WRONG for an out-of-range
-    // one: `byte 5 += 300` truncated 300→44 and yielded 49 instead of raising
-    // OverflowException. Compute at the promoted width (i32) — reusing the i32
-    // checked-arith via recursion — then narrow-CHECK the result back to the LHS
-    // type so any out-of-range sum/difference/product/quotient throws. Bitwise
-    // and shift ops stay on the LHS-width path below: they cannot overflow the
-    // LHS width (`&`/`|`/`^` keep operand bits; `<<`/`>>` mask the count, #1041).
+    // §6.6/§6.2 (#1043, #2140): an ARITHMETIC compound assignment on an integer
+    // LHS whose §6.2-promoted result width EXCEEDS the LHS width runs the op at
+    // the promoted width and CHECKED-narrows back to the LHS type. Two triggers:
+    // a SUB-i32 LHS (`byte`/`sbyte`/`short`/`ushort`) promotes to at least `int`
+    // (#1043 — `byte b := 5; b += 300` must raise, not truncate 300→44); and ANY
+    // LHS with a strictly WIDER RHS (`int += long`, `uint += ulong`,
+    // `byte += long`) promotes to the RHS type (#2140). Below the promoted width
+    // the #1042 tail's `CreateIntCast(r, l->getType())` silently TRUNCATED a wide
+    // RHS — `i += 2^32L` dropped the high bits and stored 0 with no raise, and
+    // `i += (2^32+65)L` stored a wrong in-range 65 — while the sub-i32 extend-to-
+    // i32 emitted an INVALID narrowing ZExt/SExt on an i64 RHS (malformed IR /
+    // assert crash). Same defect class #1996 fixed for `char` (0535081); this is
+    // its integer-family sibling.
+    //
+    // Per §6.2 the arithmetic runs in the WIDER operand's type with THAT type's
+    // signedness (`arithUns`): each operand is first extended to the promoted
+    // width by ITS OWN signedness (LHS by `uns`, RHS by `rUns`), so a byte's
+    // 0..255 value ZExts and a signed `long` RHS SExts. `byte(5) += -1L` then
+    // computes signed `5 + (-1) = 4` (not a spurious unsigned overflow) and
+    // narrows to `byte(4)`. The result is narrowed back to the LHS type by the
+    // §5.2 CHECKED narrowing (`uns`): a trunc whose sign/zero re-extension differs
+    // from the wide value is out of range → OverflowException (never a silent
+    // truncation, §6.1). Bitwise and shift ops stay on the LHS-width path below:
+    // they cannot overflow the LHS width (`&`/`|`/`^` keep operand bits; `<<`/`>>`
+    // mask the count, #1041) and a shift's result already has the left operand's
+    // type (§6.5). (`mod` has no compound form, §6.6; listed for parity.)
     if (l->getType()->isIntegerTy() && !l->getType()->isIntegerTy(1) &&
-        l->getType()->getIntegerBitWidth() < 32 &&
+        r->getType()->isIntegerTy() && !r->getType()->isIntegerTy(1) &&
         (op == "+" || op == "-" || op == "*" || op == "/" || op == "mod")) {
         llvm::Type* dstTy = l->getType();
-        auto toI32 = [&](llvm::Value* v) -> llvm::Value* {
-            if (v->getType()->isIntegerTy(32)) return v;
-            return uns ? builder_.CreateZExt(v, i32())
-                       : builder_.CreateSExt(v, i32());
-        };
-        llvm::Value* wide = emitCompoundOp(op, toI32(l), toI32(r),
-                                           /*fp=*/false, uns);
-        if (!wide) return nullptr;
-        // §5.2 checked narrowing: trunc, extend back with the result's
-        // signedness, compare to the i32 value — a mismatch means out of range.
-        llvm::Value* trunc = builder_.CreateTrunc(wide, dstTy);
-        llvm::Value* back = uns ? builder_.CreateZExt(trunc, i32())
-                                : builder_.CreateSExt(trunc, i32());
-        emitGuardThrow(builder_.CreateICmpNE(back, wide), "OverflowException");
-        return trunc;
+        unsigned lBits = dstTy->getIntegerBitWidth();
+        unsigned rBits = r->getType()->getIntegerBitWidth();
+        unsigned promo = lBits;
+        if (rBits > promo) promo = rBits;
+        if (promo < 32) promo = 32;
+        if (promo > lBits) {
+            llvm::Type* wideTy = llvm::Type::getIntNTy(llvm_, promo);
+            // §6.2: the op's type is the wider operand's — the RHS when it is
+            // strictly wider, else the LHS (a sub-i32 LHS floored to i32, or a
+            // same-width pair; §6.2 admits no mixed-signedness same-width pair, so
+            // `uns` == `rUns` there).
+            bool arithUns = (rBits > lBits) ? rUns : uns;
+            auto widen = [&](llvm::Value* v, bool vUns) -> llvm::Value* {
+                if (v->getType() == wideTy) return v;
+                return vUns ? builder_.CreateZExt(v, wideTy)
+                            : builder_.CreateSExt(v, wideTy);
+            };
+            llvm::Value* wide = emitCompoundOp(op, widen(l, uns), widen(r, rUns),
+                                               /*fp=*/false, arithUns);
+            if (!wide) return nullptr;
+            // §5.2 checked narrowing: trunc, extend back with the LHS
+            // signedness, compare to the wide value — a mismatch means out of
+            // range.
+            llvm::Value* trunc = builder_.CreateTrunc(wide, dstTy);
+            llvm::Value* back = uns ? builder_.CreateZExt(trunc, wideTy)
+                                    : builder_.CreateSExt(trunc, wideTy);
+            emitGuardThrow(builder_.CreateICmpNE(back, wide),
+                           "OverflowException");
+            return trunc;
+        }
     }
     // #1042: the compound result has the LHS type, and the checked-arith
     // intrinsics / shifts below require both operands to share that integer

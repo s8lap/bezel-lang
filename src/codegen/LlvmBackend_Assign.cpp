@@ -1692,7 +1692,8 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
     llvm::Value* newVal = emitCompoundOp(
         op, cur, rhs, cur->getType()->isFloatingPointTy(),
         isUnsignedTargetExpr(*as.target),
-        isCharTargetExpr(*as.target));  // §6.6/§5.2 #1961
+        isCharTargetExpr(*as.target),      // §6.6/§5.2 #1961
+        isUnsignedTargetExpr(*as.value));  // §6.2 #2140 rUns
     if (!newVal) return false;
 
     // --- Call setter with the new value and the pre-computed receiver/params. ---
@@ -1837,7 +1838,8 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
         llvm::Value* newVal = emitCompoundOp(
             op, cur, rhs, valLlvm->isFloatingPointTy(),
             isUnsignedTargetExpr(*as.target),
-            isCharTargetExpr(*as.target));  // §6.6/§5.2 #1961
+            isCharTargetExpr(*as.target),      // §6.6/§5.2 #1961
+            isUnsignedTargetExpr(*as.value));  // §6.2 #2140 rUns
         if (!newVal) return false;
         // Write back via lowerCollectionIndexerSet (encodes and dispatches to
         // bz_dict_set_str / bz_dict_set_gen, handling disposing variants).
@@ -1928,7 +1930,8 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
         newVal = emitCompoundOp(
             op, cur, rhs, elemTy->isFloatingPointTy(),
             isUnsignedTargetExpr(*as.target),
-            isCharTargetExpr(*as.target));  // §6.6/§5.2 #1961
+            isCharTargetExpr(*as.target),      // §6.6/§5.2 #1961
+            isUnsignedTargetExpr(*as.value));  // §6.2 #2140 rUns
         if (!newVal) return false;
     }
 
@@ -2890,7 +2893,8 @@ bool Emitter::lowerPropertyCompound(const ast::AssignmentStmt& as) {
     llvm::Value* res = emitCompoundOp(
         op, cur, rhs, cur->getType()->isFloatingPointTy(),
         isUnsignedTargetExpr(*as.target),
-        isCharTargetExpr(*as.target));  // §6.6/§5.2 #1961
+        isCharTargetExpr(*as.target),      // §6.6/§5.2 #1961
+        isUnsignedTargetExpr(*as.value));  // §6.2 #2140 rUns
     return res ? lowerPropertySetValue(*as.target, res) : false;
 }
 
