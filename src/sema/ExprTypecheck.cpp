@@ -8592,39 +8592,92 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // the right-hand OPERAND was unchecked, so e.g. `x &= 1.5` on
         // `x: int` hit the same IR-verification crash — checked here too,
         // now that the right-hand side has a type.
+        //
+        // §6.6/§7.11 (#2153): the check runs on NULLABLE primitive operands
+        // too, on the UNDERLYING primitive types — §7.11 lifts an operator
+        // exactly where it is defined on the underlying type, so the §6.2/
+        // §6.6 admission is the underlying pair's (`int? += double?` is the
+        // same family error as `int += double`), the §6.6 narrow-integer /
+        // char write-back applies on the present branch (the #1964/#2140
+        // lowering; `byte? += 300` raises OverflowException at runtime), and
+        // three nullable-specific rules apply: a nullable RHS with a
+        // NON-nullable target never stores back (§5.1's nullable conversions
+        // run T → T? only); a `string?` target requires narrowing first
+        // (§7.11 is confined to nullable VALUE types, §4.6/§7.4); and a
+        // `bool` target has no arithmetic to lift (§3.5) — the plain-`bool`
+        // target is rejected by the same new rule (it was excluded from the
+        // family check, so `bool += bool` compiled to an i1 add). A NAMED
+        // RHS (record/class/enum/interface/choice) is checked after the
+        // primitive pair: no built-in operator exists between a primitive
+        // and a named type (§6.2's promotion covers primitives), so it is
+        // an error unless the RHS type declares an applicable §25.2
+        // overload. Before #2153 the `!nullable`/primitive-RHS gate skipped
+        // ALL of these; they reached codegen and produced garbage values
+        // (`decimal? += record?` reinterpreted the record's bits as a
+        // decimal; `int? += bool?` sign-extended the i1), runtime segfaults
+        // (`string?(null) += "x"`), or malformed-IR aborts (`int += int?`).
         if (!eventPayload && as->target && as->value &&
             (as->op == "+=" || as->op == "-=" || as->op == "*=" ||
              as->op == "/=" || as->op == "&=" || as->op == "|=" ||
              as->op == "^=" || as->op == "<<=" || as->op == ">>=")) {
             TypeRef* tTy = ctx_.exprType(*as->target);
             TypeRef* rTy = ctx_.exprType(*as->value);
+            using P = PrimitiveType;
+            // Diagnostic-only spelling of a primitive type; mirrors
+            // primitiveSpelling (ExprTypecheck_Exprs.cpp, anonymous
+            // namespace, not visible here).
+            auto spell = [](P p) -> const char* {
+                switch (p) {
+                    case P::Bool:    return "bool";
+                    case P::Char:    return "char";
+                    case P::String:  return "string";
+                    case P::Byte:    return "byte";
+                    case P::SByte:   return "sbyte";
+                    case P::Short:   return "short";
+                    case P::UShort:  return "ushort";
+                    case P::Int:     return "int";
+                    case P::UInt:    return "uint";
+                    case P::Long:    return "long";
+                    case P::ULong:   return "ulong";
+                    case P::Float:   return "float";
+                    case P::Double:  return "double";
+                    case P::Decimal: return "decimal";
+                    case P::Object:  return "Object";
+                    case P::None:    return "<none>";
+                }
+                return "<unknown>";
+            };
+            // §6.6/§7.11 (#2153): spell a primitive operand WITH its own
+            // nullability (`int?`) so the diagnostics name the types as
+            // written; non-nullable operands keep the plain spelling (the
+            // #1689 messages are unchanged).
+            auto spellN = [&spell](const TypeRef* t) {
+                return std::string(spell(t->primitive)) +
+                       (t->nullable ? "?" : "");
+            };
             if (tTy && rTy && tTy->kind == TypeRef::Kind::Primitive &&
-                rTy->kind == TypeRef::Kind::Primitive &&
-                !tTy->nullable && !rTy->nullable) {
-                using P = PrimitiveType;
-                // Diagnostic-only spelling of a primitive type; mirrors
-                // primitiveSpelling (ExprTypecheck_Exprs.cpp, anonymous
-                // namespace, not visible here).
-                auto spell = [](P p) -> const char* {
-                    switch (p) {
-                        case P::Bool:    return "bool";
-                        case P::Char:    return "char";
-                        case P::String:  return "string";
-                        case P::Byte:    return "byte";
-                        case P::SByte:   return "sbyte";
-                        case P::Short:   return "short";
-                        case P::UShort:  return "ushort";
-                        case P::Int:     return "int";
-                        case P::UInt:    return "uint";
-                        case P::Long:    return "long";
-                        case P::ULong:   return "ulong";
-                        case P::Float:   return "float";
-                        case P::Double:  return "double";
-                        case P::Decimal: return "decimal";
-                        case P::Object:  return "Object";
-                        case P::None:    return "<none>";
-                    }
-                    return "<unknown>";
+                rTy->kind == TypeRef::Kind::Primitive) {
+                // §6.6/§7.11/§5.1 (#2153): a nullable RHS with a NON-nullable
+                // target can never store back — the lifted `x op e` result is
+                // nullable wherever it is defined at all (§7.11: a mixed
+                // expression "lifts as well … and the result is `T?`"), and
+                // §5.1's nullable conversions run T → T? only, never back.
+                // Applies to all nine operator forms; reported below once the
+                // operand KINDS have passed their own checks.
+                auto reportNullableRhs = [&]() {
+                    std::string binOp(as->op.substr(0, as->op.size() - 1));
+                    ctx_.diagnostics().report(
+                        Severity::Error, as->value->span.begin,
+                        std::string("compound assignment `") +
+                        std::string(as->op) +
+                        "` has a nullable right-hand operand (`" +
+                        spellN(rTy) + "`) with a non-nullable target (`" +
+                        spellN(tTy) + "`): the result of `" + spellN(tTy) +
+                        " " + binOp + " " + spellN(rTy) + "` is nullable "
+                        "where defined (§7.11) and cannot store back into "
+                        "the non-nullable target — narrow the right-hand "
+                        "operand first (`?? <fallback>`, `!`, or a §7.4 "
+                        "check) (§6.6)");
                 };
                 bool isShift = (as->op == "<<=" || as->op == ">>=");
                 bool isBitwise = (as->op == "&=" || as->op == "|=" ||
@@ -8653,11 +8706,51 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             "` is not valid on " + badKind + " — bitwise and "
                             "shift operators require integer operands "
                             "(§6.5)");
+                    // §6.6/§7.11 (#2153): an integer-kinded NULLABLE RHS with
+                    // a non-nullable target (`int &= long?`, `int <<= int?`)
+                    // has no storable result — same rule as the arithmetic
+                    // forms below.
+                    else if (rTy->nullable && !tTy->nullable)
+                        reportNullableRhs();
                     // A shift's result is always the left operand's type
                     // (§6.5) — once the operand-kind check above passes
                     // there is no R-vs-T mismatch left to check.
-                } else if (tTy->primitive != P::String &&
-                           tTy->primitive != P::Bool) {
+                } else if (tTy->primitive == P::Bool) {
+                    // §6.6/§3.5 (#2153): no arithmetic is defined on `bool`
+                    // (§3.5 lists the numeric types only), so `bool op= e`
+                    // has no result to store — and §7.11 lifts an operator
+                    // only where the underlying type defines it, so a
+                    // `bool?` target is rejected identically. Previously the
+                    // family check EXCLUDED a bool target: `bool += bool`
+                    // compiled to an i1 add and raised OverflowException at
+                    // RUNTIME instead of being rejected here.
+                    ctx_.diagnostics().report(
+                        Severity::Error, as->span.begin,
+                        std::string("compound assignment `") +
+                        std::string(as->op) + "` is not valid on a `" +
+                        spellN(tTy) + "` target — the arithmetic operators "
+                        "are not defined on `bool` (§3.5); boolean "
+                        "combinations use `and`/`or`/`not` (§17.2) (§6.6)");
+                } else if (tTy->primitive == P::String && tTy->nullable) {
+                    // §6.6/§4.6/§7.4 (#2153): a `string?` target — §7.11's
+                    // lifting is confined to nullable VALUE types and "does
+                    // not extend" to `string` (§4.6 states the boundary for
+                    // ordering; §7.4's use-requires-narrowing discipline
+                    // governs every other operation on a nullable
+                    // reference). Previously `string?(null) += "x"` compiled
+                    // and the #857 concat path dereferenced the null string
+                    // pointer — a runtime segfault.
+                    ctx_.diagnostics().report(
+                        Severity::Error, as->span.begin,
+                        "compound assignment on a `string?` target requires "
+                        "a non-nullable `string` — §7.11's lifting covers "
+                        "nullable value types only and does not extend to "
+                        "`string`; narrow the target first (§7.4) (§6.6)");
+                } else if (rTy->nullable && !tTy->nullable) {
+                    // §6.6/§7.11 (#2153): nullable RHS, non-nullable target
+                    // (`int += int?`, `string += int?`) — see reportNullableRhs.
+                    reportNullableRhs();
+                } else if (tTy->primitive != P::String) {
                     // Arithmetic (`+= -= *= /=`) or a non-shift bitwise op
                     // whose operands both passed the integer-kind check
                     // above. Compute R = type of `target op value` per
@@ -8695,22 +8788,120 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         isTrueInt(rPrim);
                     if (!rEqualsT && !rConvertsToT && !integerWriteBack) {
                         std::string binOp(as->op.substr(0, as->op.size() - 1));
+                        // §7.11 (#2153): with a nullable operand the computed
+                        // R lifts to `R?`; spell it so (`int? + double?`
+                        // computes `double?`). The `T?(x op e)` remedy stays
+                        // valid spelling — §5.3's nullable cast is admitted
+                        // exactly where the underlying conversion is.
+                        std::string rSpell =
+                            std::string(spell(rPrim)) +
+                            ((tTy->nullable || rTy->nullable) ? "?" : "");
                         ctx_.diagnostics().report(
                             Severity::Error, as->value->span.begin,
                             std::string("compound assignment `") +
                             std::string(as->op) + "` has no valid result: `" +
-                            spell(tTy->primitive) + " " + binOp + " " +
-                            spell(rTy->primitive) + "` computes `" +
-                            spell(rPrim) + "`, which is neither `" +
-                            spell(tTy->primitive) + "` nor implicitly "
+                            spellN(tTy) + " " + binOp + " " +
+                            spellN(rTy) + "` computes `" +
+                            rSpell + "`, which is neither `" +
+                            spellN(tTy) + "` nor implicitly "
                             "convertible to it, and `" +
-                            spell(tTy->primitive) + "` is not an integer/"
+                            spellN(tTy) + "` is not an integer/"
                             "char target receiving an integer result (the "
                             "only case §6.6's write-back narrows) — convert "
                             "the right-hand operand explicitly, or write "
-                            "`x := " + spell(tTy->primitive) + "(x " + binOp +
+                            "`x := " + spellN(tTy) + "(x " + binOp +
                             " e);` if the loss is intended (§6.6)");
                     }
+                }
+            } else if (tTy && rTy &&
+                       tTy->kind == TypeRef::Kind::Primitive &&
+                       rTy->kind == TypeRef::Kind::Named && rTy->declaration) {
+                // §6.6/§6.2/§25.2 (#2153): a NAMED RHS (record/class/enum/
+                // interface/choice) against a primitive-typed target. No
+                // built-in operator exists between a primitive and a named
+                // type — §6.2's promotion covers primitive numeric operands,
+                // and §5.1 never implicitly converts an enum to its
+                // underlying integer — so the compound form has no result
+                // UNLESS the RHS type declares an applicable operator
+                // overload: §25.2 admits "a binary overload may pair the
+                // declaring type with any other type in either position",
+                // matched IN ORDER (#1096: left operand → param 0, here the
+                // primitive; right operand → param 1, the declaring type)
+                // including declarations inherited from base classes
+                // (§25.2 v0.181), with findBinaryOperator's §7.11
+                // nullability gate (#1132: a nullable operand matches only a
+                // nullable parameter — user-operator lifting is deferred).
+                // When such an overload exists the compound stays admitted
+                // here and desugars through it (§25.1). A Named RHS with NO
+                // declaration (an unresolved name or a type parameter) is
+                // left unchecked, conservatively, as before.
+                std::string binOp(as->op.substr(0, as->op.size() - 1));
+                bool hasApplicableOp = false;
+                for (MethodSymbol* m : collectInheritedOperators(
+                         rTy->declaration, binOp, 2)) {
+                    auto paramTy = [&](Symbol* paramSym) -> TypeRef* {
+                        auto* ps = dynamic_cast<ParameterSymbol*>(paramSym);
+                        if (!ps) return nullptr;
+                        return ps->declType
+                                   ? ctx_.resolvedType(*ps->declType)
+                                   : ps->resolvedDeclType;
+                    };
+                    TypeRef* p0 = paramTy(m->params[0]);
+                    TypeRef* p1 = paramTy(m->params[1]);
+                    if (!p0 || !p1) continue;
+                    // Mirrors operandMatchesParam (ExprTypecheck_Exprs.cpp):
+                    // a primitive param accepts a primitive operand (numeric
+                    // coercion downstream); a Named param needs the operand's
+                    // declaration (or a derived one) with nullability
+                    // agreement.
+                    bool leftOk = p0->kind == TypeRef::Kind::Primitive;
+                    bool rightOk =
+                        p1->kind == TypeRef::Kind::Named && p1->declaration &&
+                        (p1->declaration == rTy->declaration ||
+                         isSubtype(rTy->declaration, p1->declaration)) &&
+                        (p1->nullable || !rTy->nullable);
+                    if (leftOk && rightOk) {
+                        hasApplicableOp = true;
+                        break;
+                    }
+                }
+                if (!hasApplicableOp) {
+                    const char* kindWord = "";
+                    switch (rTy->declaration->kind) {
+                        case ast::TypeDeclKind::Record:
+                            kindWord = "record"; break;
+                        case ast::TypeDeclKind::Class:
+                            kindWord = "class"; break;
+                        case ast::TypeDeclKind::Enum:
+                            kindWord = "enum"; break;
+                        case ast::TypeDeclKind::Interface:
+                            kindWord = "interface"; break;
+                        case ast::TypeDeclKind::Choice:
+                            kindWord = "choice"; break;
+                    }
+                    std::string rhsName =
+                        std::string(rTy->declaration->name) +
+                        (rTy->nullable ? "?" : "");
+                    std::string tail =
+                        rTy->nullable
+                            ? std::string(
+                                  "user-defined operators do not lift over a "
+                                  "nullable operand (§7.11 — deferred) — "
+                                  "narrow the operand or convert it "
+                                  "explicitly (§6.6)")
+                            : "`" + std::string(rTy->declaration->name) +
+                                  "` declares no applicable `operator " +
+                                  binOp + "` overload (§25.2) — convert the "
+                                  "right-hand operand explicitly or declare "
+                                  "the operator (§6.6)";
+                    ctx_.diagnostics().report(
+                        Severity::Error, as->value->span.begin,
+                        std::string("compound assignment `") +
+                        std::string(as->op) + "` has no valid result: no "
+                        "built-in operator `" + binOp + "` is defined "
+                        "between `" + spellN(tTy) + "` and " + kindWord +
+                        " type `" + rhsName + "` (§6.2's promotion covers "
+                        "primitive numeric operands only), and " + tail);
                 }
             }
         }
