@@ -812,8 +812,20 @@ llvm::Value* Emitter::emitExcSlot() {
         auto* fnTy = llvm::FunctionType::get(ptrTy(),
                                              llvm::ArrayRef<llvm::Type*>{},
                                              /*isVarArg=*/false);
-        excAddrFn_ = llvm::Function::Create(
-            fnTy, llvm::Function::ExternalLinkage, "bz_exc_addr", module_.get());
+        // fix #2148 follow-up: DEDUPE on an existing declaration. The
+        // iterator/async owning-`TakeCurrent` error path independently declares
+        // `bz_exc_addr` via module_->getOrInsertFunction (LlvmBackend_Iterators.cpp,
+        // LlvmBackend_Async.cpp). A plain llvm::Function::Create does NOT check for
+        // an existing global — so when emitExcSlot ran SECOND (that TakeCurrent
+        // path emitted first), LLVM renamed this new function to "bz_exc_addr.1",
+        // which emitExcSlot then cached and every emitExcSlot caller referenced —
+        // an UNDEFINED symbol at link (the runtime exports only "bz_exc_addr"),
+        // breaking any owning iterator whose emission order put TakeCurrent first.
+        // The type is identical (ptr()) at all three sites, so getOrInsertFunction
+        // returns the one canonical Function regardless of which site ran first.
+        // per §30.14 / fix #704
+        excAddrFn_ = llvm::cast<llvm::Function>(
+            module_->getOrInsertFunction("bz_exc_addr", fnTy).getCallee());
     }
     return builder_.CreateCall(excAddrFn_, {}, "exc.slot");
 }

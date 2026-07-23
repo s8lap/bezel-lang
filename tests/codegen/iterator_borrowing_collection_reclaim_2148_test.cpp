@@ -35,6 +35,9 @@
 // ran=false -> the -999 sentinel); with the fix every program is ASan/LSan-clean
 // and returns the expected value. // per §28.9, §28.11 (issue #2148)
 
+#include <cstddef>
+#include <string>
+
 #include "support/aot_support.hpp"   // runAotChecked — ASan/LSan AOT harness
 #include "test_harness.hpp"
 
@@ -47,6 +50,25 @@ namespace {
 int runChecked(const std::string& prog) {
     auto r = runAotChecked(prog);
     return r.ran ? r.exitCode : -999;
+}
+
+// For the owning-iterator follow-up cells: pin ran (link + ASan/LSan clean),
+// exitCode, and the count of the parameter destructor's "dispose 1" line (must be
+// exactly once — no double-dispose, no skipped dispose).
+struct JitResultCount {
+    bool ran;
+    int  exitCode;
+    int  disposeOnce;
+};
+JitResultCount runCount(const std::string& prog) {
+    auto r = runAotChecked(prog);
+    int n = 0;
+    const std::string& s = r.stdoutText;
+    const std::string needle = "dispose 1";
+    for (std::size_t p = s.find(needle); p != std::string::npos;
+         p = s.find(needle, p + needle.size()))
+        ++n;
+    return { r.ran, r.exitCode, n };
 }
 }  // namespace
 
@@ -200,6 +222,80 @@ BEZEL_TEST(iterator_borrowing_collection_reclaim_2148, array_literal_reclaimed_o
         "  end Main; "
         "end C;"),
         10);
+}
+
+// ── REGRESSION GUARD (follow-up): the re-established reclaim eligibility re-runs
+// collectBorrowingArrayFreeEligible during MoveNext lowering, which perturbed the
+// order in which `bz_exc_addr` (the thread-exception-slot accessor) first entered
+// the module. That symbol is declared BOTH by the owning-`TakeCurrent` error path
+// (module_->getOrInsertFunction) and by emitExcSlot — and emitExcSlot used a plain
+// llvm::Function::Create that does NOT dedupe, so when it ran second LLVM minted a
+// colliding `bz_exc_addr.1` (undefined at link — the runtime exports only
+// `bz_exc_addr`), breaking the LINK of a bare `yield return <owned param>` owning
+// iterator. Fixed by deduping in emitExcSlot (getOrInsertFunction). This is the
+// EXACT regressed shape (cf. iterator_owned_param_yield_transfer_1863): an
+// IOwningEnumerable<R> iterator that yields its `owned` parameter, consumed via the
+// manual owning protocol, must LINK, run, and dispose the parameter EXACTLY once.
+// per §29.1, §29.8 (issue #2148 follow-up)
+BEZEL_TEST(iterator_borrowing_collection_reclaim_2148, owning_iter_yield_owned_param_links_and_disposes_once) {
+    JitResultCount r = runCount(
+        "module M; "
+        "class R "
+        "  public Id: int := 0; "
+        "  public constructor(id: int) Id := id; end constructor; "
+        "  destructor Console.WriteLine(\"dispose \" + Id.ToString()); end destructor; "
+        "end R; "
+        "class C "
+        "  public static method Gen(owned a: R): IOwningEnumerable<R> "
+        "    yield return a; "
+        "  end Gen; "
+        "  public static method Main(): int "
+        "    using var source := Gen(new R(1)); "
+        "    using var en := source.GetOwningEnumerator(); "
+        "    while en.MoveNext() do "
+        "      using var u := en.TakeCurrent(); "
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);            // must LINK + run (no bz_exc_addr.1)
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.disposeOnce, 1);   // parameter disposed exactly once
+}
+
+// ── INTERACTION cell: an `owned` parameter yielded (transferred to the consumer,
+// discharged at the yield) AND a borrowing-`Array<int>` LITERAL local reclaimed at
+// MoveNext scope end, in the SAME iterator body. The param-transfer discharge and
+// the array-backing reclaim must coexist: the parameter disposes exactly once (via
+// the consumer), the array backing is freed once (no leak), no double-free.
+// Value: u.Id = 1. // per §29.1, §29.8, §28.9, §28.11 (issue #2148 follow-up)
+BEZEL_TEST(iterator_borrowing_collection_reclaim_2148, owning_iter_owned_param_and_array_literal_same_body) {
+    JitResultCount r = runCount(
+        "module M; "
+        "class R "
+        "  public Id: int := 0; "
+        "  public constructor(id: int) Id := id; end constructor; "
+        "  destructor Console.WriteLine(\"dispose \" + Id.ToString()); end destructor; "
+        "end R; "
+        "class C "
+        "  public static method Gen(owned a: R): IOwningEnumerable<R> "
+        "    var xs: Array<int> := [7, 8, 9]; "
+        "    yield return a; "
+        "  end Gen; "
+        "  public static method Main(): int "
+        "    using var source := Gen(new R(1)); "
+        "    using var en := source.GetOwningEnumerator(); "
+        "    var sum := 0; "
+        "    while en.MoveNext() do "
+        "      using var u := en.TakeCurrent(); "
+        "      sum := sum + u.Id; "
+        "    end; "
+        "    return sum; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);            // links + ASan/LSan clean (array reclaimed)
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
+    BEZEL_EXPECT_EQ(r.disposeOnce, 1);   // parameter disposed exactly once
 }
 
 // ── CONTROL (the contrast, must stay green): an OwningArray<Box> built from a
