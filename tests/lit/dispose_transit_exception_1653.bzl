@@ -42,3 +42,7 @@ end Program;
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: cannot call `Dispose()` on an element borrow read from a borrowing-family collection
 // CHECK-SAME: §28.6
 // CHECK-SAME: axiom A8
+// The SECOND site (the bare indexer-get `arr[0].Dispose()`) must fire its own
+// diagnostic — one report per violation, not one per function (#2081 review).
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: cannot call `Dispose()` on an element borrow read from a borrowing-family collection
+// CHECK-SAME: §28.6

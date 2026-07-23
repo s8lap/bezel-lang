@@ -94,6 +94,24 @@ BEZEL_TEST(codegen_choice_ser_2046, payload_free_case_roundtrip_binary_spec_9_8)
         "end Main; end C;"), 7);
 }
 
+// §9.8 EXACT WIRE, multi-field: discriminator FIRST, then payload fields by
+// name in DECLARATION order — the round-trip tests above cannot see ordering;
+// this pin can (batch-B review rider). v0.200.
+BEZEL_TEST(codegen_choice_ser_2046, multi_field_exact_wire_order_spec_9_8) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "choice FetchOutcome: ISerializable, IDeserializable "
+        "  NotModified, Failed(status: int, message: string); end FetchOutcome; "
+        "class C public static method Main(): int "
+        "  var f := FetchOutcome.Failed(504, \"up\"); "
+        "  using var s := new JsonSerializer(); "
+        "  f.Serialize(s); "
+        "  return (if s.ToString() = "
+        "    \"{\\\"$case\\\":\\\"Failed\\\",\\\"status\\\":504,\\\"message\\\":\\\"up\\\"}\" "
+        "    then 1 else 0); "
+        "end Main; end C;"), 1);
+}
+
 // §9.8: a multi-field value payload (int + string) round-trips through JSON.
 BEZEL_TEST(codegen_choice_ser_2046, multi_field_payload_roundtrip_json_spec_9_8) {
     BEZEL_EXPECT_EQ(run(
