@@ -343,3 +343,147 @@ BEZEL_TEST(task_wheneach_2082, owned_empty_completes_immediately) {
         "    return Cell.n + count; "  // 0
         "  end Main; end C;"), 0);
 }
+
+// ============================================================
+// STILL-RUNNING inputs (#2112): every test above feeds already-completed
+// inputs (Task.FromResult / Task.FromOwnedResult), so at init each observer
+// fires INLINE and MoveNextAsync always takes the synchronous `ready` path —
+// the parked `pending_advance` delivery, the disposed->observer-frees
+// (`free_completed`) arm, and late-observer refcount survival (the #2095
+// closures) are never executed. The tests below feed inputs that are genuinely
+// STILL RUNNING at enumeration start, built with the sanctioned Task.Delay
+// still-running idiom (async producer awaits Task.Delay before producing —
+// stdlib §6.7 Delay; the same idiom as async_451 / taskscope_asan_808). With
+// no input completable in the microseconds before the first MoveNextAsync runs,
+// that call is forced down the park path (pending_advance), and the completion
+// is delivered by the per-input observer that fires later on the timer/pool
+// thread — the parked-advance protocol. Instrumented probe evidence (temporary
+// counters, #2112 report): owned_still_running_parks_then_delivers observes
+// park=3/parked_deliver=3; owned_dispose_in_flight_observer_frees observes
+// park=1/parked_deliver=1/free_completed=2.
+//
+// These use the OWNING variant deliberately: the borrowing variant additionally
+// requires the caller to hold the `Array<Task<T>>` local across the loop's
+// suspend, which trips a separate general async frame-spill defect (an
+// `Array<T>` local is corrupted across an `await`; `OwningArray<T>` is not —
+// filed separately from this lane). The park/deliver runtime code
+// (bz_we_move_next / bz_we_input_completed) is shared by both variants — only
+// the `is_owning` free arm differs — so the owning tests exercise the identical
+// parked-advance protocol without depending on that unrelated defect.
+
+// #2112 — park-then-complete (pending_advance delivery). Three OwningTask<Cell>
+// inputs are all still running (each awaits Task.Delay before producing its
+// Cell) when the `await for` begins, so the first MoveNextAsync finds `ready`
+// empty and parks a `pending_advance` task; the per-input observer that fires
+// when a Delay elapses delivers the completion to that parked advance (the
+// `else if (e->pending_advance)` arm of bz_we_input_completed). Full consume:
+// every OwningTask is yielded and its Cell taken by `using var x := await tk`
+// and disposed at end of iteration. Oracle: count == 3 (all yielded through the
+// parked path) AND Cell.n == 0 (each Cell disposed exactly once) -> 0; any
+// leak / double-free / UAF flips runAotChecked's oracle to -999.
+BEZEL_TEST(task_wheneach_2082, owned_still_running_parks_then_delivers) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kCell +
+        "class C "
+        "  public static async method MakeCell(ms: int): OwningTask<Cell> "
+        "    await Task.Delay(ms); "
+        "    return new Cell(); "
+        "  end MakeCell; "
+        "  public static method Make(): owned OwningArray<OwningTask<Cell>> "
+        "    var arr := new OwningArray<OwningTask<Cell>>(); "
+        "    arr.Add(C.MakeCell(30)); "
+        "    arr.Add(C.MakeCell(30)); "
+        "    arr.Add(C.MakeCell(30)); "
+        "    return arr; "
+        "  end Make; "
+        "  public static async method Main(): Task<int> "
+        "    var count := 0; "
+        "    await for var tk in Task.WhenEachOwned(owned C.Make()) do "
+        "      using var x := await tk; "
+        "      count := count + 1; "
+        "    end; "
+        "    if count = 3 and Cell.n = 0 then return 0; else return 1; end; "
+        "  end Main; end C;"), 0);
+}
+
+// #2112 — dispose-with-in-flight-inputs: the disposed->observer-frees arm
+// (`free_completed`) AND late-observer refcount survival (the #2095 closures).
+// The first input has a short delay and completes first; the loop consumes it
+// (using var x) and BREAKS, disposing the enumerator while the other two inputs
+// are still running (long delay, not yet completed). bz_we_dispose finds `ready`
+// empty and `current_yielded` already taken, so it frees no input here — the two
+// in-flight tasks are still owned by their registered observers, which each hold
+// a refcount on the enumerator context (so it is NOT deleted at Dispose:
+// refcount survival). When those Delays later elapse (flushed at scheduler
+// shutdown, timer drain), each observer runs bz_we_input_completed, sees
+// `disposed` + `is_owning`, and discharges its task through bz_we_free_owned_task
+// (`free_completed = true`) — disposing the produced Cell exactly once; the last
+// observer's release deletes the context. Oracle: count == 1 (one consumed
+// before break); the two in-flight Cells + task structs must be freed exactly
+// once by the deferred observers — a leak (observer never freed) or double-free
+// (dispose also swept the input) flips runAotChecked's oracle to -999.
+BEZEL_TEST(task_wheneach_2082, owned_dispose_in_flight_observer_frees) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kCell +
+        "class C "
+        "  public static async method MakeCell(ms: int): OwningTask<Cell> "
+        "    await Task.Delay(ms); "
+        "    return new Cell(); "
+        "  end MakeCell; "
+        "  public static method Make(): owned OwningArray<OwningTask<Cell>> "
+        "    var arr := new OwningArray<OwningTask<Cell>>(); "
+        "    arr.Add(C.MakeCell(5)); "    // completes first -> consumed
+        "    arr.Add(C.MakeCell(60)); "   // in-flight at Dispose -> free_completed
+        "    arr.Add(C.MakeCell(60)); "   // in-flight at Dispose -> free_completed
+        "    return arr; "
+        "  end Make; "
+        "  public static async method Main(): Task<int> "
+        "    var count := 0; "
+        "    await for var tk in Task.WhenEachOwned(owned C.Make()) do "
+        "      using var x := await tk; "
+        "      count := count + 1; "
+        "      break; "  // dispose with two OwningTask<Cell> still running
+        "    end; "
+        "    return count; "  // 1; deferred observers free the two in-flight Cells
+        "  end Main; end C;"), 1);
+}
+
+// #2112 follow-up — a FAULTED in-flight input freed by the disposed observer
+// must dispose its owned exception object too (bz_we_free_owned_task disposes
+// error_obj; bz_task_free alone never touches it, §30.9). Extends the
+// already-completed owned_faulted_input_unconsumed_disposed_no_leak case to the
+// DEFERRED path: the faulting input is still running at Dispose and its observer
+// runs free_completed at shutdown. One input completes first (consumed + break);
+// a still-running faulting input and a still-running ok input remain in flight
+// at Dispose. Oracle: count == 1; the faulting input's InvalidOperationException
+// (40 bytes) and the ok input's Cell must both be disposed by the deferred
+// observers — a leak flips runAotChecked's oracle to -999.
+BEZEL_TEST(task_wheneach_2082, owned_faulted_in_flight_dispose_no_leak) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kCell +
+        "class C "
+        "  public static async method MakeCell(ms: int): OwningTask<Cell> "
+        "    await Task.Delay(ms); "
+        "    return new Cell(); "
+        "  end MakeCell; "
+        "  public static async method BoomCell(ms: int): OwningTask<Cell> "
+        "    await Task.Delay(ms); "
+        "    throw new InvalidOperationException(\"boom\"); "
+        "  end BoomCell; "
+        "  public static method Make(): owned OwningArray<OwningTask<Cell>> "
+        "    var arr := new OwningArray<OwningTask<Cell>>(); "
+        "    arr.Add(C.MakeCell(5)); "    // completes first -> consumed
+        "    arr.Add(C.BoomCell(60)); "   // in-flight faulted -> free_completed disposes exc
+        "    arr.Add(C.MakeCell(60)); "   // in-flight ok -> free_completed disposes Cell
+        "    return arr; "
+        "  end Make; "
+        "  public static async method Main(): Task<int> "
+        "    var count := 0; "
+        "    await for var tk in Task.WhenEachOwned(owned C.Make()) do "
+        "      using var x := await tk; "
+        "      count := count + 1; "
+        "      break; "  // dispose with a faulted + an ok task still running
+        "    end; "
+        "    return count; "  // 1; deferred observers free the exc object + the Cell
+        "  end Main; end C;"), 1);
+}
