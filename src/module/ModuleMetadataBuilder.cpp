@@ -1182,6 +1182,15 @@ ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(child);
         if (ts == nullptr) continue;  // aliases/extensions/externs: see note
         if (!isExportedType(*ts)) continue;  // §13.2 internal types not exported
+        // §2.20/#2047: the auto-imported stdlib prelude decl (Result) is NOT
+        // part of this module's public interface — every importer injects its
+        // own copy, so exporting it would (a) pollute the interface with a
+        // decl the module never wrote and (b) mis-kind it as a Class in the
+        // schema (Choice has no MetaTypeDeclKind yet, #2121). Also keeps the
+        // driver-path metadata identical to the metadata-only build path (the
+        // object_section_roundtrip pin).
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
+            if (td->isSynthesizedPrelude) continue;
         md.types.push_back(convertTypeDecl(*ts, ctx, source));
         md.exports.push_back(std::string(ts->name));  // §2.4 exported name
     }
