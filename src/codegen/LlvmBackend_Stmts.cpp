@@ -833,12 +833,24 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         // (`d += 2.0m`, `c += 1`, or a wrapped literal) is present
                         // always. For a scalar payload a struct-typed RHS is the
                         // nullable form; for a `decimal?` payload the bare
-                        // %bz.decimal is ALSO a struct, so detect nullability by
-                        // the tagged-struct type (== elemTy) instead.
+                        // %bz.decimal is ALSO a struct, so nullability cannot be
+                        // "is a struct" — it is "is a struct that is NOT the bare
+                        // %bz.decimal" (#2149). That covers both a `decimal?` RHS
+                        // (`{i8; %bz.decimal}`, != decimalStructType()) AND a
+                        // nullable-INT RHS (`decimal? += int?`, `{i8; i32}`): both
+                        // must have their payload unwrapped (and, for the int, be
+                        // §5.1-coerced to decimal below). The pre-#2149 `== elemTy`
+                        // test matched only a `decimal?` RHS, so a nullable-int RHS
+                        // was treated always-present and its whole `{i8; i32}`
+                        // struct flowed to coerceNumericToType (whose int→decimal
+                        // branch requires an INTEGER source, so it fell through
+                        // unchanged) and then emitDecimalArith — a silent miscompile
+                        // (the struct's bits reinterpreted as a decimal).
                         llvm::Value* lTag = nullablePrimHasValue(cur);      // i1
                         llvm::Value* lPay = nullablePrimValue(cur);         // T
                         bool rNullable = decimalPayload
-                            ? (rhs->getType() == elemTy)
+                            ? (rhs->getType()->isStructTy() &&
+                               rhs->getType() != decimalStructType())
                             : rhs->getType()->isStructTy();
                         llvm::Value* rTag = rNullable
                             ? nullablePrimHasValue(rhs) : builder_.getTrue();
@@ -856,11 +868,13 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         builder_.SetInsertPoint(opBB);
                         llvm::Value* pay = nullptr;
                         if (decimalPayload) {
-                            // §6.4 / §5.1 (#2141): an integer RHS (`d += 5`)
-                            // §5.1-converts to `decimal`; a decimal RHS is used
-                            // as-is (a `double`/`float` RHS is a §6.2 compile
-                            // error, rejected in sema). Route through the §6.4
-                            // decimal intrinsic — its div/mod §7.11
+                            // §6.4 / §5.1 (#2141): an integer RHS (`d += 5`, or
+                            // the unwrapped payload of an `int?`/`long?` RHS —
+                            // #2149) §5.1-converts to `decimal`; a decimal RHS
+                            // (bare `decimal` or the unwrapped `decimal?` payload)
+                            // is used as-is (a `double`/`float` RHS is a §6.2
+                            // compile error, rejected in sema). Route through the
+                            // §6.4 decimal intrinsic — its div/mod §7.11
                             // DivideByZeroException guard runs on this present
                             // branch only.
                             rPay = coerceNumericToType(
