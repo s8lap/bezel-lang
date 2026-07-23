@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.218 — July 2026**
+**Companion to the Bezel Language Specification, v0.219 — July 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -7016,3 +7016,9 @@ Rationale §3.3 is rewritten as the recorded reversal it is: the #1373 ruling's 
 **Recorded for a future revision, not landed here:** the §17.6 indexer-increment advisory defect (the "explicit read and write" remedy has identical cost to the desugaring it advises against, and the tally case now belongs to stdlib §4.20 `Counter<K>`, v0.215) — verified 2026-07-22 and tracked by [#2134](https://github.com/s8lap/bezel-lang/issues/2134).
 
 **Migration.** None — wording only.
+
+### v0.219 changelog (v0.218 → v0.219)
+
+**Clarification — §17.6's indexer-increment advice corrected ([#2134](https://github.com/s8lap/bezel-lang/issues/2134); verified 2026-07-22, owner-directed fix).** The advisory paragraph after the indexer desugaring recommended "writing the read and write explicitly" for collections where the getter+setter cost matters — a self-refuting remedy: the explicit spelling performs the same one getter and one setter (the same two hash lookups on `Dictionary<K, int>`) and, for non-trivial collection/index expressions, re-evaluates them where the desugaring binds `__coll`/`__idx` once. The corrected text states the truth the rationale's §18 ref-returning-indexers deferral already implied — the two-access cost is inherent to indexer-mediated read-modify-write, and no rewrite of the statement changes it — and routes the tally case to `Counter<K>` (stdlib §4.20, v0.215), aligning §17.6 with stdlib §4.8's existing single-lookup-upsert note. The desugaring itself, the no-deduplication rule, and the ownership split on class-element collections are unchanged — the defect was advisory prose only. Classified a clarification (the rule is genuinely unchanged); the reviewer confirmation is the #2134 verification record.
+
+**Migration.** None — advisory wording only. #2134 closes at this landing.
