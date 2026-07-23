@@ -213,6 +213,14 @@ private:
     // Slice S26: enclosing-loop nesting depth, for the §21.5 rule that
     // `break`/`continue` are legal only inside a loop.
     int loopDepth_ = 0;
+    // §21.5 (v0.201, #2051): the loop label of each enclosing loop, outermost
+    // first — one entry per open loop (empty for an unlabeled loop). Its size is
+    // kept equal to `loopDepth_`. Used to reject duplicate labels ("labels do
+    // not shadow"), to resolve a labeled `break`/`continue` target (and compute
+    // its nesting offset for codegen), and to apply the `finally`-boundary rule
+    // to the resolved target. Reset across the callable (lambda) boundary
+    // alongside `loopDepth_`, so a label is visible only within its own callable.
+    std::vector<std::string_view> loopLabelStack_;
     // Slice S27: enclosing catch-arm-body depth, for the §31.5 rule
     // that a bare `throw;` / `throw` re-raise is valid only in a catch
     // arm body.
@@ -792,6 +800,19 @@ private:
     // inferred (unresolved identifiers, un-typed calls) are left alone
     // so this pass never produces false positives on incomplete typing.
     void checkConditionIsBool(const ast::Expr& cond, std::string_view ctx);
+
+    // §21.5 (v0.201, #2051): reject a loop label that duplicates the label of an
+    // enclosing loop in the same callable ("labels do not shadow"). No-op for an
+    // unlabeled loop (empty `label`). Call before pushing onto loopLabelStack_.
+    void checkLoopLabelShadow(std::string_view label, SourceLocation loc);
+    // §21.5 (v0.201): resolve a `break`/`continue` target. `label` empty is the
+    // unlabeled form (innermost loop, offset 0). A labeled form resolves against
+    // the enclosing loop labels: unknown → error naming the labels in scope;
+    // otherwise sets `offsetOut` to the nesting distance from the jump to the
+    // target (0 = innermost) for codegen. Applies the §31.2 finally-boundary rule
+    // to the resolved target (labeled or not). Precondition: loopDepth_ > 0.
+    void checkLoopJumpTarget(std::string_view label, bool isBreak,
+                             int& offsetOut, SourceLocation loc);
 
     // §20: type the `if` expression `x if c else y` with the COMMON type
     // of its two branches and record it on `e`. A branch whose type is

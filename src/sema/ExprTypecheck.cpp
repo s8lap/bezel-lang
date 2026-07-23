@@ -7511,6 +7511,77 @@ static bool userTypeSupportsForIn(const TypeSymbol* root) {
     return false;
 }
 
+// §21.5 (v0.201, #2051): reject a loop label that shadows an enclosing loop's.
+void ExprTC::checkLoopLabelShadow(std::string_view label, SourceLocation loc) {
+    if (label.empty()) return;
+    for (const auto& l : loopLabelStack_) {
+        if (l == label) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("loop label '") + std::string(label) +
+                    "' duplicates the label of an enclosing loop; labels do not "
+                    "shadow (\xc2\xa7""21.5)");
+            return;
+        }
+    }
+}
+
+// §21.5 (v0.201): resolve a `break`/`continue` target loop, compute the codegen
+// nesting offset, and apply the §31.2 finally-boundary rule.
+void ExprTC::checkLoopJumpTarget(std::string_view label, bool isBreak,
+                                 int& offsetOut, SourceLocation loc) {
+    int targetDepth; // 1-based depth of the resolved target loop
+    if (label.empty()) {
+        // Unlabeled: the immediately enclosing loop.
+        offsetOut = 0;
+        targetDepth = loopDepth_;
+    } else {
+        // Labeled: the nearest enclosing loop carrying `label` (§21.5). At most
+        // one such loop can be in scope — checkLoopLabelShadow rejects duplicates
+        // at declaration — but scan innermost-first for robustness.
+        int ti = -1;
+        for (int i = static_cast<int>(loopLabelStack_.size()) - 1; i >= 0; --i) {
+            if (loopLabelStack_[static_cast<std::size_t>(i)] == label) {
+                ti = i;
+                break;
+            }
+        }
+        if (ti < 0) {
+            std::string inScope;
+            for (const auto& l : loopLabelStack_) {
+                if (l.empty()) continue;
+                if (!inScope.empty()) inScope += ", ";
+                inScope += "'";
+                inScope += std::string(l);
+                inScope += "'";
+            }
+            std::string msg = std::string("unknown loop label '") +
+                              std::string(label) + "' in `" +
+                              (isBreak ? "break" : "continue") +
+                              "` (\xc2\xa7""21.5); ";
+            msg += inScope.empty() ? "no loop labels are in scope"
+                                   : ("labels in scope: " + inScope);
+            ctx_.diagnostics().report(Severity::Error, loc, std::move(msg));
+            return;
+        }
+        offsetOut = static_cast<int>(loopLabelStack_.size()) - 1 - ti;
+        targetDepth = ti + 1;
+    }
+    // per §21.5/§31.2 (v0.182, #1578; generalized to labeled targets in v0.201):
+    // inside a `finally`, a `break`/`continue` whose target loop was already open
+    // when the `finally` was entered (encloses it) is a compile error — it would
+    // silently abandon an in-flight exception. A loop opened wholly inside the
+    // `finally` is unaffected.
+    if (finallyLoopBoundary_ != -1 && targetDepth <= finallyLoopBoundary_) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            isBreak ? "`break` inside a `finally` block may not target a loop "
+                      "that encloses the `finally` (\xc2\xa7""21.5/\xc2\xa7""31.2)"
+                    : "`continue` inside a `finally` block may not target a loop "
+                      "that encloses the `finally` (\xc2\xa7""21.5/\xc2\xa7""31.2)");
+    }
+}
+
 void ExprTC::visitStmt(const ast::Stmt& s) {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         // Initializer evaluates BEFORE the local comes into scope.
@@ -9074,9 +9145,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             visitExpr(*ws->condition);
             checkConditionIsBool(*ws->condition, "while");
         }
+        checkLoopLabelShadow(ws->label, s.span.begin);   // §21.5 (v0.201)
+        loopLabelStack_.push_back(ws->label);
         ++loopDepth_;
         for (const auto& bs : ws->body) if (bs) visitStmt(*bs);
         --loopDepth_;
+        loopLabelStack_.pop_back();
     } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
         if (fs->iterable) visitExpr(*fs->iterable);
         if (fs->withExpr) visitExpr(*fs->withExpr);
@@ -9277,41 +9351,33 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         }
         Scope* saveScope = currentScope_;
         currentScope_ = &forScope;
+        checkLoopLabelShadow(fs->label, s.span.begin);   // §21.5 (v0.201)
+        loopLabelStack_.push_back(fs->label);
         ++loopDepth_;
         for (const auto& bs : fs->body) if (bs) visitStmt(*bs);
         --loopDepth_;
+        loopLabelStack_.pop_back();
         currentScope_ = saveScope;
-    } else if (dynamic_cast<const ast::BreakStmt*>(&s)) {
+    } else if (auto* brk = dynamic_cast<const ast::BreakStmt*>(&s)) {
         // Slice S26 (§21.5): `break` is legal only inside a loop.
         if (loopDepth_ == 0) {
             ctx_.diagnostics().report(
                 Severity::Error, s.span.begin,
                 "`break` is not allowed outside a loop (§21.5)");
-        } else if (finallyLoopBoundary_ != -1 &&
-                   loopDepth_ <= finallyLoopBoundary_) {
-            // per §21.5/§31.2 (v0.182, #1578): a `break` inside a `finally`
-            // is a compile error when its target loop (the immediately
-            // enclosing loop) encloses the `finally` — it was already open
-            // when the `finally` was entered, so `loopDepth_` here has not
-            // grown past `finallyLoopBoundary_`. A loop opened wholly
-            // inside the `finally` is unaffected (§21.5).
-            ctx_.diagnostics().report(
-                Severity::Error, s.span.begin,
-                "`break` inside a `finally` block may not target a loop "
-                "that encloses the `finally` (§21.5/§31.2)");
+        } else {
+            checkLoopJumpTarget(brk->label, /*isBreak=*/true,
+                                const_cast<ast::BreakStmt*>(brk)->targetLoopOffset,
+                                s.span.begin);
         }
-    } else if (dynamic_cast<const ast::ContinueStmt*>(&s)) {
+    } else if (auto* cont = dynamic_cast<const ast::ContinueStmt*>(&s)) {
         if (loopDepth_ == 0) {
             ctx_.diagnostics().report(
                 Severity::Error, s.span.begin,
                 "`continue` is not allowed outside a loop (§21.5)");
-        } else if (finallyLoopBoundary_ != -1 &&
-                   loopDepth_ <= finallyLoopBoundary_) {
-            // per §21.5/§31.2 (v0.182, #1578): same rule as `break` above.
-            ctx_.diagnostics().report(
-                Severity::Error, s.span.begin,
-                "`continue` inside a `finally` block may not target a loop "
-                "that encloses the `finally` (§21.5/§31.2)");
+        } else {
+            checkLoopJumpTarget(cont->label, /*isBreak=*/false,
+                                const_cast<ast::ContinueStmt*>(cont)->targetLoopOffset,
+                                s.span.begin);
         }
     } else if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
         // per §21.6 (#1242): a do…end block introduces a lexical scope;

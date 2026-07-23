@@ -61,6 +61,17 @@ private:
     // is left untouched (bare `end;` form — always valid).
     void consumeOptionalEndKeyword(std::string_view expected);
 
+    // §1.6 / §21.5 (v0.201, #2051): the closer of a `while`/`for`/`await for`.
+    // Call after `consumeKeyword("end")`. `keyword` is the loop's introducing
+    // keyword (`"while"`/`"for"`); `loopLabel` is its loop label (empty when
+    // unlabeled). A loop with a label is a NAMED construct: its closer is the
+    // label (`end scan;`) or bare `end;`, and the keyword closer is rejected; an
+    // unlabeled loop takes the keyword closer (`end for;`) or bare `end;`, and an
+    // identifier closer is rejected. Mismatches report a fix-naming diagnostic
+    // and consume the token for error recovery.
+    void consumeOptionalLoopEndLabel(std::string_view keyword,
+                                     std::string_view loopLabel);
+
     // Grammar productions.
     std::unique_ptr<ast::ModuleDecl> parseModuleDecl();
     std::unique_ptr<ast::Import> parseImport();

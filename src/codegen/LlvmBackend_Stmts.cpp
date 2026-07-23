@@ -1850,61 +1850,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     // condition block. CG13: they first dispose the loop body's (and
     // any nested) `using var`s. Both terminate the current block.
     // CG21c (§31.2): if inside a try-with-finally, route through finally.
-    if (dynamic_cast<const ast::BreakStmt*>(&s)) {
-        if (!loopStack_.empty()) {
-            // #1083 / §31.2: route through the finally ONLY when the break EXITS
-            // the try — i.e. the target loop was already open at try-entry (the
-            // try is nested inside the loop). A loop opened INSIDE the try body
-            // (loopStack_.size() > loopDepthAtEntry) is intra-try: break it
-            // directly, leaving the finally to run later when the try exits.
-            // Routing such a break through the finally skipped the rest of the
-            // try body and, with the mode slot still set, re-ran the finally.
-            if (!finallyStack_.empty() &&
-                loopStack_.size() <= finallyStack_.back().loopDepthAtEntry) {
-                // fix #1598 / §29.7/§28.10 (v0.182): a break that crosses a
-                // finally disposes only the try-BODY scopes (>= this finally's
-                // entry depth) here; the enclosing scopes down to the loop's own
-                // scope depth — which may include a `using var` established
-                // before the try but inside the loop — are disposed by the
-                // finally's mode-2 dispatch AFTER the finally body runs
-                // (reverse establishment, mirroring the #1567 return fix). The
-                // pre-v0.182 code called emitLoopDisposals(loopScopeDepth) HERE,
-                // disposing that enclosing `using var` BEFORE the finally ran —
-                // a use-after-dispose if the finally touched it.
-                auto& fr = finallyStack_.back();
-                emitDisposalsInRange(fr.disposeDepthAtEntry, disposeStack_.size());
-                builder_.CreateStore(builder_.getInt32(2), fr.exitModSlot);
-                builder_.CreateBr(fr.finNormalBB);
-            } else {
-                // No finally in the way: dispose eagerly down to the loop scope,
-                // as before.
-                emitLoopDisposals(loopStack_.back().scopeDepth);
-                builder_.CreateBr(loopStack_.back().breakTarget);
-            }
-            return true;
-        }
+    if (auto* brk = dynamic_cast<const ast::BreakStmt*>(&s)) {
+        if (!loopStack_.empty())
+            return lowerLoopJump(brk->targetLoopOffset, /*isBreak=*/true);
         return false;
     }
-    if (dynamic_cast<const ast::ContinueStmt*>(&s)) {
-        if (!loopStack_.empty()) {
-            // #1083: as above — a continue of a loop opened inside the try is
-            // intra-try; only a continue that exits the try routes via finally.
-            if (!finallyStack_.empty() &&
-                loopStack_.size() <= finallyStack_.back().loopDepthAtEntry) {
-                // fix #1598 / §29.7/§28.10 (v0.182): mirrors the break fix above
-                // — dispose only the try-body scopes here; the finally's mode-3
-                // dispatch disposes the enclosing range (down to the loop scope)
-                // AFTER the finally body runs.
-                auto& fr = finallyStack_.back();
-                emitDisposalsInRange(fr.disposeDepthAtEntry, disposeStack_.size());
-                builder_.CreateStore(builder_.getInt32(3), fr.exitModSlot);
-                builder_.CreateBr(fr.finNormalBB);
-            } else {
-                emitLoopDisposals(loopStack_.back().scopeDepth);
-                builder_.CreateBr(loopStack_.back().continueTarget);
-            }
-            return true;
-        }
+    if (auto* cnt = dynamic_cast<const ast::ContinueStmt*>(&s)) {
+        if (!loopStack_.empty())
+            return lowerLoopJump(cnt->targetLoopOffset, /*isBreak=*/false);
         return false;
     }
     // CG13: a `do … end` block is a disposal scope (§A.6, §28.3).
@@ -2656,6 +2609,11 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
     }
 
     if (hasFin) {
+        // §21.5 (v0.201, #2051): grab this frame's labeled-break/continue routes
+        // (accumulated while lowering the try body) before the pop — the switch
+        // below emits a case per entry.
+        std::vector<FinallyFrame::LabeledRoute> myLabeledRoutes =
+            std::move(finallyStack_.back().labeledRoutes);
         // Pop the frame — outer frames (if any) are now at back().
         finallyStack_.pop_back();
         if (!finallyBodyStack_.empty()) finallyBodyStack_.pop_back();
@@ -2759,6 +2717,35 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 // fix #1598 / §29.7/§28.10 (v0.182): mode-3 twin of mode-2 above.
                 emitDisposalsInRange(loopScopeDepth, bodyScopeIdx);
                 builder_.CreateBr(loopContBB);
+            }
+        }
+
+        // §21.5 (v0.201, #2051): per-target modes for a labeled break/continue
+        // that CROSSED this finally to reach an OUTER loop. Each mints a case
+        // that, after the finally body has run, either (a) routes onward to the
+        // next-outer finally when that finally is still INSIDE the target loop —
+        // the labeled twin of the mode-2/3 outerFr path — or (b) terminates:
+        // dispose down to the target loop's own scope depth and jump to its
+        // break/continue block. The onward disposal ranges mirror modes 2/3, so
+        // the reverse-establishment interleave (#1567/#1598) is preserved.
+        for (const auto& route : myLabeledRoutes) {
+            auto* rBB =
+                llvm::BasicBlock::Create(llvm_, "finally.lbl", currentFn_);
+            sw->addCase(builder_.getInt32(route.mode), rBB);
+            builder_.SetInsertPoint(rBB);
+            const bool outerInsideTarget =
+                outerFr && outerFr->loopDepthAtEntry > route.targetLoopIdx;
+            if (outerInsideTarget) {
+                int outerMode = getOrAddLabeledRoute(
+                    *outerFr, route.isBreak, route.targetLoopIdx,
+                    route.targetBlock, route.targetScopeDepth);
+                emitDisposalsInRange(outerFr->disposeDepthAtEntry, bodyScopeIdx);
+                builder_.CreateStore(builder_.getInt32(outerMode),
+                                     outerFr->exitModSlot);
+                builder_.CreateBr(outerFr->finNormalBB);
+            } else {
+                emitDisposalsInRange(route.targetScopeDepth, bodyScopeIdx);
+                builder_.CreateBr(route.targetBlock);
             }
         }
 
@@ -3084,6 +3071,71 @@ bool Emitter::lowerIf(const ast::IfStmt& ifs) {
     return allPathsTerminate;
 }
 
+
+// §21.5 (v0.201, #2051): the exit-mode value for routing a labeled break/
+// continue THROUGH a finally frame. Deduped per (isBreak, targetLoopIdx).
+int Emitter::getOrAddLabeledRoute(FinallyFrame& fr, bool isBreak,
+                                  std::size_t targetLoopIdx,
+                                  llvm::BasicBlock* targetBlock,
+                                  std::size_t targetScopeDepth) {
+    for (auto& r : fr.labeledRoutes)
+        if (r.isBreak == isBreak && r.targetLoopIdx == targetLoopIdx)
+            return r.mode;
+    int m = fr.nextLabeledMode++;
+    fr.labeledRoutes.push_back(
+        {m, isBreak, targetBlock, targetScopeDepth, targetLoopIdx});
+    return m;
+}
+
+// §21.5 (v0.201, #2051): break/continue to the loop `offset` levels out.
+bool Emitter::lowerLoopJump(int offset, bool isBreak) {
+    // Guard: a malformed offset (out of range) would index past the stack; sema
+    // rejects unresolved labels before codegen, so this should never fire, but
+    // fall back to the innermost loop rather than read out of bounds.
+    if (offset < 0 || static_cast<std::size_t>(offset) >= loopStack_.size())
+        offset = 0;
+    std::size_t targetIdx =
+        loopStack_.size() - 1 - static_cast<std::size_t>(offset);
+    const LoopTargets& tgt = loopStack_[targetIdx];
+    llvm::BasicBlock* targetBlock = isBreak ? tgt.breakTarget : tgt.continueTarget;
+
+    // A `finally` lies between the jump and the target loop iff the innermost
+    // active finally was entered while the target loop (or an inner loop) was
+    // already open — i.e. its loopDepthAtEntry exceeds the target loop's index.
+    // (For offset 0 this is exactly the pre-v0.201 site check
+    //  `loopStack_.size() <= finallyStack_.back().loopDepthAtEntry`.)
+    if (!finallyStack_.empty() &&
+        finallyStack_.back().loopDepthAtEntry > targetIdx) {
+        FinallyFrame& fr = finallyStack_.back();
+        // Dispose only the try-BODY scopes here (>= this finally's body scope);
+        // the enclosing scopes down to the target loop's own scope depth are
+        // disposed by the finally's dispatch AFTER the finally body runs
+        // (reverse establishment — #1567/#1598/§31.2).
+        emitDisposalsInRange(fr.disposeDepthAtEntry, disposeStack_.size());
+        int mode;
+        if (offset == 0) {
+            // Unlabeled / innermost target: the finally's captured innermost
+            // loop (mode-2/mode-3 dispatch) IS the target — reuse the fixed,
+            // battle-tested modes 2 (break) / 3 (continue).
+            mode = isBreak ? 2 : 3;
+        } else {
+            // Labeled jump to an OUTER loop: a fixed mode would target the wrong
+            // (innermost) loop, so mint a per-target exit mode carrying the true
+            // target block and dispose-floor; the finally dispatch emits a case
+            // for it and threads it through any further-outer crossed finally.
+            mode = getOrAddLabeledRoute(fr, isBreak, targetIdx, targetBlock,
+                                        tgt.scopeDepth);
+        }
+        builder_.CreateStore(builder_.getInt32(mode), fr.exitModSlot);
+        builder_.CreateBr(fr.finNormalBB);
+    } else {
+        // No finally crossed: dispose every scope down to the target loop's own
+        // scope depth and jump straight to its break/continue block.
+        emitLoopDisposals(tgt.scopeDepth);
+        builder_.CreateBr(targetBlock);
+    }
+    return true;
+}
 
 bool Emitter::lowerWhile(const ast::WhileStmt& ws) {
     auto* condBB = llvm::BasicBlock::Create(llvm_, "while.cond", currentFn_);

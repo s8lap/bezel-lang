@@ -1091,6 +1091,23 @@ private:
         // carries the value across the finally for exit mode 5; null for a
         // valueless `return` / a `Task` method / a non-async frame.
         llvm::AllocaInst* asyncRetSlot = nullptr;
+        // §21.5 (v0.201, #2051): labeled `break`/`continue` that CROSS this
+        // finally to reach an OUTER loop. The fixed modes 0-5 name only the
+        // innermost-loop break/continue (mode 2/3), so a labeled jump to an
+        // outer loop — or one with a loop between the target and this try — needs
+        // its own exit mode carrying the true target block and scope-floor. Each
+        // distinct (isBreak, target loop) routed through this finally gets a
+        // fresh mode >= 6 (deduped); the dispatch switch emits a case per entry.
+        struct LabeledRoute {
+            int mode;                        // exit-mode value (>= 6)
+            bool isBreak;
+            llvm::BasicBlock* targetBlock;   // target loop's break/continue block
+            std::size_t targetScopeDepth;    // dispose floor (target's scopeDepth)
+            std::size_t targetLoopIdx;       // loopStack_ index — for the outer
+                                             // frame's inside-loop test
+        };
+        std::vector<LabeledRoute> labeledRoutes;
+        int nextLabeledMode = 6;
     };
     std::vector<FinallyFrame> finallyStack_;
     // §29.7 (#623): parallel to finallyStack_ — holds the finallyBody AST
@@ -6965,6 +6982,15 @@ private:
     // jumping out of / around the loop body.
     void emitLoopDisposals(std::size_t loopScopeDepth);
 
+    // §21.5 (v0.201, #2051): return the exit-mode value for routing a labeled
+    // `break`/`continue` (to loop `targetLoopIdx`, block `targetBlock`, floor
+    // `targetScopeDepth`) THROUGH finally frame `fr`, minting a fresh mode the
+    // first time and reusing it for identical (isBreak, targetLoopIdx) requests.
+    int getOrAddLabeledRoute(FinallyFrame& fr, bool isBreak,
+                             std::size_t targetLoopIdx,
+                             llvm::BasicBlock* targetBlock,
+                             std::size_t targetScopeDepth);
+
     // §35.4 (v0.200, #2045 stage 3): emit the active-case disposal for an
     // OWNING-classified choice value held in `slot`. Reads the runtime TAG
     // (field 0 of the choice struct, see choiceStruct), switches on it, and
@@ -7011,6 +7037,14 @@ private:
     // CG5: while loop. cond block tests, body block loops back.
     // CG11: `continue` targets condBB, `break` targets endBB.
     bool lowerWhile(const ast::WhileStmt& ws);
+
+    // §21.5 (v0.201, #2051): lower a `break`/`continue` to the target loop
+    // `offset` levels out (0 = innermost enclosing loop, from
+    // BreakStmt/ContinueStmt::targetLoopOffset). Disposes every scope crossed
+    // (reverse establishment) and routes through every crossed `finally`. offset
+    // 0 reproduces the pre-v0.201 unlabeled path exactly. Precondition:
+    // loopStack_ is non-empty and offset < loopStack_.size(). Always terminal.
+    bool lowerLoopJump(int offset, bool isBreak);
 
     // CG51 (§16.5) + CG51b (§16.4): lower `for var i in lo..hi [step k] do … end`
     // over a closed range literal to a counted loop. Returns false when the

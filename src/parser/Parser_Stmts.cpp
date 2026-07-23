@@ -222,6 +222,32 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
     // the expression-led shapes (AssignmentStmt vs ExpressionStmt, decided
     // after parsing the leading expression).
 
+    // §21.5 / A.6 LoopLabel (v0.201, #2051): a loop label prefixes a loop
+    // statement — `scan: for …` / `scan: while …` / `scan: await for …`. Two
+    // tokens of lookahead at statement start: `Identifier ":"`. No v0.197
+    // statement begins that way (`:=` is one lexeme; every other statement-
+    // leading identifier is followed by `.`/`[`/`(`/an operator/`;`/`=>`, never a
+    // bare `:`), so this is unambiguous (grammar A.6 commentary). After the label
+    // the next token MUST introduce a loop; anything else is a compile error.
+    std::string_view loopLabel;
+    if (current_.kind == TokenKind::Identifier &&
+        peekNext().kind == TokenKind::Punctuator && peekNext().text == ":") {
+        loopLabel = current_.text;
+        advance(); // Identifier
+        advance(); // ":"
+        const bool isLoopStart =
+            isKeyword("while") || isKeyword("for") ||
+            (isKeyword("await") && peekNext().kind == TokenKind::Keyword &&
+             peekNext().text == "for");
+        if (!isLoopStart) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "a loop label may prefix only a loop statement — `for`, "
+                "`while`, or `await for` (§21.5)");
+            loopLabel = {}; // drop it; parse whatever follows for recovery
+        }
+    }
+
     // A.6 LocalConstDecl (slice 53):
     //   "const" Identifier (":" Type)? ":=" ConstExpr ";"
     if (isKeyword("const")) {
@@ -413,10 +439,12 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
         return std::unique_ptr<ast::Stmt>(stmt.release());
     }
 
-    // WhileStmt (A.6): `"while" Expression "do" Statement* "end" ";"`.
+    // WhileStmt (A.6): `LoopLabel? "while" Expression "do" Statement*
+    //                   "end" ("while" | Identifier)? ";"`.
     if (isKeyword("while")) {
         advance();
         auto stmt = std::make_unique<ast::WhileStmt>();
+        stmt->label = loopLabel; // §21.5 (v0.201): empty when unlabeled
         stmt->condition = parseExpression();
         if (!consumeKeyword("do")) {
             diagnostics_.report(Severity::Error, current_.location,
@@ -435,7 +463,10 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected 'end' to close 'while' statement");
         }
-        consumeOptionalEndKeyword("while"); // §1.6 / v0.170 (#1374)
+        // §1.6 / §21.5 (v0.201): a labeled loop is a NAMED construct — its
+        // closer is `end scan;` (or bare `end;`); the keyword closer `end while;`
+        // applies only to unlabeled loops.
+        consumeOptionalLoopEndLabel("while", loopLabel);
         if (!consumePunctuator(";")) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ';' after 'end' of 'while'");
@@ -690,6 +721,7 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
         peekNext().text == "for";
     if (isKeyword("for") || awaitFor) {
         auto stmt = std::make_unique<ast::ForStmt>();
+        stmt->label = loopLabel; // §21.5 (v0.201): empty when unlabeled
         if (awaitFor) {
             stmt->isAwait = true;
             advance(); // past `await`
@@ -749,7 +781,9 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected 'end' to close 'for' statement");
         }
-        consumeOptionalEndKeyword("for"); // §1.6 / v0.170 (#1374)
+        // §1.6 / §21.5 (v0.201): labeled loop closes with `end scan;` (or bare
+        // `end;`); `end for;` applies only to unlabeled loops.
+        consumeOptionalLoopEndLabel("for", loopLabel);
         if (!consumePunctuator(";")) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ';' after 'end' of 'for'");
@@ -782,21 +816,32 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
         return std::unique_ptr<ast::Stmt>(stmt.release());
     }
 
+    // BreakStmt / ContinueStmt (A.6, v0.201): `"break" Identifier? ";"` /
+    // `"continue" Identifier? ";"`. The optional identifier is the target loop
+    // label (§21.5); sema resolves it against the enclosing labeled loops.
     if (consumeKeyword("break")) {
+        auto stmt = std::make_unique<ast::BreakStmt>();
+        if (current_.kind == TokenKind::Identifier) {
+            stmt->label = current_.text;
+            advance();
+        }
         if (!consumePunctuator(";")) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ';' after 'break'");
         }
-        return std::unique_ptr<ast::Stmt>(
-            std::make_unique<ast::BreakStmt>().release());
+        return std::unique_ptr<ast::Stmt>(stmt.release());
     }
     if (consumeKeyword("continue")) {
+        auto stmt = std::make_unique<ast::ContinueStmt>();
+        if (current_.kind == TokenKind::Identifier) {
+            stmt->label = current_.text;
+            advance();
+        }
         if (!consumePunctuator(";")) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ';' after 'continue'");
         }
-        return std::unique_ptr<ast::Stmt>(
-            std::make_unique<ast::ContinueStmt>().release());
+        return std::unique_ptr<ast::Stmt>(stmt.release());
     }
 
     // YieldStmt (A.6): `yield return Expression ";"` or `yield break ";"`.

@@ -414,4 +414,74 @@ void Parser::consumeOptionalEndKeyword(std::string_view expected) {
     // Not a recognised end-label keyword — leave it untouched.
 }
 
+void Parser::consumeOptionalLoopEndLabel(std::string_view keyword,
+                                         std::string_view loopLabel) {
+    // §1.6 / §21.5 (v0.201): closer rules for loop statements. An Identifier is
+    // treated as a closer-label attempt only when a matching label OR when it is
+    // immediately followed by `;` — otherwise it is left for the caller so a
+    // missing-semicolon (`… end` then the next statement) keeps its old recovery.
+    const bool identCloser =
+        current_.kind == TokenKind::Identifier &&
+        (current_.text == loopLabel ||
+         (peekNext().kind == TokenKind::Punctuator && peekNext().text == ";"));
+    if (!loopLabel.empty()) {
+        // Named construct: `end scan;` or bare `end;`.
+        if (identCloser) {
+            if (current_.text == loopLabel) {
+                advance(); // label matches
+            } else {
+                std::string msg = "end label '";
+                msg += current_.text;
+                msg += "' does not match the loop label '";
+                msg += loopLabel;
+                msg += "'; close with 'end ";
+                msg += loopLabel;
+                msg += ";' or 'end;'";
+                diagnostics_.report(Severity::Error, current_.location,
+                                    std::move(msg));
+                advance(); // consume for error recovery
+            }
+            return;
+        }
+        // The introducing keyword closer does NOT apply to a named loop.
+        if (current_.kind == TokenKind::Keyword && current_.text == keyword) {
+            std::string msg = "this loop is named '";
+            msg += loopLabel;
+            msg += "'; close with 'end ";
+            msg += loopLabel;
+            msg += ";' or 'end;', not 'end ";
+            msg += keyword;
+            msg += ";' (§1.6/§21.5)";
+            diagnostics_.report(Severity::Error, current_.location,
+                                std::move(msg));
+            advance(); // consume for error recovery
+            return;
+        }
+        // Bare `end;` (a `;` or anything else) — always valid; leave untouched.
+        return;
+    }
+    // Unlabeled loop: `end for;`/`end while;` or bare `end;`.
+    if (current_.kind == TokenKind::Keyword && current_.text == keyword) {
+        advance(); // keyword closer matches
+        return;
+    }
+    // An identifier closer on an unlabeled loop is a mismatch — the loop has no
+    // name to repeat (§1.6). Report only when it is clearly a closer attempt.
+    if (identCloser) {
+        std::string msg = "end label '";
+        msg += current_.text;
+        msg += "' does not match: this '";
+        msg += keyword;
+        msg += "' loop is unlabeled — close with 'end ";
+        msg += keyword;
+        msg += ";' or 'end;'";
+        diagnostics_.report(Severity::Error, current_.location, std::move(msg));
+        advance(); // consume for error recovery
+        return;
+    }
+    // A mismatched keyword closer (e.g. `end while;` on a `for`): reuse the
+    // known-keyword mismatch diagnostic path.
+    consumeOptionalEndKeyword(keyword);
+}
+
 } // namespace bezel

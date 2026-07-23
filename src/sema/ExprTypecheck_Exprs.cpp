@@ -5151,6 +5151,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         ReturnCtx saveRet = returnCtx_;
         TypeRef* saveRetTy = currentReturnType_;
         int saveLoop = loopDepth_;
+        // §21.5 (v0.201, #2051): a lambda is its own callable — an enclosing
+        // method's loop labels are not in scope inside it (mirrors the loopDepth_
+        // reset). Saved/reset/restored across the boundary.
+        auto saveLoopLabels = std::move(loopLabelStack_);
+        loopLabelStack_.clear();
         int saveCatch = catchDepth_;
         // per §21.5/§31.2 (v0.182, #1578): a lambda is its own callable, so a
         // `break`/`continue` inside it can only ever target a loop declared
@@ -5326,6 +5331,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         inIteratorMethod_ = saveIter;
         inLambda_ = saveInLambda;
         loopDepth_ = saveLoop;
+        loopLabelStack_ = std::move(saveLoopLabels);  // §21.5 (v0.201)
         catchDepth_ = saveCatch;
         finallyLoopBoundary_ = saveFinallyLoopBoundary;
         finallyDepth_ = saveFinallyDepth;  // per §21.7 (#1589)

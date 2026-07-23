@@ -304,10 +304,15 @@ struct IfStmt : Stmt {
     std::vector<std::unique_ptr<Stmt>> elseBody;
 };
 
-// A.6: `WhileStmt ::= "while" Expression Statement* "end" ";"`.
+// A.6 (v0.201): `WhileStmt ::= LoopLabel? "while" Expression "do" Statement*
+//                               "end" ("while" | Identifier)? ";"`.
 struct WhileStmt : Stmt {
     std::unique_ptr<Expr> condition;
     std::vector<std::unique_ptr<Stmt>> body;
+    // §21.5 (v0.201): the optional loop label (`scan: while …`); empty when the
+    // loop is unlabeled. Sema uses it to build the per-callable label stack and
+    // to reject duplicates; the closer `end scan;` must match it (§1.6).
+    std::string_view label;
 };
 
 // A.6: `ForStmt ::= "for" "var" Identifier (":" Type)? "in" Expression
@@ -332,6 +337,9 @@ struct ForStmt : Stmt {
     // through / break / continue / return edges) so the variable is auto-
     // dropped each iteration with the must-use warning rather than a hard error.
     bool ownedIterVarAutoDropAtBodyEnd = false;
+    // §21.5 (v0.201): the optional loop label (`scan: for …` / `scan: await for
+    // …`); empty when unlabeled. See WhileStmt::label.
+    std::string_view label;
 };
 
 // A.6: `DoEndBlock ::= "do" Statement* "end" ";"`. Statement-sequencing
@@ -340,9 +348,22 @@ struct DoEndBlock : Stmt {
     std::vector<std::unique_ptr<Stmt>> body;
 };
 
-// A.6 trivial transfer statements.
-struct BreakStmt : Stmt {};
-struct ContinueStmt : Stmt {};
+// A.6 (v0.201): `BreakStmt ::= "break" Identifier? ";"`,
+//               `ContinueStmt ::= "continue" Identifier? ";"`.
+// `label` is the optional target loop label; empty is the unlabeled form
+// (targets the immediately enclosing loop). `targetLoopOffset` is filled by
+// sema (§21.5 resolution): 0 = innermost enclosing loop, 1 = next-out, … — the
+// nesting distance from the jump site to the resolved target loop. Codegen reads
+// it to pick the target entry in its loop stack (whose depth matches sema's by
+// construction — both walk the same AST), disposing every scope crossed.
+struct BreakStmt : Stmt {
+    std::string_view label;
+    int targetLoopOffset = 0;
+};
+struct ContinueStmt : Stmt {
+    std::string_view label;
+    int targetLoopOffset = 0;
+};
 
 // A.6: `IncrementStmt ::= LValue ("++" | "--") ";"`. Statement-only per
 // §17.6 — `++`/`--` are not expression operators.

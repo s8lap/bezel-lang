@@ -204,6 +204,17 @@ private:
     std::vector<LoopContext> loops_;
     std::vector<TryHandlerContext> tryHandlers_;
 
+    // §21.5 (v0.201, #2051): the loop `offset` levels out from the innermost
+    // (0 = innermost). Precondition: loops_ non-empty. An out-of-range offset
+    // (only reachable when sema already reported an unresolved label and left
+    // targetLoopOffset at its 0 default, or a malformed offset) clamps to the
+    // innermost, so the CFG never indexes out of bounds.
+    const LoopContext& loopAtOffset(int offset) const {
+        if (offset < 0 || static_cast<std::size_t>(offset) >= loops_.size())
+            offset = 0;
+        return loops_[loops_.size() - 1 - static_cast<std::size_t>(offset)];
+    }
+
     // Where should an exception (from a throwable call or an explicit
     // throw) route to? Nearest enclosing catch dispatcher, or the
     // function-level exit if none. Used by ThrowStmt visit.
@@ -316,19 +327,23 @@ private:
             }
             return visitTry(*trys, from);
         }
-        if (dynamic_cast<const ast::BreakStmt*>(&s)) {
+        if (auto* brk = dynamic_cast<const ast::BreakStmt*>(&s)) {
             from->stmts.push_back(&s);
             if (!loops_.empty()) {
-                cfg_.addEdge(from, loops_.back().afterEnd);
+                // §21.5 (v0.201, #2051): a labeled `break` exits the target loop
+                // `targetLoopOffset` levels out (0 = innermost), which sema
+                // resolved. The loops_ nesting matches, so index from the back.
+                cfg_.addEdge(from, loopAtOffset(brk->targetLoopOffset).afterEnd);
             } else {
                 cfg_.addEdge(from, cfg_.exit());
             }
             return nullptr;
         }
-        if (dynamic_cast<const ast::ContinueStmt*>(&s)) {
+        if (auto* cnt = dynamic_cast<const ast::ContinueStmt*>(&s)) {
             from->stmts.push_back(&s);
             if (!loops_.empty()) {
-                cfg_.addEdge(from, loops_.back().header);
+                // §21.5 (v0.201): a labeled `continue` advances the target loop.
+                cfg_.addEdge(from, loopAtOffset(cnt->targetLoopOffset).header);
             } else {
                 cfg_.addEdge(from, cfg_.exit());
             }
