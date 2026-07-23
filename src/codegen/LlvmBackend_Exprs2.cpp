@@ -6274,8 +6274,8 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 // if the helper cannot lower it, emit a TERMINATED never-match —
                 // NEVER fall through to the #1847 diagnostic / return-nullptr,
                 // which would leave `case.end` unterminated (#1852 blocker 1).
-                if (llvm::Value* m =
-                        emitTypeParamPatternTest(sit->second, scrut, scrutTy))
+                if (llvm::Value* m = emitTypeParamPatternTest(
+                        sit->second, scrut, scrutTy, np->span.begin))
                     return m;
                 return builder_.getInt1(false);
             }
@@ -6508,8 +6508,8 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 if (rt->kind == sema::TypeRef::Kind::Named && !rt->declaration) {
                     const sema::TypeRef* ct = resolveTypeParamRef(rt);
                     if (ct && ct != rt) {
-                        if (llvm::Value* m =
-                                emitTypeParamPatternTest(ct, scrut, scrutTy))
+                        if (llvm::Value* m = emitTypeParamPatternTest(
+                                ct, scrut, scrutTy, bp->type->span.begin))
                             return m;
                         // BELT-AND-SUSPENDERS (#1852 blocker 1): the param
                         // resolved to a concrete type the helper cannot lower —
@@ -6604,6 +6604,14 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                     // Object scrutinee (see emitStringGuardedIsA) — a `var x: C`
                     // typed binding shares the concrete-name fault the bare
                     // `case o of C` NamedPattern above had.
+                    // §12.9/§14.2/§19.3 (#2012, #2069): a `var x: Wrap<T>` binding
+                    // whose T substitutes to a runtime-erased kind at this
+                    // monomorphization collapses onto a sibling descriptor — REJECT
+                    // (probes p_case_stmt/p_case_val: rc=0, answered TRUE on
+                    // c3ea38c). This covers BOTH the statement- and value-form case
+                    // (both route through patternMatches).
+                    if (rejectCollapsedTypeTestTarget(rt, bp->type->span.begin))
+                        return builder_.getInt1(false);
                     if (llvm::GlobalVariable* pid =
                             perInstDescriptorForTarget(rt))
                         return emitStringGuardedIsA(scrut, pid, scrutTy);

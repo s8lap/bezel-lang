@@ -5188,7 +5188,12 @@ ExprTC::IfaceBindReject ExprTC::typeTestInterfaceBindAmbiguous(
 // so admitting the now-sound type-tests here resolves #1971's over-reject. An
 // UNFOLDED size (arraySizeValue < 0) stays conservative: its key still collapses,
 // so it must be treated as erased (never under-rejected).
-bool ExprTC::typeArgRuntimeReified(const TypeRef* t) {
+// Hoisted to a free `bezel::sema::typeArgRuntimeReified` (declared in
+// TypeResolution.hpp) so codegen's #2069 collapse guard shares the SAME strict
+// predicate (its recursion into declared-Named args is what descTypeArgConcrete
+// lacks — the nested `is Wrap<Inner<T>>` collapse, #2184). The ExprTC member
+// below forwards here so no sema call site changes.
+bool typeArgRuntimeReified(const TypeRef* t) {
     if (!t) return false;
     switch (t->kind) {
         case TypeRef::Kind::Named:
@@ -5225,6 +5230,12 @@ bool ExprTC::typeArgRuntimeReified(const TypeRef* t) {
         default:
             return false;  // Function / Unit / Error — erased.
     }
+}
+
+// Forwarding alias (#2069): the hoisted free function above is the single source
+// of truth; existing sema call sites keep calling the ExprTC member unchanged.
+bool ExprTC::typeArgRuntimeReified(const TypeRef* t) {
+    return bezel::sema::typeArgRuntimeReified(t);
 }
 
 // §26.5 (#714/#927): find the ancestor of `recv` (or `recv` itself) that

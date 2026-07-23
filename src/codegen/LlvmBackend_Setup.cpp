@@ -2,6 +2,7 @@
 
 #include "common/OwnershipFacts.hpp"  // #1414 stage 4: shared ownership-facts core
 #include "sema/ConstFold.hpp"
+#include "sema/TypeResolution.hpp"  // #2069: sema::typeArgRuntimeReified (strict oracle)
 
 // §4.4 fix #521: decimal compile-time literal parser (defined in bezel_runtime.cpp).
 extern "C" void bz_decimal_parse_cstr(const char* s, void* out);
@@ -2850,8 +2851,21 @@ llvm::Value* Emitter::constValueForPatternName(
 // return-nullptr, which would leave `case.end` unterminated → malformed IR).
 llvm::Value* Emitter::emitTypeParamPatternTest(const sema::TypeRef* ct,
                                                llvm::Value* scrut,
-                                               const sema::TypeRef* scrutTy) {
+                                               const sema::TypeRef* scrutTy,
+                                               SourceLocation loc) {
     if (!ct) return nullptr;
+
+    // §12.9/§14.2/§19.3 (#2012, #2069): `ct` is the type argument a bare `case`/
+    // `is` type-parameter pattern (`case o of var x: T`) resolved to at this
+    // monomorphization. If it is a CONSTRUCTED generic whose own argument is
+    // runtime-erased (`T=Wrap<(int)->int>`), the descriptor collapses onto a
+    // sibling and a Wrap<(string)->string> value would MIS-bind (probe
+    // /var/tmp/bezel-scratch/laneF/p_case_bareparam.bzl: rc=0, answered TRUE on
+    // c3ea38c). REJECT — the whole target came from a type variable, so pass
+    // targetFromTypeVar=true. Returns a well-formed never-match on reject; the
+    // reported Error fails the compile.
+    if (rejectCollapsedTypeTestTarget(ct, loc, /*targetFromTypeVar=*/true))
+        return builder_.getInt1(false);
 
     // Is `scrut` a heap object that carries a vtable/descriptor emitIsA can
     // walk? A runtime is-a only makes sense on a class/interface/Object/built-in-
@@ -4124,6 +4138,131 @@ llvm::GlobalVariable* Emitter::perInstDescriptorForTarget(
     llvm::GlobalVariable* sharedDesc =
         dit != descArray_.end() ? dit->second : nullptr;
     return (pid && pid != sharedDesc) ? pid : nullptr;
+}
+
+// #2069: does `t` STILL mention an unbound type parameter — a bare-parameter
+// placeholder (a Named with a null declaration and NO generic args) — recursively
+// through Named generic arguments, inline-array elements, and function
+// parameter/return shapes? Used by rejectCollapsedTypeTestTarget to DEFER (not
+// error) when an ENCLOSING monomorphization has not yet bound the variable: the
+// guard re-runs, fully substituted, at that instantiation. Mirrors
+// descTypeArgConcrete / refMentionsTypeVariable's treatment of a null-decl-no-
+// args Named as a type-variable mention (distinct from a constructed null-decl
+// builtin like Array<int>, which carries args).
+static bool typeTestArgStillOpen(const sema::TypeRef* t) {
+    if (!t) return false;
+    switch (t->kind) {
+        case sema::TypeRef::Kind::Named:
+            if (!t->declaration && t->genericArgs.empty())
+                return true;  // bare-parameter placeholder
+            for (const sema::TypeRef* a : t->genericArgs)
+                if (typeTestArgStillOpen(a)) return true;
+            return false;
+        case sema::TypeRef::Kind::InlineArray:
+            return typeTestArgStillOpen(t->arrayElement);
+        case sema::TypeRef::Kind::Function:
+            for (const auto& p : t->funcParams)
+                if (typeTestArgStillOpen(p.type)) return true;
+            return typeTestArgStillOpen(t->funcReturn);
+        default:
+            return false;
+    }
+}
+
+// §12.9/§14.2/§19.3/§31.2.1 (#2012, per the #2069 ruling
+// /var/tmp/bezel-scratch/impl-run-2026-07-24/rulings/misc/issue-2069.md):
+// the per-monomorphization RE-RUN of the descriptor-erasure guard, as a
+// conservative compile-time REJECT.
+//
+// A runtime type-test target (`is`/`as`, a statement- or value-form `case` typed
+// binding, a `catch` arm) whose head is a CONSTRUCTED generic that MENTIONS a
+// type parameter can, at a given monomorphization, have that parameter
+// substituted to a GROUND but RUNTIME-ERASED kind — a function type, or any kind
+// whose descriptor key (appendDescKey) collapses at ANY depth. perInstDescriptor-
+// ForTarget then either falls back to the shared (erased) descriptor or mints a
+// key that COLLIDES with a sibling instantiation (`Wrap<(string)->string>` and
+// `Wrap<(int)->int>` share `C{Wrap}<F;>`; nested, `Wrap<Inner<(…)->…>>` collide),
+// so the test matches the WRONG instantiation and binds a value at a wrong static
+// type — the #2001/#2006 type-confusion class (a memory-unsafety precursor via
+// the follow-on `as`). Verified live on c3ea38c (probes under
+// /var/tmp/bezel-scratch/laneF/: p_is, p_nested, p_case_stmt, p_case_val,
+// p_case_bareparam, p_catch_class all COMPILE rc=0 + answer TRUE).
+//
+// The reject is an IMPLEMENTATION-LIMITATION diagnostic (the #1943 device,
+// LlvmBackend_Calls2.cpp) — NOT new language semantics: §19.3 still says "match
+// the SUBSTITUTED type argument, per instantiation". The generic DECLARATION
+// stays valid, and every REIFIED instantiation (`Wrap<int>`, `Wrap<string>`,
+// `Wrap<[3]int>`, or a `T=int` monomorphization) still compiles and runs with the
+// precise #1843 answer. The reject LIFTS automatically once function-type identity
+// is reified in the descriptor key (#1939 leg 1): the substituted arguments become
+// reified and the predicate below stops firing.
+//
+// The predicate is the STRICT sema oracle sema::typeArgRuntimeReified, which
+// RECURSES into declared-Named arguments — NOT descTypeArgConcrete, whose non-
+// recursion on a declared Named (`Inner<(int)->int>` → concrete without looking
+// inside) admits the nested collapse and stays unsound (#2184).
+//
+// `targetFromTypeVar` is set at the ONE surface (emitTypeParamPatternTest) whose
+// target has ALREADY been substituted from a bare `case`/`is` type-parameter
+// pattern (`case o of var x: T` with T=Wrap<(int)->int>) — there the whole target
+// came from a type-variable mention, so every argument counts as mentioned even
+// though a further substitution is a no-op. The other three surfaces pass the
+// target AS WRITTEN (`Wrap<T>`) and detect the mention per-argument via the
+// substituteTypeRefLocal pointer-change signal.
+//
+// Returns true iff it reported an error (the caller then bails with a well-formed
+// placeholder; the reported Error makes Emitter::run() return nullptr, #628
+// part 1, so the compile fails cleanly). NEVER called from a `new`/box-mint site:
+// CONSTRUCTING `Wrap<(string)->string>` stays legal; only TESTING against a
+// collapsed target is rejected.
+bool Emitter::rejectCollapsedTypeTestTarget(const sema::TypeRef* rt,
+                                            SourceLocation loc,
+                                            bool targetFromTypeVar) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->genericArgs.empty())
+        return false;  // only a CONSTRUCTED generic head can collapse an argument
+    for (std::size_t i = 0; i < rt->genericArgs.size(); ++i) {
+        const sema::TypeRef* arg = rt->genericArgs[i];
+        // Resolve through the active monomorphization, exactly as
+        // perInstDescriptorForTarget does. substituteTypeRefLocal allocates a
+        // FRESH TypeRef only when substitution changed something, so a pointer
+        // change is the exact "this argument mentioned a bound type variable"
+        // signal — a per-node identity compare, NOT any pointer-keyed iteration
+        // (no #2116-class nondeterminism).
+        const sema::TypeRef* subst =
+            substituteTypeRefLocal(arg, genericSubstSemaTy_);
+        bool mentionedVar =
+            targetFromTypeVar || (subst != arg) || typeTestArgStillOpen(arg);
+        if (!mentionedVar)
+            continue;  // a LITERAL ground argument — sema already ruled on it
+                       // (#2006/#2012/#2018 rejects); never double-report here.
+        if (typeTestArgStillOpen(subst))
+            continue;  // an enclosing monomorphization will bind it — DEFER.
+        if (!sema::typeArgRuntimeReified(subst)) {
+            std::string paramName;
+            if (rt->declaration &&
+                i < rt->declaration->genericParams.size() &&
+                rt->declaration->genericParams[i])
+                paramName =
+                    std::string(rt->declaration->genericParams[i]->name);
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "runtime type-test target's generic argument is not runtime-"
+                "distinguishable at this instantiation" +
+                    (paramName.empty()
+                         ? std::string()
+                         : " (for type parameter `" + paramName + "`)") +
+                    ": the substituted type argument is a still-erased type kind "
+                    "(e.g. a function type), which the runtime type descriptor "
+                    "collapses, so the test could match a DIFFERENT instantiation "
+                    "and bind a value at a wrong static type "
+                    "(\xC2\xA7""19.3 / \xC2\xA7""12.7 / \xC2\xA7""12.9 / "
+                    "\xC2\xA7""14.2 / \xC2\xA7""17.4; #2069 ruling). The generic "
+                    "declaration stays valid; this instantiation of it is rejected "
+                    "until function-type identity is reified (#1939)");
+            return true;
+        }
+    }
+    return false;
 }
 
 // #1939 leg 3 (§12.7/§12.9/§31.2.1): the CONCRETE constructed generic ancestor

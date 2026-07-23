@@ -2584,6 +2584,23 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             // did. perInstDescriptorForTarget substitutes type parameters
             // recursively and returns null for a non-generic / non-concrete
             // target, keeping the shared resolution for those.
+            //
+            // §12.9/§14.2/§31.2.1 (#2012, #2069): if the arm's type parameter
+            // substitutes to a runtime-erased kind at this monomorphization
+            // (`catch var e: MyExc<T>`, T=(int)->int) the descriptor collapses
+            // onto a sibling and the arm would catch a wrong-instantiation
+            // exception at a wrong static type — REJECT (probe p_catch_class:
+            // rc=0, answered 1 on c3ea38c). For a constructed arm (`MyExc<T>`)
+            // resolveTypeParamRef leaves the inner T unbound (resolved==rt), so the
+            // per-argument substitution fires; a bare-parameter arm (`T` bound to a
+            // constructed generic) is rewritten top-level, so pass
+            // targetFromTypeVar there. On reject skip this arm type (the reported
+            // Error fails the compile).
+            bool armFromTypeVar = rt && rt->kind == sema::TypeRef::Kind::Named &&
+                                  !rt->declaration && resolved && resolved != rt;
+            if (rejectCollapsedTypeTestTarget(resolved, ty->span.begin,
+                                              armFromTypeVar))
+                continue;
             if (llvm::GlobalVariable* pid = perInstDescriptorForTarget(resolved))
                 desc = pid;
             if (!desc) continue;

@@ -65,4 +65,19 @@ bool overrideParamTypeMatches(const TypeRef* derivedTy, const TypeRef* baseTy,
 // delegates to Resolver::isBuiltinTypeName.
 bool isBuiltinTypeName(std::string_view n);
 
+// §14.2/§12.9/§19.3 (#1946, #2069): the STRICT runtime-reification oracle. A
+// type argument is runtime-reified — the per-monomorphization descriptor (#1843)
+// distinguishes it from a sibling — iff it is a concrete Named type (resolved
+// declaration, or a null-decl builtin generic with reified args), a primitive,
+// or a FOLDED-size inline array whose element is itself reified, RECURSIVELY
+// through generic/element arguments. A function type, an unfolded inline array,
+// Unit/Error, or a bare parameter placeholder collapses in the descriptor key
+// (appendDescKey: `Kind::Function` → "F" at any depth) → NOT distinguishable.
+// Hoisted from ExprTC (which keeps a forwarding alias) so codegen's #2069
+// per-monomorphization collapse guard (rejectCollapsedTypeTestTarget) shares the
+// SAME predicate — critically the RECURSION into declared-Named arguments that
+// codegen's descTypeArgConcrete lacks (the nested `is Wrap<Inner<T>>` collapse,
+// #2184). Single source of truth: ExprTC::typeArgRuntimeReified delegates here.
+bool typeArgRuntimeReified(const TypeRef* t);
+
 } // namespace bezel::sema

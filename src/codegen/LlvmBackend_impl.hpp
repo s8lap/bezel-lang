@@ -3805,9 +3805,13 @@ private:
     // same-primitive test. Returns null ONLY for a type-test kind it cannot lower
     // — the caller then emits a TERMINATED never-match (never falls through to a
     // return-nullptr, which would leave `case.end` unterminated → malformed IR).
+    // `loc` (#2069) is the pattern's span — the collapse guard
+    // (rejectCollapsedTypeTestTarget) runs here for a bare-parameter pattern whose
+    // SUBSTITUTED target is a runtime-erased constructed generic.
     llvm::Value* emitTypeParamPatternTest(const sema::TypeRef* ct,
                                           llvm::Value* scrut,
-                                          const sema::TypeRef* scrutTy);
+                                          const sema::TypeRef* scrutTy,
+                                          SourceLocation loc);
 
     // §19.3/§19.5 (#1938): emit a runtime is-a of `scrut` against `desc`, but
     // short-circuit a runtime bz_string* scrutinee to a clean never-match BEFORE
@@ -4512,6 +4516,17 @@ private:
     // interface with concrete arguments; nullptr otherwise (caller keeps its
     // existing shared-descriptor resolution).
     llvm::GlobalVariable* perInstDescriptorForTarget(const sema::TypeRef* rt);
+    // §12.9/§14.2/§19.3/§31.2.1 (#2012, per the #2069 ruling): at a given
+    // monomorphization, REJECT a runtime type-test target whose type-parameter-
+    // mentioning generic argument substitutes to a GROUND but runtime-ERASED kind
+    // (a function type, or a collapse at any depth) — the descriptor key would
+    // collide with a sibling instantiation and bind a value at a wrong static type
+    // (#2001/#2006 confusion class). An implementation-limitation diagnostic (the
+    // #1943 device); lifts when function-type identity is reified (#1939). Returns
+    // true iff it reported an error (caller bails with a well-formed placeholder).
+    // Called at the four type-test surfaces only, NEVER at a new/box-mint site.
+    bool rejectCollapsedTypeTestTarget(const sema::TypeRef* rt, SourceLocation loc,
+                                       bool targetFromTypeVar = false);
     // #1843: substitute `map` (param-name → concrete TypeRef) through `t`,
     // allocating into descArena_ where substitution changes structure.
     const sema::TypeRef* substituteTypeRefLocal(

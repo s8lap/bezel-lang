@@ -1667,6 +1667,18 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
                 nonNull, obj, llvm::ConstantPointerNull::get(ptrTy()));
         return nullptr;
     }
+    // §12.9/§14.2/§19.3 (#2012, per the #2069 ruling): at THIS monomorphization
+    // the target's type-parameter argument may substitute to a runtime-erased
+    // kind (a function type) whose descriptor key collapses onto a sibling
+    // instantiation, so `o is Wrap<T>` (T=(int)->int) would match a
+    // Wrap<(string)->string> value and `as` reinterpret it — REJECT (an
+    // implementation-limitation diagnostic; lifts under #1939 reification). Return
+    // a well-formed placeholder of the op's result type; the reported Error fails
+    // the compile (Emitter::run → nullptr, #628 part 1).
+    if (rejectCollapsedTypeTestTarget(rt, te.span.begin)) {
+        if (te.op == "as") return llvm::ConstantPointerNull::get(ptrTy());
+        return builder_.getInt1(false);
+    }
     // §8.6 / §12.7: resolve the target's runtime descriptor. For a reference
     // type (class/interface) this is its descArray_; for a boxable VALUE type
     // (record/enum) or a value primitive it is the box descriptor built in
