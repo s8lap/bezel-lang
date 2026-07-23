@@ -8470,6 +8470,17 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // the same operand-type restriction as the binary bitwise operators — it
         // is not valid on a `bool` / `char` / floating-point target. Compound
         // assignments do NOT route through typeBinary, so guard here.
+        // §3.5/§6.5 (#2163, review follow-up to #2153): `string` and `decimal`
+        // targets are rejected here too, mirroring the RHS-side kind list of
+        // the #1689 block below — §3.5 defines bitwise on the eight integer
+        // primitives only and shifts "on the integer types", so neither has a
+        // §6.6 result. They were previously missing from this TARGET list:
+        // `string <<= 2` crashed the compiler (cast<IntegerType> assert),
+        // `string? &= 2` aborted on malformed IR, `decimal &= 3` was a silent
+        // no-op (emitDecimalArith knows no `&`), and `decimal? &= 3` silently
+        // NULLED the target (the #2141 lifted lowering's `if (pay)` fallback).
+        // The nullable forms reject identically (tt->primitive is read
+        // regardless of tt->nullable, exactly as for `char?`).
         if (as->target &&
             (as->op == "&=" || as->op == "|=" || as->op == "^=" ||
              as->op == "<<=" || as->op == ">>=")) {
@@ -8477,11 +8488,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 if (tt->kind == TypeRef::Kind::Primitive) {
                     PrimitiveType p = tt->primitive;
                     const char* badKind =
-                        (p == PrimitiveType::Float || p == PrimitiveType::Double)
+                        (p == PrimitiveType::Float ||
+                         p == PrimitiveType::Double ||
+                         p == PrimitiveType::Decimal)
                             ? "floating-point types"
                         : (p == PrimitiveType::Bool)
                             ? "`bool` (boolean operations use `and`/`or`/`not`)"
-                        : (p == PrimitiveType::Char) ? "`char`" : nullptr;
+                        : (p == PrimitiveType::Char)   ? "`char`"
+                        : (p == PrimitiveType::String) ? "`string`" : nullptr;
                     if (badKind)
                         ctx_.diagnostics().report(Severity::Error, as->span.begin,
                             std::string("operator `") + std::string(as->op) +
