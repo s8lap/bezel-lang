@@ -166,7 +166,24 @@ llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
     // range, so signed i32 arithmetic never spuriously overflows before the
     // §5.2 range check (which still fires for a genuinely out-of-range result).
     if (charTarget) {
-        llvm::Value* res = emitCompoundOp(op, l, r, /*fp=*/false, /*uns=*/false);
+        // §6.6/§5.2 (#1996): the arithmetic must run at the WIDER of char's i32
+        // and the RHS width so a RHS that exceeds i32 range reaches the §5.2
+        // range check UNTRUNCATED. `char` lowers to i32; the recursion below
+        // otherwise coerces the RHS to i32 FIRST (the #1042 width-match at the
+        // end of this function), so `char(0) += 2^32` (a `long` RHS) truncated
+        // 2^32 → 0 and stored char(0) with no raise — while the explicit
+        // `char(c + 2^32L)` cast correctly raises. Widen the char operand to the
+        // RHS width (`char` is non-negative in 0..U+10FFFF, so sign/zero extend
+        // agree) so the op runs at the full width; emitCharRangeCheck then sees
+        // the true i64 result (its SExt is a no-op at that width) and truncates
+        // back to i32 only after the range check passes. Matches the explicit-
+        // cast form exactly (the #1996 compound-vs-cast parity gap).
+        llvm::Value* lw = l;
+        if (l->getType()->isIntegerTy() && r->getType()->isIntegerTy() &&
+            r->getType()->getIntegerBitWidth() >
+                l->getType()->getIntegerBitWidth())
+            lw = builder_.CreateSExt(l, r->getType(), "char.wide");
+        llvm::Value* res = emitCompoundOp(op, lw, r, /*fp=*/false, /*uns=*/false);
         if (!res) return nullptr;
         return emitCharRangeCheck(res);
     }
