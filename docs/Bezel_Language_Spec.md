@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.217 — July 2026**
+**Version 0.218 — July 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -463,7 +463,7 @@ Each primitive keyword aliases a standard library type. `string`, though a refer
 
 Static members of the standard library type are accessible through either form: `int.Parse`, `int.MaxValue`, `double.IsNaN`, `string.IsNullOrEmpty`.
 
-`Object` has no lowercase keyword alias. Keyword aliases are reserved for primitive value types; `Object` is a class and is referenced as `Object` unconditionally. Code coming from C#, where `object` is a keyword for `System.Object`, should write `Object` in Bezel.
+`Object` has no lowercase keyword alias. Keyword aliases are reserved for primitive value types; `Object` is a class and is referenced as `Object` unconditionally — there is no `object` spelling.
 
 The PascalCase standard-library names in the table above (`Boolean`, `Byte`, `SByte`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Float`, `Double`, `Decimal`, `Char`, `String`) are **reserved type names**: a program may not declare a user type (class, record, enum, interface, or type alias) whose name is one of them. Each names a compiler-known primitive (or `string`) through its lowercase keyword alias, and the dual-form rule above makes the PascalCase form interchangeable with the keyword everywhere a type is named — except the enum underlying-type position, which requires the keyword form ([§10.3](#sec-underlying-type), Appendix A.3 EnumInheritance); allowing a user type to take one of these names would let a declaration silently shadow the primitive at some use sites and not others, producing a different value than the author intended. Declaring such a type is a compile error directing the author to choose a different name. (This does not reserve other standard-library type names — only the PascalCase aliases of the primitive value types and `String`; an ordinary library type such as `Array` or `Stream` may still be shadowed by a user type under the normal name-resolution rules.)
 

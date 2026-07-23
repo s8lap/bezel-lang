@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.217 — July 2026**
+**Companion to the Bezel Language Specification, v0.218 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -1528,7 +1528,7 @@ The implementation example above omits some methods for brevity; the production 
 <a id="sec-linkedlistt"></a>
 ### 4.6 `LinkedList<T>`
 
-Borrowing doubly-linked list. Use when frequent insertion/removal in the middle is required. (Bezel deliberately does not name this type `List<T>` — programmers from C#, Java, Kotlin, and Python should reach for `Array<T>` for a dynamic array; `LinkedList<T>` is the explicit choice for a linked structure.)
+Borrowing doubly-linked list. Use when frequent insertion/removal in the middle is required. (The name `List<T>` is reserved and unused: it commonly denotes a dynamic array — which `Array<T>` is here — so a linked structure under that name would mislead; `LinkedList<T>` makes the linked representation an explicit choice.)
 
 ```bezel
 public class LinkedList<T>: ICollection<T>
