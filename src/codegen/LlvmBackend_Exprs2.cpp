@@ -1484,6 +1484,19 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         auto savedSingleCaptureLocals = singleCaptureLocals_;
         llvm::Function* savedBoxCaptureLocalsFn = boxCaptureLocalsFn_;
         auto savedDefinitelyEscaping = definitelyEscapingLambdas_;
+        // #2132: emitAsyncLambda now ALSO recomputes the borrowing-array /
+        // dict-materializer / grouping scope-end reclaim eligibility for the
+        // lambda body and keys it to the lambda resume fn. Save/restore it exactly
+        // like the closure-release sets above — otherwise a collection LITERAL /
+        // materializer local in the ENCLOSING async body that follows this
+        // `var f := <lambda>` would be registered against the lambda's stale
+        // eligibility (wrong set + wrong fn key) and leak.
+        auto savedBorrowingArrayFreeElig = borrowingArrayFreeEligible_;
+        llvm::Function* savedBorrowingArrayFreeEligFn = borrowingArrayFreeEligibleFn_;
+        auto savedDictMaterializerFreeElig = dictMaterializerFreeEligible_;
+        llvm::Function* savedDictMaterializerFreeEligFn = dictMaterializerFreeEligibleFn_;
+        auto savedGroupingFreeElig = groupingFreeEligible_;
+        llvm::Function* savedGroupingFreeEligFn = groupingFreeEligibleFn_;
 
         emitAsyncLambda(lam, fn, paramSyms, asyncResultElemSemaTy,
                        asyncDeclaredTaskTy);
@@ -1496,6 +1509,12 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         singleCaptureLocals_ = std::move(savedSingleCaptureLocals);
         boxCaptureLocalsFn_ = savedBoxCaptureLocalsFn;
         definitelyEscapingLambdas_ = std::move(savedDefinitelyEscaping);
+        borrowingArrayFreeEligible_ = std::move(savedBorrowingArrayFreeElig);
+        borrowingArrayFreeEligibleFn_ = savedBorrowingArrayFreeEligFn;
+        dictMaterializerFreeEligible_ = std::move(savedDictMaterializerFreeElig);
+        dictMaterializerFreeEligibleFn_ = savedDictMaterializerFreeEligFn;
+        groupingFreeEligible_ = std::move(savedGroupingFreeElig);
+        groupingFreeEligibleFn_ = savedGroupingFreeEligFn;
         smKind_ = savedSmKind;
         smStateStruct_ = savedSmStateStruct;
         smSelf_ = savedSmSelf;

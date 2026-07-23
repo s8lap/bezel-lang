@@ -6553,6 +6553,19 @@ void Emitter::emitImplicitReturn(llvm::Function* fn) {
 }
 
 
+// §29.3 / §30.2 (#2132): map a suspend-live local's alloca to its reserved
+// state-machine frame field, so the per-suspend spill/restore (emitAwaitSuspend
+// for async, the yield handler for iterators — both iterate smAllocaToField_)
+// saves and reloads it across the suspend. A no-op outside a state machine, or
+// when the local is not in smLocalFields_ (i.e. not suspend-live).
+void Emitter::mapSuspendLocalSlot(const ast::Node* declNode,
+                                  llvm::AllocaInst* slot) {
+    if (!smStateStruct_ || !smSelf_ || !slot) return;
+    auto fit = smLocalFields_.find(declNode);
+    if (fit != smLocalFields_.end())
+        smAllocaToField_[slot] = fit->second;
+}
+
 void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     const ast::Type* declType) {
     // §27.5 / §28.9 (#969): record this local's block-nesting depth so the
@@ -6581,6 +6594,13 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         materializeHeapCollectionLiteral(cl, collTy)) {
                     llvm::AllocaInst* slot = entryAlloca(ptrTy());
                     locals_[declNode] = slot;
+                    // §30.2 (#2132): a heap collection built from a `[...]`
+                    // LITERAL and held across an `await` must round-trip through
+                    // the async frame — this early-return path bypasses the
+                    // general slot path's smAllocaToField_ registration, so wire
+                    // it here or the slot is never spilled/restored (garbage
+                    // pointer on resume → SEGV on read / leak on scope-end drop).
+                    mapSuspendLocalSlot(declNode, slot);
                     builder_.CreateStore(arr, slot);
                     // #1871 / §28.9 / §28.11: reclaim the backing of an eligible
                     // borrowing-`Array<T>` LITERAL local at scope end
@@ -6619,6 +6639,10 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 if (llvm::Value* tbl = materializeHeapDictLiteral(cl, dictTy)) {
                     llvm::AllocaInst* slot = entryAlloca(ptrTy());
                     locals_[declNode] = slot;
+                    // §30.2 (#2132): see the heap-collection-literal path above —
+                    // a dict built from a `[k:v, …]` literal held across an await
+                    // must be wired into the async frame's spill/restore too.
+                    mapSuspendLocalSlot(declNode, slot);
                     builder_.CreateStore(tbl, slot);
                     return;
                 }
@@ -6654,6 +6678,10 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             }
             llvm::AllocaInst* slot = entryAlloca(arrTy);
             locals_[declNode] = slot;
+            // §30.2 (#2132): an inline (value) array built from a `[...]` literal
+            // held across an await must round-trip through the async frame too —
+            // this early-return path bypasses the general slot-path registration.
+            mapSuspendLocalSlot(declNode, slot);
             // Store each element via GEP.
             auto* aty = llvm::dyn_cast<llvm::ArrayType>(arrTy);
             llvm::Type* elemTy = aty ? aty->getElementType() : i32();

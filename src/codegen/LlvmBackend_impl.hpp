@@ -5427,6 +5427,16 @@ private:
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
         std::vector<std::pair<const ast::Node*, llvm::Type*>>& out);
 
+    // §29.3 / §30.2 (#2132): inside a state-machine body (iterator or async), a
+    // suspend-live local's alloca must be mapped to its reserved frame field via
+    // smAllocaToField_, or the per-suspend spill/restore (emitAwaitSuspend / the
+    // yield handler, both iterate smAllocaToField_) never saves it — so on resume
+    // the fresh-stack alloca holds garbage. The general lowerLocalDecl slot path
+    // does this inline; the early-return initializer paths (heap-collection
+    // literal, dict literal, inline-array literal) must call this so a collection
+    // built from a `[...]` LITERAL and held across an await round-trips too.
+    void mapSuspendLocalSlot(const ast::Node* declNode, llvm::AllocaInst* slot);
+
     // §29.7 (#944): true when `fs` is a for-in whose lowering creates an
     // implicit iterator-format enumerator (Dispose at vtable slot 1) — i.e. the
     // builtin-enumerable vtable path of lowerIEnumerableBuiltinFor (a CallExpr /

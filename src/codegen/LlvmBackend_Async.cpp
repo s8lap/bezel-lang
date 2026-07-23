@@ -878,6 +878,23 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         collectDefinitelyEscapingLambdas(*ci.stmts);
         // Must run AFTER collectClosureReleaseEligible (uses its result).
         collectCellFreeEligible(*ci.stmts);
+        // fix #2132 / #1871 / #1003 / #1028 / #1930 / §28.9 / §28.11: the
+        // scope-end reclaim of a plain `var` borrowing-`Array<T>` LITERAL (its
+        // backing is "reclaimed with the instance"), of a `var` fresh
+        // borrowing-array / dict / grouping MATERIALIZER, must be re-established
+        // for the RESUME fn too — the registration sites in lowerLocalDecl gate on
+        // `currentFn_ == borrowingArrayFreeEligibleFn_` (and the dict/grouping
+        // analogues), but the async body lowers with currentFn_ == resumeFn while
+        // emitFunctionBody pinned these to the ENTRY fn (Setup.cpp), so every such
+        // reclaim was silently skipped and the backing leaked across the async
+        // return edge (the #2132 drop-after-await leak: `var xs := [ … ]; await …;`
+        // — the array is spilled/restored fine now, but never freed). One call
+        // populates all three sets; re-pin all three fn keys to resumeFn. Mirrors
+        // the closure/unwind/cell re-establishment above. // per §28.9, §28.11
+        collectBorrowingArrayFreeEligible(*ci.stmts);
+        borrowingArrayFreeEligibleFn_ = resumeFn;
+        dictMaterializerFreeEligibleFn_ = resumeFn;
+        groupingFreeEligibleFn_ = resumeFn;
         // §30.9 / §31.2 (#438): start with no pending handler-context spill slots;
         // lowerTry registers them as it lowers any in-handler await.
         asyncHandlerSpillSlots_.clear();
@@ -1263,6 +1280,24 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             closureReleaseEligible_.clear();
         }
         closureReleaseEligibleFn_ = resumeFn;
+        // fix #2132 / #1871 / §28.9 / §28.11: re-establish the borrowing-`Array<T>`
+        // literal / materializer scope-end reclaim eligibility for the async
+        // LAMBDA's resume fn too (see emitAsyncMethod's mirror). Without it a
+        // `var xs: Array<T> := [ … ]` in an async lambda body held across an await
+        // is spilled/restored (the smAllocaToField_ fix) but never FREED on the
+        // lambda's async return edge — its backing leaks. Expression-bodied lambdas
+        // have no stmts (and no such local); clear the (enclosing method's) set so
+        // its entries cannot misapply under this resume fn's key.
+        if (!lam.exprBody)
+            collectBorrowingArrayFreeEligible(lam.stmts);
+        else {
+            borrowingArrayFreeEligible_.clear();
+            dictMaterializerFreeEligible_.clear();
+            groupingFreeEligible_.clear();
+        }
+        borrowingArrayFreeEligibleFn_ = resumeFn;
+        dictMaterializerFreeEligibleFn_ = resumeFn;
+        groupingFreeEligibleFn_ = resumeFn;
         // CRITICAL (nested lambda): the await spill/restore loop iterates
         // smAllocaToField_, mapping a suspend-local's alloca → its frame field.
         // An ENCLOSING async method's resume populated this with ITS allocas
