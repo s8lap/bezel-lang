@@ -145,3 +145,78 @@ BEZEL_TEST(nullable_fp_equality_1981, int_nullable_eq_int_unaffected) {
         "var n: int? := 3; "
         "if n = 3 then return 1; else return 0; end;")), 1);
 }
+
+// =========================================================================
+// #1991 — BOTH-nullable equality with DIFFERENT FP widths (`float? = double?`).
+// This case took neither the same-width both-nullable branch (LLVM struct types
+// differ) nor the mixed nullable-vs-scalar #1981 promotion (the "plain" side is
+// itself a struct), and fell through to the bare struct-equality path — which
+// extracted a float payload from one operand and a double from the other →
+// `fcmp oeq float, double` (malformed IR, compile abort). The fix promotes the
+// narrower payload to the wider FP type (FPExt) and applies the null-safe §8.4
+// rule on the promoted scalars.
+// =========================================================================
+
+// §6.2 / §8.4: `float? = double?`, both present with equal value — the exact
+// #1991 repro. float(1.5) widens to double 1.5 → EQUAL (return 1). Without the
+// fix this did not compile (IR-verify abort).
+BEZEL_TEST(nullable_fp_equality_1991, float_nullable_eq_double_nullable_true) {
+    BEZEL_EXPECT_EQ(run(mainOf(
+        "var a: float? := 1.5f; var b: double? := 1.5; "
+        "if a = b then return 1; else return 0; end;")), 1);
+}
+
+// §8.4: `<>` is the negation — both present and equal → false (return 0).
+BEZEL_TEST(nullable_fp_equality_1991, float_nullable_ne_double_nullable_false) {
+    BEZEL_EXPECT_EQ(run(mainOf(
+        "var a: float? := 1.5f; var b: double? := 1.5; "
+        "if a <> b then return 1; else return 0; end;")), 0);
+}
+
+// §8.4: both present, values differ → NOT equal (return 0).
+BEZEL_TEST(nullable_fp_equality_1991, float_nullable_eq_double_nullable_differ) {
+    BEZEL_EXPECT_EQ(run(mainOf(
+        "var a: float? := 1.5f; var b: double? := 2.5; "
+        "if a = b then return 1; else return 0; end;")), 0);
+}
+
+// §8.4: BOTH null → EQUAL (return 1). The null-safe both-null rule must hold
+// across widths — the struct-equality fall-through would have compared the
+// (meaningless) payload slots instead.
+BEZEL_TEST(nullable_fp_equality_1991, float_double_both_null_equal) {
+    BEZEL_EXPECT_EQ(run(mainOf(
+        "var a: float? := null; var b: double? := null; "
+        "if a = b then return 1; else return 0; end;")), 1);
+}
+
+// §8.4: exactly one null → NOT equal (return 0), regardless of the other's value.
+BEZEL_TEST(nullable_fp_equality_1991, float_null_vs_double_present_unequal) {
+    BEZEL_EXPECT_EQ(run(mainOf(
+        "var a: float? := null; var b: double? := 1.5; "
+        "if a = b then return 1; else return 0; end;")), 0);
+}
+
+// §8.4: exactly one null with `<>` → TRUE (return 1).
+BEZEL_TEST(nullable_fp_equality_1991, float_null_vs_double_present_ne_true) {
+    BEZEL_EXPECT_EQ(run(mainOf(
+        "var a: float? := null; var b: double? := 1.5; "
+        "if a <> b then return 1; else return 0; end;")), 1);
+}
+
+// §6.2: reversed operand order `double? = float?` reaches the same branch (both
+// sides are inspected for the nullable-value struct shape). 1.5 = 1.5f → true.
+BEZEL_TEST(nullable_fp_equality_1991, double_nullable_eq_float_nullable_rev) {
+    BEZEL_EXPECT_EQ(run(mainOf(
+        "var a: double? := 1.5; var b: float? := 1.5f; "
+        "if a = b then return 1; else return 0; end;")), 1);
+}
+
+// §6.2: a value NOT exactly representable in float — `float? = double?` promotes
+// the float payload to double, so float(0.1) (≈0.100000001…) is NOT equal to the
+// double 0.1. This documents that the promotion is float→double (mixed-width
+// §6.2), not a lossy double→float narrowing that would spuriously equate them.
+BEZEL_TEST(nullable_fp_equality_1991, float_double_precision_widening_unequal) {
+    BEZEL_EXPECT_EQ(run(mainOf(
+        "var a: float? := 0.1f; var b: double? := 0.1; "
+        "if a = b then return 1; else return 0; end;")), 0);
+}

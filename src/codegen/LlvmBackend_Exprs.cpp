@@ -6568,6 +6568,87 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             l, r, llvm::cast<llvm::ArrayType>(l->getType()), elemTy);
         return op == "=" ? eq : builder_.CreateNot(eq);
     }
+    // §8.4 / §6.2 / #1991: BOTH sides are nullable value types but with
+    // DIFFERENT payload widths — `float? = double?` / `float? <> double?`. The
+    // same-type branch below (l->getType() == r->getType()) does not fire, the
+    // mixed nullable-vs-scalar #1981 promotion excludes a struct operand, and
+    // the bare struct-equality fall-through would extract MISMATCHED payload
+    // types → `fcmp oeq float, double` (malformed IR, an IR-verify abort). Do
+    // here what #1981 did on the scalar path: unwrap both payloads, promote the
+    // narrower FP payload to the wider FP type (FPExt) — integer widths widen by
+    // each side's own signedness — then apply the null-safe §8.4 rule (both-null
+    // → equal; exactly-one-null → not-equal; both-present → the promoted-payload
+    // equality). The op runs on the promoted scalars, so no `fcmp` on mismatched
+    // FP widths is ever emitted.
+    if ((op == "=" || op == "<>") && l->getType()->isStructTy() &&
+        r->getType()->isStructTy() && l->getType() != r->getType()) {
+        const sema::TypeRef* lnv = nullptr;
+        const sema::TypeRef* rnv = nullptr;
+        if (bin.left)
+            if (auto* t = ctx_.exprType(*bin.left))
+                if (isNullableValueTy(t) &&
+                    l->getType() == nullableValueStructTy(t))
+                    lnv = t;
+        if (bin.right)
+            if (auto* t = ctx_.exprType(*bin.right))
+                if (isNullableValueTy(t) &&
+                    r->getType() == nullableValueStructTy(t))
+                    rnv = t;
+        if (lnv && rnv) {
+            llvm::Value* lHas = nullablePrimHasValue(l);   // i1
+            llvm::Value* rHas = nullablePrimHasValue(r);
+            llvm::Value* lPay = nullablePrimValue(l);
+            llvm::Value* rPay = nullablePrimValue(r);
+            bool lFP = lPay->getType()->isFloatingPointTy();
+            bool rFP = rPay->getType()->isFloatingPointTy();
+            bool lUns = bin.left  && isUnsignedTargetExpr(*bin.left);
+            bool rUns = bin.right && isUnsignedTargetExpr(*bin.right);
+            if (lFP || rFP) {
+                // §6.2: the wider of two FP payloads, else the lone FP type.
+                llvm::Type* fty =
+                    (lFP && rFP)
+                        ? (lPay->getType()->getPrimitiveSizeInBits() >=
+                                   rPay->getType()->getPrimitiveSizeInBits()
+                               ? lPay->getType()
+                               : rPay->getType())
+                        : (lFP ? lPay->getType() : rPay->getType());
+                auto toFP = [&](llvm::Value* v, bool u) -> llvm::Value* {
+                    if (!v->getType()->isFloatingPointTy())
+                        return u ? builder_.CreateUIToFP(v, fty)
+                                 : builder_.CreateSIToFP(v, fty);
+                    if (v->getType() != fty)
+                        return builder_.CreateFPExt(v, fty);
+                    return v;
+                };
+                lPay = toFP(lPay, lUns);
+                rPay = toFP(rPay, rUns);
+            } else if (lPay->getType()->isIntegerTy() &&
+                       rPay->getType()->isIntegerTy() &&
+                       lPay->getType() != rPay->getType()) {
+                // §6.2: widen the narrower integer payload by its own signedness.
+                unsigned lb = lPay->getType()->getIntegerBitWidth();
+                unsigned rb = rPay->getType()->getIntegerBitWidth();
+                if (lb < rb)
+                    lPay = builder_.CreateIntCast(lPay, rPay->getType(), !lUns);
+                else
+                    rPay = builder_.CreateIntCast(rPay, lPay->getType(), !rUns);
+            }
+            // Null-safe §8.4 on the promoted payloads: tags equal AND (both-null
+            // OR the inner values equal). emitValueEquality on the two scalars
+            // applies the inner type's rule (FP uses the NaN-aware oeq of §4.3.1).
+            sema::TypeRef innerTy = *lnv;
+            innerTy.nullable = false;
+            llvm::Value* tagsEq =
+                builder_.CreateICmpEQ(lHas, rHas, "eq.nv2tag");
+            llvm::Value* bothHave =
+                builder_.CreateAnd(lHas, rHas, "eq.nv2both");
+            llvm::Value* payEq = emitValueEquality(lPay, rPay, &innerTy);
+            llvm::Value* inner = builder_.CreateOr(
+                builder_.CreateNot(bothHave), payEq, "eq.nv2inner");
+            llvm::Value* eq = builder_.CreateAnd(tagsEq, inner, "eq.nv2");
+            return op == "=" ? eq : builder_.CreateNot(eq);
+        }
+    }
     // §8.4 / issue #416: BOTH sides are nullable value types (the tagged
     // {i8 hasValue; T value} struct) — e.g. `record? = record?`, `int? = int?`,
     // `enum? = enum?`. Route to emitValueEquality's nullable-value branch, which
