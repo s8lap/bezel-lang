@@ -143,6 +143,15 @@ now() { awk '{print $1; exit}' /proc/uptime 2>/dev/null || date +%s; }  # monoto
 TLOGDIR=/var/tmp/bezel-scratch/gate-timings
 TLOG="$TLOGDIR/gate-timings.jsonl"
 GATE_T0=$(now)
+# Canonical live-status file (#2100 follow-up): one place ANY watcher polls —
+# "running" written here, the verdict written by gate_finish on EVERY exit.
+# Exists because detached gates (survivors of background-task shedding) emit
+# no completion signal of their own; best-effort, never affects gating.
+GATE_STATUS_FILE="$S/gate-status.json"
+printf '{"status":"running","mode":"%s","head":"%s","pid":%d,"started":"%s"}\n' \
+  "$MODE" "$(git rev-parse --short HEAD 2>/dev/null || echo '?')" "$$" \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '')" \
+  > "$GATE_STATUS_FILE" 2>/dev/null || true
 GATE_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
 GATE_EPOCH=$(date +%s 2>/dev/null || echo 0)
 GATE_HOST=$(hostname 2>/dev/null || echo "?")
@@ -195,6 +204,12 @@ gate_finish() { # rc -> print aligned summary + append JSON; must NOT change exi
     echo "   machine log: $TLOG"
   } || true
   emit_json "$rc" "$result" "$total" 2>/dev/null || true
+  # Verdict to the canonical status file (see GATE_STATUS_FILE above).
+  printf '{"status":"%s","rc":%d,"mode":"%s","head":"%s","total_s":%s,"failed_phase":%s,"finished":"%s"}\n' \
+    "$result" "$rc" "$MODE" "$GATE_HEAD_SHORT" "$total" \
+    "$([ -n "$FAILED_PHASE" ] && printf '"%s"' "$FAILED_PHASE" || echo null)" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '')" \
+    > "${GATE_STATUS_FILE:-$S/gate-status.json}" 2>/dev/null || true
 }
 
 fail() { FAILED_PHASE="$1"; echo "== GATE FAIL: $1 =="; exit 1; }
