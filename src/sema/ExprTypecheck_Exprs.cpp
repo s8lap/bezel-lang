@@ -4072,6 +4072,27 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
     }
 }
 
+// §35.5 / §19.3 (#2047 follow-up): see the declaration in ExprTypecheck_impl.hpp.
+// A `case this of Ok(…)` inside a choice instance method (the stdlib `Result`'s
+// own IsOk, or any user choice method) must resolve `Ok` to the enclosing
+// choice's CASE, not to a same-named user class — but sema leaves `this` untyped
+// for a named-type method, so the scrutinee-choice-first pattern resolution is
+// skipped. Recover the enclosing choice as the scrutinee type here (local to the
+// case handler; `this` stays globally untyped, so codegen's own value recovery
+// is unaffected).
+TypeRef* ExprTC::recoverChoiceThisScrutTy(const ast::Expr* scrutinee,
+                                          TypeRef* scrutTy) {
+    if (scrutTy || !scrutinee || !currentType_ ||
+        currentType_->kind != ast::TypeDeclKind::Choice)
+        return scrutTy;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(scrutinee);
+    if (!id || (id->name != "this" && id->name != "base")) return scrutTy;
+    auto* t = ctx_.makeTypeRef();
+    t->kind = TypeRef::Kind::Named;
+    t->declaration = currentType_;
+    return t;
+}
+
 void ExprTC::visitChildren(const ast::Expr& e) {
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
         if (be->left) visitExpr(*be->left);
@@ -5470,6 +5491,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         validateCaseArms(ce->arms);  // §16.4 / §19.6 (#738)
         TypeRef* scrutTy =
             ce->scrutinee ? ctx_.exprType(*ce->scrutinee) : nullptr;
+        scrutTy = recoverChoiceThisScrutTy(ce->scrutinee.get(), scrutTy);
         // §10.6 (#772): "Inside a `case` whose scrutinee is an enum, the enum
         // prefix may be omitted." This holds throughout the construct, INCLUDING
         // arm bodies (`Red => Green`), not only patterns. Inject the scrutinee

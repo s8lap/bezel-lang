@@ -1119,6 +1119,20 @@ private:
     // Param-symbol lookup for the in-progress method/ctor on currentType_.
     const std::vector<Symbol*>* paramSymbolsOf(const ast::Member& m) const;
 
+    // §35.5 / §19.3 (#2047 follow-up): recover the scrutinee type of a `case`
+    // whose scrutinee is `this` / `base` inside a CHOICE instance method. Sema
+    // leaves `this` untyped for a named-type method (the same posture as a record
+    // `this`), so `ctx_.exprType(this)` is null and the choice-case-first pattern
+    // resolution would be skipped — letting a pattern head that names a case
+    // (`Ok`) fall through to general name lookup and collide with a same-named
+    // user CLASS (the §35 spec rule is "a case name resolves to a case pattern,
+    // never a type test"). When `scrutTy` is null and the scrutinee is
+    // `this`/`base` in a choice method, returns a Named TypeRef for the enclosing
+    // choice; otherwise returns `scrutTy` unchanged. `this` stays globally
+    // untyped (codegen recovers the runtime value on its own path).
+    TypeRef* recoverChoiceThisScrutTy(const ast::Expr* scrutinee,
+                                      TypeRef* scrutTy);
+
     // Build a method scope (params on top of module scope), then visit
     // body. Locals are registered into this scope as visitStmt walks
     // LocalDecls.

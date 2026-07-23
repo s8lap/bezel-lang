@@ -9532,6 +9532,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         validateCaseArms(cs->arms);  // §16.4 / §19.6 (#738)
         TypeRef* scrutTy =
             cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;
+        scrutTy = recoverChoiceThisScrutTy(cs->scrutinee.get(), scrutTy);
         // §5.1 / §19 (#1153): reject an out-of-range integer pattern literal
         // (statement-position `case` is exempt from exhaustiveness but not from
         // the literal-range gate — codegen would otherwise truncate it).

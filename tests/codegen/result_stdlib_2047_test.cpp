@@ -297,3 +297,71 @@ BEZEL_TEST(codegen_result_2047, spec_35_4_owning_isok_iserror) {
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 3);
 }
+
+// --- §35.5 / §19.3: case-name vs. class-name collision ---------------------
+
+// §35.5 / §19.3 (#2047 follow-up): a user `class Ok` shares the NAME of the
+// injected `Result`'s `Ok` case. The prelude's `IsOk` (`case this of Ok(_) …`)
+// must resolve `Ok` to the CASE, not the user class — per §35.5 "a case name
+// resolves to a case pattern, never a type test". Before the fix this reported a
+// spurious "positional destructuring pattern `Ok(...)` is not valid on a class
+// type (§19.3)" inside the prelude and failed the whole compile; now Result and
+// the user class coexist and Result runs. (This is the general defect — `this`
+// is untyped for a named-type method, so the scrutinee-choice-first resolution
+// was skipped.)
+BEZEL_TEST(codegen_result_2047, spec_35_5_user_class_named_after_case_ok_coexists) {
+    BEZEL_EXPECT_EQ(runDecls(
+        "class Ok "
+        "  public v: int; "
+        "  public constructor(x: int) v := x; end constructor; "
+        "end Ok;",
+        "var r: Result<int, string> := Result<int, string>.Ok(5); "
+        "var acc: int := 0; "
+        "if r.IsOk() then acc := acc + 5; end; "        // prelude IsOk resolves
+        "case r of "                                     // its own `Ok` case
+        "  Ok(var v)    => do acc := acc + v; end, "     // user's `case r of Ok`
+        "  Error(var m) => do acc := 0; end "            // also resolves the case
+        "end; "
+        "return acc;"), 10);
+}
+
+// §35.5 / §19.3: the GENERAL shape — a USER choice `Opt` with an instance method
+// `case this of Some(_) …`, where `Some` collides with a user `class Some`. The
+// pattern head resolves to the choice's case, so `HasValue()` works. Pins that
+// the fix is general (any choice instance method over `this`), not prelude-only.
+BEZEL_TEST(codegen_result_2047, spec_35_5_user_choice_method_case_name_class_collision) {
+    BEZEL_EXPECT_EQ(runDecls(
+        "class Some "
+        "  public v: int; "
+        "  public constructor(x: int) v := x; end constructor; "
+        "end Some; "
+        "choice Opt "
+        "  Some(value: int), "
+        "  None; "
+        "  public method HasValue(): bool => (case this of "
+        "    Some(_) => true, "
+        "    None    => false); "
+        "end Opt;",
+        "var o: Opt := Opt.Some(9); "
+        "if o.HasValue() then return 7; end; "
+        "return 0;"), 7);
+}
+
+// §35.5 CONTROL: with NO colliding class, a choice instance method's `case this`
+// still resolves correctly — the recovery does not perturb the normal path.
+BEZEL_TEST(codegen_result_2047, spec_35_5_no_collision_case_this_still_resolves) {
+    BEZEL_EXPECT_EQ(runDecls(
+        "choice Opt "
+        "  Some(value: int), "
+        "  None; "
+        "  public method HasValue(): bool => (case this of "
+        "    Some(_) => true, "
+        "    None    => false); "
+        "end Opt;",
+        "var a: Opt := Opt.Some(4); "
+        "var b: Opt := Opt.None; "
+        "var acc: int := 0; "
+        "if a.HasValue() then acc := acc + 1; end; "
+        "if not b.HasValue() then acc := acc + 2; end; "
+        "return acc;"), 3);
+}
