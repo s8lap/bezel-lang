@@ -4810,6 +4810,10 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 dynamic_cast<ParameterSymbol*>(asym)) {
                                 narrowings_.erase(asym);
                                 nullNarrowed_.erase(asym);
+                                // §7.4 v0.214 (#2085/#2116): the callee may
+                                // rebind the ref/out local, so any `local._f`
+                                // facts riding it no longer hold.
+                                dropFieldFactsRooted(asym);
                             }
                         }
                     }
@@ -5227,6 +5231,24 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // postcondition. Clear the set for the lambda body and restore after.
         auto saveOutPostconds = std::move(currentOutPostconds_);
         currentOutPostconds_.clear();
+        // §7.4 (v0.214, #2113/#2116): the lambda body is DEFERRED code — its
+        // readonly-field fact state is not the enclosing statement's.
+        //   IN:  ambient-rooted facts (rootId 0 — `this`/static) ride in: a
+        //        readonly field observed non-null holds that value forever
+        //        after (§22.8 single assignment; a during-construction test
+        //        that observed non-null saw the final value, §22.7/§7.4), so
+        //        the fact is true whenever the closure later runs. LOCAL-rooted
+        //        facts are dropped: the captured root may be rebound between
+        //        the closure's creation and its invocation, which the
+        //        enclosing walk cannot see.
+        //   OUT: the enclosing set is RESTORED — a fact established inside the
+        //        lambda body must not leak to the enclosing scope (the body may
+        //        run never or later; #2113's hole, closed for this set).
+        // (nullNarrowed_/narrowings_ keep their legacy leak — that is #2113's
+        // own scope for the local sets.)
+        auto saveFieldNarrowed = fieldNarrowed_;
+        fieldNarrowed_.erase(fieldNarrowed_.lower_bound({1u, 0u}),
+                             fieldNarrowed_.end());  // drop local-rooted
         currentScope_ = &lamScope;
         // §27.3 (v0.217, #2101): with a return-type ascription the body is
         // checked exactly as a method body against a declared return type —
@@ -5357,6 +5379,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         currentScope_ = saveScope;
         returnCtx_ = saveRet;
         currentReturnType_ = saveRetTy;
+        // §7.4 (v0.214, #2113/#2116): restore the enclosing fact set — facts
+        // established inside the (deferred) lambda body never leak out.
+        fieldNarrowed_ = std::move(saveFieldNarrowed);
         currentOutPostconds_ = std::move(saveOutPostconds);  // §22.4 (#1585)
         inAsyncContext_ = saveAsync;
         inBindAtom_ = saveInBindAtom;  // §17.15 (#2098)
@@ -5576,7 +5601,14 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     "scrutinee type (\xC2\xA7""19) — a `case` pattern operand "
                     "must be comparable to the scrutinee");
         };
+        // §7.4 (v0.214, #2116): case arms are ALTERNATIVES — the same
+        // running-intersection per-arm base + after-case join as the CaseStmt
+        // handler (see the note there for why it is drop-respecting). An
+        // expression-case arm's `do … end` body can contain early-exit `if`
+        // statements that establish facts.
+        auto caseRunningField = fieldNarrowed_;
         for (const auto& arm : ce->arms) {
+            fieldNarrowed_ = caseRunningField;  // §7.4 #2116: per-arm base
             // §19 / §A (#727): in a SCRUTINEE-LESS `case`, an arm's pattern is a
             // boolean CONDITION expression (a ConstantPattern) — typecheck its
             // constants so identifiers resolve and codegen can lower them.
@@ -6171,7 +6203,14 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 }
                 for (const auto& s : arm.stmts) if (s) visitStmt(*s);
             }
+            // §7.4 #2116: fold this arm's exit into the running intersection.
+            for (auto it = caseRunningField.begin();
+                 it != caseRunningField.end();) {
+                if (fieldNarrowed_.count(*it)) ++it;
+                else it = caseRunningField.erase(it);
+            }
         }
+        fieldNarrowed_ = std::move(caseRunningField);  // §7.4 #2116
         currentScope_ = preArmEnumScope;  // §10.6 (#772): pop the enum scope
         inEnumScrutineeCaseArms_ = savedEnumArms;
         // §19.6: an expression-position `case` whose value cannot be proven

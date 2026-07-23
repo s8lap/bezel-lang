@@ -16,13 +16,16 @@
 // resolves to the nested type, so the bodies need no change.
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "ast/Node.hpp"
@@ -111,6 +114,59 @@ private:
     // {hasValue; payload} representation of `record?`/`int?`) stays correct.
     // Block-scoped the same way `narrowings_` is (saved/restored per block).
     std::unordered_set<Symbol*> nullNarrowed_;
+
+    // §7.4 (v0.214, #2085 redone per #2116): flow-narrowing facts for nullable
+    // `readonly` fields. Spec §7.4 (v0.214): "A nullable `readonly` field —
+    // instance or `static` — participates in flow narrowing … The tracked shape
+    // is exactly one field off an admitted root — `this._f`, `TypeName._s`, or
+    // `local._f` where `local` is itself narrowing-tracked; a fact rides its
+    // root (reassigning `local` drops it), and any non-final field segment makes
+    // a path non-trackable."
+    //
+    // DETERMINISM-BY-CONSTRUCTION (#2116 redo requirement). The #2085 landing
+    // keyed facts on raw (Symbol*, FieldSymbol*) pointers in a pointer-ORDERED
+    // std::set; it was reverted for concurrency-nondeterministic wrong-result
+    // flakes under the 8-way sharded ASan gate. This redo stores NO pointers in
+    // the fact set at all:
+    //   * A fact is a pair of DENSE INTEGER ids `(rootId, fieldId)`. rootId 0
+    //     is the ambient root (`this` / bare instance field / `base` / a
+    //     static field through its type name or bare); a local/parameter root
+    //     gets a per-run dense id from `narrowFactIds_` below. fieldId is the
+    //     FieldSymbol's dense id.
+    //   * Ids are handed out lazily, in FIRST-TRACKING-USE order — a pure
+    //     function of the single-threaded, source-ordered AST walk. Two runs of
+    //     the same input assign identical ids regardless of address layout.
+    //   * The container is a std::set over integer pairs, so even its ITERATION
+    //     order is address-independent; and every consumer decision (gate
+    //     membership, root-drop, mutable-capture drop, branch/loop/arm
+    //     intersection joins) is additionally order-independent set algebra.
+    //   * `narrowFactIds_` is pointer-KEYED but access is find/emplace only —
+    //     it is NEVER iterated (auditable by inspection of narrowFactIdOf /
+    //     narrowFactIdIfTracked, its only accessors).
+    //
+    // Fact lifetime (§7.4 v0.214): "outside its construction window (§22.8's
+    // single-assignment rule) a `readonly` field has no writer on any path,
+    // through any alias, so no call, `await`, or closure can invalidate a fact
+    // about its value" — hence ambient-rooted (rootId 0) facts are never
+    // invalidated. A `local._f` fact rides its ROOT: reassignment (`:=`/`??=`),
+    // ref/out passing, and the §7.4 mutable-capture regime drop it, mirroring
+    // `nullNarrowed_`. "The rule does not apply inside the declaring type's
+    // constructors, field initializers, static constructor, or static field
+    // initializers (the assignment window)" — narrowFromFieldNullTest applies
+    // the carve-out at establishment. Saved/restored/joined like
+    // `nullNarrowed_` through the if-statement walk, plus (unlike the legacy
+    // local set — see the pre-existing holes filed from this lane) reset at
+    // elif-condition visits, per-case-arm, and across lambda-body boundaries
+    // (#2113 closed for THIS set).
+    std::set<std::pair<std::uint32_t, std::uint32_t>> fieldNarrowed_;
+
+    // §7.4 / #2116: identity → dense-id table for the fact keys above, plus the
+    // reverse (dense id → symbol) vector used when a local-rooted fact must be
+    // matched against the mutable-capture name set. Insert-only for the run;
+    // never iterated; never cleared (ids stay valid across method bodies —
+    // facts themselves are method-local via runMethodBody's clear).
+    std::unordered_map<const Symbol*, std::uint32_t> narrowFactIds_;
+    std::vector<const Symbol*> narrowFactIdSyms_;  // [id] → symbol; [0] = null
 
     // §7.4 (v0.182, #1566): the set of local/parameter NAMES that are "mutably
     // captured" — assigned, or passed `ref`/`out`, anywhere inside ANY lambda of
@@ -1100,6 +1156,82 @@ private:
     // applied. (issue #418)
     bool narrowFromNullTest(const ast::Expr* cond, bool forTrueBranch);
 
+    // §7.4 (v0.214, #2085/#2116) helper: if `cond` is a
+    // `<readonly-field path> <> null` / `= null` test whose operand is a
+    // trackable readonly-field access path (see readonlyFieldPathOf), record
+    // its (rootId, fieldId) key in `fieldNarrowed_` for the narrowing branch.
+    // Excluded inside the field's declaring-type construction window (the rule
+    // does not apply there — §7.4/§22.8). Returns true iff a field-narrowing
+    // fact was recorded.
+    bool narrowFromFieldNullTest(const ast::Expr* cond, bool forTrueBranch);
+
+    // §7.4 (v0.214, #2085/#2116): the FIELD-ONLY establishment walk used to
+    // (re)seed `fieldNarrowed_` for a branch context without touching
+    // `nullNarrowed_`/`narrowings_` — the same condition shapes
+    // collectNarrowings covers (a single null test, `and`-composition for the
+    // true branch), field facts only. Used by the if-statement walk to give an
+    // elif CONDITION its correct entry state (entry + preceding conditions'
+    // false-branch facts) before it is visited — the legacy sets skip that
+    // reset and leak the preceding branch BODY's state into the condition's
+    // gates (pre-existing local hole, filed separately from lane #2116).
+    void collectFieldNarrowings(const ast::Expr* cond, bool forTrueBranch);
+
+    // §7.4 (v0.214, #2085/#2116): if `e` denotes a trackable nullable
+    // `readonly`-field access path — exactly ONE field off an admitted root
+    // (`this`/`base`/bare implicit-this, a NON-GENERIC type name for a static
+    // readonly, or a local/parameter for `local._f`) — return its
+    // (rootId, fieldId) narrowing key. `assignIds` selects the two modes:
+    // TRUE (establishment) assigns fresh dense ids as needed; FALSE
+    // (consultation/invalidation) only reuses ids handed out earlier — a path
+    // whose ids were never assigned cannot be in `fieldNarrowed_`, so nullopt
+    // is returned without mutating the id table (keeps consultation
+    // side-effect-free). Recognition resolves symbols through the PURE
+    // `ctx_.exprSymbol` side table stamped by the operand's earlier visit —
+    // no lookupName (which can record §22.5 forward-param hits), no TypeRef
+    // creation — so recognizing-and-declining leaves the compiler state
+    // untouched (#2116 determinism audit).
+    //
+    // #2114: a `TypeName._s` root whose TypeName is GENERIC (spelled type
+    // arguments, or a TypeSymbol with generic params) is NOT trackable: sema
+    // shares one FieldSymbol across instantiations while codegen gives each
+    // instantiation separate static storage (probe on record with #2114), so a
+    // shared key would let `Cache<int>._s <> null` admit `Cache<string>._s.M`.
+    // A BARE static field of the enclosing generic type stays trackable — one
+    // body has a single instantiation context. Conservative decline-with-
+    // reasons; lifting needs instantiation-aware keys (#2114 stays open).
+    std::optional<std::pair<std::uint32_t, std::uint32_t>>
+        readonlyFieldPathOf(const ast::Expr* e, bool assignIds);
+
+    // §7.4 / #2116: dense-id accessors for `narrowFactIds_` (its ONLY
+    // accessors — the table is never iterated). narrowFactIdOf assigns on
+    // first use (deterministic first-tracking-use order); narrowFactIdIfTracked
+    // is the read-only probe returning 0 for "never tracked" (0 is the ambient
+    // root id, never assigned to a symbol).
+    std::uint32_t narrowFactIdOf(const Symbol* s);
+    std::uint32_t narrowFactIdIfTracked(const Symbol* s) const;
+
+    // §7.4 (v0.214, #2085/#2116): the resolved TypeRef of a field symbol (body
+    // field or positional-record parameter), or null when unresolved. Pure
+    // side-table reads.
+    TypeRef* fieldTypeOf(const FieldSymbol* fs);
+
+    // §7.4 (v0.214, #2085/#2116): true iff `fs` carries the `readonly` modifier.
+    static bool isReadonlyField(const FieldSymbol* fs);
+
+    // §7.4 (v0.214, #2085/#2116): drop every readonly-field fact rooted at
+    // `root` (a local that was reassigned, passed `ref`/`out`, or mutably
+    // captured — the path's facts ride the root). A no-op for a symbol that was
+    // never tracked. Ambient-rooted facts (rootId 0) are never dropped — a
+    // readonly field has no writer outside its construction window (§7.4).
+    void dropFieldFactsRooted(const Symbol* root);
+
+    // §7.4 / #2116: replace `fieldNarrowed_` with its intersection with
+    // `other` — the all-paths join used by the if-statement walk, the loop
+    // join, and the case-arm join. Pure set algebra over integer keys:
+    // membership of the result is independent of container iteration order.
+    void intersectFieldFactsWith(
+        const std::set<std::pair<std::uint32_t, std::uint32_t>>& other);
+
     // §22.4 (v0.183, #1585) caller-side narrowing: if `cond` is a call to a
     // method that declares a `when true`/`when false` out-nullability
     // postcondition, and the requested branch is the one where the result
@@ -1136,9 +1268,12 @@ private:
     // pure set intersection, independent of container iteration order and
     // emitting no diagnostic, so it is deterministic across shard processes
     // (#2116).
+    // #2116: `entryField` joins `fieldNarrowed_` under the same
+    // zero-iteration-path intersection rule.
     void intersectNarrowingSetsAfterLoop(
         const std::unordered_set<Symbol*>& entryNull,
-        const std::unordered_map<Symbol*, TypeRef*>& entryNarrowings);
+        const std::unordered_map<Symbol*, TypeRef*>& entryNarrowings,
+        const std::set<std::pair<std::uint32_t, std::uint32_t>>& entryField);
 
     void visitTopDecl(const ast::TopDecl& d);
 

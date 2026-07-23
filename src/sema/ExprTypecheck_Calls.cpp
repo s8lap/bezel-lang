@@ -8888,18 +8888,29 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             fieldType = ctx_.resolvedType(*pd->type);
                     }
                     if (fieldType && fieldType->nullable) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, ma.span.begin,
-                            std::string("member access `.") +
-                            std::string(ma.member) +
-                            "` on nullable field `" +
-                            std::string(tid->name) +
-                            "` requires a local copy first (§7.4): "
-                            "fields are not narrowable — copy to a local "
-                            "with `var tmp := " +
-                            std::string(tid->name) +
-                            "` and guard the local");
-                        return;
+                        // §7.4 (v0.214, #2085/#2116): a nullable `readonly`
+                        // field — instance or static — narrows (it has no
+                        // writer after construction, so no TOCTOU hazard). A
+                        // bare `_f` after a `_f <> null` guard is accessible
+                        // while its fact holds. Consultation is read-only
+                        // (assignIds=false): it neither mints ids nor touches
+                        // any compiler state on the reject path.
+                        auto key = readonlyFieldPathOf(ma.target.get(),
+                                                       /*assignIds=*/false);
+                        if (!(key && fieldNarrowed_.count(*key))) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ma.span.begin,
+                                std::string("member access `.") +
+                                std::string(ma.member) +
+                                "` on nullable field `" +
+                                std::string(tid->name) +
+                                "` requires a local copy first (§7.4): "
+                                "fields are not narrowable — copy to a local "
+                                "with `var tmp := " +
+                                std::string(tid->name) +
+                                "` and guard the local");
+                            return;
+                        }
                     }
                 }
             }
@@ -8911,15 +8922,26 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // already non-nullable at this point, so they don't reach this branch.
             TypeRef* tgt = ctx_.exprType(*ma.target);
             if (tgt && tgt->nullable) {
-                ctx_.diagnostics().report(
-                    Severity::Error, ma.span.begin,
-                    std::string("member access `.") +
-                    std::string(ma.member) +
-                    "` on a nullable field or property requires narrowing to "
-                    "non-null first (§7.4): copy the nullable value to a "
-                    "local variable and guard with `<> null`, "
-                    "force-unwrap with `!`, or use `?.`");
-                return;
+                // §7.4 (v0.214, #2085/#2116): a nullable `readonly`-field path
+                // off an admitted root — `this._f`, `TypeName._s` (non-generic,
+                // #2114), or `local._f` — is narrowable (no writer after
+                // construction). It is accessible in a region where its
+                // `<path> <> null` fact holds. `a.b._f` (a non-final field
+                // segment) is not a trackable path, so readonlyFieldPathOf
+                // returns nullopt and the copy-to-local rejection stands.
+                auto key = readonlyFieldPathOf(ma.target.get(),
+                                               /*assignIds=*/false);
+                if (!(key && fieldNarrowed_.count(*key))) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        std::string("member access `.") +
+                        std::string(ma.member) +
+                        "` on a nullable field or property requires narrowing to "
+                        "non-null first (§7.4): copy the nullable value to a "
+                        "local variable and guard with `<> null`, "
+                        "force-unwrap with `!`, or use `?.`");
+                    return;
+                }
             }
         } else if (dynamic_cast<const ast::IndexExpr*>(ma.target.get())) {
             // per §7.4 (#1161): the target is an index/indexer result
