@@ -75,6 +75,11 @@ namespace {
 bool armIsOwnedProducer(const ast::Expr* arm, const sema::SemaContext& ctx,
                         const TypeParamResolver& resolveParam) {
     if (!arm) return false;
+    // §28.3 K3.4 (v0.209, #2080): a MARKED arm `owned x` is an OWNED arm —
+    // the transfer hands over the binding's obligation on the selected path,
+    // so the meet treats it exactly as a fresh producer (the arm-meet row's
+    // marked-arm entry; the UNMARKED read stays a borrow arm, K3.13).
+    if (dynamic_cast<const ast::MarkedTransferExpr*>(arm)) return true;
     if (dynamic_cast<const ast::ConditionalExpr*>(arm) ||
         dynamic_cast<const ast::CaseExpr*>(arm))
         return conditionalCaseArmMeetIsOwned(*arm, ctx, resolveParam);
@@ -828,6 +833,10 @@ bool argsConsumeBinding(const std::vector<ast::CallArgument>& args,
 
 bool exprConsumesBinding(const ast::Expr* e, std::string_view name) {
     if (!e) return false;
+    // §28.3 K3.4 (v0.209, #2080): the marked ARM transfer `owned x` — a K3
+    // consuming position wherever an if/case arm admits it.
+    if (auto* mt = dynamic_cast<const ast::MarkedTransferExpr*>(e))
+        return mt->name == name;
     if (auto* call = dynamic_cast<const ast::CallExpr*>(e)) {
         // Explicit `x.Dispose()` (K3.10; the `x!.Dispose()` spelling too).
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(

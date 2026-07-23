@@ -576,6 +576,20 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     }
                 }
             }
+            // §28.3 K3.4/K7.4 (v0.209, #2080): a local consumed by a MARKED
+            // ARM TRANSFER joins maybe-consumed (Owned at this exit on the
+            // not-selected paths) — its per-path scope-end disposal is
+            // codegen's null-guarded dynamicDispose (the marker lowering
+            // nulls the slot on the selected path), so neither the
+            // discharge error nor the must-use warning applies (the marked
+            // arm is an announced consume; per-path disposal is the
+            // language's job).
+            if (auto* lsAt = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                if (auto* ldAt =
+                        dynamic_cast<const ast::LocalDecl*>(lsAt->decl)) {
+                    if (ldAt->dischargedByArmTransfer) continue;
+                }
+            }
             ctx_.diagnostics().report(
                 Severity::Error,
                 st.obligationOrigin ? st.obligationOrigin->span.begin
@@ -1813,6 +1827,9 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
     // an OUTER binding, which the block's exit state must reflect on every
     // iteration).
     bindAtomsProcessed_.clear();
+    // §28.3 K3.4 (v0.209, #2080): same re-arming for the marked-arm
+    // constructs (their K7.4 joins mutate outer bindings' states).
+    markedConstructsProcessed_.clear();
     // §29.2 (#834) "Iterator yield ownership": when this block is the
     // body-entry of a `for`/`await for` loop whose iterable is an owning
     // enumerable (`IOwningEnumerable<T>` / `IOwningAsyncEnumerable<T>`), the
@@ -2810,6 +2827,13 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
     if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
         return bx->body ? producerState(*bx->body) : OwnershipState::Borrowed;
     }
+    // §28.3 K3.4 (v0.209, #2080): a marked arm transfer `owned x` is an
+    // OWNED producer — the K3.4 transfer hands the consumer the binding's
+    // obligation on the path where its arm is selected (the arm-meet row's
+    // marked-arm entry).
+    if (dynamic_cast<const ast::MarkedTransferExpr*>(&e)) {
+        return OwnershipState::Owned;
+    }
     // `new T(...)` is the canonical producer of Owned values — but only
     // for reference types (classes). §9: a record is a value type with
     // no disposal obligation (§9.7 forbids record destructors and owned
@@ -3256,10 +3280,11 @@ void MethodOwnership::checkArmMeetMixed(const ast::Expr& e) {
                "the arms of this if/case expression mix an owned value with a "
                "borrow — the ownership meet is undefined (§28.3, v0.184): "
                "owned⊓owned is owned and borrowed⊓borrowed is borrowed, but a "
-               "mixed set has no coherent owner (a named owned binding written "
-               "as an arm is a borrow arm). Equalize the arms — bind the owned "
-               "source first, or transfer both arms — so every arm has the same "
-               "ownership");
+               "mixed set has no coherent owner (an UNMARKED named owned "
+               "binding written as an arm is a borrow arm). Equalize the arms "
+               "— mark the named binding with the arm transfer (`owned x`, "
+               "§28.3 K3.4 v0.209), bind the owned source first, or transfer "
+               "both arms — so every arm has the same ownership");
 }
 
 bool MethodOwnership::localDropOnOverwriteCovered(const sema::Symbol* sym) {
@@ -3849,6 +3874,18 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // transition y to MovedFrom. recordMovesIn handles `move local`,
     // `move this.field`, and `f(owned z)` in any position.
     recordMovesIn(*as.value);
+    // §28.3 K3.4/K7.4 (v0.209, #2080): an assignment RHS containing MARKED
+    // arm transfers (`x := (if c then owned a else new Res(2));`) — run the
+    // consume-if-selected processing so the marked binding's state joins
+    // per K7.4 (recordMovesIn does not walk arm constructs; without this
+    // the consumed-on-selected-path binding stayed Owned and scope end
+    // double-disposed it). Deduped per block visit by
+    // markedConstructsProcessed_, so the LocalDecl/checkRead route never
+    // double-processes.
+    if ((dynamic_cast<const ast::ConditionalExpr*>(as.value.get()) ||
+         dynamic_cast<const ast::CaseExpr*>(as.value.get())) &&
+        exprContainsMarkedTransfer(*as.value))
+        processMarkedArmConstruct(*as.value);
     // #1066 / §9.7 (v0.153): `x := new Bag([…])` / `this.f := new Bag([…])`
     // from a temporary is a dangling borrow.
     if (const auto* ne = dynamic_cast<const ast::NewExpr*>(as.value.get()))

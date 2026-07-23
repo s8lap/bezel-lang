@@ -583,6 +583,35 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
         return parseWhenExpr(/*parenAtom=*/false);
     }
 
+    // §A.7 MarkedTransfer (v0.209, #2080): `"owned" Identifier` — the K3.4
+    // transfer marker as a PrimaryAtom. `owned` is reserved and begins no
+    // other expression, so the reading commits at its first token; the
+    // binding/assignment RHS forms are site-parsed BEFORE parseExpression
+    // (the v0.180 consumeKeyword("owned") hooks), so this atom forms only in
+    // the remaining expression positions — sema enforces the positional
+    // admission (if-expression branch / expression-`case`/`when` arm result /
+    // the §35.5 case-scrutinee production; everywhere else rejected naming
+    // axiom A7's narrowed bound).
+    if (isKeyword("owned")) {
+        auto mt = std::make_unique<ast::MarkedTransferExpr>();
+        mt->span.begin = current_.location;
+        advance();  // past `owned`
+        if (current_.kind != TokenKind::Identifier) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "expected an identifier after the `owned` transfer marker "
+                "\xe2\x80\x94 the marker names a local binding or `owned` "
+                "parameter (`owned x`); field paths use `move x.f` "
+                "(\xc2\xa7""28.8.1) (A.7 MarkedTransfer, \xc2\xa7""28.3, "
+                "v0.209)");
+        } else {
+            mt->name = current_.text;
+            mt->span.end = current_.location;
+            advance();
+        }
+        return std::unique_ptr<ast::Expr>(mt.release());
+    }
+
     // §A.5 NewExpr — `new Type "(" ArgList? ")"` or shorthand `new "(" … ")"`.
     if (isKeyword("new")) {
         advance(); // past `new`

@@ -214,6 +214,19 @@ struct LocalDecl : Stmt {
     // pass (handleLocalDecl), which validates the source is a named owned
     // binding and records the move.
     bool initializerHasOwnedMarker = false;
+    // §28.3 K3.4/K7.4 (v0.209, #2080): set by the ownership pass on a plain
+    // `var` owned class/interface local consumed by a MARKED ARM TRANSFER
+    // (`owned x` as an if-expression branch or expression-`case`/`when` arm
+    // result) — consume-if-selected. Codegen's MarkedTransferExpr lowering
+    // NULLS the slot on the selected path, so the K7.4 per-path scope-end
+    // disposal is exactly a NULL-GUARDED dynamicDispose registered at the
+    // declaration's scope (both edges): the consumed path reloads null and
+    // skips; the not-selected path disposes exactly once. The §28.3
+    // end-of-method discharge error and the affine auto-drop are both
+    // suppressed for a local carrying this flag (the marked arm is an
+    // announced consume; the per-path disposal is the language's job).
+    // Monotone (set-only), fixpoint-safe.
+    bool dischargedByArmTransfer = false;
     // §17.15 (v0.216, #2098): this LocalDecl is a CLAUSE of a binding atom
     // `(var x := E; body)` (a BindExpr child, A.7 BindClause), not a statement.
     // Set by the parser. A clause binding is single-assignment and not an
@@ -1190,6 +1203,21 @@ struct CaseArm {
 struct CaseExpr : Expr {
     std::unique_ptr<Expr> scrutinee;   // null when bare `case CaseArm*`
     std::vector<CaseArm> arms;
+};
+
+// A.7 `MarkedTransfer ::= "owned" Identifier` (v0.209, #2080): the K3.4
+// transfer marker as an expression PrimaryAtom — `owned` is reserved and
+// begins no other expression, so the form is additive. Positional admission
+// is enforced SEMANTICALLY (§28.3): an if-expression branch or an
+// expression-`case`/`when` arm result (consume-if-selected, K3.4/K7.4); the
+// binding/assignment RHS forms remain site-parsed flags
+// (LocalDecl::initializerHasOwnedMarker / AssignmentStmt), so this node
+// never appears there; everywhere else — `??` operands, operator operands,
+// guards, argument subexpressions — sema rejects it naming axiom A7's
+// narrowed bound. A `case` SCRUTINEE parsed into this node is the separate
+// §35.5 owning-match marker production, routed to its own validation.
+struct MarkedTransferExpr : Expr {
+    std::string_view name;
 };
 
 // A.7 `BindExpr ::= "(" BindClause+ Expression ")"`,

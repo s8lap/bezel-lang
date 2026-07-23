@@ -604,6 +604,36 @@ private:
     // re-run the atom's transfer functions.
     std::unordered_set<const ast::Expr*> bindAtomsProcessed_;
 
+    // §28.3 K3.4/K7.4 (v0.209, #2080): the arm-position transfer marker
+    // `owned x` — consume-if-selected. processMarkedArmConstruct processes an
+    // if-expression / expression-`case`/`when` that CONTAINS marked arms:
+    // each value arm is walked from the construct-entry state; a marked arm
+    // consumes its binding on that arm's path (handleMarkedArmTransfer —
+    // named owned plain LOCAL of class/interface type in this first landing;
+    // the K5.1 freeze and the moved-from machinery ride markMovedByName);
+    // after the arms, the binding joins per K7.4 — MovedFrom when EVERY
+    // non-absorbing value arm consumed it, else Owned + maybeConsumed — and
+    // its LocalDecl is flagged dischargedByArmTransfer so codegen's
+    // null-guarded scope-end disposal implements the per-path boundary
+    // (the marker lowering nulls the slot on the selected path). The K8.3
+    // scrutinee freeze — a `case` arm result marking the SCRUTINEE's own
+    // binding — is rejected here (the scrutinee borrow is live through the
+    // selected arm's completion). Constructs WITHOUT marked arms keep the
+    // pre-v0.209 walk byte-identically. Deduped per block visit
+    // (markedConstructsProcessed_, cleared with bindAtomsProcessed_).
+    void processMarkedArmConstruct(const ast::Expr& e);
+    void handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt);
+    // True when `e` contains a MarkedTransferExpr in an arm position of any
+    // nested if/case construct (the gate for processMarkedArmConstruct — a
+    // construct without markers keeps the old walk).
+    static bool exprContainsMarkedTransfer(const ast::Expr& e);
+    std::unordered_set<const ast::Expr*> markedConstructsProcessed_;
+    // Per-ARM accumulation of the bindings consumed by marked transfers
+    // while that arm was walked (nested constructs append theirs — a
+    // consume-if-inner-selected is still maybe-consumed from outside).
+    // Saved/cleared/collected around each arm by processMarkedArmConstruct.
+    std::vector<sema::Symbol*> armTransferConsumed_;
+
     // Walk an expression and side-effect any `move` operations it
     // contains. Used by handleLocalDecl so `move`-in-initializer
     // properly transitions the source's state.

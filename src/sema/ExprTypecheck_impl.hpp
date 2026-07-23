@@ -265,6 +265,19 @@ private:
     // an await there suspends the lambda's state machine, not the atom's
     // enclosing frame).
     bool inBindAtom_ = false;
+    // §28.3 A7 (v0.209, #2080): the ONE expression node currently admitted to
+    // be a MarkedTransferExpr — set (saved/restored) around the visit of each
+    // admitted child: an if-expression branch (ConditionalExpr then/else) or
+    // an expression-`case`/`when` arm result (CaseArm exprBody). The
+    // MarkedTransferExpr arm checks `&e == markedArmSlot_`, so a marker
+    // NESTED inside an admitted child (`(if c then f(owned x) else y)`) is
+    // still rejected — admission is the exact arm position, not the subtree.
+    const ast::Expr* markedArmSlot_ = nullptr;
+    // §35.5 (v0.209/#2080 F4): the case-SCRUTINEE node currently being
+    // visited (CaseExpr/CaseStmt). A MarkedTransferExpr here is the separate
+    // owning-match scrutinee production — routed to the §35.5 targeted
+    // rejection (#2124), not the A7 positional reject.
+    const ast::Expr* caseScrutineeSlot_ = nullptr;
     // #721/§29.5: true while visiting an iterator method body (sync or async,
     // i.e. it contains `yield`). A plain `return;` in an iterator is forbidden
     // (use `yield break`); for an ASYNC iterator §21.7 does not catch it (it is

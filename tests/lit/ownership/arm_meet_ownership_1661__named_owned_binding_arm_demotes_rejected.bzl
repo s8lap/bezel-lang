@@ -28,4 +28,7 @@ class W
 end W;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: the arms of this if/case expression mix an owned value with a borrow
-// CHECK-SAME: a named owned binding written as an arm is a borrow arm
+// (v0.209, #2080: the diagnostic now names the marked-arm remedy — the
+// UNMARKED read stays a borrow arm; `owned x` is the K3.4 arm transfer.)
+// CHECK-SAME: an UNMARKED named owned binding written as an arm is a borrow arm
+// CHECK-SAME: mark the named binding with the arm transfer (`owned x`, §28.3 K3.4 v0.209)

@@ -9455,7 +9455,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             }
         }
     } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
-        if (cs->scrutinee) visitExpr(*cs->scrutinee);
+        if (cs->scrutinee) {
+            // §35.5 (v0.209/#2080 F4): the A.6 statement form's `case owned x
+            // of` scrutinee marker — same routing as the expression atom's.
+            const ast::Expr* savedScrutSlot = caseScrutineeSlot_;
+            caseScrutineeSlot_ = cs->scrutinee.get();
+            visitExpr(*cs->scrutinee);
+            caseScrutineeSlot_ = savedScrutSlot;
+        }
         validateCaseArms(cs->arms);  // §16.4 / §19.6 (#738)
         TypeRef* scrutTy =
             cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;

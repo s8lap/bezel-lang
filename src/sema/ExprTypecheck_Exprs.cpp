@@ -563,6 +563,67 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         currentScope_ = savedScope;
         return;
     }
+    // §28.3 K3.4 / A7 (v0.209, #2080): the arm-position transfer marker
+    // `owned x` (A.7 MarkedTransfer). Positional admission is enforced HERE
+    // (the grammar is additive): the node is admitted exactly as an
+    // if-expression branch or an expression-`case`/`when` arm result
+    // (markedArmSlot_, set by those constructs' child visits) — everywhere
+    // else it is a compile error naming axiom A7's narrowed bound. A CASE
+    // SCRUTINEE marker (`case owned x of`, caseScrutineeSlot_) is the
+    // separate §35.5 owning-match production — its consuming lowering is not
+    // implemented yet, so it draws its own targeted rejection (#2124). The
+    // marker's TYPE is the named binding's (needed for the construct's §20
+    // common-arm-type computation); the ownership semantics —
+    // consume-if-selected, the K5.1 freeze, the K8.3 scrutinee-arm reject —
+    // are the ownership pass's.
+    if (auto* mt = dynamic_cast<const ast::MarkedTransferExpr*>(&e)) {
+        if (&e == caseScrutineeSlot_) {
+            ctx_.diagnostics().report(
+                Severity::Error, e.span.begin,
+                "the owning-match consuming scrutinee (`case owned " +
+                std::string(mt->name) +
+                " of \xe2\x80\xa6`) is not implemented in this version "
+                "\xe2\x80\x94 match on a borrow (`case " +
+                std::string(mt->name) +
+                " of \xe2\x80\xa6`) and transfer per-arm instead "
+                "(\xc2\xa7""35.5, v0.200; #2124)");
+        } else if (&e != markedArmSlot_) {
+            ctx_.diagnostics().report(
+                Severity::Error, e.span.begin,
+                "the transfer marker `owned " + std::string(mt->name) +
+                "` is admitted only as an if-expression branch, an "
+                "expression-`case`/`when` arm result, or the entire "
+                "right-hand side of a binding or assignment \xe2\x80\x94 "
+                "in every other expression position (`??` operands, "
+                "operator operands, guards, argument subexpressions) it is "
+                "a compile error (axiom A7, narrowed v0.209; "
+                "\xc2\xa7""28.3 / A.7 MarkedTransfer)");
+        }
+        // Type the marker as the named binding, whatever the admission
+        // verdict, so downstream typing does not cascade.
+        if (!mt->name.empty()) {
+            if (Symbol* sym = lookupName(mt->name)) {
+                ctx_.setExprSymbol(&e, sym);
+                if (auto* loc = dynamic_cast<LocalSymbol*>(sym)) {
+                    if (loc->declType) ctx_.setExprType(&e, loc->declType);
+                } else if (auto* par = dynamic_cast<ParameterSymbol*>(sym)) {
+                    if (par->declType) {
+                        if (auto* rt = ctx_.resolvedType(*par->declType))
+                            ctx_.setExprType(&e, rt);
+                    } else if (par->resolvedDeclType) {
+                        ctx_.setExprType(&e, par->resolvedDeclType);
+                    }
+                }
+            } else {
+                ctx_.diagnostics().report(
+                    Severity::Error, e.span.begin,
+                    "unknown identifier `" + std::string(mt->name) +
+                    "` in the `owned` transfer marker (\xc2\xa7""28.3, "
+                    "v0.209)");
+            }
+        }
+        return;
+    }
     // Slice 3b: IdentifierExpr name lookup. `this` / `base` are
     // implicit-meaning identifiers — leave them unresolved
     // (typecheck handles their semantics in a future slice).
@@ -4924,8 +4985,18 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // §20: the `if` expression's condition must be bool.
             checkConditionIsBool(*ce->condition, "if-expression");
         }
-        if (ce->thenValue) visitExpr(*ce->thenValue);
-        if (ce->elseValue) visitExpr(*ce->elseValue);
+        // §28.3 A7 (v0.209, #2080): an if-expression BRANCH is a marked-
+        // transfer admission position — announce the exact child node.
+        const ast::Expr* savedSlot = markedArmSlot_;
+        if (ce->thenValue) {
+            markedArmSlot_ = ce->thenValue.get();
+            visitExpr(*ce->thenValue);
+        }
+        if (ce->elseValue) {
+            markedArmSlot_ = ce->elseValue.get();
+            visitExpr(*ce->elseValue);
+        }
+        markedArmSlot_ = savedSlot;
     } else if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
         if (te->operand) visitExpr(*te->operand);
     } else if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
@@ -5369,7 +5440,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             ctx_.setExprType(lam, lamTy);
         }
     } else if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
-        if (ce->scrutinee) visitExpr(*ce->scrutinee);
+        if (ce->scrutinee) {
+            // §35.5 (v0.209/#2080 F4): a `case owned x of` scrutinee
+            // marker parses as a scrutinee-rooted MarkedTransferExpr —
+            // announce the node so the marker arm routes it to the
+            // §35.5 validation instead of the A7 positional reject.
+            const ast::Expr* savedScrutSlot = caseScrutineeSlot_;
+            caseScrutineeSlot_ = ce->scrutinee.get();
+            visitExpr(*ce->scrutinee);
+            caseScrutineeSlot_ = savedScrutSlot;
+        }
         validateCaseArms(ce->arms);  // §16.4 / §19.6 (#738)
         TypeRef* scrutTy =
             ce->scrutinee ? ctx_.exprType(*ce->scrutinee) : nullptr;
@@ -5765,7 +5845,15 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;
                 if (arm.guard) visitExpr(*arm.guard);
-                if (arm.exprBody) visitExpr(*arm.exprBody);
+                if (arm.exprBody) {
+                    // §28.3 A7 (v0.209, #2080): an expression-`case`/
+                    // `when` ARM RESULT is a marked-transfer admission
+                    // position — announce the exact child node.
+                    const ast::Expr* savedMtSlot = markedArmSlot_;
+                    markedArmSlot_ = arm.exprBody.get();
+                    visitExpr(*arm.exprBody);
+                    markedArmSlot_ = savedMtSlot;
+                }
                 for (const auto& s : arm.stmts) if (s) visitStmt(*s);
                 currentScope_ = saveScope;
             } else if (dp && currentScope_ && dp->typeName) {
@@ -5829,7 +5917,14 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         Scope* saveScope = currentScope_;
                         currentScope_ = &armScope;
                         if (arm.guard) visitExpr(*arm.guard);
-                        if (arm.exprBody) visitExpr(*arm.exprBody);
+                        if (arm.exprBody) {
+                            // §28.3 A7 (v0.209, #2080): arm-result
+                            // marked-transfer admission position.
+                            const ast::Expr* savedMtSlot = markedArmSlot_;
+                            markedArmSlot_ = arm.exprBody.get();
+                            visitExpr(*arm.exprBody);
+                            markedArmSlot_ = savedMtSlot;
+                        }
                         for (const auto& bs : arm.stmts)
                             if (bs) visitStmt(*bs);
                         currentScope_ = saveScope;
@@ -6013,12 +6108,28 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;
                 if (arm.guard) visitExpr(*arm.guard);
-                if (arm.exprBody) visitExpr(*arm.exprBody);
+                if (arm.exprBody) {
+                    // §28.3 A7 (v0.209, #2080): an expression-`case`/
+                    // `when` ARM RESULT is a marked-transfer admission
+                    // position — announce the exact child node.
+                    const ast::Expr* savedMtSlot = markedArmSlot_;
+                    markedArmSlot_ = arm.exprBody.get();
+                    visitExpr(*arm.exprBody);
+                    markedArmSlot_ = savedMtSlot;
+                }
                 for (const auto& s : arm.stmts) if (s) visitStmt(*s);
                 currentScope_ = saveScope;
             } else {
                 if (arm.guard) visitExpr(*arm.guard);
-                if (arm.exprBody) visitExpr(*arm.exprBody);
+                if (arm.exprBody) {
+                    // §28.3 A7 (v0.209, #2080): an expression-`case`/
+                    // `when` ARM RESULT is a marked-transfer admission
+                    // position — announce the exact child node.
+                    const ast::Expr* savedMtSlot = markedArmSlot_;
+                    markedArmSlot_ = arm.exprBody.get();
+                    visitExpr(*arm.exprBody);
+                    markedArmSlot_ = savedMtSlot;
+                }
                 for (const auto& s : arm.stmts) if (s) visitStmt(*s);
             }
         }

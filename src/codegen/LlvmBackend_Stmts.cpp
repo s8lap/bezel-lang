@@ -132,6 +132,24 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                  (collectionTypeOfLocal(ld) || dictTypeOfLocal(ld) ||
                   linkedListTypeOfLocal(ld)))
             registerUsingDisposal(ld);
+        // §28.3 K3.4/K7.4 (v0.209, #2080): a plain `var` owned class/
+        // interface local consumed by a MARKED ARM TRANSFER (`owned x` as an
+        // if-expression branch / expression-`case`/`when` arm result). The
+        // marker's lowering NULLS the slot on the selected path, so K7.4's
+        // per-path scope-end disposal is exactly a NULL-GUARDED
+        // dynamicDispose registered here (both edges): the consumed path
+        // reloads null and skips; a not-selected path disposes exactly once.
+        // The ownership pass suppressed both the §28.3 discharge error and
+        // the affine auto-drop for this local (everDischarged excludes it
+        // from autoDropAtScopeEnd), so this is its sole scope-end path.
+        else if (ld->dischargedByArmTransfer) {
+            auto it = locals_.find(ld);
+            if (it != locals_.end() && !disposeStack_.empty()) {
+                Disposal d{it->second, nullptr};
+                d.dynamicDispose = true;
+                disposeStack_.back().push_back(d);
+            }
+        }
         // §28.3: a plain `var` owned local NOT flagged for auto-drop (it is
         // discharged on some path) is auto-disposed only on the exception-
         // unwind path (an `unwindOnly` Disposal); its normal-exit discharge is

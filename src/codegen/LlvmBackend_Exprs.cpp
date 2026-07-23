@@ -1532,6 +1532,29 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
         return lowerBindExpr(*bx);
     }
+    // §28.3 K3.4/K7.4 (v0.209, #2080): the marked ARM transfer `owned x` —
+    // consume-if-selected. The value is the binding's current object; the
+    // slot is NULLED on this (selected) path so the K7.4 per-path scope-end
+    // disposal — the null-guarded dynamicDispose the ownership pass's
+    // dischargedByArmTransfer flag registers — runs exactly once: the
+    // consumed path reloads null and skips; a not-selected path disposes
+    // the still-live value. The ownership pass restricted the operand to a
+    // plain `var` owned class/interface LOCAL, so locals_ always has the
+    // slot.
+    if (auto* mt = dynamic_cast<const ast::MarkedTransferExpr*>(&e)) {
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(e))) {
+            auto it = locals_.find(ls->decl);
+            if (it != locals_.end()) {
+                llvm::Type* ety = nullptr;
+                llvm::Value* addr = boxedStorage(it->second, ety);
+                llvm::Value* v = builder_.CreateLoad(ptrTy(), addr, "arm.take");
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), addr);
+                return v;
+            }
+        }
+        return llvm::PoisonValue::get(ptrTy());  // rejected upstream
+    }
     // CG60: lambda expression `(params) => body` — emitted as a
     // nested LLVM function; the lambda value is its function pointer.
     // Non-capturing only (per §A.7, captures are a later slice).

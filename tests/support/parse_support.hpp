@@ -440,6 +440,10 @@ inline std::string exprToString(const ast::Expr& e) {
         if (!t->operand) return std::string("(throw)");
         return "(throw " + exprToString(*t->operand) + ")";
     }
+    if (auto* mt = dynamic_cast<const ast::MarkedTransferExpr*>(&e)) {
+        // A.7 MarkedTransfer (v0.209, #2080): rendered as written.
+        return "(owned " + std::string(mt->name) + ")";
+    }
     if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
         // §17.15 / A.7 BindExpr (v0.216, #2098): rendered as written —
         // `(var x: T := owned E; body)`.

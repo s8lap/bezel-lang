@@ -509,6 +509,24 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         }
         return;
     }
+    // §28.3 K3.4 (v0.209, #2080): a marked arm transfer reached directly (an
+    // admitted arm position whose construct is walked by
+    // processMarkedArmConstruct routes here for its marked arms; sema
+    // rejected every other placement).
+    if (auto* mt = dynamic_cast<const ast::MarkedTransferExpr*>(&e)) {
+        handleMarkedArmTransfer(*mt);
+        return;
+    }
+    // §28.3 K3.4/K7.4 (v0.209, #2080): an if-expression containing marked
+    // arms — consume-if-selected processing (per-arm walk + K7.4 join). A
+    // conditional WITHOUT markers keeps the pre-v0.209 treatment (the
+    // fallback checkRead, which has no ConditionalExpr recursion) so no new
+    // diagnostics fire on existing programs.
+    if (dynamic_cast<const ast::ConditionalExpr*>(&e) &&
+        exprContainsMarkedTransfer(e)) {
+        processMarkedArmConstruct(e);
+        return;
+    }
     // §19 / §28.8 (#1284): a `case` EXPRESSION (`var r := case b Box(a) => …`,
     // `return case … end`). The expression-position counterpart of the CaseStmt
     // handler in visitStmt (#1280): walk the scrutinee, each arm's guard, and each
@@ -517,6 +535,15 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
     // Each arm is a mutually-exclusive branch: visit it from the pre-case state and
     // restore afterward (arm-local discharge does not leak into the post-case
     // state). Nothing else here consumes the CaseExpr as an owned value.
+    // §28.3 K3.4/K7.4 (v0.209, #2080): a case/when containing MARKED arms
+    // routes to the consume-if-selected processing instead (per-arm walk +
+    // K7.4 join); marker-free constructs keep this walk byte-identically.
+    if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        if (exprContainsMarkedTransfer(e)) {
+            processMarkedArmConstruct(e);
+            return;
+        }
+    }
     if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
         if (ce->scrutinee) checkRead(*ce->scrutinee, /*selfTarget=*/false);
         BlockState saved = states_;
@@ -1191,6 +1218,19 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
     // every expression position the walkers reach.
     if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
         processBindAtom(*bx);
+        return;
+    }
+    // §28.3 K3.4/K7.4 (v0.209, #2080): an if/case construct containing
+    // MARKED arms reached in a read position (a LocalDecl initializer, an
+    // assignment RHS, a return operand — the binding contexts route their
+    // expression through checkRead) — run the consume-if-selected
+    // processing exactly once per block visit (the guard); marker-free
+    // constructs keep the pre-v0.209 behavior (no ConditionalExpr/CaseExpr
+    // recursion here).
+    if ((dynamic_cast<const ast::ConditionalExpr*>(&e) ||
+         dynamic_cast<const ast::CaseExpr*>(&e)) &&
+        exprContainsMarkedTransfer(e)) {
+        processMarkedArmConstruct(e);
         return;
     }
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
@@ -1923,6 +1963,24 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
             reportCapturedOwnedConsume(oid->name, oid->span.begin, "transfer");
         }
         if (un->operand) scanCapturedOwnedConsumeExpr(*un->operand, insideLambda);
+        return;
+    }
+    // §28.3 K3.4 (v0.209, #2080): the marked ARM transfer `owned r` inside a
+    // closure body consuming a CAPTURED owned binding — a closure consume is
+    // rejected whether or not the closure escapes (§28.3 v0.184, #1958),
+    // exactly as `Sink(owned r)` / `move r` / `r.Dispose()` are.
+    if (const auto* mt = dynamic_cast<const ast::MarkedTransferExpr*>(&e)) {
+        if (insideLambda) {
+            // Resolve by name against the tracked outer states — the same
+            // capture criterion isCapturedOwnedBinding applies to identifiers.
+            for (auto& [s, lo] : states_) {
+                if (s->name == mt->name && lo.state == OwnershipState::Owned) {
+                    reportCapturedOwnedConsume(mt->name, mt->span.begin,
+                                               "transfer");
+                    break;
+                }
+            }
+        }
         return;
     }
     if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
@@ -11635,6 +11693,180 @@ void MethodOwnership::checkTaskScopeConsumption(
     };
     for (const auto& s : body)
         if (s) scan(*s);
+}
+
+// §28.3 K3.4 (v0.209, #2080): true when `e` contains a MarkedTransferExpr in
+// an ARM position of a nested if/case construct. Sema already rejected every
+// non-arm placement, so a simple containment scan over the arm-bearing
+// shapes suffices as the processing gate.
+bool MethodOwnership::exprContainsMarkedTransfer(const ast::Expr& e) {
+    if (dynamic_cast<const ast::MarkedTransferExpr*>(&e)) return true;
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e))
+        return (cd->thenValue && exprContainsMarkedTransfer(*cd->thenValue)) ||
+               (cd->elseValue && exprContainsMarkedTransfer(*cd->elseValue));
+    if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        for (const auto& arm : ce->arms)
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression &&
+                arm.exprBody && exprContainsMarkedTransfer(*arm.exprBody))
+                return true;
+        return false;
+    }
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e))
+        return bx->body && exprContainsMarkedTransfer(*bx->body);
+    return false;
+}
+
+// §28.3 K3.4 (v0.209, #2080): validate + consume one marked arm transfer.
+// First-landing operand bound: a plain `var` owned LOCAL of class/interface
+// type — `owned` parameters and non-class values (owning collections, task
+// frames) draw a targeted rejection (their per-path scope-end disposal
+// machinery is separate; tracked with #2080's residuals). The K5.1 freeze,
+// the moved-from/maybe-consumed read machinery, and everDischarged_ all
+// ride markMovedByName.
+void MethodOwnership::handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt) {
+    if (mt.name.empty()) return;
+    sema::Symbol* sym = nullptr;
+    LocalOwnership* st = nullptr;
+    for (auto& [s, lo] : states_) {
+        if (s->name == mt.name) { sym = s; st = &lo; break; }
+    }
+    if (!st || st->state != OwnershipState::Owned) {
+        // §28.3 v0.209: the marker names a NAMED OWNED BINDING; a borrow, a
+        // fresh producer, or an unknown name is not transferable.
+        report(
+            Severity::Error, mt.span.begin,
+            std::string("the arm transfer marker `owned ") +
+            std::string(mt.name) +
+            "` requires a named owned binding — `" + std::string(mt.name) +
+            "` is not an owned binding at this point (\xc2\xa7""28.3 K3.4, "
+            "v0.209)");
+        return;
+    }
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    const ast::LocalDecl* ld =
+        ls ? dynamic_cast<const ast::LocalDecl*>(ls->decl) : nullptr;
+    const bool classValued =
+        ls && ls->declType &&
+        ls->declType->kind == sema::TypeRef::Kind::Named &&
+        ls->declType->declaration &&
+        (ls->declType->declaration->kind == ast::TypeDeclKind::Class ||
+         ls->declType->declaration->kind == ast::TypeDeclKind::Interface) &&
+        !ls->declType->declaration->isValueBuiltin;
+    if (!ld || !classValued) {
+        // Targeted first-landing bound: per-path scope-end disposal is wired
+        // for plain class/interface LOCALS (null-guarded dynamicDispose);
+        // owned parameters and collection-/task-valued bindings need their
+        // own scope-end machinery. Decline with reasons, never a silent
+        // per-path leak or double-free. // per §28.3 K3.4/K7.4 v0.209 (#2080)
+        report(
+            Severity::Error, mt.span.begin,
+            std::string("the arm transfer marker `owned ") +
+            std::string(mt.name) +
+            "` is supported only on a plain `var` owned local of class or "
+            "interface type in this version \xe2\x80\x94 equalize by "
+            "statement instead (\xc2\xa7""28.3 K3.4/K7.4, v0.209; #2080)");
+        return;
+    }
+    markMovedByName(mt.name, mt.span.begin);
+    armTransferConsumed_.push_back(sym);
+}
+
+void MethodOwnership::processMarkedArmConstruct(const ast::Expr& e) {
+    if (!markedConstructsProcessed_.insert(&e).second) return;
+    // Collect the construct's shape: condition/scrutinee + value arms.
+    const ast::Expr* head = nullptr;             // condition or scrutinee
+    std::vector<const ast::Expr*> guards;
+    std::vector<const ast::Expr*> arms;          // value-arm expressions
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        head = cd->condition.get();
+        arms.push_back(cd->thenValue.get());
+        arms.push_back(cd->elseValue.get());
+    } else if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        head = ce->scrutinee.get();
+        for (const auto& arm : ce->arms) {
+            if (arm.guard) guards.push_back(arm.guard.get());
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression)
+                arms.push_back(arm.exprBody.get());
+        }
+    } else {
+        return;
+    }
+    if (head) checkRead(*head, /*selfTarget=*/false);
+    for (const ast::Expr* g : guards)
+        if (g) checkRead(*g, /*selfTarget=*/false);
+    // §28.3 v0.209 / K8.3: a `case` arm result marking the SCRUTINEE's own
+    // binding is ALWAYS rejected — the scrutinee borrow is live through the
+    // selected arm's completion, so the transfer would free the value under
+    // the live borrow ("the consume-site freeze applies unchanged").
+    std::string_view scrutRootName;
+    if (dynamic_cast<const ast::CaseExpr*>(&e) && head)
+        if (const ast::IdentifierExpr* r = identifierRoot(*head))
+            scrutRootName = r->name;
+    // Walk each value arm from the construct-entry state, collecting the
+    // marked consumes per arm; absorbing arms (throw / null-literal, K7.5)
+    // impose no join constraint.
+    BlockState saved = states_;
+    std::vector<std::vector<sema::Symbol*>> perArm;
+    std::size_t nonAbsorbingArms = 0;
+    for (const ast::Expr* arm : arms) {
+        if (!arm) continue;
+        const bool absorbing =
+            dynamic_cast<const ast::ThrowExpr*>(arm) != nullptr ||
+            dynamic_cast<const ast::NullLiteralExpr*>(arm) != nullptr;
+        states_ = saved;
+        std::vector<sema::Symbol*> savedList = std::move(armTransferConsumed_);
+        armTransferConsumed_.clear();
+        if (auto* mt = dynamic_cast<const ast::MarkedTransferExpr*>(arm)) {
+            if (!scrutRootName.empty() && mt->name == scrutRootName) {
+                report(
+                    Severity::Error, mt->span.begin,
+                    std::string("a `case` arm result may not transfer the "
+                    "scrutinee's own binding (`owned ") +
+                    std::string(mt->name) +
+                    "`) — the scrutinee borrow is live through the selected "
+                    "arm's completion (K8.3 / \xc2\xa7""28.3 K5.1, v0.209)");
+            } else {
+                handleMarkedArmTransfer(*mt);
+            }
+        } else {
+            handleDischarge(*arm);
+        }
+        if (!absorbing) {
+            perArm.push_back(armTransferConsumed_);
+            ++nonAbsorbingArms;
+        }
+        armTransferConsumed_ = std::move(savedList);
+    }
+    states_ = std::move(saved);
+    // K7.4: the join. A binding consumed in EVERY non-absorbing value arm is
+    // MovedFrom after the construct; consumed in SOME is Owned +
+    // maybe-consumed (unreadable, per-path scope-end disposal via the
+    // dischargedByArmTransfer flag — codegen's marker lowering nulls the
+    // slot on the selected path, so the null-guarded scope-end dispose runs
+    // exactly once).
+    std::unordered_map<sema::Symbol*, std::size_t> consumedCount;
+    for (const auto& lst : perArm)
+        for (sema::Symbol* s : lst) ++consumedCount[s];
+    for (auto& [sym, count] : consumedCount) {
+        auto it = states_.find(sym);
+        if (it == states_.end()) continue;
+        if (count >= nonAbsorbingArms && nonAbsorbingArms > 0) {
+            it->second.state = OwnershipState::MovedFrom;  // consumed on all
+        } else {
+            it->second.state = OwnershipState::Owned;
+            it->second.maybeConsumed = true;               // K7.4
+        }
+        // The consumes were recorded on per-arm states that were restored;
+        // re-record the outer bookkeeping (monotone).
+        everDischarged_.insert(sym);
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
+            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl))
+                const_cast<ast::LocalDecl*>(ld)->dischargedByArmTransfer =
+                    true;
+        // Propagate to the enclosing construct's per-arm collection (a
+        // nested consume is consume-if-outer-arm-selected too).
+        armTransferConsumed_.push_back(sym);
+    }
 }
 
 // §17.15 / K8.5 (v0.216, #2098): process a binding atom in evaluation order.
