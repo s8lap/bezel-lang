@@ -365,3 +365,36 @@ BEZEL_TEST(codegen_result_2047, spec_35_5_no_collision_case_this_still_resolves)
         "if not b.HasValue() then acc := acc + 2; end; "
         "return acc;"), 3);
 }
+
+// --- §2.20 auto-import shadowing -------------------------------------------
+
+// §2.20 (#2047 follow-up 2): a user top-level type named `Result` SHADOWS the
+// auto-imported prelude `Result` — the injected choice is NOT added, so the
+// user's own `Result` is the only one and the program compiles + runs. Before
+// the fix the injected `Result<T, E>` choice collided with the user's `Result`
+// (two same-named top-level types), corrupting name resolution and
+// per-monomorphization descriptor emission for the WHOLE module (an unrelated
+// `is Box<string>` mis-resolved). Mirrors the corpus shape that regressed
+// (a `sealed abstract class Result<T>` hierarchy + a generic `is`/`as`).
+BEZEL_TEST(codegen_result_2047, spec_2_20_user_result_type_shadows_prelude) {
+    BEZEL_EXPECT_EQ(runDecls(
+        "class Box<U> "
+        "  public V: U; "
+        "  public constructor(v: U) V := v; end constructor; "
+        "end Box; "
+        "sealed abstract class Result<T> end Result; "
+        "sealed class Ok<T> : Result<T> "
+        "  public Value: T; "
+        "  public constructor(v: T) Value := v; end constructor; "
+        "end Ok;",
+        "using var b: Box<string> := new Box<string>(\"hi\"); "
+        "var o: Object := b; "
+        // the user's Result<T> is usable, and an unrelated constructed-generic
+        // `is` test resolves correctly (both broke under the collision).
+        "var r: Result<int> := new Ok<int>(5); "
+        "var acc: int := 0; "
+        "if o is Box<string> then acc := acc + 1; end; "
+        "if o is not Box<int> then acc := acc + 2; end; "
+        "if r is Ok<int> then acc := acc + 4; end; "
+        "return acc;"), 7);
+}

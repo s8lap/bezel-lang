@@ -4,6 +4,8 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include <cstdlib>
@@ -83,19 +85,38 @@ void injectStdlibPrelude(ast::SourceFile& unit) {
     std::unique_ptr<ast::SourceFile> preludeUnit =
         preludeParser.parseCompilationUnit();
     if (!preludeUnit || preludeDiags.hasErrors()) return;  // defensive: no-op
-    // Mark each injected type decl as synthesized so codegen emits its functions
-    // with INTERNAL linkage — every module gets a private copy, so external
-    // linkage would collide when two modules link (multiple-definition).
-    for (auto& td : preludeUnit->topDecls)
-        if (auto* decl = dynamic_cast<ast::TypeDecl*>(td.get()))
-            decl->isSynthesizedPrelude = true;
+    // #2047 follow-up 2: an auto-imported prelude type is SHADOWED by a user
+    // top-level declaration of the same name (standard auto-import shadowing) —
+    // inject a prelude decl ONLY when the user declares no type of that name.
+    // Without this, a program that declares its own `Result` (the corpus does —
+    // e.g. a `sealed abstract class Result<T>` hierarchy) collides with the
+    // injected `Result<T, E>` choice: two same-named top-level types corrupt name
+    // resolution and per-monomorphization descriptor emission for the WHOLE
+    // module (an unrelated `is Box<string>` then mis-resolves). The user's type
+    // wins; the stdlib `Result` is simply unavailable in that module.
+    std::unordered_set<std::string_view> userTypeNames;
+    for (const auto& td : unit.topDecls)
+        if (auto* decl = dynamic_cast<const ast::TypeDecl*>(td.get()))
+            userTypeNames.insert(decl->name);
+    std::vector<std::unique_ptr<ast::TopDecl>> toInject;
+    for (auto& td : preludeUnit->topDecls) {
+        auto* decl = dynamic_cast<ast::TypeDecl*>(td.get());
+        if (!decl) continue;
+        if (userTypeNames.count(decl->name)) continue;  // user shadows the prelude
+        // Mark each injected type decl as synthesized so codegen emits its
+        // functions with INTERNAL linkage — every module gets a private copy, so
+        // external linkage would collide when two modules link.
+        decl->isSynthesizedPrelude = true;
+        toInject.push_back(std::move(td));
+    }
     // Prepend so the choice precedes any user decl (declaration order is not
     // significant for type resolution, but this keeps a user forward-reference
-    // to `Result` unambiguous). Move each TopDecl's ownership into `unit`.
+    // to `Result` unambiguous). Move each surviving TopDecl's ownership into
+    // `unit`.
     unit.topDecls.insert(
         unit.topDecls.begin(),
-        std::make_move_iterator(preludeUnit->topDecls.begin()),
-        std::make_move_iterator(preludeUnit->topDecls.end()));
+        std::make_move_iterator(toInject.begin()),
+        std::make_move_iterator(toInject.end()));
 }
 
 // Link a native object (plus any §2.5 dependency objects) into an executable

@@ -1160,8 +1160,23 @@ void Emitter::declareFunctions() {
         if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
         auto* fnType = llvm::FunctionType::get(
             llvm::Type::getVoidTy(llvm_), {ptrTy()}, /*isVarArg=*/false);
+        // #2047 follow-up 2: a SYNTHESIZED builtin class (`ts->decl == nullptr` —
+        // a value-builtin like Range/DateTime materialized on demand by
+        // SemaContext::builtinClassSym, NOT a type DECLARED in this module) is a
+        // per-module private helper: its (no-op, value-type) `Dispose` is
+        // referenced only by that module's own internal `vt$<T>` vtable, never
+        // across the module ABI. External linkage collides
+        // (`multiple definition of bz$Range$Dispose`) whenever two modules link —
+        // and the auto-imported `Result`'s own `case`-body exhaustiveness check
+        // synthesizes `Range` in EVERY module, making the clash universal. Emit it
+        // INTERNAL (each module a private copy); a user/imported class (decl !=
+        // null) keeps the external cross-module ABI. Mirrors the DisposeCore/init
+        // exported-only-when-public gating just below.
+        bool synthesizedBuiltin = ts->decl == nullptr;
         auto* fn = llvm::Function::Create(
-            fnType, llvm::Function::ExternalLinkage,
+            fnType,
+            synthesizedBuiltin ? llvm::Function::InternalLinkage
+                               : llvm::Function::ExternalLinkage,
             "bz$" + std::string(ts->name) + "$Dispose", module_.get());
         disposerFns_[ts] = fn;
         // §2.5 / §2.6 / §28.4 step 3 (issue #328 / #103): the DisposeCore (the
