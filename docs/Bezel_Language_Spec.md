@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.218 — July 2026**
+**Version 0.219 — July 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -3232,12 +3232,7 @@ end;
 
 Each subexpression in the LHS — the collection expression and every index expression — is evaluated exactly once. The indexer's getter and setter are each called once. For a value-type element T that overloads `operator ++`, the assigned value is `T.operator++(__coll[__idx])` instead of `__coll[__idx] + 1`.
 
-Implementations may not deduplicate the getter+setter pair: every `arr[i]++` performs one logical read followed by one logical write through the indexer. For collections where this cost matters (e.g. an `arr[k]++` on a `Dictionary<K, int>` that pays two hash lookups), users should write the read and write explicitly:
-
-```bezel
-var v := dict[key];
-dict[key] := v + 1;
-```
+Implementations may not deduplicate the getter+setter pair: every `arr[i]++` performs one logical read followed by one logical write through the indexer — on a `Dictionary<K, int>`, two hash lookups. The two-access cost is **inherent** to indexer-mediated read-modify-write: the language has no ref-returning indexers (a recorded deferral, [rationale §18](Bezel_Design_Rationale.md#sec-things-deferred)), so no rewrite of the statement changes it — spelling the read and write as separate statements performs the same getter and setter calls, and re-evaluates the collection and index expressions besides. For **tallying** specifically, the standard library's `Counter<K>` ([stdlib §4.20](Bezel_Standard_Library.md#sec-counterk), v0.215) is the dedicated single-operation form (`tally.Increment(key);`, with absent keys created at the delta); for general accumulation the indexer read-modify-write, in either spelling, is the supported idiom (stdlib [§4.8](Bezel_Standard_Library.md#sec-dictionaryk-v)).
 
 The same desugaring applies to `--`. For `+=`, `-=`, and the other compound assignments on indexer slots, the same desugaring applies with the operator changed accordingly; it is the indexer instance of the general compound-assignment rule of [§6.6](#sec-compound-assignments) (v0.184), which also fixes the result's typing — including the checked narrow-integer write-back — for every target kind.
 
