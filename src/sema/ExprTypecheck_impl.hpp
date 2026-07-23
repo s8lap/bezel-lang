@@ -1125,6 +1125,21 @@ private:
     // known-non-null; a (possibly-)null value clears that knowledge.
     void narrowOnAssignment(Symbol* sym, const TypeRef* valueType);
 
+    // §7.4 (issue #2118): after a loop body (which may execute ZERO times),
+    // reduce the current narrowing state to the intersection of what holds on
+    // the zero-iteration path (`entryNull` / `entryNarrowings`, captured before
+    // the body) and what the body left (the current `nullNarrowed_` /
+    // `narrowings_`). A fact ESTABLISHED inside the body is dropped (absent from
+    // the entry sets); an entry fact the body INVALIDATED is dropped (the body
+    // walk removed it, so it is absent from the current sets); an entry fact the
+    // body left untouched survives (present in both). Result membership is a
+    // pure set intersection, independent of container iteration order and
+    // emitting no diagnostic, so it is deterministic across shard processes
+    // (#2116).
+    void intersectNarrowingSetsAfterLoop(
+        const std::unordered_set<Symbol*>& entryNull,
+        const std::unordered_map<Symbol*, TypeRef*>& entryNarrowings);
+
     void visitTopDecl(const ast::TopDecl& d);
 
     // Param-symbol lookup for the in-progress method/ctor on currentType_.

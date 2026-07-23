@@ -6069,6 +6069,39 @@ void ExprTC::narrowOnAssignment(Symbol* sym, const TypeRef* valueType) {
         nullNarrowed_.erase(sym);
 }
 
+// §7.4 (issue #2118): join the narrowing state across a loop body's two
+// reaching paths. A loop body may run zero times, so the after-loop state is
+// the INTERSECTION of the entry sets (zero-iteration path) and the current
+// sets as the body left them (>=1-iteration path): a narrowing established
+// inside the body does NOT survive (it is not an entry fact), while an entry
+// narrowing the body invalidated is already gone from the current sets. This
+// mirrors the if-statement all-paths join (see the IfStmt handler) applied to
+// while/for bodies. Iteration order over the pointer-keyed containers does not
+// affect the result — set/map intersection is order-independent and no
+// diagnostic is emitted — so sema output is stable across shard processes
+// (#2116).
+void ExprTC::intersectNarrowingSetsAfterLoop(
+    const std::unordered_set<Symbol*>& entryNull,
+    const std::unordered_map<Symbol*, TypeRef*>& entryNarrowings) {
+    for (auto it = nullNarrowed_.begin(); it != nullNarrowed_.end();) {
+        if (entryNull.count(*it))
+            ++it;
+        else
+            it = nullNarrowed_.erase(it);
+    }
+    // §12.7 type-narrowings are only ever established inside nested if/case
+    // guards that already restore the map, so the body's exit map is a subset of
+    // the entry map; intersecting keeps that invariant (and drops any entry
+    // narrowing a top-level reassignment invalidated).
+    for (auto it = narrowings_.begin(); it != narrowings_.end();) {
+        auto e = entryNarrowings.find(it->first);
+        if (e != entryNarrowings.end() && e->second == it->second)
+            ++it;
+        else
+            it = narrowings_.erase(it);
+    }
+}
+
 // §7.4 / §8.4 (issue #418): a `<simple var> <> null` / `= null` test proves a
 // nullable simple variable non-null in one branch by recording it in
 // `nullNarrowed_`. The parser desugars `x is not null` to `x <> null` and
@@ -9210,7 +9243,16 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         checkLoopLabelShadow(ws->label, s.span.begin);   // §21.5 (v0.201)
         loopLabelStack_.push_back(ws->label);
         ++loopDepth_;
+        // §7.4 (#2118): a `while` body may execute zero times, so a narrowing
+        // established INSIDE the body (`x := nonNull;`, `x ??= nonNull;`, or an
+        // early-return null guard) must NOT leak past the loop — on the
+        // zero-iteration path the variable was never proved non-null. Capture
+        // the entry narrowing state, walk the body, then join to the
+        // intersection of entry and body-exit (see intersectNarrowingSetsAfterLoop).
+        auto whileEntryNull = nullNarrowed_;
+        auto whileEntryNarrowings = narrowings_;
         for (const auto& bs : ws->body) if (bs) visitStmt(*bs);
+        intersectNarrowingSetsAfterLoop(whileEntryNull, whileEntryNarrowings);
         --loopDepth_;
         loopLabelStack_.pop_back();
     } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
@@ -9416,7 +9458,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         checkLoopLabelShadow(fs->label, s.span.begin);   // §21.5 (v0.201)
         loopLabelStack_.push_back(fs->label);
         ++loopDepth_;
+        // §7.4 (#2118): a `for` body may execute zero times (an empty range or
+        // empty collection), so a narrowing established INSIDE the body must NOT
+        // leak past the loop — same reasoning as the `while` handler above. Join
+        // to the intersection of the entry and body-exit narrowing state.
+        auto forEntryNull = nullNarrowed_;
+        auto forEntryNarrowings = narrowings_;
         for (const auto& bs : fs->body) if (bs) visitStmt(*bs);
+        intersectNarrowingSetsAfterLoop(forEntryNull, forEntryNarrowings);
         --loopDepth_;
         loopLabelStack_.pop_back();
         currentScope_ = saveScope;
