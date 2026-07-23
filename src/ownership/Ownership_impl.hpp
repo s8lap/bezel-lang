@@ -1533,18 +1533,20 @@ private:
     // visited set. // per §9.7, #1611
     bool isBorrowBearingRecord(const sema::TypeRef* rt) const;
 
-    // Recursive worker for isBorrowBearingRecord (#1611). `seen` accumulates
-    // the record TypeRefs already being visited on this call chain so a
-    // self- or mutually-referential record type (e.g. a legal §9.2
+    // Recursive worker for isBorrowBearingRecord (#1611). `seen` holds the
+    // record TypeRefs on the CURRENT DFS path (inserted on entry, erased on
+    // exit) so a self- or mutually-referential record type (e.g. a legal §9.2
     // `Origin`-style static field whose type is the enclosing record) is
-    // visited at most once instead of recursing without bound (keyed on the
-    // TypeRef, not the TypeDecl: two instantiations of one generic record on
-    // a chain — `Wrap<Wrap<ArraySpan<int>>>`, #2145 — are distinct subjects,
-    // while a genuinely cyclic chain revisits the SAME cached field TypeRef).
-    // `env` is the §9.7/#2145 instantiation-site substitution environment for
-    // a generic record's bare-parameter fields; null = declaration-site
-    // behaviour. Mirrors common::isBorrowBearingRecordCommon exactly (#1595
-    // lockstep). // per §9.7
+    // visited at most once per path instead of recursing without bound (keyed
+    // on the TypeRef, not the TypeDecl: two instantiations of one generic
+    // record on a chain — `Wrap<Wrap<ArraySpan<int>>>`, #2145 — are distinct
+    // subjects, while a genuinely cyclic chain revisits the SAME cached field
+    // TypeRef; path — not visited-set — semantics so one field TypeRef shared
+    // by SIBLING frames re-classifies under each frame's own env, the #2145
+    // diamond). `env` is the §9.7/#2145 instantiation-site substitution
+    // environment for a generic record's bare-parameter fields; null =
+    // declaration-site behaviour. Mirrors common::isBorrowBearingRecordCommon
+    // exactly (#1595 lockstep). // per §9.7
     bool isBorrowBearingRecordImpl(
         const sema::TypeRef* rt,
         std::unordered_set<const sema::TypeRef*>& seen,

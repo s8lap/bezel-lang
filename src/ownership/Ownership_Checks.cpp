@@ -2569,36 +2569,51 @@ bool MethodOwnership::isBorrowBearingRecordImpl(
     const common::RecordSubstEnv* fieldEnv =
         myEnv.map.empty() ? nullptr : &myEnv;
 
-    // Positional record fields (§9.1) — never static, so no exclusion needed.
-    for (const ast::Param& f : decl->positionalFields) {
-        if (!f.type) continue;
-        if (recordFieldIsBorrowCarrying(ctx_.resolvedType(*f.type), seen,
-                                        fieldEnv))
-            return true;
-    }
-    // Body-record reference fields (§9.2).
-    for (const auto& m : decl->members) {
-        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get())) {
-            // §9.2 (v0.182) / #1611: "Static members are ignored... The same
-            // static-member exemption applies wherever this membership rule
-            // is reused" — a static field is per-TYPE storage, not part of
-            // any instance's own layout, so it neither qualifies nor
-            // disqualifies a record's borrow-bearing-ness (and, being
-            // legally self- or mutually-referential per the §9.2 `Origin`
-            // pattern, must not be walked as if it were instance storage).
-            // Mirrors Resolver::recordValueContainsSelf's own static
-            // exclusion (TypeResolution_Checks.cpp). // per §9.2, §9.7
-            bool isStatic = false;
-            for (std::string_view mod : fd->modifiers)
-                if (mod == "static") { isStatic = true; break; }
-            if (isStatic) continue;
-            if (fd->type &&
-                recordFieldIsBorrowCarrying(ctx_.resolvedType(*fd->type),
-                                            seen, fieldEnv))
+    const bool carrying = [&]() -> bool {
+        // Positional record fields (§9.1) — never static, so no exclusion
+        // needed.
+        for (const ast::Param& f : decl->positionalFields) {
+            if (!f.type) continue;
+            if (recordFieldIsBorrowCarrying(ctx_.resolvedType(*f.type), seen,
+                                            fieldEnv))
                 return true;
         }
-    }
-    return false;
+        // Body-record reference fields (§9.2).
+        for (const auto& m : decl->members) {
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get())) {
+                // §9.2 (v0.182) / #1611: "Static members are ignored... The
+                // same static-member exemption applies wherever this
+                // membership rule is reused" — a static field is per-TYPE
+                // storage, not part of any instance's own layout, so it
+                // neither qualifies nor disqualifies a record's
+                // borrow-bearing-ness (and, being legally self- or mutually-
+                // referential per the §9.2 `Origin` pattern, must not be
+                // walked as if it were instance storage). Mirrors
+                // Resolver::recordValueContainsSelf's own static exclusion
+                // (TypeResolution_Checks.cpp). // per §9.2, §9.7
+                bool isStatic = false;
+                for (std::string_view mod : fd->modifiers)
+                    if (mod == "static") { isStatic = true; break; }
+                if (isStatic) continue;
+                if (fd->type &&
+                    recordFieldIsBorrowCarrying(ctx_.resolvedType(*fd->type),
+                                                seen, fieldEnv))
+                    return true;
+            }
+        }
+        return false;
+    }();
+    // PATH semantics, not visited-set memoization: un-mark on exit so a
+    // SIBLING field can re-classify the same field TypeRef under its OWN
+    // substitution env — one shared `NRec<X>` node reached through both
+    // `PairR<int>` and `PairR<Res>` frames must answer per-frame, or the
+    // benign-first walk vacuously classifies the borrow-carrying sibling
+    // (#2145 diamond). Termination is unaffected: a genuinely cyclic chain
+    // still repeats a TypeRef on the CURRENT path and is cut above. Mirrors
+    // common::isBorrowBearingRecordCommon exactly (#1595 lockstep).
+    // // per §9.7, #1611, #2145
+    seen.erase(rt);
+    return carrying;
 }
 
 // §9.7 (v0.180, #1540): see header for the null-source-form contract. Uses

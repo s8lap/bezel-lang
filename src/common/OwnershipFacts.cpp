@@ -413,14 +413,17 @@ bool isReferenceTypeForRecordField(const sema::TypeRef* rt) {
 // §9.7: true when `rt` is itself a borrow-bearing record (recursion target of
 // the field walk below) — mirrors MethodOwnership::isBorrowBearingRecordImpl
 // (Ownership_Checks.cpp) exactly, so the declaration-site and instantiation-
-// site checks classify identically (#1595). `seen` is the #1611 cycle guard,
-// keyed on the visited TypeRef (not the TypeDecl: two distinct INSTANTIATIONS
-// of one generic record on a chain — `Wrap<Wrap<ArraySpan<int>>>`, #2145 —
-// are distinct classification subjects, while a genuinely cyclic chain
-// revisits the SAME cached field TypeRef, `SemaContext::resolvedType` being
-// per-node, so termination is preserved). `env` is the #2145 instantiation-
-// site substitution environment for the record's bare-parameter fields; null
-// reproduces the declaration-site behaviour.
+// site checks classify identically (#1595). `seen` is the #1611 cycle guard —
+// the set of TypeRefs on the CURRENT DFS path (inserted on entry, erased on
+// exit), keyed on the visited TypeRef (not the TypeDecl: two distinct
+// INSTANTIATIONS of one generic record on a chain —
+// `Wrap<Wrap<ArraySpan<int>>>`, #2145 — are distinct classification subjects,
+// while a genuinely cyclic chain revisits the SAME cached field TypeRef,
+// `SemaContext::resolvedType` being per-node, so termination is preserved;
+// path — not visited-set — semantics so one field TypeRef shared by SIBLING
+// frames re-classifies under each frame's own env, the #2145 diamond). `env`
+// is the #2145 instantiation-site substitution environment for the record's
+// bare-parameter fields; null reproduces the declaration-site behaviour.
 bool isBorrowBearingRecordCommon(const sema::TypeRef* rt,
                                  const sema::SemaContext& ctx,
                                  std::unordered_set<const sema::TypeRef*>& seen,
@@ -506,28 +509,42 @@ bool isBorrowBearingRecordCommon(const sema::TypeRef* rt,
     seedRecordSubstEnv(*decl, *rt, env, myEnv);
     const RecordSubstEnv* fieldEnv = myEnv.map.empty() ? nullptr : &myEnv;
 
-    // Positional record fields (§9.1) — never static, so no exclusion needed.
-    for (const ast::Param& f : decl->positionalFields) {
-        if (!f.type) continue;
-        if (recordFieldTypeIsBorrowCarryingCommon(ctx.resolvedType(*f.type),
-                                                  ctx, seen, fieldEnv))
-            return true;
-    }
-    // Body-record reference fields (§9.2); static fields are per-TYPE storage
-    // and excluded (mirrors Resolver::recordValueContainsSelf's own exclusion).
-    for (const auto& m : decl->members) {
-        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get())) {
-            bool isStatic = false;
-            for (std::string_view mod : fd->modifiers)
-                if (mod == "static") { isStatic = true; break; }
-            if (isStatic) continue;
-            if (fd->type &&
-                recordFieldTypeIsBorrowCarryingCommon(
-                    ctx.resolvedType(*fd->type), ctx, seen, fieldEnv))
+    const bool carrying = [&]() -> bool {
+        // Positional record fields (§9.1) — never static, so no exclusion
+        // needed.
+        for (const ast::Param& f : decl->positionalFields) {
+            if (!f.type) continue;
+            if (recordFieldTypeIsBorrowCarryingCommon(
+                    ctx.resolvedType(*f.type), ctx, seen, fieldEnv))
                 return true;
         }
-    }
-    return false;
+        // Body-record reference fields (§9.2); static fields are per-TYPE
+        // storage and excluded (mirrors Resolver::recordValueContainsSelf's
+        // own exclusion).
+        for (const auto& m : decl->members) {
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get())) {
+                bool isStatic = false;
+                for (std::string_view mod : fd->modifiers)
+                    if (mod == "static") { isStatic = true; break; }
+                if (isStatic) continue;
+                if (fd->type &&
+                    recordFieldTypeIsBorrowCarryingCommon(
+                        ctx.resolvedType(*fd->type), ctx, seen, fieldEnv))
+                    return true;
+            }
+        }
+        return false;
+    }();
+    // PATH semantics, not visited-set memoization: un-mark on exit so a
+    // SIBLING field can re-classify the same field TypeRef under its OWN
+    // substitution env — one shared `NRec<X>` node reached through both
+    // `PairR<int>` and `PairR<Res>` frames must answer per-frame, or the
+    // benign-first walk vacuously classifies the borrow-carrying sibling
+    // (#2145 diamond). Termination is unaffected: a genuinely cyclic chain
+    // still repeats a TypeRef on the CURRENT path and is cut above.
+    // // per §9.7, #1611, #2145
+    seen.erase(rt);
+    return carrying;
 }
 
 // §28.3 (v0.194, #1801) helpers for the bare-type-parameter source set. Kept in
