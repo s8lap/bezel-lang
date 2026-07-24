@@ -1648,6 +1648,15 @@ void checkMember(const ast::Member& m, SemaContext& ctx,
             // fix #2187 / §22.8: static-ctor readonly single-assignment.
             da.runStaticConstructor(*cd, *enclosing);
         } else {
+            // fix #2187 scope boundary: readonly single-assignment (§22.8) is
+            // enforced only for CLASS constructors above. A RECORD constructor
+            // falls here (roCtorMode_ stays false), so a `readonly` record field
+            // can still be double-assigned — and §7.4/#2116 narrowing applies to
+            // record fields too, so the class-side exploit reproduces on a record
+            // (probe-confirmed SEGV, pre-existing on main). Tracked as #2207; not
+            // covered by #2206 (that residual is class-scoped: ref/out + this(...)
+            // chain). Enforcing it needs the once-ness tracking WITHOUT importing
+            // runConstructor's class-specific §22.7 this-observation gating.
             da.run(cd->params, cd->body);
         }
     } else if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(&m)) {
