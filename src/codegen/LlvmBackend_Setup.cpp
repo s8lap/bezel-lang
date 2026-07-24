@@ -11119,6 +11119,43 @@ struct StringEscapeWalker {
     // (use-after-free). The lambda's OWN params/locals are distinct LocalDecls
     // and never match `target`, so they are unaffected.
     bool inLambda = false;
+    // Call-bounded callback context; only StringEscapeWalker sets this.
+    bool callBoundedLambda = false;
+
+    // #1430 / §28.14: identify a user-authored plain function-typed formal.
+    // The callee-side ownership pass verifies this body as call-bounded; only
+    // that verified form may relax the caller's capture escape walk.
+    bool isCallBoundedFunctionFormal(const ast::Expr* callee, std::size_t i) {
+        auto* ms = callee
+            ? dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*callee))
+            : nullptr;
+        if (!ms || !ms->decl || ms->isOperator || ms->extensionDecl ||
+            !ms->genericParams.empty())
+            return false;
+        if (i >= ms->params.size()) return false;
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(ms->params[i]);
+        if (!ps || !ps->modifier.empty()) return false;
+        if (ps->declType &&
+            ps->declType->kind == ast::TypeKind::Function)
+            return true;
+        const sema::TypeRef* rt = ps->resolvedDeclType;
+        return rt && rt->kind == sema::TypeRef::Kind::Function;
+    }
+
+    // #1430 / §28.14: a lambda passed directly to a call-bounded formal is
+    // invoked before the caller's scope can end. Its captures therefore remain
+    // valid through the call and do not make a borrowing collection escape.
+    void walkCallBoundedLambda(const ast::LambdaExpr* lam) {
+        if (!lam) return;
+        bool savedInLambda = inLambda;
+        bool savedCallBounded = callBoundedLambda;
+        inLambda = true;
+        callBoundedLambda = true;
+        if (lam->exprBody) expr(lam->exprBody.get(), /*safeRead=*/false);
+        for (auto& s : lam->stmts) stmt(s.get());
+        callBoundedLambda = savedCallBounded;
+        inLambda = savedInLambda;
+    }
 
     // #1871 / §28.9 / §28.11: enable the borrowing-`Array<T>`-ONLY safe-read
     // relaxations below (a for-in over the target array, and a binding of the
@@ -11292,6 +11329,13 @@ struct StringEscapeWalker {
                 a.name.empty() && isConsoleNonRetainingStringArg(callee, i) &&
                 isTargetIdent(a.value.get()))
                 safeArg = true;
+            if (!safeArg && a.modifier.empty() && a.name.empty() &&
+                isCallBoundedFunctionFormal(callee, i)) {
+                if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(a.value.get())) {
+                    walkCallBoundedLambda(lam);
+                    continue;
+                }
+            }
             expr(a.value.get(), safeArg);
         }
     }
@@ -11399,7 +11443,10 @@ struct StringEscapeWalker {
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
             // FINDING [1]: inside a lambda body, a captured-local read always
             // escapes — the env outlives the scope (safe-read does not apply).
-            if (isTargetIdent(id) && (!safeRead || inLambda)) escaped = true;
+            if (isTargetIdent(id) && (!safeRead ||
+                                      (inLambda &&
+                                       !(borrowingArrayMode &&
+                                         callBoundedLambda)))) escaped = true;
             return;
         }
         // Concat / comparison: both operands are non-consuming reads.
@@ -14279,6 +14326,22 @@ void Emitter::collectCellFreeEligible(
             }
         }
 
+        bool isCallBoundedFormal(const ast::Expr* callee, std::size_t i) {
+            auto* ms = callee
+                ? dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*callee))
+                : nullptr;
+            if (!ms || !ms->decl || ms->isOperator || ms->extensionDecl ||
+                !ms->genericParams.empty() || i >= ms->params.size())
+                return false;
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(ms->params[i]);
+            if (!ps || !ps->modifier.empty()) return false;
+            if (ps->declType &&
+                ps->declType->kind == ast::TypeKind::Function)
+                return true;
+            return ps->resolvedDeclType &&
+                   ps->resolvedDeclType->kind == sema::TypeRef::Kind::Function;
+        }
+
         void expr(const ast::Expr* e, bool topPos) {
             if (!e) return;
             if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
@@ -14299,10 +14362,28 @@ void Emitter::collectCellFreeEligible(
                 expr(m->target.get(), false); return; }
             if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
                 expr(c->callee.get(), false);
-                for (auto& a : c->args) expr(a.value.get(), false); return; }
+                for (std::size_t i = 0; i < c->args.size(); ++i) {
+                    const auto& a = c->args[i];
+                    if (a.value && isCallBoundedFormal(c->callee.get(), i) &&
+                        dynamic_cast<const ast::LambdaExpr*>(a.value.get()))
+                        expr(a.value.get(), true);
+                    else
+                        expr(a.value.get(), false);
+                }
+                return;
+            }
             if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
                 expr(c->callee.get(), false);
-                for (auto& a : c->args) expr(a.value.get(), false); return; }
+                for (std::size_t i = 0; i < c->args.size(); ++i) {
+                    const auto& a = c->args[i];
+                    if (a.value && isCallBoundedFormal(c->callee.get(), i) &&
+                        dynamic_cast<const ast::LambdaExpr*>(a.value.get()))
+                        expr(a.value.get(), true);
+                    else
+                        expr(a.value.get(), false);
+                }
+                return;
+            }
             if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
                 expr(ix->target.get(), false);
                 for (auto& a : ix->indices) expr(a.value.get(), false); return; }

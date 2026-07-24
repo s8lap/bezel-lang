@@ -5660,7 +5660,71 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     syncIterClosureArgs.push_back(args[ai]);
         }
     }
+    // #2195 / §28.14: a direct lambda argument to a call-bounded formal is a
+    // temporary closure whose captures live only through this call. Preserve
+    // the capture-cell records emitted while lowering the argument; unlike a
+    // lambda local there is no lowerLocalDecl call to register the cell free.
+    // The cell must remain alive until the captured owner's scope-end disposal
+    // has read through it, so registration is deferred to that scope's second
+    // disposal pass. // per §28.14, §28.9
+    auto callArgumentCapturedCells = std::move(lastLambdaCapturedCells_);
+    lastLambdaCapturedCells_.clear();
+
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs);
+    if (!diverged_) {
+        // #1073 / §28.9: function-typed parameters borrow a directly-produced
+        // closure. Release the caller's +1 after the call; an identifier/field
+        // closure is a borrow and is deliberately not included here.
+        std::size_t closureArgOffset = isStaticMethod(ms) ? 0 : 1;
+        for (std::size_t ai = closureArgOffset;
+             ai < args.size() && ai < argExprs.size(); ++ai) {
+            if (argExprs[ai] &&
+                (isPlusOneClosureProducer(argExprs[ai]) ||
+                 isUserMethodClosureReturnCall(argExprs[ai])))
+                emitClosureRelease(args[ai]);
+        }
+
+        // #2195: defer each direct call-bounded capture-cell free until the
+        // scope that owns the captured local has disposed the local itself.
+        // Searching by slot handles both locals and parameters; the declaration
+        // depth fallback also covers a value capture with no owner disposal.
+        for (const auto& ce : callArgumentCapturedCells) {
+            std::size_t ownerScope = disposeStack_.size();
+            for (std::size_t si = 0; si < disposeStack_.size(); ++si) {
+                bool found = false;
+                for (const auto& d : disposeStack_[si]) {
+                    if (d.slot == ce.newSlot &&
+                        !d.boxedCellFree && !d.boxedCellFreeDeferred &&
+                        !d.closureRelease && !d.stringRelease &&
+                        !d.boxRelease) {
+                        ownerScope = si;
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) break;
+            }
+            if (ownerScope == disposeStack_.size()) {
+                auto depth = declScopeDepth_.find(ce.key);
+                if (depth != declScopeDepth_.end() && depth->second > 0 &&
+                    depth->second - 1 < disposeStack_.size())
+                    ownerScope = depth->second - 1;
+            }
+            if (ownerScope == disposeStack_.size()) continue;
+            bool duplicate = false;
+            for (const auto& d : disposeStack_[ownerScope])
+                if (d.slot == ce.newSlot && d.boxedCellFreeDeferred) {
+                    duplicate = true;
+                    break;
+                }
+            if (!duplicate) {
+                Disposal d{ce.newSlot, nullptr};
+                d.boxedCellFreeDeferred = true;
+                disposeStack_[ownerScope].push_back(d);
+            }
+        }
+    }
+    callArgumentCapturedCells.clear();
     if (!diverged_)
         for (llvm::Value* cl : syncIterClosureArgs) emitClosureRelease(cl);
     // Record the concrete subst that drives the RESULT local's layout so that
