@@ -4568,6 +4568,9 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // lowerLocalDecl (mirrors borrowingArrayFreeEligible_).
     groupingFreeEligible_.clear();
     groupingFreeEligibleFn_ = fn;
+    // #2142: Set<T>-literal eligibility, populated by the same pass.
+    setLiteralFreeEligible_.clear();
+    setLiteralFreeEligibleFn_ = fn;
     // #422 / §27.5 / §28.9: which `var` closure (function-typed) locals may be
     // released at scope end (mirrors stringReleaseEligible_).
     closureReleaseEligible_.clear();
@@ -6872,6 +6875,29 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         Disposal d{slot, nullptr};
                         d.collection = true;  // per-element disposer null
                         disposeStack_.back().push_back(d);
+                    }
+                    // fix #2142 / §28.9 / §28.11 (v0.220): reclaim the backing of
+                    // an eligible borrowing-`Set<T>` LITERAL local at scope end.
+                    // materializeHeapCollectionLiteral dispatches Set/OwningSet to
+                    // materializeHeapSetLiteral internally (a bz_dict_t*, NOT a
+                    // bz_array_t*, so this is a SEPARATE eligibility set from the
+                    // Array branch above — sharing its `d.collection = true` path
+                    // would call the wrong runtime free and leak the dict struct +
+                    // entries). Set<T> is a borrowing-family collection exactly
+                    // like Array<T> (§28.9/§7052's table: trivial-dispose Dispose,
+                    // backing "reclaimed with the instance"), so the same implicit-
+                    // reclaim obligation applies; #2142 found it was in NEITHER
+                    // eligibility set. buildCollectionTempDisposal derives the
+                    // correct bz_dict_free wiring (including the Set<string>
+                    // dictStringKeys +1 release) from `collTy` — reused rather than
+                    // duplicated (it already backs the call-argument temp-disposal
+                    // path with the identical Set/Dict dispatch).
+                    else if (currentFn_ == setLiteralFreeEligibleFn_ &&
+                        setLiteralFreeEligible_.count(
+                            static_cast<const void*>(declNode)) &&
+                        !disposeStack_.empty()) {
+                        disposeStack_.back().push_back(
+                            buildCollectionTempDisposal(slot, collTy));
                     }
                     return;
                 }
@@ -12669,9 +12695,11 @@ void Emitter::collectBorrowingArrayFreeEligible(
     borrowingArrayFreeEligible_.clear();
     dictMaterializerFreeEligible_.clear();  // #1028
     groupingFreeEligible_.clear();          // #1930
+    setLiteralFreeEligible_.clear();        // #2142
     std::vector<const ast::LocalDecl*> candidates;
     std::vector<const ast::LocalDecl*> dictCandidates;  // #1028
     std::vector<const ast::LocalDecl*> groupingCandidates;  // #1930
+    std::vector<const ast::LocalDecl*> setLiteralCandidates;   // #2142
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
@@ -12699,6 +12727,14 @@ void Emitter::collectBorrowingArrayFreeEligible(
             else if (ld && !ld->isUsing && ld->initializer &&
                      isFreshOwnerlessDictMaterializerExpr(ld->initializer.get()))
                 dictCandidates.push_back(ld);
+            // #2142 / §28.9 / §28.11: a plain `var s: Set<T> := [ ... ]` — a
+            // dict-backed collection literal whose backing the local solely
+            // owns (see isBorrowingSetLiteralLocal). Previously in NEITHER
+            // reclaim eligibility set (the Array-literal check above requires
+            // name-head "Array"; the dict-materializer check above requires a
+            // CallExpr initializer) — leaked unconditionally, sync AND async.
+            else if (isBorrowingSetLiteralLocal(ld))
+                setLiteralCandidates.push_back(ld);
         }
         // Recurse into nested blocks (mirrors collectStringReleaseEligible).
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
@@ -12765,6 +12801,24 @@ void Emitter::collectBorrowingArrayFreeEligible(
         if (!w.escaped)
             groupingFreeEligible_.insert(static_cast<const void*>(ld));
     }
+    // #2142 / §28.9 / §28.11: same conservative escape walk as the Array-literal
+    // pass above (borrowingArrayMode, safeViewAliases) — Set<T> is a borrowing-
+    // family collection exactly like Array<T> (spec table, §7052/§28.9): a
+    // `for var x in s` clones a per-loop enumerator that borrows the dict table
+    // and whose Dispose frees only its own struct, never the backing, so
+    // iterating the set is a borrow-read, not an escape (same reasoning as
+    // #1871's array pass — the walker's borrowingArrayMode branch is written
+    // generically over the target LocalDecl, not array-IR-specific).
+    for (const ast::LocalDecl* ld : setLiteralCandidates) {
+        std::unordered_set<const void*> safeViews;
+        collectSafeViewAliases(body, ld, safeViews);
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        w.borrowingArrayMode = true;
+        w.safeViewAliases = &safeViews;
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            setLiteralFreeEligible_.insert(static_cast<const void*>(ld));
+    }
 }
 
 
@@ -12798,6 +12852,36 @@ bool Emitter::isBorrowingArrayLiteralLocal(const ast::LocalDecl* ld) {
     ElementPolicy ep = elementPolicyFor(el, /*owningFamily=*/false);
     if (ep.disposerThunk != nullptr) return false;
     if (ep.cat == ElementPolicy::Category::RuntimeManaged) return false;
+    return true;
+}
+
+
+// fix #2142 / §28.9 / §28.11 (v0.220): is `ld` a plain `var s: Set<T> := [ ... ]`
+// whose backing the local solely owns — a borrowing `Set<T>` (name-head exactly
+// "Set", not OwningSet/SortedSet — kept minimal per #2142's exact title)
+// initialised by a LIST-form collection literal (Set<T> never uses the ":"
+// dict-literal syntax, so `lit->isDict` is always false for a well-formed Set
+// target)? Unlike isBorrowingArrayLiteralLocal, no element-policy gate is
+// needed here: Set<T> is ALWAYS dict-backed when it materializes at all (a
+// class/interface element fails materializeHeapSetLiteral, so the caller's
+// `if (llvm::Value* arr = ...)` guard already skips registration for that case
+// — see lowerLocalDecl), and buildCollectionTempDisposal derives the correct
+// bz_dict_free wiring (including the Set<string> dictStringKeys +1 release)
+// for every element type the runtime supports. A `new Set<T>(...)` / alias /
+// materializer initializer is not a CollectionLiteralExpr, so it is not
+// matched (those carry their own disposal obligation or are handled
+// elsewhere).
+bool Emitter::isBorrowingSetLiteralLocal(const ast::LocalDecl* ld) const {
+    if (!ld || ld->isUsing || !ld->initializer) return false;
+    const sema::TypeRef* rt = nullptr;
+    if (ld->type) rt = ctx_.resolvedType(*ld->type);
+    if (!rt) rt = ctx_.exprType(*ld->initializer);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (builtinTypeName(rt) != "Set") return false;
+    auto* lit = dynamic_cast<const ast::CollectionLiteralExpr*>(
+        ld->initializer.get());
+    if (!lit || lit->isDict) return false;
     return true;
 }
 

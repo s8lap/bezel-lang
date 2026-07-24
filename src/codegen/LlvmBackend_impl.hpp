@@ -6395,8 +6395,17 @@ private:
     // walk, separate set because groupings free via bz_grouping_free).
     std::unordered_set<const void*> groupingFreeEligible_;
     llvm::Function* groupingFreeEligibleFn_ = nullptr;
-    // Compute borrowingArrayFreeEligible_ (and #1930 groupingFreeEligible_) for a
-    // block body (see the .cpp).
+    // #2142 / §28.9 / §28.11: the Set<T> analog of borrowingArrayFreeEligible_ —
+    // plain `var s: Set<T> := [ ... ]` collection-literal locals (dict-backed,
+    // bz_dict_t*) that the type-agnostic escape walk proves never escape. Set<T>
+    // is a borrowing-family collection (spec table, §28.9/§7052) exactly like
+    // Array<T>: trivial-dispose, backing "reclaimed with the instance". Populated
+    // alongside borrowingArrayFreeEligible_ (same escape walk, separate set
+    // because a Set frees via bz_dict_free, not bz_array_free).
+    std::unordered_set<const void*> setLiteralFreeEligible_;
+    llvm::Function* setLiteralFreeEligibleFn_ = nullptr;
+    // Compute borrowingArrayFreeEligible_ (and #1930 groupingFreeEligible_, #2142
+    // setLiteralFreeEligible_) for a block body (see the .cpp).
     void collectBorrowingArrayFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     // #1930 / stdlib §5 / §28.9: true if `ld` is a plain `var g := <expr>` whose
@@ -6412,6 +6421,14 @@ private:
     // via a single bz_array_free(backing, null) — the §28.9 "reclaimed with the
     // instance" mechanism. Non-const: calls elementPolicyFor.
     bool isBorrowingArrayLiteralLocal(const ast::LocalDecl* ld);
+    // #2142 / §28.9 / §28.11: true if `ld` is a plain `var s: Set<T> := [ ... ]`
+    // — a borrowing `Set<T>` local (name-head exactly "Set", not OwningSet/
+    // SortedSet — kept minimal per #2142) initialised by a LIST-form collection
+    // literal (Set<T> never uses the ":" dict-literal syntax). Such a literal's
+    // backing (a bz_dict_t*) is reclaimed at scope end via a single
+    // bz_dict_free — the §28.9 "reclaimed with the instance" mechanism, mirrored
+    // from isBorrowingArrayLiteralLocal.
+    bool isBorrowingSetLiteralLocal(const ast::LocalDecl* ld) const;
     // #1871 / §28.9 / §28.11: collect the `var v: IEnumerable<T> := <arrLd>` VIEW
     // locals in `body` that are proven never to escape — a binding of the array
     // into such a borrowing view does not extend the backing's lifetime, so it
