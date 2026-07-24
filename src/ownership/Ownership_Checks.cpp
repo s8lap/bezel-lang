@@ -2628,6 +2628,23 @@ bool MethodOwnership::recordFieldIsBorrowCarrying(
                 return true;
             if (ft->declaration->kind == ast::TypeDeclKind::Record)
                 return isBorrowBearingRecordImpl(ft, seen, env);  // transitive
+            // §9.7 transitivity (v0.226, #2159): "Its type is another borrow-
+            // bearing record, or a borrow-bearing choice (§35.4) (transitivity)."
+            // A CHOICE-kind field makes the record borrow-bearing iff that choice
+            // is borrow-bearing AT THIS instantiation — consult the single §35.4
+            // authority (common::classifyChoiceType), threading `env` so a
+            // generic choice field whose args are the record's parameters
+            // (`Holder<T>(K: Opt<T>)`) resolves through the record's
+            // substitution. The classifier self-guards the record↔choice mutual
+            // recursion its consultation opens. Mirrors
+            // common::recordFieldTypeIsBorrowCarryingCommon's Choice leg (#1595
+            // lockstep). (An OWNING choice cannot be a record field — §9.7/§15.3
+            // — so only the borrow-bearing verdict matters.) // per §9.7, §35.4
+            if (ft->declaration->kind == ast::TypeDeclKind::Choice) {
+                auto cls = common::classifyChoiceType(ft, ctx_, env);
+                return cls &&
+                       *cls == common::ChoiceClassification::BorrowBearing;
+            }
             return false;  // enum
         }
         case sema::TypeRef::Kind::InlineArray: {
@@ -2875,15 +2892,29 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
         // Direct construction form: `return new Rec(...);` / `return new
         // ArraySpan<int>(local, …);` — at least one constructor argument must
         // alias a scope-bound owned local (the borrow whose source is disposed
-        // at this method's exit).
-        for (const ast::CallArgument& a : ne->args) {
-            if (!a.value) continue;
-            const ast::IdentifierExpr* argRoot = identifierRoot(*a.value);
+        // at this method's exit). A constructor argument that is itself a
+        // borrow-bearing CHOICE-case construction — `new HolderC(RefC.Some(
+        // local))`, #2159 — is PEELED to its payload arguments: identifierRoot
+        // of `RefC.Some(local)` would resolve to the choice type `RefC`, not the
+        // payload source `local`, so the arg must be recursed the same way
+        // collectRecordBorrowRoots peels it. // per §9.7, §35.4
+        std::function<bool(const ast::Expr&)> checkArg =
+            [&](const ast::Expr& arg) -> bool {
+            // A choice-case construction argument: recurse into its payload args.
+            if (auto* ce = dynamic_cast<const ast::CallExpr*>(&arg);
+                ce && ce->callee &&
+                dynamic_cast<sema::ChoiceCaseSymbol*>(
+                    ctx_.exprSymbol(*ce->callee))) {
+                for (const ast::CallArgument& pa : ce->args)
+                    if (pa.value && checkArg(*pa.value)) return true;
+                return false;
+            }
+            const ast::IdentifierExpr* argRoot = identifierRoot(arg);
             // (a) The argument root is DIRECTLY a scope-bound owned local
             //     (`new Holder(local.AsSpan())` — root `local`).
             if (reportIfScopeBoundOwned(argRoot, ne->span.begin,
                                         /*spanForm=*/typeIsSpan))
-                return;  // one diagnostic per return is enough
+                return true;  // one diagnostic per return is enough
             // (b) §9.7 transitivity (#2127): the argument is itself a borrow-
             //     bearing local whose CARRIED source is a live escape-bound
             //     obligation — a span var (`var s := local.AsSpan(); return new
@@ -2900,9 +2931,14 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
                             argSym, ne->span.begin.offset)) {
                         reportCarriedSource(src, ne->span.begin,
                                             /*spanForm=*/typeIsSpan);
-                        return;
+                        return true;
                     }
             }
+            return false;
+        };
+        for (const ast::CallArgument& a : ne->args) {
+            if (!a.value) continue;
+            if (checkArg(*a.value)) return;
         }
         return;
     }
@@ -5231,11 +5267,18 @@ void MethodOwnership::collectRecordBorrowRoots(
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
         // A `new Rec(a, b)` borrow-bearing record carries a borrow from each
         // borrow-carrying constructor argument; record every arg root (the
-        // spec's "every carried borrow's source"). Over-recording a value-typed
-        // arg root is harmless — a value arg can never be an owned binding the
-        // freeze protects, so it never matches a consumed binding.
+        // spec's "every carried borrow's source"). RECURSE per argument (rather
+        // than a one-level addRoot) so a nested construction argument is peeled
+        // to its own roots: a nested `new Inner(...)` record, and — the #2159
+        // case — a borrow-bearing CHOICE-case construction `RefC.Some(local)`
+        // whose identifierRoot would wrongly resolve to the choice type `RefC`
+        // rather than the payload source `local` (the ChoiceCaseSymbol branch
+        // below peels it). A plain `local.AsSpan()` / bare-alias argument
+        // recurses to the `else` addRoot leg unchanged (#2127/#2144 behaviour
+        // preserved). Over-recording a value-typed arg root is harmless.
+        // // per §9.7, §35.4, #2159
         for (const ast::CallArgument& a : ne->args)
-            if (a.value) addRoot(*a.value);
+            if (a.value) collectRecordBorrowRoots(*a.value, self, srcs);
     } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e);
                ce && ce->callee &&
                dynamic_cast<sema::ChoiceCaseSymbol*>(

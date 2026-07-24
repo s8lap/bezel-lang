@@ -491,6 +491,24 @@ bool recordFieldTypeIsBorrowCarryingCommon(
             if (ft->declaration->kind == ast::TypeDeclKind::Record)
                 return isBorrowBearingRecordCommon(ft, ctx, seen, env,
                                                    choiceSeen);
+            // §9.7 transitivity (v0.226, #2159): "Its type is another borrow-
+            // bearing record, or a borrow-bearing choice (§35.4) (transitivity)."
+            // A CHOICE-kind field makes the record borrow-bearing iff that choice
+            // is borrow-bearing AT THIS instantiation — consult the §35.4
+            // classifier, threading the record's env (so a generic choice field
+            // whose args are the record's parameters — `Holder<T>(K: Opt<T>)` —
+            // resolves through the record's substitution) and the shared
+            // `choiceSeen` path set (so the record↔choice mutual recursion this
+            // leg opens terminates). An OWNING choice payload cannot appear in a
+            // record (§9.7 records have no owned fields; §15.3/§35.4 owning
+            // choices are move-only and may not be a record field — rejected
+            // separately), so only the borrow-bearing verdict matters here.
+            if (ft->declaration->kind == ast::TypeDeclKind::Choice) {
+                std::unordered_set<const ast::TypeDecl*> localChoiceSeen;
+                auto& cs = choiceSeen ? *choiceSeen : localChoiceSeen;
+                auto cls = classifyChoiceCore(ft, ctx, env, cs);
+                return cls && *cls == ChoiceClassification::BorrowBearing;
+            }
             return false;  // enum
         }
         case sema::TypeRef::Kind::InlineArray: {
