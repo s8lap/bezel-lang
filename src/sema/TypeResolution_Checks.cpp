@@ -969,6 +969,80 @@ void Resolver::checkRecordRestrictions() {
                         }
                     }
                 }
+                // §9.7 / §35.4 (issue #2210, v0.226): an owning-classified
+                // choice as a record field is rejected. Records declare no
+                // disposal path (§9.7: no destructor, no `owned` fields, no
+                // `IDisposable`), and §35.4 makes owning choices move-only
+                // value types whose active case carries `owned` payloads
+                // (§28.3); the buried owner would never be discharged. The
+                // §35.4 classification is structural (§35.4.1) — a generic
+                // `Opt<T>` field whose `T` is an owning class instantiates to
+                // an owning choice and is rejected at the instantiation site.
+                // Borrow-bearing and value-like choices are unaffected; the
+                // former is travel-restricted by §9.7's regular borrow rules
+                // (consulted via the #2159 Choice leg of the record field
+                // walk), the latter is an ordinary value type.
+                //
+                // Positional records: type rides on `posParam->type`. Body
+                // fields: type rides on the `FieldDecl`. Resolve whichever
+                // is present and consult the §35.4 classifier.
+                const ast::Type* ftypeAst = nullptr;
+                if (fs->posParam && fs->posParam->type)
+                    ftypeAst = fs->posParam->type.get();
+                else if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
+                    ftypeAst = fd->type.get();
+                if (ftypeAst) {
+                    const TypeRef* rt = ctx_.resolvedType(*ftypeAst);
+                    if (rt && rt->kind == TypeRef::Kind::Named &&
+                        rt->declaration &&
+                        rt->declaration->kind == ast::TypeDeclKind::Choice) {
+                        auto verdict = common::classifyChoiceType(rt, ctx_);
+                        if (verdict &&
+                            *verdict == common::ChoiceClassification::Owning) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, m->declLoc,
+                                std::string("record `") +
+                                std::string(t->name) +
+                                "` may not have an owning-classified choice "
+                                "field `" + std::string(fs->name) +
+                                "` (§35.4, §9.7); owning choices are move-only "
+                                "value types and records declare no disposal "
+                                "path (§15.3, §9.7)");
+                        }
+                    }
+                }
+            }
+            // §9.7 / §35.4 (issue #2210): body-record auto-properties
+            // (`property Name: T;`) are storage-bearing fields too; reject
+            // an owning-classified choice type at the property declaration.
+            if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
+                if (isAutoPropertySymbol(ps)) {
+                    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+                    if (pd && pd->type) {
+                        const TypeRef* rt = ctx_.resolvedType(*pd->type);
+                        if (rt && rt->kind == TypeRef::Kind::Named &&
+                            rt->declaration &&
+                            rt->declaration->kind ==
+                                ast::TypeDeclKind::Choice) {
+                            auto verdict =
+                                common::classifyChoiceType(rt, ctx_);
+                            if (verdict &&
+                                *verdict ==
+                                    common::ChoiceClassification::Owning) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, m->declLoc,
+                                    std::string("record `") +
+                                    std::string(t->name) +
+                                    "` may not have an owning-classified "
+                                    "choice auto-property `" +
+                                    std::string(ps->name) +
+                                    "` (§35.4, §9.7); owning choices are "
+                                    "move-only value types and records "
+                                    "declare no disposal path (§15.3, §9.7)");
+                            }
+                        }
+                    }
+                }
             }
         }
         // §9.6: a record may not derive from a class or from another record.
