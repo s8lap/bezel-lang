@@ -11070,6 +11070,22 @@ struct StringEscapeWalker {
                static_cast<const void*>(loc->decl) == target;
     }
 
+    // #1951 / §19.2 / §20 / §28.3 / §28.9: does `e` (an expression-position
+    // `case`/`when` or if-expression) have a `string` or `string?` result? Only
+    // then does lowerCaseExpr/lowerConditional RETAIN a bare-string-local ARM
+    // read (minting a fresh +1 for the result, leaving the local's own +1 in its
+    // slot). For exactly those expressions, a bare read of the tracked local
+    // written as an arm/branch is a BORROW — not an escape — so the local stays
+    // scope-end-release eligible; the retain and this relaxation move in lockstep
+    // (keyed on the SAME string-result test), so an eligible local is always the
+    // one codegen retains. A non-string arm-meet (an Object/class/value result)
+    // does NOT retain, so its arm reads keep the conservative escape treatment.
+    bool isStringResultArmMeet(const ast::Expr* e) {
+        const sema::TypeRef* rt = ctx.exprType(*e);
+        return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+               rt->primitive == sema::PrimitiveType::String;
+    }
+
     // #1185 / stdlib §3.1: StringBuilder.Append/AppendLine(string) is a RETAINING
     // builtin consumer — Append retains (or, for a +1 producer, transfers) the
     // string into its owned parts list, so the builder holds an INDEPENDENT +1
@@ -11344,10 +11360,19 @@ struct StringEscapeWalker {
         }
         // Conditional: condition is a read; each branch forwards the value on
         // to the parent position, so inherit `safeRead`.
+        // #1951: for a `string`/`string?`-result if-expression, lowerConditional
+        // RETAINS a bare-string-local branch (minting a fresh +1, leaving the
+        // local's own +1 in its slot), so a bare read of the tracked local as a
+        // branch is a BORROW, not an escape — walk the branches as safe reads so
+        // the local stays scope-end-release eligible (coordinated with the
+        // retain; §28.3 arm-meet). A sub-expression branch (`s + "!"`, `f(s)`)
+        // keeps its own escape rules via the recursion.
         if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            bool branchSafe =
+                (stringReleaseMode && isStringResultArmMeet(e)) ? true : safeRead;
             expr(c->condition.get(), /*safeRead=*/true);
-            expr(c->thenValue.get(), safeRead);
-            expr(c->elseValue.get(), safeRead);
+            expr(c->thenValue.get(), branchSafe);
+            expr(c->elseValue.get(), branchSafe);
             return;
         }
         // Range endpoints are reads.
@@ -11398,10 +11423,20 @@ struct StringEscapeWalker {
             return;
         }
         if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+            // #1951: for a `string`/`string?`-result expression-position
+            // `case`/`when`, lowerCaseExpr RETAINS a bare-string-local ARM read
+            // (minting a fresh +1, leaving the local's own +1 in its slot), so a
+            // bare read of the tracked local as an arm RESULT is a BORROW, not an
+            // escape — walk the arm bodies as safe reads so the local stays
+            // scope-end-release eligible (coordinated with the retain; §28.3
+            // arm-meet). The scrutinee and guards stay escape positions (neither
+            // is the arm-meet result), and a sub-expression arm keeps its own
+            // escape rules via the recursion.
+            bool armSafe = stringReleaseMode && isStringResultArmMeet(e);
             expr(ce->scrutinee.get(), /*safeRead=*/false);
             for (auto& arm : ce->arms) {
                 expr(arm.guard.get(), /*safeRead=*/false);
-                expr(arm.exprBody.get(), /*safeRead=*/false);
+                expr(arm.exprBody.get(), /*safeRead=*/armSafe);
                 for (auto& s : arm.stmts) stmt(s.get());
             }
             return;

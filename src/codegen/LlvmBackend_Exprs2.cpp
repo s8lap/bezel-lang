@@ -5443,12 +5443,28 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
             // release the +1 at scope end, closing the leak the `!nullable` gate
             // left open. Every arm value here is a `ptr` (a reference-typed
             // `string`/`string?`), so the ptr guard below is what scopes this.
+            //
+            // fix #1951 (conditional escape): RETAIN a bare read of a named
+            // string LOCAL that owns +1 (a producer/borrow local) written as an
+            // arm — do NOT transfer it (the removed `!returnedStringLocalOwns
+            // PlusOne` guard). A `case`/`when` arm `1 => s` selects `s` on ONE
+            // path only, so transferring `s`'s single reference out (leaving the
+            // slot's +1 uncounted) leaked `s` on EVERY OTHER path, where the
+            // suppressed scope-end release never ran (#1951). Retaining instead
+            // mints a fresh +1 for the arm result and leaves `s`'s own +1 in its
+            // slot, so the coordinated StringEscapeWalker relaxation (a bare
+            // string-typed case-arm read is a borrow, so the local stays scope-
+            // end-release eligible) discharges `s` once on the non-selected paths
+            // and the retained arm reference once on the selected path — balanced
+            // on every path, no leak, no double-free. This diverges from the
+            // ReturnStmt/arrow/lambda paths, which keep the transfer for an
+            // UNCONDITIONAL escape (`return s`) where the single reference
+            // genuinely flows out and the local is not released.
             if (v && resultSemaTy &&
                 resultSemaTy->kind == sema::TypeRef::Kind::Primitive &&
                 resultSemaTy->primitive == sema::PrimitiveType::String &&
                 v->getType()->isPointerTy() &&
-                !isPlusOneStringProducer(arm.exprBody.get()) &&
-                !returnedStringLocalOwnsPlusOne(arm.exprBody.get()))
+                !isPlusOneStringProducer(arm.exprBody.get()))
                 emitStringRetain(v);
             // fix #573 / §19.2 / §7.1 / §7.5: defer the branch-to-endBB so
             // nullable widening can emit into this block after all arms are
@@ -7301,18 +7317,27 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
     // consumer's null-guarded release. Recognizing the nullable if-expr as a
     // producer (isPlusOneStringProducer, #1952) lets a `var s: string? := (if
     // …)` bind + release it, closing the leak the `!nullable` gate left open.
+    //
+    // fix #1951 (conditional escape): RETAIN a bare read of a named string LOCAL
+    // owning +1 written as a BRANCH — do NOT transfer it (the removed
+    // `!returnedStringLocalOwnsPlusOne` guard). An if-branch `(if c then s else
+    // …)` selects `s` on ONE path only; transferring its single reference out
+    // leaked `s` on the other path, where the suppressed scope-end release never
+    // ran. Retaining mints a fresh +1 for the branch result and leaves `s`'s own
+    // +1 in its slot, coordinated with the StringEscapeWalker relaxation (a
+    // string-typed if-branch read is a borrow → the local stays release
+    // eligible). The ReturnStmt/arrow/lambda paths keep the transfer for an
+    // UNCONDITIONAL escape (`return s`). See lowerCaseExpr for the full rationale.
     if (resultSemaType &&
         resultSemaType->kind == sema::TypeRef::Kind::Primitive &&
         resultSemaType->primitive == sema::PrimitiveType::String) {
         if (tv && !thenDiv && tv->getType()->isPointerTy() &&
-            !isPlusOneStringProducer(c.thenValue.get()) &&
-            !returnedStringLocalOwnsPlusOne(c.thenValue.get())) {
+            !isPlusOneStringProducer(c.thenValue.get())) {
             builder_.SetInsertPoint(thenEnd);
             emitStringRetain(tv);
         }
         if (ev && !elseDiv && ev->getType()->isPointerTy() &&
-            !isPlusOneStringProducer(c.elseValue.get()) &&
-            !returnedStringLocalOwnsPlusOne(c.elseValue.get())) {
+            !isPlusOneStringProducer(c.elseValue.get())) {
             builder_.SetInsertPoint(elseEnd);
             emitStringRetain(ev);
         }
