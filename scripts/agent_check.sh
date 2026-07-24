@@ -149,6 +149,19 @@ if [ "${1:-}" = "--select" ]; then
 fi
 
 # --- targeted test run (the default) ------------------------------------------
+# --no-lit skips the lit diagnostic track below (for pure codegen-value lanes
+# that never touch a diagnostic string). Default is to RUN it. Strip it from the
+# args before the footgun guard so a bare `--no-lit <filter>` still validates.
+NO_LIT=0
+_ac_args=()
+for _a in "$@"; do
+  case "$_a" in
+    --no-lit) NO_LIT=1 ;;
+    *) _ac_args+=("$_a") ;;
+  esac
+done
+set -- "${_ac_args[@]}"
+
 # Footgun guards BEFORE we build, so mistakes fail fast.
 [ "$#" -ge 1 ] || die "no test filter given.
   Run a TARGETED subset:  scripts/agent_check.sh <filter> [filter2 ...]
@@ -184,6 +197,28 @@ for f in "$@"; do
     echo "agent_check: filter '$f' green ($summ)"
   fi
 done
+
+# --- lit diagnostic track (default-on; --no-lit to skip) ----------------------
+# A gtest FILTER cannot catch a change to a SHARED diagnostic STRING: a lane
+# editing one diagnostic breaks lit tests filed under UNRELATED issue numbers
+# (e.g. a #2159 change broke the #2145 reject lits — invisible to a `2159` gtest
+# filter and to the entire gtest track). The gate always runs lit, but catching
+# the drift HERE saves a full gate cycle. The whole track is ~6s on the
+# already-built bezelc; run it via the same `check-lit` target the gate uses
+# (config/bezelc wiring guaranteed) unless the lane is pure codegen-value work.
+if [ "${NO_LIT:-0}" != 1 ]; then
+  echo "== agent_check: lit diagnostic track (real bezelc + FileCheck) — catches shared-diagnostic drift a gtest filter cannot =="
+  litlog="$SCRATCH/test_lit.log"
+  "$DH" suite cmake --build "$BUILD_DIR" --target check-lit 2>&1 | tee "$litlog"
+  litrc=${PIPESTATUS[0]}
+  if [ "$litrc" -ne 0 ]; then
+    echo "agent_check: LIT diagnostic track FAILED — a change to a shared diagnostic string likely broke a pinned CHECK (grep '$litlog' for 'FAIL: Bezel-lit'); update the expectation or fix the diagnostic. Skip with --no-lit ONLY if your change cannot affect any diagnostic."
+    rc_all=1
+  else
+    echo "agent_check: lit diagnostic track green"
+  fi
+fi
+
 [ "$rc_all" -eq 0 ] && echo "== agent_check: ALL requested filters green ==" \
                     || echo "== agent_check: some filters FAILED (see above) =="
 exit "$rc_all"
