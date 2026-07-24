@@ -5380,14 +5380,46 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     !gpNames.empty()) {
                     // Resolve generic args using the OUTER substitution so
                     // that `Pair<T>` in `Pair<string>` context resolves T→ptr.
+                    //
+                    // §14.1 (v0.226, "monomorphization"): a generic body is
+                    // specialized "with each type parameter replaced by the
+                    // supplied type argument" — and that replacement COMPOSES
+                    // when the argument is ITSELF a type parameter of an
+                    // enclosing generic being monomorphized. #2192: for
+                    // `class B<U> { … new A<U>() … }` instantiated
+                    // `B<(int)->int>`, the receiver `a`'s type is `A<U>`, so
+                    // `recvTy->genericArgs[0]` is the still-open `U`. The LLVM
+                    // side already composes (lowerTypeRef reads genericSubst_,
+                    // the OUTER map), but the SEMA side (newSema, which drives
+                    // per-instantiation descriptor resolution —
+                    // perInstDescriptorForTarget / rejectCollapsedTypeTestTarget)
+                    // was storing the RAW arg, leaving the callee env `T→U`
+                    // instead of `T→(int)->int`. That collapsed every `A<U>`
+                    // onto ONE shared (erased) descriptor, so inside `probe`
+                    // `o is Wrap<T>` answered BOTH false-TRUE (a
+                    // `Wrap<(string)->string>` matched at T=(int)->int — the
+                    // #2001/#2006 type-confusion class) AND false-FALSE (a
+                    // reified `Wrap<int>` failed `is Wrap<T=int>`). Compose the
+                    // SEMA argument through the active OUTER substitution
+                    // (genericSubstSemaTy_ == savedSemaTy here — the callee env
+                    // is not installed until after this loop) so the callee's
+                    // descriptor env is the fully-monomorphized `T→(int)->int`.
+                    // substituteTypeRefLocal recurses (nested `A<Wrap<U>>`) and
+                    // is a per-node structural op — no pointer-keyed iteration
+                    // (#2116 determinism). An empty outer env (the direct case
+                    // `new A<(int)->int>()`) → identity, so behavior there is
+                    // unchanged: the reified-precise answer (#1843/#1939 box
+                    // vtables) and the collapsed-target reject (#2012 guard) are
+                    // exactly as before; only the transitive path is repaired.
                     std::unordered_map<std::string_view, llvm::Type*> newSubst;
                     std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
                     for (std::size_t gi = 0;
                          gi < gpNames.size(); ++gi) {
-                        llvm::Type* concrTy = lowerTypeRef(recvTy->genericArgs[gi]);
+                        const sema::TypeRef* argSema = substituteTypeRefLocal(
+                            recvTy->genericArgs[gi], genericSubstSemaTy_);
                         std::string_view pname = gpNames[gi];
-                        newSubst[pname] = concrTy;
-                        newSema[pname] = recvTy->genericArgs[gi];
+                        newSubst[pname] = lowerTypeRef(argSema);
+                        newSema[pname] = argSema;
                     }
                     // Check if any resolved arg is still i32 (unresolved generic
                     // fallback). If so, try the localGenericSubst_ for the receiver.
