@@ -1266,7 +1266,8 @@ void Emitter::emitOwningChoiceActiveCaseDisposal(
 
 void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
                                           llvm::Value* recvPtr,
-                                          const sema::TypeRef* resultTy) {
+                                          const sema::TypeRef* resultTy,
+                                          bool calleeReturnsOwned) {
     // #1039 / #1053 / §28.3: a fresh owned-class producer used ONLY as the
     // receiver of a member access or method call — never bound to a variable —
     // is owned by nothing and leaks. Dispose it after the value result has been
@@ -1297,6 +1298,29 @@ void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
         const auto* td =
             dynamic_cast<const ast::TypeDecl*>(resultTy->declaration->decl);
         if (td && td->kind == ast::TypeDeclKind::Enum) valueResult = true;
+        // fix #1859 / §28.3: a CLASS/INTERFACE result under an ANNOUNCED
+        // `owned` return type is a FRESH transfer, not a borrow of the
+        // receiver — the declared return type IS the announcement (K1.5 +
+        // K3.13, "Fresh productions are owned: … owned-returning calls").
+        // The ordinary (unmarked) instance-method-return row is the one that
+        // aliases the receiver ("Borrowed — instance method: source is the
+        // receiver") and stays excluded (calleeReturnsOwned is false there).
+        // An owned return could, in principle, construct a fresh object
+        // whose OWN field stores a borrow of the receiver (the admitted
+        // `_owner`-back-reference field-store shape, §28.6) — that is the
+        // SAME residual-trust hazard the language already accepts at every
+        // other field-store site (§28.6's "honest limit of the static
+        // rule", backstopped by checked-disposal mode's DisposedAccess-
+        // Exception), not a new one this fix introduces: the receiver was
+        // ALREADY due for disposal at the end of the full expression per
+        // §28.3's unbound-temporary rule (its only use was as this call's
+        // receiver — a borrowing use), independent of what the callee's
+        // body happens to do internally.
+        else if (td && (td->kind == ast::TypeDeclKind::Class ||
+                        td->kind == ast::TypeDeclKind::Interface) &&
+                 calleeReturnsOwned) {
+            valueResult = true;
+        }
     }
     if (!valueResult) return;
     // Dispose (idempotent vtable Dispose + reclaim exactly once). A fresh `new`

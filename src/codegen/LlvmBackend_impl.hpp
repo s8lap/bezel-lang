@@ -7545,9 +7545,27 @@ private:
     // receiver, a borrow-returning call, or a reference-yielding result is never
     // disposed (no double-free, no UAF). `recvPtr` MUST be the already-lowered
     // receiver pointer (never re-lowered — that would re-run the producer).
+    // fix #1859 / §28.3: `calleeReturnsOwned` is true when the CALL (not the
+    // field-read overload of this call site) has an ANNOUNCED `owned` return
+    // type (ast::MethodDecl::returnOwned). An announced-owned return is the
+    // SAME signature-level discriminant isFreshOwnedClassProducer already
+    // uses to admit a call as a fresh owned RECEIVER — applied here to the
+    // call's RESULT instead: a plain (unmarked) class/interface return is a
+    // borrow of the receiver (K1.5, "instance method: source is the
+    // receiver") and must never free it (the class_reference_result_not_
+    // disposed / borrow_returning_receiver_not_disposed_1053 controls in
+    // fresh_owned_receiver_disposal_1039_test.cpp), but an `owned` return
+    // announces a FRESH transfer that carries no signature-level borrow of
+    // the receiver (only a deferred-activation return type — Task family,
+    // an iterator interface — announces a carried receiver borrow, per K6.2;
+    // a plain `owned` class/interface return is not one of those kinds).
+    // Defaults to false so the field-read call site (which can never reach
+    // an `owned` producing position — accessor reads are lend-only, axiom
+    // A4) is unaffected.
     void disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
                                      llvm::Value* recvPtr,
-                                     const sema::TypeRef* resultTy);
+                                     const sema::TypeRef* resultTy,
+                                     bool calleeReturnsOwned = false);
 
     // #913 / #1054 / §28.7: dispose the displaced old value of an owned class
     // local before a reassignment store overwrites it. Fires only when `target`

@@ -5749,7 +5749,16 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                 call.callee.get()))
             recvExpr = ma->target.get();
-        disposeFreshNewReceiverTemp(recvExpr, args[0], ctx_.exprType(call));
+        // fix #1859 / §28.3: pass whether THIS call's own declared return is
+        // `owned` — the signature-level announcement that its result carries
+        // no borrow of the receiver (see disposeFreshNewReceiverTemp's own
+        // comment). `ms->decl` is this call's callee MethodDecl (already
+        // resolved above), not the receiver-producing call's.
+        bool calleeReturnsOwned = false;
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
+            calleeReturnsOwned = md->returnOwned;
+        disposeFreshNewReceiverTemp(recvExpr, args[0], ctx_.exprType(call),
+                                    calleeReturnsOwned);
     }
 
     // #1467 / §22.4 / §28.3: dispose each `out owned` (class/interface) value
