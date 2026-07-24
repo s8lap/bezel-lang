@@ -2130,27 +2130,40 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         for (std::string_view mod : md->modifiers)
                             if (mod == "async") { isAsync = true; break; }
                         if (!isAsync) return;
+                        // §35.4 / §9.7 (v0.226, #2183): the re-check reads the
+                        // BORROW-BEARING-CHOICE classification too ("record"
+                        // read as "record or choice") — a generic async method
+                        // whose type argument makes a choice parameter borrow-
+                        // bearing (`F.Work<ArraySpan<int>>` binding `Opt<T>` →
+                        // `Opt<ArraySpan<int>>`) is rejected at the instantiation
+                        // site, the choice-side dual of the record re-check.
+                        auto subIsBorrowBearing = [&](TypeRef* t) -> bool {
+                            if (common::isBorrowBearingRecordOrSpan(t, ctx_))
+                                return true;
+                            auto cv = common::classifyChoiceType(t, ctx_);
+                            return cv && *cv == common::ChoiceClassification::
+                                                    BorrowBearing;
+                        };
                         for (const ast::Param& p : md->params) {
                             if (!p.type) continue;
                             TypeRef* declTy = ctx_.resolvedType(*p.type);
                             if (!declTy) continue;
                             TypeRef* subTy = substituteReturnType(declTy, subst);
                             if (subTy == declTy) continue;  // T not bound here
-                            if (!common::isBorrowBearingRecordOrSpan(subTy, ctx_))
-                                continue;
+                            if (!subIsBorrowBearing(subTy)) continue;
                             ctx_.diagnostics().report(
                                 Severity::Error, ce.span.begin,
                                 "instantiating `async` method `" +
                                 std::string(md->name) + "` with this type "
                                 "argument makes parameter `" +
                                 std::string(p.name) + "` borrow-bearing — a "
-                                "span, or a record carrying a non-runtime-"
-                                "managed borrow, may not be a parameter of an "
-                                "`async` method: it is captured into the heap "
-                                "state-machine frame that outlives the "
+                                "span, or a record or choice carrying a non-"
+                                "runtime-managed borrow, may not be a parameter "
+                                "of an `async` method: it is captured into the "
+                                "heap state-machine frame that outlives the "
                                 "synchronous call, so the borrow's source is "
-                                "bounded by no stack frame (§30.1, re-checked "
-                                "at the instantiation site)");
+                                "bounded by no stack frame (§30.1, §35.4, re-"
+                                "checked at the instantiation site)");
                         }
                         // Result/element type: the single generic argument of
                         // the declared async return type (`T` of `Task<T>` /
@@ -2167,20 +2180,19 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 TypeRef* subResult =
                                     substituteReturnType(declResult, subst);
                                 if (subResult != declResult &&
-                                    common::isBorrowBearingRecordOrSpan(
-                                        subResult, ctx_))
+                                    subIsBorrowBearing(subResult))
                                     ctx_.diagnostics().report(
                                         Severity::Error, ce.span.begin,
                                         "instantiating `async` method `" +
                                         std::string(md->name) + "` with this "
                                         "type argument makes its result "
                                         "borrow-bearing — a span, or a record "
-                                        "carrying a non-runtime-managed "
-                                        "borrow, may not be an `async` "
+                                        "or choice carrying a non-runtime-"
+                                        "managed borrow, may not be an `async` "
                                         "method's result: it would escape the "
                                         "state-machine frame with no bounded "
-                                        "source (§30.1, re-checked at the "
-                                        "instantiation site)");
+                                        "source (§30.1, §35.4, re-checked at "
+                                        "the instantiation site)");
                             }
                         }
                     };

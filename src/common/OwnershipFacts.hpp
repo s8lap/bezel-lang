@@ -262,18 +262,32 @@ RecordSubstEnv::Entry resolveRecordFieldSubst(const sema::TypeRef* ft,
 //
 // Returns `std::nullopt` when `rt` is not a user choice type (so a caller
 // can gate on the kind in one test). Generic choices classify per-
-// instantiation at the USE SITE (§35.11); for an UNINSTANTIATED generic
-// choice this function takes the conservative most-restrictive reading of
-// a bare type-parameter payload (a marked `owned T` payload counts as
-// Owning; an unmarked `T` payload counts as BorrowBearing) — sound because
-// per-instantiation reclassification at a use site can only RELAX it.
+// instantiation at the USE SITE (§35.11): the CONCRETE type arguments in
+// `rt->genericArgs` are threaded into the borrow leg (a bare `T` payload is
+// reclassified as its substituted type — `Opt<int>` is value-like,
+// `Opt<ArraySpan<int>>` / `Opt<Res>` borrow-bearing), mirroring the §9.7
+// record instantiation-site substitution (#2145). For an UNINSTANTIATED or
+// still-generic choice (a payload whose substituted type is itself a bare
+// parameter — no concrete argument available) this function takes the
+// conservative most-restrictive reading of a bare type-parameter payload (a
+// marked `owned T` payload counts as Owning; an unmarked `T` payload counts as
+// BorrowBearing) — sound because per-instantiation reclassification at a use
+// site can only RELAX it.
+//
+// `env` (#2183) is an OPTIONAL incoming substitution environment for `rt`'s own
+// bare-parameter arguments, used when this choice is a field/component of an
+// enclosing generic type whose parameters supply those arguments (a
+// `record Holder<T>(K: Opt<T>)` classified at `Holder<int>` resolves `Opt<T>`'s
+// `T` through the record's env). Null for a top-level use — the frame env is
+// then seeded from `rt->genericArgs` alone.
 //
 // Recurses through value-typed components (record fields, inline-array
 // elements, other choices' payloads) per §35.4. A cycle guard bounds the
-// recursion through self- or mutually-referential payload types (an
+// recursion through self- or mutually-referential payload types, including the
+// record↔choice mutual recursion the §9.7 transitivity opens (#2159): an
 // instance-field value cycle is already rejected by §35.1's no-self-
 // containment rule; the guard mirrors isBorrowBearingRecordOrSpan's #1611
-// discipline).
+// discipline.
 enum class ChoiceClassification {
     ValueLike,      // §35.4.3
     BorrowBearing,  // §35.4.2
@@ -281,7 +295,8 @@ enum class ChoiceClassification {
 };
 
 std::optional<ChoiceClassification> classifyChoiceType(
-    const sema::TypeRef* rt, const sema::SemaContext& ctx);
+    const sema::TypeRef* rt, const sema::SemaContext& ctx,
+    const RecordSubstEnv* env = nullptr);
 
 // §28.1 (v0.196) per-instantiation erasure of the `owned` payload marker, as
 // §35.4 requires for a choice's classification: given a payload field's type

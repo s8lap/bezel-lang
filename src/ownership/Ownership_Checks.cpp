@@ -9514,6 +9514,26 @@ void MethodOwnership::checkAsyncSignatureBorrowBearing(
             const sema::TypeRef* rt =
                 ps->declType ? ctx_.resolvedType(*ps->declType)
                              : ps->resolvedDeclType;
+            // §35.4 / §9.7 (v0.226, #2183): a borrow-bearing CHOICE parameter is
+            // equally forbidden — "Borrow-bearing choices are subject to every
+            // rule of this section, with 'record' read as 'record or choice'".
+            // Kept a distinct branch so the diagnostic names the choice (the
+            // record predicate never returns true for a choice type).
+            if (isBorrowBearingChoice(rt)) {
+                report(
+                    Severity::Error, ps->declLoc,
+                    std::string("`async` parameter `") + std::string(ps->name) +
+                    "` has a borrow-bearing choice type — a choice carrying a "
+                    "non-runtime-managed borrow (a span, or a class/interface "
+                    "payload) at this instantiation may not be a parameter of an "
+                    "`async` method, `async` lambda, or async iterator: it is "
+                    "captured into the heap state-machine frame that outlives the "
+                    "synchronous call and lives until the task settles, so the "
+                    "borrow's source is bounded by no stack frame (§30.1, §35.4). "
+                    "Pass a heap-owned window instead — an `Array<T>` with "
+                    "explicit offset/count, or an owned result type");
+                continue;
+            }
             if (!isBorrowBearingRecordOrSpan(rt)) continue;
             report(
                 Severity::Error, ps->declLoc,
@@ -9537,7 +9557,18 @@ void MethodOwnership::checkAsyncSignatureBorrowBearing(
         const ast::Type* resultNode = returnType->genericArgs.front().get();
         if (resultNode) {
             const sema::TypeRef* resRt = ctx_.resolvedType(*resultNode);
-            if (isBorrowBearingRecordOrSpan(resRt))
+            // §35.4 / §9.7 (#2183): a borrow-bearing choice result/element type.
+            if (isBorrowBearingChoice(resRt))
+                report(
+                    Severity::Error, resultNode->span.begin,
+                    "an `async` method may not have a borrow-bearing choice "
+                    "result or element type — a choice carrying a non-runtime-"
+                    "managed borrow (a span, or a class/interface payload) at "
+                    "this instantiation would escape the state-machine frame "
+                    "with no bounded source (§30.1, §35.4). Return a heap-owned "
+                    "window (an `Array<T>` with explicit offset/count) or an "
+                    "owned result type instead");
+            else if (isBorrowBearingRecordOrSpan(resRt))
                 report(
                     Severity::Error, resultNode->span.begin,
                     "an `async` method may not have a borrow-bearing result or "
