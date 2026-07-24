@@ -147,7 +147,12 @@ GATE_T0=$(now)
 # "running" written here, the verdict written by gate_finish on EVERY exit.
 # Exists because detached gates (survivors of background-task shedding) emit
 # no completion signal of their own; best-effort, never affects gating.
-GATE_STATUS_FILE="$S/gate-status.json"
+# Honor an inherited GATE_STATUS_FILE so a caller launching a DETACHED gate can
+# point the verdict at a PER-RUN path and poll it (the shared default is a single
+# file every gate overwrites — useless when gates run back-to-back, and a stale
+# reader would see another gate's result). A completion waiter should still key
+# on the `head` field == its own gate's commit (or watch the LOG line directly).
+GATE_STATUS_FILE="${GATE_STATUS_FILE:-$S/gate-status.json}"
 printf '{"status":"running","mode":"%s","head":"%s","pid":%d,"started":"%s"}\n' \
   "$MODE" "$(git rev-parse --short HEAD 2>/dev/null || echo '?')" "$$" \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '')" \
