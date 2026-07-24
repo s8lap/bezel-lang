@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.223 — July 2026**
+**Version 0.224 — July 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -3902,6 +3902,24 @@ Destructuring applies to records and choice cases ([§35.5](#sec-choice-matching
 
 Inside a positional destructuring pattern, a naked identifier is interpreted as a binding for that position — `Point(x, y)` binds `x` and `y` (it does not type-test the positions against types named `x` and `y`). The naked-identifier form is the common shorthand; the explicit `Point(var x, var y)` is also accepted and means the same thing. The naked-identifier form is *not* available outside positional destructuring: at the top level of a pattern, an identifier alone is parsed as a type test, so a binding requires the explicit `var` form (`var x` or `var x: T`). Nested patterns inside a destructuring (e.g. `Outer(Inner(x))`) follow the same rule recursively.
 
+**Named destructuring (v0.224):** `Rect(Width = var w, Height = var h)`, `Header(Version = 1, Body = var b)`. A destructuring pattern's parenthesized slot list may be written **by name** instead of by position: each named slot is `Identifier "=" Pattern` (grammar A.7 `NamedSlot`), where the `Identifier` names a member of the pattern's type and the pattern after `=` interrogates that member. A slot list is **either** positional **or** named, never mixed in one pattern (v1); mixing (`Rect(3, Height = var h)`) is a compile error naming the rule. At least one slot is required, as for the positional form.
+
+The `=` is the interrogation reading of [§8.4](#sec-=-and), not an assignment: a call site *constructs* by name with `:=` (`new Rect(Width := 3)`, [§22.5](#sec-optional-parameters-and-named-arguments)), while a pattern *asks* whether a member holds a value (`Rect(Width = 3)` — "is `Width` 3?"), which is exactly what `=` means. No new token is introduced and no collision arises: `=` is not a pattern relational operator (grammar A.7 admits only `<` `>` `<=` `>=`, and a bare constant already means equals), and the expression positions embedded in a slot pattern — relational operands and range bounds — parse at the Shift level or tighter ([§17.1](#sec-precedence)), below equality, so no pattern-interior expression can absorb a slot's `=`.
+
+A named slot's `Identifier` resolves against the pattern's type, by kind:
+
+- **Record** — a positional field's auto-generated property ([§9.1](#sec-positional-records)) or a body auto-property ([§9.2](#sec-body-records)). Computed (expression-bodied) record properties are not named-slot targets in v1 — the storage-only set, the same targets `with` takes ([§9.5](#sec-non-destructive-update-with)).
+- **Choice case** — a payload field name of the case the pattern's head names ([§35.1](#sec-choice-declaration), [§35.5](#sec-case-patterns), with the [§19.8](#sec-inside-enum-scrutinees)/[§35.5](#sec-choice-matching) prefix-omission rule); the head names the case, not the choice type.
+- **Class** — a **public readable instance property**, stored or computed, declared or inherited ([§23](#sec-properties-and-indexers)). Positional destructuring deliberately gives classes no pattern surface (above); the named form is the by-name match surface a class's public readable properties are, and reading one transfers nothing.
+
+An unknown name, a duplicate name in one slot list, a write-only property ([§23.3](#sec-block-form-properties)), an indexer ([§23.4](#sec-indexers)), a static member, or — on a class — a field or method rather than a property, is a compile error at the pattern, each naming its rule. Enums and primitives have no named-destructure form (they have no slot surface). An interface-typed pattern head is not admitted in v1. Resolution honours ordinary member visibility ([§13](#sec-visibility)); v1 fixes the class set to *public* readable properties.
+
+Matching `T(N1 = p1, …, Nk = pk)` proceeds like the positional form: the **type test comes first** (subtype matching for a class hierarchy, the case-tag test for a choice case; a named pattern therefore never matches `null`, [§19.5](#sec-type-pattern-matching-never-matches-null), and no slot is read on a failed type test), then the named members are read in **textual order**, short-circuiting on the first refuted slot. Each read is the ordinary member read — a record field copy/borrow, a choice payload read, or a **class property getter invocation** — and a getter *runs* during matching: [§19.4](#sec-guards)'s first-match arm order makes the getter-evaluation order deterministic and observable, and a getter that throws propagates out of the `case` construct from the arm being tried (`pure` and contract-bearing getters keep their [§22.15](#sec-pure-members)/[§22.16](#sec-contract-clauses) semantics; matching adds no purity requirement). Each slot's right-hand side is a **full pattern** (grammar A.7 `AltPattern`): a binding (`var w`), `_`, a constant, `null`, a range, a relational, a per-slot `|` alternative among binding-free members (§19.3, unchanged), a type test, or a nested destructuring — named or positional — recursively. A **constant slot is the equality test** `scrutinee.N = c` under the slot's declared type's `=` ([§8.4](#sec-=-and), null-safe, lifted per [§7.11](#sec-lifted-operators) for a nullable slot); a constant slot whose declared type does not bear `=` (e.g. a non-auto-equality-bearing record, [§9.2](#sec-body-records)) is a compile error at the pattern — the same use-site discipline as writing the comparison out.
+
+A naked identifier on a named slot's right-hand side is **not** a binding. Directly after `=` — the interrogation operator — it resolves as at the top level of a pattern: a constant reference or a type test by name resolution, so `Rect(Width = w)` is an equality test when `w` names a `const`. The positional naked-binding shorthand (above) is scoped to positional slots, where there is no `=` to misread; a binding in a named slot is spelled `var w`.
+
+**Named-slot bindings and ownership.** [§19.3](#sec-patterns)'s pattern-binding ownership rule applies verbatim to every named slot: the binding is a **borrow**, non-destructive on the scrutinee — for a class property, a borrow whose source is the scrutinee ([§28.3](#sec-local-variables-ownership-and-borrows) producers, the instance-getter row); for a value-typed record/choice payload, a copy; for `string`/runtime-managed, a shared reference. A named slot never transfers: a getter may not return a fresh owned value ([§28.6](#sec-leak-prevention)), so no slot read can mint an obligation, and in an **owning match** ([§35.5](#sec-owning-match)) named slots do **not** transfer — an owned payload matched by a named slot is borrowed during the arm and disposed at construct completion by the standard [§35.5](#sec-owning-match-traces) machinery, exactly as a discarded slot. A program that wants an owned payload transferred writes the positional destructure.
+
 **Var patterns:** `var t`. Matches any value, binds it. Almost always combined with a `when` guard.
 
 **Discard `_`:** Matches any value, binds nothing. When used as a top-level pattern (a catch-all arm), it must be the last arm (see [§19.6](#sec-exhaustiveness)); inside destructuring patterns (`Point(_, y)`), `_` may appear in any position with no last-arm restriction.
@@ -3949,6 +3967,8 @@ The compiler proves exhaustiveness statically in the following cases:
 - **Nullable scrutinee:** under the rules above plus an explicit `null` pattern.
 
 An arm carrying a `when` guard contributes **nothing** to static exhaustiveness (v0.182 — the compiler does not evaluate guards): the analysis considers only unguarded patterns. A match whose every arm is guarded is therefore never statically exhaustive — in expression position it draws the warning and raises `MatchFailureException` if every guard declines at run time.
+
+**Named-destructure arms (v0.224).** An unguarded arm whose pattern is a named destructuring `T(N1 = p1, …, Nk = pk)` ([§19.3](#sec-patterns)) contributes to static exhaustiveness **exactly where an unguarded arm covering `T` by the rules above would** — a type pattern for a sealed-hierarchy leaf (including a determined generic instantiation, per the determination rule below), or, for a choice case, where the all-slots-irrefutable positional destructure would (the choice bullet above) — **if and only if every named slot is irrefutable** (a binding or `_`). Any refutable slot (a constant, `null`, range, relational, alternative list, type test, or nested destructuring) makes the arm contribute nothing, exactly as a refutable positional slot does: coverage is counted per type or case name, one level deep, with **no per-property value-space analysis** in v1 (`Rect(Width = 1..100)` arms never sum to coverage of `Rect`, whatever the property's type). Consequently a sealed hierarchy is matched exhaustively with no `_` arm by named-destructure arms whose slots are all irrefutable, exactly as by bare type patterns.
 
 ```bezel
 public sealed abstract class Shape ... end Shape;
@@ -9785,6 +9805,7 @@ If **no arm** of an owning match selects: in statement position the construct co
 
 - A **payload-free case** is matched by its bare name (`NotModified`) — a constant-style pattern resolving through the scrutinee-type prefix-omission rule, extended from enums ([§10.6](#sec-case-matching), [§19.8](#sec-inside-enum-scrutinees)): within a `case` whose scrutinee is a choice, the choice prefix may be omitted. A name resolving to a case is a case pattern, never a type test.
 - A **payload case** is matched by a positional destructuring pattern `CaseName(slot, …)` with the case's exact payload arity — grammar A.7's existing destructuring production. All [§19.3](#sec-patterns) slot rules carry over: naked identifiers bind, `var x` binds explicitly, `_` discards per slot, per-slot `|` alternatives among binding-free members, nested patterns recurse.
+- A payload case's slots may equivalently be matched **by name** — `Fetched(response = var r)` (v0.224) — resolving the case's payload field names ([§19.3](#sec-patterns) *Named destructuring*, [§35.1](#sec-choice-declaration)); the slot list is positional or named, never mixed. All the same slot rules carry over. The borrowing match binds payload borrows and the owning match does **not** transfer through a named slot (a named-matched owned payload is borrowed during the arm and disposed at construct completion, [§19.3](#sec-patterns)); a program wanting the payload transferred writes the positional destructure.
 - A payload case may **not** be matched bare: `Fetched` without parentheses is a compile error naming the arity — matching a payload while ignoring it is spelled visibly as `Fetched(_)`, the same explicitness §19.3 demands of record destructuring arity.
 - Payload-free case names are admissible members of `|` **alternative lists** (and count toward exhaustiveness, [§19.6](#sec-exhaustiveness)); payload-carrying case patterns are not, even in the all-discard form — they are destructurings, not constants ([§19.3](#sec-patterns)).
 
@@ -10919,7 +10940,8 @@ Pattern         ::= "_"                       /* discard */
                   | RelOpPattern Shift                 /* relational; restricted
                                                          operator set, see below */
                   | Type                              /* type test */
-                  | QualifiedName "(" PositionalPatternList ")" /* destructuring */
+                  | QualifiedName "(" (PositionalPatternList | NamedPatternList) ")"
+                                                                /* destructuring */
                               /* The grammar does not syntactically distinguish
                                  a single-Identifier `Constant` (an enum
                                  constant or named const reference) from a
@@ -10938,6 +10960,28 @@ PositionalPattern     ::= AltPattern              /* per-slot alternatives
                         | Identifier              /* naked binding,
                                                      valid only inside
                                                      positional destructuring */
+NamedPatternList ::= NamedSlot ("," NamedSlot)* ","?
+NamedSlot        ::= Identifier "=" AltPattern
+                              /* Named-destructure slots (v0.224): a destructure's
+                                 slot list is positional OR named, never mixed
+                                 (v1, enforced structurally). After
+                                 QualifiedName "(", an Identifier followed by "="
+                                 commits the named reading — "=" is not a pattern
+                                 relop (RelOpPattern below) and cannot occur in
+                                 pattern-embedded expressions, which parse at
+                                 Shift level or tighter (§17.1). The slot
+                                 Identifier is a plain member name (a qualified
+                                 name before "=" does not parse). The slot RHS is
+                                 a full AltPattern (per-slot alternatives,
+                                 nesting); a naked identifier RHS resolves as at
+                                 top level (constant or type test), never as a
+                                 binding — a named-slot binding is spelled `var x`
+                                 (§19.3). A constant slot is the "=" equality test
+                                 (§8.4). Name resolution (records: storage
+                                 fields/auto-properties; choice cases: payload
+                                 field names; classes: public readable
+                                 properties) and the borrow-only binding rule:
+                                 §19.3; coverage: §19.6. */
 
 RangePattern    ::= PatternBound (".." | "..<") PatternBound
                   | PatternBound ".."
@@ -11219,6 +11263,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - A type-pattern matches only non-null values; `null` matches only the `null` literal pattern, the `var` pattern, and `_`.
 - `step` is not used in patterns; it is a range modifier only.
 - A record-destructuring pattern's positional-binding count matches the record's positional-field count; the same arity rule applies to choice-case destructuring, and a payload-carrying case may not be matched bare ([§35.5](#sec-choice-matching)).
+- A destructuring pattern's slot list is **positional or named, never mixed** (v0.224); a named slot's identifier resolves against the pattern's type — a record's stored fields/auto-properties, a choice case's payload field names, or a class's public readable properties — and a named-slot binding is a borrow, a constant slot an `=` test, exactly as for the positional form ([§19.3](#sec-patterns)).
 - A choice `case` with every declared case covered by an unguarded, irrefutable-slot arm is statically exhaustive with no `_` arm ([§19.6](#sec-exhaustiveness)); the marked owning-match scrutinee (`case owned x of`) is a consume subject to the freeze ([K5](#sec-kernel-k5)), and guard evaluation in an owning match observes borrows, with transfer at arm selection ([§35.5](#sec-owning-match-guards)).
 - Static exhaustiveness counts only **unguarded** arms; a `when`-guarded arm contributes nothing to the proof ([§19.6](#sec-exhaustiveness)).
 - A multi-type catch alternative in **binding** form requires the listed types' nearest common base to be more specific than `Object`; if it is `Object`, the binding form is a compile error (the non-binding form `Type1 | Type2` is unrestricted). The binding's static type is that nearest common base ([§31.2.1](#sec-arm-patterns), v0.182).
