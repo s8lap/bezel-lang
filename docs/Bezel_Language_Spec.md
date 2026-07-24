@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.224 — July 2026**
+**Version 0.225 — July 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -1842,6 +1842,8 @@ end Parser;
 A nested type is referenced from outside as `Outer.Nested`. A nested class has access to all members (including `private`) of its enclosing class when it holds an instance of the enclosing class. The enclosing class similarly has full access to its nested types' members.
 
 Nested types may themselves contain nested types. Nested types in records are permitted but uncommon.
+
+A nested type is a *member* and lives in a type body; it is distinct from a **method-local** `record`/`enum` ([§21.10](#sec-local-type-declarations), v0.225), which is a body-scoped *statement* with no access surface. The visibility rules are deliberately opposite: a nested type **requires** the keyword (above), a local type **forbids** it — a member has an access surface to declare, a local does not. A local record's own body may itself contain §11.6 nested member types, which follow their own rules.
 
 <a id="sec-static-classes"></a>
 ### 11.7 Static classes
@@ -4287,6 +4289,33 @@ A method call, an `await` expression, or any other expression whose result is `(
 An expression statement whose result is a non-`()` type is permitted but the compiler emits a warning: the result is silently discarded, which may indicate a bug (a return value the programmer forgot to use). **One exemption (v0.215): the fluent-receiver discard.** A discarded **method-call** result draws no warning when it is a [§28.3](#sec-producers) **borrow** whose source set lies within the statement's receiver chain **and** whose static type equals the receiver's static type — the `return this` fluent shape (`sb.Append(x);`, stdlib §3.1, chained calls included): the caller still holds the receiver, so nothing computed is lost. Both conditions are load-bearing: dropping the type test would silence same-source *queries* (`FirstOrNull()`-class results are receiver-sourced too), and the exemption deliberately covers method calls only, not accessor reads. A fluent method whose declared return is a *base* of the receiver's type stays warned — conservative by design; `_ := …` remains available ([§17.13](#sec-the-discard-_)). Owned results and every other borrow keep this section's regime unchanged. To suppress the warning, use the discard form `_ := expression;` ([§17.13](#sec-the-discard-_)) — but only when the result type allows it. For non-trivial-dispose class types and for `Task`, the warning is replaced by a hard error directing the caller to the discard `_ := expression;` (immediate disposal, [§17.13](#sec-the-discard-_) — not available for `Task`), `using var _ := expression;` (scope-end disposal), an explicit `.Dispose()`, or `Task.FireAndForget` as appropriate.
 
 Method calls returning `()` and `await` expressions on `Task` (no result) are the common cases; no warning is emitted for these.
+
+<a id="sec-local-type-declarations"></a>
+### 21.10 Local type declarations (v0.225)
+
+A `record` or `enum` may be declared as a **statement**, scoped to the enclosing body like a local variable (grammar A.6 `LocalTypeDecl ::= RecordDecl | EnumDecl`). The local type is an **ordinary nominal record or enum** — every §9 (records) and §10 (enums) rule applies unchanged; the sole relaxation is *where the declaration may appear*. The form lets a shape used once — a projection's result record, a small closed constant set scoped to one algorithm — live next to its single use instead of at module or class level.
+
+```bezel
+public static method Render(users: Array<User>): string
+  record NameAge(Name: string, Age: int);   // local: visible only to end Render
+  var rows := users.Select(lambda(u) => new NameAge(u.Name, u.Age)).ToArray();
+  var sb := new StringBuilder();
+  for var row in rows do
+    sb.AppendLine($"{row.Name}: {row.Age}");
+  end;
+  return sb.ToString();
+end Render;
+```
+
+**Grammar and admissible positions.** `record` and `enum` are reserved ([§1.4](#sec-keywords), Appendix B.1) and begin no other statement, so the statement reading commits at the first token and no existing program changes meaning. Two slots of the reused Appendix A.3 productions are restricted semantically: the `Visibility?` slot **must be empty** — a local type has no access surface (there is no "outside" holding a reference), so a visibility keyword is a compile error naming the rule; this deliberately contrasts with [§11.6](#sec-nested-types) nested types, where the keyword is *required* because a member has an access surface to declare. The `GenericParams?` slot **must be empty** (v1) — a local type declares no type parameters of its own. `LocalTypeDecl` is admitted wherever a `Statement` is: method, constructor, destructor, and accessor bodies, lambda `do`-bodies, `do … end` blocks, loop bodies, and statement-position arm bodies. "Method-local" reads throughout as *body-local*.
+
+**Scope and name discipline.** A local type's name is in scope from its declaration statement to the end of the **innermost enclosing statement block** — exactly a local variable's scope ([§21.1](#sec-variable-declarations), [§21.6](#sec-do-end-blocks)). The declaration must precede first use; local types are therefore order-significant, and a local type's field types may name only types already in scope (module-visible types, the enclosing class's nested types, and *earlier* local types) — no forward references, hence no mutually recursive local types. Within its scope the name is an ordinary type reference in **body positions**: local-variable ascriptions, `new`, generic arguments (`Array<NameAge>`), `typeof`/`nameof`/`default`, casts and type patterns, and lambda-parameter ascriptions. The name may **not** appear in any **member signature** — parameter, return, field/property/indexer, generic-constraint, or base/interface positions — which is a compile error naming that rule (*"a method-local type may not appear in a member signature"*); the name is simply not in scope at any signature, but the rule is stated so the diagnostic is the named one. The declared name may **not shadow** any type name visible at the declaration point (a local `NameAge` silently shadowing a module-level `NameAge` is a trap, not a convenience — the collision is an error), nor collide with another declaration in the same body's declaration space (another local type or a local variable, the [§11.3](#sec-member-body)-style clash discipline applied to the body). Two *different* methods may each declare `record Row(…)`: the names never meet, and the types are distinct.
+
+**Restrictions (v1).** A local type may not **reference an enclosing generic parameter** (an enclosing method's or class's `T`) — a compile error naming the rule; such a type would be implicitly generic, making its identity, [§9.2](#sec-body-records) equality synthesis, [§9.8](#sec-serialization-synthesis) serialization synthesis, and boxed conformances per-instantiation, a genuine design space disproportionate to the concrete-field motivating case, and a `forbid → allow` widening is compatible where the reverse would break. A welcome consequence of the restriction: a local type's identity is **instantiation-independent** — one nominal type per declaration even inside a generic body, so a public generic's carried body ([§2.8.2](#sec-artifact-interface)) carries it as ordinary body content with no per-instantiation identity questions. `choice` may **not** be declared locally (its payload-derived three-way classification, announced-owning-match obligations, and coverage machinery are a heavier admission deserving its own study — recorded liftable with evidence); `class` and `interface` may not (a class carries ownership, destructors, and the §28 disposal machinery — body-scoped kernel surface for no recorded need; an interface is a contract for an outside a local has none of).
+
+**Semantics — an ordinary nominal type.** Identity is **per-declaration**: two same-shaped local records in different methods are distinct types (nominal, deliberately — no structural unification, which is exactly the anonymous-types discipline the language declines). Auto-equality ([§9.2](#sec-body-records)), `with` ([§9.5](#sec-non-destructive-update-with)), auto-`ToString` ([§8.5](#sec-tostring)), serialization synthesis ([§9.8](#sec-serialization-synthesis) — eligibility by field types, conformance declared as usual), interface implementation ([§9.6](#sec-records-and-inheritance)), and the derived type properties ([§3.6](#sec-derived-type-properties) — auto-equality-bearing, borrow-bearing per [§9.7](#sec-records-and-disposal), sendable per [§30.14](#sec-sendable-types), serialization-eligible) are all computed by their existing rules from the declaration. A local `enum` is a §10 enum wholesale: constants, explicit values, underlying types, methods, interface conformances, and `case` matching with prefix omission ([§10.6](#sec-case-matching)) and enum-scrutinee exhaustiveness ([§19.6](#sec-exhaustiveness)) inside the scope. Static members are admitted as on any record/enum (a local type's `static readonly` state is program-lived under [§22.13](#sec-static-initialization-order), like any other static).
+
+**Boxing and escape — the one subtle rule, stated exactly as far as [§8.6](#sec-boxing) already goes.** A **non-borrow-bearing** local record ([§9.7](#sec-records-and-disposal) — no borrow-carrying fields; `string`/runtime-managed fields do not count) that implements an interface may be **returned boxed through that interface**: the type identity escapes *unnameably*, the precedent being a `private` nested type ([§11.6](#sec-nested-types)) escaping through a public interface today, and such a box is genuinely self-contained — records carry no disposal ([§9.7](#sec-records-and-disposal): records cannot implement `IDisposable`) and a non-borrow-bearing record holds no references whose sources it could outlive. A **borrow-bearing** local record boxes under [§8.6](#sec-boxing) *Boxing of borrow-bearing records* **unchanged**: a short-lived, call-bounded box is admitted, and storing such a box in a field, returning it from a method, or capturing it in a closure that escapes the source scope stays rejected by the same [§8.6](#sec-boxing)/[§9.7](#sec-records-and-disposal)/[§28.3](#sec-local-variables-ownership-and-borrows) rules as the unboxed form. The locality of the declaration adds **no new admission**: the case an unqualified admission would wrongly bless — `record View(Cell: Widget)` declared over a `using var` widget and returned boxed through an interface, the widget disposed at the method's end and the box left dangling — is exactly what §8.6's existing rejection stops, fully engaged for local records.
 
 ---
 
@@ -10517,6 +10546,24 @@ Statement       ::= LocalDecl | LocalConstDecl | AssignmentStmt | ExpressionStmt
                   | ReturnStmt | ThrowStmt | BreakStmt | ContinueStmt
                   | TryStmt | YieldStmt
                   | IncrementStmt
+                  | LocalTypeDecl
+
+LocalTypeDecl   ::= RecordDecl | EnumDecl
+                              /* Method-local type declaration (v0.225, §21.10):
+                                 `record`/`enum` are reserved and begin no other
+                                 statement — token-one commit, no existing program
+                                 changes meaning. The reused A.3 productions are
+                                 restricted semantically: the Visibility? slot must
+                                 be empty (a local type has no access surface —
+                                 contrast §11.6, where nested types REQUIRE the
+                                 keyword) and the GenericParams? slot must be empty
+                                 (v1). Scope: the declaration to the innermost
+                                 enclosing block's end, like a local variable
+                                 (§21.6); order-significant (no forward references);
+                                 no signature positions; no shadowing of a visible
+                                 type name (§21.10). References to enclosing generic
+                                 parameters are rejected (v1, §21.10). A.3
+                                 (RecordDecl, EnumDecl) is unchanged. */
 
 CaseStmt        ::= "case" "owned"? Expression "of" CaseArm ("," CaseArm)* ","? "end" "case"? ";"
 WhenStmt        ::= "when" WhenArm ("," WhenArm)* ","? "end" "when"? ";"
@@ -11129,6 +11176,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - An override must match the base member's visibility, return type, parameter types, **and parameter modifiers (`ref`, `out`, `owned`, `scoped` — v0.184)** exactly, except that a parameter may widen `T` to `T?` ([§12.1](#sec-members-are-non-virtual-by-default), v0.181 — the same contravariant allowance as interface implementations); the widening is monotone down the override chain.
 - An inheritance cycle is rejected: no type may, directly or transitively, list itself among its base classes or extended interfaces ([§12.10](#sec-inheritance-cycles)).
 - A type may not declare two members that are indistinguishable: two fields, properties, or nested types of the same name, or two methods, constructors, or operator overloads of the same name that are not distinguishable as overloads ([§22.6](#sec-overloading)), are a compile error; likewise a non-overloadable member (field, property, nested type) may not share its name with any other member regardless of kind. Legal overloads are unaffected ([§11.3](#sec-member-body)).
+- A **method-local** `record`/`enum` declaration ([§21.10](#sec-local-type-declarations), v0.225) is an ordinary nominal record/enum by every §9/§10 rule, registered in a body-scoped type space: it carries no visibility keyword and no generic parameters (v1), is scoped to its enclosing block like a local variable, must precede first use, may not appear in any member signature, may not reference an enclosing generic parameter, and may not shadow a type name visible at its declaration or clash with another declaration in the same body's declaration space. A local `choice`, `class`, or `interface` is rejected.
 - Neither `owned` (on an ordinary or `out` parameter) nor `scoped` distinguishes overloads: two members differing only in these modifiers clash ([§22.6](#sec-overloading), v0.181 — the v0.77 `out`/`out owned` carve-out is withdrawn).
 - Variant generic parameters (`in`, `out`) appear only in the appropriate position.
 - A variant assignment whose source has a value-type type argument is rejected; the type itself (e.g. `IEnumerable<int>`) is fully usable, only the variant conversion is forbidden ([§12.9](#sec-variance)).
