@@ -10,5 +10,5 @@
 
 module M; class Res public method Val(): int return 5; end Val; end Res; record Inner<U>(V: U); record Outer<T>(I: Inner<T>); static class F public static async method Work<T>(x: T): Task<T> return x; end Work; end F; class C public static method Main(): int var local := new Res(); var i := new Inner<Res>(local); var o := new Outer<Res>(i); var t := F.Work<Outer<Res>>(o); return 0; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: instantiating `async` method `Work` with this type argument makes parameter `x` borrow-bearing — a span, or a record carrying a non-runtime-managed borrow, may not be a parameter of an `async` method
-// CHECK-SAME: (§30.1, re-checked at the instantiation site)
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: instantiating `async` method `Work` with this type argument makes parameter `x` borrow-bearing — a span, or a record or choice carrying a non-runtime-managed borrow, may not be a parameter of an `async` method
+// CHECK-SAME: (§30.1, §35.4, re-checked at the instantiation site)

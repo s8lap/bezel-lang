@@ -10,5 +10,5 @@
 
 module M; record Wrap<T>(V: T); static class F public static async method Work2<T>(x: Wrap<T>): Task<int> return 1; end Work2; end F; class C public static method Main(): int var local := new Array<int>(); local.Add(7); var w := new Wrap<ArraySpan<int>>(local.AsSpan()); var t := F.Work2<ArraySpan<int>>(w); return 0; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: instantiating `async` method `Work2` with this type argument makes parameter `x` borrow-bearing — a span, or a record carrying a non-runtime-managed borrow, may not be a parameter of an `async` method
-// CHECK-SAME: (§30.1, re-checked at the instantiation site)
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: instantiating `async` method `Work2` with this type argument makes parameter `x` borrow-bearing — a span, or a record or choice carrying a non-runtime-managed borrow, may not be a parameter of an `async` method
+// CHECK-SAME: (§30.1, §35.4, re-checked at the instantiation site)
