@@ -198,21 +198,19 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
     // the mint WITHOUT recognition still double-retains a producer arm (the leak
     // — #1948).
     //
-    // fix #1952 (nullable sibling): the SAME normalization applies to a NULLABLE
-    // `string?` result (`primary ?? fallback` over two `string?` values). A null
-    // arm is a null `ptr` and bz_string_retain is a null no-op, so a borrow arm
-    // is minted to +1 and a null arm contributes null — the merged result is
-    // +1-or-null, discharged once by the consumer's null-guarded release.
-    // Recognizing the nullable `??` as a producer (isPlusOneStringProducer,
-    // #1952) MUST move in lockstep with lifting this gate: recognition without
-    // the nullable per-arm mint would let the consumer transfer an un-normalized
-    // borrow arm (a UAF). Both are lifted together here.
+    // NON-NULLABLE ONLY (fix #1952 rework): the per-arm mint is confined to a
+    // non-nullable `string` result. A `string?` `??` (both operands nullable) is
+    // NOT normalized here — minting +1 for a borrow arm of a `string?` `??`
+    // leaked when the result flowed through the un-refcounted nullable return
+    // path (`return a ?? b` over `string?` borrows; #2196). The non-nullable
+    // `??` result is discharged by the non-nullable consumers (return / bind),
+    // so its borrow-arm mint is always balanced.
     const sema::TypeRef* coalResTy = ctx_.exprType(bin);
-    bool coalStringResult =
-        coalResTy &&
+    bool coalNonNullString =
+        coalResTy && !coalResTy->nullable &&
         coalResTy->kind == sema::TypeRef::Kind::Primitive &&
         coalResTy->primitive == sema::PrimitiveType::String;
-    if (coalStringResult && l->getType()->isPointerTy() && bin.left &&
+    if (coalNonNullString && l->getType()->isPointerTy() && bin.left &&
         !isPlusOneStringProducer(bin.left.get()) &&
         !returnedStringLocalOwnsPlusOne(bin.left.get()))
         emitStringRetain(l);
@@ -227,7 +225,7 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
     // flows to endBB), before the branch. Skipped when the RHS is itself a +1
     // producer / owning local (it already carries its single reference) or when
     // it diverged (never reaches endBB).
-    if (coalStringResult && !rhsDiverged && r->getType()->isPointerTy() &&
+    if (coalNonNullString && !rhsDiverged && r->getType()->isPointerTy() &&
         bin.right && !isPlusOneStringProducer(bin.right.get()) &&
         !returnedStringLocalOwnsPlusOne(bin.right.get()))
         emitStringRetain(r);
@@ -5432,18 +5430,6 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
             // recognizing the case-expression as a producer WITHOUT this per-arm
             // mint would drop a borrow arm's reference (a use-after-free).
             //
-            // fix #1952 (nullable sibling): the SAME normalization applies to a
-            // NULLABLE owned `string?` result. A producer arm (`"a"+"b"`) mints
-            // +1 as before; the null arm's value is a null `ptr` and
-            // bz_string_retain is a null no-op, so a `_ => null` arm contributes
-            // null and the merged result is +1-or-null — discharged once by the
-            // consumer's null-guarded release. Recognizing the nullable case-expr
-            // as a producer (isPlusOneStringProducer, #1952) lets a `var s:
-            // string? := (case … => "a"+"b", …)` bind it as a producer local and
-            // release the +1 at scope end, closing the leak the `!nullable` gate
-            // left open. Every arm value here is a `ptr` (a reference-typed
-            // `string`/`string?`), so the ptr guard below is what scopes this.
-            //
             // fix #1951 (conditional escape): RETAIN a bare read of a named
             // string LOCAL that owns +1 (a producer/borrow local) written as an
             // arm — do NOT transfer it (the removed `!returnedStringLocalOwns
@@ -5460,7 +5446,21 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
             // ReturnStmt/arrow/lambda paths, which keep the transfer for an
             // UNCONDITIONAL escape (`return s`) where the single reference
             // genuinely flows out and the local is not released.
-            if (v && resultSemaTy &&
+            //
+            // NON-NULLABLE ONLY (fix #1952 rework). The per-arm mint is
+            // deliberately confined to a non-nullable owned `string` result. A
+            // `string?` result is NOT normalized here: minting +1 for a borrow
+            // arm of a `string?` arm-meet is UNSOUND when the result flows
+            // through the un-refcounted nullable path (a `string?` method return
+            // does not release the minted +1 — #2196), which leaked the retained
+            // borrow (a returned `(if c then p else null)` / `a ?? b`). Instead,
+            // a `string?` arm-meet is refcounted only when every arm is already
+            // +1-or-null WITHOUT a borrow retain — a producer / `null` / string
+            // literal — which isPlusOneStringProducer recognizes directly (no
+            // per-arm mint needed); a `string?` arm-meet WITH a borrow arm stays
+            // on the old (borrow, unreleased) path — safe, and unchanged from
+            // before #1952.
+            if (v && resultSemaTy && !resultSemaTy->nullable &&
                 resultSemaTy->kind == sema::TypeRef::Kind::Primitive &&
                 resultSemaTy->primitive == sema::PrimitiveType::String &&
                 v->getType()->isPointerTy() &&
@@ -7310,14 +7310,6 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
     // branch's reference (a use-after-free); the mint WITHOUT recognition would
     // still let the consumer double-retain a producer branch (the leak — #1948).
     //
-    // fix #1952 (nullable sibling): the SAME per-branch mint applies to a
-    // NULLABLE `string?` result (`(if c then "a"+"b" else null)`). A null branch
-    // is a null `ptr` and bz_string_retain is a null no-op, so it contributes
-    // null and the merged result is +1-or-null — discharged once by the
-    // consumer's null-guarded release. Recognizing the nullable if-expr as a
-    // producer (isPlusOneStringProducer, #1952) lets a `var s: string? := (if
-    // …)` bind + release it, closing the leak the `!nullable` gate left open.
-    //
     // fix #1951 (conditional escape): RETAIN a bare read of a named string LOCAL
     // owning +1 written as a BRANCH — do NOT transfer it (the removed
     // `!returnedStringLocalOwnsPlusOne` guard). An if-branch `(if c then s else
@@ -7328,7 +7320,14 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
     // string-typed if-branch read is a borrow → the local stays release
     // eligible). The ReturnStmt/arrow/lambda paths keep the transfer for an
     // UNCONDITIONAL escape (`return s`). See lowerCaseExpr for the full rationale.
-    if (resultSemaType &&
+    //
+    // NON-NULLABLE ONLY (fix #1952 rework): as in lowerCaseExpr, a `string?`
+    // result is NOT normalized here — minting +1 for a borrow branch of a
+    // `string?` if-expression leaked when the result flowed through the
+    // un-refcounted nullable return path (#2196). A `string?` if-expression is
+    // refcounted only when every branch is already +1-or-null (producer / `null`
+    // / string literal), which isPlusOneStringProducer recognizes directly.
+    if (resultSemaType && !resultSemaType->nullable &&
         resultSemaType->kind == sema::TypeRef::Kind::Primitive &&
         resultSemaType->primitive == sema::PrimitiveType::String) {
         if (tv && !thenDiv && tv->getType()->isPointerTy() &&

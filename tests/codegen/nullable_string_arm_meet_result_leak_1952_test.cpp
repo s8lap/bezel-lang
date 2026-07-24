@@ -22,13 +22,29 @@
 // `+` producer row never gated on nullable — proving the gap is specific to the
 // gated arm-meet forms, and the fix is exactly to un-gate them.
 //
-// THE FIX (extends #1934's two coordinated halves to `string?`): the arm
-// normalization mints +1 on a producer arm and leaves a `null` arm null
-// (bz_string_retain is a null no-op), so the merged result is +1-or-null;
-// `isPlusOneStringProducer` recognizes the nullable case/if/`??` so the bind
-// classifies it a producer local and releases the +1 (null-safely) at scope end.
-// Sound because the value shape is identical to the already-working nullable
-// `+`/interpolation producer.
+// THE FIX (three parts). (1) `isPlusOneStringProducer` recognizes a `string?`
+// case/if arm-meet as a producer — but GUARDED: only when every arm is already
+// +1-or-null WITHOUT a per-arm borrow retain (a +1 producer, a `null` literal, a
+// string literal, or a diverging `throw`). Then the merged result is uniformly
+// {+1 | null | sentinel}, so a `string?` producer local bound to it is released
+// soundly at scope end (a null/sentinel release is a no-op). (2) `typeCase`
+// applies the §20 null-arm rule (a bare `null` arm makes the result the nullable
+// form of the other arms' common type) — without it the case-expr was typed
+// `Object?` instead of `string?`, defeating (1). (3) `lowerCaseExpr` Path B no
+// longer wraps a `string?` (reference) result into a `{i8, ptr}` value struct —
+// it reconciles only a genuine non-pointer arm — so the inferred-type local path
+// keeps a bare `ptr` and refcounts it.
+//
+// WHY GUARDED (the reworked scope). Minting +1 for a BORROW arm of a `string?`
+// arm-meet is UNSOUND when the result flows through the un-refcounted nullable
+// return path (a `string?` method return does not release the minted +1 —
+// #2196): a returned `(if c then p else null)` / `a ?? b` over `string?` borrows
+// leaked the retained borrow. The guard confines the fix to arm-meets that need
+// NO borrow retain (producer/null/literal arms), which are exactly #1952's
+// titled shape. A `string?` `??` is left un-recognized entirely (non-nullable
+// only); a `string?` arm-meet with a borrow arm stays on the old (borrow,
+// released-by-the-source) path — safe, and regression-free vs the un-refcounted
+// nullable return (guarded by tests F/G below).
 //
 // SCOPE NOTE (recorded). This closes the DIRECT-binding form (the arm-meet
 // expression bound to a local in the same body). The ISSUE's own probe routed
@@ -36,7 +52,7 @@
 // caller); that leak is a DIFFERENT, broader gap — nullable-`string` method
 // returns are NOT +1-normalized (the ReturnStmt mint and isUserMethodString
 // ReturnCall are both `!nullable`-gated), so `var s := Pick()` leaks even for a
-// plain `return "a"+"b"` with no arm-meet at all. That is filed separately; this
+// plain `return "a"+"b"` with no arm-meet at all. Filed separately (#2196); this
 // test pins the arm-meet-specific nullable leak #1952 is titled for.
 //
 // OBSERVABILITY. runAotChecked links + runs under ASan/LSan. Each case binds the
@@ -145,25 +161,54 @@ const char* kInferredNullableCaseProducerLoop =
     "  end Main; "
     "end C;";
 
-// (F) the NULLABLE `??` sibling (§7.7): a producer LHS if-expr coalesced with a
-// null-tolerant fallback, result `string?`. Exercises the lowerCoalesce nullable
-// arm normalization. LHS is non-null ("ab"), so the fallback is not evaluated.
-// total = 5 * 2 = 10.
-const char* kNullableCoalesceProducerLoop =
+// (F) REGRESSION GUARD — a NULLABLE arm-meet with a BORROW arm, RETURNED through
+// a `string?` method and bound in the caller, must stay LSan-CLEAN. This is the
+// shape the FIRST cut of #1952 regressed: minting +1 for the borrow arm (`b`, a
+// param) of a `string?` arm-meet leaked when the result flowed through the
+// un-refcounted `string?` return path (#2196), where nothing releases the minted
+// +1. The rework confines the arm-meet +1 normalization to NON-nullable results
+// and recognizes a `string?` arm-meet as a producer ONLY when every arm is
+// already +1-or-null (a borrow arm fails that guard), so this shape stays on the
+// old (borrow, released-by-the-source) path — clean, no minted +1 to strand.
+// `bb` ("bb") is the source; it is released at its own scope end. total =
+// 3 * "bb".Length (2) = 6.
+const char* kNullableCaseBorrowArmReturnedLoop =
     "module M; class C "
-    "  public static method Sel(n: int): int "
-    "    return n; "
-    "  end Sel; "
+    "  public static method P(n: int, b: string?): string? "
+    "    return (case n of 1 => b, _ => null); "
+    "  end P; "
     "  public static method Main(): int "
-    "    var total := 0; "
-    "    var i := 0; "
-    "    while i < 5 do "
-    "      var f: string? := null; "
-    "      var s: string? := (if C.Sel(1) = 1 then \"a\" + \"b\" else null) ?? f; "
-    "      total := total + s!.Length; "
+    "    var total := 0; var i := 0; "
+    "    while i < 3 do "
+    "      var bb: string? := \"b\" + \"b\"; "
+    "      var r := C.P(1, bb); "
+    "      total := total + r!.Length; "
     "      i := i + 1; "
     "    end; "
-    "    return total; "                    // 10
+    "    return total; "                    // 6
+    "  end Main; "
+    "end C;";
+
+// (G) REGRESSION GUARD — the `??` analog: `return a ?? b` over two `string?`
+// borrows, bound in the caller. The first cut of #1952 minted +1 for the `??`
+// borrow arms and leaked it through the `string?` return; the rework leaves a
+// `string?` `??` un-normalized (non-nullable-only), so it stays clean. `pb`
+// ("bb") is the source, released at its own scope end. total = 3 * 2 = 6.
+const char* kNullableCoalesceBorrowsReturnedLoop =
+    "module M; class C "
+    "  public static method P(a: string?, b: string?): string? "
+    "    return a ?? b; "
+    "  end P; "
+    "  public static method Main(): int "
+    "    var total := 0; var i := 0; "
+    "    while i < 3 do "
+    "      var pa: string? := null; "
+    "      var pb: string? := \"b\" + \"b\"; "
+    "      var r := C.P(pa, pb); "
+    "      total := total + r!.Length; "
+    "      i := i + 1; "
+    "    end; "
+    "    return total; "                    // 6
     "  end Main; "
     "end C;";
 
@@ -217,12 +262,26 @@ BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
 }
 
 // =====================================================================
-// (F) The nullable `??` sibling — LSan-clean. §7.7 / §28.3 / §28.9.
+// (F) REGRESSION GUARD — a nullable arm-meet with a BORROW arm, returned through
+// a `string?` method, is LSan-clean (no minted +1 stranded on the un-refcounted
+// nullable return path — #2196). §28.3 / §28.9.
 // =====================================================================
 BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
-           nullable_coalesce_producer_loop_lsan_clean_spec_7_7) {
-    JitResult r = runAotChecked(kNullableCoalesceProducerLoop);
+           nullable_case_borrow_arm_returned_loop_no_regression_spec_28_3) {
+    JitResult r = runAotChecked(kNullableCaseBorrowArmReturnedLoop);
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 10);
+    BEZEL_EXPECT_EQ(r.exitCode, 6);
+}
+
+// =====================================================================
+// (G) REGRESSION GUARD — the `??` analog: `return a ?? b` over two `string?`
+// borrows is LSan-clean (a `string?` `??` is left un-normalized). §7.7 / §28.9.
+// =====================================================================
+BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
+           nullable_coalesce_borrows_returned_loop_no_regression_spec_7_7) {
+    JitResult r = runAotChecked(kNullableCoalesceBorrowsReturnedLoop);
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 6);
 }

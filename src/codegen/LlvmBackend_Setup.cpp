@@ -10417,60 +10417,70 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // double-counted the arm's +1 and the arm's original reference leaked
     // (#1934). Recognized for the same non-nullable `string` result the per-arm
     // mint in lowerCaseExpr is keyed on, so the two decisions stay in lockstep.
-    // fix #1952 (extends #1934 to `string?`): the nullable sibling. A `case`/
-    // `when` (and the if-expression / `??` below) whose result is a NULLABLE
-    // owned `string` (`1 => "a"+"b", _ => null`) is a +1-or-null producer:
-    // lowerCaseExpr's arm normalization (extended to `string?`) mints EXACTLY +1
-    // on a producer arm and leaves the null arm null (bz_string_retain is a
-    // null/sentinel no-op), so the result carries one reference when non-null
-    // and none when null — discharged once by a null-guarded release. This is
-    // the SAME value shape a nullable `+`/interpolation already produces (the
-    // `+` row below never gated on nullable), so recognizing it identically is
-    // sound. Without it a `var s: string? := (case … => "a"+"b", …)` was neither
-    // classified a producer (this gate) nor a borrow (collectStringRelease
-    // Eligible's borrow branch rejects `string?`), so its +1 was never released.
+    // fix #1934 / §19.2 / §28.3 (producers arm-meet, v0.184; v0.220) / §28.9: an
+    // expression-position `case`/`when` result. A NON-NULLABLE owned `string`
+    // result is always a +1 producer — lowerCaseExpr normalizes each arm to +1
+    // (a producer arm transfers, a borrow arm is retained) and the non-nullable
+    // consumer (return / bind) discharges it once.
+    //
+    // fix #1952 (rework) — the NULLABLE sibling, guarded. A `string?` result is
+    // recognized as a producer ONLY when every arm is ALREADY +1-or-null WITHOUT
+    // a per-arm borrow retain — a +1 producer, a `null` literal, a string
+    // literal (an immortal sentinel), or a diverging `throw` arm. In that case
+    // the merged result is uniformly {+1 | null | sentinel}, so a `string?`
+    // producer local bound to it (`var s: string? := (case … => "a"+"b", _ =>
+    // null)`) is released soundly at scope end (a null/sentinel release is a
+    // no-op, the producer's +1 is freed) — closing #1952 WITHOUT the nullable
+    // per-arm mint that leaked when the result flowed through the un-refcounted
+    // nullable return path (#2196: a returned `string?` arm-meet with a BORROW
+    // arm). A `string?` arm-meet WITH a borrow arm fails the guard and stays on
+    // the old (borrow, unreleased) path — safe, unchanged from before #1952, and
+    // regression-free vs the un-refcounted nullable return.
+    auto armReleasableNullable = [this](const ast::Expr* a) -> bool {
+        if (!a) return true;                                   // no value arm
+        if (dynamic_cast<const ast::NullLiteralExpr*>(a)) return true;
+        if (dynamic_cast<const ast::StringLiteralExpr*>(a)) return true;
+        if (dynamic_cast<const ast::ThrowExpr*>(a)) return true;  // diverges
+        return isPlusOneStringProducer(a);
+    };
     if (auto* ce = dynamic_cast<const ast::CaseExpr*>(init)) {
         const sema::TypeRef* rt = ctx_.exprType(*ce);
-        return rt &&
-               rt->kind == sema::TypeRef::Kind::Primitive &&
-               rt->primitive == sema::PrimitiveType::String;
+        if (!rt || rt->kind != sema::TypeRef::Kind::Primitive ||
+            rt->primitive != sema::PrimitiveType::String)
+            return false;
+        if (!rt->nullable) return true;   // non-nullable: arm normalization mints
+        for (const auto& arm : ce->arms)
+            if (!armReleasableNullable(arm.exprBody.get())) return false;
+        return true;
     }
     // fix #1948 / §20 / §28.3 (producers arm-meet, v0.184; v0.220) / §28.9: an
-    // if-expression `(if c then v1 else v2)` whose result is a (non-nullable)
-    // owned `string`. §28.3's `(if c then v1 else v2)` producers row makes the
-    // result the arm-meet of the branches "identically to the `a ?? b` row"
-    // (v0.184) — "owned ⊓ owned = owned … exactly one arm's value is produced
-    // at runtime and is discharged once". lowerConditional normalizes each
-    // branch to own EXACTLY +1 (a producer branch transfers its reference; a
-    // borrow branch is retained), so the if-expression result carries exactly
-    // one reference — the consumer (return / assign / bind) must TRANSFER it,
-    // not mint a second borrow-retain. Same two coordinated halves as the
-    // case/when result (#1934), the sibling §19.2 ties to the identical rule.
-    // (#1952 extends this to `string?` — the nullable if-expression sibling,
-    // same value shape / same soundness argument as the nullable case/when.)
+    // if-expression `(if c then v1 else v2)` whose result is an owned `string` —
+    // §28.3's row makes it the arm-meet of the branches "identically to the `a ??
+    // b` row" (v0.184). Non-nullable: a +1 producer (lowerConditional normalizes
+    // each branch). Nullable (#1952 rework): the SAME guard as the case/when
+    // above — recognized only when every branch is +1-or-null/sentinel/throw.
     if (auto* cond = dynamic_cast<const ast::ConditionalExpr*>(init)) {
         const sema::TypeRef* rt = ctx_.exprType(*cond);
-        return rt &&
-               rt->kind == sema::TypeRef::Kind::Primitive &&
-               rt->primitive == sema::PrimitiveType::String;
+        if (!rt || rt->kind != sema::TypeRef::Kind::Primitive ||
+            rt->primitive != sema::PrimitiveType::String)
+            return false;
+        if (!rt->nullable) return true;
+        return armReleasableNullable(cond->thenValue.get()) &&
+               armReleasableNullable(cond->elseValue.get());
     }
     if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(init)) {
         // fix #1948 / §7.7 / §28.3 (producers arm-meet, v0.184; v0.220) / §28.9:
-        // a null-coalescing `a ?? b` whose result is a (non-nullable) owned
-        // `string`. §28.3's `a ?? b` producers row is "the meet of the
-        // ownership states of a and b … owned ⊓ owned = owned (exactly one of
-        // the two owned values is produced at runtime and is discharged once —
-        // no leak, no double-free)". lowerCoalesce normalizes each arm to +1 (a
+        // a null-coalescing `a ?? b` whose result is a (NON-NULLABLE) owned
+        // `string`. §28.3's `a ?? b` producers row is "the meet … owned ⊓ owned
+        // = owned (exactly one of the two owned values is produced at runtime and
+        // is discharged once)". lowerCoalesce normalizes each arm to +1 (a
         // producer arm transfers; the LHS / a borrow arm is retained), so the
-        // ?? result carries exactly one reference the consumer TRANSFERS — the
-        // same two-halves shape as the case/when result (#1934) and the
-        // if-expression (above), the three forms §28.3 ties to one arm-meet.
-        // (#1952 extends this to `string?` — the nullable `??` sibling, e.g.
-        // `primary ?? fallback` over two `string?` values; same value shape /
-        // same soundness argument as the nullable case/when and if-expression.)
+        // consumer TRANSFERS the single reference. Confined to NON-NULLABLE
+        // (#1952 rework): a `string?` `??` is NOT recognized — its borrow-arm
+        // mint leaked through the un-refcounted nullable return path (#2196).
         if (bin->op == "??") {
             auto* rt = ctx_.exprType(*init);
-            return rt &&
+            return rt && !rt->nullable &&
                    rt->kind == sema::TypeRef::Kind::Primitive &&
                    rt->primitive == sema::PrimitiveType::String;
         }
@@ -11071,18 +11081,23 @@ struct StringEscapeWalker {
     }
 
     // #1951 / §19.2 / §20 / §28.3 / §28.9: does `e` (an expression-position
-    // `case`/`when` or if-expression) have a `string` or `string?` result? Only
+    // `case`/`when` or if-expression) have a NON-NULLABLE `string` result? Only
     // then does lowerCaseExpr/lowerConditional RETAIN a bare-string-local ARM
     // read (minting a fresh +1 for the result, leaving the local's own +1 in its
     // slot). For exactly those expressions, a bare read of the tracked local
     // written as an arm/branch is a BORROW — not an escape — so the local stays
     // scope-end-release eligible; the retain and this relaxation move in lockstep
-    // (keyed on the SAME string-result test), so an eligible local is always the
-    // one codegen retains. A non-string arm-meet (an Object/class/value result)
-    // does NOT retain, so its arm reads keep the conservative escape treatment.
+    // (keyed on the SAME non-nullable-string-result test), so an eligible local
+    // is always the one codegen retains. NON-NULLABLE ONLY (fix #1952 rework):
+    // the arm normalization does not mint for a `string?` result, so a `string?`
+    // arm-meet keeps the conservative escape treatment here — no relaxation
+    // without a matching retain (that mismatch would drop the local's release =
+    // a double-free). A non-string arm-meet likewise keeps the conservative
+    // treatment.
     bool isStringResultArmMeet(const ast::Expr* e) {
         const sema::TypeRef* rt = ctx.exprType(*e);
-        return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+        return rt && !rt->nullable &&
+               rt->kind == sema::TypeRef::Kind::Primitive &&
                rt->primitive == sema::PrimitiveType::String;
     }
 

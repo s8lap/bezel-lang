@@ -3541,45 +3541,51 @@ void ExprTC::typeConditional(const ast::ConditionalExpr& cnd,
 // result PHI and crash. When EVERY arm diverges, the case yields no value
 // and no type is recorded.
 void ExprTC::typeCase(const ast::CaseExpr& cse, const ast::Expr& e) {
-    TypeRef* common = nullptr;     // running common type of the VALUE arms
-    bool haveValueArm = false;     // at least one non-diverging, non-null arm
+    TypeRef* common = nullptr;     // running common type of the value arms
+    bool haveValueArm = false;     // at least one non-diverging arm seen
     bool reported = false;         // emit the §20 error at most once
-    // §20 / §19.2 (v0.210): a bare `null` arm "imposes no constraint of its own
-    // … it target-types to the nullable form of the other branches' common
-    // type" — `(if c then s else null)` with `s: string` has type `string?`;
-    // §19.2 ties the expression-position case/when result to that SAME rule
-    // ("identical to ?? and the if expression"). typeConditional already
-    // implements this for the if-expression via its NullLiteralExpr branch
-    // detection; typeCase previously did NOT — a bare `null` arm's own
-    // (placeholder) type is `nullable Object`, so folding it through
-    // commonTypeOf widened the result to `Object?` instead of `T?`. That
-    // mis-typing then defeated downstream string ownership recognition
-    // (isPlusOneStringProducer keys on a `string` result), leaking a nullable
-    // producer arm's minted string (#1952). Mirror typeConditional: SKIP bare
-    // `null` arms in the common-type fold and, if any was present, wrap the
-    // value arms' common type in its nullable form.
+    // #1952 / §20 / §19.2 (v0.210): a bare `null` arm "imposes no constraint of
+    // its own … it target-types to the nullable form of the other branches'
+    // common type" — `(if c then s else null)` with `s: string` has type
+    // `string?`; §19.2 ties the expression-position case/when result to that
+    // SAME rule. typeCase folds the `null` arm's own placeholder type (`nullable
+    // Object`) through commonTypeOf, so a `string` value arm meeting a `null`
+    // arm widened to `Object?` (string boxes to Object) instead of `string?`.
+    // That mis-typing defeated isPlusOneStringProducer's `string` check and
+    // leaked the nullable producer arm's minted string (#1952). We detect that
+    // exact STRING shape below and record `string?`.
+    //
+    // SCOPED TO `string` (recorded). Only the `string` value-arm shape is
+    // overridden. A VALUE-type null-arm result (`int?`, `bool?`, record?, enum?)
+    // keeps the pre-#1952 fold UNCHANGED — its lowerCaseExpr Path A/B handling
+    // depends on the folded (`Object?`) type, and re-typing it via the general
+    // nullable-form rule regressed the value-nullable result (#573,
+    // codegen_cg28_573). typeConditional applies the nullable-form rule for ALL
+    // types because the if-expression lowering path differs; the case/when path
+    // is brought into line only for `string`, which is the leak #1952 concerns.
     bool sawNullArm = false;
-    TypeRef* nullArmTy = nullptr;  // preserves the all-`null` case's prior type
-    auto nullableOf = [&](TypeRef* ty) -> TypeRef* {
-        if (!ty || ty->nullable) return ty;
-        TypeRef* nn = ctx_.makeTypeRef(*ty);
-        nn->nullable = true;
-        return nn;
-    };
+    bool haveNonNullValueArm = false;
+    bool allNonNullValueArmsString = true;
     for (const auto& arm : cse.arms) {
         // Only expression-bodied arms produce a value (statement / `do…end`
         // arms are statement-position only, §19.2). A bottom-typed arm body
         // (e.g. `throw E`) has a null exprType and imposes no constraint.
         if (!arm.exprBody) continue;
-        // A bare `null` arm imposes no type of its own (§20 null-arm rule);
-        // it only makes the result nullable around the other arms' type.
-        if (dynamic_cast<const ast::NullLiteralExpr*>(arm.exprBody.get())) {
-            sawNullArm = true;
-            if (!nullArmTy) nullArmTy = ctx_.exprType(*arm.exprBody);
-            continue;
-        }
+        bool isNullLit =
+            dynamic_cast<const ast::NullLiteralExpr*>(arm.exprBody.get()) !=
+            nullptr;
+        if (isNullLit) sawNullArm = true;
         TypeRef* at = ctx_.exprType(*arm.exprBody);
         if (!at) continue;  // diverging (bottom) arm — no constraint
+        if (!isNullLit) {
+            haveNonNullValueArm = true;
+            if (!(at->kind == TypeRef::Kind::Primitive &&
+                  at->primitive == PrimitiveType::String && !at->nullable))
+                allNonNullValueArmsString = false;
+        }
+        // Fold every arm — INCLUDING a `null` arm's `Object?` placeholder — so
+        // value-type null-arm results keep their pre-#1952 typing (the string
+        // shape is overridden after the loop).
         if (!haveValueArm) {
             common = at;
             haveValueArm = true;
@@ -3601,17 +3607,20 @@ void ExprTC::typeCase(const ast::CaseExpr& cse, const ast::Expr& e) {
         }
         common = merged;
     }
-    // Record the common type (when there was a value-producing arm) so
-    // member access on the case result (`(case … end).M`) resolves. A bare
-    // `null` arm makes that common type nullable (§20). When every arm
-    // diverges, no type is recorded — the case produces no value. An all-`null`
-    // arm set keeps its prior placeholder type (`nullable Object`) rather than
-    // becoming untyped — the §20 "all-null has no type" error is a separate,
-    // pre-existing edge left unchanged here.
-    if (haveValueArm && common)
-        ctx_.setExprType(&e, sawNullArm ? nullableOf(common) : common);
-    else if (sawNullArm && nullArmTy)
-        ctx_.setExprType(&e, nullArmTy);
+    // #1952: a `string` value arm meeting a bare `null` arm has type `string?`
+    // (§20's null-arm rule). Record it directly, replacing the folded `Object?`.
+    if (sawNullArm && haveNonNullValueArm && allNonNullValueArmsString) {
+        TypeRef* strq = ctx_.makeTypeRef();
+        strq->kind = TypeRef::Kind::Primitive;
+        strq->primitive = PrimitiveType::String;
+        strq->nullable = true;
+        ctx_.setExprType(&e, strq);
+        return;
+    }
+    // Record the folded common type (when there was a value-producing arm) so
+    // member access on the case result (`(case … end).M`) resolves. When every
+    // arm diverges, no type is recorded — the case produces no value.
+    if (haveValueArm && common) ctx_.setExprType(&e, common);
 }
 
 // Slice S7: diagnose assignment to a readonly field outside the
