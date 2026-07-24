@@ -7181,6 +7181,14 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
             }
         }
     } else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(&m)) {
+        // #2168 / §23.1 / §28.6 (v0.226): an auto-property initializer writes
+        // the compiler-generated non-`owned` backing field. Apply the same
+        // fresh-owned producer rejection as an explicit non-`owned` field
+        // initializer, before the getter-body checks below. // per §23.1, §28.6
+        if (pd->autoInitializer) {
+            MethodOwnership mo(ctx);
+            mo.checkAutoPropertyInitializer(*pd);
+        }
         // #926 / §28.6 (v0.153): a property/indexer GETTER may not return a
         // freshly-produced owned value (a getter is a borrow-producing position).
         // This is the only ownership check run on accessors today — a NARROW

@@ -409,3 +409,64 @@ BEZEL_TEST(owned_field_assign,
         "end Holder;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ---- §23.1 / §28.6 / #2168: auto-property backing-field initializer -------
+//
+// An auto-property's generated backing field is ordinary non-`owned` storage
+// (§23.1). Therefore §28.6's fresh-value-to-borrow-field rejection applies at
+// this declaration site exactly as it does to an explicit non-`owned` field.
+// These controls pin the two valid alternatives: initialize the auto-property
+// later from an existing borrow, or put the fresh value in an explicit `owned`
+// field whose containing-object disposal cascade owns it (§28.5). // spec v0.226
+
+static bool hasAutoPropertyInitializerLeakError(
+        const bezel::test::OwnershipResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("freshly-produced owned value cannot initialize "
+                           "auto-property `Current`") != std::string::npos &&
+            d.message.find("§28.6") != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+// §23.1 / §28.6 (v0.226) REJECT: `new Widget()` is owned (§28.3 K1.5),
+// but Current's generated backing field has no owning marker or cascade.
+BEZEL_TEST(owned_field_assign,
+           fresh_new_auto_property_initializer_rejected_spec_23_1_28_6_2168) {
+    auto r = parseAndCheckOwnership(std::string("module M; "
+        "class Widget end Widget; "
+        "class Holder "
+        "  public readonly property Current: Widget := new Widget(); "
+        "end Holder;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasAutoPropertyInitializerLeakError(r));
+}
+
+// §23.1 / §28.3 / §28.6 (v0.226) ACCEPT: an initializer-less auto-property
+// remains valid. The constructor stores a caller-owned borrow in its backing
+// field; no fresh obligation is abandoned at the declaration site.
+BEZEL_TEST(owned_field_assign,
+           class_auto_property_without_initializer_accepted_spec_23_1_2168) {
+    auto r = parseAndCheckOwnership(std::string("module M; "
+        "class Widget end Widget; "
+        "class Holder "
+        "  public readonly property Current: Widget; "
+        "  public constructor(w: Widget) Current := w; end constructor; "
+        "end Holder;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §28.5 / §28.6 (v0.226) ACCEPT: the existing owning-storage pattern remains
+// the way to give a fresh field-initializer value a real owner. Holder's
+// generated disposal cascade owns and disposes Current.
+BEZEL_TEST(owned_field_assign,
+           fresh_new_owned_field_initializer_still_accepted_spec_28_5_2168) {
+    auto r = parseAndCheckOwnership(std::string("module M; "
+        "class Widget end Widget; "
+        "class Holder "
+        "  public owned Current: Widget := new Widget(); "
+        "end Holder;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

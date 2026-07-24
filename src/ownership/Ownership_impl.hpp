@@ -184,17 +184,15 @@ public:
     void scanGetterReturns(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
     void scanGetterReturnsStmt(const ast::Stmt* s);
 
-    // #1484 / §28.6: a field INITIALIZER (`f: T := E`) that stores a freshly-
-    // produced owned value (producerState == Owned) into a NON-`owned` (borrow)
-    // field is an error — the field does not own its referent, so the fresh value
-    // is left with no owner and leaks. This is the field-initializer counterpart
-    // of the constructor-body assignment reject (handleAssignment's
-    // targetIsNonOwnedField branch); the two positions enforce the identical
-    // §28.6 rule via the same producerState classifier and owned-modifier gate. A
-    // NARROW check only (not the full ownership pass), so a legal borrow
-    // initializer surfaces no other new diagnostics, and an `owned` field's fresh
-    // initializer stays accepted (§28.5). // per §28.6
+    // #1484 / #2168 / §23.1 / §28.6: declaration initializers that store a
+    // freshly-produced owned value (producerState == Owned) into NON-`owned`
+    // backing storage are errors — the value is left with no owner and leaks.
+    // checkFieldInitializer covers explicit fields and preserves the §28.5
+    // `owned`-field path. checkAutoPropertyInitializer covers an auto-property's
+    // generated backing field, which has no `owned` declaration form (§23.1).
+    // Both checks exempt static storage (§22.13), and are NARROW checks only.
     void checkFieldInitializer(const ast::FieldDecl& fd);
+    void checkAutoPropertyInitializer(const ast::PropertyDecl& pd);
 
     // §28.3 SB01-B (v0.190, #1919/#1926): the callee-side borrow-return
     // prohibition on a plain (non-`async`) `Task`-family return applies to

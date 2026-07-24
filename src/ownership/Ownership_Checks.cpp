@@ -7068,6 +7068,30 @@ void MethodOwnership::checkFieldInitializer(const ast::FieldDecl& fd) {
     }
 }
 
+// #2168 / §23.1 / §28.6 (v0.226): an auto-property initializer stores into the
+// compiler-generated backing field. That field has no `owned` marker or disposal
+// cascade, so a fresh owned producer would be abandoned exactly as in the
+// explicit non-`owned` field initializer rejected above. Reject rather than
+// silently invent ownership for an accessor whose read face is lend-only (A4).
+// Static auto-properties keep §22.13's process-lifetime storage exemption.
+void MethodOwnership::checkAutoPropertyInitializer(
+        const ast::PropertyDecl& pd) {
+    if (pd.bodyKind != ast::PropertyBodyKind::Auto || !pd.autoInitializer)
+        return;
+    for (std::string_view m : pd.modifiers)
+        if (m == "static") return;
+    if (producerState(*pd.autoInitializer) != OwnershipState::Owned) return;
+
+    report(Severity::Error, pd.autoInitializer->span.begin,
+           std::string("a freshly-produced owned value cannot initialize "
+                       "auto-property `") +
+               std::string(pd.name) +
+               "` — its generated backing field is non-`owned`, so the value "
+               "would leak; store the value in an explicit `owned` field whose "
+               "containing object disposes it (§28.5), or expose a factory method "
+               "returning `owned T` (§28.6)");
+}
+
 void MethodOwnership::scanGetterReturnsStmt(const ast::Stmt* s) {
     if (!s) return;
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
