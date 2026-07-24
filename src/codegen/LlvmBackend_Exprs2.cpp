@@ -196,14 +196,23 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
     // recognizes it) the consumer TRANSFERS. Both halves are required:
     // recognition WITHOUT the per-arm mint drops a borrow arm's reference (UAF);
     // the mint WITHOUT recognition still double-retains a producer arm (the leak
-    // — #1948). Only a non-nullable `string` result is affected; `string?` (both
-    // operands nullable) stays on its existing retain-free path.
+    // — #1948).
+    //
+    // fix #1952 (nullable sibling): the SAME normalization applies to a NULLABLE
+    // `string?` result (`primary ?? fallback` over two `string?` values). A null
+    // arm is a null `ptr` and bz_string_retain is a null no-op, so a borrow arm
+    // is minted to +1 and a null arm contributes null — the merged result is
+    // +1-or-null, discharged once by the consumer's null-guarded release.
+    // Recognizing the nullable `??` as a producer (isPlusOneStringProducer,
+    // #1952) MUST move in lockstep with lifting this gate: recognition without
+    // the nullable per-arm mint would let the consumer transfer an un-normalized
+    // borrow arm (a UAF). Both are lifted together here.
     const sema::TypeRef* coalResTy = ctx_.exprType(bin);
-    bool coalNonNullString =
-        coalResTy && !coalResTy->nullable &&
+    bool coalStringResult =
+        coalResTy &&
         coalResTy->kind == sema::TypeRef::Kind::Primitive &&
         coalResTy->primitive == sema::PrimitiveType::String;
-    if (coalNonNullString && l->getType()->isPointerTy() && bin.left &&
+    if (coalStringResult && l->getType()->isPointerTy() && bin.left &&
         !isPlusOneStringProducer(bin.left.get()) &&
         !returnedStringLocalOwnsPlusOne(bin.left.get()))
         emitStringRetain(l);
@@ -218,7 +227,7 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
     // flows to endBB), before the branch. Skipped when the RHS is itself a +1
     // producer / owning local (it already carries its single reference) or when
     // it diverged (never reaches endBB).
-    if (coalNonNullString && !rhsDiverged && r->getType()->isPointerTy() &&
+    if (coalStringResult && !rhsDiverged && r->getType()->isPointerTy() &&
         bin.right && !isPlusOneStringProducer(bin.right.get()) &&
         !returnedStringLocalOwnsPlusOne(bin.right.get()))
         emitStringRetain(r);
@@ -5421,10 +5430,20 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
             // this, a producer arm's +1 was double-counted by the consumer's
             // borrow-retain — the arm's original reference leaked (#1934); and
             // recognizing the case-expression as a producer WITHOUT this per-arm
-            // mint would drop a borrow arm's reference (a use-after-free). Only a
-            // non-nullable owned `string` result (a `ptr` value) is affected; a
-            // `string?` result stays on its existing (retain-free) path.
-            if (v && resultSemaTy && !resultSemaTy->nullable &&
+            // mint would drop a borrow arm's reference (a use-after-free).
+            //
+            // fix #1952 (nullable sibling): the SAME normalization applies to a
+            // NULLABLE owned `string?` result. A producer arm (`"a"+"b"`) mints
+            // +1 as before; the null arm's value is a null `ptr` and
+            // bz_string_retain is a null no-op, so a `_ => null` arm contributes
+            // null and the merged result is +1-or-null — discharged once by the
+            // consumer's null-guarded release. Recognizing the nullable case-expr
+            // as a producer (isPlusOneStringProducer, #1952) lets a `var s:
+            // string? := (case … => "a"+"b", …)` bind it as a producer local and
+            // release the +1 at scope end, closing the leak the `!nullable` gate
+            // left open. Every arm value here is a `ptr` (a reference-typed
+            // `string`/`string?`), so the ptr guard below is what scopes this.
+            if (v && resultSemaTy &&
                 resultSemaTy->kind == sema::TypeRef::Kind::Primitive &&
                 resultSemaTy->primitive == sema::PrimitiveType::String &&
                 v->getType()->isPointerTy() &&
@@ -5505,13 +5524,35 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
                 return v->getType()->isPointerTy() &&
                        llvm::isa<llvm::ConstantPointerNull>(v);
             };
-            // Check whether there is a mixed-type situation: at least one
-            // ptr-null arm AND at least one non-ptr arm.
+            // fix #1952 / §7.1 / §7.2 / §28.9: reconcile ONLY a genuine LLVM
+            // TYPE mismatch — a ptr-null arm alongside a NON-POINTER value arm
+            // (`1 => 100, _ => null`, where `100` is a bare i32 and `null` is a
+            // ptr). A NON-NULL POINTER arm (a class/`string` reference) shares
+            // the `ptr` type with the ptr-null arm, so a nullable REFERENCE
+            // result (`string?`, `Object?`, `C?`) needs NO wrapping — it is just
+            // a `ptr` whose null is a real null pointer. The prior classification
+            // set `hasNonPtr` for ANY non-null arm, so a `1 => "a"+"b", _ =>
+            // null` (result `string?`) was wrongly wrapped into a `{i8, ptr}`
+            // tagged struct — the tagged form nullable VALUE types use. That
+            // struct then escaped `isNullableValueTy(string?)==false`'s Path A,
+            // survived the plain-`var` (inferred-type) local path (which, unlike
+            // the declared-type path's unwrapNarrowedNullable, does not unwrap
+            // it), and left the minted arm string un-refcounted → a leak (#1952,
+            // inferred `var s := (case … _ => null)` shape). lowerConditional's
+            // Path B already gates on the genuine mismatch (`tv->getType() !=
+            // ev->getType()`) — the if-expression sibling was clean for exactly
+            // this reason; this brings the case/when path into line with it.
             bool hasNullPtr = false, hasNonPtr = false;
             llvm::Value* nonPtrSample = nullptr;
             for (auto& [v, bb] : incomings) {
                 if (isNullPtr(v)) { hasNullPtr = true; }
-                else              { hasNonPtr = true; nonPtrSample = v; }
+                else if (!v->getType()->isPointerTy()) {
+                    // A genuine non-pointer VALUE arm (bare scalar/struct) — the
+                    // only kind that needs the tagged {i8, T} reconciliation.
+                    hasNonPtr = true; nonPtrSample = v;
+                }
+                // else: a non-null POINTER arm — same `ptr` type as ptr-null,
+                // no wrapping needed (a nullable reference stays a bare ptr).
             }
             if (hasNullPtr && hasNonPtr && nonPtrSample) {
                 // Derive the nullable struct type from the non-ptr arm.
@@ -7252,9 +7293,15 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
     // required: recognition WITHOUT this per-branch mint would drop a borrow
     // branch's reference (a use-after-free); the mint WITHOUT recognition would
     // still let the consumer double-retain a producer branch (the leak — #1948).
-    // Only a non-nullable owned `string` result (a `ptr` value) is affected; a
-    // `string?` result stays on its existing (retain-free) path.
-    if (resultSemaType && !resultSemaType->nullable &&
+    //
+    // fix #1952 (nullable sibling): the SAME per-branch mint applies to a
+    // NULLABLE `string?` result (`(if c then "a"+"b" else null)`). A null branch
+    // is a null `ptr` and bz_string_retain is a null no-op, so it contributes
+    // null and the merged result is +1-or-null — discharged once by the
+    // consumer's null-guarded release. Recognizing the nullable if-expr as a
+    // producer (isPlusOneStringProducer, #1952) lets a `var s: string? := (if
+    // …)` bind + release it, closing the leak the `!nullable` gate left open.
+    if (resultSemaType &&
         resultSemaType->kind == sema::TypeRef::Kind::Primitive &&
         resultSemaType->primitive == sema::PrimitiveType::String) {
         if (tv && !thenDiv && tv->getType()->isPointerTy() &&

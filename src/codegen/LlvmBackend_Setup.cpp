@@ -10417,9 +10417,21 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // double-counted the arm's +1 and the arm's original reference leaked
     // (#1934). Recognized for the same non-nullable `string` result the per-arm
     // mint in lowerCaseExpr is keyed on, so the two decisions stay in lockstep.
+    // fix #1952 (extends #1934 to `string?`): the nullable sibling. A `case`/
+    // `when` (and the if-expression / `??` below) whose result is a NULLABLE
+    // owned `string` (`1 => "a"+"b", _ => null`) is a +1-or-null producer:
+    // lowerCaseExpr's arm normalization (extended to `string?`) mints EXACTLY +1
+    // on a producer arm and leaves the null arm null (bz_string_retain is a
+    // null/sentinel no-op), so the result carries one reference when non-null
+    // and none when null — discharged once by a null-guarded release. This is
+    // the SAME value shape a nullable `+`/interpolation already produces (the
+    // `+` row below never gated on nullable), so recognizing it identically is
+    // sound. Without it a `var s: string? := (case … => "a"+"b", …)` was neither
+    // classified a producer (this gate) nor a borrow (collectStringRelease
+    // Eligible's borrow branch rejects `string?`), so its +1 was never released.
     if (auto* ce = dynamic_cast<const ast::CaseExpr*>(init)) {
         const sema::TypeRef* rt = ctx_.exprType(*ce);
-        return rt && !rt->nullable &&
+        return rt &&
                rt->kind == sema::TypeRef::Kind::Primitive &&
                rt->primitive == sema::PrimitiveType::String;
     }
@@ -10434,9 +10446,11 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // one reference — the consumer (return / assign / bind) must TRANSFER it,
     // not mint a second borrow-retain. Same two coordinated halves as the
     // case/when result (#1934), the sibling §19.2 ties to the identical rule.
+    // (#1952 extends this to `string?` — the nullable if-expression sibling,
+    // same value shape / same soundness argument as the nullable case/when.)
     if (auto* cond = dynamic_cast<const ast::ConditionalExpr*>(init)) {
         const sema::TypeRef* rt = ctx_.exprType(*cond);
-        return rt && !rt->nullable &&
+        return rt &&
                rt->kind == sema::TypeRef::Kind::Primitive &&
                rt->primitive == sema::PrimitiveType::String;
     }
@@ -10451,9 +10465,12 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
         // ?? result carries exactly one reference the consumer TRANSFERS — the
         // same two-halves shape as the case/when result (#1934) and the
         // if-expression (above), the three forms §28.3 ties to one arm-meet.
+        // (#1952 extends this to `string?` — the nullable `??` sibling, e.g.
+        // `primary ?? fallback` over two `string?` values; same value shape /
+        // same soundness argument as the nullable case/when and if-expression.)
         if (bin->op == "??") {
             auto* rt = ctx_.exprType(*init);
-            return rt && !rt->nullable &&
+            return rt &&
                    rt->kind == sema::TypeRef::Kind::Primitive &&
                    rt->primitive == sema::PrimitiveType::String;
         }
