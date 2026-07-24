@@ -1372,6 +1372,24 @@ private:
     // source it already held). // per §28.3
     void collectRecordBorrowRoots(const ast::Expr& e, const sema::Symbol* self,
                                   std::vector<const sema::Symbol*>& srcs);
+    // §35.5 / §9.7 (v0.220, #2180): a case-arm payload BINDING of a borrow-
+    // bearing carrier (a borrow-bearing record / span / choice payload) is "a
+    // borrow whose source is the scrutinee's source" (§35.5 / §19.3). Such a
+    // binding is a pattern `BindingPattern`, NOT a `LocalDecl`, so
+    // collectRecordBorrowSource never records its provenance and the escape leg
+    // could not resolve its carried source. This pre-pass walks every case
+    // statement / expression (including control-flow-nested and arm-nested
+    // ones) and records `armBinding -> scrutineeRoot` into recordBorrowLocalSource_,
+    // so carriedEscapeBoundSourceLiveAt resolves the binding's source through the
+    // scrutinee's OWN carried provenance (the choice local's roots, collected by
+    // collectRecordBorrowSource). Runs after collectBorrowUses so the scrutinee
+    // provenance is already in place. // per §35.5, §9.7 (v0.220)
+    void collectCaseArmBorrowSources(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void collectCaseArmBorrowSourcesStmt(const ast::Stmt& s);
+    void collectCaseArmBorrowSourcesExpr(const ast::Expr& e);
+    void registerCaseArmBorrowSources(const std::vector<ast::CaseArm>& arms,
+                                      const ast::Expr* scrutinee);
     // §28.3 (v0.186, #1726): true when the borrow-bearing-record local `recLocal`
     // transitively carries a borrow of `consumed` — a DFS over
     // recordBorrowLocalSource_ following record-local roots to a binding root.
@@ -1589,6 +1607,18 @@ private:
     // likewise the string-backed spans `ReadOnlyStringSpan` /
     // `ReadOnlyAsciiByteSpan` (string is runtime-managed, §9.7). // per §30.1
     bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt) const;
+
+    // §35.4 / §9.7 (v0.220, #2180): true when `rt` is a BORROW-BEARING choice
+    // (its §35.4.2 classification — any case has a plain borrow-carrying payload
+    // field). §9.7 (v0.220): "Borrow-bearing choices are subject to every rule
+    // of this section, with 'record' read as 'record or choice' throughout" —
+    // including the closure-capture escape bullet. isBorrowBearingRecordOrSpan
+    // is false for a choice (a choice is not a record or a span view), so the
+    // capture-escape legs OR this in to cover the choice CARRIER axis. Wraps the
+    // shared classifier common::classifyChoiceType (the same §35.4 authority the
+    // sendability, disposal-codegen, and lint paths consult), so a value-like or
+    // owning choice is correctly NOT flagged here. // per §35.4, §9.7 (v0.220)
+    bool isBorrowBearingChoice(const sema::TypeRef* rt) const;
 
     // §30.1 (v0.179, #1438): an `async` method / async iterator may not declare
     // a parameter, result, or (for an async iterator) element type that is a

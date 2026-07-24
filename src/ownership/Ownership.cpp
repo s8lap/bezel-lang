@@ -109,6 +109,14 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // at each consume site (`move` / `owned`-arg / drop-on-overwrite). Runs once,
     // before the dataflow, so the query is stable across the fixpoint passes.
     collectBorrowUses(body);
+    // §35.5 / §9.7 (v0.220, #2180): record each case-arm payload BINDING's
+    // borrow source (the scrutinee's source, §35.5) into the same provenance
+    // map, so an escaping closure capturing an arm binding of borrow-bearing
+    // carrier type is diagnosed exactly as one capturing the scrutinee. Runs
+    // AFTER collectBorrowUses so a borrow-bearing-choice scrutinee local's own
+    // construction roots are already collected and the transitive resolution
+    // reaches the scope-bound source. // per §35.5, §9.7 (v0.220)
+    collectCaseArmBorrowSources(body);
     // §28.14 (v0.175, #808): scoped callback parameters. Record the enclosing
     // method's parameter symbols (distinguishes real captures from lambda-
     // internal params), then run the three syntactic pre-passes: call-site

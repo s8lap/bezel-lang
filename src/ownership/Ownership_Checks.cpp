@@ -2426,14 +2426,28 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e) {
             // the #1966 return-path gating; a NON-escaping capture never
             // reaches this check (it runs only on the return path), keeping
             // §9.7's "that escapes" qualifier exact. // per §9.7
+            //
+            // §35.4 / §9.7 (v0.220, #2180): "Borrow-bearing choices are subject
+            // to every rule of this section, with 'record' read as 'record or
+            // choice' throughout" — so a borrow-bearing CHOICE carrier (a choice
+            // local carrying a borrow, or a case-arm payload binding of borrow-
+            // bearing type, §35.5) is equally rejected here. capTy is OR'd with
+            // isBorrowBearingChoice; its carried source is resolved through the
+            // SAME recordBorrowLocalSource_ provenance (the choice local's
+            // construction roots via collectRecordBorrowSource, the arm
+            // binding's scrutinee source via collectCaseArmBorrowSources). The
+            // diagnostic forks on the carrier kind. // per §35.4, §9.7 (v0.220)
             {
                 const sema::TypeRef* capTy = nullptr;
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
                     capTy = ls->declType;
-                if (capTy && isBorrowBearingRecordOrSpan(capTy)) {
+                const bool capIsChoice = capTy && isBorrowBearingChoice(capTy);
+                if (capTy &&
+                    (isBorrowBearingRecordOrSpan(capTy) || capIsChoice)) {
                     if (sema::Symbol* src = carriedEscapeBoundSourceLiveAt(
                             sym, id->span.begin.offset)) {
-                        const bool capIsSpan = !isBorrowBearingRecord(capTy);
+                        const bool capIsSpan =
+                            !capIsChoice && !isBorrowBearingRecord(capTy);
                         if (isCatchBorrow(src)) {
                             report(
                                 Severity::Error, id->span.begin,
@@ -2448,6 +2462,20 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e) {
                                 "it (§9.7 / §31.1; copy the data you need out "
                                 "of it into an owned value the closure can "
                                 "capture instead)");
+                        } else if (capIsChoice) {
+                            report(
+                                Severity::Error, id->span.begin,
+                                std::string("returned closure captures `") +
+                                std::string(sym->name) +
+                                "`, a borrow-bearing choice carrying a borrow "
+                                "of `" + std::string(src->name) +
+                                "` whose source is disposed at scope end — a "
+                                "borrow-bearing choice may not be captured by a "
+                                "closure that escapes its source's scope (§9.7 "
+                                "closure-capture rule, with \"record\" read as "
+                                "\"record or choice\", §35.4; copy the data you "
+                                "need into an owned value the closure can "
+                                "capture, or keep the closure from escaping)");
                         } else if (capIsSpan) {
                             report(
                                 Severity::Error, id->span.begin,
@@ -3192,12 +3220,18 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
             // record-capturing closure exactly as one capturing the source
             // directly. A record whose sources all outlive the frame (a
             // param-backed span) resolves nothing and adds no constraint.
-            // // per §9.7, §28.9
+            // §35.4 / §9.7 (v0.220, #2180): a captured borrow-bearing CHOICE
+            // carrier (a choice local, or an arm-binding of borrow-bearing type)
+            // re-borrows its carried source the same way, so a lambda capturing
+            // it contributes that source and the existing store/return escape
+            // checks (the #861 outer-local store especially) fire with no
+            // further code. // per §9.7, §35.4, §28.9
             if (sym) {
                 const sema::TypeRef* capTy = nullptr;
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
                     capTy = ls->declType;
-                if (capTy && isBorrowBearingRecordOrSpan(capTy)) {
+                if (capTy && (isBorrowBearingRecordOrSpan(capTy) ||
+                              isBorrowBearingChoice(capTy))) {
                     if (sema::Symbol* src = carriedEscapeBoundSourceLiveAt(
                             sym, id->span.begin.offset))
                         return src;
@@ -3508,6 +3542,235 @@ void MethodOwnership::collectCatchBorrowsStmt(const ast::Stmt& s) {
 void MethodOwnership::collectCatchBorrows(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     for (const auto& s : body) if (s) collectCatchBorrowsStmt(*s);
+}
+
+// ---------------------------------------------------------------------------
+// §35.5 / §9.7 (v0.220, #2180) — case-arm payload-binding borrow provenance.
+//
+// §35.5: matching a choice value non-destructively is the default, and §19.3's
+// rule applies verbatim — "a pattern binding is a borrow whose source is the
+// scrutinee's source." A case-arm payload binding (`Got(var x)`, `Got(y)`) of
+// borrow-bearing carrier type therefore carries the SAME borrow the scrutinee
+// does; if the scrutinee is a borrow-bearing choice local over a scope-bound
+// source, so is the binding, and capturing the binding in an escaping closure
+// dangles (§9.7 closure bullet, read with "record" as "record or choice").
+//
+// The arm binding's LocalSymbol has a pattern `BindingPattern` (or the #1271
+// naked anchor) as its `decl`, NOT a `LocalDecl`, so collectRecordBorrowSource
+// never records it. This pre-pass records `armBinding -> scrutineeRoot` into the
+// same recordBorrowLocalSource_ provenance, so carriedEscapeBoundSourceLiveAt
+// resolves the binding's carried source transitively through the scrutinee's own
+// entry (the choice local's construction roots). Runs after collectBorrowUses so
+// the scrutinee's provenance is already collected. The walk is source-order over
+// statement / arm / positional-pattern vectors — no pointer-keyed iteration on a
+// decision path (#2116). // per §35.5, §19.3, §9.7 (v0.220)
+void MethodOwnership::registerCaseArmBorrowSources(
+    const std::vector<ast::CaseArm>& arms, const ast::Expr* scrutinee) {
+    if (!scrutinee) return;
+    // §35.5: the binding's source is the SCRUTINEE's source. Resolve the
+    // scrutinee to its root identifier symbol; the transitive DFS in
+    // carriedEscapeBoundSourceLiveAt then resolves that symbol's OWN carried
+    // provenance (a borrow-bearing choice local's roots). A non-identifier
+    // scrutinee (an owning-match temporary, a call result) carries no tracked
+    // local provenance and adds no constraint — sound: an escaping temporary
+    // source is caught by the no-temporary-source rules, not this one.
+    const ast::IdentifierExpr* sroot = identifierRoot(*scrutinee);
+    if (!sroot) return;
+    sema::Symbol* scrutSym = ctx_.exprSymbol(*sroot);
+    if (!scrutSym) return;
+    for (const ast::CaseArm& arm : arms) {
+        const auto* dp =
+            dynamic_cast<const ast::DestructuringPattern*>(arm.pattern.get());
+        if (!dp) continue;
+        for (const ast::PositionalPattern& sp : dp->subPatterns) {
+            // The binding's dynamic-cast-safe anchor Node (#1271): the naked
+            // binding's synthesized BindingPattern, or the explicit `var x`
+            // BindingPattern. A discard `_` / nested destructure binds nothing.
+            const ast::Node* anchor = nullptr;
+            if (!sp.nakedBinding.empty())
+                anchor = sp.nakedAnchor.get();
+            else if (auto* bp = dynamic_cast<const ast::BindingPattern*>(
+                         sp.pattern.get()))
+                anchor = bp;
+            if (!anchor) continue;
+            // Find the arm binding's LocalSymbol by its decl anchor (the same
+            // decl == node lookup findLocalSymbol / collectCatchBorrowsStmt use).
+            sema::LocalSymbol* bindSym = nullptr;
+            for (const auto& s : ctx_.symbols()) {
+                if (auto* ls = dynamic_cast<sema::LocalSymbol*>(s.get())) {
+                    if (ls->decl == anchor) { bindSym = ls; break; }
+                }
+            }
+            if (!bindSym) continue;
+            // Only a borrow-bearing carrier binding carries a borrow source
+            // (§35.5); a value / string / runtime-managed payload binding is a
+            // copy or shared reference with no lifetime constraint.
+            const sema::TypeRef* bt = bindSym->declType;
+            if (!bt || !(isBorrowBearingRecordOrSpan(bt) ||
+                         isBorrowBearingChoice(bt)))
+                continue;
+            // Window [anchor offset, MAX): every use of the binding is inside
+            // the arm body at an offset past the pattern; an arm binding is
+            // immutable, so no straight-line reassignment ever retires it.
+            const std::uint32_t from = anchor->span.begin.offset;
+            std::vector<RecordBorrowSource>& entries =
+                recordBorrowLocalSource_[bindSym];
+            entries.push_back({scrutSym, from, UINT32_MAX});
+        }
+    }
+}
+
+void MethodOwnership::collectCaseArmBorrowSourcesExpr(const ast::Expr& e) {
+    if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        registerCaseArmBorrowSources(cx->arms, cx->scrutinee.get());
+        if (cx->scrutinee) collectCaseArmBorrowSourcesExpr(*cx->scrutinee);
+        for (const auto& arm : cx->arms) {
+            if (arm.guard) collectCaseArmBorrowSourcesExpr(*arm.guard);
+            if (arm.exprBody) collectCaseArmBorrowSourcesExpr(*arm.exprBody);
+            for (const auto& bs : arm.stmts)
+                if (bs) collectCaseArmBorrowSourcesStmt(*bs);
+        }
+        return;
+    }
+    // Descend the compound expression forms a CaseExpr can nest inside. Lambda
+    // bodies are intentionally NOT descended: a case inside a closure binds a
+    // closure-scoped arm binding over a closure-scoped scrutinee, not a method-
+    // scope obligation this method's escape check governs (mirrors
+    // collectLocalDepths). // per §35.5
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) collectCaseArmBorrowSourcesExpr(*ma->target);
+    } else if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (nm->target) collectCaseArmBorrowSourcesExpr(*nm->target);
+    } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (ce->callee) collectCaseArmBorrowSourcesExpr(*ce->callee);
+        for (const auto& a : ce->args)
+            if (a.value) collectCaseArmBorrowSourcesExpr(*a.value);
+    } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        if (nc->callee) collectCaseArmBorrowSourcesExpr(*nc->callee);
+        for (const auto& a : nc->args)
+            if (a.value) collectCaseArmBorrowSourcesExpr(*a.value);
+    } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target) collectCaseArmBorrowSourcesExpr(*ix->target);
+        for (const auto& a : ix->indices)
+            if (a.value) collectCaseArmBorrowSourcesExpr(*a.value);
+    } else if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left) collectCaseArmBorrowSourcesExpr(*be->left);
+        if (be->right) collectCaseArmBorrowSourcesExpr(*be->right);
+    } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (un->operand) collectCaseArmBorrowSourcesExpr(*un->operand);
+    } else if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand) collectCaseArmBorrowSourcesExpr(*pb->operand);
+    } else if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->operand) collectCaseArmBorrowSourcesExpr(*tt->operand);
+    } else if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (cd->condition) collectCaseArmBorrowSourcesExpr(*cd->condition);
+        if (cd->thenValue) collectCaseArmBorrowSourcesExpr(*cd->thenValue);
+        if (cd->elseValue) collectCaseArmBorrowSourcesExpr(*cd->elseValue);
+    } else if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        for (const auto& a : ne->args)
+            if (a.value) collectCaseArmBorrowSourcesExpr(*a.value);
+    } else if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        if (th->operand) collectCaseArmBorrowSourcesExpr(*th->operand);
+    } else if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
+        for (const auto& cl : bx->clauses)
+            if (cl && cl->initializer)
+                collectCaseArmBorrowSourcesExpr(*cl->initializer);
+        if (bx->body) collectCaseArmBorrowSourcesExpr(*bx->body);
+    }
+}
+
+void MethodOwnership::collectCaseArmBorrowSourcesStmt(const ast::Stmt& s) {
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        registerCaseArmBorrowSources(cs->arms, cs->scrutinee.get());
+        if (cs->scrutinee) collectCaseArmBorrowSourcesExpr(*cs->scrutinee);
+        for (const auto& arm : cs->arms) {
+            if (arm.guard) collectCaseArmBorrowSourcesExpr(*arm.guard);
+            if (arm.exprBody) collectCaseArmBorrowSourcesExpr(*arm.exprBody);
+            for (const auto& bs : arm.stmts)
+                if (bs) collectCaseArmBorrowSourcesStmt(*bs);
+        }
+        return;
+    }
+    // Recurse into the control-flow forms (mirrors collectCatchBorrowsStmt's
+    // coverage) so a case nested under an if / loop / do-end / try / arm body
+    // is reached; also scan the statements' own expressions for embedded case
+    // expressions.
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) collectCaseArmBorrowSourcesExpr(*es->expr);
+        return;
+    }
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer) collectCaseArmBorrowSourcesExpr(*ld->initializer);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->value) collectCaseArmBorrowSourcesExpr(*as->value);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) collectCaseArmBorrowSourcesExpr(*rs->value);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) collectCaseArmBorrowSourcesExpr(*ds->value);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (ts->value) collectCaseArmBorrowSourcesExpr(*ts->value);
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) collectCaseArmBorrowSourcesExpr(*ys->value);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition)
+            collectCaseArmBorrowSourcesExpr(*ifs->ifBranch.condition);
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) collectCaseArmBorrowSourcesStmt(*bs);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition) collectCaseArmBorrowSourcesExpr(*el.condition);
+            for (const auto& bs : el.body)
+                if (bs) collectCaseArmBorrowSourcesStmt(*bs);
+        }
+        for (const auto& bs : ifs->elseBody)
+            if (bs) collectCaseArmBorrowSourcesStmt(*bs);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition) collectCaseArmBorrowSourcesExpr(*ws->condition);
+        for (const auto& bs : ws->body)
+            if (bs) collectCaseArmBorrowSourcesStmt(*bs);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable) collectCaseArmBorrowSourcesExpr(*fs->iterable);
+        if (fs->withExpr) collectCaseArmBorrowSourcesExpr(*fs->withExpr);
+        for (const auto& bs : fs->body)
+            if (bs) collectCaseArmBorrowSourcesStmt(*bs);
+        return;
+    }
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : dob->body)
+            if (bs) collectCaseArmBorrowSourcesStmt(*bs);
+        return;
+    }
+    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : trys->body)
+            if (bs) collectCaseArmBorrowSourcesStmt(*bs);
+        for (const auto& arm : trys->catches) {
+            if (arm.guard) collectCaseArmBorrowSourcesExpr(*arm.guard);
+            if (arm.body) collectCaseArmBorrowSourcesStmt(*arm.body);
+        }
+        for (const auto& bs : trys->finallyBody)
+            if (bs) collectCaseArmBorrowSourcesStmt(*bs);
+        return;
+    }
+}
+
+void MethodOwnership::collectCaseArmBorrowSources(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    for (const auto& s : body) if (s) collectCaseArmBorrowSourcesStmt(*s);
 }
 
 // §28.3 / §28.9 (#861): record each LocalDecl's block-nesting depth. The method
@@ -4973,6 +5236,18 @@ void MethodOwnership::collectRecordBorrowRoots(
         // freeze protects, so it never matches a consumed binding.
         for (const ast::CallArgument& a : ne->args)
             if (a.value) addRoot(*a.value);
+    } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e);
+               ce && ce->callee &&
+               dynamic_cast<sema::ChoiceCaseSymbol*>(
+                   ctx_.exprSymbol(*ce->callee))) {
+        // §35.4 / §9.7 (v0.220, #2180): a borrow-bearing CHOICE construction
+        // `Box.Got(hh)` carries a borrow from each borrow-carrying payload
+        // argument, exactly like `new Rec(...)`. The callee resolves to a
+        // ChoiceCaseSymbol; record every payload-arg root (identifierRoot of
+        // the whole `Box.Got(hh)` CallExpr would wrongly resolve to the choice
+        // type `Box`, not `hh`, so the arg-walk is required). // per §35.4
+        for (const ast::CallArgument& a : ce->args)
+            if (a.value) addRoot(*a.value);
     } else {
         addRoot(e);
     }
@@ -4986,7 +5261,12 @@ void MethodOwnership::collectRecordBorrowSource(const ast::LocalDecl& ld) {
     // states_-based source tracking.
     if (!ld.initializer) return;
     const sema::TypeRef* rt = ctx_.exprType(*ld.initializer);
-    if (!isBorrowBearingRecordOrSpan(rt)) return;
+    // §35.4 / §9.7 (v0.220, #2180): a borrow-bearing CHOICE local (`var b :=
+    // Box.Got(hh);`) equally "counts as a live local borrow of every carried
+    // borrow's source" (§35.4, applying §9.7's rules with "record" read as
+    // "record or choice"), so collect its construction roots into the same
+    // provenance map. // per §35.4, §9.7 (v0.220)
+    if (!isBorrowBearingRecordOrSpan(rt) && !isBorrowBearingChoice(rt)) return;
     sema::LocalSymbol* lsym = findLocalSymbol(ld);
     if (!lsym) return;
     std::vector<const sema::Symbol*> srcs;
@@ -9209,6 +9489,16 @@ bool MethodOwnership::isBorrowBearingRecordOrSpan(const sema::TypeRef* rt) const
         n == "ArraySpan" || n == "ReadOnlyArraySpan")
         return true;
     return isBorrowBearingRecord(rt);
+}
+
+// §35.4 / §9.7 (v0.220, #2180): a BORROW-BEARING choice — §35.4.2 classification.
+// The single §35.4 authority is common::classifyChoiceType (shared with the
+// sendability / disposal-codegen / lint paths); a null type, a non-choice type,
+// or a value-like / owning choice is correctly NOT flagged. // per §35.4, §9.7
+bool MethodOwnership::isBorrowBearingChoice(const sema::TypeRef* rt) const {
+    if (!rt) return false;
+    auto cls = common::classifyChoiceType(rt, ctx_);
+    return cls && *cls == common::ChoiceClassification::BorrowBearing;
 }
 
 void MethodOwnership::checkAsyncSignatureBorrowBearing(
