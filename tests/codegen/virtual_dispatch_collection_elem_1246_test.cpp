@@ -139,6 +139,15 @@ BEZEL_TEST(virtual_dispatch_collection_elem_1246,
 // §14.2 / §12 (#1246): same bug exists for the borrowing `Array<T>`.
 // `Run<T>(arr: Array<T>)` with T=B, elements are D instances. Before the
 // fix: 0. After: D.V()=5 twice → 10.
+// §15.4/§28.11: a borrowing collection holds a borrow of a live local, not a
+// fresh temp. The two D instances are bound to `using var` locals declared
+// before the borrowing array `a`, then added as borrows; `a` (inner in
+// declaration order) is disposed first and never outlives d0/d1, so the elements
+// stay live through `G.Run(a)`'s iteration. The original added fresh `new D()`
+// temporaries, which post-#1881 are disposed at the end of each Add statement —
+// the `for var x in arr do ... x.V()` then dereferenced freed D objects (a
+// heap-use-after-free). Intent (virtual dispatch to D.V() on a borrowing
+// Array<T> element) and the `== 10` (5 twice) are both preserved.
 BEZEL_TEST(virtual_dispatch_collection_elem_1246,
            forin_array_class_constraint_spec_12_14_2) {
     BEZEL_EXPECT_EQ(run(
@@ -156,8 +165,9 @@ BEZEL_TEST(virtual_dispatch_collection_elem_1246,
         "  end Run; "
         "end G; "
         "class C public static method Main(): int "
+        "  using var d0 := new D(); using var d1 := new D(); "
         "  using var a := new Array<B>(); "
-        "  a.Add(new D()); a.Add(new D()); "
+        "  a.Add(d0); a.Add(d1); "   // borrows of live locals (§15.4/§28.11)
         "  return G.Run(a); "   // D.V()=5 twice → 10
         "end Main; end C;"), 10);
 }

@@ -125,17 +125,32 @@ BEZEL_TEST(owned_coll_dispose_4_5, owning_array_drain_disposes_each) {
         "return R._n;"), 2);
 }
 
-// stdlib §4.5: a borrowing Array<T>.Dispose() releases the backing storage but
-// does NOT dispose the elements (they are borrows owned elsewhere). The
-// `using var` scope-end frees the array without touching the elements → 0.
+// stdlib §4.5 / §28.11: a borrowing Array<T>.Dispose() releases the backing
+// storage but does NOT dispose the elements (they are borrows owned elsewhere).
+// The elements are two `using var` R locals bound in the OUTER scope; the array
+// holds a BORROW of each (§15.4/§28.11: a borrowing collection holds a borrow of
+// a live local, not a fresh temp — the array is inner-scoped, so it never
+// outlives the borrowed sources, satisfying §28.11's store rule). When the inner
+// `do` block ends, the array is disposed while r0/r1 are still alive; a borrowing
+// array skips its elements, so R._n is STILL 0 at the return — proving the array
+// disposed nothing. (r0/r1 dispose later, at Main's scope end, after the return
+// value is computed.) The original added fresh `new R()` temporaries to the
+// borrowing array; post-#1881 those are disposed at the end of each Add statement
+// (destructors run → R._n == 2, and a subsequent read would be a use-after-free),
+// so the `== 0` no longer meant "disposal skipped the elements" — it meant "the
+// leak masked the disposal". This rewrite restores the original property (== 0
+// because the borrowing array skips its live borrowed elements) without weakening
+// the assertion.
 BEZEL_TEST(owned_coll_dispose_4_5, borrowing_array_dispose_skips_elements) {
     BEZEL_EXPECT_EQ(runResource(
+        "using var r0 := new R(); "
+        "using var r1 := new R(); "
         "do "
         "  using var a := new Array<R>(); "
-        "  a.Add(new R()); "
-        "  a.Add(new R()); "
-        "end; "
-        "return R._n;"), 0);
+        "  a.Add(r0); "
+        "  a.Add(r1); "
+        "end; "                 // array disposed here — borrowing → elements untouched
+        "return R._n;"), 0);    // borrowed r0/r1 still alive → 0
 }
 
 // Safety: a null element must be skipped (no use-after-free / null deref).

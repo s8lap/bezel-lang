@@ -127,12 +127,21 @@ BEZEL_TEST(static_iface_dispatch_807, sum_two_instantiations) {
 BEZEL_TEST(static_iface_dispatch_807, sum_user_meters_value) {
     // per §11.8: T.Zero() and `total + x` lower to DIRECT calls of
     // Meters.Zero / Meters.operator+ at the T=Meters instantiation.
+    // §15.4/§28.11: a borrowing collection holds a borrow of a live local, not a
+    // fresh temp. The three Meters are bound to `using var` locals declared before
+    // the borrowing `Array<Meters>` and added as borrows, so they stay live while
+    // F.Sum iterates and evaluates `total + x` (Meters.operator+ reads each). The
+    // original added fresh `new Meters(..)` temporaries, which post-#1881 are
+    // disposed at the end of each Add statement — F.Sum then dereferenced freed
+    // Meters in `total + x` (a heap-use-after-free). Intent (static-interface
+    // dispatch through T=Meters) and the `== 42` (10+13+19) are both preserved.
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kMeters + kSum +
         "class C public static method Main(): int "
+        "  using var m0 := new Meters(10); using var m1 := new Meters(13); "
+        "  using var m2 := new Meters(19); "
         "  using var xs := new Array<Meters>(); "
-        "  xs.Add(new Meters(10)); xs.Add(new Meters(13)); "
-        "  xs.Add(new Meters(19)); "
+        "  xs.Add(m0); xs.Add(m1); xs.Add(m2); "   // borrows of live locals
         "  var t := F.Sum(xs); "
         "  return t.Value; "
         "end Main; end C;"), 42);

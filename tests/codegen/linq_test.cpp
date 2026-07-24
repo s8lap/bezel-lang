@@ -99,9 +99,19 @@ BEZEL_TEST(linq, max_class_icomparable_1194) {
         "  public constructor(a: int) amount := a; end constructor; "
         "  public method CompareTo(other: Money): int => amount - other.amount; "
         "end Money; "
+        // §15.4/§28.11: a borrowing collection holds a borrow of a live local,
+        // not a fresh temp. The three Money are bound to `using var` locals
+        // declared before the borrowing Array<Money> and added as borrows, so
+        // Max()/Min() (which dispatch through Money.CompareTo and return a borrow
+        // of the receiver's element, §28.3) read live Money. The original added
+        // fresh `new Money(..)` temporaries, disposed post-#1881 at each Add's end
+        // — CompareTo then dereferenced freed Money (heap-use-after-free). The
+        // dispatch intent and the `mx.amount = 9 and mn.amount = 3` are preserved.
         "class C public static method Main(): int "
+        "  using var m0 := new Money(3); using var m1 := new Money(9); "
+        "  using var m2 := new Money(5); "
         "  using var a := new Array<Money>(); "
-        "  a.Add(new Money(3)); a.Add(new Money(9)); a.Add(new Money(5)); "
+        "  a.Add(m0); a.Add(m1); a.Add(m2); "   // borrows of live locals
         "  var mx := a.Max(); var mn := a.Min(); "
         "  return int(mx.amount = 9 and mn.amount = 3); "
         "end Main; end C;"), 1);
@@ -175,6 +185,13 @@ BEZEL_TEST(linq, min_max_non_icomparable_class_rejected_1198) {
 // stdlib §5.1 / §14.2 (#1198): anti-over-reject — a class element with a
 // selector lambda is accepted regardless of IComparable (the selector returns
 // a concrete numeric T, satisfying the `where U: IComparable<U>` form).
+// §15.4/§28.11: a borrowing collection holds a borrow of a live local, not a
+// fresh temp. The three Box are bound to `using var` locals declared before the
+// borrowing Array<Box> and added as borrows, so the selector `b.val` reads live
+// Box during Max()/Min(). The original added fresh `new Box(..)` temporaries,
+// disposed post-#1881 at each Add's end — the selector then dereferenced freed
+// Box (heap-use-after-free). The anti-over-reject intent and the `mx = 9 and
+// mn = 3` are preserved.
 BEZEL_TEST(linq, min_max_selector_non_icomparable_accepted_1198) {
     BEZEL_EXPECT_EQ(run(
         "module M; import System.Collections.Generic; "
@@ -183,8 +200,10 @@ BEZEL_TEST(linq, min_max_selector_non_icomparable_accepted_1198) {
         "  public constructor(v: int) val := v; end constructor; "
         "end Box; "
         "class C public static method Main(): int "
+        "  using var b0 := new Box(3); using var b1 := new Box(9); "
+        "  using var b2 := new Box(5); "
         "  using var a := new Array<Box>(); "
-        "  a.Add(new Box(3)); a.Add(new Box(9)); a.Add(new Box(5)); "
+        "  a.Add(b0); a.Add(b1); a.Add(b2); "   // borrows of live locals
         "  var mx := a.Max(lambda(b) => b.val); "
         "  var mn := a.Min(lambda(b) => b.val); "
         "  return int(mx = 9 and mn = 3); "

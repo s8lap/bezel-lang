@@ -422,6 +422,18 @@ BEZEL_TEST(array_reversed_sorted_472, ownedarray_sorted_rejected_spec_3) {
 //
 // Box wraps a single int; CompareTo orders by the wrapped value.
 // Spec: §14.2 (IComparable), stdlib §3 (Array.Sort/Sorted), #1195.
+//
+// §15.4/§28.11: a borrowing collection holds a borrow of a live local, not a
+// fresh temp. Each Box is bound to a `using var` local declared before the
+// borrowing Array<Box> and added as a borrow, so it stays live through Sort()/
+// Sorted() and the Get(i).v reads. The originals added fresh `new Box(..)`
+// temporaries, which post-#1881 are disposed at the end of each Add statement —
+// Sort's CompareTo (and the later Get(i).v) then dereferenced freed Box
+// (use-after-free; under the JIT harness a corrupted-value read). Sorted()
+// returns a fresh borrowing Array<Box> holding the SAME element borrows
+// (stdlib §4.4), so the sorted copy also reads the live Boxes; disposing the
+// copy is a no-op that never touches them. Each rewrite preserves the sort/
+// copy intent and the exact expected value.
 // ===========================================================================
 
 namespace {
@@ -446,8 +458,10 @@ std::string boxMain1195(const std::string& body) {
 //       = 10*49 + 20*7 + 30 = 490+140+30 = 660.
 BEZEL_TEST(array_reversed_sorted_472, sort_noarg_class_icomparable_inplace_1195) {
     BEZEL_EXPECT_EQ(run(boxMain1195(
+        "  using var b0 := new Box(30); using var b1 := new Box(10); "
+        "  using var b2 := new Box(20); "
         "  using var a := new Array<Box>(); "
-        "  a.Add(new Box(30)); a.Add(new Box(10)); a.Add(new Box(20)); "
+        "  a.Add(b0); a.Add(b1); a.Add(b2); "
         "  a.Sort(); "
         "  return a.Get(0).v * 49 + a.Get(1).v * 7 + a.Get(2).v;")), 660);
 }
@@ -456,8 +470,10 @@ BEZEL_TEST(array_reversed_sorted_472, sort_noarg_class_icomparable_inplace_1195)
 // [Box(5),Box(1),Box(3)] → [Box(1),Box(3),Box(5)]: 1*49+3*7+5 = 75.
 BEZEL_TEST(array_reversed_sorted_472, sort_noarg_class_icomparable_ascending_1195) {
     BEZEL_EXPECT_EQ(run(boxMain1195(
+        "  using var b0 := new Box(5); using var b1 := new Box(1); "
+        "  using var b2 := new Box(3); "
         "  using var a := new Array<Box>(); "
-        "  a.Add(new Box(5)); a.Add(new Box(1)); a.Add(new Box(3)); "
+        "  a.Add(b0); a.Add(b1); a.Add(b2); "
         "  a.Sort(); "
         "  return a.Get(0).v * 49 + a.Get(1).v * 7 + a.Get(2).v;")), 75);
 }
@@ -468,8 +484,10 @@ BEZEL_TEST(array_reversed_sorted_472, sort_noarg_class_icomparable_ascending_119
 // Use simpler encoding: sorted copy Get(0).v = 10.
 BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_class_icomparable_copy_1195) {
     BEZEL_EXPECT_EQ(run(boxMain1195(
+        "  using var b0 := new Box(30); using var b1 := new Box(10); "
+        "  using var b2 := new Box(20); "
         "  using var a := new Array<Box>(); "
-        "  a.Add(new Box(30)); a.Add(new Box(10)); a.Add(new Box(20)); "
+        "  a.Add(b0); a.Add(b1); a.Add(b2); "
         "  using var s := a.Sorted(); "
         "  return s.Get(0).v;")), 10);
 }
@@ -477,8 +495,10 @@ BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_class_icomparable_copy_1195) 
 // §14.2 / #1195: Sorted() original array unchanged — first element stays Box(30).
 BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_class_icomparable_original_unchanged_1195) {
     BEZEL_EXPECT_EQ(run(boxMain1195(
+        "  using var b0 := new Box(30); using var b1 := new Box(10); "
+        "  using var b2 := new Box(20); "
         "  using var a := new Array<Box>(); "
-        "  a.Add(new Box(30)); a.Add(new Box(10)); a.Add(new Box(20)); "
+        "  a.Add(b0); a.Add(b1); a.Add(b2); "
         "  using var s := a.Sorted(); "
         "  return a.Get(0).v;")), 30);
 }
@@ -487,8 +507,10 @@ BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_class_icomparable_original_un
 // sorted → [Box(10),Box(20),Box(30)]: 10*49 + 20*7 + 30 = 660.
 BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_class_icomparable_order_1195) {
     BEZEL_EXPECT_EQ(run(boxMain1195(
+        "  using var b0 := new Box(30); using var b1 := new Box(10); "
+        "  using var b2 := new Box(20); "
         "  using var a := new Array<Box>(); "
-        "  a.Add(new Box(30)); a.Add(new Box(10)); a.Add(new Box(20)); "
+        "  a.Add(b0); a.Add(b1); a.Add(b2); "
         "  using var s := a.Sorted(); "
         "  return s.Get(0).v * 49 + s.Get(1).v * 7 + s.Get(2).v;")), 660);
 }
