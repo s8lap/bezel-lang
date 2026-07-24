@@ -6404,8 +6404,18 @@ private:
     // because a Set frees via bz_dict_free, not bz_array_free).
     std::unordered_set<const void*> setLiteralFreeEligible_;
     llvm::Function* setLiteralFreeEligibleFn_ = nullptr;
+    // #2143 / §28.9 / §28.11: the Dictionary<K,V> LITERAL analog of
+    // borrowingArrayFreeEligible_ — plain `var d: Dictionary<K,V> := [k:v, …]`
+    // (or the empty `[]` literal targeting a Dictionary) locals that the
+    // type-agnostic escape walk proves never escape. Distinct from
+    // dictMaterializerFreeEligible_ (ToDictionary()-call results): this set is
+    // for the LITERAL initializer form, which has no reclaim path at all today
+    // (#2143) — the materializer path already reclaims via the sibling set.
+    std::unordered_set<const void*> dictLiteralFreeEligible_;
+    llvm::Function* dictLiteralFreeEligibleFn_ = nullptr;
     // Compute borrowingArrayFreeEligible_ (and #1930 groupingFreeEligible_, #2142
-    // setLiteralFreeEligible_) for a block body (see the .cpp).
+    // setLiteralFreeEligible_, #2143 dictLiteralFreeEligible_) for a block body
+    // (see the .cpp).
     void collectBorrowingArrayFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     // #1930 / stdlib §5 / §28.9: true if `ld` is a plain `var g := <expr>` whose
@@ -6429,6 +6439,14 @@ private:
     // bz_dict_free — the §28.9 "reclaimed with the instance" mechanism, mirrored
     // from isBorrowingArrayLiteralLocal.
     bool isBorrowingSetLiteralLocal(const ast::LocalDecl* ld) const;
+    // #2143 / §28.9 / §28.11: true if `ld` is a plain `var d: Dictionary<K,V> :=
+    // [k:v, …]` (or the empty `[]` literal targeting a Dictionary) — a borrowing
+    // `Dictionary<K,V>` local (name-head exactly "Dictionary", not
+    // "OwningDictionary" — that family owns its values and requires `using`,
+    // already handled by registerUsingDisposal) initialised by a collection
+    // literal. Such a literal's backing (a bz_dict_t*) is reclaimed at scope end
+    // via a single bz_dict_free, mirroring isBorrowingArrayLiteralLocal.
+    bool isBorrowingDictLiteralLocal(const ast::LocalDecl* ld) const;
     // #1871 / §28.9 / §28.11: collect the `var v: IEnumerable<T> := <arrLd>` VIEW
     // locals in `body` that are proven never to escape — a binding of the array
     // into such a borrowing view does not extend the backing's lifetime, so it

@@ -878,27 +878,29 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         collectDefinitelyEscapingLambdas(*ci.stmts);
         // Must run AFTER collectClosureReleaseEligible (uses its result).
         collectCellFreeEligible(*ci.stmts);
-        // fix #2132 / #2142 / #1871 / #1003 / #1028 / #1930 / §28.9 / §28.11:
-        // the scope-end reclaim of a plain `var` borrowing-`Array<T>` /
-        // `Set<T>` LITERAL (its backing is "reclaimed with the instance"), of a
-        // `var` fresh borrowing-array / dict / grouping MATERIALIZER, must be
-        // re-established for the RESUME fn too — the registration sites in
-        // lowerLocalDecl gate on `currentFn_ == borrowingArrayFreeEligibleFn_`
-        // (and the dict/grouping/set-literal analogues), but the async body
-        // lowers with currentFn_ == resumeFn while emitFunctionBody pinned
-        // these to the ENTRY fn (Setup.cpp), so every such reclaim was silently
-        // skipped and the backing leaked across the async return edge (the
-        // #2132 drop-after-await leak: `var xs := [ … ]; await …;` — the array
-        // is spilled/restored fine now, but never freed; #2142 found the
-        // Set-literal shape leaked in BOTH sync and async — it was never
+        // fix #2132 / #2142 / #2143 / #1871 / #1003 / #1028 / #1930 / §28.9 /
+        // §28.11: the scope-end reclaim of a plain `var` borrowing-`Array<T>` /
+        // `Set<T>` / `Dictionary<K,V>` LITERAL (its backing is "reclaimed with
+        // the instance"), of a `var` fresh borrowing-array / dict / grouping
+        // MATERIALIZER, must be re-established for the RESUME fn too — the
+        // registration sites in lowerLocalDecl gate on `currentFn_ ==
+        // borrowingArrayFreeEligibleFn_` (and the dict/grouping/set-literal/
+        // dict-literal analogues), but the async body lowers with currentFn_ ==
+        // resumeFn while emitFunctionBody pinned these to the ENTRY fn
+        // (Setup.cpp), so every such reclaim was silently skipped and the
+        // backing leaked across the async return edge (the #2132 drop-after-
+        // await leak: `var xs := [ … ]; await …;` — the array is spilled/
+        // restored fine now, but never freed; #2142/#2143 found the Set/Dict
+        // literal shapes leaked in BOTH sync and async — they were never
         // registered in ANY eligibility set, entry or resume). One call
-        // populates all four sets; re-pin all four fn keys to resumeFn. Mirrors
+        // populates all five sets; re-pin all five fn keys to resumeFn. Mirrors
         // the closure/unwind/cell re-establishment above. // per §28.9, §28.11
         collectBorrowingArrayFreeEligible(*ci.stmts);
         borrowingArrayFreeEligibleFn_ = resumeFn;
         dictMaterializerFreeEligibleFn_ = resumeFn;
         groupingFreeEligibleFn_ = resumeFn;
         setLiteralFreeEligibleFn_ = resumeFn;   // #2142
+        dictLiteralFreeEligibleFn_ = resumeFn;  // #2143
         // §30.9 / §31.2 (#438): start with no pending handler-context spill slots;
         // lowerTry registers them as it lowers any in-handler await.
         asyncHandlerSpillSlots_.clear();
@@ -1284,14 +1286,14 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             closureReleaseEligible_.clear();
         }
         closureReleaseEligibleFn_ = resumeFn;
-        // fix #2132 / #2142 / #1871 / §28.9 / §28.11: re-establish the
-        // borrowing-`Array<T>` / `Set<T>` literal / materializer scope-end
-        // reclaim eligibility for the async LAMBDA's resume fn too (see
-        // emitAsyncMethod's mirror). Without it a `var xs: Array<T> := [ … ]`
-        // in an async lambda body held across an await is spilled/restored
-        // (the smAllocaToField_ fix) but never FREED on the lambda's async
-        // return edge — its backing leaks. Expression-bodied lambdas have no
-        // stmts (and no such local); clear the (enclosing method's) set so
+        // fix #2132 / #2142 / #2143 / #1871 / §28.9 / §28.11: re-establish the
+        // borrowing-`Array<T>` / `Set<T>` / `Dictionary<K,V>` literal /
+        // materializer scope-end reclaim eligibility for the async LAMBDA's
+        // resume fn too (see emitAsyncMethod's mirror). Without it a
+        // `var xs: Array<T> := [ … ]` in an async lambda body held across an await
+        // is spilled/restored (the smAllocaToField_ fix) but never FREED on the
+        // lambda's async return edge — its backing leaks. Expression-bodied lambdas
+        // have no stmts (and no such local); clear the (enclosing method's) set so
         // its entries cannot misapply under this resume fn's key.
         if (!lam.exprBody)
             collectBorrowingArrayFreeEligible(lam.stmts);
@@ -1300,11 +1302,13 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             dictMaterializerFreeEligible_.clear();
             groupingFreeEligible_.clear();
             setLiteralFreeEligible_.clear();   // #2142
+            dictLiteralFreeEligible_.clear();  // #2143
         }
         borrowingArrayFreeEligibleFn_ = resumeFn;
         dictMaterializerFreeEligibleFn_ = resumeFn;
         groupingFreeEligibleFn_ = resumeFn;
         setLiteralFreeEligibleFn_ = resumeFn;   // #2142
+        dictLiteralFreeEligibleFn_ = resumeFn;  // #2143
         // CRITICAL (nested lambda): the await spill/restore loop iterates
         // smAllocaToField_, mapping a suspend-local's alloca → its frame field.
         // An ENCLOSING async method's resume populated this with ITS allocas

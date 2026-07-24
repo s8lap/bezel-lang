@@ -4571,6 +4571,9 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // #2142: Set<T>-literal eligibility, populated by the same pass.
     setLiteralFreeEligible_.clear();
     setLiteralFreeEligibleFn_ = fn;
+    // #2143: Dictionary<K,V>-literal eligibility, populated by the same pass.
+    dictLiteralFreeEligible_.clear();
+    dictLiteralFreeEligibleFn_ = fn;
     // #422 / §27.5 / §28.9: which `var` closure (function-typed) locals may be
     // released at scope end (mirrors stringReleaseEligible_).
     closureReleaseEligible_.clear();
@@ -6899,6 +6902,26 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         disposeStack_.back().push_back(
                             buildCollectionTempDisposal(slot, collTy));
                     }
+                    // fix #2143 / §28.9 / §28.11 (v0.220): reclaim the backing of
+                    // an eligible EMPTY Dictionary-literal `var d: Dictionary<K,V>
+                    // := [];` local at scope end. The empty-literal form parses
+                    // with `isDict=false` (§15.4 R39: syntactically ambiguous), so
+                    // it materializes via THIS branch (materializeHeapCollectionLiteral
+                    // redirects an empty literal targeting a dict-type-name to
+                    // materializeHeapDictLiteral internally) rather than the
+                    // dedicated non-empty dict-literal branch below — hence this
+                    // second registration site, keyed to the SAME dictLiteralFreeEligible_
+                    // set isBorrowingDictLiteralLocal populates for both literal
+                    // shapes. An empty dict has no entries, so no value disposer is
+                    // ever invoked — `buildCollectionTempDisposal` still derives it
+                    // correctly (harmlessly unused) from `collTy`.
+                    else if (currentFn_ == dictLiteralFreeEligibleFn_ &&
+                        dictLiteralFreeEligible_.count(
+                            static_cast<const void*>(declNode)) &&
+                        !disposeStack_.empty()) {
+                        disposeStack_.back().push_back(
+                            buildCollectionTempDisposal(slot, collTy));
+                    }
                     return;
                 }
             }
@@ -6919,6 +6942,33 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     // must be wired into the async frame's spill/restore too.
                     mapSuspendLocalSlot(declNode, slot);
                     builder_.CreateStore(tbl, slot);
+                    // fix #2143 / §28.9 / §28.11 (v0.220): reclaim the backing of
+                    // an eligible NON-EMPTY Dictionary-literal local at scope end
+                    // (bz_dict_free via buildCollectionTempDisposal, which also
+                    // derives the correct per-value disposer — null for a plain
+                    // int/value V, the box-free thunk for a record V, the string-
+                    // release thunk for a string V). `Dictionary<K,V>` is trivial-
+                    // dispose (§28.9/§7052): its backing is "reclaimed with the
+                    // instance", but this literal path early-returns, bypassing
+                    // the shared #1028 reclaim block at the end of lowerLocalDecl
+                    // (that block only matches a ToDictionary()-CALL initializer,
+                    // not a literal) — #2143 found the literal form had NO reclaim
+                    // path at all, sync or async (the issue's own repro reported
+                    // "sync clean", but that was an LSan false-negative on a
+                    // single-shot program — a looped repro shows it leaking in
+                    // sync too, confirming this is a plain missing-reclaim gap,
+                    // not an async-only frame issue). `OwningDictionary<K,V>`
+                    // literals are NOT in the eligibility set (isBorrowingDictLiteralLocal
+                    // requires name-head exactly "Dictionary"); a `using var`
+                    // OwningDictionary already gets its disposal from
+                    // registerUsingDisposal, unaffected by this change.
+                    if (currentFn_ == dictLiteralFreeEligibleFn_ &&
+                        dictLiteralFreeEligible_.count(
+                            static_cast<const void*>(declNode)) &&
+                        !disposeStack_.empty()) {
+                        disposeStack_.back().push_back(
+                            buildCollectionTempDisposal(slot, dictTy));
+                    }
                     return;
                 }
             }
@@ -12696,10 +12746,12 @@ void Emitter::collectBorrowingArrayFreeEligible(
     dictMaterializerFreeEligible_.clear();  // #1028
     groupingFreeEligible_.clear();          // #1930
     setLiteralFreeEligible_.clear();        // #2142
+    dictLiteralFreeEligible_.clear();       // #2143
     std::vector<const ast::LocalDecl*> candidates;
     std::vector<const ast::LocalDecl*> dictCandidates;  // #1028
     std::vector<const ast::LocalDecl*> groupingCandidates;  // #1930
     std::vector<const ast::LocalDecl*> setLiteralCandidates;   // #2142
+    std::vector<const ast::LocalDecl*> dictLiteralCandidates;  // #2143
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
@@ -12735,6 +12787,16 @@ void Emitter::collectBorrowingArrayFreeEligible(
             // CallExpr initializer) — leaked unconditionally, sync AND async.
             else if (isBorrowingSetLiteralLocal(ld))
                 setLiteralCandidates.push_back(ld);
+            // #2143 / §28.9 / §28.11: a plain `var d: Dictionary<K,V> :=
+            // [k:v, …]` (or the empty `[]` form) — a dict-literal whose backing
+            // the local solely owns (see isBorrowingDictLiteralLocal). Distinct
+            // from the ToDictionary()-materializer dictCandidates above (a
+            // CallExpr initializer); the LITERAL form had no reclaim path at
+            // all (leaked in BOTH sync and async — corrected finding, #2143's
+            // filed "sync clean" claim was an LSan false-negative on a
+            // single-shot repro; a looped repro shows it leaking in sync too).
+            else if (isBorrowingDictLiteralLocal(ld))
+                dictLiteralCandidates.push_back(ld);
         }
         // Recurse into nested blocks (mirrors collectStringReleaseEligible).
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
@@ -12819,6 +12881,19 @@ void Emitter::collectBorrowingArrayFreeEligible(
         if (!w.escaped)
             setLiteralFreeEligible_.insert(static_cast<const void*>(ld));
     }
+    // #2143 / §28.9 / §28.11: same conservative escape walk for Dictionary-
+    // literal locals (borrowingArrayMode — a `for var x in d` over a Dictionary
+    // is likewise a borrow-read of the backing table, never a retaining escape).
+    for (const ast::LocalDecl* ld : dictLiteralCandidates) {
+        std::unordered_set<const void*> safeViews;
+        collectSafeViewAliases(body, ld, safeViews);
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        w.borrowingArrayMode = true;
+        w.safeViewAliases = &safeViews;
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            dictLiteralFreeEligible_.insert(static_cast<const void*>(ld));
+    }
 }
 
 
@@ -12882,6 +12957,33 @@ bool Emitter::isBorrowingSetLiteralLocal(const ast::LocalDecl* ld) const {
     auto* lit = dynamic_cast<const ast::CollectionLiteralExpr*>(
         ld->initializer.get());
     if (!lit || lit->isDict) return false;
+    return true;
+}
+
+
+// fix #2143 / §28.9 / §28.11 (v0.220): is `ld` a plain `var d: Dictionary<K,V>
+// := [k:v, …]` (or the empty `[]` literal targeting a Dictionary — §15.4 R39:
+// the empty form parses with `isDict=false`) whose backing the local solely
+// owns — a borrowing `Dictionary<K,V>` (name-head exactly "Dictionary", not
+// "OwningDictionary" — that family owns its values, requires `using`, and is
+// already handled by registerUsingDisposal) initialised by a collection
+// literal? No element/value-policy gate is needed: buildCollectionTempDisposal
+// derives the correct bz_dict_free wiring (dictValueDisposer for a record/
+// string/class value) for every K/V combination materializeHeapDictLiteral
+// supports.
+bool Emitter::isBorrowingDictLiteralLocal(const ast::LocalDecl* ld) const {
+    if (!ld || ld->isUsing || !ld->initializer) return false;
+    const sema::TypeRef* rt = nullptr;
+    if (ld->type) rt = ctx_.resolvedType(*ld->type);
+    if (!rt) rt = ctx_.exprType(*ld->initializer);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (builtinTypeName(rt) != "Dictionary") return false;
+    auto* lit = dynamic_cast<const ast::CollectionLiteralExpr*>(
+        ld->initializer.get());
+    if (!lit) return false;
+    bool emptyLiteral = lit->keys.empty() && lit->elements.empty();
+    if (!lit->isDict && !emptyLiteral) return false;
     return true;
 }
 

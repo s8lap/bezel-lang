@@ -830,30 +830,31 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // non-throwing path. // per §28.3
         unwindIneligibleFn_ = moveNextFn;
         collectUnwindIneligible(*ci.stmts);
-        // fix #2148 / #2142 / #1871 / #1003 / #1028 / #1930 / §28.9 / §28.11:
-        // the scope-end reclaim of a plain `var` borrowing-`Array<T>` /
-        // `Set<T>` LITERAL (its backing is "reclaimed with the instance"), and
-        // of a `var` fresh borrowing-array / dict / grouping MATERIALIZER,
-        // must be re-established for the MOVENEXT fn too — the registration
-        // sites in lowerLocalDecl gate on `currentFn_ ==
-        // borrowingArrayFreeEligibleFn_` (and the dict/grouping/set-literal
-        // analogues), but the iterator body lowers with currentFn_ ==
-        // moveNextFn while emitFunctionBody left these keyed to the ENTRY
-        // (factory) fn (Setup.cpp), so every such reclaim was silently
-        // skipped and the backing leaked when the iterator ran to normal
-        // completion (the #2148 leak: an `Array<T>` literal / Split
+        // fix #2148 / #2142 / #2143 / #1871 / #1003 / #1028 / #1930 / §28.9 /
+        // §28.11: the scope-end reclaim of a plain `var` borrowing-`Array<T>` /
+        // `Set<T>` / `Dictionary<K,V>` LITERAL (its backing is "reclaimed with
+        // the instance"), and of a `var` fresh borrowing-array / dict /
+        // grouping MATERIALIZER, must be re-established for the MOVENEXT fn too
+        // — the registration sites in lowerLocalDecl gate on `currentFn_ ==
+        // borrowingArrayFreeEligibleFn_` (and the dict/grouping/set-literal/
+        // dict-literal analogues), but the iterator body lowers with
+        // currentFn_ == moveNextFn while emitFunctionBody left these keyed to
+        // the ENTRY (factory) fn (Setup.cpp), so every such reclaim was
+        // silently skipped and the backing leaked when the iterator ran to
+        // normal completion (the #2148 leak: an `Array<T>` literal / Split
         // materializer local in a `yield` body — the MoveNext scope-end drop
-        // never freed it; the same gap applies to a Set<T> literal in a yield
-        // body, fixed here alongside #2142's entry- and resume-fn fixes for
-        // parity). One call re-populates all four sets; re-pin all four fn
-        // keys to moveNextFn. Mirrors emitAsyncMethod's resume-fn
-        // re-establishment (LlvmBackend_Async.cpp) and the unwind
+        // never freed it; the same gap applies to a Set<T>/Dictionary<K,V>
+        // literal in a yield body, fixed here alongside #2142/#2143's entry-
+        // and resume-fn fixes for parity). One call re-populates all five
+        // sets; re-pin all five fn keys to moveNextFn. Mirrors emitAsyncMethod's
+        // resume-fn re-establishment (LlvmBackend_Async.cpp) and the unwind
         // re-establishment just above. // per §28.9, §28.11
         collectBorrowingArrayFreeEligible(*ci.stmts);
         borrowingArrayFreeEligibleFn_ = moveNextFn;
         dictMaterializerFreeEligibleFn_ = moveNextFn;
         groupingFreeEligibleFn_ = moveNextFn;
         setLiteralFreeEligibleFn_ = moveNextFn;   // #2142
+        dictLiteralFreeEligibleFn_ = moveNextFn;  // #2143
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", moveNextFn);
         builder_.SetInsertPoint(entry);
 

@@ -1497,13 +1497,15 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         llvm::Function* savedDictMaterializerFreeEligFn = dictMaterializerFreeEligibleFn_;
         auto savedGroupingFreeElig = groupingFreeEligible_;
         llvm::Function* savedGroupingFreeEligFn = groupingFreeEligibleFn_;
-        // #2142: same save/restore for the Set-literal reclaim eligibility set
-        // — populated by the SAME collectBorrowingArrayFreeEligible call
-        // emitAsyncLambda makes above, so it needs the identical protection
-        // against the lambda's stale keys leaking into the enclosing body's
-        // registration.
+        // #2142 / #2143: same save/restore for the Set-literal / Dict-literal
+        // reclaim eligibility sets — populated by the SAME
+        // collectBorrowingArrayFreeEligible call emitAsyncLambda makes above, so
+        // they need the identical protection against the lambda's stale keys
+        // leaking into the enclosing body's registration.
         auto savedSetLiteralFreeElig = setLiteralFreeEligible_;
         llvm::Function* savedSetLiteralFreeEligFn = setLiteralFreeEligibleFn_;
+        auto savedDictLiteralFreeElig = dictLiteralFreeEligible_;
+        llvm::Function* savedDictLiteralFreeEligFn = dictLiteralFreeEligibleFn_;
 
         emitAsyncLambda(lam, fn, paramSyms, asyncResultElemSemaTy,
                        asyncDeclaredTaskTy);
@@ -1524,6 +1526,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         groupingFreeEligibleFn_ = savedGroupingFreeEligFn;
         setLiteralFreeEligible_ = std::move(savedSetLiteralFreeElig);      // #2142
         setLiteralFreeEligibleFn_ = savedSetLiteralFreeEligFn;             // #2142
+        dictLiteralFreeEligible_ = std::move(savedDictLiteralFreeElig);    // #2143
+        dictLiteralFreeEligibleFn_ = savedDictLiteralFreeEligFn;           // #2143
         smKind_ = savedSmKind;
         smStateStruct_ = savedSmStateStruct;
         smSelf_ = savedSmSelf;
