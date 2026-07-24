@@ -1758,11 +1758,87 @@ void MethodOwnership::collectIdentifiersInStmt(
         if (ds->value) collectIdentifiersIn(*ds->value, out);
         return;
     }
-    // Control-flow statements inside a lambda block body (if/while/for/…)
-    // are not walked: this bounded slice diagnoses the direct
-    // `() => localRef.field` / single-statement-body forms exercised by the
-    // reproducer. Deeper block-body capture analysis is deferred (and would
-    // only add rejections, never relax one).
+    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (ts->value) collectIdentifiersIn(*ts->value, out);
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) collectIdentifiersIn(*ys->value, out);
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        if (is->target) collectIdentifiersIn(*is->target, out);
+        return;
+    }
+    // §9.7 / §28.9 (v0.220, #2181): a capture appearing ONLY under a control-
+    // flow statement of a block-bodied lambda (`return lambda(): int => do if
+    // cond then return h.S[0]; end; … end;`) is as much a capture of the
+    // enclosing-method local as a top-level-statement one, and must reach the
+    // SAME escape check (the §28.9 owned-local leg, the §31.1 catch leg, the
+    // §27.5 ref/out leg, and the #2144 §9.7 record/span legs all ride this
+    // collector). The earlier bounded slice walked only the leaf statement
+    // kinds above and dropped every control-flow-nested capture, so it was
+    // invisible to every leg and the program compiled and dangled at runtime.
+    // Recurse into each control-flow form's guard/condition/iterable/scrutinee
+    // expressions AND its nested statements, in source order (mirrors
+    // collectLocalDepthsStmt's / collectCatchBorrowsStmt's coverage; determinism
+    // is preserved — no pointer-keyed iteration). Widening only ADDS captures to
+    // the escape check, whose ESCAPE gate is unchanged, so a non-escaping or a
+    // param-/field-sourced capture stays accepted. // per §9.7 (v0.220), §28.9
+    auto walkBody =
+        [&](const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+            for (const auto& bs : body)
+                if (bs) collectIdentifiersInStmt(*bs, out);
+        };
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition)
+            collectIdentifiersIn(*ifs->ifBranch.condition, out);
+        walkBody(ifs->ifBranch.body);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition) collectIdentifiersIn(*el.condition, out);
+            walkBody(el.body);
+        }
+        walkBody(ifs->elseBody);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition) collectIdentifiersIn(*ws->condition, out);
+        walkBody(ws->body);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable) collectIdentifiersIn(*fs->iterable, out);
+        if (fs->withExpr) collectIdentifiersIn(*fs->withExpr, out);
+        walkBody(fs->body);
+        return;
+    }
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        walkBody(dob->body);
+        return;
+    }
+    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        walkBody(trys->body);
+        for (const auto& arm : trys->catches) {
+            if (arm.guard) collectIdentifiersIn(*arm.guard, out);
+            if (arm.body) collectIdentifiersInStmt(*arm.body, out);
+        }
+        walkBody(trys->finallyBody);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        if (cs->scrutinee) collectIdentifiersIn(*cs->scrutinee, out);
+        for (const auto& arm : cs->arms) {
+            if (arm.guard) collectIdentifiersIn(*arm.guard, out);
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
+                if (arm.exprBody) collectIdentifiersIn(*arm.exprBody, out);
+            } else {
+                walkBody(arm.stmts);
+            }
+        }
+        return;
+    }
+    // BreakStmt / ContinueStmt carry no capturable expression. Any other leaf
+    // statement form is not a capture site.
 }
 
 void MethodOwnership::collectLambdaIdentifiers(
