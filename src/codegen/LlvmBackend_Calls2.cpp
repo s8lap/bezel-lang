@@ -5945,8 +5945,19 @@ bool Emitter::computeAncestorGenericSubst(
     auto* curTd = dynamic_cast<const ast::TypeDecl*>(cur->decl);
     if (!curTd || curTd->genericParams.size() != recvTy->genericArgs.size())
         return false;
-    for (std::size_t gi = 0; gi < curTd->genericParams.size(); ++gi)
-        curArgs[curTd->genericParams[gi].name] = recvTy->genericArgs[gi];
+    for (std::size_t gi = 0; gi < curTd->genericParams.size(); ++gi) {
+        // §14.1 / §19.3 (v0.226, #2202): the receiver may itself have been
+        // instantiated transitively inside an enclosing generic body, e.g.
+        // `Outer<X>` creates `Sub<X>` where `Sub<U>: Base<U>`.  Its recorded
+        // argument is then the still-open X, while the active outer SEMA map
+        // carries X's concrete monomorphization.  Compose that map at the seed
+        // (as the direct-dispatch path does for #2192); every later base-chain
+        // step already resolves through curArgs.  With no active outer map the
+        // substitution is identity, preserving the #585/#902/#747/#1101-C
+        // direct, concrete-derived, synthesized-receiver, and layout paths.
+        curArgs[curTd->genericParams[gi].name] = substituteTypeRefLocal(
+            recvTy->genericArgs[gi], genericSubstSemaTy_);
+    }
 
     // Walk up the class base chain until we reach `ancestor`.
     while (cur && cur != ancestor) {
