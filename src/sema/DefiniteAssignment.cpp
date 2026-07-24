@@ -370,6 +370,61 @@ public:
         }
     }
 
+    // fix #2207 / §22.8: walk a record (value-type) instance-constructor body
+    // with readonly single-assignment enforcement. §22.8 says "A field declared
+    // in a class or record may include an initializer" and the readonly
+    // single-assignment rule it states (§7.4/#2116 depend on it) applies to
+    // records too. Class ctors get the check via runConstructor; static ctors
+    // via runStaticConstructor. A record's authored ctor previously fell to
+    // the plain `da.run` path with `roCtorMode_` false, so `_f := a; _f := b;`
+    // inside a record ctor compiled — and §7.4/#2116 narrowing applies to
+    // record readonly fields too, so the #2187 exploit (a stored-lambda
+    // ambient fact derefing a value the ctor later nulled) reproduced on
+    // records (probe-confirmed SEGV in `lam$0`). Enable readonly tracking
+    // WITHOUT importing the class-specific §22.7 this-observation gating
+    // (records have no base-first-construction footgun) or the §7.9/§22.7
+    // field-DA bookkeeping (records have no `this`-observation gate to fire
+    // on the fall-off path; ctorMode_ stays false). INSTANCE readonly fields
+    // carrying an initializer run as step 2 before a non-chaining ctor's body
+    // (§22.8), so they are seeded as already-assigned exactly as in
+    // runStaticConstructor; a `this(...)`-chaining ctor skips step 2 (its
+    // initializers ran in the chained-to ctor), so the seeding is suppressed
+    // in that case — mirroring runConstructor's choice. Cross-ctor once-ness
+    // (a chaining ctor re-assigning a field the chained-to ctor already
+    // assigned) is the #2206 route B residual, out of scope here.
+    void runRecordConstructor(const ast::ConstructorDecl& cd,
+                              const ast::TypeDecl& rec) {
+        roCtorMode_ = true;
+        std::vector<std::string_view> readonlyInitialized;
+        for (const auto& m : rec.members) {
+            auto* f = dynamic_cast<const ast::FieldDecl*>(m.get());
+            if (!f || !f->initializer) continue;
+            bool isStatic = false, isReadonly = false;
+            for (auto mod : f->modifiers) {
+                if (mod == "static") isStatic = true;
+                else if (mod == "readonly") isReadonly = true;
+            }
+            if (!isStatic && isReadonly)
+                readonlyInitialized.push_back(f->name);
+        }
+        std::size_t startIdx = 0;
+        bool isThisChain = false;
+        if (const ast::CallExpr* chain = getChainingCall(cd)) {
+            startIdx = 1;
+            if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(
+                    chain->callee.get())) {
+                if (cid->name == "this") isThisChain = true;
+            }
+        }
+        if (!isThisChain) {
+            for (auto n : readonlyInitialized)
+                readonlyMaybeAssigned_.insert(n);
+        }
+        for (std::size_t i = startIdx; i < cd.body.size(); ++i) {
+            if (cd.body[i]) visitStmt(*cd.body[i]);
+        }
+    }
+
 private:
     SemaContext& ctx_;
     // declared_ records every local introduced in this method (by name).
@@ -1642,21 +1697,33 @@ void checkMember(const ast::Member& m, SemaContext& ctx,
         MethodDA da(ctx);
         bool inClass =
             enclosing && enclosing->kind == ast::TypeDeclKind::Class;
+        bool inRecord =
+            enclosing && enclosing->kind == ast::TypeDeclKind::Record;
         if (!cd->isStatic && inClass) {
             da.runConstructor(*cd, *enclosing);  // §22.7 + §22.8 checking
         } else if (cd->isStatic && inClass) {
             // fix #2187 / §22.8: static-ctor readonly single-assignment.
             da.runStaticConstructor(*cd, *enclosing);
+        } else if (!cd->isStatic && inRecord) {
+            // fix #2207 / §22.8: record-ctor readonly single-assignment. §22.8
+            // and the §7.4/#2116 narrowing it underwrites apply to records too,
+            // so the #2187 exploit reproduces on records (pre-existing SEGV).
+            // Enable roCtorMode_ without the class-specific §22.7
+            // observation-gate or §7.9/§22.7 field-DA bookkeeping (records
+            // have neither). The fall-off and this-observation checks that
+            // runConstructor runs deliberately do NOT run for records: a record
+            // has no base-first-construction footgun (§22.7 rule 1) and no
+            // non-nullable-field obligation to discharge on fall-off (§7.9
+            // applies to class instances, not record values — records are
+            // value types with no per-instance non-nullable-field set to
+            // check). Static ctors on records (if admitted) are out of scope
+            // here — records typically have no static ctor surface; if one
+            // is added later, route it through runStaticConstructor analogously.
+            da.runRecordConstructor(*cd, *enclosing);
         } else {
-            // fix #2187 scope boundary: readonly single-assignment (§22.8) is
-            // enforced only for CLASS constructors above. A RECORD constructor
-            // falls here (roCtorMode_ stays false), so a `readonly` record field
-            // can still be double-assigned — and §7.4/#2116 narrowing applies to
-            // record fields too, so the class-side exploit reproduces on a record
-            // (probe-confirmed SEGV, pre-existing on main). Tracked as #2207; not
-            // covered by #2206 (that residual is class-scoped: ref/out + this(...)
-            // chain). Enforcing it needs the once-ness tracking WITHOUT importing
-            // runConstructor's class-specific §22.7 this-observation gating.
+            // Interfaces, enums, choices, and any remaining type — readonly
+            // single-assignment (§22.8) does not apply. No class this-
+            // observation gating either. Plain local-DA walk.
             da.run(cd->params, cd->body);
         }
     } else if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(&m)) {
