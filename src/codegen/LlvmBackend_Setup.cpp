@@ -11563,6 +11563,22 @@ struct StringEscapeWalker {
             // local may itself be returned/stored). Walk the initializer as an
             // escape position — but its sub-reads (e.g. `s.ToUpper()` receiver) are
             // still recognized as safe by expr().
+            // fix #2201 / §17.8 / §28.9: when the initializer is the null-forgiving
+            // `s!` (PostfixBangExpr), the new local is a borrow of `s` — §17.8
+            // preserves ownership, and lowerStmt's `armStringLocalRefcount` arms
+            // the new local for a retain + scope-end release exactly when the
+            // source is a borrow. So `s` is NOT consumed by the binding; its +1
+            // stays in `s`'s slot and must be released at `s`'s scope end. Walk
+            // the bang's operand as safeRead so the source stays eligible. The
+            // rebind shape `var s := s!` (the new local shadows the source) and
+            // the distinct-name shape `var t := s!` both fit this clause (the
+            // `s!` reading is via the operand, regardless of whether the new
+            // local's name collides with the source).
+            if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(
+                    ld->initializer.get())) {
+                expr(pb->operand.get(), /*safeRead=*/true);
+                return;
+            }
             expr(ld->initializer.get(), /*safeRead=*/false);
             return;
         }
