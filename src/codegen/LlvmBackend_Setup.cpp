@@ -12829,6 +12829,110 @@ void Emitter::freeUnboundOwnedBorrowingArrayTemp(
 }
 
 
+// fix #1909 / §17.13 / §28.3 / §28.11: dispose an unbound owned temporary of
+// an OWNING collection type (OwningArray/OwningDictionary/OwningSet/
+// OwningStack/OwningQueue/OwningLinkedList) — the `_ := <owned producer of an
+// owning collection>` discard shape. Prior to this fix, the discard codegen
+// (LlvmBackend_Stmts.cpp) had NO reclaim path for this shape at all:
+// discardOutOwnedVar requires a named identifier operand (this is a
+// TEMPORARY — a CallExpr/NewExpr, not an IdentifierExpr); disposeOwnedValue
+// (§28.3 v0.150, #1009) is gated on a USER Class/Interface declaration
+// (owning collections are decl-null builtins, so `rt->declaration` is null —
+// the gate never fires); and freeUnboundOwnedBorrowingArrayTemp above is
+// scoped to the BORROWING family (its elements are never disposed — §28.9,
+// stdlib §3/§5), so it does not cascade into an owning collection's owned
+// elements. The result: the discarded container (struct + backing buffer)
+// AND every owned element it held leaked (issue #1909's 184B/216B repro).
+//
+// This mirrors registerUsingDisposal's collection-family dispatch for a
+// NAMED owning-collection `using var` local (LlvmBackend_Setup.cpp, the
+// linkedList / collection / dict branches) — the SAME name-head
+// classification and the SAME elementPolicyFor-derived per-element
+// disposer — applied to a bare (`v`, `rt`) pair instead of a LocalDecl, since
+// an unbound temporary has no LocalDecl to key off. Per §28.11 "Owning
+// collections": "Disposing an OwningArray<T> automatically disposes every
+// element — the cascade is the type's contract" (and the parallel language
+// for OwningDictionary/OwningLinkedList) — the SAME cascade a `using var`
+// gets, now also reached by the discard-of-a-temporary path. All three
+// runtime frees (bz_array_free / bz_dict_free / bz_llist_free) are null-safe
+// (see the #824 comment at lowerOwnedCollectionFieldStore above), so a
+// nullable owning-collection temp (`OwningArray<T>?`) needs no separate
+// null guard here — the natural covering case (§28.9's null-is-a-no-op-
+// disposal rule) falls out of the runtime call alone.
+void Emitter::freeUnboundOwnedOwningCollectionTemp(llvm::Value* v,
+                                                    const sema::TypeRef* rt) {
+    if (!v || !rt) return;
+    // per §4.6/§4.7: LinkedList-family collections are bz_llist_t*-backed,
+    // not bz_array_t*-backed — check this BEFORE the array-backed dispatch
+    // (mirrors registerUsingDisposal's ordering).
+    if (isLinkedListTypeName(rt)) {
+        const sema::TypeRef* el =
+            (!rt->genericArgs.empty()) ? rt->genericArgs[0] : nullptr;
+        ElementPolicy ep = elementPolicyFor(el, /*owningFamily=*/true);
+        llvm::Value* disp = ep.disposerThunk
+            ? llvm::cast<llvm::Value>(ep.disposerThunk)
+            : llvm::ConstantPointerNull::get(ptrTy());
+        auto* fn = declareC("bz_llist_free", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {v, disp});
+        return;
+    }
+    // #394 / stdlib §4.9: OwningDictionary<K,V> owns its VALUES
+    // (genericArgs[1]), not its keys (§28.11, #894) — free via bz_dict_free
+    // with the value-cascade disposer.
+    if (isDictTypeName(rt)) {
+        const sema::TypeRef* val =
+            (rt->genericArgs.size() > 1) ? rt->genericArgs[1] : nullptr;
+        ElementPolicy ep = elementPolicyFor(val, /*owningFamily=*/true);
+        llvm::Value* disp = ep.disposerThunk
+            ? llvm::cast<llvm::Value>(ep.disposerThunk)
+            : llvm::ConstantPointerNull::get(ptrTy());
+        auto* fn = declareC("bz_dict_free", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {v, disp});
+        return;
+    }
+    if (isCollectionTypeName(rt)) {
+        // #1012 / §4.10: OwningSet<T> shares the name-head "array-backed"
+        // default (kArrayBackedCollections), but a Set whose element is
+        // generic-dict-eligible (records, non-nullable primitives/enums,
+        // strings) is ACTUALLY bz_dict_t*-backed at construction
+        // (genericBackingType) — mirrors registerUsingDisposal's setDictBacked
+        // check exactly, so this stays correct even though OwningSet<T>'s
+        // `where T: class` constraint means the dict-backed branch is
+        // presently unreachable for the owning family (class/interface
+        // elements are never dict-eligible) — kept for parity with the
+        // named-local path and to stay correct if that constraint ever
+        // loosens.
+        bool isSetName = rt->headName() == "Set" || rt->headName() == "OwningSet" ||
+                          rt->headName() == "SortedSet";
+        bool setDictBacked = isSetName &&
+            genericBackingType(rt, 0, /*isSet=*/true, nullptr) != nullptr;
+        if (setDictBacked) {
+            auto* fn = declareC("bz_dict_free", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy()});
+            builder_.CreateCall(
+                fn, {v, llvm::ConstantPointerNull::get(ptrTy())});
+            return;
+        }
+        const sema::TypeRef* el =
+            (!rt->genericArgs.empty()) ? rt->genericArgs[0] : nullptr;
+        ElementPolicy ep = elementPolicyFor(el, /*owningFamily=*/true);
+        llvm::Value* disp = ep.disposerThunk
+            ? llvm::cast<llvm::Value>(ep.disposerThunk)
+            : llvm::ConstantPointerNull::get(ptrTy());
+        auto* fn = declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {v, disp});
+        return;
+    }
+    // Not a recognized collection name-head: no-op (the ownership-pass gate
+    // that calls this — DiscardStmt::disposeOwnedCollectionValue — is scoped
+    // to isOwningCollectionNameHead, so this branch is unreachable in
+    // practice; kept as a safe no-op rather than an assert).
+}
+
+
 // #1003 / stdlib §5 / §28: compute borrowingArrayFreeEligible_ for a block body.
 // Mirrors collectStringReleaseEligible: find every plain `var` borrowing-Array
 // local bound to a fresh materializer, then run the conservative (type-agnostic)

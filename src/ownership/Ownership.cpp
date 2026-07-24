@@ -2215,6 +2215,39 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                         rt->declaration->decl != nullptr)
                         const_cast<ast::DiscardStmt*>(ds)->disposeOwnedValue = true;
             }
+            // fix #1909 / §17.13 / §28.3 / §28.11: a discard `_ := <owned
+            // producer>` whose TYPE is an OWNING COLLECTION (OwningArray/
+            // OwningDictionary/OwningSet/OwningStack/OwningQueue/
+            // OwningLinkedList) is the producer-TEMPORARY analogue of
+            // #1892's named-binding fix — the one owned-producer shape the
+            // disposeOwnedValue gate just above deliberately excludes (an
+            // owning collection is a decl-null builtin, so `rt->declaration`
+            // is null and that gate never fires — see its own comment).
+            // Without this, `_ := factory.Make()` for a `Make(): owned
+            // OwningArray<R>` factory emitted NO disposal at all: not
+            // discardOutOwnedVar (the operand is a CallExpr/NewExpr
+            // temporary, not a named IdentifierExpr) and not disposeOwnedValue
+            // (decl-null). §28.3's unbound-owned-temporary rule applies
+            // uniformly regardless of producer TYPE — "an unnamed owned
+            // temporary … is reclaimed automatically once the expression
+            // that produced it is finished with it" — so mark it here too;
+            // producerState == Owned is the SAME sound gate the class/
+            // interface check above uses (a BORROW discard — e.g. a USER
+            // method returning a non-`owned` owning collection, classified
+            // Borrowed by the #1008-Part-C rule just above in producerState —
+            // is left unmarked, so codegen never disposes it: no double-free,
+            // no UAF of a collection some other holder owns). Codegen
+            // (freeUnboundOwnedOwningCollectionTemp) cascades disposal into
+            // the collection's owned elements per §28.11's owning-collection
+            // contract — the same cascade a `using var` of the same type
+            // gets. // per §28.3, §28.11, §17.13
+            if (producerState(*ds->value) == OwnershipState::Owned) {
+                if (const sema::TypeRef* rt = ctx_.exprType(*ds->value))
+                    if (rt->kind == sema::TypeRef::Kind::Named &&
+                        isOwningCollectionNameHead(rt->headName()))
+                        const_cast<ast::DiscardStmt*>(ds)
+                            ->disposeOwnedCollectionValue = true;
+            }
             // §17.13 / §15.3 (#1016): a discard `_ := expr` of a move-only
             // owning inline array (`[N owned]T` / `[N owned]T?`). Permitted per
             // §17.13 bullet 2 — disposes each non-null slot at end-of-statement.

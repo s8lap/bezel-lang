@@ -1859,6 +1859,27 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 }
                 if (!diverged_) emitDisposals(disposeStack_.back());
                 disposeStack_.pop_back();
+            } else if (ds->disposeOwnedCollectionValue) {
+                // fix #1909 / §17.13 / §28.3 / §28.11: the ownership pass
+                // classified this discard's value as an owned PRODUCER whose
+                // type is an OWNING collection (OwningArray/OwningDictionary/
+                // OwningSet/OwningStack/OwningQueue/OwningLinkedList) — the
+                // producer-TEMPORARY counterpart of the disposeOwnedValue
+                // class/interface branch above, for the one producer shape
+                // that branch's decl-null gate excludes. Lower the value once,
+                // then free it via the collection-family runtime dispatch
+                // (freeUnboundOwnedOwningCollectionTemp), which cascades
+                // disposal into the collection's owned elements — never
+                // dynamicDispose (an owning collection is a decl-null
+                // builtin with no vtable). No exception-edge dispose-stack
+                // entry is needed here: the temporary's only operand
+                // (ds->value) has already fully evaluated by the time this
+                // runs, so there is no LATER sub-expression in this
+                // statement whose throw could skip the free.
+                llvm::Value* v = lowerExpr(*ds->value);
+                if (!diverged_ && v)
+                    freeUnboundOwnedOwningCollectionTemp(
+                        v, ctx_.exprType(*ds->value));
             } else if (ds->disposeInlineOwnedArray) {
                 // §17.13 / §15.3 (#1016): a discard `_ := expr` of a move-only
                 // owning inline array. Dispose each non-null slot at end-of-

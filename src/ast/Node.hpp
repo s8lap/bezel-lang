@@ -404,6 +404,20 @@ struct DiscardStmt : Stmt {
     // is a no-op). Distinct from disposeOwnedValue (fresh-producer path) which
     // stores to a separate alloca and does not null an original slot.
     bool discardOutOwnedVar = false;
+    // fix #1909 / §17.13 / §28.3 / §28.11: set by the ownership pass when
+    // `value` is an owned PRODUCER (producerState == Owned) whose type is an
+    // OWNING collection (OwningArray/OwningDictionary/OwningSet/OwningStack/
+    // OwningQueue/OwningLinkedList) — the producer-TEMPORARY analogue of
+    // disposeOwnedValue above, for the one owned-producer shape that gate
+    // deliberately excludes (an owning collection is a decl-null builtin, not
+    // a user Class/Interface — see disposeOwnedValue's comment). An unbound
+    // owning-collection temporary is disposed at end-of-statement exactly as
+    // any other unbound owned temporary (§28.3), cascading into its owned
+    // elements per §28.11's owning-collection contract. Codegen routes this
+    // through the collection-family runtime free (bz_array_free /
+    // bz_dict_free / bz_llist_free), never dynamicDispose (owning
+    // collections have no vtable).
+    bool disposeOwnedCollectionValue = false;
 };
 
 // A.6: `YieldStmt ::= "yield" "return" Expression ";" | "yield" "break" ";"`.

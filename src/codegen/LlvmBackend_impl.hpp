@@ -6507,6 +6507,25 @@ private:
     void freeUnboundOwnedBorrowingArrayTemp(const ast::Expr* recvExpr,
                                             llvm::Value* recvVal,
                                             const sema::TypeRef* recvTy);
+    // fix #1909 / §17.13 / §28.3 / §28.11: dispose an UNBOUND owned temporary
+    // whose type is an OWNING collection (OwningArray/OwningDictionary/
+    // OwningSet/OwningStack/OwningQueue/OwningLinkedList) — the discard
+    // `_ := <owned-producer-of-owning-collection>` shape (the
+    // DiscardStmt::disposeOwnedCollectionValue gate, set by the ownership
+    // pass). Frees the container AND cascades disposal into its owned
+    // elements (the owning family's contract, §28.11 "Owning collections") —
+    // unlike freeUnboundOwnedBorrowingArrayTemp, which frees only the
+    // backing of a BORROWING collection (its elements are never disposed).
+    // Dispatches on `rt`'s name-head to the matching runtime free (array-
+    // backed / bz_dict_t*-backed / bz_llist_t*-backed), mirroring
+    // registerUsingDisposal's collection dispatch for a NAMED owning-
+    // collection local — the same classification, applied to a bare value
+    // instead of a LocalDecl. `v` must already be the fully-lowered
+    // collection pointer (never re-lowered). Every one of the three runtime
+    // frees is null-safe, so a nullable owning-collection temp needs no
+    // separate null guard here.
+    void freeUnboundOwnedOwningCollectionTemp(llvm::Value* v,
+                                              const sema::TypeRef* rt);
     // True if `init` is a codegen-internal +1 string producer: a string `+`
     // BinaryExpr or an InterpolatedStringExpr. These are lowered to a fresh
     // malloc'd rc=1 header that codegen fully controls — so binding the result
