@@ -10751,6 +10751,82 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // #2199 / stdlib §9.6 / §4.6 / §28.9 (v0.220): the stdlib `string` INSTANCE
+    // methods that transform self into a fresh heap `bz.string` at rc := 1. Each
+    // lowers (in tryLowerStringMethod, LlvmBackend_String.cpp) to either an inline
+    // malloc + initStringRc (`#422: producer's reference, rc := 1`) or to a
+    // runtime helper that mints the same shape — `bz_str_substring`,
+    // `bz_str_replace`, `bz_str_trim_chars`, `bz_str_pad`. The previous producer
+    // recognizer enumerated ONLY the static `string.Join` form plus the
+    // ToString-family (numeric/char/Guid/DateTime/TimeSpan/DateOnly/TimeOnly/
+    // StringBuilder/synthesized record); the string-transforming instance methods
+    // were absent. So a consumer (the `??` arm normalization in #1948 / #1952,
+    // the WriteLine arg in #1994, the field-store in #2023, a bound-local in
+    // #2065, …) saw the result as a BORROW and RETAINED it, double-counting the
+    // producer's +1. The extra reference never dropped → leak (the #2199 repro:
+    // 140 bytes leaked in 8 allocations across 4 iterations of `p ?? s.ToUpper()`;
+    // the same shape as the ToString-family gaps closed by #1982 / #1988 /
+    // #1989 / #2065).
+    //
+    // Recognize each by the SAME shape tryLowerStringMethod keys on — a CallExpr
+    // whose callee is a MemberAccessExpr on a NON-NULLABLE `string` receiver,
+    // with a recognized method name and an arg count that matches one of the
+    // overloads the lowering mints at rc=1 — so the recognizer and the lowering
+    // stay in lockstep. An ESCAPING local is excluded from the scope-end release
+    // by the escape walk (its +1 then leaks — the safe direction); the consumer
+    // TRANSFERS the single reference (no extra retain is emitted), so the release
+    // drops it exactly once. No double-free. The property getters (`Length`,
+    // `IsAscii`, `[i: int]`, `[r: Range<int>]: string`) and the bool/int methods
+    // (`Equals`, `CompareTo`, `StartsWith`, `EndsWith`, `Contains`, `IndexOf`,
+    // `LastIndexOf`, `GetHashCode`, `ToInt32`, `ToInt64`, `ToDouble`, `ToFloat`,
+    // `ToBoolean`, `GetField`, `CountOf`, `Split`, `ToCharArray`, `GetEnumerator`,
+    // `AsSpan`) are NOT covered here because they either don't return `string` or
+    // don't go through tryLowerStringMethod's rc=1 path; they keep the existing
+    // non-producer classification (the borrowed/identity reads).
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (call->callee) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+                if (ma->target) {
+                    auto* tt = ctx_.exprType(*ma->target);
+                    if (tt && tt->kind == sema::TypeRef::Kind::Primitive &&
+                        tt->primitive == sema::PrimitiveType::String &&
+                        !tt->nullable) {
+                        std::string_view m = ma->member;
+                        std::size_t argc = call->args.size();
+                        // §9.6 ToUpper/ToLower: no args. Inline malloc + initStringRc.
+                        if ((m == "ToUpper" || m == "ToLower") && argc == 0)
+                            return true;
+                        // §9.6 Trim: 0 args (ASCII whitespace) or 1 arg
+                        // (chars: IEnumerable<char> → bz_str_trim_chars).
+                        if (m == "Trim" && (argc == 0 || argc == 1))
+                            return true;
+                        // §9.6 TrimStart/TrimEnd: no args.
+                        if ((m == "TrimStart" || m == "TrimEnd") && argc == 0)
+                            return true;
+                        // §9.6 Substring(start[, length]) → bz_str_substring.
+                        if (m == "Substring" && (argc == 1 || argc == 2))
+                            return true;
+                        // §9.6 Replace(oldChar, newChar) and Replace(oldValue,
+                        // newValue): both 2-arg forms, both rc=1.
+                        if (m == "Replace" && argc == 2)
+                            return true;
+                        // §9.6 PadLeft/PadRight(totalWidth[, paddingChar]) →
+                        // bz_str_pad.
+                        if ((m == "PadLeft" || m == "PadRight") &&
+                            (argc == 1 || argc == 2))
+                            return true;
+                        // §9.6 Insert(startIndex, value) → inline mint.
+                        if (m == "Insert" && argc == 2)
+                            return true;
+                        // §9.6 Remove(startIndex[, count]) → inline mint.
+                        if (m == "Remove" && (argc == 1 || argc == 2))
+                            return true;
+                    }
+                }
+            }
+        }
+    }
     // #429 (RETURN-escape category) / §4.6 / §28.9: a CALL to a user-defined,
     // locally-compiled method whose declared return type is `string` hands the
     // caller EXACTLY +1 (the callee's ReturnStmt lowering mints it). So such a
