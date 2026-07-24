@@ -301,10 +301,24 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
             const auto* td =
                 dynamic_cast<const ast::TypeDecl*>(decl->decl);
             if (!td) return true;  // no AST → trust the value-like verdict
+
+            // §35.11 / §35.12 (v0.226, #2211): #2183 made the §35.4
+            // classifier instantiation-aware, but this payload recursion still
+            // read the declaration template's bare `T`. Seed the same #2145
+            // substitution environment and recurse on the instantiated payload
+            // (`Opt<int>` -> `int`), not the bare parameter. Only bare payloads
+            // are substituted here, so structured recursive payload traversal is
+            // unchanged; the finite nested form `Opt<Opt<int>>` still reaches its
+            // concrete leaf without a declaration-keyed recursion shortcut.
+            common::RecordSubstEnv env;
+            common::seedRecordSubstEnv(*td, *rt, /*incoming=*/nullptr, env);
+            const common::RecordSubstEnv* fieldEnv =
+                env.map.empty() ? nullptr : &env;
             for (const auto& cc : td->choiceCases) {
                 for (const auto& pf : cc.payload) {
                     if (!pf.type) continue;
                     const TypeRef* ft = ctx.resolvedType(*pf.type);
+                    ft = common::resolveRecordFieldSubst(ft, fieldEnv).ty;
                     if (!isSendableType(ft, ctx, inProgress)) return false;
                 }
             }
@@ -935,10 +949,19 @@ std::string sendableFailureComponentPath(const TypeRef* rt, SemaContext& ctx) {
             return {};  // category-level — flat reason
         const auto* td = dynamic_cast<const ast::TypeDecl*>(decl->decl);
         if (!td) return {};
+
+        // §35.11 / §35.12 (#2211): mirror the property walk above so a failed
+        // generic payload diagnostic names the instantiated type (`Object`),
+        // not the declaration template's bare parameter (`T`).
+        common::RecordSubstEnv env;
+        common::seedRecordSubstEnv(*td, *rt, /*incoming=*/nullptr, env);
+        const common::RecordSubstEnv* fieldEnv =
+            env.map.empty() ? nullptr : &env;
         for (const auto& cc : td->choiceCases) {
             for (const auto& pf : cc.payload) {
                 if (!pf.type) continue;
                 const TypeRef* ft = ctx.resolvedType(*pf.type);
+                ft = common::resolveRecordFieldSubst(ft, fieldEnv).ty;
                 if (!ft) continue;
                 if (!isSendableType(ft, ctx)) {
                     std::string_view pName =

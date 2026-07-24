@@ -50,6 +50,20 @@ bool hasSendableConstraintError(const bezel::test::SemaResult& r) {
     return false;
 }
 
+bool hasSendablePayloadDiagnostic(const bezel::test::SemaResult& r,
+                                  std::string_view payload,
+                                  std::string_view type) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("does not satisfy the constraint") != std::string::npos &&
+            d.message.find("sendable") != std::string::npos &&
+            d.message.find(payload) != std::string::npos &&
+            d.message.find(type) != std::string::npos &&
+            d.message.find("§35.12") != std::string::npos)
+            return true;
+    return false;
+}
+
 }  // namespace
 
 // --- §35.12 ACCEPT: value-like choice IS sendable --------------------------
@@ -178,5 +192,92 @@ BEZEL_TEST(choice_sendable_35_12,
     // types) are classification-neutral → Ev is value-like. §30.14:
     // function-typed payloads are not sendable → per-field recursion
     // fails → the choice rejects despite value-like verdict.
+    BEZEL_EXPECT_TRUE(hasSendableConstraintError(r));
+}
+
+// --- §35.11 / §35.12: generic choices classify per instantiation (#2211) ----
+
+BEZEL_TEST(choice_sendable_35_12,
+           issue_2211_int_substitution_satisfies_sendable_spec_35_11_35_12) {
+    // §35.11 / §35.12 (v0.226): classification and sendability are evaluated
+    // per instantiation. The bare `T` payload substitutes to sendable `int`, so
+    // `Opt<int>` is value-like and every instantiated payload is sendable.
+    auto r = semaAll(
+        "module M; "
+        "choice Opt<T> Some(v: T), None; end Opt; "
+        "static class Box public static method S<T>(): int "
+        "  where T: sendable => 1; end Box; "
+        "class C public static method Main(): int "
+        "  return Box.S<Opt<int>>(); "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(hasSendableConstraintError(r));
+}
+
+BEZEL_TEST(choice_sendable_35_12,
+           issue_2211_nested_same_choice_satisfies_sendable_spec_35_12) {
+    // §35.12 (v0.226): payload sendability is transitive. Re-entering the same
+    // generic choice declaration at a finite nested instantiation is not a type
+    // cycle: `Opt<Opt<int>>` reaches the sendable `int` leaf and is sendable.
+    auto r = semaAll(
+        "module M; "
+        "choice Opt<T> Some(v: T), None; end Opt; "
+        "static class Box public static method S<T>(): int "
+        "  where T: sendable => 1; end Box; "
+        "class C public static method Main(): int "
+        "  return Box.S<Opt<Opt<int>>>(); "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(hasSendableConstraintError(r));
+}
+
+BEZEL_TEST(choice_sendable_35_12,
+           issue_2211_recursive_choice_cycle_terminates_and_rejects_35_1_35_12) {
+    // §35.1 / §35.12 (v0.226): a choice cannot contain itself by value. The
+    // sendability walk must terminate defensively on the recursive payload
+    // TypeRef and must not turn that invalid cycle into a sendable type after
+    // substitution makes the independent `T` payload (`int`) admissible.
+    auto r = semaAll(
+        "module M; "
+        "choice Node<T> Next(v: Node<T>), Value(v: T); end Node; "
+        "static class Box public static method S<T>(): int "
+        "  where T: sendable => 1; end Box; "
+        "class C public static method Main(): int "
+        "  return Box.S<Node<int>>(); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasSendableConstraintError(r));
+}
+
+BEZEL_TEST(choice_sendable_35_12,
+           issue_2211_object_substitution_rejected_with_instantiated_diag_35_12) {
+    // §35.12 (v0.226): a value-like verdict is necessary but not sufficient;
+    // every instantiated payload must itself be sendable. `Object` is not
+    // sendable (§30.14), and the component diagnostic must name `Object`, not
+    // the declaration template's bare `T`.
+    auto r = semaAll(
+        "module M; "
+        "choice Opt<T> Some(v: T), None; end Opt; "
+        "static class Box public static method S<T>(): int "
+        "  where T: sendable => 1; end Box; "
+        "class C public static method Main(): int "
+        "  return Box.S<Opt<Object>>(); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasSendableConstraintError(r));
+    BEZEL_EXPECT_TRUE(hasSendablePayloadDiagnostic(
+        r, "payload `v`", "type `Object`"));
+}
+
+BEZEL_TEST(choice_sendable_35_12,
+           issue_2211_class_substitution_remains_rejected_spec_35_12) {
+    // §35.11 / §35.12 (v0.226): env-threading may relax only genuinely
+    // sendable value substitutions. An unmarked class payload makes `Opt<Res>`
+    // borrow-bearing (§35.4.2), hence never sendable.
+    auto r = semaAll(
+        "module M; "
+        "choice Opt<T> Some(v: T), None; end Opt; "
+        "class Res public method V(): int => 1; end Res; "
+        "static class Box public static method S<T>(): int "
+        "  where T: sendable => 1; end Box; "
+        "class C public static method Main(): int "
+        "  return Box.S<Opt<Res>>(); "
+        "end Main; end C;");
     BEZEL_EXPECT_TRUE(hasSendableConstraintError(r));
 }
