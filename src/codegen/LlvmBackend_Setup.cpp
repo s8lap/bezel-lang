@@ -7514,8 +7514,40 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             // trade-off). Only LOCALS are in declScopeDepth_; params are left to
             // the disposal guard above (a noted follow-up).
             auto dd = declScopeDepth_.find(ce.key);
-            if (dd != declScopeDepth_.end() && dd->second < disposeStack_.size())
+            if (dd != declScopeDepth_.end() && dd->second < disposeStack_.size()) {
+                // A pattern binding is established by the case matcher in the
+                // arm's owning scope, while its capturing lambda may be nested
+                // in a `do ... end`. Defer the cell free to that owner scope;
+                // freeing it at the nested lambda scope would leave later arm
+                // reads (or a subsequent loop iteration) with a dangling cell.
+                // Ordinary outer locals retain the conservative leak behavior
+                // here: their cell may still be read after this inner scope.
+                auto* keyNode = static_cast<const ast::Node*>(ce.key);
+                bool patternBinding =
+                    dynamic_cast<const ast::BindingPattern*>(keyNode) != nullptr;
+                if (patternBinding) {
+                    std::size_t ownerScopeIdx = dd->second - 1;
+                    bool alreadyDeferred = false;
+                    for (const auto& existing : disposeStack_[ownerScopeIdx])
+                        if (existing.slot == ce.newSlot &&
+                            existing.boxedCellFreeDeferred) {
+                            alreadyDeferred = true;
+                            break;
+                        }
+                    if (!alreadyDeferred) {
+                        Disposal dcd{ce.newSlot, nullptr};
+                        dcd.boxedCellFreeDeferred = true;
+                        disposeStack_[ownerScopeIdx].push_back(dcd);
+                        if (ce.inlineArrayN > 0) {
+                            Disposal da{ce.newSlot, nullptr};
+                            da.inlineOwnedArrayCell = true;
+                            da.inlineSlotCount = ce.inlineArrayN;
+                            disposeStack_[ownerScopeIdx].push_back(da);
+                        }
+                    }
+                }
                 continue;
+            }
             Disposal dc{ce.newSlot, nullptr};
             dc.boxedCellFree = true;
             disposeStack_.back().push_back(dc);

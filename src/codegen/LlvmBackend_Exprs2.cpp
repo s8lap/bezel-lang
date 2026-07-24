@@ -1115,6 +1115,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // subsequent iterations, so the accumulated value is never overwritten by
         // a re-initialisation from the (potentially stale) original slot.
         bool isForVar = dynamic_cast<const ast::ForStmt*>(decl) != nullptr;
+        bool isPatternBinding =
+            dynamic_cast<const ast::BindingPattern*>(decl) != nullptr;
         // #806 / #782: a captured move-only OWNING inline-array
         // ([N owned]T? / [N owned]T) is initialised field-by-field (a per-slot
         // GEP store), so boxLocalSlot's whole-slot-store freshness heuristic does
@@ -1145,6 +1147,17 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         bool wasGuardedLocal = false;
         ce.envValue = boxLocalSlot(slot, newSlot, /*forLoopVar=*/forceFresh,
                                    &wasGuardedLocal);
+        // A case-arm binding's source slot is written by pattern matching each
+        // time the arm is entered. Guarded boxing intentionally reuses one
+        // holder, so refresh its cell from the newly-bound slot on every arm
+        // entry; otherwise a case inside a loop would capture the first
+        // iteration's payload forever. The holder remains live until the arm's
+        // owner scope (or the escaping closure) releases it.
+        if (isPatternBinding && wasGuardedLocal) {
+            llvm::Value* current = builder_.CreateLoad(ce.valTy, slot,
+                                                       "pattern.capture.value");
+            builder_.CreateStore(current, ce.envValue);
+        }
         locals_[decl] = newSlot;  // rebind to the ptr cell-holder
         rebindDisposalSlot(slot, newSlot);
         // §30 / #1377: when the enclosing function is an ASYNC STATE MACHINE and
@@ -1207,7 +1220,16 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             // the guarded cell is allocated exactly once — so disposing + freeing
             // it at scope end is sound. Non-array guarded cells keep the
             // conservative exclusion (a safe leak).
-            bool guardedOk = !wasGuardedLocal ||
+            // #429 / #782: guarded boxing is normally excluded — a local
+            // declared in an outer scope and captured by an inner-LOOP lambda
+            // reuses one cell across iterations, so freeing it at the lambda
+            // scope would corrupt later iterations. A CASE-ARM binding is
+            // different: its lexical lifetime is the arm scope, and the
+            // binding slot is re-established by pattern matching on each arm
+            // entry. Its guarded cell can therefore be reclaimed at that arm
+            // scope; the disposal path nulls the holder before a later loop
+            // iteration can re-enter the arm.
+            bool guardedOk = !wasGuardedLocal || isPatternBinding ||
                              (inlineN > 0 && loopStack_.empty());
             if (guardedOk)
                 lastLambdaCapturedCells_.push_back({newSlot,
@@ -1275,9 +1297,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // DEFINITELY escapes (definitelyEscapingLambdas_ — directly returned). The
         // scope-end boxedCellFree does not fire for an escaping closure, so the
         // sole env's envdtor is the cell's only free (no double-free); the defining
-        // scope is gone before the escaped closure dies (no UAF). Exclude
-        // guarded/for-var cells (shared/per-iteration holders).
-        if (!alreadyBoxed && !wasGuardedLocal && !isForVar &&
+        // scope is gone before the escaped closure dies (no UAF). Ordinary guarded
+        // and for-var cells remain excluded (shared/per-iteration holders); a
+        // case-arm binding is the scoped exception handled above.
+        if (!alreadyBoxed && (!wasGuardedLocal || isPatternBinding) && !isForVar &&
             currentFn_ == boxCaptureLocalsFn_ &&
             definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)) &&
             singleCaptureLocals_.count(static_cast<const void*>(decl)))
@@ -5281,6 +5304,8 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
                 llvm::Value* inner = nullablePrimValue(scrut);
                 llvm::AllocaInst* slot = entryAlloca(inner->getType());
                 builder_.CreateStore(inner, slot);
+                if (!disposeStack_.empty())
+                    declScopeDepth_[bp] = disposeStack_.size();
                 locals_[bp] = slot;
             } else if (btyRef && isBoxableValueType(btyRef) &&
                        scrut->getType()->isPointerTy()) {
@@ -5310,10 +5335,14 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
                     builder_.CreateLoad(valTy, payload, "tb.unbox"), slot);
                 builder_.CreateBr(ubContBB);
                 builder_.SetInsertPoint(ubContBB);
+                if (!disposeStack_.empty())
+                    declScopeDepth_[bp] = disposeStack_.size();
                 locals_[bp] = slot;
             } else {
                 llvm::AllocaInst* slot = entryAlloca(scrut->getType());
                 builder_.CreateStore(scrut, slot);
+                if (!disposeStack_.empty())
+                    declScopeDepth_[bp] = disposeStack_.size();
                 locals_[bp] = slot;
             }
         }
@@ -5819,6 +5848,12 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                                 llvm::AllocaInst* slot =
                                     entryAlloca(fv->getType());
                                 builder_.CreateStore(fv, slot);
+                                // §19.3 / §27.5: a case-arm binding owns its
+                                // capture-cell lifetime at the arm scope, not at
+                                // the nested block that first captures it.
+                                if (!disposeStack_.empty())
+                                    declScopeDepth_[sp.nakedAnchor.get()] =
+                                        disposeStack_.size();
                                 locals_[sp.nakedAnchor.get()] = slot;
                             } else if (auto* vbp =
                                            dynamic_cast<const ast::BindingPattern*>(
@@ -5826,6 +5861,11 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                                 llvm::AllocaInst* slot =
                                     entryAlloca(fv->getType());
                                 builder_.CreateStore(fv, slot);
+                                // §19.3 / §27.5: a case-arm binding owns its
+                                // capture-cell lifetime at the arm scope, not at
+                                // the nested block that first captures it.
+                                if (!disposeStack_.empty())
+                                    declScopeDepth_[vbp] = disposeStack_.size();
                                 locals_[vbp] = slot;
                             }
                         }
@@ -6983,6 +7023,9 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 if (!sp.nakedBinding.empty()) {
                     llvm::AllocaInst* slot = entryAlloca(fv->getType());
                     builder_.CreateStore(fv, slot);
+                    if (!disposeStack_.empty())
+                        declScopeDepth_[sp.nakedAnchor.get()] =
+                            disposeStack_.size();
                     locals_[sp.nakedAnchor.get()] = slot;  // #1271 real Node anchor
                 } else if (auto* vbp = dynamic_cast<const ast::BindingPattern*>(
                                sp.pattern.get())) {

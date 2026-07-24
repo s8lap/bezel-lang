@@ -6395,6 +6395,8 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
                            arm.pattern.get())) {
             llvm::AllocaInst* slot = entryAlloca(scrut->getType());
             builder_.CreateStore(scrut, slot);
+            if (!disposeStack_.empty())
+                declScopeDepth_[bp] = disposeStack_.size();
             locals_[bp] = slot;
         }
         if (arm.guard) {

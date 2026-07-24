@@ -2006,6 +2006,11 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             llvm::Value* cell =
                 builder_.CreateLoad(ptrTy(), it->slot, "cell.ptr");
             builder_.CreateCall(freeFn(), {cell});
+            // A guarded capture may be re-entered (for example, a case arm in
+            // a loop). Null the holder after reclaim so the next entry allocates
+            // a fresh cell instead of reusing freed storage.
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 it->slot);
             continue;
         }
         // #1017: a DEFERRED boxed-cell free is handled in the SECOND pass below
@@ -3198,6 +3203,8 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         llvm::Value* cell =
             builder_.CreateLoad(ptrTy(), d.slot, "cell.deferred.ptr");
         builder_.CreateCall(freeFn(), {cell});
+        // Null the guarded holder so a later re-entry allocates a fresh cell.
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), d.slot);
     }
 }
 
