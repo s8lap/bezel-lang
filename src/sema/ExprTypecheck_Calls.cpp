@@ -7312,21 +7312,17 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
     // constructors. That interaction is deferred — skip such types.
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
         if (td->hasPositionalFields) {
-            // #1105 (§9.1): a RECORD's positional fields ARE its primary
-            // constructor — one argument per field, in declaration order, no
-            // chaining and no per-field defaults. Validate `new Record(args)`
-            // here; record construction otherwise skipped ALL argument checking
-            // (the early return), so too-few / too-many / wrong-typed args were
-            // silently accepted and miscompiled (`new Pt(1)`→Y=0; `new
-            // Pt("a","b")`→garbage; `new Pt(3.14,..)`→int bit-pattern; some
-            // wrong-typed forms reach codegen and crash IR verification). A
-            // primary-constructor CLASS may combine positional fields with
-            // chained body constructors (the deferred interaction above) — so
-            // restrict to records. Generic records need per-instantiation type
-            // substitution of the field types (the #428 family) — defer those;
-            // validate non-generic records, which is where the cluster lives.
-            if (t->kind == ast::TypeDeclKind::Record &&
-                t->genericParams.empty()) {
+            // #1105 / #2203 (§9.1 / §14.1): a RECORD's positional fields ARE
+            // its primary constructor — one argument per field, in declaration
+            // order, no chaining and no per-field defaults. Validate
+            // `new Record(args)` here; skipping generic records used to admit
+            // `new Wrap<string>("x")` for `record Wrap<W>(tag: int)`. Codegen
+            // then stored the 8-byte string pointer into the 4-byte `tag` field,
+            // corrupting the stack. checkArgsAgainstParams substitutes each
+            // field type through the concrete NewExpr target, so generic fields
+            // such as `Box<T>(value: T)` are checked against the instantiated T
+            // while phantom parameters leave unrelated fields unchanged.
+            if (t->kind == ast::TypeDeclKind::Record) {
                 // The positional fields are the constructor's parameter list
                 // (one per field, declaration order). Reuse the same arity +
                 // named-argument binding + per-argument assignability check the
@@ -7386,7 +7382,8 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                 }
                 checkArgsAgainstParams(
                     fields, ne.args, ne.span.begin,
-                    std::string("`new ") + std::string(t->name) + "`");
+                    std::string("`new ") + std::string(t->name) + "`",
+                    &ne, t);
             }
             return;
         }

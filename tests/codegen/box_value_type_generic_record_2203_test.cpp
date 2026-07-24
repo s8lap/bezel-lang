@@ -1,20 +1,15 @@
-// Codegen + ASan — #2203: boxing a value-type generic record `Wrap<W>` to
-// Object and then reusing the source value's stack slot for a larger value
-// (e.g. a string argument to the next `new Wrap<string>(...)`) writes
-// 8 bytes into a 4-byte record slot — stack-buffer-overflow.
+// Codegen + ASan — #2203: a generic positional record's constructor arguments
+// must be checked after substituting its concrete type arguments. The reported
+// `record Wrap<W>(tag: int); new Wrap<string>("x")` incorrectly skipped sema
+// checking because the record was generic, then codegen wrote the 8-byte string
+// pointer into the 4-byte `tag` field. Boxing made LLVM's stack coloring reuse
+// the dead temporary and exposed the overflow, but box layout/lifetime was not
+// the source of the invalid store.
 //
-// §8.6 / §12.7 (spec v0.226): the value-representation codegen must not let
-// the compiler re-use a boxed value's 4-byte record slot for a subsequent
-// 8-byte value. The ASan-evidence build compiles + runs the program under
-// `-fsanitize=address`; pre-fix it crashes with `stack-buffer-overflow` on
-// the 8-byte store to the 4-byte slot. The value-correctness build
-// (no ASan) exercises the same control flow and asserts the result.
-//
-// The repro is the lane-J pre-existing one: construct a boxed value-type
-// generic record whose struct layout is a 4-byte `{i32}` (the W parameter
-// does not affect the field), then construct another boxed record whose
-// argument is an 8-byte string. The compiler reuses the first record's
-// 4-byte slot for the string pointer and overflows by 4 bytes.
+// §9.1 / §14.1 (spec v0.226): positional fields are the synthesized primary-
+// constructor parameters, and generic instantiations substitute only fields
+// that actually name their type parameters. Thus `Wrap<string>` still requires
+// an int tag, while `Box<W>(value: W)` requires a string for `Box<string>`.
 
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
@@ -23,6 +18,7 @@
 #include <string>
 
 using bezel::test::runAot;
+using bezel::test::runAotChecked;
 
 namespace {
 
@@ -62,18 +58,30 @@ BEZEL_TEST(box_value_type_generic_record_2203, generic_concrete_int_round_trip) 
     BEZEL_EXPECT_EQ(rc, 1);
 }
 
-// (3) HEADLINE — the lane-J reproducer. Boxing `Wrap<int>(1)` (4-byte
-// record) then constructing `Wrap<string>("x")` (8-byte payload) in the
-// same scope. Pre-fix: the compiler reuses the 4-byte slot for the
-// 8-byte string argument, triggering an 8-byte WRITE into a 4-byte
-// slot → ASan stack-buffer-overflow. The expected value is 2
-// (m is Wrap<int> matches, w is Wrap<int> does not match).
-// Under the no-corruption harness (no ASan) the program also returns
-// 2 because the corrupted slot is not observed by the `is` test
-// (the boxed value is the live reference). The ASan-evidence build
-// in the lane-F probe /var/tmp/bezel-scratch/laneJ-review/p_record_direct.bzl
-// is the strict oracle.
-BEZEL_TEST(box_value_type_generic_record_2203, box_then_larger_reuse_4byte_slot) {
+// (3) HEADLINE — the reported reproducer is rejected before codegen because
+// `Wrap<string>` still has an `int` positional field: W is a phantom type
+// parameter, not the type of `tag`. Pre-fix, sema skipped argument checking for
+// every generic positional record and codegen stored the 8-byte string pointer
+// into the 4-byte `tag` alloca. Boxing only made the dead 4-byte source slot
+// visible to stack coloring; it was not the source of the over-wide store.
+BEZEL_TEST(box_value_type_generic_record_2203,
+           wrong_typed_phantom_argument_rejected_before_boxing) {
+    auto r = runAotChecked(
+        "module M; "
+        "record Wrap<W>(tag: int); "
+        "class C public static method Main(): int "
+        "  var mi: Object := new Wrap<int>(1); "
+        "  var wsx: Object := new Wrap<string>(\"x\"); "
+        "  return 0; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// (4) CONTROL — a different concrete generic argument does not change the
+// phantom record's field type. Both boxes are constructed with valid int tags;
+// `is` still distinguishes the concrete instantiations. Expect 2.
+BEZEL_TEST(box_value_type_generic_record_2203,
+           valid_phantom_siblings_box_and_distinguish) {
     int rc = run(
         "module M; "
         "record Wrap<W>(tag: int); "
@@ -82,24 +90,36 @@ BEZEL_TEST(box_value_type_generic_record_2203, box_then_larger_reuse_4byte_slot)
         "   + (if w is Wrap<T> then 1 else 0); end A; "
         "class C public static method Main(): int "
         "  var mi: Object := new Wrap<int>(1); "
-        "  var wsx: Object := new Wrap<string>(\"x\"); "
+        "  var wsx: Object := new Wrap<string>(2); "
         "  using var a := new A<int>(); "
         "  return a.probe(mi, wsx); end Main; end C;");
-    // m is Wrap<int> → 1*2 = 2 ; w is Wrap<int> → 0 ; total = 2.
     BEZEL_EXPECT_EQ(rc, 2);
 }
 
-// (4) VALUE CORRECTNESS — `is Wrap<T>` over the boxed value still yields
-// the correct result once the layout/stack-slot fix is in. The test also
-// documents the precise return-value contract: (true, false) for a
-// (Wrap<int>, Wrap<string>) pair under A<int>. Expect 2.
+// (5) SUBSTITUTION CONTROL — when the positional field actually has type W,
+// the concrete argument is required and preserved through boxing/unboxing.
+BEZEL_TEST(box_value_type_generic_record_2203,
+           concrete_generic_field_type_round_trips) {
+    int rc = run(
+        "module M; "
+        "record Box<W>(value: W); "
+        "class C public static method Main(): int "
+        "  var o: Object := new Box<string>(\"ok\"); "
+        "  var b := o as Box<string>; "
+        "  return (if b!.value = \"ok\" then 1 else 0); "
+        "end Main; end C;");
+    BEZEL_EXPECT_EQ(rc, 1);
+}
+
+// (6) VALUE CORRECTNESS — `is Wrap<T>` over boxed phantom values retains the
+// precise concrete descriptor. Expect 10.
 BEZEL_TEST(box_value_type_generic_record_2203, is_wrap_t_distinguishes_siblings) {
     int rc = run(
         "module M; "
         "record Wrap<W>(tag: int); "
         "class C public static method Main(): int "
         "  var mi: Object := new Wrap<int>(7); "
-        "  var wsx: Object := new Wrap<string>(\"y\"); "
+        "  var wsx: Object := new Wrap<string>(8); "
         "  return (if mi is Wrap<int> then 1 else 0) * 10 "
         "       + (if wsx is Wrap<int> then 1 else 0); "
         "end Main; end C;");
