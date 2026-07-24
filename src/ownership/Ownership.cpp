@@ -148,6 +148,19 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     scopedPreScan(body);
     scopedCalleeScan(body);
     checkTaskScopeConsumption(body);
+    // #2166 / §28.10 (v0.220): the using-var borrow-pin classification
+    // (handleLocalDecl's `usingVarSourceIsBorrow` flag) is set by the dataflow's
+    // visitStmt walk for every LocalDecl reached IN-LINE in the method body.
+    // A LocalDecl inside a LAMBDA body is reached only by the lambda's own
+    // dataflow, which the ownership pass does NOT run. Run the using-var
+    // borrow-pin classification layer for lambda-body LocalDecls here as a
+    // structural pre-pass — every lambda body is walked with a fresh state map,
+    // and every LocalDecl inside it is run through handleLocalDecl (which sets
+    // usingVarSourceIsBorrow based on the shared predicates). Runs BEFORE the
+    // method body's dataflow so the FLAG is set before codegen reads it;
+    // saves/restores member state per lambda so the method body's state is
+    // unmodified. // per §28.10 v0.220, #2166
+    applyUsingVarBorrowPinInLambdas(body);
     // §15.3 (#1549): the move-only inline-array whole-value-reassignment leak
     // warning. A syntactic pre-pass like the ones above — see the header
     // comment on moveOnlyArrayLeakScan for why it runs outside the CFG
@@ -5618,6 +5631,289 @@ void MethodOwnership::checkLambdaTaskFamilyBorrowReturnsExpr(
         checkOneLambdaTaskFamilyBorrowReturn(
             *lam, lam == topLam ? topExpected : nullptr);
 }
+
+// #2166 / §28.10 (v0.220): the `using var` borrow-pin classification —
+// `handleLocalDecl`'s `usingVarSourceIsBorrow` flag — is set during the
+// dataflow for every `LocalDecl` reached IN-LINE in the method body. A
+// `LocalDecl` inside a LAMBDA body is reached only by the lambda's own
+// dataflow, which the ownership pass does NOT run (lambdas carry their body
+// as an `Expr`; `checkCapturedOwnedConsumeInStmt` / `checkLambdaTaskFamily-
+// BorrowReturns` walk the lambda body for narrow checks but never classify
+// the local-decl layer). The typed `using var` then reaches codegen's
+// classOfLocal unconditionally and `registerUsingDisposal` registers a
+// scope-end dispose — double-freeing the borrow whose real owner also
+// disposes it (heap-use-after-free under ASan for the field-read shape;
+// the same shape family as #2128/#2137, just in lambda position).
+//
+// Walk every lambda in `body` and call `handleLocalDecl` on each LocalDecl
+// inside the lambda body, with a fresh state map. `handleLocalDecl` already
+// sets `usingVarSourceIsBorrow` based on the shared predicates
+// (`usingVarInitIsRecognizedBorrow`, the bare-id tracked-binding branch,
+// the bind-atom / arm-meet / bare-T-call branches) — no codegen re-
+// derivation is needed; the only thing missing for lambda bodies was the
+// walk. A lambda body is an independent scope: state changes inside the
+// lambda body must not leak to the outer scope (which is mid-dataflow when
+// this pre-pass runs), so save/restore `states_` and `fieldMovedFrom_`
+// around the recursive walk. Nested lambdas are walked recursively with
+// their own save/restore.
+//
+// The `isUsing` flag and the Shared predicates are spec-§28.10-cited and
+// are the SAME predicates that fire for an in-method `using var` — so a
+// fresh owned/adopt value inside a lambda body still adopts (the predicate
+// stays Borrowed for fresh-owned producers per the #2128 layering), and a
+// borrow RHS pins. // per §28.10 v0.220, #2166
+void MethodOwnership::applyUsingVarBorrowPinInLambdas(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    // Collect every LambdaExpr in the body (collectBodyLambdas already
+    // descends into nested lambdas, so the flat list covers all nesting).
+    std::vector<const ast::LambdaExpr*> lambdas;
+    for (const auto& s : body) {
+        if (s) collectBodyLambdas(*s, lambdas);
+    }
+    for (const ast::LambdaExpr* lam : lambdas) {
+        // Save the outer scope's state — the pre-pass runs ahead of the
+        // dataflow's LocalDecl/visitStmt walk for the METHOD body, so the
+        // outer `states_` is the pre-seed state (parameters + nothing else).
+        // The fields-snapshot's type is the standard field-moved-from map;
+        // decltype saves spelling it out here.
+        BlockState savedStates = states_;
+        auto savedFieldMovedFrom = fieldMovedFrom_;
+        states_.clear();
+        fieldMovedFrom_.clear();
+        // Walk the lambda's own body. Expression-bodied lambdas carry their
+        // body as a single `exprBody`; block-bodied lambdas carry `stmts`.
+        // Neither contains a top-level LocalDecl (the lambda is a value, not
+        // a binding), so neither shape needs a direct handleLocalDecl call
+        // here — we just walk into the body to find nested LocalDecls and
+        // nested lambdas.
+        if (lam->exprBody) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*lam->exprBody, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas) {
+                applyUsingVarBorrowPinInLambdaBody(*nested);
+            }
+        }
+        for (const auto& s : lam->stmts) {
+            if (s) applyUsingVarBorrowPinInLambdaStmt(*s);
+        }
+        // Restore the outer scope's state — the lambda is its own scope.
+        states_ = std::move(savedStates);
+        fieldMovedFrom_ = std::move(savedFieldMovedFrom);
+    }
+}
+
+// #2166: walk a single lambda body statement and run handleLocalDecl on any
+// LocalDecl, while recursing into nested control-flow to find deeper
+// LocalDecls and nested lambdas. Mirrors `collectBodyLambdas` shape-for-shape
+// so every Stmt kind the lambda body can contain is covered; the difference
+// is the leaf action (`handleLocalDecl` on a LocalDecl + nested-lambda walk
+// instead of plain collection). Under-collecting here merely misses a pin
+// (a conservative over-adopt → ASan trip), so completeness is the bar.
+void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        handleLocalDecl(*ld);
+        return;
+    }
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lc->value) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*lc->value, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyUsingVarBorrowPinInLambdaBody(*nested);
+        }
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*rs->value, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyUsingVarBorrowPinInLambdaBody(*nested);
+        }
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*es->expr, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyUsingVarBorrowPinInLambdaBody(*nested);
+        }
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->target) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*as->target, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyUsingVarBorrowPinInLambdaBody(*nested);
+        }
+        if (as->value) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*as->value, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyUsingVarBorrowPinInLambdaBody(*nested);
+        }
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (ts->value) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*ts->value, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyUsingVarBorrowPinInLambdaBody(*nested);
+        }
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*ifs->ifBranch.condition, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyUsingVarBorrowPinInLambdaBody(*nested);
+        }
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition) {
+                std::vector<const ast::LambdaExpr*> nestedLambdas;
+                collectBodyLambdasExpr(*el.condition, nestedLambdas);
+                for (const ast::LambdaExpr* nested : nestedLambdas)
+                    applyUsingVarBorrowPinInLambdaBody(*nested);
+            }
+            for (const auto& bs : el.body)
+                if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        }
+        for (const auto& bs : ifs->elseBody)
+            if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*ws->condition, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyUsingVarBorrowPinInLambdaBody(*nested);
+        }
+        for (const auto& bs : ws->body)
+            if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*fs->iterable, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyUsingVarBorrowPinInLambdaBody(*nested);
+        }
+        if (fs->withExpr) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*fs->withExpr, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyUsingVarBorrowPinInLambdaBody(*nested);
+        }
+        for (const auto& bs : fs->body)
+            if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        return;
+    }
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : db->body)
+            if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        if (is->target) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*is->target, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyUsingVarBorrowPinInLambdaBody(*nested);
+        }
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*ds->value, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyUsingVarBorrowPinInLambdaBody(*nested);
+        }
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*ys->value, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyUsingVarBorrowPinInLambdaBody(*nested);
+        }
+        return;
+    }
+    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : trys->body)
+            if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        for (const auto& arm : trys->catches) {
+            if (arm.guard) {
+                std::vector<const ast::LambdaExpr*> nestedLambdas;
+                collectBodyLambdasExpr(*arm.guard, nestedLambdas);
+                for (const ast::LambdaExpr* nested : nestedLambdas)
+                    applyUsingVarBorrowPinInLambdaBody(*nested);
+            }
+            if (arm.body) applyUsingVarBorrowPinInLambdaStmt(*arm.body);
+        }
+        for (const auto& bs : trys->finallyBody)
+            if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        if (cs->scrutinee) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*cs->scrutinee, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyUsingVarBorrowPinInLambdaBody(*nested);
+        }
+        for (const auto& arm : cs->arms) {
+            if (arm.guard) {
+                std::vector<const ast::LambdaExpr*> nestedLambdas;
+                collectBodyLambdasExpr(*arm.guard, nestedLambdas);
+                for (const ast::LambdaExpr* nested : nestedLambdas)
+                    applyUsingVarBorrowPinInLambdaBody(*nested);
+            }
+            if (arm.exprBody) {
+                std::vector<const ast::LambdaExpr*> nestedLambdas;
+                collectBodyLambdasExpr(*arm.exprBody, nestedLambdas);
+                for (const ast::LambdaExpr* nested : nestedLambdas)
+                    applyUsingVarBorrowPinInLambdaBody(*nested);
+            }
+            for (const auto& bs : arm.stmts)
+                if (bs) applyUsingVarBorrowPinInLambdaStmt(*bs);
+        }
+        return;
+    }
+    // Break / Continue / etc.: no child expressions reachable.
+}
+
+// #2166: walk a single (nested) lambda body with its own save/restore. The
+// nested-lambda recursion is inlined here so the save/restore is tight
+// (each nested lambda is its own scope). Body walking mirrors the outer
+// `applyUsingVarBorrowPinInLambdas` block/expr-body shape.
+void MethodOwnership::applyUsingVarBorrowPinInLambdaBody(
+        const ast::LambdaExpr& lam) {
+    BlockState savedStates = states_;
+    auto savedFieldMovedFrom = fieldMovedFrom_;
+    states_.clear();
+    fieldMovedFrom_.clear();
+    if (lam.exprBody) {
+        std::vector<const ast::LambdaExpr*> nestedLambdas;
+        collectBodyLambdasExpr(*lam.exprBody, nestedLambdas);
+        for (const ast::LambdaExpr* nested : nestedLambdas)
+            applyUsingVarBorrowPinInLambdaBody(*nested);
+    }
+    for (const auto& s : lam.stmts)
+        if (s) applyUsingVarBorrowPinInLambdaStmt(*s);
+    states_ = std::move(savedStates);
+    fieldMovedFrom_ = std::move(savedFieldMovedFrom);
+}
+
 
 // §28.3 SB01-B (v0.190, #1919): collect every LambdaExpr appearing anywhere in a
 // statement (including nested lambdas — collectBodyLambdasExpr descends into a

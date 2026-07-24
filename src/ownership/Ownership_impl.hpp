@@ -223,6 +223,30 @@ public:
     void checkLambdaTaskFamilyBorrowReturnsExpr(
         const ast::Expr& e, const sema::TypeRef* topExpected = nullptr);
 
+    // #2166 / §28.10 (v0.220): the `using var` borrow-pin classification
+    // (`handleLocalDecl`'s `usingVarSourceIsBorrow` flag — see the #2128/#2137
+    // derivation above) is set by the dataflow's `visitStmt` walk for every
+    // `LocalDecl` reached IN-LINE in a method body. A `LocalDecl` inside a
+    // LAMBDA body is reached only by the lambda's own dataflow, which the
+    // ownership pass does NOT run (lambdas carry their body as an `Expr`;
+    // `checkCapturedOwnedConsumeInStmt` / `checkLambdaTaskFamilyBorrowReturns`
+    // are the only lambda walks, and neither classifies the local-decl layer).
+    // Codegen (`registerUsingDisposal`, `classOfLocal`) then treats the typed
+    // `using var` as an adoption and registers a scope-end dispose — double-
+    // freeing the borrow whose real owner also disposes it (heap-use-after-
+    // free under ASan for the field-read shape; the same shape family as
+    // #2128/#2137, just in lambda position).
+    //
+    // Run the using-var borrow classification for lambda-body LocalDecls at
+    // a structural pre-pass (before the dataflow) — collect every LambdaExpr
+    // in `body`, walk each lambda body with a FRESH state map (lambda bodies
+    // are independent scopes), and call `handleLocalDecl` on every LocalDecl.
+    // `handleLocalDecl` already sets `usingVarSourceIsBorrow` based on the
+    // shared predicates (no codegen re-derivation needed); the only thing
+    // missing for lambda bodies was the walk. // per §28.10 v0.220, #2166
+    void applyUsingVarBorrowPinInLambdas(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+
     // #1066 / §9.7 (v0.153) + §28.3: a borrow-bearing record may not be
     // constructed from a TEMPORARY bound to one of its borrow-carrying fields —
     // the temporary's lifetime ends at the construction expression, so the record
@@ -794,6 +818,18 @@ private:
     void collectBodyLambdasExpr(
         const ast::Expr& e,
         std::vector<const ast::LambdaExpr*>& out) const;
+    // #2166 / §28.10 (v0.220): per-statement walker for the lambda-body
+    // using-var borrow-pin pre-pass. Mirrors `collectBodyLambdas` shape-for-
+    // shape — under-collecting merely misses a pin (conservative over-adopt,
+    // detectable as an ASan trip), so completeness is the bar. Calls
+    // `handleLocalDecl` on every LocalDecl reached (the predicate that sets
+    // `usingVarSourceIsBorrow`); recurses into nested lambdas via
+    // `applyUsingVarBorrowPinInLambdaBody`.
+    void applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s);
+    // #2166 / §28.10 (v0.220): per-lambda body walker — saves/restores
+    // `states_` and `fieldMovedFrom_` (the lambda body is its own scope) and
+    // descends into the lambda's stmts and any nested lambdas.
+    void applyUsingVarBorrowPinInLambdaBody(const ast::LambdaExpr& lam);
     // §28.3 SB01-B (#1929): collect the lambdas that are the DIRECT value of a
     // `return E;` in a block body (mirroring the return traversal), so the block
     // driver can apply the enclosing declared return type only to those.
