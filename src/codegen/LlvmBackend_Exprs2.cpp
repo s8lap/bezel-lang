@@ -176,12 +176,52 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
                     llvm::ConstantPointerNull::get(ptrTy()), lhsSlot);
         }
     }
+    // fix #1948 / §7.7 / §28.3 (producers arm-meet, v0.184; v0.220) / §28.9: a
+    // null-coalescing `a ?? b` whose result is a (non-nullable) owned `string`.
+    // §28.3's `a ?? b` producers row is the meet of a's and b's ownership:
+    // "owned ⊓ owned = owned (exactly one of the two owned values is produced
+    // at runtime and is discharged once — no leak, no double-free)". For a
+    // runtime-managed `string` (§28.9) the result must carry EXACTLY +1 on
+    // whichever arm the join takes. Normalize each arm to +1 IN ITS OWN BLOCK
+    // before the endBB PHI — the SAME per-arm mint lowerCaseExpr/lowerConditional
+    // apply to the sibling case/when result and the if-expression (#1934/#1948):
+    //   • LHS arm (this entry block, the non-null path l→endBB): retained unless
+    //     it is itself a +1 producer or a string local owning +1. The retain is
+    //     emitted UNCONDITIONALLY here, but on the *null* path l is null and
+    //     bz_string_retain is a null no-op — so it counts only when l is the
+    //     result (the non-null path), exactly where the PHI takes l.
+    //   • RHS arm (below, in rhsEndBB): retained unless a +1 producer / owning
+    //     local, minting the +1 the null path needs.
+    // The whole `??` is then a single +1 producer (isPlusOneStringProducer
+    // recognizes it) the consumer TRANSFERS. Both halves are required:
+    // recognition WITHOUT the per-arm mint drops a borrow arm's reference (UAF);
+    // the mint WITHOUT recognition still double-retains a producer arm (the leak
+    // — #1948). Only a non-nullable `string` result is affected; `string?` (both
+    // operands nullable) stays on its existing retain-free path.
+    const sema::TypeRef* coalResTy = ctx_.exprType(bin);
+    bool coalNonNullString =
+        coalResTy && !coalResTy->nullable &&
+        coalResTy->kind == sema::TypeRef::Kind::Primitive &&
+        coalResTy->primitive == sema::PrimitiveType::String;
+    if (coalNonNullString && l->getType()->isPointerTy() && bin.left &&
+        !isPlusOneStringProducer(bin.left.get()) &&
+        !returnedStringLocalOwnsPlusOne(bin.left.get()))
+        emitStringRetain(l);
     builder_.CreateCondBr(isNull, rhsBB, endBB);
 
     builder_.SetInsertPoint(rhsBB);
     llvm::Value* r = lowerExpr(*bin.right);
     bool rhsDiverged = diverged_;  // CG40: e.g. `a ?? throw E`
     if (!r) return nullptr;
+    // fix #1948 (RHS arm of the string `??` normalization above): mint the +1
+    // the null path's result needs, in rhsEndBB (the block r is defined in, which
+    // flows to endBB), before the branch. Skipped when the RHS is itself a +1
+    // producer / owning local (it already carries its single reference) or when
+    // it diverged (never reaches endBB).
+    if (coalNonNullString && !rhsDiverged && r->getType()->isPointerTy() &&
+        bin.right && !isPlusOneStringProducer(bin.right.get()) &&
+        !returnedStringLocalOwnsPlusOne(bin.right.get()))
+        emitStringRetain(r);
     llvm::BasicBlock* rhsEndBB = nullptr;
     if (!rhsDiverged) {
         rhsEndBB = builder_.GetInsertBlock();
@@ -7186,6 +7226,48 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
             }
             // Both ptr nulls or neither: leave them — the PHI mismatch
             // reflects a pre-existing sema error and is not our concern.
+        }
+    }
+
+    // fix #1948 / §20 / §7.7 / §28.3 (producers arm-meet, v0.184; v0.220) /
+    // §28.9: an if-expression `(if c then v1 else v2)` whose result is a
+    // (non-nullable) owned `string`. §28.3's producers table makes the result
+    // the arm-meet of the branches "identically to the `a ?? b` row" (v0.184):
+    // "owned ⊓ owned = owned — exactly one arm's value is produced at runtime
+    // and is discharged once". For a runtime-managed `string` (§28.9) that
+    // means the result must carry EXACTLY +1, on WHICHEVER branch is taken.
+    // Because the PHI joins the branches into one value, the consumer (return /
+    // assign / bind) makes ONE retain-or-transfer decision for the merged
+    // value, so each branch is normalized to +1 HERE, in its own block, before
+    // the join — mirroring the per-arm normalization lowerCaseExpr applies to
+    // the sibling case/when result (#1934) and the ReturnStmt / Assign paths
+    // apply to a plain `return <concat>`. A branch that is itself a +1 producer
+    // (`+`/interpolation/nested string-returning call, or a string local owning
+    // +1) already carries its single reference — leave it; any other branch (a
+    // param/field borrow, a string-literal sentinel) is a +0 borrow and is
+    // RETAINED to mint the +1 (bz_string_retain is a no-op on a
+    // sentinel/literal/null). The whole if-expression is then a single +1
+    // producer (isPlusOneStringProducer recognizes it), so the consumer
+    // TRANSFERS the reference out without a second retain. Both halves are
+    // required: recognition WITHOUT this per-branch mint would drop a borrow
+    // branch's reference (a use-after-free); the mint WITHOUT recognition would
+    // still let the consumer double-retain a producer branch (the leak — #1948).
+    // Only a non-nullable owned `string` result (a `ptr` value) is affected; a
+    // `string?` result stays on its existing (retain-free) path.
+    if (resultSemaType && !resultSemaType->nullable &&
+        resultSemaType->kind == sema::TypeRef::Kind::Primitive &&
+        resultSemaType->primitive == sema::PrimitiveType::String) {
+        if (tv && !thenDiv && tv->getType()->isPointerTy() &&
+            !isPlusOneStringProducer(c.thenValue.get()) &&
+            !returnedStringLocalOwnsPlusOne(c.thenValue.get())) {
+            builder_.SetInsertPoint(thenEnd);
+            emitStringRetain(tv);
+        }
+        if (ev && !elseDiv && ev->getType()->isPointerTy() &&
+            !isPlusOneStringProducer(c.elseValue.get()) &&
+            !returnedStringLocalOwnsPlusOne(c.elseValue.get())) {
+            builder_.SetInsertPoint(elseEnd);
+            emitStringRetain(ev);
         }
     }
 

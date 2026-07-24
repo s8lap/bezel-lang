@@ -10423,7 +10423,40 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                rt->kind == sema::TypeRef::Kind::Primitive &&
                rt->primitive == sema::PrimitiveType::String;
     }
+    // fix #1948 / §20 / §28.3 (producers arm-meet, v0.184; v0.220) / §28.9: an
+    // if-expression `(if c then v1 else v2)` whose result is a (non-nullable)
+    // owned `string`. §28.3's `(if c then v1 else v2)` producers row makes the
+    // result the arm-meet of the branches "identically to the `a ?? b` row"
+    // (v0.184) — "owned ⊓ owned = owned … exactly one arm's value is produced
+    // at runtime and is discharged once". lowerConditional normalizes each
+    // branch to own EXACTLY +1 (a producer branch transfers its reference; a
+    // borrow branch is retained), so the if-expression result carries exactly
+    // one reference — the consumer (return / assign / bind) must TRANSFER it,
+    // not mint a second borrow-retain. Same two coordinated halves as the
+    // case/when result (#1934), the sibling §19.2 ties to the identical rule.
+    if (auto* cond = dynamic_cast<const ast::ConditionalExpr*>(init)) {
+        const sema::TypeRef* rt = ctx_.exprType(*cond);
+        return rt && !rt->nullable &&
+               rt->kind == sema::TypeRef::Kind::Primitive &&
+               rt->primitive == sema::PrimitiveType::String;
+    }
     if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(init)) {
+        // fix #1948 / §7.7 / §28.3 (producers arm-meet, v0.184; v0.220) / §28.9:
+        // a null-coalescing `a ?? b` whose result is a (non-nullable) owned
+        // `string`. §28.3's `a ?? b` producers row is "the meet of the
+        // ownership states of a and b … owned ⊓ owned = owned (exactly one of
+        // the two owned values is produced at runtime and is discharged once —
+        // no leak, no double-free)". lowerCoalesce normalizes each arm to +1 (a
+        // producer arm transfers; the LHS / a borrow arm is retained), so the
+        // ?? result carries exactly one reference the consumer TRANSFERS — the
+        // same two-halves shape as the case/when result (#1934) and the
+        // if-expression (above), the three forms §28.3 ties to one arm-meet.
+        if (bin->op == "??") {
+            auto* rt = ctx_.exprType(*init);
+            return rt && !rt->nullable &&
+                   rt->kind == sema::TypeRef::Kind::Primitive &&
+                   rt->primitive == sema::PrimitiveType::String;
+        }
         if (bin->op != "+") return false;
         auto* rt = ctx_.exprType(*init);
         return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
