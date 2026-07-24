@@ -5105,6 +5105,51 @@ bool Emitter::lowerOwnedSeqDrainFor(const ast::ForStmt& fs) {
                 }
             }
         }
+    } else if (auto* id =
+                   dynamic_cast<const ast::IdentifierExpr*>(fs.iterable.get())) {
+        // fix #2167 / stdlib §4.5/§4.7/§4.11 v0.135: the bound form
+        // `var d := coll.Drain(); for var x in d do ... end` — when the iterable
+        // is an IOwningEnumerable<T>-typed LOCAL whose initializer is the
+        // builtin Drain() call, the drain view IS the receiver collection
+        // (stdlib §4.5 "no separate enumerable object") and the for-in should
+        // drain IT, not iterate it as a generic bz_array / vtable iterator. The
+        // bz_array protocol path would read the class-instance layout as an
+        // array header (the vtable pointer becomes the count — a SEGV); the
+        // vtable path would dispatch Dispose via slot 1 (the iterator-frame
+        // Dispose) on a class instance whose slot 1 is a field offset, not a
+        // function pointer (a SEGV too, §29.7). Recover the original Drain()
+        // call expression from the LocalDecl and lower the same way as the
+        // inline form — semantic equivalence, same discharge / disposal story
+        // (no separate owning binding for `d`, aliasing per §28.10 / #2146).
+        if (auto* sym = ctx_.exprSymbol(*id);
+            sym && dynamic_cast<const sema::LocalSymbol*>(sym)) {
+            const auto* ls = static_cast<const sema::LocalSymbol*>(sym);
+            // The local's declaration must be a plain LocalDecl (not an inline
+            // `out var` whose `decl` is an IdentifierExpr). Inline locals have
+            // no `initializer` and are excluded by definition.
+            const auto* ld =
+                dynamic_cast<const ast::LocalDecl*>(ls->decl);
+            if (ld && ld->initializer) {
+                if (auto* ce2 =
+                        dynamic_cast<const ast::CallExpr*>(ld->initializer.get())) {
+                    if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(
+                            ce2->callee.get())) {
+                        if (ma2->member == "Drain" && ma2->target) {
+                            collExpr = ma2->target.get();
+                            const sema::TypeRef* ct =
+                                ctx_.exprType(*collExpr);
+                            if (ct && ct->kind == sema::TypeRef::Kind::Named) {
+                                if (ct->astNode && ct->astNode->name &&
+                                    !ct->astNode->name->parts.empty())
+                                    collName = ct->headName();
+                                else if (!ct->importedName.empty())
+                                    collName = ct->importedName;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     if (!collExpr) return false;
     if (collName != "OwningArray" && collName != "OwningLinkedList" &&
