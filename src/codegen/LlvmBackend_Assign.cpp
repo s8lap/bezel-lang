@@ -1831,10 +1831,20 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
                                                         : nullptr;
         llvm::Type* valLlvm = valTy ? lowerTypeRef(valTy) : cur->getType();
         if (!valLlvm) valLlvm = cur->getType();
-        // Widen RHS to match (mirrors lowerCollectionIndexerCompound array path).
-        if (rhs->getType() != valLlvm && rhs->getType()->isIntegerTy() &&
-            valLlvm->isIntegerTy())
-            rhs = builder_.CreateSExt(rhs, valLlvm);
+        // §6.2 / §5.1 (#2161): an integer RHS narrower than the dict value
+        // type widens (ZExt unsigned, SExt signed — the RHS's own signedness,
+        // per §5.1's table) before emitCompoundOp; a wider RHS flows through
+        // UNCHANGED so emitCompoundOp's #2140/#2147 wide branch runs the op
+        // at the §6.2-promoted width and applies the §6.6/§5.2 CHECKED
+        // narrow-integer write-back. The pre-fix unconditional SExt was an
+        // invalid narrowing cast on a wider variable RHS (IR-verify abort:
+        // "Type too small for SExt  %14 = sext i64 %13 to i32") and silently
+        // truncated a wider constant RHS to a wrong in-range value. Mirrors
+        // coerceNumericToType's `srcBits < targetBits` widening rule; the
+        // array-indexer branch has no pre-widen and lets emitCompoundOp run
+        // the math end-to-end.
+        rhs = coerceNumericToType(rhs, valLlvm,
+                                  isUnsignedTargetExpr(*as.value));
         llvm::Value* newVal = emitCompoundOp(
             op, cur, rhs, valLlvm->isFloatingPointTy(),
             isUnsignedTargetExpr(*as.target),
