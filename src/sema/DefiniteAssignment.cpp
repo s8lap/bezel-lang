@@ -158,6 +158,35 @@ std::unordered_set<std::string_view> joinLiveBranches(
     return result;
 }
 
+// fix #2187 / §22.8: join the per-branch *may-be-assigned* sets of an
+// if/try/case for the readonly single-assignment tracker. Where the §7.9/§22.7
+// definite-assignment tracker above uses INTERSECTION (a field is assigned only
+// where assigned on every reaching path), single-assignment enforcement needs
+// the dual: a readonly field is *possibly already assigned* after the construct
+// if it was assigned on ANY live branch that reaches the join — a UNION over the
+// non-terminated branches. A branch that provably diverges (throw/return)
+// reaches no join, so its assignments cannot cause a later double-assign on a
+// path that flows past the construct — excluding it (parallel to
+// joinLiveBranches) is what keeps `if c then _f:=a; return; else end; _f:=b;`
+// accepted (the only live path never assigned `_f`). Each branch out already
+// starts from `entry` (the caller reset it), so the union is ⊇ entry. If every
+// branch diverges the join is unreachable; return entry (value irrelevant, no
+// reachable assignment follows).
+std::unordered_set<std::string_view> joinUnionLive(
+    const std::vector<std::unordered_set<std::string_view>>& outs,
+    const std::vector<bool>& terminated,
+    const std::unordered_set<std::string_view>& entry) {
+    std::unordered_set<std::string_view> result;
+    bool any = false;
+    for (std::size_t i = 0; i < outs.size(); ++i) {
+        if (i < terminated.size() && terminated[i]) continue;  // diverging arm
+        for (auto n : outs[i]) result.insert(n);
+        any = true;
+    }
+    if (!any) return entry;
+    return result;
+}
+
 // Per-method walker. The state is the set of locally-declared names
 // that have been definitely assigned at the current program point.
 // Names enter the set when:
@@ -224,16 +253,31 @@ public:
     void runConstructor(const ast::ConstructorDecl& cd,
                         const ast::TypeDecl& klass) {
         ctorMode_ = true;
+        roCtorMode_ = true;  // fix #2187: readonly single-assignment tracking
         bool sealed = false, abstract = false;
         for (auto m : klass.modifiers) {
             if (m == "sealed") sealed = true;
             if (m == "abstract") abstract = true;
         }
         classSealedNonAbstract_ = sealed && !abstract;
+        // fix #2187 / §22.8: readonly INSTANCE fields that carry a field
+        // initializer are assigned at step 2 — before a non-chaining ctor's body
+        // runs — so a body assignment to one is a SECOND assignment. Collect
+        // them here; they are seeded into `readonlyMaybeAssigned_` after the
+        // chaining decision below (a `this(...)`-chaining ctor skips step 2, so
+        // its initializers did not run in THIS ctor — see the seeding site).
+        std::vector<std::string_view> readonlyInitialized;
         for (const auto& m : klass.members) {
             if (auto* f = dynamic_cast<const ast::FieldDecl*>(m.get())) {
                 if (isSevenNineStrictField(*f, ctx_))
                     fieldsNeedingInit_.push_back(f->name);
+                bool isStatic = false, isReadonly = false;
+                for (auto mod : f->modifiers) {
+                    if (mod == "static") isStatic = true;
+                    else if (mod == "readonly") isReadonly = true;
+                }
+                if (isReadonly && !isStatic && f->initializer)
+                    readonlyInitialized.push_back(f->name);
             } else if (auto* p =
                            dynamic_cast<const ast::PropertyDecl*>(m.get())) {
                 if (isSevenNineStrictAutoProp(*p, ctx_))
@@ -259,6 +303,7 @@ public:
         // `base()`) the field initializers run but the needing-set is still
         // unassigned (the body must assign it).
         std::size_t startIdx = 0;
+        bool isThisChain = false;
         if (const ast::CallExpr* chain = getChainingCall(cd)) {
             startIdx = 1;
             inChainingPosition_ = true;
@@ -266,10 +311,23 @@ public:
             inChainingPosition_ = false;
             if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(
                     chain->callee.get())) {
-                if (cid->name == "this")
+                if (cid->name == "this") {
+                    isThisChain = true;
                     for (auto n : fieldsNeedingInit_) assignedFields_.insert(n);
+                }
             }
         }
+        // fix #2187 / §22.8: seed initializer-carrying readonly fields as
+        // already-assigned for a base/implicit-base ctor (its field initializers
+        // ran as step 2). A `this(...)`-chaining ctor SKIPS step 2 — its
+        // initializers ran in the chained-to ctor — so seeding from initializers
+        // here would be wrong; the chained-to ctor's own single-assignment is
+        // checked when THAT ctor is walked. (Cross-ctor once-ness — a chaining
+        // ctor re-assigning a field the chained-to ctor already set — is the
+        // residual noted in the commit; this slice enforces within-ctor and
+        // initializer+body once-ness, which closes the probe-confirmed exploit.)
+        if (!isThisChain)
+            for (auto n : readonlyInitialized) readonlyMaybeAssigned_.insert(n);
         for (std::size_t i = startIdx; i < cd.body.size(); ++i) {
             if (cd.body[i]) visitStmt(*cd.body[i]);
         }
@@ -280,6 +338,35 @@ public:
             // Reported at the constructor's own location (there is no falling-
             // off statement to point at).
             checkCtorFieldCompletion(&cd.span.begin);
+        }
+    }
+
+    // fix #2187 / §22.8: walk a STATIC constructor body with readonly
+    // single-assignment enforcement — the static analogue of runConstructor's
+    // readonly tracking. §7.4 narrows `static readonly` fields too ("instance or
+    // static"), so a double assignment in a static constructor is the same
+    // soundness hole as the instance case. There is no instance under
+    // construction, so none of §22.7's `this`-observation gating applies (this
+    // walk stays in the ordinary local-DA regime, `ctorMode_` false); static
+    // constructors take no parameters. `static readonly` fields carrying a
+    // static field initializer run before the static-ctor body (§22.12), so they
+    // are seeded as already-assigned, exactly like the instance initializer case.
+    void runStaticConstructor(const ast::ConstructorDecl& cd,
+                              const ast::TypeDecl& klass) {
+        roCtorMode_ = true;
+        for (const auto& m : klass.members) {
+            auto* f = dynamic_cast<const ast::FieldDecl*>(m.get());
+            if (!f || !f->initializer) continue;
+            bool isStatic = false, isReadonly = false;
+            for (auto mod : f->modifiers) {
+                if (mod == "static") isStatic = true;
+                else if (mod == "readonly") isReadonly = true;
+            }
+            if (isStatic && isReadonly)
+                readonlyMaybeAssigned_.insert(f->name);
+        }
+        for (const auto& s : cd.body) {
+            if (s) visitStmt(*s);
         }
     }
 
@@ -326,6 +413,35 @@ private:
     bool classSealedNonAbstract_ = false;
     std::vector<std::string_view> fieldsNeedingInit_;
     std::unordered_set<std::string_view> assignedFields_;
+
+    // fix #2187 / §22.8 (single-assignment of readonly fields). Active while
+    // walking ANY class constructor body — instance (runConstructor) or static
+    // (runStaticConstructor). §22.8: "A field declared `readonly` may be
+    // assigned only in a field initializer or in a constructor body" — and,
+    // referenced by §7.4/§21.1 as "§22.8's single-assignment rule" /
+    // "member-level runtime single-assignment", a readonly field is assigned
+    // *exactly once*. The compiler previously enforced only the PLACEMENT
+    // (checkReadonlyAssignment in ExprTypecheck.cpp accepts any assignment while
+    // `inConstructor_`), not the once-ness — so `_f := a; _f := b;` compiled,
+    // breaking the §7.4 readonly-field narrowing (#2116) whose ambient-fact
+    // ride-into-a-closure is sound EXACTLY because an observed non-null readonly
+    // value is final. A double assignment made a stored lambda deref a value the
+    // ctor later nulled (probe-confirmed SEGV in `lam$0`).
+    //
+    // `readonlyMaybeAssigned_` is the set of readonly fields possibly assigned
+    // on some path reaching the current point — the DUAL of `assignedFields_`
+    // (which is the all-paths definite set): union at joins (joinUnionLive),
+    // seeded at body entry with readonly fields that carry a field initializer
+    // (they run as step 2 before a non-chaining ctor's body, §22.8). An
+    // assignment to a readonly field already in this set is a second assignment
+    // → error. `inLoopDepth_ > 0` marks an assignment textually inside a loop
+    // body: a loop could assign the field on more than one iteration, and the
+    // construction window carves out §7.4 narrowing so the compiler cannot prove
+    // a guard limits it to once — so any readonly assignment inside a loop is
+    // rejected (the conservative, sound reading of single-assignment).
+    bool roCtorMode_ = false;
+    int inLoopDepth_ = 0;
+    std::unordered_set<std::string_view> readonlyMaybeAssigned_;
 
     // §22.4 (v0.181): short-circuit-sensitive definite-assignment state for a
     // boolean sub-expression. `afterTrue` / `afterFalse` are the sets of
@@ -486,6 +602,14 @@ private:
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
             // RHS first — that's a read before the write.
             if (as->value) visitExpr(*as->value);
+            // fix #2187 / §22.8: single-assignment of a readonly field. Runs for
+            // EVERY assignment op (`:=`, `??=`, compound) — any second write
+            // breaks the finality the §7.4 narrowing (#2116) relies on. Placed
+            // before the §22.7 field-DA bookkeeping below so it fires regardless
+            // of whether the target is §7.9-strict (a nullable readonly field —
+            // the exploit's `_f: string?` — is not, yet still narrows).
+            if (roCtorMode_ && as->target)
+                checkReadonlyOnceness(*as->target, as->span.begin);
             // §22.7 rule 1 (v0.184): a `:=` store to a field or auto-property of
             // `this` marks that field definitely assigned toward the
             // observation gate, and is itself NOT an observation (do not recurse
@@ -567,6 +691,12 @@ private:
             // field-outs (a field is assigned after the `if` only where assigned
             // on every reaching path). `fieldEntry` is that per-branch start.
             auto fieldEntry = assignedFields_;
+            // fix #2187 / §22.8: readonly may-be-assigned state threaded in
+            // parallel, with UNION at the join (joinUnionLive) — the dual of the
+            // field-DA intersection. Each branch starts from the same entry set;
+            // after the `if`, a readonly field is possibly-assigned if it was on
+            // any live branch. `roEntry` is that per-branch start.
+            auto roEntry = readonlyMaybeAssigned_;
             // `falseState` threads the assigned set on the path where every
             // guard checked so far was false.
             auto falseState = std::move(c0.afterFalse);
@@ -580,12 +710,15 @@ private:
             consumedLazyOuts.push_back(std::move(consumedLazy_));
             std::vector<std::unordered_set<std::string_view>> fieldOuts;
             fieldOuts.push_back(std::move(assignedFields_));
+            std::vector<std::unordered_set<std::string_view>> roOuts;
+            roOuts.push_back(std::move(readonlyMaybeAssigned_));
             std::vector<bool> branchTerminated;
             branchTerminated.push_back(terminated_);
             for (const auto& el : ifs->elifBranches) {
                 assigned_ = falseState;
                 consumedLazy_ = consumedLazyEntry;
                 assignedFields_ = fieldEntry;
+                readonlyMaybeAssigned_ = roEntry;
                 terminated_ = false;
                 CondState ci = el.condition
                                    ? evalCond(*el.condition)
@@ -598,12 +731,14 @@ private:
                 branchOuts.push_back(std::move(assigned_));
                 consumedLazyOuts.push_back(std::move(consumedLazy_));
                 fieldOuts.push_back(std::move(assignedFields_));
+                roOuts.push_back(std::move(readonlyMaybeAssigned_));
                 branchTerminated.push_back(terminated_);
             }
             if (ifs->hasElse) {
                 assigned_ = falseState;
                 consumedLazy_ = consumedLazyEntry;
                 assignedFields_ = fieldEntry;
+                readonlyMaybeAssigned_ = roEntry;
                 terminated_ = false;
                 for (const auto& bs : ifs->elseBody) {
                     if (bs) visitStmt(*bs);
@@ -611,11 +746,13 @@ private:
                 branchOuts.push_back(std::move(assigned_));
                 consumedLazyOuts.push_back(std::move(consumedLazy_));
                 fieldOuts.push_back(std::move(assignedFields_));
+                roOuts.push_back(std::move(readonlyMaybeAssigned_));
                 branchTerminated.push_back(terminated_);
             } else {
                 branchOuts.push_back(std::move(falseState)); // no-else: guard-false path
                 consumedLazyOuts.push_back(consumedLazyEntry); // no-else: no new consumption
                 fieldOuts.push_back(fieldEntry); // no-else: guard-false path assigns no field
+                roOuts.push_back(roEntry); // no-else: guard-false path assigns no readonly field
                 branchTerminated.push_back(false);     // no-else = path live
             }
             // Intersect assigned / field sets over the LIVE branches only —
@@ -626,6 +763,10 @@ private:
             // Intersect field-assignment sets (§22.7), same live-branch join.
             assignedFields_ =
                 joinLiveBranches(fieldOuts, branchTerminated, fieldEntry);
+            // fix #2187 / §22.8: UNION the readonly may-be-assigned sets over the
+            // live branches — the dual of the intersection above.
+            readonlyMaybeAssigned_ =
+                joinUnionLive(roOuts, branchTerminated, roEntry);
             // Intersect consumedLazy_ sets (#1226). Kept as a whole-branch
             // intersection: lazy single-consumption (#1226) is a distinct
             // obligation from definite-assignment and out of this fix's scope.
@@ -667,12 +808,21 @@ private:
             // loop cannot assume the body ran). Observations *inside* the body
             // still see the body's growing field-state (a single iteration).
             auto fieldEntry = assignedFields_;
+            // fix #2187 / §22.8: any assignment to a readonly field inside a loop
+            // body could recur on a later iteration — rejected by checkReadonly
+            // Onceness while `inLoopDepth_ > 0`. The body's rejected assignments
+            // never enter `readonlyMaybeAssigned_`, and a zero-trip loop assigns
+            // nothing, so the set is restored to entry after the loop.
+            auto roEntry = readonlyMaybeAssigned_;
+            ++inLoopDepth_;
             for (const auto& bs : ws->body) {
                 if (bs) visitStmt(*bs);
             }
+            --inLoopDepth_;
             assigned_ = std::move(c.afterFalse);
             consumedLazy_ = std::move(consumedLazyEntry);
             assignedFields_ = std::move(fieldEntry);
+            readonlyMaybeAssigned_ = std::move(roEntry);
             terminated_ = entryTerminated; // loop may not execute
             return;
         }
@@ -702,18 +852,25 @@ private:
             // §22.7 (v0.184): like `while`, a zero-trip `for` body assigns no
             // field, so body field assignments do not survive past the loop.
             auto fieldEntry = assignedFields_;
+            // fix #2187 / §22.8: as with `while`, a readonly assignment in a
+            // `for` body is rejected (loop iteration ⇒ potential re-assignment)
+            // and the may-be-assigned set is restored past the zero-trip loop.
+            auto roEntry = readonlyMaybeAssigned_;
             bool entryTerminated = terminated_;
             terminated_ = false;
             if (!fs->varName.empty()) {
                 declared_.insert(fs->varName);
                 assigned_.insert(fs->varName);
             }
+            ++inLoopDepth_;
             for (const auto& bs : fs->body) {
                 if (bs) visitStmt(*bs);
             }
+            --inLoopDepth_;
             assigned_ = std::move(entry);
             consumedLazy_ = std::move(consumedLazyEntry); // body-marks removed
             assignedFields_ = std::move(fieldEntry);
+            readonlyMaybeAssigned_ = std::move(roEntry);
             terminated_ = entryTerminated; // loop may not execute
             return;
         }
@@ -734,6 +891,7 @@ private:
             // assigned on every arm (the try-body-completed path and every
             // catch path). `fieldEntry` is that per-arm start.
             auto fieldEntry = assignedFields_;
+            auto roEntry = readonlyMaybeAssigned_;
             bool entryTerminated = terminated_;
             terminated_ = false;
             for (const auto& bs : ts->body) {
@@ -747,17 +905,30 @@ private:
             consumedLazyOuts.push_back(std::move(consumedLazy_));
             std::vector<std::unordered_set<std::string_view>> fieldOuts;
             fieldOuts.push_back(std::move(assignedFields_));
+            // fix #2187 / §22.8: the readonly may-be-assigned state after the try
+            // BODY — a throw could occur after any try-body readonly assignment
+            // completed, so each catch arm starts seeing those possible
+            // assignments (over-approx: reset to `roTryBody`, NOT the pre-try
+            // `roEntry`). This makes `try _f:=a; catch _f:=b; end;` a rejected
+            // double-assign (one throw edge leaves `_f` already set), while two
+            // mutually-exclusive catch arms each assigning `_f` stay accepted
+            // (each resets to the same `roTryBody`, not accumulating).
+            auto roTryBody = readonlyMaybeAssigned_;
+            std::vector<std::unordered_set<std::string_view>> roOuts;
+            roOuts.push_back(std::move(readonlyMaybeAssigned_));
             std::vector<bool> armTerminated;
             armTerminated.push_back(terminated_);
             for (const auto& arm : ts->catches) {
                 assigned_ = entry;
                 consumedLazy_ = consumedLazyEntry;
                 assignedFields_ = fieldEntry;
+                readonlyMaybeAssigned_ = roTryBody;
                 terminated_ = false;
                 if (arm.body) visitStmt(*arm.body);
                 outs.push_back(std::move(assigned_));
                 consumedLazyOuts.push_back(std::move(consumedLazy_));
                 fieldOuts.push_back(std::move(assignedFields_));
+                roOuts.push_back(std::move(readonlyMaybeAssigned_));
                 armTerminated.push_back(terminated_);
             }
             // Intersect assigned / field sets over the LIVE arms only — the
@@ -768,6 +939,12 @@ private:
             // Intersect field-assignment sets (§22.7), same live-arm join.
             assignedFields_ =
                 joinLiveBranches(fieldOuts, armTerminated, fieldEntry);
+            // fix #2187 / §22.8: UNION the readonly may-be-assigned sets over the
+            // live arms (dual of the field intersection). The finally body below
+            // runs in this joined state — a readonly assignment there over a
+            // try/catch-assigned field is a rejected double-assign.
+            readonlyMaybeAssigned_ =
+                joinUnionLive(roOuts, armTerminated, roTryBody);
             // Intersect consumedLazy_ sets (#1226). Kept as a whole-arm
             // intersection: lazy single-consumption is a distinct obligation
             // from definite-assignment, out of this fix's scope.
@@ -817,15 +994,21 @@ private:
             auto entryAssigned = assigned_;
             auto entryConsumedLazy = consumedLazy_;
             auto fieldEntry = assignedFields_;
+            // fix #2187 / §22.8: readonly may-be-assigned entry — case arms are
+            // mutually exclusive (like if/else), so each resets to `roEntry` and
+            // the post-case set is the UNION over live arms (joinUnionLive).
+            auto roEntry = readonlyMaybeAssigned_;
             std::vector<std::unordered_set<std::string_view>> armOuts;
             std::vector<std::unordered_set<std::string_view>> armConsumedLazyOuts;
             std::vector<std::unordered_set<std::string_view>> armFieldOuts;
+            std::vector<std::unordered_set<std::string_view>> armRoOuts;
             std::vector<bool> armTerminated;
             bool hasCatchAll = false;
             for (const auto& arm : cs->arms) {
                 assigned_ = entryAssigned;
                 consumedLazy_ = entryConsumedLazy;
                 assignedFields_ = fieldEntry;
+                readonlyMaybeAssigned_ = roEntry;
                 terminated_ = false;
                 // Pattern bindings (`var t`) are non-destructive fresh names
                 // (§19 pattern binding), always definitely assigned within the
@@ -845,6 +1028,7 @@ private:
                 armOuts.push_back(std::move(assigned_));
                 armConsumedLazyOuts.push_back(std::move(consumedLazy_));
                 armFieldOuts.push_back(std::move(assignedFields_));
+                armRoOuts.push_back(std::move(readonlyMaybeAssigned_));
                 armTerminated.push_back(terminated_);
             }
             if (!hasCatchAll) {
@@ -853,6 +1037,7 @@ private:
                 armOuts.push_back(entryAssigned);
                 armConsumedLazyOuts.push_back(entryConsumedLazy);
                 armFieldOuts.push_back(fieldEntry);
+                armRoOuts.push_back(roEntry);
                 armTerminated.push_back(false);
             }
             // Join over the LIVE arms only (fix #1753): a `return`/`throw` arm
@@ -862,6 +1047,10 @@ private:
             assigned_ = joinLiveBranches(armOuts, armTerminated, entryAssigned);
             assignedFields_ =
                 joinLiveBranches(armFieldOuts, armTerminated, fieldEntry);
+            // fix #2187 / §22.8: UNION the readonly may-be-assigned sets over the
+            // live arms (dual of the field intersection).
+            readonlyMaybeAssigned_ =
+                joinUnionLive(armRoOuts, armTerminated, roEntry);
             if (!armConsumedLazyOuts.empty()) {
                 auto consumedOut = armConsumedLazyOuts.front();
                 for (std::size_t i = 1; i < armConsumedLazyOuts.size(); ++i) {
@@ -884,6 +1073,11 @@ private:
         }
         if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
             if (is->target) visitExpr(*is->target);
+            // fix #2187 / §22.8: `_f++`/`_f--` on a readonly field is a
+            // read-modify-WRITE — a second write over any prior assignment
+            // breaks single-assignment exactly as a `:=` would.
+            if (roCtorMode_ && is->target)
+                checkReadonlyOnceness(*is->target, is->span.begin);
             return;
         }
         if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
@@ -1167,6 +1361,54 @@ private:
         }
     }
 
+    // fix #2187 / §22.8: enforce single-assignment of a `readonly` field within
+    // a constructor body. Called at every AssignmentStmt (any op: `:=`, `??=`,
+    // compound) while `roCtorMode_`. Resolving the target to its FieldSymbol
+    // covers every receiver shape uniformly — `this._f`, `TypeName._s`, and a
+    // bare `_f` — and reads the declared `readonly` modifier directly. A field
+    // that is already in `readonlyMaybeAssigned_` (from an earlier body
+    // assignment on a reaching path, or from a field initializer seeded at body
+    // entry) is being assigned a SECOND time; an assignment textually inside a
+    // loop body could recur on a later iteration. Both break §22.8's
+    // single-assignment rule (§7.4/§21.1) and are rejected. A first, non-loop
+    // assignment records the field and is admitted (the legitimate single
+    // assignment, including the conditional-single-across-branches shape, which
+    // the per-branch reset + union join keeps accepted). Placement (assignment
+    // outside any constructor) is a separate check — checkReadonlyAssignment in
+    // ExprTypecheck.cpp; this one only adds the once-ness §7.4's soundness needs.
+    void checkReadonlyOnceness(const ast::Expr& target,
+                              const SourceLocation& loc) {
+        if (!roCtorMode_) return;
+        auto* fs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(target));
+        if (!fs) return;
+        bool isReadonly = false;
+        for (auto mod : fs->modifiers)
+            if (mod == "readonly") { isReadonly = true; break; }
+        if (!isReadonly) return;
+        std::string_view name = fs->name;
+        if (inLoopDepth_ > 0) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("cannot assign to readonly field `") +
+                std::string(name) +
+                "` inside a loop — a readonly field is assigned exactly once, "
+                "and a loop body could assign it on more than one iteration "
+                "(§22.8 single-assignment)");
+            return;
+        }
+        if (readonlyMaybeAssigned_.count(name)) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("cannot assign to readonly field `") +
+                std::string(name) +
+                "` more than once — a readonly field is assigned exactly once "
+                "across its field initializer and constructor body "
+                "(§22.8 single-assignment)");
+            return;
+        }
+        readonlyMaybeAssigned_.insert(name);
+    }
+
     void checkRead(const ast::IdentifierExpr& id) {
         if (id.name == "this" || id.name == "base") return;
         // Only flag locals declared in this method that haven't been
@@ -1398,9 +1640,13 @@ void checkMember(const ast::Member& m, SemaContext& ctx,
         }
     } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
         MethodDA da(ctx);
-        if (!cd->isStatic && enclosing &&
-            enclosing->kind == ast::TypeDeclKind::Class) {
-            da.runConstructor(*cd, *enclosing);  // §22.7 observation checking
+        bool inClass =
+            enclosing && enclosing->kind == ast::TypeDeclKind::Class;
+        if (!cd->isStatic && inClass) {
+            da.runConstructor(*cd, *enclosing);  // §22.7 + §22.8 checking
+        } else if (cd->isStatic && inClass) {
+            // fix #2187 / §22.8: static-ctor readonly single-assignment.
+            da.runStaticConstructor(*cd, *enclosing);
         } else {
             da.run(cd->params, cd->body);
         }
