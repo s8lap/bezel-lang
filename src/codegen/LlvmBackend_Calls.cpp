@@ -3927,6 +3927,39 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* fn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy(), i64()});
             builder_.CreateCall(fn, {recv, slot, builder_.getInt64(esz)});
+            // fix #1881 / §28.3 Unbound owned temporaries / §28.11 "Storing a
+            // borrow": a BORROWING collection's Add/Push/Enqueue takes a
+            // BORROW — its element parameter carries no `owned` marker — so
+            // the call transfers no ownership. Per §2771's own citation,
+            // "Add, Insert, and the indexer-set on a borrowing collection
+            // remain governed by §28.3's unbound-temporary admission and
+            // §28.11's residual-trust store rule" — this call is admitted
+            // (only the COLLECTION-LITERAL form is rejected at the literal
+            // site, §2771), and §28.3 enumerates "a non-owned argument" as
+            // one of the borrowing uses an unbound owned temporary may serve
+            // before being "disposed at the end of the full expression".
+            // Before this fix nothing disposed such an argument here: a
+            // borrowing collection never takes the #1955 owning-transfer
+            // path below (arrIsOwning is false), and no other codegen site
+            // reaches an Add/Push/Enqueue argument — `new Res(1)` in
+            // `arr.Add(new Res(1))` leaked with its destructor never run
+            // (issue #1881). Add/Push/Enqueue return unit, so nothing in
+            // this statement can chain off the call's result — the call's
+            // own end IS the full-expression boundary for this argument.
+            // isFreshOwnedClassProducer (shared with the #1039/#1053
+            // receiver-temp fix) is the sound gate: a BORROW argument (a
+            // named-binding read, a field, another borrow-returning call) is
+            // not a fresh producer and stays undisposed here — no UAF of a
+            // value some other holder still owns. Disposing the fresh
+            // producer here creates exactly the "borrow-lifetime hazard that
+            // checked disposal mode backstops" the spec names at §2771: the
+            // copy just stored in `recv` dangles from this point on,
+            // backstopped by DisposedAccessException in checked-disposal
+            // mode (undefined behavior, by design, unchecked) — the same
+            // accepted residual as every other borrowing-collection store
+            // (§28.11's "Storing a borrow" store-site rule).
+            if (!arrIsOwning && isFreshOwnedClassProducer(call.args[0].value.get()))
+                emitDisposeAndReclaim(v);
             // #1955 / §28.3: for an OWNING collection the element parameter is
             // `owned` (the collection takes over the element's disposal), so a
             // bare owned local/param element argument's ownership just
