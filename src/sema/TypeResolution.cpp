@@ -280,6 +280,11 @@ void Resolver::run(const ast::SourceFile& src) {
     checkTopLevelVisibility();
     // Slice S23: record restrictions (§9.7).
     checkRecordRestrictions();
+    // #2208 (§35.1, v0.226): choice self-containment through value-typed
+    // payload components (record↔choice by-value cycles, mutable mutual pairs
+    // of choices, etc.). Walks the same value-containment graph as the
+    // §9 record check; the cycle's choice-side diagnostic is reported here.
+    checkChoiceSelfContainment();
     // §9.8 (issue #550): ISerializable/IDeserializable conformance eligibility.
     checkSerializationEligibility();
     // #594 (§28.2): user code may not declare Dispose() on a class/record.

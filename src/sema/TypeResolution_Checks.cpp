@@ -65,24 +65,70 @@ static bool ownedMarkerErasedAtSubstitutedType(const TypeRef* t) {
     return false;
 }
 
-// #1272 (§9): value-containment-cycle detection for records. Returns true when
-// `start` is transitively reachable from `cur` by following value-typed record
-// fields (record, nullable-record, and inline-array-of-record fields — all
-// stored inline). A class/interface field is a heap reference and breaks the
-// cycle; a bare generic type-parameter field (declaration == null) is opaque and
-// conservatively ignored. `seen` prevents unbounded recursion through unrelated
-// cycles.
+// #1272 / #2208 (§9 + §35.1, v0.226): value-containment-cycle detection for
+// value types. Returns true when `start` is transitively reachable from `cur`
+// by following value-typed components — record instance fields, choice case
+// payloads, and inline-array elements of either. A class/interface component
+// is a heap reference and breaks the cycle; a bare generic type-parameter
+// (declaration == null) is opaque and conservatively ignored. `seen` prevents
+// unbounded recursion through unrelated cycles and through the cycle itself on
+// malformed recursive graphs (record→choice→record, mutual record pairs, etc.),
+// which would otherwise send `Emitter::recordStruct` into infinite LLVM struct
+// layout recursion (#2208 — the §35.1 choice-self-containment clause also
+// reachable here, since a choice is walked like a record).
+//
+// The unwrap step strips nullable (`T?` for a value type is still stored inline
+// — §9) and inline-array wrappers (`[N]T` is a fixed-size value struct, so its
+// element participates in the value-containment graph — §15.1). Named types
+// other than Record/Choice (classes, interfaces, enums, primitives) are not
+// stored inline and therefore break the cycle.
+//
+// `recordsAllowed` (default true) is the keying for diagnostic dedup: when
+// false, the walker treats records as cycle-breakers (a record remains a heap
+// reference's analytical counterpart in this mode) and only follows choices.
+// This is the choice-side check's view of the world — a record↔choice cycle's
+// record already reports itself via checkRecordRestrictions, and the choice
+// check only fires when the cycle is purely choice↔choice. The two checks
+// therefore never emit duplicate diagnostics on a single malformed graph.
 bool Resolver::recordValueContainsSelf(TypeSymbol* start, TypeSymbol* cur,
-                                       std::unordered_set<TypeSymbol*>& seen) {
+                                       std::unordered_set<TypeSymbol*>& seen,
+                                       bool recordsAllowed) {
     if (!cur) return false;
-    // Unwrap an inline-array element (possibly nested) to the record it stores.
-    auto valueRecordOf = [](TypeRef* rt) -> TypeSymbol* {
-        while (rt && rt->kind == TypeRef::Kind::InlineArray) rt = rt->arrayElement;
-        if (rt && rt->kind == TypeRef::Kind::Named && rt->declaration &&
-            rt->declaration->kind == ast::TypeDeclKind::Record)
-            return rt->declaration;
+    // Unwrap nullable + inline-array to the value-typed declaration (record or
+    // choice) that the component stores inline. Returns null for any non-value
+    // type (class, interface, enum, primitive, function, unresolved/error).
+    auto valueTypeOf = [&](const TypeRef* rt) -> TypeSymbol* {
+        while (rt && rt->kind == TypeRef::Kind::InlineArray)
+            rt = rt->arrayElement;
+        if (!rt || rt->kind != TypeRef::Kind::Named || !rt->declaration)
+            return nullptr;
+        auto k = rt->declaration->kind;
+        if (k == ast::TypeDeclKind::Choice) return rt->declaration;
+        if (k == ast::TypeDeclKind::Record)
+            return recordsAllowed ? rt->declaration : nullptr;
         return nullptr;
     };
+    // §35.1: a choice's value-typed components are its case-payload fields.
+    // Walking payload→record→field→... extends the existing record-only walk
+    // to the record↔choice by-value cycles that issue #2208 surfaced.
+    if (cur->kind == ast::TypeDeclKind::Choice) {
+        for (Symbol* m : cur->members) {
+            auto* cc = dynamic_cast<ChoiceCaseSymbol*>(m);
+            if (!cc || !cc->caseDecl) continue;
+            for (const ast::Param& pf : cc->caseDecl->payload) {
+                if (!pf.type) continue;
+                TypeSymbol* contained =
+                    valueTypeOf(ctx_.resolvedType(*pf.type));
+                if (!contained) continue;
+                if (contained == start) return true;
+                if (seen.insert(contained).second &&
+                    recordValueContainsSelf(start, contained, seen,
+                                            recordsAllowed))
+                    return true;
+            }
+        }
+        return false;
+    }
     for (Symbol* m : cur->members) {
         auto* fs = dynamic_cast<FieldSymbol*>(m);
         if (!fs || hasMod(fs, "static")) continue;
@@ -95,11 +141,11 @@ bool Resolver::recordValueContainsSelf(TypeSymbol* start, TypeSymbol* cur,
         else if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
             ftype = fd->type.get();
         if (!ftype) continue;
-        TypeSymbol* contained = valueRecordOf(ctx_.resolvedType(*ftype));
+        TypeSymbol* contained = valueTypeOf(ctx_.resolvedType(*ftype));
         if (!contained) continue;
         if (contained == start) return true;
         if (seen.insert(contained).second &&
-            recordValueContainsSelf(start, contained, seen))
+            recordValueContainsSelf(start, contained, seen, recordsAllowed))
             return true;
     }
     return false;
@@ -981,6 +1027,55 @@ void Resolver::checkRecordRestrictions() {
                     "?` field is still stored inline); use a `class` (a heap "
                     "reference) for a recursive structure (§9)");
             }
+        }
+    }
+}
+
+// #2208 (§35.1, v0.226): a choice may not transitively contain itself through
+// value-typed components (case payloads, including payload records, nested
+// payloads, and inline-array elements of either). The §35.1 statement is
+// pronounced on the cycle's STARTING choice — each choice that transitively
+// contains itself through value-typed components is its own violation (a
+// choice↔choice mutual pair reports once per choice, mirroring the §9 mutual
+// record pair `A` ↔ `B` that fires once per record). The underlying walker is
+// the existing Resolver::recordValueContainsSelf (extended to follow choice
+// payloads — §9's record walk was too narrow for the record↔choice case).
+// Without this check, a `choice Ch Wrap(r: Rec)` paired with a
+// `record Rec(K: Ch)` would loop codegen's Emitter::recordStruct into
+// infinite LLVM struct-body recursion (a stack overflow / hang).
+//
+// `recordsAllowed = false` keys the duplicate-avoidance between the two CHECK
+// sides: a record↔choice cycle (the most common form of #2208) is reported
+// exactly once — by the record's checkRecordRestrictions — never twice (the
+// choice check deliberately does NOT fire here, because the record is the
+// cycle's canonical starting point). The choice check is therefore the
+// record-side diagnostic's complement on record↔choice graphs: it suppresses
+// itself when a record is on the cycle's path, and only fires on cycles that
+// are entirely choices (or that satisfy the §35.1 single-choice self-
+// containment clause, which the walker also covers).
+//
+// NB: a mutual choice PAIR (A ↔ B) is reported ONCE PER choice — both A and B
+// independently violate §35.1 from their own starting declLoc. This is the
+// same-shape behavior the existing §9 record self-containment check emits
+// for a mutual record pair (one diagnostic per record, both firing on the
+// same graph). The "recordsAllowed = false" discipline is graph-level dedup
+// (record-side vs choice-side), not per-cycle-fold dedup.
+void Resolver::checkChoiceSelfContainment() {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t || t->kind != ast::TypeDeclKind::Choice) continue;
+        std::unordered_set<TypeSymbol*> seen;
+        if (recordValueContainsSelf(t, t, seen, /*recordsAllowed=*/false)) {
+            ctx_.diagnostics().report(
+                Severity::Error, t->declLoc,
+                std::string("choice `") + std::string(t->name) +
+                "` cannot recursively contain itself by value through its "
+                "case payloads — a choice is stored inline, so a "
+                "value-typed cycle through its payload fields has infinite "
+                "size (a nullable payload is still stored inline); use a "
+                "`class` (a heap reference) at the cycle's break point "
+                "(§35.1)");
         }
     }
 }

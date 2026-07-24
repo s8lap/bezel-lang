@@ -246,6 +246,14 @@ private:
     // only and never own a resource.
     void checkRecordRestrictions();
 
+    // #2208 (§35.1, v0.226): a choice may not transitively contain itself
+    // through value-typed components (case payloads, including payload records
+    // and nested/nullable/inline forms). The walker is recordValueContainsSelf;
+    // this function fires the diagnostic on the choice when the walker reports
+    // back to the choice itself (the record-side diagnostic fires separately
+    // from checkRecordRestrictions when the cycle is reachable from a record).
+    void checkChoiceSelfContainment();
+
     // §9.8 (issue #550): records and enums that declare `: ISerializable` or
     // `: IDeserializable` must satisfy the synthesis-eligibility rule.  Types
     // that declare the conformance but are ineligible (ineligible component
@@ -355,16 +363,25 @@ private:
     // MethodDecl has an Abstract body.
     static bool hasMod(MemberSymbol* m, std::string_view want);
 
-    // #1272 (§9): true when the value-type record `start` transitively contains
-    // itself BY VALUE (a self-referential record has infinite inline size and
-    // cannot be laid out). Walks the value-containment graph from `cur` — record
-    // fields, nullable-record fields (`T?` for a value type is still inline),
-    // and inline-array-of-record fields — following only value-typed records; a
-    // class/interface field (a heap reference) breaks the cycle. `seen` guards
-    // against unbounded recursion through other records. A recursive record must
-    // use a class (heap reference) instead.
+    // #1272 / #2208 (§9 + §35.1, v0.226): true when the value-type `start`
+    // transitively contains itself BY VALUE (a self-referential value type has
+    // infinite inline size and cannot be laid out). Walks the value-containment
+    // graph from `cur` — record instance fields, choice case payloads, and
+    // inline-array elements of either — unwrapping nullable (`T?` for a value
+    // type is still inline, §9) and inline-array wrappers. A class/interface
+    // component is a heap reference and breaks the cycle; a bare generic type
+    // parameter is opaque and conservatively ignored. `seen` guards against
+    // unbounded recursion through unrelated cycles and terminates the walk on
+    // the cycle itself on malformed recursive graphs (record↔choice, mutual
+    // records, mutual choices, etc.). When `recordsAllowed` is false, records
+    // are treated as cycle-breakers — the choice-side check uses this to fire
+    // only on purely choice↔choice cycles, leaving record↔choice cycles to the
+    // record-side diagnostic (no duplicate firing on a single malformed graph).
+    // A recursive structure must use a class (heap reference) at the cycle's
+    // break point.
     bool recordValueContainsSelf(TypeSymbol* start, TypeSymbol* cur,
-                                 std::unordered_set<TypeSymbol*>& seen);
+                                 std::unordered_set<TypeSymbol*>& seen,
+                                 bool recordsAllowed = true);
 
     // Slice S15: a base member is overridable when it is `virtual`,
     // `abstract`, or `override` — but not `sealed override` (which
