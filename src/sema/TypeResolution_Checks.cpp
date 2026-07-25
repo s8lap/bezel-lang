@@ -1738,6 +1738,31 @@ void Resolver::checkHashContainerKeys() {
     // generic params (no concrete type is known at the declaration site), so those
     // sites pass pass 1. Here we walk concrete instantiations of the enclosing
     // type to check whether the bound type is equality-bearing.
+    //
+    // §14.2 "Derived-property constraints" (#2111): "the per-instantiation
+    // re-check for those interior uses is subsumed by the constraint, and one
+    // diagnostic (the constraint failure, at the instantiation site) replaces
+    // the interior one." When the enclosing generic type declares a
+    // `where <param>: hashable` constraint on THIS key parameter, the §14.2
+    // constraint check at the enclosing type's instantiation site
+    // (checkOneConstraint) owns the diagnostic, so the interior §3.6 rule-2
+    // check here is skipped — a bad instantiation is reported exactly once.
+    // Suppress ONLY when a matching `hashable` constraint is present on that
+    // exact param: an unconstrained `Registry2<K>` whose body mentions
+    // `Dictionary<K, int>` carries its own interior obligation and must still
+    // fire here (silently dropping it would be a soundness regression).
+    auto paramHasHashableConstraint = [](const TypeSymbol* enc,
+                                         std::string_view pn) -> bool {
+        if (!enc || !enc->decl) return false;  // imported type, no AST
+        const auto* td = dynamic_cast<const ast::TypeDecl*>(enc->decl);
+        if (!td) return false;
+        for (const ast::GenericConstraint& gc : td->genericConstraints) {
+            if (gc.typeParam != pn) continue;
+            for (const ast::ConstraintItem& ci : gc.items)
+                if (ci.kind == "hashable") return true;
+        }
+        return false;
+    };
     std::unordered_set<const ast::Type*> reported2;
     for (const HashContainerSite& s : hashContainerSites_) {
         // Only unresolved-param keys (declaration == null); concrete keys were
@@ -1752,6 +1777,11 @@ void Resolver::checkHashContainerKeys() {
             s.keyRef->astNode->name->parts.size() != 1)
             continue;
         std::string_view paramName = s.keyRef->headName();
+        // §14.2 (#2111): if the enclosing type declares `where <param>:
+        // hashable`, the constraint check at the instantiation site owns the
+        // diagnostic — skip the interior check (one diagnostic replaces the
+        // interior one). See paramHasHashableConstraint above.
+        if (paramHasHashableConstraint(s.enclosingType, paramName)) continue;
         // Find the index of this parameter in the enclosing type's param list.
         std::size_t paramIdx = s.enclosingType->genericParams.size();
         for (std::size_t i = 0; i < s.enclosingType->genericParams.size(); ++i) {
