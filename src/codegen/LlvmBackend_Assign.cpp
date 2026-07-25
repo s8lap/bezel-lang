@@ -875,15 +875,15 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         // falls back to elementDisposerThunk() since the interface receiver's
         // concrete element type is not in its TypeRef — T: class is guaranteed
         // by §4.2's constraint, so the shared vtable thunk is correct).
+        const sema::TypeRef* arrEl2 =
+            (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+        bool arrIsOwning2 =
+            recvTy->astNode && recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty() &&
+            common::isOwningPrefixedName(recvTy->headName());
         {
-            const sema::TypeRef* arrEl =
-                (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
-            bool arrIsOwning2 =
-                recvTy->astNode && recvTy->astNode->name &&
-                !recvTy->astNode->name->parts.empty() &&
-                common::isOwningPrefixedName(recvTy->headName());
             llvm::Function* elemDisp =
-                elementPolicyFor(arrEl, arrIsOwning2).disposerThunk;
+                elementPolicyFor(arrEl2, arrIsOwning2).disposerThunk;
             if (!elemDisp && listIfaceOwning) elemDisp = elementDisposerThunk();
             if (elemDisp) {
                 auto* fn = declareC("bz_array_set_disposing",
@@ -912,6 +912,30 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         auto* fn = declareC("bz_array_set", llvm::Type::getVoidTy(llvm_),
                             {ptrTy(), i64(), ptrTy(), i64()});
         builder_.CreateCall(fn, {recv, idx, slot, builder_.getInt64(esz)});
+        // fix #2204 / §28.3 Unbound owned temporaries / §28.11 "Storing a
+        // borrow": the SAME fresh-producer argument leak the #1881 Add/Push/
+        // Enqueue fix disposes exists here for the borrowing (no-disposer)
+        // branch of the Array<T> indexer-set `arr[i] := rhs` — an owned
+        // TEMPORARY (`new R(1)`) is a non-owned RHS to a borrow-taking set,
+        // transfers no ownership (§28.3's "non-owned argument"), and under the
+        // pre-fix codegen was never disposed: dtor never ran, LSan reported 16B
+        // leaked. Per §28.3 v0.226 the assignment-statement end IS the full-
+        // expression boundary for this RHS (the indexer-set is a statement-
+        // shaped store, not a chain-off expression — nothing downstream can
+        // reuse the value). Dispose a fresh-producer RHS (isFreshOwnedClass-
+        // Producer — the same discriminant the #1039/#1053 receiver-temp and
+        // #1881 Add/Push/Enqueue/Insert fixes use) right after the
+        // bz_array_set call, gated on the receiving collection being BORROWING
+        // (the owning branch fell through above into the disposing setter +
+        // nullTransferredOwnedLocalSlot path, which already handles the
+        // transfer; mutually exclusive). This intentionally creates the same
+        // "borrow-lifetime hazard that checked disposal mode backstops" the
+        // spec names: the copy just stored in `recv` dangles from this point
+        // on, backstopped by DisposedAccessException in checked-disposal mode,
+        // undefined behavior (by design) unchecked — the same accepted
+        // residual as every other borrowing-collection store (§28.11).
+        if (!arrIsOwning2 && isFreshOwnedClassProducer(valueExpr))
+            emitDisposeAndReclaim(val);
         return true;
     }
 
@@ -1066,6 +1090,37 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
             auto* fn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {recv, keyPtr, vPtr});
+            // fix #2204 / §28.3 Unbound owned temporaries / §28.11 "Storing a
+            // borrow": the SAME fresh-producer argument leak the #1881 Add/Push/
+            // Enqueue fix disposes exists here for a BORROWING Dictionary<K,V>'s
+            // indexer-set `d[k] := rhs` (gen-key, no disposer) — an owned
+            // TEMPORARY (`new R(1)`) is a non-owned RHS to a borrow-taking set,
+            // transfers no ownership (§28.3's "non-owned argument"), and under
+            // the pre-fix codegen was never disposed: dtor never ran, LSan
+            // reported 16B leaked. Per §28.3 v0.226 the assignment-statement end
+            // IS the full-expression boundary for this RHS (the indexer-set is
+            // a statement-shaped store, not a chain-off expression). Dispose a
+            // fresh-producer RHS (isFreshOwnedClassProducer — the same
+            // discriminant the #1039/#1053 receiver-temp and #1881 Add/Push/
+            // Enqueue/Insert fixes use) right after the bz_dict_set_gen call,
+            // gated on the receiving collection being BORROWING (`!dictIsOwning2`;
+            // an OwningDictionary takes ownership via the disposing setter +
+            // nullTransferredOwnedLocalSlot path above — mutually exclusive).
+            // The fresh-producer gate IS the class-type check: isFreshOwnedClass-
+            // Producer only returns true for class-typed fresh producers, so a
+            // record (the dict's value is heap-boxed — `vPtr` is a separately-
+            // owned box, not the source `val`) or a string (the dict retains
+            // a +1, transferring the borrow into a co-owned +1) is NEVER
+            // matched — no spurious double-free of the boxed record or the
+            // transferred string +1. This intentionally creates the same
+            // "borrow-lifetime hazard that checked disposal mode backstops"
+            // the spec names: the pointer just stored in the dict dangles
+            // from this point on, backstopped by DisposedAccessException in
+            // checked-disposal mode, undefined behavior (by design) unchecked
+            // — the same accepted residual as every other borrowing-collection
+            // store (§28.11).
+            if (!dictIsOwning2 && isFreshOwnedClassProducer(valueExpr))
+                emitDisposeAndReclaim(val);
         }
         return true;
     }
@@ -1085,6 +1140,22 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
                             {ptrTy(), ptrTy(), i64(), ptrTy()});
         builder_.CreateCall(fn, {recv, kd, kl, vPtr});
+        // fix #2204 / §28.3 Unbound owned temporaries / §28.11 "Storing a
+        // borrow": the borrowing Dictionary<K,V> string-key branch of the
+        // indexer-set `d[k] := rhs` — identical to the gen-key branch above
+        // except the key is a string. The value side is the same: a fresh-
+        // producer class RHS is a non-owned argument to a borrow-taking set,
+        // transfers no ownership, and under the pre-fix codegen was never
+        // disposed. Dispose it right after the bz_dict_set_str call, gated on
+        // the receiving collection being BORROWING (the owning branch fell
+        // through above into the disposing setter + nullTransferredOwnedLocal-
+        // Slot path, which already handles the transfer; mutually exclusive).
+        // Same isFreshOwnedClassProducer gate as the gen-key branch — the
+        // class-only gate excludes records (heap-boxed, vPtr is a separately
+        // owned box) and strings (the dict retains a +1, transferring the
+        // borrow into a co-owned +1) so no spurious double-free.
+        if (!dictIsOwning2 && isFreshOwnedClassProducer(valueExpr))
+            emitDisposeAndReclaim(val);
     }
     return true;
 }

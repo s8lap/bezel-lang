@@ -4220,6 +4220,30 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* fn = declareC("bz_array_insert_at", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), i64(), ptrTy(), i64()});
             builder_.CreateCall(fn, {recv, idx, slot, builder_.getInt64(esz)});
+            // fix #2204 / §28.3 Unbound owned temporaries / §28.11 "Storing a
+            // borrow": the SAME fresh-producer argument leak the #1881 Add/
+            // Push/Enqueue fix disposes exists here for a BORROWING array's
+            // `.Insert(index, item)` — an owned TEMPORARY (`new R(1)`) is a
+            // non-owned argument to a borrow-taking call, transfers no
+            // ownership (§28.3's "non-owned argument"), and under the pre-fix
+            // codegen was never disposed: dtor never ran, LSan reported 16B
+            // leaked. Per §28.3 v0.226 the call's end IS the full-expression
+            // boundary for this argument (Insert returns unit — nothing can
+            // chain off the result). Dispose a fresh-producer argument
+            // (isFreshOwnedClassProducer — the same discriminant the #1039/
+            // #1053 receiver-temp and #1881 Add/Push/Enqueue fixes use) right
+            // after the bz_array_insert_at call, gated on the receiving
+            // collection being BORROWING (`!arrIsOwning`; an OWNING collection
+            // instead takes ownership via the #1955 nulling path below —
+            // mutually exclusive, no double dispatch). This intentionally
+            // creates the same "borrow-lifetime hazard that checked disposal
+            // mode backstops" the spec names: the copy just stored in `recv`
+            // dangles from this point on, backstopped by DisposedAccessException
+            // in checked-disposal mode, undefined behavior (by design)
+            // unchecked — the same accepted residual as every other
+            // borrowing-collection store (§28.11).
+            if (!arrIsOwning && isFreshOwnedClassProducer(call.args[1].value.get()))
+                emitDisposeAndReclaim(v);
             // #1955 / §28.3: for an OWNING collection Insert takes ownership of
             // the element (arg 1) — null the caller's slot for a bare owned
             // local/param so the caller's null-guarded unwind disposal stays
