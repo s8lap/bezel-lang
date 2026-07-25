@@ -1020,6 +1020,30 @@ private:
         // (e.g. `owned error: string`) is NOT vtable-disposed. Null for a
         // non-generic owning choice (owningChoiceTy alone suffices there).
         const sema::TypeRef* owningChoiceRef = nullptr;
+        // fix #2115 / §28.9 / §35.4: a VALUE-LIKE choice local whose cases
+        // carry a runtime-managed (`string`) payload. The choice value is a
+        // value-typed struct on the stack; a +1 producer string stored into a
+        // case payload (`Msg.Note("he" + "llo")`) is held by NO other owner —
+        // the construction path (LlvmBackend_Calls2.cpp §35.3) stores the
+        // pointer raw, with no retain tracking, and value-like choices are
+        // skipped by registerOwningChoiceDisposal (the owning switch is for
+        // `owned`-marked heap payloads only). So the scope-end auto-dispose
+        // must release the ACTIVE case's string slot(s): a tag-switched
+        // bz_string_release walk, the same switch/join shape as the owning-
+        // choice active-case disposal but calling emitStringRelease (null- and
+        // sentinel-safe) on the active case's string-typed payload fields.
+        // Fires on BOTH the normal and unwind exit, exactly once per exit
+        // (mirroring owningChoice). Registered ONLY for a local the escape
+        // walk (StringEscapeWalker) proved never escapes AND whose initializer
+        // is a choice construction every string payload arg of which is a +1
+        // producer or literal — so the slot provably owns exactly +1 on the
+        // active case's strings and no copy/alias/release-site can double-free.
+        bool valueLikeChoiceStrRelease = false;
+        // fix #2115: the choice TypeSymbol + INSTANTIATED TypeRef the release
+        // switch traverses (the tag is field 0; case i's payload slot is
+        // field 1+i; a string payload field is released via emitStringRelease).
+        const sema::TypeSymbol* valueLikeChoiceStrReleaseTy = nullptr;
+        const sema::TypeRef* valueLikeChoiceStrReleaseRef = nullptr;
     };
     std::vector<std::vector<Disposal>> disposeStack_;
     // §28.3 (line 4910): owned parameters of the current function awaiting
@@ -6411,6 +6435,20 @@ private:
     void collectStringReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
+    // fix #2115 / §28.9 / §35.4: the set of `var` value-like choice LocalDecl
+    // nodes whose initializer is a choice construction every string payload arg
+    // of which is a +1 producer or a literal, AND a conservative whole-body walk
+    // (the shared StringEscapeWalker) proved the value never escapes its scope.
+    // For such a local the slot is the SOLE owner of the active case's string
+    // payload(s); a scope-end tag-switched bz_string_release walk (the value-
+    // like analog of emitOwningChoiceActiveCaseDisposal) reclaims them exactly
+    // once. Computed by collectStringReleaseEligible (it reuses that scan's
+    // StringEscapeWalker invocations); consulted in lowerLocalDecl. Membership is
+    // the ONLY thing that arms the release — absence ⇒ the payload leaks (the
+    // pre-existing, safe behavior). Gated on stringReleaseEligibleFn_ (the same
+    // analyzed-function contract as the string set).
+    std::unordered_set<const void*> valueLikeChoiceStrReleaseEligible_;
+
     // #1003 / stdlib §5 / §28 (trivial-dispose borrowing collections): the set
     // of plain `var` LocalDecl nodes that bind a FRESHLY-MATERIALIZED borrowing
     // array-backed collection (`Array<T>`/`Stack<T>`/`Queue<T>`) produced by a
@@ -6666,6 +6704,35 @@ private:
     // stays readable.
     void armStringLocalRefcount(const void* declNode, llvm::AllocaInst* slot,
                                 llvm::Value* v, const ast::Expr* init);
+
+    // fix #2115 / §28.9 / §35.4: classify a `var` choice local for scope-end
+    // managed-payload release. Returns the INSTANTIATED choice TypeRef iff `ld`
+    // is a non-`using` choice local whose resolved type classifies ValueLike AND
+    // whose initializer is a choice-case construction (`Msg.Note(...)`) every
+    // string-typed payload arg of which is a +1 producer (concat / interp /
+    // range-slice / ToString-mint) or a string literal (sentinel rc — release is
+    // a no-op) — so the slot provably owns +1 on the active case's strings and
+    // releasing them at scope end is balanced. Returns null otherwise (a borrow
+    // payload arg, a non-construction initializer, an owning/borrow-bearing
+    // choice, or a non-choice type → no release; the conservative, safe default).
+    const sema::TypeRef* valueLikeChoiceLocalMintsStringPayload(
+        const ast::LocalDecl* ld) const;
+    // fix #2115: register (if eligible) the scope-end managed-payload release of
+    // a value-like choice local. Called from lowerLocalDecl after the slot store;
+    // gated on valueLikeChoiceStrReleaseEligible_ (the escape walk's verdict) so
+    // it never fires on a local whose value is copied/returned/captured/case-
+    // matched (a second release through an alias would double-free). Mirrors
+    // armStringLocalRefcount's contract for the string-local release.
+    void armValueLikeChoiceStrRelease(const void* declNode,
+                                      llvm::AllocaInst* slot,
+                                      const ast::LocalDecl* ld);
+    // fix #2115: emit a tag-switched bz_string_release walk over the ACTIVE
+    // case's string-typed payload fields of a value-like choice struct. Mirrors
+    // emitOwningChoiceActiveCaseDisposal's switch/join shape but calls
+    // emitStringRelease (null- and sentinel-safe) on each string payload slot.
+    void emitValueLikeChoiceActiveCaseStrRelease(
+        llvm::AllocaInst* slot, const sema::TypeSymbol* choiceTy,
+        const sema::TypeRef* choiceRef);
 
     // #429 (closure RETURN category) / §28.9 / §28.3: true when `init` is a
     // call to a user-defined, locally-compiled method whose declared return type

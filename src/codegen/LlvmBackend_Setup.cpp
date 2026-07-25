@@ -7424,6 +7424,20 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     if (v)
         armStringLocalRefcount(static_cast<const void*>(declNode), slot, v,
                                init);
+    // fix #2115 / §28.9 / §35.4: a value-like choice local whose construction
+    // mints a +1 string payload (e.g. `var a := Msg.Note("he" + "llo");`) owns
+    // that payload with no other owner — the §35.3 construction path stores the
+    // pointer raw, with no retain tracking, and registerOwningChoiceDisposal
+    // skips value-like choices. Register a scope-end tag-switched string release
+    // over the active case's string payload(s), gated on the escape walk's
+    // non-escaping verdict (valueLikeChoiceStrReleaseEligible_) so a copied /
+    // returned / captured / case-matched / reassigned local is never armed (a
+    // second release through an alias would double-free). Mirrors the string-
+    // local release arming just above; only acts on the value-like choice
+    // locals collectStringReleaseEligible classified for THIS function.
+    if (slot && v)
+        armValueLikeChoiceStrRelease(static_cast<const void*>(declNode), slot,
+            dynamic_cast<const ast::LocalDecl*>(declNode));
     // #422 / #429 / §27.5 / §28.9: if this `var` closure (function-typed) local
     // was proven non-escaping and initialized by a +1 closure producer (a lambda
     // expression, a method reference, or a call to a user-defined closure-
@@ -9388,6 +9402,112 @@ bool Emitter::registerOwningChoiceDisposal(const ast::LocalDecl* ld) {
 }
 
 
+const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
+        const ast::LocalDecl* ld) const {
+    // fix #2115 / §28.9 / §35.4: classify a `var` choice local for scope-end
+    // managed-payload release. The value-like choice struct is a value-typed
+    // stack slot; a +1 producer string stored into a case payload
+    // (`Msg.Note("he" + "llo")`) is held by NO other owner — the §35.3
+    // construction path stores the pointer raw, with no retain tracking — so it
+    // leaks unless the scope-end auto-dispose releases the active case's string
+    // slot. This helper recognizes the shape that makes a scope-end release
+    // SOUND: the slot provably owns +1 on the active case's strings (every
+    // string payload arg is a +1 producer or a sentinel literal), so a single
+    // release balances the +1. A BORROW payload arg (a field/param/identifier
+    // read) is rejected: releasing it would drop a reference owned elsewhere
+    // (double-release / UAF). The escape walk (collectStringReleaseEligible,
+    // via StringEscapeWalker) is the SECOND gate — performed by the caller — so
+    // a copied/returned/captured/case-matched local is never armed (its value
+    // may alias into a longer-lived owner; a scope-end release would dangle or
+    // double-free). Returns the instantiated choice TypeRef when eligible, null
+    // otherwise. // per §28.9 (string refcount discipline), §35.4 v0.226.
+    if (!ld || ld->isUsing || !ld->initializer) return nullptr;
+    // Resolve the choice type (the declared annotation wins; else the
+    // initializer's inferred type), through the active substitution so a
+    // generic choice at a concrete instantiation resolves to its specialized
+    // cases — the same path registerOwningChoiceDisposal walks.
+    const sema::TypeRef* rt =
+        ld->type ? ctx_.resolvedType(*ld->type)
+                 : ctx_.exprType(*ld->initializer);
+    rt = resolveTypeParamRef(rt);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration) {
+        return nullptr;
+    }
+    if (rt->declaration->kind != ast::TypeDeclKind::Choice) return nullptr;
+    auto verdict = common::classifyChoiceType(rt, ctx_);
+    if (!verdict || *verdict != common::ChoiceClassification::ValueLike) {
+        return nullptr;  // owning (handled by registerOwningChoiceDisposal) /
+                         // borrow-bearing — no string release here.
+    }
+    // The choice's TypeDecl — needed for §28.1 / #2047 per-instantiation
+    // payload-type substitution. A generic choice payload declared as the bare
+    // type-parameter `T` (`Result<int, E>.Error(...)`) must be looked up in
+    // the instantiation's `genericArgs` (the substituted TypeRef `rt`), not in
+    // the parameter-declared raw type (which still reads as the bare `T`
+    // Named-with-null-declaration TypeRef). Without the substitution the
+    // generic `Error("x" + "y")` payload is classified non-string (the bare
+    // `E` doesn't have `kind==Primitive && primitive==String`), so the +1
+    // producer it carries is never registered for release — the leak #2115
+    // ships with a generic gap. Same `choiceDecl` cast the owning-choice emit
+    // (LlvmBackend_Disposal.cpp) and the §9.7 ownership checks use.
+    const auto* choiceDecl =
+        dynamic_cast<const ast::TypeDecl*>(rt->declaration);
+    // The initializer must be a choice-case construction. A value flowing from
+    // any other source (a call returning a choice, a field/param read) is
+    // conservatively rejected: the payload's ownership cannot be proved at this
+    // analysis level, so release is unsafe (the value may be a borrow).
+    auto* call = dynamic_cast<const ast::CallExpr*>(ld->initializer.get());
+    if (!call || !call->callee) return nullptr;
+    auto* cc = dynamic_cast<sema::ChoiceCaseSymbol*>(
+        ctx_.exprSymbol(*call->callee));
+    if (!cc || !cc->caseDecl) return nullptr;
+    // Walk the constructed case's payload fields in declaration order. A
+    // string-typed field's call argument must be a +1 producer (concat /
+    // interpolation / range-slice / ToString-mint) or a string literal (a
+    // sentinel global — bz_string_release is a no-op on it); any BORROW string
+    // arg disqualifies the local (releasing the slot would release a string the
+    // local does not own). At least one string payload must be a +1 producer —
+    // otherwise there is no leak to fix and registering a release is pointless
+    // (a literal-only payload is all sentinels). Non-string fields are ignored
+    // (the active-case release walk only touches string-typed payload slots).
+    bool anyProducer = false;
+    for (std::size_t i = 0; i < cc->caseDecl->payload.size(); ++i) {
+        const ast::Param& pf = cc->caseDecl->payload[i];
+        if (!pf.type) continue;
+        // fix #2115 (generic-choice payload substitution): `pf.type` is the
+        // PARAMETER-DECLARED type, which for a generic choice payload is the
+        // bare type-parameter TypeRef — not the concrete instantiated type.
+        // Resolve through the instantiation's genericArgs so a generic
+        // `Result<int, E>.Error(e)` at `E = string` classifies as the string
+        // payload and the +1 producer is recognized. A non-generic payload
+        // (no substitution needed) returns the resolved declared type
+        // unchanged — the existing behavior.
+        const sema::TypeRef* ft = common::substitutedChoicePayloadType(
+            pf, choiceDecl, rt, ctx_);
+        if (!ft || ft->kind != sema::TypeRef::Kind::Primitive ||
+            ft->primitive != sema::PrimitiveType::String) {
+            continue;  // non-string payload field — irrelevant to this walk
+        }
+        // This payload field is string-typed. Its call argument (positional,
+        // same index — sema binds the case payload like a parameter list, §35.3)
+        // must be a +1 producer or a literal.
+        const ast::Expr* arg =
+            (i < call->args.size() && call->args[i].value)
+                ? call->args[i].value.get()
+                : nullptr;
+        if (!arg) return nullptr;  // under-bound — defensive (sema rejects)
+        bool isProducer = isPlusOneStringProducer(arg);
+        bool isLiteral =
+            dynamic_cast<const ast::StringLiteralExpr*>(arg) ||
+            dynamic_cast<const ast::VerbatimStringExpr*>(arg);
+        if (!isProducer && !isLiteral) return nullptr;  // borrow arg — unsafe
+        if (isProducer) anyProducer = true;
+    }
+    if (!anyProducer) return nullptr;  // no +1 to reclaim (literal-only payload)
+    return rt;  // eligible — the slot owns +1 on the active case's strings.
+}
+
+
 void Emitter::registerUnwindOwnedLocal(const ast::LocalDecl* ld) {
     // §28.3 (line 4910): a plain `var` owned local is auto-disposed when an
     // exception unwinds out of its scope (an `unwindOnly` Disposal — normal exit
@@ -11182,6 +11302,39 @@ void Emitter::armStringLocalRefcount(const void* declNode,
     }
 }
 
+
+void Emitter::armValueLikeChoiceStrRelease(const void* declNode,
+                                           llvm::AllocaInst* slot,
+                                           const ast::LocalDecl* ld) {
+    // fix #2115 / §28.9 / §35.4: register the scope-end managed-payload release
+    // of a value-like choice local. The slot store itself is performed by the
+    // caller (lowerLocalDecl). Eligibility has TWO gates, both pre-computed by
+    // collectStringReleaseEligible for THIS function body:
+    //   (1) valueLikeChoiceLocalMintsStringPayload — the local is a value-like
+    //       choice whose initializer is a choice construction every string
+    //       payload arg of which is a +1 producer or a literal (the slot owns
+    //       +1 on the active case's strings); and
+    //   (2) the StringEscapeWalker proved the value never escapes (no copy /
+    //       return / capture / case-match / arg-pass — a second release through
+    //       an alias would double-free), recorded in
+    //       valueLikeChoiceStrReleaseEligible_.
+    // Gated on stringReleaseEligibleFn_ (the same analyzed-function contract as
+    // the string set): a lambda/thunk body lowered mid-function is not walked,
+    // so its choice locals just leak (never double-freed — the safe direction).
+    if (!slot || !ld || disposeStack_.empty()) return;
+    if (emittingDisposerBody_) return;  // a disposer walks fields directly
+    if (currentFn_ != stringReleaseEligibleFn_) return;
+    if (!valueLikeChoiceStrReleaseEligible_.count(declNode)) return;
+    const sema::TypeRef* rt = valueLikeChoiceLocalMintsStringPayload(ld);
+    if (!rt || !rt->declaration) return;  // defensive — eligibility is stale
+    Disposal d{slot, nullptr};
+    d.valueLikeChoiceStrRelease = true;
+    d.valueLikeChoiceStrReleaseTy = rt->declaration;
+    d.valueLikeChoiceStrReleaseRef = rt;  // instantiated (genericArgs) — for the
+                                          // specialized-struct substitution
+    disposeStack_.back().push_back(d);
+}
+
 namespace {
 // #422: a strict, conservative walk that decides whether a SPECIFIC string
 // `var` local (identified by its LocalDecl node) ever escapes its scope. A
@@ -11353,6 +11506,25 @@ struct StringEscapeWalker {
     // callees (no compiled body to hold the discipline), non-identifier args —
     // stays ESCAPED, leak-over-UAF as before. String-walker only: closure envs
     // and boxed Objects have no equivalent callee-side retain discipline.
+    //
+    // SOUNDNESS — fix #2115 / §28.9 / §35.4 v0.226: the relaxation is gated on
+    // stringReleaseMode (the #1997 narrowing), mirroring #1994 and #2023. The
+    // retain-on-store premise is sound ONLY for a `string`-typed argument: a
+    // field store of a `string` param routes through lowerStringFieldStore's
+    // emitStringRetain (the callee field gets its own +1). The value-like
+    // CHOICE release walk (#2115) reuses this SAME walker with
+    // stringReleaseMode=false, and a field store of a CHOICE-typed param is a
+    // RAW aggregate memcpy with NO emitStringRetain of the payload string —
+    // the callee field aliases the caller's SAME +1. So if the choice walk
+    // admitted the #1430 relaxation, a value-like choice local armed for
+    // scope-end release, passed as a plain method arg to a callee that field-
+    // stores it, would be released at scope end (freeing the string) while the
+    // callee's field still references it → use-after-free. With the gate, the
+    // choice walk (mode=false) treats every plain method arg as an ESCAPE —
+    // the local is excluded from scope-end release and its payload leaks (the
+    // safe pre-fix behavior, leak-over-UAF). The shared dict-materializer
+    // (#1028), grouping (#1930), and borrowing-Array (#1003) walks also run in
+    // mode=false and keep their conservative ESCAPE here for the same reason.
     void walkCallArgs(const ast::Expr* callee,
                       const std::vector<ast::CallArgument>& args) {
         const sema::MethodSymbol* ms = nullptr;
@@ -11366,8 +11538,11 @@ struct StringEscapeWalker {
         for (size_t i = 0; i < args.size(); ++i) {
             const ast::CallArgument& a = args[i];
             bool safeArg = false;
-            if (ms && a.modifier.empty() && a.name.empty() &&
-                i < ms->params.size() && isTargetIdent(a.value.get())) {
+            // fix #2115: gated on stringReleaseMode — see the SOUNDNESS note
+            // above (a choice-typed param field-store is raw memcpy, no retain).
+            if (stringReleaseMode && ms && a.modifier.empty() &&
+                a.name.empty() && i < ms->params.size() &&
+                isTargetIdent(a.value.get())) {
                 auto* ps =
                     dynamic_cast<sema::ParameterSymbol*>(ms->params[i]);
                 if (ps && ps->modifier.empty()) safeArg = true;
@@ -12668,6 +12843,7 @@ void Emitter::collectStringReleaseEligible(
     stringReleaseEligible_.clear();
     stringBorrowRetainEligible_.clear();
     stringBorrowAll_.clear();
+    valueLikeChoiceStrReleaseEligible_.clear();  // fix #2115
     // Find every `var` (non-using) string LocalDecl, classified as a +1 PRODUCER
     // (`+`/interpolation/range-slice) or a BORROW (any other string initializer:
     // a field/param/call/identifier read). Run the escape walk for each; a decl
@@ -12676,12 +12852,23 @@ void Emitter::collectStringReleaseEligible(
     // eligibility sets are disjoint by construction (producer vs borrow).
     std::vector<const ast::LocalDecl*> producerCandidates;
     std::vector<const ast::LocalDecl*> borrowCandidates;
+    // fix #2115 / §28.9 / §35.4: value-like choice locals whose initializer is
+    // a choice construction every string payload arg of which is a +1 producer
+    // or a literal — the slot owns +1 on the active case's strings. The escape
+    // walk (run below, conservative mode) gates scope-end release on the value
+    // never being copied / returned / captured / case-matched / arg-passed.
+    std::vector<const ast::LocalDecl*> valueLikeChoiceCandidates;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
             if (!ld->isUsing && ld->initializer) {
                 if (isPlusOneStringProducer(ld->initializer.get())) {
                     producerCandidates.push_back(ld);
+                } else if (valueLikeChoiceLocalMintsStringPayload(ld)) {
+                    // fix #2115: a value-like choice local whose construction
+                    // mints +1 string payload(s) — released at scope end iff
+                    // non-escaping (the walk below).
+                    valueLikeChoiceCandidates.push_back(ld);
                 } else {
                     // #429: a BORROW-initialized string local. Recognized by the
                     // local's resolved type being `string` (non-nullable; a
@@ -12748,6 +12935,29 @@ void Emitter::collectStringReleaseEligible(
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             stringBorrowRetainEligible_.insert(static_cast<const void*>(ld));
+    }
+    // fix #2115 / §28.9 / §35.4: a value-like choice local whose construction
+    // mints +1 string payload(s) is eligible for the scope-end active-case
+    // string release iff the SAME conservative escape walk proves it never
+    // escapes. The walk is the identical over-approximation used above (any
+    // non-safe-read use ⇒ escaped ⇒ excluded ⇒ no release), so releasing an
+    // eligible local's +1 string payload(s) at scope end is provably free of
+    // UAF (no escaping alias — the value was not copied / returned / captured /
+    // case-matched / arg-passed) and of double-free (once per exit; the slot is
+    // the sole owner). REASSIGNMENT is left as a conservative ESCAPE
+    // (stringReleaseMode stays FALSE here, mirroring the dict-materializer /
+    // grouping / borrowing-Array walks): a value-like choice reassign has NO
+    // release-old-on-reassign machinery, so a reassigned local's previous +1
+    // payload would leak through the very release armed here — exclude it. An
+    // escaping local is simply not armed — its payload leaks (the pre-existing,
+    // safe behavior). // per §28.9, §35.4 v0.226.
+    for (const ast::LocalDecl* ld : valueLikeChoiceCandidates) {
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        // stringReleaseMode stays false — see the rationale above.
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            valueLikeChoiceStrReleaseEligible_.insert(
+                static_cast<const void*>(ld));
     }
 }
 

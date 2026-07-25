@@ -1264,6 +1264,124 @@ void Emitter::emitOwningChoiceActiveCaseDisposal(
 }
 
 
+void Emitter::emitValueLikeChoiceActiveCaseStrRelease(
+        llvm::AllocaInst* slot, const sema::TypeSymbol* choiceTy,
+        const sema::TypeRef* choiceRef) {
+    // fix #2115 / §28.9 / §35.4: release the ACTIVE case's runtime-managed
+    // (`string`) payload(s) of a VALUE-LIKE choice struct at scope end. The
+    // choice struct is { i32 tag, case0_payload, case1_payload, … } (see
+    // choiceStruct); a string payload field is a `ptr` slot holding a +1
+    // `bz_string*` stored by the §35.3 construction path with no retain/release
+    // tracking. This emit reads the runtime TAG (field 0), switches on it, and
+    // for the active case releases each string-typed payload field via
+    // emitStringRelease — the value-like analog of
+    // emitOwningChoiceActiveCaseDisposal (which disposes `owned` heap payloads
+    // via the vtable). bz_string_release is null-safe (a never-bound string?
+    // slot) and a no-op on a sentinel/literal, so an arm whose string payload
+    // was a literal releases nothing. Payload-free / non-string-payload cases
+    // release nothing, so their switch arm collapses to the join.
+    //
+    // SOUNDNESS: the registration (armValueLikeChoiceStrRelease) guarantees the
+    // local is non-escaping (StringEscapeWalker) AND the initializer is a choice
+    // construction every string payload arg of which is a +1 producer or a
+    // literal — so the slot provably owns exactly +1 on the active case's
+    // strings, and no copy/alias/release-site exists to double-free. Fires on a
+    // SINGLE exit edge (the slot goes out of scope), so like the owning-choice
+    // active-case disposal the release is exactly-once per exit. A reassigned
+    // local is excluded at registration (no release-old-on-reassign machinery —
+    // reassignment is a conservative escape), so the active case here is always
+    // the constructed case and its string slots are the +1 the walk balances.
+    // // per §28.9 (string refcount discipline), §35.4 v0.226.
+    if (!slot || !choiceTy) return;
+    // §14.1 / §28.1 (#2047): a generic value-like choice (`Result<int, string>`)
+    // is released from a non-generic body, so install the instantiation's
+    // substitution → the specialized payload struct (a tag/payload type mismatch
+    // would otherwise fail an ICmp assertion). Same guard the owning-choice emit
+    // and choiceStruct consult.
+    RecordSubstGuard choiceSubst(this, choiceRef);
+    const auto* choiceDecl =
+        dynamic_cast<const ast::TypeDecl*>(choiceTy->decl);
+    auto cases = choiceCasesOf(choiceTy);
+    if (cases.empty()) return;
+    llvm::StructType* st = choiceStruct(choiceTy);
+    if (!st) return;
+    // Only emit the switch if at least one case has a string payload field;
+    // otherwise every arm collapses to the join and there is nothing to release.
+    auto caseHasStringPayload = [&](const sema::ChoiceCaseSymbol* cc) -> bool {
+        if (!cc || !cc->caseDecl) return false;
+        for (std::size_t j = 0; j < cc->caseDecl->payload.size(); ++j) {
+            const ast::Param& pf = cc->caseDecl->payload[j];
+            if (!pf.type) continue;
+            const sema::TypeRef* ftInst = common::substitutedChoicePayloadType(
+                pf, choiceDecl, choiceRef, ctx_);
+            if (ftInst &&
+                ftInst->kind == sema::TypeRef::Kind::Primitive &&
+                ftInst->primitive == sema::PrimitiveType::String)
+                return true;
+        }
+        return false;
+    };
+    bool any = false;
+    for (auto* cc : cases)
+        if (caseHasStringPayload(cc)) { any = true; break; }
+    if (!any) return;
+    llvm::Value* choiceVal = builder_.CreateLoad(st, slot, "vlchoice.val");
+    llvm::Value* tag = builder_.CreateExtractValue(choiceVal, {0}, "vlchoice.tag");
+    auto* joinBB =
+        llvm::BasicBlock::Create(llvm_, "vlcsr.join", currentFn_);
+    auto* switchBB =
+        llvm::BasicBlock::Create(llvm_, "vlcsr.switch", currentFn_);
+    builder_.CreateBr(switchBB);
+    builder_.SetInsertPoint(switchBB);
+    auto* sw = builder_.CreateSwitch(
+        tag, joinBB, static_cast<unsigned>(cases.size()));
+    // Walk every case in declaration order; one switch arm per case that has at
+    // least one string payload field. The string payload slot is released in
+    // payload declaration order (§35.4 "in payload declaration order" — the same
+    // ordering the owning-choice active-case disposal uses).
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        const sema::ChoiceCaseSymbol* cc = cases[i];
+        if (!cc || !cc->caseDecl) continue;
+        // Collect indices of this case's STRING payload fields (instantiated
+        // type). Non-string fields are ignored — only runtime-managed string
+        // slots carry the +1 the construction mints.
+        std::vector<unsigned> strFieldIdxs;
+        for (std::size_t j = 0; j < cc->caseDecl->payload.size(); ++j) {
+            const ast::Param& pf = cc->caseDecl->payload[j];
+            if (!pf.type) continue;
+            const sema::TypeRef* ftInst = common::substitutedChoicePayloadType(
+                pf, choiceDecl, choiceRef, ctx_);
+            if (ftInst &&
+                ftInst->kind == sema::TypeRef::Kind::Primitive &&
+                ftInst->primitive == sema::PrimitiveType::String) {
+                strFieldIdxs.push_back(static_cast<unsigned>(j));
+            }
+        }
+        if (strFieldIdxs.empty()) continue;  // nothing to release — arm
+                                             // collapses to join.
+        auto* armBB =
+            llvm::BasicBlock::Create(llvm_, "vlcsr.arm", currentFn_);
+        sw->addCase(llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_), i),
+                    armBB);
+        builder_.SetInsertPoint(armBB);
+        // GEP into the case's payload slot (field 1+i) and extract each string
+        // field. The payload slot is field 1+i of the choice struct; field j of
+        // that payload is the string pointer.
+        llvm::Value* casePayload = builder_.CreateExtractValue(
+            choiceVal, {1 + (unsigned)i}, "vlcsr.case.payload");
+        for (unsigned j : strFieldIdxs) {
+            llvm::Value* strPtr = builder_.CreateExtractValue(
+                casePayload, {j}, "vlcsr.str.field");
+            // bz_string_release is null-safe (a never-bound string? slot) and a
+            // no-op on a sentinel/literal payload — release unconditionally.
+            emitStringRelease(strPtr);
+        }
+        builder_.CreateBr(joinBB);
+    }
+    builder_.SetInsertPoint(joinBB);
+}
+
+
 void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
                                           llvm::Value* recvPtr,
                                           const sema::TypeRef* resultTy,
@@ -3131,6 +3249,20 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         if (it->owningChoice) {
             emitOwningChoiceActiveCaseDisposal(it->slot, it->owningChoiceTy,
                                                it->owningChoiceRef);
+            continue;
+        }
+        // fix #2115 / §28.9 / §35.4: a VALUE-LIKE choice local whose
+        // construction mints a +1 string payload. The active-case string
+        // release emits a switch on the runtime tag and calls
+        // bz_string_release on the active case's string payload field(s). Fires
+        // on BOTH the normal and unwind exit (the value dies either way; a
+        // given exit goes one way only → exactly once per exit). Registered
+        // ONLY for a non-escaping local (the escape walk's verdict), so the
+        // slot is the sole owner of the +1 and no alias can double-free.
+        if (it->valueLikeChoiceStrRelease) {
+            emitValueLikeChoiceActiveCaseStrRelease(
+                it->slot, it->valueLikeChoiceStrReleaseTy,
+                it->valueLikeChoiceStrReleaseRef);
             continue;
         }
         if (it->dynamicDispose) {
