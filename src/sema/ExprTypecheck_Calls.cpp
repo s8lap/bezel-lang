@@ -7301,15 +7301,50 @@ void ExprTC::checkArgsAgainstParams(
         // `owned`/`scoped` transfer of a non-implementing class to an interface
         // parameter compiled clean and then dispatched through a null vtable →
         // runtime SEGV; the bare-argument counterpart was already correctly
-        // rejected here. The by-reference family (`ref`, `out`, `out var`,
-        // `out using var`, `out owned var`) binds by reference / declares an
-        // inline out-local and is type-matched by its own (exact-type /
-        // declaration) rules elsewhere — continue to skip those here.
+        // rejected here.
         const std::string_view am = a.modifier;
-        const bool refOutFamily =
-            am == "ref" || am == "out" || am == "out var" ||
-            am == "out using var" || am == "out owned var";
-        if (refOutFamily) continue;
+        // per §22.3 v0.226 (#1756): a `ref`/`out` argument aliases the caller's
+        // storage location directly (§22.3 "ref and out argument locations"),
+        // so its type must EXACTLY match the parameter's referent type — no
+        // §5.1 implicit conversion is admitted, the same "aliases the caller's
+        // location, so no conversion is admitted" principle §14.5 states for
+        // the generic-inference case. This concrete (non-generic) position was
+        // previously folded into the by-reference-family skip and never
+        // type-checked at all, so a `ref y` of type `long` against a
+        // `ref x: int` parameter compiled clean and aliased mismatched-width
+        // storage through the parameter. The generic counterpart — a ref/out
+        // parameter whose type mentions a method type parameter — is checked
+        // by checkGenericRefOutExactUnification (§14.5, #1686), which rejects
+        // the call before reaching this point, so this check cannot
+        // double-report with it.
+        if (am == "ref" || am == "out") {
+            const ast::Param& rp = params[j];
+            if (!rp.type) continue;
+            TypeRef* rparamTy = ctx_.resolvedType(*rp.type);
+            if (rparamTy && classTarget && classParent)
+                rparamTy = substituteMemberType(rparamTy, classTarget,
+                                                classParent);
+            TypeRef* rargTy = ctx_.exprType(*a.value);
+            if (rparamTy && rargTy && !typeRefEqual(rargTy, rparamTy)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, a.value->span.begin,
+                    std::string("the `") + std::string(am) +
+                        "` argument for parameter `" + std::string(rp.name) +
+                        "` to " + calleeDesc +
+                        " does not match the parameter's referent type — "
+                        "a `ref`/`out` argument aliases the caller's "
+                        "location, so the type must match exactly and no "
+                        "implicit conversion is admitted (§22.3)");
+            }
+            continue;
+        }
+        // The inline-declaration family (`out var`, `out using var`,
+        // `out owned var`) declares a new local whose type is INFERRED FROM
+        // the parameter (§22.4), so it matches the referent type by
+        // construction — continue to skip those here.
+        if (am == "out var" || am == "out using var" ||
+            am == "out owned var")
+            continue;
         const ast::Param& p = params[j];
         if (!p.type) continue;
         TypeRef* paramTy = ctx_.resolvedType(*p.type);
