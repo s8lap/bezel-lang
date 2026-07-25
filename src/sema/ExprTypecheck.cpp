@@ -6430,9 +6430,22 @@ std::uint32_t ExprTC::narrowFactIdIfTracked(const Symbol* s) const {
 }
 
 // §7.4 (v0.214, #2085/#2116): `readonly` fields narrow. Detect the modifier on
-// a field symbol.
+// a field symbol, or a positional-record field (read-only by construction).
 bool ExprTC::isReadonlyField(const FieldSymbol* fs) {
     if (!fs) return false;
+    // §9.1/§9.4 (#2189): a positional-record field's auto-generated property is
+    // read-only (no setter; a purely positional record is immutable), so it
+    // participates in §7.4 narrowing like a `readonly` body field. The
+    // FieldSymbol is synthesized without a "readonly" modifier
+    // (SymbolCollection's positional-field loop), so recognize the posParam
+    // flag directly — this also brings fieldTypeOf's posParam branch (which
+    // follows an isReadonlyField pass) into reach. Limited to RECORD parents:
+    // a CLASS primary-constructor parameter (§22.10) is captured into a
+    // private field that is NOT public-readonly (an `owned` capture is
+    // disposed with the object — mutated), so it must not narrow.
+    if (fs->posParam && fs->parent &&
+        fs->parent->kind == ast::TypeDeclKind::Record)
+        return true;
     for (auto mod : fs->modifiers)
         if (mod == "readonly") return true;
     return false;
