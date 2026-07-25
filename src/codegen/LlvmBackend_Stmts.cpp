@@ -679,53 +679,104 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 }
             } else {
                 // fix #610 / §25.1 / §6.6: compound assignment `target OP= value`
-                // on a record or class whose type declares a user-defined
+                // whose underlying binary operator resolves to a user-defined
                 // `static operator <op>` — desugar mechanically to
-                //   target := target.operator_op_(target, value)
+                //   target := operator_op_(target, value)
                 // (per §25.1: "the compound forms desugar mechanically to
                 // read-modify-write using the underlying binary operator's
                 // overload"). Must be checked BEFORE the built-in
                 // emitCompoundOp path, which cannot handle struct operands and
                 // would SIGABRT by passing the struct type to
                 // llvm.sadd.with.overflow.
+                //
+                // fix #2156 / §25.2 (v0.226): the operator may be declared on
+                // EITHER operand's type — §25.2's candidate set is "the union
+                // of the `operator <op>` overloads declared on the static types
+                // of BOTH operands" with "parameters match operands in order"
+                // (no commutation). The former LHS-only search missed the
+                // primitive-LHS / record-RHS shape — e.g. `n *= s` where
+                // `operator *(int, Scale): int` lives on `Scale`: the primitive
+                // target found no overload and fell through to emitCompoundOp,
+                // which fed the record struct to llvm.smul.with.overflow.i32 →
+                // malformed IR (IR verification failed). Search the VALUE's type
+                // too when the target's type declares no applicable overload.
                 std::string op(as->op);
                 if (!op.empty() && op.back() == '=') op.pop_back();
+                // §25.2: match the operator's parameter types against the
+                // operand types IN ORDER (left→param0, right→param1). Sema has
+                // already validated the compound is well-typed, so this only
+                // DISAMBIGUATES when one type declares several overloads of the
+                // same token. A Named parameter matches a Named operand by
+                // declaration; a Primitive parameter matches a Primitive operand
+                // by kind (numeric widening is downstream, as for the binary
+                // form).
+                auto paramMatches = [&](sema::Symbol* paramSym,
+                                        const sema::TypeRef* operandTy) -> bool {
+                    auto* ps = dynamic_cast<sema::ParameterSymbol*>(paramSym);
+                    if (!ps) return false;
+                    sema::TypeRef* pt = ps->declType
+                                            ? ctx_.resolvedType(*ps->declType)
+                                            : ps->resolvedDeclType;
+                    if (!pt || !operandTy) return false;
+                    if (pt->kind == sema::TypeRef::Kind::Named)
+                        return operandTy->kind == sema::TypeRef::Kind::Named &&
+                               pt->declaration == operandTy->declaration;
+                    if (pt->kind == sema::TypeRef::Kind::Primitive)
+                        return operandTy->kind == sema::TypeRef::Kind::Primitive;
+                    return false;
+                };
+                auto findOnType = [&](const sema::TypeSymbol* ts,
+                                      const sema::TypeRef* leftTy,
+                                      const sema::TypeRef* rightTy)
+                        -> sema::MethodSymbol* {
+                    if (!ts) return nullptr;
+                    for (sema::Symbol* m : ts->members) {
+                        auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                        if (ms && ms->isOperator && ms->operatorToken == op &&
+                            ms->params.size() == 2 &&
+                            paramMatches(ms->params[0], leftTy) &&
+                            paramMatches(ms->params[1], rightTy))
+                            return ms;
+                    }
+                    return nullptr;
+                };
+                sema::MethodSymbol* opMethod = nullptr;
                 {
-                    sema::MethodSymbol* opMethod = nullptr;
-                    if (const sema::TypeRef* targetTy =
-                            ctx_.exprType(*as->target)) {
-                        if (targetTy->kind == sema::TypeRef::Kind::Named &&
-                            targetTy->declaration) {
-                            for (sema::Symbol* m :
-                                 targetTy->declaration->members) {
-                                auto* ms =
-                                    dynamic_cast<sema::MethodSymbol*>(m);
-                                if (ms && ms->isOperator &&
-                                    ms->operatorToken == op &&
-                                    ms->params.size() == 2) {
-                                    opMethod = ms;
-                                    break;
-                                }
-                            }
-                        }
+                    const sema::TypeRef* targetTy = ctx_.exprType(*as->target);
+                    const sema::TypeRef* valueTy  = ctx_.exprType(*as->value);
+                    // §25.2: try the target's type first (the common
+                    // LHS-declared case), then the value's type (#2156:
+                    // RHS-declared operator with a primitive param0, e.g.
+                    // `operator *(int, Scale)`).
+                    if (targetTy &&
+                        targetTy->kind == sema::TypeRef::Kind::Named &&
+                        targetTy->declaration)
+                        opMethod = findOnType(targetTy->declaration,
+                                               targetTy, valueTy);
+                    if (!opMethod && valueTy &&
+                        valueTy->kind == sema::TypeRef::Kind::Named &&
+                        valueTy->declaration)
+                        opMethod = findOnType(valueTy->declaration,
+                                              targetTy, valueTy);
+                }
+                if (opMethod) {
+                    // §25.1 / §25.2: dispatch to the user-defined binary
+                    // operator with args in source order {target, value} (the
+                    // §25.2 in-order match). Load the current target value
+                    // (struct by value or primitive scalar) and store the
+                    // result back.
+                    llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
+                    std::vector<llvm::Value*> args{cur, rhs};
+                    llvm::Value* res = emitMethodCall(
+                        opMethod, args, /*baseQualified=*/false);
+                    if (res) {
+                        builder_.CreateStore(res, addr);
+                        // §27.5 / #673: sync compound-assignment result back
+                        // to the original alloca for guarded-boxed locals.
+                        if (llvm::AllocaInst* ns = localSlot(*as->target))
+                            syncCellToOrigSlot(ns, res);
                     }
-                    if (opMethod) {
-                        // §25.1: dispatch to user-defined binary operator.
-                        // Load the current value (struct by value) and call
-                        // the overload, then store the result back.
-                        llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
-                        std::vector<llvm::Value*> args{cur, rhs};
-                        llvm::Value* res = emitMethodCall(
-                            opMethod, args, /*baseQualified=*/false);
-                        if (res) {
-                            builder_.CreateStore(res, addr);
-                            // §27.5 / #673: sync compound-assignment result back
-                            // to the original alloca for guarded-boxed locals.
-                            if (llvm::AllocaInst* ns = localSlot(*as->target))
-                                syncCellToOrigSlot(ns, res);
-                        }
-                        return false;
-                    }
+                    return false;
                 }
                 // §4.6 (#857): string compound concatenation `s += t`. A string
                 // is a pointer, not a number — emitCompoundOp below would feed the
