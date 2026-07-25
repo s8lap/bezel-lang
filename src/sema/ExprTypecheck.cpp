@@ -283,6 +283,24 @@ void ExprTC::checkNotInstanceMember(const ast::IdentifierExpr& id, Symbol* sym) 
         std::string(id.name) + "` (§22.8)");
 }
 
+namespace {
+
+// §19.3: an unguarded `_` (DiscardPattern) or unconstrained `var x`
+// (BindingPattern with no type annotation) matches any value — a
+// catch-all that makes the `case` trivially exhaustive (§19.6). Used by
+// both stmtAlwaysExits (clause (1) of the §21.7 statement-case totality
+// rule) and caseArmsExhaustive, so it lives above both.
+bool isUnguardedCatchAll(const ast::CaseArm& arm) {
+    if (arm.guard) return false;  // a guard can fail at runtime
+    const ast::Pattern* p = arm.pattern.get();
+    if (dynamic_cast<const ast::DiscardPattern*>(p)) return true;
+    if (auto* bp = dynamic_cast<const ast::BindingPattern*>(p))
+        return bp->type == nullptr;  // `var x` (untyped) is total; `var x: T` is a type test
+    return false;
+}
+
+}  // namespace
+
 // Slice DR1 (§21.7): does control definitely leave this statement
 // list abruptly (return / throw / non-terminating loop) before
 // reaching its end? Conservatively returns true only when certain,
@@ -377,39 +395,49 @@ bool ExprTC::stmtAlwaysExits(const ast::Stmt& s) {
         // method end with no return.
         for (const auto& arm : cs->arms)
             if (!armBodyAlwaysExits(arm)) return false;
-        // (1) An unguarded `_` catch-all closes the fall-through for ANY
-        //     scrutinee kind — the syntactic rule the analysis has always used.
+        // (1) §21.7 irrefutable-arm bullet: an unguarded `_` OR an unguarded
+        //     untyped `var x` is a catch-all that closes the fall-through for ANY
+        //     scrutinee kind — "one proof in both spellings" (§19.6). #2133
+        //     widened this from `_`-only (the historical DiscardPattern gate) to
+        //     also admit the var-spelled irrefutable arm, so the untyped catch-all
+        //     closes totality uniformly regardless of how the programmer wrote it.
         for (const auto& arm : cs->arms)
-            if (!arm.guard &&
-                dynamic_cast<const ast::DiscardPattern*>(arm.pattern.get()))
-                return true;
-        // (2) §35.5 / §35.6 (#2129): a CHOICE has a closed value space (§35.1 —
-        //     a choice value is exactly one of its declared cases; no cast can
-        //     manufacture an out-of-set value), so an EXHAUSTIVE choice
-        //     case-statement whose arms all diverge has no reachable fall-through
-        //     and is total. The exhaustiveness verdict is REUSED from the
-        //     expression-form check (caseArmsExhaustive), run quietly — a
-        //     statement-position `case` is itself exempt from the §19.6
-        //     non-exhaustiveness warning.
+            if (isUnguardedCatchAll(arm)) return true;
+        // (2) §21.7 closed-value-space bullets (#2129 choice, #2133 bool +
+        //     sealed): a CHOICE (§35.1 — the case set is closed by declaration),
+        //     a BOOL primitive (§4.1 — no conversion manufactures a third value),
+        //     or a `sealed abstract` closed class hierarchy (§11.7 — every
+        //     instance is one of the closed concrete-leaf set) each have a CLOSED
+        //     VALUE SPACE, so an EXHAUSTIVE case-statement whose arms all diverge
+        //     has no reachable fall-through and is total. The exhaustiveness
+        //     verdict is REUSED from the expression-form check
+        //     (caseArmsExhaustive), run quietly — a statement-position `case` is
+        //     itself exempt from the §19.6 non-exhaustiveness warning.
         //
-        //     Deliberately restricted to choices. An ENUM is NOT admitted: its
-        //     value space is the underlying integer type, and an out-of-range /
-        //     non-constant cast `E(n)` produces a "raw" value equal to no
-        //     declared constant (§5.4) that falls through — so a
-        //     constants-exhaustive enum case is genuinely non-total (accepting it
-        //     would be unsound). A BOOL and a sealed-abstract closed hierarchy are
-        //     each a closed value space and would be sound, but their statement
-        //     totality remains governed by the v0.196 "totality does not key on
-        //     the exhaustiveness proof" ruling (pinned by
-        //     tests/lit/sema/sema_ret_path__exhaustive_sealed_case_stmt_*) — a
-        //     trailing return is still required there; extending totality to them
-        //     is a separate, owner-gated decision (follow-up #2133).
+        //     For a Named CLASS scrutinee, caseArmsExhaustive returns false when
+        //     the hierarchy is OPEN (its `closed` gate fails), so totality is
+        //     correctly withheld there — admitting Class broadly does not grant
+        //     totality for open hierarchies. An ENUM is deliberately NOT admitted:
+        //     its value space is the underlying integer type, and an out-of-range
+        //     / non-constant cast `E(n)` produces a "raw" value equal to no
+        //     declared constant (§5.4) that falls through — so a constants-
+        //     exhaustive enum case is genuinely non-total (accepting it would be
+        //     unsound). The v0.196 N6 "totality does not key on the exhaustiveness
+        //     proof" ruling is superseded for the closed-value-space kinds above
+        //     (§21.7); a warning-only proof over an OPEN value space still grants
+        //     nothing.
         TypeRef* scrutTy =
             cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;
-        bool isChoice = scrutTy && scrutTy->kind == TypeRef::Kind::Named &&
-            scrutTy->declaration &&
-            scrutTy->declaration->kind == ast::TypeDeclKind::Choice;
-        if (isChoice)
+        bool admitsTotality = scrutTy && (
+            // bool bullet (§4.1)
+            (scrutTy->kind == TypeRef::Kind::Primitive &&
+             scrutTy->primitive == PrimitiveType::Bool) ||
+            // choice bullet (§35.1) + sealed-hierarchy bullet (§11.7)
+            (scrutTy->kind == TypeRef::Kind::Named &&
+             scrutTy->declaration &&
+             (scrutTy->declaration->kind == ast::TypeDeclKind::Choice ||
+              scrutTy->declaration->kind == ast::TypeDeclKind::Class)));
+        if (admitsTotality)
             return caseArmsExhaustive(cs->arms, cs->scrutinee.get(), scrutTy,
                                       s.span.begin, /*quiet=*/true);
         return false;
@@ -439,18 +467,6 @@ bool ExprTC::armBodyAlwaysExits(const ast::CaseArm& arm) {
 }
 
 namespace {
-
-// §19.3: an unguarded `_` (DiscardPattern) or unconstrained `var x`
-// (BindingPattern with no type annotation) matches any value — a
-// catch-all that makes the `case` trivially exhaustive (§19.6).
-bool isUnguardedCatchAll(const ast::CaseArm& arm) {
-    if (arm.guard) return false;  // a guard can fail at runtime
-    const ast::Pattern* p = arm.pattern.get();
-    if (dynamic_cast<const ast::DiscardPattern*>(p)) return true;
-    if (auto* bp = dynamic_cast<const ast::BindingPattern*>(p))
-        return bp->type == nullptr;  // `var x` (untyped) is total; `var x: T` is a type test
-    return false;
-}
 
 // §19.6: collect the last name part of every enum-constant pattern an
 // unguarded arm covers. Enum patterns appear as a NamedPattern (`E.Red`
