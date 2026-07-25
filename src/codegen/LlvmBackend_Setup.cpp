@@ -14914,6 +14914,38 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
                     return true;
             }
         }
+        // (b0e) fix #1987 / §17.4 / §28.3 / §28.10: a `using var c := producer()!`
+        // — the postfix null-forgiving `!` on a FRESH PRODUCER (a `new T(...)!` or
+        // an `owned`-returning call `Make()!`). The `!` on a temporary (NOT a
+        // place) carries the +1 ownership through (§17.4: a null-aware operator on
+        // a fresh temporary neither borrows from nor disposes a named place; the
+        // #1983 producer_bang test pins the field-store sibling), so the using-var
+        // ADOPTS the producer's +1 and must dispose at scope end. PostfixBangExpr
+        // is invisible to the CallExpr/NewExpr/(b1)/(b2) branches below (they key
+        // off those AST shapes directly), so without this the disposal was never
+        // registered and the producer leaked (#1987: 16B class block, ASan/LSan).
+        // Peel the `!` and recognize the inner producer via the SAME shared
+        // discriminant the sibling leak fixes (#1934/#2204) and (b0c)'s `??` RHS
+        // consult (isFreshOwnedClassProducer — covers `new T()!` and the
+        // `owned`-returning call `Make()!`; the exotic (b2u)/(b2)/(b0b) shapes
+        // seldom carry a `!` and are out of this fix's scope). A PLACE `E!` (a
+        // bare-id / field read) is a §17.4 borrow — #1983 rejects a place `E!`
+        // into an owned sink, and a `using var c := x!` over a tracked borrow is a
+        // §28.10 borrow-pin the ownership pass flags usingVarSourceIsBorrow
+        // (registerUsingDisposal early-returns before this function is reached),
+        // so the peel is gated on isFreshOwnedClassProducer and never enables a
+        // double-free of a place. Dispose dynamically through the object's own
+        // vtable (the concrete class may differ from the inferred type, as for
+        // (b1) below). // per §17.4, §28.3, §28.10, #1987
+        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(
+                ld->initializer.get())) {
+            if (pb->operand && isFreshOwnedClassProducer(pb->operand.get())) {
+                const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
+                if (isClassOrInterfaceRef(initTy) ||
+                    isClassOrInterfaceRef(resolveTypeParamRef(initTy)))
+                    return true;
+            }
+        }
         // (b0b) #911 / §25: a user-defined binary operator whose `operator OP`
         // returns `owned T` — `using var c := a + b`. The initializer is a
         // BinaryExpr, not a CallExpr, so the call branch below missed it and the
