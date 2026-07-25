@@ -17052,16 +17052,20 @@ llvm::Constant* Emitter::boxDefaultHashCodeThunk() {
 //   3. Loads both payloads (two words past the box header, BZ_BOX layout) and
 //      runs emitStructEquality (record) or an integer ICmpEQ (enum), mirroring
 //      the statically-typed §8.3 value-equality path.
-llvm::Constant* Emitter::boxRecordEqualsThunk(const sema::TypeSymbol* ts) {
-    auto it = boxRecordEqualsFns_.find(ts);
-    if (it != boxRecordEqualsFns_.end()) return it->second;
-
+//
+// `fnName` lets the per-instantiation variant (#2176, boxRecordEqualsThunkFor)
+// emit under a distinct name without touching the per-declaration cache. The
+// RECORD branch depends on the ACTIVE genericSubst_ (recordStruct resolves the
+// substituted concrete struct and recordMemberTypeResolved resolves each
+// field's concrete type); for the per-declaration shared thunk no subst is
+// active, so for a generic record it yields the TEMPLATE (erased) layout — the
+// per-instantiation variant installs the subst before calling this core.
+llvm::Function* Emitter::boxRecordEqualsThunkCore(const sema::TypeSymbol* ts,
+                                                  const std::string& fnName) {
     auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
                                          /*isVarArg=*/false);
     auto* thunk = llvm::Function::Create(
-        fnTy, llvm::Function::InternalLinkage,
-        "bz$boxeq$" + std::string(ts->name), module_.get());
-    boxRecordEqualsFns_[ts] = thunk;
+        fnTy, llvm::Function::InternalLinkage, fnName, module_.get());
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     {
         ThunkScope scope(currentFn_, builder_, thunk, entry);
@@ -17128,19 +17132,57 @@ llvm::Constant* Emitter::boxRecordEqualsThunk(const sema::TypeSymbol* ts) {
     return thunk;
 }
 
+llvm::Constant* Emitter::boxRecordEqualsThunk(const sema::TypeSymbol* ts) {
+    auto it = boxRecordEqualsFns_.find(ts);
+    if (it != boxRecordEqualsFns_.end()) return it->second;
+    llvm::Function* thunk = boxRecordEqualsThunkCore(
+        ts, "bz$boxeq$" + std::string(ts->name));
+    boxRecordEqualsFns_[ts] = thunk;
+    return thunk;
+}
+
+// #2176 (§9.1/§9.6, spec v0.226): per-instantiation Equals thunk for a
+// constructed GENERIC RECORD. Installs genericSubst_ + genericSubstSemaTy_
+// from `args` (one entry per ts->genericParams, positional) around the core
+// emit so recordStruct/recordMemberTypeResolved resolve the SUBSTITUTED
+// concrete field layout, then restores the caller's substitution. The sole
+// caller (specializedBoxVtableFor) is cached per instantiation, so this runs
+// exactly once per (record, instantiation) and needs no extra cache.
+llvm::Constant* Emitter::boxRecordEqualsThunkFor(
+        const sema::TypeSymbol* ts,
+        const std::vector<const sema::TypeRef*>& args,
+        const std::string& suffix) {
+    auto savedLLVM = genericSubst_;
+    auto savedSema = genericSubstSemaTy_;
+    for (std::size_t i = 0; i < ts->genericParams.size() && i < args.size();
+         ++i) {
+        const sema::Symbol* gp = ts->genericParams[i];
+        if (!gp || !args[i]) continue;
+        genericSubst_[gp->name] = lowerTypeRef(args[i]);
+        genericSubstSemaTy_[gp->name] = args[i];
+    }
+    llvm::Function* thunk = boxRecordEqualsThunkCore(
+        ts, "bz$boxeq$" + std::string(ts->name) + "$" + suffix);
+    genericSubst_ = std::move(savedLLVM);
+    genericSubstSemaTy_ = std::move(savedSema);
+    return thunk;
+}
+
 
 // §9.1 / §9.6 (#961): per-type structural GetHashCode thunk `i32(ptr this)` for
 // a boxed RECORD or boxed ENUM. Loads the payload (two words past the box
 // header) and runs emitRecordHashCode (record) or emitValueHashCode (enum).
-llvm::Constant* Emitter::boxRecordHashThunk(const sema::TypeSymbol* ts) {
-    auto it = boxRecordHashFns_.find(ts);
-    if (it != boxRecordHashFns_.end()) return it->second;
-
+//
+// `fnName` lets the per-instantiation variant (#2176, boxRecordHashThunkFor)
+// emit under a distinct name. The RECORD branch depends on the ACTIVE
+// genericSubst_ (recordStruct resolves the substituted concrete struct and
+// recordMemberTypeResolved resolves each field's concrete type); the
+// per-declaration shared thunk is emitted with no subst active.
+llvm::Function* Emitter::boxRecordHashThunkCore(const sema::TypeSymbol* ts,
+                                                const std::string& fnName) {
     auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy()}, /*isVarArg=*/false);
     auto* thunk = llvm::Function::Create(
-        fnTy, llvm::Function::InternalLinkage,
-        "bz$boxhash$" + std::string(ts->name), module_.get());
-    boxRecordHashFns_[ts] = thunk;
+        fnTy, llvm::Function::InternalLinkage, fnName, module_.get());
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     {
         ThunkScope scope(currentFn_, builder_, thunk, entry);
@@ -17163,6 +17205,41 @@ llvm::Constant* Emitter::boxRecordHashThunk(const sema::TypeSymbol* ts) {
             h = builder_.CreateZExtOrTrunc(h, i32());
         builder_.CreateRet(h);
     }
+    return thunk;
+}
+
+llvm::Constant* Emitter::boxRecordHashThunk(const sema::TypeSymbol* ts) {
+    auto it = boxRecordHashFns_.find(ts);
+    if (it != boxRecordHashFns_.end()) return it->second;
+    llvm::Function* thunk = boxRecordHashThunkCore(
+        ts, "bz$boxhash$" + std::string(ts->name));
+    boxRecordHashFns_[ts] = thunk;
+    return thunk;
+}
+
+// #2176 (§9.1/§9.6, spec v0.226): per-instantiation GetHashCode thunk for a
+// constructed GENERIC RECORD. Installs genericSubst_ + genericSubstSemaTy_
+// from `args` (one entry per ts->genericParams, positional) around the core
+// emit so recordStruct/recordMemberTypeResolved resolve the SUBSTITUTED
+// concrete field layout, then restores the caller's substitution. See
+// boxRecordEqualsThunkFor — same shape, sole cached caller.
+llvm::Constant* Emitter::boxRecordHashThunkFor(
+        const sema::TypeSymbol* ts,
+        const std::vector<const sema::TypeRef*>& args,
+        const std::string& suffix) {
+    auto savedLLVM = genericSubst_;
+    auto savedSema = genericSubstSemaTy_;
+    for (std::size_t i = 0; i < ts->genericParams.size() && i < args.size();
+         ++i) {
+        const sema::Symbol* gp = ts->genericParams[i];
+        if (!gp || !args[i]) continue;
+        genericSubst_[gp->name] = lowerTypeRef(args[i]);
+        genericSubstSemaTy_[gp->name] = args[i];
+    }
+    llvm::Function* thunk = boxRecordHashThunkCore(
+        ts, "bz$boxhash$" + std::string(ts->name) + "$" + suffix);
+    genericSubst_ = std::move(savedLLVM);
+    genericSubstSemaTy_ = std::move(savedSema);
     return thunk;
 }
 
@@ -18110,6 +18187,18 @@ llvm::GlobalVariable* Emitter::specializedBoxVtableFor(const sema::TypeRef* rt) 
     for (unsigned i = 0; i < vtArr->getNumOperands(); ++i)
         vtElems.push_back(vtArr->getOperand(i));
     vtElems[0] = chainGV;
+    // #2176 (§9.1/§9.6, spec v0.226): swap the shared (template-erased)
+    // Equals/GetHashCode thunks for PER-INSTANTIATION ones compiled under the
+    // substituted genericSubst_, so a type-parameter field compares/hashes
+    // through its concrete (instantiated) layout, not the erased i32 template
+    // slot. Without this, two same-value boxed `Pair<string,int>("ab",2)`
+    // compared the low 32 bits of two distinct "ab" allocations and reported
+    // unequal. Non-record boxes never reach here (the record gate above), and
+    // the slot indices match the shared vtable built in declareVtables.
+    if (kEqualsSlot < vtElems.size())
+        vtElems[kEqualsSlot] = boxRecordEqualsThunkFor(ts, args, readable);
+    if (kGetHashCodeSlot < vtElems.size())
+        vtElems[kGetHashCodeSlot] = boxRecordHashThunkFor(ts, args, readable);
     auto* vtTy = llvm::ArrayType::get(ptrTy(), vtElems.size());
     auto* vtGV = new llvm::GlobalVariable(
         *module_, vtTy, /*isConstant=*/true,

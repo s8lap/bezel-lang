@@ -4181,6 +4181,40 @@ private:
     llvm::Constant* boxRecordEqualsThunk(const sema::TypeSymbol* ts);
     llvm::Constant* boxRecordHashThunk(const sema::TypeSymbol* ts);
 
+    // #2176 (§9.1/§9.6, spec v0.226): PER-INSTANTIATION Equals/GetHashCode
+    // thunks for a CONSTRUCTED GENERIC RECORD. The shared declaration-level
+    // thunk (boxRecordEqualsThunk/boxRecordHashThunk above) is emitted with NO
+    // active genericSubst_, so recordStruct(ts) returns the per-declaration
+    // TEMPLATE struct (erased type-parameter fields) and a type-parameter field
+    // degrades to its i32 placeholder — a boxed `Pair<string,int>("ab",2)`
+    // then compared the low 32 bits of two distinct "ab" allocations, reporting
+    // same-value pairs as unequal. These helpers save/install/restore a
+    // genericSubst_ + genericSubstSemaTy_ built from `args` (one entry per
+    // ts->genericParams, positional) so the emitted thunk's recordStruct and
+    // recordMemberTypeResolved resolve the SUBSTITUTED concrete layout, then
+    // delegate to the core emit path under a per-instantiation function name
+    // (`bz$boxeq$<T>$<suffix>` / `bz$boxhash$<T>$<suffix>`). Mirrors the
+    // per-instantiation vtable minted by specializedBoxVtableFor, which is the
+    // sole caller and is itself cached per instantiation (so no extra cache is
+    // needed here). `args` must be concrete (descArgsConcrete) and align
+    // positionally with ts->genericParams; `suffix` disambiguates the function
+    // name across instantiations (the readable mangle works).
+    llvm::Constant* boxRecordEqualsThunkFor(const sema::TypeSymbol* ts,
+                                            const std::vector<const sema::TypeRef*>& args,
+                                            const std::string& suffix);
+    llvm::Constant* boxRecordHashThunkFor(const sema::TypeSymbol* ts,
+                                          const std::vector<const sema::TypeRef*>& args,
+                                          const std::string& suffix);
+    // #2176: shared emit cores for the two thunks above. `fnName` lets the
+    // per-instantiation variants emit under a distinct function name. The
+    // RECORD branch reads the ACTIVE genericSubst_ (recordStruct +
+    // recordMemberTypeResolved); the shared thunk passes no subst, the
+    // per-instantiation variants install one before calling these.
+    llvm::Function* boxRecordEqualsThunkCore(const sema::TypeSymbol* ts,
+                                             const std::string& fnName);
+    llvm::Function* boxRecordHashThunkCore(const sema::TypeSymbol* ts,
+                                           const std::string& fnName);
+
     // per §10.5 (v0.183): an enum may declare plain `ToString(): string`,
     // `Equals(E): bool`, and `GetHashCode(): int` members that REPLACE the
     // compiler-generated defaults for every consumer (interpolation §8.5, boxed
