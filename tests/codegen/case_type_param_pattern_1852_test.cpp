@@ -361,3 +361,81 @@ BEZEL_TEST(case_type_param_pattern_1852, overmatch_typed_binding_rejects_sibling
         "  return c.KindVar(wi) * 10 + c.KindVar(ws); "
         "end Main; end Program;"), 29);
 }
+
+// -- #2177: constructed-generic RECORD boxed into Object (pointer scrutinee) ----
+//
+// §19.3 (v0.182, #2177): a type-parameter pattern `var x: T` (and bare `T`) at
+// T = a CONSTRUCTED GENERIC RECORD, over a BOXED Object scrutinee, must match.
+// The CONCRETE form `var x: Pair<int,string>` matches a boxed Object precisely
+// post-#1939 leg 2 (per-monomorphization box chain), and §19.3 makes the type-
+// parameter form behave identically — "all type-pattern rules then apply to the
+// substituted type, per instantiation". The record/enum branch of
+// emitTypeParamPatternTest returned getInt1(false) for ANY pointer scrutinee
+// (a never-match that predated #1939 leg 2's per-instantiation record box
+// chains, with a comment claiming the concrete form agreed — true pre-#1939,
+// stale after). Without the fix every test below picks the `_` arm (9) instead
+// of the typed arm (2): the headline returns 99 (9*10+9) instead of 22 (2*10+2).
+
+namespace {
+// A generic record plus a generic class that type-tests its Object argument
+// against the bare parameter T (`case o of T`) and the typed-binding form
+// (`case o of var x: T`). Match → 2, non-match → 9.
+const char* kPairChk =
+    "module M; "
+    "record Pair<A, B>(first: A, second: B); "
+    "class Chk<T> "
+    "  public method KindVar(o: Object): int "
+    "    return (case o of var x: T => 2, _ => 9); "
+    "  end KindVar; "
+    "  public method KindBare(o: Object): int "
+    "    return (case o of T => 2, _ => 9); "
+    "  end KindBare; "
+    "end Chk; ";
+}  // namespace
+
+// §19.3 (#2177): T = Pair<int,string>, scrutinee a boxed Pair<int,string> — the
+// typed-binding form (`var x: T`) and the bare form (`T`) BOTH match. Pre-fix
+// both never matched (99 = 9*10+9); with the fix both match (22 = 2*10+2).
+BEZEL_TEST(case_type_param_pattern_1852, type_param_boxed_generic_record_matches) {
+    BEZEL_EXPECT_EQ(run(std::string(kPairChk) +
+        "class Program public static method Main(): int "
+        "  var o: Object := new Pair<int, string>(3, \"hi\"); "
+        "  using var c := new Chk<Pair<int, string>>(); "
+        "  return c.KindVar(o) * 10 + c.KindBare(o); "
+        "end Main; end Program;"), 22);
+}
+
+// §19.3 / §12.9 (#2177, #1939 leg 2): the per-monomorphization descriptor must
+// keep sibling instantiations distinct — Chk<Pair<int,string>> does NOT match a
+// boxed Pair<int,int>. Guards against an over-matching regression of the fix
+// (the shared erased descriptor would match both → 2; the precise per-inst
+// chain keeps the sibling out → 9).
+BEZEL_TEST(case_type_param_pattern_1852,
+           type_param_boxed_generic_record_rejects_sibling_instantiation) {
+    BEZEL_EXPECT_EQ(run(std::string(kPairChk) +
+        "class Program public static method Main(): int "
+        "  var o: Object := new Pair<int, int>(3, 4); "
+        "  using var c := new Chk<Pair<int, string>>(); "
+        "  return c.KindVar(o); "
+        "end Main; end Program;"), 9);
+}
+
+// §19.3 (#2177): a NON-generic record substitution boxed into Object — the
+// shared box descriptor (boxDescriptorFor) path, which was equally a never-
+// match on a pointer scrutinee pre-fix. Chk<Pt>.KindVar(boxed Pt) → 2.
+BEZEL_TEST(case_type_param_pattern_1852,
+           type_param_boxed_non_generic_record_matches) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Pt(x: int, y: int); "
+        "class Chk<T> "
+        "  public method KindVar(o: Object): int "
+        "    return (case o of var x: T => 2, _ => 9); "
+        "  end KindVar; "
+        "end Chk; "
+        "class Program public static method Main(): int "
+        "  var o: Object := new Pt(1, 2); "
+        "  using var c := new Chk<Pt>(); "
+        "  return c.KindVar(o); "
+        "end Main; end Program;"), 2);
+}

@@ -2976,15 +2976,32 @@ llvm::Value* Emitter::emitTypeParamPatternTest(const sema::TypeRef* ct,
     }
 
     // A record or enum substitution: a sealed value type with no subtyping, so
-    // the test is statically decidable (mirrors the NamedPattern record/enum
-    // branch). A boxed record/enum inside an Object (a pointer scrutinee) is not
-    // matched by a bare value-type name here — the concrete form returns false
-    // for a pointer scrutinee too.
+    // over an UNBOXED scrutinee the test is statically decidable (mirrors the
+    // concrete typed-binding record/enum branch — the scrutinee's static type
+    // either IS the record/enum or is not).
+    // #2177 (§19.3 v0.182): a BOXED record inside an Object (a pointer
+    // scrutinee) is a runtime type-test. The CONCRETE form `var x:
+    // Pair<int,string>` matches a boxed Object scrutinee precisely post-#1939
+    // leg 2 (per-monomorphization box chain via perInstDescriptorForTarget for
+    // a constructed generic record; the shared box descriptor via
+    // boxDescriptorFor otherwise), and §19.3 makes the type-PARAMETER form
+    // behave identically — "all type-pattern rules then apply to the
+    // substituted type". Pre-#1939 the concrete form returned false for a
+    // pointer scrutinee too, so this branch's never-match early-out was then
+    // consistent; it is the one remaining gap after #1939 leg 2. An enum
+    // target has no per-instantiation descriptor (perInstDescriptorForTarget
+    // admits Class/Interface/Record only) and may lack a box descriptor; absent
+    // either the test stays a well-formed never-match.
     if (ct->kind == sema::TypeRef::Kind::Named && ct->declaration &&
         (ct->declaration->kind == ast::TypeDeclKind::Record ||
          ct->declaration->kind == ast::TypeDeclKind::Enum)) {
-        if (scrut->getType()->isPointerTy())
+        if (scrut->getType()->isPointerTy() && scrutObjectLike()) {
+            if (llvm::GlobalVariable* desc = perInstDescriptorForTarget(ct))
+                return guardedIsA(desc);
+            if (llvm::GlobalVariable* desc = boxDescriptorFor(ct))
+                return guardedIsA(desc);
             return builder_.getInt1(false);
+        }
         const sema::TypeRef* rScrutTy = resolveTypeParamRef(scrutTy);
         bool sameType = rScrutTy && rScrutTy->declaration == ct->declaration;
         return builder_.getInt1(sameType);
