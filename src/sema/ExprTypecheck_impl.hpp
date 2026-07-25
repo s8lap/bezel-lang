@@ -289,6 +289,26 @@ private:
     // to the resolved target. Reset across the callable (lambda) boundary
     // alongside `loopDepth_`, so a label is visible only within its own callable.
     std::vector<std::string_view> loopLabelStack_;
+    // §7.4 (#2152): per-loop collector of the flow-narrowing state snapshotted
+    // at each `break`/`continue` edge. Both edge kinds can reach the after-loop
+    // program point — `break` exits the loop directly; `continue` jumps to the
+    // condition re-check, which on cond-false also exits — so each edge's state
+    // is a possible after-loop state and must be folded into the join. #2118's
+    // entry ∩ fall-through-exit model missed these edges, so a local an edge
+    // left possibly-null was wrongly narrowed non-null after the loop
+    // (over-narrowing → a bare member access accepted that §7.4 rejects). One
+    // collector per active loop, parallel to `loopLabelStack_` (back =
+    // innermost); a labeled `break L`/`continue L` routes its snapshot to the
+    // TARGET loop's collector via `targetLoopOffset`. Saved/cleared/restored
+    // across the lambda boundary alongside `loopLabelStack_` (a lambda is its
+    // own callable — a `break` inside it cannot target an enclosing loop).
+    struct LoopEdgeNarrowing {
+        std::vector<std::unordered_set<Symbol*>> nullEdges;
+        std::vector<std::unordered_map<Symbol*, TypeRef*>> typeEdges;
+        std::vector<std::set<std::pair<std::uint32_t, std::uint32_t>>>
+            fieldEdges;
+    };
+    std::vector<LoopEdgeNarrowing> loopEdgeNarrowing_;
     // Slice S27: enclosing catch-arm-body depth, for the §31.5 rule
     // that a bare `throw;` / `throw` re-raise is valid only in a catch
     // arm body.
@@ -1282,10 +1302,23 @@ private:
     // (#2116).
     // #2116: `entryField` joins `fieldNarrowed_` under the same
     // zero-iteration-path intersection rule.
+    // #2152: `edges` folds each break/continue edge snapshot into the same
+    // intersection — both edge kinds can reach the after-loop point (break
+    // directly; continue via the cond re-check on cond-false), so an edge that
+    // left a local possibly-null drops it from the after-loop state.
     void intersectNarrowingSetsAfterLoop(
         const std::unordered_set<Symbol*>& entryNull,
         const std::unordered_map<Symbol*, TypeRef*>& entryNarrowings,
-        const std::set<std::pair<std::uint32_t, std::uint32_t>>& entryField);
+        const std::set<std::pair<std::uint32_t, std::uint32_t>>& entryField,
+        const LoopEdgeNarrowing& edges);
+
+    // §7.4 (#2152): snapshot the live narrowing state at a `break`/`continue`
+    // edge into the TARGET loop's collector. `targetOffset` is the nesting
+    // offset resolved by checkLoopJumpTarget (0 = innermost loop). Bounds-
+    // checked so an erroneous jump (unknown label, jump outside any loop)
+    // snapshots nothing — `loopEdgeNarrowing_` runs parallel to
+    // `loopLabelStack_`, whose size equals `loopDepth_`.
+    void recordLoopEdgeNarrowing(int targetOffset);
 
     void visitTopDecl(const ast::TopDecl& d);
 

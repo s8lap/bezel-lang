@@ -6349,10 +6349,20 @@ void ExprTC::narrowOnAssignment(Symbol* sym, const TypeRef* valueType) {
 // affect the result — set/map intersection is order-independent and no
 // diagnostic is emitted — so sema output is stable across shard processes
 // (#2116).
+//
+// §7.4 (#2152): that two-path model missed the break/continue edges. A `break`
+// exits the loop directly and a `continue` jumps to the cond re-check (which on
+// cond-false also exits), so the state at each such edge is a possible
+// after-loop state. `edges` carries one snapshot per edge; each is folded into
+// the same intersection so that a local an edge left possibly-null is dropped
+// (and a bare member access depending on it is correctly rejected). The fold is
+// pure set/map intersection — sound (it only drops facts) and order-independent
+// (#2116).
 void ExprTC::intersectNarrowingSetsAfterLoop(
     const std::unordered_set<Symbol*>& entryNull,
     const std::unordered_map<Symbol*, TypeRef*>& entryNarrowings,
-    const std::set<std::pair<std::uint32_t, std::uint32_t>>& entryField) {
+    const std::set<std::pair<std::uint32_t, std::uint32_t>>& entryField,
+    const LoopEdgeNarrowing& edges) {
     // §7.4 (v0.214, #2116): the same zero-iteration-path intersection for the
     // readonly-field facts — a fact established INSIDE the body does not
     // survive the loop; an entry fact the body invalidated stays dropped.
@@ -6374,6 +6384,47 @@ void ExprTC::intersectNarrowingSetsAfterLoop(
         else
             it = narrowings_.erase(it);
     }
+    // §7.4 (#2152): fold each break/continue edge snapshot into the
+    // intersection. A `break`/`continue` edge state is a possible after-loop
+    // state (see the function header); a local the edge left possibly-null is
+    // absent from the edge's null set, so the intersection drops it — the bare
+    // member access after the loop is then correctly rejected. The three
+    // parallel vectors are pushed together by recordLoopEdgeNarrowing, so they
+    // share one length.
+    for (std::size_t i = 0; i < edges.nullEdges.size(); ++i) {
+        intersectFieldFactsWith(edges.fieldEdges[i]);
+        for (auto it = nullNarrowed_.begin(); it != nullNarrowed_.end();) {
+            if (edges.nullEdges[i].count(*it))
+                ++it;
+            else
+                it = nullNarrowed_.erase(it);
+        }
+        for (auto it = narrowings_.begin(); it != narrowings_.end();) {
+            auto e = edges.typeEdges[i].find(it->first);
+            if (e != edges.typeEdges[i].end() && e->second == it->second)
+                ++it;
+            else
+                it = narrowings_.erase(it);
+        }
+    }
+}
+
+// §7.4 (#2152): see the header comment. Bounds-checked: an erroneous jump
+// (loopDepth_ == 0 already reported, or an unknown label whose offset stays at
+// its default 0) may route to a nominally-innermost collector, but the program
+// is already in error and the snapshot is harmless either way — and a
+// still-valid enclosing loop's join only ever DROPS facts (intersection), so a
+// stray snapshot cannot manufacture an unsound acceptance.
+void ExprTC::recordLoopEdgeNarrowing(int targetOffset) {
+    if (loopEdgeNarrowing_.empty()) return;
+    auto idx = static_cast<std::ptrdiff_t>(loopEdgeNarrowing_.size()) - 1
+             - static_cast<std::ptrdiff_t>(targetOffset);
+    if (idx < 0 || idx >= static_cast<std::ptrdiff_t>(loopEdgeNarrowing_.size()))
+        return;
+    auto& col = loopEdgeNarrowing_[static_cast<std::size_t>(idx)];
+    col.nullEdges.push_back(nullNarrowed_);
+    col.typeEdges.push_back(narrowings_);
+    col.fieldEdges.push_back(fieldNarrowed_);
 }
 
 // §7.4 / §8.4 (issue #418): a `<simple var> <> null` / `= null` test proves a
@@ -10321,12 +10372,18 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // zero-iteration path the variable was never proved non-null. Capture
         // the entry narrowing state, walk the body, then join to the
         // intersection of entry and body-exit (see intersectNarrowingSetsAfterLoop).
+        // §7.4 (#2152): push a per-loop edge collector before the body walk so
+        // each `break`/`continue` in the body can snapshot its state; the join
+        // folds those edges in alongside the entry ∩ body-exit intersection.
         auto whileEntryNull = nullNarrowed_;
         auto whileEntryNarrowings = narrowings_;
         auto whileEntryField = fieldNarrowed_;  // §7.4 #2116
+        loopEdgeNarrowing_.emplace_back();
         for (const auto& bs : ws->body) if (bs) visitStmt(*bs);
         intersectNarrowingSetsAfterLoop(whileEntryNull, whileEntryNarrowings,
-                                        whileEntryField);
+                                        whileEntryField,
+                                        loopEdgeNarrowing_.back());
+        loopEdgeNarrowing_.pop_back();
         --loopDepth_;
         loopLabelStack_.pop_back();
     } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
@@ -10536,12 +10593,18 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // empty collection), so a narrowing established INSIDE the body must NOT
         // leak past the loop — same reasoning as the `while` handler above. Join
         // to the intersection of the entry and body-exit narrowing state.
+        // §7.4 (#2152): push a per-loop edge collector before the body walk so
+        // each `break`/`continue` in the body can snapshot its state; the join
+        // folds those edges in alongside the entry ∩ body-exit intersection.
         auto forEntryNull = nullNarrowed_;
         auto forEntryNarrowings = narrowings_;
         auto forEntryField = fieldNarrowed_;  // §7.4 #2116
+        loopEdgeNarrowing_.emplace_back();
         for (const auto& bs : fs->body) if (bs) visitStmt(*bs);
         intersectNarrowingSetsAfterLoop(forEntryNull, forEntryNarrowings,
-                                        forEntryField);
+                                        forEntryField,
+                                        loopEdgeNarrowing_.back());
+        loopEdgeNarrowing_.pop_back();
         --loopDepth_;
         loopLabelStack_.pop_back();
         currentScope_ = saveScope;
@@ -10555,6 +10618,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             checkLoopJumpTarget(brk->label, /*isBreak=*/true,
                                 const_cast<ast::BreakStmt*>(brk)->targetLoopOffset,
                                 s.span.begin);
+            // §7.4 (#2152): a `break` exits the loop, so the narrowing state at
+            // the jump point is a possible after-loop state — snapshot it into
+            // the target loop's collector for the after-loop join.
+            recordLoopEdgeNarrowing(brk->targetLoopOffset);
         }
     } else if (auto* cont = dynamic_cast<const ast::ContinueStmt*>(&s)) {
         if (loopDepth_ == 0) {
@@ -10565,6 +10632,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             checkLoopJumpTarget(cont->label, /*isBreak=*/false,
                                 const_cast<ast::ContinueStmt*>(cont)->targetLoopOffset,
                                 s.span.begin);
+            // §7.4 (#2152): a `continue` jumps to the cond re-check, which on
+            // cond-false exits the loop, so its state is also a possible
+            // after-loop state — snapshot it into the target loop's collector.
+            recordLoopEdgeNarrowing(cont->targetLoopOffset);
         }
     } else if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
         // per §21.6 (#1242): a do…end block introduces a lexical scope;

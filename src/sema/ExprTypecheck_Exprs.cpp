@@ -5253,6 +5253,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // reset). Saved/reset/restored across the boundary.
         auto saveLoopLabels = std::move(loopLabelStack_);
         loopLabelStack_.clear();
+        // §7.4 (#2152): the break/continue edge-state collectors run parallel to
+        // `loopLabelStack_` — save/clear/restore across the lambda boundary so a
+        // `break`/`continue` inside the lambda can only snapshot into a
+        // lambda-local loop's collector, never an enclosing method's (mirrors
+        // the `loopLabelStack_` reset).
+        auto saveLoopEdges = std::move(loopEdgeNarrowing_);
+        loopEdgeNarrowing_.clear();
         int saveCatch = catchDepth_;
         // per §21.5/§31.2 (v0.182, #1578): a lambda is its own callable, so a
         // `break`/`continue` inside it can only ever target a loop declared
@@ -5459,6 +5466,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         inLambda_ = saveInLambda;
         loopDepth_ = saveLoop;
         loopLabelStack_ = std::move(saveLoopLabels);  // §21.5 (v0.201)
+        loopEdgeNarrowing_ = std::move(saveLoopEdges);  // §7.4 (#2152)
         catchDepth_ = saveCatch;
         finallyLoopBoundary_ = saveFinallyLoopBoundary;
         finallyDepth_ = saveFinallyDepth;  // per §21.7 (#1589)
