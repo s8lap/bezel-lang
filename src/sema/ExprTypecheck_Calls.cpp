@@ -500,6 +500,28 @@ bool containsMethodTypeParam(
     return false;
 }
 
+// §22.3 / #1756: true when `t` is or contains an UNRESOLVED named type — a
+// TypeRef whose `kind == Named` but carries no `declaration`. This is the
+// shape a METHOD type parameter takes after substituteMemberType (which
+// substitutes only CLASS type parameters, leaving method type parameters
+// unresolved). checkArgsAgainstParams' §22.3 concrete ref/out exact-match
+// check uses it to defer to checkGenericRefOutExactUnification (§14.5, #1686)
+// exactly when the param's referent type mentions a method type parameter —
+// §14.5's authority domain — so the non-generic #1756 check does not
+// over-reject the exact-unification cases §14.5 accepts (the --full gate
+// regressions: explicit_type_arg_ref_exact / predeclared_out_single_occurrence
+// / void_swap_exact_types). It mirrors containsMethodTypeParam but needs no
+// name set: after class substitution, any remaining unresolved Named type is
+// a method type parameter (a genuinely unresolvable name would already have
+// been diagnosed elsewhere, so skipping is harmless).
+bool containsUnresolvedTypeParam(const TypeRef* t) {
+    if (!t) return false;
+    if (t->kind == TypeRef::Kind::Named && !t->declaration) return true;
+    for (auto* ga : t->genericArgs)
+        if (containsUnresolvedTypeParam(ga)) return true;
+    return false;
+}
+
 // A printable spelling for a resolved TypeRef, used by the §14.5 ref/out
 // exact-unification diagnostics (checkGenericRefOutExactUnification below).
 // Handles primitives and simple named types (declaration, or an unresolved
@@ -7301,15 +7323,62 @@ void ExprTC::checkArgsAgainstParams(
         // `owned`/`scoped` transfer of a non-implementing class to an interface
         // parameter compiled clean and then dispatched through a null vtable →
         // runtime SEGV; the bare-argument counterpart was already correctly
-        // rejected here. The by-reference family (`ref`, `out`, `out var`,
-        // `out using var`, `out owned var`) binds by reference / declares an
-        // inline out-local and is type-matched by its own (exact-type /
-        // declaration) rules elsewhere — continue to skip those here.
+        // rejected here.
         const std::string_view am = a.modifier;
-        const bool refOutFamily =
-            am == "ref" || am == "out" || am == "out var" ||
-            am == "out using var" || am == "out owned var";
-        if (refOutFamily) continue;
+        // per §22.3 v0.226 (#1756): a `ref`/`out` argument aliases the caller's
+        // storage location directly (§22.3 "ref and out argument locations"),
+        // so its type must EXACTLY match the parameter's referent type — no
+        // §5.1 implicit conversion is admitted, the same "aliases the caller's
+        // location, so no conversion is admitted" principle §14.5 states for
+        // the generic-inference case. This concrete (non-generic) position was
+        // previously folded into the by-reference-family skip and never
+        // type-checked at all, so a `ref y` of type `long` against a
+        // `ref x: int` parameter compiled clean and aliased mismatched-width
+        // storage through the parameter. The generic counterpart — a ref/out
+        // parameter whose type mentions a method type parameter — is checked
+        // by checkGenericRefOutExactUnification (§14.5, #1686), which rejects
+        // the call before reaching this point, so this check cannot
+        // double-report with it.
+        if (am == "ref" || am == "out") {
+            const ast::Param& rp = params[j];
+            if (!rp.type) continue;
+            TypeRef* rparamTy = ctx_.resolvedType(*rp.type);
+            if (rparamTy && classTarget && classParent)
+                rparamTy = substituteMemberType(rparamTy, classTarget,
+                                                classParent);
+            TypeRef* rargTy = ctx_.exprType(*a.value);
+            // Defer to §14.5 / checkGenericRefOutExactUnification when the
+            // param's referent type mentions a METHOD type parameter:
+            // substituteMemberType above substituted only CLASS type
+            // parameters, so any remaining unresolved named type is a method
+            // type parameter, whose exact-unification rule §14.5 (not this
+            // concrete §22.3 check) owns. Without this guard the #1756 check
+            // over-rejects the generic exact-unification cases §14.5 accepts
+            // (#1686) — the param stays `T` while the arg is concrete, so
+            // typeRefEqual fails spuriously. A generic method whose ref/out
+            // param is CONCRETELY typed (no type parameter) still gets the
+            // §22.3 check here, preserving #1756's non-generic guarantee.
+            if (rparamTy && containsUnresolvedTypeParam(rparamTy)) continue;
+            if (rparamTy && rargTy && !typeRefEqual(rargTy, rparamTy)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, a.value->span.begin,
+                    std::string("the `") + std::string(am) +
+                        "` argument for parameter `" + std::string(rp.name) +
+                        "` to " + calleeDesc +
+                        " does not match the parameter's referent type — "
+                        "a `ref`/`out` argument aliases the caller's "
+                        "location, so the type must match exactly and no "
+                        "implicit conversion is admitted (§22.3)");
+            }
+            continue;
+        }
+        // The inline-declaration family (`out var`, `out using var`,
+        // `out owned var`) declares a new local whose type is INFERRED FROM
+        // the parameter (§22.4), so it matches the referent type by
+        // construction — continue to skip those here.
+        if (am == "out var" || am == "out using var" ||
+            am == "out owned var")
+            continue;
         const ast::Param& p = params[j];
         if (!p.type) continue;
         TypeRef* paramTy = ctx_.resolvedType(*p.type);
