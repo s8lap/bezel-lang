@@ -403,6 +403,99 @@ const char* kEscapingLambdaStoredInField =
     "  end Main; "
     "end H;";
 
+// ===========================================================================
+// #2182 / §28.3: IIFE — `(lambda() => …)()` — non-escaping capture shapes.
+//
+// An IIFE's callee-lambda is non-escaping: Calls2.cpp emits the closure call
+// then emitClosureRelease within the same expression, so the closure env never
+// outlives the enclosing scope. Before #2182, collectCellFreeEligible's walker
+// reached every CallExpr's callee via the generic `expr(callee, false)` arm
+// (topPos=false), misclassifying the IIFE's lambda as escaping — its captures
+// landed in capturedByEscaping, the cellFreeEligible_ gate failed for them in
+// lowerLambda, and the boxed capture cell was never registered for a scope-end
+// boxedCellFree. Worse, even when a later path DID record the cell in
+// lastLambdaCapturedCells_, the IIFE has no LocalDecl to drive the consumption
+// in lowerLocalDecl, so the registration never happened. Result: per-invocation
+// leak of the boxed capture cell (16B for a record value, 8B for an int cell),
+// unbounded in a loop.
+//
+// #2182 adds:
+//   (a) collectCellFreeEligible's CallExpr arm special-cases a LambdaExpr
+//       callee and collects its captures as non-escaping;
+//   (b) lowerCall's IIFE arm calls the extracted consumeLastLambdaCapturedCells()
+//       helper (the same per-cell soundness loop lowerLocalDecl runs for
+//       `var f := lambda`) right after lowerLambda.
+//
+// All four shapes below LEAKED without the fix (Direct leak of N bytes) and are
+// LSan-CLEAN with it. Spec: §28.3 (scope-end auto-disposal of owned/boxed
+// capture cells), §28.9 (closure captures are borrows — only the cell, not the
+// captured value, is reclaimed here), §27.5 (closure env / cell layout).
+// ===========================================================================
+
+// #2182 / §28.3 Shape I1: IIFE capturing an int — the simplest variant.
+//   Without fix: 8B per-invocation leak of the int capture cell.
+//   With fix: cell freed at scope end → LSan-CLEAN.
+// Returns 0 (r = 7*2 = 14).
+const char* kIifeIntCapture =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var k: int := 7; "
+    "    var r: int := (lambda() => k * 2)(); "   // IIFE captures k (non-escaping)
+    "    if r = 14 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
+// #2182 / §28.3 Shape I2: IIFE capturing a RECORD value (the issue's repro 2).
+//   A `record Holder` is a value type; capturing it boxes the value into a
+//   heap cell so the env can hold a pointer. The cell (16B for a record
+//   holding a ptr + 2 ints) leaked per-invocation before #2182; the envdtor
+//   releases only string/function captures, never a plain boxed value type.
+//   With the fix, the cell enters cellFreeEligible_ and is freed at scope end.
+// Returns 0 (r = h.S[0] = 7).
+const char* kIifeRecordCapture =
+    "module M; record Holder(S: ArraySpan<int>); "
+    "class C public static method Main(): int "
+    "  var local := new Array<int>(); local.Add(7); "
+    "  var h := new Holder(local.AsSpan()); "
+    "  var r := (lambda(): int => h.S[0])(); "
+    "  if r = 7 then return 0; end; return 1; "
+    "end Main; end C;";
+
+// #2182 / §28.3 Shape I3: IIFE capturing a record value in a LOOP — the
+//   per-invocation leak class (the issue's "PER-INVOCATION leak … unbounded
+//   in a loop"). 1000 iterations; without the fix LSan reports
+//   "Direct leak of 16000 byte(s) in 1000 object(s)". With the fix: LSan-CLEAN.
+// Each iteration declares a fresh `h` (block-scoped to the loop body), so the
+// capture cell is allocated and freed per-iteration — the steady-state test.
+// Returns 0 (sum = 7000).
+const char* kIifeRecordCaptureLoop =
+    "module M; record Holder(S: ArraySpan<int>); "
+    "class C public static method Main(): int "
+    "  var sum: int := 0; var i: int := 0; "
+    "  while i < 1000 do "
+    "    var local := new Array<int>(); local.Add(7); "
+    "    var h := new Holder(local.AsSpan()); "
+    "    sum := sum + (lambda(): int => h.S[0])(); "
+    "    i := i + 1; "
+    "  end while; "
+    "  if sum = 7000 then return 0; end; return 1; "
+    "end Main; end C;";
+
+// #2182 / §28.3 Shape I4: IIFE capturing a string — exercises the envdtor's
+//   string-release branch in the IIFE position. The +1 string is released by
+//   the envdtor at closure last-drop; the boxed cell is freed at scope end.
+//   Without #2182 the cell leaked (8B) while the string was correctly released
+//   (envdtor path was unaffected). With the fix: both clean.
+// Returns 0 (r = s.Length = 4).
+const char* kIifeStringCapture =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var s: string := \"ab\" + \"cd\"; "
+    "    var r: int := (lambda() => s.Length)(); "
+    "    if r = 4 then return 0; end; return 1; "
+    "  end Main; "
+    "end C;";
+
 }  // namespace
 
 // ===========================================================================
@@ -485,4 +578,52 @@ BEZEL_TEST(boxed_cell_free_429, spec_27_5_escaping_returned_lambda_no_uaf) {
 // ASan-clean (detect_leaks=0, cell leaks 8 bytes — documented residual).
 BEZEL_TEST(boxed_cell_free_429, spec_27_5_escaping_field_stored_lambda_no_uaf) {
     expectValueAndNoCorruption(kEscapingLambdaStoredInField, 0);
+}
+
+// ===========================================================================
+// #2182 / §28.3 Tests — IIFE non-escaping captures (the bug this fix ships)
+// ===========================================================================
+
+// #2182 / §28.3 Shape I1: IIFE capturing an int — the boxed int capture cell
+// (8 bytes) leaked per-invocation before #2182; collectCellFreeEligible
+// misclassified the IIFE callee-lambda as escaping. With the fix the cell is
+// freed at scope end. LSan-CLEAN.
+BEZEL_TEST(boxed_cell_free_429, spec_28_3_iife_int_capture_cell_freed_2182) {
+    BEZEL_EXPECT_EQ(compileAndRun(kIifeIntCapture), 0);
+    int lsan = runUnderLeakSanitizer(kIifeIntCapture, 0);
+    if (lsan == -1) return;
+    BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// #2182 / §28.3 Shape I2: IIFE capturing a record value (the issue's repro 2).
+// A boxed record value (16 bytes) leaked per-invocation. With the fix the cell
+// enters cellFreeEligible_ and is freed at scope end. LSan-CLEAN.
+BEZEL_TEST(boxed_cell_free_429, spec_28_3_iife_record_capture_cell_freed_2182) {
+    BEZEL_EXPECT_EQ(compileAndRun(kIifeRecordCapture), 0);
+    int lsan = runUnderLeakSanitizer(kIifeRecordCapture, 0);
+    if (lsan == -1) return;
+    BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// #2182 / §28.3 Shape I3: IIFE capturing a record value in a 1000-iteration
+// loop — the per-invocation leak class. Without the fix LSan reported
+// "Direct leak of 16000 byte(s) in 1000 object(s)". With the fix each
+// iteration's capture cell is freed at the loop-body block exit. LSan-CLEAN.
+BEZEL_TEST(boxed_cell_free_429, spec_28_3_iife_record_capture_loop_lsan_clean_2182) {
+    BEZEL_EXPECT_EQ(compileAndRun(kIifeRecordCaptureLoop), 0);
+    int lsan = runUnderLeakSanitizer(kIifeRecordCaptureLoop, 0);
+    if (lsan == -1) return;
+    BEZEL_EXPECT_EQ(lsan, 0);
+}
+
+// #2182 / §28.3 Shape I4: IIFE capturing a string — confirms the envdtor's
+// string-release branch still fires in the IIFE position (the boxed cell holding
+// the captured string local is freed at scope end; the +1 string is released
+// by the envdtor at closure last-drop). Without #2182 the cell leaked 8B while
+// the string itself was already correctly released. With the fix both are clean.
+BEZEL_TEST(boxed_cell_free_429, spec_28_3_iife_string_capture_cell_freed_2182) {
+    BEZEL_EXPECT_EQ(compileAndRun(kIifeStringCapture), 0);
+    int lsan = runUnderLeakSanitizer(kIifeStringCapture, 0);
+    if (lsan == -1) return;
+    BEZEL_EXPECT_EQ(lsan, 0);
 }

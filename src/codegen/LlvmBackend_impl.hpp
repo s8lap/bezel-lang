@@ -6245,6 +6245,24 @@ private:
     void lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         const ast::Type* declType);
 
+    // #2182 / §28.3: consume lastLambdaCapturedCells_ — for each freshly-boxed
+    // capture cell of a cellFreeEligible_ local (populated by lowerLambda),
+    // register a boxedCellFree (or boxedCellFreeDeferred / inline-array-cell
+    // disposal) in the appropriate scope's disposeStack_. Mirrors the per-cell
+    // soundness checks documented at LlvmBackend_impl.hpp's Disposal flags:
+    //   - skip + defer when a reads-through-cell disposal exists (owner scope);
+    //   - skip when the captured local's decl scope is shallower than the
+    //     current scope (#969 conservative leak);
+    //   - else register boxedCellFree in the current scope (fires at scope end,
+    //     AFTER any closureRelease in the same scope, so the envdtor can read
+    //     through the cell first).
+    // Called from lowerLocalDecl for `var f := lambda` (the existing path) and
+    // from lowerCall's IIFE arm for `(lambda() => …)()` — an IIFE has no LocalDecl
+    // to drive the consumption, but its lowered lambda populates the vector the
+    // same way. Clears lastLambdaCapturedCells_ (owned by the most recent
+    // lowerLambda call).
+    void consumeLastLambdaCapturedCells();
+
     // CG13: register a `using var`'s scope-based disposal (§28.3). The
     // local is disposed at the end of its enclosing block in reverse
     // declaration order. Recorded against the innermost open scope.

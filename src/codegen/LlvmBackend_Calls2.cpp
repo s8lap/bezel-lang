@@ -3396,6 +3396,18 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         // Lower the lambda to a closure struct { fn_ptr, env_ptr, rc }.
         llvm::Value* closureObj = lowerLambda(*iifeLam);
         if (!closureObj) return nullptr;
+        // #2182 / §28.3: an IIFE is non-escaping — emitClosureRelease below
+        // frees the closure cell before the enclosing expression ends, so no
+        // env outlives the defining scope. A captured local's boxed cell can
+        // therefore be freed at the outer scope end exactly like one captured
+        // by `var f := lambda`. lowerLambda just populated
+        // lastLambdaCapturedCells_ for the cellFreeEligible_ captures (the
+        // pre-scan collectCellFreeEligible flags the IIFE's callee-lambda as
+        // non-escaping); consume the vector here, mirroring lowerLocalDecl's
+        // closure-local arm. Without this the boxed capture cell leaks
+        // per-invocation (the envdtor releases only string/function captures,
+        // never a boxed value-type capture — §28.9 / §28.3).
+        consumeLastLambdaCapturedCells();
         // Load fn_ptr from closure[0] and env_ptr from closure[1].
         llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closureObj,
                                                  "iife.fn");

@@ -7459,139 +7459,24 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         //
         //   The cell will continue to leak (its prior contained-leak status is
         //   preserved); this is the correct sound choice per the PRIME DIRECTIVE.
-        for (const auto& ce : lastLambdaCapturedCells_) {
-            // Check: does this cell's slot have any reads-through-cell disposal?
-            // #966: the cell must outlive ANY disposal that reads the captured
-            // value THROUGH it — INCLUDING one registered in an ENCLOSING scope
-            // (a `using var` declared in an outer block, captured by a lambda in
-            // an inner block). Searching only the current scope (disposeStack_
-            // .back()) freed the cell at the inner-block exit while the outer
-            // local still read + disposed through it → use-after-free (the #966
-            // SIGSEGV on `do var g := () => r.V; end; return r.V;`). Search EVERY
-            // live scope, not just the innermost one.
-            bool hasOwnerDisposal = false;
-            std::size_t ownerScopeIdx = 0;
-            for (std::size_t si = 0; si < disposeStack_.size(); ++si) {
-                for (const auto& existing : disposeStack_[si]) {
-                    if (existing.slot != ce.newSlot) continue;
-                    // These flags indicate disposals that do NOT read through the
-                    // cell (they just release a runtime-managed value stored in
-                    // the slot, not a value reached by dereferencing the slot as a
-                    // cell pointer). All other disposals use boxedStorage(slot)
-                    // which dereferences the cell — unsafe to free beforehand.
-                    if (existing.stringRelease || existing.closureRelease ||
-                        existing.boxRelease    || existing.boxedCellFree ||
-                        existing.boxedCellFreeDeferred)
-                        continue;
-                    // This existing disposal READS THROUGH the cell; freeing the
-                    // cell via boxedCellFree would be a UAF.
-                    hasOwnerDisposal = true;
-                    ownerScopeIdx = si;
-                    break;
-                }
-                if (hasOwnerDisposal) break;
-            }
-            if (hasOwnerDisposal) {
-                // #1017: the plain boxedCellFree is unsafe (the owner disposal in
-                // disposeStack_[ownerScopeIdx] reads the object through the cell,
-                // and LIFO order would free it first → UAF). Instead register a
-                // DEFERRED cell-free in the OWNER's scope — emitDisposals frees it
-                // in a second pass, AFTER every main-loop disposal in that scope
-                // (so after the owner reads through it and every capturing env is
-                // released). Without this the cell leaked (8 bytes). Only for a
-                // plain cell (no inline-array elements — that path stays the
-                // documented #747/#782 skip). Dedup: a second closure capturing the
-                // same local hits this branch too, but its cell is alreadyBoxed so
-                // it is never in lastLambdaCapturedCells_; still guard against a
-                // duplicate deferred entry on the same slot in the owner scope.
-                if (ce.inlineArrayN == 0) {
-                    bool alreadyDeferred = false;
-                    for (const auto& existing : disposeStack_[ownerScopeIdx])
-                        if (existing.slot == ce.newSlot &&
-                            existing.boxedCellFreeDeferred) {
-                            alreadyDeferred = true;
-                            break;
-                        }
-                    if (!alreadyDeferred) {
-                        Disposal dcd{ce.newSlot, nullptr};
-                        dcd.boxedCellFreeDeferred = true;
-                        disposeStack_[ownerScopeIdx].push_back(dcd);
-                    }
-                }
-                continue;  // leave cell alive for owner disposal (freed deferred)
-            }
-            // §27.5 / §28.9 (#969): even a VALUE-typed captured local (which has
-            // no reads-through-cell disposal, so the guard above misses it) is
-            // read through the cell after the inner block exits when it was
-            // declared in an ENCLOSING scope (`var x := 55; do var g := () => x;
-            // end; return x;`). Freeing the cell at this inner lambda's scope
-            // would corrupt that later read. Skip boxedCellFree when the captured
-            // local's declaration depth is shallower than the current scope (the
-            // cell then leaks until the local's own scope exits — the sound
-            // trade-off). Only LOCALS are in declScopeDepth_; params are left to
-            // the disposal guard above (a noted follow-up).
-            auto dd = declScopeDepth_.find(ce.key);
-            if (dd != declScopeDepth_.end() && dd->second < disposeStack_.size()) {
-                // A pattern binding is established by the case matcher in the
-                // arm's owning scope, while its capturing lambda may be nested
-                // in a `do ... end`. Defer the cell free to that owner scope;
-                // freeing it at the nested lambda scope would leave later arm
-                // reads (or a subsequent loop iteration) with a dangling cell.
-                // Ordinary outer locals retain the conservative leak behavior
-                // here: their cell may still be read after this inner scope.
-                auto* keyNode = static_cast<const ast::Node*>(ce.key);
-                bool patternBinding =
-                    dynamic_cast<const ast::BindingPattern*>(keyNode) != nullptr;
-                if (patternBinding) {
-                    std::size_t ownerScopeIdx = dd->second - 1;
-                    bool alreadyDeferred = false;
-                    for (const auto& existing : disposeStack_[ownerScopeIdx])
-                        if (existing.slot == ce.newSlot &&
-                            existing.boxedCellFreeDeferred) {
-                            alreadyDeferred = true;
-                            break;
-                        }
-                    if (!alreadyDeferred) {
-                        Disposal dcd{ce.newSlot, nullptr};
-                        dcd.boxedCellFreeDeferred = true;
-                        disposeStack_[ownerScopeIdx].push_back(dcd);
-                        if (ce.inlineArrayN > 0) {
-                            Disposal da{ce.newSlot, nullptr};
-                            da.inlineOwnedArrayCell = true;
-                            da.inlineSlotCount = ce.inlineArrayN;
-                            disposeStack_[ownerScopeIdx].push_back(da);
-                        }
-                    }
-                }
-                continue;
-            }
-            Disposal dc{ce.newSlot, nullptr};
-            dc.boxedCellFree = true;
-            disposeStack_.back().push_back(dc);
-            // #782: a captured move-only OWNING inline-array's elements live in the
-            // boxed cell. Dispose each non-null element THROUGH the cell, then null
-            // the slot — pushed AFTER boxedCellFree so it fires BEFORE it (reverse
-            // iteration): dispose elements, then free the cell. The original
-            // [N x ptr] alloca disposal is skipped (the array is marked
-            // "transferred" by the capture), so each element is disposed exactly
-            // once. Non-escaping-gated via lastLambdaCapturedCells_ (only cells of
-            // cellFreeEligible_ locals are recorded), so the escaped-closure UAF
-            // case never reaches here.
-            if (ce.inlineArrayN > 0) {
-                Disposal da{ce.newSlot, nullptr};
-                da.inlineOwnedArrayCell = true;
-                da.inlineSlotCount = ce.inlineArrayN;
-                disposeStack_.back().push_back(da);
-            }
-        }
+        //
+        // #2182: extracted into Emitter::consumeLastLambdaCapturedCells() so the
+        // IIFE arm of lowerCall (`(lambda() => …)()` — no LocalDecl drives this
+        // consumption) can run the SAME per-cell soundness checks after its
+        // lowerLambda call. The helper clears lastLambdaCapturedCells_.
+        consumeLastLambdaCapturedCells();
         Disposal d{slot, nullptr};
         d.closureRelease = true;
         disposeStack_.back().push_back(d);
+    } else {
+        // #2182 / §28.3: a non-closure-local lowerLocalDecl that does not reach
+        // the closureRelease arm above still owns lastLambdaCapturedCells_ if a
+        // lambda was lowered as part of its initializer (e.g. `var x :=
+        // (lambda() => h.S[0])();` — the IIFE result stored in x). The closure
+        // arm consumes the vector; the non-closure arm must clear it too so the
+        // next lowerLocalDecl in this scope does not reprocess stale cells.
+        lastLambdaCapturedCells_.clear();
     }
-    // Consume lastLambdaCapturedCells_ after any lambda-initialised local is
-    // processed; the vector belongs to the most-recent lowerLambda call and
-    // should not be reused by subsequent locals in the same scope.
-    lastLambdaCapturedCells_.clear();
     // #422 / §8.6 / §28.9: if this `var` Object/interface local was proven
     // non-escaping and initialized by a codegen +1 BOX producer (a boxable-value
     // initializer that boxForTarget wrapped), register a scope-end bz_box_release
@@ -7817,6 +7702,144 @@ void Emitter::attachOwningTaskResultDisposer(Disposal& d,
             elementPolicyFor(taskTy->genericArgs[0], /*owningFamily=*/true)
                 .disposerThunk;
     }
+}
+
+// #2182 / §28.3: consume lastLambdaCapturedCells_ — extracted from
+// lowerLocalDecl's closure-local arm so the IIFE arm of lowerCall (which has
+// no LocalDecl to drive the consumption) can run the SAME per-cell soundness
+// checks after its lowerLambda call. The body is verbatim the loop that lived
+// inline at this site (the comments document the #966/#969/#1017/#782 cases);
+// the only change is the unconditional clear at the end (the caller no longer
+// clears — the helper owns the vector's lifetime).
+void Emitter::consumeLastLambdaCapturedCells() {
+    for (const auto& ce : lastLambdaCapturedCells_) {
+        // Check: does this cell's slot have any reads-through-cell disposal?
+        // #966: the cell must outlive ANY disposal that reads the captured
+        // value THROUGH it — INCLUDING one registered in an ENCLOSING scope
+        // (a `using var` declared in an outer block, captured by a lambda in
+        // an inner block). Searching only the current scope (disposeStack_
+        // .back()) freed the cell at the inner-block exit while the outer
+        // local still read + disposed through it → use-after-free (the #966
+        // SIGSEGV on `do var g := () => r.V; end; return r.V;`). Search EVERY
+        // live scope, not just the innermost one.
+        bool hasOwnerDisposal = false;
+        std::size_t ownerScopeIdx = 0;
+        for (std::size_t si = 0; si < disposeStack_.size(); ++si) {
+            for (const auto& existing : disposeStack_[si]) {
+                if (existing.slot != ce.newSlot) continue;
+                // These flags indicate disposals that do NOT read through the
+                // cell (they just release a runtime-managed value stored in
+                // the slot, not a value reached by dereferencing the slot as a
+                // cell pointer). All other disposals use boxedStorage(slot)
+                // which dereferences the cell — unsafe to free beforehand.
+                if (existing.stringRelease || existing.closureRelease ||
+                    existing.boxRelease    || existing.boxedCellFree ||
+                    existing.boxedCellFreeDeferred)
+                    continue;
+                // This existing disposal READS THROUGH the cell; freeing the
+                // cell via boxedCellFree would be a UAF.
+                hasOwnerDisposal = true;
+                ownerScopeIdx = si;
+                break;
+            }
+            if (hasOwnerDisposal) break;
+        }
+        if (hasOwnerDisposal) {
+            // #1017: the plain boxedCellFree is unsafe (the owner disposal in
+            // disposeStack_[ownerScopeIdx] reads the object through the cell,
+            // and LIFO order would free it first → UAF). Instead register a
+            // DEFERRED cell-free in the OWNER's scope — emitDisposals frees it
+            // in a second pass, AFTER every main-loop disposal in that scope
+            // (so after the owner reads through it and every capturing env is
+            // released). Without this the cell leaked (8 bytes). Only for a
+            // plain cell (no inline-array elements — that path stays the
+            // documented #747/#782 skip). Dedup: a second closure capturing the
+            // same local hits this branch too, but its cell is alreadyBoxed so
+            // it is never in lastLambdaCapturedCells_; still guard against a
+            // duplicate deferred entry on the same slot in the owner scope.
+            if (ce.inlineArrayN == 0) {
+                bool alreadyDeferred = false;
+                for (const auto& existing : disposeStack_[ownerScopeIdx])
+                    if (existing.slot == ce.newSlot &&
+                        existing.boxedCellFreeDeferred) {
+                        alreadyDeferred = true;
+                        break;
+                    }
+                if (!alreadyDeferred) {
+                    Disposal dcd{ce.newSlot, nullptr};
+                    dcd.boxedCellFreeDeferred = true;
+                    disposeStack_[ownerScopeIdx].push_back(dcd);
+                }
+            }
+            continue;  // leave cell alive for owner disposal (freed deferred)
+        }
+        // §27.5 / §28.9 (#969): even a VALUE-typed captured local (which has
+        // no reads-through-cell disposal, so the guard above misses it) is
+        // read through the cell after the inner block exits when it was
+        // declared in an ENCLOSING scope (`var x := 55; do var g := () => x;
+        // end; return x;`). Freeing the cell at this inner lambda's scope
+        // would corrupt that later read. Skip boxedCellFree when the captured
+        // local's declaration depth is shallower than the current scope (the
+        // cell then leaks until the local's own scope exits — the sound
+        // trade-off). Only LOCALS are in declScopeDepth_; params are left to
+        // the disposal guard above (a noted follow-up).
+        auto dd = declScopeDepth_.find(ce.key);
+        if (dd != declScopeDepth_.end() && dd->second < disposeStack_.size()) {
+            // A pattern binding is established by the case matcher in the
+            // arm's owning scope, while its capturing lambda may be nested
+            // in a `do ... end`. Defer the cell free to that owner scope;
+            // freeing it at the nested lambda scope would leave later arm
+            // reads (or a subsequent loop iteration) with a dangling cell.
+            // Ordinary outer locals retain the conservative leak behavior
+            // here: their cell may still be read after this inner scope.
+            auto* keyNode = static_cast<const ast::Node*>(ce.key);
+            bool patternBinding =
+                dynamic_cast<const ast::BindingPattern*>(keyNode) != nullptr;
+            if (patternBinding) {
+                std::size_t ownerScopeIdx = dd->second - 1;
+                bool alreadyDeferred = false;
+                for (const auto& existing : disposeStack_[ownerScopeIdx])
+                    if (existing.slot == ce.newSlot &&
+                        existing.boxedCellFreeDeferred) {
+                        alreadyDeferred = true;
+                        break;
+                    }
+                if (!alreadyDeferred) {
+                    Disposal dcd{ce.newSlot, nullptr};
+                    dcd.boxedCellFreeDeferred = true;
+                    disposeStack_[ownerScopeIdx].push_back(dcd);
+                    if (ce.inlineArrayN > 0) {
+                        Disposal da{ce.newSlot, nullptr};
+                        da.inlineOwnedArrayCell = true;
+                        da.inlineSlotCount = ce.inlineArrayN;
+                        disposeStack_[ownerScopeIdx].push_back(da);
+                    }
+                }
+            }
+            continue;
+        }
+        Disposal dc{ce.newSlot, nullptr};
+        dc.boxedCellFree = true;
+        disposeStack_.back().push_back(dc);
+        // #782: a captured move-only OWNING inline-array's elements live in the
+        // boxed cell. Dispose each non-null element THROUGH the cell, then null
+        // the slot — pushed AFTER boxedCellFree so it fires BEFORE it (reverse
+        // iteration): dispose elements, then free the cell. The original
+        // [N x ptr] alloca disposal is skipped (the array is marked
+        // "transferred" by the capture), so each element is disposed exactly
+        // once. Non-escaping-gated via lastLambdaCapturedCells_ (only cells of
+        // cellFreeEligible_ locals are recorded), so the escaped-closure UAF
+        // case never reaches here.
+        if (ce.inlineArrayN > 0) {
+            Disposal da{ce.newSlot, nullptr};
+            da.inlineOwnedArrayCell = true;
+            da.inlineSlotCount = ce.inlineArrayN;
+            disposeStack_.back().push_back(da);
+        }
+    }
+    // The vector belongs to the most-recent lowerLambda call; clear it so the
+    // next lowerLambda / lowerLocalDecl starts fresh.
+    lastLambdaCapturedCells_.clear();
 }
 
 void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
@@ -14347,7 +14370,26 @@ void Emitter::collectCellFreeEligible(
             if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
                 expr(m->target.get(), false); return; }
             if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
-                expr(c->callee.get(), false);
+                // #2182 / §28.3: an IIFE — CallExpr whose callee is a
+                // LambdaExpr — is NON-escaping. Calls2.cpp emits the closure
+                // call immediately followed by emitClosureRelease, so the
+                // closure env never outlives the enclosing expression. A local
+                // captured only by IIFEs therefore qualifies for
+                // cellFreeEligible_ exactly like one captured by a `var f :=
+                // lambda` non-escaping lambda — its boxed capture cell is
+                // freed at the outer scope end. Without this special-casing
+                // the IIFE here, the generic `expr(callee, false)` recursion
+                // would collect the callee-lambda with topPos=false → the
+                // IIFE's captures land in capturedByEscaping and the boxed
+                // capture cell leaks per-invocation (no UAF; the envdtor
+                // releases only string/function captures, never a boxed
+                // value-type capture).
+                if (auto* iifeLam =
+                        dynamic_cast<const ast::LambdaExpr*>(c->callee.get())) {
+                    collectLambdaCaptures(iifeLam, em, /*isNonEscaping=*/true);
+                } else {
+                    expr(c->callee.get(), false);
+                }
                 for (auto& a : c->args) expr(a.value.get(), false); return; }
             if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
                 expr(c->callee.get(), false);
