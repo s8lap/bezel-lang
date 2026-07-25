@@ -7320,15 +7320,27 @@ void ExprTC::runMethodBody(
             if (s) visitStmt(*s);
         }
     }
-    // §7.4 (v0.214, #2116 pre-gate review): clear the readonly-field facts
-    // BEFORE the contract clauses are visited. Clauses evaluate at the
-    // member's BOUNDARIES — `requires` at entry (before any body guard has
-    // run), `ensures` at every return edge — so the body's FINAL flow state
-    // must not admit a nullable readonly-field access in a clause: a
-    // body-final `_f <> null` fact would let `requires(_f.M)` compile and
-    // then fault at entry on a null `_f` (probe-confirmed SEGV in the
-    // lowered requires prologue). The legacy local sets share this leak for
-    // parameters — pre-existing, filed separately from this review.
+    // §7.4 / §22.16 (#2188, mirroring the #2116 pre-gate review's field-set
+    // fix): clear EVERY flow-narrowing set BEFORE the contract clauses are
+    // visited. Clauses evaluate at the member's BOUNDARIES — `requires` at
+    // entry (after argument binding, before ANY body guard has run — the
+    // lowered requires prologue is #2053 slice 4a), `ensures` at every
+    // return edge — so the body's FINAL flow state must not admit a nullable
+    // access in a clause. The #2116 amendment closed this for the readonly-
+    // FIELD set (`fieldNarrowed_`); the LEGACY local/parameter sets
+    // (`nullNarrowed_`, `narrowings_`) carried the identical leak for
+    // parameters — a body-final early-return guard let `requires(s.Length >= 0)`
+    // compile on a `string?` parameter, then the lowered prologue dereffed
+    // null on `Len(null)` before the body's guard could run (probe-confirmed
+    // acceptance on main). The simple sound rule per §22.16's boundary
+    // semantics: NO body flow facts survive into any clause; clause-INTERNAL
+    // narrowing still applies (the visitExpr below re-establishes facts
+    // inside a single clause expression, e.g. `requires(s <> null and
+    // s.Length >= 0)` — §22.16 "Flow narrowing works inside clauses
+    // unchanged"). §22.4's out-nullability postcondition machinery is
+    // separate (`currentOutPostconds_`) and is not touched here.
+    nullNarrowed_.clear();
+    narrowings_.clear();
     fieldNarrowed_.clear();
     // §22.16 (v0.203, #2053): visit each contract clause's expression in the
     // method scope (params + this + enclosing statics) — body locals are not
