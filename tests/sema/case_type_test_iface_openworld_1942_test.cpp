@@ -29,13 +29,16 @@
 // help — a subclass would implement the interface only ONCE (no clash exists) —
 // so only `sealed` admits.
 //
-// REVIEW HOLD-OFF (#2186): the clash-protection admit is currently GATED OFF
-// (kClashProtectionAdmitEnabled=false in typeTestInterfaceBindAmbiguous): the
-// §12.5 conformance check satisfies members by NAME+arity only, so the no-
-// member subclass `D : K<(string)->string>, IM<(int)->int>` is wrongly
-// accepted and the §12.2 clash the admit relies on never fires (probe
-// exploit_1942.bzl mis-bound at runtime). Until #2186 lands the tail admit is
-// sealed-only; tests (7)/(7b) pin the gated behavior.
+// #2186 UNBLOCKED: the clash-protection admit is now ENABLED
+// (kClashProtectionAdmitEnabled=true in typeTestInterfaceBindAmbiguous). The
+// §12.5 conformance check now verifies the SUBSTITUTED signature, so the no-
+// member subclass `D : K<(string)->string>, IM<(int)->int>` is correctly
+// REJECTED (its inherited `Get(): ((string)->string)?` does not satisfy
+// `IM<(int)->int>`'s `Get(): ((int)->int)?`) — the §12.2 clash the admit
+// relies on now fires for any subclass that tries to declare a same-named
+// member with the new instantiation's signature. Tests (7)/(7b) pin the
+// unblocked behavior: (7) is now ADMITTED; (7b)'s D declaration is now
+// blocked at the conformance site by #2186.
 
 #include "support/sema_support.hpp"
 #include "test_harness.hpp"
@@ -206,17 +209,15 @@ BEZEL_TEST(case_type_test_iface_openworld_1942,
 
 // (7) NON-final class with a CLASH-PROTECTED interface: `Get(): T?` pins T in
 // the result position with a parameter-free member — #1942's recorded
-// direction would ACCEPT this (a `D : K<Q≠A>, IM<A>` that *declares* the
-// member is rejected as §12.2 hiding). REVIEW HOLD-OFF (#2186): the §12.5
-// conformance check satisfies abstract members by NAME+arity only, so a `D`
-// that declares NO member is wrongly accepted (the inherited
-// `Get(): ((string)->string)?` is credited for `IM<(int)->int>`) — the clash
-// never fires and the admit is exploitable (a `K<(string)->string>` value
-// binds at `K<(int)->int>`; probe exploit_1942.bzl ran exit 1). Sealed-only
-// until #2186 lands: REJECTED. Flip this expectation together with the
-// kClashProtectionAdmitEnabled gate (ExprTypecheck.cpp) when re-enabling.
+// direction ACCEPTS this (a `D : K<Q≠A>, IM<A>` that *declares* the member is
+// rejected as §12.2 hiding, and after #2186 a `D` that declares NO member is
+// rejected at the conformance site — the inherited `Get(): ((string)-
+// >string)?` does not satisfy `IM<(int)->int>`'s `Get(): ((int)->int)?`).
+// #2186 unblocked the clash-protection admit
+// (kClashProtectionAdmitEnabled=true); this test was REJECTED while the gate
+// was off and is now ADMITTED (no erased-ambiguous error).
 BEZEL_TEST(case_type_test_iface_openworld_1942,
-           nonfinal_clash_protected_gated_off_rejected_2186) {
+           nonfinal_clash_protected_admitted_2186) {
     auto r = parseSemaAll(wrap(
         "interface IM<T>\n"
         "  method Get(): T?;\n"
@@ -232,19 +233,22 @@ BEZEL_TEST(case_type_test_iface_openworld_1942,
         "      _ => do return 0; end\n"
         "    end;\n"
         "  end M;\n"));
-    BEZEL_EXPECT_TRUE(hasErasedAmbiguousError(r));
+    BEZEL_EXPECT_FALSE(hasErasedAmbiguousError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // (7b) The #2186 EXPLOIT shape pinned end-to-end: the same clash-protected
 // interface plus the no-member subclass `D : K<(string)->string>,
-// IM<(int)->int>` the buggy §12.5 conformance check accepts. The arm MUST be
-// rejected — with the clash-protection admit enabled it compiled and BOUND a
-// `K<(string)->string>` value at `K<(int)->int>` (the #2001/#2006 confusion
-// class). This test is the regression pin for the hold-off: when #2186 lands
-// and the gate is flipped, the `D` declaration below must itself become a
-// §12.5 error (keeping the file red until BOTH sides are consistent).
+// IM<(int)->int>` the pre-#2186 conformance check accepted. The `D`
+// declaration is now BLOCKED AT THE CONFORMANCE SITE — its inherited
+// `Get(): ((string)->string)?` does not satisfy `IM<(int)->int>`'s
+// `Get(): ((int)->int)?` under the substituted-signature check (#2186).
+// This test is the regression pin for the unblock: the program is still
+// rejected (one way or another), but the diagnostic is now the §11.2
+// substituted-signature conformance error, not the case-arm erased-ambiguous
+// rejection that held the line under the gated-off admit.
 BEZEL_TEST(case_type_test_iface_openworld_1942,
-           nonfinal_clash_protected_subclass_exploit_rejected_2186) {
+           nonfinal_clash_protected_subclass_exploit_blocked_by_2186_conformance) {
     auto r = parseSemaAll(wrap(
         "interface IM<T>\n"
         "  method Get(): T?;\n"
@@ -262,7 +266,21 @@ BEZEL_TEST(case_type_test_iface_openworld_1942,
         "      _ => do return 0; end\n"
         "    end;\n"
         "  end M;\n"));
-    BEZEL_EXPECT_TRUE(hasErasedAmbiguousError(r));
+    // Program is rejected (the exploit can no longer compile).
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // The blocking diagnostic is #2186's substituted-signature conformance
+    // error (§11.2), not the erased-ambiguous case-arm rejection.
+    bool hasConformanceError = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("11.2") != std::string::npos &&
+            d.message.find("interface") != std::string::npos &&
+            d.message.find("substitution") != std::string::npos) {
+            hasConformanceError = true;
+            break;
+        }
+    }
+    BEZEL_EXPECT_TRUE(hasConformanceError);
 }
 
 // (8) REIFIED regime untouched: non-final `K<T> : IM<T>` (marker) with a

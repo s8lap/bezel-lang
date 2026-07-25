@@ -5192,22 +5192,22 @@ ExprTC::IfaceBindReject ExprTC::typeTestInterfaceBindAmbiguous(
     // (nothing to clash with), so only `sealed` admits — the arm is then
     // provably dead (#1920's domain).
     //
-    // REVIEW HOLD-OFF (#2186): the clash-protection admit is DISABLED until
-    // the §12.5 interface-conformance defect is fixed. The conformance check
-    // (TypeResolution_Checks.cpp) satisfies abstract members by NAME+arity
-    // only, so `class D : K<(string)->string>, IM<(int)->int>` with NO new
-    // members is wrongly ACCEPTED — the inherited `Get(): ((string)->string)?`
-    // is credited for `IM<(int)->int>`'s `Get(): ((int)->int)?` — the §12.2
-    // clash the admit relies on never fires, and the probe exploit
-    // (laneE-review exploit_1942.bzl) binds a `K<(string)->string>` value at
-    // `K<(int)->int>` through this admit. Sealed-only until #2186 lands; then
-    // flip kClashProtectionAdmitEnabled and the paired test expectation
-    // (case_type_test_iface_openworld_1942).
+    // #2186 UNBLOCKED: the clash-protection admit is now ENABLED. The premise
+    // — that a subclass implementing the interface at a second instantiation
+    // must §12.2-clash on a same-named member — now holds because the §12.5
+    // conformance check (TypeResolution_Checks.cpp) verifies the SUBSTITUTED
+    // signature, so `class D : K<(string)->string>, IM<(int)->int>` with no
+    // new members is correctly REJECTED (the inherited `Get(): ((string)-
+    // >string)?` does not satisfy `IM<(int)->int>`'s `Get(): ((int)->int)?`).
+    // Pre-#2186 the conformance check satisfied abstract members by NAME+arity
+    // only, so D was wrongly accepted and the §12.2 clash the admit relies on
+    // never fired (probe exploit_1942.bzl bound a `K<(string)->string>` value
+    // at `K<(int)->int>` through this admit). Sealed-only was the hold-off.
     {
         bool sealedPd = false;
         for (std::string_view m : pd->modifiers)
             if (m == "sealed") { sealedPd = true; break; }
-        constexpr bool kClashProtectionAdmitEnabled = false;  // #2186 gate
+        constexpr bool kClashProtectionAdmitEnabled = true;  // #2186 unblocked
         if (!sealedPd &&
             !(kClashProtectionAdmitEnabled && uniqueConformer &&
               ifaceClashProtectedAllParams(itd, ctx_)))

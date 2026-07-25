@@ -2742,6 +2742,81 @@ bool Resolver::methodIsAbstract(MethodSymbol* ms) {
 
 void Resolver::checkAbstractImplementations() {
     if (!ctx_.module()) return;
+
+    // #2186 / §11.2 / §12.5: per-instantiation interface-obligation machinery.
+    // The §11.2 matching rule compares parameter and return types UNDER THE
+    // INTERFACE'S SUBSTITUTION, so an interface conformance declaration
+    // (`D : K<string>, IM<int>`) cannot be silently satisfied by an inherited
+    // member of the wrong instantiation (K<string>::Get(): string? for
+    // IM<int>::Get(): int?). Before #2186 the check compared name+arity+
+    // modifier only; this machinery mirrors `checkStaticInterfaceConformance`'s
+    // local helpers — same recursive substitution and the same structural
+    // equality that distinguishes declaration-less builtins/bare type params
+    // by spelling (`typeRefEqual` would conflate them, treating two null-
+    // declaration Named refs of the same shape as equal).
+    std::function<TypeRef*(TypeRef*,
+                           const std::unordered_map<std::string_view, const TypeRef*>&)>
+        substTypeRef = [&](TypeRef* d,
+                           const std::unordered_map<std::string_view, const TypeRef*>& map)
+        -> TypeRef* {
+        if (!d) return d;
+        if (d->kind != TypeRef::Kind::Named) return d;
+        if (!d->declaration && d->astNode && d->astNode->name &&
+            d->astNode->name->parts.size() == 1 && d->genericArgs.empty()) {
+            auto it = map.find(d->headName());
+            if (it != map.end() && it->second) {
+                const TypeRef* s = it->second;
+                if (d->nullable && !s->nullable) {
+                    TypeRef* nn = ctx_.makeTypeRef(*s);
+                    nn->nullable = true;
+                    return nn;
+                }
+                return const_cast<TypeRef*>(s);
+            }
+            return d;
+        }
+        if (!d->genericArgs.empty()) {
+            bool changed = false;
+            std::vector<TypeRef*> newArgs;
+            newArgs.reserve(d->genericArgs.size());
+            for (TypeRef* ga : d->genericArgs) {
+                TypeRef* s = substTypeRef(ga, map);
+                changed = changed || (s != ga);
+                newArgs.push_back(s);
+            }
+            if (changed) {
+                TypeRef* nn = ctx_.makeTypeRef(*d);
+                nn->genericArgs = std::move(newArgs);
+                return nn;
+            }
+        }
+        return d;
+    };
+    std::function<bool(const TypeRef*, const TypeRef*)> typesMatch =
+        [&](const TypeRef* a, const TypeRef* b) -> bool {
+        if (!a || !b) return false;
+        if (a->kind == TypeRef::Kind::Named && b->kind == TypeRef::Kind::Named &&
+            !a->declaration && !b->declaration) {
+            auto spell = [](const TypeRef* t) -> std::string_view {
+                if (t->astNode && t->astNode->name &&
+                    !t->astNode->name->parts.empty())
+                    return t->astNode->name->parts.back();
+                return t->importedName;
+            };
+            if (spell(a) != spell(b)) return false;
+            if (a->nullable != b->nullable) return false;
+            if (a->genericArgs.size() != b->genericArgs.size()) return false;
+            for (std::size_t i = 0; i < a->genericArgs.size(); ++i)
+                if (!typesMatch(a->genericArgs[i], b->genericArgs[i]))
+                    return false;
+            return true;
+        }
+        return typeRefEqual(a, b);
+    };
+    auto resolvedOf = [&](const ast::Type* node) -> TypeRef* {
+        return node ? ctx_.resolvedType(*node) : nullptr;
+    };
+
     for (Symbol* child : ctx_.module()->children) {
         auto* t = dynamic_cast<TypeSymbol*>(child);
         if (!t) continue;
@@ -2765,17 +2840,32 @@ void Resolver::checkAbstractImplementations() {
             abstractArities;
         std::unordered_map<std::string_view, std::unordered_set<std::size_t>>
             concreteArities;
-        // #1685 / §11.2 (v0.184): the actual interface-declared MethodSymbols
-        // per name, kept (unlike the arity-only sets above) so the `scoped`
-        // match below can compare each interface member's parameters against
-        // its concrete implementation position-by-position. Populated only
-        // from INTERFACE declarations (curIsIface below) — an abstract CLASS
-        // member's concrete override already goes through the `override`
-        // keyword and is checked exactly (`scoped` included) by
-        // checkOverrideSignatureMatch (dp->modifier != bp->modifier, §12.1);
-        // adding it here too would just re-report the same violation twice.
-        std::unordered_map<std::string_view, std::vector<MethodSymbol*>>
-            ifaceMethodsByName;
+        // #2186 / §11.2 / §12.5: per-obligation record. The interface's own
+        // method (declared with bare type-parameter types) plus the SUBSTITUTION
+        // the conformance declaration induces for that interface instantiation
+        // (`: IM<int>` → {T → int}). Applied to the interface member's signature
+        // to compare against the (similarly substituted) implementation's — the
+        // §11.2 matching rule is exact-under-substitution, not name+arity only.
+        // Carrying the substitution per obligation is what lets a generic
+        // interface implemented at TWO instantiations (D : K<string>, IM<int>)
+        // record TWO separate obligations; the flat name-only set previously
+        // used satisfied both with whichever same-named member the BFS hit first.
+        struct IfaceObligation {
+            MethodSymbol* method;
+            TypeSymbol* iface;
+            std::unordered_map<std::string_view, const TypeRef*> subst;
+        };
+        std::unordered_map<std::string_view, std::vector<IfaceObligation>>
+            ifaceObligationsByName;
+        // #2186: per-class substitution accumulated during the BFS, looked up
+        // when verifying a conformance to substitute the impl-side signature
+        // the same way. First-path-wins (a class declares one member set; the
+        // subst only changes how those members' types are READ); the same class
+        // reached via two paths with different substs is rare and not the
+        // #2186 shape (which is about interfaces implemented twice).
+        std::unordered_map<TypeSymbol*,
+                           std::unordered_map<std::string_view, const TypeRef*>>
+            classSubst;
         // §11.2 / §23: interface property names that require a property
         // implementation (a field does NOT satisfy a property contract — per
         // §23, a property is declared with the `property` keyword and
@@ -2792,12 +2882,57 @@ void Resolver::checkAbstractImplementations() {
         std::unordered_map<std::string_view,
                            std::pair<PropertySymbol*, TypeSymbol*>> ifaceProps;
         std::unordered_map<std::string_view, PropertySymbol*> concreteProps;
-        // BFS the chain.
-        std::vector<TypeSymbol*> frontier{t};
-        std::unordered_set<TypeSymbol*> seen{t};
+        // #2186: BFS over the inheritance chain tracking the per-node
+        // substitution the path induces. Dedup is by (TypeSymbol, subst-key)
+        // — not TypeSymbol alone — so a generic interface reached through two
+        // paths at different instantiations is visited once PER instantiation
+        // (two separate obligation sets, the crux of #2186). Mirrors
+        // instanceDescriptorFor's BFS in LlvmBackend_Setup.cpp (which built
+        // the per-monomorphization ancestor array under the same constraint).
+        struct FrontierNode {
+            TypeSymbol* sym;
+            std::unordered_map<std::string_view, const TypeRef*> subst;
+        };
+        auto substKey = [&](
+            const std::unordered_map<std::string_view, const TypeRef*>& m)
+            -> std::string {
+            if (m.empty()) return std::string();
+            std::vector<std::pair<std::string_view, std::string>> parts;
+            parts.reserve(m.size());
+            for (auto& [k, v] : m) {
+                parts.emplace_back(k,
+                    v ? std::string(v->headName()) : std::string());
+            }
+            std::sort(parts.begin(), parts.end());
+            std::string out;
+            for (auto& [k, v] : parts) {
+                out += std::string(k);
+                out += "=";
+                out += v;
+                out += ";";
+            }
+            return out;
+        };
+        auto seenKey = [&](TypeSymbol* s,
+                           const std::unordered_map<std::string_view,
+                                                    const TypeRef*>& m)
+            -> std::string {
+            return std::to_string(reinterpret_cast<std::uintptr_t>(s)) +
+                   "#" + substKey(m);
+        };
+        std::vector<FrontierNode> frontier;
+        frontier.push_back({t, {}});
+        std::unordered_set<std::string> seen;
+        seen.insert(seenKey(t, {}));
         std::size_t i = 0;
         while (i < frontier.size()) {
-            TypeSymbol* cur = frontier[i++];
+            FrontierNode node = frontier[i++];  // copy — frontier may realloc
+            TypeSymbol* cur = node.sym;
+            auto curSubst = node.subst;  // copy — base-loop below may realloc
+            if (cur->kind != ast::TypeDeclKind::Interface) {
+                // First-path-wins for the impl-side substitution lookup.
+                classSubst.emplace(cur, curSubst);
+            }
             bool curIsIface = (cur->kind == ast::TypeDeclKind::Interface);
             for (Symbol* m : cur->members) {
                 if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
@@ -2819,7 +2954,12 @@ void Resolver::checkAbstractImplementations() {
                         // every non-static member here is interface-declared,
                         // since methodIsAbstract is true for ALL interface
                         // members — see methodIsAbstract above).
-                        if (curIsIface) ifaceMethodsByName[ms->name].push_back(ms);
+                        // #2186: carry this visit's substitution so the
+                        // signature comparison below substitutes both sides.
+                        if (curIsIface) {
+                            ifaceObligationsByName[ms->name].push_back(
+                                IfaceObligation{ms, cur, curSubst});
+                        }
                     } else {
                         concreteNames.insert(ms->name);
                         concreteArities[ms->name].insert(ms->params.size());
@@ -2844,11 +2984,32 @@ void Resolver::checkAbstractImplementations() {
                     }
                 }
             }
-            for (TypeSymbol* b : cur->baseTypes) {
-                if (b && !seen.count(b)) {
-                    seen.insert(b);
-                    frontier.push_back(b);
+            for (std::size_t bi = 0; bi < cur->baseTypes.size(); ++bi) {
+                TypeSymbol* b = cur->baseTypes[bi];
+                if (!b) continue;
+                // #2186: bind b's generic parameters to the (already-
+                // substituted-through-curSubst) generic args of cur's base
+                // ref. `: IM<int>` at the root binds IM's T → int; the same
+                // binding through an inherited `: IM<T>` under {T → string}
+                // gives IM's T → string — two separate obligations, the
+                // crux of #2186.
+                std::unordered_map<std::string_view, const TypeRef*> bSubst;
+                if (bi < cur->baseTypeRefs.size()) {
+                    TypeRef* bref = cur->baseTypeRefs[bi];
+                    if (bref &&
+                        b->genericParams.size() == bref->genericArgs.size()) {
+                        for (std::size_t gi = 0; gi < b->genericParams.size();
+                             ++gi) {
+                            if (b->genericParams[gi] && bref->genericArgs[gi]) {
+                                bSubst[b->genericParams[gi]->name] =
+                                    substTypeRef(bref->genericArgs[gi], curSubst);
+                            }
+                        }
+                    }
                 }
+                std::string key = seenKey(b, bSubst);
+                if (!seen.insert(key).second) continue;
+                frontier.push_back(FrontierNode{b, std::move(bSubst)});
             }
         }
         for (auto name : abstractNames) {
@@ -2904,10 +3065,17 @@ void Resolver::checkAbstractImplementations() {
         // against the SAME concrete candidate codegen's `findInterfaceImpl`
         // (LlvmBackend_impl.hpp) wires into the itable slot: most-derived
         // class first, first same-arity overload in declaration order.
-        for (auto& [name, ifaceMethods] : ifaceMethodsByName) {
-            for (MethodSymbol* im : ifaceMethods) {
+        for (auto& [name, obligations] : ifaceObligationsByName) {
+            for (auto& obl : obligations) {
+                MethodSymbol* im = obl.method;
                 MethodSymbol* impl = nullptr;
                 MethodSymbol* nameOnly = nullptr;
+                // #2186: track the declaring class of the chosen impl so its
+                // signature can be substituted through the SAME path-induced
+                // substitution the BFS recorded for that class (the impl is
+                // the unspecialized template's MethodSymbol; its bare type-
+                // parameter types read correctly only under that subst).
+                TypeSymbol* implClass = nullptr;
                 TypeSymbol* c = t;
                 while (c && !impl) {
                     for (Symbol* m : c->members) {
@@ -2917,6 +3085,7 @@ void Resolver::checkAbstractImplementations() {
                             continue;
                         if (ms->params.size() == im->params.size()) {
                             impl = ms;
+                            implClass = c;
                             break;
                         }
                         if (!nameOnly) nameOnly = ms;
@@ -2934,6 +3103,9 @@ void Resolver::checkAbstractImplementations() {
                 if (!impl) impl = nameOnly;
                 if (!impl || impl->params.size() != im->params.size())
                     continue;  // missing/arity mismatch already reported above
+                std::unordered_map<std::string_view, const TypeRef*> implSubst;
+                auto csIt = classSubst.find(implClass);
+                if (csIt != classSubst.end()) implSubst = csIt->second;
                 auto describeModifier = [](std::string_view m) -> std::string {
                     return m.empty() ? std::string("no modifier")
                                       : ("`" + std::string(m) + "`");
@@ -3005,6 +3177,79 @@ void Resolver::checkAbstractImplementations() {
                         "` and must be declared `pure` — purity is never "
                         "dropped across an interface implementation "
                         "(\xC2\xA7""22.15)");
+                }
+                // #2186 / §11.2: parameter types must match exactly UNDER THE
+                // INTERFACE'S SUBSTITUTION — and the impl's substitution. This
+                // is the substituted-signature comparison the name+arity+modifier
+                // check above was missing; without it, an inherited member of
+                // the wrong instantiation silently satisfied a second generic-
+                // interface conformance (D : K<string>, IM<int> with no
+                // Get(): int?). Parameter nullability widening (interface T,
+                // implementation T?) is admitted per §11.2's contravariant-
+                // parameter allowance; everything else must match exactly.
+                for (std::size_t pi = 0; pi < im->params.size(); ++pi) {
+                    auto* ip = dynamic_cast<ParameterSymbol*>(im->params[pi]);
+                    auto* cp = dynamic_cast<ParameterSymbol*>(impl->params[pi]);
+                    if (!ip || !cp) continue;
+                    if (ip->modifier != cp->modifier) continue;  // reported above
+                    TypeRef* it = resolvedOf(ip->declType);
+                    TypeRef* ct = resolvedOf(cp->declType);
+                    if (!it || !ct) continue;
+                    if (it->kind == TypeRef::Kind::Error ||
+                        ct->kind == TypeRef::Kind::Error) continue;
+                    const TypeRef* itSub = substTypeRef(it, obl.subst);
+                    const TypeRef* ctSub = substTypeRef(ct, implSubst);
+                    // §11.2 widening: impl may declare T? where interface
+                    // requires T (the implementation accepts more inputs).
+                    bool match = typesMatch(itSub, ctSub);
+                    if (!match && itSub && ctSub &&
+                        !itSub->nullable && ctSub->nullable) {
+                        TypeRef stripped = *ctSub;
+                        stripped.nullable = false;
+                        match = typesMatch(itSub, &stripped);
+                    }
+                    if (match) continue;
+                    ctx_.diagnostics().report(
+                        Severity::Error, impl->declLoc,
+                        std::string("method `") + std::string(name) +
+                        "` does not match interface `" +
+                        std::string(obl.iface->name) + "`'s member `" +
+                        std::string(name) + "` on parameter " +
+                        std::to_string(pi + 1) + " — parameter types must "
+                        "match exactly under the interface's substitution, "
+                        "with only the T -> T? nullability widening admitted "
+                        "(\xC2\xA7""11.2)");
+                    break;  // one diagnostic per member is enough
+                }
+                // #2186 / §11.2: return type must match exactly UNDER
+                // SUBSTITUTION (no covariance, no widening — §11.2 is
+                // strict on returns). A mismatch here is the surface of
+                // wrong-typed interface dispatch the issue calls out (a
+                // statically int?-typed call dispatching to a string?-
+                // returning body).
+                const ast::Type* imRetNode =
+                    imDecl ? imDecl->returnType.get() : nullptr;
+                const ast::Type* implRetNode =
+                    implDecl ? implDecl->returnType.get() : nullptr;
+                if (imRetNode && implRetNode) {
+                    TypeRef* irt = resolvedOf(imRetNode);
+                    TypeRef* crt = resolvedOf(implRetNode);
+                    if (irt && crt &&
+                        irt->kind != TypeRef::Kind::Error &&
+                        crt->kind != TypeRef::Kind::Error) {
+                        const TypeRef* irtSub = substTypeRef(irt, obl.subst);
+                        const TypeRef* crtSub = substTypeRef(crt, implSubst);
+                        if (!typesMatch(irtSub, crtSub)) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, impl->declLoc,
+                                std::string("method `") + std::string(name) +
+                                "` does not match interface `" +
+                                std::string(obl.iface->name) + "`'s return "
+                                "type — return types must match exactly "
+                                "(no covariance) under the interface's "
+                                "substitution (\xC2\xA7""11.2)");
+                        }
+                    }
                 }
             }
         }
