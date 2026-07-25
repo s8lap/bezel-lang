@@ -2664,14 +2664,29 @@ static bool functionSlotTypeRefEqual(const TypeRef* a, const TypeRef* b) {
             return true;
         case TypeRef::Kind::Primitive:
             return a->primitive == b->primitive;
-        case TypeRef::Kind::Named:
+        case TypeRef::Kind::Named: {
+            // §27.1.1 (#2108): two Named slots are equal only when their
+            // declaration pointers AND generic args match. Builtin stdlib
+            // collection/wrapper types (Array<T>, Set<T>, Task<T>, …) carry a
+            // null declaration — reconstructed from module metadata or a
+            // compiler-known synthetic astNode with no user TypeDecl (§2.5 /
+            // #495) — so the pointer-identity check alone treats ANY two null-
+            // declaration builtins with equal generic args as EQUAL (e.g.
+            // Array<int> vs Set<int>). When both declarations are null, also
+            // compare the alias-transparent head name (headName) so distinct
+            // builtin heads compare UNEQUAL; identical builtin heads still
+            // compare equal and fall through to the generic-args check.
             if (a->declaration != b->declaration) return false;
+            if (a->declaration == nullptr &&
+                a->headName() != b->headName())
+                return false;
             if (a->genericArgs.size() != b->genericArgs.size()) return false;
             for (std::size_t i = 0; i < a->genericArgs.size(); ++i) {
                 if (!functionSlotTypeRefEqual(a->genericArgs[i], b->genericArgs[i]))
                     return false;
             }
             return true;
+        }
         case TypeRef::Kind::InlineArray:
             return a->arrayOwned == b->arrayOwned &&
                    functionSlotTypeRefEqual(a->arrayElement, b->arrayElement);
