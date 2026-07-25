@@ -10,12 +10,15 @@
 // unless the author declares the operators under §25.2's co-declaration
 // rule."
 //
-// These tests exercise the classification-driven rule (the simpler half
-// of §35.7): a non-value-like choice rejects `=`/`<>` and direct Equals/
-// GetHashCode. The recursive per-payload admissibility rule for value-
-// like choices (§35.7's "auto-equality-bearing when every payload field
-// is §9.2-admissible") is deferred — it requires the §9.2 admissibility
-// recursion extended for choices.
+// These tests exercise both halves of §35.7: the classification-driven rule
+// (a non-value-like choice rejects `=`/`<>` and direct Equals/GetHashCode),
+// and the recursive per-payload admissibility rule for value-like choices
+// (§35.7's "auto-equality-bearing when every payload field is §9.2-admissible"
+// — a value-like choice with an inadmissible payload, e.g. a function-typed
+// payload, is NOT auto-equality-bearing and draws the same use-site error;
+// #2110, v0.226). The use-site `=`/`<>` check routes through the same
+// isAutoEqualityBearingChoice predicate that drives isEqualityBearing, the
+// §14.2 `where T: hashable` constraint, and checkHashContainerKeys.
 
 #include <string>
 #include <string_view>
@@ -127,6 +130,64 @@ BEZEL_TEST(choice_equality_35_7,
     BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "owning"));
 }
 
+// --- §35.7 REJECT: value-like choice with an inadmissible payload (#2110) ----
+// The recursive half of §35.7: a value-like choice whose case payload fails
+// the §9.2 admissible-component rule is NOT auto-equality-bearing, and `=`/
+// `<>` draw the same use-site error as a non-value-like choice. The function
+// type `() -> int` is classification-neutral per §35.4 (the choice stays
+// value-like), yet is outside the §9.2 admissible-component list, so it is
+// rejected by the recursive rule. v0.226, #2110.
+
+BEZEL_TEST(choice_equality_35_7,
+           spec_35_7_valuelike_inadmissible_payload_rejects_equality_op_2110) {
+    // §35.7 / §3.6 (v0.226, #2110): `=` on a value-like choice with a
+    // function-typed payload rejects — the payload is not a §9.2 admissible
+    // equality component.
+    auto r = semaAll(
+        "module M; "
+        "choice Ev On(f: () -> int), Off; end Ev; "
+        "class C public static method Main(): int "
+        "  var a: Ev := Ev.Off; "
+        "  var b: Ev := Ev.Off; "
+        "  if a = b then return 1; else return 0; end; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "is not available on choice"));
+    BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "admissible equality component"));
+}
+
+BEZEL_TEST(choice_equality_35_7,
+           spec_35_7_valuelike_inadmissible_payload_rejects_not_equal_op_2110) {
+    // §35.7 (v0.226, #2110): the recursive per-payload rule covers `<>` too.
+    auto r = semaAll(
+        "module M; "
+        "choice Ev On(f: () -> int), Off; end Ev; "
+        "class C public static method Main(): int "
+        "  var a: Ev := Ev.Off; "
+        "  var b: Ev := Ev.Off; "
+        "  if a <> b then return 1; else return 0; end; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "is not available on choice"));
+}
+
+// --- §35.7 ACCEPT (contrast): the same shape with an admissible payload ------
+
+BEZEL_TEST(choice_equality_35_7,
+           spec_35_7_valuelike_admissible_payload_still_allows_equality_2110) {
+    // §35.7 (v0.226, #2110): the recursive rule rejects ONLY the inadmissible-
+    // payload case — a value-like choice whose payload IS a §9.2 admissible
+    // component (int) remains auto-equality-bearing, and `=` stays allowed.
+    // The §35.7 use-site error does NOT fire.
+    auto r = semaAll(
+        "module M; "
+        "choice Ev On(v: int), Off; end Ev; "
+        "class C public static method Main(): int "
+        "  var a: Ev := Ev.Off; "
+        "  var b: Ev := Ev.Off; "
+        "  if a = b then return 1; else return 0; end; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(lacksErrDiagWith(r, "is not available on choice"));
+}
+
 // --- §35.7 REJECT: direct .Equals() / .GetHashCode() on non-value-like -----
 
 BEZEL_TEST(choice_equality_35_7,
@@ -155,6 +216,48 @@ BEZEL_TEST(choice_equality_35_7,
         "  return a.GetHashCode(); "
         "end Main; end D;");
     BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "is not available on choice"));
+}
+
+// --- §35.7 REJECT: direct .Equals()/.GetHashCode() on value-like, inadmissible
+// payload (#2110) -----------------------------------------------------------
+// The recursive half of §35.7 on the DIRECT-CALL path: a value-like choice
+// whose case payload fails the §9.2 admissible-component rule is NOT auto-
+// equality-bearing, so direct `.Equals()`/`.GetHashCode()` draw the same use-
+// site error as on a non-value-like choice. The function type `() -> int` is
+// classification-neutral per §35.4 (the choice stays value-like), yet outside
+// the §9.2 admissible-component list. v0.226, #2110.
+
+BEZEL_TEST(choice_equality_35_7,
+           spec_35_7_valuelike_inadmissible_payload_rejects_direct_equals_call_2110) {
+    // §35.7 / §3.6 (v0.226, #2110): direct `.Equals()` on a value-like choice
+    // with a function-typed payload rejects — the payload is not a §9.2
+    // admissible equality component. Mirrors the `=` use-site test for the
+    // direct-call path the spec names alongside `=`/`<>`.
+    auto r = semaAll(
+        "module M; "
+        "choice Ev On(f: () -> int), Off; end Ev; "
+        "class C public static method Main(): int "
+        "  var a: Ev := Ev.Off; "
+        "  return if a.Equals(a) then 1 else 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "is not available on choice"));
+    BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "admissible equality component"));
+}
+
+BEZEL_TEST(choice_equality_35_7,
+           spec_35_7_valuelike_inadmissible_payload_rejects_direct_gethashcode_call_2110) {
+    // §35.7 (v0.226, #2110): the recursive per-payload rule covers direct
+    // `.GetHashCode()` too — a value-like choice with a function-typed
+    // payload is not hashable, so hashing it is a use-site compile error.
+    auto r = semaAll(
+        "module M; "
+        "choice Ev On(f: () -> int), Off; end Ev; "
+        "class C public static method Main(): int "
+        "  var a: Ev := Ev.Off; "
+        "  return a.GetHashCode(); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "is not available on choice"));
+    BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "admissible equality component"));
 }
 
 // --- §35.7 ACCEPT: value-like choice allows .Equals() / .GetHashCode() ----

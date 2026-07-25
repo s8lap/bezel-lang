@@ -3152,13 +3152,19 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                     break;
                 }
             }
-            // §35.7 (v0.200, #2045): a choice that is NOT value-like — any
-            // borrow-bearing or owning choice — draws §9.2's use-site
-            // compile error on `=`/`<>`, exactly as a non-auto-equality-
-            // bearing record does. (A value-like choice with an
-            // inadmissible payload also rejects per §35.7's recursive
-            // admissibility rule, but that recursion is deferred — the
-            // classification-driven rule covers the common cases.)
+            // §35.7 (v0.200, #2045; v0.226, #2110): a choice draws §9.2's
+            // use-site compile error on `=`/`<>` exactly when it is NOT
+            // auto-equality-bearing — i.e. any borrow-bearing or owning choice,
+            // AND any value-like choice whose case payload fails the §9.2
+            // admissible-component rule (§35.7's recursive clause: "any
+            // value-like choice with an inadmissible payload"). The predicate
+            // is the SAME isAutoEqualityBearingChoice that drives
+            // isEqualityBearing, the §14.2 `where T: hashable` constraint, and
+            // checkHashContainerKeys, so all consumers move together — the
+            // former classification-only "recursion is deferred" note is
+            // retired. (A function-typed or `Object` payload is
+            // classification-neutral per §35.4 — still ValueLike — yet outside
+            // the §9.2 admissible-component list, so it reaches here.)
             if (ts && ts->kind == ast::TypeDeclKind::Choice) {
                 // §35.7 / §28.1 (#2047): classify at the operand's INSTANTIATION
                 // so `Result<int, string>` is value-like (the `owned` markers
@@ -3174,21 +3180,39 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                     bare.declaration = ts;
                     opTy = &bare;
                 }
-                auto verdict = common::classifyChoiceType(opTy, ctx_);
-                if (verdict &&
-                    *verdict != common::ChoiceClassification::ValueLike) {
+                // §35.7 (v0.226, #2110): the recursive admissibility check
+                // lives inside isAutoEqualityBearingChoice; the classification
+                // is consulted only to phrase the diagnostic (owning /
+                // borrow-bearing vs value-like-with-inadmissible-payload).
+                if (!isAutoEqualityBearingChoice(ts, ctx_, opTy)) {
+                    auto verdict = common::classifyChoiceType(opTy, ctx_);
+                    std::string reason;
+                    if (verdict &&
+                        *verdict != common::ChoiceClassification::ValueLike) {
+                        reason =
+                            std::string("it is not auto-equality-bearing "
+                                        "(§35.7) — the choice is ") +
+                            (*verdict == common::ChoiceClassification::Owning
+                                 ? "owning"
+                                 : "borrow-bearing") +
+                            ", and a non-value-like choice carries no "
+                            "value equality";
+                    } else {
+                        // Value-like yet still not auto-equality-bearing:
+                        // a case payload failed the §9.2 admissible-component
+                        // rule (§35.7's recursive clause).
+                        reason =
+                            "it is not auto-equality-bearing (§35.7): the "
+                            "choice is value-like but a case payload is not "
+                            "an admissible equality component (§9.2)";
+                    }
                     ctx_.diagnostics().report(
                         Severity::Error, be.span.begin,
                         "`" + std::string(op) + "` is not available on choice `" +
-                        std::string(ts->name) + "`: it is not auto-equality-"
-                        "bearing (§35.7) — the choice is " +
-                        (*verdict == common::ChoiceClassification::Owning
-                             ? "owning"
-                             : "borrow-bearing") +
-                        ", and a non-value-like choice carries no value "
-                        "equality. Declare `=` and `<>` overloads (with "
-                        "`Equals`/`GetHashCode`), or restructure to a "
-                        "value-like choice.");
+                        std::string(ts->name) + "`: " + reason +
+                        ". Declare `=` and `<>` overloads (with "
+                        "`Equals`/`GetHashCode`), or restructure the choice "
+                        "payload to an admissible component type.");
                 }
             }
         }
