@@ -4096,7 +4096,29 @@ TypeRef* ExprTC::recoverChoiceThisScrutTy(const ast::Expr* scrutinee,
 void ExprTC::visitChildren(const ast::Expr& e) {
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
         if (be->left) visitExpr(*be->left);
-        if (be->right) visitExpr(*be->right);
+        // §7.4 (v0.226, #2212): in `A and B`, `B` is checked under `A`'s
+        // true-facts — "x <> null and x.Length > 0" is well-typed. Narrowing
+        // is otherwise established only by collectNarrowings AFTER the
+        // condition is fully visited (if/elif/while visitors), never inside
+        // visitExpr — so without this, the right operand saw no left-side
+        // narrowing and `requires(s <> null and s.Length >= 0)` on a `string?`
+        // was wrongly rejected. Per §22.16 ("Flow narrowing works inside
+        // clauses unchanged") this applies in contract clauses too. `or` is
+        // left alone (collectNarrowings is and-only). Save/restore mirrors
+        // checkOutPostcondAtReturn; collectNarrowings recurses into `and`
+        // itself (ExprTypecheck.cpp:6710-6714).
+        if (be->op == "and" && be->left && be->right) {
+            auto savedNull = nullNarrowed_;
+            auto savedNarrow = narrowings_;
+            auto savedField = fieldNarrowed_;
+            collectNarrowings(be->left.get(), /*forTrueBranch=*/true);
+            visitExpr(*be->right);
+            nullNarrowed_ = std::move(savedNull);
+            narrowings_ = std::move(savedNarrow);
+            fieldNarrowed_ = std::move(savedField);
+        } else if (be->right) {
+            visitExpr(*be->right);
+        }
     } else if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
         if (ue->operand) visitExpr(*ue->operand);
     } else if (auto* ma =
