@@ -1277,19 +1277,14 @@ void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
     if (!isFreshOwnedClassProducer(recvExpr)) return;
     // The extracted result must be a NON-REFERENCE value — provably free of any
     // reference or borrow into the receiver: a numeric/bool/char/decimal
-    // primitive, an enum, or unit. EXCLUDED, because each may alias into it:
-    // `string` and `object` (reference-typed primitives — a field / method result
-    // borrows the receiver's refcounted string or sub-object); a struct (could
-    // embed a borrow of a receiver sub-object); and an ordinary class/interface
-    // result (a reference). An ANNOUNCED `owned` result is the symmetric
-    // exception for class/interface results and for declaration-less owning
-    // builtins (`OwningArray<T>`, `Shared<T>`, …): the signature announces a
-    // fresh transfer, not a receiver borrow. The branch deliberately excludes
-    // Task/iterator heads whose deferred activation may carry receiver borrows.
-    // EXCLUDED reference results stay excluded for unmarked/borrow returns.
-    // (Bezel's borrow checker guarantees an instance method cannot escape `this`
-    // past the call when its result is such a value, so post-call disposal is
-    // sound — §15.3.)
+    // primitive, an enum, or unit. EXCLUDED, because each may alias into the
+    // receiver: `string` and `object` (reference-typed primitives — a field /
+    // method result borrows the receiver's refcounted string or sub-object); a
+    // struct (could embed a borrow of a receiver sub-object); any class /
+    // interface result (a reference). Excluding these frees the temporary ONLY
+    // when nothing aliases it. (Bezel's borrow checker guarantees an instance
+    // method cannot escape `this` past the call when its result is such a
+    // value, so post-call disposal is sound — §15.3.)
     bool valueResult = false;
     if (resultTy->kind == sema::TypeRef::Kind::Unit) {
         valueResult = true;
@@ -1324,21 +1319,6 @@ void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
         else if (td && (td->kind == ast::TypeDeclKind::Class ||
                         td->kind == ast::TypeDeclKind::Interface) &&
                  calleeReturnsOwned) {
-            valueResult = true;
-        }
-    } else if (resultTy->kind == sema::TypeRef::Kind::Named &&
-               !resultTy->declaration && calleeReturnsOwned) {
-        // fix #2205 / §28.3: a declaration-less owning builtin result is the
-        // non-class/interface counterpart of #1859's announced-owned branch.
-        // `OwningArray<T>` and the other owning collection/wrapper heads are
-        // fresh transfers when the signature says `owned`, so they cannot carry
-        // a signature-level borrow of this receiver. Keep the deferred-activation
-        // families out: Task/iterator results own their frame/container but may
-        // carry the receiver borrow until settlement (§28.3 / §30.5).
-        const std::string_view head = resultTy->headName();
-        if (common::isOwningTypeHead(head) &&
-            !common::isTaskFamilyHead(head) &&
-            !common::isIterableInterfaceHead(head)) {
             valueResult = true;
         }
     }

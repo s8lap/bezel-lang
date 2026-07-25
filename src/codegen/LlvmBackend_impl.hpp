@@ -7539,15 +7539,12 @@ private:
     // member/method-call receiver — a literal `new <class>()` (#1039) or a call
     // to a method returning `owned <class>` (#1053-case-2) — where the extracted
     // result is a primitive / enum / unit value (provably no reference or borrow
-    // into the receiver), or an announced-owned declaration-less owning builtin
-    // (`OwningArray<T>`, `Shared<T>`, …), leaves the temporary owned by nothing
-    // and leaks. Dispose it here (idempotent vtable Dispose + reclaim block
-    // exactly once), null-guarded. A no-op for any other receiver/result shape —
-    // a non-fresh receiver, a borrow-returning call, or a reference-yielding
-    // result is never disposed (no double-free, no UAF). Deferred Task/iterator
-    // results remain excluded because their frames may carry receiver borrows
-    // until settlement. `recvPtr` MUST be the already-lowered receiver pointer
-    // (never re-lowered — that would re-run the producer).
+    // into the receiver), leaves the temporary owned by nothing and it leaks.
+    // Dispose it here (idempotent vtable Dispose + reclaim block exactly once),
+    // null-guarded. A no-op for any other receiver/result shape — a non-fresh
+    // receiver, a borrow-returning call, or a reference-yielding result is never
+    // disposed (no double-free, no UAF). `recvPtr` MUST be the already-lowered
+    // receiver pointer (never re-lowered — that would re-run the producer).
     // fix #1859 / §28.3: `calleeReturnsOwned` is true when the CALL (not the
     // field-read overload of this call site) has an ANNOUNCED `owned` return
     // type (ast::MethodDecl::returnOwned). An announced-owned return is the
