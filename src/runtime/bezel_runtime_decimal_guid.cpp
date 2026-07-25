@@ -558,6 +558,11 @@ extern "C" void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out,
     uint32_t sc = 0;
     bool in_frac = false;
     bool any_digit = false;
+    // §4.4 / §9.3 (fix #1829): count integer-part digits the full 96-bit
+    // mantissa could not store.  Each is a factor of 10 in the true magnitude
+    // the stored mantissa loses; it must be absorbed by scale (a '.' fraction
+    // or a negative exponent) or the value is out of range — settled below.
+    uint32_t dropped_int = 0;
     for (; *s; ++s) {
         if (*s == '.') { in_frac = true; continue; }
         if (*s == 'e' || *s == 'E') {
@@ -597,14 +602,36 @@ extern "C" void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out,
         if (in_frac) ++sc;
         if (m <= kMax96 / 10) {
             m = m * 10 + (uint32_t)(*s - '0');
+        } else if (!in_frac) {
+            // §4.4 / §9.3 (fix #1829): the 96-bit mantissa is full and this
+            // digit is in the integer part, so it cannot be stored.  Count it:
+            // it is a factor of 10 in the magnitude that must be paid for by
+            // scale or reported as out of range.  (Fractional digits beyond
+            // the 29th significant are dropped with no magnitude change — a
+            // precision loss dec_store's rounding already governs.)
+            ++dropped_int;
         }
-        // If mantissa would overflow, just track scale (lose trailing digits
-        // beyond 29).
     }
     if (!any_digit) {
         // FormatException — no digits found.
         bz_set_exc(fe_vtable);
         return;
+    }
+    // §4.4 / §9.3 (fix #1829): settle dropped integer-part digits against the
+    // accumulated scale.  Each dropped digit is a factor of 10 in the magnitude
+    // the stored mantissa lost; the scale (fractional digits + any negative
+    // exponent) absorbs it by the same factor, so consuming `dropped_int` from
+    // the scale reconstructs the magnitude exactly (the dropped digits become
+    // fractional and are rounded by dec_store).  If the scale cannot absorb
+    // them, the value's magnitude exceeds `decimal.MaxValue` — raise
+    // OverflowException, never silently truncate.
+    if (dropped_int > 0) {
+        if (dropped_int > sc) {
+            // §6.4: OverflowException — magnitude beyond decimal's range.
+            bz_set_exc(ove_vtable);
+            return;
+        }
+        sc -= dropped_int;
     }
     dec_store(out, m, sc, neg, ove_vtable);
 }
@@ -631,9 +658,10 @@ extern "C" void bz_decimal_parse(const void* str, bz_decimal_t* out,
 }
 
 // TryParse — returns 0 on failure (no throw), 1 on success.
-// per fix #521: uses bz_decimal_parse_cstr with null vtables so no exception
-// is stored; on failure bz_exc is not set and the return value signals failure.
-// Overflow also returns 0 (mirrors .NET Decimal.TryParse behaviour).
+// per fix #521: pre-validates the string shape, then calls bz_decimal_parse_cstr
+// with a sentinel OverflowException vtable (fix #1829) so an out-of-range value
+// is observed via bz_exc and reported as failure — never silently truncated.
+// Mirrors .NET Decimal.TryParse: overflow returns 0, no exception raised.
 extern "C" int32_t bz_decimal_try_parse(const void* str, bz_decimal_t* out) {
     // We need a way to catch failures. Use setjmp/longjmp? That's complex.
     // Instead, validate the string manually before parsing.
@@ -661,14 +689,20 @@ extern "C" int32_t bz_decimal_try_parse(const void* str, bz_decimal_t* out) {
         has_digit = true;
     }
     if (!has_digit) return 0;
-    // Pass null vtables: on overflow bz_exc is NOT set (TryParse returns false).
+    // Pass a non-null sentinel OverflowException vtable so that an out-of-range
+    // value sets bz_exc (per §9.3: TryParse returns false wherever Parse would
+    // raise; fix #1829 — a null vtable silently swallowed the overflow via the
+    // bz_set_exc null-no-op and returned success with a truncated value).  The
+    // string's shape was validated above, so only OverflowException can fire
+    // here and fe_vtable stays null.
+    unsigned char sentinelOve = 0;
     extern thread_local void* bz_exc;
     void* prev_exc = bz_exc;
     bz_exc = nullptr;
-    bz_decimal_parse_cstr(buf, out, nullptr, nullptr);
+    bz_decimal_parse_cstr(buf, out, &sentinelOve, nullptr);
     if (bz_exc) {
-        // Overflow or other error during parse — return 0 (no exception raised).
-        // Discard the internally set exc and restore caller's exception state.
+        // Overflow during parse — return 0 (no exception raised).  Discard the
+        // internally set exc and restore the caller's exception state.
         free(bz_exc);
         bz_exc = prev_exc;
         return 0;
