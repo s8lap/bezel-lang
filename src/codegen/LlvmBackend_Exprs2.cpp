@@ -6326,15 +6326,16 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                     enumConstantByName(enumTy, np->name->parts.back()))
                 return emitEquals(scrut, cv, isStr);
         }
-        // §19 / §A.8 (#957): a NamedPattern whose qualified name resolves to a
-        // named CONST (`C.K`, a module/own-class const) is a constant-equality
-        // pattern, not a type test — the parser emits a NamedPattern for any
-        // non-primitive name and defers Constant-vs-Type to resolution here.
-        // Fold the const's value and compare (mirrors the ConstantPattern
+        // §19 / §A.8 (#957, #1853): a NamedPattern whose name resolves to a
+        // named CONST — a local compile-time const (`const K := 7`, #1853), a
+        // qualified `C.K`, or a bare module/own-class const — is a constant-
+        // equality pattern, not a type test. The parser emits a NamedPattern
+        // for any non-primitive name and defers Constant-vs-Type to resolution
+        // here. Fold the const's value and compare (mirrors the ConstantPattern
         // handler: reconcile width for non-string scrutinees, content-compare
         // for strings). Checked before the type-descriptor branch; the two
-        // never collide (a const member's last name part is not a type name).
-        if (llvm::Value* cv = constValueForPatternName(np->name.get())) {
+        // never collide (a const's last name part is not a type name).
+        if (llvm::Value* cv = constValueForPatternName(np)) {
             if (!isStr) cv = reconcile(cv, scrut->getType());
             // §19 (#964): a named-const pattern whose type is incompatible with
             // the scrutinee (e.g. a `string` const vs an `int` scrutinee) would
@@ -6458,19 +6459,19 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 return builder_.getInt1(false);
             }
         }
-        // §19.3 (#1847): a top-level NamedPattern that resolved to none of the
-        // handlers above — an enum constant, a named `const`, a class/interface
-        // type descriptor, a record/enum type name, or (above) a type parameter.
-        // Sema now rejects the reported ill-formed forms (a bare identifier naming
-        // a runtime VALUE or an unresolved name — checkTopLevelNamedPattern,
-        // ExprTypecheck.cpp), so the only pattern still reaching here is a valid-
-        // per-spec form the backend does not yet lower: a `const` LOCAL used as a
-        // pattern (constValueForPatternName searches only const MEMBERS).
-        // Returning nullptr here left `case.end` unterminated in expression
-        // position (a malformed-IR ICE) and silently truncated the arm chain in
-        // statement position (the mandatory `_` skipped — a silent miscompile).
-        // Fail LOUDLY and consistently instead: emit a diagnostic and a
-        // never-match so the block stays terminated.
+        // §19.3 (#1847, #1853): a top-level NamedPattern that resolved to none
+        // of the handlers above — an enum constant, a named `const` (member or
+        // local — #1853 wired the local-const form into constValueForPatternName
+        // above), a class/interface type descriptor, a record/enum type name, or
+        // (above) a type parameter. Sema now rejects the reported ill-formed
+        // forms (a bare identifier naming a runtime VALUE, a RUNTIME const, or an
+        // unresolved name — checkTopLevelNamedPattern, ExprTypecheck.cpp), so a
+        // pattern still reaching here is a valid-per-spec form the backend does
+        // not yet lower. Returning nullptr here left `case.end` unterminated in
+        // expression position (a malformed-IR ICE) and silently truncated the arm
+        // chain in statement position (the mandatory `_` skipped — a silent
+        // miscompile). Fail LOUDLY and consistently instead: emit a diagnostic
+        // and a never-match so the block stays terminated.
         if (np->name && !np->name->parts.empty())
             ctx_.diagnostics().report(
                 Severity::Error, np->span.begin,

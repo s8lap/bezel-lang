@@ -2357,16 +2357,37 @@ void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
                     if (cm2->name == last) return;
     }
 
-    // Resolve in the current lexical scope. A `const` LOCAL (`const K := 5`) is
-    // a valid constant pattern; a type parameter (v0.182 — `case x of T`), an
-    // enum constant, a const member, or a (nested) type all resolve here too
-    // and are accepted. Anything that resolves to a *runtime value* — a `var`
-    // local, a parameter, or a mutable field/property — is NOT a type or
-    // constant and is the reported defect.
+    // Resolve in the current lexical scope. A compile-time-classified `const`
+    // LOCAL (`const K := 5`) is a valid constant pattern (§17.14 / §19.3); a
+    // type parameter (v0.182 — `case x of T`), an enum constant, a const
+    // member, or a (nested) type all resolve here too and are accepted.
+    // Anything that resolves to a *runtime value* — a `var` local, a
+    // parameter, a mutable field/property, or a RUNTIME const local — is NOT
+    // a type or compile-time constant and is the reported defect.
     Symbol* s = lookupName(last);
     if (s) {
         if (auto* ls = dynamic_cast<LocalSymbol*>(s)) {
-            if (ls->isConst) return;  // const local — valid constant pattern
+            // §17.14 (v0.226, #1853): a reference to a local `const` is a
+            // constant expression — and thus a valid §19.3 pattern constant —
+            // ONLY when compile-time-classified. A RUNTIME const (`const K := n + 1;`
+            // where n is non-const, §21.1) is a single-assignment runtime value,
+            // not a foldable constant, so it may not be a `case` pattern
+            // constant. Record the resolved symbol on the pattern so codegen
+            // folds K's initializer at the case site (locals are not in
+            // `symbols()`, so constValueForPatternName cannot recover it by name).
+            if (ls->isConst) {
+                if (!ls->isCompileTimeConst) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, np->span.begin,
+                        "`" + std::string(last) + "` is a runtime const, not a "
+                        "compile-time constant, so it cannot be a `case` pattern "
+                        "constant (\xC2\xA7""17.14 / \xC2\xA7""19.3): a pattern constant "
+                        "must be a compile-time-classified const");
+                    return;
+                }
+                ctx_.setPatternSymbol(np, ls);  // codegen folds via this
+                return;  // compile-time const local — valid constant pattern
+            }
             reportNamedPatternIsValue(np, last);
             return;
         }

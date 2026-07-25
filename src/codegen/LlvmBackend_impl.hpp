@@ -3783,13 +3783,19 @@ private:
     llvm::GlobalVariable* descriptorForPatternName(
         const ast::QualifiedName* name);
 
-    // §19 / §A.8 (#957): fold the value of a NamedPattern whose qualified name
-    // resolves to a named CONST (`C.K`, or a bare module/own-class const). A
-    // pattern name carries no resolved-symbol entry, so resolve it by name
-    // (mirrors descriptorForPatternName). Returns null when the name is not a
-    // const — the pattern is then a type-test / enum constant handled
-    // elsewhere, or deferred.
-    llvm::Value* constValueForPatternName(const ast::QualifiedName* name);
+    // §19 / §A.8 (#957, #1853): fold the value of a NamedPattern whose name
+    // resolves to a named CONST. Three resolution forms:
+    //  - a bare name that sema recorded as a LOCAL compile-time const
+    //    (§17.14 — `const K := 7; case n of K`): fold K's initializer. A
+    //    pattern name carries no resolved-symbol entry under exprSymbol (a
+    //    Pattern is not an Expr) and locals are not in `symbols()`, so sema's
+    //    checkTopLevelNamedPattern records the resolved LocalSymbol on the
+    //    pattern via setPatternSymbol; read it here (#1853).
+    //  - a qualified `C.K`: K is a const member of the type named just before.
+    //  - a bare `K`: a unique const MEMBER of that name (module/own-class).
+    // Returns null when the name is not a const — the pattern is then a
+    // type-test / enum constant handled elsewhere, or deferred.
+    llvm::Value* constValueForPatternName(const ast::NamedPattern* np);
 
     // §19.3 (v0.182, #1852): emit the i1 match condition "scrut is-a `ct`" for a
     // type-test pattern whose type is a bare **type parameter** resolved, through

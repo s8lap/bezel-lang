@@ -112,6 +112,23 @@ public:
     const std::unordered_map<const ast::Expr*, Symbol*>& allExprSymbols() const {
         return exprSymbols_;
     }
+
+    // §19.3 (v0.226, #1853): per-Pattern resolved symbol. A bare-name
+    // NamedPattern that resolves to a LOCAL `const` carries no Expr node for
+    // exprSymbol() to key on (a Pattern is not an Expr), so codegen's const
+    // pattern resolver cannot recover the scope-correct LocalSymbol from the
+    // name alone (locals are not in `symbols()` and a flat name search would
+    // mis-handle shadowing). Sema records the resolved symbol here during
+    // checkTopLevelNamedPattern; codegen's constValueForPatternName reads it
+    // to fold the local const's compile-time value. Currently set only for a
+    // compile-time-classified local const pattern (§17.14).
+    void setPatternSymbol(const ast::Pattern* p, Symbol* s) {
+        patternSymbols_[p] = s;
+    }
+    Symbol* patternSymbol(const ast::Pattern& p) const {
+        auto it = patternSymbols_.find(&p);
+        return it == patternSymbols_.end() ? nullptr : it->second;
+    }
     // §14.1/#783: iterate all AST-type→TypeRef and expr→TypeRef entries. Used by
     // ModuleLoader to COPY a re-parsed generic method body's resolved/expr types
     // from the fresh context into the main context, so codegen's per-instantiation
@@ -352,6 +369,8 @@ private:
     std::unordered_map<const ast::Type*, TypeRef*> resolvedTypes_;
     std::unordered_map<const ast::Expr*, TypeRef*> exprTypes_;
     std::unordered_map<const ast::Expr*, Symbol*> exprSymbols_;
+    // §19.3 (#1853): see setPatternSymbol — a bare-name local-const NamedPattern.
+    std::unordered_map<const ast::Pattern*, Symbol*> patternSymbols_;
     std::unordered_map<const ast::LambdaExpr*, std::vector<Symbol*>> lambdaParams_;
     // Cache for the common primitive TypeRefs. Key is `(p << 1) | nullable`.
     std::unordered_map<std::uint32_t, TypeRef*> primitiveCache_;

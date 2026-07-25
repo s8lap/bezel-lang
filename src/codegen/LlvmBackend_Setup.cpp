@@ -2794,14 +2794,37 @@ llvm::GlobalVariable* Emitter::descriptorForPatternName(
 // type-test / enum-constant handlers (or the deferred-null fall-through) to
 // take over.
 llvm::Value* Emitter::constValueForPatternName(
-        const ast::QualifiedName* name) {
-    if (!name || name->parts.empty()) return nullptr;
+        const ast::NamedPattern* np) {
+    if (!np || !np->name || np->name->parts.empty()) return nullptr;
+    const ast::QualifiedName* name = np->name.get();
     std::string_view last = name->parts.back();
     auto fold = [&](sema::ConstMemberSymbol* cs) -> llvm::Value* {
         auto* cd = dynamic_cast<const ast::ConstDecl*>(cs->decl);
         if (cd && cd->value) return lowerExpr(*cd->value);
         return nullptr;  // imported const w/o AST decl — decline (loud)
     };
+    // §19.3 (v0.226, #1853): a BARE name resolving to a LOCAL compile-time
+    // const. constValueForPatternName previously searched only ConstMemberSymbol
+    // (const MEMBERS), so a local `const K := 7` used as `case n of K` resolved
+    // to nullptr → the arm chain was silently truncated / a clean backend
+    // diagnostic (#1847 guard). Sema's checkTopLevelNamedPattern records the
+    // scope-correct LocalSymbol on the pattern (locals are not in `symbols()`,
+    // and a flat name search could not honour shadowing); fold its initializer
+    // exactly like the local-const READ path. Only a compile-time-classified
+    // const reaches here — sema rejects a runtime const as a pattern constant
+    // (§17.14), so the fold never re-evaluates a runtime expression.
+    if (name->parts.size() == 1) {
+        if (auto* sym = ctx_.patternSymbol(*np)) {
+            if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                if (ls->isCompileTimeConst && ls->decl) {
+                    if (auto* lcd =
+                            dynamic_cast<const ast::LocalConstDecl*>(ls->decl)) {
+                        if (lcd->value) return lowerExpr(*lcd->value);
+                    }
+                }
+            }
+        }
+    }
     // Qualified `C.K`: `K` is a const member of the type named just before it.
     if (name->parts.size() >= 2) {
         std::string_view typeName = name->parts[name->parts.size() - 2];
