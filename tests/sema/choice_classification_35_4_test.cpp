@@ -217,6 +217,44 @@ BEZEL_TEST(choice_classification_35_4,
     BEZEL_EXPECT_EQ(*c, ChoiceClassification::ValueLike);
 }
 
+// --- §35.4 / #2130: cycle through the owned-marker oracle must terminate -----
+
+BEZEL_TEST(choice_classification_35_4,
+           spec_35_4_self_recursive_choice_via_owned_marker_no_crash) {
+    // #2130: a choice that references ITSELF through an `owned` payload
+    // marker (`choice L Nil(), Cons(owned t: L)`) is degenerate input that
+    // §35.1 rejects elsewhere (the §35.1 no-self-containment rule,
+    // `Resolver::checkChoiceSelfContainment`, emits the diagnostic). The
+    // classifier itself must NOT crash on it: the #2047 shared oracle pair
+    // `classifyChoiceType <-> ownedMarkerActiveOnInstantiatedType` recursed
+    // with a FRESH cycle-guard set per invocation, so the guard never fired
+    // across the pair and the stack overflowed. The cycle guard now threads
+    // through the pair, so the re-entry edge classifies ValueLike (per the
+    // existing #2159 cycle-edge rule) and returns instead of overflowing.
+    auto r = resolveAll(
+        "module M; choice L Nil(), Cons(owned t: L); end L;");
+    auto c = classify(r, "L");
+    // The verdict itself is unspecified for degenerate input (§35.1 rejects
+    // the program); the assertion is that classification TERMINATES here
+    // rather than stack-overflowing.
+    BEZEL_EXPECT_TRUE(c.has_value());
+}
+
+BEZEL_TEST(choice_classification_35_4,
+           spec_35_4_mutually_recursive_choice_pair_via_owned_marker_no_crash) {
+    // #2130 (the A<->B form): two choices that reference each other through
+    // `owned` payload markers form a cycle through the same oracle pair. The
+    // threaded cycle guard terminates the recursion here too. §35.1 rejects
+    // the program separately; this test asserts only that the classifier
+    // does not stack-overflow on the cyclic value-typed component walk.
+    auto r = resolveAll(
+        "module M; "
+        "choice A X(owned t: B); end A; "
+        "choice B Y(owned t: A); end B;");
+    auto c = classify(r, "A");
+    BEZEL_EXPECT_TRUE(c.has_value());
+}
+
 // --- §35.4: kind gate — non-choice types return nullopt ---------------------
 
 BEZEL_TEST(choice_classification_35_4,

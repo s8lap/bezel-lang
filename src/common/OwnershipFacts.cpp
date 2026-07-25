@@ -443,6 +443,14 @@ std::optional<ChoiceClassification> classifyChoiceCore(
     const RecordSubstEnv* env,
     std::unordered_set<const ast::TypeDecl*>& choiceSeen);
 
+// §28.1 (v0.226, #2130): the file-local `owned`-marker erasure oracle impl,
+// forward-declared here so classifyChoiceCore's owning leg can thread its
+// in-flight `choiceSeen` through the choice↔choice recursion an `owned`-
+// typed payload opens. Defined alongside classifyChoiceCore below.
+bool ownedMarkerActiveOnInstantiatedTypeImpl(
+    const sema::TypeRef* ft, const sema::SemaContext& ctx,
+    std::unordered_set<const ast::TypeDecl*>& choiceSeen);
+
 // §9.7's borrow-carrying-field kinds, applied to one resolved field type in
 // the substitution environment `env` (which governs `ft`'s OWN bare-parameter
 // mentions). Split out of the walker (from the former lambda) because a
@@ -877,18 +885,23 @@ std::optional<ChoiceClassification> classifyChoiceCore(
     const ChoiceClassification verdict = [&]() -> ChoiceClassification {
         // §35.4.1: OWNING — any case has an ACTIVE `owned` marker (per the
         // §28.1 per-instantiation erasure oracle) or a move-only value-typed
-        // payload. Uses its OWN decl-seed set (the owning walk never recurses
-        // into a record, so it need not share the record↔choice path guard,
-        // and keeping it separate avoids polluting the borrow leg's guard).
+        // payload. The `owned`-marker leg threads the in-flight `choiceSeen`
+        // path guard through the file-local oracle impl so the choice↔choice
+        // cycle an `owned`-typed payload opens (an `owned` slot whose
+        // instantiated type is itself a choice — #2130) terminates; PATH
+        // semantics (insert on entry, erase on exit) mean any entry pushed by
+        // the recursive descent is gone before the borrow leg runs. The
+        // move-only leg keeps its OWN accumulator (`owningSeen` never recurses
+        // into a record and shares no path with the borrow leg).
         std::unordered_set<const ast::TypeDecl*> owningSeen;
         owningSeen.insert(decl);
         for (const auto& cc : decl->choiceCases) {
             for (const auto& pf : cc.payload) {
                 if (!pf.type) continue;
                 if (pf.modifier == "owned") {
-                    if (ownedMarkerActiveOnInstantiatedType(
+                    if (ownedMarkerActiveOnInstantiatedTypeImpl(
                             substitutedChoicePayloadType(pf, decl, rt, ctx),
-                            ctx))
+                            ctx, choiceSeen))
                         return ChoiceClassification::Owning;
                     continue;  // erased → a value / runtime-managed slot.
                 }
@@ -916,10 +929,23 @@ std::optional<ChoiceClassification> classifyChoiceCore(
     return verdict;
 }
 
-}  // namespace
-
-bool ownedMarkerActiveOnInstantiatedType(const sema::TypeRef* ft,
-                                         const sema::SemaContext& ctx) {
+// §28.1 (v0.226, #2130): file-local impl of the per-instantiation `owned`
+// marker erasure oracle that THREADS the choice-decl cycle guard, so the
+// choice↔choice recursion this oracle opens (an `owned` payload slot whose
+// instantiated type is itself a choice — `choice L Cons(owned t: L)` —
+// recurses ownedMarkerActiveOnInstantiatedTypeImpl -> classifyChoiceCore ->
+// (owning leg) -> ownedMarkerActiveOnInstantiatedTypeImpl) terminates on a
+// self- or mutually-referential choice. The public entrypoint below seeds a
+// fresh guard for an isolated query; the choice classifier passes its OWN
+// in-flight `choiceSeen` so the guard carries across the pair (the bug, per
+// the issue body: the public entrypoint created a fresh set per invocation,
+// so the guard never fired across ownedMarkerActiveOnInstantiatedType <->
+// classifyChoiceType and the stack overflowed). PATH semantics — insert on
+// entry, erase on exit — match classifyChoiceCore, so sibling payload
+// frames re-classify under their own env (the #2145 diamond).
+bool ownedMarkerActiveOnInstantiatedTypeImpl(
+    const sema::TypeRef* ft, const sema::SemaContext& ctx,
+    std::unordered_set<const ast::TypeDecl*>& choiceSeen) {
     if (!ft) return true;  // unknown → conservative (owning)
     switch (ft->kind) {
         case sema::TypeRef::Kind::InlineArray:
@@ -945,8 +971,11 @@ bool ownedMarkerActiveOnInstantiatedType(const sema::TypeRef* ft,
                     return true;  // owning heap reference (vtable disposal)
                 case ast::TypeDeclKind::Choice: {
                     // A nested choice: the marker is active only when that
-                    // choice is itself owning at this instantiation.
-                    auto v = classifyChoiceType(ft, ctx);
+                    // choice is itself owning at this instantiation. Thread
+                    // the in-flight `choiceSeen` so the choice↔choice cycle
+                    // this opens terminates (#2130).
+                    auto v = classifyChoiceCore(ft, ctx, /*env=*/nullptr,
+                                                choiceSeen);
                     return v && *v == ChoiceClassification::Owning;
                 }
                 default:  // Record, Enum
@@ -959,6 +988,19 @@ bool ownedMarkerActiveOnInstantiatedType(const sema::TypeRef* ft,
             // slot.
             return false;
     }
+}
+
+}  // namespace
+
+bool ownedMarkerActiveOnInstantiatedType(const sema::TypeRef* ft,
+                                         const sema::SemaContext& ctx) {
+    // Public entry: an isolated per-instantiation query with no in-flight
+    // classification path, so seed a fresh cycle guard. The choice-side
+    // recursion (an `owned` payload whose type is a choice) consults the
+    // file-local impl directly with the classifier's threaded `choiceSeen`,
+    // which is where the #2130 cycle guard fires. // per §28.1, #2130
+    std::unordered_set<const ast::TypeDecl*> choiceSeen;
+    return ownedMarkerActiveOnInstantiatedTypeImpl(ft, ctx, choiceSeen);
 }
 
 const sema::TypeRef* substitutedChoicePayloadType(
