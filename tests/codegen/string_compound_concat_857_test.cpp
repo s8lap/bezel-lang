@@ -4,14 +4,8 @@
 // add intrinsic (`llvm.sadd.with.overflow` — "Intrinsic has incorrect return
 // type"). The explicit `s := s + t` worked, so the defect was compound-assign-
 // specific. `s += t` now mirrors `s := s + t`: emitStringConcat with the §4.6
-// RHS and the `:=` retain/release discipline (transfer the +1 concat result
-// into the slot, release the old value).
-//
-// #2157 (§4.6/§6.6, spec v0.226): the §4.6 `string + T` conversion rule was
-// retired — `s += 5` is now a compile error (matching `s + 5`), so the former
-// `string_plus_equals_int` value test moved to the lit sema track
-// (compound_string_target_2157__string_plus_equals_int_rejected.bzl). The
-// cases below all use a `string` RHS, the only form §4.6 now admits.
+// `string + T` RHS conversion and the `:=` retain/release discipline (transfer
+// the +1 concat result into the slot, release the old value).
 //
 // Value tests — runJit returns the raw int (kept in 0..255).
 
@@ -42,6 +36,16 @@ BEZEL_TEST(string_compound_concat_857, chained_plus_equals_content) {
         "module M; class C public static method Main(): int "
         "  var s := \"ab\"; s += \"cd\"; s += \"ef\"; "
         "  return (if s = \"abcdef\" then 1 else 0); "  // 1
+        "end Main; end C;"), 1);
+}
+
+// §4.6 `string + T`: a non-string RHS (`s += 5`) converts the operand to its
+// string form before concatenating.
+BEZEL_TEST(string_compound_concat_857, string_plus_equals_int) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"n=\"; s += 5; "
+        "  return (if s = \"n=5\" then 1 else 0); "  // 1
         "end Main; end C;"), 1);
 }
 
