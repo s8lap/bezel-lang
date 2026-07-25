@@ -73,6 +73,17 @@ MODE="${1:-default}"
 S=/var/tmp/bezel-scratch; mkdir -p "$S"
 DH=scripts/dev_heavy.sh
 
+# Zero-builders preflight (cold-cache flake defense): a --full gate run
+# concurrently with even one producer build can stall a shard and trigger the
+# cold-cache timeout flake (the #1 documented cause). Refuse to start if heavy
+# compile/test comms are already active. Matched by process COMM (exact name) so
+# it cannot self-match this bash script. Bypass with GATE_SKIP_BUILDER_CHECK=1.
+if [ -z "${GATE_SKIP_BUILDER_CHECK:-}" ] && pgrep -x 'cmake|cc1plus|ld|mold|lld|ninja|make|bezel_tests' >/dev/null 2>&1; then
+  echo "GATE ABORT: heavy build/test process(es) already active — gating now risks the cold-cache flake (zero-builders rule). Stop them, or set GATE_SKIP_BUILDER_CHECK=1:" >&2
+  pgrep -ax 'cmake|cc1plus|ld|mold|lld|ninja|make|bezel_tests' >&2 || true
+  exit 2
+fi
+
 # ASan is OPT-IN (--full), not the default (#1861). The unified ASan surface is
 # still the sharded runner: with ASan on, the single sharded pass forces
 # generated-code AddressSanitizer on every test program
@@ -102,7 +113,7 @@ if [ "$ASAN" -eq 1 ]; then
   # blew through 900s under contention/eviction (2026-07-23). The ceiling is
   # therefore decided AFTER the build phase, when coldness is knowable: core.a
   # rebuilt this gate (the k2 identity changed => every key is new) or a
-  # near-empty bincache => 1500s; otherwise 900s. A genuine per-test hang is
+  # near-empty bincache => 1800s; otherwise 900s. A genuine per-test hang is
   # still bounded by the harness's 120s compile / 30s run deadlines — this is
   # only the coarse per-shard backstop, and the CANARY is the fail-fast layer,
   # so a generous cold ceiling no longer delays broken-tree detection. A
@@ -232,13 +243,19 @@ trap 'rc=$?; gate_finish "$rc" || true; exit $rc' EXIT
 # DETERMINISTIC failure fails all 5; a pollution/timing flake passes at least
 # once — one run isn't enough, it shares the flake rate. Sets ARB_LAST_SUSPECTS
 # for the caller's phase note. Returns:
-#   0  every suspect passed alone within 5 tries (sharding flake) — continue
-#   1  a suspect fails alone all 5 tries (real regression)
+#   0  every sampled suspect passed alone within 5 tries (sharding flake) — continue
+#   1  a sampled suspect fails alone all 5 tries (real regression)
 #   2  nonzero exit but NO crash/FAIL marker in the log (undercount/timeout)
-#   3  >8 distinct suspects (real cross-cutting regression; not arbitrated —
-#      fail fast and bound the arbitration cost)
+# A large suspect list is arbitrated via a CAPPED SAMPLE (<= ARB_SAMPLE),
+# never fail-fast on COUNT: a shard killed at the timeout ceiling (cold AOT
+# cache / contention) emits a "died on:" victim for every test in flight, so a
+# TIMEOUT lists MANY suspects that all pass alone — indistinguishable by count
+# from a real cross-cutting regression. Sampling bounds the re-run cost while
+# still surfacing a genuine widespread regression (some sampled suspect fails
+# all 5). Replaces an earlier ">8 => fail-fast real-regression" that mis-reported
+# cold-cache timeouts as mass regressions (the #2205 mis-revert, 2026-07-25).
 arbitrate() { # $1 = sharded-run log
-  local log="$1" crashed failed suspects nsus real t suite passed_alone k
+  local log="$1" crashed failed suspects nsus real t suite passed_alone k sampled
   crashed=$(grep 'died on:' "$log" | sed -E 's/.*died on: //')
   failed=$(grep -E '^\[ FAIL' "$log" | sed -E 's/^\[ FAIL \] //' | awk '{print $1}')
   # "died on: <none>" = a shard died before running ANY test (e.g. OOM-kill at
@@ -251,13 +268,14 @@ arbitrate() { # $1 = sharded-run log
   [ -z "$suspects" ] && return 2
   nsus=$(printf '%s\n' "$suspects" | grep -c .)
   ARB_LAST_SUSPECTS=$nsus
-  if [ "$nsus" -gt 8 ]; then
-    grep -E '^\[ FAIL' "$log" | head
-    return 3
-  fi
-  real=0
+  real=0; sampled=0
   while IFS= read -r t; do
     [ -z "$t" ] && continue
+    sampled=$((sampled+1))
+    if [ "$sampled" -gt "${ARB_SAMPLE:-8}" ]; then
+      echo "   (capped arbitration at ${ARB_SAMPLE:-8} of $nsus suspects; a real cross-cutting regression would surface in the sample)"
+      break
+    fi
     suite="${t%%.*}"
     passed_alone=0
     for k in 1 2 3 4 5; do
@@ -298,14 +316,14 @@ echo "   binary: $(ls -la --time-style=+%H:%M:%S build/tests/bezel_tests | awk '
 # the SHARD_ENV note above). Cold predicate: core.a rebuilt this gate (k2
 # identity changed => every cache key new) OR a near-empty bincache (fresh box
 # or eviction — a warm full-suite state holds ~11k+ entries; the find is
-# bounded). Explicit BEZEL_SHARD_TIMEOUT wins unconditionally.
+# cheap and uncapped). Explicit BEZEL_SHARD_TIMEOUT wins unconditionally.
 if [ "$ASAN" -eq 1 ]; then
   core_post=$(stat -c %Y build/libbezel_core.a 2>/dev/null || echo -1)
-  cache_n=$(find "${BEZEL_AOT_CACHE_DIR:-/var/tmp/bezel-scratch/aot-bincache}" -type f 2>/dev/null | head -2001 | wc -l)
+  cache_n=$(find "${BEZEL_AOT_CACHE_DIR:-/var/tmp/bezel-scratch/aot-bincache}" -type f 2>/dev/null | wc -l)
   GATE_COLD=0
   { [ "$core_post" != "$CORE_MTIME_PRE" ] || [ "$cache_n" -lt 2000 ]; } && GATE_COLD=1
   sto="$GATE_EXPLICIT_STO"
-  if [ -z "$sto" ]; then sto=900; [ "$GATE_COLD" -eq 1 ] && sto=1500; fi
+  if [ -z "$sto" ]; then sto=900; [ "$GATE_COLD" -eq 1 ] && sto=1800; fi
   SHARD_ENV+=(BEZEL_SHARD_TIMEOUT="$sto")
   core_note="unchanged"; [ "$core_post" != "$CORE_MTIME_PRE" ] && core_note="rebuilt"
   cold_note="warm-predicted"; [ "$GATE_COLD" -eq 1 ] && cold_note="cold-predicted"
@@ -467,8 +485,6 @@ if [ "$rc" -ne 0 ]; then
   case "$arb" in
     2) rec_ran shard_arbitration "1" "no crash/FAIL marker"
        fail "sharded suite — nonzero exit, no crash/FAIL marker (see $S/gate_shard.log)";;
-    3) rec_ran shard_arbitration "1" "$ARB_SUSPECTS suspects"
-       fail "sharded suite — $ARB_SUSPECTS failing tests (real regression, too many to be flakes)";;
     1) rec_ran shard_arbitration "1" "$ARB_SUSPECTS suspects, a real fail"
        fail "sharded suite — a suspect fails alone all 5 tries (real regression)";;
     0) rec_ran shard_arbitration "0" "$ARB_SUSPECTS suspects, all flaky"
