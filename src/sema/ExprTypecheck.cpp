@@ -9205,6 +9205,29 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 return std::string(spell(t->primitive)) +
                        (t->nullable ? "?" : "");
             };
+            // §6.2/§6.6 (#2155): a literal-derived RHS is "adoptable" — §5.1's
+            // constant narrowing lets a compile-time constant implicitly
+            // convert to any integer type whose range contains its value, so
+            // `uint += 1` (RHS literal `1`) is admissible even though `int`
+            // and `uint` have no implicit widening in either direction. The
+            // binary op's §6.2 path (typeBinary) treats such an RHS the same
+            // way; mirror that here so the §6.2 reject below fires only for a
+            // NON-literal RHS (a variable or call result), matching the
+            // issue's reproducers (`int += ulong`, `ulong &= int`). Mirrors
+            // isLiteralDerivedExpr (ExprTypecheck_Exprs.cpp); the LHS target
+            // is always an lvalue, so only the RHS is tested.
+            const std::function<bool(const ast::Expr*)> isLitDerived =
+                [&](const ast::Expr* e) -> bool {
+                if (!e) return false;
+                if (dynamic_cast<const ast::IntLiteralExpr*>(e)) return true;
+                if (dynamic_cast<const ast::FloatLiteralExpr*>(e)) return true;
+                if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e))
+                    return isLitDerived(ue->operand.get());
+                if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e))
+                    return isLitDerived(be->left.get()) &&
+                           isLitDerived(be->right.get());
+                return false;
+            };
             if (tTy && rTy && tTy->kind == TypeRef::Kind::Primitive &&
                 rTy->kind == TypeRef::Kind::Primitive) {
                 // §6.6/§7.11/§5.1 (#2153): a nullable RHS with a NON-nullable
@@ -9228,6 +9251,30 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         "the non-nullable target — narrow the right-hand "
                         "operand first (`?? <fallback>`, `!`, or a §7.4 "
                         "check) (§6.6)");
+                };
+                // §6.2/§6.6 (#2155): the compound desugaring `x op= e` →
+                // `x := x op e` (§6.6) inherits the binary op's §6.2
+                // admissibility — if there is no implicit conversion between
+                // the operand types in either direction (§5.1: "never
+                // implicit: between signed and unsigned types of the same or
+                // narrower width", and between decimal and binary floats),
+                // the binary `x op e` is itself a §6.2 compile error, so the
+                // compound form is too. Used by both the bitwise (non-shift)
+                // branch and the arithmetic branch below.
+                auto reportInadmissiblePair = [&]() {
+                    std::string binOp(as->op.substr(0, as->op.size() - 1));
+                    ctx_.diagnostics().report(
+                        Severity::Error, as->value->span.begin,
+                        std::string("compound assignment `") +
+                        std::string(as->op) +
+                        "` has no implicit conversion between operand types `" +
+                        spellN(tTy) + "` and `" + spellN(rTy) +
+                        "` — the desugared `" + spellN(tTy) + " " + binOp +
+                        " " + spellN(rTy) + "` is itself a §6.2 compile "
+                        "error (no implicit conversion in either direction "
+                        "per §5.1), so the compound form is too; add an "
+                        "explicit cast (§5.2) to convert one operand to the "
+                        "other's type (§6.2/§6.6)");
                 };
                 bool isShift = (as->op == "<<=" || as->op == ">>=");
                 bool isBitwise = (as->op == "&=" || as->op == "|=" ||
@@ -9262,6 +9309,28 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     // forms below.
                     else if (rTy->nullable && !tTy->nullable)
                         reportNullableRhs();
+                    // §6.2/§6.6 (#2155): the bitwise (non-shift) forms
+                    // (`&= |= ^=`) carry the SAME pair-admissibility as the
+                    // binary `&`/`|`/`^` — typeBinary runs the §6.2 promotion
+                    // for the non-shift bitwise ops, so `ulong &= int` must
+                    // be the same §6.2 error as `ulong & int`. (Shifts are
+                    // exempt: the count "does not participate in the
+                    // mixed-type promotion of §6.2", §6.5.) Both operands
+                    // already passed the integer-kind check above, so the
+                    // §5.1 "no conversion either way" pair is the only
+                    // remaining §6.2 reject. A literal-derived RHS is exempt
+                    // (§5.1 constant narrowing: `uint &= 1` admits). Before
+                    // this the bitwise branch checked operand KINDS only, so
+                    // `ulong &= int` compiled and stored a value under a
+                    // conversion the spec does not define.
+                    else if (!isShift &&
+                             tTy->primitive != rTy->primitive &&
+                             !primitiveWidens(tTy->primitive,
+                                              rTy->primitive) &&
+                             !primitiveWidens(rTy->primitive,
+                                              tTy->primitive) &&
+                             !isLitDerived(as->value.get()))
+                        reportInadmissiblePair();
                     // A shift's result is always the left operand's type
                     // (§6.5) — once the operand-kind check above passes
                     // there is no R-vs-T mismatch left to check.
@@ -9300,7 +9369,49 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     // §6.6/§7.11 (#2153): nullable RHS, non-nullable target
                     // (`int += int?`, `string += int?`) — see reportNullableRhs.
                     reportNullableRhs();
-                } else if (tTy->primitive != P::String) {
+                } else if (tTy->primitive == P::String) {
+                    // §6.6/§4.6 (#2157): a non-nullable STRING target. The
+                    // only compound operator defined on strings is `+=`
+                    // (concatenation, §4.6: "`s + t` concatenates two
+                    // strings"), and it requires a `string` RHS — "The
+                    // compiler does not implicitly convert other types to
+                    // `string`; use interpolation or `.ToString()`." The
+                    // bitwise/shift forms on a string target were already
+                    // rejected by the §6.5 target-kind guard above. The
+                    // desugaring `s op= e` → `s := s op e` (§6.6) makes the
+                    // compound form's admission identical to the binary
+                    // `s op e`: `s += 5` matches the §4.6 reject of `s + 5`,
+                    // and `s -= t` / `s *= 1` / `s /= 1` have no result (no
+                    // `-`/`*`/`/` is defined on strings, §4.6/§3.5). Before
+                    // this check the arithmetic branch skipped a String
+                    // target entirely (the old `else if (tTy->primitive !=
+                    // P::String)` guard): `s += 5` was silently admitted and
+                    // the #857 codegen path's retired `string + T` rule
+                    // rendered the int, and `s -= t` reached codegen and
+                    // ABORTED — `llvm.ssub.with.overflow` on string pointers
+                    // failed IR verification.
+                    if (as->op != "+=") {
+                        std::string binOp(as->op.substr(0, as->op.size() - 1));
+                        ctx_.diagnostics().report(
+                            Severity::Error, as->value->span.begin,
+                            std::string("compound assignment `") +
+                            std::string(as->op) + "` is not defined on a "
+                            "`string` target — only `+` (concatenation) is "
+                            "defined on strings (§4.6); the desugared `s " +
+                            binOp + " t` has no result (§4.6/§6.6)");
+                    } else if (rTy->primitive != P::String) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, as->value->span.begin,
+                            std::string("compound assignment `+=` on a "
+                            "`string` target requires a `string` right-hand "
+                            "operand — the compiler does not implicitly "
+                            "convert other types to `string` (§4.6); use "
+                            "string interpolation, `.ToString()`, or "
+                            "concatenate an explicit `string` (§4.6/§6.6)"));
+                    }
+                    // else: `s += "x"` (string += string) — admitted, the
+                    // §4.6 concatenation form (codegens via the #857 path).
+                } else {
                     // Arithmetic (`+= -= *= /=`) or a non-shift bitwise op
                     // whose operands both passed the integer-kind check
                     // above. Compute R = type of `target op value` per
@@ -9336,6 +9447,29 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         (isTrueInt(tTy->primitive) ||
                          tTy->primitive == P::Char) &&
                         isTrueInt(rPrim);
+                    // §6.2/§6.6 (#2155): the integer/integer (or char/
+                    // integer) pair with "no conversion either way" (the
+                    // rPrim fall-through above) is §6.2-inadmissible — e.g.
+                    // `int`/`ulong`, `long`/`uint`, `sbyte`/`uint` (§5.1:
+                    // "never implicit: between signed and unsigned types of
+                    // the same or narrower width"). integerWriteBack would
+                    // otherwise admit ANY such integer/integer pair, so
+                    // reject the §6.2-inadmissible ones here (mirroring the
+                    // binary op's §6.2 reject, typeBinary). The legitimate
+                    // narrow-integer write-back (`b += 10` on `byte`,
+                    // `i += long` on `int`, `c += 1` on `char`) and a
+                    // literal-derived RHS (`uint += 1`, §5.1 constant
+                    // narrowing) keep an admissible pair and stay admitted.
+                    // (#2153: lifted forms like `int? += ulong?` reach this
+                    // branch on the underlying primitives and reject
+                    // identically.)
+                    if (integerWriteBack &&
+                        !primitiveWidens(tTy->primitive,
+                                         rTy->primitive) &&
+                        !primitiveWidens(rTy->primitive,
+                                         tTy->primitive) &&
+                        !isLitDerived(as->value.get()))
+                        reportInadmissiblePair();
                     if (!rEqualsT && !rConvertsToT && !integerWriteBack) {
                         std::string binOp(as->op.substr(0, as->op.size() - 1));
                         // §7.11 (#2153): with a nullable operand the computed

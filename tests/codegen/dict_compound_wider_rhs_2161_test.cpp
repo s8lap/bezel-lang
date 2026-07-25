@@ -227,26 +227,25 @@ BEZEL_TEST(codegen_2161_const_long_oor, shr_33_no_raise) {
 }
 
 // ============================================================================
-// Unsigned widening — `ulong` RHS to int dict. `ulong` widens to `long` (both
-// i64), so the promoted width is still i64; the §6.2 unsigned arithmetic posture
-// is `ulong` (both operands unsigned). An out-of-uint-range value is still
-// out of int range after the §6.2 widening + §5.2 narrow → raise.
+// #2155 (§6.2/§6.6, spec v0.226): the two `var ulong` RHS cells that used to
+// live here — `d["a"] |= <ulong var>` and `d["a"] &= <ulong var>` on an int
+// dict — were REMOVED. They previously asserted a runtime OverflowException,
+// but that was the OLD WRONG behavior: the pair (`int`, `ulong`) has no
+// implicit conversion in either direction (§5.1 — `int` widens only to
+// long/float/double/decimal; `ulong` widens only to float/double/decimal; the
+// signed↔unsigned pair is "never implicit" in both directions). The binary
+// `int | ulong` / `int & ulong` is itself a §6.2 compile error, so the
+// compound form (desugared `x := x op e`, §6.6) is the same compile error.
+// The prior §6.6 family check admitted the compound (diverging from the
+// binary) and raised at runtime; #2155's §6.2 pair-admissibility fix makes the
+// compound match the binary, so these cells now compile-reject (the RHS is a
+// variable, so the §5.1 constant-narrowing / literal-derived exemption does
+// NOT apply). The compile-reject is covered on the dict-indexer path by the
+// lit sema track: compound_mixed_signedness_2155__dict_int_or_equals_ulong_rejected.bzl
+// and compound_mixed_signedness_2155__dict_int_and_equals_ulong_rejected.bzl.
+// A literal-derived RHS above int.MaxValue is still admitted by §5.1 constant
+// narrowing — see uint_in_range_stores below (the literal fits int range).
 // ============================================================================
-
-BEZEL_TEST(codegen_2161_var_ulong, or_2_32_raises) {
-    BEZEL_EXPECT_EQ(throwsOverflow(
-        dictBody("0", "var w: ulong := 4294967296UL; d[\"a\"] |= w", "0")), 1);
-}
-// In-range ulong RHS above int.MaxValue (the #2140 anchor cell): the
-// §6.2-promoted wide op is signed (ulong + int → long, see §6.2) but the
-// narrow-back check uses the LHS's signedness (signed int → SExt) — a value
-// outside int range raises even though ulong can hold it. Use a LHS that
-// preserves the high bit (`int(-1) & 2147483648UL` = 2147483648) so the
-// narrow-back check fires; `0 & 2147483648UL` = 0 always lands in range.
-BEZEL_TEST(codegen_2161_var_ulong, and_2_31_raises) {
-    BEZEL_EXPECT_EQ(throwsOverflow(
-        dictBody("-1", "var w: ulong := 2147483648UL; d[\"a\"] &= w", "0")), 1);
-}
 
 // ============================================================================
 // Signedness of the widening itself — a RHS UNSIGNED and NARROWER than the

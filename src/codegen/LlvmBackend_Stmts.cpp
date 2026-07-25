@@ -783,11 +783,18 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // string pointers to the integer checked-add intrinsic (malformed
                 // IR). When the target is a string, `+=` is a concat: mirror the
                 // working `s := s + t` path (emitStringConcat + the `:=`
-                // retain/release discipline). A non-string RHS (`s += 5`) is
-                // converted via the §4.6 `string + T` rule. The concat result is a
+                // retain/release discipline). The concat result is a
                 // +1 producer, transferred into a string LOCAL/FIELD slot with the
                 // old value released (other lvalues — array element, static, ref/
                 // out, `string?` — get a plain store, leak-safe as before).
+                // §4.6/§6.6 (#2157): sema now enforces that a `string` target's
+                // `+=` RHS is itself a `string` (the retired `string + T`
+                // conversion rule was removed — `s += 5` is now a §4.6 compile
+                // error, matching `s + 5`). The non-string RHS branch below is
+                // therefore defensive-only (unreachable for type-correct input);
+                // it is retained so a non-string RHS that reaches codegen by a
+                // future regression still renders rather than corrupting the
+                // concat.
                 if (op == "+") {
                     const sema::TypeRef* tgtTy = ctx_.exprType(*as->target);
                     if (tgtTy &&
@@ -803,7 +810,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         llvm::Value* res = emitStringConcat(curS, rStr);
                         // §4.6: a non-string RHS was rendered to a fresh `rStr`
                         // (emitPrimitiveToString, rc=1) — release it after the
-                        // concat borrows it.
+                        // concat borrows it. (#2157: defensive — sema rejects
+                        // `s += <non-string>` upstream.)
                         if (rStr != rhs) emitStringRelease(rStr);
                         // #1481 / §4.6 / §28.9: a STRING-typed RHS that is itself
                         // a +1 PRODUCER (`i.ToString()`, a call returning string,
