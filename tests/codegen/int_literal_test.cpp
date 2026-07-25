@@ -200,3 +200,69 @@ BEZEL_TEST(codegen_cg1, negation_beyond_long_min_rejected_1155) {
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(anyErrorContains(r, "does not fit in `long`"));
 }
+
+// §4.2 Boundary carve-out (v0.226, #1828): the unsuffixed decimal literal of
+// magnitude 2^31 is admitted ONLY as the immediate operand of a unary `-`,
+// denoting int.MinValue (-2147483648). The long-side analog (2^63 under `L`)
+// is pinned by the tests above; the int-side path was asymmetric — sema's
+// unsuffixed-`int` range-check branch did not consult `literalUnderUnaryMinus_`,
+// so `-2147483648` was rejected with "integer literal does not fit in `int`"
+// before the negation could apply. The four tests below pin the int side:
+// acceptance, exact bit pattern, and the two boundaries that must STILL reject.
+
+// `-2147483648` compiles and runs as int.MinValue (negative). Without the fix
+// this fails to compile (the literal-range check rejects magnitude 2^31).
+BEZEL_TEST(codegen_cg1, int_min_value_literal_negation_accepted_1828) {
+    auto r = runAot(
+        "module M; class App public static method Main(): int "
+        "  var a := -2147483648; "
+        "  return (if a < 0 then 1 else 0); end Main; end App;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
+}
+
+// `-2147483648` carries the exact two's-complement bit pattern 0x80000000 —
+// i.e. it folds to int.MinValue, not to int.MinValue + 1 (the off-by-one that
+// once afflicted the long side when strtoll saturated at long.MaxValue).
+// Observed via BitConverter.Reinterpret<uint> (stdlib §2.12): the same bits
+// viewed as unsigned are exactly 2^31 = 2147483648U.
+BEZEL_TEST(codegen_cg1, int_min_value_literal_exact_bits_1828) {
+    auto r = runAot(
+        "module M; class App public static method Main(): int "
+        "  var a := -2147483648; "
+        "  return (if BitConverter.Reinterpret<uint>(a) = 2147483648U then 0 else 1); "
+        "end Main; end App;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// §4.2: the carve-out admits magnitude 2^31 ONLY as the immediate operand of a
+// unary `-`. The bare positive `2147483648` (no `-`) is one past int.MaxValue
+// (2^31 − 1) and must still be rejected — it neither fits `int` nor carries a
+// suffix naming a wider type. (Guards against an over-broad fix that admits the
+// magnitude unconditionally.)
+BEZEL_TEST(codegen_cg1, bare_int_over_max_rejected_1828) {
+    auto r = runAot(
+        "module M; class App public static method Main(): int "
+        "  var a := 2147483648; "
+        "  return 0; end Main; end App;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(anyErrorContains(r, "does not fit in `int`"));
+}
+
+// §4.2: a magnitude one past |int.MinValue| (`-2147483649`, 2^31 + 1) exceeds
+// `int` even under a unary minus — rejected. (Guards against an over-broad fix
+// that admits any magnitude under unary `-`; only the exact 2^31 boundary is
+// admitted.)
+BEZEL_TEST(codegen_cg1, negation_beyond_int_min_rejected_1828) {
+    auto r = runAot(
+        "module M; class App public static method Main(): int "
+        "  var a := -2147483649; "
+        "  return 0; end Main; end App;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(anyErrorContains(r, "does not fit in `int`"));
+}

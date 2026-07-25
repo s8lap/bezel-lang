@@ -1003,8 +1003,23 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 (errno == ERANGE || mag > 2147483647ull)) {
                 using P = PrimitiveType;
                 bool widened = false;
+                // §4.2 Boundary carve-out (v0.159, #1828): the unsuffixed
+                // decimal literal of magnitude 2^31 is admitted ONLY as the
+                // immediate operand of a unary `-`, denoting int.MinValue
+                // (-2147483648). The long-side analog (2^63 under `L`) is
+                // honored in the suffixed branch below via the same
+                // `literalUnderUnaryMinus_` flag; without this int-side check
+                // the magnitude 2^31 was rejected here before the negation
+                // could apply, so int.MinValue was unwritable as a bare
+                // literal (asymmetric with the working long.MinValue path).
+                // Anything strictly above 2^31 still falls through to
+                // widen-or-reject below.
+                if (literalUnderUnaryMinus_ && errno != ERANGE &&
+                    mag == 2147483648ull) {
+                    widened = true;  // keep pt == Int; this is int.MinValue.
+                }
                 // Widen to the declared type when in a typed variable context.
-                if (currentLiteralWideningHint_ != P::None) {
+                else if (currentLiteralWideningHint_ != P::None) {
                     bool fits = false;
                     switch (currentLiteralWideningHint_) {
                         case P::Long:
