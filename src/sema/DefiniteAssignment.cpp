@@ -1322,6 +1322,25 @@ private:
     // target is treated as a pure write.
     void visitCallArg(const ast::CallArgument& a) {
         if (!a.value) return;
+        // fix #2206 / §22.8: a `ref`/`out` argument whose operand resolves to a
+        // readonly field is an assignment to that field — the callee writes
+        // through the alias (`out` definitely, `ref` possibly; soundness assumes
+        // it might). The once-check (#2187's checkReadonlyOnceness) previously
+        // fired only on AssignmentStmt/IncrementStmt, so a readonly field
+        // assigned by `:=` could be written a SECOND time through an `out`/`ref`
+        // argument without diagnosis — the same finality break the §7.4/#2116
+        // narrowing anchor is sound only against (an observed non-null readonly
+        // value must be final). Feed every `ref`/`out` operand through the
+        // once-check: a first, non-loop write is admitted as the legitimate
+        // single assignment (placement is separately gated by
+        // checkRefOutFieldOperand while `inConstructor_`); a SECOND one, or any
+        // such write textually inside a loop, is rejected. The check no-ops on
+        // non-field operands (a local/param is not a FieldSymbol) and outside
+        // the readonly ctor mode, so inline `out var x`, plain `out local`, and
+        // all non-ctor call sites are unaffected.
+        if (roCtorMode_ &&
+            (a.modifier.rfind("out", 0) == 0 || a.modifier == "ref"))
+            checkReadonlyOnceness(*a.value, a.value->span.begin);
         if (a.modifier.rfind("out", 0) == 0) {
             if (auto* id =
                     dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
