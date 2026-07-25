@@ -3288,10 +3288,31 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     lt->funcReturn->primitive == P::Decimal)
                                     elemIsDecimal = true;
                         }
-                        ctx_.setExprType(&ce,
-                            elemIsDecimal
-                                ? ctx_.primitiveTypeRef(P::Decimal)
-                                : ctx_.primitiveTypeRef(P::Int));
+                        // fix #1836 / stdlib §5.1 (v0.226): the no-selector
+                        // Sum()/Min()/Max() result is the element's OWN numeric
+                        // type (`Sum(): long` for IEnumerable<long>, `Min()/Max():
+                        // T`), not int. The seven §5.1 numeric primitives key the
+                        // result off the element; the selector form keeps the
+                        // decimal/int default. (Mirrors the concrete-collection
+                        // path below; codegen derives the accumulator likewise.)
+                        bool noSelectorKeyed = false;
+                        if (ce.args.empty() && srcElem &&
+                            srcElem->kind == TypeRef::Kind::Primitive &&
+                            !srcElem->nullable) {
+                            P ep = srcElem->primitive;
+                            if (ep == P::Int || ep == P::Long ||
+                                ep == P::UInt || ep == P::ULong ||
+                                ep == P::Float || ep == P::Double ||
+                                ep == P::Decimal) {
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(ep));
+                                noSelectorKeyed = true;
+                            }
+                        }
+                        if (!noSelectorKeyed)
+                            ctx_.setExprType(&ce,
+                                elemIsDecimal
+                                    ? ctx_.primitiveTypeRef(P::Decimal)
+                                    : ctx_.primitiveTypeRef(P::Int));
                     }
                     // stdlib §5/§5.1: Average → double (int/long/double forms)
                     // or → decimal for IEnumerable<decimal>.
@@ -4138,6 +4159,27 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     }
                             }
                             if (!sumSelectorClassified) {
+                            // fix #1836 / stdlib §5.1 (v0.226): the no-selector
+                            // Sum()/Min()/Max() result is the element's OWN
+                            // numeric type (`Sum(): long` for Array<long>;
+                            // `Min()/Max(): T`), not int. The seven §5.1 numeric
+                            // primitives key the result off the element; the
+                            // selector form keeps the decimal/int default below.
+                            bool noSelectorKeyed = false;
+                            if (ce.args.empty() && elem &&
+                                elem->kind == TypeRef::Kind::Primitive &&
+                                !elem->nullable) {
+                                P ep = elem->primitive;
+                                if (ep == P::Int || ep == P::Long ||
+                                    ep == P::UInt || ep == P::ULong ||
+                                    ep == P::Float || ep == P::Double ||
+                                    ep == P::Decimal) {
+                                    ctx_.setExprType(&ce,
+                                        ctx_.primitiveTypeRef(ep));
+                                    noSelectorKeyed = true;
+                                }
+                            }
+                            if (!noSelectorKeyed) {
                             // Check selector return type (if a lambda arg).
                             if (!elemIsDecimal && !ce.args.empty() &&
                                 ce.args[0].value) {
@@ -4153,6 +4195,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 elemIsDecimal
                                     ? ctx_.primitiveTypeRef(P::Decimal)
                                     : ctx_.primitiveTypeRef(P::Int));
+                            }
                             }
                             }
                         }

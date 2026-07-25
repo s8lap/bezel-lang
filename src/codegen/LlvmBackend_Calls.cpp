@@ -1618,9 +1618,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // hardwired to i32, which truncated a long/uint/ulong selector's
             // result to 32 bits and emitted malformed IR for a float/double
             // selector (its i32-typed sum then mismatched the double-typed use
-            // site — #1697/#1757). Derive the accumulator LLVM type from R; the
-            // no-selector Sum() form keeps R = int (its per-type §5.1 widening
-            // is separate and unchanged here).
+            // site — #1697/#1757). Derive the accumulator LLVM type from R.
+            //
+            // fix #1836 / stdlib §5.1 (v0.226): the NO-SELECTOR Sum() form
+            // accumulates in the element's OWN numeric type (long/uint/ulong/
+            // float/double — `Sum(): long` for Array<long>), not int. The pre-
+            // fix hardwire of R = int for the no-selector form truncated a
+            // long/ulong element's sum to 32 bits (9_000_000_000 mod 2^32 =
+            // 410_065_408). Decimal took the isDecimalSum path above.
             sema::PrimitiveType retP = sema::PrimitiveType::Int;
             if (!call.args.empty() && call.args[0].value) {
                 if (auto* lamTy = ctx_.exprType(*call.args[0].value))
@@ -1642,6 +1647,26 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                 break;  // keep Int (legacy) for anything else
                         }
                     }
+            } else if (recvTy && !recvTy->genericArgs.empty() &&
+                       recvTy->genericArgs[0]) {
+                // no-selector: per stdlib §5.1 the result is the element's own
+                // numeric type. Sema types it likewise (ExprTypecheck_Calls);
+                // derive the accumulator width from the element so a long/uint/
+                // ulong/float/double element is summed at its own width.
+                sema::TypeRef* e = recvTy->genericArgs[0];
+                if (e->kind == sema::TypeRef::Kind::Primitive && !e->nullable) {
+                    switch (e->primitive) {
+                        case sema::PrimitiveType::UInt:
+                        case sema::PrimitiveType::Long:
+                        case sema::PrimitiveType::ULong:
+                        case sema::PrimitiveType::Float:
+                        case sema::PrimitiveType::Double:
+                            retP = e->primitive;
+                            break;
+                        default:
+                            break;  // Int stays; decimal handled above
+                    }
+                }
             }
             sema::TypeRef* retTyRef = ctx_.primitiveTypeRef(retP);
             const bool accIsFP = (retP == sema::PrimitiveType::Float ||
@@ -1674,10 +1699,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
             llvm::Value* el = builder_.CreateLoad(elemTy, ep);
             llvm::Value* val = closure ? callClosure(closure, el, accLLTy) : el;
-            // No-selector form: the element is loaded at its own width; keep the
-            // legacy narrowing to the (int) accumulator. The selector form
-            // already returns accLLTy, so this branch is a no-op there.
-            if (val->getType() != accLLTy) val = builder_.CreateTrunc(val, accLLTy);
+            // fix #1836: with the no-selector accumulator now derived from the
+            // element type (#1836) and the selector accumulator from the
+            // selector return (#1757), val already matches accLLTy on every
+            // path; this integer-only narrowing is a defensive no-op kept for
+            // the int-default fallback (a non-numeric element).
+            if (val->getType() != accLLTy && val->getType()->isIntegerTy() &&
+                accLLTy->isIntegerTy())
+                val = builder_.CreateTrunc(val, accLLTy);
             llvm::Value* acc = builder_.CreateLoad(accLLTy, accSlot);
             builder_.CreateStore(
                 accIsFP ? builder_.CreateFAdd(acc, val)
@@ -2232,21 +2261,47 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 }
             }
 
-            // --- Numeric U (selector) or the legacy no-selector form. Derive
-            // the accumulator LLVM type, float-ness, and signedness from U so a
-            // long/uint/ulong projection is not truncated and a float/double
-            // projection uses FP compare (mirrors the #1757 Sum-selector fix). A
-            // no-selector Min()/Max() keeps U = int and the legacy i32 slot. ---
+            // --- Numeric U (selector) or the no-selector numeric element.
+            // Derive the accumulator LLVM type, float-ness, and signedness from
+            // U (selector) or from the element type (no-selector) so a
+            // long/uint/ulong value is not truncated and a float/double value
+            // uses FP compare (mirrors the #1757 Sum-selector fix and the #1836
+            // no-selector Sum fix). Per stdlib §5.1 (v0.226) the no-selector
+            // Min()/Max() returns the element's own type T; a non-numeric
+            // element keeps the legacy int fallback. ---
             sema::PrimitiveType retP = sema::PrimitiveType::Int;
             const bool selNumeric =
                 uRef && uRef->kind == sema::TypeRef::Kind::Primitive &&
                 !uRef->nullable;
-            if (selNumeric) retP = uRef->primitive;
+            if (selNumeric) {
+                retP = uRef->primitive;
+            } else if (call.args.empty() && recvTy &&
+                       !recvTy->genericArgs.empty() &&
+                       recvTy->genericArgs[0]) {
+                // fix #1836 / stdlib §5.1 (v0.226): no-selector Min()/Max()
+                // returns the element's own numeric type T (long/uint/ulong/
+                // float/double), not int. (Decimal took the §5.1 decimal path
+                // above; class/string took the pointer-comparable path.)
+                sema::TypeRef* e = recvTy->genericArgs[0];
+                if (e->kind == sema::TypeRef::Kind::Primitive && !e->nullable) {
+                    switch (e->primitive) {
+                        case sema::PrimitiveType::UInt:
+                        case sema::PrimitiveType::Long:
+                        case sema::PrimitiveType::ULong:
+                        case sema::PrimitiveType::Float:
+                        case sema::PrimitiveType::Double:
+                            retP = e->primitive;
+                            break;
+                        default:
+                            break;  // Int stays
+                    }
+                }
+            }
             sema::TypeRef* retTyRef = ctx_.primitiveTypeRef(retP);
             const bool accIsFP = (retP == sema::PrimitiveType::Float ||
                                   retP == sema::PrimitiveType::Double);
             const bool accIsUnsigned = isUnsignedPrim(retP);
-            llvm::Type* accLLTy = selNumeric ? lowerTypeRef(retTyRef) : i32();
+            llvm::Type* accLLTy = lowerTypeRef(retTyRef);
             if (!accLLTy) accLLTy = i32();
             llvm::Value* closure = call.args.empty() ? nullptr
                 : lowerLinqLambda(call.args[0].value.get(), retTyRef);
@@ -2282,10 +2337,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
             llvm::Value* el = builder_.CreateLoad(elemTy, ep);
             llvm::Value* val = closure ? callClosure(closure, el, accLLTy) : el;
-            // Legacy no-selector narrowing to the i32 accumulator; the selector
-            // form already returns accLLTy so this is a no-op there. Guard the
-            // trunc to integer→integer (a float/double selector value equals
-            // accLLTy and never reaches here).
+            // fix #1836: with the no-selector accumulator now derived from the
+            // element type (#1836) and the selector accumulator from U (#1901),
+            // val already matches accLLTy on every path; this integer-only
+            // narrowing is a defensive no-op kept for the int-default fallback.
             if (val->getType() != accLLTy && val->getType()->isIntegerTy() &&
                 accLLTy->isIntegerTy())
                 val = builder_.CreateTrunc(val, accLLTy);
