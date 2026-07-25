@@ -5292,21 +5292,28 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // postcondition. Clear the set for the lambda body and restore after.
         auto saveOutPostconds = std::move(currentOutPostconds_);
         currentOutPostconds_.clear();
-        // §7.4 (v0.214, #2113/#2116): the lambda body is DEFERRED code — its
-        // readonly-field fact state is not the enclosing statement's.
-        //   IN:  ambient-rooted facts (rootId 0 — `this`/static) ride in: a
-        //        readonly field observed non-null holds that value forever
-        //        after (§22.8 single assignment; a during-construction test
-        //        that observed non-null saw the final value, §22.7/§7.4), so
-        //        the fact is true whenever the closure later runs. LOCAL-rooted
-        //        facts are dropped: the captured root may be rebound between
-        //        the closure's creation and its invocation, which the
-        //        enclosing walk cannot see.
-        //   OUT: the enclosing set is RESTORED — a fact established inside the
-        //        lambda body must not leak to the enclosing scope (the body may
-        //        run never or later; #2113's hole, closed for this set).
-        // (nullNarrowed_/narrowings_ keep their legacy leak — that is #2113's
-        // own scope for the local sets.)
+        // §7.4 (v0.226, #2113/#2116): the lambda body is DEFERRED code — its
+        // narrowing fact state is not the enclosing statement's. All three
+        // narrowing sets are saved now and restored after the body visit.
+        //   IN:  facts established BEFORE the lambda ride in (capture) — the
+        //        closure sees the ambient state. fieldNarrowed_ additionally
+        //        drops LOCAL-rooted facts here (the captured root may be
+        //        rebound between the closure's creation and its invocation,
+        //        which the enclosing walk cannot see); ambient-rooted facts
+        //        (rootId 0 — `this`/static) ride in unchanged, a readonly
+        //        field observed non-null holding that value forever after
+        //        (§22.8 single assignment; a during-construction test that
+        //        observed non-null saw the final value, §22.7/§7.4). The local
+        //        sets (nullNarrowed_/narrowings_) need NO in-side drop: their
+        //        key is the stable Symbol*, and §7.4's invalidation rules
+        //        (reassignment, ref/out, mutably-captured-then-call) have
+        //        already removed anything unsound by the point of capture.
+        //   OUT: the enclosing sets are RESTORED — a fact established inside
+        //        the lambda body must not leak to the enclosing scope (the body
+        //        may run never or later; #2113's hole, now closed for all
+        //        three sets).
+        auto saveNullNarrowed = nullNarrowed_;
+        auto saveNarrowings = narrowings_;
         auto saveFieldNarrowed = fieldNarrowed_;
         fieldNarrowed_.erase(fieldNarrowed_.lower_bound({1u, 0u}),
                              fieldNarrowed_.end());  // drop local-rooted
@@ -5440,8 +5447,10 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         currentScope_ = saveScope;
         returnCtx_ = saveRet;
         currentReturnType_ = saveRetTy;
-        // §7.4 (v0.214, #2113/#2116): restore the enclosing fact set — facts
+        // §7.4 (v0.226, #2113/#2116): restore the enclosing fact sets — facts
         // established inside the (deferred) lambda body never leak out.
+        nullNarrowed_ = std::move(saveNullNarrowed);
+        narrowings_ = std::move(saveNarrowings);
         fieldNarrowed_ = std::move(saveFieldNarrowed);
         currentOutPostconds_ = std::move(saveOutPostconds);  // §22.4 (#1585)
         inAsyncContext_ = saveAsync;
