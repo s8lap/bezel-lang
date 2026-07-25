@@ -956,6 +956,28 @@ void Resolver::checkRecordRestrictions() {
                         dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
                     if (fd->type) {
                         auto* rt = ctx_.resolvedType(*fd->type);
+                        if (rt && rt->kind == TypeRef::Kind::Named &&
+                            rt->declaration &&
+                            rt->declaration->kind == ast::TypeDeclKind::Choice) {
+                            // §9.7: records cannot contain an owning choice;
+                            // unlike a class, a record has no owning container
+                            // teardown for the choice's owned payload.
+                            auto classification =
+                                common::classifyChoiceType(rt, ctx_);
+                            if (classification &&
+                                *classification ==
+                                    common::ChoiceClassification::Owning) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, m->declLoc,
+                                    std::string("record `") +
+                                        std::string(t->name) +
+                                        " may not have an owning choice field `" +
+                                        std::string(fs->name) +
+                                        "` (§9.7, §35.4.1)");
+                                continue;
+                            }
+                        }
+                        // Inline-array field with owned slots.
                         if (rt &&
                             rt->kind == TypeRef::Kind::InlineArray &&
                             rt->arrayOwned) {
