@@ -9437,6 +9437,106 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         " type `" + rhsName + "` (§6.2's promotion covers "
                         "primitive numeric operands only), and " + tail);
                 }
+            } else if (tTy && rTy &&
+                       tTy->kind == TypeRef::Kind::Named &&
+                       tTy->declaration &&
+                       (rTy->kind == TypeRef::Kind::Primitive ||
+                        (rTy->kind == TypeRef::Kind::Named &&
+                         rTy->declaration))) {
+                // §6.6/§25.2 (#2162): a NAMED TARGET (record/class/enum/
+                // interface/choice) with a compound `op=` desugars to
+                // `x := x op e` (§6.6). The binary `x op e` has a result R
+                // ONLY via a §25.2 operator overload: §6.2's mixed-type
+                // promotion covers primitive numeric operands, §6.5 bitwise
+                // is the eight integer primitives, and §5.1 never implicitly
+                // converts a named type to a primitive — §10: "An enum is not
+                // implicitly convertible to or from its underlying integer
+                // type" (§5.4 requires the explicit cast); records/classes/
+                // choices have no numeric reading at all. So per §6.6 "In
+                // every other case the compound form is a compile error"
+                // unless an applicable `operator <op>` overload is declared
+                // on the target's type — or, mirroring #2156's codegen
+                // candidate set ("the union of the `operator <op>` overloads
+                // declared on the static types of BOTH operands"), on the
+                // RHS's type when the RHS is also Named. Matched IN ORDER
+                // (#1096: left operand → param 0; here the target; right
+                // operand → param 1, the RHS) including inherited overloads
+                // (§25.2 v0.181) and findBinaryOperator's §7.11 nullability
+                // gate (#1132). Before this check a Named TARGET fell through
+                // BOTH the primitive-pair branch above AND the primitive-
+                // target/Named-RHS branch above, so `x |= Flags.B` (and the
+                // arithmetic twin `x += Flags.B`) on `x: Flags` compiled
+                // silently and codegen emitted an unspecified value.
+                std::string binOp(as->op.substr(0, as->op.size() - 1));
+                auto operandMatchesParam = [&](const TypeRef* operandTy,
+                                               Symbol* paramSym) -> bool {
+                    auto* ps = dynamic_cast<ParameterSymbol*>(paramSym);
+                    if (!ps) return false;
+                    TypeRef* pt = ps->declType
+                                      ? ctx_.resolvedType(*ps->declType)
+                                      : ps->resolvedDeclType;
+                    if (!pt || !operandTy) return false;
+                    // Mirrors operandMatchesParam (ExprTypecheck_Exprs.cpp):
+                    // a primitive param accepts a primitive operand (numeric
+                    // coercion downstream); a Named param needs the operand's
+                    // declaration (or a derived one) with §7.11 nullability
+                    // agreement (user-operator lifting over T? is deferred).
+                    if (pt->kind == TypeRef::Kind::Primitive)
+                        return operandTy->kind == TypeRef::Kind::Primitive;
+                    if (pt->kind != TypeRef::Kind::Named || !pt->declaration ||
+                        operandTy->kind != TypeRef::Kind::Named ||
+                        !operandTy->declaration)
+                        return false;
+                    return (pt->declaration == operandTy->declaration ||
+                            isSubtype(operandTy->declaration,
+                                      pt->declaration)) &&
+                           (pt->nullable || !operandTy->nullable);
+                };
+                auto typeDeclaresApplicable = [&](TypeSymbol* decl) -> bool {
+                    if (!decl) return false;
+                    for (MethodSymbol* m :
+                         collectInheritedOperators(decl, binOp, 2)) {
+                        if (m->params.size() < 2) continue;
+                        if (operandMatchesParam(tTy, m->params[0]) &&
+                            operandMatchesParam(rTy, m->params[1]))
+                            return true;
+                    }
+                    return false;
+                };
+                bool hasApplicableOp =
+                    typeDeclaresApplicable(tTy->declaration) ||
+                    (rTy->kind == TypeRef::Kind::Named && rTy->declaration &&
+                     typeDeclaresApplicable(rTy->declaration));
+                if (!hasApplicableOp) {
+                    const char* kindWord = "";
+                    switch (tTy->declaration->kind) {
+                        case ast::TypeDeclKind::Record:
+                            kindWord = "record"; break;
+                        case ast::TypeDeclKind::Class:
+                            kindWord = "class"; break;
+                        case ast::TypeDeclKind::Enum:
+                            kindWord = "enum"; break;
+                        case ast::TypeDeclKind::Interface:
+                            kindWord = "interface"; break;
+                        case ast::TypeDeclKind::Choice:
+                            kindWord = "choice"; break;
+                    }
+                    std::string targetName =
+                        std::string(tTy->declaration->name) +
+                        (tTy->nullable ? "?" : "");
+                    ctx_.diagnostics().report(
+                        Severity::Error, as->span.begin,
+                        std::string("compound assignment `") +
+                        std::string(as->op) + "` has no valid result on " +
+                        kindWord + " type `" + targetName + "`: no built-in "
+                        "operator `" + binOp + "` is defined on a named type "
+                        "(§6.2/§6.5 cover primitive operands only), and `" +
+                        std::string(tTy->declaration->name) +
+                        "` declares no applicable `operator " + binOp +
+                        "` overload (§25.2) — convert via the underlying "
+                        "integer explicitly (§5.4) or declare the operator "
+                        "(§6.6/§10.4)");
+                }
             }
         }
         // per §24.4: an event += / -= is not a real compound assignment, so
