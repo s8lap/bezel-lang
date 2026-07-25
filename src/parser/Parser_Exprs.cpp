@@ -883,10 +883,23 @@ bool Parser::checkRetiredParenLambda() {
 // (nullable suffix), `[` / `]` (inline-array prefix), `<` / `>` (nested
 // generic args).  Operators other than `<`, `>`, `?`, `[`, `]`, `,` are
 // not valid inside a type-arg list and cause us to bail out.
+//
+// per §A.5 / §22.12 (issue #2191): a GenericArg is a Type, and a Type
+// includes the function-type spelling `( FuncParamType ("," …)* ","? )
+// "->" "owned"? Type` (and the unit type `()`).  The scan therefore also
+// admits the function-type tokens — `(` / `)` (depth-tracked: the spec's
+// "balanced <…> group respecting nesting" covers the function type's
+// parameter list), the `->` separator, the `:` of a named function-type
+// parameter, and the reserved FuncParamMods keywords `owned` / `ref` /
+// `out` (`scoped` is a contextual identifier, already accepted).  Those
+// keywords cannot appear as expression operands, so admitting them cannot
+// turn a relational `<` into a false type-arg reading; an ill-formed
+// combination still reaches parseType, the authority.
 bool Parser::tokensLookLikeMethodTypeArgs() {
     // peekAt(0) must be `<`.
     std::size_t k = 1;                // start scanning after the opening `<`
     std::size_t depth = 1;            // nesting level of `<` / `>`
+    std::size_t parenDepth = 0;       // function-type parameter-list nesting (#2191)
     static const std::size_t kLimit = 64; // prevent scanning unbounded input
     for (std::size_t guard = 0; guard < kLimit; ++guard, ++k) {
         const Token& t = peekAt(k);
@@ -899,6 +912,7 @@ bool Parser::tokensLookLikeMethodTypeArgs() {
                     // The outer `>` closes this generic-arg list and the
                     // inner `>` would be left to the caller.  Treat this
                     // as closing: after the `>>`, we need `(`.
+                    if (parenDepth != 0) return false; // `>>` inside function `(…)`
                     const Token& after = peekAt(k + 1);
                     if (depth == 2) {
                         // both `>` consumed here; we need `(` next.
@@ -912,6 +926,7 @@ bool Parser::tokensLookLikeMethodTypeArgs() {
                 depth -= 2; continue;
             }
             if (t.text == ">") {
+                if (parenDepth != 0) return false; // `>` inside function-type `(…)`
                 --depth;
                 if (depth == 0) {
                     // The closing `>` of the arg list.  Confirm `(` follows.
@@ -921,18 +936,34 @@ bool Parser::tokensLookLikeMethodTypeArgs() {
                 }
                 continue;
             }
+            // §A.5 FunctionType `(...) -> owned? Type` (and the unit `()`) is
+            // a GenericArg (#2191): track the parameter-list nesting so the
+            // scan stays sound (an unmatched `)` cannot be a type-arg list).
+            if (t.text == "(") { ++parenDepth; continue; }
+            if (t.text == ")") {
+                if (parenDepth == 0) return false;
+                --parenDepth; continue;
+            }
+            // `->` separates a function type's parameters from its return;
+            // `:` precedes a named function-type parameter's type (`(x: int)`).
+            if (t.text == "->" || t.text == ":") continue;
             // Punctuators valid inside a type arg: `,`, `?`, `[`, `]`.
             if (t.text == "," || t.text == "?" ||
                 t.text == "[" || t.text == "]") continue;
-            // Any other punctuator (e.g. `+`, `-`, `*`, `(`, `)`, `=`,
+            // Any other punctuator (e.g. `+`, `-`, `*`, `=`,
             // `..`) cannot appear inside a type arg; bail out.
             return false;
         }
         if (t.kind == TokenKind::Keyword) {
             // Primitive-type keywords (int, string, bool, …) are valid type
-            // names.  Other keywords (if, while, return, …) cannot appear
-            // inside a type arg.
+            // names.  The function-type parameter modifiers (§A.5
+            // FuncParamMods: `owned` / `ref` / `out`, the latter also part
+            // of `out owned`) are reserved keywords (Appendix B.1) admitted
+            // so a function-type GenericArg scans correctly (#2191); they
+            // cannot appear as expression operands.  Other keywords (if,
+            // while, return, …) cannot appear inside a type arg.
             if (isPrimitiveTypeKeyword(t.text)) continue;
+            if (t.text == "owned" || t.text == "ref" || t.text == "out") continue;
             return false;
         }
         if (t.kind == TokenKind::Identifier) continue; // type name component
@@ -957,6 +988,7 @@ bool Parser::tokensLookLikeMethodTypeArgs() {
 bool Parser::tokensLookLikeReceiverTypeArgs() {
     std::size_t k = 1;                // start scanning after the opening `<`
     std::size_t depth = 1;
+    std::size_t parenDepth = 0;       // function-type parameter-list nesting (#2191)
     static const std::size_t kLimit = 64;
     for (std::size_t guard = 0; guard < kLimit; ++guard, ++k) {
         const Token& t = peekAt(k);
@@ -965,6 +997,7 @@ bool Parser::tokensLookLikeReceiverTypeArgs() {
             if (t.text == "<") { ++depth; continue; }
             if (t.text == ">>") {
                 if (depth <= 2) {
+                    if (parenDepth != 0) return false; // `>>` inside function `(…)`
                     const Token& after = peekAt(k + 1);
                     if (depth == 2) {
                         return after.kind == TokenKind::Punctuator &&
@@ -975,6 +1008,7 @@ bool Parser::tokensLookLikeReceiverTypeArgs() {
                 depth -= 2; continue;
             }
             if (t.text == ">") {
+                if (parenDepth != 0) return false; // `>` inside function-type `(…)`
                 --depth;
                 if (depth == 0) {
                     // The closing `>` of the arg list.  Confirm `.` follows —
@@ -985,12 +1019,23 @@ bool Parser::tokensLookLikeReceiverTypeArgs() {
                 }
                 continue;
             }
+            // §A.5 FunctionType (and unit `()`) as a GenericArg (#2191):
+            // track the parameter-list nesting so the scan stays sound.
+            if (t.text == "(") { ++parenDepth; continue; }
+            if (t.text == ")") {
+                if (parenDepth == 0) return false;
+                --parenDepth; continue;
+            }
+            if (t.text == "->" || t.text == ":") continue;
             if (t.text == "," || t.text == "?" ||
                 t.text == "[" || t.text == "]") continue;
             return false;
         }
         if (t.kind == TokenKind::Keyword) {
             if (isPrimitiveTypeKeyword(t.text)) continue;
+            // §A.5 FuncParamMods (`owned` / `ref` / `out`) inside a
+            // function-type GenericArg (#2191).
+            if (t.text == "owned" || t.text == "ref" || t.text == "out") continue;
             return false;
         }
         if (t.kind == TokenKind::Identifier) continue;
