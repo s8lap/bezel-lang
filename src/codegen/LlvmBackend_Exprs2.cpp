@@ -509,8 +509,23 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                 // (emitOwnedFieldDisposals) — skips it instead of disposing the
                 // already-transferred object again (a double-free → SIGSEGV).
                 // Mirrors the local using-var null above and the collection-slot
-                // move (lowerMoveFromCollectionSlot). Only pointer-typed
-                // (class/interface) owned fields carry a disposal obligation.
+                // move (lowerMoveFromCollectionSlot). Only pointer-typed owned
+                // fields carry a disposal obligation: class/interface references
+                // (isOwnedReferenceField), builtin iterator-interface frames
+                // (isOwnedIteratorInterfaceField), AND owning-collection handles
+                // (ownedCollectionFieldType — bz_array_t*/bz_llist_t*/bz_dict_t*).
+                //
+                // #2185 / §28.8.1 / §28.7: owning-collection fields MUST be in
+                // this null-set. Otherwise the spec-canonical build-before-take /
+                // restore-then-return shape (`using var t := move _arr; _arr :=
+                // fresh;`) double-frees: the field keeps the moved-out pointer, so
+                // the §28.7 drop-on-overwrite store (`lowerOwnedCollectionField
+                // Store`) calls bz_array_free on the value the new owner (here the
+                // using-var `t`) already owns — and `t`'s scope-end disposal then
+                // frees the same block again (free()-on-a-bogus-header SEGV). The
+                // auto-dispose path (emitOwnedFieldDisposals) and bz_array_free
+                // are null-safe, so nulling here makes both the drop-on-overwrite
+                // and any later disposal skip the moved-out collection cleanly.
                 //
                 // §28.8.1, #899: NOT inside a destructor body
                 // (emittingDisposerBody_). The same reasoning as for the qualified
@@ -526,7 +541,8 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                 // qualified-form fix, so inside a destructor the field is left
                 // non-null and the auto-dispose pass disposes it exactly once.
                 if ((isOwnedReferenceField(fs) ||
-                     isOwnedIteratorInterfaceField(fs)) &&
+                     isOwnedIteratorInterfaceField(fs) ||
+                     ownedCollectionFieldType(fs) != nullptr) &&
                     !emittingDisposerBody_) {
                     llvm::Type* fty = nullptr;
                     if (llvm::Value* addr = implicitFieldAddr(*id, fty)) {
@@ -563,8 +579,9 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
             if (auto* fs = dynamic_cast<sema::FieldSymbol*>(
                     ctx_.exprSymbol(*ma));
                 fs && (isOwnedReferenceField(fs) ||
-                       isOwnedIteratorInterfaceField(fs)) && fs->parent &&
-                !emittingDisposerBody_) {
+                       isOwnedIteratorInterfaceField(fs) ||
+                       ownedCollectionFieldType(fs) != nullptr) &&
+                fs->parent && !emittingDisposerBody_) {
                 auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                     ma->target.get());
                 // A NON-`this` receiver is nulled only when it is an OWNED place
