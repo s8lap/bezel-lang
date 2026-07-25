@@ -8487,11 +8487,42 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // wild read / SIGSEGV). Routing through emitGuardThrow makes the fault
         // a first-class, catchable throw like every other builtin guard.
         if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
+            const ast::Expr* parseArg = call.args[0].value.get();
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             llvm::AllocaInst* slot = makeGuidSlot();
             auto* fn = declareC("bz_guid_parse", i32(), {ptrTy(), ptrTy()});
             llvm::Value* ok = builder_.CreateCall(fn, {strVal, slot}, "guid.parse.ok");
+            // fix #1998 / §28.3 "Unbound owned temporaries" / §4.6 / §28.9
+            // (v0.226): Guid.Parse takes its `s: string` argument by BORROW —
+            // bz_guid_parse (→ guid_parse_str) only READS s->data to decode the
+            // 16 bytes, it does not adopt the reference (no `owned` on the
+            // parameter, stdlib §2.6). So a fresh +1 string producer passed as
+            // that argument — the issue's repro `Guid.Parse(g.ToString())`,
+            // where g.ToString() mints an rc=1 heap bz.string (#1982/#1989) —
+            // is the producer-temp-consumed-only-by-a-borrow-parameter shape:
+            // §28.3's unbound-temporary rule enumerates "a non-`owned`
+            // argument" as a borrowing use an unbound owned temporary may
+            // serve before being "disposed at the end of the full expression",
+            // and Parse returns a Guid (nothing chains off the argument past
+            // the call), so the call's own end IS that boundary. Before this
+            // fix nothing disposed the temp here: nothing else owns the +1 and
+            // the argument is not bound to a name, so it leaked (the #1998
+            // repro: 69 bytes/iteration — the 32-byte header + 37-byte buffer
+            // — under ASan/LSan). Release the +1 reference immediately after
+            // the consuming call: the string has been fully read by
+            // guid_parse_str before bz_guid_parse returns (ok is 1/0), so the
+            // reference is dead from this point on, on both the success and
+            // the FormatException paths (the release runs before
+            // emitGuardThrow's branch). A non-producer argument (a string
+            // local/field/literal — a borrow, or an immortal rc=0 literal) is
+            // NOT released here: its real owner reclaims it, and releasing a
+            // borrow would be a double-free. Same shape as the #1881
+            // borrowing-collection-Add and #2204 Insert/indexer-set arg-temp
+            // disposal (isFreshOwnedClassProducer + emitDisposeAndReclaim),
+            // adapted to the runtime-managed string (emitStringRelease).
+            if (isPlusOneStringProducer(parseArg))
+                emitStringRelease(strVal);
             llvm::Value* failed =
                 builder_.CreateICmpEQ(ok, builder_.getInt32(0), "guid.parse.bad");
             emitGuardThrow(failed, "FormatException");  // §2.6 / §2.18, #2004
@@ -8501,6 +8532,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // Guid.TryParse(s: string, out result: Guid): bool
         if (m == "TryParse" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
+            const ast::Expr* parseArg = call.args[0].value.get();
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             llvm::Type* et = nullptr;
@@ -8510,6 +8542,16 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // use our own slot and copy.  Normally outAddr is already the right size.
             auto* fn = declareC("bz_guid_try_parse", i32(), {ptrTy(), ptrTy()});
             llvm::Value* ok = builder_.CreateCall(fn, {strVal, outAddr}, "guid.tryp.ok");
+            // fix #1998 / §28.3 "Unbound owned temporaries" / §4.6 / §28.9
+            // (v0.226): same producer-temp-consumed-only-by-a-borrow-parameter
+            // shape as Guid.Parse above — TryParse's `s: string` is a BORROW
+            // (bz_guid_try_parse only reads s->data; no `owned` on the
+            // parameter, stdlib §2.6), so a fresh +1 string producer argument
+            // (e.g. Guid.TryParse(g.ToString(), out r)) leaked before this
+            // release. The bool result is returned by value, so the call's end
+            // is the full-expression boundary for the argument (§28.3).
+            if (isPlusOneStringProducer(parseArg))
+                emitStringRelease(strVal);
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "guid.tryp.bool");
         }
         // per stdlib §2.6 / #1357: Guid.FromByteArray(bytes: Array<byte>): Guid
