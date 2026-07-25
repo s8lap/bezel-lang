@@ -2898,6 +2898,38 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
         // of `RefC.Some(local)` would resolve to the choice type `RefC`, not the
         // payload source `local`, so the arg must be recursed the same way
         // collectRecordBorrowRoots peels it. // per §9.7, §35.4
+        //
+        // §9.7 precision (#2150): only the args bound to BORROW-CARRYING
+        // positional fields can carry a borrow out of the frame — §9.7's "a
+        // borrow-bearing record value may not outlive the source of any borrow
+        // it CONTAINS" scopes the rule to the borrows actually stored in borrow-
+        // carrying fields. A value-typed positional field (int, enum, …) holds a
+        // VALUE, not a borrow, so rooting its argument via identifierRoot is
+        // wrong: `new Holder(p.AsSpan(), s.Count)` with `s` escape-bound would
+        // spuriously reject though only an int is stored in the int field. Pair
+        // each arg with decl->positionalFields and skip the non-borrow-carrying
+        // positions, exactly as isNullSourceRecordExpr (~2780) already does for
+        // the null-source ACCEPT recognizer. A builtin span view (typeIsSpan —
+        // no user Record decl, no positional fields) keeps the conservative
+        // every-arg check: we have no field info to gate on. // per §9.7
+        const ast::TypeDecl* recordDecl = nullptr;
+        common::RecordSubstEnv recordEnv;
+        const common::RecordSubstEnv* fieldEnv = nullptr;
+        std::function<bool(const sema::TypeRef*)> isBorrowCarryingField;
+        if (!typeIsSpan && rt->declaration) {
+            const auto* decl =
+                dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
+            if (decl && decl->kind == ast::TypeDeclKind::Record) {
+                recordDecl = decl;
+                common::seedRecordSubstEnv(*decl, *rt, /*incoming=*/nullptr,
+                                           recordEnv);
+                fieldEnv = recordEnv.map.empty() ? nullptr : &recordEnv;
+                isBorrowCarryingField = [&](const sema::TypeRef* ft) -> bool {
+                    std::unordered_set<const sema::TypeRef*> seen;
+                    return recordFieldIsBorrowCarrying(ft, seen, fieldEnv);
+                };
+            }
+        }
         std::function<bool(const ast::Expr&)> checkArg =
             [&](const ast::Expr& arg) -> bool {
             // A choice-case construction argument: recurse into its payload args.
@@ -2936,8 +2968,19 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
             }
             return false;
         };
-        for (const ast::CallArgument& a : ne->args) {
+        for (std::size_t i = 0; i < ne->args.size(); ++i) {
+            const ast::CallArgument& a = ne->args[i];
             if (!a.value) continue;
+            // §9.7 precision (#2150): skip a positional arg whose matched field
+            // is non-borrow-carrying — only borrows actually stored in borrow-
+            // carrying fields can escape (a value-typed field holds a value, not
+            // a borrow). A position without a matched positional field, or a
+            // builtin span (no recordDecl), stays conservative: rooted.
+            if (recordDecl && i < recordDecl->positionalFields.size()) {
+                const ast::Param& f = recordDecl->positionalFields[i];
+                if (f.type && !isBorrowCarryingField(ctx_.resolvedType(*f.type)))
+                    continue;
+            }
             if (checkArg(*a.value)) return;
         }
         return;
