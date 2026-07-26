@@ -7139,6 +7139,21 @@ void ExprTC::checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
         return;
     }
     if (!md || !ms->parent) return;
+    // §22.3 (#1756): pass the call's receiver as classTarget (and ms->parent as
+    // classParent) so checkArgsAgainstParams's ref/out exact-type check can run
+    // substituteMemberType on the parameter referent type. Without this, a
+    // non-generic method on a GENERIC class — e.g. `Coll<K>.Copy(ref r: [20]K)`
+    // called as `c.Copy(ref arr)` — leaves the referent type unresolved
+    // (`[20]K`) and the exact check false-rejects the matching `[20]int`
+    // argument. (Generic METHODS are skipped wholesale by the §22.3 guard in
+    // checkArgsAgainstParams; this substitution is what makes the
+    // non-generic-method-on-generic-class case check correctly. For a static
+    // call the receiver is a type name with no value exprType, but
+    // substituteMemberType's empty-genericParams early-out makes that a no-op
+    // for non-generic classes.)
+    const ast::Expr* recvTarget = nullptr;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+        recvTarget = ma->target.get();
     // §22.5 named-argument binding is now performed by checkArgsAgainstParams,
     // so a named-arg call is checked here too (no bail).
     // `ms` is the overload resolveMethodOverload selected for this call. Count
@@ -7159,12 +7174,14 @@ void ExprTC::checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
         if (!b.ok)
             checkArgsAgainstParams(md->params, ce.args, ce.span.begin,
                                    std::string("call to `") +
-                                   std::string(ms->name) + "`");
+                                   std::string(ms->name) + "`",
+                                   recvTarget, ms->parent, md);
         return;
     }
     checkArgsAgainstParams(md->params, ce.args, ce.span.begin,
                            std::string("call to `") +
-                           std::string(ms->name) + "`");
+                           std::string(ms->name) + "`",
+                           recvTarget, ms->parent, md);
 }
 
 // §2.2 / §2.5 / §2.6 step 3 (issue #328 inc 3): type-check a call to an imported
@@ -7276,7 +7293,8 @@ void ExprTC::checkArgsAgainstParams(
     const std::vector<ast::Param>& params,
     const std::vector<ast::CallArgument>& args, SourceLocation loc,
     const std::string& calleeDesc, const ast::Expr* classTarget,
-    TypeSymbol* classParent) {
+    TypeSymbol* classParent,
+    const ast::MethodDecl* calleeMethodDecl) {
     // per §22.5: bind arguments to parameters. The binding emits its own
     // arity / named-arg diagnostics; on failure there is no consistent
     // per-parameter mapping to type-check, so stop here.
@@ -7301,15 +7319,60 @@ void ExprTC::checkArgsAgainstParams(
         // `owned`/`scoped` transfer of a non-implementing class to an interface
         // parameter compiled clean and then dispatched through a null vtable →
         // runtime SEGV; the bare-argument counterpart was already correctly
-        // rejected here. The by-reference family (`ref`, `out`, `out var`,
-        // `out using var`, `out owned var`) binds by reference / declares an
-        // inline out-local and is type-matched by its own (exact-type /
-        // declaration) rules elsewhere — continue to skip those here.
+        // rejected here.
         const std::string_view am = a.modifier;
-        const bool refOutFamily =
-            am == "ref" || am == "out" || am == "out var" ||
-            am == "out using var" || am == "out owned var";
-        if (refOutFamily) continue;
+        // per §22.3 (#1756): a `ref`/`out` argument aliases the caller's
+        // storage location directly (§22.3 "ref and out argument locations"),
+        // so its type must EXACTLY match the parameter's referent type — no
+        // §5.1 implicit conversion is admitted, the same "aliases the caller's
+        // location, so no conversion is admitted" principle §14.5 states for
+        // the generic-inference case. This concrete (non-generic) position was
+        // previously folded into the by-reference-family skip and never
+        // type-checked at all, so a `ref y` of type `long` against a
+        // `ref x: int` parameter compiled clean and aliased mismatched-width
+        // storage through the parameter.
+        //
+        // This check is NON-GENERIC ONLY: substituteMemberType (below) resolves
+        // CLASS-level type params, not a generic method's OWN type params, so
+        // for `foo<T>(ref T x)` the parameter referent type stays the
+        // unresolved `T` and the exact-type comparison would compare the arg's
+        // concrete type against that unresolved `T` and false-reject. Generic
+        // ref/out is §14.5's domain — checkGenericRefOutExactUnification
+        // (#1686, run before this point) rejects the call when generic
+        // inference does not unify invariantly — so a BLANKET skip of every
+        // generic method here defers all generic ref/out to §14.5 and cannot
+        // double-report. (Constructors pass no MethodDecl; their class-level
+        // params are substituted, so the check fires for them.)
+        if (am == "ref" || am == "out") {
+            if (calleeMethodDecl && !calleeMethodDecl->genericParams.empty())
+                continue;
+            const ast::Param& rp = params[j];
+            if (!rp.type) continue;
+            TypeRef* rparamTy = ctx_.resolvedType(*rp.type);
+            if (rparamTy && classTarget && classParent)
+                rparamTy = substituteMemberType(rparamTy, classTarget,
+                                                classParent);
+            TypeRef* rargTy = ctx_.exprType(*a.value);
+            if (rparamTy && rargTy && !typeRefEqual(rargTy, rparamTy)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, a.value->span.begin,
+                    std::string("the `") + std::string(am) +
+                        "` argument for parameter `" + std::string(rp.name) +
+                        "` to " + calleeDesc +
+                        " does not match the parameter's referent type — "
+                        "a `ref`/`out` argument aliases the caller's "
+                        "location, so the type must match exactly and no "
+                        "implicit conversion is admitted (§22.3)");
+            }
+            continue;
+        }
+        // The inline-declaration family (`out var`, `out using var`,
+        // `out owned var`) declares a new local whose type is INFERRED FROM
+        // the parameter (§22.4), so it matches the referent type by
+        // construction — continue to skip those here.
+        if (am == "out var" || am == "out using var" ||
+            am == "out owned var")
+            continue;
         const ast::Param& p = params[j];
         if (!p.type) continue;
         TypeRef* paramTy = ctx_.resolvedType(*p.type);

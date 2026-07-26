@@ -1532,7 +1532,8 @@ private:
         const std::vector<ast::CallArgument>& args, SourceLocation loc,
         const std::string& calleeDesc,
         const ast::Expr* classTarget = nullptr,
-        TypeSymbol* classParent = nullptr);
+        TypeSymbol* classParent = nullptr,
+        const ast::MethodDecl* calleeMethodDecl = nullptr);
 
     // Slice T7: check `new T(args)` against T's sole constructor (if
     // any). Zero declared constructors → the implicit default ctor
