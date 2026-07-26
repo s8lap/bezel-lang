@@ -9,5 +9,5 @@
 
 module M; class C public static method Zap(ref u: string?) u := null; end Zap; public static method Run(): int var s: string? := "hi"; var f := lambda() => do Zap(ref s); end; if s <> null then f(); return s.Length; end; return -1; end Run; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: member access `.Length` on a nullable value requires narrowing it to non-null first
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: cannot narrow `T?` accessed through a mutably-captured local
 // CHECK-SAME: (§7.4)

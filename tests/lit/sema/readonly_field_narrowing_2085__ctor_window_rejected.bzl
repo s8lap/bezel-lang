@@ -7,5 +7,5 @@
 
 module M; class C public readonly _name: string?; public constructor(n: string?) _name := n; if _name <> null then var x := _name.Length; end; end constructor; destructor end destructor; public static method Main(): int using var c := new C("hi"); return 0; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: member access `.Length` on nullable field `_name` requires a local copy first
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: cannot narrow `T?` accessed through a field
 // CHECK-SAME: (§7.4)

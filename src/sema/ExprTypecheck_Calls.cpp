@@ -8971,18 +8971,36 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 TypeRef* dt = isSimpleVar ? declaredTypeOf(tsym) : nullptr;
                 bool declaredNullable = dt && dt->nullable;
                 if (isSimpleVar && declaredNullable && !isKnownNonNull(tsym)) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, ma.span.begin,
-                        std::string("member access `.") +
-                        std::string(ma.member) +
-                        "` on a nullable value requires narrowing it to "
-                        "non-null first (§7.4): guard with `if " +
-                        std::string(tid->name) +
-                        " <> null`, force-unwrap with `" +
-                        std::string(tid->name) +
-                        "!`, or use the null-conditional `" +
-                        std::string(tid->name) + "?." +
-                        std::string(ma.member) + "`");
+                    // §7.4 (v0.226, #2084): the simple-var gate fires for two
+                    // distinct reasons, and the remedy differs. A plain
+                    // local/parameter is narrowed by `if x <> null` (and the
+                    // `!` / `?.` forms). A MUTABLY-CAPTURED local (§7.4
+                    // v0.182, #1566) cannot be narrowed in place — any
+                    // control-transfer op between the test and the use could
+                    // invoke a closure that nulls it (the same invalidation
+                    // drop `invalidateCapturedNarrowings` performs), so the
+                    // `if x <> null` guard is not enough. Name the
+                    // branch-correct remedy: copy to an uncaptured local.
+                    if (mutablyCapturedNames_.count(tsym->name)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ma.span.begin,
+                            "cannot narrow `T?` accessed through a "
+                            "mutably-captured local (§""7.4): copy to an "
+                            "uncaptured local first");
+                    } else {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ma.span.begin,
+                            std::string("member access `.") +
+                            std::string(ma.member) +
+                            "` on a nullable value requires narrowing it to "
+                            "non-null first (§""7.4): guard with `if " +
+                            std::string(tid->name) +
+                            " <> null`, force-unwrap with `" +
+                            std::string(tid->name) +
+                            "!, or use the null-conditional `" +
+                            std::string(tid->name) + "?." +
+                            std::string(ma.member) + "`");
+                    }
                     return;
                 }
                 // per §7.4 (#862): a bare identifier resolving to a FIELD or
@@ -9013,17 +9031,15 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         auto key = readonlyFieldPathOf(ma.target.get(),
                                                        /*assignIds=*/false);
                         if (!(key && fieldNarrowed_.count(*key))) {
+                            // §7.4 (v0.226, #2084): name the branch-correct remedy
+                            // explicitly. A mutable field/property read cannot
+                            // be narrowed at the use site at all (TOCTOU
+                            // hazard); the field-copy idiom is the only fix.
                             ctx_.diagnostics().report(
                                 Severity::Error, ma.span.begin,
-                                std::string("member access `.") +
-                                std::string(ma.member) +
-                                "` on nullable field `" +
-                                std::string(tid->name) +
-                                "` requires a local copy first (§7.4): "
-                                "fields are not narrowable — copy to a local "
-                                "with `var tmp := " +
-                                std::string(tid->name) +
-                                "` and guard the local");
+                                "cannot narrow `T?` accessed through a field "
+                                "(it may be reassigned between reads) — "
+                                "copy to a local first (§""7.4)");
                             return;
                         }
                     }

@@ -102,7 +102,7 @@ BEZEL_TEST(positional_record_field_narrow_2189, mutable_field_still_rejected) {
         "  public method Len(): int "
         "    if _name <> null then return _name.Length; end; return 0; "
         "  end Len; end C;",
-        "requires a local copy first"));
+        "copy to a local first"));
 }
 
 // §7.4 / §22.10 (#2189) over-narrow guard: a CLASS primary-constructor
@@ -119,5 +119,5 @@ BEZEL_TEST(positional_record_field_narrow_2189, class_primary_ctor_param_rejecte
         "  public static method Main(): int "
         "    using var c := new C(\"hey\"); return c.Len(); "
         "  end Main; end C;",
-        "requires a local copy first"));
+        "copy to a local first"));
 }

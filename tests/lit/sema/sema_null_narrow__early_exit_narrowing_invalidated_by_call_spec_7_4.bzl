@@ -10,5 +10,5 @@
 
 module M; class C public static method Touch() end Touch; public static method Run(): int var s: string? := "hi"; var f := lambda() => do s := null; end; if s = null then return -1; end; Touch(); return s.Length; end Run; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: member access `.Length` on a nullable value requires narrowing it to non-null first
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: cannot narrow `T?` accessed through a mutably-captured local
 // CHECK-SAME: (§7.4)
