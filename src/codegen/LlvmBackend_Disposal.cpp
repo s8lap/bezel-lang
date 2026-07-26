@@ -209,6 +209,195 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
 }
 
 
+// §28.7 / §30.5 (#2173 / #1889): drop-on-overwrite / scope-end of an owned
+// Task-family FIELD. The full using-var task drop sequence MUST run on the
+// OLD task pointer at fieldAddr (load-old already done by the caller; the
+// slot also already null-guarded by the caller — for the field-store case,
+// the caller has stored the new value AND the new pointer is non-null yet
+// the OLD one is in `oldVal`; for the scope-end case, the caller has loaded
+// the field and confirmed it is non-null). The sequence is identical to
+// the using-var task disposal (the disposal sequence in this file's
+// emitDisposals -> if (it->task) block), EXTRACTED here so a single
+// maintenance burden covers both the field-store path (#2173) and the
+// scope-end path (#1889). Specifically:
+//
+//   1. Error-obj prelude (the §30.9 fault-ownership check): a faulted task
+//      owns its fault exception and disposes it exactly once at task
+//      disposal. We dispose the fault now (or defer if it is in flight per
+//      the #1288 / #1197 scope-end protocol), or skip unconditionally for
+//      a borrowed aggregate (§30.10 / #1529).
+//
+//   2. Per-T disposer attach (§30.5 / #1258 / #1503): for an OwningTask
+//      <T:class> field, the disposer thunk for T is attached via
+//      bz_task_set_result_disposer so an unconsumed Owned T result is freed
+//      whenever bz_task_free reclaims the task (whether synchronously now
+//      or later via fire-and-forget's completion continuation).
+//
+//   3. Fire-and-forget (§30.5 / §30.10): bz_task_fire_and_forget
+//      registers a continuation that calls bz_task_free when the task is
+//      done. In checked mode, bz_task_fire_and_forget_checked is used so
+//      an abandoned continuation touching disposed state raises
+//      DisposedAccessException (instead of UAF).
+//
+// `target` is the field expression (used to look up the field symbol and
+// hence the declared Task/Task<T>/OwningTask<T> type); for the field-store
+// case the original `target` is passed in by lowerOwnedTaskFieldStore, for
+// the scope-end case the field's expression is reconstructed from the
+// FieldSymbol pointer (its `identifier` is on the field itself).
+//
+// `fieldAddr` is the slot address (struct field GEP); `oldVal` is the
+// already-loaded task pointer at that slot. The helper does NOT null the
+// slot — the scope-end caller nulls the slot after the call (the re-
+// entrant auto-dispose guard mirrors the subscriptionField / eventSource-
+// Field pattern lower in this file); the field-store caller has already
+// stored the new value BEFORE this call (the store-new-FIRST ordering
+// rationale in lowerOwnedTaskFieldStore's comment).
+void Emitter::emitOwnedTaskDisposal(const sema::FieldSymbol* fs,
+                                    llvm::Value* oldVal) {
+    if (!oldVal) return;
+    if (oldVal == llvm::ConstantPointerNull::get(ptrTy())) return;
+    // Per §30.15 a Channel<T>.Receive() task uses bz_channel_receive_abandon
+    // instead. A plain field typed Task<T> / OwningTask<T> cannot
+    // syntactically be a Channel<T>.Receive() call (the field's type is the
+    // task type, not a call), so the receive-abandon branch is unreachable
+    // here. Defensive note: a `using var` assigned `Channel<T>.Receive()`
+    // gets a *local* not a field, so emitOwnedTaskDisposal is never called
+    // for it.
+    //
+    // §30.9 fault ownership (v0.179): a faulted task OWNS its fault
+    // exception and disposes it exactly once at task disposal. The task
+    // struct is freed by bz_task_free / fire-and-forget but NOT the Bezel
+    // exception object; only Bezel codegen can run its destructor. Three
+    // paths:
+    //   • BORROWED aggregate (§30.10 / #1529): a WhenAll/WhenAll<T>
+    //     aggregate never owns its error_obj — skip unconditionally.
+    //   • NOT in flight (not borrowed): dispose the exception now.
+    //   • IN FLIGHT (borrowed by an awaiter mid-dispatch): defer disposal
+    //     to the catch arm's terminal act (#1288 / #1197).
+    // (A still-running async task is not yet errored here → skipped; a
+    // non-faulted task has a null error_obj → skipped. bz_task_free below
+    // ignores error_obj, so the now-dangling task->error_obj is never read.)
+    {
+        auto* isErrFn = declareC("bz_task_is_error", i1(), {ptrTy()});
+        llvm::Value* err = builder_.CreateCall(isErrFn, {oldVal}, "otask.err");
+        auto* edBB = llvm::BasicBlock::Create(llvm_, "otask.errdisp",
+                                              currentFn_);
+        auto* eaBB = llvm::BasicBlock::Create(llvm_, "otask.errcont",
+                                              currentFn_);
+        builder_.CreateCondBr(err, edBB, eaBB);
+        builder_.SetInsertPoint(edBB);
+        auto* fbFn = declareC("bz_task_fault_borrowed",
+                              llvm::Type::getInt8Ty(llvm_), {ptrTy()});
+        llvm::Value* fb = builder_.CreateCall(fbFn, {oldVal}, "otask.faultborrowed");
+        llvm::Value* isFB = builder_.CreateICmpNE(
+            fb, llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
+        auto* borrowedAggBB = llvm::BasicBlock::Create(
+            llvm_, "otask.eo.aggborrowed", currentFn_);
+        auto* checkBB = llvm::BasicBlock::Create(llvm_, "otask.eo.check",
+                                                 currentFn_);
+        builder_.CreateCondBr(isFB, borrowedAggBB, checkBB);
+        builder_.SetInsertPoint(borrowedAggBB);
+        builder_.CreateBr(eaBB);
+        builder_.SetInsertPoint(checkBB);
+        auto* eoFn = declareC("bz_task_error_obj", ptrTy(), {ptrTy()});
+        llvm::Value* eo = builder_.CreateCall(eoFn, {oldVal}, "otask.errobj");
+        llvm::Value* eoNull = builder_.CreateICmpEQ(
+            eo, llvm::ConstantPointerNull::get(ptrTy()));
+        auto* doBB = llvm::BasicBlock::Create(llvm_, "otask.eodisp",
+                                              currentFn_);
+        builder_.CreateCondBr(eoNull, eaBB, doBB);
+        builder_.SetInsertPoint(doBB);
+        auto* isBorrowedFn = declareC("bz_is_exc_borrowed",
+                                      llvm::Type::getInt8Ty(llvm_), {ptrTy()});
+        llvm::Value* bv = builder_.CreateCall(isBorrowedFn, {eo},
+                                              "otask.eo.borrowed");
+        llvm::Value* isB = builder_.CreateICmpNE(
+            bv, llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
+        auto* deferBB = llvm::BasicBlock::Create(llvm_, "otask.eo.defer",
+                                                 currentFn_);
+        auto* dispBB  = llvm::BasicBlock::Create(llvm_, "otask.eo.dispnow",
+                                                 currentFn_);
+        builder_.CreateCondBr(isB, deferBB, dispBB);
+        builder_.SetInsertPoint(deferBB);
+        auto* deferFn = declareC("bz_defer_exc_dispose",
+                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(deferFn, {eo});
+        builder_.CreateBr(eaBB);
+        builder_.SetInsertPoint(dispBB);
+        emitDisposeAndReclaim(eo);
+        builder_.CreateBr(eaBB);
+        builder_.SetInsertPoint(eaBB);
+    }
+    // §30.5 / #1258 / #1503: attach the per-T disposer for the
+    // produced-but-unconsumed owned class result of an OwningTask<T:class>
+    // field BEFORE the task is reclaimed below. Detected by the field's
+    // declared type via taskFamilyTypeFromField — mirrors the using-var
+    // path's taskOwnedResultDisposer field, which is set at registration
+    // time from the local's initializer type. For a Task<T> / Task / value-
+    // result OwningTask<T>, the disposer is null and the conditional
+    // set_result_disposer call is skipped.
+    llvm::Value* taskOwnedResultDisposer = nullptr;
+    if (fs) {
+        if (const sema::TypeRef* taskTy = taskFamilyTypeFromField(fs)) {
+            auto taskName = [](const sema::TypeRef* rt) -> std::string_view {
+                if (!rt) return {};
+                if (!rt->declaration) {
+                    if (rt->astNode && rt->astNode->name &&
+                        !rt->astNode->name->parts.empty())
+                        return rt->headName();
+                } else if (!rt->declaration->decl) {
+                    return rt->declaration->name;
+                }
+                return {};
+            };
+            if (taskName(taskTy) == "OwningTask" &&
+                !taskTy->genericArgs.empty() &&
+                taskTy->genericArgs[0] &&
+                taskTy->genericArgs[0]->kind == sema::TypeRef::Kind::Named &&
+                taskTy->genericArgs[0]->declaration &&
+                (taskTy->genericArgs[0]->declaration->kind ==
+                     ast::TypeDeclKind::Class ||
+                 taskTy->genericArgs[0]->declaration->kind ==
+                     ast::TypeDeclKind::Interface)) {
+                llvm::Function* thunk =
+                    elementPolicyFor(taskTy->genericArgs[0],
+                                     /*owningFamily=*/true).disposerThunk;
+                if (thunk) {
+                    taskOwnedResultDisposer =
+                        llvm::cast<llvm::Value>(thunk);
+                }
+            }
+        }
+    }
+    if (taskOwnedResultDisposer) {
+        auto* setDispFn = declareC("bz_task_set_result_disposer",
+                                   llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), ptrTy()});
+        builder_.CreateCall(setDispFn, {oldVal, taskOwnedResultDisposer});
+    }
+    // §30.10 (v0.179 / #1520): in checked disposal mode, route this
+    // abandonment through bz_task_fire_and_forget_checked instead of the
+    // plain entry point. See the using-var task disposal for the full
+    // rationale (a still-running task's continuation may resume past
+    // this point and touch state this scope's OTHER disposals just tore
+    // down, and DisposedAccessException is the §30.10 source-outlives-
+    // settlement diagnostic).
+    if (checkedDisposal_) {
+        llvm::Value* daVt = llvm::ConstantPointerNull::get(ptrTy());
+        { auto vit = builtinVtable_.find("DisposedAccessException");
+          if (vit != builtinVtable_.end()) daVt = vit->second; }
+        auto* fn = declareC("bz_task_fire_and_forget_checked",
+                            llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {oldVal, daVt});
+    } else {
+        auto* fn = declareC("bz_task_fire_and_forget",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(fn, {oldVal});
+    }
+}
+
+
 void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
     // Each owned field carries either a class/interface object (disposed via
     // its vtable) or — #362 / stdlib §4.5 — a heap collection (freed via
@@ -237,6 +426,15 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         // field — a bz_event_source_t* freed via bz_event_source_free (null-safe),
         // which reclaims the subscriber list and the struct. No vtable.
         bool eventSourceField = false;
+        // §28.6 / §30.5 (#1889): true for an owned Task / Task<T> / OwningTask<T>
+        // field — their Dispose() runs the full using-var task protocol via
+        // emitOwnedTaskDisposal (error_obj prelude + per-T result_disposer +
+        // bz_task_fire_and_forget[_checked]), the field analog of the using-var
+        // task drop. isOwnedReferenceField rejects Task-family (they have no user
+        // TypeDecl / no vtable), so a separate branch is needed. Mirrors the
+        // iterField / eventSourceField / sharedField / weakField / subscription
+        // companions for the other builtin-handle owned-field families.
+        bool taskField = false;
     };
     std::vector<OwnedField> owned;
     for (const sema::Symbol* m : ts->members) {
@@ -278,6 +476,20 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // (null-safe), which reclaims the subscriber list + struct.
             OwnedField of{fs, nullptr};
             of.eventSourceField = true;
+            owned.push_back(of);
+        } else if (taskFamilyTypeFromField(fs)) {
+            // §28.6 / §30.5 (#1889): an `owned` Task / Task<T> / OwningTask<T>
+            // FIELD. isOwnedReferenceField returns false for Task-family (they
+            // have no user TypeDecl / no vtable, and the isTaskTypeName check
+            // is what excludes them), so a separate branch is needed — the
+            // sibling branches above (subscriptionField, iterField,
+            // eventSourceField, sharedField, weakField) follow the same shape
+            // for their respective builtin-handle types. The dispose sequence
+            // (error_obj prelude + per-T result_disposer + fire-and-forget
+            // [_checked]) is the using-var task disposal protocol, dispatched
+            // in the iteration loop below via emitOwnedTaskDisposal.
+            OwnedField of{fs, nullptr};
+            of.taskField = true;
             owned.push_back(of);
         } else {
             // §28.13 / stdlib §2.16 (#620): an `owned` field of Shared<T> or
@@ -429,6 +641,33 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
             builder_.CreateBr(iterContBB);
             builder_.SetInsertPoint(iterContBB);
+            continue;
+        }
+        // §28.6 / §30.5 (#1889): an owned Task / Task<T> / OwningTask<T>
+        // FIELD. The full using-var task protocol runs (error_obj prelude,
+        // per-T result_disposer attach, bz_task_fire_and_forget[_checked])
+        // via emitOwnedTaskDisposal — the field analog of the using-var task
+        // drop. Mirrors the iterField branch above (null-guard + null-after
+        // so a re-entrant / second pass is a no-op, per the #396 slot-null
+        // precedent). The field-store path at #2173 shares the same helper
+        // (lowerOwnedTaskFieldStore calls emitOwnedTaskDisposal too).
+        if (it->taskField) {
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                val, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* taskDispBB = llvm::BasicBlock::Create(
+                llvm_, "owned.task.dispose", currentFn_);
+            auto* taskContBB = llvm::BasicBlock::Create(
+                llvm_, "owned.task.cont", currentFn_);
+            builder_.CreateCondBr(isNull, taskContBB, taskDispBB);
+            builder_.SetInsertPoint(taskDispBB);
+            emitOwnedTaskDisposal(it->fs, val);
+            // Null the slot AFTER the disposal so a re-entrant / second
+            // pass is a no-op (the #396 slot-null precedent; mirrors
+            // iterField / eventSourceField / sharedField / weakField
+            // / subscriptionField below).
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+            builder_.CreateBr(taskContBB);
+            builder_.SetInsertPoint(taskContBB);
             continue;
         }
         llvm::Value* isNull = builder_.CreateICmpEQ(
