@@ -5817,12 +5817,24 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     // access (`this.seq` / `obj.seq`) to the underlying binding symbol, so a
     // field/property source (whether spelled bare or `this.`-qualified) is
     // correctly recognized and NOT double-freed against the field cascade.
+    // #1840 / §29.2 / §28.5: a NAMED source — a local/param/field/auto-property —
+    // is disposed at its own lifetime end, NEVER by the for-in. A COMPUTED
+    // property getter (`public property P: T => expr;`) is invoked at the
+    // call site and its result is a fresh value (owned when T is owning),
+    // exactly like a method call — the for-in BORROWS nothing and must dispose
+    // the produced source frame once at loop end. Classify via isAutoProperty
+    // (an auto-property backed by a compiler-generated field is the OWNED
+    // NAMED case; every other property — expression-body, block-body,
+    // expression-bodied `=>` — is the COMPUTED, fresh-value case).
     bool sourceIsNamedLocal = false;
     if (sema::Symbol* sym = ctx_.exprSymbol(*fs.iterable)) {
-        sourceIsNamedLocal = dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
-                             dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr ||
-                             dynamic_cast<sema::FieldSymbol*>(sym) != nullptr ||
-                             dynamic_cast<sema::PropertySymbol*>(sym) != nullptr;
+        if (dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
+            dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr ||
+            dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
+            sourceIsNamedLocal = true;
+        } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
+            sourceIsNamedLocal = sema::isAutoPropertySymbol(ps);
+        }
     }
     if (!sourceIsNamedLocal) {
         Disposal ds{srcSlot, nullptr};
