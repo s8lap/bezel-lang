@@ -447,8 +447,53 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             // the discharge error (auto-drop for them is a separate piece). The
             // synchronous-body auto-drop below uses the same everDischarged == 0
             // never-moved invariant as the sync-iterator-param case above.
+            // §28.3 (#1900): the `everDischarged_ == 0` gate is RELAXED for a
+            // local whose slot definitely holds a fresh value — a reassign
+            // AFTER the most recent discharge (the consume-and-restore idiom
+            // `s.Take(owned x); x := new Res();`, or the reset-a-resource
+            // idiom `x.Dispose(); x := new Res();`). endState.Owned at this
+            // point guarantees the restore happened on every path reaching
+            // scope end (the dataflow joins would otherwise have shown
+            // maybe-consumed), so auto-drop is exactly-once-safe. We never
+            // ERASE everDischarged_ — the monotone set still gates the
+            // conditional-discharge double-free the original gate was
+            // designed to catch.
+            // never-moved invariant as the sync-iterator-param case above.
+            // §28.3 (#1883, #1900): the `everDischarged_ == 0` gate is REMOVED
+            // — the `!st.maybeConsumed` outer conjunct is the precise filter.
+            // The two maybe-consumed-free cases the gate used to deny are
+            // exactly the cases the per-path auto-drop the spec mandates:
+            //
+            //   * §28.3 (#1900): a slot restored AFTER the most recent
+            //     discharge (the consume-and-restore idiom `s.Take(owned x);
+            //     x := new Res();`, or the reset-a-resource idiom `x.Dispose();
+            //     x := new Res();`). endState.Owned here guarantees the
+            //     restore happened on every path reaching scope end (the
+            //     dataflow joins would otherwise have shown maybe-consumed).
+            //
+            //   * §28.3 (#1883): an Owned ⊓ Disposed join where the local
+            //     was DISPOSED on one branch and not the other (no
+            //     post-join read/borrow/consume). joinInto keeps the join
+            //     at Owned without a maybeConsumed marker (per #1626's
+            //     Disposed-half rework — the marker is the MOVE / transfer-
+            //     out danger only). Dispose nulls the slot (#415,
+            //     LlvmBackend_Calls.cpp's explicit-Dispose lowering), so
+            //     the auto-drop is null-safe: the null-guard at scope end
+            //     skips the disposed-on-this-path branch and disposes only
+            //     the still-owned branch.
+            //
+            // The MOVED-FROM split (Owned ⊓ MovedFrom) sets maybeConsumed
+            // (joinInto, #1626) and stays rejected by `!st.maybeConsumed` —
+            // the moved-from value is a dangling reference on the moved
+            // path and auto-disposing would double-free. The arm-transfer
+            // partial-consume case (Owned + maybeConsumed) likewise stays
+            // rejected. everDischarged_ stays MONOTONE so the conditional-
+            // discharge double-free the original gate was designed to
+            // catch is still gated for the MOVED-FROM half — we just
+            // removed the cross-check on the DISPOSED half which was an
+            // over-rejection.
             if (!isAsync_ && !sawYield_ && !isDestructor_ &&
-                everDischarged_.count(sym) == 0 &&
+                !st.maybeConsumed &&
                 (reassignedLocals.count(sym) == 0 ||
                  reassignedDropCovered_.count(sym) != 0)) {
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
@@ -571,7 +616,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             // that leaks the whole frame and is a pre-existing gap shared by every
             // suspend-local kind, not one D2 closes from here. // per §30.5, §28.12, §28.3 (v0.190)
             if (isAsync_ && !sawYield_ && !isDestructor_ &&
-                everDischarged_.count(sym) == 0 &&
+                !st.maybeConsumed &&
                 (reassignedLocals.count(sym) == 0 ||
                  reassignedDropCovered_.count(sym) != 0)) {
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
@@ -716,7 +761,19 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // via their own machinery; routing them here would double-dispose).
     if (!isAsync_ && !sawYield_ && !isDestructor_) {
         for (sema::Symbol* sym : everOwnedPlainLocals_) {
-            if (everDischarged_.count(sym) != 0) continue;
+            // §28.3 (#1883, #1900): the nested-scope mirror of the function-
+            // exit gate — the `!st.maybeConsumed` filter the function-exit
+            // gate relies on isn't computed here (this loop iterates
+            // everOwnedPlainLocals_ over a SYNTACTIC scope-end, not the
+            // dataflow endState), so keep the monotone everDischarged_ ==
+            // 0 / definite-restore check here. The ownedDischargedSplit
+            // detection the joinInto fix enables is only needed at the
+            // function-exit gate; nested-scope owned locals are not
+            // collected into the conditional-discharge state machine the
+            // same way (their scope-bound disposal is the same `using var`
+            // path the auto-drop already emits here).
+            if (everDischarged_.count(sym) != 0 &&
+                definitelyRestoredLocals_.count(sym) == 0) continue;
             if (reassignedLocals.count(sym) != 0 &&
                 reassignedDropCovered_.count(sym) == 0) continue;
             auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
@@ -4306,7 +4363,30 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // value (owned or borrowed per the RHS producer). Clear it so a
             // later use of the reassigned local is not spuriously rejected.
             st.maybeConsumed = false;
+            // §28.3 (#1883): mirror of the maybeConsumed clear above — a
+            // reassignment clears the conditional-discharge (Owned ⊓ Disposed
+            // join) marker too, for the same reason: the local now holds a
+            // definite fresh value, not the conditionally-disposed one.
+            st.disposedOnSomePath = false;
             st.awaitSpent = false;  // #1869: fresh value — not an await-spend
+            // §28.3 (#1900): a reassignment of an owned-value slot restores
+            // the slot's "definitely holds a fresh value" status, which the
+            // scope-end auto-drop gate uses (alongside `everDischarged_ == 0`)
+            // to recognize the consume-and-restore idiom
+            // (`s.Take(owned x); x := new Res();`) and the reset-a-resource
+            // idiom (`x.Dispose(); x := new Res();`). Only an Owned-state RHS
+            // counts — a borrow reassign leaves the local Borrowed (no scope-
+            // end disposal obligation, the auto-drop loop won't visit it).
+            // The set is REMOVED-from on every discharge in markMovedByName /
+            // markDisposedByName, so a subsequent `x.Dispose()` after the
+            // restore correctly re-poisons the local for the gate. The
+            // conditional-vs-unconditional qualifier is supplied by the
+            // dataflow itself: endState.Owned AND definitelyRestored is the
+            // (unconditional-restore-on-every-path) gate the auto-drop
+            // applies — a conditional-only reassign leaves endState at
+            // maybe-consumed and the gate doesn't fire.
+            if (st.state == OwnershipState::Owned)
+                definitelyRestoredLocals_.insert(sym);
             // §28.7 / §28.3 (#1625): flag a null-INITIALIZED plain local
             // (`var x: T? := null;`, PolyNull) the first time it ADOPTS Owned
             // state from a non-null RHS, so codegen treats it as an owned class

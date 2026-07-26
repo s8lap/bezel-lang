@@ -144,6 +144,22 @@ struct LocalOwnership {
     // (branch merges only — loop back-edges keep the plain-Owned/suspend-local
     // handling unchanged). // per §30.5, Appendix C.6, §28.3
     bool awaitSpent = false;
+
+    // §28.3 (#1883): set on the Owned record resulting from an Owned ⊓
+    // Disposed join (the post-#1626 rework Disposed-half behavior). Distinct
+    // from `maybeConsumed` (which is the MOVED-FROM split's use-after-free
+    // danger): the Disposed split is BENIGN for an explicit Dispose — §28.2
+    // idempotence — but a READ after the join would operate on a disposed
+    // object on the disposed-branch path (use-after-dispose, §28.2). The
+    // markDisposedByName carve-out (#601: "a further Dispose() call remains
+    // a no-op, not an error, in both modes") keeps the post-join Dispose
+    // accepted, so this flag is consulted by checkRead / markMovedByName
+    // only — NOT by markDisposedByName (which would otherwise over-reject
+    // #601's one-branch discharge pattern). joinInto sets it on the
+    // surviving Owned record (reassignment clears it via handleAssignment,
+    // exactly like maybeConsumed — the local is then definitely owned again).
+    // // per §28.3, §28.2
+    bool disposedOnSomePath = false;
 };
 
 // Spelled state for diagnostics + tests.

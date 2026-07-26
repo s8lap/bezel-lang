@@ -357,6 +357,22 @@ private:
     // out, so auto-disposing would risk a double-free). Monotone (grows only), so
     // it is fixpoint-safe across the dataflow's block re-evaluations.
     std::unordered_set<sema::Symbol*> everDischarged_;
+    // §28.3 (#1900): locals whose slot DEFINITELY holds a fresh value at the
+    // current program point — i.e. the LAST state-changing operation on the local
+    // was an UNCONDITIONAL reassignment (`x := new T()` at straight-line scope,
+    // not inside a conditional branch). Tracks the consume-and-restore idiom
+    // (`s.Take(owned x); x := new Res();`) and the reset-a-resource idiom
+    // (`x.Dispose(); x := new Res();`), where the slot is provably fresh on every
+    // path reaching scope end despite everDischarged_ being set. A discharge
+    // (markMovedByName / markDisposedByName) REMOVES the symbol from the set so
+    // a subsequent conditional discharge cannot silently re-poison the local.
+    // Used as an additional accept clause in the scope-end auto-drop gate
+    // alongside `everDischarged_ == 0` — never as a REPLACEMENT, so the monotone
+    // everDischarged_ still protects the conditional-discharge double-free the
+    // original gate was designed to catch. NOT monotone: grows on reassign and
+    // shrinks on discharge (it represents a current-point fact, not a
+    // path-history).
+    std::unordered_set<sema::Symbol*> definitelyRestoredLocals_;
     // §28.3 (#1257): every plain (non-`using`) `var` local that a LocalDecl
     // transfer classified as Owned at its declaration. Recorded so the end-of-
     // method auto-drop can flag a nested-scope owned local that is NOT present in

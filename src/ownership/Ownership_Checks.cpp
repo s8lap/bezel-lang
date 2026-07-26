@@ -1306,6 +1306,37 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
             st->state = OwnershipState::Poisoned;
             return;
         }
+        // §28.3 (#1883): the OWNED ⊓ DISPOSED join — one branch disposed
+        // (or discarded) `x`, the other left it Owned. The join record
+        // stays Owned (post-#1626 v2 rework — maybeConsumed is the
+        // MOVED-FROM-split use-after-free marker, NOT the Disposed-split
+        // use-after-dispose marker) and the scope-end auto-drop applies
+        // per-path (the spec's "scope-end auto-drop applies per-path,
+        // disposal runs only on the still-owned path"). But a USE
+        // between the join and the scope end reads the slot on the
+        // disposed-branch path — use-after-dispose, §28.2 — which the
+        // maybeConsumed flag is silent on. Diagnose here at the use
+        // site (the spec's "diagnostics should point at the offending
+        // use, not the declaration" rule), separately from the
+        // MovedFrom split. The `markDisposedByName` path is INTENTIONALLY
+        // exempt — §28.2's idempotent-Dispose guarantee / #601's
+        // one-branch discharge pattern means a post-join `.Dispose()`
+        // is the proper discharge on the still-owned path and a no-op
+        // on the disposed path, and rejecting it would over-reject that
+        // valid program. // per §28.3, §28.2
+        if (st->disposedOnSomePath &&
+            st->state == OwnershipState::Owned) {
+            report(
+                Severity::Error, id->span.begin,
+                std::string("local `") + std::string(id->name) +
+                "` may have already been disposed on another branch and "
+                "may not be read here (conditional-discharge join, §28.3 "
+                "/ §28.2 — confine every read of `" +
+                std::string(id->name) + "` to a single branch, or "
+                "reassign it after the discharge to clear the obligation)");
+            st->state = OwnershipState::Poisoned;
+            return;
+        }
         if (st->state == OwnershipState::MovedFrom) {
             report(
                 Severity::Error, id->span.begin,
@@ -4972,6 +5003,28 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
                 (dischargedState == OwnershipState::Disposed &&
                  dischargedAwaitSpent && !unionKeys))
                 st.maybeConsumed = true;
+            // §28.3 (#1883): the OWNED ⊓ DISPOSED split (the
+            // non-await-spend Disposed case) sets `disposedOnSomePath`
+            // — a separate flag from `maybeConsumed` that distinguishes
+            // this split's use-after-dispose danger (reads are unsound
+            // on the disposed-branch path) from the MovedFrom split's
+            // use-after-free danger. The carve-out for explicit Dispose
+            // (§28.2 idempotence / #601's one-branch discharge pattern)
+            // is enforced by NOT consulting this flag in
+            // markDisposedByName — only checkRead and markMovedByName
+            // consult it, so the post-join `.Dispose()` is the proper
+            // discharge on the still-owned path (and a no-op on the
+            // disposed path) and is NOT rejected. A read at this point
+            // would observe a disposed object on the disposed branch
+            // (use-after-dispose, §28.2) — diagnose at the offending
+            // use site per the spec's "diagnostics should point at the
+            // offending use, not the declaration" rule. joinInto
+            // preserves the existing maybeConsumed=false for this
+            // split (the #1626 v2 rework) — the new flag is
+            // additive on the Owned record, not a replacement.
+            if (dischargedState == OwnershipState::Disposed &&
+                !dischargedAwaitSpent)
+                st.disposedOnSomePath = true;
             continue;
         }
         // Other mismatches (e.g. Uninitialized on one side at a non-loop
@@ -5070,12 +5123,21 @@ void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation l
     // must stay benign (#601). Clear any stale await-spend marker so this
     // Disposed is not upgraded to maybe-consumed at a later branch join.
     st->awaitSpent = false;
+    // §28.3 (#1883): clear the conditional-discharge join flag too — once
+    // the local is definitively Disposed, the flag is no longer relevant
+    // (checkRead / markMovedByName only consult it on the Owned state).
+    st->disposedOnSomePath = false;
     st->explicitlyDisposed = true;
     st->explicitDisposeLoc = loc;
     // §29.8 (#945): record the discharge so the iterator owned-param auto-dispose
     // check skips a parameter the body explicitly disposes on some path.
     for (auto& [s, stt] : states_)
         if (s->name == name) { everDischarged_.insert(s); break; }
+    // §28.3 (#1900): any subsequent dispose/move on a previously-restored local
+    // re-poisons it — `x := new R(); x.Dispose();` leaves the slot disposed, so
+    // the next endState-Owned check must NOT auto-drop the slot.
+    for (auto& [s, stt] : states_)
+        if (s->name == name) { definitelyRestoredLocals_.erase(s); break; }
 }
 
 // -------------------------------------------------------------------------
@@ -5708,6 +5770,10 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
     // check skips a parameter the body moves out on some path.
     for (auto& [s, stt] : states_)
         if (s->name == name) { everDischarged_.insert(s); break; }
+    // §28.3 (#1900): a move after a restore re-poisons — see the matching
+    // comment in markDisposedByName above.
+    for (auto& [s, stt] : states_)
+        if (s->name == name) { definitelyRestoredLocals_.erase(s); break; }
 }
 
 // §22.3 (v0.169, #1348): see the header. A named owned binding is exactly the
@@ -12859,6 +12925,8 @@ void MethodOwnership::handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt)
     // one's slot — the F4 nondeterminism).
     st->state = OwnershipState::MovedFrom;
     everDischarged_.insert(sym);
+    // §28.3 (#1900): a move-transfer re-poisons a previously-restored local.
+    definitelyRestoredLocals_.erase(sym);
     armTransferConsumed_.push_back(sym);
 }
 
@@ -12950,6 +13018,9 @@ void MethodOwnership::processMarkedArmConstruct(const ast::Expr& e) {
         // The consumes were recorded on per-arm states that were restored;
         // re-record the outer bookkeeping (monotone).
         everDischarged_.insert(sym);
+        // §28.3 (#1900): arm-transfer-consumed re-poisons a previously-
+        // restored local, mirroring markMovedByName.
+        definitelyRestoredLocals_.erase(sym);
         if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
             if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl))
                 const_cast<ast::LocalDecl*>(ld)->dischargedByArmTransfer =
