@@ -181,3 +181,75 @@ BEZEL_TEST(fresh_owned_receiver_1859, bound_receiver_unaffected_no_double_free_2
         "end P;";
     BEZEL_EXPECT_EQ(run(src), 11);
 }
+
+// ===========================================================================
+// fix #2205 / §28.3 — OWNING-COLLECTION / OWNING-WRAPPER RESULT (the
+// decl-null builtin leg). #1859's gate extension admitted a class/interface
+// result under an announced `owned` return; the same K1.5/K3.13 reasoning
+// applies to an owning-collection return (`OwningArray<T>`, `OwningDictionary
+// <K,V>`, `OwningLinkedList<T>`) and to the owning-wrapper builtin heads
+// (Shared, Weak, …) — but those producer kinds have `resultTy->declaration
+// == nullptr` (builtin, decl-null), so the class/interface `td` branch never
+// matches. Extends the gate with the name-head membership test (common:
+// :isOwningCollectionHead / isOwningTypeHead, common/BuiltinRegistry.hpp) so
+// the receiver-temp-disposal logic recognizes the announced-owned fresh-
+// transfer shape regardless of whether the result is a user-declared class
+// or a decl-null builtin.
+//
+// This test mirrors the issue's own repro: `new Mk().Make()` where Make()
+// returns `owned OwningArray<Res>`. The collection + its elements are
+// correctly freed by the #1909 discard fix; the REGRESSOR is the receiver
+// temp's own block (16 bytes). FAIL-WITHOUT: R._n=1 (collection + element
+// freed by #1909) AND LSan flag on the receiver (16B). PASS-WITH: R._n=1
+// + no LSan flag (receiver reclaimed too).
+// ===========================================================================
+BEZEL_TEST(fresh_owned_receiver_2205, owning_collection_result_receiver_disposed_28_3) {
+    const std::string src =
+        "module M; "
+        "class Res "
+        "  public static _n: int := 0; "
+        "  public Id: int; "
+        "  public constructor(id: int) Id := id; end constructor; "
+        "  destructor _n := _n + 1; end destructor; "
+        "end Res; "
+        "class Mk "                                        // destructorless
+        "  public method Make(): owned OwningArray<Res> "
+        "    var a := new OwningArray<Res>(); "
+        "    a.Add(new Res(1)); "
+        "    return a; "
+        "  end Make; "
+        "end Mk; "
+        "class P "
+        "  public static method Main(): int "
+        "    do _ := new Mk().Make(); end; "   // discards the collection (#1909)
+        "    return Res._n; "                 // 1: one Res disposed via cascade
+        "  end Main; "
+        "end P;";
+    BEZEL_EXPECT_EQ(run(src), 1);  // LSan leg (runAotChecked) proves Mk's block freed
+}
+
+// OwningDictionary<K,V> result (an owning-collection head) — the same gate
+// extension, validating the head-membership test fires for the dictionary
+// head too (not just OwningArray).
+BEZEL_TEST(fresh_owned_receiver_2205, owning_dictionary_result_receiver_disposed_28_3) {
+    const std::string src =
+        "module M; "
+        "class R "
+        "  public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; "
+        "end R; "
+        "class Mk "
+        "  public method Make(): owned OwningDictionary<int, R> "
+        "    var d := new OwningDictionary<int, R>(); "
+        "    d.Add(1, new R()); "
+        "    return d; "
+        "  end Make; "
+        "end Mk; "
+        "class P "
+        "  public static method Main(): int "
+        "    do _ := new Mk().Make(); end; "
+        "    return R._n; "                 // 1
+        "  end Main; "
+        "end P;";
+    BEZEL_EXPECT_EQ(run(src), 1);
+}

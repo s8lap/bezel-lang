@@ -1439,6 +1439,24 @@ void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
                  calleeReturnsOwned) {
             valueResult = true;
         }
+    } else if (resultTy->kind == sema::TypeRef::Kind::Named &&
+               !resultTy->declaration && calleeReturnsOwned) {
+        // fix #2205 / §28.3: an owning-collection / owning-wrapper result
+        // (decl-null builtin, e.g. OwningArray<T>, OwningDictionary<K,V>,
+        // OwningList<T>, Shared<T>, …) under an ANNOUNCED `owned` return is
+        // likewise a FRESH transfer, not a borrow of the receiver — same
+        // K1.5/K3.13 reasoning as #1859's class/interface case, just
+        // expressed through the name-head instead of an AST TypeDecl (the
+        // owning types are decl-null in the type system). The ordinary
+        // (unmarked) instance-method-return row of an owning return is
+        // itself an owned producer per §28.3's producer table, and the
+        // receiver was ALREADY due for disposal at the end of the full
+        // expression per §28.3's unbound-temporary rule.
+        std::string_view head = resultTy->headName();
+        if (common::isOwningCollectionHead(head) ||
+            common::isOwningTypeHead(head)) {
+            valueResult = true;
+        }
     }
     if (!valueResult) return;
     // Dispose (idempotent vtable Dispose + reclaim exactly once). A fresh `new`
