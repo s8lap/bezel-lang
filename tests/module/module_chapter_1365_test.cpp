@@ -99,6 +99,13 @@ bool parsesClean(std::string_view source) {
     return sf && !diags.hasErrors();
 }
 
+bool hasDiagnosticContaining(const ImporterRun& run, std::string_view text) {
+    for (const auto& diagnostic : run.diags.diagnostics()) {
+        if (diagnostic.message.find(text) != std::string::npos) return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -379,6 +386,75 @@ BEZEL_TEST(module_chapter_1365, collision_alias_resolves_spec_2_2) {
         "  end Main; "
         "end Program;");
     BEZEL_EXPECT_TRUE(!r->hadErrors);
+}
+
+// §2.2 (v0.226, #2179): two imports may not bind the same alias, even when
+// they name different modules; diagnose the later declaration and both origins.
+BEZEL_TEST(import_alias_collision_2179,
+           alias_vs_alias_distinct_modules_rejected_spec_2_2_v0226) {
+    ModuleMetadata depA = buildMetaFor(
+        "module LibA; public class Alpha end Alpha;");
+    ModuleMetadata depB = buildMetaFor(
+        "module LibB; public class Beta end Beta;");
+    auto r = runImporterTwo(
+        depA, depB,
+        "module App; "
+        "import LibA as Q; "
+        "import LibB as Q; "
+        "public class Program "
+        "  public static method Main(): int => 0; "
+        "end Program;");
+
+    BEZEL_EXPECT_TRUE(r->hadErrors);
+    BEZEL_EXPECT_TRUE(hasDiagnosticContaining(
+        *r, "import alias `Q` for module `LibB` collides with the same alias "
+            "already bound to module `LibA`; choose a different alias (§2.2)"));
+}
+
+// §2.2 (v0.226, #2179) control: distinct aliases bind independently and remain
+// usable as qualifiers for their respective modules.
+BEZEL_TEST(import_alias_collision_2179,
+           distinct_aliases_compile_cleanly_spec_2_2_v0226) {
+    ModuleMetadata depA = buildMetaFor(
+        "module LibA; public class Alpha "
+        "public static method Value(): int => 1; end Alpha;");
+    ModuleMetadata depB = buildMetaFor(
+        "module LibB; public class Beta "
+        "public static method Value(): int => 2; end Beta;");
+    auto r = runImporterTwo(
+        depA, depB,
+        "module App; "
+        "import LibA as Q; "
+        "import LibB as R; "
+        "public class Program "
+        "  public static method Main(): int => "
+        "      Q.Alpha.Value() + R.Beta.Value(); "
+        "end Program;");
+
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
+}
+
+// §2.2 (v0.226, #1489/#1515) regression: the alias-vs-unambiguously-imported
+// bare-name check remains active alongside the new alias-vs-alias branch.
+BEZEL_TEST(import_alias_collision_2179,
+           alias_vs_imported_bare_name_still_rejected_spec_2_2_v0226) {
+    ModuleMetadata depA = buildMetaFor(
+        "module LibA; public class Q end Q;");
+    ModuleMetadata depB = buildMetaFor(
+        "module LibB; public class Beta end Beta;");
+    auto r = runImporterTwo(
+        depA, depB,
+        "module App; "
+        "import LibA; "
+        "import LibB as Q; "
+        "public class Program "
+        "  public static method Main(): int => 0; "
+        "end Program;");
+
+    BEZEL_EXPECT_TRUE(r->hadErrors);
+    BEZEL_EXPECT_TRUE(hasDiagnosticContaining(
+        *r, "import alias `Q` collides with the unambiguously imported public "
+            "bare name `Q` (from module `LibA`)"));
 }
 
 // §2.2: a declaration in the current module shadows a same-named import

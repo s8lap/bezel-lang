@@ -209,8 +209,27 @@ void Resolver::run(const ast::SourceFile& src) {
         // ambiguous (ambiguousImportNames_). A name shadowed by a local
         // declaration was never added to importedNameOrigin, so the alias/local
         // collision — a distinct entry in §2.2's list — is not diagnosed here.
+        // §2.2 (v0.226, #2179): aliases are declarations, so each alias may
+        // be bound only once in a file. Keep the first module for each alias so
+        // a later declaration can name both conflicting modules.
+        std::unordered_map<std::string, std::string> aliasOrigin;
         for (const auto& imp : src.imports) {
-            if (!imp || imp->alias.empty()) continue;
+            if (!imp || !imp->name || imp->alias.empty()) continue;
+            std::string dotted;
+            for (std::size_t i = 0; i < imp->name->parts.size(); ++i) {
+                if (i != 0) dotted += '.';
+                dotted += std::string(imp->name->parts[i]);
+            }
+            auto [aliasIt, inserted] = aliasOrigin.emplace(imp->alias, dotted);
+            if (!inserted) {
+                ctx_.diagnostics().report(
+                    Severity::Error, imp->span.begin,
+                    std::string("import alias `") + imp->alias +
+                    "` for module `" + dotted +
+                    "` collides with the same alias already bound to module `" +
+                    aliasIt->second + "`; choose a different alias (\xC2\xA7""2.2)");
+                continue;
+            }
             auto originIt = importedNameOrigin.find(imp->alias);
             if (originIt == importedNameOrigin.end()) continue;
             if (ambiguousImportNames_.count(imp->alias)) continue;
