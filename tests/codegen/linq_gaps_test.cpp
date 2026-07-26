@@ -25,13 +25,23 @@
 // empty input and duplicate elements), chaining with existing operators, and
 // (for closure-taking ops: ThenBy) an ASan/no-corruption leg.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::runAot;
 using bezel::test::runJit;
 
 namespace {
 int run(const std::string& src) {
+    auto r = runAot(src);
+    return r.ran ? r.exitCode : -999;
+}
+// §29.11 / #1226 / issue #1768: a few IOE-assertion tests return values outside
+// 0..255 (WEXITSTATUS mask of runAot would corrupt them). Keep those on runJit —
+// the lenient oracle is acceptable for an IOE guard test (only asserts an
+// exception fires, not a specific exit code).
+int runJitOnly(const std::string& src) {
     auto r = runJit(src);
     return r.ran ? r.exitCode : -999;
 }
@@ -571,14 +581,15 @@ BEZEL_TEST(linq_gaps, first_or_null_nonempty_spec_5) {
         "end Main; end C;"), 42);
 }
 
-// §5 FirstOrNull: empty → null (coalesce to -1)
+// §5 FirstOrNull: empty → null (coalesce to 200 — within 0..255 exit code)
 BEZEL_TEST(linq_gaps, first_or_null_empty_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  var n: int? := a.FirstOrNull(); "
-        "  return n ?? -1; "  // null → -1
-        "end Main; end C;"), -1);
+        "  return n ?? 200; "  // null → 200 (positive sentinel that survives the
+                              //   8-bit WEXITSTATUS mask that runAot applies)
+        "end Main; end C;"), 200);
 }
 
 // §5 FirstOrNull on a lazy pipeline
@@ -592,15 +603,15 @@ BEZEL_TEST(linq_gaps, first_or_null_lazy_spec_5) {
         "end Main; end C;"), 4);
 }
 
-// §5 FirstOrNull on lazy — no match → null
+// §5 FirstOrNull on lazy — no match → null (coalesce to 200)
 BEZEL_TEST(linq_gaps, first_or_null_lazy_no_match_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
         "  var n: int? := a.Where(lambda(x) => x > 99).FirstOrNull(); "
-        "  return n ?? -1; "  // no match → null → -1
-        "end Main; end C;"), -1);
+        "  return n ?? 200; "  // no match → null → 200
+        "end Main; end C;"), 200);
 }
 
 // ===========================================================================
@@ -618,14 +629,14 @@ BEZEL_TEST(linq_gaps, last_or_null_nonempty_spec_5) {
         "end Main; end C;"), 3);
 }
 
-// §5 LastOrNull: empty → null
+// §5 LastOrNull: empty → null (coalesce to 200)
 BEZEL_TEST(linq_gaps, last_or_null_empty_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  var n: int? := a.LastOrNull(); "
-        "  return n ?? -1; "
-        "end Main; end C;"), -1);
+        "  return n ?? 200; "  // 0..255 exit code range
+        "end Main; end C;"), 200);
 }
 
 // §5 LastOrNull: lazy pipeline — last match
@@ -654,25 +665,25 @@ BEZEL_TEST(linq_gaps, single_or_null_exactly_one_spec_5) {
         "end Main; end C;"), 99);
 }
 
-// §5 SingleOrNull: empty → null
+// §5 SingleOrNull: empty → null (coalesce to 200)
 BEZEL_TEST(linq_gaps, single_or_null_empty_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  var n: int? := a.SingleOrNull(); "
-        "  return n ?? -1; "
-        "end Main; end C;"), -1);
+        "  return n ?? 200; "
+        "end Main; end C;"), 200);
 }
 
-// §5 SingleOrNull: more than one → null
+// §5 SingleOrNull: more than one → null (coalesce to 200)
 BEZEL_TEST(linq_gaps, single_or_null_multiple_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); "
         "  var n: int? := a.SingleOrNull(); "
-        "  return n ?? -1; "  // more than one → null → -1
-        "end Main; end C;"), -1);
+        "  return n ?? 200; "  // more than one → null → 200
+        "end Main; end C;"), 200);
 }
 
 // §5 SingleOrNull: lazy pipeline with exactly one match
@@ -767,15 +778,20 @@ BEZEL_TEST(linq_gaps_issue449, array_reverse_inplace_single_element_spec_3) {
 
 // §3/§4.4: lazy Reverse on an IEnumerable<T> receiver (Where pipeline) still
 // works correctly — the lazy path must remain unbroken by the fix.
+// Value 531 (= 5·100 + 3·10 + 1) > 255, masks under runAot's 8-bit exit code
+// (WEXITSTATUS). Use a base-8 positional encoding: r.Get(0)*64 + r.Get(1)*8
+// + r.Get(2) = 5*64 + 3*8 + 1 = 345 — still > 255. Use base-4: 5*16 + 3*4 +
+// 1 = 93 (within 0..255) and the order [1,3,5] yields 33 — both reachable
+// and discriminable.
 BEZEL_TEST(linq_gaps_issue449, lazy_reverse_after_where_still_correct_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); "
         "  using var r: Array<int> := a.Where(lambda(x) => x mod 2 = 1).Reverse().ToArray(); "
-        // Where(odd) = [1,3,5]; Reverse = [5,3,1]
-        "  return r.Get(0) * 100 + r.Get(1) * 10 + r.Get(2); "
-        "end Main; end C;"), 531);
+        // Where(odd) = [1,3,5]; Reverse = [5,3,1] → 5*16 + 3*4 + 1 = 93.
+        "  return r.Get(0) * 16 + r.Get(1) * 4 + r.Get(2); "
+        "end Main; end C;"), 93);
 }
 
 // ===========================================================================
@@ -794,7 +810,7 @@ BEZEL_TEST(linq_gaps_issue449, lazy_reverse_after_where_still_correct_spec_5) {
 // NOTE: the DA static error fires only in the full compiler (not JIT mode);
 // JIT mode sees the runtime guard (InvalidOperationException).
 BEZEL_TEST(linq_gaps_issue1218, bound_lazy_iterated_twice_raises_ioe_spec_29_11) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runJitOnly(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
