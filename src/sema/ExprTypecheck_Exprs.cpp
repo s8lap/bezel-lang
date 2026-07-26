@@ -5457,7 +5457,28 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 default: break;
             }
         }
-        if (lam->exprBody) visitExpr(*lam->exprBody);
+        if (lam->exprBody) {
+            // per §15.4 (#1825): when a lambda's expression body is a collection
+            // literal AND the lambda has a determinable target return type from
+            // context (a typed-local / function-typed call argument), the literal
+            // IS materialisable against that target — exactly like the call-arg
+            // (#1174) and local-decl (#1866) paths. The selector / no-target
+            // case still rejects per the L5480 guard below (the target is
+            // `IEnumerable<U>`, an interface, never materialisable). Thread the
+            // target onto the literal's exprType BEFORE visiting so the
+            // CollectionLiteralExpr visitor sees the materialisation hint and
+            // leaves the literal typed — codegen (LlvmBackend_Exprs2.cpp
+            // lowerLambda) then reads `ctx_.exprType(*lam.exprBody)` and
+            // materialises against the target type, mirroring the
+            // `return [e1, …]` path in lowerReturnStmt.
+            if (lamTargetRet &&
+                isCollectionLiteralAdmissibleTarget(lamTargetRet) &&
+                dynamic_cast<const ast::CollectionLiteralExpr*>(
+                    lam->exprBody.get())) {
+                ctx_.setExprType(lam->exprBody.get(), lamTargetRet);
+            }
+            visitExpr(*lam->exprBody);
+        }
         currentLiteralWideningHint_ = saveLamWideningHint;
         // per §15.4 (#1693): a collection literal has no standalone type — it is
         // well-typed only where a *determinable, admissible concrete* target

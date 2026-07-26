@@ -44,8 +44,15 @@ namespace bezel::sema {
 // `isCollectionLiteralInterfaceTarget` recognises a non-admissible interface
 // target; `reportCollectionLiteralInterfaceTarget` emits the §15.4 rejection.
 // Shared across the call-argument (#1174), string-method (#1174), and
-// local-declaration (#1866) positions.
+// local-declaration (#1866) positions. `isCollectionLiteralAdmissibleTarget`
+// is the positive predicate (concrete target → OK to materialise), used by
+// the lambda-body materialisation path (#1825): when a lambda's expression
+// body is a collection literal AND its target return type (a typed local /
+// call-arg function-typed slot) is a §15.4 admissible concrete target, the
+// literal is materialised against the target exactly like the call-arg and
+// local-decl paths already do.
 bool isCollectionLiteralInterfaceTarget(const TypeRef* t);
+bool isCollectionLiteralAdmissibleTarget(const TypeRef* t);
 void reportCollectionLiteralInterfaceTarget(DiagnosticEngine& diags,
                                             SourceLocation loc,
                                             std::string_view ifaceName);

@@ -146,6 +146,62 @@ void reportCollectionLiteralInterfaceTarget(
         "`Dictionary`); construct one of those and pass it (§15.4)");
 }
 
+// per §15.4 (#1825): the POSITIVE side of `isCollectionLiteralInterfaceTarget`.
+// A collection literal is admissible (i.e. codegen can materialise it
+// against this target) when the target is one of:
+//   * an INLINE array (`[N owned]T` / `[N]T`) — handled separately by
+//     lowerReturnStmt's `lowerInlineArrayReturn` / `materializeHeapCollectionLiteral`
+//     paths, but the LAMBDA-BODY materialiser routes through here too;
+//   * a CONCRETE builtin collection named type (`Array`/`OwningArray`,
+//     `Stack`/`OwningStack`, `Queue`/`OwningQueue`, `LinkedList`/
+//     `OwningLinkedList`, `Set`/`OwningSet`, `Dictionary`/`OwningDictionary`)
+//     — matched by name in codegen's materializeHeapCollectionLiteral /
+//     materializeHeapDictLiteral;
+//   * a user type that declared `FromCollectionLiteral` (stdlib §15.4 — the
+//     user hook for materialising a literal into their own type).
+// A collection INTERFACE is deliberately NOT admissible (see
+// isCollectionLiteralInterfaceTarget). Declared in ExprTypecheck_impl.hpp —
+// shared with the lambda-body materialisation path (#1825) and any future
+// site that needs the same positive check.
+bool isCollectionLiteralAdmissibleTarget(const TypeRef* t) {
+    if (!t) return false;
+    // Inline array: any sized [N]T / [N owned]T.
+    if (t->kind == TypeRef::Kind::InlineArray) return true;
+    if (t->kind != TypeRef::Kind::Named) return false;
+    // A collection INTERFACE has no concrete backing → never admissible.
+    if (isCollectionLiteralInterfaceTarget(t)) return false;
+    // A user type that opted in via FromCollectionLiteral: walk its members
+    // for a static method of that exact name. Mirrors the codegen side (the
+    // runtime calls the static `FromCollectionLiteral(elements)` factory).
+    if (t->declaration) {
+        for (const Symbol* m : t->declaration->members) {
+            const auto* ms = dynamic_cast<const MethodSymbol*>(m);
+            if (!ms || ms->name != "FromCollectionLiteral" || ms->params.empty())
+                continue;
+            // isStatic lives on the AST decl, not the Symbol (mirrors the
+            // sema-side pattern at ExprTypecheck_Exprs.cpp:6251-6254).
+            bool isStatic = false;
+            for (auto mod : ms->modifiers)
+                if (mod == "static") { isStatic = true; break; }
+            if (isStatic) return true;
+        }
+        return false;
+    }
+    // Builtin collections: Array/OwningArray/Stack/OwningStack/Queue/
+    // OwningQueue/Set/OwningSet/LinkedList/OwningLinkedList/Dictionary/
+    // OwningDictionary — matched by simple name (the #1414 stage-3 registry
+    // is the single source of truth, but a name-only check is sufficient
+    // here because the codegen side does the same).
+    if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
+        return false;
+    std::string_view n = t->headName();
+    return n == "Array" || n == "OwningArray" || n == "Stack" ||
+           n == "OwningStack" || n == "Queue" || n == "OwningQueue" ||
+           n == "Set" || n == "OwningSet" || n == "LinkedList" ||
+           n == "OwningLinkedList" || n == "Dictionary" ||
+           n == "OwningDictionary";
+}
+
 // §22.6 classify how `argTy` matches `paramTy` at one argument position.
 // Exact when the types are equal (Resolver::typeRefEqual); Convert when a
 // §5.1 implicit conversion applies; NotApplicable otherwise (the candidate

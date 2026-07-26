@@ -1638,7 +1638,28 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     } else
     // Emit body.
     if (lam.exprBody) {
-        llvm::Value* v = lowerExpr(*lam.exprBody);
+        llvm::Value* v = nullptr;
+        // §15.4 (#1825): a lambda's expression body that is a collection literal
+        // has no standalone type — lowerExpr returns null for a
+        // CollectionLiteralExpr. The sema side now propagates the lambda's target
+        // return type (a §15.4-admissible concrete target) onto the literal's
+        // exprType for the typed-local / function-typed-call-arg cases, so the
+        // body is typed. Materialize it here against that type — exactly like
+        // the return-stmt, local-decl, and call-arg paths (LlvmBackend_Stmts.cpp
+        // lowerReturnStmt, Setup.cpp lowerLocalDecl, Assign.cpp
+        // materializeCollectionLiteralForArg). Empty dict literals are
+        // redirected to the dict materializer by materializeHeapCollectionLiteral
+        // itself, so the call is uniform.
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                lam.exprBody.get())) {
+            if (sema::TypeRef* rt = ctx_.exprType(*lam.exprBody)) {
+                if (!cl->isDict)
+                    v = materializeHeapCollectionLiteral(cl, rt);
+                else
+                    v = materializeHeapDictLiteral(cl, rt);
+            }
+        }
+        if (!v) v = lowerExpr(*lam.exprBody);
         if (!builder_.GetInsertBlock()->getTerminator()) {
             if (v && !retTy->isVoidTy()) {
                 // fix #541 / §7.1: when the lambda's expected return type is a
