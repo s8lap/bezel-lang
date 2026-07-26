@@ -6723,7 +6723,23 @@ bool MethodOwnership::propertyGetterIsRecognizedBorrow(
         const ast::PropertyDecl& pd) const {
     switch (pd.bodyKind) {
     case ast::PropertyBodyKind::Expression:
-        return pd.exprBody && exprIsReceiverSourcedBorrowReturn(*pd.exprBody);
+        return pd.exprBody && (exprIsReceiverSourcedBorrowReturn(*pd.exprBody) ||
+                               // #2175(b): a builtin `recv.Drain()` alias over
+                               // a receiver-sourced chain is also a borrow
+                               // (the view aliases the receiver's array;
+                               // stdlib §4.5 v0.195). Without this, a getter
+                               // like `property Q: IOwningEnumerable<R> =>
+                               // _items.Drain();` slips past the body scan —
+                               // exprIsReceiverSourcedBorrowReturn's
+                               // CallExpr arm is intentionally absent — and
+                               // the caller's `using var q := h.Q;` then
+                               // adopts, double-freeing the borrow under
+                               // ASan. The check is narrow: builtin `Drain`
+                               // only (no user MethodSymbol), receiver
+                               // receiver-sourced, and an owning-collection
+                               // head. // per §28.10, §28.3, stdlib §4.5
+                               // v0.195, #2175
+                               getterBodyIsDrainAliasOverReceiverSourced(*pd.exprBody));
     case ast::PropertyBodyKind::Auto:
         // An initializer-LESS auto-property's generated getter is a
         // backing-field read — a borrow of storage (§28.3 producers row),
@@ -6739,7 +6755,9 @@ bool MethodOwnership::propertyGetterIsRecognizedBorrow(
             switch (acc.bodyKind) {
             case ast::PropertyAccessorBodyKind::Expression:
                 return acc.exprBody &&
-                       exprIsReceiverSourcedBorrowReturn(*acc.exprBody);
+                       (exprIsReceiverSourcedBorrowReturn(*acc.exprBody) ||
+                        // #2175(b): drain-alias receiver-sourced twin above.
+                        getterBodyIsDrainAliasOverReceiverSourced(*acc.exprBody));
             case ast::PropertyAccessorBodyKind::Block: {
                 bool sawReturn = false;
                 bool allBorrow = true;
@@ -6754,6 +6772,45 @@ bool MethodOwnership::propertyGetterIsRecognizedBorrow(
         }
         return false;  // no getter accessor (write-only property)
     }
+    return false;
+}
+
+// #2175(b) / stdlib §4.5 v0.195: true when `e` is the BUILTIN `recv.Drain()`
+// (no user MethodSymbol — the alias property) over a receiver whose chain
+// terminates at `this` (or a field of `this`). The receiver of the getter is
+// the borrow source per the alias semantics — the view is the receiver's
+// array. A user `Drain` method is not the alias and falls through (handled
+// by the ordinary user-call rules, never reaches this predicate). // per
+// §28.10, §28.3, stdlib §4.5 v0.195, #2175
+bool MethodOwnership::getterBodyIsDrainAliasOverReceiverSourced(
+        const ast::Expr& e) const {
+    auto* ce = dynamic_cast<const ast::CallExpr*>(&e);
+    if (!ce || !ce->args.empty() || !ce->callee) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get());
+    if (!ma || ma->member != "Drain" || !ma->target) return false;
+    if (dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*ce->callee)))
+        return false;  // user `Drain` method — not the alias
+    // Receiver type head must be an owning collection (the alias property).
+    std::string_view rcn;
+    if (const sema::TypeRef* rt = ctx_.exprType(*ma->target)) {
+        if (!rt->aliasResolvedHead.empty())
+            rcn = rt->aliasResolvedHead;
+        else if (rt->astNode && rt->astNode->name &&
+                 !rt->astNode->name->parts.empty())
+            rcn = rt->headName();
+    }
+    if (!common::isOwningCollectionHead(rcn)) return false;
+    // Walk the chain to its root identifier; only a `this`-rooted chain is
+    // admitted. A scope-bound-local-rooted chain (e.g. `a.Items.Drain()`)
+    // is NOT a getter shape — the local lives in the caller's scope and the
+    // call-site checkReturnDrainFromScopeBoundReceiver already rejects the
+    // caller position. The getter-admission case is the `this.f.Drain()`
+    // shape (a getter that exposes a field's view).
+    const ast::Expr* root = ma->target.get();
+    while (auto* hop = dynamic_cast<const ast::MemberAccessExpr*>(root))
+        root = hop->target.get();
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(root))
+        return id->name == "this";
     return false;
 }
 

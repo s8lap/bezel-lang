@@ -3583,9 +3583,9 @@ bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) cons
         dynamic_cast<const ast::IdentifierExpr*>(&init)) {
         if (dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(init)))
             return true;
-        // #2137(a) — a USER borrow-returning PROPERTY getter read. §28.3
-        // producers: "Property access `obj.Prop` | Borrowed (source: `obj`)";
-        // a user getter is additionally definition-site guaranteed
+        // #2137(a) / #2174 — a USER borrow-returning PROPERTY getter read.
+        // §28.3 producers: "Property access `obj.Prop` | Borrowed (source:
+        // `obj`)"; a user getter is additionally definition-site guaranteed
         // borrow-producing ("a property or indexer getter may not return a
         // freshly-produced owned value — a getter is a borrow-producing
         // position", §28.6), and §28.3 (v0.196) admits the static getter over
@@ -3594,15 +3594,99 @@ bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) cons
         // (mirroring the call shape below): only a resolved PropertyDecl whose
         // getter provably returns receiver-/static-storage-sourced borrows
         // pins. Builtin properties (`tcs.Task`, `Task.Result` — owned-producing
-        // surfaces with no PropertyDecl) and interface-dispatched reads
-        // (PropertySymbol with no AST decl) keep adoption. Indexer
+        // surfaces with no PropertyDecl) keep adoption. Indexer
         // PropertySymbols never arrive here (an indexer read is an IndexExpr,
         // recognized below). // per §28.10, §28.3, §28.6, #2137
         if (auto* ps =
                 dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(init))) {
-            if (!ps->isIndexer)
-                if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
+            if (!ps->isIndexer) {
+                if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
                     if (propertyGetterIsRecognizedBorrow(*pd)) return true;
+                } else if (auto* ma =
+                               dynamic_cast<const ast::MemberAccessExpr*>(&init)) {
+                    // #2174: an INTERFACE- or virtual-DISPATCHED read — the
+                    // PropertySymbol has no resolved PropertyDecl (the
+                    // PropertySymbol is the interface's auto-property or
+                    // a virtual override, with no body to body-scan). §28.6's
+                    // "a property or indexer getter may not return a
+                    // freshly-produced owned value" is a SIGNATURE-LEVEL
+                    // guarantee for any user-declared getter — the same
+                    // guarantee #2137(b) relied on for the resolved case.
+                    // Pin it: the typed `using var` over `i.P` would
+                    // otherwise reach codegen's classOfLocal dispose path
+                    // and double-free the borrow (heap-use-after-free under
+                    // ASan, the #2137 family). The condition is narrow:
+                    //   1. init is a `MemberAccessExpr` (the dispatch form);
+                    //   2. the PropertySymbol's `parent` is an INTERFACE
+                    //      (interface-dispatched) or a CLASS that
+                    //      contributes a virtual/override (the inherited
+                    //      member case — same dispatch path);
+                    //   3. the receiver's static type is the interface
+                    //      or the base class (so the read is NOT a
+                    //      direct dispatch on a concrete class — the
+                    //      concrete class's getter would have resolved to
+                    //      its own PropertyDecl and taken the resolved
+                    //      branch above).
+                    // Anything else with null decl (a builtin property
+                    // like `tcs.Task` registered through some other
+                    // pathway) keeps adoption, matching the pre-#2174
+                    // behavior for those shapes.
+                    // // per §28.10, §28.3, §28.6, #2137, #2174
+                    if (ma->target && ps->parent) {
+                        // Match either: (a) parent is an interface
+                        // (declaration site) or (b) the read goes through
+                        // an interface-typed receiver. The "parent is a
+                        // class with a virtual/override member" branch is
+                        // already covered by the resolved case (the
+                        // inheriting class's PropertySymbol carries the
+                        // concrete PropertyDecl, ps->decl is set).
+                        const sema::TypeRef* rt =
+                            ctx_.exprType(*ma->target);
+                        bool interfaceDispatched = false;
+                        if (rt) {
+                            // Receiver's static type is an interface head.
+                            if (rt->declaration &&
+                                rt->declaration->kind ==
+                                    ast::TypeDeclKind::Interface) {
+                                interfaceDispatched = true;
+                            } else if (!rt->declaration &&
+                                       rt->astNode && rt->astNode->name) {
+                                // A null-declaration Named with a head
+                                // name (e.g. IHas for an interface alias)
+                                // — also interface-dispatched.
+                                std::string_view head = rt->headName();
+                                if (head.size() > 0 && head.front() == 'I' &&
+                                    head[1] >= 'A' && head[1] <= 'Z') {
+                                    // Conservative: only call it an
+                                    // interface if the head starts with
+                                    // an uppercase letter after `I`.
+                                    // (Real interface names start with
+                                    // `I` followed by uppercase.)
+                                    interfaceDispatched = true;
+                                }
+                            }
+                        }
+                        // Also: an inherited (virtual/override) member
+                        // resolved to a parent-class PropertySymbol with
+                        // no decl — the inherited shape. We need the
+                        // parent to be a CLASS (not interface) with a
+                        // virtual/override member. This is rare (the
+                        // inheriting class usually carries its own
+                        // PropertyDecl) and conservative: only fire
+                        // when the member carries a virtual/override
+                        // modifier on the symbol.
+                        bool inheritedVirtual = false;
+                        if (ps->parent &&
+                            ps->parent->kind == ast::TypeDeclKind::Class) {
+                            for (auto m : ps->modifiers)
+                                if (m == "virtual" || m == "override") {
+                                    inheritedVirtual = true; break;
+                                }
+                        }
+                        if (interfaceDispatched || inheritedVirtual) return true;
+                    }
+                }
+            }
         }
     }
     // An INDEXER access — a bare `coll[i]` / `arr[i]`. The element-slot table
@@ -5058,6 +5142,24 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // borrow and is not flagged. Exempt when the return type is `owned` (the
     // legal transfer). // per §28.6
     checkOwnedFieldReturn(e);
+    // #2175(a) / §28.3 (v0.226) "Returning a deferred-activation frame":
+    // `return a.Drain();` (the owning-collection builtin alias) over a
+    // SCOPE-BOUND receiver escapes the receiver's scope. §28.3: "A returned
+    // frame carrying a borrow of anything else — a scope-bound local, a
+    // `using var`, a temporary — is rejected at the return site." The
+    // #2146 stable-named-receiver case admits a borrow-pin at the binding
+    // site (the alias's container obligation stays with the receiver's
+    // owner); the return site is the receiver's METHOD EXIT — a scope-
+    // bound local/using-var/temporary receiver is disposed at the exit
+    // boundary, so the returned view dangles. The current code lets it
+    // through (the runtime is benign by accident — the caller's adoption
+    // registers no dispose for a declaration-less IOwningEnumerable), but
+    // the spec is unambiguous. Reject: the temporary-receiver shape is
+    // already rejected at the binding site (#2169); this is its return-
+    // site twin. A non-temporary receiver (a parameter or a `this`-rooted
+    // field chain) is admitted — its lifetime is wider than the call. // per
+    // §28.3 v0.226, stdlib §4.5 v0.195, #2175
+    checkReturnDrainFromScopeBoundReceiver(e);
     // For slice O1, treat `return x;` (bare identifier) as a
     // discharge. The "is the method's return type owned T?" check
     // is sema's; here we just satisfy the discharge requirement
@@ -6962,6 +7064,165 @@ void MethodOwnership::checkOwnedFieldReturn(const ast::Expr& e) {
         "return (§28.6); `move` transfers the field's value out, leaving it with "
         "no owner — declare the return type `owned` (e.g. `: owned T`) to "
         "transfer ownership to the caller");
+}
+
+// #2175(a) / §28.3 v0.226 (spec "Returning a deferred-activation frame"):
+// `return recv.Drain();` (the owning-collection builtin alias — stdlib §4.5
+// v0.195: "`Drain()` on `OwningArray<T>` returns the array itself at that
+// static type — no separate enumerable object") escapes the receiver's
+// SCOPE-BOUND lifetime. The view aliases the receiver's array; the alias's
+// container obligation stays with the receiver's owner — which is disposed
+// at the method's exit. The #2146 stable-named-receiver pin covers the
+// binding position; this is its RETURN-SITE twin. Pre-fix the code let
+// `using var a := new Holder(); return a.Items.Drain();` through (the
+// runtime is benign by accident — the caller's adoption registers no
+// dispose for a declaration-less IOwningEnumerable type), but the spec
+// is unambiguous: "A returned frame carrying a borrow of anything else —
+// a scope-bound local, a `using var`, a temporary — is rejected at the
+// return site." (The temporary-receiver shape is already rejected at the
+// binding site by #2169's `checkDrainOnTemporary`; this is its return-site
+// twin for the scope-bound local/using-var shapes.) The check is narrow:
+// ONLY a builtin `recv.Drain()` call (no user MethodSymbol) on an owning-
+// collection head, where `recv` is a tracked scope-bound owned local or
+// `using var`. A `this`-rooted chain (the receiver is a field of `this`)
+// is admitted — `this` outlives the call. A bare-identifier-receiver
+// parameter is admitted — the parameter outlives the call. A non-Drain
+// call is not affected (Drain is the only builtin with the
+// receiver-aliases-view property; a user-method Drain is classified by the
+// ordinary user-call rules and never reaches this check). // per §28.3
+// v0.226, stdlib §4.5 v0.195, #2175
+void MethodOwnership::checkReturnDrainFromScopeBoundReceiver(
+        const ast::Expr& e) {
+    auto* ce = dynamic_cast<const ast::CallExpr*>(&e);
+    if (!ce || !ce->callee) return;
+    if (!ce->args.empty()) return;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get());
+    if (!ma || ma->member != "Drain" || !ma->target) return;
+    // BUILTIN `Drain` only — a USER method named `Drain` resolves a
+    // MethodSymbol and is classified by the ordinary user-call rules (the
+    // #2146 receiver-alias property holds only for the builtin).
+    if (dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*ce->callee)))
+        return;
+    // Receiver type head must be an owning collection.
+    std::string_view rcn;
+    if (const sema::TypeRef* rt = ctx_.exprType(*ma->target)) {
+        if (!rt->aliasResolvedHead.empty())
+            rcn = rt->aliasResolvedHead;
+        else if (rt->astNode && rt->astNode->name &&
+                 !rt->astNode->name->parts.empty())
+            rcn = rt->headName();
+    }
+    if (!common::isOwningCollectionHead(rcn)) return;
+    // Identify the receiver. A bare IdentifierExpr whose symbol is a tracked
+    // scope-bound local / `using var` is the rejecting shape. A field-rooted
+    // chain (MemberAccessExpr whose target is receiver-sourced) is admitted.
+    // Anything else (a parameter, a call result, a method reference, …) is
+    // admitted: the parameter / caller-frame source outlives the call.
+    const ast::Expr* recv = ma->target.get();
+    // `this`-rooted: the receiver is `this` or a chain off it — admitted.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(recv)) {
+        if (id->name == "this") return;  // `this` outlives the call
+        // Tracked local: scope-bound owned local or `using var` — reject.
+        // A non-tracked local (e.g. an out-of-method binding) is conservatively
+        // admitted; the runtime is the caller's problem.
+        if (auto* sym = ctx_.exprSymbol(*id)) {
+            if (auto* st = lookupState(id->name)) {
+                // `using var` (implicitDischarge) OR a plain owned local
+                // recorded in everOwnedPlainLocals_ — both disposed at this
+                // method's exit; a borrow derived from either is an escape.
+                const bool usingVar = st->implicitDischarge;
+                const bool plainOwnedLocal =
+                    st->state == OwnershipState::Owned &&
+                    everOwnedPlainLocals_.count(sym) != 0;
+                if (!usingVar && !plainOwnedLocal) return;
+                report(
+                    Severity::Error, e.span.begin,
+                    std::string("cannot return `") +
+                    std::string(ma->target->span.begin.column > 0
+                                    ? id->name
+                                    : "scope-bound receiver") +
+                    "`.Drain()` — the drain view aliases the receiver's "
+                    "owning-collection array (stdlib §4.5 v0.195), and the "
+                    "receiver is " +
+                    (usingVar
+                         ? std::string("a `using var` disposed at the "
+                                       "callee's scope end")
+                         : std::string(
+                               "a scope-bound owned local disposed at the "
+                               "callee's scope end")) +
+                    ", so the returned view dangles (§28.3 *Returning a "
+                    "deferred-activation frame*, v0.226; bind the receiver "
+                    "in the caller's scope and return the drain from there, "
+                    "or move the array out of the local first via `move`)");
+                return;
+            }
+            // Tracked but in some other state (moved-from / disposed / etc.) —
+            // the existing state-error paths diagnose, do not double-report
+            // a return-site drain escape. Admit.
+            return;
+        }
+        // Untracked bare identifier: a parameter (outlives the call —
+        // admitted) or an unresolved import (admitted conservatively).
+        return;
+    }
+    // A MemberAccessExpr receiver (`obj.Items.Drain()`): the chain's ROOT
+    // determines the borrow source. `this`-rooted (`this.f.Drain()`) is
+    // admitted — `this` outlives the call. A chain rooted at a tracked
+    // scope-bound owned local or `using var` is the same hazard as the
+    // bare-identifier case (the chain's source is the local's storage,
+    // disposed at the callee's scope end). A parameter-rooted chain is
+    // admitted — the parameter outlives the call. Walk down the chain
+    // until we reach the root identifier and check the tracked state.
+    if (auto* rma = dynamic_cast<const ast::MemberAccessExpr*>(recv)) {
+        const ast::Expr* root = rma;
+        while (auto* hop = dynamic_cast<const ast::MemberAccessExpr*>(root))
+            root = hop->target.get();
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(root)) {
+            if (id->name == "this") return;  // `this.f.Drain()` — admitted
+            if (auto* sym = ctx_.exprSymbol(*id)) {
+                if (auto* st = lookupState(id->name)) {
+                    const bool usingVar = st->implicitDischarge;
+                    const bool plainOwnedLocal =
+                        st->state == OwnershipState::Owned &&
+                        everOwnedPlainLocals_.count(sym) != 0;
+                    if (!usingVar && !plainOwnedLocal) return;  // parameter or borrowed
+                    report(
+                        Severity::Error, e.span.begin,
+                        std::string("cannot return `") +
+                        std::string(id->name) +
+                        "`.Drain()` — the drain view aliases the receiver's "
+                        "owning-collection array (stdlib §4.5 v0.195), and the "
+                        "chain's source `" +
+                        std::string(id->name) +
+                        "` is " +
+                        (usingVar
+                             ? std::string("a `using var` disposed at the "
+                                           "callee's scope end")
+                             : std::string(
+                                   "a scope-bound owned local disposed at the "
+                                   "callee's scope end")) +
+                        ", so the returned view dangles (§28.3 *Returning a "
+                        "deferred-activation frame*, v0.226; bind the source "
+                        "in the caller's scope and return the drain from "
+                        "there, or move the array out of the local first via "
+                        "`move`)");
+                    return;
+                }
+                return;  // untracked (parameter / import) — admitted
+            }
+            return;  // unresolved — admit conservatively
+        }
+        // Chain rooted in something other than an identifier (e.g. another
+        // call). The chain is conservatively admitted — the indexer case
+        // is the only interesting non-id root and a using var cannot appear
+        // there. The chained-call temporary case is already covered by #2169.
+        return;
+    }
+    // An IndexExpr receiver (`arr[0].Drain()`) is conservatively admitted
+    // here — the indexer's slot borrow is the only interesting source and
+    // a `using var` cannot appear in indexer position. The chained-call
+    // temporary case is already covered by #2169.
+    return;
 }
 
 namespace {

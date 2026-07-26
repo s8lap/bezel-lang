@@ -1253,6 +1253,21 @@ private:
     // iterator-emission paths. // per §28.3, stdlib §4.5 v0.195, #2169
     void checkDrainOnTemporary(
             const ast::CallExpr& ce, SourceLocation bindingLoc);
+    // #2175(a) / §28.3 v0.226 (spec "Returning a deferred-activation frame"):
+    // the RETURN-SITE twin of checkDrainOnTemporary. `return recv.Drain();`
+    // over a scope-bound owned local / `using var` / temporary escapes the
+    // receiver's scope — the drain view aliases the array (stdlib §4.5
+    // v0.195) and is disposed at the callee's exit. Pre-fix the code let it
+    // through (runtime benign by accident — the caller's adoption registers
+    // no dispose for a declaration-less IOwningEnumerable type); the spec
+    // is unambiguous ("a scope-bound local, a `using var`, a temporary —
+    // is rejected at the return site"). The check is narrow: ONLY a builtin
+    // `recv.Drain()` call on an owning-collection head where `recv` is a
+    // tracked scope-bound owned local or `using var`. A `this`-rooted chain
+    // is admitted (the receiver outlives the call); a parameter is
+    // admitted; a non-Drain call is not affected. // per §28.3 v0.226,
+    // stdlib §4.5 v0.195, #2175
+    void checkReturnDrainFromScopeBoundReceiver(const ast::Expr& e);
     // §28.3 (v0.194, #1801 S5): reject a loop-carried bare-type-parameter
     // accumulation — `prev := Math.Max(prev, cur)` — where a contributing source
     // is a scope-bound owned local declared in a block the assignment target's
@@ -2074,6 +2089,17 @@ private:
     // scannable body and are not recognized (adoption, as before). // per
     // §28.10, §28.3, §28.6, #2137
     bool propertyGetterIsRecognizedBorrow(const ast::PropertyDecl& pd) const;
+    // #2175(b) / stdlib §4.5 v0.195: true when `e` is the BUILTIN `recv.Drain()`
+    // (no user MethodSymbol) over a receiver whose chain terminates at
+    // `this` (or a field of `this`). Used by propertyGetterIsRecognizedBorrow
+    // to admit `property Q: IOwningEnumerable<R> => _items.Drain();` as a
+    // borrow-pin: the view aliases the receiver's array (§4.5 v0.195), the
+    // receiver is the getter's `this` (outlives the call), and the caller's
+    // `using var q := h.Q;` correctly becomes a §28.10 borrow-pin. A user
+    // `Drain` method, or a non-owning-collection receiver, is not the
+    // alias and falls through. // per §28.10, §28.3, stdlib §4.5 v0.195, #2175
+    bool getterBodyIsDrainAliasOverReceiverSourced(
+        const ast::Expr& e) const;
 
     // §28.10 "using var initialized from a borrow" (#2128, extended #2137/
     // #2146): true when a `using var` initializer is one of the borrow shapes
