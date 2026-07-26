@@ -285,3 +285,52 @@ BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 6);
 }
+
+// =====================================================================
+// (H) fix #2196 / §28.9 — the issue's own repro: a `string?` method return
+// whose BODY hands the caller a fresh +1 string (a `+` concat, no arm-meet
+// involved) leaks that string when the caller binds the result to a local.
+// The non-nullable sibling (`Pick(): string` → "a"+"b" → bound) is clean;
+// the nullable sibling leaked exactly 35B (32-byte header + 3-byte buffer)
+// because the WHOLE nullable-string refcount path was gated `!nullable`:
+//   * callee side — ReturnStmt's `+1` mint (LlvmBackend_Stmts.cpp) is gated
+//     `!declRet->nullable`, so a `string?` return neither retains a borrow
+//     nor is recognized as a transfer — the value just passes through;
+//   * caller side — `isUserMethodStringReturnCall` (LlvmBackend_Setup.cpp)
+//     is gated `!nullable` (both imported and local-method branches), so a
+//     `Pick(): string?` call is not classified a +1 producer; the caller's
+//     `var s` then falls to `collectStringReleaseEligible`'s BORROW branch,
+//     which ALSO rejects `string?` — so the local is tracked for neither
+//     transfer+release nor retain+release, and its +1 leaks.
+// Fix #2196 un-gates BOTH halves (in lockstep — extending caller-side
+// recognition without the callee-side mint is a UAF, the §28.9 residue-1
+// hazard the comment at #694 flagged): ReturnStmt mints +1 for a `string?`
+// return (null-safe: `bz_string_retain` is a no-op on a sentinel/null), and
+// `isUserMethodStringReturnCall` recognizes the `string?` return as a +1
+// producer. `var s := C.Pick(1)` is now a transfer+release (no leak), and
+// the loop's 5 iterations do not accumulate. §4.6 / §28.3 / §28.9.
+// =====================================================================
+const char* kNullableStringMethodReturnBindLoop =
+    "module M; class C "
+    "  public static method Pick(n: int): string? "
+    "    return \"a\" + \"b\"; "
+    "  end Pick; "
+    "  public static method Main(): int "
+    "    var total := 0; "
+    "    var i := 0; "
+    "    while i < 5 do "
+    "      var s := C.Pick(1); "
+    "      total := total + s!.Length; "
+    "      i := i + 1; "
+    "    end; "
+    "    return total; "                    // 5 * "ab".Length (2) = 10
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
+           nullable_string_method_return_bind_loop_lsan_clean_28_9) {
+    JitResult r = runAotChecked(kNullableStringMethodReturnBindLoop);
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);         // 5 minted strings each freed once
+    BEZEL_EXPECT_EQ(r.exitCode, 10);  // 5 * "ab".Length
+}

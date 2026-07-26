@@ -1656,7 +1656,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             v->getType()->isPointerTy()) {
             const sema::TypeRef* declRet =
                 ctx_.resolvedType(*currentReturnTypeNode_);
-            if (declRet && !declRet->nullable &&
+            // fix #2196 / §28.9: a method whose declared return type is
+            // nullable `string?` mints exactly +1 the same way the non-nullable
+            // sibling does — the K1.5/K3.13 RETURN-escape reasoning (an announced
+            // return is a fresh transfer to the caller) applies to `string?` just
+            // as it does to `string`. The earlier `!declRet->nullable` gate
+            // suppressed the +1 mint for nullable-string returns, leaving the
+            // caller's `var s := M()` bind to leak the fresh +1 string. The
+            // existing null-safety of bz_string_retain (no-op on a sentinel/
+            // null) makes the extension sound — a `return null` literal is
+            // still a null carry, not a +1. // per §4.6, §28.3, §28.9
+            if (declRet &&
                 declRet->kind == sema::TypeRef::Kind::Primitive &&
                 declRet->primitive == sema::PrimitiveType::String &&
                 !isPlusOneStringProducer(rs->value.get()) &&

@@ -11070,9 +11070,10 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             if (dynamic_cast<sema::LocalSymbol*>(sym) ||
                 dynamic_cast<sema::ParameterSymbol*>(sym)) {
                 // The result type of the call is the funcReturn of the callee.
-                // If that result is non-nullable string, this call is a +1 producer.
+                // If that result is string (nullable OR non-nullable, fix #2196),
+                // this call is a +1 producer.
                 const sema::TypeRef* resultTy = ctx_.exprType(*init);
-                if (resultTy && !resultTy->nullable &&
+                if (resultTy &&
                     resultTy->kind == sema::TypeRef::Kind::Primitive &&
                     resultTy->primitive == sema::PrimitiveType::String)
                     return true;
@@ -11104,11 +11105,13 @@ bool Emitter::isUserMethodStringReturnCall(const ast::Expr* init) const {
     if (ms->isOperator) return false;              // operator overloads excluded
     if (ctx_.isImported(ms)) {
         // §4.6 / §28.9 / #694 residue-1: an imported method whose declared
-        // return type is non-nullable string already ran ReturnStmt string-retain
-        // minting in the exporter. The caller receives +1 and must release at
-        // scope end, not borrow-retain. Treat it as a +1 producer.
+        // return type is string (nullable OR non-nullable) already ran ReturnStmt
+        // string-retain minting in the exporter (fix #2196: the nullable sibling
+        // mints +1 the same way the non-nullable does — bz_string_retain is
+        // null-safe). The caller receives +1 and must release at scope end, not
+        // borrow-retain. Treat it as a +1 producer.
         const sema::TypeRef* rt = ctx_.importedReturnType(ms);
-        return rt && !rt->nullable &&
+        return rt &&
                rt->kind == sema::TypeRef::Kind::Primitive &&
                rt->primitive == sema::PrimitiveType::String;
     }
@@ -11120,7 +11123,12 @@ bool Emitter::isUserMethodStringReturnCall(const ast::Expr* init) const {
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md || !md->returnType) return false;
     const sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
-    return rt && !rt->nullable &&
+    // fix #2196 / §4.6 / §28.9: the locally-compiled-body leg also extends to
+    // `string?` — the SAME return-mint above (now nullable-aware) runs in the
+    // callee, so the caller receives exactly +1. Excluding nullable here would
+    // leave the +1 un-minted on the caller side and silently leak the fresh
+    // string when the caller binds the result to a local.
+    return rt &&
            rt->kind == sema::TypeRef::Kind::Primitive &&
            rt->primitive == sema::PrimitiveType::String;
 }
