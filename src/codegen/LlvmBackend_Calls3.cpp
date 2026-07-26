@@ -963,7 +963,9 @@ llvm::Value* Emitter::materializeVtableIEnumerableToArray(
 
 llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
                                             sema::TypeRef*& elemRef,
-                                            bool ownFreshGroupings) {
+                                            bool ownFreshGroupings,
+                                            llvm::Value** outRecvArr) {
+    if (outRecvArr) *outRecvArr = nullptr;
     auto* recvTy = ctx_.exprType(recvExpr);
     // stdlib §5 (#752): a bare `GroupBy(...)` is IEnumerable<IGrouping<TKey,T>>
     // (so isLazyEnumerableType below is true), but lowerExpr cannot lower it to
@@ -1333,6 +1335,12 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
     // Concrete collection (Array<T> family): wrap it as a lazy ARRAY source.
     int64_t esz = collectionElemSize(recvTy);
     auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
+    // #2151 / §28.3: surface the borrowed array through the out-param so callers
+    // that CONSUME the lazy (ToDictionary, etc., which route through
+    // bz_lazy_dispose) can still reclaim an unbound fresh-materializer
+    // receiver at the call site — the lazy wrap itself is a borrow, so
+    // bz_lazy_dispose leaves the array alive for the caller.
+    if (outRecvArr) *outRecvArr = recv;
     return builder_.CreateCall(wrapFn, {recv, builder_.getInt64(esz)}, "lazy.src");
 }
 
@@ -1469,8 +1477,27 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     // selector and storing the element). The value selector is applied per
     // element when supplied.
     if (m == "ToDictionary" && call.args.size() >= 1 && call.args[0].value) {
+        // #2151 / §28.3 / stdlib §5: a chained `X.Split(",").ToDictionary(...)` (or
+        // any fresh-array-materializer receiver) leaves the intermediate `Split`
+        // `Array<string>` temporary unbound — the `bz_lazy_from_array` wrap in
+        // lowerToLazyEnumerator is a BORROW (the lazy is consumed by
+        // `bz_lazy_to_dict` via `bz_lazy_dispose`, but the array it pointed at is
+        // not freed — `bz_lazy_dispose` only frees arrays it OWNS via
+        // `bz_lazy_from_owned_array`). The using-Array-eligibility walk keys on
+        // `currentFn_ == borrowingArrayFreeEligibleFn_` for NAMED-LOCAL
+        // `var xs := Split(...)` receivers (working there via a scope-end
+        // `bz_array_free`), but does NOT fire for an unbound temporary receiver
+        // of this shape — the array is dropped, not bound to a local. Reclaim
+        // the intermediate here, immediately after `bz_lazy_to_dict` consumes
+        // the lazy. `freeUnboundOwnedBorrowingArrayTemp` is gated on
+        // `isFreshOwnerlessArrayMaterializerExpr` / `isUnboundOwnedBorrowingArrayCallExpr`
+        // so a named-local / `using var` / `move`-receiver is NOT freed again
+        // (its owner disposes it — no double-free, no UAF).
         sema::TypeRef* elemRef = nullptr;
-        llvm::Value* lazy = lowerToLazyEnumerator(*ma->target, elemRef);
+        llvm::Value* recvArr = nullptr;
+        llvm::Value* lazy = lowerToLazyEnumerator(*ma->target, elemRef,
+                                                  /*ownFreshGroupings=*/false,
+                                                  &recvArr);
         if (!lazy) return nullptr;
         llvm::Type* elemTy2 = elemLlvmOf(elemRef);
 
@@ -1602,6 +1629,12 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
              builder_.getInt64(valInline ? 1 : 0), valTramp, valClosure,
              builder_.getInt64(keyIsString ? 1 : 0)},
             "linq.todict");
+        // #2151 / §28.3: reclaim an unbound fresh-materializer receiver array
+        // here (the lazy is already consumed/disposed by bz_lazy_to_dict). See
+        // the matching comment at the ToDictionary entry above for rationale
+        // and the no-double-free gate.
+        if (recvArr) freeUnboundOwnedBorrowingArrayTemp(
+                ma->target.get(), recvArr, ctx_.exprType(*ma->target));
         // Release the inline-lambda / primitive-intrinsic-method-ref key/value
         // closures if we own them (eager materialization — the closures are
         // fully consumed during bz_lazy_to_dict, same as eager LINQ terminals

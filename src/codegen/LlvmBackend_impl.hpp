@@ -8196,7 +8196,8 @@ private:
     // non-GroupBy receivers.
     llvm::Value* lowerToLazyEnumerator(const ast::Expr& recvExpr,
                                        sema::TypeRef*& elemRef,
-                                       bool ownFreshGroupings = false);
+                                       bool ownFreshGroupings = false,
+                                       llvm::Value** outRecvArr = nullptr);
 
     // stdlib §5 (#651/#752): materialize a `GroupBy(keySelector)` call into an
     // owned `Array<IGrouping<TKey, T>>` (a bz_array_t* of bz_grouping_t*
