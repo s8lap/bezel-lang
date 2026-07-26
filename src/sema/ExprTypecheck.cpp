@@ -10358,11 +10358,28 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // preceding condition's false-branch facts (earlier ones are
             // already folded in from previous iterations). The visit's own
             // drops then advance the running context.
+            //
+            // fix #2164 / §7.4: also seed `nullNarrowed_` to entry +
+            // preceding conditions' false-branch facts BEFORE the visit.
+            // The legacy local set was reset AFTER `visitExpr(*el.condition)`
+            // (line ~10366 historically), so member-access gates inside the
+            // elif condition judged against the THEN-body's exit state
+            // (compile-accepted null deref that SIGSEGV'd at runtime). The
+            // `else`-branch narrowing below correctly admits the sound
+            // `if x = null then return 0; elif x.Length > 0 …` ACCEPT —
+            // entry + prior false-branch facts sees x nullable, and the
+            // else-branch narrowing seeds x non-null for the elif BODY.
             fieldNarrowed_ = fieldCondState;
             collectFieldNarrowings(
                 i == 0 ? ifs->ifBranch.condition.get()
                        : ifs->elifBranches[i - 1].condition.get(),
                 /*forTrueBranch=*/false);
+            nullNarrowed_ = entryNullNarrowed;
+            collectNarrowings(ifs->ifBranch.condition.get(),
+                              /*forTrueBranch=*/false);
+            for (std::size_t j = 0; j < i; ++j)
+                collectNarrowings(ifs->elifBranches[j].condition.get(),
+                                  /*forTrueBranch=*/false);
             if (el.condition) {
                 visitExpr(*el.condition);
                 checkConditionIsBool(*el.condition, "elif");
@@ -10722,14 +10739,25 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // entry ∩ after-body (an entry fact the body INVALIDATED stays
         // dropped — the invalidating statement may have run before the
         // throw); the after-try state is after-body ∩ each catch arm's exit.
-        // (The legacy nullNarrowed_ set leaks try-body facts into catch arms —
-        // the same pre-existing local-narrowing hole family filed from this
-        // lane.)
+        //
+        // fix #2164 / §7.4: the legacy `nullNarrowed_` set has the SAME
+        // hygiene need — a guard inside the body (`if x = null then return 0;
+        // end;`) established x non-null, and the catch arm `return x.Length;`
+        // inherited that fact. But the catch arm runs when the body was
+        // INTERRUPTED — possibly before the guard executed, when x is still
+        // nullable — so the compile-ACCEPT turns into a null deref SIGSEGV.
+        // Apply the same discipline to the local set: catch-arm entry is
+        // entry ∩ after-body (no body-establishments, no body-drops
+        // resurrected); after-try is after-body ∩ each catch exit. Set
+        // algebra — no container-iteration dependence. // per §7.4, #2116,
+        // #2164
         auto tryEntryField = fieldNarrowed_;
+        auto tryEntryNull = nullNarrowed_;
         const std::uint64_t tryDropEpoch0 = fieldFactDropEpoch_;
         for (const auto& bs : trys->body) if (bs) visitStmt(*bs);
         auto afterBodyField = fieldNarrowed_;
         auto tryJoinField = afterBodyField;
+        auto afterBodyNull = nullNarrowed_;
         // Catch-arm running base (#2116 pre-gate review, hardened): the body
         // can be interrupted at ANY point, and the exit-state intersection
         // entry ∩ after-body is BLIND to an interior drop that a later
@@ -10753,6 +10781,28 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             if (afterBodyField.count(*it)) ++it;
             else it = catchRunningField.erase(it);
         }
+        // §7.4 #2164: the legacy local set has no drop-epoch tracking, so the
+        // catch-arm entry is the conservative (entry ∩ after-body) intersection
+        // — entry facts that the body KEPT (no interior drop on them — they
+        // were present at entry and the body did not erase them). Body
+        // establishments never enter (a throw may precede the establishing
+        // guard; probe-confirmed SEGV in #2164). The legacy set only grows on
+        // positive evidence and is erased only by explicit reassignment / mutable-
+        // capture — the simpler intersection (no drop-edge carved-out) matches
+        // the legacy semantics: a fact x in `tryEntryNull` AND `afterBodyNull`
+        // holds at the catch-arm entry; anything established inside the body
+        // (afterBodyNull − tryEntryNull) is filtered out.
+        auto catchRunningNull = tryEntryNull;
+        for (auto it = catchRunningNull.begin();
+             it != catchRunningNull.end();) {
+            if (afterBodyNull.count(*it)) ++it;
+            else it = catchRunningNull.erase(it);
+        }
+        // §7.4 #2164: the after-try join is after-body ∩ every catch's
+        // exit. Initialized to afterBodyNull once, then shrunken by each
+        // arm's exit (the same shape tryJoinField has for the field set,
+        // just without drop-edge carving).
+        auto tryJoinNull = afterBodyNull;
         for (const auto& arm : trys->catches) {
             // §31.2.1/§12.9/§14.2 (#1939): the CATCH-surface copy of the
             // #2006/#2012/#2018 erasure guard. §31.2.1: an arm "matches any
@@ -10786,6 +10836,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // const resolvedType reads; this assignment seeds the arm-body
             // running field facts. No ordering dependence.
             fieldNarrowed_ = catchRunningField;          // §7.4 #2116
+            nullNarrowed_ = catchRunningNull;            // §7.4 #2164
             // §31.2: a `catch var e: T` arm binds the caught exception
             // to `e` (a borrow of the caught type) in the guard and
             // body scope. The binding's decl anchors on the arm body so
@@ -10842,6 +10893,20 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 if (fieldNarrowed_.count(*it)) ++it;
                 else it = catchRunningField.erase(it);
             }
+            // §7.4 #2164: same after-arm / next-arm intersection for the
+            // local set. tryJoinNull is the after-try join (after-body ∩
+            // every catch exit); catchRunningNull is the next-arm base
+            // (each new arm starts from entry ∩ after-body ∩ earlier
+            // arms' exits, shrinking as arms diverge).
+            for (auto it = tryJoinNull.begin(); it != tryJoinNull.end();) {
+                if (nullNarrowed_.count(*it)) ++it;
+                else it = tryJoinNull.erase(it);
+            }
+            for (auto it = catchRunningNull.begin();
+                 it != catchRunningNull.end();) {
+                if (nullNarrowed_.count(*it)) ++it;
+                else it = catchRunningNull.erase(it);
+            }
         }
         // §7.4 (v0.214, #2116 pre-gate review): the FINALLY body runs on every
         // exit from the construct — the body's normal completion, its EARLY
@@ -10885,6 +10950,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                tryJoinField.end());
         tryJoinField.insert(fieldNarrowed_.begin(), fieldNarrowed_.end());
         fieldNarrowed_ = std::move(tryJoinField);
+        // §7.4 #2164: the corresponding local-set after-try state — the
+        // pre-finally running intersection (tryJoinNull as built per-arm
+        // above), intersected with the finally body's exit. The finally runs
+        // on every exit path, so its exits factor in: a fact the finally
+        // established enters; a fact the finally erased drops. The legacy
+        // local set has no drop-edge carving — apply the same
+        // intersection-only discipline (matches the §7.4 join the if-stmt
+        // and case-stmt handlers already apply).
+        nullNarrowed_.insert(tryJoinNull.begin(), tryJoinNull.end());
     } else if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
         // §29.9: `yield` is a method-level construct only — `yield return` and
         // `yield break` are both forbidden inside a lambda. Without this the
@@ -11029,13 +11103,26 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // guards of non-selected arms do evaluate at runtime) stay dropped —
         // conservative and sound in both directions. The same running
         // intersection is the after-case state (it equals entry ∩ every arm
-        // exit, which also covers the no-match fall-through path). (The
-        // legacy nullNarrowed_ set leaks arm-to-arm here — a pre-existing
-        // local-narrowing hole confirmed by probe and filed separately from
-        // lane #2116.)
+        // exit, which also covers the no-match fall-through path).
+        //
+        // fix #2164 / §7.4: the legacy `nullNarrowed_` set shares the same
+        // arm-to-arm hygiene need. Without it, a guard inside arm 1's body
+        // (`if x = null then return 0; end;`) established x as non-null and
+        // the next arm's body (`return x.Length;`) inherited that fact — but
+        // the next arm runs only when arm 1 did NOT (so x might be null there:
+        // compile-accepted null deref, SIGSEGV at runtime). Apply the SAME
+        // running-intersection discipline to the local set: each arm starts
+        // from the running intersection, after-arm intersection folds the
+        // exit. entryNullNarrowed is captured once at the top of the
+        // construct; the running intersection is seeded with it and shrunken
+        // by each arm's exit. Set algebra over symbol pointers — no
+        // container-iteration dependence. // per §7.4, #2116, #2164
         auto caseRunningField = fieldNarrowed_;
+        auto caseEntryNull = nullNarrowed_;
+        auto caseRunningNull = caseEntryNull;
         for (const auto& arm : cs->arms) {
             fieldNarrowed_ = caseRunningField;  // §7.4 #2116: per-arm base
+            nullNarrowed_ = caseRunningNull;    // §7.4 #2164: per-arm base
             // §19 / §A (#727): scrutinee-less arm — typecheck the bool CONDITION
             // expression(s) the ConstantPattern holds.
             // §19 / §A.8 (#957): a scrutinee-BEARING arm whose pattern is a
@@ -11551,8 +11638,17 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 if (fieldNarrowed_.count(*it)) ++it;
                 else it = caseRunningField.erase(it);
             }
+            // §7.4 #2164: the same running-intersection discipline for the
+            // LOCAL set — every later arm starts from entry ∩ earlier-arm
+            // exits, and the after-case state is the same intersection.
+            for (auto it = caseRunningNull.begin();
+                 it != caseRunningNull.end();) {
+                if (nullNarrowed_.count(*it)) ++it;
+                else it = caseRunningNull.erase(it);
+            }
         }
         fieldNarrowed_ = std::move(caseRunningField);  // §7.4 #2116
+        nullNarrowed_ = std::move(caseRunningNull);    // §7.4 #2164
         currentScope_ = preArmEnumScope;  // §10.6 (#772): pop the enum scope
         inEnumScrutineeCaseArms_ = savedEnumArms;
     }
