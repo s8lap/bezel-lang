@@ -525,6 +525,67 @@ TypeRef* ExprTC::bindLambdaDestructure(const ast::DestructuringPattern& dp,
     return rt;
 }
 
+// §27.3 (v0.226, #2107): see ExprTypecheck_impl.hpp. Recursively collect the
+// resolved type of every value-carrying `return e;` in a block-bodied lambda
+// body. Descends through every statement wrapper that may lexically contain a
+// `return` (do/end, if/elif/else, while, for, try/catch/finally, statement-
+// position case block arms) but NOT into nested lambdas — a nested lambda is an
+// expression value (LocalDecl initializer, AssignmentStmt value, ReturnStmt
+// value, ExpressionStmt expr, …) and its returns belong to its own callable,
+// not this one. A `return;` (no value) contributes nothing (procedure-exit).
+void ExprTC::collectLambdaReturnTypeFromStmt(const ast::Stmt* s,
+                                             std::vector<TypeRef*>& out) {
+    if (!s) return;
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+        if (rs->value)
+            if (auto* t = ctx_.exprType(*rs->value)) out.push_back(t);
+        return;
+    }
+    if (auto* bs = dynamic_cast<const ast::DoEndBlock*>(s)) {
+        collectLambdaReturnTypes(bs->body, out);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s)) {
+        collectLambdaReturnTypes(ifs->ifBranch.body, out);
+        for (auto& el : ifs->elifBranches)
+            collectLambdaReturnTypes(el.body, out);
+        collectLambdaReturnTypes(ifs->elseBody, out);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+        collectLambdaReturnTypes(ws->body, out);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+        collectLambdaReturnTypes(fs->body, out);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+        collectLambdaReturnTypes(ts->body, out);
+        for (auto& arm : ts->catches)
+            collectLambdaReturnTypeFromStmt(arm.body.get(), out);
+        collectLambdaReturnTypes(ts->finallyBody, out);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+        for (auto& arm : cs->arms)
+            if (arm.bodyKind == ast::CaseArmBodyKind::Block)
+                collectLambdaReturnTypes(arm.stmts, out);
+        return;
+    }
+    // Every other statement (LocalDecl, AssignmentStmt, ExpressionStmt,
+    // BreakStmt, ContinueStmt, ThrowStmt, YieldStmt, DiscardStmt, …) carries
+    // expressions, not `return` statements; a nested lambda lives in those
+    // expressions and is excluded by construction.
+}
+
+void ExprTC::collectLambdaReturnTypes(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
+        std::vector<TypeRef*>& out) {
+    for (const auto& s : stmts)
+        collectLambdaReturnTypeFromStmt(s.get(), out);
+}
+
 void ExprTC::visitExpr(const ast::Expr& e) {
     // §17.15 (v0.216, #2098): the binding atom `(var x := E; body)`. Handled
     // before visitChildren — the clauses are §21.1 declaration statements
@@ -4661,6 +4722,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 TypeRef* savedPending = pendingLambdaParamType_;
                 TypeRef* savedLamRet = pendingLambdaReturnType_;
                 std::vector<TypeRef*> savedLamParams = pendingLambdaParamTypes_;
+                TypeRef* savedLamTargetRet = pendingLambdaTargetReturn_;
                 if (auto* lam =
                         dynamic_cast<const ast::LambdaExpr*>(a.value.get())) {
                     if (eventPayload)     pendingLambdaParamType_ = eventPayload;
@@ -4780,6 +4842,20 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                             paramTy, classSubst);
                                     pendingLambdaParamTypes_.push_back(paramTy);
                                 }
+                                // §27.3 (v0.226, #2107): thread the target
+                                // function type's return slot so the block-body
+                                // inference knows a target exists and suppresses
+                                // the divergent-return error (divergent returns
+                                // are checked against the target under §5.1, not
+                                // unified by inference). Apply the same class-
+                                // level generic substitution as the params.
+                                pendingLambdaTargetReturn_ = pt->funcReturn;
+                                if (!classSubst.empty() &&
+                                    pendingLambdaTargetReturn_)
+                                    pendingLambdaTargetReturn_ =
+                                        substituteReturnType(
+                                            pendingLambdaTargetReturn_,
+                                            classSubst);
                             }
                         }
                     }
@@ -4848,6 +4924,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 pendingLambdaParamType_ = savedPending;
                 pendingLambdaReturnType_ = savedLamRet;
                 pendingLambdaParamTypes_ = savedLamParams;
+                pendingLambdaTargetReturn_ = savedLamTargetRet;
             }
             // per §7.4 (#1188): a `ref`/`out` argument can be reassigned by the
             // callee — including being set to null — so a prior null-narrowing
@@ -5141,6 +5218,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // Consumed once so nested lambdas don't inherit it.
         TypeRef* lamRetHint = pendingLambdaReturnType_;
         pendingLambdaReturnType_ = nullptr;
+        // §27.3 (v0.226, #2107): the target function type's return slot,
+        // threaded from a typed-local initializer or a function-typed call
+        // argument. When present the block body HAS a target return type and
+        // the divergent-return inference error is suppressed. Consumed once so
+        // a nested lambda doesn't inherit it.
+        TypeRef* lamTargetRet = pendingLambdaTargetReturn_;
+        pendingLambdaTargetReturn_ = nullptr;
         // §27.3 (v0.217, #2101): the optional return-type ascription. When
         // present it behaves exactly as a method's declared return type —
         // each `return e;` (and an expression body) is checked against it
@@ -5515,33 +5599,54 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             } else if (lam->exprBody) {
                 inferredReturn = ctx_.exprType(*lam->exprBody);
             } else {
-                // Scan stmts (flat, not recursive) for a `return EXPR`.
-                for (const auto& s : lam->stmts) {
-                    if (!s) continue;
-                    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s.get())) {
-                        if (rs->value) { inferredReturn = ctx_.exprType(*rs->value); break; }
-                    }
-                    // Check common wrappers: DoEndBlock, IfStmt body.
-                    auto scanInner = [&](const std::vector<std::unique_ptr<ast::Stmt>>& inner) {
-                        for (const auto& ss : inner) {
-                            if (!ss) continue;
-                            if (auto* rs2 = dynamic_cast<const ast::ReturnStmt*>(ss.get()))
-                                if (rs2->value && !inferredReturn)
-                                    inferredReturn = ctx_.exprType(*rs2->value);
-                        }
-                    };
-                    if (auto* bs = dynamic_cast<const ast::DoEndBlock*>(s.get()))
-                        scanInner(bs->body);
-                    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
-                        scanInner(ifs->ifBranch.body);
-                        for (auto& el : ifs->elifBranches) scanInner(el.body);
-                        scanInner(ifs->elseBody);
-                    }
-                    if (inferredReturn) break;
-                }
-                // Fallback: use int (i32) for lambdas with no visible return.
+                // §27.3 (v0.226, #2107): recursively collect EVERY value-
+                // carrying `return e;` type in the block body (descending
+                // through statement wrappers — do/end, if/elif/else, while,
+                // for, try/catch/finally, statement-position case block arms
+                // — but NOT into nested lambdas, which are their own
+                // callables). The first collected type is the inferred return,
+                // replacing the old flat first-return scan that missed returns
+                // nested below one wrapper level and silently fell back to
+                // `int`. And under §27.3, a no-target block body with
+                // divergent value-return types is a compile error — the
+                // compiler does not unify them to a common supertype.
+                std::vector<TypeRef*> returnTypes;
+                collectLambdaReturnTypes(lam->stmts, returnTypes);
+                if (!returnTypes.empty())
+                    inferredReturn = returnTypes.front();
+                // Fallback: use int (i32) for lambdas with no visible value
+                // return (a procedure lambda / all-bare-returns body).
                 if (!inferredReturn)
                     inferredReturn = ctx_.primitiveTypeRef(PrimitiveType::Int);
+                // §27.3 (v0.226, #2107): the divergent-return error fires only
+                // when the lambda has NEITHER a return-type ascription NOR a
+                // target return type (lamTargetRet), AND the body has ≥2 value
+                // returns whose types are not all the SAME type. The programmer
+                // states the intended type instead — a target type, a return-
+                // type ascription, or an ascribed variable type.
+                if (!hasAscription && lamTargetRet == nullptr &&
+                    returnTypes.size() >= 2) {
+                    TypeRef* first = returnTypes.front();
+                    bool divergent = false;
+                    for (std::size_t ri = 1; ri < returnTypes.size(); ++ri) {
+                        if (!functionSlotTypeRefEqual(first, returnTypes[ri])) {
+                            divergent = true;
+                            break;
+                        }
+                    }
+                    if (divergent) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, lam->span.begin,
+                            "a block-bodied lambda with no target type has "
+                            "divergent `return` types \xe2\x80\x94 its return "
+                            "type cannot be inferred; give it a target type, a "
+                            "return-type ascription "
+                            "(`lambda(\xe2\x80\xa6): T => \xe2\x80\xa6`), or an "
+                            "ascribed variable type "
+                            "(`var f: (\xe2\x80\xa6) -> T := \xe2\x80\xa6`) "
+                            "(\xc2\xa7""27.3)");
+                    }
+                }
             }
             // §30.6 (#800, partial): the function type of an ASYNC lambda has a
             // `Task<T>` (or `OwningTask<T>` for a class-typed, ownership-

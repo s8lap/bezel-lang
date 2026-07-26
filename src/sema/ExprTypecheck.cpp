@@ -2673,7 +2673,9 @@ bool ExprTC::primitiveBoxesIntoBuiltinIface(PrimitiveType fromPrim,
 // §5.1 widening. Mirrors Resolver::typeRefEqual (TypeResolution_Checks.cpp)
 // but is duplicated locally — ExprTC has no handle on a Resolver instance —
 // rather than threading one through for this single use.
-static bool functionSlotTypeRefEqual(const TypeRef* a, const TypeRef* b) {
+// §27.3 (v0.226, #2107): external linkage (declared in ExprTypecheck_impl.hpp)
+// so ExprTypecheck_Exprs.cpp's divergent-return check can reuse it.
+bool functionSlotTypeRefEqual(const TypeRef* a, const TypeRef* b) {
     if (a == b) return true;
     if (!a || !b) return false;
     if (a->kind != b->kind) return false;
@@ -8340,6 +8342,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // can reject a forgotten `await` in the body. Restored after the visit.
         TypeRef* savedLamRet = pendingLambdaReturnType_;
         std::vector<TypeRef*> savedLamParams = pendingLambdaParamTypes_;
+        TypeRef* savedLamTargetRet = pendingLambdaTargetReturn_;
         if (ld->type && ld->initializer) {
             if (dynamic_cast<const ast::LambdaExpr*>(ld->initializer.get())) {
                 if (auto* dt = ctx_.resolvedType(*ld->type)) {
@@ -8348,6 +8351,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         !dt->funcReturn->genericArgs.empty())
                         pendingLambdaReturnType_ =
                             dt->funcReturn->genericArgs.front();
+                    // §27.3 (v0.226, #2107): thread the target function type's
+                    // return slot so the block-body inference knows a target
+                    // exists and suppresses the divergent-return error — under a
+                    // target, divergent returns are checked against R via §5.1 at
+                    // each `return` (a future slice), never unified by inference.
+                    if (dt->kind == TypeRef::Kind::Function)
+                        pendingLambdaTargetReturn_ = dt->funcReturn;
                     // fix #829: thread the target's positional parameter types so
                     // an untyped lambda param `(a, b) => …` is given its inferred
                     // type (the body's operator/member resolution then sees the
@@ -8364,6 +8374,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if (ld->initializer) visitExpr(*ld->initializer);
         pendingLambdaReturnType_ = savedLamRet;
         pendingLambdaParamTypes_ = savedLamParams;
+        pendingLambdaTargetReturn_ = savedLamTargetRet;
         currentLiteralWideningHint_ = savedHint;
         // stdlib §5 (#755): reject STORING a bare lazy GroupBy result in a local —
         // the lazy IGrouping<TKey,T> enumerator dangles after the store and
@@ -8739,7 +8750,22 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 default: break;
             }
         }
+        // §27.3 (v0.226, #2107): thread the enclosing value-method's function
+        // return slot when the returned value is a lambda — the same target the
+        // typed-local initializer and call-argument positions thread. Without
+        // this, `return lambda() => do return d; return c; end;` in a method
+        // declared `(): () -> Animal` is wrongly rejected as divergent: under a
+        // target the returns are checked against it via §5.1 (and the resulting
+        // `() -> Dog` converts to the target under §27.1.1), never unified by
+        // inference. Restored after the visit.
+        TypeRef* savedLamTargetRet = pendingLambdaTargetReturn_;
+        if (rs->value && returnCtx_ == ReturnCtx::ValueMethod &&
+            currentReturnType_ &&
+            currentReturnType_->kind == TypeRef::Kind::Function &&
+            dynamic_cast<const ast::LambdaExpr*>(rs->value.get()))
+            pendingLambdaTargetReturn_ = currentReturnType_->funcReturn;
         if (rs->value) visitExpr(*rs->value);
+        pendingLambdaTargetReturn_ = savedLamTargetRet;
         currentLiteralWideningHint_ = savedRetHint;
         // §22.4 (v0.183, #1585): a `return E;` that may produce a postcondition's
         // stated constant must leave the out parameter provably non-null.
@@ -9173,9 +9199,26 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         }
         if (as->value) {
             TypeRef* savedPending = pendingLambdaParamType_;
+            TypeRef* savedLamTargetRet = pendingLambdaTargetReturn_;
             if (eventPayload &&
                 dynamic_cast<const ast::LambdaExpr*>(as->value.get()))
                 pendingLambdaParamType_ = eventPayload;
+            // §27.3 (v0.226, #2107): thread the assignment target's function
+            // return slot when the value is a lambda — the same target the
+            // typed-local initializer position threads for its inline form
+            // (`var f: (…) -> R := lambda …`). A deferred reassignment
+            // `var f: (…) -> Animal; … f := lambda() => do return d; return c;
+            // end;` is the SAME shape and must NOT be rejected as divergent:
+            // under the target the returns are checked against R via §5.1, not
+            // unified by inference. `as->target` was visited above so its
+            // exprType is available. Restored after the visit.
+            if (as->target &&
+                dynamic_cast<const ast::LambdaExpr*>(as->value.get())) {
+                if (TypeRef* tgtTy = ctx_.exprType(*as->target)) {
+                    if (tgtTy->kind == TypeRef::Kind::Function)
+                        pendingLambdaTargetReturn_ = tgtTy->funcReturn;
+                }
+            }
             // per §4.2 (v0.182): an assignment target whose declared type is
             // a wider integer type (long/ulong/uint) is an admitting typed
             // context — an unsuffixed literal exceeding `int`'s range but
@@ -9220,6 +9263,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             }
             currentLiteralWideningHint_ = savedAssignHint;
             pendingLambdaParamType_ = savedPending;
+            pendingLambdaTargetReturn_ = savedLamTargetRet;
         }
         // §6.6 (v0.184, #1689): a compound assignment `x op= e` desugars to
         // `x := x op e`. Let T be the target's type and R the type of
