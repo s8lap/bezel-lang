@@ -457,6 +457,28 @@ BEZEL_TEST(import_alias_collision_2179,
             "bare name `Q` (from module `LibA`)"));
 }
 
+// §2.2 (v0.226, #2213): an alias may not collide with a type declared in
+// the current module, even though local declarations win over imported bare
+// names for lookup. The collision is diagnosed at the alias declaration.
+BEZEL_TEST(import_alias_collision_2213,
+           alias_vs_local_module_type_rejected_spec_2_2_v0226) {
+    ModuleMetadata dep = buildMetaFor(
+        "module Lib; public class Widget end Widget;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import Lib as Foo; "
+        "public class Foo end Foo; "
+        "public class Program "
+        "  public static method Main(): int => 0; "
+        "end Program;");
+
+    BEZEL_EXPECT_TRUE(r->hadErrors);
+    BEZEL_EXPECT_TRUE(hasDiagnosticContaining(
+        *r, "import alias `Foo` for module `Lib` collides with type `Foo` "
+            "declared in the current module; choose a different alias (§2.2)"));
+}
+
 // §2.2: a declaration in the current module shadows a same-named import
 // for bare-name purposes; no ambiguity, no error (§2.2 last paragraph).
 BEZEL_TEST(module_chapter_1365, local_shadows_import_not_ambiguous_spec_2_2) {

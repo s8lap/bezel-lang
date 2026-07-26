@@ -230,6 +230,23 @@ void Resolver::run(const ast::SourceFile& src) {
                     aliasIt->second + "`; choose a different alias (\xC2\xA7""2.2)");
                 continue;
             }
+            // §2.2 (v0.226, #2213): an import alias also occupies the
+            // current module's declaration namespace. A local type wins over
+            // an imported bare name for lookup, but the alias is still a
+            // declaration-site collision rather than a silently shadowed
+            // qualifier. `localNames` is the snapshot taken before imports,
+            // so it covers all declarations already present in this module
+            // scope when name resolution starts.
+            if (localNames.count(imp->alias)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, imp->span.begin,
+                    std::string("import alias `") + imp->alias +
+                    "` for module `" + dotted +
+                    "` collides with type `" + imp->alias +
+                    "` declared in the current module; choose a different "
+                    "alias (\xC2\xA7""2.2)");
+                continue;
+            }
             auto originIt = importedNameOrigin.find(imp->alias);
             if (originIt == importedNameOrigin.end()) continue;
             if (ambiguousImportNames_.count(imp->alias)) continue;
