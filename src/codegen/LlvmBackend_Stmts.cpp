@@ -770,9 +770,37 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     llvm::Value* res = emitMethodCall(
                         opMethod, args, /*baseQualified=*/false);
                     if (res) {
-                        builder_.CreateStore(res, addr);
+                        // §28.7 / §17.6 (#1831): a user-defined compound
+                        // `target OP= value` (e.g. `_c += k` where
+                        // `operator +` returns a fresh owned class) desugars
+                        // to `target := operator(target, value)` (§25.1), and
+                        // the store back must DROP-ON-OVERWRITE the displaced
+                        // value exactly like the plain `:=` path — for an
+                        // OWNED class/interface FIELD, route through
+                        // lowerOwnedClassFieldStore (the field analog of the
+                        // local disposal below, mirroring the #1702 ++/-- fix
+                        // in the unary branch). For an OWNED class LOCAL,
+                        // fall through to disposeDisplacedOwnedClassLocal +
+                        // a plain store (matching §28.7's "RHS first, dispose
+                        // displaced, store new" ordering: the operator already
+                        // borrowed `cur`, so the disposal of the old value
+                        // runs after the operator returns, before the new
+                        // value is stored). Without this the displaced
+                        // value leaks (a leak per `+=` invocation — e.g. the
+                        // old `_c` and the `new Counter(...)` operator
+                        // result every time `_c += k` reassigns the field).
+                        // Borrow / value / ref / static / record / indexer
+                        // targets keep the plain store (no drop-on-overwrite
+                        // entry — no double-free).
+                        if (!lowerOwnedClassFieldStore(*as->target, addr, res)) {
+                            disposeDisplacedOwnedClassLocal(
+                                as->target.get(), addr, elemTy, res);
+                            builder_.CreateStore(res, addr);
+                        }
                         // §27.5 / #673: sync compound-assignment result back
-                        // to the original alloca for guarded-boxed locals.
+                        // to the original alloca for guarded-boxed locals
+                        // (a no-op for a field target — localSlot returns
+                        // null for a non-local).
                         if (llvm::AllocaInst* ns = localSlot(*as->target))
                             syncCellToOrigSlot(ns, res);
                     }
