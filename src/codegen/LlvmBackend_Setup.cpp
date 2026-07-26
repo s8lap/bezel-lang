@@ -11414,22 +11414,29 @@ struct StringEscapeWalker {
     }
 
     // #1951 / §19.2 / §20 / §28.3 / §28.9: does `e` (an expression-position
-    // `case`/`when` or if-expression) have a NON-NULLABLE `string` result? Only
-    // then does lowerCaseExpr/lowerConditional RETAIN a bare-string-local ARM
-    // read (minting a fresh +1 for the result, leaving the local's own +1 in its
-    // slot). For exactly those expressions, a bare read of the tracked local
-    // written as an arm/branch is a BORROW — not an escape — so the local stays
-    // scope-end-release eligible; the retain and this relaxation move in lockstep
-    // (keyed on the SAME non-nullable-string-result test), so an eligible local
-    // is always the one codegen retains. NON-NULLABLE ONLY (fix #1952 rework):
-    // the arm normalization does not mint for a `string?` result, so a `string?`
-    // arm-meet keeps the conservative escape treatment here — no relaxation
-    // without a matching retain (that mismatch would drop the local's release =
-    // a double-free). A non-string arm-meet likewise keeps the conservative
-    // treatment.
+    // `case`/`when` or if-expression) have a `string` (nullable or non-
+    // nullable) result? Only then does lowerCaseExpr/lowerConditional RETAIN
+    // a bare-string-local ARM read (minting a fresh +1 for the result,
+    // leaving the local's own +1 in its slot). For exactly those
+    // expressions, a bare read of the tracked local written as an
+    // arm/branch is a BORROW — not an escape — so the local stays scope-end-
+    // release eligible; the retain and this relaxation move in lockstep
+    // (keyed on the SAME nullable-or-not-string-result test), so an eligible
+    // local is always the one codegen retains.
+    //
+    // NULLABLE-INCLUSIVE (fix #2200, nullable analog of #1951): the pre-
+    // #2196 "nullable-string arm-meet stays conservative" posture was rooted
+    // in the un-refcounted nullable return path; after #2196 the whole
+    // `string?` value path is refcounted, so extending both halves (the
+    // mint above and this walker relaxation) to nullable closes the leak
+    // a `case n of 1 => s, _ => null` written as a `string?` producer arm
+    // caused. The retain-on-borrow premise is unchanged: bz_string_retain
+    // is null-safe, so a `null` arm simply no-ops. A non-string arm-meet
+    // likewise keeps the conservative treatment (no codegen retain ⇒ no
+    // relaxation).
     bool isStringResultArmMeet(const ast::Expr* e) {
         const sema::TypeRef* rt = ctx.exprType(*e);
-        return rt && !rt->nullable &&
+        return rt &&
                rt->kind == sema::TypeRef::Kind::Primitive &&
                rt->primitive == sema::PrimitiveType::String;
     }

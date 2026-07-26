@@ -334,3 +334,71 @@ BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
     BEZEL_EXPECT_TRUE(r.ran);         // 5 minted strings each freed once
     BEZEL_EXPECT_EQ(r.exitCode, 10);  // 5 * "ab".Length
 }
+
+// =====================================================================
+// (I) fix #2200 / §28.3 / §28.9 — nullable CONDITIONAL-ESCAPE: a `string`
+// producer LOCAL escaping via one arm of a `string?` `case`/`if` leaked on
+// the non-escaping paths. The non-nullable sibling was fixed by #1951
+// (retain a bare string-local arm read; the StringEscapeWalker relaxes the
+// local to scope-end-release eligible; balanced on every path). The
+// nullable analog was deliberately deferred by #1952 because the nullable
+// return path was un-refcounted (#2196 root). After #2196 the whole
+// `string?` value path is refcounted, so extending both halves (the
+// per-arm mint in lowerCaseExpr/lowerConditional AND the
+// StringEscapeWalker.isStringResultArmMeet relaxation) to nullable closes
+// the leak. The issue's exact repro: `var s := "x" + "y"; return (case n
+// of 1 => s, _ => null);` — n=2 always takes the null arm; pre-fix `s`'s
+// +1 leaked each call (105B = 32B header * 3 + 9B indirect buffer).
+// // per #1951, #2196, #2200, §28.3, §28.9
+// =====================================================================
+const char* kNullableConditionalEscapeLocalLoop =
+    "module M; class C "
+    "  public static method P(n: int): string? "
+    "    var s := \"x\" + \"y\"; "
+    "    return (case n of 1 => s, _ => null); "
+    "  end P; "
+    "  public static method Main(): int "
+    "    var t := 0; var i := 0; "
+    "    while i < 4 do "
+    "      var r := C.P(2); "
+    "      if r = null then t := t + 1; end; "
+    "      i := i + 1; "
+    "    end; "
+    "    return t; "  // 4 — every iteration's null arm
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
+           nullable_conditional_escape_local_lsan_clean_spec_28_3) {
+    JitResult r = runAotChecked(kNullableConditionalEscapeLocalLoop);
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);         // 4 minted "xy" each freed once
+    BEZEL_EXPECT_EQ(r.exitCode, 4);   // 4 (every iteration null)
+}
+
+// The if-expression sibling of #2200. Same shape, `if` not `case`.
+// §20 / §28.3 / §28.9.
+const char* kNullableIfConditionalEscapeLocalLoop =
+    "module M; class C "
+    "  public static method P(n: int): string? "
+    "    var s := \"x\" + \"y\"; "
+    "    return (if n = 1 then s else null); "
+    "  end P; "
+    "  public static method Main(): int "
+    "    var t := 0; var i := 0; "
+    "    while i < 4 do "
+    "      var r := C.P(2); "
+    "      if r = null then t := t + 1; end; "
+    "      i := i + 1; "
+    "    end; "
+    "    return t; "  // 4
+    "  end Main; "
+    "end C;";
+
+BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
+           nullable_if_conditional_escape_local_lsan_clean_spec_28_3) {
+    JitResult r = runAotChecked(kNullableIfConditionalEscapeLocalLoop);
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 4);
+}

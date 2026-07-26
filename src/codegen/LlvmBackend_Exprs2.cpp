@@ -5493,20 +5493,24 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
             // UNCONDITIONAL escape (`return s`) where the single reference
             // genuinely flows out and the local is not released.
             //
-            // NON-NULLABLE ONLY (fix #1952 rework). The per-arm mint is
-            // deliberately confined to a non-nullable owned `string` result. A
-            // `string?` result is NOT normalized here: minting +1 for a borrow
-            // arm of a `string?` arm-meet is UNSOUND when the result flows
-            // through the un-refcounted nullable path (a `string?` method return
-            // does not release the minted +1 — #2196), which leaked the retained
-            // borrow (a returned `(if c then p else null)` / `a ?? b`). Instead,
-            // a `string?` arm-meet is refcounted only when every arm is already
-            // +1-or-null WITHOUT a borrow retain — a producer / `null` / string
-            // literal — which isPlusOneStringProducer recognizes directly (no
-            // per-arm mint needed); a `string?` arm-meet WITH a borrow arm stays
-            // on the old (borrow, unreleased) path — safe, and unchanged from
-            // before #1952.
-            if (v && resultSemaTy && !resultSemaTy->nullable &&
+            // NULLABLE-INCLUSIVE (fix #2200, nullable analog of #1951). After #2196
+            // the whole `string?` value path is refcounted (callee return-mint
+            // + caller producer recognition + caller scope-end release), so
+            // the pre-#2196 unsoundness ("minting +1 for a `string?` arm-meet
+            // leaks because the nullable return path is un-refcounted") is
+            // gone. Extending the per-arm mint + the StringEscapeWalker
+            // relaxation (coordinated, both keyed on the SAME nullable-string-
+            // result test — see isStringResultArmMeet below) to nullable
+            // closes the leak the conservative pre-#2196 posture caused:
+            // a `case n of 1 => s, _ => null` written where `s` is a +1
+            // string local leaked `s`'s +1 on every non-selected path
+            // (transfer-style suppression of scope-end release combined with
+            // no arm-side mint = unbalanced leak). The same mint+walker-
+            // relaxation pair that makes the non-nullable arm-meet balanced
+            // makes the nullable one balanced; bz_string_retain is null-safe,
+            // so the `null` arm simply no-ops. // per #1951, #2200, §28.3,
+            // §28.9
+            if (v && resultSemaTy &&
                 resultSemaTy->kind == sema::TypeRef::Kind::Primitive &&
                 resultSemaTy->primitive == sema::PrimitiveType::String &&
                 v->getType()->isPointerTy() &&
@@ -7382,13 +7386,16 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
     // eligible). The ReturnStmt/arrow/lambda paths keep the transfer for an
     // UNCONDITIONAL escape (`return s`). See lowerCaseExpr for the full rationale.
     //
-    // NON-NULLABLE ONLY (fix #1952 rework): as in lowerCaseExpr, a `string?`
-    // result is NOT normalized here — minting +1 for a borrow branch of a
-    // `string?` if-expression leaked when the result flowed through the
-    // un-refcounted nullable return path (#2196). A `string?` if-expression is
-    // refcounted only when every branch is already +1-or-null (producer / `null`
-    // / string literal), which isPlusOneStringProducer recognizes directly.
-    if (resultSemaType && !resultSemaType->nullable &&
+    // NULLABLE-INCLUSIVE (fix #2200, nullable analog of #1951): the same
+    // reasoning as lowerCaseExpr above — after #2196 the whole `string?`
+    // value path is refcounted, so the pre-#2196 unsoundness ("minting +1
+    // for a `string?` if-expression leaks because the nullable return path
+    // is un-refcounted") is gone. Extending the per-branch mint + the
+    // StringEscapeWalker relaxation (coordinated — see
+    // isStringResultArmMeet) closes the leak a `string?` conditional-escape
+    // caused. bz_string_retain is null-safe, so a `null` branch is a no-op.
+    // // per #1951, #2200, §28.3, §28.9
+    if (resultSemaType &&
         resultSemaType->kind == sema::TypeRef::Kind::Primitive &&
         resultSemaType->primitive == sema::PrimitiveType::String) {
         if (tv && !thenDiv && tv->getType()->isPointerTy() &&
