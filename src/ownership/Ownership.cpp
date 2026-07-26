@@ -4262,7 +4262,23 @@ bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
            head == "OwningSet" || head == "OwningStack" ||
            head == "OwningQueue" || head == "OwningLinkedList" ||
            head == "OwningBuffer" ||
-           head == "TaskCompletionSource" || head == "OwningTaskCompletionSource";
+           head == "TaskCompletionSource" || head == "OwningTaskCompletionSource" ||
+           // #2160 / §28.10: the borrowing-family collections are
+           // HEAP-OWNED class instances whose backing storage is
+           // reclaimed at scope end. The spec is genuinely ambiguous on
+           // whether their `Dispose()`-is-a-no-op (§28.11) means "no
+           // disposal obligation" (the §21.1 const-alias reading) or
+           // "no USER-CODE disposal — the heap allocation is still a
+           // discharge obligation" (the §28.10 using-var reading). The
+           // latter matches what the §28.3 auto-drop must-use warning
+           // names as the remedy (`using var` is the canonical
+           // discharge; `const` would leave the heap allocation
+           // undischarged). The owner ruling is pending; this is the
+           // implementation. // per §28.10, §28.11, §21.1, #2160
+           head == "Array" || head == "Stack" || head == "Queue" ||
+           head == "Set" || head == "SortedSet" ||
+           head == "Dictionary" || head == "SortedDictionary" ||
+           head == "LinkedList" || head == "OwningBuffer";
 }
 
 void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
