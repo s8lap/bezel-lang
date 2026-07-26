@@ -7952,6 +7952,24 @@ void MethodOwnership::collectOwnedConsumingAwaitsStmt(
             if (auto* a = awaitRoot(*ld->initializer)) out.insert(a);
         return;
     }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        // #1826 / §30.5 / §17.13: the explicit discard `_ := await ...;` is
+        // an owned-consuming position — per §17.13 the `_` discard
+        // announces a consume + freeze + end-of-statement disposal of its
+        // operand (the #1009/#1016/#1387/#1651 DiscardStmt flags carry
+        // that out for owned classes, move-only owning inline arrays, and
+        // plain named-owned locals). For a Pattern B `OwningTask<T>`
+        // result the discard disposes the await's transferred result the
+        // same way `using var x := await ...` does. The previous code had
+        // no DiscardStmt case here, so the await fell off the
+        // `consuming` set and the §30.5 Pattern-B site check at
+        // checkAwaitSitesExpr wrongly rejected it. (`checkAwaitSitesStmt`
+        // already walks DiscardStmt — only the COLLECT side missed it.)
+        // // per §30.5, §17.13
+        if (ds->value)
+            if (auto* a = awaitRoot(*ds->value)) out.insert(a);
+        return;
+    }
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
         // `target := await ...` is owned-consuming when the target is an owned
         // storage location — a local (re-assigned owned local), an `owned`
@@ -8228,7 +8246,8 @@ void MethodOwnership::checkAwaitSitesExpr(
                         Severity::Error, ue->span.begin,
                         "awaiting an `OwningTask<T>` (Pattern B) must appear in "
                         "an owned-consuming context — a `using var`/`var` "
-                        "binding, an `owned` argument, an owned-field/owned-slot "
+                        "binding, an explicit `_ := ...` discard (§17.13), an "
+                        "`owned` argument, an owned-field/owned-slot "
                         "assignment, or an owned `return` — otherwise the "
                         "ownership-transferring result is dropped without "
                         "disposal (§30.5; the canonical form is `using var x := "
