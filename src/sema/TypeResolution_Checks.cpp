@@ -4429,9 +4429,24 @@ bool Resolver::isFfiCompatibleType(const ast::Type& t, bool returnPosition) {
             // explicitly for clarity.
             if (t.arrayOwned) return false;
             if (!t.arrayElement) return false;
+            // §32.5 (v0.196, #1827): a nullable inline array `[N]T?` has no
+            // C representation. Per §32.5 "Nullable value types are
+            // rejected" — only the pointer-carrying boundary forms
+            // (`CString?`/`WString?`/`RawBytes?`) admit `?`. Inline arrays
+            // fall in the same class as `int?`/`bool?` and are rejected.
+            // The InlineArray mirror of the Named case's `if (t.nullable)
+            // return false;` was missing — the diagnostic at the call site
+            // spells the rejected `[N]T?` and cites §32.5.
+            if (t.nullable) return false;
             // The element must be an FFI-compatible *primitive* — §32.5 does
             // not admit inline arrays of class/record/inline-array elements.
             const ast::Type& elem = *t.arrayElement;
+            // §32.5 (v0.196, #1827): an inline array whose element is a
+            // nullable value type `[N](int?)` is the InlineArray mirror of
+            // the Named `int?` reject above — same root cause, same hole.
+            // Without this check, primitiveFromName ignores nullability and
+            // the element passes through as if it were the bare primitive.
+            if (elem.nullable) return false;
             if (elem.kind != ast::TypeKind::Named || !elem.name ||
                 elem.name->parts.size() != 1)
                 return false;
