@@ -90,3 +90,64 @@ BEZEL_TEST(codegen_null_narrow, nullable_record_narrowed_read_spec_7_4) {
         "  if b <> null then return b.V; end; return -1; "
         "end Main; end C;"), 7);
 }
+
+// Codegen — issue #2106 (§7.4): a method DISPATCH on a narrowed nullable
+// VALUE-type receiver (record/struct) reads the wrong `this` value. The
+// narrowed nullable value lowers to its tagged-optional `{i8 hasValue; T
+// payload}` struct; without unwrapping the payload before forming the
+// callee's `this`, the callee reads its fields from the tag region and
+// returns a garbage value. Field READs on the same narrowed value already
+// unwrap (the existing #418 path); only METHOD DISPATCH was missing it.
+//
+// Repro (issue body, plain local, no fields involved): returns 7 (3+4).
+// Pre-fix this returned 4 (the hasValue tag interpreted as the first field).
+BEZEL_TEST(codegen_null_narrow, narrowed_record_method_dispatch_spec_7_4_2106) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Point(x: int, y: int) "
+        "  public method Sum(): int return x + y; end Sum; "
+        "end Point; "
+        "class C public static method Main(): int "
+        "  var p: Point? := new Point(3, 4); "
+        "  if p <> null then return p.Sum(); end; "
+        "  return -1; "
+        "end Main; end C;"), 7);
+}
+
+// Regression guard: narrowed nullable record method dispatch with
+// multiple statements in the callee, exercising the same payload-extraction
+// path with a non-trivial callee body.
+BEZEL_TEST(codegen_null_narrow, narrowed_record_method_dispatch_multi_stmt_2106) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "record Pair(a: int, b: int) "
+        "  public method Combined(): int "
+        "    var s := a; "
+        "    s := s + b; "
+        "    return s * 2; "
+        "  end Combined; "
+        "end Pair; "
+        "class C public static method Main(): int "
+        "  var pp: Pair? := new Pair(2, 3); "
+        "  if pp <> null then return pp.Combined(); end; "
+        "  return -1; "
+        "end Main; end C;"), 10);
+}
+
+// Regression guard: a narrowed nullable CLASS receiver still works — a
+// class reference is a plain pointer so the unwrap path is a no-op for it
+// (the shape check is `{i8, ptr}`, not `{i8, T}`-payload). Confirms the
+// fix did not regress the existing class-receiver path.
+BEZEL_TEST(codegen_null_narrow, narrowed_class_method_dispatch_control_2106) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class Box public _v: int; "
+        "  public constructor(v: int) _v := v; end constructor; "
+        "  public method Get(): int return _v; end Get; "
+        "end Box; "
+        "class C public static method Main(): int "
+        "  var b: Box? := new Box(11); "
+        "  if b <> null then return b.Get(); end; "
+        "  return -1; "
+        "end Main; end C;"), 11);
+}

@@ -5033,6 +5033,36 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             recv = currentThis_;
         }
         if (!recv) return nullptr;
+        // #2106 / §7.4: a flow-narrowed nullable VALUE-type receiver (`p: Point?`
+        // proven non-null) lowers to its tagged-optional `{i8 hasValue; T payload}`
+        // struct, but sema has typed the receiver as the non-nullable T (the
+        // narrowing). Form `this` from the unwrapped payload — otherwise the
+        // callee's body reads `this.x` from the tag region and returns a garbage
+        // value (a silent wrong-value; field-READs already unwrap via the same
+        // path, only METHOD dispatch was missing it). A genuinely-nullable
+        // reference (`Class?`) is a plain pointer so unwrap is a no-op; a
+        // narrowed nullable value (`Point?` proven non-null) is the case this
+        // unwraps. A record receiver is then spilled to a stack slot by the
+        // existing record-shaping block below (CG29, §26.1). Mirrors the
+        // arithmetic-narrowed-operand path in LlvmBackend_Exprs.cpp ~line 5492.
+        // #2106 / §7.4: a flow-narrowed nullable VALUE-type receiver (`p: Point?`
+        // proven non-null) lowers to its tagged-optional `{i8 hasValue; T payload}`
+        // struct, but the callee's `this` is the unwrapped T (a method dispatch
+        // on a narrowed receiver, per §7.4). Form `this` from the payload
+        // element of the wrapper — otherwise the callee reads `this.x` from
+        // the tag region and returns a garbage value (a silent wrong-value;
+        // field-READs on the same narrowed value already unwrap via the same
+        // path, only METHOD dispatch was missing it). Triggered by detecting the
+        // canonical {i8 hasVal; T payload} struct shape; safe because a method
+        // call on a NON-narrowed nullable value type is rejected by sema (the
+        // receiver must be non-null for the method's `this`), so the wrapper
+        // here is always a narrowed value the callee expects to unwrap.
+        if (auto* st = llvm::dyn_cast<llvm::StructType>(recv->getType())) {
+            if (st->getNumElements() == 2 &&
+                st->getElementType(0) == nullablePrimHasValTy()) {
+                recv = nullablePrimValue(recv);
+            }
+        }
         // §14.2 (value-type-conforms-to-interface) + §9.4/§10.5 (record/enum =
         // value type): when a generic method `M<T>(x: T) where T: IFoo` is
         // monomorphized with T = a RECORD or an ENUM, the body's `x.Foo()` was
