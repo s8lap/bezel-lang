@@ -58,9 +58,9 @@ BEZEL_TEST(codegen_owned_task_field, owned_task_field_disposed_at_scope_end_1889
         "  public static async method Make(i: int): OwningTask<Cell> "
         "    return new Cell(); "
         "  end Make; "
-        "  public static async method Main(): Task "
+        "  public static method Main(): int "
         "    do using var h := new Holder(App.Make(5)); end; "
-        "    Console.WriteLine(\"Cell.n=\" + Cell.n.ToString()); "
+        "    return Cell.n; "
         "  end Main; "
         "end App;"), 0);
 }
@@ -112,12 +112,12 @@ BEZEL_TEST(codegen_owned_task_field, owned_task_field_disposed_on_overwrite_2173
         "  public static async method Make(i: int): OwningTask<Cell> "
         "    return new Cell(); "
         "  end Make; "
-        "  public static async method Main(): Task "
+        "  public static method Main(): int "
         "    do "
         "      using var h := new Holder(App.Make(5)); "
         "      h.Set(App.Make(99)); "
         "    end; "
-        "    Console.WriteLine(\"Cell.n=\" + Cell.n.ToString()); "
+        "    return Cell.n; "
         "  end Main; "
         "end App;"), 0);
 }
