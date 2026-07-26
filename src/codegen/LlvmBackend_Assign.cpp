@@ -2252,6 +2252,14 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     auto  savedUD        = unwindScopeDepth_;
     auto  savedDiv       = diverged_;
     auto  savedGSubst    = genericSubst_;
+    // #2170 / §30.5: a block-getter accessed from an async body must not
+    // inherit the caller's state-machine mode — the getter's `return` is
+    // ordinary (its `ret i32` terminates the getter), and the async return
+    // path's gate `smKind_ == Await && smStateStruct_` (LlvmBackend_Stmts.cpp
+    // ~line 1510) would otherwise emit bz_task_complete / spill-free /
+    // frame-free into the getter's body. Save+null+restore.
+    auto  savedSmKind    = smKind_;
+    auto* savedSmStruct  = smStateStruct_;
 
     // --- Switch into the getter function ---
     currentFn_          = fn;
@@ -2267,6 +2275,8 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     currentCaughtExc_   = nullptr;
     unwindScopeDepth_   = 0;
     diverged_           = false;
+    smKind_             = SuspendKind::Yield;
+    smStateStruct_      = nullptr;
 
     // --- Emit body ---
     lowerScopedBlock(acc->stmts);
@@ -2287,6 +2297,8 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     unwindScopeDepth_   = savedUD;
     diverged_           = savedDiv;
     genericSubst_       = std::move(savedGSubst);
+    smKind_             = savedSmKind;
+    smStateStruct_      = savedSmStruct;
     if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
 
     return fn;
@@ -2393,6 +2405,12 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     auto  savedUD        = unwindScopeDepth_;
     auto  savedDiv       = diverged_;
     auto  savedGSubst    = genericSubst_;
+    // #2170 / §30.5: an accessor (block getter/setter) built during vtable
+    // emission may also be reached from an async body; the saved/restored
+    // smKind_/smStateStruct_ here ensures the accessor's `return` does not
+    // accidentally trip the async-complete path on its parent.
+    auto  savedSmKind    = smKind_;
+    auto* savedSmStruct  = smStateStruct_;
 
     currentFn_          = fn;
     builder_.SetInsertPoint(entryBB);
@@ -2408,6 +2426,8 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     currentCaughtExc_   = nullptr;
     unwindScopeDepth_   = 0;
     diverged_           = false;
+    smKind_             = SuspendKind::Yield;
+    smStateStruct_      = nullptr;
 
     // §28.2 v0.134 / issue #601: checked disposal mode guard for property
     // accessors. Class properties only (enum properties are NOT disposable,
@@ -2521,6 +2541,8 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     unwindScopeDepth_   = savedUD;
     diverged_           = savedDiv;
     genericSubst_       = std::move(savedGSubst);
+    smKind_             = savedSmKind;
+    smStateStruct_      = savedSmStruct;
     if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
 
     return fn;
