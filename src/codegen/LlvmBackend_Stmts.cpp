@@ -5610,7 +5610,8 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
             if (!rt->astNode || !rt->astNode->name ||
                 rt->astNode->name->parts.empty())
                 return false;
-            return rt->headName() == "IEnumerable";
+            return rt->headName() == "IEnumerable" ||
+                   rt->headName() == "IOwningEnumerable";
         };
         if (auto* par = dynamic_cast<sema::ParameterSymbol*>(sym)) {
             if (par->declType) {
