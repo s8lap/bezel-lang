@@ -2673,9 +2673,7 @@ bool ExprTC::primitiveBoxesIntoBuiltinIface(PrimitiveType fromPrim,
 // §5.1 widening. Mirrors Resolver::typeRefEqual (TypeResolution_Checks.cpp)
 // but is duplicated locally — ExprTC has no handle on a Resolver instance —
 // rather than threading one through for this single use.
-// §27.3 (v0.226, #2107): external linkage (declared in ExprTypecheck_impl.hpp)
-// so ExprTypecheck_Exprs.cpp's divergent-return check can reuse it.
-bool functionSlotTypeRefEqual(const TypeRef* a, const TypeRef* b) {
+static bool functionSlotTypeRefEqual(const TypeRef* a, const TypeRef* b) {
     if (a == b) return true;
     if (!a || !b) return false;
     if (a->kind != b->kind) return false;
@@ -8342,7 +8340,6 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // can reject a forgotten `await` in the body. Restored after the visit.
         TypeRef* savedLamRet = pendingLambdaReturnType_;
         std::vector<TypeRef*> savedLamParams = pendingLambdaParamTypes_;
-        TypeRef* savedLamTargetRet = pendingLambdaTargetReturn_;
         if (ld->type && ld->initializer) {
             if (dynamic_cast<const ast::LambdaExpr*>(ld->initializer.get())) {
                 if (auto* dt = ctx_.resolvedType(*ld->type)) {
@@ -8351,13 +8348,6 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         !dt->funcReturn->genericArgs.empty())
                         pendingLambdaReturnType_ =
                             dt->funcReturn->genericArgs.front();
-                    // §27.3 (v0.226, #2107): thread the target function type's
-                    // return slot so the block-body inference knows a target
-                    // exists and suppresses the divergent-return error — under a
-                    // target, divergent returns are checked against R via §5.1 at
-                    // each `return` (a future slice), never unified by inference.
-                    if (dt->kind == TypeRef::Kind::Function)
-                        pendingLambdaTargetReturn_ = dt->funcReturn;
                     // fix #829: thread the target's positional parameter types so
                     // an untyped lambda param `(a, b) => …` is given its inferred
                     // type (the body's operator/member resolution then sees the
@@ -8374,7 +8364,6 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if (ld->initializer) visitExpr(*ld->initializer);
         pendingLambdaReturnType_ = savedLamRet;
         pendingLambdaParamTypes_ = savedLamParams;
-        pendingLambdaTargetReturn_ = savedLamTargetRet;
         currentLiteralWideningHint_ = savedHint;
         // stdlib §5 (#755): reject STORING a bare lazy GroupBy result in a local —
         // the lazy IGrouping<TKey,T> enumerator dangles after the store and

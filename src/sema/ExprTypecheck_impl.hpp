@@ -50,13 +50,6 @@ void reportCollectionLiteralInterfaceTarget(DiagnosticEngine& diags,
                                             SourceLocation loc,
                                             std::string_view ifaceName);
 
-// §27.1.1 (v0.180): exact structural equality of two TypeRefs — the INVARIANT
-// fallback for a function-value slot that is not a bare, non-generic
-// class/interface reference. Defined in ExprTypecheck.cpp (mirrors
-// Resolver::typeRefEqual); shared with ExprTypecheck_Exprs.cpp for the
-// §27.3 divergent-return check (#2107).
-bool functionSlotTypeRefEqual(const TypeRef* a, const TypeRef* b);
-
 class ExprTC {
 public:
     ExprTC(SemaContext& ctx) : ctx_(ctx) {}
@@ -429,37 +422,9 @@ private:
     // Null otherwise. Consumed (and cleared) by visitExpr(LambdaExpr).
     TypeRef* pendingLambdaReturnType_ = nullptr;
 
-    // §27.3 (v0.226, #2107): when about to visit a lambda whose expected
-    // function type is known from context (a typed local/field initializer
-    // `var f: (…) -> R := …`, or a call argument to a `(…) -> R` parameter),
-    // this holds the target's RETURN slot R so the block-body inference knows a
-    // target exists and suppresses the divergent-return error — divergent
-    // returns are checked against the target under §5.1 elsewhere, not unified
-    // by inference. Distinct from pendingLambdaReturnType_ (which carries only
-    // the peeled Task element T for the async forgotten-`await` check). Null
-    // when no target return type is available. Consumed (and cleared) by
-    // visitExpr(LambdaExpr) so a nested lambda never inherits it.
-    TypeRef* pendingLambdaTargetReturn_ = nullptr;
-
     // issue #777 / §30.6: true when `t` is a Named `Task<…>` / `OwningTask<…>`
     // (the async task wrapper). Used to detect a forgotten `await`.
     bool isTaskShapedRef(const TypeRef* t) const;
-
-    // §27.3 (v0.226, #2107): recursively collect the resolved type of every
-    // value-carrying `return e;` in a block-bodied lambda body, descending
-    // through statement wrappers (do/end, if/elif/else, while, for,
-    // try/catch/finally, statement-position case block arms) but NOT into
-    // nested lambdas (a nested lambda is an expression value and its own
-    // callable — its returns are its own). Used by the no-target block-body
-    // return-type inference to (a) pick the first return's type, replacing the
-    // old flat first-return scan that missed returns nested below one wrapper
-    // level and silently fell back to `int`, and (b) detect §27.3 divergent
-    // returns (≥2 value returns whose types are not all the same).
-    void collectLambdaReturnTypes(
-        const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
-        std::vector<TypeRef*>& out);
-    void collectLambdaReturnTypeFromStmt(const ast::Stmt* s,
-                                         std::vector<TypeRef*>& out);
 
     // per §24.3: the payload type of an event-handler call's callee, or null
     // when `callee` is not `<event>.Subscribe/.Add/.Remove`. Used to set
