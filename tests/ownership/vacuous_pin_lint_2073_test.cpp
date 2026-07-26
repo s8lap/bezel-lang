@@ -290,6 +290,39 @@ BEZEL_TEST(vacuous_pin_lint_2073,
 // and the #1595 `using var t := F.Work(p)` Task-family pattern). FAILS WITHOUT
 // THE REWORK. // per §28.10 #2073 (rework 2)
 
+// `using var` over StringBuilder must not emit the inert-RHS warning: although
+// compiler-intrinsic, StringBuilder owns its parts array and retained strings,
+// and the runtime performs real scope-end cleanup (stdlib §3.1; spec §28.9,
+// v0.226). The plain-`var` control pins the matching §28.3 owned auto-drop hint,
+// so the two binding forms cannot oscillate between incompatible classifications.
+BEZEL_TEST(stringbuilder_ownership_hint_2190,
+           stringbuilder_classified_owned_spec_28_3_28_9_v0226) {
+    auto usingResult = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public method Using(): int "
+        "    using var sb := new StringBuilder(); "
+        "    return sb.Length; "
+        "  end Using; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(usingResult.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(usingResult, "sb"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(usingResult, "sb"));
+
+    auto plainResult = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public method Plain(): int "
+        "    var sb := new StringBuilder(); "
+        "    return sb.Length; "
+        "  end Plain; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(plainResult.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(plainResult, "sb"));
+}
+
 // `using var` over a fresh Channel<T> — the §6.9 / #600 canonical pattern.
 BEZEL_TEST(vacuous_pin_lint_2073,
            channel_using_var_no_warn_spec_28_10) {

@@ -4020,6 +4020,11 @@ bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
     if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
         return false;
     std::string_view head = rt->headName();
+    // stdlib §3.1 / spec §28.9 (#2190): StringBuilder owns its heap parts
+    // array and a +1 reference to every appended string. Codegen's dedicated
+    // path releases those parts, so this built-in carries a real disposal
+    // obligation rather than the borrowing collections' no-op Dispose.
+    if (head == "StringBuilder") return true;
     // §2.15 concrete serializers/deserializers: each explicitly implements
     // IDisposable and owns parser or output-buffer state (the §2.15 spec
     // example uses `using var s := new JsonSerializer();`), so a `using var`
