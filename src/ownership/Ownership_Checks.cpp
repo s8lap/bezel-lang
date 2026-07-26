@@ -4232,6 +4232,30 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
                 "components are all `null`)");
             return true;
         }
+
+        // §35.4 (v0.220, #2180): the same rule applies to a borrow-bearing
+        // choice — §9.7 explicitly: "Borrow-bearing choices are subject to
+        // every rule of this section, with 'record' read as 'record or
+        // choice' throughout." A directly-choice-typed class field is the
+        // nullable analog of the record-field face above (#2159 fixed the
+        // transitive record-with-choice-field case; #2209 fixes the
+        // directly-choice-typed case). Kept distinct from the record leg so
+        // the record diagnostic's wording (and pinned CHECK matchers) stays
+        // unchanged. // per §9.7, §35.4 (v0.220, #2209)
+        if (isBorrowBearingChoice(rhsType)) {
+            report(
+                Severity::Error, as.span.begin,
+                "a borrow-bearing choice may not be stored in an instance "
+                "field of a class — a borrow-bearing-value's carried borrow "
+                "can be consumed through access paths with no per-access "
+                "disposed-flag check, so the checked-mode trust regime that "
+                "covers a direct class-typed borrow field does not apply "
+                "here (§9.7 / §35.4; store the borrow's source instead — "
+                "e.g. an `owned` field of the underlying class — and "
+                "re-derive the view at the use site, or store a value whose "
+                "borrow-carrying components are all `null`)");
+            return true;
+        }
     }
 
     // §28.3 / §28.8 (issue #402): a BARE read of an owned LOCAL stored into an
@@ -4543,6 +4567,32 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
                     "rejected regardless of whether the borrow's source "
                     "provably outlives it (§9.7 / §28.11; store into an "
                     "owning-family collection and transfer ownership with "
+                    "`Add(owned item)` instead, or store a value whose "
+                    "borrow-carrying components are all `null`)");
+                continue;
+            }
+
+            // §35.4 (v0.220, #2180): the same rule applies to a borrow-bearing
+            // choice — §9.7's verbatim "record or choice" extension. The
+            // nullable/collection analog of the field-store rule above
+            // (#2209). Kept distinct from the record leg above so the record
+            // diagnostic's wording (and pinned CHECK matchers) stays
+            // unchanged. // per §9.7, §35.4 (v0.220, #2209)
+            if (isBorrowBearingChoice(argType)) {
+                const std::string recvName =
+                    recvRoot ? std::string(recvRoot->name) : std::string("it");
+                report(
+                    Severity::Error, a.value->span.begin,
+                    std::string("a borrow-bearing choice passed to `.") +
+                    std::string(m) + "(...)` on `" + recvName +
+                    "` may not be copied into a collection reachable beyond "
+                    "this method's scope (the receiver, a field, or a "
+                    "parameter) — a borrow-bearing-value's carried borrow "
+                    "bypasses the disposed-flag check the escape analysis "
+                    "relies on for a direct borrow, so the store is "
+                    "rejected regardless of whether the borrow's source "
+                    "provably outlives it (§9.7 / §35.4 / §28.11; store into "
+                    "an owning-family collection and transfer ownership with "
                     "`Add(owned item)` instead, or store a value whose "
                     "borrow-carrying components are all `null`)");
                 continue;
@@ -7095,6 +7145,34 @@ void MethodOwnership::checkFieldInitializer(const ast::FieldDecl& fd) {
                 "class — and re-derive the record view at the use site, or "
                 "initialize with a value whose borrow-carrying components "
                 "are all `null`)");
+            return;
+        }
+
+        // §35.4 (v0.220, #2180): the same rule applies to a borrow-bearing
+        // choice field type — §9.7's verbatim "record or choice" extension.
+        // The literal-initializer null-source form (every borrow-carrying
+        // component provably `null`) is exempt; a CHOICE has no `null`-source
+        // construction today (the §35.4 §9.7 no-temporary-source rule), so
+        // every borrow-bearing choice initializer is rejected — the check
+        // remains correct by the same reasoning as the record leg. Kept
+        // distinct from the record leg so the record diagnostic's wording
+        // (and pinned CHECK matchers) stays unchanged. // per §9.7, §35.4
+        // (v0.220, #2209)
+        if (isBorrowBearingChoice(fieldType)) {
+            report(
+                Severity::Error, fd.initializer->span.begin,
+                std::string("a borrow-bearing choice may not be stored in "
+                            "the instance field `") +
+                std::string(fd.name) +
+                "` — a borrow-bearing-value's carried borrow can be "
+                "consumed through access paths with no per-access "
+                "disposed-flag check, so the checked-mode trust regime "
+                "that covers a direct class-typed borrow field does not "
+                "apply here (§9.7 / §35.4; store the borrow's source "
+                "instead — e.g. an `owned` field of the underlying class "
+                "— and re-derive the view at the use site, or initialize "
+                "with a value whose borrow-carrying components are all "
+                "`null`)");
             return;
         }
     }
