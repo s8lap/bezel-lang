@@ -11540,9 +11540,33 @@ struct StringEscapeWalker {
             bool safeArg = false;
             // fix #2115: gated on stringReleaseMode — see the SOUNDNESS note
             // above (a choice-typed param field-store is raw memcpy, no retain).
-            if (stringReleaseMode && ms && a.modifier.empty() &&
-                a.name.empty() && i < ms->params.size() &&
-                isTargetIdent(a.value.get())) {
+            //
+            // fix #2115c: also admit the relaxation for the borrowing-Array /
+            // borrowing-Set / borrowing-Dictionary walks (borrowingArrayMode=true).
+            // These walks reuse this walker for the same over-approximation the
+            // pre-#2115 code applied unconditionally: a plain (no-modifier)
+            // parameter position of a resolved user/imported method is a CALL-
+            // BOUNDED borrow (the callee is compiled under the same ownership
+            // discipline — §28.3 / §28.9 / §28.11 — and does not alias the
+            // backing past the call). The #1430 SOUNDNESS note in this comment
+            // above is strictly about the VALUE-LIKE CHOICE walk
+            // (stringReleaseMode=false, borrowingArrayMode=false, the choice test
+            // pins a UAF when the relaxation fires), so that walk remains
+            // blocked. The borrowing-Array walk's analogous test
+            // (async_array_frame_spill_2132.borrowing_array_literal_passed_as_
+            // borrow_arg) expects the relaxation: a `var arr: Array<int> :=
+            // [10, 20, 30]; await C.Use(arr);` must release arr at Main's
+            // scope end (caller-side reclamation is correct — the callee just
+            // reads). Without this, the borrowing-Array walk is uniformly
+            // "treating every plain method arg as an escape" and the
+            // caller-side backing leaks (LSan), regressing #2132. The dict-
+            // materializer (#1028) and grouping (#1930) walks use neither mode
+            // — they remain conservative ESCAPE here (their call-bounded-borrow
+            // soundness is not asserted by any test, and the conservative
+            // direction is leak-over-UAF, the safe default).
+            if ((stringReleaseMode || borrowingArrayMode) && ms &&
+                a.modifier.empty() && a.name.empty() &&
+                i < ms->params.size() && isTargetIdent(a.value.get())) {
                 auto* ps =
                     dynamic_cast<sema::ParameterSymbol*>(ms->params[i]);
                 if (ps && ps->modifier.empty()) safeArg = true;
