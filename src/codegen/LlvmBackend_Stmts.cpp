@@ -614,21 +614,6 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // and BEFORE the local helper (which only fires for plain locals).
                 if (!handled)
                     handled = lowerOwnedClassFieldStore(*as->target, addr, rhs);
-                // §28.7 / §30.5 (#2173): drop-on-overwrite for owned Task-family
-                // FIELDS — the field analog of the using-var task drop. Mirrors
-                // lowerOwnedClassFieldStore's shape with two crucial differences
-                // (see the Setup.cpp body): the store-new happens BEFORE the
-                // dispose (a task's bz_task_fire_and_forget completion continuation
-                // can re-enter the slot on this thread), and the disposal is the
-                // FULL using-var task protocol via emitOwnedTaskDisposal (error_obj
-                // prelude + per-T result_disposer + fire-and-forget[_checked]) —
-                // not a plain emitDisposeAndReclaim. Must come AFTER the class-
-                // field helper (which would mis-handle Task-family: its
-                // isOwnedClassFieldLvalue check excludes Task-family because the
-                // builtin types have no user TypeDecl / no vtable) and BEFORE the
-                // local helper (which only fires for plain locals).
-                if (!handled)
-                    handled = lowerOwnedTaskFieldStore(*as->target, addr, rhs);
                 if (!handled) {
                     // §28.7 (#1054): reassigning an owned class local must dispose
                     // the displaced old value before overwriting (the class analog

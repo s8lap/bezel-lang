@@ -6954,21 +6954,6 @@ private:
                                    llvm::Value* fieldAddr,
                                    llvm::Value* newVal);
 
-    // §28.7 / §30.5 (#2173): drop-on-overwrite for an owned Task-family FIELD
-    // — the field analog of the using-var task drop path. Mirrors
-    // lowerOwnedClassFieldStore's shape with two crucial differences (see
-    // the Setup.cpp body for the rationale): the store-new happens BEFORE
-    // disposal (a task's bz_task_fire_and_forget completion continuation can
-    // re-enter the slot on this thread), and the disposal is the FULL
-    // using-var task protocol via emitOwnedTaskDisposal (error_obj prelude,
-    // per-T result_disposer, fire-and-forget[_checked]) — not a plain
-    // emitDisposeAndReclaim (which would free the task synchronously and
-    // not attach the per-class result disposer, leaking any unconsumed
-    // Owned T result).
-    bool lowerOwnedTaskFieldStore(const ast::Expr& target,
-                                  llvm::Value* fieldAddr,
-                                  llvm::Value* newVal);
-
     // §28.7 / §15.3 (#1385): drop-on-overwrite for a WHOLE-VALUE reassignment
     // of a move-only OWNING inline-array local or field (`[N owned]T` /
     // `[N owned]T?`). Disposes each non-null slot of the displaced value in
@@ -7974,35 +7959,6 @@ private:
     // register a scope-end task disposal — its owner (the mint CALL) disposes
     // the one frame. Mirrors producerState's Owned-vs-Borrow split.
     bool taskLocalInitializerIsBorrowSource(const ast::LocalDecl* ld);
-
-    // §28.7 / §30.5 (#2173): is `target` an `owned` Task-family field lvalue
-    // that needs drop-on-overwrite? Mirrors isOwnedClassFieldLvalue's scope
-    // exclusions (locals, ref params, static fields) and the class-instance
-    // restriction. Used by lowerOwnedTaskFieldStore to gate the field-store
-    // emit; emitOwnedFieldDisposals uses taskFamilyTypeFromField directly for
-    // its scope-end classification (it doesn't need the lvalue shape).
-    bool isOwnedTaskField(const ast::Expr& target);
-    // §28.7 / §30.5 (#2173): recover the resolved Task / Task<T> / OwningTask<T>
-    // TypeRef for an `owned` field. Mirrors taskTypeOfLocal's local-form pattern
-    // but reads the declared type from the FieldDecl (or importedMemberType for
-    // an imported field). Null if the field's type is not Task-family.
-    const sema::TypeRef* taskFamilyTypeFromField(const sema::FieldSymbol* fs);
-    // §28.7 / §30.5 (#2173 / #1889): drop-on-overwrite / scope-end of an
-    // owned Task-family FIELD. Invoke the full task-disposal sequence
-    // (error_obj prelude + per-T result_disposer attach +
-    // bz_task_fire_and_forget[_checked]) at the OLD task pointer. The caller
-    // is responsible for null-guarding / nulling the slot (the field-store
-    // caller has stored the new value BEFORE this call per the store-new-
-    // FIRST ordering in #2173; the scope-end caller nulls the slot AFTER).
-    // `fs` is the field's FieldSymbol — used to resolve the declared Task /
-    // Task<T> / OwningTask<T> type via taskFamilyTypeFromField for the per-T
-    // result_disposer derivation. Shared by lowerOwnedTaskFieldStore (the
-    // field-store call site) and emitOwnedFieldDisposals (the scope-end
-    // #1889 path). Mirrors the using-var task disposal sequence in
-    // emitDisposals -> if (it->task) block; extracted to a single helper so
-    // the two field paths cannot drift.
-    void emitOwnedTaskDisposal(const sema::FieldSymbol* fs,
-                              llvm::Value* oldVal);
 
     // issue #401 / stdlib §4.1 / §4.2: is `rt` one of the int-indexed list
     // INTERFACES (IReadOnlyList<T>, IList<T>, IOwningList<T>)? These are the only
