@@ -418,3 +418,47 @@ BEZEL_TEST(format_revision_812_1339, hole_relational_chain_not_misdiagnosed_2102
     BEZEL_EXPECT_FALSE(diagContains(prog, "generic-argument list"));
     BEZEL_EXPECT_EQ(run(prog), 0);
 }
+
+// ── #2139: bare `Identifier<T1, T2>` (no `.Member` / `(args)` after the `>`) ─
+//
+// §18.5 (v0.226): the hole-delimitation rule cuts the top-level `,` inside the
+// generic-argument list — the same as the canonical `{Cache<int, string>.Default}`
+// case. The earlier fix (this file's #2102 block, the recognizer requiring
+// `.`/`(` after the `>`) only fired for the .Member-access shape; a bare
+// `{Cache<int, string>}` (no member access after the `>`) silently fell
+// through, the sub-parser then parsed `Cache < int` as a relational
+// comparison, and the user saw "operator `<` is not defined for type `Cache`"
+// instead of the §18.5 diagnostic pointing at the actual construct. The fix
+// broadens the recognizer so the §18.5 + parenthesization-remedy message
+// fires for the bare shape too.
+const char* kRegistryWithStatic =
+    "module M; "
+    "class Registry<T, U> "
+    "  public static Default: int := 42; "
+    "end Registry; ";
+
+BEZEL_TEST(format_revision_812_1339, hole_bare_generic_arg_2139_diagnosed) {
+    const std::string prog = std::string(kRegistryWithStatic) +
+        "class C public static method Main(): int "
+        "  var s := $\"{Registry<int, string>}\"; "
+        "  return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasCompileError(prog));
+    BEZEL_EXPECT_TRUE(diagContains(prog, "generic-argument list"));
+    BEZEL_EXPECT_TRUE(diagContains(prog, "\xC2\xA7""18.5"));
+    BEZEL_EXPECT_TRUE(diagContains(prog, "parenthesize"));
+    // The confusing downstream message must NOT be what the user sees instead.
+    BEZEL_EXPECT_FALSE(diagContains(prog, "operator `<` is not defined"));
+}
+
+// The §18.5 documented remedy (parenthesizing the whole call so it sits inside
+// the hole's top nesting level) still compiles and runs correctly; this fix
+// must not disturb the existing, spec-sanctioned workaround.
+BEZEL_TEST(format_revision_812_1339, hole_bare_generic_arg_parenthesized_2139_ok) {
+    const std::string prog = std::string(kRegistryWithStatic) +
+        "class C public static method Main(): int "
+        "  var s := $\"{(Registry<int, string>.Default)}\"; "
+        "  return (if s = \"42\" then 1 else 0); "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(run(prog), 1);
+}

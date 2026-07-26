@@ -102,8 +102,27 @@ bool holeCutInsideGenericArgList(std::string_view exprText,
             }
             if (!isTypeArgToken(u)) break;  // not a type-arg list after all
         }
-        if (!closed || j + 1 >= toks.size()) continue;
-        const Token& after = toks[j + 1];
+        if (!closed) continue;
+        // The §18.5 (v0.226, #2139) case: a bare `Identifier<T1, T2>` at the
+        // hole's top level — the `>` is the LAST token of the fragment (no
+        // `.Member` / `(...)` access follows). The cut on `,` still happened
+        // mid-generic-args; the §18.5 rule applies, and the fragment now
+        // contains an unmatched `<`. Without this branch, the recognizer
+        // would reject the case and the user would see a confusing downstream
+        // type error ("operator `<` is not defined", "unresolved identifier
+        // `x`", etc.) pointing at the wrong construct. (A relational chain
+        // like `a < b, c > d` keeps a non-EOF token after the `>` and so
+        // still falls through to the `followedByAccess` check.)
+        const std::size_t afterIdx = j + 1;
+        const bool afterIsEof = afterIdx >= toks.size() ||
+            toks[afterIdx].kind == TokenKind::EndOfFile;
+        if (afterIsEof) {
+            if (cutOffset > open.location.offset &&
+                cutOffset < toks[j].location.offset + toks[j].text.size())
+                return true;
+            continue;
+        }
+        const Token& after = toks[afterIdx];
         bool followedByAccess = after.kind == TokenKind::Punctuator &&
             (after.text == "." || after.text == "(");
         if (!followedByAccess) continue;
