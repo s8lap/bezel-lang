@@ -12500,6 +12500,56 @@ bool Emitter::isOwnedClassFieldLvalue(const ast::Expr& target) {
 }
 
 
+// §28.7 / §30.5 (#2173): is `target` an `owned` Task-family field lvalue that
+// needs drop-on-overwrite? Like isOwnedClassFieldLvalue this excludes locals,
+// ref params, and static fields — and like lowerOwnedClassFieldStore this is
+// a CLASS instance field (records have no §28.4-step-2 auto-dispose). Mirrors
+// isOwnedClassFieldLvalue's classifier; the taskFamilyTypeFromField helper
+// extracts the resolved Task/Task<T>/OwningTask<T> type from the field's
+// declared type (mirroring taskTypeOfLocal's local-form pattern).
+bool Emitter::isOwnedTaskField(const ast::Expr& target) {
+    if (localSlot(target)) return false;
+    {
+        llvm::Type* dummy = nullptr;
+        if (refParamAddr(target, dummy)) return false;
+    }
+    if (staticFieldGlobal(target)) return false;
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    if (!sym) return false;
+    auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
+    if (!fs) return false;
+    if (!fs->parent || fs->parent->kind != ast::TypeDeclKind::Class) return false;
+    // Must be `owned` modified AND Task-family typed. isOwnedReferenceField
+    // excludes Task-family (Task/Task<T>/OwningTask<T> are builtin types with
+    // no user TypeDecl — caught by the `pt->declaration` check), so a
+    // separate classifier is needed. taskFamilyTypeFromField is the type
+    // extraction helper below.
+    if (!hasOwnedModifier(fs)) return false;
+    return taskFamilyTypeFromField(fs) != nullptr;
+}
+
+
+// §28.7 / §30.5 (#2173): recover the resolved Task / Task<T> / OwningTask<T>
+// TypeRef for an `owned` field's declared type. Mirrors taskTypeOfLocal's
+// local-form pattern (prefer the resolved declared type over any initializer,
+// since fields rarely have field-initializer expressions here). Returns null
+// if the field's type is not Task-family.
+const sema::TypeRef* Emitter::taskFamilyTypeFromField(
+        const sema::FieldSymbol* fs) {
+    const sema::TypeRef* rt = nullptr;
+    // #662 foundation B: imported field — type from importedMemberType.
+    if (!fs->decl) {
+        rt = ctx_.importedMemberType(fs);
+    } else {
+        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+        if (!fd || !fd->type) return nullptr;
+        rt = ctx_.resolvedType(*fd->type);
+    }
+    if (!rt) return nullptr;
+    return isTaskTypeName(rt) ? rt : nullptr;
+}
+
+
 // §28.7 / #1328: dispose the prior value of an owned class/interface CLASS
 // field before storing the new owner. Parallel to lowerOwnedCollectionFieldStore
 // for collections.
@@ -12566,6 +12616,79 @@ bool Emitter::lowerOwnedClassFieldStore(const ast::Expr& target,
     // §28.4-step-2 emitOwnedFieldDisposals null-guard handles a re-entrant
     // dispose that catches the field in that window (null → skips it).
     builder_.CreateStore(newVal, fieldAddr);
+    return true;
+}
+
+
+// §28.7 / §30.5 (#2173): dispose the prior value of an owned Task-family
+// FIELD before storing the new owner — the field analog of the using-var
+// task path (it->task in LlvmBackend_Disposal.cpp's emitDisposals). The
+// displacement must dispose the OLD task (which disposes its result, §30.5)
+// so stale uses fault as DisposedAccessException in checked mode. Mirrors
+// lowerOwnedClassFieldStore's load-old → null-guard → identity-guard →
+// dispose-old → store-new shape with two crucial differences:
+//
+//   (a) NULL THE SLOT BEFORE DISPOSING (#2173): a task's disposal may
+//       trigger continuations (the bz_task_fire_and_forget completion
+//       continuation can resume code that touches `this.f`); if the slot
+//       still held the OLD task pointer when the continuation ran, the
+//       continuation could re-dispose / observe a freed object. The new
+//       task stays in its evaluated SSA temporary while the slot is null,
+//       then is stored after disposal, preserving §28.7's required order.
+//
+//   (b) The disposal pattern is the full using-var task protocol: for an
+//       OwningTask<T:class> result, attach the per-T disposer via
+//       bz_task_set_result_disposer so an unconsumed result is freed by
+//       bz_task_free wherever it lands (matching the scope-end path the
+//       class-local owned-task auto-drop follows, #1868); then run the
+//       §30.9 fault-ownership error_obj prelude (isError → defer/handle
+//       error → fire_and_forget) so a faulted task disposes its exception
+//       EXACTLY ONCE; then bz_task_fire_and_forget (or the checked
+//       variant in checkedDisposal_ mode).
+//
+// emitOwnedTaskDisposal does the disposal sequence at the given slot,
+// shared by the field-store caller here and the scope-end caller in
+// emitOwnedFieldDisposals (the analogous scope-end path).
+bool Emitter::lowerOwnedTaskFieldStore(const ast::Expr& target,
+                                       llvm::Value* fieldAddr,
+                                       llvm::Value* newVal) {
+    if (!isOwnedTaskField(target)) return false;
+    if (!fieldAddr || !newVal) return false;
+    if (!newVal->getType()->isPointerTy()) return false;
+    // Load the old task pointer.
+    llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), fieldAddr, "otask.old");
+
+    // Null-guard (a moved-from slot holds null) AND identity-guard (a self-
+    // assignment `this.f := this.f` would otherwise dispose the value that
+    // is being stored → UAF). Mirrors lowerOwnedClassFieldStore exactly.
+    llvm::Value* nullp = llvm::ConstantPointerNull::get(ptrTy());
+    llvm::Value* live = builder_.CreateICmpNE(oldVal, nullp, "otask.live");
+    llvm::Value* doDispose = builder_.CreateAnd(
+        live, builder_.CreateICmpNE(oldVal, newVal, "otask.diff"));
+
+    auto* dispBB  = llvm::BasicBlock::Create(llvm_, "otask.dispose", currentFn_);
+    auto* storeBB = llvm::BasicBlock::Create(llvm_, "otask.store", currentFn_);
+    auto* contBB  = llvm::BasicBlock::Create(llvm_, "otask.cont", currentFn_);
+    builder_.CreateCondBr(doDispose, dispBB, storeBB);
+    builder_.SetInsertPoint(dispBB);
+    // Per §28.7, disposal of the displaced value precedes the new store. Null the
+    // field first so a synchronous fire-and-forget continuation or result
+    // destructor cannot observe/re-dispose the old task while its disposal runs.
+    // The new value remains in the already-evaluated SSA temporary until storeBB.
+    builder_.CreateStore(nullp, fieldAddr);
+    // The slot is null while the helper disposes oldVal; storeBB installs the
+    // already-evaluated new task only after the helper completes. The helper
+    // itself never touches the field slot.
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
+    emitOwnedTaskDisposal(fs, oldVal);
+    builder_.CreateBr(storeBB);
+    builder_.SetInsertPoint(storeBB);
+    // Constructor first-assignment (old null) and identity assignment both arrive
+    // here directly; the displacement edge arrives only after old-task disposal.
+    builder_.CreateStore(newVal, fieldAddr);
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(contBB);
     return true;
 }
 
