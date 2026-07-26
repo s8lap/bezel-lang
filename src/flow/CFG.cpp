@@ -354,7 +354,85 @@ private:
         // linear: append to the current block.
         from->stmts.push_back(&s);
         recordStmtAwaits(from, s); // async-readiness 3a (additive)
+        // §28.8.1 (v0.193, #2215): an ExpressionStmt whose expression is a
+        // synchronous call (CallExpr / NullCondCallExpr / NewExpr) may throw
+        // on entry to the call. A purely-linear block hides that exit from
+        // the field-move dataflow — the field-restoration OR-merge at exit
+        // sees only the post-call restored state on the normal path, so a
+        // `M(move x.f); x.f := ...` pattern's "unrestored on the throw edge"
+        // situation goes unreported. Split the call onto a fresh Linear
+        // block and tag that block with an exception edge to the active try
+        // handler (or the function exit). The pre-call block (`from`) keeps
+        // the moved-from state, the callBlock is the exception-source — the
+        // post-call successor block (returned below) starts fresh so any
+        // `_resource := fresh` follows on the normal-only path. The dataflow
+        // merges: pre-call block normal-edge → callBlock normal-edge → next
+        // block; callBlock exception-edge → exceptionTarget. The
+        // dischargeOnExceptionEdge pass auto-disposes owned locals on the
+        // exception edge but lets the field-move facts pass through
+        // untouched, so endFlow.fields retains the moved-from flag from the
+        // exception path even when the normal path restores the field —
+        // exactly the case the §28.8.1 path-sensitive diagnostic (#867)
+        // reports.
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+            if (es->expr && exprMayThrow(es->expr.get())) {
+                CFGBlock* callBlock = cfg_.makeBlock(CFGBlock::Kind::Linear);
+                callBlock->sourceStmt = &s;
+                // Move the call stmt off `from` and onto the new block, then
+                // add the forward edge. The exception edge fires FROM this
+                // block (whose pre-call state holds the moved-from field)
+                // and any subsequent statements begin on a fresh `next` block
+                // so a post-call restore (`x.f := fresh`) does NOT appear on
+                // the callBlock's exit state — the exception edge's exit
+                // state remains unrestored.
+                from->stmts.pop_back();
+                callBlock->stmts.push_back(&s);
+                recordStmtAwaits(callBlock, s); // await sites on the call itself
+                cfg_.addEdge(from, callBlock);
+                cfg_.addExceptionEdge(callBlock, exceptionTarget());
+                CFGBlock* next = cfg_.makeBlock(CFGBlock::Kind::Linear);
+                cfg_.addEdge(callBlock, next);
+                return next;
+            }
+        }
         return from;
+    }
+
+    // Conservative over-approximation: any expression that contains a
+    // CallExpr / NullCondCallExpr / NewExpr at any depth may throw. We do not
+    // (and need not) walk operand / argument / receiver sub-expressions — the
+    // over-approximation is sound for the §28.8.1 path-sensitive field-
+    // restoration merge (an extra exception edge cannot make a restored
+    // path look unrestored; the OR-merge of a moved-from flag on a path the
+    // callee cannot actually reach is conservative but correct, and the
+    // existing §28.3 exception-path discharge for owned locals is also
+    // over-approximated the same way — see L538-545).
+    static bool exprMayThrow(const ast::Expr* e) {
+        if (!e) return false;
+        if (dynamic_cast<const ast::CallExpr*>(e)) return true;
+        if (dynamic_cast<const ast::NullCondCallExpr*>(e)) return true;
+        if (dynamic_cast<const ast::NewExpr*>(e)) return true;
+        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            return exprMayThrow(be->left.get()) || exprMayThrow(be->right.get());
+        }
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            return exprMayThrow(ue->operand.get());
+        }
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            return exprMayThrow(ma->target.get());
+        }
+        if (auto* nc = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            return exprMayThrow(nc->target.get());
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            return exprMayThrow(ix->target.get());
+        }
+        if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            return exprMayThrow(cd->condition.get()) ||
+                   exprMayThrow(cd->thenValue.get()) ||
+                   exprMayThrow(cd->elseValue.get());
+        }
+        return false;
     }
 
     CFGBlock* visitIf(const ast::IfStmt& s, CFGBlock* from) {
