@@ -2908,6 +2908,61 @@ void MethodOwnership::checkBareBorrowTempLaunder(const ast::Expr& e) {
            "so it outlives the result's uses)");
 }
 
+// #2169 / §28.3 v0.226: see Ownership_impl.hpp's header comment. Identify the
+// owning-collection `Drain()` builtin (no args, member access named `Drain`,
+// receiver head is an owning collection) and reject the binding when the
+// receiver is a non-stable-named place — the alias's container obligation
+// outlives only the temporary's K8 boundary, so the binding escapes. Stable-
+// named receivers reach common::isOwningCollectionDrainAliasCall (the #2146
+// §28.10 borrow-pin recognition) untouched; this fires its temporary twin.
+void MethodOwnership::checkDrainOnTemporary(
+        const ast::CallExpr& ce, SourceLocation bindingLoc) {
+    if (!ce.args.empty()) return;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+    if (!ma || ma->member != "Drain" || !ma->target) return;
+    // BUILTIN `Drain` only — a USER method named `Drain` resolves a
+    // MethodSymbol and is classified by the ordinary user-call rules (never
+    // by the alias fact, the same gate that #2146 enforces).
+    if (dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*ce.callee)))
+        return;
+    // Receiver type head must be an owning collection (the alias's container-
+    // alias property holds only for those — for a user-typed receiver the
+    // `Drain()` method, if it exists, is just an ordinary user method).
+    std::string_view rcn;
+    if (const sema::TypeRef* rt = ctx_.exprType(*ma->target)) {
+        if (!rt->aliasResolvedHead.empty())
+            rcn = rt->aliasResolvedHead;
+        else if (rt->astNode && rt->astNode->name &&
+                 !rt->astNode->name->parts.empty())
+            rcn = rt->headName();
+    }
+    if (!common::isOwningCollectionHead(rcn)) return;
+    // #2146 / §28.10 (v0.220): stable-named receivers are the borrow-pin
+    // case — leave them to isOwningCollectionDrainAliasCall (which classifies
+    // the producer Borrowed, registers no scope-end dispose, and lets the
+    // existing alias recognizer do the rest). Only the non-stable-named
+    // receivers reach this rejection.
+    const ast::Expr* recv = ma->target.get();
+    if (dynamic_cast<const ast::IndexExpr*>(recv)) return;     // arr[i] — named-slot
+    if (dynamic_cast<const ast::IdentifierExpr*>(recv)) return; // local/param/field
+    if (auto* rma = dynamic_cast<const ast::MemberAccessExpr*>(recv))
+        if (dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*rma)) != nullptr)
+            return;                                            // receiver.field — field
+    // Anything else is a temporary producer (`F.Make()`, `GetFresh()`, an
+    // arithmetic, a parenthesised expression, an if/?? expression — anything
+    // whose lifetime ends at the K8 full-expression boundary). The drain
+    // view aliases the receiver's array; binding it past the boundary
+    // escapes the temporary. Reject.
+    report(Severity::Error, bindingLoc,
+           "a `Drain()` over a temporary receiver escapes the temporary's "
+           "full-expression boundary — the drain view aliases the receiver's "
+           "array (stdlib §4.5 v0.195) and its borrow outlives only that "
+           "boundary, so binding it past the construct is rejected (§28.3 "
+           "temporary-boundary rule, #2169); bind the receiver to a name "
+           "first (`using var tmp := <producer>;` then `tmp.Drain()` is the "
+           "stable-named-receiver borrow-pin shape)");
+}
+
 bool MethodOwnership::checkBareBorrowLoopCarriedEscape(
         const ast::AssignmentStmt& as) {
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S5). A loop-carried
@@ -3651,6 +3706,27 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
         // out through the borrow result — rejected (the temporary bounds the
         // result to the full expression). // per §28.3 v0.194
         checkBareBorrowTempLaunder(*ld.initializer);
+        // #2169 / §28.3 v0.226: `using var d := Temp.Drain();` and the plain-`var`
+        // twin carry the temporary's array borrow through a binding boundary
+        // the temporary does not outlive (stdlib §4.5 v0.195: "`Drain()` returns
+        // the array itself at that static type — no separate enumerable
+        // object"; the alias's container obligation stays with the receiver's
+        // owner — the temporary — which dies at the binding's full-expression
+        // boundary). Per §28.3 "a borrow or frame that would escape [the
+        // temporary's boundary] is rejected — the language has no general
+        // lifetime-extension mechanism". The #2146 stable-named receiver case
+        // is recognized as a §28.10 borrow-pin; this is its temporary-receiver
+        // twin, and the runtime counterpart (codegen's iterator-format
+        // dispose-slot-1 on what is actually a bz_array, ASan SEGV) cannot be
+        // closed in this revision — adoption with the correct
+        // owning-collection disposal lives in the locked iterator-emission
+        // paths. Reject at the binding site so the program is not compilable
+        // to a SEGV, and steer the user to the idiom that DOES work today:
+        // bind the temporary first (`using var tmp := <producer>;`), then
+        // drain the named binding (`tmp.Drain()`, a stable-named receiver — the
+        // #2146 borrow-pin path). // per §28.3, stdlib §4.5 v0.195, #2169
+        if (auto* ce = dynamic_cast<const ast::CallExpr*>(ld.initializer.get()))
+            checkDrainOnTemporary(*ce, ld.span.begin);
         // §15.3 (#1899) bullet 1 "Local-to-local assignment": `var b := a;` where
         // the initializer is a bare read of a move-only inline-array local MOVES
         // the whole array out of `a`, leaving `a` moved-from. Mark the source so a

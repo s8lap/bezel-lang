@@ -1235,6 +1235,24 @@ private:
     // handleAssignment on the escaping expression `e`. A no-op unless `e` is such
     // a call with a temporary source. // per §28.3 v0.194
     void checkBareBorrowTempLaunder(const ast::Expr& e);
+    // #2169 / §28.3 v0.226: reject a `Drain()` call bound to a local when the
+    // receiver is a non-stable-named place (a temporary). The drain view
+    // aliases the receiver's array (stdlib §4.5 v0.195), so the binding's
+    // lifetime extends a borrow past the temporary's K8 boundary — a
+    // temporary escape per §28.3. Fired from handleLocalDecl only (a `Drain()`
+    // expression-statement or argument is consumed inside its own full
+    // expression, no escape). The `bindingLoc` is the LocalDecl's own span
+    // begin — the parser-stamped binding site, distinct from the synthetic
+    // expr nodes' default span (the receiver's span is not a useful target
+    // here: a single Drain call may live across many lines and the binding
+    // is what the user writes; reporting at the binding is the prevailing
+    // diagnostic position). The #2146 stable-named-receiver case is the
+    // §28.10 borrow-pin recognition; this is its temporary-receiver twin,
+    // currently REJECTED because the codegen-side adoption (iterator-format
+    // dispose slot-1 → owning-collection cascade) lives in the locked
+    // iterator-emission paths. // per §28.3, stdlib §4.5 v0.195, #2169
+    void checkDrainOnTemporary(
+            const ast::CallExpr& ce, SourceLocation bindingLoc);
     // §28.3 (v0.194, #1801 S5): reject a loop-carried bare-type-parameter
     // accumulation — `prev := Math.Max(prev, cur)` — where a contributing source
     // is a scope-bound owned local declared in a block the assignment target's
