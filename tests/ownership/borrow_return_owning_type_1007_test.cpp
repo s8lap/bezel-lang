@@ -145,10 +145,21 @@ BEZEL_TEST(borrow_return_1007, owned_param_through_nonowned_rejected) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// §28.6 (#1008 Part C): a bare read of an `owned` owning-collection field of the
-// RECEIVER (`this`) returned through a non-`owned` return is a legal receiver-
-// borrow (the caller may read it but not dispose it; the receiver disposes it).
-BEZEL_TEST(borrow_return_1007, owned_field_read_this_borrow_allowed) {
+// §28.6 (#1008 Part C, revised by #1760): a bare read of an `owned` owning-
+// collection field of the RECEIVER (`this`) returned through a non-`owned`
+// return is REJECTED at the definition site. The original #1008 Part C carved
+// this out as a "the caller holds the receiver across the call, so the borrow
+// is safe" exception, but under interface / virtual-override / imported /
+// function-value dispatch the call site cannot resolve the concrete method
+// and producerState falls to the name-head Owned fallback, and the caller
+// disposes the borrow — a HARD double-free of the field's real owner. Owning
+// collections are not Dispose-idempotent (unlike Shared/Weak/ChannelSender/
+// CancellationTokenSource, whose double-dispose is a safe refcount no-op),
+// so the carve-out is unsound. The remedy is the spec's own: return the borrow
+// through the non-owning collection type (`Array<T>`) for read-only access, or
+// declare `owned` for a transfer. (The test name keeps the old intent
+// marker for git blame; the assertion is the corrected one.)
+BEZEL_TEST(borrow_return_1007, owned_field_read_this_borrow_rejected_1760) {
     auto r = parseAndCheckOwnership(mod(
         "class P "
         "  public owned _items: OwningArray<Cell>; "
@@ -156,7 +167,7 @@ BEZEL_TEST(borrow_return_1007, owned_field_read_this_borrow_allowed) {
         "  destructor end destructor; "
         "  public method Get(): OwningArray<Cell> => this._items; "
         "end P;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // An explicit `owned` return type makes the container-ownership transfer

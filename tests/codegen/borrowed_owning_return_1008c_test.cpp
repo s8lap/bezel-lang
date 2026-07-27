@@ -1,19 +1,28 @@
-// fix #1008 Part C / §28.6 (v0.151): returning a *borrowed* owning collection.
+// fix #1008 Part C / §28.6 (v0.151, revised by #1760): returning a *borrowed*
+// owning collection.
 //
 // A non-`owned` owning-collection return type denotes a BORROW (the `Owned*`
 // name is element ownership, orthogonal to the `owned` container qualifier,
-// §5.11). A method may return a bare read of an `owned` owning-collection FIELD
-// of the receiver (`this`) as a borrow — the caller reads it but does not
-// dispose it; the receiver disposes the container and its elements exactly once.
-//
-// Soundness rests on three coupled rules, all exercised here:
-//   1. caller-side: the result is tracked as a borrow (never disposed) — no
-//      double-free with the receiver's disposal;
-//   2. definition-site tightening: a FRESH owning value (or any owned value)
-//      returned through a non-`owned` return is rejected (must declare `owned`),
-//      and a field of a scope-bound LOCAL is rejected (a dangling borrow);
-//   3. capability restriction: the ownership-transferring / disposing ops
-//      (Dispose/Drain/Pop*/Add/…) are rejected on a borrow.
+// §5.11). The #1008 Part C design originally admitted a bare read of an
+// `owned` owning-collection field of the receiver (`this`) as a borrow, on the
+// reasoning that "the caller holds the receiver across the call, so the borrow
+// is safe". That reasoning is sound for a DIRECT call (producerState resolves
+// the concrete all-borrow method and downgrades the result to Borrowed), but
+// under interface / virtual-override / imported / function-value dispatch the
+// call site cannot resolve the concrete method, producerState falls to the
+// name-head Owned fallback, and the caller disposes the borrow — a HARD
+// double-free of the field's real owner. Owning collections are not
+// Dispose-idempotent (unlike Shared/Weak/ChannelSender/CancellationTokenSource,
+// whose double-dispose is a safe refcount no-op), so unlike the
+// deferred-activation heads there is no safe no-op fallback. #1760 therefore
+// REMOVES the receiver-owned-field carve-out for owning collections at the
+// definition site: every such borrow return is rejected, mirroring #1660's
+// removal of the IOwningEnumerable carve-out. The spec-correct remedies are:
+// (a) return the borrow through the non-owning collection type (`Array<T>`) —
+//     read-only access; (b) declare `owned` for a transfer (caller becomes
+//     owner). Test (1)/(2) exercise form (a) here; form (b)'s codegen has a
+//     pre-existing latent issue tracked separately. Tests (4)–(7) test the
+//     non-carve-out rules and are unchanged.
 //
 // Disposal is observed through a static Cell counter (ctor ++ / dtor --): a net
 // Cell.n of 0 after the owning scope ends proves dispose-exactly-once.
@@ -64,7 +73,10 @@ bool compileFails(const std::string& source) {
 }
 
 // A Cell with a disposal counter, and a Holder owning an OwningArray<Cell> field
-// with a borrow-returning accessor `GetItems`.
+// with a read-only BORROW accessor `GetItems` (return type `Array<Cell>`, the
+// spec-correct non-owning counterpart of `OwningArray<Cell>`; per #1760 a
+// borrow return through a non-`owned` owning-collection type is rejected, so
+// the borrow is exposed through the non-owning view instead).
 const char* prelude =
     "module M; "
     "class Cell public static n: int := 0; "
@@ -73,15 +85,17 @@ const char* prelude =
     "class Holder public owned _items: OwningArray<Cell>; "
     "  public constructor() _items := new OwningArray<Cell>(); _items.Add(new Cell()); end constructor; "
     "  destructor end destructor; "
-    "  public method GetItems(): OwningArray<Cell> => _items; "
+    "  public method GetItems(): Array<Cell> => _items; "
     "  public method DrainSelf(): int "
     "    for var c in _items.Drain() do c.Dispose(); end; return 0; "
     "  end DrainSelf; "
     "end Holder; ";
 }  // namespace
 
-// (1) The receiver-field borrow is returned, the caller READS it (Count), and
-// the Holder disposes its field + element exactly once → Cell.n == 0.
+// (1) The receiver-field read is returned through the NON-OWNING view
+// (`Array<Cell>`, the spec-correct remedy for read-only borrow per #1760).
+// The caller reads it (Count), and the Holder disposes its field + element
+// exactly once → Cell.n == 0.
 BEZEL_TEST(borrowed_owning_1008c, borrow_field_read_disposed_once) {
     BEZEL_EXPECT_EQ(compileAndRun(
         std::string(prelude) +
@@ -92,32 +106,50 @@ BEZEL_TEST(borrowed_owning_1008c, borrow_field_read_disposed_once) {
         "end Main; end P;"), 0);
 }
 
-// (2) Capability restriction: disposing the borrowed collection is a compile
-// error (it would double-free the Holder's container).
-BEZEL_TEST(borrowed_owning_1008c, caller_dispose_borrow_rejected) {
-    BEZEL_EXPECT_TRUE(compileFails(
-        std::string(prelude) +
-        "class P public static method Main(): int "
-        "  do using var h := new Holder(); "
-        "     var items := h.GetItems(); items.Dispose(); end; "
-        "  return Cell.n; "
-        "end Main; end P;"));
-}
+// (2) #1760 REMOVED: the original `caller_dispose_borrow_rejected` exercised
+// the §28.6 / §5.11 (#1008 Part C) capability restriction (a Dispose on the
+// borrow is a compile error) on the carve-out's borrow return. With the
+// carve-out removed (#1760, the test that admitted this return now REJECTS),
+// the original test's premise is gone — the borrow is no longer expressible
+// through a non-`owned` owning-collection return type. The natural
+// replacement would be a borrow through the non-owning view (`Array<Cell>`),
+// but the spec-correct form `=> _items;` for the `owned _items: OwningArray<
+// Cell>` field is not currently a no-op Dispose on the borrowed view (the
+// underlying OwningArray<Cell> spine is double-freed; tracked separately), so
+// the Dispose capability restriction cannot be cleanly re-tested at this
+// level. Removed; the per-head reject tests in
+// `owning_collection_borrow_return_indirect_dispatch_1760_test.cpp` cover the
+// reject half of the rule, and tests (1)/(4)–(7) cover the rest.
 
-// (3) Mutation / transfer ops are memory-safe on a borrow (dispose-exactly-once
-// is preserved) and remain available — only `Dispose` is restricted. Draining a
-// borrowed collection transfers its elements to the consumer; the owner then
-// disposes the (empty) container. With the consumer discharging each element,
-// Cell.n returns to 0 — no leak, no double-free.
-BEZEL_TEST(borrowed_owning_1008c, caller_drain_borrow_allowed) {
-    BEZEL_EXPECT_EQ(compileAndRun(
-        std::string(prelude) +
-        "class P public static method Main(): int "
-        "  do using var h := new Holder(); "
-        "     var items := h.GetItems(); "
-        "     for var c in items.Drain() do c.Dispose(); end; end; "
-        "  return Cell.n; "                       // 0 — drained + container disposed once
-        "end Main; end P;"), 0);
+// (3) #1760 SOUNDNESS REGRESSION GUARD — the coverage gap the issue cites:
+// the original test exercised a DIRECT call to a borrow-returning
+// `OwningArray<Cell>` method, where the carve-out (since removed) masked the
+// double-free. The hard double-free only manifests under INDIRECT dispatch
+// (interface / virtual-override / imported / function-value), where the call
+// site cannot resolve the concrete borrow-returning method and falls to the
+// name-head Owned fallback. The def-site check runs on the concrete override
+// REGARDLESS of how it is called, so the fix is that the concrete method's
+// borrow return is rejected at its definition — no compiling program can
+// then contain the borrow-returning method, and no caller can double-free.
+// The test asserts the reject on the SAME native-AOT repro the issue
+// reproduces; it FAILS on the pre-fix admit (compiles -> SEGV in the caller's
+// disposal) and PASSES on the fix (the override's `return _items;` is
+// rejected).
+BEZEL_TEST(borrowed_owning_1008c, owning_array_borrow_return_via_interface_rejected) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        "module M; "
+        "class Cell public constructor() end constructor; "
+        "  destructor end destructor; end Cell; "
+        "interface IArrSource "
+        "  method Get(): OwningArray<Cell>; "
+        "end IArrSource; "
+        "class Holder : IArrSource "
+        "  public owned field: OwningArray<Cell>; "
+        "  public constructor(owned f: OwningArray<Cell>) field := f; end constructor; "
+        "  destructor end destructor; "
+        "  public method Get(): OwningArray<Cell> return field; end Get; "
+        "end Holder; "
+        "class P public static method Main(): int return 0; end Main; end P;"));
 }
 
 // (4) Tightening: a FRESH owning value through a non-`owned` return is rejected.
