@@ -3897,7 +3897,28 @@ static bool descTypeArgConcrete(const sema::TypeRef* a) {
     if (a->kind == sema::TypeRef::Kind::InlineArray)
         return a->arraySizeValue >= 0 && descTypeArgConcrete(a->arrayElement);
     if (a->kind == sema::TypeRef::Kind::Named) {
-        if (a->declaration) return true;
+        // #2184 (§12.9/§14.2/§17.4/#2069 ruling): a DECLARED-Named head is
+        // not, by itself, "concrete" for descriptor-key purposes — the inner
+        // genericArgs might still collapse (a function-typed arg, an erased
+        // builtin, an unfolded inline-array size). Recurse into the args,
+        // matching sema::typeArgRuntimeReified (the strict oracle the #2012
+        // collapse guard uses), so the lax oracle here stops admitting
+        // `Wrap<Inner<(int)->int>>` / `Wrap<Inner<(string)->string>>` as
+        // distinct-concrete when the INNER (int)->int vs (string)->string
+        // arg is erased — those two instantiate to a colliding descriptor key
+        // and would route a runtime type-test to the wrong class (#2001
+        // memory-unsafety class; nested-erased-arg collapse, the issue #2184
+        // repro shape). The recursion is the safe direction (falls back to
+        // the shared descriptor, no false-positive admission). Per the
+        // sema-side split (the strict oracle's #2022 null-decl-with-args
+        // rule), a DECLARED head with non-empty genericArgs recurses; a
+        // null-decl head with no args (a bare parameter placeholder) stays
+        // non-concrete.
+        if (a->declaration) {
+            for (const sema::TypeRef* g : a->genericArgs)
+                if (!descTypeArgConcrete(g)) return false;
+            return true;
+        }
         if (a->genericArgs.empty()) return false;  // bare param placeholder
         for (const sema::TypeRef* g : a->genericArgs)
             if (!descTypeArgConcrete(g)) return false;
