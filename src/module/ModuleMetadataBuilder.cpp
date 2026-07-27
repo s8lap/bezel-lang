@@ -71,6 +71,10 @@ MetaTypeDeclKind toMetaTypeDeclKind(ast::TypeDeclKind k) {
         case ast::TypeDeclKind::Interface: return MetaTypeDeclKind::Interface;
         case ast::TypeDeclKind::Record:    return MetaTypeDeclKind::Record;
         case ast::TypeDeclKind::Enum:      return MetaTypeDeclKind::Enum;
+        // §35 (v0.200, #2044, #2121): a choice in module metadata is recorded
+        // as Choice, not as a Class fallback (the previous silent fallback
+        // misdrove any cross-module importer that branched on the kind).
+        case ast::TypeDeclKind::Choice:    return MetaTypeDeclKind::Choice;
     }
     return MetaTypeDeclKind::Class;
 }

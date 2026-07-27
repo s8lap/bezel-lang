@@ -105,6 +105,11 @@ ast::TypeDeclKind fromMetaTypeDeclKind(MetaTypeDeclKind k) {
         case MetaTypeDeclKind::Interface: return ast::TypeDeclKind::Interface;
         case MetaTypeDeclKind::Record:    return ast::TypeDeclKind::Record;
         case MetaTypeDeclKind::Enum:      return ast::TypeDeclKind::Enum;
+        // §35 (v0.200, #2044, #2121): mirror the toMetaTypeDeclKind arm; the
+        // loaded TypeSymbol carries the Choice kind, so the importer's
+        // downstream classifiers (which all branch on ts->kind) take the
+        // choice path and not the Class fallback.
+        case MetaTypeDeclKind::Choice:    return ast::TypeDeclKind::Choice;
     }
     return ast::TypeDeclKind::Class;
 }

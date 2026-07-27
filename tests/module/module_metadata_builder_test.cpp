@@ -244,6 +244,35 @@ BEZEL_TEST(module_metadata_builder, enum_constants_built_spec_10) {
     }
 }
 
+// §35 (v0.200, #2044) / #2121: a public user-declared choice in module
+// metadata is recorded with `MetaTypeDeclKind::Choice`, not the silent
+// `Class` fallback that the previous `-Wswitch` arm omission produced. The
+// enum byte (now `Choice = 4`) flows through serialize / deserialize so a
+// cross-module importer that branches on the kind takes the choice path.
+BEZEL_TEST(module_metadata_builder, choice_kind_recorded_spec_35_2121) {
+    auto r = buildFromSource(
+        "module Lib; "
+        "public choice Color Red, Green, Blue; end Color;");
+    BEZEL_EXPECT_TRUE(r->ok);
+    const MetaTypeDecl* cc = findType(r->meta, "Color");
+    BEZEL_EXPECT_TRUE(cc != nullptr);
+    if (!cc) return;
+    BEZEL_EXPECT_TRUE(cc->kind == MetaTypeDeclKind::Choice);
+    // The wire byte must match the enum value — pin the wire format so a
+    // future case-serialization layer can extend the schema without shifting
+    // the choice-kind byte out from under existing readers.
+    std::vector<std::uint8_t> bytes = serialize(r->meta);
+    BEZEL_EXPECT_TRUE(!bytes.empty());
+    std::optional<ModuleMetadata> decoded = deserialize(bytes);
+    BEZEL_EXPECT_TRUE(decoded.has_value());
+    if (!decoded) return;
+    const MetaTypeDecl* dcc = findType(*decoded, "Color");
+    BEZEL_EXPECT_TRUE(dcc != nullptr);
+    if (!dcc) return;
+    BEZEL_EXPECT_TRUE(dcc->kind == MetaTypeDeclKind::Choice);
+    BEZEL_EXPECT_TRUE(dcc->kind == cc->kind);
+}
+
 // §2.5/§2.6: built metadata survives serialize → deserialize unchanged (the
 // builder produces a schema the Increment-1 codec round-trips).
 BEZEL_TEST(module_metadata_builder, built_metadata_roundtrips_spec_2_5) {

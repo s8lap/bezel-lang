@@ -215,6 +215,14 @@ enum class MetaTypeDeclKind : std::uint8_t {
     Interface = 1, // §11
     Record = 2,    // §9
     Enum = 3,      // §10
+    // §35 (v0.200, #2044): choice kinds carry through the metadata schema so
+    // a cross-module importer of a choice does not fall back to Class
+    // (#2121). The case-list itself is not yet serialized (cross-module choice
+    // consumers are not in scope yet); this enum value is the foundational
+    // step that removes the `-Wswitch` warning at toMetaTypeDeclKind /
+    // fromMetaTypeDeclKind and keeps the byte in the wire format stable for
+    // the future case-serialization work.
+    Choice = 4,    // §35
 };
 
 // §14 generic parameter (`Variance? Identifier`). Variance is "in", "out", or
