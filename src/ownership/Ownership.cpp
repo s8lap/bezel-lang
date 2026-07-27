@@ -222,6 +222,71 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             }
         }
     }
+    // §29.8 (#2154/#2217): a linear owning iterator whose body consists solely
+    // of direct `yield return <owned-param>` statements has a precise runtime
+    // ownership boundary at each yield state. Record those states so the clone
+    // frame can own the captures and dispose only parameters whose transfer
+    // point has not yet been reached. This deliberately narrow prototype avoids
+    // applying a monotone "ever discharged" fact to every suspension state.
+    bool linearOwningEnumerable = false;
+    if (returnType) {
+        const sema::TypeRef* rt = ctx_.resolvedType(*returnType);
+        linearOwningEnumerable = rt &&
+            rt->kind == sema::TypeRef::Kind::Named &&
+            rt->headName() == "IOwningEnumerable";
+    }
+    if (sawYield_ && !isAsync_ && linearOwningEnumerable &&
+        paramSyms && !body.empty()) {
+        std::unordered_map<sema::Symbol*, unsigned> moveState;
+        bool linear = true;
+        unsigned state = 0;
+        for (const auto& stmt : body) {
+            auto* ys = stmt ? dynamic_cast<const ast::YieldStmt*>(stmt.get())
+                            : nullptr;
+            auto* id = ys && !ys->isBreak && ys->value
+                         ? dynamic_cast<const ast::IdentifierExpr*>(ys->value.get())
+                         : nullptr;
+            sema::Symbol* sym = id ? ctx_.exprSymbol(*id) : nullptr;
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+            if (!ps || ps->modifier != "owned" || moveState.count(sym)) {
+                linear = false;
+                break;
+            }
+            moveState[sym] = ++state;
+        }
+        std::vector<sema::ParameterSymbol*> ownedParams;
+        for (sema::Symbol* sym : *paramSyms) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+            if (!ps || ps->modifier != "owned") continue;
+            const sema::TypeRef* pt = ps->declType
+                ? ctx_.resolvedType(*ps->declType)
+                : ps->resolvedDeclType;
+            bool classLike = pt && pt->kind == sema::TypeRef::Kind::Named &&
+                pt->declaration &&
+                (pt->declaration->kind == ast::TypeDeclKind::Class ||
+                 pt->declaration->kind == ast::TypeDeclKind::Interface);
+            if (!classLike) linear = false;
+            ownedParams.push_back(ps);
+        }
+        if (linear && !ownedParams.empty() &&
+            moveState.size() == ownedParams.size()) {
+            for (auto* ps : ownedParams) {
+                auto it = moveState.find(ps);
+                if (it == moveState.end()) {
+                    linear = false;
+                    break;
+                }
+            }
+        } else {
+            linear = false;
+        }
+        if (linear) {
+            for (auto* ps : ownedParams) {
+                ps->iteratorAutoDispose = true;
+                ps->iteratorMoveYieldState = moveState[ps];
+            }
+        }
+    }
     // Slice O11-real: run the analysis as a forward dataflow over the
     // body's full CFG, including the real F2 try/catch/finally exception
     // edges (`treatTryAsOpaque=false`). The straight-line / if-else / loop /

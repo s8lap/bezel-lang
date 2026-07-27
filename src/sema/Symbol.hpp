@@ -323,14 +323,13 @@ struct ParameterSymbol : Symbol {
     // Preferred over `declType` (which is null in that case) by identifier
     // resolution. Null otherwise.
     TypeRef* resolvedDeclType = nullptr;
-    // §29.8 (#945): set by the ownership pass on an `owned` parameter of a SYNC
-    // iterator method whose body never moves the parameter out. The iterator's
-    // state machine takes ownership at construction and disposes the parameter
-    // at iterator-Dispose (after the body's `using var` / `finally` cleanups,
-    // reverse declaration order). Codegen (emitIteratorMethod's Dispose) reads
-    // this flag to emit that disposal. Owned params the body discharges are
-    // never flagged, so there is no double-free.
+    // §29.8 (#945, #2154): set by the ownership pass when iterator teardown
+    // may still own this parameter. Codegen null-guards the frame slot. For the
+    // narrow linear owning-iterator case, iteratorMoveYieldState records the
+    // one-based yield state that transfers the parameter; a per-enumerator
+    // Dispose then drops it only while suspended before that state.
     bool iteratorAutoDispose = false;
+    unsigned iteratorMoveYieldState = 0;
     // §28.3 v0.150/v0.152 (#1008 Part B, affine auto-drop extended to params):
     // set by the ownership pass on an `owned` parameter of a SYNCHRONOUS, non-
     // iterator, non-destructor method that is never discharged on any path

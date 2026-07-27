@@ -515,6 +515,21 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // The iterator nulls current_val after transfer and on exhaustion.
     bool isOwningIter = (retName == "IOwningEnumerable");
 
+    // §29.8 (#2154/#2217): narrow CLONE-DISPOSES-CAPTURES prototype. The
+    // ownership pass records a yield state only when the complete body is a
+    // linear sequence of direct owned-parameter transfers. In that shape the
+    // first enumerator claims the captures from the source and its Dispose can
+    // distinguish not-yet-yielded parameters from already-transferred ones by
+    // the current state.
+    bool cloneDisposesOwnedCaptures = false;
+    for (sema::Symbol* sym : ms->params) {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+        if (ps && ps->iteratorMoveYieldState != 0) {
+            cloneDisposesOwnedCaptures = true;
+            break;
+        }
+    }
+
     // §29 (#1120): true when T is an owned class or interface AND the return type
     // is IEnumerable<T> (or a related non-owning interface) — meaning the
     // enumerator frame RETAINS ownership of the most-recently-yielded value.
@@ -711,6 +726,42 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", getEnumFn);
         llvm::IRBuilder<> gb(entry);
         llvm::Value* self = &*getEnumFn->arg_begin();
+        llvm::Value* sourceState = gb.CreateStructGEP(
+            stateStructTy, self, STATE_FIELD);
+        auto* cloneBB = entry;
+        if (cloneDisposesOwnedCaptures) {
+            // The captures carry affine obligations, so only one clone may claim
+            // them. A later GetEnumerator is a loud failure rather than replaying
+            // pointers whose ownership the first clone already consumed.
+            auto* claimedBB = llvm::BasicBlock::Create(
+                llvm_, "claim.used", getEnumFn);
+            cloneBB = llvm::BasicBlock::Create(llvm_, "claim.ok", getEnumFn);
+            llvm::Value* prior = gb.CreateLoad(i32(), sourceState, "claim.state");
+            gb.CreateCondBr(gb.CreateICmpEQ(prior, gb.getInt32(-3)),
+                            claimedBB, cloneBB);
+
+            gb.SetInsertPoint(claimedBB);
+            auto* callocTy = llvm::FunctionType::get(
+                ptrTy(), {i64(), i64()}, false);
+            auto* callocFnV = module_->getOrInsertFunction(
+                "calloc", callocTy).getCallee();
+            llvm::Value* excObj = gb.CreateCall(
+                callocTy, callocFnV,
+                {llvm::ConstantInt::get(i64(), 1),
+                 llvm::ConstantInt::get(i64(), kExcObjSize)},
+                "claim.excobj");
+            auto vit = builtinVtable_.find("InvalidOperationException");
+            if (vit != builtinVtable_.end()) gb.CreateStore(vit->second, excObj);
+            auto* excAddrTy = llvm::FunctionType::get(ptrTy(), {}, false);
+            auto* excAddrFnV = module_->getOrInsertFunction(
+                "bz_exc_addr", excAddrTy).getCallee();
+            llvm::Value* excSlot = gb.CreateCall(
+                excAddrTy, excAddrFnV, {}, "claim.exc");
+            gb.CreateStore(excObj, excSlot);
+            gb.CreateRet(llvm::ConstantPointerNull::get(ptrTy()));
+            gb.SetInsertPoint(cloneBB);
+        }
+
         uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stateStructTy);
         auto* callocFn3 = declareC("calloc", ptrTy(), {i64(), i64()});
         llvm::Value* clone = gb.CreateCall(callocFn3,
@@ -729,8 +780,21 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             gb.CreateStructGEP(stateStructTy, clone, CURRENT_VAL_OWNED_FIELD));
         gb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
             gb.CreateStructGEP(stateStructTy, clone, SPILL_PTR_FIELD));
-        // Install the clone vtable so disposing the enumerator frees it without
-        // touching the source's owned parameters.
+        // In the linear §29.8 shape, ownership of each capture moves source →
+        // clone. Nulling the source makes its later Dispose a no-op for them.
+        if (cloneDisposesOwnedCaptures) {
+            for (std::size_t i = 0; i < frame.captures.size(); ++i) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    frame.captures[i].first);
+                if (!ps || ps->iteratorMoveYieldState == 0) continue;
+                unsigned fieldIdx = frame.captureStart + (unsigned)i;
+                gb.CreateStore(llvm::Constant::getNullValue(frame.captures[i].second),
+                    gb.CreateStructGEP(stateStructTy, self, fieldIdx));
+            }
+            gb.CreateStore(gb.getInt32(-3), sourceState);
+        }
+        // Install the clone vtable. In the narrow owned-capture shape its Dispose
+        // also runs the state-keyed §29.8 parameter cleanup.
         gb.CreateStore(cloneVtGV,
             gb.CreateStructGEP(stateStructTy, clone, VTABLE_FIELD));
         gb.CreateRet(clone);
@@ -1026,7 +1090,8 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // auto-dispose because the clone borrows the captures from the source). The
     // bodies are otherwise identical (same finally chains, same spill free, same
     // state guard). Parameterised by `targetFn` and `disposeOwned`.
-    auto emitDisposeBody = [&](llvm::Function* targetFn, bool disposeOwned) {
+    auto emitDisposeBody = [&](llvm::Function* targetFn, bool disposeOwned,
+                               bool stateKeyedOwned) {
         currentFn_ = targetFn;
         currentThis_ = nullptr;
         locals_.clear(); paramSlots_.clear(); refParams_.clear();
@@ -1064,11 +1129,13 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // `0`) proceed and free the frame, while a SECOND Dispose (after the first
         // set `-2`) no-ops. This covers checked mode (frame quarantined, slot not
         // nulled, so the call-site null guard does not fire) and any alias path.
+        llvm::Value* disposeState = nullptr;
         {
             llvm::Value* stateGEP = builder_.CreateStructGEP(
                 stateStructTy, self, STATE_FIELD);
             llvm::Value* curState =
                 builder_.CreateLoad(i32(), stateGEP, "dsp.curstate");
+            disposeState = curState;
             llvm::Value* isDisposed = builder_.CreateICmpEQ(
                 curState, builder_.getInt32(-2), "dsp.isdisposed");
             auto* earlyRet =
@@ -1121,13 +1188,27 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                 llvm::Value* fptr =
                     builder_.CreateStructGEP(stateStructTy, self, fieldIdx);
                 llvm::Value* obj = builder_.CreateLoad(ptrTy(), fptr, "itp.obj");
-                llvm::Value* isNull = builder_.CreateICmpEQ(
-                    obj, llvm::ConstantPointerNull::get(ptrTy()), "itp.isnull");
                 auto* dispBB =
                     llvm::BasicBlock::Create(llvm_, "itp.dispose", targetFn);
                 auto* contBB =
                     llvm::BasicBlock::Create(llvm_, "itp.cont", targetFn);
-                builder_.CreateCondBr(isNull, contBB, dispBB);
+                llvm::Value* shouldDispose = builder_.CreateICmpNE(
+                    obj, llvm::ConstantPointerNull::get(ptrTy()), "itp.nonnull");
+                if (stateKeyedOwned && ps->iteratorMoveYieldState != 0) {
+                    // State N means yield N has already transferred its parameter.
+                    // State 0 still owns all captures; -1 means fully exhausted.
+                    llvm::Value* notComplete = builder_.CreateICmpSGE(
+                        disposeState, builder_.getInt32(0), "itp.active");
+                    llvm::Value* beforeMove = builder_.CreateICmpSLT(
+                        disposeState,
+                        builder_.getInt32((int)ps->iteratorMoveYieldState),
+                        "itp.beforemove");
+                    shouldDispose = builder_.CreateAnd(
+                        shouldDispose,
+                        builder_.CreateAnd(notComplete, beforeMove),
+                        "itp.shoulddispose");
+                }
+                builder_.CreateCondBr(shouldDispose, dispBB, contBB);
                 builder_.SetInsertPoint(dispBB);
                 emitDisposeAndReclaim(obj);
                 builder_.CreateStore(
@@ -1375,8 +1456,11 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // clone/enumerator Dispose does not. For a single-use IEnumerator<T> iterator
     // there is no separate clone, but emitting cloneDisposeFn is harmless (it is
     // never reached) and keeps the vtable layout uniform.
-    emitDisposeBody(disposeFn, /*disposeOwned=*/true);
-    emitDisposeBody(cloneDisposeFn, /*disposeOwned=*/false);
+    emitDisposeBody(disposeFn, /*disposeOwned=*/true,
+                    /*stateKeyedOwned=*/false);
+    emitDisposeBody(cloneDisposeFn,
+                    /*disposeOwned=*/cloneDisposesOwnedCaptures,
+                    /*stateKeyedOwned=*/cloneDisposesOwnedCaptures);
 
     // Clear the per-iterator finally / disposal tracking.
     smIterFinallyAtState_.clear();
