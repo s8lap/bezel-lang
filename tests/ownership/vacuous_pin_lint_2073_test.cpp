@@ -960,27 +960,19 @@ BEZEL_TEST(vacuous_pin_lint_2073,
 }
 
 // ============================================================================
-// #2160 — reclassified: a `using var` over a fresh borrowing-family
-// collection (`new Array<int>()` etc.) does NOT fire the inert-RHS warning.
-// Per the issue's interpretation (a SPEC CHANGE: the §28.11 trivial-dispose
-// reading is being narrowed in favor of the §28.10 heap-reclamation
-// reading), these collections are HEAP-OWNED class instances whose
-// backing storage must be reclaimed at scope end — the §28.10 discharge
-// (`using var`) is the correct pattern, not the §21.1 `const` alias.
-// Pre-#2160 (rework 3c, #2073): the inert-RHS warning fired; the user was
-// steered to `const`, leaving the heap allocation undischarged. The
-// previous `borrowing_collections_inert_rhs_warns_spec_28_11` test pinned
-// that behavior; this test REPLACES it with the corrected
-// `using_var_disposable_array_no_lint_*` shape (see
-// tests/ownership/using_var_disposable_array_no_lint_2160_test.cpp for
-// the new positive control). The narrower self-test below just confirms
-// the no-warning behavior for each head — the full AOT+ASan oracle for
-// the dispose-once property lives in the 2160 test file (it needs
-// runAotChecked, not parseAndCheckOwnership). // per §28.10, §28.11,
-// §21.1, #2073 (rework 3c), #2160
+// rework 3c — positive controls for the borrowing-collection TRIVIAL-DISPOSE
+// carve-out. Per §28.11 (v0.215) the borrowing family (Array/Stack/Queue/Set/
+// SortedSet/Dictionary/SortedDictionary/LinkedList) has a no-op `Dispose()`,
+// so a `using var` over `new Array<int>()` etc. is genuinely vacuous — the
+// §21.1 `const` alias is the correct spelling. These tests pin the
+// §28.10/§28.11 narrowing of the disposable-types list: a future rework
+// that adds borrowing collections to `rhsIsDisposableClassType` (a regression
+// to the pre-v0.215 surface) would silence these inert warnings, breaking
+// the test — making the carve-out structural, not just commented.
+// // per §28.10 / §28.11 / §21.1, #2073 (rework 3c)
 // ============================================================================
 BEZEL_TEST(vacuous_pin_lint_2073,
-           borrowing_collections_no_longer_inert_warn_spec_28_10) {
+           borrowing_collections_inert_rhs_warns_spec_28_11) {
     const char* cases[] = {
         "Array<int>", "Stack<int>", "Queue<int>", "Set<int>",
         "SortedSet<int>", "Dictionary<string, int>",
@@ -993,11 +985,7 @@ BEZEL_TEST(vacuous_pin_lint_2073,
             names[i] + " := new " + cases[i] + "(); return 0; end M; "
             "public static method Main(): int return 0; end Main; end C;";
         auto r = parseAndCheckOwnership(source);
-        // The inert-RHS warning must NOT fire on a fresh
-        // borrowing-collection producer — the heap allocation IS a
-        // discharge obligation (§28.10), so the §21.1 `const` remedy
-        // is wrong. // per §28.10, #2160
-        BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, names[i]));
+        BEZEL_EXPECT_TRUE(hasInertRhsWarning(r, names[i]));
     }
 }
 

@@ -856,26 +856,10 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     } else if (auto* id =
                                    dynamic_cast<const ast::IdentifierExpr*>(
                                        un->operand.get())) {
-                        // §28.8.1 / #825: a bare `move _field` is syntactically
-                        // identical to `move this._field` — both leave the field
-                        // in moved-from state. exprIsOwnedFieldRead resolves the
-                        // bare identifier via sema and returns true only for an
-                        // owned field of the current class. Without this check
-                        // the bare-identifier `move _resource` arm routes to
-                        // markMovedByName (treating it as a LOCAL move), and the
-                        // field-move fact is never recorded — the §28.8.1
-                        // path-sensitive diagnostic (#867) never fires even
-                        // when the CFG emits the implicit exception edge from
-                        // the call (the diagnostic consumes endFlow.fields,
-                        // which is empty without the field-move entry).
-                        if (exprIsOwnedFieldRead(*id)) {
-                            recordFieldMove(id->name, un->span.begin);
-                        } else {
-                            // §28.8 (#395): `move b` of a borrow is not an owned
-                            // value — reject rather than silently consuming it.
-                            if (!checkOwnedArgSource(*a.value, id->span.begin))
-                                markMovedByName(id->name, id->span.begin);
-                        }
+                        // §28.8 (#395): `move b` of a borrow is not an owned
+                        // value — reject rather than silently consuming it.
+                        if (!checkOwnedArgSource(*a.value, id->span.begin))
+                            markMovedByName(id->name, id->span.begin);
                         consumed = true;
                     } else if (auto* ma =
                                    dynamic_cast<const ast::MemberAccessExpr*>(
