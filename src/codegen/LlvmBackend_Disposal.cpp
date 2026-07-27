@@ -2030,6 +2030,39 @@ llvm::Function* Emitter::nestedCollectionDisposerThunk(const sema::TypeRef* elem
 }
 
 
+// §28.11 / §30.5 (#1889): dispose one Task-family element owned by an
+// owning collection. Collection free callbacks have the same `void(void*)` ABI
+// as class-element thunks, but a task needs the full non-blocking protocol rather
+// than a vtable Dispose call: its unconsumed class result and fault object are
+// both part of the task's disposal contract. Build the callback in a private
+// LLVM function while temporarily making it the active emitter function, then
+// restore the caller's insertion point. // per §30.5
+llvm::Function* Emitter::taskElementDisposerThunk(const sema::TypeRef* taskTy) {
+    auto it = taskElementDisposerThunks_.find(taskTy);
+    if (it != taskElementDisposerThunks_.end()) return it->second;
+
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    std::string name = "bz$taskElemDispose";
+    name += "$" + std::to_string(reinterpret_cast<std::uintptr_t>(taskTy));
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      name, module_.get());
+    taskElementDisposerThunks_[taskTy] = fn;
+    llvm::Argument* task = &*fn->args().begin();
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    builder_.SetInsertPoint(entry);
+    emitTaskDisposal(taskTy, task);
+    builder_.CreateRetVoid();
+    currentFn_ = savedFn;
+    builder_.restoreIP(savedIP);
+    return fn;
+}
+
+
 bool Emitter::collectionElemIsClass(const sema::TypeRef* collTy, unsigned idx) {
     // fix #619 / §28.11 v0.135 / §14.4: the §28.11 table's owned/borrow column
     // applies to "class / interface type" — both class AND interface elements are
