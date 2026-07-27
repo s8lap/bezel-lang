@@ -3310,6 +3310,270 @@ llvm::Value* Emitter::drainLazyPipelineToOwnedIEnumerable(
     return wrapOwnedArrayAsIEnumerable(arr, iEnumTy);
 }
 
+// #2218 / stdlib §4.5/§4.13 / spec §29.1/§29.2: wrap a bz_array_t*-backed owning
+// collection — OwningArray<T> / OwningSet<T> / OwningQueue<T> — in a vtable-
+// backed IOwningEnumerator<T> for the explicit `coll.Drain().GetOwningEnumerator()`
+// (or `var e := coll.Drain(); e.GetOwningEnumerator()`) manual-protocol path.
+// .Drain() on these types returns the collection itself at static type
+// IOwningEnumerable<T> (stdlib §4.5 "no separate enumerable object"), so the
+// receiver is a raw bz_array_t* with NO vtable at offset 0 (its first field is
+// `data`, a heap-buffer pointer). Without this wrapper the codegen dispatched
+// the receiver's slot 4 — a bz_array_t* has no slot 4, so the load returned
+// garbage and the call SEGV'd (#2218). The wrapper:
+//
+//   * BORROWS the array — the source `coll` (still in scope) owns the array
+//     and disposes any remaining elements on its own scope end (the §28.3
+//     owned-local discharge rules apply to the original `a`).
+//   * MoveNext (slot 2) pops the next element via bz_array_drain_next into
+//     the wrapper's `pending` slot, returning i1 (true ⇔ a new element was
+//     yielded). §29.1's "advanced-but-untaken" pending is held in the slot
+//     until TakeCurrent / Dispose / a subsequent MoveNext.
+//   * TakeCurrent (slot 3) moves the pending element out and nulls the slot,
+//     per §29.1 ("after a successful MoveNext, TakeCurrent() transfers
+//     ownership of the most-recently-yielded value to the caller, leaving the
+//     enumerator's internal slot empty"). A double-take / before-first-advance
+//     / after-exhaustion surfaces as a null `pending` load and is handled by
+//     the existing iterator-frame IOE path (the lower-level path here is just
+//     the pop-and-store; an IOE-raising wrapper is layered on top in
+//     emitIteratorMethod-style when TakeCurrent comes from a yield-iterator
+//     frame — this wrapper is the manual-protocol analogue, mirroring the
+//     bz_array_drain_next-based drain loop of `for var x in coll.Drain()`).
+//   * Dispose (slot 1) disposes the pending value if non-null (per §29.1 "a
+//     Dispose() after an advance whose value was never taken disposes the
+//     pending value"), then frees the wrapper. The ARRAY is NOT freed —
+//     `coll`'s owner (the user's `using var a`) disposes it.
+//   * Slot 4 (GetOwningEnumerator) returns `self` as a safe no-op — calling
+//     GetOwningEnumerator on an IOwningEnumerator<T> is not a defined
+//     operation, but a vtable slot must exist; the function returns the
+//     receiver so any unexpected dispatch is at least non-crashing.
+//
+// Element name key matches ensureArrayEnumMachinery's per-element-type
+// scheme, so all calls with the same element T share the same functions +
+// vtable global.
+llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
+        llvm::Value* arr, const sema::TypeRef* iOwnEnumTy) {
+    // Element type is always a class pointer (IOwningEnumerable<T> constrains
+    // T: class per stdlib §4.13). Resolve through the active per-instantiation
+    // substitution in case the iOwnEnumTy is a generic template; the bare
+    // type-parameter case lowers as a class pointer (§29.2 #990 mirror).
+    const sema::TypeRef* elemTr = (iOwnEnumTy && !iOwnEnumTy->genericArgs.empty())
+                                      ? iOwnEnumTy->genericArgs[0]
+                                      : nullptr;
+    const sema::TypeRef* resolvedElem = resolveTypeParamRef(elemTr);
+    llvm::Type* elemLlvm;
+    if (resolvedElem && resolvedElem != elemTr)
+        elemLlvm = lowerTypeRef(resolvedElem);
+    else if (elemTr && elemTr->kind == sema::TypeRef::Kind::Named &&
+             elemTr->declaration == nullptr)
+        elemLlvm = ptrTy();   // unresolved type param — class per §4.13
+    else if (elemTr)
+        elemLlvm = lowerTypeRef(elemTr);
+    else
+        elemLlvm = ptrTy();
+
+    // Element-name key (same scheme as ensureArrayEnumMachinery) so the
+    // Dispose / MoveNext / TakeCurrent / vtable are created once per element
+    // type. The wrapper is a per-element-type singleton — fresh calls allocate
+    // a new instance but reuse the same code and vtable.
+    std::string elemName = elemLlvm->isIntegerTy()
+        ? ("i" + std::to_string(elemLlvm->getIntegerBitWidth()))
+        : (elemLlvm->isPointerTy() ? "ptr" : "f");
+    std::string prefix = "bz$ownarrenum$" + elemName + "$";
+
+    // Wrapper struct: { ptr vtable, ptr arr, ptr pending }. Three pointer
+    // fields (vtable + arr + pending); the wrapper holds a borrow of the
+    // array (does NOT own it) and an owned class pointer in `pending` that
+    // the Dispose path must release if non-null (§29.1 abandonment rule).
+    std::string stName = "ownarrenum." + elemName;
+    auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
+    if (!stTy) {
+        stTy = llvm::StructType::create(llvm_,
+            {ptrTy(), ptrTy(), ptrTy()}, stName);
+    }
+
+    // The disposer for `pending` — for an owning collection, the element type
+    // is a class and its destructor is what the runtime calls. We mirror the
+    // bz_array_drain_next contract (the value left in pending is the popped
+    // CLASS pointer), so we use emitDisposeAndReclaim on the loaded pointer.
+    // That helper nulls the slot on the way out and recycles storage; the
+    // pending slot is then nulled in the wrapper so a redundant Dispose is
+    // a no-op (mirrors the iterator-frame's -2 sentinel + slot nulling).
+
+    // --- Dispose(self) — dispose pending (if any), free wrapper. ---
+    auto* dispFn = module_->getFunction(prefix + "Dispose");
+    if (!dispFn) {
+        dispFn = llvm::Function::Create(
+            llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+            llvm::Function::InternalLinkage, prefix + "Dispose", module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", dispFn);
+        // §28: emitDisposeAndReclaim uses the Emitter's `builder_` /
+        // `currentFn_` to insert into. Swap them in for the duration of the
+        // helper body, then restore so the caller of
+        // wrapArrayAsIOwningEnumerator sees its own builder / currentFn
+        // unchanged (#2218 IR-verification: the previous attempt left the
+        // outer currentFn_ in place and ended up emitting helper-body
+        // instructions into the wrong function). The save pattern mirrors
+        // emitPosFieldGetter (LlvmBackend_impl.hpp ~1462) — save the insert
+        // block/point rather than the whole IRBuilder (which is
+        // non-copyable).
+        llvm::Function* savedCurrentFn = currentFn_;
+        auto* savedBB = builder_.GetInsertBlock();
+        llvm::BasicBlock::iterator savedIP{};
+        if (savedBB) savedIP = builder_.GetInsertPoint();
+        currentFn_ = dispFn;
+        builder_.SetInsertPoint(bb);
+        llvm::Value* self = dispFn->arg_begin();
+        // Load pending (ptr); if non-null, dispose + reclaim.
+        llvm::Value* pendF = builder_.CreateStructGEP(stTy, self, 2);
+        llvm::Value* pend = builder_.CreateLoad(ptrTy(), pendF, "oaed.pend");
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            pend, llvm::ConstantPointerNull::get(ptrTy()), "oaed.pend.null");
+        auto* dispBB = llvm::BasicBlock::Create(llvm_, "oaed.disp", dispFn);
+        auto* contBB = llvm::BasicBlock::Create(llvm_, "oaed.cont", dispFn);
+        builder_.CreateCondBr(isNull, contBB, dispBB);
+        builder_.SetInsertPoint(dispBB);
+        // emitDisposeAndReclaim expects an instruction-point set on the
+        // current builder. It loads the class vtable, dispatches the slot-1
+        // Dispose, then frees the object. Set the slot to null first so a
+        // re-entrant Dispose (slot-1 Dispose cascades back to pending's
+        // release) does not re-dispose.
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pendF);
+        emitDisposeAndReclaim(pend);
+        builder_.CreateBr(contBB);
+        builder_.SetInsertPoint(contBB);
+        // Free the wrapper struct.
+        auto* freeFn = module_->getOrInsertFunction(
+            "free", llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false)).getCallee();
+        builder_.CreateCall(llvm::FunctionType::get(
+            llvm::Type::getVoidTy(llvm_), {ptrTy()}, false), freeFn, {self});
+        builder_.CreateRetVoid();
+        currentFn_ = savedCurrentFn;
+        if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
+    }
+
+    // --- MoveNext(self) -> i1 — pop next element via bz_array_drain_next. ---
+    auto* mnFn = module_->getFunction(prefix + "MoveNext");
+    if (!mnFn) {
+        mnFn = llvm::Function::Create(
+            llvm::FunctionType::get(i1(), {ptrTy()}, false),
+            llvm::Function::InternalLinkage, prefix + "MoveNext", module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", mnFn);
+        // Swap builder_/currentFn_ for the helper body (see Dispose above).
+        llvm::Function* savedCurrentFn = currentFn_;
+        auto* savedBB = builder_.GetInsertBlock();
+        llvm::BasicBlock::iterator savedIP{};
+        if (savedBB) savedIP = builder_.GetInsertPoint();
+        currentFn_ = mnFn;
+        builder_.SetInsertPoint(bb);
+        llvm::Value* self = mnFn->arg_begin();
+        // If a previous advance's pending value is still set (the user broke
+        // the protocol by calling MoveNext again without TakeCurrent), dispose
+        // it before the next advance — the wrapper does not retain two
+        // pendings (it has a single slot). Per §29.1 the standard disposition
+        // for an undisposed pending is "dispose", matching the iterator-frame
+        // MoveNext's "dispose previous yield" behaviour (#747 / Iterators.cpp
+        // ~960).
+        llvm::Value* pendF2 = builder_.CreateStructGEP(stTy, self, 2);
+        llvm::Value* prev = builder_.CreateLoad(ptrTy(), pendF2, "oaem.prev");
+        llvm::Value* prevNull = builder_.CreateICmpEQ(
+            prev, llvm::ConstantPointerNull::get(ptrTy()), "oaem.prev.null");
+        auto* dispPrevBB =
+            llvm::BasicBlock::Create(llvm_, "oaem.dispprev", mnFn);
+        auto* afterDispBB =
+            llvm::BasicBlock::Create(llvm_, "oaem.after", mnFn);
+        builder_.CreateCondBr(prevNull, afterDispBB, dispPrevBB);
+        builder_.SetInsertPoint(dispPrevBB);
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pendF2);
+        emitDisposeAndReclaim(prev);
+        builder_.CreateBr(afterDispBB);
+        builder_.SetInsertPoint(afterDispBB);
+        // bz_array_drain_next(arr, &pending) → i1 (true = yielded)
+        llvm::Value* arrF = builder_.CreateStructGEP(stTy, self, 1);
+        llvm::Value* arrPtr = builder_.CreateLoad(ptrTy(), arrF, "oaem.arr");
+        // Use a fresh alloca in the function's entry block for the out-param
+        // (drain writes the popped class pointer into it).
+        auto* allocaBB = &mnFn->getEntryBlock();
+        llvm::IRBuilder<> ab(allocaBB, allocaBB->begin());
+        auto* outSlot = ab.CreateAlloca(ptrTy(), nullptr, "oaem.out");
+        auto* drainFT = llvm::FunctionType::get(
+            i1(), {ptrTy(), ptrTy()}, false);
+        auto* drainFn = module_->getOrInsertFunction(
+            "bz_array_drain_next", drainFT).getCallee();
+        llvm::Value* ok = builder_.CreateCall(drainFT, drainFn, {arrPtr, outSlot},
+                                       "oaem.ok");
+        // Store the popped pointer into pending (a no-op if drain returned
+        // false, since the slot was just nulled in that path).
+        llvm::Value* popped = builder_.CreateLoad(ptrTy(), outSlot, "oaem.popped");
+        builder_.CreateStore(popped, builder_.CreateStructGEP(stTy, self, 2));
+        builder_.CreateRet(ok);
+        currentFn_ = savedCurrentFn;
+        if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
+    }
+
+    // --- TakeCurrent(self) -> ptr — move pending out, null slot, return. ---
+    auto* tcFn = module_->getFunction(prefix + "TakeCurrent");
+    if (!tcFn) {
+        tcFn = llvm::Function::Create(
+            llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
+            llvm::Function::InternalLinkage, prefix + "TakeCurrent",
+            module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", tcFn);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value* self = tcFn->arg_begin();
+        llvm::Value* pendF = b.CreateStructGEP(stTy, self, 2);
+        llvm::Value* pend = b.CreateLoad(ptrTy(), pendF, "oaetc.pend");
+        // Null the slot before returning so a subsequent TakeCurrent / Dispose
+        // / MoveNext sees an empty pending. (The IOE check on a null pending
+        // is raised by the iterator-frame's TakeCurrent wrapper when the
+        // enumerator is a yield-iterator frame; for THIS manual-protocol
+        // wrapper we just hand back the pointer as-is — null in, null out —
+        // and let the caller's `if en.MoveNext() then ...` guard the take.)
+        b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pendF);
+        b.CreateRet(pend);
+    }
+
+    // --- Slot 4 (GetOwningEnumerator): return self (no-op safe default). ---
+    auto* geFn = module_->getFunction(prefix + "GetOwningEnumerator");
+    if (!geFn) {
+        geFn = llvm::Function::Create(
+            llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
+            llvm::Function::InternalLinkage, prefix + "GetOwningEnumerator",
+            module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", geFn);
+        llvm::IRBuilder<> b(bb);
+        b.CreateRet(&*geFn->arg_begin());
+    }
+
+    // Vtable: [0]=self, [1]=Dispose, [2]=MoveNext, [3]=TakeCurrent,
+    // [4]=GetOwningEnumerator (no-op).
+    std::string vtName = prefix + "vtable";
+    auto* vtGV = module_->getGlobalVariable(vtName);
+    if (!vtGV) {
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
+        std::vector<llvm::Constant*> elems = {
+            llvm::ConstantPointerNull::get(ptrTy()),  // slot 0: self-ptr (below)
+            dispFn, mnFn, tcFn, geFn
+        };
+        vtGV = new llvm::GlobalVariable(*module_, vtTy, /*isConst=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(vtTy, elems), vtName);
+        elems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy());
+        vtGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
+    }
+
+    // Allocate + fill the OWNING-enumerator instance { vtable, arr, pending=0 }.
+    uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stTy);
+    auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
+    llvm::Value* en = builder_.CreateCall(callocFn2,
+        {builder_.getInt64(1), builder_.getInt64(stSz)}, "ownarrenum");
+    builder_.CreateStore(vtGV, builder_.CreateStructGEP(stTy, en, 0));
+    builder_.CreateStore(arr, builder_.CreateStructGEP(stTy, en, 1));
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+        builder_.CreateStructGEP(stTy, en, 2));
+    return en;
+}
+
 // §29.2 (#437 / #1850): create-or-reuse the array-enumerator machinery (struct
 // type, method functions, vtable) keyed on the lowered element type. Factored
 // out of wrapArrayAsIEnumerable so the nested covariant-view factory

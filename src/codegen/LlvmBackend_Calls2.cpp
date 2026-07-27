@@ -4250,6 +4250,29 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         dynamic_cast<const ast::NewExpr*>(ma->target.get());
                     llvm::Value* src = lowerExpr(*ma->target);
                     if (src && src->getType()->isPointerTy()) {
+                        // #2218 / stdlib §4.5/§4.13 / spec §29.1/§29.2: when
+                        // the source is a bz_array_t*-backed owning collection
+                        // (OwningArray<T> / OwningSet<T> / OwningQueue<T>) the
+                        // `Drain()` view returns the collection itself at
+                        // static type IOwningEnumerable<T> (stdlib §4.5 "no
+                        // separate enumerable object") — but the storage is a
+                        // raw bz_array_t* whose first field is the data buffer
+                        // pointer, NOT a vtable. Dispatching slot 4 of the
+                        // receiver (the iterator-frame protocol path below)
+                        // loads the data pointer, then GEPs slot 4 → reads
+                        // garbage, and the subsequent call SEGVs. Detect the
+                        // builtin-collection receiver (either the temporary
+                        // `coll.Drain()` form or a local holding one) and
+                        // build a vtable-backed IOwningEnumerator<T> wrapper
+                        // (wrapArrayAsIOwningEnumerator) that drains via
+                        // bz_array_drain_next — mirroring the drain loop in
+                        // lowerOwnedSeqDrainFor (Stmts.cpp) and the §29.2
+                        // `for var x in coll.Drain() do` desugaring.
+                        if (auto* wrap =
+                                tryBuildOwningEnumeratorForBuiltinSource(
+                                    ma->target.get(), recvTy)) {
+                            return wrap;
+                        }
                         if (sourceIsTemporary)
                             return src;  // #1641: `using var e` disposes it (slot 1)
                         llvm::Value* vt = builder_.CreateLoad(ptrTy(), src);
@@ -4265,6 +4288,37 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 }
             }
         }
+        // #2218 / stdlib §4.5/§4.13 / spec §29.1/§29.2 — implementation of
+        // the `tryBuildOwningEnumeratorForBuiltinSource` helper consulted by
+        // the GetOwningEnumerator dispatch above. The call site passes the
+        // receiver expression and its static type (IOwningEnumerable<T>); we
+        // recognise three shapes and bail otherwise:
+        //
+        //   1. `coll.Drain()` directly — `targetExpr` is a CallExpr whose
+        //      callee is a `Drain` MemberAccess on an OwningArray/OwningSet/
+        //      OwningQueue/OwningBuffer receiver.
+        //   2. A local `var x := coll.Drain(); ... x.GetOwningEnumerator()`
+        //      — `targetExpr` is an IdentifierExpr resolving to a LocalSymbol
+        //      whose LocalDecl initializer is a Drain() call of shape (1).
+        //   3. A `using var x := coll.Drain(); ... x.GetOwningEnumerator()`
+        //      — same as (2) but the local is a using-var.
+        //
+        // For shape (1) the CallExpr's lowerExpr (in the dispatch site) has
+        // already produced the bz_array_t* (the coll itself, since Drain
+        // returns the receiver). For shape (2) we re-evaluate the underlying
+        // coll.Drain() expression so the lowerer produces a fresh bz_array_t*
+        // pointer at this point — we DO NOT want to re-load the local, which
+        // would re-evaluate the entire initializer (an owning-binding
+        // violation: coll would be moved twice). We extract the CallExpr from
+        // the LocalDecl's initializer, then lower the coll expression
+        // separately and substitute the result.
+        //
+        // LinkedList and Dictionary are intentionally NOT supported here;
+        // they need their own wrappers (the bz_llist_drain_next and the
+        // per-entry pop path, respectively). Returning null falls through to
+        // the iterator-frame slot-4 path, which will SEGV on those types —
+        // matching the prior behaviour and flagging the follow-up.
+        // -------------------------------------------------------------------
         // issue #759 / §29.3 / §30.7: explicit `e.MoveNextAsync()` where `e` is
         // the builtin IAsyncEnumerator<T> / IOwningAsyncEnumerator<T> (no sema
         // TypeDecl, hence no MethodSymbol). Same async-iterator vtable layout
@@ -7601,6 +7655,122 @@ bool Emitter::isStringExprType(const ast::Expr& e) {
            rt->primitive == sema::PrimitiveType::String;
 }
 
+
+
+// #2218 / stdlib §4.5/§4.13 / spec §29.1/§29.2: implementation of the
+// helper consulted by the GetOwningEnumerator dispatch in lowerCall.
+// Returns a vtable-backed IOwningEnumerator<T> wrapper when the receiver
+// is a bz_array_t*-backed owning collection (owning array family, set,
+// queue, buffer); null otherwise. See the header comment for shape
+// detection. Re-evaluation of the underlying coll.Drain() expression (for
+// shape 2/3) produces a fresh bz_array_t* at this use site without
+// re-running the owning-binding evaluation that created the local — the
+// "double-move" trap lowerOwnedSeqDrainFor specifically avoids.
+llvm::Value* Emitter::tryBuildOwningEnumeratorForBuiltinSource(
+        const ast::Expr* targetExpr, const sema::TypeRef* recvTy) {
+    if (!targetExpr || !recvTy) return nullptr;
+
+    auto builtinArrayBackedHead = [](const sema::TypeRef* t) -> bool {
+        if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
+        std::string_view h = t->headName();
+        return h == "OwningArray" || h == "OwningSet" ||
+               h == "OwningQueue" || h == "OwningBuffer";
+    };
+
+    // Recover the bz_array_t* (the underlying collection) from the receiver
+    // expression. The lowerer of the CallExpr / MemberAccessExpr has been
+    // through the OwningArray + Drain() path, so the LLVM value is the
+    // collection's bz_array_t* (Drain() returns the receiver itself, per
+    // stdlib §4.5). For the local form, we re-lower the underlying
+    // coll.Drain() expression to obtain the bz_array_t* at this use site.
+    auto lowerUnderlyingArray = [&](const ast::Expr* e) -> llvm::Value* {
+        if (!e) return nullptr;
+        llvm::Value* v = lowerExpr(*e);
+        if (v && v->getType()->isPointerTy()) return v;
+        return nullptr;
+    };
+
+    // Shape 1: receiver IS a `coll.Drain()` call. The lowerer returns the
+    // coll bz_array_t* (Drain returns its receiver). Verify the coll is
+    // bz_array_t*-backed and proceed.
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(targetExpr)) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                ce->callee.get())) {
+            if (ma->member == "Drain" && ma->target) {
+                const sema::TypeRef* ct = ctx_.exprType(*ma->target);
+                if (builtinArrayBackedHead(ct)) {
+                    llvm::Value* arr = lowerUnderlyingArray(ma->target.get());
+                    if (arr) return wrapArrayAsIOwningEnumerator(arr, recvTy);
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    // Shape 2/3/4: receiver is an IdentifierExpr (local). Recover the
+    // initializer and detect a bz_array_t*-backed owning collection in
+    // three ways:
+    //   (a) `var x := coll.Drain();` (Drain call on a builtin collection).
+    //   (b) `var x := new OwningArray<T>();` (NewExpr on a builtin
+    //       collection, the for-loop desugaring #1838/#1839 + #2146 case).
+    //   (c) `var x := coll` where `coll` is itself a bz_array_t*-backed
+    //       local (further indirection — same lowering rule (a)/(b) on
+    //       coll's initializer; not implemented in this commit because no
+    //       #2218 reproducer crosses two indirection levels).
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(targetExpr)) {
+        auto* sym = ctx_.exprSymbol(*id);
+        if (!sym) return nullptr;
+        auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym);
+        if (!ls) return nullptr;
+        const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+        if (!ld || !ld->initializer) return nullptr;
+        // (a) `var x := coll.Drain();` — re-evaluate the underlying coll
+        // at this use site (do NOT re-run the entire local initializer;
+        // would re-run the move-binding into the local, a §28.3 violation).
+        if (auto* ce2 = dynamic_cast<const ast::CallExpr*>(
+                ld->initializer.get())) {
+            if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(
+                    ce2->callee.get())) {
+                if (ma2->member == "Drain" && ma2->target) {
+                    const sema::TypeRef* ct = ctx_.exprType(*ma2->target);
+                    if (builtinArrayBackedHead(ct)) {
+                        llvm::Value* arr = lowerUnderlyingArray(
+                            ma2->target.get());
+                        if (arr) return wrapArrayAsIOwningEnumerator(
+                                          arr, recvTy);
+                    }
+                }
+            }
+            return nullptr;
+        }
+        // (b) `var x := new OwningArray<T>();` (and owning variants). The
+        // local holds the bz_array_t* produced by the `new` initializer.
+        // Re-evaluate the NewExpr to obtain the bz_array_t* (NewExpr has
+        // no §28.3 move-binding into the local because the value is a
+        // fresh owned producer; the local is a plain `var` alias of the
+        // new'd object). Mirrors the #1838 / #1839 / #2146 pattern.
+        if (auto* ne = dynamic_cast<const ast::NewExpr*>(
+                ld->initializer.get())) {
+            const sema::TypeRef* initTy = ctx_.exprType(*ne);
+            if (builtinArrayBackedHead(initTy)) {
+                // The NewExpr is a fresh call — re-evaluating it would
+                // allocate a SECOND bz_array_t* (a leak). Instead, load
+                // the local's existing slot (its value is the bz_array_t*
+                // already produced by the original `new` at construction).
+                if (auto it2 = locals_.find(ld);
+                    it2 != locals_.end()) {
+                    llvm::Value* arr = builder_.CreateLoad(
+                        ptrTy(), it2->second, "oaet.srcarr");
+                    if (arr) return wrapArrayAsIOwningEnumerator(
+                                      arr, recvTy);
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    return nullptr;
+}
 
 
 }  // namespace bezel::codegen

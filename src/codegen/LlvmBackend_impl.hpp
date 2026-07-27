@@ -4442,6 +4442,42 @@ private:
     llvm::Value* drainLazyPipelineToOwnedIEnumerable(
         llvm::Value* lazyVal, const sema::TypeRef* iEnumTy);
 
+    // #2218 / stdlib §4.5/§4.13 / spec §29.1/§29.2: wrap a bz_array_t*-backed
+    // owning collection (OwningArray<T> / OwningSet<T> / OwningQueue<T> — the
+    // .Drain() view returns the collection itself at static type
+    // IOwningEnumerable<T>, per stdlib §4.5 "no separate enumerable object") in a
+    // vtable-backed IOwningEnumerator<T>. The wrapper's MoveNext pops the next
+    // element via bz_array_drain_next, TakeCurrent transfers ownership of the
+    // pending element to the caller, and Dispose disposes any advanced-but-
+    // untaken pending value (§29.1) then frees the wrapper. The wrapper BORROWS
+    // the array — the source collection remains the array's owner and disposes
+    // any remaining elements on its own scope end. Returns a fresh calloc'd
+    // wrapper pointer (the caller / using-var machinery disposes it via slot 1).
+    // Generic key matches the ensureArrayEnumMachinery naming so the same
+    // per-element-type machinery is shared across an entire compilation unit.
+    llvm::Value* wrapArrayAsIOwningEnumerator(llvm::Value* arr,
+                                              const sema::TypeRef* iOwnEnumTy);
+
+    // #2218 / stdlib §4.5/§4.13 / spec §29.1/§29.2: at the call site of
+    // `recv.GetOwningEnumerator()`, detect whether `recv` is actually a
+    // bz_array_t*-backed owning collection (owning array family, set, queue,
+    // buffer) — typically `coll.Drain()` directly, or a local whose
+    // initializer was a `Drain()` call on one of these. Returns a fresh
+    // vtable-backed IOwningEnumerator<T> wrapper (via
+    // wrapArrayAsIOwningEnumerator) on hit; null when the receiver is a
+    // compiler-emitted iterator frame (the slot-4 dispatch path) or any
+    // other non-builtin source. The detection mirrors lowerOwnedSeqDrainFor
+    // (Stmts.cpp) which similarly recovers the original Drain() target from
+    // a bound IOwningEnumerable<T> local so the for-loop can drain the
+    // underlying collection instead of treating its data pointer as a
+    // vtable. LinkedList and Dictionary need their own wrappers (out of
+    // scope here) — those cases return null and fall through to the
+    // iterator-frame path, which will surface as a SEGV just like the
+    // bz_array_t case did before this fix. Stack is LIFO (owning); left for
+    // a follow-up that mirrors the OwningStack drain loop.
+    llvm::Value* tryBuildOwningEnumeratorForBuiltinSource(
+        const ast::Expr* targetExpr, const sema::TypeRef* recvTy);
+
     // #1069: wrap a (Owned)LinkedList<T> — node-based bz_llist, NOT array-backed —
     // in the same vtable-backed enumerator the array wrapper produces, but walking
     // nodes (bz_llist_first_node / node_next / node_value_ptr) instead of an index.
