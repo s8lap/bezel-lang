@@ -1945,6 +1945,37 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
     for (const ast::Stmt* s : block.stmts) {
         if (s) visitStmt(*s);
     }
+    // #2109 (§30.7 / §28.3): for every for/await-for loop whose iterable and
+    // (optional) `with` cancellation-token expression are evaluated in this
+    // block, run `recordMovesIn` on them. The for-loop's iterable is NOT part
+    // of any block's `stmts` (it sits in `from` before the for-header), so
+    // visitStmt's normal walk never reaches it — without this step an
+    // owned-sink argument inside the iterable, e.g. the documented named-local
+    // form `Task.WhenEachOwned(owned tasks)` (stdlib §6.7 v0.212, the
+    // proposal 0023 D7 example), is never recorded as a move, leaving
+    // `tasks` Owned at method-scope end with the §28.3 "would be dropped
+    // here without disposal" rejection. We deliberately use
+    // `recordMovesIn` (the move-recording half of the call-site walk) rather
+    // than `handleDischarge` because the iterable's RESULT is consumed by the
+    // enumerator frame — §29.8 disposes it (WhenEachOwned's enumerator frees
+    // the OwningArray on Dispose; the same pattern applies to every other
+    // for-loop iterable). Discharging the result here would fight the
+    // enumerator-disposal path. This is precisely the moved-mask scope: walk
+    // the iterable's arguments once, record every owned-sink transfer. The
+    // `with` cancellation-token expression is also evaluated here (per
+    // §30.7, treated as a normal argument expression on the pre-loop edge).
+    //
+    // Order: AFTER block.stmts so any `var x := …;` lines whose declaration
+    // introduces the iterable's owned-sink source run first; `recordMovesIn`
+    // keys off `lookupState`, which only finds the symbol after the LocalDecl
+    // has populated it. Running the forOrigins walk before would silently
+    // drop the move (lookupState returns null for an undeclared name) and
+    // leave the binding Owned — the very regression this fix targets.
+    for (const ast::ForStmt* fs : block.forOrigins) {
+        if (!fs) continue;
+        if (fs->iterable) recordMovesIn(*fs->iterable);
+        if (fs->withExpr) recordMovesIn(*fs->withExpr);
+    }
     // §31.1 / §31.2.1 (#1591): a catch arm's `when` guard is an ordinary
     // expression position and may itself embed a `throw` (§31.2.1: a guard
     // that diverges supersedes the in-flight exception and propagates).

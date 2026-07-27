@@ -467,6 +467,12 @@ private:
         // the loop, in `from`; record any explicit `await` in them there.
         recordAwaitsInExpr(cfg_, from, s.iterable.get());
         recordAwaitsInExpr(cfg_, from, s.withExpr.get());
+        // #2109 (§30.7 / §28.3): tag `from` as the block that originates this
+        // for-loop's iterable evaluation, so the ownership pass can locate the
+        // iterable expression and run its owned-sink argument moves through
+        // `recordMovesIn`. Additive — the iterable has never been part of any
+        // block's `stmts`, so this is the only way an analysis can find it.
+        from->forOrigins.push_back(&s);
         CFGBlock* header = cfg_.makeBlock(CFGBlock::Kind::Branch);
         header->isLoopHeader = true;
         // §30.7: `await for` desugars to a `MoveNextAsync()` `await` per

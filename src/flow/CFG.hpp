@@ -114,6 +114,24 @@ struct CFGBlock {
     // populated only by the CFG builder's visitFor.
     const ast::ForStmt* forBodyEntry = nullptr;
 
+    // #2109 (§30.7 / §28.3): when a `for`/`await for` loop originates at
+    // this block (i.e. its iterable and optional `with` cancellation-token
+    // expression are evaluated in this block, before the for-header Branch),
+    // `forOrigins` lists every such ForStmt. The ownership pass iterates this
+    // list once per block visit and runs `recordMovesIn` on each loop's
+    // iterable/with expression — the ONLY walk that ever reached for-loop
+    // arguments, because the iterable is NOT part of any block's `stmts`.
+    // Using `recordMovesIn` (move-recording only) rather than `handleDischarge`
+    // is intentional: the iterable's RESULT is consumed by the enumerator
+    // frame (§29.8 disposes it), so attempting to discharge the call's result
+    // here would conflict with the enumerator-disposal path. Without this
+    // field a named-local owned-form iterable
+    // (`Task.WhenEachOwned(owned tasks)`) is recorded as a plain read of
+    // `tasks`, leaving it Owned at scope end — the §28.3 rejection the issue
+    // pins. Empty for every block that does not originate a for/await-for.
+    // Additive; populated only by the CFG builder's visitFor.
+    std::vector<const ast::ForStmt*> forOrigins;
+
     // #764: for an if/elif condition Branch block, the condition expression —
     // so a forward analysis can null-discriminate the successors (`x <> null`
     // makes x non-null on succs[0] and null on succs[1]; `x = null` the reverse).
