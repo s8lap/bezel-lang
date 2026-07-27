@@ -7136,6 +7136,55 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             phi->addIncoming(innerMatched, unboxEnd);
             return phi;
         }
+        // #1977 / §19.3 / §9.4: value-type-PRIMITIVE scrutinee against a record
+        // destructuring pattern (e.g. `case (n: int) of Pt(a, b) => …`) is never
+        // a match — a primitive int is not a Pt record. The non-pointer branch
+        // below unconditionally runs `CreateExtractValue(scrut, …)`, which aborts
+        // the backend on a non-struct `scrut` (i32 / f64 / bool / inline-array /
+        // enum primitive — anything LLVM treats as a scalar, not an aggregate):
+        // the ExtractValue operand indices are invalid for the scalar type, and
+        // the LLVM IR verifier asserts on the resulting malformed instruction.
+        // Sibling of the #1949 fix's pointer-branch objectLike gate: there it
+        // rejected a vtable-less reference scrutinee (a string, a runtime-
+        // managed ref), here it rejects a value-type PRIMITIVE / enum / inline-
+        // array scrutinee. A destructuring pattern over a non-record scrutinee
+        // statically no-matches — emit the binding slots with `undef` placeholders
+        // so the arm body (e.g. `a + b`) still lowers against the right LLVM
+        // types (the arm is statically dead anyway: this branch returns false
+        // and dispatch falls to `_`), and the slot bindings keep `case.end`
+        // terminated. The pointer-branch fix (#1949) had to enter a separate
+        // `unboxBB` to emit the bindings because the box-load was conditional;
+        // here the binding emission is unconditional, so a single early-return
+        // after stub-slot emission is the simpler shape. // per §19.3, §9.4
+        if (!scrut->getType()->isStructTy()) {
+            // Statically dead: emit each binding with an undef placeholder of the
+            // field's recorded LLVM type (so the arm body's identifier reads
+            // resolve to well-typed allocas), then no-match.
+            for (std::size_t i = 0; i < dp->subPatterns.size(); ++i) {
+                const auto& sp = dp->subPatterns[i];
+                if (i >= fields.size()) break;
+                const sema::TypeRef* fty = recordMemberType(fields[i]);
+                llvm::Type* llvmFty =
+                    fty ? lowerTypeRef(const_cast<sema::TypeRef*>(fty))
+                        : i32();  // fallback when fieldTy is unknown
+                if (!sp.nakedBinding.empty()) {
+                    llvm::AllocaInst* slot = entryAlloca(llvmFty);
+                    builder_.CreateStore(
+                        llvm::UndefValue::get(llvmFty), slot);
+                    locals_[sp.nakedAnchor.get()] = slot;
+                } else if (auto* vbp =
+                               dynamic_cast<const ast::BindingPattern*>(
+                                   sp.pattern.get())) {
+                    llvm::AllocaInst* slot = entryAlloca(llvmFty);
+                    builder_.CreateStore(
+                        llvm::UndefValue::get(llvmFty), slot);
+                    locals_[vbp] = slot;
+                }
+                // Non-binding sub-patterns are skipped — the arm body is
+                // statically dead, so the sub-pattern check never runs.
+            }
+            return builder_.getInt1(false);
+        }
         // Extract each field value from the struct and register the slot.
         // Build up a cumulative match condition for constant sub-patterns.
         llvm::Value* matched = builder_.getInt1(true);
