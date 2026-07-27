@@ -5520,6 +5520,97 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         resultTy->genericArgs.push_back(arrTy);
                                     }
                                 }
+                                // fix #1830 / §6.7 (v0.217) / stdlib §6.7 (line 2875):
+                                // typed Task.WhenAll<T> over an INLINE collection
+                                // literal. The intrinsic receives a bare
+                                // Array<Task> (no Task generic arg) — the
+                                // materialised literal's element type is
+                                // `Task`, not `Task<T>`, so the primary
+                                // argTy branch above falls through to the
+                                // bare-Task result. Fall back to inspecting
+                                // the literal's element exprTypes: when ALL
+                                // elements are `Task<T>` (or `OwningTask<T>`)
+                                // for the same T, type the result as
+                                // `Task<Array<T>>` so the `await w` site
+                                // gets the right element type. Mixed/empty
+                                // literals keep the bare-Task result. Also
+                                // covers the case where the literal has no
+                                // exprType at all (a CollectionLiteralExpr
+                                // without a typed target — its argTy is null,
+                                // and the primary branch's `argTy` guards
+                                // skip this case).
+                                if (resultTy->genericArgs.empty() &&
+                                    (!argTy ||
+                                     (argTy->kind == TypeRef::Kind::Named &&
+                                      (!argTy->genericArgs.empty() &&
+                                       argTy->genericArgs[0] &&
+                                       argTy->genericArgs[0]->kind ==
+                                           TypeRef::Kind::Named &&
+                                       argTy->genericArgs[0]->genericArgs
+                                           .empty())))) {
+                                    auto* cl = dynamic_cast<
+                                        const ast::CollectionLiteralExpr*>(
+                                            ce.args[0].value.get());
+                                    if (cl && !cl->elements.empty()) {
+                                        TypeRef* commonT = nullptr;
+                                        bool allTaskT = true;
+                                        for (const auto& elUp : cl->elements) {
+                                            if (!elUp) { allTaskT = false; break; }
+                                            TypeRef* et =
+                                                ctx_.exprType(*elUp);
+                                            if (!et || et->kind !=
+                                                    TypeRef::Kind::Named ||
+                                                et->genericArgs.empty() ||
+                                                !et->genericArgs[0]) {
+                                                allTaskT = false; break;
+                                            }
+                                            std::string_view hn;
+                                            if (!et->declaration && et->astNode &&
+                                                et->astNode->name &&
+                                                !et->astNode->name->parts.empty())
+                                                hn = et->headName();
+                                            else if (et->declaration &&
+                                                     !et->declaration->decl)
+                                                hn = et->declaration->name;
+                                            if (hn != "Task" && hn != "OwningTask") {
+                                                allTaskT = false; break;
+                                            }
+                                            TypeRef* T = et->genericArgs[0];
+                                            if (!commonT) {
+                                                commonT = T;
+                                            } else if (commonT != T) {
+                                                // Differing T: bare-Task only
+                                                // when T's are structurally
+                                                // distinct (different
+                                                // declarations / names).
+                                                if (commonT->kind != T->kind ||
+                                                    commonT->headName() !=
+                                                        T->headName()) {
+                                                    allTaskT = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if (allTaskT && commonT) {
+                                            auto* arrTy = ctx_.makeTypeRef();
+                                            arrTy->kind = TypeRef::Kind::Named;
+                                            arrTy->nullable = false;
+                                            auto* arrAnn = new ast::Type();
+                                            arrAnn->kind =
+                                                ast::TypeKind::Named;
+                                            auto* arrNm =
+                                                new ast::QualifiedName();
+                                            arrNm->parts.push_back("Array");
+                                            arrAnn->name.reset(arrNm);
+                                            arrTy->astNode = arrAnn;
+                                            arrTy->genericArgs.push_back(
+                                                commonT);
+                                            resultTy = makeTaskTypeRef();
+                                            resultTy->genericArgs.push_back(
+                                                arrTy);
+                                        }
+                                    }
+                                }
                             }
                             ctx_.setExprType(&ce, resultTy);
                         }
