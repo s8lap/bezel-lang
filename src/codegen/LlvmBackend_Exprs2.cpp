@@ -2447,6 +2447,21 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         ? ctx_.resolvedType(*ne.type)
         : const_cast<sema::TypeRef*>(ctx_.exprType(ne));
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return nullptr;
+    // §22.4 / §28.3 (#1833 (b), #1467 sibling): snapshot the
+    // discardOwnedOutSlots_ stack at the entry of `lowerNew` so the
+    // statement-context `out _` slot a ctor's `out owned` parameter
+    // writes into (recorded by buildOrderedArgs, dispatched by lowerCall
+    // for method calls) is disposed here exactly the same way — under
+    // `!diverged_`, null-guarded, via dynamic vtable Dispose + reclaim.
+    // Without this, `new R(out _)` at the top level / statement context
+    // (`var q := new R(out _);`) recorded a scratch slot the function
+    // never disposed: the produced owned heap value leaked (LSan Direct
+    // leak in bz$R$ctor). Nested-in-a-method-call (`M(new R(out _))`)
+    // is incidentally disposed by the enclosing lowerCall (the #1467
+    // path), so this fix is strictly additive. The disposal runs at the
+    // bottom of lowerNew, before each `return obj`, exactly mirroring
+    // lowerCall's loop. // per §22.4, §28.3, §17.13, #1833 (b), #1467
+    const std::size_t newDiscardOwnedBase = discardOwnedOutSlots_.size();
     // The ast::Type name node used for the builtin-exception / collection
     // dispatch below: the explicit type node when present, else the inferred
     // target's node (a shorthand targeting a builtin collection, e.g.
@@ -4037,6 +4052,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         emitNewPendingCheck(obj);
         genericSubst_ = std::move(savedSubst);
         genericSubstSemaTy_ = std::move(savedSemaTy);
+        // #1833 (b): the importedGenericWithBody path recorded
+        // discardOwnedOutSlots_ entries via buildOrderedArgs at line 3999
+        // for any `out _` against an `out owned` ctor parameter. The
+        // inlined ctor body wrote each scratch. Dispose them here before
+        // returning, mirroring lowerCall's loop shape.
+        disposeNewDiscardOwnedOutSlots(newDiscardOwnedBase);
         return obj;
     }
 
@@ -4083,6 +4104,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         emitNewPendingCheck(obj);  // CG20: an imported constructor may throw
         genericSubst_ = std::move(savedSubst);
         genericSubstSemaTy_ = std::move(savedSemaTy);
+        // #1833 (b): the imported-ctor path iterates ne.args manually (no
+        // buildOrderedArgs call), so no discardOwnedOutSlots_ entry was
+        // recorded. disposeNewDiscardOwnedOutSlots is therefore a no-op
+        // here — included for symmetry with the other return points so
+        // the stack discipline is unambiguous.
+        disposeNewDiscardOwnedOutSlots(newDiscardOwnedBase);
         return obj;
     }
 
@@ -4279,6 +4306,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     // Restore the outer generic substitution.
     genericSubst_ = std::move(savedSubst);
     genericSubstSemaTy_ = std::move(savedSemaTy);
+    // #1833 (b): the in-module ctor paths (early buildOrderedArgs pre-pass
+    // at line 3906 reused by the explicit-ctor dispatch at line 4141) may
+    // have recorded `out _` discard-owned slots. Dispose them before
+    // returning to the caller, exactly like lowerCall does for method
+    // calls — closes the §22.4 / §28.3 top-level ctor-discard leak in
+    // `var q := new R(out _);`.
+    disposeNewDiscardOwnedOutSlots(newDiscardOwnedBase);
     return obj;
 }
 

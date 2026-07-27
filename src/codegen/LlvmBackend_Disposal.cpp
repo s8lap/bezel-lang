@@ -1389,6 +1389,42 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
         builder_.CreateCall(freeFn(), {obj});
 }
 
+// #1833 (b) / #1467 / §22.4 / §28.3: dispose every `out _` discard-owned
+// scratch slot recorded by buildOrderedArgs in the `[base, end)` range,
+// on the normal-return path (`!diverged_`). Byte-identical pattern to
+// lowerCall's end-of-statement disposal pass — extracted here so lowerNew
+// can drive its own recorded slots the same way. On the divergent path
+// (the ctor threw) no scratch is written, so no slot reaches a non-null
+// value: the unwind reclaims the heap block via the enclosing obj
+// (emitNewPendingCheck / the inlineCtorBody cleanup), not through these
+// scratch slots, so skipping them on `diverged_` is sound. The
+// `resize(base)` trims the stack back so a NESTED discard inside an arg
+// builds its own scope (the lowerCall-side discipline).
+void Emitter::disposeNewDiscardOwnedOutSlots(std::size_t base) {
+    if (diverged_) {
+        discardOwnedOutSlots_.resize(base);
+        return;
+    }
+    for (std::size_t di = base; di < discardOwnedOutSlots_.size(); ++di) {
+        llvm::AllocaInst* slot = discardOwnedOutSlots_[di];
+        llvm::Value* obj = builder_.CreateLoad(ptrTy(), slot, "new.outdisc.obj");
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            obj, llvm::ConstantPointerNull::get(ptrTy()));
+        auto* dispBB = llvm::BasicBlock::Create(
+            llvm_, "new.outdisc.dispose", currentFn_);
+        auto* contBB = llvm::BasicBlock::Create(
+            llvm_, "new.outdisc.cont", currentFn_);
+        builder_.CreateCondBr(isNull, contBB, dispBB);
+        builder_.SetInsertPoint(dispBB);
+        emitDisposeAndReclaim(obj);
+        builder_.CreateStore(
+            llvm::ConstantPointerNull::get(ptrTy()), slot);
+        builder_.CreateBr(contBB);
+        builder_.SetInsertPoint(contBB);
+    }
+    discardOwnedOutSlots_.resize(base);
+}
+
 
 void Emitter::emitOwningChoiceActiveCaseDisposal(
         llvm::AllocaInst* slot, const sema::TypeSymbol* choiceTy,

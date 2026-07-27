@@ -4762,6 +4762,25 @@ private:
     // can null to block a second reclaim. free(null) is a no-op.
     void emitDisposeAndReclaim(llvm::Value* obj);
 
+    // #1833 (b) / #1467 / §22.4 / §28.3: for a `discardOwnedOutSlots_` range
+    // `[base, end)` recorded by buildOrderedArgs on the constructor call path,
+    // emit the disposal+reclaim of each slot that was written by a normal
+    // constructor return (the `!diverged_` guard). The loop is byte-identical
+    // to lowerCall's end-of-statement disposal pass: null-guard (the slot was
+    // null-initialized before buildOrderedArgs; a false-returning ctor may
+    // leave it null), dynamic vtable Dispose + reclaim, store null back
+    // (so any later debug-mode readers observe the post-dispose state).
+    // Drives `new T(out _)` at the top level / statement context (issue #1833
+    // (b)), strictly mirroring how lowerCall drives the same shape for method
+    // calls (the #1467 path). On the divergent path (the ctor threw) the
+    // slots are untouched: an unwind disposes the heap block via the
+    // enclosing `obj` reclamation, not through these scratch slots. The
+    // resize argument trims the stack back to `base` so a NESTED discard
+    // inside an arg has its own scope, exactly like lowerCall's stack
+    // discipline.
+    void disposeNewDiscardOwnedOutSlots(std::size_t base);
+
+
     // #415 / §28.2 / §28.4: for an explicit `receiver.Dispose()` on a class/
     // interface instance, return the addressable slot/field this scope OWNS and
     // may null to block a second reclaim — i.e. when reclaiming the block at the
