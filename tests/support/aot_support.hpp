@@ -1463,7 +1463,9 @@ inline std::string runAotOut(std::string_view source) {
 // ran=false with a diagnostic beginning "runAotChecked: SKIP" so a caller can
 // distinguish "environment can't run this" from "the program is dirty".
 // ---------------------------------------------------------------------------
-inline JitResult runAotChecked(std::string_view source) {
+inline JitResult runAotCheckedImpl(std::string_view source,
+                                    const char* name,
+                                    bool detectLeaks) {
     JitResult r;
 
     // SKIP if the C toolchain (which the driver shells out to for the ASan link)
@@ -1474,7 +1476,7 @@ inline JitResult runAotChecked(std::string_view source) {
     }();
     if (!toolchainOk) {
         r.diagnostics.report(Severity::Error, SourceLocation{},
-                             "runAotChecked: SKIP — C toolchain (clang) "
+                             std::string(name) + ": SKIP — C toolchain (clang) "
                              "unavailable for the ASan link");
         return r;
     }
@@ -1482,7 +1484,7 @@ inline JitResult runAotChecked(std::string_view source) {
     aot_detail::WorkDir wd{aot_detail::makeWorkDir()};
     if (wd.path.empty()) {
         r.diagnostics.report(Severity::Error, SourceLocation{},
-                             "runAotChecked: could not create work dir");
+                             std::string(name) + ": could not create work dir");
         return r;
     }
     namespace fs = aot_detail::fs;
@@ -1494,7 +1496,7 @@ inline JitResult runAotChecked(std::string_view source) {
 
     if (!aot_detail::writeSource(srcPath, source)) {
         r.diagnostics.report(Severity::Error, SourceLocation{},
-                             "runAotChecked: failed to write source");
+                             std::string(name) + ": failed to write source");
         return r;
     }
 
@@ -1506,29 +1508,40 @@ inline JitResult runAotChecked(std::string_view source) {
     aot_detail::CompileStatus cc =
         aot_detail::cachedCompile(source, srcPath, exePath, opts, ccErr);
     if (cc.outcome != aot_detail::CompileOutcome::Ok) {
-        std::string prefix =
+        // #2214: prefix every non-OK compile outcome with the harness name so
+        // the diagnostic tells the reader which harness produced the reject.
+        // A Rejected / Crashed / TimedOut outcome gets the bare harness-name
+        // prefix ("<name>: ..."); an Infra outcome also gets the SKIP marker
+        // so a toolchain-absent env still surfaces a distinguishable diagnostic.
+        const std::string prefix =
             cc.outcome == aot_detail::CompileOutcome::Infra
-                ? "runAotChecked: SKIP — "
-                : "";
+                ? (std::string(name) + ": SKIP — ")
+                : (std::string(name) + ": ");
         r.diagnostics.report(Severity::Error, SourceLocation{},
                              prefix + std::move(cc.diag));
         return r;  // reject / compiler crash / compile timeout — ran=false
     }
 
-    // --- Run under LeakSanitizer. abort_on_error=0 so a sanitizer error prints
-    //     a REPORT and exits 99 (rather than SIGABRT); detection keys on the
-    //     report text (M3), not the exit code. --------------------------------
+    // --- Run under (optionally) LeakSanitizer. abort_on_error=0 so a sanitizer
+    //     error prints a REPORT and exits 99 (rather than SIGABRT); detection
+    //     keys on the report text (M3), not the exit code. When detectLeaks is
+    //     false (the *Lenient variant) LeakSanitizer is disabled at runtime
+    //     (detect_leaks=0); the generated-code AddressSanitizer is still
+    //     active, so UAF / OOB in emitted loads still trips. ---------------
+    const std::string asanOpts = std::string("detect_leaks=") +
+                                 (detectLeaks ? "1" : "0") +
+                                 ":exitcode=99:abort_on_error=0";
     bool timedOut = false;
     int status = aot_detail::spawnCaptured(
         {exePath}, outPath, sanPath, aot_detail::aotTimeoutSec(), timedOut,
-        {{"ASAN_OPTIONS", "detect_leaks=1:exitcode=99:abort_on_error=0"}});
+        {{"ASAN_OPTIONS", asanOpts}});
     r.stdoutText = aot_detail::slurp(outPath);
     std::string sanText = aot_detail::slurp(sanPath);
 
     if (timedOut) {
         r.exitCode = -1;
         r.diagnostics.report(Severity::Error, SourceLocation{},
-                             "runAotChecked: program timed out");
+                             std::string(name) + ": program timed out");
         return r;
     }
 
@@ -1550,8 +1563,9 @@ inline JitResult runAotChecked(std::string_view source) {
             aot_detail::emitSanitizerReportToStderr(sanText);
         // A leak / double-free / UAF is a dispose-exactly-once violation: FAIL.
         r.exitCode = crashed ? -1 : code;
-        std::string msg = "runAotChecked: sanitizer fired (";
-        msg += crashed ? "crash/abort" : "LSan/ASan at exit";
+        std::string msg = std::string(name) + ": sanitizer fired (";
+        msg += crashed ? "crash/abort"
+                       : (detectLeaks ? "LSan/ASan at exit" : "ASan at exit");
         msg += ")";
         if (!sanText.empty()) {
             const std::size_t cap = 8192;
@@ -1562,10 +1576,31 @@ inline JitResult runAotChecked(std::string_view source) {
         return r;
     }
 
-    // Clean run: dispose-exactly-once verified for this program.
+    // Clean run: dispose-exactly-once verified for this program (runAotChecked).
+    // runAotCheckedLenient makes no dispose-exactly-once claim — the program
+    // is only checked for crashes / generated-code UAF / OOB, not for leaks.
     r.exitCode = code;
     r.ran = WIFEXITED(status);
     return r;
+}
+
+inline JitResult runAotChecked(std::string_view source) {
+    return runAotCheckedImpl(source, "runAotChecked", /*detectLeaks=*/true);
+}
+
+// runAotCheckedLenient — issue #2214. Like runAotChecked but with
+// LeakSanitizer DISABLED at runtime (detect_leaks=0); the generated-code
+// AddressSanitizer (use-after-free / out-of-bounds in emitted loads) is still
+// active. Use this for tests whose program intentionally or incidentally leaks
+// (e.g. exercising for-in over an IOwningEnumerable<Drain>, where the for-in
+// enumerator's own lifecycle is what's being tested and a leak in the test
+// scaffold would otherwise trip the leak sentinel before the iteration count
+// can be observed). The test program is NOT verified leak-clean under this
+// helper — use runAotChecked for the ASan/LSan memory net. Crash and
+// generated-code-ASan detection are unchanged: a real sanitizer error or a
+// process crash still surfaces as ran=false with the report in `diagnostics`.
+inline JitResult runAotCheckedLenient(std::string_view source) {
+    return runAotCheckedImpl(source, "runAotCheckedLenient", /*detectLeaks=*/false);
 }
 
 }  // namespace bezel::test
