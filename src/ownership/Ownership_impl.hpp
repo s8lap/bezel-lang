@@ -2125,6 +2125,21 @@ private:
     // scannable body and are not recognized (adoption, as before). // per
     // §28.10, §28.3, §28.6, #2137
     bool propertyGetterIsRecognizedBorrow(const ast::PropertyDecl& pd) const;
+    // §28.10 / §28.3 / §28.6 / #2137-residual: body-level predicate called
+    // from propertyGetterIsRecognizedBorrow ONLY for the Task-family return
+    // carve. A Task-family getter's body determines whether it MINTS a fresh
+    // owned frame (a Task.Run(...) etc. — §28.3 owned-mint; the call's using
+    // var adopts and disposes the task) or BORROWS an external task frame (a
+    // receiver-sourced field read of a Task-typed field, a Drain alias, a
+    // block whose every return is receiver-sourced). For the borrow-pin
+    // decision we admit the borrow-source bodies only; mint-source bodies
+    // keep adoption. // per §28.10, §28.3, §28.6, #2137
+    bool propertyGetterBodyScan(const ast::PropertyDecl& pd) const;
+    // §28.3 / #2137-residual: true when the property's declared return type
+    // is a Task-family head (`Task` / `OwningTask`). Mirrors
+    // callResultIsAsyncTask's narrowing for the AST type node form, applied
+    // to the property's return type. // per §28.3, #2137
+    bool propertyReturnTypeIsTaskFamily(const ast::PropertyDecl& pd) const;
     // #2175(b) / stdlib §4.5 v0.195: true when `e` is the BUILTIN `recv.Drain()`
     // (no user MethodSymbol) over a receiver whose chain terminates at
     // `this` (or a field of `this`). Used by propertyGetterIsRecognizedBorrow

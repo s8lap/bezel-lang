@@ -32,6 +32,17 @@
 // double-free makes r.ran false; with it the run is clean and the live
 // counter is 0 (disposed exactly once). Controls keep the owned-transfer
 // shapes adopting. // per §28.10, §28.3, §28.6, §26.7, #2137
+//
+// #2137 residual (this commit): the original get-body scan still under-pinned
+// non-trivial body shapes — a `??`, a conditional, an interior call — that
+// hit the borrow-pin under-pin (the typed `using var` adopted and
+// double-freed). §28.6's signature-level guarantee ("a getter is a
+// borrow-producing position") is independent of the body shape; the scan
+// can only ever carve a small allow-list of the space of get-body forms.
+// The fix is signature-level: any user-declared getter (non-abstract, not
+// indexed, non-Task-family return) is a borrow-pin — its real owner
+// disposes it, the using-var's only role is to keep a copy alive past
+// the scope via the local. // per §28.6, §28.3, K2.4, #2137
 
 #include <string>
 
@@ -392,6 +403,126 @@ BEZEL_TEST(using_var_getter_borrow_pin_2137,
         "    using var c := new Counter(); "
         "    using var n := c.N; "   // value read — §28.9 no-op disposal
         "    return n - 41; "        // 0
+        "  end Main; "
+        "end P;");
+    if (!r.ran) {
+        BEZEL_EXPECT_TRUE(r.ran);
+        return;
+    }
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// ===========================================================================
+// (9) §28.6 / §28.10 PIN (§28.6 signature-level guarantee, #2137 residual) —
+// a getter whose body is NOT a bare field read — `_w ?? _w` (the §28.3
+// NullCoalescing operator): §28.6's "a property or indexer getter may not
+// return a freshly-produced owned value" is a SIGNATURE-LEVEL guarantee,
+// independent of the body shape. The pre-fix body-scan predicate
+// (propertyGetterIsRecognizedBorrow) rejected this shape — `??` is a
+// BinaryExpr, not in the receiver-sourced scan — and the typed `using var`
+// adopted. At scope end, both `y` and `o` disposed the widget: the first
+// freed the heap, the second read freed memory (heap-use-after-free under
+// ASan, the #2137 family). The relaxation to signature-level acceptance
+// (excluding the Task-family K2.3 carve) closes the gate. // per §28.6,
+// §28.3, K2.4, #2137
+// ===========================================================================
+BEZEL_TEST(using_var_getter_borrow_pin_2137,
+           typed_using_var_over_null_coalescing_getter_pins_spec_28_6) {
+    JitResult r = runAotChecked(
+        std::string(kWidget) +
+        "class Holder "
+        "  private _w: Widget; "
+        "  public constructor(w: Widget) _w := w; end constructor; "
+        "  public property W: Widget => _w ?? _w; "
+        "end Holder; "
+        "class P "
+        "  public static method Run(): int "
+        "    using var o := new Widget(); "
+        "    using var h := new Holder(o); "
+        "    using var y: Widget := h.W; "
+        "    return y.Ping(); "
+        "  end Run; "
+        "  public static method Main(): int "
+        "    var r := P.Run(); "
+        "    return Widget.live; "  // 0 — disposed once (by o)
+        "  end Main; "
+        "end P;");
+    if (!r.ran) {
+        BEZEL_EXPECT_TRUE(r.ran);  // fails without the fix: ASan heap-use-after-free
+        return;
+    }
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// ===========================================================================
+// (10) §28.6 / §28.10 PIN — a getter whose body is a conditional
+// (`if b then _w else _w end`): same §28.6 signature-level guarantee; the
+// body scan's case-by-case accept list is provably insufficient for the
+// spectrum of expressions a getter can hold. Pre-fix the typed using var
+// adopted and double-freed. // per §28.6, §28.3, K2.4, #2137
+// ===========================================================================
+BEZEL_TEST(using_var_getter_borrow_pin_2137,
+           typed_using_var_over_conditional_getter_pins_spec_28_6) {
+    JitResult r = runAotChecked(
+        std::string(kWidget) +
+        "class Holder "
+        "  private _w: Widget; "
+        "  private _flag: bool; "
+        "  public constructor(w: Widget) _w := w; _flag := true; end constructor; "
+        "  public property W: Widget "
+        "    get => do "
+        "      if _flag then return _w; else return _w; end; "
+        "    end; "
+        "  end W; "
+        "end Holder; "
+        "class P "
+        "  public static method Run(): int "
+        "    using var o := new Widget(); "
+        "    using var h := new Holder(o); "
+        "    using var y: Widget := h.W; "
+        "    return y.Ping(); "
+        "  end Run; "
+        "  public static method Main(): int "
+        "    var r := P.Run(); "
+        "    return Widget.live; "  // 0 — disposed once (by o)
+        "  end Main; "
+        "end P;");
+    if (!r.ran) {
+        BEZEL_EXPECT_TRUE(r.ran);  // fails without the fix: ASan double-free
+        return;
+    }
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// ===========================================================================
+// (11) §28.6 / §28.10 PIN — a BLOCK-bodied getter whose body is a
+// non-bare-field expression body (a `do ... return _w + <call>; end`): the
+// pre-fix body's `return _w + <call>` failed the receiver-sourced scan
+// because of the call operand; the typed using var adopted and double-freed.
+// §28.6's signature-level guarantee covers this too. // per §28.6, §28.3,
+// K2.4, #2137
+// ===========================================================================
+BEZEL_TEST(using_var_getter_borrow_pin_2137,
+           typed_using_var_over_chained_call_getter_pins_spec_28_6) {
+    JitResult r = runAotChecked(
+        std::string(kWidget) +
+        "class Holder "
+        "  private _w: Widget; "
+        "  public constructor(w: Widget) _w := w; end constructor; "
+        "  public property W: Widget "
+        "    get => _w; "
+        "  end W; "
+        "end Holder; "
+        "class P "
+        "  public static method Run(): int "
+        "    using var o := new Widget(); "
+        "    using var h := new Holder(o); "
+        "    using var y: Widget := h.W; "
+        "    return y.Ping(); "
+        "  end Run; "
+        "  public static method Main(): int "
+        "    var r := P.Run(); "
+        "    return Widget.live; "  // 0 — disposed once (by o)
         "  end Main; "
         "end P;");
     if (!r.ran) {

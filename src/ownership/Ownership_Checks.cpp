@@ -6806,13 +6806,56 @@ bool MethodOwnership::methodReturnsOnlyReceiverSourcedBorrows(
     return sawReturn && allBorrow;
 }
 
-// §28.10 / §28.3 / §28.6 (#2137). See the header for the full contract. §28.6
-// guarantees a USER getter is a borrow-producing position ("a property or
-// indexer getter may not return a freshly-produced owned value"); recognition
-// nevertheless stays POSITIVE and body-scanned, mirroring the call-shape
-// predicate, so a getter shape the scan cannot prove (a `??`, a conditional, a
-// chained call) conservatively keeps adoption rather than guessing.
+// §28.10 / §28.3 / §28.6 (#2137, #2137-residual). See the header for the
+// full contract. §28.6 guarantees a USER getter is a borrow-producing
+// position ("a property or indexer getter may not return a freshly-produced
+// owned value — a getter is a borrow-producing position"); this guarantee is
+// SIGNATURE-LEVEL, independent of body shape. The pre-residual body-scan
+// predicate (#2137 fix #1) carved a positive allow-list of get-body forms
+// the scan can prove — a bare field read, a chain of fields, a
+// `recv.Drain()` builtin alias, a block whose every return is
+// receiver-sourced — but the space of expressions a getter can hold is
+// open-ended (a `??`, a conditional expression, a chained call, a method
+// invocation, a constructor call). Every unproven shape kept its using-var
+// adoption and double-freed the borrow under ASan (heap-use-after-free,
+// the #2137 family).
+//
+// Relaxation: a non-abstract, non-indexer, non-Task-family user-declared
+// getter is unconditionally a borrow-pin (§28.6 signature-level). Task-
+// family returns stay body-scanned because §28.3 "Task-family calls produce
+// owned frames" — the task container itself transfers under mint rules;
+// pinning a Task-family mint would lose the task to a double-free of the
+// container. Abstract / interface accessors have no body and §28.6 does not
+// bind an implementation-free contract (an interface's concrete override
+// MAY be the Task-family or owned-returning shape; the #2174 carve handles
+// interface-dispatched reads separately at the call site). Indexer reads
+// are handled by the IndexExpr branch of usingVarInitIsRecognizedBorrow
+// and never reach this predicate. // per §28.10, §28.3, §28.6, #2137
 bool MethodOwnership::propertyGetterIsRecognizedBorrow(
+        const ast::PropertyDecl& pd) const {
+    if (pd.isIndexer) return false;
+    if (pd.bodyKind == ast::PropertyBodyKind::Block) {
+        for (const ast::PropertyAccessor& acc : pd.accessors) {
+            if (acc.isSet) continue;
+            if (acc.bodyKind == ast::PropertyAccessorBodyKind::Abstract)
+                return false;
+            break;  // only the first getter accessor; the rest are mirrors
+        }
+    }
+    if (propertyReturnTypeIsTaskFamily(pd))
+        return propertyGetterBodyScan(pd);
+    return true;  // §28.6 signature-level borrow-pin
+}
+
+// §28.10 / §28.3 / §28.6 / #2137-residual: body-level predicate called
+// from propertyGetterIsRecognizedBorrow ONLY for the Task-family return
+// carve. A Task-family getter's body determines whether it MINTS a fresh
+// owned frame (a Task.Run(...) etc.) or BORROWS an external task frame
+// (a receiver-sourced field read, a Drain alias, a block whose every
+// return is receiver-sourced). For the borrow-pin decision we admit the
+// borrow-source bodies only; mint-source bodies keep adoption. // per
+// §28.10, §28.3, §28.6, #2137
+bool MethodOwnership::propertyGetterBodyScan(
         const ast::PropertyDecl& pd) const {
     switch (pd.bodyKind) {
     case ast::PropertyBodyKind::Expression:
@@ -6866,6 +6909,18 @@ bool MethodOwnership::propertyGetterIsRecognizedBorrow(
         return false;  // no getter accessor (write-only property)
     }
     return false;
+}
+
+// §28.3 / #2137-residual: true when the property's declared return type
+// is a Task-family head (`Task` / `OwningTask`). Mirrors
+// callResultIsAsyncTask's narrowing for the AST type node form, applied to
+// the property's return type. // per §28.3, #2137
+bool MethodOwnership::propertyReturnTypeIsTaskFamily(
+        const ast::PropertyDecl& pd) const {
+    if (!pd.type || !pd.type->name) return false;
+    const auto& parts = pd.type->name->parts;
+    if (parts.empty()) return false;
+    return parts[0] == "Task" || parts[0] == "OwningTask";
 }
 
 // #2175(b) / stdlib §4.5 v0.195: true when `e` is the BUILTIN `recv.Drain()`
