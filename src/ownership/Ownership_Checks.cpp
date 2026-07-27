@@ -2821,6 +2821,112 @@ bool MethodOwnership::isNullSourceRecordExpr(const ast::Expr& e) const {
     return true;
 }
 
+// §35.4 / §9.7 (v0.226, #2209): null-source-form recognizer for a
+// borrow-bearing choice — parallel to isNullSourceRecordExpr (the #1540 pair
+// the field/collection/initializer reject paths consult for records). Recognizes
+// two static shapes:
+//
+//   (a) A PAYLOAD-FREE case reference — a `MemberAccessExpr` whose resolved
+//       symbol is a ChoiceCaseSymbol with `caseDecl->payload.empty()`. The
+//       canonical pattern is `Opt.None`, `Box.Empty`, `CancellationToken.None`
+//       (the stdlib's sentinel-value shape, which #1540's record rule already
+//       exempts via isNullSourceRecordExpr for records that happen to wrap it).
+//
+//   (b) A CASE CONSTRUCTION (`Choice.Case(arg0, arg1, …)`) whose callee resolves
+//       to a ChoiceCaseSymbol and whose every BORROW-CARRYING payload field is
+//       bound to a literal `null` (recursing into a nested null-source
+//       record/choice argument). A borrow-typed payload that is not literal-null
+//       — including a `local` of borrow-typed value, a record constructor, or
+//       any other non-`null` expression — fails this check. Choice payload
+//       args are positional here, exactly as record construction args are
+//       (the §35.3 construction path always passes them positionally),
+//       matching isNullSourceRecordExpr's positional-field indexing.
+//
+// Anything else — an IdentifierExpr reading a local of borrow-bearing choice
+// type, an IndexExpr, a MemberAccessExpr whose access path is not a payload-
+// free case, a non-construction CallExpr whose callee is not a choice case, a
+// `null` literal of bare choice type that does not name a case at all — is
+// treated as NOT null-source, matching the reject-not-trust posture that
+// #1540 applies to every other record read site: a value read back from a
+// place is never provably null at the static level here, even if it happens to
+// hold one at run time. The doc-style of nested borrow-bearing record/choice
+// arguments (transitivity, §9.7) keeps the check consistent with
+// isNullSourceRecordExpr, which recurses through `new Rec(null, new Inner(null))`
+// — the choice leg below extends the same shape to `Choice.Borrowed(new
+// Inner(null))` / `ChoiceWrapper.Borrowed(Choice.Borrowed(null))`.
+// // per §35.4, §9.7 (v0.226, #2209)
+bool MethodOwnership::isNullSourceChoiceExpr(const ast::Expr& e) const {
+    // (a) Payload-free case reference: `Opt.None` — a static, payload-free
+    // case accessor resolved as a MemberAccessExpr.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (sema::Symbol* sym = ctx_.exprSymbol(*ma)) {
+            if (auto* cc = dynamic_cast<sema::ChoiceCaseSymbol*>(sym)) {
+                if (cc->caseDecl && cc->caseDecl->payload.empty())
+                    return true;
+                // (c) A MemberAccessExpr naming a PAYLOAD case without a
+                // trailing call — `Opt.Some` taken as a value — is not
+                // well-formed (the payload fields have no values to bind);
+                // sema rejects it elsewhere. The bare read produced by some
+                // error path is rejected here for symmetry with the record
+                // path's "not-construction" rejection below.
+                return false;
+            }
+        }
+    }
+    // (b) Case construction: `Choice.Case(arg0, arg1, …)`. Recognised by the
+    // callee resolving to a ChoiceCaseSymbol, whose `caseDecl->payload` lists
+    // the case's payload fields, indexed by the corresponding CallArgument.
+    const auto* ce = dynamic_cast<const ast::CallExpr*>(&e);
+    if (!ce || !ce->callee) return false;
+    sema::Symbol* sym = ctx_.exprSymbol(*ce->callee);
+    if (!sym) return false;
+    auto* cc = dynamic_cast<sema::ChoiceCaseSymbol*>(sym);
+    if (!cc || !cc->caseDecl) return false;
+    // §35.4 / §9.7 / §30.1 (#2183): the per-instantiation substitution env
+    // for this choice's payload field walk (empty for a non-generic choice;
+    // threaded from the case's owning choice's generic args via the same
+    // recordFieldIsBorrowCarrying's lookup so a `Opt<T>` payload field whose
+    // `T` is a borrow-typed class resolves through it here, mirroring #2159
+    // for records).
+    const ast::TypeDecl* chDecl = nullptr;
+    if (auto* chTs =
+            dynamic_cast<sema::TypeSymbol*>(cc->parent))
+        chDecl = dynamic_cast<const ast::TypeDecl*>(chTs->decl);
+    common::RecordSubstEnv env;
+    // The choice kind's static type of the case construction; used as the
+    // carrier for `rt`'s own generic arguments. Best-effort: the resolved
+    // type may be null on a malformed construction path.
+    if (const sema::TypeRef* ct = ctx_.exprType(e))
+        if (chDecl) common::seedRecordSubstEnv(*chDecl, *ct, /*incoming=*/nullptr, env);
+    const common::RecordSubstEnv* fieldEnv = env.map.empty() ? nullptr : &env;
+    auto isBorrowCarrying = [&](const ast::Param& pf) -> bool {
+        if (!pf.type) return false;
+        std::unordered_set<const sema::TypeRef*> seen;
+        return recordFieldIsBorrowCarrying(
+            ctx_.resolvedType(*pf.type), seen, fieldEnv);
+    };
+    const auto& fields = cc->caseDecl->payload;
+    for (std::size_t i = 0; i < ce->args.size() && i < fields.size(); ++i) {
+        const ast::Param& f = fields[i];
+        if (!isBorrowCarrying(f)) continue;
+        const ast::Expr* arg = ce->args[i].value.get();
+        if (!arg) return false;
+        // Direct `null` literal borrow — the simple, no-dynamic-knowledge
+        // null-source admission. The literal form is the only admissible
+        // source of `null` here: a `null`-typed local of borrow-bearing
+        // record/choice type is the same; nested borrow-bearing record/choice
+        // constructors are accepted iff they themselves are null-source.
+        if (dynamic_cast<const ast::NullLiteralExpr*>(arg)) continue;
+        // Nested borrow-bearing RECORD argument (transitivity, §9.7): the
+        // outer construction is null-source only if this one is too. The
+        // choice-call analog is checked below.
+        if (isNullSourceRecordExpr(*arg)) continue;
+        if (isNullSourceChoiceExpr(*arg)) continue;
+        return false;
+    }
+    return true;
+}
+
 void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
     // §9.7 / §4.14 / §4.15: a borrow-bearing record — OR a builtin span VIEW
     // (Span / ReadOnlySpan / ArraySpan / ReadOnlyArraySpan), which carries a
@@ -4246,45 +4352,54 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
     // lifetime-based, so it runs before (and independently of) the
     // owned-field move-on-read skip and the scope-bound-local source lookup
     // below, both of which only apply to the general borrow-lifetime rule.
+    //
+    // §35.4 / §9.7 (v0.226, #2209): the parallel CHOICE face (§35.4: "Borrow-
+    // bearing choices are subject to every rule of this section, with 'record'
+    // read as 'record or choice'"). Before this fix the predicate consulted
+    // `isBorrowBearingRecord` only, which never classifies a choice, so a
+    // `this.field := Choice.Borrowed(local)` (or any other construction of a
+    // choice whose active case carries a borrow-typed payload) silently
+    // escaped the check: the field's runtime value would carry the borrow,
+    // outliving `local` after auto-drop — the same shape §9.7 rejects for
+    // records, just on the choice axis. The CHOICE branch uses the new
+    // `isNullSourceChoiceExpr` (#2209) for the same reason the record branch
+    // uses `isNullSourceRecordExpr`: an `Opt.None` / `Choice.Empty` / explicit
+    // `Borrowed(null)` payload admits the storage. Two distinct diagnostics
+    // so the message names the carrier kind. // per §9.7, §35.4
     if (dest == Dest::Field) {
         const sema::TypeRef* rhsType = ctx_.exprType(*as.value);
-        if (isBorrowBearingRecord(rhsType) &&
-            !isNullSourceRecordExpr(*as.value)) {
+        const bool rhsIsRecord = isBorrowBearingRecord(rhsType);
+        const bool rhsIsChoice = !rhsIsRecord && isBorrowBearingChoice(rhsType);
+        if ((rhsIsRecord && !isNullSourceRecordExpr(*as.value)) ||
+            (rhsIsChoice && !isNullSourceChoiceExpr(*as.value))) {
             report(
                 Severity::Error, as.span.begin,
-                "a borrow-bearing record may not be stored in an instance "
-                "field of a class — a record-carried borrow can be consumed "
-                "through access paths with no per-access disposed-flag "
-                "check, so the checked-mode trust regime that covers a "
-                "direct class-typed borrow field does not apply here (§9.7; "
-                "store the borrow's source instead — e.g. an `owned` field "
-                "of the underlying class — and re-derive the record view at "
-                "the use site, or store a value whose borrow-carrying "
-                "components are all `null`)");
-            return true;
-        }
-
-        // §35.4 (v0.220, #2180): the same rule applies to a borrow-bearing
-        // choice — §9.7 explicitly: "Borrow-bearing choices are subject to
-        // every rule of this section, with 'record' read as 'record or
-        // choice' throughout." A directly-choice-typed class field is the
-        // nullable analog of the record-field face above (#2159 fixed the
-        // transitive record-with-choice-field case; #2209 fixes the
-        // directly-choice-typed case). Kept distinct from the record leg so
-        // the record diagnostic's wording (and pinned CHECK matchers) stays
-        // unchanged. // per §9.7, §35.4 (v0.220, #2209)
-        if (isBorrowBearingChoice(rhsType)) {
-            report(
-                Severity::Error, as.span.begin,
-                "a borrow-bearing choice may not be stored in an instance "
-                "field of a class — a borrow-bearing-value's carried borrow "
-                "can be consumed through access paths with no per-access "
-                "disposed-flag check, so the checked-mode trust regime that "
-                "covers a direct class-typed borrow field does not apply "
-                "here (§9.7 / §35.4; store the borrow's source instead — "
-                "e.g. an `owned` field of the underlying class — and "
-                "re-derive the view at the use site, or store a value whose "
-                "borrow-carrying components are all `null`)");
+                rhsIsChoice
+                    ? std::string(
+                          "a borrow-bearing choice may not be stored in an "
+                          "instance field of a class — a choice-carried "
+                          "borrow can be consumed through access paths with "
+                          "no per-access disposed-flag check, so the "
+                          "checked-mode trust regime that covers a direct "
+                          "class-typed borrow field does not apply here "
+                          "(§9.7 with \"record\" read as \"record or "
+                          "choice\", §35.4; store the borrow's source "
+                          "instead — e.g. an `owned` field of the underlying "
+                          "class — and re-derive the choice at the use "
+                          "site, or store a value whose borrow-carrying "
+                          "payloads are all `null`/`None`)")
+                    : std::string(
+                          "a borrow-bearing record may not be stored in an "
+                          "instance field of a class — a record-carried "
+                          "borrow can be consumed through access paths with "
+                          "no per-access disposed-flag check, so the "
+                          "checked-mode trust regime that covers a direct "
+                          "class-typed borrow field does not apply here "
+                          "(§9.7; store the borrow's source instead — e.g. "
+                          "an `owned` field of the underlying class — and "
+                          "re-derive the record view at the use site, or "
+                          "store a value whose borrow-carrying components "
+                          "are all `null`)"));
             return true;
         }
     }
@@ -4580,52 +4695,46 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
         // before (and independently of) the scope-bound-local source lookup
         // below, which only decides the general (non-record) borrow rule.
         // The null-source form is exempt, mirroring the instance-field rule.
+        //
+        // §35.4 / §9.7 (v0.226, #2209): the parallel CHOICE face, mirroring
+        // the instance-field #2209 fix above — a borrow-bearing CHOICE
+        // argument to Add/Insert/etc on an Escapes-classified receiver is
+        // rejected at the call site, with the same null-source exception
+        // (an `Opt.None` payload-free case, or `Choice.Borrowed(null)` with
+        // every borrow-carrying payload null, is admitted).
         if (kind == RecvKind::Escapes) {
             const sema::TypeRef* argType = ctx_.exprType(*a.value);
-            if (isBorrowBearingRecord(argType) &&
-                !isNullSourceRecordExpr(*a.value)) {
+            const bool argIsRecord = isBorrowBearingRecord(argType);
+            const bool argIsChoice =
+                !argIsRecord && isBorrowBearingChoice(argType);
+            if ((argIsRecord && !isNullSourceRecordExpr(*a.value)) ||
+                (argIsChoice && !isNullSourceChoiceExpr(*a.value))) {
                 const std::string recvName =
                     recvRoot ? std::string(recvRoot->name) : std::string("it");
                 report(
                     Severity::Error, a.value->span.begin,
-                    std::string("a borrow-bearing record passed to `.") +
+                    (argIsChoice ? std::string(
+                                       "a borrow-bearing choice passed to `.")
+                                 : std::string(
+                                       "a borrow-bearing record passed to `.")) +
                     std::string(m) + "(...)` on `" + recvName +
                     "` may not be copied into a collection reachable beyond "
                     "this method's scope (the receiver, a field, or a "
-                    "parameter) — a record-carried borrow's access paths "
-                    "bypass the disposed-flag check the escape analysis "
-                    "relies on for a direct borrow, so the store is "
-                    "rejected regardless of whether the borrow's source "
-                    "provably outlives it (§9.7 / §28.11; store into an "
-                    "owning-family collection and transfer ownership with "
-                    "`Add(owned item)` instead, or store a value whose "
-                    "borrow-carrying components are all `null`)");
-                continue;
-            }
-
-            // §35.4 (v0.220, #2180): the same rule applies to a borrow-bearing
-            // choice — §9.7's verbatim "record or choice" extension. The
-            // nullable/collection analog of the field-store rule above
-            // (#2209). Kept distinct from the record leg above so the record
-            // diagnostic's wording (and pinned CHECK matchers) stays
-            // unchanged. // per §9.7, §35.4 (v0.220, #2209)
-            if (isBorrowBearingChoice(argType)) {
-                const std::string recvName =
-                    recvRoot ? std::string(recvRoot->name) : std::string("it");
-                report(
-                    Severity::Error, a.value->span.begin,
-                    std::string("a borrow-bearing choice passed to `.") +
-                    std::string(m) + "(...)` on `" + recvName +
-                    "` may not be copied into a collection reachable beyond "
-                    "this method's scope (the receiver, a field, or a "
-                    "parameter) — a borrow-bearing-value's carried borrow "
-                    "bypasses the disposed-flag check the escape analysis "
-                    "relies on for a direct borrow, so the store is "
-                    "rejected regardless of whether the borrow's source "
-                    "provably outlives it (§9.7 / §35.4 / §28.11; store into "
-                    "an owning-family collection and transfer ownership with "
-                    "`Add(owned item)` instead, or store a value whose "
-                    "borrow-carrying components are all `null`)");
+                    "parameter) — a " +
+                    (argIsChoice ? "choice" : "record") +
+                    "-carried borrow's access paths bypass the "
+                    "disposed-flag check the escape analysis relies on for "
+                    "a direct borrow, so the store is rejected regardless of "
+                    "whether the borrow's source provably outlives it (§9.7"
+                    + std::string(argIsChoice ? " with \"record\" read as "
+                                                "\"record or choice\", §35.4"
+                                                : "")
+                    + " / §28.11; store into an owning-family collection "
+                      "and transfer ownership with `Add(owned item)` "
+                      "instead, or store a value whose borrow-carrying "
+                      + std::string(argIsChoice
+                                        ? "payloads are all `null`/`None`)"
+                                        : "components are all `null`)"));
                 continue;
             }
         }
@@ -7305,52 +7414,48 @@ void MethodOwnership::checkFieldInitializer(const ast::FieldDecl& fd) {
     // there. TYPE-based, so it is checked ahead of (and independently of)
     // the owned-field / fresh-owned-value check below, which governs the
     // unrelated §28.6 leak rule.
+    //
+    // §35.4 / §9.7 (v0.226, #2209): the parallel CHOICE face, mirroring the
+    // assignment-site #2209 fix above — a borrow-bearing CHOICE initializer
+    // (e.g. `f: Opt := Opt.Some(local);` where `Opt`'s `Some` payload carries
+    // a borrow-typed `local`) is rejected, with the same null-source
+    // exception the record leg uses (an `Opt.None` payload-free case, or an
+    // `Opt.Some(null)` with the borrow-carrying payload null, is admitted).
     {
         const sema::TypeRef* fieldType =
             fd.type ? ctx_.resolvedType(*fd.type) : nullptr;
-        if (isBorrowBearingRecord(fieldType) &&
-            !isNullSourceRecordExpr(*fd.initializer)) {
+        const bool initIsRecord = isBorrowBearingRecord(fieldType);
+        const bool initIsChoice =
+            !initIsRecord && isBorrowBearingChoice(fieldType);
+        if ((initIsRecord && !isNullSourceRecordExpr(*fd.initializer)) ||
+            (initIsChoice && !isNullSourceChoiceExpr(*fd.initializer))) {
             report(
                 Severity::Error, fd.initializer->span.begin,
-                std::string("a borrow-bearing record may not be stored in "
-                            "the instance field `") +
+                std::string(initIsChoice
+                                ? "a borrow-bearing choice may not be stored "
+                                  "in the instance field `"
+                                : "a borrow-bearing record may not be stored "
+                                  "in the instance field `") +
                 std::string(fd.name) +
-                "` — a record-carried borrow can be consumed through access "
-                "paths with no per-access disposed-flag check, so the "
-                "checked-mode trust regime that covers a direct class-typed "
-                "borrow field does not apply here (§9.7; store the borrow's "
-                "source instead — e.g. an `owned` field of the underlying "
-                "class — and re-derive the record view at the use site, or "
-                "initialize with a value whose borrow-carrying components "
-                "are all `null`)");
-            return;
-        }
-
-        // §35.4 (v0.220, #2180): the same rule applies to a borrow-bearing
-        // choice field type — §9.7's verbatim "record or choice" extension.
-        // The literal-initializer null-source form (every borrow-carrying
-        // component provably `null`) is exempt; a CHOICE has no `null`-source
-        // construction today (the §35.4 §9.7 no-temporary-source rule), so
-        // every borrow-bearing choice initializer is rejected — the check
-        // remains correct by the same reasoning as the record leg. Kept
-        // distinct from the record leg so the record diagnostic's wording
-        // (and pinned CHECK matchers) stays unchanged. // per §9.7, §35.4
-        // (v0.220, #2209)
-        if (isBorrowBearingChoice(fieldType)) {
-            report(
-                Severity::Error, fd.initializer->span.begin,
-                std::string("a borrow-bearing choice may not be stored in "
-                            "the instance field `") +
-                std::string(fd.name) +
-                "` — a borrow-bearing-value's carried borrow can be "
-                "consumed through access paths with no per-access "
-                "disposed-flag check, so the checked-mode trust regime "
-                "that covers a direct class-typed borrow field does not "
-                "apply here (§9.7 / §35.4; store the borrow's source "
-                "instead — e.g. an `owned` field of the underlying class "
-                "— and re-derive the view at the use site, or initialize "
-                "with a value whose borrow-carrying components are all "
-                "`null`)");
+                "` — a " +
+                std::string(initIsChoice ? "choice" : "record") +
+                "-carried borrow can be consumed through access paths with "
+                "no per-access disposed-flag check, so the checked-mode trust "
+                "regime that covers a direct class-typed borrow field does "
+                "not apply here (" +
+                std::string(initIsChoice
+                                ? "§9.7 with \"record\" read as \"record or "
+                                  "choice\", §35.4"
+                                : "§9.7") +
+                "; store the borrow's source instead — e.g. an `owned` field "
+                "of the underlying class — and re-derive the " +
+                std::string(initIsChoice ? "choice"
+                                          : "record view") +
+                " at the use site, or initialize with a value whose borrow-"
+                "carrying " +
+                std::string(initIsChoice ? "payloads are all `null`/`None`"
+                                          : "components are all `null`") +
+                ")");
             return;
         }
     }
