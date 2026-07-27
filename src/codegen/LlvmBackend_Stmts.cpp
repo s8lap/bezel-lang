@@ -6011,7 +6011,32 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
             if (!uniqueGetEnum) uniqueGetEnum = ge;
             else if (uniqueGetEnum != ge) { ambiguous = true; break; }
         }
-        if (ambiguous || !uniqueGetEnum) return false;  // → NYI (sound)
+        // #1779 / §21.4 / §29.2: when MULTIPLE classes implement the interface
+        // with DISTINCT `GetEnumerator` methods (truly polymorphic), no single
+        // static call on the interface-typed receiver is sound. Emit a specific
+        // diagnostic rather than falling through to the generic codegen NYI so
+        // users see the actual reason for the failure and the tracked issue.
+        // Single-implementer / shared-base cases still devirtualize below.
+        if (ambiguous || !uniqueGetEnum) {
+            if (ambiguous) {
+                ctx_.diagnostics().report(
+                    Severity::Error, fs.span.begin,
+                    "for-in over interface `" + std::string(ts->name) +
+                    "` is polymorphic: implementing classes define distinct "
+                    "`GetEnumerator` methods, and the builtin `IEnumerable<T>` "
+                    "is not yet synthesized as an itable-participating interface "
+                    "(#1779; §29.2 — would require runtime itable dispatch); "
+                    "iterate a concrete class, or refactor the implementers to "
+                    "share a `GetEnumerator`");
+                // Report-only path — claim handled so the caller doesn't append
+                // the generic "not yet implemented: codegen for this for
+                // statement" diagnostic on top of ours. No IR was emitted; the
+                // compilation is already a hard error and the rest of the
+                // statement body is dead.
+                return true;
+            }
+            return false;  // non-ambiguous miss (no implementer compiled) → NYI
+        }
         ts = uniqueGetEnum->parent;  // devirtualize to the implementing class
     }
 
