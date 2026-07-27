@@ -730,6 +730,15 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     if (ldAt->dischargedByArmTransfer) continue;
                 }
             }
+            // #1634 / §22.4 / §28.8: companion to the handleAssignment fix
+            // above — an `out owned` parameter's value transfers to the caller
+            // at every method exit, releasing the callee-side obligation.
+            // Suppress the fall-through discharge error for these parameters
+            // (without this skip the assignment-time change would now fire the
+            // error on every legal exit). // per §22.4, §28.8
+            if (auto* psOut = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+                if (psOut->modifier == "out owned") continue;
+            }
             ctx_.diagnostics().report(
                 Severity::Error,
                 st.obligationOrigin ? st.obligationOrigin->span.begin
@@ -4701,14 +4710,20 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // method exit (the over-rejection of issue #390). Definite
             // assignment of the `out` parameter on every path (§7.9) is a
             // separate concern not handled here.
-            if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
-                if (ps->modifier == "out owned") {
-                    st.state = OwnershipState::Disposed;
-                    st.obligationOrigin = &as;
-                    st.source.reset();
-                    return;
-                }
-            }
+            // #1634 / §22.4 / §28.8: an `out owned` parameter's value transfers
+            // to the caller at method exit (the call site adopts the slot
+            // contents), so a mid-body read is a BORROW of the slot — never
+            // a use-after-dispose. The previous early-return marked the
+            // parameter Disposed immediately on assignment, which made the
+            // next read `if r <> null` fire a false "use after Dispose"
+            // warning (#1634). The correct model: let the assignment fall
+            // through to the normal handling below, leaving state Owned (the
+            // producer's state). The out-transfer releases the callee-side
+            // obligation at every exit edge (mirroring what `return`
+            // discharges for `owned` return types, but here implicit on every
+            // exit) — so the endState fall-through error below skips
+            // `out owned` parameters instead (companion fix). // per §22.4,
+            // §28.8
             // §28.3 / §28.7 (v0.180) consume-site freeze: reassigning an OWNED
             // local is a drop-on-overwrite that silently disposes the displaced
             // value. If a live local borrow of that value exists, the overwrite
