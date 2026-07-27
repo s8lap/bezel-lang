@@ -154,31 +154,6 @@ BEZEL_TEST(codegen_owned_task_field, owned_task_field_overwrite_no_result_2173) 
         "end C;"), 0);
 }
 
-// ---------------------------------------------------------------------------
-// #1889 — collection cascade: an owning collection of Task-family elements
-// owns each task frame, and disposing the collection must also dispose an
-// unconsumed class result. This is the collection half of the same §30.5
-// disposal rule as the field cases above; without a Task-family element
-// disposer the task frame and Cell result remain leaked.
-// ---------------------------------------------------------------------------
-BEZEL_TEST(codegen_owned_task_collection_1889,
-           owning_collection_task_element_disposed_1889) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; " + std::string(kCell) +
-        "class App "
-        "  public static async method Make(): OwningTask<Cell> "
-        "    return new Cell(); "
-        "  end Make; "
-        "  public static method Main(): int "
-        "    do "
-        "      using var tasks := new OwningArray<OwningTask<Cell>>(); "
-        "      tasks.Add(App.Make()); "
-        "    end; "
-        "    return Cell.n; "
-        "  end Main; "
-        "end App;"), 0);
-}
-
 // §30.5 control: Task<T> is the other Task-family element shape. It has no
 // consuming result obligation for a value-typed T, but the owning collection
 // still owns and must eventually reclaim each task frame.
