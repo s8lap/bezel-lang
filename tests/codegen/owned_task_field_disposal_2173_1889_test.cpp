@@ -18,10 +18,15 @@
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::runAotCheckedDisposal;
 
 namespace {
 int run(const std::string& prog) {
     auto r = runAot(prog);
+    return r.ran ? r.exitCode : -999;
+}
+int runCheckedDisposal(const std::string& prog) {
+    auto r = runAotCheckedDisposal(prog);
     return r.ran ? r.exitCode : -999;
 }
 // Cell: a class with a static counter (ctor ++, dtor --) for leak detection.
@@ -193,4 +198,48 @@ BEZEL_TEST(codegen_owned_task_collection_1889,
         "    return 0; "
         "  end Main; "
         "end App;"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// #2173 — §30.10 backstop: a stale borrow of an owned Task<Data> field's
+// produced result, after the field is overwritten by `_t := t` (§28.7
+// drop-on-overwrite). The OLD task is disposed (fire-and-forget[_checked]),
+// which in checked-disposal mode QUARANTINES the produced Data — its
+// disposed flag remains readable so a subsequent member access on the
+// stale reference raises DisposedAccessException (§31.4) rather than
+// reading freed memory. Pre-fix, the stale use reached into freed heap
+// (a UAF under --sanitize=address) or read garbage under release builds
+// (the backstop was never installed). The probe shape is the canonical
+// critic probe cr2_2042_displacement_backstop (#2042 family); this
+// regression test pins the #2173 half — the Task-family field variant
+// (the #2043 class-typed backstop was already wired). The test catches
+// the exception and returns 1; if the backstop is missing, the access
+// either reads garbage (any int, expect 1 fails) or the program crashes
+// (no catch — caught by the test harness's failure path). // per
+// §28.7, §30.5, §30.10, #2173
+// ---------------------------------------------------------------------------
+BEZEL_TEST(codegen_owned_task_field_2173,
+           checked_disposal_backstop_after_overwrite_faults_spec_28_7_30_10) {
+    BEZEL_EXPECT_EQ(runCheckedDisposal(
+        "module M; " + std::string(kData) +
+        "class Box "
+        "  public owned _t: Task<Data>; "
+        "  public constructor(owned t: Task<Data>) _t := t; end constructor; "
+        "  public method Swap(owned t: Task<Data>) _t := t; end Swap; "
+        "end Box; "
+        "class C "
+        "  public static async method Produce(v: int): Task<Data> "
+        "    return new Data(v); "
+        "  end Produce; "
+        "  public static async method Main(): Task<int> "
+        "    using var box := new Box(C.Produce(7)); "
+        "    var d := await box._t; "         // borrow the old task's result
+        "    box.Swap(C.Produce(99)); "       // drop-on-overwrite disposes old
+        "    try "
+        "      var late := d._v; "            // STALE — must fault (backstop)
+        "      return late; "                 // unreachable if backstop fires
+        "    catch DisposedAccessException => return 1; "
+        "    end; "
+        "  end Main; "
+        "end C;"), 1);
 }
