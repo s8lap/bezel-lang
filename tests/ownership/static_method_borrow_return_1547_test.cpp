@@ -171,6 +171,79 @@ BEZEL_TEST(static_borrow_return_1547, static_property_stays_accepted) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// vNEXT, #1819 (ruling 2026-07-24, spec v0.220→vNEXT): the §28.3 *Borrow
+// lifetime rules* / §28.6 *Leak prevention* bullets widen the static-property
+// callee-side admission from "a bare read of a `static` `owned` field" to
+// "a bare read of a `static` class- or interface-typed field, in any
+// admissible form" — `owned`, `readonly` without `owned` (§22.13 exempts the
+// referent from ownership-discharge; the value lives for the duration of
+// the program), or a §22.12-rule-2 admitted mutable static (whose stores
+// never dispose a displaced referent, so every referent it has ever held
+// stays alive to process exit). The widening aligns the spec's letter with
+// the implementation, the stdlib §3.2 `Encoding` singleton surface, and the
+// v0.196 static-method diagnostic's own "re-expose the field through a
+// static property" remedy. **This test pins the OWNED form** — the form the
+// pre-vNEXT letter covered — so a future narrowing cannot regress it. The
+// non-owned and mutable-form siblings below cover the new admissions.
+BEZEL_TEST(static_borrow_return_1547, static_property_owned_stays_accepted) {
+    auto r = parseAndCheckOwnership(mod(
+        "class Holder "
+        "  private static owned readonly _shared: Res := new Res(); "
+        "  public static property Shared: Res => _shared; "
+        "end Holder;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// vNEXT, #1819 (ruling 2026-07-24, spec v0.220→vNEXT): the §28.3/§28.6
+// static-property callee-side admission widens to admit a §22.12-rule-2
+// ADMITTED MUTABLE STATIC behind a getter. This test pins the form via
+// `Mutex` (the form-(i) internally-synchronized class-typed handle from
+// stdlib §6) — a mutable static field whose every store is single-pointer-
+// word atomic, never disposes a displaced referent, and is exempt from the
+// §22.12 rule 4 domain-reachability warning by virtue of being in the
+// form-(i) set. The getter re-exposes the storage and the static-property
+// call site classifies the result as the §28.3 *Static property access* row
+// Borrowed (always-live source, K2). The `T.f` sibling below tests the
+// direct (non-getter) read of the same kind of field.
+BEZEL_TEST(static_borrow_return_1547, static_property_mutex_stays_accepted) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Holder "
+        "  public static _m: Mutex := new Mutex(); "
+        "  public static property M: Mutex => _m; "
+        "end Holder; "
+        "class C "
+        "  public static method Main(): int "
+        "    var m: Mutex := Holder.M; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// vNEXT, #1819 (ruling 2026-07-24, spec v0.220→vNEXT): the new
+// **Static field access `T.f`** producers row — the caller-side twin of
+// the existing `T.P` row, listed alongside it in §28.3 *Producers* — pins
+// a direct read of a `static` class- or interface-typed field as Borrowed
+// (source: the declaring type's static storage — K2's always-live source).
+// The bare in-scope spelling `_shared` (the declaring type's own static
+// field) is the §28.3 producers row's other form, equally admitted. This
+// test pins the bare-spelling accept so a future narrowing cannot regress
+// the direct-read path the encoding-style access `T.f` covers.
+BEZEL_TEST(static_borrow_return_1547, static_field_read_in_scope_stays_accepted) {
+    auto r = parseAndCheckOwnership(mod(
+        "class Holder "
+        "  public static readonly _shared: Res := new Res(); "
+        "end Holder; "
+        "class C "
+        "  public static method Main(): int "
+        "    var x: Res := Holder._shared; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // §28.3 v0.201 (#2048): the body-side admission retired — a static method
 // whose body returns a static-property READ is now rejected AT THE
 // DECLARATION (signature-keyed, body-independent). The v0.196 admission

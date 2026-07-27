@@ -6784,7 +6784,8 @@ void MethodOwnership::checkStaticBorrowReturn(const ast::Expr& e) {
         return;
     if (!isBorrowableType(ctx_.resolvedType(*returnType_))) return;
     if (!ownedArgSourceIsBorrow(e)) return;
-    // §28.3 / §28.6 (v0.196, #1815): a flagged borrow that is a read of the
+    // §28.3 / §28.6 (v0.196, #1815; widened in vNEXT, #1819 across the
+    // admissible static field forms): a flagged borrow that is a read of the
     // declaring (or another) type's STATIC storage — a bare `_instance` (a
     // static `FieldSymbol`) or `Other._instance` (a static-member access) — is
     // a static-storage RE-EXPOSURE. v0.187 admitted such a read returned from a
@@ -6798,16 +6799,24 @@ void MethodOwnership::checkStaticBorrowReturn(const ast::Expr& e) {
     // return of a static PROPERTY read (`=> T.P`) is not classified a borrow by
     // ownedArgSourceIsBorrow above (it resolves to a property, not a
     // FieldSymbol), so the surviving getter admission is left unflagged. The
-    // static-member-read branch only re-shapes the DIAGNOSTIC: it names the
-    // static-property remedy so the migration is mechanical; every other borrow
-    // return (a borrowed parameter/local, a field reached through one) keeps the
-    // ordinary no-receiver message below. // per §28.3, §28.6
+    // admission under vNEXT (#1819) covers every admissible static class- or
+    // interface-typed field form — `owned`, §22.13-exempt `readonly`, or a
+    // §22.12-rule-2 admitted mutable static — because every such form keeps its
+    // referents alive to process exit (§22.13, §22.12 rule 2's overwrite-never-
+    // disposes), exactly the always-live claim K2 makes. The static-member-read
+    // branch only re-shapes the DIAGNOSTIC: it names the static-property remedy
+    // so the migration is mechanical; every other borrow return (a borrowed
+    // parameter/local, a field reached through one) keeps the ordinary no-
+    // receiver message below. // per §28.3, §28.6
     if (exprIsStaticMemberRead(e)) {
         report(
             Severity::Error, e.span.begin,
             "a static method may not re-expose static storage — returning a "
-            "bare read of a `static` `owned` field through a non-`owned` "
-            "return re-exposes ownership, and because nothing in the signature "
+            "bare read of a `static` class- or interface-typed field through a "
+            "non-`owned` return re-exposes ownership (any admissible field form "
+            "— `owned`, §22.13-exempt `readonly`, or a §22.12-rule-2 admitted "
+            "mutable static; vNEXT, #1819 — is process-lived and the getter is "
+            "the only admitted caller), and because nothing in the signature "
             "distinguishes this from a factory, every caller (§28.3 *Factory "
             "methods*) mints a second owner for the borrowed-out storage "
             "(§28.6, v0.196 retires the v0.187 static-method arm); re-expose "
