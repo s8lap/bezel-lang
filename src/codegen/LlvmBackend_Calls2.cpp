@@ -5847,66 +5847,6 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs);
     if (!diverged_)
         for (llvm::Value* cl : syncIterClosureArgs) emitClosureRelease(cl);
-    // fix #1073 / §28.9 / §27.5: extend the #1864 closure ARGUMENT-PASS release
-    // from sync-iterator callees only to plain (non-iterator) callees. A +1
-    // closure producer (lambda / method-ref) passed DIRECTLY as an argument to
-    // a plain method is a +1 TEMPORARY the caller still owns after the call —
-    // the callee parameter is a borrow (Bezel parameters are borrows by
-    // default), so the callee has not transferred any reference out of the
-    // caller's transient. Without this release the closure cell + env leak
-    // (LSan: 40 + 8 bytes — verified on the issue's exact repro on
-    // stock main): the #1864 sync-iterator release covers only `bodyKind ==
-    // Block && containsYield` callees, leaving the common `Sink.Take(lambda()
-    // => …)` shape leaking. The release is sound because either (a) the
-    // callee just-borrows h and uses it (calls h() and discards) — caller
-    // still owns +1, release is the right thing; (b) the callee stores h in a
-    // function-typed class field — `lowerClosureFieldStore` retains (rc 1→2),
-    // so caller's release (rc 2→1) leaves the field owning its +1; (c) the
-    // callee returns h — `ReturnStmt` closure retain mints +1 (rc 1→2), so
-    // caller's release (rc 2→1) leaves the return value owning its +1.
-    // The unsafe cases (release WOULD UAF) are excluded:
-    //   - ASYNC methods (iterator or otherwise) — async frames capture the
-    //     closure without retaining (no `emitClosureRetain` in
-    //     `emitAsyncMethod` / `emitAsyncIteratorMethod`); releasing the
-    //     caller's +1 would free the cell while the frame still uses it across
-    //     awaits;
-    //   - `owned` closure parameters — ownership transfers IN to the callee;
-    //     the caller no longer owns +1; releasing would double-free;
-    //   - sync-iterator callees — already handled by the #1864 block above
-    //     (their frame retains; either path would be correct, the existing
-    //     one is preserved for surgical clarity).
-    // Parallel to the #429 string ARGUMENT-PASS release (a few blocks below);
-    // an exception path leaks the temporary (the safe direction, matching
-    // both blocks' `!diverged_` guard). // per §28.9 closure-cell ARC
-    if (!diverged_ && !args.empty()) {
-        bool isAsyncCallee = isAsyncMethod(ms);
-        bool isSyncIterCallee = false;
-        if (!isAsyncCallee) {
-            if (auto* mdIt =
-                    dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-                isSyncIterCallee =
-                    mdIt->bodyKind == ast::MethodBodyKind::Block &&
-                    containsYield(mdIt->stmts);
-            }
-        }
-        if (!isAsyncCallee && !isSyncIterCallee) {
-            std::size_t argOffset = isStaticMethod(ms) ? 0 : 1;
-            for (std::size_t ai = argOffset;
-                 ai < args.size() && ai < argExprs.size(); ++ai) {
-                std::size_t pIdx = ai - argOffset;
-                // Skip `owned` parameters — ownership transfers in.
-                if (pIdx < ms->params.size()) {
-                    if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
-                            ms->params[pIdx])) {
-                        if (ps->modifier == "owned") continue;
-                    }
-                }
-                if (argExprs[ai] &&
-                    isPlusOneClosureProducer(argExprs[ai]))
-                    emitClosureRelease(args[ai]);
-            }
-        }
-    }
     // Record the concrete subst that drives the RESULT local's layout so that
     // lowerLocalDecl can associate it with the result's local variable.
     //
