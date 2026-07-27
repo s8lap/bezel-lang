@@ -172,6 +172,28 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
         }
     }
 
+    // §30.5 / §28.11 (#1889): an owning collection of Task-family values owns
+    // each task frame. A task is a builtin class with no user declaration, so it
+    // must be classified before the declaration-based class arm below. The
+    // element thunk performs the complete non-blocking task disposal protocol;
+    // borrowing collections retain the existing borrow-only policy.
+    if (elemTy && isTaskTypeName(elemTy)) {
+        if (owningFamily) {
+            return ElementPolicy{
+                ElementPolicy::Category::ClassOwned,
+                ptrTy(),
+                taskElementDisposerThunk(elemTy),
+                /*retainRelease=*/false
+            };
+        }
+        return ElementPolicy{
+            ElementPolicy::Category::ClassBorrow,
+            ptrTy(),
+            /*disposerThunk=*/nullptr,
+            /*retainRelease=*/false
+        };
+    }
+
     bool isSharedWeakElem = isSharedOrWeak(elemTy);
     // Distinguish Shared vs Weak for per-element release thunk selection.
     auto isWeakElem = [](const sema::TypeRef* t) {
