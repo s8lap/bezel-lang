@@ -5159,18 +5159,42 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // §20: the `if` expression's condition must be bool.
             checkConditionIsBool(*ce->condition, "if-expression");
         }
+        // §7.4 (v0.210, #2105): the §20 conditional atom's condition
+        // narrows its own branches exactly as an if-STATEMENT condition
+        // narrows its controlled block (per §7.4 v0.210 first bullet,
+        // "in an `if`/`elif` condition … of the §20 conditional atom,
+        // each condition narrowing its own branches"). Save the entry
+        // narrowings, push true-branch facts before thenValue, false-
+        // branch facts before elseValue, restore after — mirroring the
+        // IfStmt save/restore in ExprTypecheck.cpp around the two
+        // bodies. The post-`if` expression state is irrelevant (a
+        // conditional atom yields one of the two branch values, with no
+        // following statements on either path); the entry state is what
+        // any enclosing context resumes with.
+        auto entryNarrowings = narrowings_;
+        auto entryNullNarrowed = nullNarrowed_;
+        auto entryFieldNarrowed = fieldNarrowed_;
         // §28.3 A7 (v0.209, #2080): an if-expression BRANCH is a marked-
         // transfer admission position — announce the exact child node.
         const ast::Expr* savedSlot = markedArmSlot_;
         if (ce->thenValue) {
+            nullNarrowed_ = entryNullNarrowed;
+            fieldNarrowed_ = entryFieldNarrowed;
+            collectNarrowings(ce->condition.get(), /*forTrueBranch=*/true);
             markedArmSlot_ = ce->thenValue.get();
             visitExpr(*ce->thenValue);
         }
         if (ce->elseValue) {
+            nullNarrowed_ = entryNullNarrowed;
+            fieldNarrowed_ = entryFieldNarrowed;
+            collectNarrowings(ce->condition.get(), /*forTrueBranch=*/false);
             markedArmSlot_ = ce->elseValue.get();
             visitExpr(*ce->elseValue);
         }
         markedArmSlot_ = savedSlot;
+        narrowings_ = entryNarrowings;
+        nullNarrowed_ = entryNullNarrowed;
+        fieldNarrowed_ = entryFieldNarrowed;
     } else if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
         if (te->operand) visitExpr(*te->operand);
     } else if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
@@ -6460,6 +6484,31 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 for (const auto& s : arm.stmts) if (s) visitStmt(*s);
                 currentScope_ = saveScope;
             } else {
+                // §7.4 (v0.210, #2105): a scrutinee-less `when` arm's
+                // own boolean CONDITION narrows that arm's own body —
+                // per §7.4 v0.210 first bullet: "a `when` guard … or a
+                // `(when …)` arm condition (§19.1, narrowing that arm's
+                // body)". For the expression-position form, the
+                // condition is the ConstantPattern's first constant
+                // (the parser wraps a single boolean expression in a
+                // ConstantPattern; multiple constants are alternatives
+                // for an enum scrutinee pattern, irrelevant here).
+                // Save the running narrowings, push true-branch facts
+                // for this arm's condition, restore on exit. Mirrors
+                // the IfStmt save/restore in ExprTypecheck.cpp and the
+                // §20 conditional atom save/restore above (#2105).
+                auto armEntryNarrow = narrowings_;
+                auto armEntryNull = nullNarrowed_;
+                auto armEntryField = fieldNarrowed_;
+                if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(
+                        arm.pattern.get())) {
+                    if (!cp->constants.empty() && cp->constants[0]) {
+                        nullNarrowed_ = armEntryNull;
+                        fieldNarrowed_ = armEntryField;
+                        collectNarrowings(cp->constants[0].get(),
+                                          /*forTrueBranch=*/true);
+                    }
+                }
                 if (arm.guard) visitExpr(*arm.guard);
                 if (arm.exprBody) {
                     // §28.3 A7 (v0.209, #2080): an expression-`case`/
@@ -6471,6 +6520,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     markedArmSlot_ = savedMtSlot;
                 }
                 for (const auto& s : arm.stmts) if (s) visitStmt(*s);
+                narrowings_ = armEntryNarrow;
+                nullNarrowed_ = armEntryNull;
+                fieldNarrowed_ = armEntryField;
             }
             // §7.4 #2116: fold this arm's exit into the running intersection.
             for (auto it = caseRunningField.begin();

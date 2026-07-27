@@ -11822,9 +11822,38 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
                 currentScope_ = saveScope;
             } else {
+                // §7.4 (v0.210, #2105): a scrutinee-less `when` arm's
+                // own boolean CONDITION narrows that arm's own body —
+                // per §7.4 v0.210 first bullet: "a `when` guard … or a
+                // `(when …)` arm condition (§19.1, narrowing that arm's
+                // body)". For the statement-position form, the
+                // condition is the ConstantPattern's first constant
+                // (the parser wraps a single boolean expression in a
+                // ConstantPattern; multiple constants are alternatives
+                // for an enum scrutinee pattern, irrelevant here).
+                // Save/restore mirrors the IfStmt and CaseExpr
+                // scrutinee-less handlers (the per-arm running
+                // intersection below #2116/#2164 is unaffected — only
+                // this arm's BODY sees the condition's true-branch
+                // facts, the exit intersection is unchanged).
+                auto armEntryNarrow = narrowings_;
+                auto armEntryNull = nullNarrowed_;
+                auto armEntryField = fieldNarrowed_;
+                if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(
+                        arm.pattern.get())) {
+                    if (!cp->constants.empty() && cp->constants[0]) {
+                        nullNarrowed_ = armEntryNull;
+                        fieldNarrowed_ = armEntryField;
+                        collectNarrowings(cp->constants[0].get(),
+                                          /*forTrueBranch=*/true);
+                    }
+                }
                 if (arm.guard) visitExpr(*arm.guard);
                 if (arm.exprBody) visitExpr(*arm.exprBody);
                 for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
+                narrowings_ = armEntryNarrow;
+                nullNarrowed_ = armEntryNull;
+                fieldNarrowed_ = armEntryField;
             }
             // §7.4 #2116: fold this arm's exit into the running intersection.
             for (auto it = caseRunningField.begin();
