@@ -1,7 +1,9 @@
 // Regression tests for #2154 / #2217. Per §29.8 v0.226, an iterator
 // state-machine disposes every `owned` parameter that has not yet moved out when
-// the iterator is torn down. For the linear owning-iterator shape below, the
-// enumerator clone owns the captures and keys cleanup to the reached yield state.
+// the iterator is torn down. The #2154 part-2 extension recognizes the same
+// linear-shape relationship when one yield sits inside a `try` block (only a
+// `finally` is allowed by §29.6). The enumerator clone owns the captures and
+// keys cleanup to the reached yield state.
 
 #include <cstddef>
 #include <string>
@@ -84,4 +86,58 @@ BEZEL_TEST(iterator_owned_param_abandon_2154,
         "      while en.MoveNext() do "
         "        using var u := en.TakeCurrent(); "
         "      end; "));
+}
+
+// Per §29.6 only `try` bodies with a `finally` arm admit `yield`.
+// §29.8 / #2154 part 2: when one owned-parameter yield sits inside the
+// `try` and another at the top level, both belong to the linear
+// resume sequence (yield state 1 + yield state 2). On early break after
+// the first transfer the second parameter must still be disposed by the
+// frame's auto-cleanup; on a full drain each consumer `u` disposes the
+// transfer it received.
+
+std::string tryYieldProgram(const std::string& drive) {
+    return
+        "module M; "
+        "class R "
+        "  public Id: int := 0; "
+        "  public constructor(id: int) Id := id; end constructor; "
+        "  destructor Console.WriteLine(\"dispose \" + Id.ToString()); end destructor; "
+        "end R; "
+        "class C "
+        "  public static method Gen(owned a: R, owned b: R): IOwningEnumerable<R> "
+        "    try yield return a; finally end; "
+        "    yield return b; "
+        "  end Gen; "
+        "  public static method Main(): int "
+        "    do "
+        "      using var source: IOwningEnumerable<R> := Gen(new R(1), new R(2)); "
+        "      using var en: IOwningEnumerator<R> := source.GetOwningEnumerator(); " +
+        drive +
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;";
+}
+
+BEZEL_TEST(iterator_owned_param_abandon_2154,
+           try_yield_break_after_first_transfer_spec_29_8) {
+    expectCleanAndDisposedOnce(tryYieldProgram(
+        "      while en.MoveNext() do "
+        "        using var u := en.TakeCurrent(); "
+        "        break; "
+        "      end; "));
+}
+
+BEZEL_TEST(iterator_owned_param_abandon_2154,
+           try_yield_full_drain_spec_29_8) {
+    expectCleanAndDisposedOnce(tryYieldProgram(
+        "      while en.MoveNext() do "
+        "        using var u := en.TakeCurrent(); "
+        "      end; "));
+}
+
+BEZEL_TEST(iterator_owned_param_abandon_2154,
+           try_yield_never_started_spec_29_8) {
+    expectCleanAndDisposedOnce(tryYieldProgram(""));
 }

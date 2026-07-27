@@ -453,6 +453,57 @@ void Emitter::collectYields(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
     }
 }
 
+// §29.8 (#2154 part 2): walk the iterator body in EXECUTION order (same order
+// as `collectYields`) and record the 1-based yield state at which each
+// `owned`-class-typed parameter is transferred out via `yield return`.
+// Mirrors the sema-side linear check at Ownership.cpp but extends through
+// `try` bodies so the `try { yield return a; } ...; yield return b;` shape
+// (forbidden by §29.6 only when there's a catch — a finally-only try is
+// allowed) and the equivalent `do/end` block both participate. Any yield
+// return that is not a bare identifier-expression of an `owned` parameter
+// aborts the scan (`ok=false`); the iterator is then routed through the
+// legacy monotone ownership path. `if/else`/`while`/`for` are NOT
+// descended — their state ordering is data-dependent and the #2154 narrow
+// shape covers a single, statically-determined resume sequence.
+static void collectYieldStatesForOwnedParams(
+    sema::SemaContext& ctx,
+    const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
+    unsigned& state,
+    std::unordered_map<sema::ParameterSymbol*, unsigned>& out,
+    bool& ok) {
+    for (const auto& s : stmts) {
+        if (!s) continue;
+        if (!ok) return;
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s.get())) {
+            if (ys->isBreak || !ys->value) { ok = false; return; }
+            auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                ys->value.get());
+            sema::Symbol* sym = id ? ctx.exprSymbol(*id) : nullptr;
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+            if (!ps || ps->modifier != "owned") { ok = false; return; }
+            if (out.count(ps)) { ok = false; return; }
+            out[ps] = ++state;
+            continue;
+        }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s.get())) {
+            // Recurse through the protected body only; §29.6 already
+            // forbids `yield` in catches / finally, so no leak there.
+            collectYieldStatesForOwnedParams(
+                ctx, ts->body, state, out, ok);
+            continue;
+        }
+        if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
+            collectYieldStatesForOwnedParams(
+                ctx, db->body, state, out, ok);
+            continue;
+        }
+        // IfStmt / WhileStmt / ForStmt / lambdas / anything else has
+        // data-dependent state ordering — abort the linear scan.
+        ok = false;
+        return;
+    }
+}
+
 
 void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                          const CallableInfo& ci) {
@@ -521,10 +572,55 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // first enumerator claims the captures from the source and its Dispose can
     // distinguish not-yet-yielded parameters from already-transferred ones by
     // the current state.
+    //
+    // #2154 part 2: re-run the same scan HERE in the codegen, extending
+    // through `try` bodies (and `do/end` blocks) so the multi-yield shape
+    // `try { yield return a; } finally { } ; yield return b;` is included
+    // in the state-keyed cleanup. The sema-side check is unchanged (so the
+    // ownership flagging for `iteratorAutoDispose` / scope-end reject is
+    // exactly what sema told us), but the codegen-side MAP is what the
+    // LLVM disposal loop consults per parameter — it can be richer than
+    // what sema's narrow prototype accepted without widening sema's
+    // contract. The legacy monotone path still applies when the scan
+    // yields an ambiguous shape (`ok=false`).
+    std::unordered_map<sema::ParameterSymbol*, unsigned> ownedParamYieldStates;
+    if (isOwningIter) {
+        bool scanOk = true;
+        unsigned scanState = 0;
+        collectYieldStatesForOwnedParams(
+            ctx_, *ci.stmts, scanState, ownedParamYieldStates, scanOk);
+        // Cross-check: every owned parameter on the method must appear
+        // in the scan, and only `owned` parameters may appear. If sema
+        // flagged something we couldn't statically pin to a yield
+        // state, prefer the legacy monotone disposal there.
+        if (scanOk && !ownedParamYieldStates.empty()) {
+            bool allMatched = true;
+            for (auto* sym : ms->params) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+                if (!ps || ps->modifier != "owned") continue;
+                if (ownedParamYieldStates.count(ps) == 0) {
+                    allMatched = false;
+                    break;
+                }
+            }
+            if (!allMatched) ownedParamYieldStates.clear();
+        } else {
+            ownedParamYieldStates.clear();
+        }
+    }
     bool cloneDisposesOwnedCaptures = false;
     for (sema::Symbol* sym : ms->params) {
         auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
-        if (ps && ps->iteratorMoveYieldState != 0) {
+        if (!ps || ps->modifier != "owned") continue;
+        // Per-param gate: include the param in CLONE-DISPOSES-CAPTURES
+        // only if BOTH the sema-side prototype (linear-flat shape
+        // already covered by #2154) AND/OR the codegen-side scan
+        // (extended linear shape including try-bodies) has placed a
+        // yield state on it. A parameter with no state assignment
+        // either way is handled by the legacy monotone loop.
+        bool semaState = ps->iteratorMoveYieldState != 0;
+        bool codegenState = ownedParamYieldStates.count(ps) != 0;
+        if (semaState || codegenState) {
             cloneDisposesOwnedCaptures = true;
             break;
         }
@@ -786,7 +882,13 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             for (std::size_t i = 0; i < frame.captures.size(); ++i) {
                 auto* ps = dynamic_cast<sema::ParameterSymbol*>(
                     frame.captures[i].first);
-                if (!ps || ps->iteratorMoveYieldState == 0) continue;
+                if (!ps || ps->modifier != "owned") continue;
+                // (#2154 part 2) include both the sema-side prototype's
+                // assignment (linear-flat body) AND the codegen-side
+                // extended scan (linear body that descends through `try`).
+                bool hasState = ps->iteratorMoveYieldState != 0 ||
+                    ownedParamYieldStates.count(ps) != 0;
+                if (!hasState) continue;
                 unsigned fieldIdx = frame.captureStart + (unsigned)i;
                 gb.CreateStore(llvm::Constant::getNullValue(frame.captures[i].second),
                     gb.CreateStructGEP(stateStructTy, self, fieldIdx));
@@ -1183,7 +1285,20 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             for (std::size_t i = frame.captures.size(); i-- > 0;) {
                 auto* ps = dynamic_cast<sema::ParameterSymbol*>(
                     frame.captures[i].first);
-                if (!ps || !ps->iteratorAutoDispose) continue;
+                if (!ps || ps->modifier != "owned") continue;
+                // (#2154 part 2) Visit the slot when EITHER sema flagged
+                // it as auto-disposable (the legacy monotone flag, true
+                // for params sema proved undischarged on every path) OR
+                // the codegen-side scan placed a yield-state on it
+                // (extended linear shape including try-bodies). A param
+                // outside either set has already been consumed in the
+                // source frame and the clone's memcpy'd slot matches a
+                // null/empty value — nothing to dispose.
+                unsigned yieldState = ps->iteratorMoveYieldState;
+                auto cit = ownedParamYieldStates.find(ps);
+                if (cit != ownedParamYieldStates.end()) yieldState = cit->second;
+                bool semaAutoDispose = ps->iteratorAutoDispose;
+                if (!semaAutoDispose && yieldState == 0) continue;
                 unsigned fieldIdx = frame.captureStart + (unsigned)i;
                 llvm::Value* fptr =
                     builder_.CreateStructGEP(stateStructTy, self, fieldIdx);
@@ -1194,14 +1309,14 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                     llvm::BasicBlock::Create(llvm_, "itp.cont", targetFn);
                 llvm::Value* shouldDispose = builder_.CreateICmpNE(
                     obj, llvm::ConstantPointerNull::get(ptrTy()), "itp.nonnull");
-                if (stateKeyedOwned && ps->iteratorMoveYieldState != 0) {
+                if (stateKeyedOwned && yieldState != 0) {
                     // State N means yield N has already transferred its parameter.
                     // State 0 still owns all captures; -1 means fully exhausted.
                     llvm::Value* notComplete = builder_.CreateICmpSGE(
                         disposeState, builder_.getInt32(0), "itp.active");
                     llvm::Value* beforeMove = builder_.CreateICmpSLT(
                         disposeState,
-                        builder_.getInt32((int)ps->iteratorMoveYieldState),
+                        builder_.getInt32((int)yieldState),
                         "itp.beforemove");
                     shouldDispose = builder_.CreateAnd(
                         shouldDispose,
