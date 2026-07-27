@@ -5815,38 +5815,59 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // target-inferred result type. Factored into applyMethodGenericSubst so
     // lowerNullCondCall (`?.`) shares the exact same trigger.
     applyMethodGenericSubst(call, ms);
-    // #1864 / §27.5 / §29.2 / §28.9: an inline-closure PRODUCER (a lambda or
-    // method reference — isPlusOneClosureProducer) passed DIRECTLY as an
-    // argument to a SYNC ITERATOR method is a +1 TEMPORARY (the producer's
-    // reference). The iterator's state-machine frame RETAINS its OWN +1 on the
-    // closure cell at construction (emitIteratorMethod's capture-store retain)
-    // and drops it at the SOURCE Dispose, so it invokes the closure across every
-    // MoveNext independently of this temporary. The producer's transient
-    // reference must therefore be released once the call returns — otherwise the
-    // cell leaks (LSan: 40 bytes, #1864) after the frame that borrowed-and-
-    // retained it is torn down. This is the closure analogue of the #429 string
-    // ARGUMENT-PASS release below, scoped to sync-iterator callees — the only
-    // closure sink whose frame-capture retain this fix arms (an async iterator
-    // or a closure-returning method is left as-is; its capture/return is not
-    // retained here, so releasing would UAF). Snapshot the closure values BEFORE
-    // emitMethodCall (which may rewrite `args` for nullable widening) and release
-    // AFTER, on the normal path only (an exception path leaks the temporary — the
-    // safe direction, matching the string block's `!diverged_` guard).
-    std::vector<llvm::Value*> syncIterClosureArgs;
+    // #1864 / #1921 / §27.5 / §28.9 / §29.2: an inline-closure PRODUCER (a
+    // lambda or method reference — isPlusOneClosureProducer) passed DIRECTLY as
+    // an argument is a +1 TEMPORARY (the producer's reference). Release the
+    // caller's transient reference AFTER the call returns, on the normal path
+    // only (an exception path leaks the temporary — the safe direction,
+    // matching the string block's `!diverged_` guard). The release is safe for
+    // THREE callee shapes, all gated by the same `!isAsyncMethod` +
+    // `!calleeReturnsClosure` precondition:
+    //   (a) SYNC ITERATOR (current #1864): the iterator's state-machine frame
+    //       RETAINS its own +1 on the closure cell at construction
+    //       (emitIteratorMethod's capture-store retain) and drops it at the
+    //       SOURCE Dispose. Caller's release (rc→1) is safe — the frame's
+    //       reference stays alive until Dispose.
+    //   (b) PLAIN NON-ITERATOR METHOD (this fix, #1921 case A): the callee
+    //       uses the closure synchronously inside the call and never retains
+    //       it past the call. Caller's release (rc→0) reclaims the temporary.
+    //   (c) PLAIN METHOD that stores the closure in a FIELD (the field-store
+    //       path lowerClosureFieldStore TRANSFERS the producer's +1 when the
+    //       RHS is a producer — no extra retain — so the field becomes the
+    //       sole owner): the caller's release (rc→0) is the design intent
+    //       matching the field's transferred ownership, NOT a UAF.
+    // The release is UNSAFE for async iterators (frame is suspended across
+    // yields and does not retain at the call boundary) and for closure-
+    // returning methods (the returned value borrows the closure and would
+    // dangle on release). Both shapes are excluded by the precondition.
+    // Snapshot the closure values BEFORE emitMethodCall (which may rewrite
+    // `args` for nullable widening) and release AFTER.
+    std::vector<llvm::Value*> postCallClosureReleases;
     if (auto* mdIt = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-        if (!isAsyncMethod(ms) &&
-                mdIt->bodyKind == ast::MethodBodyKind::Block &&
-                containsYield(mdIt->stmts)) {
-            std::size_t clOffset = isStaticMethod(ms) ? 0 : 1;
-            for (std::size_t ai = clOffset;
-                 ai < args.size() && ai < argExprs.size(); ++ai)
-                if (argExprs[ai] && isPlusOneClosureProducer(argExprs[ai]))
-                    syncIterClosureArgs.push_back(args[ai]);
+        if (!isAsyncMethod(ms)) {
+            // The callee returns a closure-typed value: the return value
+            // borrows the caller's closure, so releasing here would dangle
+            // the return value. Excluded.
+            bool calleeReturnsClosure = false;
+            if (mdIt->returnType) {
+                sema::TypeRef* rt = ctx_.resolvedType(*mdIt->returnType);
+                if (rt && rt->kind == sema::TypeRef::Kind::Function)
+                    calleeReturnsClosure = true;
+            }
+            if (!calleeReturnsClosure) {
+                std::size_t clOffset = isStaticMethod(ms) ? 0 : 1;
+                for (std::size_t ai = clOffset;
+                     ai < args.size() && ai < argExprs.size(); ++ai)
+                    if (argExprs[ai] &&
+                        isPlusOneClosureProducer(argExprs[ai]))
+                        postCallClosureReleases.push_back(args[ai]);
+            }
         }
     }
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs);
     if (!diverged_)
-        for (llvm::Value* cl : syncIterClosureArgs) emitClosureRelease(cl);
+        for (llvm::Value* cl : postCallClosureReleases)
+            emitClosureRelease(cl);
     // Record the concrete subst that drives the RESULT local's layout so that
     // lowerLocalDecl can associate it with the result's local variable.
     //
