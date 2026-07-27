@@ -153,6 +153,7 @@ BEZEL_TEST(codegen_owned_task_field, owned_task_field_overwrite_no_result_2173) 
         "  end Main; "
         "end C;"), 0);
 }
+<<<<<<< HEAD
 
 // ---------------------------------------------------------------------------
 // #1889 — collection cascade: an owning collection of Task-family elements
@@ -243,3 +244,5 @@ BEZEL_TEST(codegen_owned_task_field_2173,
         "  end Main; "
         "end C;"), 1);
 }
+=======
+>>>>>>> parent of b6034ff (fix #1889: dispose Task-family elements in owning collections)

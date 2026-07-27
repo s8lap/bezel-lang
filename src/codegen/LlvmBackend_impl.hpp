@@ -1099,10 +1099,6 @@ private:
     // collections (e.g. OwningArray<OwningArray<R>>). Keyed by the TypeRef* of
     // the inner collection element type (unique per sema type).
     std::map<const sema::TypeRef*, llvm::Function*> nestedCollectionDisposerThunks_;
-    // §28.11 / §30.5 (#1889): per-Task-family-type element thunks for owning
-    // collections of tasks. Each thunk runs the complete non-blocking task drop
-    // protocol, including disposal of an unconsumed class result.
-    std::map<const sema::TypeRef*, llvm::Function*> taskElementDisposerThunks_;
     // #429 / §4.6 / §28.9: the cached per-element string-release thunk (built
     // lazily) for a borrowing Array<string>'s co-owned string elements.
     llvm::Function* stringElementReleaseThunk_ = nullptr;
@@ -4986,10 +4982,6 @@ private:
     // OwningArray<OwningArray<R>>). Recursively resolves the inner element's
     // disposer via elementPolicyFor. Cached per element-collection TypeRef*.
     llvm::Function* nestedCollectionDisposerThunk(const sema::TypeRef* elemCollTy);
-    // §28.11 / §30.5 (#1889): void(void*) thunk for a Task-family element of an
-    // owning collection. Runs the same complete non-blocking disposal protocol
-    // as a task local/owned task field, including the unconsumed-result cascade.
-    llvm::Function* taskElementDisposerThunk(const sema::TypeRef* taskTy);
 
     // #429 / §4.6 / §28.9: a module-level `void(void*)` thunk that calls
     // bz_string_release on the element (the slot holds a bz_string*). Used as the
