@@ -1740,6 +1740,32 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 !returnedClosureLocalOwnsPlusOne(rs->value.get()))
                 emitClosureRetain(v);
         }
+        // fix #1747 / §28.9 / §9.7 / §28.3: a method whose declared return
+        // type is a RECORD with at least one `string` field does NOT mint
+        // an extra +1 on each string field — the constructor's NewExpr arm
+        // already wired each string field to its +1 producer (an
+        // interpolation or `+` for the producer case, or the field's
+        // declaration initializer for the literal case). The callee is
+        // THUS NOT in the +1-minting business for `return new P(...)`;
+        // the record VALUE carries its fields' +1 references to the
+        // caller, and the caller's non-escaping `var p := Mk()` local
+        // balances them at scope end via the recordStringFields
+        // Disposal. The round trip neither leaks (the +1 is released by
+        // the caller) nor dangles (no alias survived the scope — the
+        // escape walk proves the local never escaped). A literal field
+        // initializer is a sentinel — its bz_string_release at scope
+        // end is a no-op (the literal's rc is 0 / sentinel).
+        //
+        // NARROW SCOPE (per the lane's prior decline): the caller-side
+        // registration is restricted to a non-escaping `var p := <call>`
+        // whose return type is a record with string fields. A NewExpr
+        // initializer (the constructor itself is the sole +1 owner), a
+        // copy (`var q := p`), a with-copy, a by-value-arg, a
+        // collection/field store, or a nullable result keep the prior
+        // safe-leak behaviour — the walker over-approximates them as
+        // escapes and they are not registered for release. No code
+        // path emits here — the prior decline pinned this scope and
+        // no callee-side retain is needed.
         // fix #568 / §14.1 / §7.1: when the declared return type is a nullable
         // VALUE type whose concrete form is reached only through the active
         // monomorphization (`T?` with T = a value type — prim/enum/record), the

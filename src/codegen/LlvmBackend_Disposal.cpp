@@ -2413,6 +2413,26 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             emitBoxRelease(b);
             continue;
         }
+        // fix #1747 / §28.9 / §9.7 / §28.3: a plain `var` RECORD local bound
+        // from a record-returning CALL (`var p := Mk()`), proven non-escaping
+        // by the conservative escape walk (StringEscapeWalker with
+        // recordFieldReleaseMode — see LlvmBackend_Setup.cpp). The callee
+        // minted the +1 each string field owns (buildRecordValue's
+        // currentReturnIsRecord_ retain after `return new P(...)`, the
+        // narrow scope the prior lane decline pinned); at scope end — on
+        // BOTH the normal and unwind exit (the fields die either way; a
+        // given exit goes one way only, so each is released exactly once)
+        // — every string field is bz_string_release'd and the slot nulled.
+        // The local was proven non-escaping, so no alias survives the scope
+        // (no UAF) and each field owns exactly one +1 (no double-free).
+        // bz_string_release is null-/sentinel-safe so a literal field is a
+        // no-op (the callee didn't retain it; release stays a no-op too).
+        // `slot` is the record's struct alloca; `cls` is the record
+        // TypeSymbol used to GEP each string storage member.
+        if (it->recordStringFields) {
+            emitRecordStringFieldReleases(it->slot, it->cls);
+            continue;
+        }
         // #429 / §27.5: a boxed capture cell (shared heap allocation from
         // boxLocalSlot) whose owning lambda is proven non-escaping.  `slot`
         // is the ptr-alloca (newSlot) holding the cell pointer.  At scope end

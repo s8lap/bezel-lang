@@ -4642,6 +4642,16 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // #422 / §8.6 / §28.9: which `var` Object/interface locals holding a boxed
     // VALUE may be released at scope end (mirrors stringReleaseEligible_).
     boxReleaseEligible_.clear();
+    // fix #1747 / §28.9 / §9.7 / §28.3: which plain `var` RECORD locals bound
+    // from a record-returning CALL (`var p := Mk()`) may have their string
+    // fields released at scope end (mirrors stringReleaseEligible_;
+    // consulted in lowerLocalDecl). The narrow scope the lane pinned: a
+    // NewExpr-init local, a copy, a with-copy, a by-value-arg, a collection/
+    // field store, or a nullable result are all EXCLUDED (the walker only
+    // admits the call-result pattern with a record-with-string-fields
+    // return type and a conservative non-escape verdict).
+    recordCallResultReleaseEligible_.clear();
+    recordCallResultReleaseEligibleFn_ = fn;
     boxReleaseEligibleFn_ = fn;
     // §27.5 / §28.9 / #672: which +1-box-producer locals are captured by exactly
     // one lambda env, so the owning lambda's envdtor may perform the deferred
@@ -4658,6 +4668,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         collectUnwindIneligible(*ci.stmts);
         collectMoveOnlyArrayTransferred(*ci.stmts);
         collectStringReleaseEligible(*ci.stmts);
+        collectRecordCallResultReleaseEligible(*ci.stmts);  // fix #1747
         collectBorrowingArrayFreeEligible(*ci.stmts);  // #1003
         collectClosureReleaseEligible(*ci.stmts);
         collectBoxReleaseEligible(*ci.stmts);
@@ -7634,6 +7645,36 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         Disposal d{slot, nullptr};
         d.grouping = true;
         disposeStack_.back().push_back(d);
+    }
+    // fix #1747 / §28.9 / §9.7 / §28.3: if this plain `var` RECORD local was
+    // bound from a record-returning CALL (`var p := Mk()`) and proven
+    // NON-escaping by the conservative escape walk
+    // (recordCallResultReleaseEligible_), register a scope-end release of
+    // each string field (the recordStringFields Disposal). The callee mints
+    // the +1 each field owns (the narrow NewExpr-return path's
+    // emitRecordStringFieldRetains), so this single release balances it
+    // (no double-free, no UAF). Gated on currentFn_ matching the analyzed
+    // function (a lambda/thunk body lowered mid-function is not analyzed
+    // → its record locals just leak, never double-freed). disposeStack_ is
+    // non-empty inside any lowered block body.
+    if (v && currentFn_ == recordCallResultReleaseEligibleFn_ &&
+        recordCallResultReleaseEligible_.count(
+            static_cast<const void*>(declNode)) &&
+        !disposeStack_.empty()) {
+        // Recover the record TypeSymbol from the declared annotation, or
+        // — for an inferred `var p := Mk()` — from the initializer's
+        // exprType (the same fallback the eligibility pass uses).
+        const sema::TypeSymbol* recTs = nullptr;
+        const sema::TypeRef* tr = nullptr;
+        if (declType) tr = ctx_.resolvedType(*declType);
+        if (!tr && init) tr = ctx_.exprType(*init);
+        if (tr && isRecordWithStringFieldsTypeRef(tr))
+            recTs = tr->declaration;
+        if (recTs) {
+            Disposal d{slot, recTs};
+            d.recordStringFields = true;
+            disposeStack_.back().push_back(d);
+        }
     }
 }
 
@@ -11418,6 +11459,19 @@ struct StringEscapeWalker {
     // reassigned alias ⇒ reachable double-free). They leave this false; only the two
     // string call sites in collectStringReleaseEligible set it true.
     bool stringReleaseMode = false;
+    // fix #1747 / §28.9 / §9.7 / §28.3: OPT-IN gate for the record-call-result
+    // receiver-taint below. A bare member access on the tracked RECORD local
+    // whose member RUNS USER CODE — a METHOD, a COMPUTED property, an indexer,
+    // or an unresolved symbol — receives `this` as a pointer to the value
+    // struct and may copy the whole record (its un-retained string fields)
+    // into a longer-lived location; a scope-end release would then dangle
+    // that alias (UAF). A bare storage-FIELD / auto-property read runs no
+    // user code and cannot capture `this`, so it stays a safe read and the
+    // record remains eligible. This draws exactly the line the string walk
+    // does not need (strings have no methods that capture `this`). Only the
+    // record-call-result eligibility pass sets it; the
+    // string/dict/grouping/borrowing-Array walks leave it false.
+    bool recordFieldReleaseMode = false;
     // #1871: the set of `var v: IEnumerable<T> := <target-array>` VIEW LocalDecls
     // that were independently proven never to escape. A binding of the target into
     // one of these is a borrow (the view wrapper borrows the array's backing; its
@@ -11741,11 +11795,40 @@ struct StringEscapeWalker {
         }
         // `s.Member` / `s.Method(...)`: the receiver is a read.
         if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
-            expr(m->target.get(), /*safeRead=*/true);
+            // fix #1747 / §28.9 / §9.7 / §28.3: in recordFieldReleaseMode a
+            // member access on the tracked RECORD local whose member RUNS
+            // USER CODE (a method, a computed property, an indexer, or an
+            // unresolved symbol) receives `this` as a pointer to the value
+            // struct and may copy the whole record into a longer-lived
+            // location — a scope-end release would then dangle that alias
+            // (UAF). A bare storage-FIELD / auto-property read runs no user
+            // code and cannot capture `this`, so it stays a safe read and
+            // the record remains eligible. Mirrors the receiver treatment
+            // the string walk doesn't need.
+            bool recSafe = true;
+            if (recordFieldReleaseMode && isTargetIdent(m->target.get())) {
+                sema::Symbol* sym = ctx.exprSymbol(*m);
+                bool storageRead =
+                    (dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) ||
+                    (sym && sema::isAutoPropertySymbol(sym));
+                if (!storageRead) recSafe = false;
+            }
+            expr(m->target.get(), /*safeRead=*/recSafe);
             return;
         }
         if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
-            expr(m->target.get(), /*safeRead=*/true);
+            // fix #1747: same receiver-taint as the plain MemberAccessExpr
+            // arm above, for the null-conditional `p?.Member` / `p?.Method()`
+            // form.
+            bool recSafe = true;
+            if (recordFieldReleaseMode && isTargetIdent(m->target.get())) {
+                sema::Symbol* sym = ctx.exprSymbol(*m);
+                bool storageRead =
+                    (dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) ||
+                    (sym && sema::isAutoPropertySymbol(sym));
+                if (!storageRead) recSafe = false;
+            }
+            expr(m->target.get(), /*safeRead=*/recSafe);
             return;
         }
         // Call: the receiver (callee) is a read; every ARGUMENT escapes.
@@ -13141,6 +13224,90 @@ void Emitter::collectStringReleaseEligible(
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             valueLikeChoiceStrReleaseEligible_.insert(
+                static_cast<const void*>(ld));
+    }
+}
+
+
+// fix #1747 / §28.9 / §9.7 / §28.3: walk the function body and classify
+// every plain-`var` record-call-result LocalDecl — a `var p := <call>` whose
+// initializer is a CallExpr returning a record with at least one `string`
+// field — by escape verdict. The verdict gates the caller's scope-end
+// recordStringFields Disposal: a non-escaping local is the SOLE owner of
+// the callee-minted +1 on each string field (per the narrow NewExpr-return
+// gate on the callee side), so a single release is balanced (no double-free,
+// no UAF). The walker is the shared StringEscapeWalker with
+// recordFieldReleaseMode set so a method/computed-property/indexer
+// RECEIVER on the local taints (it may copy the whole record into a
+// longer-lived location); every other non-safe-read position (call arg,
+// return, lambda capture, with-copy, by-value param, etc.) keeps its
+// conservative escape rule. NARROW SCOPE (per the lane's prior decline):
+// NewExpr-init / copy / with-copy / by-value-arg / collection-or-field-
+// store / nullable / nested-record channels are NOT classified here —
+// they keep the prior safe-leak behaviour (the walker has no special
+// interest in them; they simply don't match the call-result gate below
+// and so aren't registered for release). Gated on currentFn_ matching
+// the analyzed function (a lambda/thunk body lowered mid-function is not
+// analyzed → its record locals just leak, never double-freed).
+void Emitter::collectRecordCallResultReleaseEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    recordCallResultReleaseEligible_.clear();
+    std::vector<const ast::LocalDecl*> candidates;
+    std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            if (!ld->isUsing && ld->initializer) {
+                // #429-style narrow: only a record-returning CALL initializer
+                // is in scope. A `new P(...)` initializer (NewExpr) does NOT
+                // receive callee-minted +1s (the constructor copies field
+                // args directly into the record's slots; only the literal
+                // field sentinel/no-arg-ctor shape stays no-+1). A copy
+                // (IdentifierExpr naming another record local) and a
+                // with-copy (WithExpr) likewise carry no callee-minted +1
+                // by themselves. Restrict to CallExpr only.
+                if (dynamic_cast<const ast::CallExpr*>(ld->initializer.get())) {
+                    // Recover the record-with-string-fields type from the
+                    // declared annotation, or — for an inferred
+                    // `var p := Mk()` — from the initializer's exprType.
+                    const sema::TypeRef* tr = nullptr;
+                    if (ld->type) tr = ctx_.resolvedType(*ld->type);
+                    if (!tr) tr = ctx_.exprType(*ld->initializer);
+                    if (isRecordWithStringFieldsTypeRef(tr))
+                        candidates.push_back(ld);
+                }
+            }
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scan(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scan(b.get());
+            for (auto& b : is->elseBody) scan(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scan(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scan(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scan(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scan(b.get());
+            for (auto& c : ts->catches) scan(c.body.get());
+            for (auto& b : ts->finallyBody) scan(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scan(a.get());
+        }
+    };
+    for (auto& s : body) scan(s.get());
+
+    for (const ast::LocalDecl* ld : candidates) {
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        // recordFieldReleaseMode = true (the gate above); the other modes
+        // stay false so the string-release / borrowing-Array / value-like-
+        // choice relaxation never affects this pass.
+        w.recordFieldReleaseMode = true;
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            recordCallResultReleaseEligible_.insert(
                 static_cast<const void*>(ld));
     }
 }

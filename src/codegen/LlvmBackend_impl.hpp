@@ -721,6 +721,24 @@ private:
         // UAF) and it runs once per exit (no double-free). `slot` holds the box
         // pointer; the class/collection/dict fields are unused.
         bool boxRelease = false;
+        // fix #1747 / §28.9 / §9.7 / §28.3: a plain `var` RECORD local (value
+        // type) bound from a RECORD-RETURNING CALL (`var p := Mk()`) whose
+        // declared type owns at least one `string` field, and which the
+        // conservative escape walk proved NON-escaping. A record's string
+        // fields are runtime-managed (§28.9); a record returned by value
+        // carries its callee-minted +1 on each string field out to the caller
+        // (a directly-returned `new P(...)` retains each string field; this
+        // is the narrow scope the prior lane decline pinned). A record has
+        // no disposer (§9.7), so without this scope-end release the caller's
+        // local leaks the +1 (#1747). At scope end — on BOTH the normal and
+        // unwind exit (the fields die either way; a given exit goes one way
+        // only, so each is released exactly once) — every string field is
+        // released via bz_string_release (null-safe / sentinel-no-op) and
+        // nulled. The local was proven non-escaping, so no alias survives
+        // the scope (no UAF) and each field owns exactly one +1 (no
+        // double-free). `slot` is the record's struct alloca; `cls` is the
+        // record TypeSymbol (used to GEP each string storage member).
+        bool recordStringFields = false;
         // §2.15 / issue #550: a `using var` bound to a BinarySerializer or
         // BinaryDeserializer.  These are opaque heap handles with no user
         // TypeSymbol and no vtable.  At scope end they are freed via
@@ -2295,6 +2313,66 @@ private:
         auto* fn = declareC("bz_box_release",
                             llvm::Type::getVoidTy(llvm_), {ptrTy()});
         builder_.CreateCall(fn, {b});
+    }
+
+    // fix #1747 / §28.9 / §9.7 / §28.3: GEP every string storage member of
+    // record `ts` at struct ADDRESS `recAddr` (the slot in a plain-`var`
+    // local), load the field's current string pointer, bz_string_release
+    // (null-/sentinel-safe), and null the slot so a re-read sees a defined
+    // null (matching the boxRelease / closureRelease / stringRelease
+    // semantics). Used by the recordStringFields scope-end Disposal.
+    void emitRecordStringFieldReleases_impl(llvm::Value* recAddr,
+                                            const sema::TypeSymbol* ts) {
+        if (!recAddr || !ts || ts->kind != ast::TypeDeclKind::Record) return;
+        llvm::StructType* st = recordStruct(ts);
+        if (!st) return;
+        std::vector<const sema::Symbol*> storage;
+        collectRecordStorage(ts, storage);
+        for (const sema::Symbol* m : storage) {
+            if (!isStringStorageMember(m)) continue;
+            auto idxIt = fieldIndex_.find(m);
+            if (idxIt == fieldIndex_.end()) continue;
+            llvm::Value* addr =
+                builder_.CreateStructGEP(st, recAddr, idxIt->second,
+                                          "recstrf.addr");
+            llvm::Value* val =
+                builder_.CreateLoad(ptrTy(), addr, "recstrf.val");
+            emitStringRelease(val);
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+        }
+    }
+
+    // fix #1747 / §28.9: GEP every string storage member of record VALUE
+    // `recVal` (a struct SSA value), load the field's current string
+    // pointer, and bz_string_retain (null-/sentinel-safe). Used on the
+    // callee side immediately after `return new P(...)` builds the value
+    // — the retain mints the +1 the returned record carries to the
+    // caller, balancing the caller's scope-end recordStringFields
+    // disposal. A literal field is a sentinel and its retain is a no-op
+    // (bz_string_retain is null-/sentinel-safe). `recVal` is a struct
+    // VALUE; we spill it to a temp because CreateStructGEP wants a
+    // pointer and we don't have one for an SSA value.
+    void emitRecordStringFieldRetains_impl(llvm::Value* recVal,
+                                           const sema::TypeSymbol* ts) {
+        if (!recVal || !ts || ts->kind != ast::TypeDeclKind::Record) return;
+        llvm::StructType* st = recordStruct(ts);
+        if (!st) return;
+        // Spill the SSA value to a temp slot so each GEP can address it.
+        llvm::AllocaInst* tmp = entryAlloca(st);
+        builder_.CreateStore(recVal, tmp);
+        std::vector<const sema::Symbol*> storage;
+        collectRecordStorage(ts, storage);
+        for (const sema::Symbol* m : storage) {
+            if (!isStringStorageMember(m)) continue;
+            auto idxIt = fieldIndex_.find(m);
+            if (idxIt == fieldIndex_.end()) continue;
+            llvm::Value* addr =
+                builder_.CreateStructGEP(st, tmp, idxIt->second,
+                                          "recstrr.addr");
+            llvm::Value* val =
+                builder_.CreateLoad(ptrTy(), addr, "recstrr.val");
+            emitStringRetain(val);
+        }
     }
 
     // Load the data pointer (field 0) from a bz_string pointer.
@@ -5496,6 +5574,81 @@ private:
         const sema::TypeRef* rt = recordMemberType(m);
         return rt && rt->kind == sema::TypeRef::Kind::Function;
     }
+
+    // fix #1747 / §28.9 / §9.7 / §28.3: does record `ts` have at least one
+    // `string` storage member (positional field, body field, or auto-property)?
+    // Such a field holds a runtime-managed reference whose +1 must be
+    // released when the record value dies (§28.9, §9.7 — a record has no
+    // disposer, so the discipline falls on the caller / disposal walker).
+    bool recordHasStringFields(const sema::TypeSymbol* ts) {
+        if (!ts || ts->kind != ast::TypeDeclKind::Record) return false;
+        std::vector<const sema::Symbol*> storage;
+        collectRecordStorage(ts, storage);
+        for (const sema::Symbol* m : storage) {
+            if (isStringStorageMember(m)) return true;
+        }
+        return false;
+    }
+
+    // fix #1747 / §28.9 / §9.7 / §28.3: is `tr` a (non-nullable) record
+    // TypeRef whose record owns at least one `string` field? Convenience
+    // classifier used at return sites (the callee retain) and the caller's
+    // call-result registration. A nullable record (`P?`) is excluded — it
+    // lowers to {i8, P} and a nullable-result release path is deferred.
+    bool isRecordWithStringFieldsTypeRef(const sema::TypeRef* tr) {
+        if (!tr || tr->nullable ||
+            tr->kind != sema::TypeRef::Kind::Named || !tr->declaration)
+            return false;
+        return recordHasStringFields(tr->declaration);
+    }
+
+    // fix #1747 / §28.9 / §9.7 / §28.3: release each string storage member
+    // of record `ts` at the struct ADDRESS `recAddr`. For each string
+    // field: GEP the slot, load the string pointer, bz_string_release (null-
+    // safe / sentinel-no-op), null the slot. Used by the recordStringFields
+    // scope-end Disposal to balance the callee-minted +1.
+    void emitRecordStringFieldReleases(llvm::Value* recAddr,
+                                       const sema::TypeSymbol* ts) {
+        emitRecordStringFieldReleases_impl(recAddr, ts);
+    }
+
+    // fix #1747 / §28.9: retain each string storage member of record VALUE
+    // `recVal` (a struct SSA value — spilled to a temp, GEP + load +
+    // bz_string_retain). Used on the callee side after `return new P(...)`
+    // to mint the +1 the returned record carries out to the caller. The
+    // retained +1 is what the caller's scope-end recordStringFields
+    // Disposal balances. A literal field is a sentinel — its retain is a
+    // no-op (bz_string_retain is null-/sentinel-safe).
+    void emitRecordStringFieldRetains(llvm::Value* recVal,
+                                      const sema::TypeSymbol* ts) {
+        emitRecordStringFieldRetains_impl(recVal, ts);
+    }
+
+    // fix #1747 / §28.9 / §9.7 / §28.3: set while lowering the operand of
+    // a ReturnStmt whose declared return type is a record with string
+    // fields. Detected as a NewExpr of the matching record — read here to
+    // retain each string field after construction, transferring one +1 out
+    // of the callee to the caller.
+    bool currentReturnIsRecord_ = false;
+
+    // fix #1747 / §28.9 / §9.7 / §28.3: the set of plain `var` RECORD
+    // LocalDecl nodes whose declared type owns at least one `string` field,
+    // whose initializer is a CALL returning that record (`var p := Mk()`),
+    // and which the conservative escape walk proved never to escape. The
+    // callee mints the +1 each string field owns (the narrow NewExpr
+    // return path's emitRecordStringFieldRetains), so the caller's scope-
+    // end recordStringFields Disposal balances it (no double-free, no
+    // UAF). A NewExpr-init local, a copy (`var q := p`), a with-copy, a
+    // by-value-argument, a collection/field store, or a nullable result
+    // keeps the prior safe-leak behaviour — the walker over-approximates
+    // and the eligibility is intentionally narrow.
+    std::unordered_set<const void*> recordCallResultReleaseEligible_;
+    llvm::Function* recordCallResultReleaseEligibleFn_ = nullptr;
+
+    // fix #1747: walk the function body, classifying each plain-`var`
+    // record-call-result LocalDecl by escape verdict.
+    void collectRecordCallResultReleaseEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
     // #429: is the resolved TypeRef `rt` a (non-nullable) `string`? Used to
     // zero-init a no-initializer `var s: string;` slot so reassignment's
