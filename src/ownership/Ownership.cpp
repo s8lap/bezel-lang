@@ -2659,17 +2659,30 @@ static bool isClassOrInterfaceResult(const sema::TypeRef* rt) {
 // non-value-builtin name — an unsubstituted type parameter, or an
 // unresolved/imported reference) is NOT erased, because erasing a class
 // substitution there would leak its resource; keeping the marker over-warns at
-// worst, never under-disposes. // per §28.1 v0.196 #1817
+// worst, never under-disposes.
+//
+// §28.1/§28.2 v0.196/#1817/#1860 — E1/E2 reconciliation (#1857): the
+// authoritative reject set in `checkOwnedDeclType` declares every primitive
+// (including `Object`, which §28.2 excludes from the `IDisposable` contract),
+// the unit type `()`, and every function type to carry no disposal obligation.
+// The earlier E1 carve-out (keeping `Object`/`Unit`/`Function` Owned as a
+// deliberate leak-safe choice) is provably wrong at the substitution boundary:
+// a `Factory<Object>.Make(…)` return was spuriously tracked Owned and emitted a
+// bogus §28.3 auto-drop warning (`var n := f.Make(7)` — `n: Object` carries no
+// Dispose). The substitution-erasure predicate now mirrors E2 — `Owned` is
+// erased on Object/Unit/Function the same way it is on `string`/int/long/…, so
+// the bare-type-parameter transfer meaning at a class/interface substitution is
+// unchanged. // per §28.1 v0.196 #1817, §28.2 v0.196 #1857
 bool isValueSubstitutionErased(const sema::TypeRef* rt) {
     if (!rt) return false;
     switch (rt->kind) {
         case sema::TypeRef::Kind::Primitive:
-            // Every primitive is value/runtime-managed with no disposal
-            // obligation (`string` is runtime-managed, §28.9) — EXCEPT `Object`,
-            // the root reference type, whose substitution is a class-like
-            // transfer that must stay Owned.
-            return rt->primitive != sema::PrimitiveType::Object &&
-                   rt->primitive != sema::PrimitiveType::None;
+            // Every primitive is a value/runtime-managed type with no disposal
+            // obligation — `string` is runtime-managed (§28.9) and the rest
+            // (including `Object` — §28.2's "`Dispose()` is not on `Object`")
+            // are value types, mirroring `checkOwnedDeclType`'s uniform
+            // primitive reject.
+            return true;
         case sema::TypeRef::Kind::Named:
             if (rt->declaration) {
                 // A value-builtin (DateTime/Guid/TimeSpan/CancellationToken/…)
@@ -2700,6 +2713,10 @@ bool isValueSubstitutionErased(const sema::TypeRef* rt) {
             return !rt->arrayOwned;
         case sema::TypeRef::Kind::Unit:
         case sema::TypeRef::Kind::Function:
+            // The unit type `()` and any function type are value/runtime-
+            // managed (§28.9) — `checkOwnedDeclType` rejects `owned` on both,
+            // so the substitution-erasure predicate erases the marker too.
+            return true;
         case sema::TypeRef::Kind::Error:
             return false;
     }
