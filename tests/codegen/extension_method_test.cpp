@@ -595,3 +595,73 @@ BEZEL_TEST(codegen_extension, real_member_wins_over_object_extension_spec_26_5_1
         "  return f.Tag(); "  // 100 — the real member, not the extension
         "end Main; end C;"), 100);
 }
+
+// ===========================================================================
+// §26.2 / §26.5 (#1314) — `extension Object` resolved through a VALUE-typed
+// receiver (record / enum / primitive). Spec §2 says "every type derives from
+// Object" — that holds for value types too, but a value receiver must be BOXED
+// to a heap Object reference (§8.6) before the call so the extension's
+// `this: Object` argument matches the callee's `ptr` `this` parameter. Before
+// the fix: (a) sema rejected `p.Tag()` on a record/enum/primitive receiver as
+// `no member Tag on type <receiver>`, because the Object-match in
+// `extensionFindMatchingAncestor` was scoped to Class/Interface receivers only;
+// (b) even if sema had resolved, codegen would have passed the raw struct
+// where ptrTy() is expected and the §484 non-pointer guard silently dropped
+// the call (returning 0). After the fix: sema admits the value-typed receiver
+// and codegen boxes the value via boxValue (§8.6) before the call.
+// ===========================================================================
+
+// Object extension resolved through a RECORD receiver — the receiver is boxed
+// to a heap Object reference (§8.6 / §28.9 producer) and the extension's
+// `this: Object` is that box pointer.
+BEZEL_TEST(codegen_extension, method_on_object_via_record_receiver_spec_26_5_1314) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "extension Object public method Tag(): int => 7; end; "
+        "record Pt(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pt(1, 2); "
+        "  return p.Tag(); "  // 7 — boxed to Object, extension dispatches
+        "end Main; end C;"), 7);
+}
+
+// Object extension resolved through an ENUM receiver — the underlying integer
+// is boxed to Object (record-box-style, since an enum is a value type per §10).
+BEZEL_TEST(codegen_extension, method_on_object_via_enum_receiver_spec_26_5_1314) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "extension Object public method Tag(): int => 42; end; "
+        "enum Color: int Red := 1, Green := 2, Blue := 3; end Color; "
+        "class C public static method Main(): int "
+        "  var c := Color.Red; "
+        "  return c.Tag(); "  // 42
+        "end Main; end C;"), 42);
+}
+
+// Object extension resolved through a PRIMITIVE (numeric) receiver — the i32
+// value is boxed to Object (§8.6). Other value primitives (bool, char) box the
+// same way; i32 is the canonical case.
+BEZEL_TEST(codegen_extension, method_on_object_via_int_receiver_spec_26_5_1314) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "extension Object public method Tag(): int => 99; end; "
+        "class C public static method Main(): int "
+        "  var n := 5; "
+        "  return n.Tag(); "  // 99
+        "end Main; end C;"), 99);
+}
+
+// Object extension over a record receiver with an argument — exercises the
+// boxing for the receiver AND the normal argument-pass + cleanup path. ASan
+// (runAotChecked) verifies the box is released after the call when the
+// callee does not retain it.
+BEZEL_TEST(codegen_extension, method_on_object_via_record_with_arg_spec_26_5_1314) {
+    BEZEL_EXPECT_EQ(runMod(
+        "module M; "
+        "extension Object public method Plus(n: int): int => n + 1; end; "
+        "record Pt(x: int, y: int); "
+        "class C public static method Main(): int "
+        "  var p := new Pt(1, 2); "
+        "  return p.Plus(10); "  // 11
+        "end Main; end C;"), 11);
+}
