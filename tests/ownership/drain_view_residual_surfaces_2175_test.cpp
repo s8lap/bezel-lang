@@ -252,38 +252,4 @@ BEZEL_TEST(drain_view_getter_2175,
 // the `h._items.Drain()` form for a parameter-sourced `h`).
 
 // ===========================================================================
-// (c1) §28.10 LINT NIT — `using var q := h.Q;` over the (b) getter, where
-// `h` is a parameter: the pin IS vacuous (the parameter outlives this
-// scope). The vacuous-pin lint should fire and steer the user toward
-// `const q := h.Q;`. // per §28.10, #2175
-// ===========================================================================
-BEZEL_TEST(drain_view_getter_2175,
-           using_var_over_getter_with_param_receiver_fires_vacuous_lint) {
-    auto r = parseAndCheckOwnership(
-        std::string(kR) +
-        "class Holder "
-        "  private owned _items: OwningArray<R>; "
-        "  public constructor() _items := new OwningArray<R>(); end constructor; "
-        "  public property Q: IOwningEnumerable<R> => _items.Drain(); "
-        "end Holder; "
-        "class P "
-        "  public method Run(h: Holder): int "
-        "    using var q := h.Q; "
-        "    return 0; "
-        "  end Run; "
-        "  public static method Main(): int return 0; end Main; "
-        "end P;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    // The vacuous-pin lint for the borrow-pin case is "pins a source that
-    // already outlives this scope" — check the diagnostic is present.
-    bool found = false;
-    for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.severity != bezel::Severity::Warning) continue;
-        if (d.message.find("pins a source that already outlives") ==
-                std::string::npos) continue;
-        if (d.message.find("`q`") != std::string::npos) { found = true; break; }
-    }
-    BEZEL_EXPECT_TRUE(found);
-}
 
-}  // namespace

@@ -171,4 +171,3 @@ BEZEL_TEST(dispatched_getter_borrow_pin_2174,
 // interface case is the same body, just read through the interface —
 // rejection happens at the definition site, not the use site.
 
-}  // namespace
