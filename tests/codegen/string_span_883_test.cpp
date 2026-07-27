@@ -23,6 +23,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 int run(const std::string& prog) {
@@ -140,4 +141,67 @@ BEZEL_TEST(string_span_883, search_methods_deferred_clean_reject) {
         "  var os := other.AsSpan(); "
         "  return sp.IndexOf(os); "
         "end Main; end C;"), true);
+}
+
+// §3.3 / §29.2 / #971 item 2: `for var c in sp` over a ReadOnlyStringSpan
+// iterates the span's code points in order (source-relative offset
+// start..start+len). Sum-of-codes for "hello" is 104+101+108+108+111 = 532.
+// Uses runAotOut (write the sum to stdout) because 532 exceeds the 8-bit
+// exit-code channel that runAot reads.
+BEZEL_TEST(string_span_883, for_in_iterates_full_span_971) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hello\"; "
+        "  var sp := s.AsSpan(); "
+        "  var sum := 0; "
+        "  for var c in sp do sum := sum + c; end; "
+        "  Console.WriteLine(sum); "
+        "  return 0; "
+        "end Main; end C;"), "532");
+}
+
+// §3.3 / §29.2 / #971 item 2: for-in over a SLICED span iterates ONLY the
+// sliced sub-range. "hello world".AsSpan(6, 5) -> "world"; sum = 119+111+
+// 114+108+100 = 552. Uses runAotOut (552 > 255).
+BEZEL_TEST(string_span_883, for_in_iterates_sliced_span_971) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hello world\"; "
+        "  var sp := s.AsSpan(6, 5); "
+        "  var sum := 0; "
+        "  for var c in sp do sum := sum + c; end; "
+        "  Console.WriteLine(sum); "
+        "  return 0; "
+        "end Main; end C;"), "552");
+}
+
+// §3.3 / §29.2 / #971 item 2: for-in over a span produced by
+// `s.AsSpan(start, length)` (the `(start, length)` overload) iterates the
+// sub-range. "hello".AsSpan(1, 3) -> "ell"; sum = 101+108+108 = 317. Uses
+// runAotOut (317 > 255). (.Slice() is not yet wired in codegen; this is the
+// shape that DOES go through the span's start/length fields.)
+BEZEL_TEST(string_span_883, for_in_iterates_slice_subview_971) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hello\"; "
+        "  var sp := s.AsSpan(1, 3); "
+        "  var sum := 0; "
+        "  for var c in sp do sum := sum + c; end; "
+        "  Console.WriteLine(sum); "
+        "  return 0; "
+        "end Main; end C;"), "317");
+}
+
+// §3.3 / §29.2 / #971 item 2: for-in over a ZERO-LENGTH span is a no-op
+// (the body never runs; sum stays 0). Verifies the condBB's i32-widened
+// length-0 comparison works without an OOB read on the empty sub-range.
+BEZEL_TEST(string_span_883, for_in_over_zero_length_span_971) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var s := \"hello\"; "
+        "  var sp := s.AsSpan(2, 0); "
+        "  var sum := 0; "
+        "  for var c in sp do sum := sum + c; end; "
+        "  return sum; "
+        "end Main; end C;"), 0);
 }

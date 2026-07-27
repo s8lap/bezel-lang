@@ -2110,6 +2110,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         if (lowerArrayFor(*fors)) return false;
         // §4.6: `for var c in s` over a string — iterates chars.
         if (lowerStringFor(*fors)) return false;
+        // §3.3 / §29.2 / #971 item 2: `for var c in sp` over a
+        // ReadOnlyStringSpan — iterates code points over the span's
+        // [start, start+len) sub-range of the source string. Runs after
+        // lowerStringFor (string is a more specific check) and before the
+        // enumerable paths (which would otherwise fall through to the NYI).
+        if (lowerStringSpanFor(*fors)) return false;
         // stdlib §5: `for var x in <lazy LINQ pipeline>` — iterate the deferred
         // enumerator without materializing it.
         if (lowerLazyLinqFor(*fors)) return false;
@@ -5157,6 +5163,77 @@ bool Emitter::lowerStringFor(const ast::ForStmt& fs) {
     builder_.SetInsertPoint(incBB);
     llvm::Value* idxInc = builder_.CreateLoad(i64(), idxSlot);
     builder_.CreateStore(builder_.CreateAdd(idxInc, builder_.getInt64(1)), idxSlot);
+    builder_.CreateBr(condBB);
+
+    builder_.SetInsertPoint(endBB);
+    return true;
+}
+
+
+// §3.3 / §29.2 / #971 item 2: `for var c in sp do … end` over a
+// ReadOnlyStringSpan — iterate code points over the span's
+// [start, start+len) sub-range of the source string. Same lowering shape
+// as lowerStringFor but the source pointer (field 0 of the {ptr, i32, i32}
+// span struct), start offset (field 1) and code-point length (field 2) come
+// from the span; the loop variable is loaded via loadCodePoint(src, start+idx).
+// A null iterable / non-span static type / type without the span struct
+// falls through (returns false) so the regular for-handler chain can take it.
+bool Emitter::lowerStringSpanFor(const ast::ForStmt& fs) {
+    if (!fs.iterable) return false;
+    auto* tt = ctx_.exprType(*fs.iterable);
+    if (!tt || tt->kind != sema::TypeRef::Kind::Named || tt->declaration ||
+        !tt->astNode || !tt->astNode->name ||
+        tt->astNode->name->parts.empty())
+        return false;
+    if (tt->headName() != "ReadOnlyStringSpan") return false;
+
+    llvm::Value* sv = lowerExpr(*fs.iterable);
+    if (!sv) return false;
+    // {ptr source, i32 start, i32 length}
+    llvm::Value* srcPtr = builder_.CreateExtractValue(sv, {0u}, "ssp.src");
+    llvm::Value* start  = builder_.CreateExtractValue(sv, {1u}, "ssp.start");
+    llvm::Value* len32  = builder_.CreateExtractValue(sv, {2u}, "ssp.len");
+
+    // Index counter (i64) into the span's logical [0, len) range.
+    auto* idxSlot = entryAlloca(i64());
+    builder_.CreateStore(builder_.getInt64(0), idxSlot);
+
+    // Loop variable slot — the body sees `c` as the current char (i32).
+    auto* varSlot = entryAlloca(i32());
+    locals_[&fs] = varSlot;
+
+    auto* condBB = llvm::BasicBlock::Create(llvm_, "ssp.cond", currentFn_);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ssp.body", currentFn_);
+    auto* incBB  = llvm::BasicBlock::Create(llvm_, "ssp.inc",  currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "ssp.end",  currentFn_);
+    builder_.CreateBr(condBB);
+
+    builder_.SetInsertPoint(condBB);
+    llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+    // idx < len (widened from i32 → i64 for the compare)
+    llvm::Value* len64 =
+        builder_.CreateZExt(len32, i64(), "ssp.len64");
+    llvm::Value* cond = builder_.CreateICmpULT(idx, len64, "ssp.cond");
+    builder_.CreateCondBr(cond, bodyBB, endBB);
+
+    builder_.SetInsertPoint(bodyBB);
+    llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
+    // Source index = start + idx (start is i32).
+    llvm::Value* start64 =
+        builder_.CreateZExt(start, i64(), "ssp.start64");
+    llvm::Value* srcIdx =
+        builder_.CreateAdd(start64, idxB, "ssp.srcidx");
+    builder_.CreateStore(loadCodePoint(srcPtr, srcIdx), varSlot);
+    loopStack_.push_back({incBB, endBB, disposeStack_.size()});
+    lowerForBody(fs);
+    loopStack_.pop_back();
+    if (!builder_.GetInsertBlock()->getTerminator())
+        builder_.CreateBr(incBB);
+
+    builder_.SetInsertPoint(incBB);
+    llvm::Value* idxInc = builder_.CreateLoad(i64(), idxSlot);
+    builder_.CreateStore(builder_.CreateAdd(idxInc, builder_.getInt64(1)),
+                         idxSlot);
     builder_.CreateBr(condBB);
 
     builder_.SetInsertPoint(endBB);

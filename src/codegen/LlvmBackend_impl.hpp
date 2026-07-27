@@ -7527,6 +7527,14 @@ private:
     // each char (i32 code point) in order. For ASCII/UTF-8 strings this
     // iterates bytes; full Unicode code-point iteration deferred.
     bool lowerStringFor(const ast::ForStmt& fs);
+    // §3.3 / §29.2 / #971 item 2: `for var c in sp do … end` over a
+    // ReadOnlyStringSpan — iterates code points over the span's [start, start+len)
+    // sub-range of the source string. Same lowering shape as lowerStringFor but
+    // the source pointer and the length come from the {ptr, i32 start, i32 length}
+    // span struct (field 0 is the source, field 1 is the start offset, field 2
+    // is the code-point length). The span itself is a stateless view, so no
+    // disposal scope is needed for the iterable.
+    bool lowerStringSpanFor(const ast::ForStmt& fs);
 
     // §29.2: `for var x in obj` over a user-defined IEnumerable<T> type,
     // or over a runtime Array<T>/collection when the iterable's type has
