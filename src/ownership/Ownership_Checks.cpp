@@ -2598,10 +2598,10 @@ namespace {
 // (§9.7 transitivity: "another borrow-bearing record … (transitivity)" applied
 // to the span views, which are borrow-bearing records without a user TypeDecl).
 // Name-head resolution mirrors builtinTypeRefNameHead (declaration name, else
-// use-site syntactic head, else imported name). The string-backed spans
-// (ReadOnlyStringSpan / ReadOnlyAsciiByteSpan) view a runtime-managed `string`
-// and are deliberately NOT here (§9.7); CancellationToken (§30.8) is a value
-// builtin and likewise not a span. // per §9.7, §4.14, §4.15
+// use-site syntactic head, else imported name). The string-backed span
+// ReadOnlyStringSpan views a runtime-managed `string` and is deliberately NOT
+// here (§9.7); CancellationToken (§30.8) is a value builtin and likewise not a
+// span. // per §9.7, §4.14, §4.15
 bool isBuiltinSpanTypeRef(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
     const std::string_view n =
@@ -10027,9 +10027,8 @@ bool MethodOwnership::isBorrowBearingRecordOrSpan(const sema::TypeRef* rt) const
     if (!rt) return false;
     // Builtin span *views* carry a borrow of their backing Array / OwningBuffer
     // (a reference type) but have no user Record TypeDecl, so isBorrowBearing
-    // Record misses them. The string-backed spans (ReadOnlyStringSpan /
-    // ReadOnlyAsciiByteSpan) view a runtime-managed `string` and are NOT
-    // borrow-bearing (§9.7); CancellationToken (§30.8) is a value builtin and
+    // Record misses them. The string-backed span ReadOnlyStringSpan views a
+    // runtime-managed `string` and is NOT borrow-bearing (§9.7); CancellationToken (§30.8) is a value builtin and
     // is likewise not in this list — its exemption is the single enumerated
     // stdlib carve-out. // per §30.1, §4.14, §4.15
     const std::string_view n = builtinTypeRefNameHead(rt);

@@ -11052,9 +11052,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // §9.6 / §3.3 (#883): string.AsSpan() and its overloads
                     // ((start), (start, length), (r: Range<int>)) return a
                     // ReadOnlyStringSpan — a non-allocating char-level view over a
-                    // contiguous range of the string. (string also has
-                    // AsAsciiByteSpan/TryAsAsciiByteSpan returning a
-                    // ReadOnlyAsciiByteSpan — deferred; see the follow-up issue.)
+                    // contiguous range of the string.
                     if (ma.member == "AsSpan") {
                         static const ast::Type* kStrSpanNode = []() -> ast::Type* {
                             auto* qn = new ast::QualifiedName;

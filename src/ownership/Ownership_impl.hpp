@@ -1723,8 +1723,8 @@ private:
     // predicate above misses it). The stdlib-certified `CancellationToken`
     // (§30.8, the single enumerated exception) is a value builtin with no
     // Record decl and is not in the span list, so it is correctly NOT flagged;
-    // likewise the string-backed spans `ReadOnlyStringSpan` /
-    // `ReadOnlyAsciiByteSpan` (string is runtime-managed, §9.7). // per §30.1
+    // likewise the string-backed span `ReadOnlyStringSpan` (string is
+    // runtime-managed, §9.7). // per §30.1
     bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt) const;
 
     // §35.4 / §9.7 (v0.220, #2180): true when `rt` is a BORROW-BEARING choice

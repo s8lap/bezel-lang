@@ -184,7 +184,7 @@ bool staticFactoryReturnsFreshOwned(const ast::MethodDecl& md,
 // borrow of its backing reference-typed store but has no user Record
 // TypeDecl. `CancellationToken` (§30.8, the single stdlib-certified
 // exception) and the string-backed spans (`ReadOnlyStringSpan` /
-// `ReadOnlyAsciiByteSpan`, over the runtime-managed `string`) are correctly
+// `ReadOnlyStringSpan`, over the runtime-managed `string`) is correctly
 // excluded.
 //
 // Two consumers need the IDENTICAL predicate: the async-signature

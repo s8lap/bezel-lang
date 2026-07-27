@@ -355,7 +355,6 @@ stdlib_0028	stdlib	217-Built-in-exception-types-cross-reference	fragment	compile
 stdlib_0029	stdlib	31-StringBuilder	skip	n/a	skip:signature
 stdlib_0030	stdlib	32-Encoding	skip	n/a	skip:signature
 stdlib_0031	stdlib	33-ReadOnlyStringSpan	skip	n/a	blocked-on-#971
-stdlib_0032	stdlib	34-ReadOnlyAsciiByteSpan	skip	n/a	blocked-on-#971
 stdlib_0033	stdlib	41-Borrowing-collection-interfaces	skip	n/a	skip:signature
 stdlib_0034	stdlib	42-Owning-collection-interfaces	skip	n/a	skip:signature
 stdlib_0035	stdlib	43-How-the-borrowing-and-owning-hierarchies-relate	skip	n/a	skip:signature-listing

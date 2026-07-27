@@ -3736,7 +3736,7 @@ ExprTC::moveThroughInterfaceSlotName(const ast::Expr& operand) const {
 // `move span[i]` cannot transfer ownership. The borrowing spans view a
 // non-owning source — `ArraySpan<T>` / `ReadOnlyArraySpan<T>` view a borrowing
 // `Array<T>`, and the read-only spans (`ReadOnlySpan<T>`, `IReadOnlySpan<T>`,
-// `ReadOnlyStringSpan`, `ReadOnlyAsciiByteSpan`) view a borrowed string / buffer
+// `ReadOnlyStringSpan`) view a borrowed string / buffer
 // — so their slots hold borrows with nothing to move out. (The OWNING `Span<T>`
 // over an `OwningBuffer` is intentionally NOT matched.) Returns the span type
 // name when `operand` is `span[i]` over such a span, else the empty string.
@@ -3757,7 +3757,7 @@ ExprTC::moveThroughBorrowingSpanSlotName(const ast::Expr& operand) const {
         name = tt->headName();
     if (name == "ArraySpan" || name == "ReadOnlyArraySpan" ||
         name == "ReadOnlySpan" || name == "IReadOnlySpan" ||
-        name == "ReadOnlyStringSpan" || name == "ReadOnlyAsciiByteSpan")
+        name == "ReadOnlyStringSpan")
         return std::string(name);
     return {};
 }
