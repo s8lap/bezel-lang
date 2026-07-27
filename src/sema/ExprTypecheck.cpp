@@ -3,6 +3,7 @@
 
 #include <cerrno>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -2443,6 +2444,124 @@ const ChoiceCaseSymbol* ExprTC::findChoiceCaseOnScrutinee(
         }
     }
     return nullptr;
+}
+
+// #2219: apply the scrutinee's per-instantiation generic-arg substitution to
+// a generic CHOICE's case payload field type. Walks `ty` and rewrites every
+// bare-name TypeRef whose declaration is one of `scrutTy->declaration`'s
+// generic parameters (matched by NAME) with the corresponding entry from
+// `scrutTy->genericArgs`. Recurses into Named genericArgs, InlineArray
+// element types, Function parameter/return types, and the nullable wrapper,
+// so `Array<T>?` at scrutinee `Result<Array<int>, string>` substitutes to
+// `Array<int>?`. A bare `T` at the case-payload slot becomes the substituted
+// `int`, which is what the destructuring pattern's binding type must be so
+// the arms' §20 common-type computation sees both arms at `int`. Without
+// this, both arms of `case r of Ok(v) => v, Err(e) => e` over `Result<int,
+// int>` were typed against the bare `T` and `E` (different generic params
+// of the same choice), and `commonTypeOf` rejected the unrelated named
+// types with the §20 "no common type" diagnostic.
+//
+// Returns `ty` unchanged when no substitution applies (a non-generic choice,
+// a non-parametric field type, a scrutinee without genericArgs) so callers
+// can use the helper unconditionally.
+//
+// Mirrors the field-walk of Resolver::applyGenericSubst + the env-build part
+// of Resolver::buildBaseGenericSubst (TypeResolution_Checks.cpp) — local
+// copy because the ExprTC worker has no Resolver handle (#1621 / §31.2.1
+// split). Per §35.5 "Case patterns" + §14.5 "Type-argument inference"
+// posture (type-level arguments are NEVER inferred; the scrutinee's args are
+// the ones substituted).
+TypeRef* ExprTC::substituteGenericCaseFieldType(
+        const TypeRef* ty, const TypeRef* scrutTy) {
+    if (!ty || !scrutTy) return const_cast<TypeRef*>(ty);
+    // Collect the substitution map from the scrutinee's choice declaration.
+    // A non-Named scrutinee, a non-choice, or an instantiated-without-args
+    // candidate carries no substitution (return unchanged).
+    if (scrutTy->kind != TypeRef::Kind::Named || !scrutTy->declaration ||
+        scrutTy->declaration->kind != ast::TypeDeclKind::Choice) {
+        return const_cast<TypeRef*>(ty);
+    }
+    const auto& params = scrutTy->declaration->genericParams;
+    const auto& args = scrutTy->genericArgs;
+    if (params.empty() || args.empty()) return const_cast<TypeRef*>(ty);
+    if (params.size() != args.size()) return const_cast<TypeRef*>(ty);
+    // std::function yields a self-referential walker for the recursive kinds
+    // (Named-with-genericArgs, InlineArray element, Function param/return).
+    std::function<TypeRef*(const TypeRef*)> substituteInto =
+        [&](const TypeRef* sub) -> TypeRef* {
+        if (!sub) return nullptr;
+        // A bare-Named TypeRef naming a generic parameter of the scrutinee's
+        // choice — type resolution mints generic params as Named refs with
+        // `declaration == nullptr` (the resolveNamed path at
+        // TypeResolution_Names.cpp:1308 deliberately nulls the declaration so
+        // sema slices distinguish "unresolved-but-parameter" from real Named
+        // types). Match by NAME against the choice's `genericParams`.
+        if (sub->kind == TypeRef::Kind::Named && !sub->declaration &&
+            sub->astNode && sub->astNode->name &&
+            !sub->astNode->name->parts.empty() &&
+            sub->astNode->name->parts.size() == 1) {
+            for (std::size_t i = 0; i < params.size(); ++i) {
+                if (auto* gp = dynamic_cast<const GenericParamSymbol*>(
+                        params[i])) {
+                    if (gp->name == sub->astNode->name->parts.front()) {
+                        TypeRef* rep = args[i];
+                        if (!rep) return const_cast<TypeRef*>(sub);
+                        if (sub->nullable && !rep->nullable) {
+                            TypeRef* nn = ctx_.makeTypeRef(*rep);
+                            nn->nullable = true;
+                            return nn;
+                        }
+                        return rep;
+                    }
+                }
+            }
+            return const_cast<TypeRef*>(sub);
+        }
+        // Recursive kinds: walk nested positions, copy through when at
+        // least one changed, return the input otherwise.
+        if (sub->kind == TypeRef::Kind::Named &&
+            !sub->genericArgs.empty()) {
+            std::vector<TypeRef*> newArgs;
+            newArgs.reserve(sub->genericArgs.size());
+            bool anyChange = false;
+            for (const auto* arg : sub->genericArgs) {
+                TypeRef* after = substituteInto(arg);
+                newArgs.push_back(after);
+                if (after != arg) anyChange = true;
+            }
+            if (!anyChange) return const_cast<TypeRef*>(sub);
+            TypeRef* out = ctx_.makeTypeRef(*sub);
+            out->genericArgs = std::move(newArgs);
+            return out;
+        }
+        if (sub->kind == TypeRef::Kind::InlineArray) {
+            TypeRef* after = substituteInto(sub->arrayElement);
+            if (after == sub->arrayElement) return const_cast<TypeRef*>(sub);
+            TypeRef* out = ctx_.makeTypeRef(*sub);
+            out->arrayElement = after;
+            return out;
+        }
+        if (sub->kind == TypeRef::Kind::Function) {
+            bool anyChange = false;
+            std::vector<TypeRef::FuncParam> newParams;
+            newParams.reserve(sub->funcParams.size());
+            for (const auto& p : sub->funcParams) {
+                TypeRef* after = substituteInto(p.type);
+                if (after != p.type) anyChange = true;
+                newParams.push_back({p.modifier, p.name, after});
+            }
+            TypeRef* afterRet = substituteInto(sub->funcReturn);
+            if (afterRet != sub->funcReturn) anyChange = true;
+            if (!anyChange) return const_cast<TypeRef*>(sub);
+            TypeRef* out = ctx_.makeTypeRef(*sub);
+            out->funcParams = std::move(newParams);
+            out->funcReturn = afterRet;
+            return out;
+        }
+        // Primitive / Unit / Error — no nested positions to walk.
+        return const_cast<TypeRef*>(sub);
+    };
+    return substituteInto(ty);
 }
 
 
@@ -11417,6 +11536,20 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 cc->caseDecl->payload[i].type) {
                                 fieldTy = ctx_.resolvedType(
                                     *cc->caseDecl->payload[i].type);
+                                // #2219: a generic choice `Both<T,E>` at the
+                                // scrutinee instantiates with concrete args
+                                // (`Both<int,int>`); the case's bare-type-param
+                                // payload types (`T`, `E`) must be substituted
+                                // with the actual instantiation args so the
+                                // destructured slot is bound at the right type
+                                // (and both arms' common-type computation sees
+                                // both at `int`, not at unrelated `T`/`E`).
+                                // Substitute the field type here so every slot
+                                // binding (below) sees the resolved form.
+                                if (fieldTy) {
+                                    fieldTy = substituteGenericCaseFieldType(
+                                        fieldTy, scrutTy);
+                                }
                             }
                             if (!sp.nakedBinding.empty()) {
                                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();

@@ -6171,6 +6171,17 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 cc->caseDecl->payload[i].type) {
                                 fieldTy = ctx_.resolvedType(
                                     *cc->caseDecl->payload[i].type);
+                                // #2219: a generic choice at the scrutinee
+                                // substitutes its bare-type-param payload types
+                                // with the actual instantiation args so the
+                                // destructured slot is bound at the right type
+                                // (and both arms' common-type computation sees
+                                // both at `int`, not at unrelated `T`/`E`).
+                                // See CaseStmt analogue for the rationale.
+                                if (fieldTy) {
+                                    fieldTy = substituteGenericCaseFieldType(
+                                        fieldTy, scrutTy);
+                                }
                             }
                             if (!sp.nakedBinding.empty()) {
                                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();

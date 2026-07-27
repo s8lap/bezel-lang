@@ -882,6 +882,23 @@ private:
     const ChoiceCaseSymbol* findChoiceCaseOnScrutinee(TypeRef* scrutTy,
                                                       std::string_view name);
 
+    // #2219: when a `case` destructuring pattern binds a slot on a GENERIC
+    // choice case (e.g. `case r of Good(v) => …` over `Result<int, string>`),
+    // the case's payload field's TYPE may name a generic parameter `T` of the
+    // choice declaration. That bare `T` must be substituted by the SCRUTINEE's
+    // generic argument (`int`) so the slot binding is correctly typed and the
+    // arms' common-type computation sees the substituted form. Walks `ty`
+    // and substitutes every bare-name TypeRef whose declaration is a
+    // GenericParamSymbol of `scrutTy->declaration` with the corresponding
+    // entry from `scrutTy->genericArgs`. Recurses into Named genericArgs,
+    // InlineArray element types, Function parameter/return types, and the
+    // nullable wrapper. Returns `ty` unchanged when no substitution applies.
+    // Mirrors (the field-walk part of) Resolver::applyGenericSubst +
+    // buildBaseGenericSubst — local copy because the ExprTC worker has no
+    // Resolver handle (#1621 / §31.2.1 split).
+    TypeRef* substituteGenericCaseFieldType(const TypeRef* ty,
+                                            const TypeRef* scrutTy);
+
     // Slice S21: does a callable with this return-type ascription
     // produce a value? No ascription → no (unit). An ascription that
     // resolves to the unit type → no. Anything else → yes.
