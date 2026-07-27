@@ -5894,6 +5894,20 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 std::size_t tag = 0;
                 if (auto* cc = choiceCaseByName(
                         choiceTy, dp->typeName->parts.back(), &tag)) {
+                    // §14.1 / §28.1 (v0.226, #2208): a GENERIC-choice match
+                    // arm must extract the payload at the SPECIALIZED LLVM
+                    // type — the choice struct returned by choiceStruct is
+                    // keyed on the active substitution (per #2047 the
+                    // construction site already installs the guard here).
+                    // Without this guard a `Some(value: T)` arm with T =
+                    // Array<int> extracts from the unspecialized {i32}
+                    // payload slot, reads zero/garbage into the binding's
+                    // local, and the program's `inner.Count` returns 0.
+                    // The owning-choice active-case disposal
+                    // (LlvmBackend_Disposal.cpp #2047) and the value-like
+                    // string release (also #2047) install the same guard;
+                    // this arm-binding path was the asymmetric omission.
+                    RecordSubstGuard choiceMatchSubst(this, scrutTy);
                     llvm::Value* tagVal =
                         builder_.CreateExtractValue(scrut, {0}, "choice.tag");
                     llvm::Value* matched = builder_.CreateICmpEQ(

@@ -12,6 +12,7 @@
 
 #include "ast/Node.hpp"
 #include "common/BuiltinRegistry.hpp"
+#include "common/OwnershipFacts.hpp"  // §35.4/§35.5 (#2208): substitutedChoicePayloadType
 #include "sema/ConstFold.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
@@ -11531,6 +11532,25 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         for (std::size_t i = 0; i < dp->subPatterns.size();
                              ++i) {
                             const auto& sp = dp->subPatterns[i];
+                            // §14.1 / §35.4 (v0.226, #2208): a GENERIC-choice
+                            // case payload's RESOLVED type is the BARE type
+                            // parameter for a `Some(value: T)` declaration
+                            // (TypeResolution's generic-param path leaves
+                            // `decl == null`), not the instantiated payload
+                            // type. Bind the bare T → `inner: T`, and every
+                            // downstream `.Count`/method call on `inner`
+                            // classifies against the unspecialized kind, so
+                            // `inner.Count` falls through the Array<T>
+                            // bz_array_len fast path and reads garbage
+                            // (returns 0 for a valid Array<int>). Substitute
+                            // the choice's instantiation through the payload
+                            // type so `inner: Array<int>` at the binding site.
+                            // Per-instantiation substitution — matches
+                            // common::substitutedChoicePayloadType's contract
+                            // (used by §35.4 classification and §35.3
+                            // construction). A non-generic choice returns
+                            // the resolved type unchanged (the helper's
+                            // early-return path). // per §35.5, §14.1 (v0.226)
                             TypeRef* fieldTy = nullptr;
                             if (i < cc->caseDecl->payload.size() &&
                                 cc->caseDecl->payload[i].type) {
