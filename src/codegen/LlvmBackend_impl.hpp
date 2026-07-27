@@ -8377,6 +8377,15 @@ private:
     // (Add*/Remove*/Find/Count/First/Last/etc.) and LinkedListNode<T> property
     // accesses (.Value/.Next/.Previous) via the bz_llist_* runtime.
     llvm::Value* tryLowerLinkedListInstanceCall(const ast::CallExpr& call);
+    // #1296: a value-reading terminal operator (.Sum / .First / .Last / .Max /
+    // .Min / .Single / .ElementAt / .ToArray / *OrNull) on an IGrouping
+    // receiver. Extracts the element array via bz_grouping_elements and runs
+    // the terminal on that bz_array_t* (the IGrouping's elements field). Called
+    // from lowerCall before the normal method-symbol dispatch so the call does
+    // not fall through to a generic dispatch that treats the IGrouping as
+    // empty (Sum → 0, First → throw, ToArray → []). stdlib §5 / spec §28.9 /
+    // §29.11.
+    llvm::Value* tryLowerIGroupingTerminalCall(const ast::CallExpr& call);
 
     // §4.15 (#549): lower Array<T>.AsSpan()/AsReadOnlySpan() and
     // ArraySpan<T>/ReadOnlyArraySpan<T> instance method calls
