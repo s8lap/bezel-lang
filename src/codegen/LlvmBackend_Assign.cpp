@@ -4705,6 +4705,40 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                         builder_.CreateStore(
                             llvm::ConstantPointerNull::get(ptrTy()), scratch);
                         discardOwnedOutSlots_.push_back(scratch);
+                        // #1833 (a) / §22.4 / §28.3 / §17.13: the normal-path
+                        // disposal above (`discardOwnedOutSlots_` loop in
+                        // lowerCall) fires only when the callee RETURNS. If the
+                        // callee WRITES the scratch (assigns a fresh owned heap
+                        // value into `r`) and then THROWS, the scratch holds an
+                        // owned value nobody will dispose — the LSan Direct
+                        // leak (bz$W$TryMakeThrow). Per §28.3 the value's
+                        // ownership already transferred to the caller the moment
+                        // the callee assigned it; the caller's ordinary
+                        // exception-path discharge must handle it on unwind.
+                        // Register an `unwindOnly dynamicDispose` entry against
+                        // the same scratch in `disposeStack_.back()`: it is
+                        // null-guarded (a callee that did not write keeps the
+                        // slot null and the disposal no-ops; a false-returning
+                        // `Try*` callee that wrote null also skips), so a
+                        // throw-after-assign path disposes the value EXACTLY
+                        // ONCE on the unwind edge. The `unwindOnly` flag
+                        // guarantees the normal-return path is unaffected
+                        // (the discardOwnedOutSlots_ loop handles that).
+                        // Mirrors the `out owned var x` case (handled earlier
+                        // in ensureOutVarSlots): the inline recipient already
+                        // registers an `unwindOnly` disposal, so the
+                        // throw-after-assign repro there is sound — only the
+                        // discard case was uncovered. The discard and the
+                        // real-binding share the same scratch alloca, so a
+                        // nested `out _, out owned var x` keeps the unwind
+                        // coverage for both. // per §22.4, §28.3, §28.10,
+                        // #1833 (a), #1467
+                        if (!disposeStack_.empty()) {
+                            Disposal d{scratch, nullptr};
+                            d.unwindOnly = true;
+                            d.dynamicDispose = true;
+                            disposeStack_.back().push_back(d);
+                        }
                     }
                 }
             }
