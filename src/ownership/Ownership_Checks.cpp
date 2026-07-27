@@ -8721,6 +8721,57 @@ bool MethodOwnership::callResultIsAsyncTask(const ast::CallExpr& ce) const {
     return head == "Task" || head == "OwningTask";
 }
 
+// §15.4 / §30.5 (#1616): reject fresh Task-family producers in the
+// borrowing Array<Task> literals accepted by the compiler-intrinsic WhenAll /
+// WhenAny overloads.  §15.4 states: "each element expression of non-trivial-
+// dispose class type must be a borrow"; a fresh producer is rejected at the
+// literal site.  These intrinsics have no MethodDecl parameters, so their
+// literal target is otherwise invisible to the generic formal-argument checks.
+void MethodOwnership::checkBorrowingTaskArrayLiteral(
+        const ast::CallExpr& call) {
+    if (common::calleeMethodDecl(call, ctx_)) return;
+    const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+        call.callee.get());
+    if (!ma || (ma->member != "WhenAll" && ma->member != "WhenAny") ||
+        !ma->target || call.args.size() != 1 || !call.args[0].value)
+        return;
+    const auto* taskId = dynamic_cast<const ast::IdentifierExpr*>(
+        ma->target.get());
+    if (!taskId || taskId->name != "Task") return;
+    const auto* literal = dynamic_cast<const ast::CollectionLiteralExpr*>(
+        call.args[0].value.get());
+    if (!literal || literal->isDict) return;
+
+    auto isTaskFamily = [](const sema::TypeRef* rt) {
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+        std::string_view head;
+        if (rt->astNode && rt->astNode->name &&
+            !rt->astNode->name->parts.empty())
+            head = rt->headName();
+        else if (!rt->importedName.empty())
+            head = rt->importedName;
+        else if (rt->declaration && !rt->declaration->decl)
+            head = rt->declaration->name;
+        return head == "Task" || head == "OwningTask";
+    };
+
+    for (const auto& elem : literal->elements) {
+        if (!elem || !isTaskFamily(ctx_.exprType(*elem))) continue;
+        const bool fresh = isUnboundProducerExpr(*elem) ||
+                           producerState(*elem) == OwnershipState::Owned;
+        if (!fresh) continue;
+        report(
+            Severity::Error, elem->span.begin,
+            "a borrowing `Array<Task>` collection literal passed to `Task." +
+                std::string(ma->member) +
+                "` may not contain a fresh Task-family producer: every Task "
+                "call mints a caller-owned, non-trivial-dispose frame, while "
+                "the borrowing array owns none of its elements; bind each task "
+                "to a named owner first and put those borrows in the literal "
+                "(§15.4 / §30.5, v0.226)");
+    }
+}
+
 // #1526 (§28.3 "Deferred-activation callees", v0.179): drive the whole-body
 // walk. See the header comment (Ownership_impl.hpp) for the escape-position
 // list and the rationale for reusing the checkAwaitSites/checkResultSites
@@ -8828,6 +8879,10 @@ void MethodOwnership::checkDeferredActivationTempSitesExpr(const ast::Expr& e,
                                                              bool escaping,
                                                              bool forSource) {
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        // §15.4 / §30.5 (#1616): Task.WhenAll/WhenAny over an inline literal —
+        // separate from the general deferred-activation args check because the
+        // intrinsic has no MethodDecl parameters.
+        checkBorrowingTaskArrayLiteral(*ce);
         // §28.3 / stdlib §5 (#1917): reject a lazy `Select` whose inline lambda
         // selector mints a fresh cleanup-bearing value per element — the launder
         // is position-independent (this walk visits every CallExpr, so the check

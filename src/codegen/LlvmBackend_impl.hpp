@@ -7987,6 +7987,13 @@ private:
     // but reads the declared type from the FieldDecl (or importedMemberType for
     // an imported field). Null if the field's type is not Task-family.
     const sema::TypeRef* taskFamilyTypeFromField(const sema::FieldSymbol* fs);
+    // §28.3 / §30.5 (#1905): dispose an already-evaluated owned Task-family
+    // value with the complete protocol (fault object, unconsumed owned result,
+    // then fire-and-forget/free). Used at an unbound task receiver's full-
+    // expression boundary after synchronous Wait(), and by the field wrapper
+    // below. `taskTy` supplies the OwningTask<T> result disposer when needed.
+    void emitTaskDisposal(const sema::TypeRef* taskTy,
+                          llvm::Value* task);
     // §28.7 / §30.5 (#2173 / #1889): drop-on-overwrite / scope-end of an
     // owned Task-family FIELD. Invoke the full task-disposal sequence
     // (error_obj prelude + per-T result_disposer attach +

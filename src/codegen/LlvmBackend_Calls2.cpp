@@ -2613,7 +2613,14 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
                         else if (!itTy->importedName.empty())
                             inm = itTy->importedName;
                     }
-                    if (inm == "IOwningEnumerable")
+                    // §29.1 / §30.7 (#963, #1891): both owning iterator
+                    // families transfer the current element into the for-variable
+                    // slot.  An explicit `x.Dispose()` is therefore this scope's
+                    // sole reclaim path and must free + null that slot.  The async
+                    // spelling was previously omitted, so await-for ran only the
+                    // destructor and leaked the transferred element's heap block.
+                    if (inm == "IOwningEnumerable" ||
+                        inm == "IOwningAsyncEnumerable")
                         return lvalueAddr(receiver, slotTy);
                 }
                 return nullptr;
@@ -4012,6 +4019,15 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         auto* awaitFn = declareC("bz_task_await_sync", ptrTy(),
                                                  {ptrTy()});
                         builder_.CreateCall(awaitFn, {task}, "task.wait");
+                        // §28.3 / §30.5 (#1905): "Such a temporary is disposed
+                        // at the end of the full expression in which it is
+                        // produced." A Task-family CALL mints an owned frame;
+                        // `Wait()` only borrows that receiver, so an unbound call
+                        // receiver must run the full task-disposal protocol after
+                        // settlement. A named field/local/property receiver is
+                        // storage that lends and remains owned elsewhere.
+                        if (dynamic_cast<const ast::CallExpr*>(ma->target.get()))
+                            emitTaskDisposal(recvTy, task);
                         return nullptr;  // unit result
                     }
                 }

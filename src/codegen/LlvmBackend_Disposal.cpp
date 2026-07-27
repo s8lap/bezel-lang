@@ -253,8 +253,25 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
 // before this call and stores the already-evaluated new value afterward.
 void Emitter::emitOwnedTaskDisposal(const sema::FieldSymbol* fs,
                                     llvm::Value* oldVal) {
+    emitTaskDisposal(fs ? taskFamilyTypeFromField(fs) : nullptr, oldVal);
+}
+
+// §28.3 / §30.5 (#1905): the full Task-family disposal protocol for an
+// already-evaluated owned task value.  Field disposal delegates here above;
+// unbound Task temporaries consumed by synchronous `Wait()` use the same
+// protocol at their full-expression boundary.  Sharing this sequence is
+// load-bearing for fault-object ownership and unconsumed OwningTask<T> results —
+// a bare bz_task_free would reclaim only the task struct.
+void Emitter::emitTaskDisposal(const sema::TypeRef* taskTy,
+                               llvm::Value* oldVal) {
     if (!oldVal) return;
     if (oldVal == llvm::ConstantPointerNull::get(ptrTy())) return;
+    // §30.5 / §29.2 (#1891): "the iteration variable is owned; the §28.3
+    // discharge rules apply on every body-exit edge" — for an await-for
+    // binding, TakeCurrent transferred the element into the for-slot, so
+    // explicit `x.Dispose()` (or the auto-drop at iteration end) is this
+    // scope's sole reclaim path.  The async path was previously omitted; run
+    // the dispose+free the destructor call did not.
     // Per §30.15 a Channel<T>.Receive() task uses bz_channel_receive_abandon
     // instead. A plain field typed Task<T> / OwningTask<T> cannot
     // syntactically be a Channel<T>.Receive() call (the field's type is the
@@ -336,35 +353,33 @@ void Emitter::emitOwnedTaskDisposal(const sema::FieldSymbol* fs,
     // result OwningTask<T>, the disposer is null and the conditional
     // set_result_disposer call is skipped.
     llvm::Value* taskOwnedResultDisposer = nullptr;
-    if (fs) {
-        if (const sema::TypeRef* taskTy = taskFamilyTypeFromField(fs)) {
-            auto taskName = [](const sema::TypeRef* rt) -> std::string_view {
-                if (!rt) return {};
-                if (!rt->declaration) {
-                    if (rt->astNode && rt->astNode->name &&
-                        !rt->astNode->name->parts.empty())
-                        return rt->headName();
-                } else if (!rt->declaration->decl) {
-                    return rt->declaration->name;
-                }
-                return {};
-            };
-            if (taskName(taskTy) == "OwningTask" &&
-                !taskTy->genericArgs.empty() &&
-                taskTy->genericArgs[0] &&
-                taskTy->genericArgs[0]->kind == sema::TypeRef::Kind::Named &&
-                taskTy->genericArgs[0]->declaration &&
-                (taskTy->genericArgs[0]->declaration->kind ==
-                     ast::TypeDeclKind::Class ||
-                 taskTy->genericArgs[0]->declaration->kind ==
-                     ast::TypeDeclKind::Interface)) {
-                llvm::Function* thunk =
-                    elementPolicyFor(taskTy->genericArgs[0],
-                                     /*owningFamily=*/true).disposerThunk;
-                if (thunk) {
-                    taskOwnedResultDisposer =
-                        llvm::cast<llvm::Value>(thunk);
-                }
+    if (taskTy) {
+        auto taskName = [](const sema::TypeRef* rt) -> std::string_view {
+            if (!rt) return {};
+            if (!rt->declaration) {
+                if (rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty())
+                    return rt->headName();
+            } else if (!rt->declaration->decl) {
+                return rt->declaration->name;
+            }
+            return {};
+        };
+        if (taskName(taskTy) == "OwningTask" &&
+            !taskTy->genericArgs.empty() &&
+            taskTy->genericArgs[0] &&
+            taskTy->genericArgs[0]->kind == sema::TypeRef::Kind::Named &&
+            taskTy->genericArgs[0]->declaration &&
+            (taskTy->genericArgs[0]->declaration->kind ==
+                 ast::TypeDeclKind::Class ||
+             taskTy->genericArgs[0]->declaration->kind ==
+                 ast::TypeDeclKind::Interface)) {
+            llvm::Function* thunk =
+                elementPolicyFor(taskTy->genericArgs[0],
+                                 /*owningFamily=*/true).disposerThunk;
+            if (thunk) {
+                taskOwnedResultDisposer =
+                    llvm::cast<llvm::Value>(thunk);
             }
         }
     }

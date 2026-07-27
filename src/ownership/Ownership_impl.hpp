@@ -2415,6 +2415,13 @@ private:
     void checkResultSitesStmt(const ast::Stmt& s);
     void checkResultSitesExpr(const ast::Expr& e, bool bindingValue);
 
+    // §15.4 / §30.5 (#1616): Task.WhenAll/WhenAny are compiler intrinsics with
+    // no MethodDecl parameter metadata, but their sole argument is the borrowing
+    // target Array<Task>. Reject each fresh non-trivial-dispose Task producer in
+    // an inline literal; otherwise its full-expression auto-disposal obligation
+    // is lost in the borrowing array. Bound task borrows remain admitted.
+    void checkBorrowingTaskArrayLiteral(const ast::CallExpr& call);
+
     // -- #1526 (§28.3 "Deferred-activation callees", v0.179) --------------------
     //
     // A call whose return type is a §29.3/§30.7 iterator/async-iterator
