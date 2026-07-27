@@ -7952,7 +7952,6 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // If Task<T> has a non-empty genericArgs, we use the typed variant.
             bool isTyped = false;
             int64_t elemSz = 8;
-            const sema::TypeRef* T_for_typed = nullptr;
             if (arrTy && arrTy->kind == sema::TypeRef::Kind::Named &&
                 !arrTy->genericArgs.empty() && arrTy->genericArgs[0]) {
                 auto* elemTaskTy = arrTy->genericArgs[0];
@@ -7961,65 +7960,14 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 if ((elemName == "Task" || elemName == "OwningTask") &&
                     !elemTaskTy->genericArgs.empty() &&
                     elemTaskTy->genericArgs[0]) {
-                    T_for_typed = elemTaskTy->genericArgs[0];
-                    llvm::Type* tLlvmTy = lowerTypeRef(T_for_typed);
+                    // T is elemTaskTy->genericArgs[0].
+                    auto* T = elemTaskTy->genericArgs[0];
+                    llvm::Type* tLlvmTy = lowerTypeRef(T);
                     if (tLlvmTy) {
                         elemSz = static_cast<int64_t>(
                             module_->getDataLayout().getTypeAllocSize(tLlvmTy));
                     }
                     isTyped = true;
-                }
-            }
-            // fix #1830 / §6.7 / stdlib §6.7 (line 2875): typed Task.WhenAll<T>
-            // over an INLINE collection literal. sema may have set the literal's
-            // exprType to the bare Array<Task> shape (the arg has no MethodDecl
-            // target type, so the argTy path above is null / falls through to
-            // the bare-Task isTyped=false). Fall back to inspecting the
-            // literal's element exprTypes directly: when ALL elements are
-            // Task<T> for the same T, emit the typed bz_task_when_all_results
-            // call so the runtime collects each task's T-typed result into
-            // an Array<T> (matching the result type sema produced). Mirrors
-            // the sema-side inferLiteralTaskTType in ExprTypecheck_Calls.cpp.
-            if (!isTyped) {
-                if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
-                        call.args[0].value.get())) {
-                    if (!cl->elements.empty()) {
-                        const sema::TypeRef* commonT = nullptr;
-                        bool allTaskT = true;
-                        for (const auto& elUp : cl->elements) {
-                            if (!elUp) { allTaskT = false; break; }
-                            const sema::TypeRef* et =
-                                ctx_.exprType(*elUp);
-                            if (!et || et->kind != sema::TypeRef::Kind::Named ||
-                                et->genericArgs.empty() ||
-                                !et->genericArgs[0]) {
-                                allTaskT = false; break;
-                            }
-                            auto ename = builtinTypeName(et);
-                            if ((ename != "Task" && ename != "OwningTask") ||
-                                et->genericArgs.empty() ||
-                                !et->genericArgs[0]) {
-                                allTaskT = false; break;
-                            }
-                            const sema::TypeRef* T = et->genericArgs[0];
-                            if (!commonT) {
-                                commonT = T;
-                            } else if (commonT != T) {
-                                if (commonT->kind != T->kind ||
-                                    commonT->headName() != T->headName()) {
-                                    allTaskT = false; break;
-                                }
-                            }
-                        }
-                        if (allTaskT && commonT) {
-                            llvm::Type* tLlvmTy = lowerTypeRef(commonT);
-                            if (tLlvmTy) {
-                                elemSz = static_cast<int64_t>(
-                                    module_->getDataLayout().getTypeAllocSize(tLlvmTy));
-                                isTyped = true;
-                            }
-                        }
-                    }
                 }
             }
             llvm::Value* result;
@@ -8030,20 +7978,6 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 result = builder_.CreateCall(whenAllResFn,
                     {arr, builder_.getInt64(elemSz)},
                     "task.when_all_results");
-                // fix #1830 / §6.7 (v0.217) / §30.5: the runtime
-                // bz_task_when_all_results completes the aggregate with a
-                // HEAP-ALLOCATED `Array<T>*` (a bz_array_t). The result
-                // buffer holds a POINTER to the array (sizeof void*).
-                // Disposal: the using-var / scope-end path on the LOCAL
-                // bound by the await (`using var arr := await wa;`) calls
-                // bz_array_free on the array at scope end — that is the
-                // canonical owner. We deliberately do NOT attach a
-                // result_disposer here, because every awaiting call site
-                // binds the result to a local whose using-var disposal
-                // is already responsible for the array; an attached
-                // disposer would double-free at the task's bz_task_free.
-                // (A discarded `await w;` leaves the array un-owned —
-                // a pre-existing leak, not enlarged by this fix.)
             } else {
                 auto* whenAllFn = declareC("bz_task_when_all", ptrTy(), {ptrTy()});
                 result = builder_.CreateCall(whenAllFn, {arr}, "task.when_all");

@@ -5224,70 +5224,30 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         // receiver is a value type (record/enum), box it into a proper interface
         // reference ({ vtable*, i64 rc, record-bytes }) so the extension body's
         // `this.M()` / `this[i]` dispatches through the correct itable.
-        // §26.5 / #1314: when the extension targets `Object` and the actual
-        // receiver is a value type (record/enum/primitive), box it into a heap
-        // Object reference (the standard §8.6 boxing path) so the extension's
-        // `this: Object` argument matches the callee's `ptr` `this` parameter
-        // and the §484 non-pointer guard does not silently drop the call.
         if (isExtensionMethod(ms)) {
             bool byPtr = false;
             llvm::Type* thisTy = extensionThisType(ms, &byPtr);
-            const sema::TypeRef* extTgt = ms->extensionDecl->targetType
-                ? ctx_.resolvedType(*ms->extensionDecl->targetType)
-                : nullptr;
-            // §26.5 / #1314: Object-target value-typed receiver → box to Object
-            // even when extensionThisType returns ptrTy() (byPointer=false, since
-            // Object is a Primitive TypeRef rather than a Named Class decl). The
-            // existing if-block below only fires for byPointer=true (Class/Record
-            // targets); Object/Interface-Primitive targets would otherwise pass a
-            // raw struct where ptrTy() is expected — the §484 guard then returns
-            // nullptr and the call silently becomes `ret i32 0`.
-            bool targetIsObject = extTgt &&
-                extTgt->kind == sema::TypeRef::Kind::Primitive &&
-                extTgt->primitive == sema::PrimitiveType::Object;
-            bool targetIsIface = extTgt &&
-                extTgt->kind == sema::TypeRef::Kind::Named &&
-                extTgt->declaration &&
-                extTgt->declaration->kind == ast::TypeDeclKind::Interface;
-            const sema::TypeRef* recvSemaTy = nullptr;
-            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
-                    call.callee.get())) {
-                if (ma->target)
-                    recvSemaTy = ctx_.exprType(*ma->target);
-            }
-            if (targetIsObject && recvSemaTy && isBoxableValueType(recvSemaTy) &&
-                !recv->getType()->isPointerTy()) {
-                // §8.6 / §28.9: boxing is a +1 producer; boxValue returns the
-                // heap-box pointer (the §28.9 producer). The callee either
-                // retains it (stores/transfers it) or releases it on Dispose;
-                // here we release after the call when the callee did not
-                // capture the reference (§28.3 plain-call-side cleanup). The
-                // box release is registered to the enclosing disposeStack_ so
-                // both the normal-return and unwind paths dispose the box
-                // exactly once.
-                llvm::Value* boxed = boxValue(recv, recvSemaTy);
-                // #1314: a record/enum/primitive boxed to Object is a runtime-
-                // managed producer that must be released at scope end if the
-                // callee does not retain it. Park the box pointer in an alloca
-                // slot registered for dynamic disposal (the box's vtable carries
-                // the disposer). The slot lets the disposal-walk null the slot
-                // on the callee-retains path so a subsequent scope-end pass
-                // doesn't double-release.
-                auto* boxSlot = entryAlloca(ptrTy());
-                builder_.CreateStore(boxed, boxSlot);
-                recv = builder_.CreateLoad(ptrTy(), boxSlot);
-                if (!disposeStack_.empty()) {
-                    Disposal d{boxSlot, /*ty=*/nullptr};
-                    d.dynamicDispose = true;
-                    disposeStack_.back().push_back(d);
-                }
-            } else if (byPtr && thisTy && !recv->getType()->isPointerTy()) {
+            if (byPtr && thisTy && !recv->getType()->isPointerTy()) {
+                // Determine whether the declared extension target is an interface.
+                const sema::TypeRef* extTgt = ms->extensionDecl->targetType
+                    ? ctx_.resolvedType(*ms->extensionDecl->targetType)
+                    : nullptr;
+                bool targetIsIface = extTgt &&
+                    extTgt->kind == sema::TypeRef::Kind::Named &&
+                    extTgt->declaration &&
+                    extTgt->declaration->kind == ast::TypeDeclKind::Interface;
                 if (targetIsIface) {
                     // Box the record/value receiver into an interface reference
                     // so the extension body's itable dispatch (`this.M()` /
                     // `this[i]`) reaches the correct vtable / itable map.
                     // Simply spilling to a stack slot leaves a raw struct with
                     // no vtable header → SIGSEGV on itable lookup (§26.5/#1237).
+                    const sema::TypeRef* recvSemaTy = nullptr;
+                    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                            call.callee.get())) {
+                        if (ma->target)
+                            recvSemaTy = ctx_.exprType(*ma->target);
+                    }
                     if (recvSemaTy && isBoxableValueType(recvSemaTy))
                         recv = boxValue(recv, recvSemaTy);
                     // If the sema type could not be recovered (unusual) or the

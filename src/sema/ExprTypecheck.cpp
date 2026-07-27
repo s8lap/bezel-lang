@@ -5469,41 +5469,23 @@ static const TypeRef* extensionFindMatchingAncestor(
     std::vector<std::unique_ptr<TypeRef>>& owned) {
     if (!target || !recv) return nullptr;
     if (extensionTargetMatchesReceiver(target, recv, freeVars)) return recv;
-    // §26.2/§26.5 (#1308, #1314): `Object` (a Primitive TypeRef) is the implicit
-    // base of EVERY type — spec §2 "every type derives from Object", §12 "if no
-    // base class is specified, the implicit base is Object". A receiver's
-    // `baseTypeRefs` chain does NOT materialise this implicit Object base, so
-    // the walk below never reaches Object for a class/interface receiver whose
-    // declared bases are empty (or don't transitively list Object). Treat Object
-    // as a matching (least-specific, §26.5.1 rule 1) ancestor of any reference-
-    // OR value-typed receiver so `extension Object` methods resolve for:
-    //   (a) reference-typed (class/interface) — no boxing needed
-    //   (b) value-typed (record/enum/primitive) — codegen must box the value to
-    //       an Object reference before the call (§8.6 / #1314 follow-up).
+    // §26.2/§26.5 (#1308): `Object` (a Primitive TypeRef) is the implicit base
+    // of every class and interface — spec §2 "every type derives from Object",
+    // §12 "if no base class is specified, the implicit base is Object". A
+    // receiver's `baseTypeRefs` chain does NOT materialise this implicit Object
+    // base, so the walk below never reaches Object for a class/interface
+    // receiver whose declared bases are empty (or don't transitively list
+    // Object). Treat Object as a matching (least-specific, §26.5.1 rule 1)
+    // ancestor of any reference-typed receiver so `extension Object` methods
+    // resolve. Value-typed receivers (record/enum/primitive) would need boxing
+    // to Object before the call and are out of scope here — they fall through
+    // to the existing diagnostic.
     if (target->kind == TypeRef::Kind::Primitive &&
-        target->primitive == PrimitiveType::Object) {
-        if (recv->kind == TypeRef::Kind::Named && recv->declaration) {
-            auto k = recv->declaration->kind;
-            if (k == ast::TypeDeclKind::Class ||
-                k == ast::TypeDeclKind::Interface ||
-                k == ast::TypeDeclKind::Record ||
-                k == ast::TypeDeclKind::Enum)
-                return target;
-        } else if (recv->kind == TypeRef::Kind::Primitive) {
-            // Value-typed primitives (numeric, bool, char) are not string/Object;
-            // they box to Object (§8.6). The receiver's `extensionThisType` will
-            // return ptrTy() — and codegen boxes before the call.
-            using P = PrimitiveType;
-            switch (recv->primitive) {
-                case P::Bool: case P::Byte: case P::SByte: case P::Short:
-                case P::UShort: case P::Int: case P::UInt: case P::Long:
-                case P::ULong: case P::Float: case P::Double: case P::Decimal:
-                case P::Char:
-                    return target;
-                default: break;  // String/Object/Unit/Function — fall through
-            }
-        }
-    }
+        target->primitive == PrimitiveType::Object &&
+        recv->kind == TypeRef::Kind::Named && recv->declaration &&
+        (recv->declaration->kind == ast::TypeDeclKind::Class ||
+         recv->declaration->kind == ast::TypeDeclKind::Interface))
+        return target;
     // Walk user-declared receiver's base type chain.
     if (recv->kind == TypeRef::Kind::Named && recv->declaration) {
         std::vector<const TypeRef*> frontier;
