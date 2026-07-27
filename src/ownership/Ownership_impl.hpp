@@ -108,6 +108,17 @@ struct GenericReturnContext {
     // must NOT fire on such a body. Computed in checkMember, where the enclosing
     // type's base types are reachable. // per §28.3 v0.194
     bool returnInheritsBareTypeParam = false;
+    // §28.3 (v0.196; #1910): when `returnInheritsBareTypeParam` is true, the
+    // positions (in this method's parameter list) that correspond to a SOURCE
+    // parameter in the inherited declaration — a plain parameter whose type
+    // mentions the returned type parameter. The S10 carve-out in
+    // checkInstanceBorrowReturn admits parameter-sourced borrow returns ONLY
+    // at these positions; a parameter at a non-source position (e.g. one
+    // whose inherited counterpart is `Other` instead of `T`) carries a borrow
+    // whose source is not re-established at every caller and must still be
+    // rejected. Empty when `returnInheritsBareTypeParam` is false. // per §28.3
+    // v0.196
+    std::vector<std::size_t> inheritedBareTypeParamSourcePositions;
 };
 
 // §28.1 (v0.196, #1817/#1860): true when a bare-type-parameter `owned` slot's
@@ -320,6 +331,16 @@ private:
     // body is admitted, exactly as the bare-T rule admits it. Set from the
     // GenericReturnContext computed in checkMember. // per §28.3 v0.194
     bool returnInheritsBareTypeParam_ = false;
+    // §28.3 (v0.196, #1910): when `returnInheritsBareTypeParam_` is true, the
+    // positions in this method's parameter list that correspond to a SOURCE
+    // parameter in the inherited declaration. checkInstanceBorrowReturn uses
+    // these to admit parameter-sourced borrow returns ONLY at source
+    // positions — a non-source parameter return is still rejected, because
+    // its borrow's source is not re-established at every caller. Empty when
+    // `returnInheritsBareTypeParam_` is false (no carve-out to gate). Set
+    // from the GenericReturnContext computed in checkMember. // per §28.3
+    // v0.196
+    std::vector<std::size_t> inheritedBareTypeParamSourcePositions_;
     // §28.3 (v0.194, #1801 S6): true when the bare-type-parameter return's
     // POTENTIAL SOURCE SET is structurally empty — a static method with no plain
     // (non-`owned`) parameter whose declared type mentions the returned parameter.
@@ -2776,6 +2797,14 @@ private:
     // The enclosing method's own parameter symbols — distinguishes a real
     // capture of a method parameter from a lambda-internal parameter.
     std::unordered_set<sema::Symbol*> methodParamSet_;
+    // §28.3 v0.196 (#1910): the enclosing method's ordered parameter symbol
+    // list (matches md->params position-for-position). Used by
+    // checkInstanceBorrowReturn to map a ParameterSymbol* back to its
+    // positional index when the S10 carve-out's positional-source check
+    // needs to know whether the parameter is at a SOURCE position in the
+    // inherited declaration. Empty when no params were threaded (rare —
+    // constructors/destructors).
+    std::vector<sema::Symbol*> paramSyms_;
     // §28.14 freeze: source symbol -> {bounding local's name, admission call
     // site}. A frozen source may not be moved from, disposed, or reassigned
     // AFTER the admission site (source-offset ordered; the pre-scan records,

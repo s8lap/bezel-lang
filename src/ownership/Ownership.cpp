@@ -126,6 +126,15 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // the transfer functions enforce it. // per §28.14, stdlib §6.10
     if (paramSyms)
         for (sema::Symbol* sym : *paramSyms) methodParamSet_.insert(sym);
+    // §28.3 v0.196 (#1910): cache the ordered parameter symbol list for the
+    // S10 positional-source check in checkInstanceBorrowReturn (which needs
+    // to map a ParameterSymbol back to its positional index). The vector
+    // mirrors the impl's md->params position-for-position.
+    if (paramSyms) {
+        paramSyms_.clear();
+        paramSyms_.reserve(paramSyms->size());
+        for (sema::Symbol* sym : *paramSyms) paramSyms_.push_back(sym);
+    }
     // §28.14 v0.177 (#1419): classify this method's PLAIN function-typed
     // parameters as call-bounded, then run the callee-side sink pre-pass.
     // It runs BEFORE scopedPreScan so the carrier-alias map is complete when
@@ -921,6 +930,16 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // parameter capture as lambda-internal when the set is empty). // per §28.14 v0.196
     if (paramSyms)
         for (sema::Symbol* sym : *paramSyms) methodParamSet_.insert(sym);
+    // §28.3 v0.196 (#1910): also cache the ordered parameter symbol list for
+    // checkInstanceBorrowReturn's S10 positional-source check. Mirror of the
+    // run() path above. Without this the expression-body `=>` form would
+    // over-reject source-position parameter returns (e.g. `Pick(a: C, b: C):
+    // C => a;` from #1885's positive test).
+    if (paramSyms) {
+        paramSyms_.clear();
+        paramSyms_.reserve(paramSyms->size());
+        for (sema::Symbol* sym : *paramSyms) paramSyms_.push_back(sym);
+    }
     // Seed `owned` / `out owned` parameters as Owned locals (as run() does) so
     // returning an owned param is classified as an owned transfer, not a borrow.
     // Non-owned params stay out of `states_`; the ParameterSymbol branch in
@@ -2745,6 +2764,63 @@ static bool methodInheritsBareTypeParamReturn(const ast::MethodDecl& md,
     return false;
 }
 
+// §28.3 (v0.196, #1910): when methodInheritsBareTypeParamReturn is true, find
+// the same inherited declaration and return the POSITIONS of its source
+// parameters — plain (non-`owned`, non-`out`, non-`ref`) parameters whose
+// declared type mentions the returned type parameter. The implementing
+// method's parameters at these same positions are SOURCE POSITIONS (their
+// borrows are re-established at every caller, mirroring
+// bareTypeParamCallSourceRoots' positional reading). Parameters at any other
+// position are NOT source positions — a borrow through them in the body is
+// not re-established at the caller (the inherited counterpart is not a
+// source parameter the caller passes a value for), and the S10 carve-out
+// must not blanket-admit it. Returns an empty vector when the method does
+// not inherit bare-T, or when the inherited declaration has no source
+// parameters (an empty-set signature — the factory regime governs instead
+// and checkInstanceBorrowReturn is gated by `returnOwned_` /
+// `returnIsBareTypeParam_`). // per §28.3 v0.196
+static std::vector<std::size_t>
+inheritedBareTypeParamSourcePositions(const ast::MethodDecl& md,
+                                      const sema::MethodSymbol* ms,
+                                      const sema::SemaContext& ctx) {
+    std::vector<std::size_t> positions;
+    if (!ms || !ms->parent) return positions;
+    std::vector<sema::TypeSymbol*> work(ms->parent->baseTypes.begin(),
+                                        ms->parent->baseTypes.end());
+    std::unordered_set<const sema::TypeSymbol*> seen;
+    while (!work.empty()) {
+        sema::TypeSymbol* base = work.back();
+        work.pop_back();
+        if (!base || !seen.insert(base).second) continue;
+        for (const sema::Symbol* mem : base->members) {
+            auto* bms = dynamic_cast<const sema::MethodSymbol*>(mem);
+            if (!bms || bms->name != md.name) continue;
+            const auto* bmd = dynamic_cast<const ast::MethodDecl*>(bms->decl);
+            if (!bmd || bmd->params.size() != md.params.size()) continue;
+            if (!baseReturnIsBareTypeParam(*bmd, *base, ctx)) continue;
+            // Found the inherited declaration. Identify its returned T (the
+            // bare-type-parameter name) and walk its params to record source
+            // positions — those map positionally onto this impl's params.
+            std::string_view retParam;
+            if (bmd->returnType && bmd->returnType->name &&
+                bmd->returnType->name->parts.size() == 1)
+                retParam = bmd->returnType->name->parts.front();
+            if (retParam.empty()) return positions;
+            for (std::size_t i = 0; i < bmd->params.size(); ++i) {
+                const ast::Param& p = bmd->params[i];
+                if (!p.modifier.empty()) continue;  // `owned`/`out`/`ref` — not sources
+                if (!p.type ||
+                    !bareReturnTypeMentionsParam(*p.type, retParam))
+                    continue;
+                positions.push_back(i);
+            }
+            return positions;
+        }
+        for (sema::TypeSymbol* b2 : base->baseTypes) work.push_back(b2);
+    }
+    return positions;
+}
+
 MethodOwnership::BareBorrowCallInfo
 MethodOwnership::analyzeBareBorrowCall(const ast::CallExpr& ce) {
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S3/S10/S11/S13). See the
@@ -2850,7 +2926,23 @@ MethodOwnership::analyzeBareBorrowCall(const ast::CallExpr& ce) {
     // function value — runtime-managed, no constraint. // per §28.3 v0.194
     if (ma->member == "Aggregate" && ce.args.size() == 2) {
         noteTemp(ma->target.get());
-        pushRootIfBorrowable(ma->target.get());
+        // #1902: the receiver root is a source UNCONDITIONALLY — do NOT gate it
+        // on isBorrowableType(receiver) as pushRootIfBorrowable does for
+        // ARGUMENTS. The receiver of a LINQ sequence operator is a builtin
+        // collection (`Array`/`OwningArray`/the lazy `IEnumerable` sentinel),
+        // whose resolved TypeRef carries a NULL `declaration` — so the
+        // borrowable predicate (which reads `false` for a null-declaration
+        // Named ref, treating it as a bare type parameter) would wrongly drop
+        // it. The borrowable-RESULT gate above already decided this is a
+        // borrow; the receiver it is borrowed from is definitionally its
+        // source, mirroring the LINQ element-access branch below (and
+        // bareTypeParamCallSourceRoots, which likewise pushes the receiver
+        // root without a borrowable check, gating only arguments). The S13
+        // test only exercised the seed source — a regression test now pins
+        // the receiver-source freeze. // per §28.3 v0.194 / stdlib §5
+        if (const ast::IdentifierExpr* root = identifierRoot(*ma->target))
+            if (sema::Symbol* s = ctx_.exprSymbol(*root))
+                info.sources.push_back(s);
         const ast::CallArgument& seed = ce.args[0];
         if (!seed.isDiscard && seed.value && seed.name.empty()) {
             noteTemp(seed.value.get());
@@ -6702,13 +6794,6 @@ void MethodOwnership::checkInstanceBorrowReturn(const ast::Expr& e) {
     if (isStatic_) return;              // static: checkStaticBorrowReturn's job
     if (returnOwned_) return;           // `owned` return transfers ownership
     if (returnIsBareTypeParam_) return; // bare-T: checkBareTypeParamReturn's job
-    // §28.3 (v0.194 S10; #1885): a body implementing/overriding a bare-T-returning
-    // generic declaration inherits that classification — callers dispatch through
-    // the generic signature and re-establish borrows against their own arguments,
-    // so a parameter-sourced borrow return here is admitted (the caller-side dual
-    // is findInheritedBareReturnDecl). Without this, `class VChooser: IChooser<C>
-    // ... method Pick(a: C, b: C): C return a;` would be over-rejected.
-    if (returnInheritsBareTypeParam_) return;
     if (!returnType_) return;
     if (returnType_->kind == ast::TypeKind::Named && returnType_->name &&
         !returnType_->name->parts.empty() &&
@@ -6724,6 +6809,40 @@ void MethodOwnership::checkInstanceBorrowReturn(const ast::Expr& e) {
     auto* ps = dynamic_cast<sema::ParameterSymbol*>(ctx_.exprSymbol(*root));
     if (!ps) return;
     if (ps->modifier == "owned" || ps->modifier == "out owned") return;
+    // §28.3 (v0.196 S10, #1910): a body implementing/overriding a bare-T-returning
+    // generic declaration inherits that classification — callers dispatch through
+    // the generic signature and re-establish borrows against their own arguments,
+    // so a parameter-sourced borrow return here is admitted ONLY when the
+    // parameter is at a SOURCE POSITION in the inherited declaration (its
+    // declared type in the inherited method mentions the returned type parameter).
+    // A parameter at a NON-source position in the inherited declaration (e.g. a
+    // parameter typed at `Other` instead of `T`) carries a borrow whose source
+    // is not re-established at every caller — the caller doesn't pass a `T` at
+    // that slot — and the carve-out must not blanket-admit it (the #1910 fix).
+    // `this`/receiver-sourced and static-storage returns reach this branch only
+    // when their root is a parameter, so the positional-source gate here is the
+    // sole discriminator. The vector is empty when `returnInheritsBareTypeParam_`
+    // is false, so a non-inherited body falls through to the report below.
+    if (returnInheritsBareTypeParam_) {
+        // Find the parameter's position in the impl's parameter list — the
+        // paramSyms_ vector is the ordered list (matches md->params position-
+        // for-position), so pointer equality against the impl's ParameterSymbol
+        // gives the index. O(n) over a small list (≤ a handful).
+        std::size_t pos = static_cast<std::size_t>(-1);
+        for (std::size_t i = 0; i < paramSyms_.size(); ++i) {
+            if (paramSyms_[i] == ps) {
+                pos = i;
+                break;
+            }
+        }
+        if (pos != static_cast<std::size_t>(-1)) {
+            for (std::size_t sp : inheritedBareTypeParamSourcePositions_) {
+                if (sp == pos) return;  // source position → admit
+            }
+        }
+        // Non-source position (or unknown position) → fall through to reject.
+        // // per §28.3 v0.196, #1910
+    }
     report(
         Severity::Error, e.span.begin,
         std::string("a borrow reached through parameter `") +
@@ -6816,6 +6935,14 @@ void MethodOwnership::computeBareReturnContext(
     // from a body implementing/overriding a bare-T-returning generic declaration.
     returnInheritsBareTypeParam_ =
         genericCtx && genericCtx->returnInheritsBareTypeParam;
+    // §28.3 (v0.196, #1910): the S10 carve-out's POSITIONAL source check
+    // — only parameters at a source position in the inherited declaration
+    // are admitted as parameter-sourced borrow returns. The full source
+    // positions vector is computed once in checkMember (where the MethodDecl
+    // and MethodSymbol are in scope) and threaded through GenericReturnContext.
+    inheritedBareTypeParamSourcePositions_ =
+        genericCtx ? genericCtx->inheritedBareTypeParamSourcePositions
+                   : std::vector<std::size_t>{};
     // `owned T` is the ordinary ownership-transferring return (§28.8), outside
     // this rule; and a bare parameter is a single-part Named head.
     if (returnOwned_ || !genericCtx || !returnType_ ||
@@ -7522,6 +7649,17 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
                 }
             genericCtx.returnInheritsBareTypeParam =
                 methodInheritsBareTypeParamReturn(*md, selfMs, ctx);
+            // §28.3 (v0.196, #1910): compute the source positions in the
+            // inherited declaration so checkInstanceBorrowReturn can apply
+            // the S10 carve-out positionally (only admit parameter-sourced
+            // returns at a source position — non-source positions, where
+            // the inherited parameter is NOT typed at the returned type
+            // parameter, are still rejected). Empty when
+            // returnInheritsBareTypeParam is false.
+            if (genericCtx.returnInheritsBareTypeParam) {
+                genericCtx.inheritedBareTypeParamSourcePositions =
+                    inheritedBareTypeParamSourcePositions(*md, selfMs, ctx);
+            }
         }
         if (md->bodyKind == ast::MethodBodyKind::Block) {
             MethodOwnership mo(ctx);
