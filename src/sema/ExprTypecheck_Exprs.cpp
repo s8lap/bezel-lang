@@ -6255,6 +6255,60 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         }
                     }
                 }
+                // §19.3 (v0.226, #2178): a generic-record DESTRUCTURING pattern
+                // (the form `Pair(a, b)` against a record `record Pair<A,B>(…)`)
+                // names no type arguments, so the record's instantiation is
+                // undeterminable from the pattern. Today the implementation
+                // resolves the destructured record's SHARED per-declaration
+                // descriptor and binds the fields at TEMPLATE offsets — a box
+                // of ANY instantiation is accepted and the arm's bindings
+                // land at the WRONG static type, the same memory-unsafe class
+                // the #2001/#2006/#2012/#2018 erasure guards close. A
+                // destructuring pattern with no type-args spelling is the
+                // natural site for a static rejection; the typed binding
+                // `var p: Pair<int, string>` remains the precise spelling.
+                // The destructured record's `genericParams` non-empty is the
+                // trigger; the scrutinee's static type must NOT erase the
+                // instantiation — the strict reading of the issue's
+                // ERASED+RECORD = REJECT criterion. `Object` is the canonical
+                // erased scrutinee; a non-generic interface and a class
+                // scrutinee are likewise erased (a class has no relationship
+                // to the destructured record, and a non-generic interface
+                // cannot carry the record's instantiation in its args). A
+                // scrutinee of the destructured record itself (the
+                // `p: Pair<int, string>` case) is the admit path; this fix
+                // does not change that arm's already-typed binding treatment.
+                if (recTy && !recTy->genericParams.empty()) {
+                    bool scrutErased =
+                        !scrutTy ||
+                        (scrutTy->kind == TypeRef::Kind::Primitive &&
+                         scrutTy->primitive == PrimitiveType::Object) ||
+                        (scrutTy->kind == TypeRef::Kind::Named &&
+                         scrutTy->declaration &&
+                         (scrutTy->declaration->kind == ast::TypeDeclKind::Class ||
+                          (scrutTy->declaration->kind ==
+                               ast::TypeDeclKind::Interface &&
+                           scrutTy->genericArgs.empty()))) ||
+                        (scrutTy->kind == TypeRef::Kind::Named &&
+                         scrutTy->declaration != nullptr &&
+                         scrutTy->declaration != recTy);
+                    if (scrutErased) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, dp->span.begin,
+                            "record-destructuring pattern `" +
+                            std::string(lastName) +
+                            "(...)` is generic but names no type arguments, "
+                            "and the scrutinee's static type does not "
+                            "determine the record's instantiation — a box of "
+                            "ANY instantiation would match and the arm's "
+                            "bindings would read fields at the record's "
+                            "TEMPLATE layout, the same wrong-typed-read "
+                            "hazard #2001/#2006 fixed; use a typed binding "
+                            "(`var p: " + std::string(lastName) +
+                            "<…> => …`) so the type is statically known "
+                            "(\xc2\xa7""19.3 / \xc2\xa7""12.7, v0.226, #2178)");
+                    }
+                }
                 // §19.3 / Appendix C: "a record-destructuring pattern's
                 // positional-binding count matches the record's positional-
                 // field count." Without this check an over- or under-bound

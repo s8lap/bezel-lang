@@ -11502,6 +11502,47 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         }
                     }
                 }
+                // §19.3 (v0.226, #2178): a generic-record DESTRUCTURING pattern
+                // against an ERASED scrutinee — the scrutinee's static type does
+                // not determine the record's instantiation, so the pattern
+                // would match any instantiation and bind the fields at the
+                // record's TEMPLATE layout (a wrong-typed-read hazard, the same
+                // family the #2001/#2006/#2012/#2018 erasure guards close).
+                // Mirror the CaseExpr-side check below for the statement
+                // position; the typed binding `var p: Pair<int, string>` remains
+                // the precise spelling. See the ExprTypecheck_Exprs.cpp
+                // counterpart for the full rationale.
+                if (recTy && !recTy->genericParams.empty()) {
+                    bool scrutErased =
+                        !scrutTy ||
+                        (scrutTy->kind == TypeRef::Kind::Primitive &&
+                         scrutTy->primitive == PrimitiveType::Object) ||
+                        (scrutTy->kind == TypeRef::Kind::Named &&
+                         scrutTy->declaration &&
+                         (scrutTy->declaration->kind == ast::TypeDeclKind::Class ||
+                          (scrutTy->declaration->kind ==
+                               ast::TypeDeclKind::Interface &&
+                           scrutTy->genericArgs.empty()))) ||
+                        (scrutTy->kind == TypeRef::Kind::Named &&
+                         scrutTy->declaration != nullptr &&
+                         scrutTy->declaration != recTy);
+                    if (scrutErased) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, dp->span.begin,
+                            "record-destructuring pattern `" +
+                            std::string(lastName) +
+                            "(...)` is generic but names no type arguments, "
+                            "and the scrutinee's static type does not "
+                            "determine the record's instantiation — a box of "
+                            "ANY instantiation would match and the arm's "
+                            "bindings would read fields at the record's "
+                            "TEMPLATE layout, the same wrong-typed-read "
+                            "hazard #2001/#2006 fixed; use a typed binding "
+                            "(`var p: " + std::string(lastName) +
+                            "<…> => …`) so the type is statically known "
+                            "(\xc2\xa7""19.3 / \xc2\xa7""12.7, v0.226, #2178)");
+                    }
+                }
                 // §19.3 / Appendix C: the positional-binding count must match
                 // the record's positional-field count (mirrors the CaseExpr
                 // handler). An over-/under-bound pattern was accepted and then
