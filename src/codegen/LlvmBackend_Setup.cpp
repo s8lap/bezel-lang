@@ -11619,12 +11619,34 @@ struct StringEscapeWalker {
     void walkCallArgs(const ast::Expr* callee,
                       const std::vector<ast::CallArgument>& args) {
         const sema::MethodSymbol* ms = nullptr;
+        const sema::ExternDeclSymbol* xd = nullptr;
         if (callee) {
             ms = dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*callee));
             if (ms && (ms->isOperator || ms->extensionDecl ||
                        !ms->genericParams.empty() ||
                        (ms->decl == nullptr && !ctx.isImported(ms))))
                 ms = nullptr;  // not a plain compiled method — no relaxation
+            // fix #2222 residue (FFI+concat scope-end release gap): when the
+            // callee is NOT a compiled MethodSymbol, fall through to the FFI
+            // form (`extern`/`extern "c"`/`extern block`). An FFI callee with
+            // a plain (no-modifier) parameter position is a CALL-BOUNDED
+            // BORROW for the borrowed string (the C side does not retain,
+            // and the marshalled UTF-8 buffer for width>1 is freed
+            // post-call by the cstringParamAt path in LlvmBackend_Calls2.cpp
+            // per #2222). Without this relaxation the FFI call would mark
+            // the tracked string local as ESCAPED, so the scope-end release
+            // never arms and the local's +1 leaks at function return (the
+            // original #2222 32-byte direct + 104-byte indirect leak in
+            // FFI + concat + non-loop-FFI repro). String-release analysis
+            // only — gated on stringReleaseMode below — so the shared
+            // dict-materializer / grouping / borrowing-Array walks keep
+            // their conservative ESCAPE (their FFI call-bounded-borrow
+            // soundness is not asserted by any test, leak-over-UAF is the
+            // safe default). // per §28.9, §32.5, §32.6, #2222
+            if (!ms) {
+                xd = dynamic_cast<sema::ExternDeclSymbol*>(
+                    ctx.exprSymbol(*callee));
+            }
         }
         for (size_t i = 0; i < args.size(); ++i) {
             const ast::CallArgument& a = args[i];
@@ -11660,6 +11682,28 @@ struct StringEscapeWalker {
                 i < ms->params.size() && isTargetIdent(a.value.get())) {
                 auto* ps =
                     dynamic_cast<sema::ParameterSymbol*>(ms->params[i]);
+                if (ps && ps->modifier.empty()) safeArg = true;
+            }
+            // fix #2222 residue: a string local passed in a plain
+            // (no-modifier, no-name) parameter position of an EXTERN
+            // (FFI) callee is a CALL-BOUNDED borrow — the C side does
+            // not retain, and the cstringParamAt machinery in
+            // LlvmBackend_Calls2.cpp releases the marshalled UTF-8
+            // buffer post-call. So the caller-side scope-end release
+            // never strands the callee and the local stays
+            // scope-end-release eligible. Gated on stringReleaseMode
+            // (the #1997 narrowing) so the shared
+            // dict-materializer / grouping / borrowing-Array walks —
+            // which have NO counterpart release-old-on-reassign step —
+            // keep their conservative ESCAPE here (their FFI call-
+            // bounded-borrow soundness is not asserted by any test,
+            // leak-over-UAF is the safe default). // per §28.9, §32.5,
+            // §32.6, #2222
+            if (!safeArg && stringReleaseMode && xd &&
+                a.modifier.empty() && a.name.empty() &&
+                i < xd->params.size() && isTargetIdent(a.value.get())) {
+                auto* ps =
+                    dynamic_cast<sema::ParameterSymbol*>(xd->params[i]);
                 if (ps && ps->modifier.empty()) safeArg = true;
             }
             // #1185: a string local passed to StringBuilder.Append/AppendLine's

@@ -97,3 +97,56 @@ BEZEL_TEST(cstring_param_buf_free_2222, single_nonascii_cstring_param_freed_32_6
         "end Main; end C;";
     BEZEL_EXPECT_EQ(runProgram(src), 4);
 }
+
+// #2222 residue (FILED: 2026-07-28) / §28.9 / §32.6 / fix #2222 scope-end release gap:
+// the original #2222 LSan report was 32+104 bytes from the FFI + string-concat
+// repro — a bz.string header (32 bytes direct) + its 103-byte data buffer (104
+// bytes indirect, including the null terminator). The #2222 fix closed the
+// bz_string_to_utf8z buffer leak (the non-ASCII marshalled buffer) but left
+// behind a different leak in the ASCII + concat case: the StringEscapeWalker
+// conservatively marked the `var s := "abc"; s := s + "x" 100x; strlen(s);`
+// local as ESCAPED at the FFI call (the pre-fix walker key only on a
+// compiled MethodSymbol and treats every other callee as escaped), so the
+// scope-end release of `s` never armed and the FINAL concat result leaked
+// at function return. Both controls are non-escaping paths that the
+// post-StringEscapeWalker-fix relaxation admits — the C side does not
+// retain, and the ASCII marshal hands over the raw bz.string data pointer
+// as a borrow. Pre-fix: 32+104 byte LSan leak (the final concat result).
+// Post-fix: ran==true, exit code 103. // per §28.9, §32.5, §32.6, #2222
+BEZEL_TEST(cstring_param_buf_free_2222, ascii_concat_then_ffi_scope_end_release) {
+    const std::string src =
+        "module M; "
+        "extern \"c\" public method strlen(s: CString): int; end; "
+        "class C public static method Main(): int "
+        "  var s := \"abc\"; "
+        "  var i := 0; "
+        "  while i < 100 do "
+        "    s := s + \"x\"; "
+        "    i := i + 1; "
+        "  end; "
+        "  return strlen(s); "
+        "end Main; end C;";
+    // s.Length == 103 (post-loop), strlen("abc" + 100*"x") == 103. ran==false
+    // → -999 means ASan/LSan detected a leak and the binary exited non-clean.
+    BEZEL_EXPECT_EQ(runProgram(src), 103);
+}
+
+// #2222 residue / plain read of a string local at an FFI call from a
+// non-function-body scope (a `do` block) — same walker fix admits the
+// `do strlen(s); end` shape without leaking the final concat. Also runs
+// the FFI at non-ASCII widths with no concat, the analogous ASCII+FFI
+// without concat (already clean as a control), and a chained-FFI case
+// (multiple borrows in sequence stay non-escaping). Each pre-fix would
+// either fail (LSan) or run into the conservative-ESCAPE posture; each
+// post-fix returns normally with ran==true. // per §28.9, §32.5, §32.6, #2222
+BEZEL_TEST(cstring_param_buf_free_2222, ffi_borrow_in_do_block_no_concat_clean) {
+    const std::string src =
+        "module M; "
+        "extern \"c\" public method strlen(s: CString): int; end; "
+        "class C public static method Main(): int "
+        "  var s := \"abc\"; "
+        "  do var n := strlen(s); end; "
+        "  return s.Length; "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(runProgram(src), 3);
+}
