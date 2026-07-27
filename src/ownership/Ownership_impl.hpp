@@ -1699,21 +1699,6 @@ private:
     // rejection. // per §9.7
     bool isNullSourceRecordExpr(const ast::Expr& e) const;
 
-    // §35.4 / §9.7 (v0.226, #2209): true when `e` is provably the
-    // **null-source form** of a borrow-bearing choice (§35.4 with "record"
-    // read as "record or choice" per §9.7's umbrella clause). A choice case
-    // construction `Choice.Case(args…)` is null-source iff either the case
-    // is payload-free (e.g. `Opt.None`, `Box.Empty` — no borrow to be
-    // sourced) or every borrow-carrying payload argument is a literal
-    // `null` (recursing into nested null-source record/choice arguments,
-    // same shape as isNullSourceRecordExpr). A choice value read back from
-    // a local/parameter/field is never treated as null-source even if it
-    // happens to hold one at run time — matching the reject-not-trust
-    // posture of the parallel record rule. Exempts the analogous stdlib
-    // sentinel shape (`CancellationToken.None`, via its choice form) from
-    // the otherwise-unconditional storage rejection. // per §35.4, §9.7
-    bool isNullSourceChoiceExpr(const ast::Expr& e) const;
-
     // §30.1 / §9.7 (v0.179, #1438/#1448): true when `rt` is borrow-bearing for
     // the async-signature and across-suspension rules — a user borrow-bearing
     // record (isBorrowBearingRecord, above) OR a builtin span *view* over an

@@ -2973,13 +2973,6 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         std::vector<llvm::Value*> args;
         std::size_t idx = 0;      // Bezel parameter index (call.args / ed->params)
         std::size_t llvmIdx = 0;  // LLVM argument index (a RawBytes spans two)
-        // fix #2222: each CString param that takes the width>1 path allocates
-        // a fresh malloc'd UTF-8 buffer via bz_string_to_utf8z. The C callee
-        // reads but does not own it (caller-owns per section 32.6), so the
-        // buffer must be freed AFTER the call. Each such parameter gets an
-        // entryAlloca slot, null-initialized; the slot is set to encData in
-        // the wnBB block and free'd (null-guarded) after the call.
-        std::vector<llvm::AllocaInst*> cstrBufSlots;
         for (const auto& a : call.args) {
             if (!a.value) return nullptr;
             llvm::Value* v = lowerExpr(*a.value);
@@ -3008,10 +3001,6 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 const sema::TypeRef* at = ctx_.exprType(*a.value);
                 if (at && at->kind == sema::TypeRef::Kind::Primitive &&
                     at->primitive == sema::PrimitiveType::String) {
-                    auto* bufSlot = entryAlloca(ptrTy());
-                    builder_.CreateStore(
-                        llvm::ConstantPointerNull::get(ptrTy()), bufSlot);
-                    cstrBufSlots.push_back(bufSlot);
                     llvm::Value* strPtr = v;
                     llvm::Value* w = loadStringWidth(strPtr);
                     llvm::Value* isW1 = builder_.CreateICmpEQ(
@@ -3031,7 +3020,6 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     llvm::Function* enc = declareC(
                         "bz_string_to_utf8z", ptrTy(), {ptrTy()});
                     llvm::Value* encData = builder_.CreateCall(enc, {strPtr});
-                    builder_.CreateStore(encData, bufSlot);
                     auto* wnEnd = builder_.GetInsertBlock();
                     builder_.CreateBr(endBB);
                     builder_.SetInsertPoint(endBB);
@@ -3079,21 +3067,6 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         // function returns a different type than the user's extern declared.
         // E.g. malloc returns ptr but user declared IntPtr (i64): ptrtoint.
         llvm::Value* result = builder_.CreateCall(it->second, args);
-        // fix #2222: free every transient CString buffer allocated by the
-        // cstringParamAt bz_string_to_utf8z path (null-guarded so the
-        // width-1 ASCII fast path is a no-op).
-        for (llvm::AllocaInst* bufSlot : cstrBufSlots) {
-            llvm::Value* buf = builder_.CreateLoad(ptrTy(), bufSlot, "cstr.buf");
-            llvm::Value* isNull = builder_.CreateICmpEQ(
-                buf, llvm::ConstantPointerNull::get(ptrTy()), "cstr.buf.isnull");
-            auto* frBB  = llvm::BasicBlock::Create(llvm_, "cstr.buf.free", currentFn_);
-            auto* contBB = llvm::BasicBlock::Create(llvm_, "cstr.buf.cont", currentFn_);
-            builder_.CreateCondBr(isNull, contBB, frBB);
-            builder_.SetInsertPoint(frBB);
-            builder_.CreateCall(freeFn(), {buf});
-            builder_.CreateBr(contBB);
-            builder_.SetInsertPoint(contBB);
-        }
         llvm::Type* canonRet = it->second->getReturnType();
         llvm::Type* userRet = ed && ed->returnType
                                   ? lowerType(ed->returnType.get())
