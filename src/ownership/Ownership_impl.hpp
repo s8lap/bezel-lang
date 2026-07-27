@@ -2875,6 +2875,16 @@ private:
     };
     std::vector<ScopedAdmission> scopedAdmissionQueue_;
 
+    // §32.5 (v0.186, #1719): extern calls whose argument list contains both an
+    // `out` recipient and a callback are checked after scopedPreScan's whole-body
+    // walk, when traceable lambda-local initializers and reassignment facts are
+    // complete. The callback may run before native code initializes the `out`
+    // recipient, so its capture set must not contain that same binding. Direct
+    // lambdas, method references, and never-reassigned lambda/method-reference
+    // locals have statically visible capture sets. // per §32.5
+    std::vector<const ast::CallExpr*> externOutCaptureCallQueue_;
+    void checkExternOutCallbackCapture(const ast::CallExpr& call);
+
     // §28.14 (v0.180) bounding-object resolution result. The object whose
     // teardown bounds a stored callback: a `using var`/`await using var` local
     // (forms 1/2/5, and form 4 with a local chain head), or `this` (forms 3/4 —

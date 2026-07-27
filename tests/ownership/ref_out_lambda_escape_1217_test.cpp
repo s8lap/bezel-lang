@@ -56,6 +56,18 @@ bool rejectsRefOutEscape(const bezel::test::OwnershipResult& r,
     return false;
 }
 
+bool rejectsExternOutCallbackCapture(
+    const bezel::test::OwnershipResult& r, const std::string& bindingName) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("§32.5") == std::string::npos) continue;
+        if (d.message.find("extern call") == std::string::npos) continue;
+        if (d.message.find("same call") == std::string::npos) continue;
+        if (d.message.find(bindingName) == std::string::npos) continue;
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 // =============================================================================
@@ -168,5 +180,136 @@ BEZEL_TEST(ref_out_lambda_escape_1217,
         "public static method MakeConst(): () -> int "
         "  return lambda() => 42; "
         "end MakeConst;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// =============================================================================
+// #1719 — §32.5 same-call extern out-recipient/callback capture intersection.
+// Native code may invoke the callback before assigning the out recipient, so a
+// callback that captures that binding would read indeterminate bits.
+// =============================================================================
+
+BEZEL_TEST(extern_out_callback_capture_issue_1719,
+           direct_lambda_capturing_same_out_binding_rejected) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "extern \"c\" "
+        "  public method fill(out value: int, cb: () -> int): int; "
+        "end; "
+        "class C public static method Main(): int "
+        "  var x: int; "
+        "  _ := fill(out x, lambda() => x); "
+        "  return x; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(rejectsExternOutCallbackCapture(r, "x"));
+}
+
+// §32.5 (#1719): a never-reassigned local initialized from a lambda has a
+// statically visible capture set too; spelling the callback through that local
+// must not launder the same-call out-recipient read.
+BEZEL_TEST(extern_out_callback_capture_issue_1719,
+           traced_lambda_local_capturing_same_out_binding_rejected) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "extern \"c\" "
+        "  public method fill(out value: int, cb: () -> int): int; "
+        "end; "
+        "class C public static method Main(): int "
+        "  var x: int; "
+        "  var cb := lambda() => x; "
+        "  _ := fill(out x, cb); "
+        "  return x; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(rejectsExternOutCallbackCapture(r, "x"));
+}
+
+// §32.5 / §22.4 (#1719): an inline `out var` introduces the same recipient
+// binding for the whole call; a sibling callback still may not capture it.
+BEZEL_TEST(extern_out_callback_capture_issue_1719,
+           inline_out_var_captured_by_callback_rejected) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "extern \"c\" "
+        "  public method fill(out value: int, cb: () -> int): int; "
+        "end; "
+        "class C public static method Main(): int "
+        "  _ := fill(out var x, lambda() => x); "
+        "  return x; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(rejectsExternOutCallbackCapture(r, "x"));
+}
+
+// §32.5 (#1719): the intersection is call-wide, not left-to-right. The
+// callback may precede the out argument syntactically and must still be rejected.
+BEZEL_TEST(extern_out_callback_capture_issue_1719,
+           callback_before_same_out_argument_rejected) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "extern \"c\" "
+        "  public method fill(cb: () -> int, out value: int): int; "
+        "end; "
+        "class C public static method Main(): int "
+        "  var x: int; "
+        "  _ := fill(lambda() => x, out x); "
+        "  return x; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(rejectsExternOutCallbackCapture(r, "x"));
+}
+
+// §32.5 explicitly contrasts `ref`: native receives initialized storage and
+// direct passing intentionally lets a same-call callback observe writes as they
+// land. Capturing a ref argument therefore remains accepted (#1719 control).
+BEZEL_TEST(extern_out_callback_capture_issue_1719,
+           direct_lambda_capturing_same_ref_binding_accepted) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "extern \"c\" "
+        "  public method inspect(ref value: int, cb: () -> int): int; "
+        "end; "
+        "class C public static method Main(): int "
+        "  var x := 7; "
+        "  _ := inspect(ref x, lambda() => x); "
+        "  return x; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §32.5 rejects only the intersection. A callback may capture some other
+// initialized binding while the extern fills `x` through out (#1719 control).
+BEZEL_TEST(extern_out_callback_capture_issue_1719,
+           callback_capturing_different_binding_accepted) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "extern \"c\" "
+        "  public method fill(out value: int, cb: () -> int): int; "
+        "end; "
+        "class C public static method Main(): int "
+        "  var x: int; "
+        "  var y := 7; "
+        "  _ := fill(out x, lambda() => y); "
+        "  return x; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §32.5 (#1719): capture identity is symbol-based, not name-based. A lambda
+// parameter that shadows the out recipient is local to the callback and is not
+// a capture of the recipient binding.
+BEZEL_TEST(extern_out_callback_capture_issue_1719,
+           lambda_parameter_shadowing_out_name_accepted) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "extern \"c\" "
+        "  public method fill(out value: int, cb: (int) -> int): int; "
+        "end; "
+        "class C public static method Main(): int "
+        "  var x: int; "
+        "  _ := fill(out x, lambda(x: int) => x); "
+        "  return x; "
+        "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

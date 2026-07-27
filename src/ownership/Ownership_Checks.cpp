@@ -10741,6 +10741,13 @@ void MethodOwnership::scopedPreScan(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     for (const auto& s : body)
         if (s) scopedPreScanStmt(*s);
+    // §32.5 (#1719): run after the whole walk so a callback local's lambda /
+    // method-reference initializer and the flow-insensitive reassignment set are
+    // complete. One pass over the queued extern calls yields one diagnostic per
+    // same-call out-binding capture. // per §32.5
+    for (const ast::CallExpr* call : externOutCaptureCallQueue_)
+        if (call) checkExternOutCallbackCapture(*call);
+    externOutCaptureCallQueue_.clear();
     // Run the queued §28.14 admissions AFTER the whole walk so the
     // lambda-literal-local and assigned-symbol maps are complete (the
     // declaration-order comparisons are unaffected — see the queue's
@@ -10903,9 +10910,16 @@ void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
     // `scoped`, then descend.
     const auto* ne = dynamic_cast<const ast::NewExpr*>(&e);
     const ast::Expr* callee = nullptr;
-    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e))
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
         callee = ce->callee.get();
-    else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e))
+        // §32.5 (#1719): only extern calls can invoke a callback while a
+        // same-call `out` recipient is still unassigned. Defer the capture-set
+        // intersection until the whole pre-scan has populated its trace maps.
+        // // per §32.5
+        if (callee && dynamic_cast<sema::ExternDeclSymbol*>(
+                          ctx_.exprSymbol(*callee)))
+            externOutCaptureCallQueue_.push_back(ce);
+    } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e))
         callee = nc->callee.get();
     if (const auto* args = scopedArgsOf(e)) {
         for (std::size_t i = 0; i < args->size(); ++i) {
@@ -11020,6 +11034,111 @@ void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
     }
     // Literals / identifiers / typeof / nameof / default / unit: no children
     // with calls.
+}
+
+// §32.5 (v0.186, #1719): an extern boundary may invoke a callback before it
+// writes another argument's `out` recipient. Both the call's out bindings and a
+// direct/traceable callback's capture set are statically visible, so intersect
+// them and reject a read of the still-unassigned recipient. `ref` is deliberately
+// absent: §32.5 chooses direct ref semantics and explicitly admits observing a
+// same-call ref binding from the callback. // per §32.5
+void MethodOwnership::checkExternOutCallbackCapture(
+    const ast::CallExpr& call) {
+    if (!call.callee) return;
+    auto* xd = dynamic_cast<sema::ExternDeclSymbol*>(
+        ctx_.exprSymbol(*call.callee));
+    if (!xd || !xd->externDecl) return;
+
+    std::vector<sema::Symbol*> outBindings;
+    for (const ast::CallArgument& arg : call.args) {
+        const bool isOut = arg.modifier == "out" ||
+                           arg.modifier.starts_with("out ");
+        if (!arg.value || !isOut) continue;
+        if (sema::Symbol* sym = ctx_.exprSymbol(*arg.value))
+            outBindings.push_back(sym);
+    }
+    if (outBindings.empty()) return;
+
+    auto formalForArg = [&](std::size_t pos,
+                            const ast::CallArgument& arg) -> const ast::Param* {
+        const auto& params = xd->externDecl->params;
+        if (!arg.name.empty()) {
+            for (const ast::Param& p : params)
+                if (p.name == arg.name) return &p;
+            return nullptr;
+        }
+        return pos < params.size() ? &params[pos] : nullptr;
+    };
+
+    for (std::size_t pos = 0; pos < call.args.size(); ++pos) {
+        const ast::CallArgument& arg = call.args[pos];
+        if (!arg.value) continue;
+        const ast::Param* formal = formalForArg(pos, arg);
+        const sema::TypeRef* formalType =
+            formal && formal->type ? ctx_.resolvedType(*formal->type) : nullptr;
+        if (!formalType || formalType->kind != sema::TypeRef::Kind::Function)
+            continue;
+
+        std::vector<const ast::IdentifierExpr*> captures;
+        bool captureSetVisible = false;
+        if (const auto* lam =
+                dynamic_cast<const ast::LambdaExpr*>(arg.value.get())) {
+            scopedCollectCaptures(*lam, captures);
+            captureSetVisible = true;
+        } else if (const auto* id =
+                       dynamic_cast<const ast::IdentifierExpr*>(arg.value.get())) {
+            sema::Symbol* sym = ctx_.exprSymbol(*id);
+            auto lit = scopedLambdaLocalInit_.find(sym);
+            if (lit != scopedLambdaLocalInit_.end() &&
+                scopedAssignedSyms_.count(sym) == 0) {
+                scopedCollectCaptures(*lit->second, captures);
+                captureSetVisible = true;
+            } else {
+                auto ref = deferredMethodRefLocalInit_.find(sym);
+                if (ref != deferredMethodRefLocalInit_.end() &&
+                    scopedAssignedSyms_.count(sym) == 0) {
+                    if (const auto* ma =
+                            dynamic_cast<const ast::MemberAccessExpr*>(
+                                ref->second)) {
+                        if (ma->target)
+                            scopedCaptureWalkExpr(*ma->target, captures);
+                        captureSetVisible = true;
+                    }
+                }
+            }
+        } else if (const auto* ma =
+                       dynamic_cast<const ast::MemberAccessExpr*>(
+                           arg.value.get())) {
+            if (dynamic_cast<sema::MethodSymbol*>(
+                    ctx_.exprSymbol(*arg.value)) && ma->target) {
+                scopedCaptureWalkExpr(*ma->target, captures);
+                captureSetVisible = true;
+            }
+        }
+        if (!captureSetVisible) continue;
+
+        std::unordered_set<sema::Symbol*> reported;
+        for (const ast::IdentifierExpr* capture : captures) {
+            if (!capture) continue;
+            sema::Symbol* captured = ctx_.exprSymbol(*capture);
+            if (!captured) continue;
+            for (sema::Symbol* out : outBindings) {
+                if (captured != out || !reported.insert(captured).second)
+                    continue;
+                report(
+                    Severity::Error, capture->span.begin,
+                    std::string("callback argument to extern call `") +
+                        std::string(xd->name) + "` captures `" +
+                        std::string(captured->name) +
+                        "`, but `" + std::string(captured->name) +
+                        "` is also passed `out` to the same call — native code "
+                        "may invoke the callback before assigning the out "
+                        "recipient, so the capture could read indeterminate bits "
+                        "(§32.5; capture a different initialized binding, or read "
+                        "the recipient only after the extern call returns)");
+            }
+        }
+    }
 }
 
 bool MethodOwnership::scopedFormalAt(const ast::Expr* callee,
