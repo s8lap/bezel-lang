@@ -37,6 +37,10 @@ int32_t bz_file_read_all_bytes(const char* path, uint8_t** out, int64_t* len) {
     return 0;
 }
 
+// §7.3: File.ReadAllText — text path (UTF-8 verbatim per stdlib §3.2).
+// The byte buffer is returned to the caller; the codegen side wraps it in a
+// fresh +1 bz.string (ptrToStr in LlvmBackend_Calls.cpp), so the bz.string's
+// release path (bz_string_release) owns the buffer from then on.
 int32_t bz_file_read_all_text(const char* path, char** out, int64_t* byte_len) {
     uint8_t* buf = nullptr; int64_t len = 0;
     int32_t r = bz_file_read_all_bytes(path, &buf, &len);
@@ -119,10 +123,12 @@ int32_t bz_file_write_all_bytes(const char* path, const uint8_t* data, int64_t l
     return 0;
 }
 
+// §7.3: File.WriteAllText — text path (UTF-8 verbatim per stdlib §3.2).
 int32_t bz_file_write_all_text(const char* path, const char* data, int64_t len) {
     return bz_file_write_all_bytes(path, (const uint8_t*)data, len);
 }
 
+// §7.3: File.AppendAllText — text path (UTF-8 verbatim per stdlib §3.2).
 int32_t bz_file_append_all_text(const char* path, const char* data, int64_t len) {
     FILE* f = fopen(path, "ab");
     if (!f) return -errno;
@@ -131,14 +137,17 @@ int32_t bz_file_append_all_text(const char* path, const char* data, int64_t len)
     return 0;
 }
 
+// §7.3: File.Exists — access(2) F_OK probe.
 bool bz_file_exists(const char* path) {
     return access(path, F_OK) == 0;
 }
 
+// §7.3: File.Delete — unlink(2).
 bool bz_file_delete(const char* path) {
     return unlink(path) == 0;
 }
 
+// §7.3: File.Copy — read source bytes, write to destination (overwrite-controlled).
 int32_t bz_file_copy(const char* src, const char* dst, bool overwrite) {
     if (!overwrite && bz_file_exists(dst)) return -EEXIST;
     uint8_t* buf; int64_t len;
@@ -149,6 +158,7 @@ int32_t bz_file_copy(const char* src, const char* dst, bool overwrite) {
     return r;
 }
 
+// §7.3: File.Move — rename(2) when possible, fall back to Copy+Delete (cross-fs).
 int32_t bz_file_move(const char* src, const char* dst) {
     if (rename(src, dst) == 0) return 0;
     int32_t r = bz_file_copy(src, dst, true);
@@ -202,11 +212,13 @@ int32_t bz_file_write_all_lines(const char* path, void* arrp) {
     return 0;
 }
 
+// §7.4: Directory.Exists — stat(2) → S_ISDIR check.
 bool bz_dir_exists(const char* path) {
     struct stat st;
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+// §7.4: Directory.CreateDirectory — mkdir -p semantics (create all intermediates).
 int32_t bz_dir_create(const char* path) {
     // Create all intermediate directories (like mkdir -p)
     char* tmp = strdup(path);
@@ -240,11 +252,14 @@ static int rmdir_recursive(const char* path) {
     return rmdir(path) == 0 ? 0 : -errno;
 }
 
+// §7.4: Directory.Delete — rmdir(2) for non-recursive, recursive walk for the
+// recursive=true overload (rm -rf).
 int32_t bz_dir_delete(const char* path, bool recursive) {
     if (recursive) return rmdir_recursive(path);
     return rmdir(path) == 0 ? 0 : -errno;
 }
 
+// §7.4: Directory.GetFiles — return char** of regular-file names, exclude dots.
 void* bz_dir_get_files(const char* path, int64_t* count_out) {
     DIR* d = opendir(path);
     if (!d) { if (count_out) *count_out = 0; return nullptr; }
@@ -265,6 +280,7 @@ void* bz_dir_get_files(const char* path, int64_t* count_out) {
     return arr;
 }
 
+// §7.4: Directory.GetDirectories — return char** of subdirectory names, exclude dots.
 void* bz_dir_get_dirs(const char* path, int64_t* count_out) {
     DIR* d = opendir(path);
     if (!d) { if (count_out) *count_out = 0; return nullptr; }
@@ -285,6 +301,7 @@ void* bz_dir_get_dirs(const char* path, int64_t* count_out) {
     return arr;
 }
 
+// §7.4: Path.Combine — concatenate two path segments with a single '/' separator.
 char* bz_path_combine(const char* a, const char* b) {
     size_t la = strlen(a), lb = strlen(b);
     bool slash = la > 0 && a[la - 1] != '/';
@@ -295,10 +312,12 @@ char* bz_path_combine(const char* a, const char* b) {
     return out;
 }
 
+// §7.4: Path.GetFileName — POSIX basename(3).
 char* bz_path_filename(const char* path) {
     return strdup(basename((char*)path));  // POSIX basename
 }
 
+// §7.4: Path.GetExtension — last '.' and beyond in the basename, or "".
 char* bz_path_extension(const char* path) {
     const char* base = strrchr(path, '/');
     base = base ? base + 1 : path;
@@ -306,6 +325,7 @@ char* bz_path_extension(const char* path) {
     return dot ? strdup(dot) : strdup("");
 }
 
+// §7.4: Path.GetFileNameWithoutExtension — basename minus its last '.' suffix.
 char* bz_path_stem(const char* path) {
     const char* base = strrchr(path, '/');
     base = base ? base + 1 : path;
@@ -317,6 +337,7 @@ char* bz_path_stem(const char* path) {
     return out;
 }
 
+// §7.4: Path.GetDirectoryName — POSIX dirname(3).
 char* bz_path_dirname(const char* path) {
     char* copy = strdup(path);
     char* dir = dirname(copy);  // POSIX dirname
@@ -325,6 +346,9 @@ char* bz_path_dirname(const char* path) {
     return result;
 }
 
+// §7.4: Path.GetFullPath — realpath(3) with a 4 KiB stack buffer, fall back
+// to the input path on resolution failure (compatible with stdlib §7.4's
+// documented behavior of never throwing for a non-resolvable input).
 char* bz_path_absolute(const char* path) {
     char buf[4096];
     return realpath(path, buf) ? strdup(buf) : strdup(path);
