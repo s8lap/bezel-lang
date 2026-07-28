@@ -177,19 +177,19 @@ constexpr std::array<BuiltinExceptionEdge, 29> kBuiltinExceptionHierarchy = {{
 
 bool isOwningPrefixedName(std::string_view head) {
     return head.rfind("Owning", 0) == 0;
-}
+}  // per §5.11 / #1372 — Owning* prefix test (consolidates the 16 codegen rfind sites)
 
 bool isOwningCollectionHead(std::string_view head) {
     return contains(kOwningCollectionHeads, head);
-}
+}  // per §28.6 / §5.11 (#1008 Part C) — element-owning collection heads
 
 bool isOwningTypeHead(std::string_view head) {
     return contains(kOwningTypeHeads, head);
-}
+}  // per §28.3 / §5.11 — owning-type heads (collections + wrappers)
 
 bool isTaskFamilyHead(std::string_view head) {
     return contains(kTaskFamilyHeads, head);
-}
+}  // per §28.3 v0.190 (SB-01) — Task-family heads; `Task` here only transfers ownership under !isAsync_
 
 // §28.3 / §29.3 / §30.7 (v0.201, #2048 / proposal 0048): the iterable or
 // enumerator interface heads — the iterator convention's announced caller-
@@ -202,28 +202,29 @@ bool isIterableInterfaceHead(std::string_view head) {
 
 bool isArrayBackedCollectionName(std::string_view n) {
     return contains(kArrayBackedCollections, n);
-}
+}  // per §4.4–§4.7 / §4.14 — bz_array_t*-backed collection names
 
 bool isDictionaryName(std::string_view n) {
     return contains(kDictionaryNames, n);
-}
+}  // per §4.8 / §4.17 — bz_dict_t*-backed K-indexed collection names
 
 bool isLinkedListName(std::string_view n) {
     return contains(kLinkedListNames, n);
-}
+}  // per §4.6 / §4.7 — bz_llist_t*-backed linked-list names
 
 bool isHeapPointerReferenceBuiltin(std::string_view n) {
     return contains(kHeapPointerReferenceBuiltins, n);
-}
+}  // per §4 / §6 / §29 / §30 / §2.14–§2.15 — heap-pointer reference builtins shared by the two codegen rep paths
 
 std::string_view builtinExceptionParentOf(std::string_view name) {
     for (const auto& edge : kBuiltinExceptionHierarchy)
         if (edge.name == name) return edge.parent;
     return {};
-}
+}  // per §31.4 / #1621 — built-in exception parent lookup (the only access from sema)
 
 // #1936 / §19.5 / §31: membership test over the same hierarchy table (the root
 // `Exception` is present as an edge with an empty parent, so it is recognized).
+// per §19.5 / §31 / #1936.
 bool isBuiltinExceptionName(std::string_view name) {
     for (const auto& edge : kBuiltinExceptionHierarchy)
         if (edge.name == name) return true;
