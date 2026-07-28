@@ -556,6 +556,37 @@ bool containsMethodTypeParam(
     return false;
 }
 
+// §22.3 / §14.5 (#2266): true when `t` mentions one of `tpNames` ANYWHERE in its
+// structure. Same question containsMethodTypeParam asks, but it walks EVERY
+// nested type slot — the inline-array element (`[4]T`) and a function type's
+// parameter/return slots (`(T) -> int`) as well as genericArgs (`Pair<T, U>`).
+//
+// It gates a SKIP of a rejection: checkArgsAgainstParams' §22.3 ref/out
+// exact-type check defers every parameter this returns true for to §14.5's
+// checkGenericRefOutExactUnification. So it must be a SUPERSET — answering true
+// too readily only defers a check, while a MISSED mention makes the exact
+// comparison run against an unsubstituted `[4]T` and false-reject a matching
+// `[4]int` argument. That is precisely how #1756's earlier narrow guards
+// (containsBareTypeParam, containsUnresolvedTypeParam — both recursing
+// genericArgs only) regressed the accepted generic ref/out calls and got
+// reverted. containsMethodTypeParam itself is left alone: it gates the §22.4
+// out-var re-type and §14.5's own domain test, whose contracts are unchanged.
+bool refOutParamTypeMentionsTypeParam(
+    const TypeRef* t,
+    const std::unordered_set<std::string_view>& tpNames) {
+    if (!t || tpNames.empty()) return false;
+    if (t->kind == TypeRef::Kind::Named && !t->declaration) {
+        std::string_view head = t->headName();
+        if (!head.empty() && tpNames.count(head)) return true;
+    }
+    for (auto* ga : t->genericArgs)
+        if (refOutParamTypeMentionsTypeParam(ga, tpNames)) return true;
+    if (refOutParamTypeMentionsTypeParam(t->arrayElement, tpNames)) return true;
+    for (const auto& fp : t->funcParams)
+        if (refOutParamTypeMentionsTypeParam(fp.type, tpNames)) return true;
+    return refOutParamTypeMentionsTypeParam(t->funcReturn, tpNames);
+}
+
 // A printable spelling for a resolved TypeRef, used by the §14.5 ref/out
 // exact-unification diagnostics (checkGenericRefOutExactUnification below).
 // Handles primitives and simple named types (declaration, or an unresolved
@@ -7468,37 +7499,72 @@ void ExprTC::checkArgsAgainstParams(
         // runtime SEGV; the bare-argument counterpart was already correctly
         // rejected here.
         const std::string_view am = a.modifier;
-        // per §22.3 (#1756): a `ref`/`out` argument aliases the caller's
-        // storage location directly (§22.3 "ref and out argument locations"),
-        // so its type must EXACTLY match the parameter's referent type — no
-        // §5.1 implicit conversion is admitted, the same "aliases the caller's
-        // location, so no conversion is admitted" principle §14.5 states for
-        // the generic-inference case. This concrete (non-generic) position was
-        // previously folded into the by-reference-family skip and never
-        // type-checked at all, so a `ref y` of type `long` against a
-        // `ref x: int` parameter compiled clean and aliased mismatched-width
-        // storage through the parameter.
+        // per §22.3 / §14.5 (#1756, #2266): a `ref`/`out` argument aliases the
+        // caller's storage location directly — §22.3 "ref and out argument
+        // locations": "A `ref` argument naming a mutable local or writable
+        // field is a true alias" — so its type must EXACTLY match the
+        // parameter's referent type and no §5.1 implicit conversion is
+        // admitted. The no-conversion half is stated normatively only in §14.5
+        // ("a `ref` or `out` parameter position unifies exactly: the parameter
+        // aliases the caller's location, so no conversion is admitted at the
+        // binding or later at the applicability check"), scoped there to
+        // type-argument inference; §22.3 states the aliasing that motivates it
+        // but not the type rule itself, so BOTH sections are cited here and in
+        // the diagnostic. (Generalising the rule to the non-generic position is
+        // a §22.3 spec amendment, filed separately — not decided in code.)
+        // This concrete position was previously folded into the
+        // by-reference-family skip and never type-checked at all, so a `ref y`
+        // of type `long` against a `ref x: int` parameter compiled clean and
+        // aliased mismatched-width storage through the parameter.
         //
-        // This check is NON-GENERIC ONLY: substituteMemberType (below) resolves
+        // The check runs only where the referent type is CONCRETE here, and the
+        // skip is PER-PARAMETER (#2266). substituteMemberType (below) resolves
         // CLASS-level type params, not a generic method's OWN type params, so
         // for `foo<T>(ref T x)` the parameter referent type stays the
         // unresolved `T` and the exact-type comparison would compare the arg's
-        // concrete type against that unresolved `T` and false-reject. Generic
-        // ref/out is §14.5's domain — checkGenericRefOutExactUnification
+        // concrete type against that unresolved `T` and false-reject. Such a
+        // parameter is §14.5's domain — checkGenericRefOutExactUnification
         // (#1686, run before this point) rejects the call when generic
-        // inference does not unify invariantly — so a BLANKET skip of every
-        // generic method here defers all generic ref/out to §14.5 and cannot
-        // double-report. (Constructors pass no MethodDecl; their class-level
-        // params are substituted, so the check fires for them.)
+        // inference does not unify invariantly.
+        //
+        // #2266: this skip used to be a BLANKET one over every generic method
+        // (`!calleeMethodDecl->genericParams.empty() -> continue`), which left a
+        // hole no check covered: §14.5's own guard bails unless SOME ref/out
+        // parameter's declared type mentions a method type parameter, and even
+        // then its per-parameter loop skips the concretely-typed slots. So
+        // `Store<T>(v: T, ref slot: int)` called with a `ref` to a `string` (or
+        // `ref slot: long` against an `int` location — an 8-byte store into a
+        // 4-byte caller slot) was accepted by both, and codegen passed the raw
+        // caller address with no coercion and no temp copy: type confusion
+        // through the alias. Skipping PER PARAMETER — only where the referent
+        // type still mentions a type parameter after class substitution — leaves
+        // §14.5's domain untouched while restoring §22.3's check on the
+        // concretely-typed slots of a generic method.
+        //
+        // The name set spans the method's own type params AND the receiver
+        // class's: after substituteMemberType a remaining mention of a CLASS
+        // param means substitution could not decide the referent type here
+        // (e.g. a receiver with no value exprType), and rejecting on a referent
+        // type we could not resolve is exactly the false-rejection that reverted
+        // #1756 four times. Deferring is the conservative answer — it can only
+        // narrow what this check reports, never widen it.
+        // (Constructors pass no MethodDecl; their class-level params are
+        // substituted, so the check fires for them.)
         if (am == "ref" || am == "out") {
-            if (calleeMethodDecl && !calleeMethodDecl->genericParams.empty())
-                continue;
             const ast::Param& rp = params[j];
             if (!rp.type) continue;
             TypeRef* rparamTy = ctx_.resolvedType(*rp.type);
             if (rparamTy && classTarget && classParent)
                 rparamTy = substituteMemberType(rparamTy, classTarget,
                                                 classParent);
+            std::unordered_set<std::string_view> tpNames;
+            if (calleeMethodDecl)
+                for (const auto& gp : calleeMethodDecl->genericParams)
+                    tpNames.insert(gp.name);
+            if (classParent)
+                for (auto* cgp : classParent->genericParams)
+                    if (cgp) tpNames.insert(cgp->name);
+            if (refOutParamTypeMentionsTypeParam(rparamTy, tpNames)) continue;
             TypeRef* rargTy = ctx_.exprType(*a.value);
             if (rparamTy && rargTy && !typeRefEqual(rargTy, rparamTy)) {
                 ctx_.diagnostics().report(
@@ -7508,8 +7574,8 @@ void ExprTC::checkArgsAgainstParams(
                         "` to " + calleeDesc +
                         " does not match the parameter's referent type — "
                         "a `ref`/`out` argument aliases the caller's "
-                        "location, so the type must match exactly and no "
-                        "implicit conversion is admitted (§22.3)");
+                        "location (§22.3), so the type must match exactly and "
+                        "no implicit conversion is admitted (§14.5)");
             }
             continue;
         }
