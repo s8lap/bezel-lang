@@ -226,16 +226,14 @@ extern "C" int32_t bz_str_lastindexof(const void* self_p, const void* sub_p) {
     return -1;
 }
 
-// per §9.6 / #535: Substring(start, count): owned string — code-point slice.
-// Returns a fresh +1 string of `count` code points starting at code-point
-// index `start`. Clamps `count` to the available tail if needed.
-// Preserves the source string's width (§4.6 per-string storage width).
-// #1282 (§9.5 / §4.6): char.ToString() / interpolation of a char. A Bezel char
-// is a Unicode scalar (up to U+10FFFF); build a single-code-point string at the
-// narrowest storage width (1/2/4 bytes per §4.6 adaptive storage) so the full
-// code point survives — the old codegen truncated it to its low byte (`%c`),
-// corrupting any char above U+00FF. On output the string is UTF-8-encoded by
-// bz_string_to_utf8z, so `char(0x0141)` renders as its UTF-8 form.
+// per §9.5 / §4.6 (issue #1282): char.ToString() / interpolation of a char. A
+// Bezel char is a Unicode scalar (up to U+10FFFF); build a single-code-point
+// string at the narrowest storage width (1/2/4 bytes per §4.6 adaptive
+// storage) so the full code point survives — the old codegen truncated it to
+// its low byte (`%c`), corrupting any char above U+00FF. On output the string
+// is UTF-8-encoded by bz_string_to_utf8z, so `char(0x0141)` renders as its
+// UTF-8 form. Per §9.6: this helper is the runtime backing for the implicit
+// string conversion of a char.
 extern "C" void* bz_char_to_string(int32_t cp) {
     uint32_t u = (uint32_t)cp;
     int8_t w = (u <= 0xFF) ? 1 : (u <= 0xFFFF ? 2 : 4);
@@ -252,6 +250,16 @@ extern "C" void* bz_char_to_string(int32_t cp) {
     return strObj;
 }
 
+// per §9.6 / #535: Substring(start, count): owned string — code-point slice.
+// Returns a fresh +1 string of `count` code points starting at code-point
+// index `start`. Clamps `count` to the available tail if needed.
+// Preserves the source string's width (§4.6 per-string storage width).
+// The codegen-side bounds check (LlvmBackend_String.cpp "Substring" branch)
+// raises IndexOutOfRangeException for `start < 0`, `start > len`, or
+// `start + length > len`; the defensive clamps here are a backstop so a stray
+// runtime caller can never read out of the source buffer. The single-arg
+// overload passes `count = -1`, which the runtime expands to the rest of
+// the string (start .. len).
 extern "C" void* bz_str_substring(const void* self_p, int64_t start, int64_t count) {
     if (!self_p) {
         // Return empty string.
@@ -549,6 +557,13 @@ extern "C" void* bz_str_from_char_array(const void* arr_p,
     return strObj;
 }
 
+// per §3.1 (StringBuilder.ToString): flatten the builder's parts array into a
+// fresh, owned byte buffer (out_data, out_len). Each part is a +1 bz_string
+// (the builder owns a +1 per part from Append/ctor, #1185); this helper
+// concatenates the byte contents into one buffer WITHOUT releasing the parts
+// — the builder's destructor / ResetTo path handles that (#1185). The caller
+// is responsible for freeing out_data via free(). Width-1 (byte) mode,
+// matching Append.
 void bz_strbuilder_to_string(void* parts_arr, char** out_data, int64_t* out_len) {
     auto* arr = (bz_array_t*)parts_arr;
     if (!arr || arr->count == 0) {
@@ -609,6 +624,13 @@ static void bz_sb_reset_to(bz_array_t* arr, char* data, int64_t len) {
     bz_array_add(arr, &strObj, 8);
 }
 
+// per §3.1 (StringBuilder.Insert(index, value)): insert `value` at the
+// byte-offset `index` of the builder's flattened content. Out-of-range
+// (index < 0 or > Length) is a no-op here; the codegen-side bounds check
+// raises IndexOutOfRangeException per the §3.1 v0.195 contract. The insert
+// does NOT retain `value` — it COPIES `value`'s bytes into the new flat
+// buffer; the caller still owns the value. The builder resets to one part
+// (via bz_sb_reset_to), releasing the old +1 parts first.
 void bz_sb_insert(void* parts_arr, int64_t index, const void* value) {
     auto* arr = (bz_array_t*)parts_arr;
     if (!arr || !value) return;
@@ -628,6 +650,13 @@ void bz_sb_insert(void* parts_arr, int64_t index, const void* value) {
     bz_sb_reset_to(arr, buf, total);
 }
 
+// per §3.1 (StringBuilder.Remove(startIndex, length)): remove `length` bytes
+// starting at byte offset `start_index` of the flattened builder content.
+// Per the §3.1 v0.195 contract, an out-of-range request raises
+// IndexOutOfRangeException at the codegen layer; the runtime clamps an
+// out-of-range window to a no-op (the SB is unchanged) so a stray caller
+// cannot corrupt the parts list. The builder resets to one part, releasing
+// the old +1 parts first.
 void bz_sb_remove(void* parts_arr, int64_t start_index, int64_t length) {
     auto* arr = (bz_array_t*)parts_arr;
     if (!arr) return;
@@ -649,6 +678,15 @@ void bz_sb_remove(void* parts_arr, int64_t start_index, int64_t length) {
     bz_sb_reset_to(arr, buf, total);
 }
 
+// per §3.1 (StringBuilder.Replace(oldValue, newValue)): replace every
+// non-overlapping byte occurrence of `old_value` in the builder's flattened
+// content with `new_value`. The §3.1 v0.195 contract raises ArgumentException
+// for an empty oldValue; the runtime short-circuits that case (no-op). The
+// builder resets to one part, releasing the old +1 parts first. Replace
+// operates at the BYTE level (parts are width-1 byte strings); multi-byte
+// code points can be corrupted if old_value crosses a code-point boundary,
+// but StringBuilder is documented as operating on the byte representation
+// (Append(ReadOnlyStringSpan) is the per-code-point path, v0.222 / #1810).
 void bz_sb_replace(void* parts_arr, const void* old_value, const void* new_value) {
     auto* arr = (bz_array_t*)parts_arr;
     if (!arr || !old_value || !new_value) return;
