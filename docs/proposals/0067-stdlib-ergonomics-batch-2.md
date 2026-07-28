@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | draft |
-| **Tracking issue** | none yet |
+| **Status** | **superseded — graduated v0.228** (owner-accepted 2026-07-28; Q1–Q5 resolutions recorded in the v0.228 changelog entry) |
+| **Tracking issue** | [#2242](https://github.com/s8lap/bezel-lang/issues/2242) (implementation) |
 | **Target module(s)** | stdlib only — `System` ([§2.2](../Bezel_Standard_Library.md#sec-math) `Math`, [§2.5](../Bezel_Standard_Library.md#sec-datetime-timespan-dateonly-timeonly) `TimeSpan`), `System.Text` ([§3.2](../Bezel_Standard_Library.md#sec-encoding) `Encoding`), `System.Collections.Generic` ([§4.4](../Bezel_Standard_Library.md#sec-arrayt) `Array<T>`), and the [§9.1](../Bezel_Standard_Library.md#sec-integer-types) integer primitives. **No spec change, no new types, no new grammar.** |
 | **Written against** | stdlib/spec v0.226 |
 | **Origin** | A 2026-07-28 API-symmetry review of the v0.226 stdlib surface (run alongside the [gap review](stdlib-gap-review-2026-07.md)'s map, which tracks capability gaps, not member-level symmetry), adversarially verified: every member below was re-located in the v0.226 stdlib text and confirmed absent; none is pre-declined in 0062's examined-and-deferred register or in [`DECLINED.md`](DECLINED.md). |

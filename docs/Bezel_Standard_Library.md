@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.227 — July 2026**
+**Companion to the Bezel Language Specification, v0.228 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -140,9 +140,17 @@ public static class Math
   public static pure method Round(x: double, digits: int): double;
   public static pure method Truncate(x: double): double;
 
+  public static pure method Floor(x: decimal): decimal;    // toward negative infinity (v0.228);
+  public static pure method Ceiling(x: decimal): decimal;  //   toward positive infinity — each to an
+  public static pure method Truncate(x: decimal): decimal; //   integral value; exact, never faults
+                                                           //   (decimal's range endpoints are integral).
+                                                           //   Truncate is toward zero. Round(decimal)
+                                                           //   is the instance Decimal.Round (§9.3).
+
   public static pure method Sign(x: int): int;            // -1, 0, or 1
   public static pure method Sign(x: long): int;
   public static pure method Sign(x: double): int;
+  public static pure method Sign(x: decimal): int;        // -1, 0, or 1 (v0.228)
 
   public static pure method Fmod(x: double, y: double): double;
   public static pure method IEEERemainder(x: double, y: double): double;
@@ -314,12 +322,25 @@ public record TimeSpan: IComparable<TimeSpan>, IEquatable<TimeSpan>
   public static method FromSeconds(seconds: double): TimeSpan;
   public static method FromMilliseconds(ms: double): TimeSpan;
 
+  public static readonly property Zero: TimeSpan;          // FromTicks(0) (v0.228)
+  public static readonly property MinValue: TimeSpan;      // FromTicks(long.MinValue)
+  public static readonly property MaxValue: TimeSpan;      // FromTicks(long.MaxValue)
+
   public method ToString(): string;                // constant ("c") form (§2.18)
   public method ToString(format: string): string;  // format vocabulary: §2.18
 
   public static method operator +(a: TimeSpan, b: TimeSpan): TimeSpan;
   public static method operator -(a: TimeSpan, b: TimeSpan): TimeSpan;
   public static method operator *(a: TimeSpan, factor: double): TimeSpan;
+                                     // computes over Ticks in double; OverflowException on a
+                                     //   product outside the tick range or a NaN operand
+                                     //   (v0.228 pin)
+  public static method operator /(a: TimeSpan, divisor: double): TimeSpan;
+                                     // same computation model and OverflowException rule
+                                     //   as * (v0.228); DivideByZeroException on
+                                     //   divisor = 0.0
+  public static method operator -(t: TimeSpan): TimeSpan;
+                                     // unary negation (v0.228); OverflowException on MinValue
 end TimeSpan;
 ```
 
@@ -1091,6 +1112,10 @@ public abstract class Encoding
   public abstract method GetByteCount(s: string): int;                       // v0.165 (#1355)
   public abstract method GetBytes(s: string, destination: Span<byte>): int;  // v0.165: returns bytes written;
                                                                              //   IndexOutOfRangeException if too short
+  public abstract method GetByteCount(s: ReadOnlyStringSpan): int;           // span-source encode (v0.228):
+  public abstract method GetBytes(s: ReadOnlyStringSpan,                     //   identical contract to the string
+                                  destination: Span<byte>): int;             //   forms over the span's range
+  public abstract method GetBytes(s: ReadOnlyStringSpan): owned Array<byte>; //   one-shot allocating form (v0.228)
   public abstract readonly property Name: string;
 
   public static readonly property UTF8: Encoding;
@@ -1111,7 +1136,7 @@ The static properties (`UTF8`, `UTF16`, `UTF32`, `ASCII`) return singleton insta
 - **`UTF32`** (`Name` = `"utf-32le"`): little-endian, no BOM emitted. `GetString` requires a byte count divisible by four, consumes one leading little-endian BOM if present, and raises `FormatException` on any unit that is not a Unicode scalar value (greater than `U+10FFFF` or in the surrogate range).
 - **`ASCII`** (`Name` = `"us-ascii"`): strict seven-bit. `GetBytes` raises `FormatException` on any code point above `U+007F`; `GetString` raises `FormatException` on any byte above `0x7F`.
 
-The `index`/`count` overload of `GetString` applies the same rules to the selected byte range; a BOM is consumed only at the start of the range. The span-source overloads (v0.222, #1809) are the same operation over a caller-selected range spelled as a span — identical fault model, BOM consumed only at the start of the span, the empty span decoding to `""`; the parameter is a call-bounded borrow and the returned `string` retains nothing of the source. They complete the v0.165 span-destination encode pair (`GetByteCount`/`GetBytes(s, destination)`) in the decode direction, on both byte-span families per the #1358 mirroring precedent.
+The `index`/`count` overload of `GetString` applies the same rules to the selected byte range; a BOM is consumed only at the start of the range. The span-source decode overloads (v0.222, #1809) are the same operation over a caller-selected range spelled as a span — identical fault model, BOM consumed only at the start of the span, the empty span decoding to `""`; the parameter is a call-bounded borrow and the returned `string` retains nothing of the source. They complete the v0.165 span-destination encode pair (`GetByteCount`/`GetBytes(s, destination)`) in the decode direction, on both byte-span families per the #1358 mirroring precedent. The span-**source** encode overloads (v0.228) are the mirror on the input side: identical contract to the string forms over the span's code-point range (`GetByteCount` and `GetBytes` agree; the empty span encodes to zero bytes; the same strict fault model, `FormatException` possible only for `ASCII`), equivalent to calling the string overload on `s.ToString()` minus the materialization — the produced bytes retain nothing of the source, and `ReadOnlyStringSpan` is not borrow-bearing ([§3.3](#sec-readonlystringspan)), so the parameter imposes no lifetime restriction.
 
 <a id="sec-readonlystringspan"></a>
 ### 3.3 `ReadOnlyStringSpan`
@@ -1321,6 +1346,13 @@ public class Array<T>: IList<T>
   public method Clear();
   public method Contains(item: T): bool;
   public method IndexOf(item: T): int;          // -1 if not found
+  public method IndexOf(item: T, startIndex: int): int;
+                                                // first occurrence at or after startIndex, or -1
+                                                //   (v0.228); 0 <= startIndex <= Count required,
+                                                //   IndexOutOfRangeException otherwise;
+                                                //   startIndex = Count is legal and returns -1
+  public method LastIndexOf(item: T): int;      // last occurrence, or -1 (v0.228). Equality is
+                                                //   Equals for both, as the one-argument IndexOf
 
   public method Sort(comparer: (T, T) -> int);  // in place
   public method Reverse();                       // in place
@@ -4390,7 +4422,15 @@ public record Int32: IComparable<int>, IEquatable<int>
 
   public static pure method Parse(s: string): int;
   public static method TryParse(s: string, out result: int): bool;
-  public static pure method Parse(s: string, radix: int): int;        // 2, 8, 10, 16
+  public static pure method Parse(s: string, radix: int): int;        // radix in {2, 8, 10, 16}; any other
+                                                                      //   radix raises ArgumentException — a
+                                                                      //   caller bug, not input failure (v0.228 pin)
+  public static method TryParse(s: string, radix: int, out result: int): bool;
+                                                                      // shape (c) (v0.228): false (out = 0)
+                                                                      //   exactly where Parse(s, radix) raises
+                                                                      //   FormatException/OverflowException;
+                                                                      //   an invalid radix raises
+                                                                      //   ArgumentException from both forms
   public static pure method Parse(s: ReadOnlyStringSpan): int;                     // v0.222 (#1810): identical contract
   public static method TryParse(s: ReadOnlyStringSpan, out result: int): bool;     //   to the string forms; shape (c)
 
