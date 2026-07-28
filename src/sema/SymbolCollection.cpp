@@ -218,6 +218,13 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
     sym->visibility = td.visibility;
     sym->modifiers = td.modifiers;
     sym->decl = &td;
+    // fix #1761: copy the AST declaration's source location onto the symbol
+    // so diagnostics keyed on t->declLoc / m->declLoc point at the actual
+    // declaration site rather than reporting 0:0. The parser now stamps
+    // `td.span.begin` for top-level type decls (see Parser_Decls.cpp's
+    // parseTypeOrInterfaceDecl); for other node types that already had their
+    // span set this propagates that location to the symbol.
+    sym->declLoc = td.span.begin;
     sym->scope = parentScope;
     // Each type opens a fresh scope for its members + generic params. Save
     // it on the symbol so nested-member collection can use it as the

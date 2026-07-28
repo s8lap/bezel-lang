@@ -222,6 +222,13 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
     //   Visibility? Modifier* keyword Identifier ... ClassBody
     // Slice 3 limits the body to the empty form `end Identifier? ;`.
 
+    // fix #1761: capture the source span [start, end] so SymbolCollection can
+    // populate the resulting TypeSymbol's declLoc (see SymbolCollection.cpp's
+    // `sym->declLoc = td.span.begin`). Without this, the kind keyword below
+    // advances past the type's first token before its span is recorded, and
+    // diagnostics keyed on the symbol's declLoc all report 0:0.
+    const SourceLocation start = current_.location;
+
     // The keyword that selects which kind of top-level declaration this is.
     ast::TypeDeclKind kind;
     if (isKeyword("class"))          kind = ast::TypeDeclKind::Class;
@@ -589,6 +596,12 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                             "expected ';' after 'end'");
     }
 
+    // fix #1761: stamp the type's [start, current_.location] span so the
+    // resulting TypeSymbol's declLoc is populated at symbol collection.
+    if (decl && decl->span.begin.line == 0) {
+        decl->span.begin = start;
+        decl->span.end = current_.location;
+    }
     return decl;
 }
 
