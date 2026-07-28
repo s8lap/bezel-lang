@@ -333,11 +333,12 @@ public record TimeSpan: IComparable<TimeSpan>, IEquatable<TimeSpan>
   public static method operator -(a: TimeSpan, b: TimeSpan): TimeSpan;
   public static method operator *(a: TimeSpan, factor: double): TimeSpan;
                                      // computes over Ticks in double; OverflowException on a
-                                     //   quotient/product outside the tick range or a NaN
-                                     //   operand (v0.228 pin)
+                                     //   product outside the tick range or a NaN operand
+                                     //   (v0.228 pin)
   public static method operator /(a: TimeSpan, divisor: double): TimeSpan;
-                                     // same computation model as * (v0.228);
-                                     //   DivideByZeroException on divisor = 0.0
+                                     // same computation model and OverflowException rule
+                                     //   as * (v0.228); DivideByZeroException on
+                                     //   divisor = 0.0
   public static method operator -(t: TimeSpan): TimeSpan;
                                      // unary negation (v0.228); OverflowException on MinValue
 end TimeSpan;
@@ -1135,7 +1136,7 @@ The static properties (`UTF8`, `UTF16`, `UTF32`, `ASCII`) return singleton insta
 - **`UTF32`** (`Name` = `"utf-32le"`): little-endian, no BOM emitted. `GetString` requires a byte count divisible by four, consumes one leading little-endian BOM if present, and raises `FormatException` on any unit that is not a Unicode scalar value (greater than `U+10FFFF` or in the surrogate range).
 - **`ASCII`** (`Name` = `"us-ascii"`): strict seven-bit. `GetBytes` raises `FormatException` on any code point above `U+007F`; `GetString` raises `FormatException` on any byte above `0x7F`.
 
-The `index`/`count` overload of `GetString` applies the same rules to the selected byte range; a BOM is consumed only at the start of the range. The span-source overloads (v0.222, #1809) are the same operation over a caller-selected range spelled as a span — identical fault model, BOM consumed only at the start of the span, the empty span decoding to `""`; the parameter is a call-bounded borrow and the returned `string` retains nothing of the source. They complete the v0.165 span-destination encode pair (`GetByteCount`/`GetBytes(s, destination)`) in the decode direction, on both byte-span families per the #1358 mirroring precedent. The span-**source** encode overloads (v0.228) are the mirror on the input side: identical contract to the string forms over the span's code-point range (`GetByteCount` and `GetBytes` agree; the empty span encodes to zero bytes; the same strict fault model, `FormatException` possible only for `ASCII`), equivalent to calling the string overload on `s.ToString()` minus the materialization — the produced bytes retain nothing of the source, and `ReadOnlyStringSpan` is not borrow-bearing ([§3.3](#sec-readonlystringspan)), so the parameter imposes no lifetime restriction.
+The `index`/`count` overload of `GetString` applies the same rules to the selected byte range; a BOM is consumed only at the start of the range. The span-source decode overloads (v0.222, #1809) are the same operation over a caller-selected range spelled as a span — identical fault model, BOM consumed only at the start of the span, the empty span decoding to `""`; the parameter is a call-bounded borrow and the returned `string` retains nothing of the source. They complete the v0.165 span-destination encode pair (`GetByteCount`/`GetBytes(s, destination)`) in the decode direction, on both byte-span families per the #1358 mirroring precedent. The span-**source** encode overloads (v0.228) are the mirror on the input side: identical contract to the string forms over the span's code-point range (`GetByteCount` and `GetBytes` agree; the empty span encodes to zero bytes; the same strict fault model, `FormatException` possible only for `ASCII`), equivalent to calling the string overload on `s.ToString()` minus the materialization — the produced bytes retain nothing of the source, and `ReadOnlyStringSpan` is not borrow-bearing ([§3.3](#sec-readonlystringspan)), so the parameter imposes no lifetime restriction.
 
 <a id="sec-readonlystringspan"></a>
 ### 3.3 `ReadOnlyStringSpan`
