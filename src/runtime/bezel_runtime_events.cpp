@@ -49,6 +49,16 @@ static void bz_free_static_event_sources(void) {
     if (!g_static_event_sources) return;
     for (bz_event_source_t* s : *g_static_event_sources) {
         if (!s) continue;
+        // #996: release any closure still held by an active handler before
+        // reclaiming the source. Mirrors bz_event_source_free below.
+        for (int64_t i = 0; i < s->count; ++i) {
+            if (s->handlers[i].active && s->handlers[i].closure) {
+                void* cl = s->handlers[i].closure;
+                s->handlers[i].closure = nullptr;
+                s->handlers[i].active  = false;
+                bz_closure_release(cl);
+            }
+        }
         free(s->handlers);
         free(s);
     }
@@ -293,6 +303,26 @@ extern "C" void bz_subscription_dispose(void* subp) {
 extern "C" void bz_event_source_free(void* srcp) {
     auto* s = (bz_event_source_t*)srcp;
     if (!s) return;
+    // #996 / §24 / #841: each subscribed handler closure is a transferred +1
+    // reference (codegen hands the source the SOLE reference at Subscribe; see
+    // bz_subscription_dispose). When the source is reclaimed BEFORE any
+    // matching Subscription has been disposed — e.g. a `using var e := ...` in
+    // an inner scope whose `sub` lives in an outer scope (the spec §24 case
+    // for "the source's destructor severs the subscriber list before
+    // reclamation") — every active handler still owns one closure cell, and
+    // each is leaked today. Release them here so the source is leak-clean
+    // whether or not the subscription was disposed first. Mirror the
+    // subscription-dispose path exactly (null-before-release, mark inactive)
+    // so a re-entrant pass sees no live handler pointing at a freed closure
+    // and no double-release is possible.
+    for (int64_t i = 0; i < s->count; ++i) {
+        if (s->handlers[i].active && s->handlers[i].closure) {
+            void* cl = s->handlers[i].closure;
+            s->handlers[i].closure = nullptr;
+            s->handlers[i].active  = false;
+            bz_closure_release(cl);
+        }
+    }
     free(s->handlers);
     free(s);
 }
