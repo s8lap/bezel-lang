@@ -329,7 +329,19 @@ echo "   binary: $(ls -la --time-style=+%H:%M:%S build/tests/bezel_tests | awk '
 # cheap and uncapped). Explicit BEZEL_SHARD_TIMEOUT wins unconditionally.
 if [ "$ASAN" -eq 1 ]; then
   core_post=$(stat -c %Y build/libbezel_core.a 2>/dev/null || echo -1)
-  cache_n=$(find "${BEZEL_AOT_CACHE_DIR:-/var/tmp/bezel-scratch/aot-bincache}" -type f 2>/dev/null | wc -l)
+  # Count the stores the SHARDS will actually read. Since #1906 each shard runs
+  # its own /var/tmp/bezel-scratch/aot-bincache-shard<N> store, so counting the
+  # single shared aot-bincache would report a warm box while every shard starts
+  # cold — which is exactly how the 2026-07-29 gate mispredicted "warm" and set
+  # a 900s ceiling for a fully cold run. Sum the per-shard stores when they
+  # exist, and fall back to the shared store for a non-sharded/`BEZEL_AOT_
+  # CACHE_DIR`-pinned invocation. The threshold below is per-shard-average.
+  if [ -z "${BEZEL_AOT_CACHE_DIR:-}" ] && \
+     compgen -G "/var/tmp/bezel-scratch/aot-bincache-shard*" >/dev/null 2>&1; then
+    cache_n=$(find /var/tmp/bezel-scratch/aot-bincache-shard* -type f 2>/dev/null | wc -l)
+  else
+    cache_n=$(find "${BEZEL_AOT_CACHE_DIR:-/var/tmp/bezel-scratch/aot-bincache}" -type f 2>/dev/null | wc -l)
+  fi
   GATE_COLD=0
   { [ "$core_post" != "$CORE_MTIME_PRE" ] || [ "$cache_n" -lt 2000 ]; } && GATE_COLD=1
   sto="$GATE_EXPLICIT_STO"
