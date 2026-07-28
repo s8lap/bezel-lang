@@ -11029,6 +11029,58 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // #2228 / stdlib §9.6 / §4.6 / §28.9: the three other static `string`
+    // factory methods that mint a fresh heap `bz.string` at rc := 1 —
+    // `string.From(c: char)` (1 arg, lowerStaticCall → emitPrimitiveToString →
+    // bz_char_to_string), `string.From(buffer: Array<char>, start, count)` (3
+    // args, lowerStaticCall → bz_str_from_char_array), and
+    // `string.Repeat(c: char, count: int)` (2 args, lowerStaticCall → inline
+    // malloc + initStringRc). Each is a builtin (no resolved MethodSymbol —
+    // isUserMethodStringReturnCall below never sees them), each hands the caller
+    // exactly +1, and each lowers in LlvmBackend_Calls2.cpp (~line 466 / 485 /
+    // 622). The same family as the #2199 instance string-transforming methods;
+    // the static factories were the residual from the same gap. Without the
+    // recognition, `var s := string.From('A')` etc. retain the result at bind
+    // (rc 1→2) and release at scope end (rc 2→1) — never dropping the
+    // producer's original +1 — leaking the 32-byte header + its data buffer
+    // (the #2228 repro: 34 bytes for From(char), 133 bytes for Repeat('A', 100),
+    // 36 bytes for From(buffer, 0, 3)).
+    //
+    // Recognize all three structurally — the callee is a MemberAccess on the
+    // `string`/`String` type keyword with member `From` (1 char arg or 3
+    // buffer/start/count args) or `Repeat` (2 char/count args) — to mirror the
+    // static-call recognition in lowerStaticCall (same shape keys on, so the
+    // recognition and the lowering stay in lockstep). A bound local TRANSFERS
+    // the single reference (no extra retain) and the scope-end release — when
+    // the escape walk proves the local non-escaping — drops rc 1→0 exactly
+    // once. No double-free: an escaping local is excluded from the release by
+    // the escape walk (its +1 then leaks, the safe direction).
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (call->callee) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+                if (ma->target) {
+                    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                            ma->target.get())) {
+                        if (tid->name == "string" || tid->name == "String") {
+                            std::size_t argc = call->args.size();
+                            // §9.6 string.From(char): string — 1-arg overload.
+                            if (ma->member == "From" && argc == 1)
+                                return true;  // emitPrimitiveToString → rc=1
+                            // §9.6 string.From(buffer, start, count): string —
+                            // 3-arg overload, bz_str_from_char_array.
+                            if (ma->member == "From" && argc == 3)
+                                return true;  // bz_str_from_char_array → rc=1
+                            // §9.6 string.Repeat(char, count): string —
+                            // 2-arg overload, inline malloc + initStringRc.
+                            if (ma->member == "Repeat" && argc == 2)
+                                return true;  // inline mint → rc=1
+                        }
+                    }
+                }
+            }
+        }
+    }
     // #2199 / stdlib §9.6 / §4.6 / §28.9 (v0.220): the stdlib `string` INSTANCE
     // methods that transform self into a fresh heap `bz.string` at rc := 1. Each
     // lowers (in tryLowerStringMethod, LlvmBackend_String.cpp) to either an inline
