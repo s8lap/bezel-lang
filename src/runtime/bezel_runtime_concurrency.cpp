@@ -1175,6 +1175,17 @@ struct BzWhenAllResultsSlot {
     int64_t idx;
 };
 
+// #2278 / §30.5: NOTE — no `result_disposer` is attached to this aggregate, and
+// attaching one is NOT the fix for the aggregate-`Array<T>` leak recorded there.
+// The implementation's current owner of a Pattern A intrinsic-collection result
+// is the awaiting `using var` (codegen's registerUsingDisposal emits the
+// container free), not the task; a task-side disposer therefore double-frees
+// `using var rs := await w;` and use-after-frees `using var rs := await
+// Task.WhenAll([…]);` (unbound temporary: the task's teardown at end of statement
+// would free the array `rs` still points at). Both were measured. Closing the
+// leak requires the coordinated change — attach a container disposer at every
+// Pattern A collection-result mint AND make the awaiting binding a §30.5 borrow
+// (usingVarSourceIsBorrow) — which is a separate lane, not a runtime one-liner.
 void* bz_task_when_all_results(void* task_arr, int64_t elem_size) {
     bz_main_domain_get();  // per fix #632: lazy-init with permanent ref
     auto* arr = (bz_array_t*)task_arr;

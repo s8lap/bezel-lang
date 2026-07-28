@@ -8037,13 +8037,23 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 // Disposal: the using-var / scope-end path on the LOCAL
                 // bound by the await (`using var arr := await wa;`) calls
                 // bz_array_free on the array at scope end — that is the
-                // canonical owner. We deliberately do NOT attach a
-                // result_disposer here, because every awaiting call site
-                // binds the result to a local whose using-var disposal
-                // is already responsible for the array; an attached
-                // disposer would double-free at the task's bz_task_free.
-                // (A discarded `await w;` leaves the array un-owned —
-                // a pre-existing leak, not enlarged by this fix.)
+                // implementation's current owner. We deliberately do NOT
+                // attach a result_disposer here: an attached disposer
+                // double-frees that local, and use-after-frees the unbound
+                // temporary form `using var rs := await Task.WhenAll([…]);`
+                // (the task dies at end of statement while `rs` still points
+                // at its array). Both measured under #2278.
+                //
+                // #2278 (open): the shapes where NO awaiting binding takes the
+                // array — a discarded `await w;`, and a plain `var rs := await
+                // w;` — therefore LEAK the aggregate `Array<T>`, and the same
+                // hole exists for any user `async` method returning
+                // `Task<Array<T>>`. It is not specific to WhenAll; #1830's
+                // literal-element fallback merely routed the #1616 inline-
+                // literal shape into it. The fix is a coordinated one — attach
+                // a container disposer at every Pattern A collection-result
+                // mint AND make the awaiting binding a §30.5 borrow-pin
+                // (usingVarSourceIsBorrow) so exactly one reclaim survives.
             } else {
                 auto* whenAllFn = declareC("bz_task_when_all", ptrTy(), {ptrTy()});
                 result = builder_.CreateCall(whenAllFn, {arr}, "task.when_all");
