@@ -9,6 +9,7 @@
 | **Gap-review item** | #5 (child process spawning), wave **D2** of the [stdlib gap DESIGN plan](stdlib-gap-design-plan-2026-07.md) |
 | **Proposed-dependencies** | **0006** (concrete stream family — `StreamReader`/`StreamWriter`/`MemoryStream`/`Stream.CopyToAsync`, [#1433](https://github.com/s8lap/bezel-lang/issues/1433)); everything drawn from 0006 is marked **(0006)** where it appears |
 | **Design influences** | .NET `Process`/`ProcessStartInfo` for the surface *shape*; Go `os/exec` for argv-array-not-shell and the drain-both-pipes discipline; Rust `std::process` for owned-handle lifecycle; **not** .NET's synchronous `WaitForExit`, **not** any shell-string spawn |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
 
 The stdlib names `System.Diagnostics.Process` as an anticipated module whose "shape is open" (stdlib [§11](../Bezel_Standard_Library.md#sec-modules-deferred-to-future-revisions)). This proposal settles that shape against the v0.177 language: an **owned class** wrapping the OS child handle, with stdio expressed as the **0006 stream family**, **async-only** exit waiting (the blocking-wait form is already declined — [gap review](stdlib-gap-review-2026-07.md) §Declined #5), a `Process`-that-is-**not-sendable** classification following 0007's `TcpConnection` precedent, and a typed spawn-failure taxonomy rooted under `IOException`.
 
@@ -75,8 +76,8 @@ public async method RunCapturedAsync(exe: string, args: Array<string>): Task<int
   using var outPipe := p.TakeStandardOutput();                  // owned pipe Streams
   using var errPipe := p.TakeStandardError();
   await using var scope := new TaskScope();                     // §6.10
-  scope.Spawn(() => outPipe.CopyToAsync(outBuf, token := scope.Token));   // (0006) CopyToAsync
-  scope.Spawn(() => errPipe.CopyToAsync(errBuf, token := scope.Token));
+  scope.Spawn(lambda() => outPipe.CopyToAsync(outBuf, token := scope.Token));   // (0006) CopyToAsync
+  scope.Spawn(lambda() => errPipe.CopyToAsync(errBuf, token := scope.Token));
   var code := await p.WaitForExitAsync(scope.Token);
   await scope.Join();                                           // both drains hit EOF at child exit
   // outBuf.ToArray() / errBuf.ToArray() now hold the captured bytes.
@@ -214,8 +215,8 @@ public method TakeStandardError(): owned Stream;    // stderr == Redirect.Pipe
 **The deadlock hazard, and the drain pattern (load-bearing).** If stdout **and** stderr are both `Pipe` and the caller drains only one, the child blocks writing to the *other* (full) pipe while the caller blocks on the drained one — a classic deadlock, made worse under Bezel's per-domain run-to-completion (a single domain awaiting `WaitForExitAsync` while the child is wedged makes no progress). **The rule, stated in the docs and shown in the `RunCapturedAsync` tour example: any stream redirected to `Pipe` must be drained, and when more than one is piped they must be drained *concurrently*.** The idiom is a `TaskScope` (stdlib §6.10) running one `CopyToAsync` (0006) per pipe on the owning domain, alongside the awaited exit:
 
 ```bezel
-scope.Spawn(() => outPipe.CopyToAsync(outBuf, token := scope.Token));
-scope.Spawn(() => errPipe.CopyToAsync(errBuf, token := scope.Token));
+scope.Spawn(lambda() => outPipe.CopyToAsync(outBuf, token := scope.Token));
+scope.Spawn(lambda() => errPipe.CopyToAsync(errBuf, token := scope.Token));
 var code := await p.WaitForExitAsync(scope.Token);
 await scope.Join();
 ```

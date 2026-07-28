@@ -6,6 +6,7 @@
 | **Tracking issue** | [#1455](https://github.com/s8lap/bezel-lang/issues/1455) |
 | **Target module(s)** | `System.Text` (auto-imported, §3 of stdlib); adds two methods to `String` (§9.6) and a new `NormalizationForm` enum |
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
 | **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #31 (P2) |
 
 ---
@@ -168,7 +169,7 @@ The load-bearing design question (§3, data-table sourcing) is resolved as **Opt
 3. **Bundle all four forms including NFKC/NFKD immediately** — declined for v1; the compatibility tables double the data size for use cases that are niche in Bezel's target domain (§3, option C reasoning).
 4. **Raising `FormatException` instead of `NotImplementedException` for NFKC/NFKD** — declined; `FormatException` signals bad input data (§31.4); `NotImplementedException` signals an unimplemented operation, which is the correct signal for "this form is not yet supported."
 5. **A separate `StringComparer.Unicode(NFC)` comparison class** — deferred; a `StringComparer` or `IComparer<string>` surface could compose normalization with case-folding for richer text comparison. Out of scope for this proposal; the explicit `Normalize` + ordinal `=` composition is the v1 idiom.
-6. **Accepting `string?` overloads** — declined; `null` strings are handled by the caller; a null-safe `IsNormalized` would silently accept a `null` input, masking a likely caller bug. Use `if s = null then false else s.IsNormalized()` explicitly.
+6. **Accepting `string?` overloads** — declined; `null` strings are handled by the caller; a null-safe `IsNormalized` would silently accept a `null` input, masking a likely caller bug. Use `(if s = null then false else s.IsNormalized())` explicitly.
 
 ---
 

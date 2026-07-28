@@ -148,14 +148,14 @@ The design lineage to follow is **SPARK/Ada**, not Dafny: a pragmatic industrial
 
 ```bezel
 public method Transfer(to: Account, amount: int)
-  requires amount > 0;
-  requires amount <= _balance;
-  ensures _balance = old(_balance) - amount;
+  requires(amount > 0)
+  requires(amount <= _balance)
+  ensures(_balance = old(_balance) - amount)
   ...
 end Transfer;
 
 class Ledger
-  invariant _debits.Count = _credits.Count;
+  invariant(_debits.Count = _credits.Count);
   ...
 end Ledger;
 ```

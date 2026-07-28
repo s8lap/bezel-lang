@@ -4,6 +4,7 @@
 **Tracking issue:** [#2040](https://github.com/s8lap/bezel-lang/issues/2040)
 **Target:** Stdlib — the `System.Testing` module proposal [0022](0022-test-framework.md) defines (new `Generator`, `Property`, `PropertyOptions` surface; `TestRunner.AddProperty` overloads; the `FromGenerator` recognition convention; report formats). Spec — **none under 0022's fork (b)**; under fork (a), one clause amending the `test`-modifier shape rule when that rule lands on 0022's own spec track (§3.3 below; no grammar production changes — parameter lists already parse). Tooling — runner execution/reporting/knobs, and the stage-S2 contract-bridge generator riding proposal [0040](0040-build-system.md)'s driver. Rationale — none.
 **Written against:** spec v0.197 (stdlib/rationale at the same revision)
+**Currency note:** Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged.
 
 This proposal expands item **P13** of [`future-directions-2026-07-18.md`](future-directions-2026-07-18.md) to graduation depth, and extends proposal [0022](0022-test-framework.md) (test framework), which it assumes in full. Where it sharpens or diverges from the P13 sketch, the divergence is recorded explicitly in §12. *Reference convention: an unprefixed §-reference is a language-spec reference; `stdlib §`, `rationale §`, and `0022 §`/`0041 §`/… prefixes are written out; this proposal's own sections are cited as "§N below" or from context.*
 
@@ -32,8 +33,8 @@ public class ParseProps
   end ParseRoundtrips;
 
   public test method SortIsIdempotent(xs: Array<int>)     // xs: generated, harness-owned, borrowed in
-    using var once := xs.Sorted((a, b) => a.CompareTo(b));
-    using var twice := once.Sorted((a, b) => a.CompareTo(b));
+    using var once := xs.Sorted(lambda(a, b) => a.CompareTo(b));
+    using var twice := once.Sorted(lambda(a, b) => a.CompareTo(b));
     Assert.Equal(once.Count, twice.Count);
     for var i in 0..<once.Count do
       Assert.Equal(once[i], twice[i]);
@@ -275,10 +276,10 @@ For every **static `pure` method** whose parameter types are all generatable and
 ```bezel
 // Source (0042 + 0043):
 public static pure method Clamp(x: int, low: int, high: int): int
-  requires low <= high;
-  ensures result >= low;
-  ensures result <= high;
-  return low if x < low else (high if x > high else x);
+  requires(low <= high)
+  ensures(result >= low)
+  ensures(result <= high)
+  return (if x < low then low else (if x > high then high else x));
 end Clamp;
 
 // Tool-emitted bridge property (fork (a) spelling):
@@ -305,7 +306,7 @@ Rejection sampling has a failure mode — a narrow `requires` (an equality, a co
 
 ### 8.4 Recorded refinement: constraint-derived domains
 
-When the `requires` fragment falls inside 0043's stage-3 prover fragment (linear integer arithmetic, null tests, closed-hierarchy case analysis — 0043 §7.3), the bridge *may* derive bounded domains directly — generating `low <= high` pairs by construction, or enumerating `requires n >= 0 and n < 16` exhaustively (§7.4's "small ranges", arriving here) — replacing rejection with construction. Recorded as the S2+ refinement it is; v1 of the bridge is rejection-only, honest and simple.
+When the `requires` fragment falls inside 0043's stage-3 prover fragment (linear integer arithmetic, null tests, closed-hierarchy case analysis — 0043 §7.3), the bridge *may* derive bounded domains directly — generating `low <= high` pairs by construction, or enumerating `requires(n >= 0 and n < 16)` exhaustively (§7.4's "small ranges", arriving here) — replacing rejection with construction. Recorded as the S2+ refinement it is; v1 of the bridge is rejection-only, honest and simple.
 
 ### 8.5 v1 bridge scope
 

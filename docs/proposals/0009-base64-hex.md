@@ -7,6 +7,7 @@
 | **Written against** | spec v0.177 / stdlib v0.165 |
 | **Tracking issue** | [#1434](https://github.com/s8lap/bezel-lang/issues/1434) |
 | **Gap-review item** | #3 (P0+P1) in [stdlib-gap-review-2026-07.md](stdlib-gap-review-2026-07.md) |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
 
 Blocks web auth headers, JWTs, binary-in-JSON, data: URIs, and hash-digest display; entirely absent today. This proposal is also the prerequisite for proposal 0010 (serialization `ISerializer.WriteBytes`), which will use standard-alphabet Base64 as its text-wire encoding.
 
@@ -42,7 +43,7 @@ Decode is strict: any character outside the class's alphabet, or invalid padding
 
 **Decision.** Encode methods accept `IReadOnlySpan<byte>` (§4.16). Decode methods return `owned Array<byte>`.
 
-**Rationale for input.** `IReadOnlySpan<byte>` is the common read-only byte-source interface (§4.16), implemented by `ReadOnlySpan<byte>` (from `OwningBuffer<byte>.AsReadOnlySpan()`), `ReadOnlyArraySpan<byte>` (from `Array<byte>.AsReadOnlySpan()`), and `ReadOnlyAsciiByteSpan`. A single overload therefore accepts all common byte sources without duplication. Encoding is not a hot inner loop (one string allocation per call; the per-byte cost is a table lookup); §4.16 recommends `IReadOnlySpan<T>` for "utility code that runs outside hot paths" exactly because the virtual dispatch overhead is negligible there.
+**Rationale for input.** `IReadOnlySpan<byte>` is the common read-only byte-source interface (§4.16), implemented by `ReadOnlySpan<byte>` (from `OwningBuffer<byte>.AsReadOnlySpan()`) and `ReadOnlyArraySpan<byte>` (from `Array<byte>.AsReadOnlySpan()`). A single overload therefore accepts all common byte sources without duplication. Encoding is not a hot inner loop (one string allocation per call; the per-byte cost is a table lookup); §4.16 recommends `IReadOnlySpan<T>` for "utility code that runs outside hot paths" exactly because the virtual dispatch overhead is negligible there.
 
 **Rationale for output.** `owned Array<byte>` is the standard fresh-byte-array return type in the stdlib: `Encoding.GetBytes` (§3.2), `File.ReadAllBytes` (§7.3), and `Stream.ReadAll` (§7.1) all return `owned Array<byte>`. Callers receiving decoded bytes wrap them into `OwningBuffer<byte>` if they need buffer semantics, or iterate directly.
 

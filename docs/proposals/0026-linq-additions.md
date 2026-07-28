@@ -6,6 +6,7 @@
 | **Tracking issue** | [#1457](https://github.com/s8lap/bezel-lang/issues/1457) |
 | **Target module** | `System.Collections.Linq` (§5; requires `import System.Collections.Linq` — not auto-imported, spec §2.3 auto-imports only System / System.Text, and the spec's own LINQ examples write the import) |
 | **Written against** | spec v0.177 / stdlib v0.165 |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
 | **Gap-review item** | #18 (P1) in [stdlib-gap-review-2026-07.md](stdlib-gap-review-2026-07.md) |
 | **Wave** | D3 — library breadth, per [stdlib-gap-design-plan-2026-07.md](stdlib-gap-design-plan-2026-07.md) |
 
@@ -97,17 +98,17 @@ end;
 
 ```bezel
 // Number lines of a string array.
-var numbered := lines.Select((line, i) => $"{i + 1}: {line}");
+var numbered := lines.Select(lambda(line, i) => $"{i + 1}: {line}");
 
 // Keep only even-positioned elements.
-var evens := items.Where((_, i) => i mod 2 = 0);
+var evens := items.Where(lambda(_, i) => i mod 2 = 0);
 ```
 
 **`MinBy` / `MaxBy` / `MinByOrNull` / `MaxByOrNull`.** Return the **element** (type `T`) whose projection under the key selector is minimal or maximal, evaluated with `TKey.CompareTo`. Contrast with the existing `Min<U>(selector)` / `Max<U>(selector)` (stdlib §5), which return the **key value** `U`. When multiple elements project to the equal minimum or maximum key, the first in source order is returned (stable-first). On an empty source, the non-`OrNull` forms throw `InvalidOperationException`; the `OrNull` forms return `null`.
 
 ```bezel
-var earliest := events.MinBy(e => e.Timestamp);          // first event by time
-var longestOrNone := words.MaxByOrNull(w => w.Length);   // null if words is empty
+var earliest := events.MinBy(lambda(e) => e.Timestamp);          // first event by time
+var longestOrNone := words.MaxByOrNull(lambda(w) => w.Length);   // null if words is empty
 ```
 
 **`Chunk`.** Partitions the source into consecutive sub-arrays each of `size` elements; the final chunk contains the remainder elements when the source length does not divide evenly. Eager: all chunks are allocated before the method returns. The result is `owned OwningArray<Array<T>>` — the outer `OwningArray` owns and will dispose each inner `Array<T>` chunk container; the inner arrays hold borrowed (for class T) or copied (for value T) elements from the source, identically to `ToArray()`.
