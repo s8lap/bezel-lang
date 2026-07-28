@@ -20,12 +20,13 @@ extern "C" {
 // Elements are stored as raw bytes; callers supply the element size.
 // ---------------------------------------------------------------------------
 
-// Allocate a new array capable of holding `initial_cap` elements of `elem_size`
-// bytes each. Returns a pointer to the internal bz_array_t struct (opaque to
-// Bezel code, which treats it as a plain `ptr`).
+// stdlib §4.4/§4.5 (Array<T>/OwningArray<T>): allocate a new array capable
+// of holding `initial_cap` elements of `elem_size` bytes each. Returns a
+// pointer to the internal bz_array_t struct (opaque to Bezel code, which
+// treats it as a plain `ptr`).
 void* bz_array_alloc(int64_t elem_size, int64_t initial_cap);
 
-// Return the current element count.
+// stdlib §4.4/§4.5: return the current element count (0 for a null arr).
 int64_t bz_array_len(void* arr);
 
 // stdlib §4.4/§4.5 (#741): the array-backed collection's allocated capacity.
@@ -38,13 +39,16 @@ int32_t bz_string_is_ascii(const void* s);
 // Used by `new OwningBuffer<T>(n)`.
 void* bz_array_alloc_count_n(int64_t elem_size, int64_t n);
 
-// Append one element (elem_size bytes) to the end. Grows capacity as needed.
+// stdlib §4.4/§4.5 (Array<T>.Add / OwningArray<T>.Add): append one element
+// (elem_size bytes) to the end. Grows capacity as needed.
 void bz_array_add(void* arr, const void* elem, int64_t elem_size);
 
-// Copy the element at `idx` into `out` (elem_size bytes). No bounds check.
+// stdlib §4.4/§4.5 (Array<T>/OwningArray<T> indexer getter): copy the
+// element at `idx` into `out` (elem_size bytes). No bounds check.
 void bz_array_get(void* arr, int64_t idx, void* out, int64_t elem_size);
 
-// Overwrite the element at `idx` with the elem_size bytes at `elem`.
+// stdlib §4.4/§4.5 (Array<T> indexer setter): overwrite the element at `idx`
+// with the elem_size bytes at `elem`. No bounds check.
 void bz_array_set(void* arr, int64_t idx, const void* elem, int64_t elem_size);
 
 // issue #388 / stdlib §4.5: the OwningArray<T> indexer setter — dispose the
@@ -57,7 +61,8 @@ void bz_array_set(void* arr, int64_t idx, const void* elem, int64_t elem_size);
 void bz_array_set_disposing(void* arr, int64_t idx, const void* elem,
                             int64_t elem_size, void (*dispose_elem)(void*));
 
-// Remove the element at `idx`, shifting subsequent elements down.
+// stdlib §4.4/§4.5 (Array<T>.RemoveAt): remove the element at `idx`,
+// shifting subsequent elements down. No bounds check.
 void bz_array_remove_at(void* arr, int64_t idx, int64_t elem_size);
 
 // fix #642 / stdlib §4.5: PopAt(i) — copy element at idx into *out (transferring
@@ -71,7 +76,10 @@ void bz_array_pop_at(void* arr, int64_t idx, void* out, int64_t elem_size);
 void bz_array_insert_at(void* arr, int64_t idx, const void* elem,
                         int64_t elem_size);
 
-// Set length to 0 (does NOT call dispose_elem; caller is responsible).
+// stdlib §4.4/§4.5 (Array<T>.Clear / OwningArray<T>.Clear): set length to 0.
+// Does NOT call dispose_elem; caller is responsible (the borrowing Array<T>
+// has nothing to dispose; the owning OwningArray<T> path is the
+// clear_disposing overload below).
 void bz_array_clear(void* arr);
 
 // stdlib §4.5: dispose every (non-null) class-typed element, then set length to
