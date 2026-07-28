@@ -180,7 +180,7 @@ Both on `IEnumerable<T>` only, matching this proposal's scoping ("none touches `
 // The tail of an affine query without materializing its source.
 // ReadRecords() is a user-written iterator method (spec §29.3) — a
 // single-pass streaming source, the case A1 scopes these operators to:
-var q := ReadRecords().Where(r => r.Level = "ERROR");
+var q := ReadRecords().Where(lambda(r) => r.Level = "ERROR");
 var lastErrors := q.TakeLast(50);      // consumes q (§29.11 point 2); buffers at most 50
 
 // Drop a trailer element without knowing the length up front:

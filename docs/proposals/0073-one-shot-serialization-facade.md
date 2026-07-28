@@ -17,7 +17,7 @@
 The §2.14/§2.15 serialization architecture is one of the library's strongest designs and this proposal changes none of it: format-agnostic agent interfaces (`ISerializer`/`IDeserializer`), capability interfaces on types (`ISerializable`/`IDeserializable`), compiler synthesis reading a type's wire shape from its declaration (spec [§9.8](../Bezel_Language_Spec.md#sec-serialization-synthesis)), no reflection anywhere (rationale [§5.19](../Bezel_Design_Rationale.md#sec-serialization-without-reflection)). What it lacks is a front door. The *only* way to serialize a value today is to hand-drive the agent:
 
 ```bezel
-// today — write (the §2.15 idiom, verbatim):
+// today — write (the §2.15 SavePoint/LoadPoint idiom, shape-faithful):
 using var s := new JsonSerializer();
 user.Serialize(s);
 var text := s.ToString();
@@ -108,7 +108,7 @@ Every facade member faults exactly as its defining agent sequence (§7) faults: 
 
 ## 4. Ownership and sendability
 
-- **Write direction**: `value: T` is an unmarked parameter — a **borrow for the duration of the call** at class substitutions, a value at record/enum substitutions (spec [§22.3](../Bezel_Language_Spec.md#sec-parameter-modifiers)). The caller keeps ownership and disposal obligation; serialization never consumes the value. The results are fresh productions: `ToText` returns a runtime-managed `string` (no marker, §1), `ToBytes` returns `owned OwningBuffer<byte>` (the §1 fresh-producer convention, identical to the agent's own `ToBytes`).
+- **Write direction**: `value: T` is an unmarked parameter — a **borrow for the duration of the call** at class substitutions (spec [§28.3](../Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows)'s unmarked-parameter classification, restated in §22.15's parameter paragraph), a value at record/enum substitutions. The caller keeps ownership and disposal obligation; serialization never consumes the value. The results are fresh productions: `ToText` returns a runtime-managed `string` (no marker, §1), `ToBytes` returns `owned OwningBuffer<byte>` (the §1 fresh-producer convention, identical to the agent's own `ToBytes`).
 - **Read direction**: `Parse<T>` returns a plain value (no ownership motion). `ParseOwned<T>` returns **`owned T`** — a fresh heap value transferred to the caller (spec [§28.8](../Bezel_Language_Spec.md#sec-ownership-transfer)), discharged by `using var` or an owned field, exactly as the recognized factory's own `owned T` return.
 - **A quiet lifetime win**: §2.15's deserializer *borrows its input span for the deserializer's lifetime*, which today makes the caller responsible for keeping the bytes alive across the `using var d` scope. Inside the facade that lifetime is the call itself, so the caller's span obligation ends at return — one fewer lifetime relationship at every call site.
 - **Sendability (spec [§30.14](../Bezel_Language_Spec.md#sec-sendable-types)): no impact.** Static classes have no instances; nothing here adds or removes sendability from any type. A parse result's sendability is `T`'s own, as if constructed directly.
@@ -165,7 +165,10 @@ public static class Json
   public static method Parse<T>(input: ReadOnlyArraySpan<byte>, options: JsonOptions): T where T: IDeserializable;
 
   // ── read, class T (IDeserializable-conforming; compiler-known check, as
-  //    0001 §3.3's JsonOwned<T>). Same six input forms as Parse<T>. ──
+  //    0001 §3.3's JsonOwned<T>). The signature spells `where T: class` only,
+  //    inheriting 0001 §3.3's exact spelling; the combined
+  //    `where T: class, IDeserializable` is grammatical (Appendix A) and may
+  //    be preferred at landing. Same six input forms as Parse<T>. ──
   public static method ParseOwned<T>(text: string): owned T where T: class;
   public static method ParseOwned<T>(text: string, options: JsonOptions): owned T where T: class;
   public static method ParseOwned<T>(input: ReadOnlySpan<byte>): owned T where T: class;

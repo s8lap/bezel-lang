@@ -74,7 +74,7 @@ Purity mirrors each type's own `Parse`: `pure` on the §9 primitives (whose `Par
 
 **String form only — the radix and span duals are declined.** A complete dual of the v0.228 parse surface would be 36 members: 17 string forms, 8 radix forms (`Parse(s, radix)`, §9.1), 11 span forms (`Parse(s: ReadOnlyStringSpan)`, §9.1–§9.3). This proposal takes the 17 and declines the rest, with reasons: the radix path (v0.228's own `TryParse(s, radix, out)`) and the span path (v0.222's allocation-conscious forms) are **specialist surfaces** whose callers are already in ceremony-tolerant territory — a hex-mask parser or a zero-allocation tokenizer is exactly where the established bool+out idiom is at home — while the convenience tier's whole value is at the casual call site, which holds a `string`. Adding 19 more members would buy surface completeness, not capability (every input remains parseable three ways). Recorded here so a later sweep can cite the decline rather than rediscover the question.
 
-**A conversion is impossible; a dual is the only route.** A #1535-style *conversion* of `TryParse` (the shape-(a)→(b) reshaping `Weak<T>.TryUpgrade` underwent at v0.222) is structurally unavailable: the per-type `TryParse` members **witness `IParsable<T>.TryParse`** through the §2.19 compiler-provided conformances — the constraint surface every generic scalar-parsing path programs against — so the bool+out shape is load-bearing and stays. The v0.222 span-parse precedent applies directly: new members land per-type, "`IParsable<T>` … unchanged — the … forms are per-type members, not constraint surface" (§9.1).
+**A conversion is impossible; a dual is the only route.** A #1535-style *conversion* of `TryParse` (the shape-(a)→(b) reshaping `Weak<T>.TryUpgrade` underwent at v0.222) is structurally unavailable: for the eleven §2.19 conformers plus `char`, the per-type `TryParse` members **witness `IParsable<T>.TryParse`** through the compiler-provided conformances — the constraint surface every generic scalar-parsing path programs against — so the bool+out shape is load-bearing and stays; for `bool` (§2.19's recorded non-conformer) and the §2.5/§2.6 temporals and `Guid` (outside §2.19's list entirely), no constraint role exists, and §4's fork-scope argument alone carries the duals-not-conversions conclusion. The v0.222 span-parse precedent applies directly: new members land per-type, "`IParsable<T>` … unchanged — the … forms are per-type members, not constraint surface" (§9.1).
 
 **Worked call sites** (every named API verified in v0.228):
 
@@ -84,12 +84,12 @@ var raw := Environment.GetEnvironmentVariable("TIMEOUT_SECS") ?? "";
 var timeout := TimeSpan.FromSeconds(double.ParseOrNull(raw) ?? 30.0);
 
 // validated input — null-test where the failure needs a message
-var when := DateOnly.ParseOrNull(line);          // when: DateOnly?
-if when = null then
+var day := DateOnly.ParseOrNull(line);           // day: DateOnly?
+if day = null then
   Console.Error.WriteLine($"not a date: {line}");
   return;
 end;
-Schedule(when);      // when narrowed non-null after the guard (spec §7.4);
+Schedule(day);       // day narrowed non-null after the guard (spec §7.4);
                      // Schedule is illustrative
 ```
 
@@ -97,7 +97,7 @@ Schedule(when);      // when narrowed non-null after the guard (spec §7.4);
 
 ## 2. `GetOrNull(key: K): V?` on the dictionary family — presented owner-gated
 
-**The tension, disclosed first.** §1(b)'s criterion has a "cannot" side, and the generic dictionaries sit on it. `Dictionary<K, V>`'s `V` is unconstrained, so `V` may be instantiated at a nullable type (`Dictionary<string, string?>` is legal), and there `V?` **collapses**: spec [§7.10](../Bezel_Language_Spec.md#sec-generics-and-nullability) — `?` is idempotent under substitution — so a `GetOrNull` result cannot distinguish "key absent" from "key present, value null". That is precisely the case the recorded criterion routes to the Try shape: *"Try + `when true` where it cannot (§14.4/§7.10 nullable-underlying instantiations)"* (v0.184 changelog; #1535 2026-07-24 joint ruling). Under the criterion's letter, a nullable-return lookup over a **generic** `V` is the shape the library told itself not to build. This section does not argue the letter away; it presents the member because the library's recorded practice already runs against the letter (next paragraph), and puts the call to the owner.
+**The tension, disclosed first.** §1(b)'s criterion has a "cannot" side, and the generic dictionaries sit on it. `Dictionary<K, V>`'s `V` is unconstrained, so `V` may be instantiated at a nullable type (`Dictionary<string, string?>` is legal), and there `V?` **collapses**: spec [§7.10](../Bezel_Language_Spec.md#sec-generics-and-nullability) — `?` is idempotent under substitution — so a `GetOrNull` result cannot distinguish "key absent" from "key present, value null". That is precisely the case the recorded criterion routes to the Try shape: *"Try + `when true` where it cannot (§14.4/§7.10 nullable-underlying instantiations)"* (v0.184 changelog; restated by #1535's 2026-07-11 joint ruling, and reaffirmed by the 2026-07-24 termination ruling §4 engages). Under the criterion's letter, a nullable-return lookup over a **generic** `V` is the shape the library told itself not to build. This section does not argue the letter away; it presents the member because the library's recorded practice already runs against the letter (next paragraph), and puts the call to the owner.
 
 One boundary inside the item: the tension is a **§4.8/§4.17 fact, not a §4.9 fact**. `OwningDictionary<K, V>` declares `where V: class`, and spec §7.10 defines `class` as restricting to *non-nullable* reference types — so at §4.9 the payload is statically non-nullable at every instantiation and `GetOrNull` satisfies the criterion as cleanly as `Weak<T>.TryUpgrade` does. The owner may accordingly accept §4.9's member and decline §4.8/§4.17's without inconsistency (open question Q2).
 
@@ -130,7 +130,7 @@ public method GetOrNull(key: K): V?;
 
 > "(When the element type is itself nullable, `?` is idempotent under substitution — spec §7.10, v0.159 — so an `*OrNull` result cannot distinguish "empty" from "a present `null`"; use `Count` or the `Try` shape when the distinction matters.)"
 
-is carried onto the §4.8/§4.17 members with the three word-substitutions the surface forces (element→value, empty→absent, `Count`→`ContainsKey`):
+is carried onto the §4.8/§4.17 members with the four word-substitutions the surface forces (element→value, empty→absent, `Count`→`ContainsKey`, `*OrNull`→`GetOrNull`):
 
 > "(When the value type is itself nullable, `?` is idempotent under substitution — spec §7.10, v0.159 — so a `GetOrNull` result cannot distinguish "absent" from "a present `null`"; use `ContainsKey` or the `Try` shape when the distinction matters.)"
 
@@ -163,7 +163,7 @@ The member's sweet spot is therefore **value-typed and `string` V** — `counts.
 
 > **Proposed §1 sentence.** "Beside the Try shapes, a surface may carry a nullable-return **convenience form**, named with the `OrNull` suffix (`ParseOrNull`, `GetOrNull`, §5's `*OrNull` element accessors): the **throwing form** (`Parse`, the `[key]` indexer) treats absence as a bug, the **`*OrNull` form** returns `T?` for direct `??`/`?.` composition where the payload can carry the signal, and the **`Try` form** remains the only shape that distinguishes the outcomes a collapsed `T?` cannot (spec §7.10); shape (b)'s `TryX` spelling stays reserved for acquisition-shaped members whose payload is statically non-nullable (`TryAcquire`, `TryUpgrade`)."
 
-If only §1 (ParseOrNull) lands, the sentence lands with `GetOrNull` struck from the parenthetical; the sentence itself is not optional — it is what keeps the taxonomy total over the document's members.
+If only §1 (ParseOrNull) lands, the sentence lands with `GetOrNull` struck from the parenthetical. The sentence is a naming of existing practice rather than a defect repair — §1's enumeration scopes itself to the *Try* shapes, and §5's `FirstOrNull` family plus §5.1's normative `MinOrNull`/`MaxOrNull` already sit outside it without recorded contradiction — but landing it with the tier's first hot-surface members is what stops the tier from being re-derived one surface at a time.
 
 ---
 
