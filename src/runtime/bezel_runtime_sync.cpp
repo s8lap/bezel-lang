@@ -62,8 +62,10 @@ static void mutex_core_release(bz_mutex_t* m) {
 
 extern "C" {
 
-// bz_mutex_new — allocate a new non-recursive POSIX mutex.  core_refs = 1
+// §6.2: Mutex — allocate a new non-recursive POSIX mutex.  core_refs = 1
 // (the Mutex object's reference).  Returns bz_mutex_t* (opaque to Bezel code).
+// The non-recursive choice (PTHREAD_MUTEX_ERRORCHECK) is the documented
+// stdlib §6.2 choice — see the file-header note.
 void* bz_mutex_new(void) {
     auto* m = new bz_mutex_t();
     pthread_mutexattr_t attr;
@@ -77,9 +79,9 @@ void* bz_mutex_new(void) {
     return m;
 }
 
-// bz_mutex_acquire — block until the mutex is available; return an owned bz_lock_t*.
-// The lock struct acquires a core ref (+1) so the mutex core stays alive even if
-// the Mutex object is disposed before the Lock is released.
+// §6.2: Mutex.Acquire — block until the mutex is available; return an owned
+// bz_lock_t*. The lock struct acquires a core ref (+1) so the mutex core
+// stays alive even if the Mutex object is disposed before the Lock is released.
 void* bz_mutex_acquire(void* mp) {
     auto* m = (bz_mutex_t*)mp;
     pthread_mutex_lock(&m->mtx);  // blocking; non-recursive → always enters if not held
@@ -88,11 +90,12 @@ void* bz_mutex_acquire(void* mp) {
     return lk;
 }
 
-// bz_mutex_try_acquire — attempt to acquire with a millisecond timeout.
-// Returns an owned bz_lock_t* on success, or null on timeout / already-held.
-// Uses pthread_mutex_timedlock with CLOCK_REALTIME (per POSIX timedlock).
-// An EDEADLK (same-thread re-lock on ERRORCHECK mutex) maps to the timeout
-// null path — enabling the TryAcquire-while-held test shape from the note.
+// §6.2: Mutex.TryAcquire(timeout_ms) — attempt to acquire with a millisecond
+// timeout. Returns an owned bz_lock_t* on success, or null on timeout /
+// already-held. Uses pthread_mutex_timedlock with CLOCK_REALTIME (per POSIX
+// timedlock). An EDEADLK (same-thread re-lock on ERRORCHECK mutex) maps to
+// the timeout null path — enabling the TryAcquire-while-held test shape
+// from the file-header note.
 void* bz_mutex_try_acquire(void* mp, int64_t timeout_ms) {
     auto* m = (bz_mutex_t*)mp;
     int rc;
@@ -119,8 +122,8 @@ void* bz_mutex_try_acquire(void* mp, int64_t timeout_ms) {
     return lk;
 }
 
-// bz_lock_release — release the held lock.  Idempotent per §28.2: the first
-// call releases the pthread_mutex; subsequent calls are no-ops.
+// §6.2: Lock.Dispose — release the held lock.  Idempotent per §28.2: the
+// first call releases the pthread_mutex; subsequent calls are no-ops.
 // Called by the Lock's disposer (scope exit / explicit Dispose()).
 void bz_lock_release(void* lkp) {
     if (!lkp) return;
