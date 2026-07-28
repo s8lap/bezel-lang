@@ -524,7 +524,12 @@ int64_t bz_decimal_to_int64(const bz_decimal_t* a, void* ove_vtable);
 // Parse from string (stdlib §9.3 Decimal.Parse / TryParse).
 // per fix #521: bz_decimal_parse raises FormatException (fe_vtable) for
 // malformed input and OverflowException (ove_vtable) for out-of-range.
-// bz_decimal_try_parse returns 0/1 with no exception.
+// bz_decimal_try_parse returns 0/1 with no exception, and writes
+// default(decimal) to *out on failure (stdlib §2.3).
+// per fix #2273: these two enforce the §9.3 grammar — "an optional leading sign
+// (+/-) followed by decimal digits with at most one `.`" — which admits NO
+// exponent, and they read the string's full length (a `string` is not
+// NUL-terminated and is not bounded by any fixed buffer here).
 void    bz_decimal_parse(const void* str, bz_decimal_t* out,
                          void* ove_vtable, void* fe_vtable);
 int32_t bz_decimal_try_parse(const void* str, bz_decimal_t* out);
@@ -536,9 +541,14 @@ void* bz_decimal_to_string(const bz_decimal_t* a);
 void bz_decimal_round(const bz_decimal_t* a, int32_t digits, bz_decimal_t* out);
 
 // Literal parse at compile-time (called by runtime init for MinValue/MaxValue).
-// Same as bz_decimal_parse but takes a null-terminated C string.
+// Takes a null-terminated C string.
 // per fix #521: ove_vtable/fe_vtable may be nullptr for compile-time use
 // (literals are lexer-validated; overflow cannot occur for known constants).
+// per fix #2273: this is the LITERAL grammar (language spec §18.1 / Appendix A)
+// and therefore admits scientific notation (`1.23e2m`) — unlike
+// bz_decimal_parse above, which implements the narrower stdlib §9.3 grammar.
+// The compile-time literal fold and bz_decimal_from_double ("%.15g" emits
+// exponent form) both depend on that admission.
 void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out,
                             void* ove_vtable, void* fe_vtable);
 

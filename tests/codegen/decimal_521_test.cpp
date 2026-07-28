@@ -556,13 +556,21 @@ BEZEL_TEST(codegen_521_overflow, min_minus_one_raises_overflow_spec_6_4) {
 }
 
 // §6.4 / §9.3: Decimal.Parse on an out-of-range string raises OverflowException.
-// The value "1e29" (10^29) exceeds MaxValue (≈7.9e28), so Parse must raise
+// The value 10^29 exceeds MaxValue (≈7.9e28), so Parse must raise
 // OverflowException rather than FormatException (the string is well-formed).
+// fix #2273: the value was spelled "1e29" here, which §9.3's grammar — "an
+// optional leading sign (+/-) followed by decimal digits with at most one `.`"
+// — does not admit, so that spelling now raises FormatException and no longer
+// tests what this case is about.  Spelled in digits, the test's intent (an
+// out-of-range MAGNITUDE raises OverflowException) is unchanged and now also
+// exercises #1829's dropped-integer-digit accounting.  The §9.3 rejection of
+// the exponent spelling is covered by
+// codegen_decimal_2273.parse_exponent_form_rejected_spec_9_3.
 BEZEL_TEST(codegen_521_overflow, parse_out_of_range_raises_overflow_spec_6_4_9_3) {
     BEZEL_EXPECT_EQ(run(prog(
         "var r := 0; "
         "try "
-        "  var _ := Decimal.Parse(\"1e29\"); "
+        "  var _ := Decimal.Parse(\"100000000000000000000000000000\"); "
         "catch OverflowException => r := 1; "
         "end; "
         "return r; ")), 1);

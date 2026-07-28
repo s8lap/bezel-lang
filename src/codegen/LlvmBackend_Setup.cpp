@@ -5,7 +5,15 @@
 #include "sema/TypeResolution.hpp"  // #2069: sema::typeArgRuntimeReified (strict oracle)
 
 // §4.4 fix #521: decimal compile-time literal parser (defined in bezel_runtime.cpp).
-extern "C" void bz_decimal_parse_cstr(const char* s, void* out);
+// fix #2273: the declaration must carry the real 4-parameter signature — the
+// former 2-parameter spelling made every call here pass uninitialised registers
+// as the OverflowException/FormatException vtables, so any literal the parser
+// rejects would have called bz_set_exc on a garbage pointer.  Both vtables are
+// null at compile time (no exception objects exist yet); the parse simply
+// leaves the struct zeroed, and sema's decimalLiteralOutOfRange has already
+// reported an out-of-range literal as a compile error.
+extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
+                                      void* ove_vtable, void* fe_vtable);
 
 namespace bezel::codegen {
 
@@ -615,7 +623,7 @@ llvm::Constant* Emitter::constInitForExpr(const ast::Expr* e, llvm::Type* ty) {
                         digits.push_back(c);
                     }
                     uint32_t dec[4] = {0, 0, 0, 0};
-                    bz_decimal_parse_cstr(digits.c_str(), dec);
+                    bz_decimal_parse_cstr(digits.c_str(), dec, nullptr, nullptr);
                     llvm::StructType* dst = decimalStructType();
                     return llvm::ConstantStruct::get(dst, {
                         llvm::ConstantInt::get(i32(), dec[0]),
