@@ -44,6 +44,39 @@
 #include <unordered_map>
 #include <unordered_set>
 
+// ---- allocation failure (spec §31.4, v0.226) ----
+//
+// §31.4 "Allocation failure" is normative and unambiguous: "When a runtime
+// allocation cannot obtain memory — a `new` expression, collection growth,
+// string construction, boxing, or the allocation of a closure, iterator, or
+// async state-machine frame — the program TERMINATES: the runtime reports the
+// failure and aborts the process. Allocation failure is not an exception.
+// There is no OutOfMemoryException; nothing is catchable; no unwinding runs …
+// The report's form is implementation-defined; the termination is not."
+//
+// Every allocation-failure site in the runtime funnels through here. The two
+// alternatives are both wrong, and both were tried:
+//   * returning NULL — callers do not check (and per §31.4 have no reason to),
+//     so it becomes a null dereference one frame later;
+//   * returning a truncated/partial result — silent data corruption, which is
+//     strictly worse than the crash it replaces (a 3-line file read back as
+//     1 line is indistinguishable from a 1-line file).
+// Terminating here is what the spec requires AND the only posture that cannot
+// corrupt: a caller that never observes failure cannot mishandle it.
+//
+// [[noreturn]] lets callers keep their original shape — no status plumbing, no
+// post-call checks, and no "grew or not" branch that could write past a buffer
+// that was never grown.
+[[noreturn]] inline void bz_alloc_fail(const char* what) {
+    // Deliberately no allocation on this path (we are already out of memory):
+    // fputs of string literals + the caller's static description only.
+    fputs("bezel: fatal: allocation failed (", stderr);
+    fputs(what ? what : "unspecified", stderr);
+    fputs(") — terminating per spec §31.4\n", stderr);
+    fflush(stderr);
+    abort();
+}
+
 // ---- shared object-layout constants ----
 static const int64_t BZ_EXC_OBJ_SIZE = 40;
 static const int64_t BZ_CLOSURE_ENV_OFFSET = 8;

@@ -66,17 +66,16 @@ int32_t bz_file_read_all_text(const char* path, char** out, int64_t* byte_len) {
 // argv[0] is excluded per §33.4: "The program's own executable path is not
 // included; args[0] is the first user-supplied argument."
 //
-// fix #2234 / §33.4 / §28.9: OOM-hardened the per-iteration allocations. The
+// fix #2234 / §33.4 / spec §31.4: OOM-harden the per-iteration allocations. The
 // pre-fix code called malloc((size_t)(len+1)) and calloc(1, BZ_STRING_SIZEOF)
-// without null-checking, then memcpys into the result — a failed malloc
-// produced a SIGSEGV on the next memcpy rather than a clean partial-result
-// that the caller can dispose. Same class of bug as #1762 finding R1 (the
-// 2026-07-12 static-analysis wave that caught bz_sort_kv_str and
-// bz_file_read_all_bytes). On any OOM at the per-iteration allocations we
-// stop appending and return whatever was built so far — the array itself is
-// a valid owned Array<string> with len == i (the successfully-built prefix).
-// bz_string_release on each committed element runs the data malloc's free
-// path, so the prefix is leak-free; the un-built suffix was never allocated.
+// without null-checking, then memcpy'd into the result — a failed malloc
+// produced a SIGSEGV on the next memcpy.
+//
+// The first cut returned a TRUNCATED array (stop appending, hand back the
+// prefix). That is silent data corruption: a program launched with 5 arguments
+// would see 2 and could not tell the difference. §31.4 names "string
+// construction" and mandates termination, so both allocations abort on
+// failure.
 void* bz_args_array(int32_t argc, char** argv) {
     int32_t n = (argc > 1) ? (argc - 1) : 0;
     void* arr = bz_array_alloc(8, n);   // elem_size = sizeof(void*) = 8
@@ -84,11 +83,11 @@ void* bz_args_array(int32_t argc, char** argv) {
         const char* src = argv[i + 1];  // skip argv[0]
         int64_t len = (int64_t)strlen(src);
         char* data = (char*)malloc((size_t)(len + 1));
-        if (!data) break;  // OOM: stop here; prefix is valid
+        if (!data) bz_alloc_fail("command-line argument string data");
         memcpy(data, src, (size_t)len);
         data[len] = '\0';
         uint8_t* s = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
-        if (!s) { free(data); break; }  // OOM: free data; prefix is valid
+        if (!s) { free(data); bz_alloc_fail("command-line argument string header"); }
         memcpy(s, &data, sizeof(void*));           // data ptr
         memcpy(s + 8, &len, sizeof(int64_t));      // len field
         s[16] = 1;                                  // width = 1 (UTF-8 bytes)
@@ -103,18 +102,16 @@ void* bz_args_array(int32_t argc, char** argv) {
 // Mirrors .NET File.ReadAllLines: n '\n'-terminated lines yield n entries; CRLF
 // line endings are stripped of the '\r' before the entry is constructed.
 //
-// fix #2237 / §7.3 / §28.9: OOM-hardened the per-line allocations. The pre-fix
-// code called malloc((size_t)(lineLen + 1)) and calloc(1, BZ_STRING_SIZEOF)
-// without null-checking, then memcpys into the result — a failed allocation
-// segfaulted on the next memcpy instead of returning a clean partial
-// Array<string> the caller can dispose. Same class of bug as #2234 / #1762
-// finding R1 (the 2026-07-12 static-analysis wave that caught bz_sort_kv_str
-// and bz_file_read_all_bytes). On any OOM at the per-line allocations we stop
-// appending and return the array of successfully-built prefix lines — a valid
-// owned Array<string> with len == n_committed (each committed
-// bz_string_struct's data malloc is freed by bz_string_release on the
-// disposer path). The un-built suffix was never published into a
-// bz_string_struct, so no leak.
+// fix #2237 / §7.3 / spec §31.4: OOM-harden the per-line allocations. The
+// pre-fix code called malloc((size_t)(lineLen + 1)) and calloc(1,
+// BZ_STRING_SIZEOF) without null-checking, then memcpy'd into the result — a
+// failed allocation segfaulted on the next memcpy.
+//
+// The first cut returned the successfully-built PREFIX. For a file reader that
+// is the worst possible outcome: a 10,000-line file read back as 12 lines is
+// indistinguishable from a 12-line file, and every downstream computation is
+// silently wrong. §31.4 mandates termination; a caller cannot recover from OOM
+// anyway, and it certainly cannot detect this.
 void* bz_file_read_all_lines(const char* path) {
     uint8_t* buf; int64_t len;
     if (bz_file_read_all_bytes(path, &buf, &len) != 0)
@@ -131,11 +128,11 @@ void* bz_file_read_all_lines(const char* path) {
             if (i == len && lineLen == 0) break;
             // Build a bz.string struct: { data ptr, len i64, width i8 }
             char* lineData = (char*)malloc((size_t)(lineLen + 1));
-            if (!lineData) break;  // OOM: stop here; prefix is valid
+            if (!lineData) bz_alloc_fail("File.ReadAllLines line data");
             memcpy(lineData, buf + start, (size_t)lineLen);
             lineData[lineLen] = '\0';
             uint8_t* s = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
-            if (!s) { free(lineData); break; }  // OOM: free data; prefix is valid
+            if (!s) { free(lineData); bz_alloc_fail("File.ReadAllLines line header"); }
             memcpy(s, &lineData, sizeof(void*));            // data
             memcpy(s + 8, &lineLen, sizeof(int64_t));      // len
             s[16] = 1;                                      // width = 1 (ASCII)

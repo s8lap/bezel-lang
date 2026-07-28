@@ -57,22 +57,22 @@ struct bz_binser_t {
     int32_t  json_pending_tag_id;
 };
 
+// fix #1762 finding R5: realloc-into-same-pointer leaks on failure — keep the
+// original buffer intact instead of overwriting it with NULL.
+//
+// A failed growth TERMINATES per spec §31.4 ("collection growth" / "string
+// construction"). The serializer does not bound-check on write, so every other
+// posture is unsafe: the first cut of this fix returned void and documented the
+// resulting overrun as acceptable ("strictly a leak fix"), which turns a
+// deterministic NULL-deref crash into a silent heap-buffer-overflow; dropping
+// the write instead would emit a silently TRUNCATED payload that no reader can
+// distinguish from a short one.
 static void bz_binser_ensure(bz_binser_t* s, int64_t need) {
     if (s->used + need <= s->cap) return;
     int64_t newcap = s->cap == 0 ? 256 : s->cap;
     while (newcap < s->used + need) newcap *= 2;
-    // fix #1762 finding R5: realloc-into-same-pointer leaks on failure. Keep
-    // the original buffer on failure; the caller will see `s->cap < need` on
-    // the next call (the write will write past `cap`, the binary serializer
-    // doesn't bound-check on the write path) — so this fix is strictly a leak
-    // fix, not a safety fix for the write-after-OOM path. The pre-fix code
-    // would set s->buf to NULL, leak the original block, and crash on the next
-    // write; the post-fix code keeps the original block intact (so subsequent
-    // writes still produce a coherent (if eventually-overrun) byte stream) and
-    // surfaces the OOM as a null buf at the end-of-serialize flush site if
-    // that ever grows one.
     void* tmp = realloc(s->buf, (size_t)newcap);
-    if (!tmp) return;
+    if (!tmp) bz_alloc_fail("serializer buffer growth");
     s->buf = static_cast<uint8_t*>(tmp);
     s->cap = newcap;
 }
@@ -697,14 +697,12 @@ int32_t bz_binser_graph_assign_tag(void* serp, void* ptr) {
     auto* s = static_cast<bz_binser_t*>(serp);
     if (s->tag_count >= s->tag_cap) {
         int32_t newcap = s->tag_cap == 0 ? 16 : s->tag_cap * 2;
-        // fix #1762 finding R5: same realloc anti-pattern as bz_binser_ensure.
-        // Keep the original `tag_ptrs` buffer on failure; the next assign_tag
-        // call will retry (and may surface the OOM by returning 0 if `ptr` is
-        // the same — but bz_binser_graph_assign_tag's `ptr` argument is the
-        // pointer to tag, and the cache key is the slot, so a retry with a
-        // larger cap would still produce the same tag_id).
+        // fix #1762 finding R5: same realloc anti-pattern as bz_binser_ensure,
+        // same §31.4 posture. Returning 0 here would mean "not seen before" to
+        // every caller, silently breaking §9.8 graph identity (the same object
+        // would be re-emitted instead of back-referenced) rather than failing.
         void* tmp = realloc(s->tag_ptrs, (size_t)newcap * sizeof(void*));
-        if (!tmp) return 0;
+        if (!tmp) bz_alloc_fail("serializer graph identity-tag table growth");
         s->tag_ptrs = static_cast<void**>(tmp);
         s->tag_cap  = newcap;
     }
