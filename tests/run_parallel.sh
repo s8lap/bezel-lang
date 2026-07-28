@@ -46,6 +46,21 @@ pids=()
 for (( i = 0; i < shards; i++ )); do
     shard_tmp="$logdir/tmp.$i"
     mkdir -p "$shard_tmp"
+    # Per-shard AOT cache dir (#1906): the AOT bincache writes are content-
+    # addressed, so collisions are benign in principle — but each shard's
+    # `aot_cache` tests assert hit/miss COUNT deltas against `cacheStats()`
+    # (a function-local atomic, per-process), and a parallel shard's COMPILE
+    # can land on the same key as this shard's MISS-by-design observation
+    # window (the per-shard test has the cache miss delta asserted just
+    # before its second run reads it). Without per-shard isolation, two
+    # shards racing on /var/tmp/bezel-scratch/aot-bincache can produce
+    # cross-shard cache pollution that mis-attributes hits/misses and
+    # surfaces as flake under `gate --full`. Each shard gets its own
+    # subdir; a `$shard_tmp/aot-cache` also co-locates the cache with the
+    # shard's TMPDIR so scripts/gc_scratch.sh (per-worktree /tmp reaping)
+    # reclaims it without a separate lifecycle.
+    shard_cache="$shard_tmp/aot-cache"
+    mkdir -p "$shard_cache"
     # Per-shard timeout: a DEADLOCKED test (e.g. a cross-domain-mutex contention
     # race, #1609) otherwise hangs `wait` below forever and wedges the whole gate.
     # timeout kills the hung shard (exit 124/137 -> counted as a crashed shard ->
@@ -57,7 +72,8 @@ for (( i = 0; i < shards; i++ )); do
     # and `exit $_rc` preserves the shard's exit code for the `wait` below.
     (
         _s=$(awk '{print $1; exit}' /proc/uptime 2>/dev/null || date +%s)
-        TMPDIR="$shard_tmp" BEZEL_SHARD_COUNT="$shards" BEZEL_SHARD_INDEX="$i" \
+        TMPDIR="$shard_tmp" BEZEL_AOT_CACHE_DIR="$shard_cache" \
+            BEZEL_SHARD_COUNT="$shards" BEZEL_SHARD_INDEX="$i" \
             timeout -k 10 "${BEZEL_SHARD_TIMEOUT:-300}" "$bin" > "$logdir/shard.$i.log" 2>&1
         _rc=$?
         _e=$(awk '{print $1; exit}' /proc/uptime 2>/dev/null || date +%s)

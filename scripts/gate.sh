@@ -255,7 +255,7 @@ trap 'rc=$?; gate_finish "$rc" || true; exit $rc' EXIT
 # all 5). Replaces an earlier ">8 => fail-fast real-regression" that mis-reported
 # cold-cache timeouts as mass regressions (the #2205 mis-revert, 2026-07-25).
 arbitrate() { # $1 = sharded-run log
-  local log="$1" crashed failed suspects nsus real t suite passed_alone k sampled
+  local log="$1" crashed failed suspects nsus real t suite passed_alone k sampled arb_cache
   crashed=$(grep 'died on:' "$log" | sed -E 's/.*died on: //')
   failed=$(grep -E '^\[ FAIL' "$log" | sed -E 's/^\[ FAIL \] //' | awk '{print $1}')
   # "died on: <none>" = a shard died before running ANY test (e.g. OOM-kill at
@@ -269,6 +269,14 @@ arbitrate() { # $1 = sharded-run log
   nsus=$(printf '%s\n' "$suspects" | grep -c .)
   ARB_LAST_SUSPECTS=$nsus
   real=0; sampled=0
+  # Per-arbitration fresh AOT cache dir (#1906): the sharded run set
+  # BEZEL_AOT_CACHE_DIR per shard in tests/run_parallel.sh so concurrent
+  # shards don't pollute each other's cache state. The arbitration re-runs
+  # a suspect alone; if it inherits the SHARDED run's cache dir it sees
+  # state left by unrelated shards' compiles — exactly the pollution that
+  # flaked the gate originally. Give each arbitration a fresh, empty cache
+  # dir so the alone run sees ONLY its own state. Dirs land on $S scratch
+  # (reclaimed by gc_scratch.sh) and are removed inline as we move on.
   while IFS= read -r t; do
     [ -z "$t" ] && continue
     sampled=$((sampled+1))
@@ -279,11 +287,13 @@ arbitrate() { # $1 = sharded-run log
     suite="${t%%.*}"
     passed_alone=0
     for k in 1 2 3 4 5; do
+      arb_cache="$(mktemp -d "$S/arb_cache.XXXXXX")"
       # ARB_ENV forces ASan on the re-run in ASan modes so an ASan-only failure
       # reproduces (empty array in plain mode -> identical command). The re-run
       # is by SUITE substring, deliberately unrestricted by any subset list — it
       # may run a few MORE tests than were selected; harmless extra coverage.
-      if BEZEL_TEST_FILTER="$suite" "${ARB_ENV[@]}" timeout 180 build/tests/bezel_tests >/dev/null 2>&1; then passed_alone=1; break; fi
+      if BEZEL_AOT_CACHE_DIR="$arb_cache" BEZEL_TEST_FILTER="$suite" "${ARB_ENV[@]}" timeout 180 build/tests/bezel_tests >/dev/null 2>&1; then passed_alone=1; rm -rf "$arb_cache"; break; fi
+      rm -rf "$arb_cache"
     done
     if [ "$passed_alone" -eq 1 ]; then
       echo "   FLAKY: $t — its suite PASSES alone within 5 tries (sharding pollution/timing, not a deterministic failure)"
