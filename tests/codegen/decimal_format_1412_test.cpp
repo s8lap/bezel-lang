@@ -331,3 +331,72 @@ module M; class C public static method Main(): int
 end Main; end C;
 )BZ"), 4);
 }
+
+// fix #2231: F29 (count > max scale 28) raises FormatException — the produced
+// string would have 29 fractional digits, which Decimal.Parse cannot represent
+// (scale bound is 0..28 per §9.3 v0.195).
+BEZEL_TEST(decimal_format_1412, F29_above_max_raises_FormatException_spec_2_18_9_3) {
+    BEZEL_EXPECT_EQ(run(R"BZ(
+module M; class C public static method Main(): int
+  var result := 0;
+  var d := 1.5m;
+  try
+    var s := d.ToString("F29");
+    result := 99;   // BUG: should not reach here
+  catch FormatException => result := 5;
+  end;
+  return result;
+end Main; end C;
+)BZ"), 5);
+}
+
+// fix #2231: F30 (well above max) also raises FormatException (the previous
+// off-by-one would have rejected 30+ but not 29; F30 is the regression guard
+// for the upper-bound logic staying strict).
+BEZEL_TEST(decimal_format_1412, F30_above_max_raises_FormatException_spec_2_18_9_3) {
+    BEZEL_EXPECT_EQ(run(R"BZ(
+module M; class C public static method Main(): int
+  var result := 0;
+  var d := 1.5m;
+  try
+    var s := d.ToString("F30");
+    result := 99;
+  catch FormatException => result := 6;
+  end;
+  return result;
+end Main; end C;
+)BZ"), 6);
+}
+
+// fix #2231: same off-by-one applied to E29 / E30 — rejected.
+BEZEL_TEST(decimal_format_1412, E29_above_max_raises_FormatException_spec_2_18_9_3) {
+    BEZEL_EXPECT_EQ(run(R"BZ(
+module M; class C public static method Main(): int
+  var result := 0;
+  var d := 1.5m;
+  try
+    var s := d.ToString("E29");
+    result := 99;
+  catch FormatException => result := 7;
+  end;
+  return result;
+end Main; end C;
+)BZ"), 7);
+}
+
+// fix #2231: P29 / P30 — rejected (the P formatter scales the digit-string
+// representation, but the same scale bound applies).
+BEZEL_TEST(decimal_format_1412, P29_above_max_raises_FormatException_spec_2_18_9_3) {
+    BEZEL_EXPECT_EQ(run(R"BZ(
+module M; class C public static method Main(): int
+  var result := 0;
+  var d := 1.5m;
+  try
+    var s := d.ToString("P29");
+    result := 99;
+  catch FormatException => result := 8;
+  end;
+  return result;
+end Main; end C;
+)BZ"), 8);
+}
