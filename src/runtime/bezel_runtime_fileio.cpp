@@ -102,6 +102,19 @@ void* bz_args_array(int32_t argc, char** argv) {
 // one entry per '\n'-terminated line (a terminal '\n' is not its own empty line).
 // Mirrors .NET File.ReadAllLines: n '\n'-terminated lines yield n entries; CRLF
 // line endings are stripped of the '\r' before the entry is constructed.
+//
+// fix #2237 / §7.3 / §28.9: OOM-hardened the per-line allocations. The pre-fix
+// code called malloc((size_t)(lineLen + 1)) and calloc(1, BZ_STRING_SIZEOF)
+// without null-checking, then memcpys into the result — a failed allocation
+// segfaulted on the next memcpy instead of returning a clean partial
+// Array<string> the caller can dispose. Same class of bug as #2234 / #1762
+// finding R1 (the 2026-07-12 static-analysis wave that caught bz_sort_kv_str
+// and bz_file_read_all_bytes). On any OOM at the per-line allocations we stop
+// appending and return the array of successfully-built prefix lines — a valid
+// owned Array<string> with len == n_committed (each committed
+// bz_string_struct's data malloc is freed by bz_string_release on the
+// disposer path). The un-built suffix was never published into a
+// bz_string_struct, so no leak.
 void* bz_file_read_all_lines(const char* path) {
     uint8_t* buf; int64_t len;
     if (bz_file_read_all_bytes(path, &buf, &len) != 0)
@@ -118,9 +131,11 @@ void* bz_file_read_all_lines(const char* path) {
             if (i == len && lineLen == 0) break;
             // Build a bz.string struct: { data ptr, len i64, width i8 }
             char* lineData = (char*)malloc((size_t)(lineLen + 1));
+            if (!lineData) break;  // OOM: stop here; prefix is valid
             memcpy(lineData, buf + start, (size_t)lineLen);
             lineData[lineLen] = '\0';
             uint8_t* s = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+            if (!s) { free(lineData); break; }  // OOM: free data; prefix is valid
             memcpy(s, &lineData, sizeof(void*));            // data
             memcpy(s + 8, &lineLen, sizeof(int64_t));      // len
             s[16] = 1;                                      // width = 1 (ASCII)
