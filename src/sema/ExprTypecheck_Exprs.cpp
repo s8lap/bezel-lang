@@ -4213,9 +4213,20 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             auto savedField = fieldNarrowed_;
             collectNarrowings(be->left.get(), /*forTrueBranch=*/true);
             visitExpr(*be->right);
-            nullNarrowed_ = std::move(savedNull);
-            narrowings_ = std::move(savedNarrow);
-            fieldNarrowed_ = std::move(savedField);
+            // fix #2258 / §7.4: un-seed the left operand's true-facts by
+            // INTERSECTING with the saved state, never by assigning it. The
+            // right operand's visit can legitimately INVALIDATE a fact that
+            // held at entry — a `ref`/`out` argument erases it (the #1188
+            // argument-invalidation path in the CallExpr handler below), and a
+            // call or `await` drops the mutably-captured locals' facts
+            // (invalidateCapturedNarrowings) — all per §7.4 "How narrowing is
+            // invalidated". Assigning the entry snapshot back RESURRECTED
+            // those facts, so `if s = null then return 0; end; var b: bool :=
+            // true and C.Clear(ref s);` left `s` narrowed and the following
+            // `s.Length` compiled to a null dereference (silent ACCEPT,
+            // SIGSEGV). The intersection keeps the drop and still discards the
+            // left operand's seeded facts (absent from the snapshot).
+            intersectNarrowingSetsWith(savedNull, savedNarrow, savedField);
         } else if (be->right) {
             visitExpr(*be->right);
         }
@@ -5163,28 +5174,58 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // narrows its own branches exactly as an if-STATEMENT condition
         // narrows its controlled block (per §7.4 v0.210 first bullet,
         // "in an `if`/`elif` condition … of the §20 conditional atom,
-        // each condition narrowing its own branches"). Save the entry
-        // narrowings, push true-branch facts before thenValue, false-
-        // branch facts before elseValue, restore after — mirroring the
-        // IfStmt save/restore in ExprTypecheck.cpp around the two
-        // bodies. The post-`if` expression state is irrelevant (a
-        // conditional atom yields one of the two branch values, with no
-        // following statements on either path); the entry state is what
-        // any enclosing context resumes with.
+        // each condition narrowing its own branches"). Each branch is
+        // seeded from the ENTRY state plus its own polarity's facts (the
+        // other branch did not execute on this path), mirroring the
+        // IfStmt walk in ExprTypecheck.cpp.
+        //
+        // fix #2258 / §7.4: the after-atom state is `entry ∩ thenExit ∩
+        // elseExit`, NOT the entry snapshot. The #2105 landing justified
+        // assigning the entry state back with "the post-`if` expression
+        // state is irrelevant (a conditional atom yields one of the two
+        // branch values, with no following statements on either path)" —
+        // which is false: a branch VALUE can be a call, and execution
+        // continues after the atom. A branch that invalidated a fact
+        // (§7.4 "How narrowing is invalidated": a `ref`/`out` argument,
+        // a call/`await` on a mutably-captured local) had that fact
+        // RESURRECTED, so `if s = null then return 0; end; var n: int :=
+        // (if c then C.ClearI(ref s) else 0); return s.Length;` was a
+        // silent ACCEPT that SIGSEGV'd. Exactly one branch runs, so a
+        // fact survives the atom only if it survived BOTH — the same
+        // all-paths join the IfStmt walk computes over its fall-through
+        // exits. Intersecting with `entry` additionally un-seeds what the
+        // CONDITION established for a branch (it holds only inside that
+        // branch).
         auto entryNarrowings = narrowings_;
         auto entryNullNarrowed = nullNarrowed_;
         auto entryFieldNarrowed = fieldNarrowed_;
         // §28.3 A7 (v0.209, #2080): an if-expression BRANCH is a marked-
         // transfer admission position — announce the exact child node.
         const ast::Expr* savedSlot = markedArmSlot_;
+        bool haveThenExit = false;
+        std::unordered_set<Symbol*> thenExitNull;
+        std::unordered_map<Symbol*, TypeRef*> thenExitNarrowings;
+        std::set<std::pair<std::uint32_t, std::uint32_t>> thenExitField;
         if (ce->thenValue) {
+            // §12.7 (#2258): reset the TYPE narrowings per branch too — the
+            // three sets are one state. Without this the `then` branch's
+            // `b is Derived` fact was still live while the `else` VALUE was
+            // checked, so `(if b is Derived then 1 else b.M())` resolved `M`
+            // against `Derived` and compiled a wrong-typed dispatch on the
+            // path where the test FAILED (probe-confirmed silent ACCEPT).
+            narrowings_ = entryNarrowings;
             nullNarrowed_ = entryNullNarrowed;
             fieldNarrowed_ = entryFieldNarrowed;
             collectNarrowings(ce->condition.get(), /*forTrueBranch=*/true);
             markedArmSlot_ = ce->thenValue.get();
             visitExpr(*ce->thenValue);
+            thenExitNull = nullNarrowed_;
+            thenExitNarrowings = narrowings_;
+            thenExitField = fieldNarrowed_;
+            haveThenExit = true;
         }
         if (ce->elseValue) {
+            narrowings_ = entryNarrowings;
             nullNarrowed_ = entryNullNarrowed;
             fieldNarrowed_ = entryFieldNarrowed;
             collectNarrowings(ce->condition.get(), /*forTrueBranch=*/false);
@@ -5192,9 +5233,14 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             visitExpr(*ce->elseValue);
         }
         markedArmSlot_ = savedSlot;
-        narrowings_ = entryNarrowings;
-        nullNarrowed_ = entryNullNarrowed;
-        fieldNarrowed_ = entryFieldNarrowed;
+        // The live sets hold the else branch's exit (or, for a branch-less
+        // malformed atom, the entry state); fold in the entry snapshot and the
+        // then branch's exit. // per §7.4 (#2258)
+        intersectNarrowingSetsWith(entryNullNarrowed, entryNarrowings,
+                                   entryFieldNarrowed);
+        if (haveThenExit)
+            intersectNarrowingSetsWith(thenExitNull, thenExitNarrowings,
+                                       thenExitField);
     } else if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
         if (te->operand) visitExpr(*te->operand);
     } else if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
@@ -5835,6 +5881,17 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // expression-case arm's `do … end` body can contain early-exit `if`
         // statements that establish facts.
         auto caseRunningField = fieldNarrowed_;
+        // §7.4 (#2258): fold THIS arm's exit into the running intersection.
+        // Named (not inlined at the loop tail) because one arm path — the
+        // choice-destructure arm below — `continue`s past the tail, and
+        // skipping the fold there loses that arm's DROPS.
+        auto foldArmExitIntoRunning = [&] {
+            for (auto it = caseRunningField.begin();
+                 it != caseRunningField.end();) {
+                if (fieldNarrowed_.count(*it)) ++it;
+                else it = caseRunningField.erase(it);
+            }
+        };
         for (const auto& arm : ce->arms) {
             fieldNarrowed_ = caseRunningField;  // §7.4 #2116: per-arm base
             // §19 / §A (#727): in a SCRUTINEE-LESS `case`, an arm's pattern is a
@@ -6238,6 +6295,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         for (const auto& bs : arm.stmts)
                             if (bs) visitStmt(*bs);
                         currentScope_ = saveScope;
+                        // §7.4 (#2258): this path leaves the arm loop early,
+                        // so fold the arm's exit HERE — the loop-tail fold
+                        // never runs for it, and a fact this arm DROPPED
+                        // would be resurrected in the after-case state.
+                        foldArmExitIntoRunning();
                         continue;  // skip the record-destructure path
                     }
                 }
@@ -6497,6 +6559,18 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // for this arm's condition, restore on exit. Mirrors
                 // the IfStmt save/restore in ExprTypecheck.cpp and the
                 // §20 conditional atom save/restore above (#2105).
+                //
+                // fix #2258 / §7.4: the un-seeding below is an
+                // INTERSECTION, never an assignment — restoring the
+                // arm's ENTRY snapshot resurrected every fact the arm
+                // legitimately invalidated (a `ref`/`out` argument in
+                // the arm's result expression, a call on a mutably-
+                // captured local; §7.4 "How narrowing is invalidated"),
+                // and since it ran BEFORE the #2116 fold the fold saw
+                // the resurrected state instead of the arm's real exit.
+                // The intersection keeps the DROPS and still discards
+                // what the arm CONDITION seeded. Same reasoning and
+                // same wording as the CaseStmt counterpart.
                 auto armEntryNarrow = narrowings_;
                 auto armEntryNull = nullNarrowed_;
                 auto armEntryField = fieldNarrowed_;
@@ -6520,16 +6594,12 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     markedArmSlot_ = savedMtSlot;
                 }
                 for (const auto& s : arm.stmts) if (s) visitStmt(*s);
-                narrowings_ = armEntryNarrow;
-                nullNarrowed_ = armEntryNull;
-                fieldNarrowed_ = armEntryField;
+                intersectNarrowingSetsWith(armEntryNull, armEntryNarrow,
+                                           armEntryField);  // §7.4 #2258
             }
-            // §7.4 #2116: fold this arm's exit into the running intersection.
-            for (auto it = caseRunningField.begin();
-                 it != caseRunningField.end();) {
-                if (fieldNarrowed_.count(*it)) ++it;
-                else it = caseRunningField.erase(it);
-            }
+            // §7.4 #2116/#2258: fold this arm's exit into the running
+            // intersection (see the lambda).
+            foldArmExitIntoRunning();
         }
         fieldNarrowed_ = std::move(caseRunningField);  // §7.4 #2116
         currentScope_ = preArmEnumScope;  // §10.6 (#772): pop the enum scope

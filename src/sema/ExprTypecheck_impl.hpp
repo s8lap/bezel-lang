@@ -1348,6 +1348,23 @@ private:
     // known-non-null; a (possibly-)null value clears that knowledge.
     void narrowOnAssignment(Symbol* sym, const TypeRef* valueType);
 
+    // §7.4 (#2258): reduce the three live narrowing sets to their INTERSECTION
+    // with one snapshot — the single primitive every all-paths join and every
+    // "un-seed what this construct established" restore is built from. Keeping
+    // the current sets' DROPS is the point: a restore written as an ASSIGNMENT
+    // (`nullNarrowed_ = saved;`) RESURRECTS a fact the visited sub-expression
+    // legitimately invalidated per §7.4 "How narrowing is invalidated" (a
+    // `ref`/`out` argument, a call/`await` on a mutably-captured local), which
+    // is a silent compile-ACCEPT of a null dereference. An intersection keeps
+    // the drop and still discards whatever the construct itself SEEDED (absent
+    // from the snapshot). Pure set/map algebra over integer keys and pointer
+    // identity — order-independent, so it is deterministic across shard
+    // processes (#2116).
+    void intersectNarrowingSetsWith(
+        const std::unordered_set<Symbol*>& otherNull,
+        const std::unordered_map<Symbol*, TypeRef*>& otherNarrowings,
+        const std::set<std::pair<std::uint32_t, std::uint32_t>>& otherField);
+
     // §7.4 (issue #2118): after a loop body (which may execute ZERO times),
     // reduce the current narrowing state to the intersection of what holds on
     // the zero-iteration path (`entryNull` / `entryNarrowings`, captured before

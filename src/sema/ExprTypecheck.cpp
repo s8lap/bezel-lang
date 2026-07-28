@@ -6524,27 +6524,7 @@ void ExprTC::intersectNarrowingSetsAfterLoop(
     const std::unordered_map<Symbol*, TypeRef*>& entryNarrowings,
     const std::set<std::pair<std::uint32_t, std::uint32_t>>& entryField,
     const LoopEdgeNarrowing& edges) {
-    // §7.4 (v0.214, #2116): the same zero-iteration-path intersection for the
-    // readonly-field facts — a fact established INSIDE the body does not
-    // survive the loop; an entry fact the body invalidated stays dropped.
-    intersectFieldFactsWith(entryField);
-    for (auto it = nullNarrowed_.begin(); it != nullNarrowed_.end();) {
-        if (entryNull.count(*it))
-            ++it;
-        else
-            it = nullNarrowed_.erase(it);
-    }
-    // §12.7 type-narrowings are only ever established inside nested if/case
-    // guards that already restore the map, so the body's exit map is a subset of
-    // the entry map; intersecting keeps that invariant (and drops any entry
-    // narrowing a top-level reassignment invalidated).
-    for (auto it = narrowings_.begin(); it != narrowings_.end();) {
-        auto e = entryNarrowings.find(it->first);
-        if (e != entryNarrowings.end() && e->second == it->second)
-            ++it;
-        else
-            it = narrowings_.erase(it);
-    }
+    intersectNarrowingSetsWith(entryNull, entryNarrowings, entryField);
     // §7.4 (#2152): fold each break/continue edge snapshot into the
     // intersection. A `break`/`continue` edge state is a possible after-loop
     // state (see the function header); a local the edge left possibly-null is
@@ -6552,21 +6532,37 @@ void ExprTC::intersectNarrowingSetsAfterLoop(
     // member access after the loop is then correctly rejected. The three
     // parallel vectors are pushed together by recordLoopEdgeNarrowing, so they
     // share one length.
-    for (std::size_t i = 0; i < edges.nullEdges.size(); ++i) {
-        intersectFieldFactsWith(edges.fieldEdges[i]);
-        for (auto it = nullNarrowed_.begin(); it != nullNarrowed_.end();) {
-            if (edges.nullEdges[i].count(*it))
-                ++it;
-            else
-                it = nullNarrowed_.erase(it);
-        }
-        for (auto it = narrowings_.begin(); it != narrowings_.end();) {
-            auto e = edges.typeEdges[i].find(it->first);
-            if (e != edges.typeEdges[i].end() && e->second == it->second)
-                ++it;
-            else
-                it = narrowings_.erase(it);
-        }
+    for (std::size_t i = 0; i < edges.nullEdges.size(); ++i)
+        intersectNarrowingSetsWith(edges.nullEdges[i], edges.typeEdges[i],
+                                   edges.fieldEdges[i]);
+}
+
+// §7.4 (#2258): the one intersection primitive — see the declaration in
+// ExprTypecheck_impl.hpp for why every "restore" of the narrowing sets must be
+// this and never an assignment.
+void ExprTC::intersectNarrowingSetsWith(
+    const std::unordered_set<Symbol*>& otherNull,
+    const std::unordered_map<Symbol*, TypeRef*>& otherNarrowings,
+    const std::set<std::pair<std::uint32_t, std::uint32_t>>& otherField) {
+    // §7.4 (v0.214, #2116): the readonly-field facts join the same way — a fact
+    // established inside the joined region does not survive it; a fact the
+    // region invalidated stays dropped.
+    intersectFieldFactsWith(otherField);
+    for (auto it = nullNarrowed_.begin(); it != nullNarrowed_.end();) {
+        if (otherNull.count(*it))
+            ++it;
+        else
+            it = nullNarrowed_.erase(it);
+    }
+    // §12.7 type-narrowings are keyed by symbol AND narrowed type: an entry
+    // whose narrowed type differs from the snapshot's is not the same fact, so
+    // it does not survive the join.
+    for (auto it = narrowings_.begin(); it != narrowings_.end();) {
+        auto e = otherNarrowings.find(it->first);
+        if (e != otherNarrowings.end() && e->second == it->second)
+            ++it;
+        else
+            it = narrowings_.erase(it);
     }
 }
 
@@ -11258,6 +11254,27 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         auto caseRunningField = fieldNarrowed_;
         auto caseEntryNull = nullNarrowed_;
         auto caseRunningNull = caseEntryNull;
+        // §7.4 (#2258): fold THIS arm's exit state into the running
+        // intersections. Named (not inlined at the loop tail) because one arm
+        // path — the choice-destructure arm below — `continue`s past the tail,
+        // and skipping the fold there loses that arm's DROPS: the after-case
+        // state would claim a fact the arm invalidated (`s := null;` inside a
+        // `Some(var v) =>` arm), a silent ACCEPT of a null dereference.
+        auto foldArmExitIntoRunning = [&] {
+            for (auto it = caseRunningField.begin();
+                 it != caseRunningField.end();) {
+                if (fieldNarrowed_.count(*it)) ++it;
+                else it = caseRunningField.erase(it);
+            }
+            // §7.4 #2164: the same running-intersection discipline for the
+            // LOCAL set — every later arm starts from entry ∩ earlier-arm
+            // exits, and the after-case state is the same intersection.
+            for (auto it = caseRunningNull.begin();
+                 it != caseRunningNull.end();) {
+                if (nullNarrowed_.count(*it)) ++it;
+                else it = caseRunningNull.erase(it);
+            }
+        };
         for (const auto& arm : cs->arms) {
             fieldNarrowed_ = caseRunningField;  // §7.4 #2116: per-arm base
             nullNarrowed_ = caseRunningNull;    // §7.4 #2164: per-arm base
@@ -11618,6 +11635,11 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         for (const auto& bs : arm.stmts)
                             if (bs) visitStmt(*bs);
                         currentScope_ = saveScope;
+                        // §7.4 (#2258): this path leaves the arm loop early, so
+                        // fold the arm's exit HERE — the loop-tail fold never
+                        // runs for it, and a fact this arm DROPPED would be
+                        // resurrected in the after-case state.
+                        foldArmExitIntoRunning();
                         continue;  // skip the record-destructure path
                     }
                 }
@@ -11854,6 +11876,26 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // intersection below #2116/#2164 is unaffected — only
                 // this arm's BODY sees the condition's true-branch
                 // facts, the exit intersection is unchanged).
+                //
+                // fix #2258 / §7.4: the un-seeding below is an
+                // INTERSECTION, never an assignment. Restoring the arm's
+                // ENTRY snapshot resurrected every fact the arm's BODY
+                // legitimately invalidated (`x := null;`, a `ref`/`out`
+                // argument, a call on a mutably-captured local — §7.4
+                // "How narrowing is invalidated"), and because this
+                // restore ran BEFORE the #2116/#2164 fold, the fold then
+                // intersected `caseRunning*` with itself (a no-op) and
+                // the arm's REAL exit state was discarded: a null flowed
+                // into a slot the checker believed non-null (silent
+                // ACCEPT, SIGSEGV). The intersection keeps the arm's
+                // DROPS and still discards what the arm CONDITION seeded
+                // (absent from the entry snapshot), so the fold below —
+                // whose input is now armEntry ∩ armExit, and
+                // armEntry ⊆ caseRunning* — computes exactly the
+                // intended caseRunning* ∩ armExit. This branch is the
+                // one every NON-binding, NON-destructuring arm takes
+                // (constant, `_` discard, enum-constant, relational,
+                // alt, and scrutinee-less boolean arms).
                 auto armEntryNarrow = narrowings_;
                 auto armEntryNull = nullNarrowed_;
                 auto armEntryField = fieldNarrowed_;
@@ -11869,24 +11911,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 if (arm.guard) visitExpr(*arm.guard);
                 if (arm.exprBody) visitExpr(*arm.exprBody);
                 for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
-                narrowings_ = armEntryNarrow;
-                nullNarrowed_ = armEntryNull;
-                fieldNarrowed_ = armEntryField;
+                intersectNarrowingSetsWith(armEntryNull, armEntryNarrow,
+                                           armEntryField);  // §7.4 #2258
             }
-            // §7.4 #2116: fold this arm's exit into the running intersection.
-            for (auto it = caseRunningField.begin();
-                 it != caseRunningField.end();) {
-                if (fieldNarrowed_.count(*it)) ++it;
-                else it = caseRunningField.erase(it);
-            }
-            // §7.4 #2164: the same running-intersection discipline for the
-            // LOCAL set — every later arm starts from entry ∩ earlier-arm
-            // exits, and the after-case state is the same intersection.
-            for (auto it = caseRunningNull.begin();
-                 it != caseRunningNull.end();) {
-                if (nullNarrowed_.count(*it)) ++it;
-                else it = caseRunningNull.erase(it);
-            }
+            // §7.4 #2116/#2164/#2258: fold this arm's exit into the running
+            // intersections (see the lambda).
+            foldArmExitIntoRunning();
         }
         fieldNarrowed_ = std::move(caseRunningField);  // §7.4 #2116
         nullNarrowed_ = std::move(caseRunningNull);    // §7.4 #2164
