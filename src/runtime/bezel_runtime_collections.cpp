@@ -41,7 +41,16 @@ void* bz_array_alloc_count_n(int64_t elem_size, int64_t n) {
 static void bz_array_grow(bz_array_t* arr, int64_t elem_size, int64_t min_cap) {
     int64_t new_cap = arr->capacity < 4 ? 4 : arr->capacity * 2;
     if (new_cap < min_cap) new_cap = min_cap;
-    arr->data = realloc(arr->data, (size_t)(new_cap * elem_size));
+    // fix #1762 finding R5: realloc-into-same-pointer leaks on failure. The
+    // canonical anti-pattern `p = realloc(p, n)` overwrites `p` with NULL on
+    // failure, leaking the original block (the only pointer to it is gone) AND
+    // crashing the next deref. Use a tmp pointer; on failure, keep the
+    // original buffer intact (the array keeps its old capacity and the next
+    // add attempt will retry — best we can do without surfacing OOM to a C
+    // helper that doesn't return a status).
+    void* tmp = realloc(arr->data, (size_t)(new_cap * elem_size));
+    if (!tmp) return;
+    arr->data = tmp;
     // Zero new entries for safety
     if (new_cap > arr->capacity) {
         memset((char*)arr->data + arr->capacity * elem_size, 0,
@@ -366,7 +375,11 @@ static uint32_t fnv1a(const char* s, int64_t len) {
 static void dict_order_append(bz_dict_t* d, int64_t slot) {
     if (d->order_count == d->order_cap) {
         int64_t new_cap = d->order_cap < 8 ? 8 : d->order_cap * 2;
-        d->order = (int64_t*)realloc(d->order, (size_t)new_cap * sizeof(int64_t));
+        // fix #1762 finding R5: same realloc anti-pattern as bz_array_grow.
+        // Keep the original `order` buffer on failure (the next append retries).
+        int64_t* tmp = (int64_t*)realloc(d->order, (size_t)new_cap * sizeof(int64_t));
+        if (!tmp) return;
+        d->order = tmp;
         d->order_cap = new_cap;
     }
     d->order[d->order_count++] = slot;
@@ -1047,7 +1060,11 @@ void bz_sort_kv_str(char** keys, int64_t* lens, void** values, int64_t n) {
     char**   ks = (char**)malloc((size_t)n * sizeof(char*));
     int64_t* ls = lens   ? (int64_t*)malloc((size_t)n * sizeof(int64_t)) : nullptr;
     void**   vs = values ? (void**)malloc((size_t)n * sizeof(void*)) : nullptr;
-    if (!ks) { free(idx); return; }
+    // fix #1762 finding R1: if `ks` malloc failed, free the already-allocated
+    // `ls` and `vs` alongside `idx` so an OOM at this site doesn't leak the
+    // other two scratch arrays. Both may be non-null here (they're allocated
+    // before the guard), so free unconditionally.
+    if (!ks) { free(ls); free(vs); free(idx); return; }
     for (int64_t i = 0; i < n; i++) {
         ks[i] = keys[idx[i]];
         if (ls) ls[i] = lens[idx[i]];
