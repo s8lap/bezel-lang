@@ -131,6 +131,16 @@ void Resolver::run(const ast::SourceFile& src) {
     }
     Scope moduleScope;
     // Populate module-scope: every top-level type / alias by name.
+    // #2131 / §2.3 v0.226: a local top-level declaration of the same name as
+    // an auto-imported prelude type SHADOWS the prelude (the prelude is
+    // prepended into `unit->topDecls` by Driver::injectStdlibPrelude, but the
+    // user's own decl sits AFTER it in iteration order; inserting it here
+    // OVERWRITES the prelude's slot so resolveNamed sees only the user decl).
+    // §2.2 reinforces the same rule for explicit `import` — locals win, imports
+    // never shadow. A reader of the loop below who skips this comment would
+    // read "child->name may collide with a prelude decl" as a bug; the pin
+    // is the §2.3 paragraph "the other always-available names... may be
+    // shadowed by local declarations under the normal name-resolution rules".
     if (ctx_.module()) {
         for (Symbol* child : ctx_.module()->children) {
             if (!child->name.empty()) {

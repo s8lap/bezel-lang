@@ -85,15 +85,19 @@ void injectStdlibPrelude(ast::SourceFile& unit) {
     std::unique_ptr<ast::SourceFile> preludeUnit =
         preludeParser.parseCompilationUnit();
     if (!preludeUnit || preludeDiags.hasErrors()) return;  // defensive: no-op
-    // #2047 follow-up 2: an auto-imported prelude type is SHADOWED by a user
-    // top-level declaration of the same name (standard auto-import shadowing) —
-    // inject a prelude decl ONLY when the user declares no type of that name.
-    // Without this, a program that declares its own `Result` (the corpus does —
-    // e.g. a `sealed abstract class Result<T>` hierarchy) collides with the
-    // injected `Result<T, E>` choice: two same-named top-level types corrupt name
-    // resolution and per-monomorphization descriptor emission for the WHOLE
-    // module (an unrelated `is Box<string>` then mis-resolves). The user's type
-    // wins; the stdlib `Result` is simply unavailable in that module.
+    // #2047 follow-up 2 / #2131 / §2.3 v0.226: an auto-imported prelude type
+    // is SHADOWED by a user top-level declaration of the same name (standard
+    // auto-import shadowing — §2.3's paragraph "the other always-available
+    // names... may be shadowed by local declarations under the normal
+    // name-resolution rules"). Inject a prelude decl ONLY when the user
+    // declares no type of that name. Without this, a program that declares its
+    // own `Result` (the corpus does — e.g. a `sealed abstract class Result<T>`
+    // hierarchy) collides with the injected `Result<T, E>` choice: two
+    // same-named top-level types corrupt name resolution and
+    // per-monomorphization descriptor emission for the WHOLE module (an
+    // unrelated `is Box<string>` then mis-resolves). The user's type wins; the
+    // stdlib `Result` is simply unavailable in that module. Pinned by
+    // tests/codegen/result_stdlib_2047_test.cpp (spec_2_20_user_result_type_*).
     std::unordered_set<std::string_view> userTypeNames;
     for (const auto& td : unit.topDecls)
         if (auto* decl = dynamic_cast<const ast::TypeDecl*>(td.get()))
