@@ -6,6 +6,7 @@
 | **Tracking issue** | [#1456](https://github.com/s8lap/bezel-lang/issues/1456) |
 | **Target module(s)** | `System.Diagnostics` (requires `import System.Diagnostics`); additions to `Debug` (existing §8.2) |
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
 | **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #23 (2×P1+P2) |
 
 ---
@@ -111,22 +112,20 @@ end Verify;
 **Expression position (the primary use case):**
 ```bezel
 // In a case arm where all logical cases are covered but the compiler cannot prove it:
-var label: string := case direction
-  Directions.North => "north"
-  Directions.South => "south"
-  Directions.East  => "east"
-  Directions.West  => "west"
-  _ => throw Verify.Unreachable($"unexpected direction: {direction}")
-end;
+var label: string := (case direction of
+  Directions.North => "north",
+  Directions.South => "south",
+  Directions.East  => "east",
+  Directions.West  => "west",
+  _ => throw Verify.Unreachable($"unexpected direction: {direction}"));
 
 // In an if-else where an else branch cannot actually be reached:
-var kind := if tokens.IsEmpty then
+var kind := (if tokens.IsEmpty then
   TokenKind.End
-else if tokens[0].IsKeyword then
+elif tokens[0].IsKeyword then
   TokenKind.Keyword
 else
-  throw Verify.Unreachable("non-keyword token fell through all branches")
-end;
+  throw Verify.Unreachable("non-keyword token fell through all branches"));
 ```
 
 **Statement position:**
@@ -314,11 +313,10 @@ Usage:
     Verify.That(buffer.Capacity > 0, "buffer must be non-empty before write");
 
     // Unreachable branch (expression form — `throw` provides the bottom type):
-    var label := case direction
-      Direction.North => "north"
-      Direction.South => "south"
-      _ => throw Verify.Unreachable($"unexpected direction: {direction}")
-    end;
+    var label := (case direction of
+      Direction.North => "north",
+      Direction.South => "south",
+      _ => throw Verify.Unreachable($"unexpected direction: {direction}"));
 
     // Unreachable branch (statement form):
     throw Verify.Unreachable("control should not reach here");

@@ -6,6 +6,7 @@
 | **Tracking issue** | [#1461](https://github.com/s8lap/bezel-lang/issues/1461) |
 | **Target module(s)** | new `System.Text.Json` (the module named-but-deferred in stdlib §11); relates to §2.14/§2.15 (the serialization vocabulary + JSON format agent) without extending them |
 | **Written against** | spec **v0.177** / stdlib **v0.165** |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
 | **Wave** | D3 (gap-review item #21) |
 | **Depends on** | nothing to ship the parse/build/query core. The `WriteTo(TextWriter)` streaming-emit variant rides proposal 0006 (concrete `StreamWriter`/`TextWriter`); the embedded-field *read* round-trip rides an owner ruling (Open Question 1). |
 
@@ -64,14 +65,13 @@ end JsonKind;
 
 ```bezel
 public method Describe(v: JsonValue): string
-  return case v of                          // exhaustive — no _ arm required (§19.6)
+  return (case v of                         // exhaustive — no _ arm required (§19.6)
     var o: JsonObject => $"object({o.Count})",
     var a: JsonArray  => $"array({a.Count})",
     var s: JsonString => $"\"{s.Value}\"",
     var n: JsonNumber => n.Raw,
-    var b: JsonBool   => if b.Value then "true" else "false",
-    var _: JsonNull   => "null"
-  end;
+    var b: JsonBool   => (if b.Value then "true" else "false"),
+    var _: JsonNull   => "null");
 end Describe;
 ```
 
@@ -214,10 +214,9 @@ The base bodies dispatch by type-test — no per-leaf override needed:
 
 ```bezel
 public method AsString(): string
-  return case this of
+  return (case this of
     var s: JsonString => s.Value,
-    _ => throw new JsonTypeException(expected := JsonKind.String, actual := this.Kind)
-  end;
+    _ => throw new JsonTypeException(expected := JsonKind.String, actual := this.Kind));
 end AsString;
 ```
 

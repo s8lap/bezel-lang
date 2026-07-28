@@ -6,6 +6,7 @@
 | **Target module** | `System` (auto-imported): additions to `Environment` (§2.4) + new `OperatingSystem` static class |
 | **Written against** | spec v0.177 / stdlib v0.165 |
 | **Tracking issue** | [#1441](https://github.com/s8lap/bezel-lang/issues/1441) |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
 | **Gap-review item** | #12 (P0+2×P1) in [stdlib-gap-review-2026-07.md](stdlib-gap-review-2026-07.md) |
 
 ---
@@ -94,7 +95,7 @@ end OperatingSystem;
 var configDir: string;
 if OperatingSystem.IsLinux() then
   configDir := Environment.GetEnvironmentVariable("HOME")! + "/.config/myapp";
-else if OperatingSystem.IsWindows() then
+elif OperatingSystem.IsWindows() then
   configDir := Environment.GetEnvironmentVariable("APPDATA")! + "\\myapp";
 else
   configDir := Environment.CurrentDirectory + "/config";

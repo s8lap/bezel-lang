@@ -7,6 +7,7 @@
 | **Written against** | spec v0.216 (owner-directed currency refresh 2026-07-22 — the draft predated `choice` and the v0.208 expression forms; §3's "honest sum-type gap" is now closed by the language and the examples use current syntax. Architecture unchanged.) |
 | **Design influences** | Elm (the architecture), iced/Rust (MVU without a VM), **not** SwiftUI's property wrappers, **not** React hooks (exploration-ui.md records why) |
 | **The one-line pitch** | The Elm runtime's defining constraint — updates are strictly serial — *is* Bezel's domain model; every piece of MVU maps to an existing language feature, and messages-as-data is exactly what sendability wants |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
 
 ## 1. The four pieces, in Bezel terms
 
@@ -109,7 +110,7 @@ public static method Update(model: AppModel, msg: Msg, fx: Effects): AppModel
       // its Msg result is POSTED back into this loop (a channel underneath —
       // the boundary carriage is §3's spelling (b); with spelling (a) the
       // §30.14 sendable-result rule is checked directly at this call).
-      fx.Run(async () => do
+      fx.Run(async lambda() => do
         try
           using var resp := await Http.Get("https://api.example.com/users");
           return Msg.UsersLoaded(await resp.JsonOwned<Array<string>>());
@@ -127,7 +128,7 @@ end Update;
 - The effect closure runs on a **worker** domain; the only thing that crosses back is the returned `Msg` — checked at the boundary. There is no way to mutate `model` from the fetch; the type system closes the door Elm closes by purity convention.
 - The multi-statement `FetchUsers` arm rides the **statement-position** `case` (grammar A.6 CaseStmt — `do … end` arm bodies are statement-form only, §19.2/v0.208); a one-armed helper extraction would let `update` stay an expression, which is §19.2's standing doctrine for arm bodies that grow.
 - **The `Users := names` slot is deliberately glossed** (the original draft glossed it silently; this refresh names it): a record field cannot *own* the transferred array (K1.7/§28.5), so a real `AppModel` either carries the collection as a borrow-bearing record (fine domain-locally, fights nothing until it crosses) or is itself a class. This is the model half of open question 1's representation decision.
-- Timers/subscriptions follow the same shape (`fx.Every(TimeSpan.FromSeconds(1), () => Msg.Tick)`) — deferred detail.
+- Timers/subscriptions follow the same shape (`fx.Every(TimeSpan.FromSeconds(1), lambda() => Msg.Tick)`) — deferred detail.
 - Whether effects are requested via an `fx` handle (shown) or by `update` returning `(Model, Cmd)` Elm-style is **open question 2** — the handle avoids inventing a tuple-ish return; the Elm shape is purer. **v0.202's `pure` sharpens this question into a real tiebreaker**: under the Cmd-return shape `update` can be *declared* `pure` (§22.15 — effects become returned data; §2's counter already is), while an `fx`-handle `update` structurally cannot. The draft now leans Cmd-shaped; the tuple-ish return it needs (a `(Model, Cmd)` product — a record can carry both when Cmd is a value-like choice of effect *descriptions*) is the concrete design to work out.
 
 ## 5. Ownership of the node tree (the Bezel-specific part)

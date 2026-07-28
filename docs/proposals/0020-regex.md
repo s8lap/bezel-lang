@@ -5,6 +5,7 @@
 | **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Target module** | `System.Text.RegularExpressions` (new; explicit `import`) |
 | **Written against** | spec **v0.177** / stdlib **v0.165** |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
 | **Tracking issue** | [#1449](https://github.com/s8lap/bezel-lang/issues/1449) |
 | **Gap-review item** | #19 (2026-07 ranking, wave D3) — *"Regex engine — P1; deferred in stdlib §11"* |
 | **Design character** | **RFC** — the load-bearing decision (engine family) is a language-values question, not a mechanical one. This proposal *frames the fork and recommends*; the fork is now resolved under delegated ruling authority (see "Rulings recorded at acceptance" below). |
@@ -374,7 +375,7 @@ var masked := swap.Replace("a@b c@d", "$2#$1");         // "b#a d#c"
 // --- callback replacement: call-bounded closure (§28.14) ---
 var subject := "x1 y2";
 using var num := new Regex(@"\d+");
-var doubled := num.Replace(subject, (match: Match) => do
+var doubled := num.Replace(subject, lambda(match: Match) => do
   // `match` is a borrow, valid only for this invocation; not retained (§28.14).
   var n := int.Parse(subject[match.Range]);
   return (n * 2).ToString();

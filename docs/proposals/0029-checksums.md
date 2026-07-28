@@ -6,6 +6,7 @@
 | **Tracking issue** | [#1454](https://github.com/s8lap/bezel-lang/issues/1454) |
 | **Target module(s)** | `System.IO.Hashing` (new module; requires `import System.IO.Hashing`) |
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
 | **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #27 (P1), wave D3 (the design plan lists #27 under wave D3); depends on proposal 0008 (integer toolkit — [#1437](https://github.com/s8lap/bezel-lang/issues/1437)) |
 
 ---
@@ -61,7 +62,7 @@ Each algorithm exposes two shapes: a **static one-shot method** for the common c
 
 The one-shot form follows proposal 0009's input/output conventions exactly:
 
-- **Input**: `IReadOnlySpan<byte>` (stdlib §4.16) — accepts `ReadOnlySpan<byte>`, `ReadOnlyArraySpan<byte>`, `ReadOnlyAsciiByteSpan`, and any other `IReadOnlySpan<byte>` implementor with one overload.
+- **Input**: `IReadOnlySpan<byte>` (stdlib §4.16) — accepts `ReadOnlySpan<byte>`, `ReadOnlyArraySpan<byte>`, and any other `IReadOnlySpan<byte>` implementor with one overload.
 - **Output**: `uint` (CRC-32) or `ulong` (XxHash64) — plain value types, no ownership, no allocation.
 
 ```bezel

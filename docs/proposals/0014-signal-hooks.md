@@ -8,6 +8,7 @@
 | **Tracking issue** | [#1442](https://github.com/s8lap/bezel-lang/issues/1442) |
 | **Gap-review item** | #14 (P1) in [stdlib-gap-review-2026-07.md](stdlib-gap-review-2026-07.md) |
 | **Unblocked by** | Bounded `Channel<T>` (v0.174, #809, stdlib §6.9) |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
 
 ---
 
@@ -126,11 +127,11 @@ public async method RunServer(token: CancellationToken): Task
   using var sigterm := Signals.Subscribe(SignalKind.Terminate);
   // Both channels receive independent deliveries; we merge via a helper task.
   await using var scope := new TaskScope();
-  scope.Spawn(async () => do
+  scope.Spawn(async lambda() => do
     var kind := await sigint.Receive();
     scope.Cancel();    // cancel the scope's token → cooperative shutdown
   end);
-  scope.Spawn(async () => do
+  scope.Spawn(async lambda() => do
     var kind := await sigterm.Receive();
     scope.Cancel();
   end);
@@ -147,7 +148,7 @@ end RunServer;
 
 ## 5. Declined alternatives
 
-1. **Callback-based subscription** (`Signals.Subscribe(kind, () => ())`) — the callback runs on the signal thread, outside any domain; touching any Bezel state from it violates §30.14. Channel delivery is the only §30.14-sound shape.
+1. **Callback-based subscription** (`Signals.Subscribe(kind, lambda() => ())`) — the callback runs on the signal thread, outside any domain; touching any Bezel state from it violates §30.14. Channel delivery is the only §30.14-sound shape.
 2. **`async` / `Task`-returning subscribe** (`Signals.WhenAsync(kind): Task<SignalKind>`) — returns a task that completes on the first signal. Cannot represent "receive every signal" without repeated calls; also raises the question of task ownership across domains. A channel is the right multi-delivery primitive.
 3. **A shared bus channel** (all subscribers share one `Channel<T>`) — fights the single-owner model; fan-out to independent channels is cleaner.
 4. **Unbounded internal buffer** — allows a slow-consumer backlog to grow without bound; against the defined-fault / no-silent-surprises discipline. Coalescing is the right behavior for signals, which POSIX itself coalesces under load.

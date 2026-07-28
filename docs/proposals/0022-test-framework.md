@@ -6,6 +6,7 @@
 | **Tracking issue** | [#1453](https://github.com/s8lap/bezel-lang/issues/1453) |
 | **Target module(s)** | A new `System.Testing` module — **explicitly imported, deliberately *not* auto-imported** (§5.6). Builds on `System` (`Exception`/`ExceptionInfo` §31.4, `Type` stdlib §2.13, `Task` §30) |
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
 | **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #24 (P1, diagnostics), wave D3 of the [stdlib gap DESIGN plan](stdlib-gap-design-plan-2026-07.md) — the one wave-D3 item flagged "numbered proposal (RFC-track) … the `test` modifier is a language change — needs the RFC discipline, owner ruling." |
 | **Related** | [#1398](https://github.com/s8lap/bezel-lang/issues/1398) (the future build driver — the natural test *runner* host); [#1419](https://github.com/s8lap/bezel-lang/issues/1419)/§28.14 (call-bounded closures — `Assert.Throws`'s shape); gap item #23 (`Verify`/`Unreachable`/`Debug.Fail` — the *sibling* diagnostics item, and the release-elidable `Debug.Assert` §8.2 this proposal is careful **not** to be) |
 
@@ -25,7 +26,7 @@ Bezel has no way to write a test. There is `Debug.Assert(condition)` (stdlib §8
 
 This proposal has **two cleanly separable parts**, and the separation is the most important structural fact about it:
 
-1. **An `Assert` library and a library test-runner (§5–§8) — no language change, ships regardless of anything below.** It is buildable *today* on machinery the language already has: `=`/§9.2 auto-equality (the `Assert.Equal` foundation), §28.14/v0.177 **call-bounded closures** (`Assert.Throws(() => …)`), §27.6 method references (the runner's registration), §31 typed exceptions (assertion failures as typed faults), and — the design's centerpiece — §28.10 `using var` and §28.4 destructors (fixture setup/teardown *as ownership*, with no `SetUp`/`TearDown` and no attributes).
+1. **An `Assert` library and a library test-runner (§5–§8) — no language change, ships regardless of anything below.** It is buildable *today* on machinery the language already has: `=`/§9.2 auto-equality (the `Assert.Equal` foundation), §28.14/v0.177 **call-bounded closures** (`Assert.Throws(lambda() => …)`), §27.6 method references (the runner's registration), §31 typed exceptions (assertion failures as typed faults), and — the design's centerpiece — §28.10 `using var` and §28.4 destructors (fixture setup/teardown *as ownership*, with no `SetUp`/`TearDown` and no attributes).
 
 2. **The discovery fork (§3) — an RFC.** *How the runner finds the tests* is the one question with a language-change option on the table (a `test` modifier). This is reserved for an owner ruling; the proposal presents all three candidates and recommends one, arguing entirely from the project's own recorded reasoning.
 
@@ -37,7 +38,7 @@ Before proposing anything, confirm the substrate exists (CLAUDE.md rule 3, trace
 
 - **Equality.** `Assert.Equal(a, b)` needs value equality. §9.2 gives body records auto-`=` over their auto-properties; §8.3 defines the **equality-bearing** derived type property; primitives/enums/`string` compare intrinsically. A record that is *not* auto-equality-bearing makes `=`/`.Equals` a **compile error at the use site** (§9.2) — that error is the design, not a gap (§5.1).
 - **Typed faults.** §31.4 gives the `Exception` surface (`Message`, `StackTrace`, `CauseChain`) and shows user subclasses chaining through `base(msg)`. An `AssertionException: Exception` is an ordinary user-style subclass (§5.4).
-- **Call-bounded closures.** §28.14 (v0.177, #1419): "A function-typed parameter declared *without* `scoped` is **call-bounded** … the caller side is correspondingly unrestricted: **any** closure — capture-bearing or not — may be passed." `Assert.Throws(() => account.Withdraw(over))` is the canonical call-bounded shape: the callee invokes the closure during the call and never retains it, so the caller's captures are trivially in-lifetime.
+- **Call-bounded closures.** §28.14 (v0.177, #1419): "A function-typed parameter declared *without* `scoped` is **call-bounded** … the caller side is correspondingly unrestricted: **any** closure — capture-bearing or not — may be passed." `Assert.Throws(lambda() => account.Withdraw(over))` is the canonical call-bounded shape: the callee invokes the closure during the call and never retains it, so the caller's captures are trivially in-lifetime.
 - **Method references.** §27.6: `greeter.Greet` (bound instance), `int.Parse` (static), `MyTests.ParsesEmpty` (a static reference). The registration runner takes exactly these.
 - **Ownership as lifecycle.** §28.10 `using var` disposes "on every exit path: normal completion, `break`, `return`, or exception"; §28.4 destructors run deterministically; §22.9 makes owned fields exception-safe. This is teardown-that-cannot-be-forgotten (§7).
 - **Domains.** §30.13: a domain is serial; continuations interleave only at `await`. A serial awaited sequence of async tests in one domain is deterministic (§6).

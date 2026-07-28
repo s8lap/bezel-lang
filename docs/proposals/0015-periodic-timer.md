@@ -8,6 +8,7 @@
 | **Tracking issue** | [#1443](https://github.com/s8lap/bezel-lang/issues/1443) |
 | **Gap-review item** | #13 (2×P1) in [stdlib-gap-review-2026-07.md](stdlib-gap-review-2026-07.md) |
 | **Implementation substrate** | #1378 (timer-thread runtime) |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
 
 ---
 
@@ -141,7 +142,7 @@ import System.Threading;
 
 public async method RunWithRefresh(): Task
   await using var scope := new TaskScope();
-  scope.Spawn(async () => do
+  scope.Spawn(async lambda() => do
     using var timer := new PeriodicTimer(TimeSpan.FromMinutes(1.0));
     while await timer.WaitForTickAsync(scope.Token) do
       await RefreshCacheAsync();

@@ -6,6 +6,7 @@
 | **Depends on** | Proposal 0001 (client), proposal 0007 (`System.Net` substrate), stdlib §7 Stream family (#1394/#645), timers (#1378), proposal 0003 (guarded shared state) |
 | **Design influences** | ASP.NET **Minimal APIs** and **Express** for the routing surface (the two independently converged on the same shape); WHATWG fetch for the `Request → Response` handler symmetry; **not** full ASP.NET (no controllers, no DI container, no middleware pipeline in v1), **not** raw Node `http` (streams-and-callbacks is the wrong level, and callbacks fit serial-per-domain async poorly) |
 | **Bezel-native leverage** | Handlers run on worker **domains**; the §30.14 sendability rules make data-race freedom a *compile-time* property of the server — the marquee thing neither Express nor ASP.NET can promise |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
 
 ## 1. Design principles
 
@@ -28,15 +29,15 @@ class Api
   // construct that worker's own routing table and handler instances (§30.14
   // spawn-entry rules — §4.1). Registered here, run there.
   public static method Routes(app: HttpApp)
-    app.Get("/health", (req) => Http.Text("ok"));
+    app.Get("/health", lambda(req) => Http.Text("ok"));
 
-    app.Get("/todos/{id}", async (req) => do
+    app.Get("/todos/{id}", async lambda(req) => do
       var id := int.Parse(req.Param("id"));       // FormatException → 400 (§4.3)
       var todo := new Todo(id, "write the server proposal", false);
       return Http.Json(todo);                     // 200, application/json
     end);
 
-    app.Post("/todos", async (req) => do
+    app.Post("/todos", async lambda(req) => do
       var todo := await req.Json<Todo>();          // single-consumption body
       return Http.Json(todo, status := 201);
     end);
@@ -65,10 +66,9 @@ class TodoApi
   public async method GetById(req: HttpRequest): OwningTask<HttpResponse>
     var id := int.Parse(req.Param("id"));
     using var g := await Store.Todos.LockAsync();
-    return case g.Value.TryGetValue(id, out var todo) of
+    return (case g.Value.TryGetValue(id, out var todo) of
       true => Http.Json(todo!),
-      _    => Http.Status(404)
-    end;
+      _    => Http.Status(404));
   end GetById;
 
   public async method Create(req: HttpRequest): OwningTask<HttpResponse>
