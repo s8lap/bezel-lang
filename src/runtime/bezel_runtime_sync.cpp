@@ -139,13 +139,15 @@ void bz_lock_release(void* lkp) {
     mutex_core_release(m);
 }
 
-// bz_mutex_dispose — dispose the Mutex object.  Marks disposed (for idempotency)
-// and releases the Mutex object's core ref.  The pthread_mutex is destroyed only
-// when the last Lock is also released (via mutex_core_release → core_refs → 0).
-// Idempotent: calling twice is a no-op on the second call.
-// fix #706: exchange(true) is atomic — concurrent Dispose calls from two domains
-// cannot both proceed to core_release (only the first caller, which sees false,
-// drops the core ref; the second sees true and returns immediately).
+// §6.2: Mutex.Dispose — dispose the Mutex object.  Marks disposed (for
+// idempotency) and releases the Mutex object's core ref.  The pthread_mutex
+// is destroyed only when the last Lock is also released (via
+// mutex_core_release → core_refs → 0). Idempotent: calling twice is a no-op
+// on the second call.
+// fix #706: exchange(true) is atomic — concurrent Dispose calls from two
+// domains cannot both proceed to core_release (only the first caller, which
+// sees false, drops the core ref; the second sees true and returns
+// immediately).
 void bz_mutex_dispose(void* mp) {
     if (!mp) return;
     auto* m = (bz_mutex_t*)mp;
