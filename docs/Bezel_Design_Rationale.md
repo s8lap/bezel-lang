@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.226 — July 2026**
+**Companion to the Bezel Language Specification, v0.227 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -890,7 +890,7 @@ var u := _user;
 if u <> null then u.DoStuff(); end;
 ```
 
-Some languages (TypeScript) narrow property accesses and pay for it with subtle time-of-check/time-of-use bugs; Kotlin refuses to smart-cast mutable properties for exactly this reason. Bezel declines to narrow fields entirely.
+Some languages (TypeScript) narrow property accesses and pay for it with subtle time-of-check/time-of-use bugs; Kotlin refuses to smart-cast mutable properties for exactly this reason. Bezel declines to narrow mutable fields and properties entirely.
 
 <a id="sec-is-postfix-only"></a>
 ### 6.2 `!` is postfix only
@@ -948,7 +948,7 @@ Bezel rejects same-name members in derived classes outright. To override a virtu
 
 A sealed hierarchy can be matched exhaustively without a `_` arm: if the base class is `sealed abstract` (or abstract with only `sealed` subclasses, recursively forming a closed set — spec §19.6) and every concrete leaf type appears as a pattern, the match is provably total.
 
-This is the partial form of sum types — useful where it applies, no language additions required. Full sum types remain deferred ([§18](#sec-things-deferred)); the hierarchy form covers most of the use cases.
+This is the class-shaped form of sum types — useful where it applies, no language additions required. The value-shaped form is the `choice` kind (spec §35); [§9.6](#sec-choices-why-a-new-kind) records the reasons and the line between them — hierarchies for behavior-carrying, identity-bearing sums, choices for value-shaped outcomes.
 
 <a id="sec-records-and-classes"></a>
 ## 9. Records and classes

@@ -1,6 +1,6 @@
 # Bezel Guide 2: Errors and Nullability
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.211.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.227.*
 
 If you know C#, Kotlin, or Swift, most of this chapter is familiar: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. Skim those parts. The three places where the ownership model changes how you write this code — and where a habit from those languages produces a *compile error* — are headed **How Bezel does it**. Read those.
 
@@ -33,7 +33,7 @@ if maybe <> null then
 end;
 ```
 
-One rule that bites people: **narrowing applies to locals only, never to fields or properties.** A field can be reassigned between the check and the use by things the compiler cannot see — a method call that writes it, a closure, or another continuation interleaving at an `await` — so the compiler will not narrow it. Copy it to a local first:
+One rule that bites people: **narrowing applies to locals and `readonly` fields only, never to mutable fields or properties.** A mutable field can be reassigned between the check and the use by things the compiler cannot see — a method call that writes it, a closure, or another continuation interleaving at an `await` — so the compiler will not narrow it. Copy it to a local first:
 
 ```bezel
 var local := _field;               // copy
@@ -42,7 +42,9 @@ if local <> null then
 end;
 ```
 
-One local *also* loses its narrowing: a local that is **mutably captured** — assigned, or passed by `ref`/`out`, inside any lambda in the method — is re-widened at the next call, function-value invocation, or `await` in the controlled block, because a closure could run and rewrite it in between (spec §7.4). Copy such a value into a plain, uncaptured local and test *that* — the same remedy as for a field.
+The exception is `readonly` fields: a nullable `readonly` field — instance or static — narrows like a local, because nothing can rewrite it after construction, so no call, closure, or `await` can invalidate the fact. The tracked shape is one field directly off a tracked root (`this._f`, `TypeName._s`, or a tracked `local._f`), and the rule does not apply inside the declaring type's constructors and initializers, where the field is still being assigned (spec §7.4).
+
+Locals can lose their narrowing too: a local that is **mutably captured** — assigned, or passed by `ref`/`out`, inside any lambda in the method — is re-widened at the next call, function-value invocation, or `await` in the controlled block, because a closure could run and rewrite it in between (spec §7.4). Copy such a value into a plain, uncaptured local and test *that* — the same remedy as for a mutable field.
 
 ---
 
