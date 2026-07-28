@@ -130,3 +130,75 @@ A lazy `Chunk` variant (producing `IEnumerable<Array<T>>`) is deferred: it requi
 - **`MinBy`/`MaxBy` on `IOwningEnumerable<T>`** — deferred to gap #29 along with all owning-LINQ operators.
 - **Lazy `Chunk`** — blocked by ownership soundness (see D3 above); deferred to gap #29.
 - **`Chunk` returning `owned Array<Array<T>>`** — rejected: the outer borrowing array (`Array<Array<T>>`) would hold borrows of inner arrays with no owner for those inner arrays; `OwningArray<Array<T>>` is the correct outer type.
+
+---
+
+## Addendum (2026-07-28): TakeLast / SkipLast rider
+
+*Source: the 2026-07-28 stdlib API review, adversarially critiqued (the review confirmed the gap below against current text). Appended without modifying any of the proposal text above. Written against spec/stdlib **v0.228** — the base proposal is written against v0.177/v0.165, so this addendum cites the current §5 semantics pins (the v0.195 clamping rule, the v0.196 callback-retention classification) where the base text predates them.*
+
+### A1 — The confirmed gap: the tail idiom is unspellable on a lazy query
+
+On a **lazy query**, the .NET tail idiom is a compile error under the affine-query rule (spec §29.11 single-consumption):
+
+```bezel
+var tail := q.Skip(q.Count() - n);   // ✗ Count() is a terminal operator and CONSUMES q
+                                     //   (§29.11 consumption point 1); the Skip call is a
+                                     //   second use of the consumed binding — a static
+                                     //   error where visible, InvalidOperationException
+                                     //   where only dynamically reachable
+```
+
+The only current spelling materializes the entire source first:
+
+```bezel
+using var all := q.ToArray();          // owned Array<T>; re-enumerable (§29.11 remedy)
+var tail := all.Skip(all.Count - n);   // legal — a collection is not affine
+```
+
+On a **collection**, by contrast, the idiom is already legal, total, and fine: `arr.Skip(arr.Count - n)` — `Count` is the §4.4 property read, and `Take`/`Skip` **clamp** (stdlib §5, v0.195: "a negative count behaves as `0`, and a count beyond the source takes everything / skips everything — they are range operations, not magnitude constructors"). So the win is deliberately scoped, and stated honestly: **collections already have a one-line spelling; the operators exist for the affine streaming case — where they are a MEMORY win (buffer at most `count` elements instead of materializing the whole source) as much as a spelling win — and for not writing the arithmetic.**
+
+### A2 — Proposed operators
+
+```bezel
+public method TakeLast(count: int): IEnumerable<T>;   // the final count elements, source order
+public method SkipLast(count: int): IEnumerable<T>;   // all but the final count elements
+```
+
+Both on `IEnumerable<T>` only, matching this proposal's scoping ("none touches `IOwningEnumerable<T>` (gap #29, deferred)").
+
+**Clamping** matches `Take`/`Skip` exactly (stdlib §5, v0.195): a negative `count` behaves as `0` (`TakeLast` yields nothing; `SkipLast` yields everything); `count` at or beyond the source length yields everything (`TakeLast`) / nothing (`SkipLast`). They are range operations, so stdlib §1's negative-magnitude fault rule deliberately does not apply — no `ArgumentException` anywhere; both operators are total over all `int` counts.
+
+**Buffering** (documented in the style of D3's eagerness note):
+
+- **`TakeLast`** — lazy until first enumeration, then **exhausts the source before yielding its first element**: no suffix is identifiable before end-of-source, so the operator runs the source to completion while retaining a sliding window of **at most `count` elements**, then yields the window. This is the lazy-then-buffer shape `GroupBy` already has (stdlib §5, v0.195), with the buffer bounded by the argument rather than by the source length. Honestly stated: the source is still fully consumed — the saving over `ToArray()` is *space* (at most `count` live at once), not *work*.
+- **`SkipLast`** — genuinely streaming: each element is yielded delayed by `count` positions through an internal ring of **at most `count` elements**; there is no point of full materialization.
+
+**Ownership (consistent with the operators above — the borrow path).** Both are **callback-free lazy operators**: they join `Take`/`Skip`/`Reverse` in stdlib §5's callback-retention classification (v0.196) — no callback is retained, and the returned query value is the ordinary deferred-activation frame carrying the receiver as its source (spec §28.14 / §28.3), with the unmarked `IEnumerable<T>` return being the stdlib §1 deferred-activation transfer announcement, exactly as `Take`/`Skip` are declared. At class-typed `T`, the internally buffered and finally yielded elements are borrows sourced from the query's source, identically to elements yielded by `Take`/`Skip`; no disposal obligation arises at any point and no `owned` marker appears anywhere. Both results are single-consumption (spec §29.11), and applying either operator to a bound query consumes that binding (§29.11 consumption point 2) — the affine discipline is preserved, not weakened.
+
+```bezel
+// The tail of an affine query without materializing its source.
+// ReadRecords() is a user-written iterator method (spec §29.3) — a
+// single-pass streaming source, the case A1 scopes these operators to:
+var q := ReadRecords().Where(r => r.Level = "ERROR");
+var lastErrors := q.TakeLast(50);      // consumes q (§29.11 point 2); buffers at most 50
+
+// Drop a trailer element without knowing the length up front:
+var body := ReadRecords().SkipLast(1); // streams; holds at most 1 element back
+```
+
+### A3 — Member summary
+
+The §2 proposed-section block above is left untouched per this addendum's append-only discipline; at graduation, the proposed §5.2 extension block additionally gains these two lines (slicing group):
+
+```bezel
+  // Tail slicing (2026-07-28 addendum): clamp as Take/Skip; buffer at most count
+  public method TakeLast(count: int): IEnumerable<T>;
+  public method SkipLast(count: int): IEnumerable<T>;
+```
+
+### A4 — Declined (addendum scope)
+
+- **Eager owned-array forms** (`TakeLastArray(count): owned Array<T>`) — `.TakeLast(n).ToArray()` composes in one step; the operators exist precisely for the non-materializing case.
+- **`IOwningEnumerable<T>` counterparts** — deferred to gap #29 with every other owning-LINQ operator, exactly as the base proposal's scoping states.
+- **A backward-from-index `TakeLast(count, fromEnd)` family** — no workload named it; index-from-end slicing is a range-syntax question, not a LINQ one.
