@@ -216,7 +216,7 @@ public class CryptographicException: Exception
 end CryptographicException;
 ```
 
-All accumulator records are compiler-known value records in the manner of 0008's `HashCode` and 0029's hashers (fixed-size state: chaining words + `[64]byte`/`[128]byte` block tails + length counters — spec §15.1 inline arrays as fields, the 0029 §4.2 construction). No member of this module is marked `pure`: the digest paths read their input through `IReadOnlySpan<byte>`, whose interface members are not declared `pure` (stdlib §4.16), so the §22.15 pure-calls-pure check cannot pass today; revisit if the span interface ever gains `pure` members.
+All accumulator records are compiler-known value records in the manner of 0008's `HashCode` and 0029's hashers (fixed-size state: chaining words + `[64]byte`/`[128]byte` block tails + length counters — spec §15.1 inline arrays as fields, the 0029 §4.2 construction); the listings above show only the public surface, not the storage, so the §9.2 zero-auto-property reading does not apply. No member of this module is marked `pure`: the digest paths read their input through `IReadOnlySpan<byte>`, whose interface members are not declared `pure` (stdlib §4.16), so the §22.15 pure-calls-pure check cannot pass today; revisit if the span interface ever gains `pure` members.
 
 ---
 
@@ -330,7 +330,7 @@ var digest := Sha256.Hash(payload.AsReadOnlySpan());           // payload: Array
 
 The observable contract above is substrate-independent (deterministic, KAT-tested). The substrate choice is nonetheless **load-bearing** and is put to the owner (open question Q1):
 
-**Recommended: ride the 0007 owner ruling — OpenSSL 3.x `libcrypto`, behind a narrow runtime-internal `bz_crypto_*` seam** parallel to 0007 §6's `bz_tls_*` (roughly: `bz_crypto_digest(alg, bytes) `, `bz_crypto_digest_{new,add,final,free}`, `bz_crypto_hmac(...)` + incremental trio, `bz_crypto_memcmp_ct`). Reasons: the backend is already owner-ruled for TLS (2026-07-04) under the CLAUDE.md system-library posture, so this adds **no new dependency decision** if — and only if — the linkage question below is answered "yes"; EVP digests/HMAC are the most-audited implementations available, including their constant-time disciplines; and hand-rolled crypto is an audit liability the project has no reason to take on. `FixedTimeEquals` maps to `CRYPTO_memcmp` (or an equivalent runtime-internal fold — trivially auditable either way).
+**Recommended: ride the 0007 owner ruling — OpenSSL 3.x `libcrypto`, behind a narrow runtime-internal `bz_crypto_*` seam** parallel to 0007 §6's `bz_tls_*` (roughly: `bz_crypto_digest(alg, bytes) `, `bz_crypto_digest_{new,add,final,free}`, `bz_crypto_hmac(...)` + incremental trio, `bz_crypto_memcmp_ct`). Reasons: the *backend choice* is already owner-ruled for TLS (2026-07-04) under the CLAUDE.md system-library posture — though the linkage **reach** is new (every hashing program links `libcrypto`, where 0007 reached only TLS users) and is exactly the dependency decision Q1 puts to the owner; EVP digests/HMAC are the most-audited implementations available, including their constant-time disciplines; and hand-rolled crypto is an audit liability the project has no reason to take on. `FixedTimeEquals` maps to `CRYPTO_memcmp` (or an equivalent runtime-internal fold — trivially auditable either way).
 
 **Entropy is deliberately decoupled:** `RandomNumberGenerator` reads `getrandom(2)` directly (not `RAND_bytes`), so the random surface has **no** libcrypto dependency regardless of Q1's answer — the OS CSPRNG is the ground truth either way, and this keeps the one security-critical *unpredictability* source independent of the substrate debate.
 
@@ -370,6 +370,7 @@ The observable contract above is substrate-independent (deterministic, KAT-teste
 2. **SHA-1 deferral.** Confirm the §3 position (defer with the named reopening trigger) — or direct v1 inclusion for interop with documentation warnings. The surface cost is mechanical either way; the question is what the founding module *says*.
 3. **Secret hygiene.** v1 ships with no zeroization promise (D4). Is a `KeyBuffer` zero-on-dispose container wanted as a co-requisite (honest only about heap copies), or does the recorded limitation stand until a real consumer demands more?
 4. **`Digest()` naming.** The finalizer is a method by grammatical necessity (§4 D2); confirm the name `Digest` (Java `MessageDigest.digest` lineage) over `GetDigest`/`ToArray`-style spellings — a pure naming call, flagged only because the type will be long-lived.
+5. **The gap-review decline #2 trigger (BigInteger).** Decline #2's recorded trigger is "ride the crypto milestone"; §3 keeps it dormant by re-anchoring the trigger to the v2 asymmetric wave (v1's symmetric surface needs no big-integer arithmetic). Confirm the re-anchoring, or direct that `BigInteger` be designed alongside this module as the decline's letter suggests.
 
 ---
 

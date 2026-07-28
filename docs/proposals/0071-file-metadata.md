@@ -184,6 +184,7 @@ One rule for "absent" — `FileNotFoundException` regardless of *which* componen
 5. **Handle-based stat (`FileStream.GetStatus()`)** — deferred: the race-free fstat companion for open files; `FileStream` already exposes `Length` (§7.1), which covers the observed need; add the full form when a real mtime-of-open-handle workload arrives.
 6. **Full POSIX mode bits / owner ids / `IsExecutable`** — declined per D5: not cross-platform-defensible as shared surface; a future platform-extensions section is the home if evidence arrives.
 7. **Async duals (`GetStatusAsync`)** — declined per §5, citing 0018 §7's recorded rule for metadata operations.
+8. **Try shape (b) (`TryGetStatus(path): FileStatus?`)** — considered, and raised as open question 6 rather than silently declined: stdlib §1's own criterion for shape (b) ("the payload is statically non-nullable, so a bool would carry no information") applies here verbatim, and shape (c) hands a result-ignoring caller a plausible-looking zero (`default(FileStatus)` reads as an empty regular file — `FileKind.File` is the zero constant, so §17.11's zero-constant warning does not fire). Shape (c) is proposed anyway for the spelling parallel with the `TryParse` family and the `out var` idiom the §9 examples lean on; note `FileStatus` would be the first user-visible record payload in shape (c) (every current shape-(c) out is a primitive or value builtin).
 8. **Per-fact statics (`File.GetSize`, `File.GetLastWriteTime`)** — declined per D1: N syscalls, mutually-inconsistent reads, and a wider surface for the same information.
 
 ## 9. Tour by example
@@ -206,10 +207,10 @@ if File.GetStatus(logPath).Size > maxBytes then
 end;
 
 // --- Existence-with-kind: one call, no Exists/Exists race ---
-if File.TryGetStatus(path, out var st) then
-  case st.Kind of
+if File.TryGetStatus(path, out var entry) then
+  case entry.Kind of
     FileKind.Directory => Descend(path),
-    FileKind.File      => Index(path, st.Size),
+    FileKind.File      => Index(path, entry.Size),
     _                  => Skip(path)
   end;
 end;
@@ -218,14 +219,14 @@ end;
 using var files := Directory.GetFiles(root);
 var total: long := 0;
 for var f in files do
-  if File.TryGetStatus(f, out var st) and st.Kind = FileKind.File then
-    total := total + st.Size;
+  if File.TryGetStatus(f, out var fst) and fst.Kind = FileKind.File then
+    total := total + fst.Size;
   end;
 end;
 
 // --- Symlink safety in a deploy tool: the no-follow form (D4) ---
-if File.TryGetLinkStatus(entry, out var st) and st.Kind = FileKind.Symlink then
-  Skip(entry);                                    // never follow links out of the release tree
+if File.TryGetLinkStatus(candidate, out var lst) and lst.Kind = FileKind.Symlink then
+  Skip(candidate);                                // never follow links out of the release tree
 end;
 
 // --- Cheap validator for static serving (0002's deferred lane) ---
@@ -240,6 +241,7 @@ var etag := $"\"{st2.Size}-{st2.ModifiedAt.Ticks}\"";
 3. **`IsReadOnly` mapping** (POSIX owner-write bit / Windows ReadOnly attribute, the .NET-compatible reading) — confirm, or drop the field entirely and ship kind/size/mtime only?
 4. **mtime type** — `DateTime` with `Kind = Utc` now, `DateTimeOffset` accessor as a compatible widening after 0012 lands (D3). Confirm the sequencing posture?
 5. **One-type "absent" fault** — `FileNotFoundException` for every missing-component case (§7), vs. .NET's `FileNotFound`/`DirectoryNotFound` split. Confirm the single-type rule?
+6. **Try shape** — shape (c) (`out status: FileStatus`) is proposed; shape (b) (`TryGetStatus(path): FileStatus?`) fits stdlib §1's shape-(b) criterion equally well and avoids the plausible-zero hazard §8#8 records. Confirm shape (c), or direct shape (b)?
 
 ## 11. Relationship to existing proposals and issues
 
