@@ -234,4 +234,8 @@ extern "C" void** bz_exc_addr() { return &bz_exc; }
 // generated code.  Returns a void* (opaque handle) — tests compare with
 // domain pointers obtained from bz_domain_spawn's join_task->domain, but
 // more directly we expose it as void* to avoid exposing bz_domain_t.
+// per stdlib §6.8 (Domain): Domain.Spawn attaches work to a per-domain
+// runtime context; the per-thread current-domain pointer is the §30.13
+// serial-per-domain dispatch carrier (see concurrency.cpp's bz_domain_t
+// and `g_current_domain`).
 extern "C" void* bz_current_domain_ptr() { return (void*)g_current_domain; }
