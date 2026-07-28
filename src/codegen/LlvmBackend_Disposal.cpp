@@ -25,6 +25,9 @@
 namespace bezel::codegen {
 
 
+// §28.4: at most one destructor per class. Returns the AST DestructorDecl for
+// `ts` (or nullptr if none — emitDisposerBody then skips the destructor-body
+// step and runs only owned-field disposal + base-chain Dispose).
 const ast::DestructorDecl* Emitter::findDestructor(const sema::TypeSymbol* ts) {
     for (const sema::Symbol* m : ts->members) {
         if (dynamic_cast<const sema::DestructorSymbol*>(m)) {
