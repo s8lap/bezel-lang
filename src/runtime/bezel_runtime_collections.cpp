@@ -1630,8 +1630,15 @@ static uint64_t xorshift128_next(uint64_t* s) {
     return t + r;
 }
 
+// per stdlib §2.7: Random(seed) ctor — allocate an xorshift128+ state.
+// fix #2238 / §2.7 / §28.9: OOM-hardened the malloc. The pre-fix code wrote
+// through `r` without a null check after malloc(sizeof(bz_rng_t)) — a failed
+// allocation produced a SIGSEGV on the next store rather than returning NULL
+// to the caller (the codegen-emitted constructor). Same class of defect as
+// #1762 R1 / #2234 / #2237.
 void* bz_random_alloc(int64_t seed) {
     auto* r = (bz_rng_t*)malloc(sizeof(bz_rng_t));
+    if (!r) return nullptr;  // OOM: surface to the caller as a null RNG handle
     r->state[0] = (uint64_t)seed ^ 0xdeadbeef12345678ULL;
     r->state[1] = (uint64_t)seed * 6364136223846793005ULL + 1442695040888963407ULL;
     if (r->state[0] == 0) r->state[0] = 1;
