@@ -61,17 +61,32 @@ bool Emitter::exprContainsAwait(const ast::Expr* e) {
     if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(e))
         return exprContainsAwait(bin->left.get()) ||
                exprContainsAwait(bin->right.get());
+    if (auto* me = dynamic_cast<const ast::MemberAccessExpr*>(e))
+        return exprContainsAwait(me->target.get());
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e))
+        return exprContainsAwait(nm->target.get());
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
         if (exprContainsAwait(ce->callee.get())) return true;
         for (const auto& a : ce->args)
             if (exprContainsAwait(a.value.get())) return true;
         return false;
     }
-    if (auto* me = dynamic_cast<const ast::MemberAccessExpr*>(e))
-        return exprContainsAwait(me->target.get());
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        if (exprContainsAwait(nc->callee.get())) return true;
+        for (const auto& a : nc->args)
+            if (exprContainsAwait(a.value.get())) return true;
+        return false;
+    }
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
         if (exprContainsAwait(ix->target.get())) return true;
         for (const auto& a : ix->indices)
+            if (exprContainsAwait(a.value.get())) return true;
+        return false;
+    }
+    if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(e))
+        return exprContainsAwait(bg->operand.get());
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+        for (const auto& a : ne->args)
             if (exprContainsAwait(a.value.get())) return true;
         return false;
     }
@@ -79,6 +94,33 @@ bool Emitter::exprContainsAwait(const ast::Expr* e) {
         return exprContainsAwait(cd->condition.get()) ||
                exprContainsAwait(cd->thenValue.get()) ||
                exprContainsAwait(cd->elseValue.get());
+    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(e))
+        return exprContainsAwait(te->operand.get());
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e))
+        return exprContainsAwait(th->operand.get());
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
+        if (exprContainsAwait(we->source.get())) return true;
+        for (const auto& ia : we->assigns)
+            if (exprContainsAwait(ia.value.get())) return true;
+        return false;
+    }
+    if (auto* re = dynamic_cast<const ast::RangeExpr*>(e))
+        return exprContainsAwait(re->lo.get()) ||
+               exprContainsAwait(re->hi.get()) ||
+               exprContainsAwait(re->step.get());
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        for (const auto& k : cl->keys)
+            if (exprContainsAwait(k.get())) return true;
+        for (const auto& v : cl->elements)
+            if (exprContainsAwait(v.get())) return true;
+        return false;
+    }
+    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+        for (const auto& p : is->parts)
+            if (exprContainsAwait(p.expr.get())) return true;
+        return false;
+    }
+    // LambdaExpr is a separate async scope (§30.6) — not descended here.
     return false;
 }
 
@@ -134,22 +176,61 @@ static unsigned countAwaitsInExpr(const ast::Expr* e) {
     if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(e))
         return countAwaitsInExpr(bin->left.get()) +
                countAwaitsInExpr(bin->right.get());
+    if (auto* me = dynamic_cast<const ast::MemberAccessExpr*>(e))
+        return countAwaitsInExpr(me->target.get());
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e))
+        return countAwaitsInExpr(nm->target.get());
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
         unsigned n = countAwaitsInExpr(ce->callee.get());
         for (const auto& a : ce->args) n += countAwaitsInExpr(a.value.get());
         return n;
     }
-    if (auto* me = dynamic_cast<const ast::MemberAccessExpr*>(e))
-        return countAwaitsInExpr(me->target.get());
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        unsigned n = countAwaitsInExpr(nc->callee.get());
+        for (const auto& a : nc->args) n += countAwaitsInExpr(a.value.get());
+        return n;
+    }
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
         unsigned n = countAwaitsInExpr(ix->target.get());
         for (const auto& a : ix->indices) n += countAwaitsInExpr(a.value.get());
+        return n;
+    }
+    if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(e))
+        return countAwaitsInExpr(bg->operand.get());
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+        unsigned n = 0;
+        for (const auto& a : ne->args) n += countAwaitsInExpr(a.value.get());
         return n;
     }
     if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e))
         return countAwaitsInExpr(cd->condition.get()) +
                countAwaitsInExpr(cd->thenValue.get()) +
                countAwaitsInExpr(cd->elseValue.get());
+    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(e))
+        return countAwaitsInExpr(te->operand.get());
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e))
+        return countAwaitsInExpr(th->operand.get());
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
+        unsigned n = countAwaitsInExpr(we->source.get());
+        for (const auto& ia : we->assigns) n += countAwaitsInExpr(ia.value.get());
+        return n;
+    }
+    if (auto* re = dynamic_cast<const ast::RangeExpr*>(e))
+        return countAwaitsInExpr(re->lo.get()) +
+               countAwaitsInExpr(re->hi.get()) +
+               countAwaitsInExpr(re->step.get());
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        unsigned n = 0;
+        for (const auto& k : cl->keys) n += countAwaitsInExpr(k.get());
+        for (const auto& v : cl->elements) n += countAwaitsInExpr(v.get());
+        return n;
+    }
+    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+        unsigned n = 0;
+        for (const auto& p : is->parts) n += countAwaitsInExpr(p.expr.get());
+        return n;
+    }
+    // LambdaExpr is a separate async scope (§30.6) — not descended here.
     return 0;
 }
 
