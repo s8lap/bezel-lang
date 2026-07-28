@@ -22,10 +22,9 @@
 // runAot observes Main()'s return via the process exit code (8-bit wrapped,
 // aot_support.hpp); every value used here is ≤ 100, so it round-trips exactly.
 
-#include "support/aot_support.hpp"   // runAot, runAotCheckedDisposal — AOT test harness
+#include "support/aot_support.hpp"   // runAotCheckedDisposal — AOT test harness
 #include "test_harness.hpp"
 
-using bezel::test::runAot;
 using bezel::test::runAotCheckedDisposal;
 
 namespace {
@@ -33,14 +32,13 @@ namespace {
 // Convenience wrapper: run in checked-disposal MODE (§28.2 — DisposedAccess-
 // Exception on use-after-dispose), via the AOT harness; returns exit code, or
 // -999 if the program failed to compile/run.
+//
+// There is deliberately no default-mode (`runAot`) wrapper here: the only cell
+// that wanted one asserted that §31.1 undefined behaviour runs to completion,
+// which is incoherent under the gate's generated-code ASan (see the note where
+// that cell used to be, below).
 int runChecked(const std::string& program) {
     auto r = runAotCheckedDisposal(program);
-    return r.ran ? r.exitCode : -999;
-}
-
-// Convenience wrapper: run in default (unchecked) mode.
-int runDefault(const std::string& program) {
-    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -92,26 +90,31 @@ BEZEL_TEST(throw_borrow_field_catch_dispose_1678, spec_31_1_borrow_field_dispose
 }
 
 
-// ── §31.1: same program in DEFAULT (unchecked) mode — the behavior is
-// undefined per the spec, so we don't pin a specific value; we only verify
-// the program RUNS (no compile error, no crash-from-the-test-harness). The
-// borrowed field read in the catch arm touches disposed memory and may
-// observe anything; what we DO pin is the COMPILE acceptance — the spec
-// admits the borrow-in-field program, and the check-vs-unchecked difference
-// is purely at runtime.
+// ── §31.1 in DEFAULT (unchecked) mode: DELIBERATELY NOT TESTED HERE.
 //
-// We use runDefault and assert != -999 (program ran). This test exists to
-// document the asymmetry; it is not the load-bearing assertion.
-
-BEZEL_TEST(throw_borrow_field_catch_dispose_1678, spec_31_1_unchecked_runs) {
-    // §31.1: in unchecked disposal mode the catch-arm access is undefined
-    // behavior (it may read garbage, fault, or happen to return a value);
-    // what the spec REQUIRES is that the program compiles and runs to
-    // completion under the language-level rules — the check is a runtime
-    // disposal-mode-only backstop. Assert the program ran (exit != -999).
-    int rc = runDefault(kBorrowFieldInThrown);
-    BEZEL_EXPECT_TRUE(rc != -999);
-}
+// A `spec_31_1_unchecked_runs` cell stood here. It ran kBorrowFieldInThrown
+// through runAot and asserted only that the program ran (exit != -999),
+// to "document the asymmetry" with the checked-mode cell above.
+//
+// That assertion cannot hold under the gate's `--full` pass, and removing it
+// is not a workaround — the cell was asking for something incoherent. §31.1
+// says the catch-arm access to a borrow whose source the unwind already
+// disposed is UNDEFINED in unchecked mode. Generated-code AddressSanitizer,
+// which `--full` forces on every test program, exists precisely to catch that
+// read: it reports a use-after-free, the harness sets ran=false, and the cell
+// fails. Asserting that undefined behaviour "runs to completion" under a
+// sanitizer whose whole job is to detect it is a contradiction, and the ASan
+// report is the CORRECT outcome, not a false positive.
+//
+// Nothing is lost. The cell's own comment said what it actually pinned was
+// COMPILE acceptance — and that is already pinned by
+// `spec_31_1_checked_faults` above, which compiles the very same
+// kBorrowFieldInThrown program (a compile error there would fail that cell
+// first). The runtime half is unpinnable by construction: the spec defines no
+// observable to assert.
+//
+// If the accept-surface ever needs its own dedicated cell, the lit track is
+// its home — it drives bezelc per-process and never runs the program.
 
 
 // ── §31.1 / §28.3: a same-frame handler whose sources' scopes enclose the
