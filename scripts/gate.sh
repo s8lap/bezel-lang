@@ -268,13 +268,41 @@ arbitrate() { # $1 = sharded-run log
   [ -z "$suspects" ] && return 2
   nsus=$(printf '%s\n' "$suspects" | grep -c .)
   ARB_LAST_SUSPECTS=$nsus
+  # Two classes of suspect, and they deserve opposite treatment (2026-07-29):
+  #
+  #   [ FAIL ]   a test that RAN and failed — the actual evidence of a defect.
+  #   died on:   the test a shard happened to be executing when it was killed
+  #              (usually at the timeout ceiling). Almost always innocent.
+  #
+  # The old code merged both, sorted alphabetically, and arbitrated the first 8.
+  # On gate E that sampled 8 of 47 and every one landed in the a*-l* range, so
+  # ELEVEN deterministic ownership failures (own_branch_disposal.*, and friends)
+  # were never re-run and the gate PASSED red. Never sample away a [ FAIL ].
+  #
+  # Dedupe by SUITE first: the re-run below filters by suite substring, so N
+  # failures in one suite are one unit of work — that alone collapsed gate E's
+  # 47 suspects to far fewer, and makes arbitrating every failing suite cheap.
+  # Only the `died on:` victims are sampled, and only after every failing suite
+  # has been checked.
+  local fail_suites crash_suites ncrash
+  fail_suites=$(printf '%s\n' "$failed" | grep -v '^$' | grep -vx '<none>' | sed 's/\..*//' | sort -u)
+  crash_suites=$(printf '%s\n' "$crashed" | grep -v '^$' | grep -vx '<none>' | sed 's/\..*//' | sort -u)
+  # A suite already covered by a [ FAIL ] needs no second arbitration.
+  if [ -n "$fail_suites" ] && [ -n "$crash_suites" ]; then
+    crash_suites=$(comm -13 <(printf '%s\n' "$fail_suites") <(printf '%s\n' "$crash_suites") 2>/dev/null || printf '%s\n' "$crash_suites")
+  fi
+  ncrash=$(printf '%s\n' "$crash_suites" | grep -c . || true)
+  suspects=$(printf '%s\n' "$fail_suites" "$crash_suites" | grep -v '^$')
   real=0; sampled=0
   while IFS= read -r t; do
     [ -z "$t" ] && continue
-    sampled=$((sampled+1))
-    if [ "$sampled" -gt "${ARB_SAMPLE:-8}" ]; then
-      echo "   (capped arbitration at ${ARB_SAMPLE:-8} of $nsus suspects; a real cross-cutting regression would surface in the sample)"
-      break
+    # Cap applies ONLY to the timeout-victim suites, which are listed last.
+    if printf '%s\n' "$crash_suites" | grep -qxF -- "$t"; then
+      sampled=$((sampled+1))
+      if [ "$sampled" -gt "${ARB_SAMPLE:-8}" ]; then
+        echo "   (capped arbitration at ${ARB_SAMPLE:-8} of $ncrash timeout-victim suites; every suite with a real [ FAIL ] was arbitrated in full)"
+        break
+      fi
     fi
     suite="${t%%.*}"
     passed_alone=0
