@@ -177,6 +177,10 @@ extern "C" int64_t bz_encoding_utf8_get_byte_count(const void* strp) {
     return count;
 }
 
+// per §3.2 v0.165 (#1355): UTF16.GetByteCount. UTF-16LE: 2 bytes per BMP code
+// point, 4 bytes per supplementary code point (surrogate pair). No byte-order
+// mark. Distinct from bz_encoding_utf16_get_bytes in semantics only — this
+// returns the count without allocating.
 extern "C" int64_t bz_encoding_utf16_get_byte_count(const void* strp) {
     if (!strp) return 0;
     const auto* s = (const bz_string_struct*)strp;
@@ -191,6 +195,8 @@ extern "C" int64_t bz_encoding_utf16_get_byte_count(const void* strp) {
     return count;
 }
 
+// per §3.2 v0.165 (#1355): UTF32.GetByteCount. UTF-32LE: 4 bytes per code
+// point (every Unicode scalar value fits in 32 bits). No byte-order mark.
 extern "C" int64_t bz_encoding_utf32_get_byte_count(const void* strp) {
     if (!strp) return 0;
     const auto* s = (const bz_string_struct*)strp;
@@ -240,6 +246,12 @@ extern "C" void bz_encoding_utf8_write_bytes(const void* strp, void* destp) {
     }
 }
 
+// per §3.2 v0.165 (#1355): UTF16 encode into a pre-allocated destination
+// buffer. Caller has pre-sized the buffer via bz_encoding_utf16_get_byte_count.
+// BMP code points → 2 bytes LE; supplementary code points → 4 bytes LE
+// surrogate pair (hi, lo). No BOM emitted. Dest size = exactly
+// bz_encoding_utf16_get_byte_count(strp) bytes; IndexOutOfRangeException if
+// shorter (raised at the caller's buffer-bounds check, not here).
 extern "C" void bz_encoding_utf16_write_bytes(const void* strp, void* destp) {
     if (!strp || !destp) return;
     const auto* s = (const bz_string_struct*)strp;
@@ -265,6 +277,10 @@ extern "C" void bz_encoding_utf16_write_bytes(const void* strp, void* destp) {
     }
 }
 
+// per §3.2 v0.165 (#1355): UTF32 encode into a pre-allocated destination
+// buffer. Every Unicode scalar value fits in 32 bits → 4 bytes LE per code
+// point. No BOM emitted. Dest size = exactly bz_encoding_utf32_get_byte_count
+// (strp) bytes.
 extern "C" void bz_encoding_utf32_write_bytes(const void* strp, void* destp) {
     if (!strp || !destp) return;
     const auto* s = (const bz_string_struct*)strp;
