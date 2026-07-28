@@ -454,10 +454,22 @@ static void dict_rehash(bz_dict_t* d) {
     free(slot_map);
 }
 
+// fix #2239 / stdlib §4.8 / §28.9: OOM-harden the string-key Dictionary ctor.
+// Pre-fix called calloc(1, sizeof(bz_dict_t)) and calloc(8, sizeof(bz_entry_t))
+// without null-checking; a failed buckets allocation left d->buckets == nullptr
+// and the first bz_dict_set_str dereferenced d->buckets[ins].key = ... to
+// SIGSEGV. Same class of defect as #1762 R1 / #2234 / #2237 / #2238 — the
+// codegen-emitted Dictionary ctor now receives NULL on OOM, matching the
+// established OOM-as-error surface.
 void* bz_dict_alloc(void) {
     auto* d = (bz_dict_t*)calloc(1, sizeof(bz_dict_t));
+    if (!d) return nullptr;       // OOM: header alloc failed
     d->capacity = 8;
     d->buckets = (bz_entry_t*)calloc(8, sizeof(bz_entry_t));
+    if (!d->buckets) {
+        free(d);
+        return nullptr;           // OOM: buckets alloc failed; leak-free
+    }
     // issue #622: order array starts null; lazily grown on first insert.
     // order_count and order_cap are zero from calloc.
     return d;
@@ -661,12 +673,21 @@ static int64_t dict_find_gen(bz_dict_t* d, const void* k, uint32_t h) {
     return -1; // table full (shouldn't happen with load factor management)
 }
 
+// fix #2239 / stdlib §4.8 / §28.9: OOM-harden the generic-key Dictionary ctor.
+// Mirrors bz_dict_alloc above: a failed buckets calloc must surface NULL to
+// the caller rather than leaving d->buckets == nullptr for the first
+// bz_dict_set_gen to dereference.
 void* bz_dict_alloc_generic(int64_t key_size,
                               uint64_t (*hash)(const void* key),
                               bool     (*eq)(const void* a, const void* b)) {
     auto* d = (bz_dict_t*)calloc(1, sizeof(bz_dict_t));
+    if (!d) return nullptr;       // OOM: header alloc failed
     d->capacity = 8;
     d->buckets = (bz_entry_t*)calloc(8, sizeof(bz_entry_t));
+    if (!d->buckets) {
+        free(d);
+        return nullptr;           // OOM: buckets alloc failed; leak-free
+    }
     d->key_size = key_size > 0 ? key_size : 1;
     d->hash_fn = hash;
     d->eq_fn = eq;
