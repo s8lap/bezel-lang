@@ -1,6 +1,6 @@
 # Bezel Guide 3: Modeling Data
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.211.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.227.*
 
 Bezel gives you five ways to declare a data shape and three ways to select over one. This guide is the picking rule for each — the definitions live in the spec (§9 records, §10 enums, §11 classes, §19 selection, §35 choices), and the *why* behind the design is rationale §9.6. For choosing a **failure signal** (`T?` vs `Try` vs `Result` vs `requires`/exceptions), see Guide 2 §6 — that table is the home; this guide does not repeat it.
 

@@ -44,7 +44,7 @@ end;
 
 The exception is `readonly` fields: a nullable `readonly` field — instance or static — narrows like a local, because nothing can rewrite it after construction, so no call, closure, or `await` can invalidate the fact. The tracked shape is one field directly off a tracked root (`this._f`, `TypeName._s`, or a tracked `local._f`), and the rule does not apply inside the declaring type's constructors and initializers, where the field is still being assigned (spec §7.4).
 
-One local *also* loses its narrowing: a local that is **mutably captured** — assigned, or passed by `ref`/`out`, inside any lambda in the method — is re-widened at the next call, function-value invocation, or `await` in the controlled block, because a closure could run and rewrite it in between (spec §7.4). Copy such a value into a plain, uncaptured local and test *that* — the same remedy as for a mutable field.
+Locals can lose their narrowing too: a local that is **mutably captured** — assigned, or passed by `ref`/`out`, inside any lambda in the method — is re-widened at the next call, function-value invocation, or `await` in the controlled block, because a closure could run and rewrite it in between (spec §7.4). Copy such a value into a plain, uncaptured local and test *that* — the same remedy as for a mutable field.
 
 ---
 

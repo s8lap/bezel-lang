@@ -1243,6 +1243,7 @@ The four interfaces form the borrowing collection family. `IReadOnlyCollection<T
 `IsReadOnly` is `false` for every standard collection implementing `ICollection<T>` (`Array<T>`, `LinkedList<T>`, `Set<T>`, `Dictionary<K, V>`; `Stack<T>`/`Queue<T>` conform only to `IReadOnlyCollection<T>` since v0.165 (#1354) and have no `IsReadOnly` member). The standard library currently ships no read-only `ICollection<T>` implementation; the member exists for user-defined read-only implementations, which return `true` and raise `InvalidOperationException` from the mutating methods (v0.195).
 
 Element disposal is never performed by or through a borrowing collection (spec §28.6, v0.213): a holder that owns its elements uses the owning family, whose `Dispose()` cascades; selective cleanup takes elements out (`Drain()`, `Pop*`, `move coll[i]`) into owned bindings first.
+
 <a id="sec-owning-collection-interfaces"></a>
 ### 4.2 Owning collection interfaces
 
@@ -3162,6 +3163,7 @@ using var cts := CancellationTokenSource.CreateLinked(callerToken, timeoutSrc.To
 **Timeout-as-a-scope needs no new type.** The RFC's `CancellationScope` sketch is already expressible: the source's destructor *cancels on dispose*, so `using var cts := CancellationTokenSource.WithCancelAfter(delay);` **is** a cancellation scope — auto-cancelled at scope exit or on timeout, whichever first. Disposal performs a **full `Cancel()`** (v0.195): registered callbacks that have not yet run are invoked synchronously on the disposing thread *before* the registration list is severed — `Register`-based cleanup therefore fires at scope exit, and §28.14's quiescence (no callback after disposal completes) holds. Recorded as the idiom rather than a wrapper type (see the v0.173 rationale entry).
 
 `Register` invokes the callback when cancellation is requested; the returned `Subscription` removes the registration when disposed. The `callback` parameter is `scoped` (spec [§28.14](Bezel_Language_Spec.md#sec-scoped-callback-parameters)): the registration stores the callback bounded by the returned `Subscription` (the owned-return bounding form — `using var reg := token.Register(...)`), and disposal severs the registration, which is the quiescence guarantee.
+
 If the token is **already in the cancelled state** at the moment `Register` is called, the callback is invoked synchronously on the calling thread before `Register` returns, and the returned `Subscription` is one whose `Dispose()` is a no-op (the registration was never installed because there was nothing to install — cancellation has already happened). Code receiving the `Subscription` should not assume the callback has not yet run.
 
 This matches C#'s `CancellationToken.Register` behavior. The synchronous-fire policy is the only race-free choice: any policy that schedules the callback for later, or that ignores the registration on an already-cancelled token, would create a window in which the caller could observe an inconsistent state ("I registered a callback but it never fired, even though the token is cancelled").

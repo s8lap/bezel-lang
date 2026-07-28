@@ -890,7 +890,7 @@ var u := _user;
 if u <> null then u.DoStuff(); end;
 ```
 
-Some languages (TypeScript) narrow property accesses and pay for it with subtle time-of-check/time-of-use bugs; Kotlin refuses to smart-cast mutable properties for exactly this reason. Bezel declines to narrow mutable fields and properties entirely; the one field kind with no writers outside construction — `readonly` — narrows (spec §7.4).
+Some languages (TypeScript) narrow property accesses and pay for it with subtle time-of-check/time-of-use bugs; Kotlin refuses to smart-cast mutable properties for exactly this reason. Bezel declines to narrow mutable fields and properties entirely.
 
 <a id="sec-is-postfix-only"></a>
 ### 6.2 `!` is postfix only
