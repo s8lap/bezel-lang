@@ -768,8 +768,8 @@ extern "C" void* bz_decimal_to_string(const bz_decimal_t* a) {
     return hdr;
 }
 
-// Round(digits) — rounds to `digits` decimal places (banker's rounding not
-// required; we use half-up as .NET's Decimal.Round default).
+// Round(digits) — rounds to `digits` decimal places using banker's rounding
+// (round-half-to-even), per stdlib §9.3 ("matching Math.Round (§2.2)").
 extern "C" void bz_decimal_round(const bz_decimal_t* a, int32_t digits,
                                   bz_decimal_t* out) {
     if (digits < 0) digits = 0;
@@ -783,14 +783,43 @@ extern "C" void bz_decimal_round(const bz_decimal_t* a, int32_t digits,
     // digit — that is the i == 0 iteration in this loop, which is the units
     // digit, several positions below the relevant one whenever remove > 1.
     // For example, 0.9651m.Round(2) drops two places; the relevant digit is
-    // the 3rd decimal place ("5"), not the 4th ("1").  Half-up: add 1 to the
-    // kept mantissa if the relevant dropped digit is >= 5.  Carry into a new
-    // place (e.g. 0.9950 → 1.00) is handled by dec_store (trailing-zero
-    // strip + max-96-bit reduction).  // per §9.3
+    // the 3rd decimal place ("5"), not the 4th ("1").  Per §9.3 banker's
+    // rounding:
+    //   • first-dropped < 5       → round down (no change to mantissa)
+    //   • first-dropped > 5       → round up   (mantissa += 1)
+    //   • first-dropped == 5 AND any later-dropped non-zero (strictly greater
+    //     than the midpoint, e.g. 0.9651) → round up
+    //   • first-dropped == 5 AND all later-dropped zero (exact midpoint, e.g.
+    //     0.9650) → round to even: round up if the kept digit is odd, no
+    //     change if it is even. 0.9650m.Round(2) keeps 96 (even) → 0.96m;
+    //     0.9750m.Round(2) keeps 97 (odd)  → 0.98m.
+    // Carry propagation (e.g. 0.9999m.Round(1) → 1m, 0.9950m.Round(2) → 1m
+    // when the kept digit is odd) is handled by dec_store (trailing-zero
+    // strip + max-96-bit reduction).
+    bool dropNonZero = false;  // any later-dropped (lower-place) digit > 0
     for (uint32_t i = 0; i < remove; ++i) {
         __uint128_t rem = m % 10;
         m /= 10;
-        if (i == remove - 1 && rem >= 5) m += 1;  // per §9.3 — first dropped digit
+        if (i == remove - 1) {
+            // First dropped digit — make the rounding decision.
+            if (rem > 5) {
+                m += 1;  // per §9.3
+            } else if (rem < 5) {
+                /* round down — no change */     // per §9.3
+            } else {
+                // rem == 5: banker's rounding.
+                if (dropNonZero) {
+                    m += 1;  // > midpoint → round up
+                } else if (m % 2 != 0) {
+                    m += 1;  // exact midpoint, kept digit odd → round up
+                }
+                // else: exact midpoint, kept digit even → round down
+            }
+        } else {
+            // Subsequent dropped digit (lower place). Track whether the
+            // dropped value exceeds an exact midpoint.
+            if (rem != 0) dropNonZero = true;
+        }
     }
     // Rounding only reduces mantissa magnitude; result always fits in 96 bits.
     dec_store(out, m, (uint32_t)digits, dec_sign(a), nullptr);

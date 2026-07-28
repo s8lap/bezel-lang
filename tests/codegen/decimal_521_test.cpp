@@ -416,15 +416,30 @@ BEZEL_TEST(codegen_521_stdlib, round_multi_drop_looks_at_first_dropped_digit_spe
         "return 0; ")), 1);
 }
 
-// fix #2229: Round with remove > 1 and the relevant dropped digit exactly 5
-// must round up (half-up at the digit at position `digits`). 0.9650m → 0.97m.
-// (Coincidentally matches banker's rule: 96 is even, so banker's also gives
-// 0.96 — but we are testing the half-up path here.)
-BEZEL_TEST(codegen_521_stdlib, round_multi_drop_half_up_9650_spec_9_3) {
+// fix #2232: Round with remove > 1 and an EXACT midpoint (first dropped
+// digit == 5, all later dropped == 0) must use banker's rounding (round-half-
+// to-even) per stdlib §9.3. 0.9650m.Round(2): kept mantissa = 96 (even), so
+// round DOWN to 0.96m. The mirror case 0.9750m.Round(2): kept mantissa = 97
+// (odd), so round UP to 0.98m. The previous half-up implementation agreed with
+// the odd case (0.9750 → 0.98) but disagreed with the even case (0.9650 → 0.97
+// instead of 0.96), violating §9.3's "matching Math.Round (§2.2)" contract
+// (Math.Round uses banker's rounding).
+BEZEL_TEST(codegen_521_stdlib, round_exact_midpoint_even_kept_spec_9_3) {
     BEZEL_EXPECT_EQ(run(prog(
         "var d := 0.9650m; "
         "var r := d.Round(2); "
-        "if r = 0.97m then return 1; end; "
+        "if r = 0.96m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// fix #2232: companion to the even-kept test above — kept mantissa = 97 (odd)
+// must round UP at the exact midpoint 0.9750 → 0.98. This is the round-half-
+// to-even "round to odd when the kept digit is odd" arm.
+BEZEL_TEST(codegen_521_stdlib, round_exact_midpoint_odd_kept_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := 0.9750m; "
+        "var r := d.Round(2); "
+        "if r = 0.98m then return 1; end; "
         "return 0; ")), 1);
 }
 
