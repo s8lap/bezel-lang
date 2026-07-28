@@ -6622,6 +6622,44 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             // #836: reconcile a non-literal constant's width to the scrutinee
             // (no-op for string / enum / already-matching types).
             if (!isStr) cv = reconcile(cv, scrut->getType());
+            // fix #2227 / §19.3 / §19.5: a ConstantPattern member whose lowered
+            // type is fundamentally incompatible with the scrutinee's LLVM type
+            // (a `null` literal pointer over a non-nullable int/float/bool/enum
+            // scrutinee — a `null` alternative is allowed by §19.3 but the
+            // non-nullable scrutinee cannot match it; or a string-literal
+            // `bz_string*` over an enum/record scrutinee whose typecheck guard
+            // did not fire because `scrutTy->kind != Kind::Primitive` (e.g. a
+            // bare `case c: Color of "Red" => …`). `reconcile` bridges only int
+            // widths and FP widths, so the residual `ptr` vs `i32` mismatch
+            // reaches `emitEquals` and trips `ICmpInst::AssertOK` (#2227
+            // repros; a sibling of #964 / #1213 — those sema guards cover the
+            // primitive-vs-primitive cases and the nullable-value `null`
+            // member case, but miss these two). Mirror the NamedPattern
+            // handler at L6422-6436: detect the fundamental mismatch, emit the
+            // §19 diagnostic once per bad member, and OR a never-match (false)
+            // into `any` so the rest of the arm's other members still
+            // participate correctly. The diagnostic fires at most once per
+            // pattern to keep the compiler output clean when the same
+            // ill-formed pattern has several bad members.
+            {
+                llvm::Type* st = scrut->getType();
+                llvm::Type* ct = cv->getType();
+                bool incompatible = st != ct &&
+                    (st->isPointerTy() != ct->isPointerTy() ||
+                     st->isIntegerTy(1) != ct->isIntegerTy(1) ||
+                     st->isFloatingPointTy() != ct->isFloatingPointTy());
+                if (incompatible) {
+                    if (!cp->constants.empty() && c.get() == cp->constants.front().get())
+                        ctx_.diagnostics().report(
+                            Severity::Error, c->span.begin,
+                            "case pattern constant type is not compatible with "
+                            "the scrutinee type (\xC2\xA7""19) — a `case` "
+                            "constant must be comparable to the scrutinee");
+                    // Skip this member — the OR-with-false leaves `any` unchanged
+                    // for the remaining members.
+                    continue;
+                }
+            }
             // CG27b: string scrutinee → content comparison (not ptr cmp).
             any = builder_.CreateOr(any, emitEquals(scrut, cv, isStr));
         }
