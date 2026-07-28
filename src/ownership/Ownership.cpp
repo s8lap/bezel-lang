@@ -3480,6 +3480,30 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
         if (calleeMs && ctx_.importedReturnOwned(calleeMs) &&
             isClassOrInterfaceResult(ctx_.exprType(e)))
             return OwnershipState::Owned;
+        // #1718 / §32.6 / §28.1: an EXTERN (FFI) method declared with an
+        // `owned` return transfers ownership to the caller. The callee is an
+        // ExternDeclSymbol (not a MethodSymbol + no MethodDecl + no
+        // importedReturnOwned_ entry), so the returnOwned / importedReturnOwned
+        // paths above never fire and the result was classified Borrowed;
+        // `using var c := strdup(...)` (the spec §32.6 ownership-transferring
+        // example) emitted the §28.10 vacuous-pin warning and the strdup'd
+        // buffer was never freed (a memory leak). Classify it Owned when the
+        // callee is an owned-returning extern — codegen's isFfiBuf branch
+        // (registerUsingDisposal, LlvmBackend_Setup) already recognises the
+        // CString/WString/RawBytes builtin head on the binding and registers a
+        // null-guarded free() at scope end (RawBytes via bz_rawbytes_free);
+        // the only missing piece was ownership-pass agreement on the Owned
+        // verdict. // per §32.6, §28.1, #1718
+        if (!calleeMs) {
+            sema::Symbol* calleeSym = ce->callee
+                                          ? ctx_.exprSymbol(*ce->callee)
+                                          : nullptr;
+            if (auto* xd =
+                    dynamic_cast<sema::ExternDeclSymbol*>(calleeSym)) {
+                if (xd->externDecl && xd->externDecl->returnOwned)
+                    return OwnershipState::Owned;
+            }
+        }
         // #1290 / §27.1 / §28.3: a call through a FUNCTION-TYPED VALUE whose
         // declared return slot carries `owned` (`mk: () -> owned Res; mk()`)
         // produces a fresh owned value, exactly like an owned-returning method
@@ -4464,6 +4488,15 @@ bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
     // (rework 3b).
     if (head == "BinarySerializer" || head == "BinaryDeserializer" ||
         head == "JsonSerializer"   || head == "JsonDeserializer")
+        return true;
+    // #1718 / §32.6 / stdlib §10: a CString/WString/RawBytes from an owned-
+    // returning EXTERN or static From/FromBytes factory carries a real free()
+    // disposal obligation (§32.6: "a `using var` discharges it"). The classifier
+    // would otherwise lump them with value-typed/runtime-managed types and fire
+    // the §28.10 vacuous-pin warning — even though codegen's isFfiBuf branch
+    // (registerUsingDisposal, LlvmBackend_Setup) registers the free(). Recognize
+    // them here so the lint does not fight the disposal.
+    if (head == "CString" || head == "WString" || head == "RawBytes")
         return true;
     return head == "Channel" || head == "ChannelSender" ||
            head == "EventSource" || head == "AsyncEventSource" ||
