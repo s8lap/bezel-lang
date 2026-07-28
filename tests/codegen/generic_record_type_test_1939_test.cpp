@@ -96,12 +96,32 @@ BEZEL_TEST(generic_record_type_test_1939, case_binding_selects_genuine_arm_19_3)
     BEZEL_EXPECT_EQ(rc, 2);
 }
 
-// (4) CONTROL — the name-resolved record DESTRUCTURING pattern (§19.3 "Record
-// destructuring") still matches a boxed generic record: the specialized box
-// chain keeps the SHARED descriptor elements, so the by-name resolution is
-// unchanged. Expect 1 (probe p1939_dp.bzl behavior preserved).
-BEZEL_TEST(generic_record_type_test_1939, destructure_by_name_still_matches_19_3) {
-    int rc = run(
+// (4) §19.3 — a bare generic record-destructuring pattern against an ERASED
+// scrutinee is REJECTED.
+//
+// REWRITTEN 2026-07-29. This cell was a CONTROL asserting the shape still
+// MATCHES (expect 1). `3f56e98` ("fix #2178: reject generic-record
+// destructuring against an erased scrutinee") deliberately made it a compile
+// error and did not update this pre-existing control, so it has been red on
+// origin/main ever since — plain AND under ASan, and it blocked every gate
+// mode until the flake-arbitration cap was fixed (c590173) and stopped hiding
+// it.
+//
+// The rejection is the SOUND outcome, not a regression. `o` is typed `Object`,
+// so the record's instantiation is not statically known: a box of ANY
+// instantiation would match `Pair(a, b)`, and the arm's bindings would then
+// read fields at the record's TEMPLATE layout — the wrong-typed-read hazard
+// #2001/#2006 closed. The diagnostic names the remedy the spec prescribes: use
+// a typed binding so the instantiation is statically determined, which is
+// exactly what `case_binding_selects_genuine_arm_19_3` (cell 3 above) already
+// covers with `var y: Pair<int, string> => ...`.
+//
+// So the positive path keeps its coverage in cell 3, and this cell now pins
+// the rejection — including the diagnostic text, so a crash or an unrelated
+// compile error cannot satisfy it (the harness maps both to the same -999
+// sentinel that a reject produces).
+BEZEL_TEST(generic_record_type_test_1939, destructure_by_name_erased_scrutinee_rejected_19_3) {
+    auto r = runAot(
         "module M; "
         "record Pair<A, B>(first: A, second: B); "
         "class C public static method Main(): int "
@@ -112,7 +132,13 @@ BEZEL_TEST(generic_record_type_test_1939, destructure_by_name_still_matches_19_3
         "    _ => do return 0; end "
         "  end; "
         "end Main; end C;");
-    BEZEL_EXPECT_EQ(rc, 1);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool named = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("names no type arguments") != std::string::npos) named = true;
+    }
+    BEZEL_EXPECT_TRUE(named);
 }
 
 // (5) CONTROL — non-generic records are untouched: `is` on the right and wrong
