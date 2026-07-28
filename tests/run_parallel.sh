@@ -42,43 +42,10 @@ start=$(date +%s)
 # temp_directory_path(), which honours $TMPDIR. Without isolation two shards
 # would write the same path concurrently and clobber each other; a private
 # TMPDIR per shard makes those fixed stems collision-free with no test changes.
-# Per-shard slice of the whole-store cache cap (#1906 rework, 2026-07-29). Each
-# shard runs its own store, so give each 1/shards of the budget and the total
-# footprint matches the single shared store it replaced. Floor of 1 GiB keeps a
-# high shard count from producing a cap too small to hold one linked binary.
-shard_cache_gb=$(( ${BEZEL_AOT_CACHE_MAX_GB:-64} / shards ))
-(( shard_cache_gb < 1 )) && shard_cache_gb=1
-
 pids=()
 for (( i = 0; i < shards; i++ )); do
     shard_tmp="$logdir/tmp.$i"
     mkdir -p "$shard_tmp"
-    # Per-shard AOT cache dir (#1906): the AOT bincache writes are content-
-    # addressed, so collisions are benign in principle — but each shard's
-    # `aot_cache` tests assert hit/miss COUNT deltas against `cacheStats()`
-    # (a function-local atomic, per-process), and a parallel shard's COMPILE
-    # can land on the same key as this shard's MISS-by-design observation
-    # window (the per-shard test has the cache miss delta asserted just
-    # before its second run reads it). Without per-shard isolation, two
-    # shards racing on /var/tmp/bezel-scratch/aot-bincache can produce
-    # cross-shard cache pollution that mis-attributes hits/misses and
-    # surfaces as flake under `gate --full`.
-    #
-    # The cache MUST live on real disk. It must NOT go under $logdir: that is
-    # rooted at ${TMPDIR:-/tmp}, which is a tmpfs (RAM) on this box, and a
-    # binary cache is not a scratch file — it accumulates one linked test
-    # executable per cache key for the whole run. Eight of them exhausted the
-    # 16G tmpfs mid-gate and killed all 8 shards with "Disk quota exceeded"
-    # (2026-07-29). Per CLAUDE.md: scratch goes to /var/tmp/bezel-scratch,
-    # never /tmp.
-    #
-    # The name is STABLE per shard index (not per run) so each shard's cache
-    # stays WARM across gates — a fresh dir every run would make every gate a
-    # full cold rebuild, which is both slow and what filled the tmpfs so fast.
-    # The per-shard size cap is the whole-store cap divided by the shard count,
-    # so aggregate disk use is unchanged from the single shared store.
-    shard_cache="${BEZEL_AOT_CACHE_ROOT:-/var/tmp/bezel-scratch}/aot-bincache-shard$i"
-    mkdir -p "$shard_cache"
     # Per-shard timeout: a DEADLOCKED test (e.g. a cross-domain-mutex contention
     # race, #1609) otherwise hangs `wait` below forever and wedges the whole gate.
     # timeout kills the hung shard (exit 124/137 -> counted as a crashed shard ->
@@ -90,9 +57,7 @@ for (( i = 0; i < shards; i++ )); do
     # and `exit $_rc` preserves the shard's exit code for the `wait` below.
     (
         _s=$(awk '{print $1; exit}' /proc/uptime 2>/dev/null || date +%s)
-        TMPDIR="$shard_tmp" BEZEL_AOT_CACHE_DIR="$shard_cache" \
-            BEZEL_AOT_CACHE_MAX_GB="$shard_cache_gb" \
-            BEZEL_SHARD_COUNT="$shards" BEZEL_SHARD_INDEX="$i" \
+        TMPDIR="$shard_tmp" BEZEL_SHARD_COUNT="$shards" BEZEL_SHARD_INDEX="$i" \
             timeout -k 10 "${BEZEL_SHARD_TIMEOUT:-300}" "$bin" > "$logdir/shard.$i.log" 2>&1
         _rc=$?
         _e=$(awk '{print $1; exit}' /proc/uptime 2>/dev/null || date +%s)
