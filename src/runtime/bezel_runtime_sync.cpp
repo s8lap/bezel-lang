@@ -492,7 +492,7 @@ static bz_task_t* semaphore_make_faulted_task(void* oce_vtable) {
 
 extern "C" {
 
-// bz_semaphore_new — allocate a new counting semaphore.  core_refs = 1.
+// §6.3: Semaphore — allocate a new counting semaphore.  core_refs = 1.
 // initialCount: the initial permit count (must be >= 0).
 // maxCount: advisory upper bound (stored; not enforced in this slice — see
 // comment on bz_semaphore_t.maxCount above).
@@ -565,9 +565,9 @@ void bz_semaphore_token_release(void* tokp) {
     semaphore_core_release(s);
 }
 
-// bz_semaphore_dispose — dispose the Semaphore object.  Marks disposed (for
-// idempotency) and releases the Semaphore object's core ref.  The sem_t is
-// destroyed only when the last SemaphoreToken is also released (via
+// §6.3: Semaphore.Dispose — dispose the Semaphore object.  Marks disposed
+// (for idempotency) and releases the Semaphore object's core ref.  The sem_t
+// is destroyed only when the last SemaphoreToken is also released (via
 // semaphore_core_release → core_refs → 0).  Idempotent: second call is no-op.
 // fix #706: exchange(true) is atomic — concurrent Dispose from two domains
 // cannot both proceed to semaphore_core_release.
@@ -767,7 +767,8 @@ static void atomic_core_release(bz_atomic_t* a) {
 
 extern "C" {
 
-// bz_atomic_new — allocate a new atomic cell; core_refs = 1.
+// §6.4: Atomic<T> / AtomicInteger<T> — allocate a new atomic cell;
+// core_refs = 1.
 void* bz_atomic_new(int cell_size, uint64_t initial) {
     if (cell_size <= 0 || cell_size > 8) cell_size = 4;  // defensive
     auto* a = new bz_atomic_t();
@@ -788,7 +789,7 @@ void* bz_atomic_new(int cell_size, uint64_t initial) {
     return a;
 }
 
-// bz_atomic_dispose — idempotent dispose (§28.2); drops the core ref.
+// §6.4: Atomic.Dispose — idempotent dispose (§28.2); drops the core ref.
 // fix #706: exchange(true) is atomic — concurrent Dispose from two domains
 // cannot both proceed to atomic_core_release.
 void bz_atomic_dispose(void* ptr) {
