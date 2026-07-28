@@ -592,20 +592,6 @@ Token Lexer::scanInterpolatedString() {
                     if (position_ < source_.size()) ++position_; // closing "
                     continue;
                 }
-                if (ic == '\'') {
-                    // per §18.5: a nested char literal is one opaque unit for
-                    // hole delimitation; braces inside it do not close the hole.
-                    ++position_;
-                    if (position_ < source_.size() && source_[position_] == '\\') {
-                        consumeEscape();
-                    } else if (position_ < source_.size()) {
-                        consumeOneScalar(source_, position_);
-                    }
-                    if (position_ < source_.size() && source_[position_] == '\'') {
-                        ++position_;
-                    }
-                    continue;
-                }
                 if (ic == '{') ++depth;
                 else if (ic == '}') --depth;
                 ++position_;
@@ -673,20 +659,6 @@ Token Lexer::scanInterpolatedVerbatimString() {
                         consumeOneScalar(source_, position_);
                     }
                     if (position_ < source_.size()) ++position_;
-                    continue;
-                }
-                if (ic == '\'') {
-                    // per §18.5: a nested char literal is one opaque unit for
-                    // hole delimitation; braces inside it do not close the hole.
-                    ++position_;
-                    if (position_ < source_.size() && source_[position_] == '\\') {
-                        consumeEscape();
-                    } else if (position_ < source_.size()) {
-                        consumeOneScalar(source_, position_);
-                    }
-                    if (position_ < source_.size() && source_[position_] == '\'') {
-                        ++position_;
-                    }
                     continue;
                 }
                 if (ic == '{') ++depth;

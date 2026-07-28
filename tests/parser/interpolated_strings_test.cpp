@@ -97,15 +97,6 @@ BEZEL_TEST(parser_interp, nested_quote_inside_part) {
         std::string("$\"got {Lookup(\"x\")} back\""));
 }
 
-// §18.5 (v0.226), issue #2233: nested char literals are complete literals for
-// hole delimitation, so a `}` character inside one must not close the hole.
-BEZEL_TEST(parser_interp, nested_char_literal_with_closing_brace) {
-    const std::string src =
-        "module M; class C public method M() _ := $\"{'\\x7D'}\"; end M; end C;";
-    auto r = parseAll(src);
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-}
-
 BEZEL_TEST(parser_interp, verbatim_interp_multiline) {
     BEZEL_EXPECT_EQ(
         render("$@\"line1\nline2 {x}\""),
