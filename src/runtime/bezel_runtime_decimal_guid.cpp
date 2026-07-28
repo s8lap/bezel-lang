@@ -777,10 +777,20 @@ extern "C" void bz_decimal_round(const bz_decimal_t* a, int32_t digits,
     if ((uint32_t)digits >= s) { *out = *a; return; }
     __uint128_t m = dec_mantissa(a);
     uint32_t remove = s - (uint32_t)digits;
+    // Drop the lowest `remove` decimal places one at a time. The rounding
+    // decision is made on the FIRST dropped digit (the digit at position
+    // `digits`, immediately after the kept range), not on the LOWEST dropped
+    // digit — that is the i == 0 iteration in this loop, which is the units
+    // digit, several positions below the relevant one whenever remove > 1.
+    // For example, 0.9651m.Round(2) drops two places; the relevant digit is
+    // the 3rd decimal place ("5"), not the 4th ("1").  Half-up: add 1 to the
+    // kept mantissa if the relevant dropped digit is >= 5.  Carry into a new
+    // place (e.g. 0.9950 → 1.00) is handled by dec_store (trailing-zero
+    // strip + max-96-bit reduction).  // per §9.3
     for (uint32_t i = 0; i < remove; ++i) {
         __uint128_t rem = m % 10;
         m /= 10;
-        if (i == 0 && rem >= 5) m += 1;
+        if (i == remove - 1 && rem >= 5) m += 1;  // per §9.3 — first dropped digit
     }
     // Rounding only reduces mantissa magnitude; result always fits in 96 bits.
     dec_store(out, m, (uint32_t)digits, dec_sign(a), nullptr);

@@ -404,6 +404,50 @@ BEZEL_TEST(codegen_521_stdlib, round_to_2_places_spec_9_3) {
         "return 0; ")), 1);
 }
 
+// fix #2229: Round must look at the FIRST dropped digit (the digit at position
+// `digits`), not the LOWEST dropped digit. 0.9651m rounded to 2 places has
+// dropped "51" (> half) → must round up to 0.97m. Previously the runtime
+// inspected i==0 (the units digit "1") and returned 0.96m.
+BEZEL_TEST(codegen_521_stdlib, round_multi_drop_looks_at_first_dropped_digit_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := 0.9651m; "
+        "var r := d.Round(2); "
+        "if r = 0.97m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// fix #2229: Round with remove > 1 and the relevant dropped digit exactly 5
+// must round up (half-up at the digit at position `digits`). 0.9650m → 0.97m.
+// (Coincidentally matches banker's rule: 96 is even, so banker's also gives
+// 0.96 — but we are testing the half-up path here.)
+BEZEL_TEST(codegen_521_stdlib, round_multi_drop_half_up_9650_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := 0.9650m; "
+        "var r := d.Round(2); "
+        "if r = 0.97m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// fix #2229: Round with remove > 1 and the relevant dropped digit just below
+// half must round DOWN. 0.9649m → 0.96m.
+BEZEL_TEST(codegen_521_stdlib, round_multi_drop_below_half_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := 0.9649m; "
+        "var r := d.Round(2); "
+        "if r = 0.96m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// fix #2229: Round with a tail of 9s propagates the carry into the next place.
+// 0.9999m.Round(1) → 1m.
+BEZEL_TEST(codegen_521_stdlib, round_carry_propagation_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := 0.9999m; "
+        "var r := d.Round(1); "
+        "if r = 1m then return 1; end; "
+        "return 0; ")), 1);
+}
+
 // ---------------------------------------------------------------------------
 // 521_consts: stdlib §9.3 — Decimal.Zero and Decimal.One static constants.
 // ---------------------------------------------------------------------------
