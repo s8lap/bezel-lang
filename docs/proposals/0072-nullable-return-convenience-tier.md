@@ -38,13 +38,12 @@ var port := int.ParseOrNull(Environment.Get("PORT") ?? "") ?? 8080;
 **Lookup-with-fallback.** The keyed twin. Accepted proposal [0002](0002-http-server.md)'s own tour example (§2.1, `TodoApi.GetById`) pays a `!` at exactly this site:
 
 ```bezel
-return case g.Value.TryGetValue(id, out var todo) of
+return (case g.Value.TryGetValue(id, out var todo) of
   true => Http.Json(todo!),
-  _    => Http.Status(404)
-end;
+  _    => Http.Status(404));
 ```
 
-— a `!` inside the arm that *is* the success arm. The Try shape is doing distinguishing work no caller here asked for; the null-or-value shape folds into `??`/`?.`/null-tests directly.
+— (0002's original spells this with the pre-v0.208 `case … end` expression form; the snippet above is modernized to the v0.208 paren-atom spelling, one of the graduation-time currency notes 0002 will need) — a `!` inside the arm that *is* the success arm. The Try shape is doing distinguishing work no caller here asked for; the null-or-value shape folds into `??`/`?.`/null-tests directly.
 
 The library already **has** this tier — ad hoc: the `FirstOrNull`/`LastOrNull`/`SingleOrNull` family (§5), `MinByOrNull`/`MaxByOrNull` (proposal [0026](0026-linq-additions.md), draft), `Environment.GetInt`/`GetBool` (v0.215 — "the convenience tier", the changelog's own words), `HttpHeaders.Get(name): string?` (proposal [0001](0001-networking-http.md) §3.4), `JsonObject.Get(key): JsonValue?` (proposal [0019](0019-json-dom.md)). What it lacks is (a) the tier's presence on the two hottest surfaces — parse and keyed lookup — and (b) a recorded rule for when the tier is admissible, so each new proposal stops re-deriving it. This proposal is that packaging: §1 the parse tier (recommended for acceptance), §2 the lookup tier (owner-gated, with the criterion tension disclosed up front), §3 the one-sentence §1 amendment the new members require, §4 the #1535 boundary, §5 the naming question.
 
