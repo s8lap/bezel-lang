@@ -319,15 +319,39 @@ echo "   binary: $(ls -la --time-style=+%H:%M:%S build/tests/bezel_tests | awk '
 # cheap and uncapped). Explicit BEZEL_SHARD_TIMEOUT wins unconditionally.
 if [ "$ASAN" -eq 1 ]; then
   core_post=$(stat -c %Y build/libbezel_core.a 2>/dev/null || echo -1)
-  cache_n=$(find "${BEZEL_AOT_CACHE_DIR:-/var/tmp/bezel-scratch/aot-bincache}" -type f 2>/dev/null | wc -l)
+  GATE_CACHE_ROOT="${BEZEL_AOT_CACHE_DIR:-/var/tmp/bezel-scratch/aot-bincache}"
+  cache_n=$(find "$GATE_CACHE_ROOT" -type f 2>/dev/null | wc -l)
   GATE_COLD=0
   { [ "$core_post" != "$CORE_MTIME_PRE" ] || [ "$cache_n" -lt 2000 ]; } && GATE_COLD=1
+  # IDENTITY CHECK (2026-07-29). The mtime comparison above only asks "did THIS
+  # gate's build touch core.a", which is the wrong question. The AOT bincache
+  # keys on a hash of libbezel_core.a AND libbezel_runtime.a (the "k2 identity",
+  # tests/support/aot_support.hpp), so a RUNTIME-only change invalidates every
+  # entry while core.a's mtime is unchanged relative to this build — and a
+  # previous gate that timed out leaves the store full of entries under the OLD
+  # identity, so the raw count looks warm too. Both signals said "warm" for a
+  # fully cold tree on 2026-07-29: gates C and D were given the 900s ceiling for
+  # a ~2400s cold run and were killed at it, having completed ~37% of the suite.
+  #
+  # Record the identity the cache is actually populated FOR, next to the store,
+  # and refresh it only after a COMPLETED pass (see the write at the end) so a
+  # timed-out gate cannot mark a half-populated store as warm.
+  GATE_CACHE_ID=$(cat build/libbezel_core.a build/libbezel_runtime.a 2>/dev/null | sha256sum 2>/dev/null | cut -d' ' -f1)
+  GATE_CACHE_ID_FILE="$GATE_CACHE_ROOT/.gate-identity"
+  gate_id_note="match"
+  if [ -n "${GATE_CACHE_ID:-}" ]; then
+    if [ "$GATE_CACHE_ID" != "$(cat "$GATE_CACHE_ID_FILE" 2>/dev/null || echo none)" ]; then
+      GATE_COLD=1; gate_id_note="CHANGED (cache is cold for this tree)"
+    fi
+  else
+    gate_id_note="unavailable"
+  fi
   sto="$GATE_EXPLICIT_STO"
   if [ -z "$sto" ]; then sto=900; [ "$GATE_COLD" -eq 1 ] && sto=1800; fi
   SHARD_ENV+=(BEZEL_SHARD_TIMEOUT="$sto")
   core_note="unchanged"; [ "$core_post" != "$CORE_MTIME_PRE" ] && core_note="rebuilt"
   cold_note="warm-predicted"; [ "$GATE_COLD" -eq 1 ] && cold_note="cold-predicted"
-  echo "   ASan shard ceiling: ${sto}s ($cold_note: core.a $core_note, bincache entries=$cache_n)"
+  echo "   ASan shard ceiling: ${sto}s ($cold_note: core.a $core_note, bincache entries=$cache_n, identity $gate_id_note)"
 fi
 
 # lit + FileCheck diagnostic track (tests/lit/): drives the REAL bezelc over .bzl
@@ -511,6 +535,18 @@ fi
 # mistake this for a full-suite validation.
 if [ "${rc:-0}" -ne 0 ] && [ "${COV_GTESTS:-0}" -eq 0 ]; then
   echo "== gate: WARNING — accepted via flake arbitration with NO completed gtest total (whole-suite timeout shape): only the arbitrated suspect suites were validated in THIS run =="
+fi
+
+# Record the cache identity this pass populated the bincache for, so the NEXT
+# gate can tell warm from cold (see the IDENTITY CHECK above). Written only on a
+# pass that produced a completed gtest total: a run killed at the shard ceiling
+# leaves the store only partly populated, and marking that warm is exactly the
+# mistake that cost gates C and D on 2026-07-29. Best-effort — never fails a
+# gate that already passed.
+if [ "${COV_GTESTS:-0}" -gt 0 ] && [ -n "${GATE_CACHE_ID:-}" ] && [ -n "${GATE_CACHE_ID_FILE:-}" ]; then
+  mkdir -p "$(dirname "$GATE_CACHE_ID_FILE")" 2>/dev/null && \
+    printf '%s\n' "$GATE_CACHE_ID" > "$GATE_CACHE_ID_FILE" 2>/dev/null && \
+    echo "== gate: recorded AOT cache identity for the next run's warm/cold prediction =="
 fi
 
 echo "== GATE PASS =="
