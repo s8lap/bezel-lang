@@ -63,7 +63,8 @@ enum class Visibility {
     Protected,
 };
 
-// Distinguishes the four class-like top-level declarations parsed in slice 3.
+// Distinguishes the five class-like top-level declarations parsed here (§9,
+// §10, §11, §35).
 // Extension declarations (§26), type aliases (§A.2 TypeAliasDecl), and
 // extern blocks (§32) get their own AST nodes in their own slices.
 enum class TypeDeclKind {
@@ -758,12 +759,8 @@ struct ChoiceCase {
     std::unique_ptr<SerializedClause> serialized;
 };
 
-// Class-like top-level declaration. Slice 3 introduced the empty body; slice
-// 5 adds generic parameters and a base-type list. Primary-constructor params
-// (classes), positional fields (records), serialization clauses, generic
-// constraints, members, and the enum-specific inheritance form are still
-// later-slice work. The four kinds share enough shape that one struct with a
-// `kind` tag is the right model until per-kind members force a split.
+// Class-like top-level declaration. The five kinds share enough shape that one
+// struct with a `kind` tag is the right model until per-kind members force a split.
 struct TypeDecl : TopDecl {
     TypeDeclKind kind = TypeDeclKind::Class;
     Visibility visibility = Visibility::None;
