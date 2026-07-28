@@ -566,12 +566,17 @@ if [ "${rc:-0}" -ne 0 ] && [ "${COV_GTESTS:-0}" -eq 0 ]; then
 fi
 
 # Record the cache identity this pass populated the bincache for, so the NEXT
-# gate can tell warm from cold (see the IDENTITY CHECK above). Written only on a
-# pass that produced a completed gtest total: a run killed at the shard ceiling
-# leaves the store only partly populated, and marking that warm is exactly the
-# mistake that cost gates C and D on 2026-07-29. Best-effort — never fails a
-# gate that already passed.
-if [ "${COV_GTESTS:-0}" -gt 0 ] && [ -n "${GATE_CACHE_ID:-}" ] && [ -n "${GATE_CACHE_ID_FILE:-}" ]; then
+# gate can tell warm from cold (see the IDENTITY CHECK above). Best-effort —
+# never fails a gate that already passed.
+#
+# The condition is `rc == 0`, i.e. the sharded pass ran to COMPLETION — not
+# merely "a nonzero gtest total". A run killed at the shard ceiling still
+# reports whatever it finished, so a nonzero total does NOT mean the store was
+# fully populated: gate I on 2026-07-29 reported 5600 of 12775 (44%) and passed
+# via arbitration, and under the old condition would have marked a 44%-populated
+# store warm — re-creating, from the other direction, exactly the mis-prediction
+# this marker exists to prevent.
+if [ "${rc:-1}" -eq 0 ] && [ "${COV_GTESTS:-0}" -gt 0 ] && [ -n "${GATE_CACHE_ID:-}" ] && [ -n "${GATE_CACHE_ID_FILE:-}" ]; then
   mkdir -p "$(dirname "$GATE_CACHE_ID_FILE")" 2>/dev/null && \
     printf '%s\n' "$GATE_CACHE_ID" > "$GATE_CACHE_ID_FILE" 2>/dev/null && \
     echo "== gate: recorded AOT cache identity for the next run's warm/cold prediction =="
