@@ -2246,6 +2246,20 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     auto  savedRef       = refParams_;
     auto  savedDispose   = disposeStack_;
     auto  savedLoop      = loopStack_;
+    // #2274 / §31.2: the getter is its OWN function — the caller's active
+    // try/finally frames do not apply inside it, so finallyStack_ is cleared
+    // below. It must therefore be SAVED and restored like loopStack_: without
+    // the save, emitting a block getter from inside a `try … finally` destroyed
+    // the enclosing frame, and lowerTry's own `finallyStack_.back()`/`pop_back()`
+    // after the body then ran on an empty stack (assertion/UB), while a
+    // `return`/`break` leaving that try emitted NO finally at all — contradicting
+    // §31.2: "`finally` runs whether the protected block completed normally, was
+    // exited by an exception (caught or uncaught), or was exited by `return` —
+    // or by a `break` or `continue` targeting an enclosing loop."
+    // finallyBodyStack_ (§29.7 #623) is documented as "always the same depth as
+    // finallyStack_", so it is cleared and restored in lockstep.
+    auto  savedFinally   = finallyStack_;
+    auto  savedFinBodies = finallyBodyStack_;
     auto* savedUnwind    = unwindTarget_;
     auto* savedProp      = propagateBB_;
     auto* savedCaught    = currentCaughtExc_;
@@ -2269,7 +2283,7 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     paramSlots_.clear();
     refParams_.clear();
     disposeStack_.clear();
-    loopStack_.clear(); finallyStack_.clear();
+    loopStack_.clear(); finallyStack_.clear(); finallyBodyStack_.clear();
     unwindTarget_       = nullptr;
     propagateBB_        = nullptr;
     currentCaughtExc_   = nullptr;
@@ -2291,6 +2305,8 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     refParams_          = std::move(savedRef);
     disposeStack_       = std::move(savedDispose);
     loopStack_          = std::move(savedLoop);
+    finallyStack_       = std::move(savedFinally);      // #2274 / §31.2
+    finallyBodyStack_   = std::move(savedFinBodies);    // #2274 / §29.7
     unwindTarget_       = savedUnwind;
     propagateBB_        = savedProp;
     currentCaughtExc_   = savedCaught;
@@ -2594,6 +2610,13 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
     auto  savedRef       = refParams_;
     auto  savedDispose   = disposeStack_;
     auto  savedLoop      = loopStack_;
+    // #2274 / §31.2 / §29.7: same save/restore hole as ensurePropertyBlockGetter
+    // — a block-bodied INDEXER getter read from inside a `try … finally` cleared
+    // the caller's finally frames, so lowerTry's post-body `finallyStack_.back()`
+    // ran on an empty stack and any `return`/`break` leaving that try emitted no
+    // finally. See the note in ensurePropertyBlockGetter for the spec sentence.
+    auto  savedFinally   = finallyStack_;
+    auto  savedFinBodies = finallyBodyStack_;
     auto* savedUnwind    = unwindTarget_;
     auto* savedProp      = propagateBB_;
     auto* savedCaught    = currentCaughtExc_;
@@ -2608,7 +2631,7 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
     paramSlots_.clear();
     refParams_.clear();
     disposeStack_.clear();
-    loopStack_.clear(); finallyStack_.clear();
+    loopStack_.clear(); finallyStack_.clear(); finallyBodyStack_.clear();
     unwindTarget_       = nullptr;
     propagateBB_        = nullptr;
     currentCaughtExc_   = nullptr;
@@ -2641,6 +2664,8 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
     refParams_          = std::move(savedRef);
     disposeStack_       = std::move(savedDispose);
     loopStack_          = std::move(savedLoop);
+    finallyStack_       = std::move(savedFinally);      // #2274 / §31.2
+    finallyBodyStack_   = std::move(savedFinBodies);    // #2274 / §29.7
     unwindTarget_       = savedUnwind;
     propagateBB_        = savedProp;
     currentCaughtExc_   = savedCaught;
