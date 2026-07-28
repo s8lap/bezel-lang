@@ -84,6 +84,10 @@ void* bz_args_array(int32_t argc, char** argv) {
     return arr;
 }
 
+// §7.3: File.ReadAllLines — split a file into a fresh owned Array<string>,
+// one entry per '\n'-terminated line (a terminal '\n' is not its own empty line).
+// Mirrors .NET File.ReadAllLines: n '\n'-terminated lines yield n entries; CRLF
+// line endings are stripped of the '\r' before the entry is constructed.
 void* bz_file_read_all_lines(const char* path) {
     uint8_t* buf; int64_t len;
     if (bz_file_read_all_bytes(path, &buf, &len) != 0)
@@ -115,6 +119,10 @@ void* bz_file_read_all_lines(const char* path) {
     return arr;
 }
 
+// §7.3: File.WriteAllBytes — write `len` bytes from `data` to the file at
+// `path`, truncating any existing contents. Returns -errno on fopen failure
+// (consistent with bz_file_read_all_bytes's -errno convention); the fwrite
+// return is currently not surfaced.
 int32_t bz_file_write_all_bytes(const char* path, const uint8_t* data, int64_t len) {
     FILE* f = fopen(path, "wb");
     if (!f) return -errno;
