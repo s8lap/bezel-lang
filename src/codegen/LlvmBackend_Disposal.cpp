@@ -505,6 +505,12 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // (error_obj prelude + per-T result_disposer + fire-and-forget
             // [_checked]) is the using-var task disposal protocol, dispatched
             // in the iteration loop below via emitOwnedTaskDisposal.
+            //
+            // #2260: the `owned` test lives INSIDE taskFamilyTypeFromField
+            // (LlvmBackend_Setup.cpp), so this arm — like every sibling above —
+            // fires only for an OWNING slot. A NON-`owned` Task-family field is
+            // a spec-legal BORROW (§28.5 / §22.12 rule 2(ii)) whose owner is
+            // elsewhere; disposing it here was a double free.
             OwnedField of{fs, nullptr};
             of.taskField = true;
             owned.push_back(of);

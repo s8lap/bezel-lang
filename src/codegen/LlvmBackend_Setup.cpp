@@ -12765,23 +12765,55 @@ bool Emitter::isOwnedTaskField(const ast::Expr& target) {
     auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
     if (!fs) return false;
     if (!fs->parent || fs->parent->kind != ast::TypeDeclKind::Class) return false;
-    // Must be `owned` modified AND Task-family typed. isOwnedReferenceField
-    // excludes Task-family (Task/Task<T>/OwningTask<T> are builtin types with
-    // no user TypeDecl — caught by the `pt->declaration` check), so a
-    // separate classifier is needed. taskFamilyTypeFromField is the type
-    // extraction helper below.
-    if (!hasOwnedModifier(fs)) return false;
+    // Must be an OWNING Task-family slot. isOwnedReferenceField excludes
+    // Task-family (Task/Task<T>/OwningTask<T> are builtin types with no user
+    // TypeDecl — caught by the `pt->declaration` check), so a separate
+    // classifier is needed. taskFamilyTypeFromField below is that classifier:
+    // #2260 moved the `owned` test INTO it, so this caller and
+    // emitOwnedFieldDisposals now share one predicate (see its comment).
     return taskFamilyTypeFromField(fs) != nullptr;
 }
 
 
 // §28.7 / §30.5 (#2173): recover the resolved Task / Task<T> / OwningTask<T>
-// TypeRef for an `owned` field's declared type. Mirrors taskTypeOfLocal's
-// local-form pattern (prefer the resolved declared type over any initializer,
-// since fields rarely have field-initializer expressions here). Returns null
-// if the field's type is not Task-family.
+// TypeRef for a field that OWNS its task frame; null for any other field.
+// Mirrors taskTypeOfLocal's local-form pattern (prefer the resolved declared
+// type over any initializer, since fields rarely have field-initializer
+// expressions here).
+//
+// #2260 — `owned` is part of THIS predicate, not the callers'. A NON-`owned`
+// Task-family field is a BORROW (§28.5 back-reference; §22.12 rule 2(ii)) —
+// spec-legal and pinned as accepted by tests/lit/sema/sema_builtin__task_t_
+// resolves.bzl — and its holder must not dispose it: the mint call's owner
+// (a `using var` local, another field) is the one disposer. The check used to
+// live only in isOwnedTaskField (the STORE path), so emitOwnedFieldDisposals
+// (LlvmBackend_Disposal.cpp, the DISPOSAL path) fired the full task drop on a
+// borrow — a double `bz_task_fire_and_forget` on one bz_task_t*, i.e. a
+// double free. Every sibling classifier (isOwnedReferenceField,
+// isOwnedSharedWeakField, isOwnedSubscriptionField, isOwnedEventSourceField,
+// ownedCollectionFieldType) gates on `owned` inside itself; this one now does
+// too, so the two callers cannot drift apart again.
+//
+// §22.10 (v0.180) / #1594 (#2260 finding 2): the `owned` modifier of a CAPTURED
+// primary-constructor parameter rides `posParam->modifier`, not `fs->modifiers`
+// (and `fs->decl` is the enclosing TypeDecl, so the FieldDecl extraction below
+// never matches it). Spec §22.10: such a parameter is "captured as a compiler-
+// generated `owned` private field, disposed by the generated `Dispose()`
+// exactly like a declared owned field (§28.4)". Without the posParam arm the
+// capture slot of `class H(owned t: OwningTask<Cell>)` was never disposed —
+// the task frame and its unconsumed result leaked. Mirrors the posParam arm
+// every sibling classifier already carries (LlvmBackend_impl.hpp).
 const sema::TypeRef* Emitter::taskFamilyTypeFromField(
         const sema::FieldSymbol* fs) {
+    if (fs->posParam) {
+        // capturedOwnedPrimaryParamType is null unless this really is a
+        // CAPTURED `owned` class primary-ctor parameter (§22.10's capture-iff-
+        // body-referenced rule, minus the initializer-consuming shape whose
+        // explicit owned field is the sole owner).
+        const sema::TypeRef* pt = capturedOwnedPrimaryParamType(fs);
+        return isTaskTypeName(pt) ? pt : nullptr;
+    }
+    if (!hasOwnedModifier(fs)) return nullptr;
     const sema::TypeRef* rt = nullptr;
     // #662 foundation B: imported field — type from importedMemberType.
     if (!fs->decl) {
