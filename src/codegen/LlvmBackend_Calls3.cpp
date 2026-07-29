@@ -70,6 +70,63 @@ bool Emitter::isVtableBackedIEnumerableType(const sema::TypeRef* rt) {
     return n == "IEnumerable" || n == "IOwningEnumerable";
 }
 
+// stdlib §5 (#755): the ELEMENT TypeRef of an `IGrouping<TKey, T>` receiver —
+// genericArgs[1]. `IGrouping<TKey, T> : IEnumerable<T>` (stdlib §5 line 3076),
+// so the §5 LINQ surface resolves on it by inheritance; but unlike every other
+// enumerable receiver the compiler recognises, its ELEMENT type is the SECOND
+// generic argument (the first is the key). Every consumer that reads
+// `recvTy->genericArgs[0]` for an element type would therefore read TKey.
+//
+// IGrouping is a compiler-known builtin (common/BuiltinRegistry.cpp) with no
+// user declaration; its TypeRef reaches codegen in three shapes — a
+// declaration-less astNode (inferred/annotated local), a builtin TypeSymbol
+// whose `decl` is null, or an `importedName` set by ModuleLoader — matching
+// the recognizers already used at the GroupBy sites in LlvmBackend_Calls.cpp
+// and LlvmBackend_ElementPolicy.cpp.
+const sema::TypeRef* Emitter::iGroupingElemTypeRef(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return nullptr;
+    std::string_view hn;
+    if (rt->declaration) {
+        if (rt->declaration->decl) return nullptr;  // a real user type
+        hn = rt->declaration->name;
+    } else if (rt->astNode && rt->astNode->name &&
+               !rt->astNode->name->parts.empty()) {
+        hn = rt->headName();
+    } else if (!rt->importedName.empty()) {
+        hn = rt->importedName;
+    } else {
+        return nullptr;
+    }
+    if (hn != "IGrouping") return nullptr;
+    if (rt->genericArgs.size() < 2 || !rt->genericArgs[1]) return nullptr;
+    return rt->genericArgs[1];
+}
+
+// stdlib §5 (#755) / §4.4: a synthesized `Array<T>` TypeRef over `elem`. An
+// `IGrouping<TKey, T>`'s members live in a concrete `bz_array_t*` the grouping
+// owns; restating the receiver TYPE as that element array lets the whole
+// array-receiver lowering — every §5 terminal together with its spec-mandated
+// faults (`Single()` → InvalidOperationException unless exactly one,
+// `ElementAt(i)` → IndexOutOfRangeException, `First`/`Last` → empty fault) —
+// apply verbatim, instead of a hand-rolled per-name duplicate that reproduced
+// none of them (#2265). Construction mirrors builtinByteArrayTypeRef.
+sema::TypeRef* Emitter::elementArrayTypeRef(const sema::TypeRef* elem) {
+    static const ast::Type* kArrayAstNode = []() -> ast::Type* {
+        auto* qn = new ast::QualifiedName;
+        qn->parts.push_back("Array");
+        auto* t = new ast::Type;
+        t->kind = ast::TypeKind::Named;
+        t->name.reset(qn);
+        return t;
+    }();
+    auto* tr = ctx_.makeTypeRef();
+    tr->kind = sema::TypeRef::Kind::Named;
+    tr->declaration = nullptr;
+    tr->astNode = kArrayAstNode;
+    tr->genericArgs.push_back(const_cast<sema::TypeRef*>(elem));
+    return tr;
+}
+
 // issue #343 / §8.3: trampoline matching the runtime's generic-dict hash fn
 // pointer `uint64_t(const void* key)`. The runtime stores raw record bytes; we
 // reinterpret the byte pointer as a record-struct pointer, load the value, and
@@ -620,7 +677,8 @@ llvm::Function* Emitter::buildSelectManyTrampoline(llvm::Type* elemTy,
                                                    int64_t innerEsz,
                                                    bool innerIsLazy,
                                                    bool rangeInner,
-                                                   bool rangeInnerIsChar) {
+                                                   bool rangeInnerIsChar,
+                                                   bool groupingInner) {
     auto* fty = llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false);
     auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
                                       "bz$linq$flatsel", module_.get());
@@ -675,6 +733,17 @@ llvm::Function* Emitter::buildSelectManyTrampoline(llvm::Type* elemTy,
         // and yield only a garbage prefix (the WRONG_VALUE behind the IR_FAIL).
         inner = coll;
     } else {
+        // stdlib §5 (#755, finding [20]): an `IGrouping<TKey, U>` result is a
+        // bz_grouping_t*, whose FIRST field is the element bz_array_t* — read it
+        // out before wrapping. Wrapping the grouping itself made bz_lazy read
+        // { void* elements; int64 key_esz; … } as an array header, so the yielded
+        // count was the KEY's byte size (4 per group for an int key) rather than
+        // the group's element count. The wrap stays borrowing: the grouping owns
+        // this array and frees it in bz_grouping_free.
+        if (groupingInner) {
+            auto* elemsFn = declareC("bz_grouping_elements", ptrTy(), {ptrTy()});
+            coll = builder_.CreateCall(elemsFn, {coll}, "fs.grp.elems");
+        }
         // Wrap the returned Array<U> as a lazy enumerator (the runtime drains it).
         auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
         inner = builder_.CreateCall(wrapFn,
@@ -1021,6 +1090,31 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
     }
     llvm::Value* recv = lowerExpr(recvExpr);
     if (!recv) return nullptr;
+    // stdlib §5 (#755): an `IGrouping<TKey, T>` source. `IGrouping : IEnumerable<T>`
+    // (stdlib §5 line 3076), so a grouping is a legal LINQ receiver and a legal
+    // `for` source (spec §29.2) — but its runtime value is a `bz_grouping_t*`,
+    // not a bz_array_t*/bz_lazy_t*, so every enumerable consumer previously read
+    // the grouping struct as whatever shape it expected and saw an EMPTY (or
+    // garbage) sequence. Its members are a concrete, fully-materialized
+    // `bz_array_t*` reachable via bz_grouping_elements; wrap THAT as a lazy ARRAY
+    // source. The wrap is BORROWING (bz_lazy_from_array): the grouping owns its
+    // element array and frees it in bz_grouping_free, so an owning wrap would
+    // double-free. Element type is genericArgs[1] (genericArgs[0] is TKey).
+    if (const sema::TypeRef* grpElem = iGroupingElemTypeRef(recvTy)) {
+        elemRef = const_cast<sema::TypeRef*>(grpElem);
+        llvm::Type* et = lowerTypeRef(grpElem);
+        if (!et) et = i32();
+        int64_t esz = lazyElemSize(et, module_->getDataLayout());
+        auto* elemsFn = declareC("bz_grouping_elements", ptrTy(), {ptrTy()});
+        llvm::Value* arr =
+            builder_.CreateCall(elemsFn, {recv}, "igrp.elems");
+        // Deliberately NOT surfaced through outRecvArr: that out-param exists so
+        // a consuming caller can reclaim an UNBOUND fresh-materializer array, and
+        // the grouping's array has an owner (the grouping).
+        auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(wrapFn, {arr, builder_.getInt64(esz)},
+                                   "lazy.igrp");
+    }
     // fix #1220 (residual) / stdlib §4.8 / §5: Dictionary<K,V> LINQ source.
     // Materialize the dictionary's entries into a fresh owned bz_array_t of
     // {K,V} structs (same layout as lowerDictEntryFor), then wrap it as an
@@ -1401,8 +1495,20 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     bool dictRecv = isDictTypeName(recvTy) &&
                     recvTy && recvTy->genericArgs.size() >= 2 &&
                     recvTy->genericArgs[0] && recvTy->genericArgs[1];
+    // stdlib §5 (#755): `IGrouping<TKey, T> : IEnumerable<T>` — a grouping is a
+    // legal receiver for the whole §5 operator surface. lowerToLazyEnumerator
+    // wraps its (grouping-owned) element array as a borrowing lazy ARRAY source,
+    // so every operator below composes uniformly. In particular `g.ToArray()`
+    // now takes the ordinary materialize path and returns a FRESH copy, as
+    // stdlib §5:3070 declares (`ToArray(): owned Array<T>`) — the #1296
+    // hand-rolled lowering returned the grouping's OWN array, which the caller's
+    // `using var` then freed alongside bz_grouping_free (a double free, #2265).
+    // Note recvTy is used ONLY in this gate; everything below reads the element
+    // type from lowerToLazyEnumerator's `elemRef` out-param, which is the
+    // grouping's genericArgs[1].
+    bool igrpRecv = iGroupingElemTypeRef(recvTy) != nullptr;
     if (!collRecv && !lazyRecv && !llRecv && !rangeRecv && !vtRecv && !strRecv &&
-        !dictRecv)
+        !dictRecv && !igrpRecv)
         return nullptr;
 
     // Element LLVM type for the receiver's element TypeRef.
@@ -1675,8 +1781,25 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                  m == "OfType");
     if (!isOp) return nullptr;
 
+    // stdlib §5 (#755) / #1914: `X.GroupBy(k).SelectMany(lambda(g) => g)` — the
+    // one composed shape that provably FLATTENS the groups away: the pipeline's
+    // elements are T values copied out of each grouping's element array, so no
+    // grouping POINTER can survive into the result and the fresh groups
+    // temporary (which nothing else owns — it leaked) can be owned by the source
+    // lazy and reclaimed at pipeline dispose. Every other operator may surface a
+    // grouping downstream (`.Where(…).First()` returns one), where owning here
+    // would use-after-free — those keep the borrowing default.
+    bool ownSrcGroupings = false;
+    if (m == "SelectMany" && call.args.size() == 1 && call.args[0].value)
+        if (auto* smLamTy = ctx_.exprType(*call.args[0].value))
+            if (smLamTy->kind == sema::TypeRef::Kind::Function &&
+                smLamTy->funcReturn)
+                ownSrcGroupings =
+                    iGroupingElemTypeRef(smLamTy->funcReturn) != nullptr;
+
     sema::TypeRef* elemRef = nullptr;
-    llvm::Value* src = lowerToLazyEnumerator(*ma->target, elemRef);
+    llvm::Value* src = lowerToLazyEnumerator(*ma->target, elemRef,
+                                             ownSrcGroupings);
     if (!src) return nullptr;
     llvm::Type* elemTy = elemLlvmOf(elemRef);
 
@@ -1857,8 +1980,24 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
             retSemaType->genericArgs[0] &&
             retSemaType->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
             retSemaType->genericArgs[0]->primitive == sema::PrimitiveType::Char;
+        // stdlib §5 (#755, finding [20]): the selector returns an
+        // `IGrouping<TKey, U>` (`GroupBy(k).SelectMany(lambda(g) => g)`). Two
+        // corrections: the inner ELEMENT type is genericArgs[1], not [0] (the
+        // block above read TKey), and the returned pointer is a bz_grouping_t*,
+        // not a bz_array_t* — read the grouping's element array in the
+        // trampoline. Without the second the grouping struct was wrapped AS an
+        // array header whose count field lands on `key_esz`, so every group
+        // yielded key_esz elements regardless of its size (4 per group for an
+        // int key — the reported symptom).
+        const sema::TypeRef* grpInnerElem = iGroupingElemTypeRef(retSemaType);
+        bool groupingInner = grpInnerElem != nullptr;
+        if (groupingInner) {
+            if (auto* t = lowerTypeRef(grpInnerElem)) innerElemTy = t;
+            innerEsz = lazyElemSize(innerElemTy, module_->getDataLayout());
+        }
         llvm::Function* tramp = buildSelectManyTrampoline(
-            elemTy, innerEsz, innerIsLazy, rangeInner, rangeInnerIsChar);
+            elemTy, innerEsz, innerIsLazy, rangeInner, rangeInnerIsChar,
+            groupingInner);
         auto* smFn = declareC("bz_lazy_selectmany", ptrTy(),
                               {ptrTy(), i64(), ptrTy(), ptrTy()});
         llvm::Value* e = builder_.CreateCall(smFn,

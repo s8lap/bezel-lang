@@ -3336,8 +3336,27 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     recvTy && recvTy->kind == TypeRef::Kind::Named &&
                     recvTy->declaration && recvTy->declaration->name == "Range" &&
                     !recvTy->genericArgs.empty();
-                if (isLazyRecv || isRangeLinqRecv) {
-                    TypeRef* srcElem = recvTy->genericArgs[0];
+                // stdlib §5 (#755): an `IGrouping<TKey, T>` receiver. `IGrouping :
+                // IEnumerable<T>` (stdlib §5:3076), so the whole §5 operator and
+                // terminal surface applies to a grouping — but its ELEMENT type is
+                // genericArgs[1] (genericArgs[0] is TKey), so it cannot share the
+                // lazy sentinel's shape test. Without this the results were left
+                // UNTYPED, and the damage was silent rather than diagnosed: `var a
+                // := g.ToArray()` produced a local with no `Array<T>` type, so
+                // `a.Count` lowered to 0 and no scope-end reclaim was registered
+                // (a wrong value plus a leak) — while stdlib §5:3099 names exactly
+                // `using var items := g.ToArray()` as the way to aggregate a group
+                // more than once.
+                bool isGroupingLinqRecv =
+                    recvTy && recvTy->kind == TypeRef::Kind::Named &&
+                    !recvTy->declaration && recvTy->astNode &&
+                    recvTy->astNode->name &&
+                    !recvTy->astNode->name->parts.empty() &&
+                    recvTy->headName() == "IGrouping" &&
+                    recvTy->genericArgs.size() >= 2 && recvTy->genericArgs[1];
+                if (isLazyRecv || isRangeLinqRecv || isGroupingLinqRecv) {
+                    TypeRef* srcElem = isGroupingLinqRecv ? recvTy->genericArgs[1]
+                                                          : recvTy->genericArgs[0];
                     if (m == "Any" || m == "All")
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                     else if (m == "Count")

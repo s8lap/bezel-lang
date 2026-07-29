@@ -685,6 +685,24 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     const auto& m = ma->member;
 
     auto* recvTy = ctx_.exprType(*ma->target);
+    // stdlib §5 (#755, supersedes #1296): an `IGrouping<TKey, T>` receiver.
+    // `IGrouping : IEnumerable<T>` (stdlib §5:3076), so every §5 eager terminal
+    // (Sum/Min/Max/Average/Any/All/Aggregate/Count(pred)/First/Last/Single/
+    // ElementAt/*OrNull/Contains/IndexOf) resolves on it — but its runtime value
+    // is a bz_grouping_t*, which none of the receiver shapes below recognized, so
+    // the calls fell through to the generic dispatch and read the grouping as an
+    // EMPTY sequence (Sum → 0, Any → false, Min/Max → 0). #1296 patched a subset
+    // by hand in a separate slot; that duplicate reproduced none of the array
+    // path's spec-mandated faults (Single with no arity check, ElementAt with no
+    // bounds check — #2265) and never covered the selector/predicate forms.
+    //
+    // The grouping's members are a fully-materialized `bz_array_t*` the GROUPING
+    // owns (bz_grouping_elements). Restate the receiver as that `Array<T>` — type
+    // AND value — and the entire array-receiver lowering below applies verbatim,
+    // faults included. `lazyTempArr` deliberately stays null for this shape: the
+    // array is the grouping's, not a snapshot this call may free.
+    const sema::TypeRef* igroupingElemRef = iGroupingElemTypeRef(recvTy);
+    if (igroupingElemRef) recvTy = elementArrayTypeRef(igroupingElemRef);
     // fix #853 / stdlib §4.1–§4.3: a BORROWING list-interface receiver
     // (IReadOnlyList<T> / IList<T>) is implemented only by the array-backed
     // Array<T>, so its runtime value is the same bz_array_t* as the concrete
@@ -951,6 +969,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     llvm::ConstantPointerNull::get(ptrTy()), addr);
             }
         }
+    } else if (igroupingElemRef) {
+        // stdlib §5 (#755): the receiver TYPE was restated as `Array<T>` above;
+        // restate the VALUE to match — the grouping's element array. This is a
+        // BORROW: the grouping owns the array and frees it in bz_grouping_free,
+        // so no lazyTempArr is registered and nothing here frees it.
+        llvm::Value* grp = lowerExpr(*ma->target);
+        if (!grp) return nullptr;
+        auto* elemsFn = declareC("bz_grouping_elements", ptrTy(), {ptrTy()});
+        recv = builder_.CreateCall(elemsFn, {grp}, "igrp.elems");
     } else {
         recv = lowerExpr(*ma->target);
     }
@@ -1018,6 +1045,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // own retain. Idempotent guards mean a non-materializer receiver is a no-op.
     auto freeFreshInputTemp = [&]() {
         if (lazyTempArr) return;  // the lazy-terminal path frees via freeLazyTemp
+        // stdlib §5 (#755): `recv` is an IGrouping's element array — the GROUPING
+        // owns it (bz_grouping_free), and `ma->target` is the grouping, not a
+        // fresh array materializer. Never reclaim it here.
+        if (igroupingElemRef) return;
         // #1004: a builtin fresh-array materializer receiver (ToArray/Sorted/
         // Reversed). #1006(b): generalized along the `owned` axis — an UNBOUND
         // `owned`-returning USER method call used as the chained receiver (e.g.

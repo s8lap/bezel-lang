@@ -8405,15 +8405,23 @@ private:
     // (Add*/Remove*/Find/Count/First/Last/etc.) and LinkedListNode<T> property
     // accesses (.Value/.Next/.Previous) via the bz_llist_* runtime.
     llvm::Value* tryLowerLinkedListInstanceCall(const ast::CallExpr& call);
-    // #1296: a value-reading terminal operator (.Sum / .First / .Last / .Max /
-    // .Min / .Single / .ElementAt / .ToArray / *OrNull) on an IGrouping
-    // receiver. Extracts the element array via bz_grouping_elements and runs
-    // the terminal on that bz_array_t* (the IGrouping's elements field). Called
-    // from lowerCall before the normal method-symbol dispatch so the call does
-    // not fall through to a generic dispatch that treats the IGrouping as
-    // empty (Sum → 0, First → throw, ToArray → []). stdlib §5 / spec §28.9 /
-    // §29.11.
-    llvm::Value* tryLowerIGroupingTerminalCall(const ast::CallExpr& call);
+    // stdlib §5 (#755, supersedes the #1296 hand-rolled terminal set): the
+    // ELEMENT TypeRef of an `IGrouping<TKey, T>` — genericArgs[1] (genericArgs[0]
+    // is TKey). Returns null when `rt` is not an IGrouping. IGrouping is a
+    // compiler-known builtin (common/BuiltinRegistry) with no user declaration,
+    // and its TypeRef reaches codegen in three shapes — a declaration-less
+    // astNode (annotated/inferred local), a builtin TypeSymbol whose `decl` is
+    // null, or an `importedName` (cross-module metadata) — so all three are
+    // recognized here.
+    static const sema::TypeRef* iGroupingElemTypeRef(const sema::TypeRef* rt);
+
+    // stdlib §5 (#755) / §4.4: a synthesized `Array<T>` TypeRef over `elem`.
+    // `IGrouping<TKey, T>`'s elements are a concrete `bz_array_t*` the grouping
+    // owns (bz_grouping_elements), so the array-receiver lowerings — every §5
+    // terminal, with their spec-mandated bounds/arity faults — apply verbatim
+    // once the receiver TYPE is restated as the element array's. Mirrors
+    // builtinByteArrayTypeRef / builtinTaskArrayTypeRef in construction.
+    sema::TypeRef* elementArrayTypeRef(const sema::TypeRef* elem);
 
     // §4.15 (#549): lower Array<T>.AsSpan()/AsReadOnlySpan() and
     // ArraySpan<T>/ReadOnlyArraySpan<T> instance method calls
@@ -8533,11 +8541,19 @@ private:
     // `rangeInnerIsChar` (§16.3, v0.183, #1586): true when `rangeInner` and the
     // selector's Range<T> result has T = char — the emitted bz_lazy_from_range
     // call flags the enumerator to step across the UTF-16 surrogate gap.
+    // `groupingInner` (stdlib §5, #755): true when the selector returns an
+    // `IGrouping<TKey, U>` (`GroupBy(k).SelectMany(lambda(g) => g)`) — the
+    // returned pointer is a `bz_grouping_t*`, not a `bz_array_t*`, so the
+    // trampoline reads the grouping's element array (bz_grouping_elements)
+    // before wrapping. Without it the grouping struct was read AS an array
+    // header, whose second field is `key_esz` — every group then yielded
+    // key_esz elements regardless of its size (issue #755 finding [20]).
     llvm::Function* buildSelectManyTrampoline(llvm::Type* elemTy,
                                               int64_t innerEsz,
                                               bool innerIsLazy = false,
                                               bool rangeInner = false,
-                                              bool rangeInnerIsChar = false);
+                                              bool rangeInnerIsChar = false,
+                                              bool groupingInner = false);
 
     // stdlib §5 Zip: a combine trampoline `void(closure, a, b, out)`. Loads the
     // left element (`aTy`) and right element (`bTy`), calls the closure

@@ -6516,7 +6516,18 @@ bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
     auto* iterTy = ctx_.exprType(*fs.iterable);
     // Only a lazy LINQ pipeline result (the structural sentinel) is handled
     // here; iterator state machines and Array<T> go through other paths.
-    if (!isLazyEnumerableType(iterTy)) return false;
+    //
+    // stdlib §5 (#755, finding [17]) / spec §29.2: an `IGrouping<TKey, T>` source
+    // is also handled here. `IGrouping : IEnumerable<T>` (stdlib §5:3076), so
+    // `for var el in g do … end` — the inner loop of the canonical
+    // `for var g in xs.GroupBy(k) do … end` shape — is well-formed Bezel; it
+    // was rejected with "not yet implemented: codegen for this for statement"
+    // because no for-handler recognized an IGrouping-typed source.
+    // lowerToLazyEnumerator wraps the grouping's (grouping-owned) element array
+    // as a BORROWING lazy array source, so the enumerator protocol below drives
+    // it exactly as it drives any lazy pipeline.
+    const sema::TypeRef* igroupingElem = iGroupingElemTypeRef(iterTy);
+    if (!igroupingElem && !isLazyEnumerableType(iterTy)) return false;
 
     // #752: route through lowerToLazyEnumerator (not lowerExpr) so a bare
     // `GroupBy(...)` iterable — which lowerExpr cannot lower to a usable
@@ -6533,7 +6544,10 @@ bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
     llvm::Value* lazy = lowerToLazyEnumerator(*fs.iterable, lazyElemRef,
                                               /*ownFreshGroupings=*/true);
     if (!lazy) return false;
-    llvm::Type* elemTy = lowerTypeRef(iterTy->genericArgs[0]);
+    // #755: an IGrouping's element type is genericArgs[1] (genericArgs[0] is the
+    // key); every other source here carries its element at genericArgs[0].
+    llvm::Type* elemTy = lowerTypeRef(
+        igroupingElem ? igroupingElem : iterTy->genericArgs[0]);
     if (!elemTy) elemTy = i32();
 
     // Store the enumerator in a slot; iterate via its vtable.
@@ -6608,10 +6622,18 @@ bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
     // Only fires when the iterable is a named local or parameter (IdentifierExpr);
     // a fresh inline lazy (CallExpr / chained operator) has no owning slot to null.
     // Per §29.11 pattern: localSlot handles both unboxed and cell-boxed variables.
-    if (llvm::AllocaInst* boundSlot = localSlot(*fs.iterable)) {
-        llvm::Type* ety = nullptr;
-        llvm::Value* addr = boxedStorage(boundSlot, ety);
-        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+    //
+    // #755: NOT for an IGrouping source. The slot there holds the GROUPING
+    // pointer (typically the enclosing `for var g in xs.GroupBy(k)` loop
+    // variable), not the enumerator this loop consumed — the enumerator is the
+    // fresh borrowing wrapper built above and already disposed. Nulling the
+    // grouping slot would dangle `g.Key` / the outer loop's own disposal.
+    if (!igroupingElem) {
+        if (llvm::AllocaInst* boundSlot = localSlot(*fs.iterable)) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(boundSlot, ety);
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+        }
     }
     builder_.CreateBr(contBB);
 
