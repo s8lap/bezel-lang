@@ -6223,6 +6223,144 @@ static std::string staticRefTypeName(const TypeRef* rt) {
     return rt ? std::string(rt->headName()) : std::string();
 }
 
+// ---------------------------------------------------------------------------
+// §22.12 rule 2 forms (iii)/(iv) and the residual error categories (#1393
+// warned-admission ruling, spec v0.221 -> v0.228 text unchanged): the
+// primitive/enum/plain-inline-array warned admission, the owning-inline-array
+// static FIELD warned admission, and the compile-error residual (`string`,
+// records, choices, value builtins, function types, generic-parameter types,
+// disqualified inline arrays, and inline-array-typed auto-properties). This
+// governs every mutable static NOT already handled by the class/interface
+// path above (isRule2GovernedReference) — i.e. primitives, enums, records,
+// choices, value builtins, `string`, function types, generic-parameter
+// types, the unit type, and inline arrays of any of these.
+// ---------------------------------------------------------------------------
+
+// §22.12 rule 2 form (iii) primitive/enum leg: a primitive value type
+// (§3.1 — bool, the integer types, float, double, decimal, char; `string`
+// and `Object` excluded) or a user-declared enum type. `nullable` is a flag
+// on the SAME TypeRef (not a distinct Kind), so the nullable form of either
+// is covered with no extra check.
+static bool isForm3PrimitiveOrEnum(const TypeRef* rt) {
+    if (!rt) return false;
+    if (rt->kind == TypeRef::Kind::Primitive)
+        return rt->primitive != PrimitiveType::String &&
+               rt->primitive != PrimitiveType::Object &&
+               rt->primitive != PrimitiveType::None;
+    if (rt->kind == TypeRef::Kind::Named && rt->declaration)
+        return rt->declaration->kind == ast::TypeDeclKind::Enum;
+    return false;
+}
+
+// §22.12 rule 2 form (iii) inline-array leg (fields only, gated by the
+// caller): a plain inline array (`[N]T`, no `owned` slot marker, §15.1)
+// whose element type is itself, recursively, form-(iii)-eligible. §15.1
+// currently forbids an inline array being the element of another inline
+// array (`[N][M]T` is a compile error), so the recursive arm is unreachable
+// today; it is kept because the spec text states the admission recursively
+// and a future multi-dimensional-array revision should not have to
+// rediscover this.
+static bool isForm3EligiblePlainInlineArray(const TypeRef* rt) {
+    if (!rt || rt->kind != TypeRef::Kind::InlineArray) return false;
+    if (rt->arrayOwned) return false;
+    const TypeRef* elem = rt->arrayElement;
+    if (!elem) return false;
+    return isForm3PrimitiveOrEnum(elem) || isForm3EligiblePlainInlineArray(elem);
+}
+
+// §22.12 rule 2 residual: `string`/`string?`.
+static bool isStringTypeRef(const TypeRef* rt) {
+    return rt && rt->kind == TypeRef::Kind::Primitive &&
+           rt->primitive == PrimitiveType::String;
+}
+
+// §22.12 rule 2 residual: a user-declared record type.
+static bool isRecordTypeRef(const TypeRef* rt) {
+    return rt && rt->kind == TypeRef::Kind::Named && rt->declaration &&
+           rt->declaration->kind == ast::TypeDeclKind::Record;
+}
+
+// §22.12 rule 2 residual: a user-declared choice type (§35).
+static bool isChoiceTypeRef(const TypeRef* rt) {
+    return rt && rt->kind == TypeRef::Kind::Named && rt->declaration &&
+           rt->declaration->kind == ast::TypeDeclKind::Choice;
+}
+
+// §22.12 rule 2 residual: a compiler-known value-builtin type (DateTime,
+// Guid, TimeSpan, CancellationToken, Range, …). Mirrors the two shapes these
+// reach TypeResolution as (SemaContext.hpp's isValueBuiltinByName doc
+// comment): a synthesized TypeSymbol with isValueBuiltin=true (reached via
+// ExprTypecheck's `new T()` inference), or — the shape a declared static
+// FIELD/property's type actually resolves to — a Named TypeRef with
+// declaration=null whose syntactic head is one of the registered names.
+static bool isValueBuiltinTypeRef(const TypeRef* rt) {
+    if (!rt || rt->kind != TypeRef::Kind::Named) return false;
+    if (rt->declaration) return rt->declaration->isValueBuiltin;
+    return isValueBuiltinByName(rt->headName());
+}
+
+// Primitive-type keyword spelling for diagnostics (mirrors
+// ExprTypecheck_Calls.cpp's file-local spellTypeRefForDiag switch, which is
+// not visible from this translation unit).
+static const char* primitiveKeyword(PrimitiveType p) {
+    switch (p) {
+        case PrimitiveType::Bool:    return "bool";
+        case PrimitiveType::Char:    return "char";
+        case PrimitiveType::String:  return "string";
+        case PrimitiveType::Byte:    return "byte";
+        case PrimitiveType::SByte:   return "sbyte";
+        case PrimitiveType::Short:   return "short";
+        case PrimitiveType::UShort:  return "ushort";
+        case PrimitiveType::Int:     return "int";
+        case PrimitiveType::UInt:    return "uint";
+        case PrimitiveType::Long:    return "long";
+        case PrimitiveType::ULong:   return "ulong";
+        case PrimitiveType::Float:   return "float";
+        case PrimitiveType::Double:  return "double";
+        case PrimitiveType::Decimal: return "decimal";
+        case PrimitiveType::Object:  return "Object";
+        default:                     return "?";
+    }
+}
+
+// Display spelling of a static field/property's VALUE-kind type for a
+// diagnostic (primitives, enums/records/choices/value-builtins, inline
+// arrays, function types, the unit type) — the counterpart to
+// staticRefTypeName above, which only handles the reference-type path.
+static std::string describeStaticValueType(const TypeRef* rt) {
+    if (!rt) return "?";
+    switch (rt->kind) {
+        case TypeRef::Kind::Primitive: {
+            std::string s(primitiveKeyword(rt->primitive));
+            if (rt->nullable) s += '?';
+            return s;
+        }
+        case TypeRef::Kind::Named: {
+            std::string s = rt->declaration ? std::string(rt->declaration->name)
+                                            : std::string(rt->headName());
+            if (s.empty()) s = "?";
+            if (rt->nullable) s += '?';
+            return s;
+        }
+        case TypeRef::Kind::InlineArray: {
+            std::string s = "[";
+            s += rt->arraySizeValue >= 0 ? std::to_string(rt->arraySizeValue)
+                                          : "N";
+            if (rt->arrayOwned) s += " owned";
+            s += "]";
+            s += describeStaticValueType(rt->arrayElement);
+            return s;
+        }
+        case TypeRef::Kind::Function:
+            return "<function type>";
+        case TypeRef::Kind::Unit:
+            return "()";
+        case TypeRef::Kind::Error:
+            return "?";
+    }
+    return "?";
+}
+
 void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
     // §22.12 rule 2 (v0.181, #1556): a mutable static reference field/property is
     // a compile error unless its type is a form-(i) synchronized handle or a
@@ -6259,6 +6397,135 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
             "domain or ensure its own internal synchronization "
             "(§22.12 rule 4, #1363)");
     };
+    // §22.12 rule 2 forms (iii)/(iv) + residual (#1393 warned-admission
+    // ruling): a mutable static NOT governed by the class/interface path
+    // above (isRule2GovernedReference) is a primitive/enum/plain-inline-array
+    // (form iii, WARNING), an owning-inline-array FIELD (form iv, WARNING),
+    // or one of the residual categories the ruling declined to admit
+    // (`string`, records, choices, value builtins, function types,
+    // generic-parameter types, disqualified inline arrays, and any
+    // inline-array-typed auto-property) — a compile ERROR naming rule 2.
+    // `isField` distinguishes the FIELDS-only admission of (iii)'s
+    // inline-array leg and all of (iv) from the auto-property case, where
+    // every inline-array shape is a residual error regardless of element
+    // type or `owned`-ness.
+    auto reportValueStatic = [&](const TypeRef* rt, std::string_view name,
+                                 std::string_view what, SourceLocation loc,
+                                 bool isField) {
+        if (!rt || rt->kind == TypeRef::Kind::Error) return;
+
+        // Form (iii) primitive/enum leg — admitted for fields AND
+        // auto-properties alike; the "fields only" qualifier in the spec
+        // text scopes only the inline-array alternative below.
+        if (isForm3PrimitiveOrEnum(rt)) {
+            ctx_.diagnostics().report(
+                Severity::Warning, loc,
+                std::string("mutable static ") + std::string(what) + " `" +
+                std::string(name) + "` has type `" +
+                describeStaticValueType(rt) + "` — a primitive/enum value "
+                "static is admitted only with a declaration-site warning "
+                "(§22.12 rule 2 form (iii)): the storage is process-global "
+                "and reachable from every domain; confine every read and "
+                "write to one domain, or use a synchronized spelling "
+                "(`AtomicInteger<T>`/`Atomic<T>` for the cell-sized "
+                "primitives, a `Mutex`/`Locked<T>` cell for `decimal` and "
+                "enums) (§22.12 rule 2, v0.221, #1393)");
+            return;
+        }
+
+        // Inline-array-typed statics: (iii)'s array leg and all of (iv) are
+        // FIELDS only — an inline-array-typed auto-property is a residual
+        // error regardless of element type or `owned`-ness.
+        if (rt->kind == TypeRef::Kind::InlineArray) {
+            if (!isField) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("mutable static ") + std::string(what) +
+                    " `" + std::string(name) + "` has inline-array type `" +
+                    describeStaticValueType(rt) + "`; §22.12 rule 2 admits "
+                    "inline-array-typed mutable statics for FIELDS only "
+                    "(forms (iii)/(iv)) — an inline-array-typed auto-"
+                    "property is not admitted (§22.12 rule 2, v0.221, "
+                    "#1393)");
+                return;
+            }
+            if (rt->arrayOwned) {
+                ctx_.diagnostics().report(
+                    Severity::Warning, loc,
+                    std::string("mutable static ") + std::string(what) +
+                    " `" + std::string(name) +
+                    "` has owning-inline-array type `" +
+                    describeStaticValueType(rt) + "` — admitted with a "
+                    "declaration-site warning (§22.12 rule 2 form (iv)): "
+                    "the array's owned instances are reachable from every "
+                    "domain and its slots are mutable; confine every slot "
+                    "read/write, `move arr[j]`, and whole-field "
+                    "reassignment to one domain, or restructure behind a "
+                    "`Locked<T>` registry (§22.12 rule 2, v0.221, #1393)");
+                return;
+            }
+            if (isForm3EligiblePlainInlineArray(rt)) {
+                ctx_.diagnostics().report(
+                    Severity::Warning, loc,
+                    std::string("mutable static ") + std::string(what) +
+                    " `" + std::string(name) + "` has type `" +
+                    describeStaticValueType(rt) + "` — a plain inline array "
+                    "of primitive/enum element type is admitted only with "
+                    "a declaration-site warning (§22.12 rule 2 form (iii)): "
+                    "confine every read and write to one domain, or use a "
+                    "`Mutex`/`Locked<T>` cell (§22.12 rule 2, v0.221, "
+                    "#1393)");
+                return;
+            }
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("mutable static ") + std::string(what) + " `" +
+                std::string(name) + "` has type `" +
+                describeStaticValueType(rt) + "`, which §22.12 rule 2 does "
+                "not admit as a mutable static — a plain inline array's "
+                "element type is outside the primitive/enum recursion (a "
+                "`string`- or record-element array imports its element "
+                "category's dilemma; a class- or interface-element array "
+                "carries borrows, whose cross-domain dangling is memory-"
+                "unsafe) (§22.12 rule 2, v0.221, #1393)");
+            return;
+        }
+
+        // Residual: `string`, records, choices, value builtins, function
+        // types, generic-parameter types, the unit type — none admitted.
+        std::string_view reason;
+        if (isStringTypeRef(rt))
+            reason = "a `string`(-bearing) static's overwrite must either "
+                     "release the displaced referent (a cross-domain "
+                     "use-after-free) or never release it (an unbounded "
+                     "leak); use a `Mutex`/`Locked<T>` cell instead";
+        else if (isRecordTypeRef(rt))
+            reason = "a multi-word record static's torn cross-domain read "
+                     "can fabricate a value violating the record's own "
+                     "invariants; use a `Mutex`/`Locked<T>` cell instead";
+        else if (isChoiceTypeRef(rt))
+            reason = "a multi-word choice static's torn cross-domain read "
+                     "can fabricate an invalid value; use a "
+                     "`Mutex`/`Locked<T>` cell instead";
+        else if (isValueBuiltinTypeRef(rt))
+            reason = "compiler-known value-builtin types (DateTime, Guid, "
+                     "\xE2\x80\xA6) are not in the admitted category set; "
+                     "use a `Mutex`/`Locked<T>` cell instead";
+        else if (rt->kind == TypeRef::Kind::Function)
+            reason = "function-typed statics are not in the admitted "
+                     "category set";
+        else
+            reason = "the admitted category set (primitive/enum value "
+                     "statics, owning-inline-array fields, or the "
+                     "form-(i)/(ii) synchronized-handle/task-cache "
+                     "reference forms) does not include this type";
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            std::string("mutable static ") + std::string(what) + " `" +
+            std::string(name) + "` has type `" + describeStaticValueType(rt) +
+            "`, which §22.12 rule 2 does not admit as a mutable static — " +
+            std::string(reason) + " (§22.12 rule 2, v0.221, #1393)");
+    };
 
     for (Symbol* m : t->members) {
         // Check FieldSymbol (body fields, not positional record fields).
@@ -6270,10 +6537,15 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
             const TypeRef* rt = ctx_.resolvedType(*fd->type);
             if (!rt) continue;
 
-            if (!hasMod(fs, "readonly"))
-                reportRule2(rt, fs->name, "field", m->declLoc);
-            else
+            if (!hasMod(fs, "readonly")) {
+                if (isRule2GovernedReference(rt))
+                    reportRule2(rt, fs->name, "field", m->declLoc);
+                else
+                    reportValueStatic(rt, fs->name, "field", m->declLoc,
+                                      /*isField=*/true);
+            } else {
                 reportRule4(rt, fs->name, "field", m->declLoc);
+            }
             continue;
         }
 
@@ -6289,10 +6561,15 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
             const TypeRef* rt = ctx_.resolvedType(*pd->type);
             if (!rt) continue;
 
-            if (!hasMod(ps, "readonly"))
-                reportRule2(rt, ps->name, "property", m->declLoc);
-            else
+            if (!hasMod(ps, "readonly")) {
+                if (isRule2GovernedReference(rt))
+                    reportRule2(rt, ps->name, "property", m->declLoc);
+                else
+                    reportValueStatic(rt, ps->name, "property", m->declLoc,
+                                      /*isField=*/false);
+            } else {
                 reportRule4(rt, ps->name, "property", m->declLoc);
+            }
         }
     }
 }

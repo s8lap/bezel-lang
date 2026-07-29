@@ -7,12 +7,21 @@
 // lives in the TYPE, `[N owned]T` — §15.3), so it was never rejected even
 // before this fix; this locks the acceptance in as a regression guard.
 //
-// Clean-compile ACCEPT control: bezelc -c must exit zero and emit no diagnostics.
+// Legitimate test update for §22.12 rule 2 form (iv) (#1393 warned-admission
+// ruling, v0.221): a mutable owning-inline-array static FIELD is admitted
+// with a declaration-site WARNING (rule 2 was, until #1393 landed, entirely
+// silent on this shape — the old NODIAG-strict assertion below predates the
+// ruling and is now stale, not merely coincidentally different). §1557's
+// ACCEPTANCE is unchanged — bezelc -c still exits zero — only the "and emits
+// NO diagnostic" half of the old assertion is corrected.
+//
+// ACCEPT-WITH-WARNING control: bezelc -c must exit zero, but it DOES emit a
+// diagnostic — pinned below.
 //
 // RUN: %bezelc -c -o %t.o %s
-// RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
+// RUN: %bezelc -c %s 2>&1 | FileCheck %s
 
 module M; class Slot end Slot; static class Globals public static _arr: [2 owned]Slot? := [new Slot(), new Slot()]; end Globals;
 
-// NODIAG-NOT: error
-// NODIAG-NOT: §
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: mutable static field `_arr` has owning-inline-array type `[2 owned]Slot?` — admitted with a declaration-site warning (§22.12 rule 2 form (iv))
+// CHECK-SAME: (§22.12 rule 2, v0.221, #1393)

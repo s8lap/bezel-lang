@@ -43,6 +43,12 @@ int run(const std::string& prog) {
 // compile-time approximation does NOT see it. A.Y has a NON-constant initializer,
 // so its backing global is a default 0 while A.X is being computed — the shape
 // that silently observed partial state before the fix.
+//
+// `_f` is `readonly` (set once, never reassigned): §22.12 rule 2 (#1393,
+// v0.221) now rejects a MUTABLE static of function type as a residual
+// category, which is not this test's concern — the cycle backstop under
+// test is about static-init ordering/re-entrancy through a function-value
+// CALL, unaffected by the field's mutability.
 const char* kIntCycle =
     "class A "
     "  public static readonly X: int := B.GetX(); "
@@ -50,13 +56,14 @@ const char* kIntCycle =
     "  private static method Seed(): int => 1; "
     "end A; "
     "class B "
-    "  private static _f: () -> int := lambda() => A.Y; "
+    "  private static readonly _f: () -> int := lambda() => A.Y; "
     "  public static method GetX(): int => _f() + 100; "
     "end B; ";
 
 // The same cycle over a NON-NULLABLE string static. The re-entrant read observes
 // A.Y still null (its initializer has not run) — a dereference of that null
-// segfaulted before the fix.
+// segfaulted before the fix. `_f` is `readonly` for the same §22.12 rule 2
+// (#1393) reason as kIntCycle above.
 const char* kStrCycle =
     "class A "
     "  public static readonly X: string := B.GetX(); "
@@ -64,7 +71,7 @@ const char* kStrCycle =
     "  private static method Make(): string => \"world\"; "
     "end A; "
     "class B "
-    "  private static _f: () -> string := lambda() => A.Y; "
+    "  private static readonly _f: () -> string := lambda() => A.Y; "
     "  public static method GetX(): string => _f(); "
     "end B; ";
 }  // namespace

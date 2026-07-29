@@ -70,16 +70,44 @@ BEZEL_TEST(static_auto_property_743, bare_access_across_methods) {
         "end C;"), 3);
 }
 
-// §23.1: a reference-typed (string) static auto-property round-trips.
-BEZEL_TEST(static_auto_property_743, string_static_auto_property) {
-    BEZEL_EXPECT_EQ(run(
+// §22.12 rule 2 (#1393, v0.221): a MUTABLE static of `string` type is now a
+// residual compile error — this program is no longer legal Bezel. Before
+// #1393 landed, rule 2 was silent on `string` entirely (the exact
+// under-enforcement #1393 reports), so this shape compiled and this test
+// exercised the auto-property backing-store SET+GET round trip through it.
+// That round-trip mechanism for a reference type remains covered: the
+// backing-store LOAD path is proven for `string` by
+// static_auto_property_string_initializer_1146 below (a `static readonly
+// property Name: string := "hello";` reads its initializer correctly), and
+// the generic (type-independent) get/set STORE mechanism is proven by the
+// `int` cases above (set_then_get, read_modify_write,
+// bare_access_across_methods) — auto-property codegen does not special-case
+// the element type between a store to an `int` global and a store to a
+// `string` global. What is no longer legal — and now the regression this
+// case pins — is the MUTATION of a static `string`, which #1393 rejects
+// for the reason stated in the diagnostic below (an overwrite must either
+// UAF the displaced referent across domains or leak it unboundedly).
+BEZEL_TEST(static_auto_property_743, string_static_auto_property_now_rejected_1393) {
+    auto r = runAot(
         "module M; class C "
         "  public static property Name: string; "
         "  public static method Main(): int "
         "    C.Name := \"hi\"; "
         "    return (if C.Name = \"hi\" then 1 else 0); "
         "  end Main; "
-        "end C;"), 1);
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool foundRule2 = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("mutable static property `Name` has type "
+                            "`string`, which \xC2\xA7""22.12 rule 2 does "
+                            "not admit as a mutable static") !=
+                std::string::npos &&
+            d.message.find("(\xC2\xA7""22.12 rule 2, v0.221, #1393)") !=
+                std::string::npos)
+            foundRule2 = true;
+    }
+    BEZEL_EXPECT_TRUE(foundRule2);
 }
 
 // ── #1146 / §23.1: a static auto-property's CONSTANT inline initializer ───────
