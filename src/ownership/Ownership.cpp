@@ -2503,8 +2503,38 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                         ys->value.get())) {
                     if (id->name != "this" && id->name != "base") {
                         if (auto* st = lookupState(id->name)) {
-                            if (st->state == OwnershipState::Owned)
+                            // fix #1267 / §29.2 "Iterator yield ownership" +
+                            // §28.10 (axiom A5): the consume above is a MOVE OUT
+                            // of the named binding, and a `using var` /
+                            // `await using var` is a scope pin — "never movable
+                            // out". Every other owned-consuming position already
+                            // rejects it (`return b;` under an `owned` return, an
+                            // `owned` argument, `move b`, `using var y := owned b`,
+                            // an arm marker); the owning-yield position was the one
+                            // that did not, and silently marking the pin Disposed
+                            // here let BOTH the consumer (through `TakeCurrent()`)
+                            // and the frame's own scope-exit disposal
+                            // (`registerUsingDisposal`) free the same slot — the
+                            // #1267 double-dispose. Reject instead: the frame keeps
+                            // the pin, so nothing is handed out twice. A plain `var`
+                            // binding is the spelling that hands the value to the
+                            // consumer. // per §29.2, §28.10, axiom A5
+                            if (st->implicitDischarge) {
+                                report(
+                                    Severity::Error, id->span.begin,
+                                    std::string("cannot yield `using var` `") +
+                                    std::string(id->name) +
+                                    "` from an owning iterator; the owning "
+                                    "`yield return` of a named owned binding "
+                                    "transfers ownership to the consumer, and a "
+                                    "`using var` is scope-bound — it cannot be "
+                                    "moved out of (§29.2 / §28.10, axiom A5); "
+                                    "bind it with a plain `var` to hand it to the "
+                                    "consumer");
+                                st->state = OwnershipState::Poisoned;
+                            } else if (st->state == OwnershipState::Owned) {
                                 markDisposedByName(id->name, id->span.begin);
+                            }
                         }
                     }
                 }
