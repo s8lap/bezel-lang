@@ -12697,9 +12697,45 @@ void MethodOwnership::reportCallBounded(SourceLocation loc,
                std::string(sink));
 }
 
+void MethodOwnership::seedLambdaCallBoundedParams(const ast::LambdaExpr& lam) {
+    // §A.7 / §21.7: sema records each lambda's own parameter symbol list
+    // (position-for-position with lam.params) via ctx_.setLambdaParams during
+    // expression type-checking; look it up rather than re-deriving symbols —
+    // this is the same ParameterSymbol* that an IdentifierExpr referencing
+    // the parameter inside the body resolves to (ctx_.exprSymbol), which is
+    // what callBoundedSourceOf/callBoundedParams_ key on. // per §28.14, #1432
+    const std::vector<sema::Symbol*>* syms = ctx_.lambdaParams(&lam);
+    if (!syms) return;
+    for (sema::Symbol* sym : *syms) {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+        // A destructuring lambda parameter (§27.4) carries no `modifier` and
+        // resolves to a record type, never a function type — falls through
+        // fnTyped below naturally; no special case needed.
+        if (!ps || !ps->modifier.empty()) continue;
+        // Mirrors run()'s fnTyped test above verbatim (the ParameterSymbol
+        // shape is identical: an explicit annotation lives in `declType`, a
+        // context-inferred type — event-handler payload, #829 positional
+        // inference — lives in `resolvedDeclType`).
+        const sema::TypeRef* rt = ps->declType
+                                       ? ctx_.resolvedType(*ps->declType)
+                                       : ps->resolvedDeclType;
+        const bool fnTyped =
+            (rt && rt->kind == sema::TypeRef::Kind::Function) ||
+            (ps->declType && ps->declType->kind == ast::TypeKind::Function);
+        if (fnTyped) callBoundedParams_.insert(sym);
+    }
+}
+
 void MethodOwnership::callBoundedScan(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
-    if (callBoundedParams_.empty()) return;
+    // #1432: previously gated on `callBoundedParams_.empty()` — sound when
+    // the ONLY source of call-bounded parameters was the enclosing method's/
+    // constructor's own formals (seeded into callBoundedParams_ before this
+    // call). Now that a LAMBDA's own plain function-typed parameters are
+    // seeded lazily as the walk descends into each LambdaExpr
+    // (seedLambdaCallBoundedParams), a method with NO function-typed formal
+    // of its own can still contain a lambda that has one — the walk must
+    // always run so that descent reaches the lambda. // per §28.14, v0.177
     for (const auto& s : body)
         if (s) callBoundedWalkStmt(*s);
 }
@@ -13032,6 +13068,24 @@ void MethodOwnership::callBoundedWalkExpr(const ast::Expr& e) {
         return;
     }
     if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // #1432 (§28.14 v0.177): the lambda is a user-authored callee too —
+        // its OWN plain function-typed parameters are call-bounded within
+        // its own body, exactly as an enclosing method's/constructor's
+        // formals are (run()'s seeding). Without this, a lambda could
+        // launder a callback past the check a method formal gets:
+        // `var sink := lambda(cb: () -> ()) => do _f := cb; end;`. Seeded
+        // for the REST of the method's §28.14 pre-passes (not popped after
+        // this lambda's own body walk): `scopedPreScan`'s deferred
+        // `checkScopedAdmission` queue runs AFTER this whole walk finishes
+        // (run()'s call order is `callBoundedScan(body); scopedPreScan(body);
+        // …`), so a lambda's own parameter forwarded to a `scoped` position
+        // from inside that SAME lambda's body must still be classified
+        // call-bounded when that later admission check runs. This is sound:
+        // each lambda occurrence mints its own distinct ParameterSymbol* (no
+        // two lambdas — sibling or nested — ever share one), so leaving an
+        // entry resident cannot make an unrelated identifier in a different
+        // lambda (or the enclosing method) resolve to it. // per §28.14, #1432
+        seedLambdaCallBoundedParams(*lam);
         // Walk the lambda BODY: a store that executes when the closure runs
         // (`() => do _f := f; end`) is still a store of the call-bounded
         // value. The lambda VALUE's own escape is judged at its use sites

@@ -3086,6 +3086,21 @@ private:
     void callBoundedScan(const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void callBoundedWalkStmt(const ast::Stmt& s);
     void callBoundedWalkExpr(const ast::Expr& e);
+    // #1432 (§28.14 v0.177): a LAMBDA is a user-authored callee too — its OWN
+    // plain function-typed parameters are call-bounded within its own body,
+    // exactly as an enclosing method's/constructor's formals are (the seeding
+    // in run() above). Called from callBoundedWalkExpr's LambdaExpr case
+    // before descending into the body; inserts each eligible parameter symbol
+    // (looked up via ctx_.lambdaParams, position-for-position with
+    // lam.params) into callBoundedParams_. NOT popped after the body walk:
+    // scopedPreScan's deferred checkScopedAdmission queue runs AFTER the
+    // whole callBoundedScan walk finishes and must still see a lambda's own
+    // parameter as call-bounded if it is forwarded to a `scoped` position
+    // from inside that same lambda's body. Sound because each lambda
+    // occurrence mints its own distinct ParameterSymbol* — no two lambdas
+    // (sibling or nested) ever share one, so a resident entry cannot make an
+    // unrelated identifier resolve to it. // per §28.14, v0.177, #1432
+    void seedLambdaCallBoundedParams(const ast::LambdaExpr& lam);
     // The call-bounded parameter `e` denotes or transitively carries (bare
     // identifier, carrier local, capturing lambda, conditional, collection
     // literal, postfix-bang), or null.
