@@ -1,6 +1,7 @@
 #include "module/ModuleLoader.hpp"
 
 #include <algorithm>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -834,6 +835,13 @@ static std::string buildSyntheticClassSource(
 // build remapped entries in the MAIN context (mainCtx):
 //   fresh IdentifierExpr* → fresh FieldSymbol   →  mainCtx[same expr*] = importedFieldSym
 //   fresh IdentifierExpr* → fresh ParamSymbol   →  mainCtx[same expr*] = importedParamSym
+//   fresh IdentifierExpr* → fresh LocalSymbol   →  mainCtx[same expr*] = SAME freshSym
+//     (#2290 bug 1: a `var`/`using var` LOCAL declared inside the ctor body has
+//     no imported counterpart to translate to — it is private to this body — so
+//     it is registered by IDENTITY. This only works if `freshSym` (and the
+//     TypeRefs it and the body's expressions carry) stay alive through codegen;
+//     see the ownImportedAuxiliary keep-alive below, mirroring #783's
+//     parseAndAttachMethodBody.)
 // Attaches the re-parsed ast::ConstructorDecl to `importedCs->decl` and keeps
 // the fresh SourceFile alive via mainCtx.ownImportedAst().
 // Returns false if parsing or sema failed (caller should leave decl=null).
@@ -852,22 +860,30 @@ static bool parseAndAttachCtorBody(
     auto sf = freshParser.parseCompilationUnit();
     if (!sf || freshDiag.hasErrors()) return false;
 
-    // Run the three sema passes in a fresh SemaContext.
-    DiagnosticEngine semaDiag;
-    sema::SemaContext freshCtx(semaDiag);
+    // §14/#662c / #2290: the fresh context AND its diagnostics must OUTLIVE
+    // this function, exactly as in #783's parseAndAttachMethodBody — codegen
+    // monomorphizes the ctor body per instantiation and, for a LOCAL variable
+    // declared inside the body (#2290 bug 1), the exprSymbol registered below
+    // for its references IS the fresh LocalSymbol itself (there is no imported
+    // symbol to translate to), so the fresh arena that owns it cannot be torn
+    // down on return. Heap-allocate both; SemaContext holds a
+    // DiagnosticEngine&, so the engine is owned first (destroyed last).
+    auto semaDiag = std::make_shared<DiagnosticEngine>();
+    auto freshCtxPtr = std::make_shared<sema::SemaContext>(*semaDiag);
+    sema::SemaContext& freshCtx = *freshCtxPtr;
     sema::collectSymbols(*sf, freshCtx);
-    if (semaDiag.hasErrors()) return false;
+    if (semaDiag->hasErrors()) return false;
     sema::resolveTypes(*sf, freshCtx);
-    if (semaDiag.hasErrors()) return false;
+    if (semaDiag->hasErrors()) return false;
     sema::typecheckExpressions(*sf, freshCtx);
     // Note: sema may emit errors for unsupported constructs (e.g. `base(...)`
     // chain on unknown base); tolerate those — we only need the exprSymbols.
     // A hard parse failure is caught above; sema errors here are usually
     // benign for the subset we're interested in (field assign + param refs).
-    // Note: sema may emit errors for unsupported constructs (e.g. `base(...)`
-    // chain on unknown base); tolerate those — we only need the exprSymbols.
-    // A hard parse failure is caught above; sema errors here are usually
-    // benign for the subset we're interested in (field assign + param refs).
+    // NOT tolerated: #710/#2290 sibling-type references (a call/`new` naming a
+    // type this synthetic reconstruction never declared) remain a silent-wrong-
+    // value risk this function does not attempt to fix — see #2290 bug 2 and
+    // #710 for the (XL, declaration-rewriting) follow-up.
 
     // Locate the fresh TypeSymbol and ConstructorSymbol in the fresh module.
     sema::TypeSymbol* freshType = nullptr;
@@ -949,10 +965,34 @@ static bool parseAndAttachCtorBody(
             auto it = importedMethods.find(freshMethodSigKey(freshMs));
             if (it != importedMethods.end())
                 mainCtx.setExprSymbol(expr, it->second);
+        } else if (dynamic_cast<sema::LocalSymbol*>(freshSym)) {
+            // §2290 bug 1: a LOCAL variable declared inside the ctor body
+            // (`var x := …;` / `using var x := …;`) has no counterpart in
+            // importedType's members — it is private to this body. Register the
+            // fresh LocalSymbol itself under mainCtx (kept alive below), so
+            // codegen's `ctx_.exprSymbol(expr)` finds the SAME symbol pointer at
+            // both the local's declaration (inlineCtorBody processes the
+            // attached ast::ConstructorDecl directly) and every later reference,
+            // instead of finding nothing and silently reading a default value.
+            mainCtx.setExprSymbol(expr, freshSym);
         }
         // Other symbols (TypeSymbol for type refs, etc.) are not remapped;
         // they are not needed by inlineCtorBody / implicitFieldAddr.
     }
+
+    // §2290 bug 1 / #783 precedent: copy the body's resolved-type and
+    // expr-type entries from the fresh context into mainCtx so codegen's
+    // per-instantiation monomorphization finds a type for LOCAL declarations
+    // and expressions the field/param/method remaps above don't cover (e.g. a
+    // local's declared/inferred type, or a `new OwningBuffer<int>(...)`
+    // sub-expression). The TypeRef* values point into the fresh context's
+    // arena, kept alive via ownImportedAuxiliary below; the AST-node keys are
+    // the re-parsed nodes, kept alive via ownImportedAst. Copying the whole map
+    // is harmless — the keys are unique to the fresh AST.
+    for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
+        if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
+    for (const auto& [expr, ref] : freshCtx.allExprTypes())
+        if (expr && ref) mainCtx.setExprType(expr, ref);
 
     // Attach the parsed ConstructorDecl and keep the AST alive.
     // Keep the backing source string alive too: all string_view fields in the
@@ -961,6 +1001,13 @@ static bool parseAndAttachCtorBody(
     importedCs->decl = parsedCd;
     mainCtx.ownImportedSource(std::move(source));
     mainCtx.ownImportedAst(std::move(sf));
+    // Keep the fresh context + diagnostics alive (#2290 bug 1: the LocalSymbol
+    // entries registered above point into freshCtx's arena). importedAuxiliary_
+    // destroys in REVERSE insertion order, and SemaContext holds a
+    // DiagnosticEngine&, so push the engine FIRST (destroyed last) and the
+    // context SECOND (destroyed first) — context-then-engine, never dangling.
+    mainCtx.ownImportedAuxiliary(semaDiag);
+    mainCtx.ownImportedAuxiliary(freshCtxPtr);
     return true;
 }
 

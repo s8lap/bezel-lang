@@ -43,6 +43,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/aot_support.hpp"  // #2290: aot_detail::spawnCaptured/hasSanitizerReport
 #include "test_harness.hpp"
 
 namespace bezel::module {
@@ -509,6 +510,74 @@ struct TempFile {
 void writeSource(const std::string& path, const std::string& src) {
     std::ofstream out(path);
     out << src;
+}
+
+// #2290 / #710: run a two-module (A-imports-B) executable under generated-code
+// AddressSanitizer/LeakSanitizer — the cross-module counterpart of
+// support/aot_support.hpp's runAotChecked, which only compiles a single module.
+// Compiles `aSrc` to a dependency object (plain, no sanitizer — see
+// bezelc's own "--sanitize=address applies to the executable build" rule),
+// then compiles+links `bSrc` against it with `opts.sanitizeAddress = true`, then
+// runs the executable with LeakSanitizer on and inspects both the exit status
+// and the captured ASan/LSan report text (aot_detail::hasSanitizerReport) — a
+// leak, double-free, or use-after-free in the imported ctor body's owned local
+// (inlined into B's IR by inlineCtorBody, §14.1) fails the assertion the same
+// way runAotChecked's single-module oracle does. Returns exit code, or -1 on
+// any build/run failure (caller inspects `*sawSanitizerReport`/`*built ok`).
+struct CrossModuleAsanResult {
+    bool builtOk = false;
+    bool ran = false;
+    bool sanitizerFired = false;
+    int exitCode = -1;
+    std::string sanitizerText;
+};
+
+CrossModuleAsanResult runCrossModuleChecked(const std::string& aSource,
+                                            const std::string& bSource) {
+    namespace aot_detail = bezel::test::aot_detail;
+    CrossModuleAsanResult result;
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_2290_asan_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+    TempFile sanOut((dir / (stem + ".san.txt")).string());
+    TempFile stdOut((dir / (stem + ".out.txt")).string());
+
+    writeSource(aSrc.path, aSource);
+    writeSource(bSrc.path, bSource);
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    if (!ra.success) return result;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+
+    codegen::CodegenOptions opts;
+    opts.sanitizeAddress = true;
+    bezel::CompileResult rb =
+        driver.compileFile(bSrc.path, bExe.path, deps, opts);
+    if (!rb.success) return result;
+    result.builtOk = true;
+
+    bool timedOut = false;
+    int status = aot_detail::spawnCaptured(
+        {bExe.path}, stdOut.path, sanOut.path, aot_detail::aotTimeoutSec(),
+        timedOut, {{"ASAN_OPTIONS", "detect_leaks=1:exitcode=99:abort_on_error=0"}});
+    if (timedOut) return result;
+
+    std::string sanText = aot_detail::slurp(sanOut.path);
+    bool crashed = WIFSIGNALED(status);
+    result.exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    result.ran = WIFEXITED(status);
+    result.sanitizerFired = crashed || aot_detail::hasSanitizerReport(sanText);
+    result.sanitizerText = std::move(sanText);
+    return result;
 }
 
 }  // namespace
@@ -3168,6 +3237,219 @@ BEZEL_TEST(cross_module_import,
     int status = std::system(bExe.path.c_str());
     int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
     BEZEL_EXPECT_EQ(code, 4);
+}
+
+// ---------------------------------------------------------------------------
+// §14 / #662c / #2290 (bug 1): imported generic-class ctor body — a LOCAL
+// VARIABLE declared inside the reconstructed ctor body
+// ---------------------------------------------------------------------------
+// Root cause (issue #2290 bug 1): parseAndAttachCtorBody's fresh-context->
+// mainCtx remap loop (ModuleLoader.cpp) handled only FieldSymbol, ParameterSymbol
+// and MethodSymbol — a `var`/`using var` LOCAL declared inside the ctor body has
+// no imported counterpart to translate to, so its exprSymbol entries were never
+// registered in mainCtx, and the fresh SemaContext that owned the LocalSymbol was
+// destroyed on return (only the AST/source were kept alive). codegen's
+// `ctx_.exprSymbol()` lookup on a later reference then found nothing, silently
+// reading the type's default value instead of the local's actual value — a
+// return of `0` where the spec-correct answer is nonzero, with NO diagnostic.
+// Fix (ModuleLoader.cpp parseAndAttachCtorBody): register each fresh LocalSymbol
+// under mainCtx BY IDENTITY (mirroring #783's parseAndAttachMethodBody), and keep
+// the fresh SemaContext + DiagnosticEngine alive via mainCtx.ownImportedAuxiliary
+// (shared_ptr, engine-then-context per #783's precedent) so the registered
+// pointers stay valid through codegen; also copies resolvedTypes/exprTypes for
+// the same reason. Cross-TYPE references (issue #2290 bug 2 / #710's own ask —
+// a call/`new` naming a SIBLING type) are NOT addressed by this fix; see #710.
+// ---------------------------------------------------------------------------
+
+// (31) §14/#2290 bug 1: a plain (non-owned) local inside the ctor body must be
+// read correctly, not silently default to 0. Exact repro from #2290 bug 1.
+BEZEL_TEST(cross_module_import,
+           imported_generic_ctor_body_local_var_read_native_spec_14_2290) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_2290_localvar_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module Gen2290Lib; "
+        "public class Wrapper<T> "
+        "  public val: T; "
+        "  public len: int := 0; "
+        "  public constructor(v: T) "
+        "    var x := 5; "
+        "    len := x; "
+        "    val := v; "
+        "  end constructor; "
+        "end Wrapper;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import Gen2290Lib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var w := new Wrapper<int>(7); "
+        "    return w.len; "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    // Before the fix: silently reads 0 (the local's read is dropped). After: 5.
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 5);
+}
+
+// (32) §14/#2290 bug 1 / §28.9 / #710: an OWNED local of a non-trivial-dispose
+// STDLIB type (`OwningBuffer<int>`, stdlib §4.14 — "both [class- and value-typed
+// T] are non-trivial-dispose... the user must discharge the buffer") declared
+// inside the ctor body — this is #710's own "owned local in the ctor body" ask,
+// for the subset that does NOT need a sibling-type stub (OwningBuffer is always
+// in scope; no #428-sized declaration-rewriting foundation required). Verifies
+// BOTH the value read through the local AND — the actual point of an "owned"
+// local — that its disposal fires under ASan/LSan with no leak, double-free, or
+// use-after-free, in the IMPORTING module's program.
+BEZEL_TEST(cross_module_import,
+           imported_generic_ctor_body_owned_local_disposed_once_spec_14_28_9_2290) {
+    std::string aSource =
+        "module Gen2290BufLib; "
+        "public class Wrapper<T> "
+        "  public val: T; "
+        "  public len: int := 0; "
+        "  public constructor(v: T) "
+        "    using var buf := new OwningBuffer<int>(4); "
+        "    buf[0] := 42; "
+        "    len := buf[0]; "
+        "    val := v; "
+        "  end constructor; "
+        "end Wrapper;";
+    std::string bSource =
+        "module App; "
+        "import Gen2290BufLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var w := new Wrapper<int>(1); "
+        "    return w.len; "
+        "  end Main; "
+        "end Program;";
+
+    CrossModuleAsanResult r = runCrossModuleChecked(aSource, bSource);
+    BEZEL_EXPECT_TRUE(r.builtOk);
+    if (!r.builtOk) return;
+    BEZEL_EXPECT_TRUE(!r.sanitizerFired);
+    if (r.sanitizerFired) return;  // report already captured in r.sanitizerText
+    BEZEL_EXPECT_TRUE(r.ran);
+    // Before the fix: buf[0]'s read is dropped, len reads 0. After: 42, and the
+    // OwningBuffer's allocation is disposed exactly once (no LSan leak report,
+    // no ASan double-free/UAF report) at the `using var` scope end.
+    BEZEL_EXPECT_EQ(r.exitCode, 42);
+}
+
+// (33) Adversarial self-pass (b): TWO instantiations of the same imported
+// generic class, each with its OWN owned local in its ctor body, both disposed
+// correctly — the per-instantiation inline emission (#14.1) must not share or
+// double-dispose the local's storage across instantiations.
+BEZEL_TEST(cross_module_import,
+           imported_generic_ctor_body_owned_local_two_instantiations_spec_14_2290) {
+    std::string aSource =
+        "module Gen2290Buf2Lib; "
+        "public class Wrapper<T> "
+        "  public val: T; "
+        "  public len: int := 0; "
+        "  public constructor(v: T) "
+        "    using var buf := new OwningBuffer<int>(4); "
+        "    buf[0] := 42; "
+        "    len := buf[0]; "
+        "    val := v; "
+        "  end constructor; "
+        "end Wrapper;";
+    std::string bSource =
+        "module App; "
+        "import Gen2290Buf2Lib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var w1 := new Wrapper<int>(1); "
+        "    using var w2 := new Wrapper<string>(\"hi\"); "
+        "    return w1.len + w2.len; "
+        "  end Main; "
+        "end Program;";
+
+    CrossModuleAsanResult r = runCrossModuleChecked(aSource, bSource);
+    BEZEL_EXPECT_TRUE(r.builtOk);
+    if (!r.builtOk) return;
+    BEZEL_EXPECT_TRUE(!r.sanitizerFired);
+    if (r.sanitizerFired) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 84);  // 42 + 42, both instantiations disposed once
+}
+
+// (34) Adversarial self-pass (a): the IMPORTING module declares its OWN local
+// variable with the SAME NAME ("buf") as the ctor body's reconstructed local.
+// Since the fix remaps by fresh-Symbol-pointer IDENTITY (not by name lookup
+// against mainCtx), the two `buf`s must not collide or alias.
+BEZEL_TEST(cross_module_import,
+           imported_generic_ctor_body_local_name_collision_spec_14_2290) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_2290_collide_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module Gen2290ColLib; "
+        "public class Wrapper<T> "
+        "  public val: T; "
+        "  public len: int := 0; "
+        "  public constructor(v: T) "
+        "    var buf := 5; "
+        "    len := buf; "
+        "    val := v; "
+        "  end constructor; "
+        "end Wrapper;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import Gen2290ColLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var buf := 999; "
+        "    using var w := new Wrapper<int>(1); "
+        "    return w.len + buf; "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    // Wrapper<int>(1).len == 5 (own body's `buf`) + the caller's own `buf` == 999
+    // → 1004, masked to WEXITSTATUS's 0..255 range: 1004 % 256 == 236.
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 1004 % 256);
 }
 
 // ---------------------------------------------------------------------------
