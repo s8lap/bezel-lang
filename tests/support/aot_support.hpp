@@ -666,24 +666,32 @@ inline void noteForkFailureDegradation(int savedErrno) {
     std::fflush(stderr);
 }
 
-// Compile `srcPath` to the native executable `exePath` via `Driver::compileFile`
-// run in a fork()ed CHILD (crash- and hang-isolated, qr1 M1). `opts` selects the
-// codegen mode (e.g. sanitizeAddress for the checked leg — S3). The child's
-// stderr (diagnostics + any clang link error) is captured, bounded, into the
-// result. fork() failure is FATAL by default (#1861: refuse the un-isolated
+// Run one REAL driver step in a fork()ed CHILD (crash- and hang-isolated, qr1
+// M1). The child's stderr (diagnostics + any clang link error) is captured,
+// bounded, into the result. fork() failure is FATAL by default (#1861: refuse the un-isolated
 // compile so process isolation is never silently lost — the basis for the
 // shard-authoritative gate having no serial backstop); it is always LOUD
 // (noteForkFailureDegradation), and BEZEL_AOT_FORKFAIL_FATAL=0 opts back into a
 // graceful in-process (un-isolated) fallback — same policy runJit had.
-inline CompileStatus forkedCompile(const std::string& srcPath,
-                                   const std::string& exePath,
-                                   const codegen::CodegenOptions& opts,
-                                   const std::string& ccErrPath) {
+//
+// GENERIC over the driver call (`work`, returning the driver's success flag) so
+// the three shapes the harness needs — compile+link in one step, compile-only,
+// link-only — share ONE copy of the isolation, capture, deadline, token and
+// fork-failure machinery. `producedPath` is the artifact the step must leave on
+// disk; `product` names it in the "reported success but produced nothing"
+// diagnostic.
+template <typename Work>
+inline CompileStatus forkedDriverStep(Work&& work,
+                                      const std::string& producedPath,
+                                      const char* product,
+                                      const std::string& ccErrPath) {
     // Bound machine-wide concurrent compiles (#1780). Held for the whole
     // compile+link (both the forked and the fork-failure in-process path) and
     // released when this function returns — including on timeout/crash, since
     // the parent always reaps before returning. Acquired BEFORE the fork so the
-    // front-end + clang/ld link all run under the one token.
+    // front-end + clang/ld link all run under the one token. The split steps
+    // take a token each, so the machine-wide bound is unchanged: a compile and
+    // its link are sequential, never concurrent.
     LinkToken linkToken;
 
     auto rejectFrom = [](std::string err, int code) -> CompileStatus {
@@ -723,8 +731,7 @@ inline CompileStatus forkedCompile(const std::string& srcPath,
             ::dup2(fd, STDERR_FILENO);
             ::close(fd);
         }
-        Driver driver;
-        CompileResult cc = driver.compileFile(srcPath, exePath, /*deps=*/{}, opts);
+        const bool ok = work();
         if (saved >= 0) {
             std::fflush(stderr);
             std::cerr.flush();
@@ -732,8 +739,8 @@ inline CompileStatus forkedCompile(const std::string& srcPath,
             ::close(saved);
         }
         std::string err = slurp(ccErrPath);
-        if (cc.success && fs::exists(exePath)) return {CompileOutcome::Ok, err, 0};
-        return rejectFrom(std::move(err), cc.success ? 0 : 1);
+        if (ok && fs::exists(producedPath)) return {CompileOutcome::Ok, err, 0};
+        return rejectFrom(std::move(err), ok ? 0 : 1);
     }
     if (pid == 0) {
         // ---- CHILD ----
@@ -770,15 +777,14 @@ inline CompileStatus forkedCompile(const std::string& srcPath,
             ::raise(SIGSEGV);
         }
 
-        Driver driver;
-        CompileResult cc = driver.compileFile(srcPath, exePath, /*deps=*/{}, opts);
+        const bool ok = work();
         std::fflush(stderr);
         std::cerr.flush();
         // _Exit (NOT exit): skip atexit handlers and static destructors in the
         // forked copy — the child's whole heap + LLVM allocator state is
         // reclaimed by the OS, keeping the parent's RSS flat (qr1 E1). Same
         // discipline as runJit's fork.
-        std::_Exit(cc.success ? 0 : 1);
+        std::_Exit(ok ? 0 : 1);
     }
 
     // ---- PARENT ----
@@ -810,15 +816,62 @@ inline CompileStatus forkedCompile(const std::string& srcPath,
     int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     if (code == 0) {
         // qr1 N3: guard against the impossible-but-cheap case of a "success"
-        // exit with no executable (would otherwise run a missing/stale exe).
-        if (!fs::exists(exePath)) {
+        // exit with no artifact (would otherwise run a missing/stale exe).
+        if (!fs::exists(producedPath)) {
             return {CompileOutcome::Infra,
-                    "runAot: driver reported success but produced no executable "
-                    "at " + exePath, 0};
+                    std::string("runAot: driver reported success but produced "
+                                "no ") + product + " at " + producedPath, 0};
         }
         return {CompileOutcome::Ok, err, 0};
     }
     return rejectFrom(std::move(err), code);
+}
+
+// Compile+link in ONE forked driver call — the un-split path, used whenever the
+// two-level cache is not in play (cache disabled, no sound identity, or the
+// crash-hook affordance armed). Byte-for-byte the pre-split behaviour.
+inline CompileStatus forkedCompile(const std::string& srcPath,
+                                   const std::string& exePath,
+                                   const codegen::CodegenOptions& opts,
+                                   const std::string& ccErrPath) {
+    return forkedDriverStep(
+        [&] {
+            Driver driver;
+            return driver.compileFile(srcPath, exePath, /*deps=*/{}, opts)
+                .success;
+        },
+        exePath, "executable", ccErrPath);
+}
+
+// The FRONT-END half, isolated identically: source → native object, no link.
+inline CompileStatus forkedCompileObject(const std::string& srcPath,
+                                         const std::string& objectPath,
+                                         const codegen::CodegenOptions& opts,
+                                         const std::string& ccErrPath) {
+    return forkedDriverStep(
+        [&] {
+            Driver driver;
+            return driver
+                .compileExecutableObject(srcPath, objectPath, /*deps=*/{}, opts)
+                .success;
+        },
+        objectPath, "object", ccErrPath);
+}
+
+// The LINK half, isolated identically: object → executable. Forked for the same
+// reason the compile is — a wedged `clang`/`ld` must hit the compile deadline
+// and be SIGKILLed rather than stall the shard to its 300s cap.
+inline CompileStatus forkedLink(const std::string& objectPath,
+                                const std::string& exePath,
+                                const codegen::CodegenOptions& opts,
+                                const std::string& ccErrPath) {
+    return forkedDriverStep(
+        [&] {
+            Driver driver;
+            return driver.linkExecutableObject(objectPath, exePath, /*deps=*/{},
+                                               opts);
+        },
+        exePath, "executable", ccErrPath);
 }
 
 // ── Content-addressed compiled-test cache (the "link-cache") ───────────────
@@ -876,15 +929,24 @@ inline CompileStatus forkedCompile(const std::string& srcPath,
 // driver deletes the .o after linking, and no metadata file is read back — so
 // the executable is the whole product and caching it is observationally exact.
 //
-// STORE: <cacheDir>/<first2>/<hash>, installed atomically (hardlink|copy to a
-// temp in the same dir, then rename) so concurrent shards race benignly. A hit
+// STORE: executables at <cacheDir>/<first2>/<hash>, objects at
+// <cacheDir>/o/<first2>/<hash>, link products at <cacheDir>/l/<first2>/<hash>,
+// installed atomically (hardlink|copy to a temp
+// in the same dir, then rename) so concurrent shards race benignly. A hit
 // hardlinks (or, across a filesystem boundary, copies) the cached exe into the
 // test's workdir and runs it as a fresh build would. A hit performs NO link, so
 // it does NOT consume a #1780 LinkToken.
 //
+// SPLIT (k3): the key above is now the FIRST of three lookups — see the "two-
+// level split" comment on computeObjectKey/computeLinkKey below for the object
+// and link keys that make a compiler-only or runtime-only rebuild keep half the
+// store warm. This key's composition is deliberately UNCHANGED so entries
+// stored before the split are still served.
+//
 // KNOBS: BEZEL_AOT_CACHE=0 disables (default ON); BEZEL_AOT_CACHE_DIR overrides
 // the location; BEZEL_AOT_CACHE_STATS=1 prints a hits/misses line at process
-// (shard) exit. GC: once per process, under an flock so only one shard sweeps,
+// (shard) exit. BEZEL_DUMP_IR bypasses the cache entirely (a served product
+// cannot print the IR the flag asks for). GC: once per process, under an flock so only one shard sweeps,
 // if the store exceeds the cap (BEZEL_AOT_CACHE_MAX_GB, default 64 GiB — sized
 // so full-suite ASan + plain products persist across gates, the point of the
 // k2 identity) the oldest-mtime entries are deleted down to 3/4 of the cap
@@ -935,15 +997,30 @@ inline bool sha256File(const std::string& path, std::array<uint8_t, 32>& out) {
     return true;
 }
 
-// SHA-256(compiler-identity ‖ runtime-library-identity), computed ONCE per
-// process (hashing the ~100 MB core archive or the test binary is a few
-// hundred ms; amortized over the whole shard it is negligible). Returns
-// nullptr if no identity input can be hashed — with no sound compiler identity
-// the cache DISABLES itself rather than risk a stale hit.
-inline const std::array<uint8_t, 32>* combinedIdentity() {
-    static std::array<uint8_t, 32> out{};
-    static const bool ok = [] {
+// The per-process build identity, computed ONCE (hashing the ~100 MB core
+// archive or the test binary is a few hundred ms; amortized over the whole
+// shard it is negligible).
+//
+// `compiler` and `runtime` are kept SEPARATE — that separation is what lets the
+// two-level cache key each build half on its own inputs (see the "k3" comment
+// below). `combined` is their SHA-256 in that order, i.e. byte-for-byte the
+// pre-split k2 identity, so every already-stored exe entry keyed under it stays
+// valid across this change.
+struct BuildIdentity {
+    bool usable = false;        // false => no sound identity; cache disabled
+    bool splitUsable = false;   // false => the two-level (k3) path is unsound here
+    std::array<uint8_t, 32> compiler{};  // core.a (guarded) or /proc/self/exe
+    std::array<uint8_t, 32> runtime{};   // libbezel_runtime.a; valid iff splitUsable
+    std::array<uint8_t, 32> combined{};  // SHA-256(compiler ‖ runtime) — the k2 key
+};
+
+inline const BuildIdentity& buildIdentity() {
+    // Leaked on purpose: read from cache paths that may run late in teardown.
+    static const BuildIdentity* id = [] {
+        auto* out = new BuildIdentity();
         llvm::SHA256 h;
+        bool haveRuntime = false;
+        std::array<uint8_t, 32> rtHash{};
 #ifdef BEZEL_RUNTIME_LIB_PATH
         // (b) the runtime archive is hashed FIRST and its readability is
         // REQUIRED: under the k2 identity it is load-bearing (core.a does not
@@ -953,10 +1030,19 @@ inline const std::array<uint8_t, 32>* combinedIdentity() {
         // sound identity exists for products linked NOW. Fail CLOSED (cache
         // disabled for this process) rather than mint under-keyed entries a
         // different runtime could later stale-hit.
-        std::array<uint8_t, 32> rtHash;
-        if (!sha256File(BEZEL_RUNTIME_LIB_PATH, rtHash)) return false;
+        if (!sha256File(BEZEL_RUNTIME_LIB_PATH, rtHash)) return out;  // unusable
+        haveRuntime = true;
+        // SOUNDNESS GUARD (new with the split): the harness hashes the archive
+        // at ITS macro, but the DRIVER links the archive at the macro compiled
+        // into bezel_core. CMake sets both from the same generator expression,
+        // so they agree — but if a future build ever let them diverge, the
+        // harness would be keying on an archive the link never consumed, i.e.
+        // exactly the stale-hit this key exists to prevent. Verify, and fail
+        // CLOSED (no cache at all) if they disagree.
+        if (Driver::runtimeLibraryPath() != std::string(BEZEL_RUNTIME_LIB_PATH))
+            return out;  // unusable
 #endif
-        bool haveIdentity = false;
+        bool haveCoreIdentity = false;
 #if defined(BEZEL_CORE_LIB_PATH) && defined(BEZEL_RUNTIME_LIB_PATH)
         // (a) k2: the compiler archive, guarded — only trusted when the
         // running binary is at least as new as the archive, i.e. it was linked
@@ -982,28 +1068,48 @@ inline const std::array<uint8_t, 32>* combinedIdentity() {
                     fs::last_write_time(BEZEL_CORE_LIB_PATH, ecCore2) ==
                         coreTime &&
                     !ecCore2) {
-                    h.update(llvm::ArrayRef<uint8_t>(coreHash.data(),
-                                                     coreHash.size()));
-                    haveIdentity = true;
+                    out->compiler = coreHash;
+                    haveCoreIdentity = true;
                 }
             }
         }
 #endif
-        if (!haveIdentity) {
+        if (!haveCoreIdentity) {
             // k1 fallback: the whole test binary (which contains the
             // whole-archived runtime). Conservative, never stale.
             std::array<uint8_t, 32> exeHash;
-            if (!sha256File("/proc/self/exe", exeHash)) return false;
-            h.update(llvm::ArrayRef<uint8_t>(exeHash.data(), exeHash.size()));
+            if (!sha256File("/proc/self/exe", exeHash)) return out;  // unusable
+            out->compiler = exeHash;
         }
-#ifdef BEZEL_RUNTIME_LIB_PATH
-        // (b): fold in the runtime archive the driver's link consumes.
-        h.update(llvm::ArrayRef<uint8_t>(rtHash.data(), rtHash.size()));
-#endif
-        out = h.final();
-        return true;
+        h.update(llvm::ArrayRef<uint8_t>(out->compiler.data(),
+                                         out->compiler.size()));
+        if (haveRuntime) {
+            // (b): fold in the runtime archive the driver's link consumes.
+            out->runtime = rtHash;
+            h.update(llvm::ArrayRef<uint8_t>(rtHash.data(), rtHash.size()));
+        }
+        out->combined = h.final();
+        out->usable = true;
+        // The two-level split is only sound when the runtime archive the link
+        // consumes is KNOWN and hashed: the link key's whole job is to make a
+        // runtime change invalidate link products, and with no runtime path
+        // there is nothing to key on. (That configuration cannot link a working
+        // Bezel program at all — the bz_* symbols would be undefined — so this
+        // is a belt-and-braces guard, not a live path.) Without it the single
+        // k2 exe key still applies, unchanged.
+        out->splitUsable = haveRuntime;
+        return out;
     }();
-    return ok ? &out : nullptr;
+    return *id;
+}
+
+// SHA-256(compiler-identity ‖ runtime-library-identity) — the k2 exe key's
+// identity component. Returns nullptr if no identity input can be hashed: with
+// no sound compiler identity the cache DISABLES itself rather than risk a stale
+// hit.
+inline const std::array<uint8_t, 32>* combinedIdentity() {
+    const BuildIdentity& id = buildIdentity();
+    return id.usable ? &id.combined : nullptr;
 }
 
 // The mode component of the key (c): every CodegenOptions bit that alters the
@@ -1044,11 +1150,170 @@ inline std::string computeCacheKey(std::string_view source,
     return toHex(h.final());
 }
 
+// ── The two-level ("k3") split of the same cache ───────────────────────────
+// WHY. Under the single k2 key above, the compiler archive and the runtime
+// archive are folded into ONE identity, so ANY src/ change invalidates EVERY
+// stored entry — and since ~92% of this project's src/ commits touch the
+// compiler while ~8% touch only the runtime, essentially every landing
+// re-cools the whole gate. The two archives are not, however, inputs to the
+// same build step:
+//
+//   object  = compileExecutableObject(source)   depends on: COMPILER, opts, source
+//   exe     = linkExecutableObject(object)      depends on: object, RUNTIME, recipe
+//
+// VERIFIED, not assumed: nothing under src/codegen, src/sema, src/ownership or
+// src/module includes a runtime header or names BEZEL_RUNTIME_LIB_PATH; the
+// runtime archive appears exactly once in the compiler, in Driver's link
+// command (Driver::linkCommandLine). Every ABI/layout constant codegen shares
+// with the runtime is a literal compiled INTO bezel_core, hence covered by the
+// compiler identity. So the emitted object is independent of the runtime
+// archive's bytes, and the split is exact — not an approximation.
+//
+// Keying each half on its own inputs therefore gives:
+//   * a runtime-only rebuild  → every cached OBJECT stays valid (no front-end
+//     work at all); only links re-run.
+//   * a compiler-only rebuild → every cached LINK stays valid for each object
+//     that came out byte-identical (i.e. all but the handful of tests the
+//     change actually affects), so the gate pays codegen but not the link.
+//
+// THE THREE KEYS (all SHA-256, all hex):
+//   KE ("k2;", unchanged) = H(compiler ‖ runtime ‖ mode ‖ source) → exe.
+//        The unchanged fast path: one hash, one hardlink, no object I/O, and —
+//        because its composition is untouched — every entry stored by the
+//        pre-split harness is still served.
+//   K1 ("k3o;") = H(compiler ‖ codegen-mode ‖ stdlib-prelude ‖ source) → object.
+//        The prelude (Driver::preludeSourceFingerprint) is the text the driver
+//        injects into EVERY compilation unit, so it is as much an input to the
+//        emitted object as the user's own source. It is keyed explicitly even
+//        though the compiler archive currently contains it — see composeObjectKey.
+//   K2 ("k3l;") = H(object-CONTENT-hash ‖ runtime ‖ link-recipe) → exe.
+//
+// WHY K2 KEYS ON THE RECIPE, NOT ON THE COMPILER. The link line itself is
+// compiler code (Driver::linkCommandLine), so a link key that ignored the
+// compiler would be stale after an edit that changes a link flag while leaving
+// codegen alone. Folding the whole compiler archive in would be sound but would
+// destroy the entire benefit (every compiler landing would re-cool links too).
+// K2 instead hashes the RECIPE — the actual command line, with only the
+// per-invocation object/exe paths and the runtime PATH abstracted
+// (Driver::linkRecipeSignature) — which is precisely the compiler-side input
+// the link depends on, and is derived from the same function that runs the
+// link, so it cannot drift.
+//
+// WHAT K2 STILL DOES NOT COVER, unchanged from k2: the external clang/ld
+// toolchain and the system libraries it links (libc/libm/libpthread/libstdc++,
+// the ASan runtime). A toolchain update should be paired with a cache wipe —
+// exactly the pre-existing caveat, no new gap.
+
+// The codegen-mode component of K1: every CodegenOptions bit that alters the
+// EMITTED OBJECT. All three do (sanitizeAddress adds the AddressSanitizer pass,
+// checkedDisposal emits §28.2 guards, isMainModule decides whether a native
+// `main` is lowered), so this is modeString's set under its own schema tag —
+// kept as a separate function so that if the two ever diverge (an option that
+// changes only the link line, say), each key can move independently.
+inline std::string codegenModeString(const codegen::CodegenOptions& opts) {
+    std::string s = "k3o;";
+    s += "sa=";  s += opts.sanitizeAddress ? '1' : '0';
+    s += ";cd="; s += opts.checkedDisposal ? '1' : '0';
+    s += ";mm="; s += opts.isMainModule ? '1' : '0';
+    s += ';';
+    return s;
+}
+
+// Driver::linkRecipeSignature, memoized per ASan mode (it is a pure function of
+// one bool, but it builds a string and is consulted on every cache lookup).
+inline const std::string& linkRecipeSignature(bool sanitizeAddress) {
+    static const std::string* plain =
+        new std::string(Driver::linkRecipeSignature(false));
+    static const std::string* asan =
+        new std::string(Driver::linkRecipeSignature(true));
+    return sanitizeAddress ? *asan : *plain;
+}
+
+// K1's composition, as a PURE function of its inputs — the process identity is
+// supplied by the caller. Split out from computeObjectKey so the cache-key
+// correctness test (tests/support/aot_cache_key_test.cpp) can vary one input at
+// a time and assert what does and does not move, without needing to doctor a
+// real archive on disk.
+//
+// `preludeText` is the auto-imported stdlib prelude the driver injects into
+// every compilation unit (Driver::preludeSourceFingerprint). It is a genuine
+// codegen input — the same user source compiled against a different prelude can
+// emit a different object — and is keyed EXPLICITLY even though today it also
+// lives inside the compiler archive that `compilerId` hashes. The redundancy is
+// deliberate: the archive covers it only because the text happens to be a
+// compiled-in constant, and a refactor that loaded the stdlib from disk would
+// silently drop that coverage while every test still passed. Keying the text
+// directly makes the property survive that refactor.
+inline std::string composeObjectKey(const std::array<uint8_t, 32>& compilerId,
+                                    const std::string& codegenMode,
+                                    std::string_view preludeText,
+                                    std::string_view source) {
+    llvm::SHA256 h;
+    h.update(llvm::ArrayRef<uint8_t>(compilerId.data(), compilerId.size()));
+    h.update(llvm::StringRef(codegenMode.data(), codegenMode.size()));
+    // Length-prefixed so no prelude/source boundary shuffle can collide.
+    const std::string plen = std::to_string(preludeText.size()) + ";";
+    h.update(llvm::StringRef(plen.data(), plen.size()));
+    h.update(llvm::StringRef(preludeText.data(), preludeText.size()));
+    h.update(llvm::StringRef(source.data(), source.size()));
+    return toHex(h.final());
+}
+
+// Driver::preludeSourceFingerprint, memoized (it is consulted on every lookup).
+inline const std::string& preludeFingerprint() {
+    static const std::string* v =
+        new std::string(Driver::preludeSourceFingerprint());
+    return *v;
+}
+
+// K2's composition, likewise pure. The TAG makes a link key structurally
+// distinct from an object key even if every other byte coincided.
+inline std::string composeLinkKey(const std::array<uint8_t, 32>& objectHash,
+                                  const std::array<uint8_t, 32>& runtimeId,
+                                  const std::string& recipe) {
+    llvm::SHA256 h;
+    static const char kTag[] = "k3l;";
+    h.update(llvm::StringRef(kTag, sizeof(kTag) - 1));
+    h.update(llvm::ArrayRef<uint8_t>(objectHash.data(), objectHash.size()));
+    h.update(llvm::ArrayRef<uint8_t>(runtimeId.data(), runtimeId.size()));
+    h.update(llvm::StringRef(recipe.data(), recipe.size()));
+    return toHex(h.final());
+}
+
+// K1: the OBJECT key — compiler identity ‖ codegen mode ‖ stdlib prelude ‖
+// source: every input the emitted object depends on. Deliberately free of any
+// runtime component (see above). "" when the split is unusable.
+inline std::string computeObjectKey(std::string_view source,
+                                    const codegen::CodegenOptions& opts) {
+    const BuildIdentity& id = buildIdentity();
+    if (!id.usable || !id.splitUsable) return {};
+    return composeObjectKey(id.compiler, codegenModeString(opts),
+                            preludeFingerprint(), source);
+}
+
+// K2: the LINK key — the object's CONTENT hash ‖ runtime identity ‖ recipe.
+// The object hash (not its cache key) is what makes this sound across a
+// compiler change: two different compilers that emit the same object bytes must
+// link to the same executable, and that is exactly what a hit asserts.
+// `sanitizeAddress` reaches the key only through the recipe, which spells the
+// `-fsanitize=address -g` flags out verbatim — so an ASan and a plain product
+// can never collide even before considering that their objects differ too.
+inline std::string computeLinkKey(const std::array<uint8_t, 32>& objectHash,
+                                  const codegen::CodegenOptions& opts) {
+    const BuildIdentity& id = buildIdentity();
+    if (!id.usable || !id.splitUsable) return {};
+    return composeLinkKey(objectHash, id.runtime,
+                          linkRecipeSignature(opts.sanitizeAddress));
+}
+
 // Per-process hit/miss counters (a hit is served from the cache; a miss ran the
 // real compiler — including reject/crash/timeout, which are never cacheable).
 struct CacheStats {
-    std::atomic<std::uint64_t> hits{0};
-    std::atomic<std::uint64_t> misses{0};
+    std::atomic<std::uint64_t> hits{0};      // executable served (KE or K2)
+    std::atomic<std::uint64_t> misses{0};    // the real linker ran
+    std::atomic<std::uint64_t> exeKeyHits{0};  // KE: whole build skipped
+    std::atomic<std::uint64_t> objHits{0};     // K1: front-end skipped
+    std::atomic<std::uint64_t> linkHits{0};    // K2: link skipped after a compile
 };
 inline CacheStats& cacheStats() {
     // Leaked on purpose: the BEZEL_AOT_CACHE_STATS atexit hook reads these
@@ -1074,9 +1339,14 @@ inline void ensureStatsAtExit() {
                 auto& s = cacheStats();
                 unsigned long long h = s.hits.load(std::memory_order_relaxed);
                 unsigned long long m = s.misses.load(std::memory_order_relaxed);
+                unsigned long long eh =
+                    s.exeKeyHits.load(std::memory_order_relaxed);
+                unsigned long long oh = s.objHits.load(std::memory_order_relaxed);
+                unsigned long long lh = s.linkHits.load(std::memory_order_relaxed);
                 std::fprintf(stderr,
-                    "[aot-cache] hits=%llu misses=%llu (%.0f%% hit) dir=%s\n",
-                    h, m, (h + m) ? 100.0 * h / (h + m) : 0.0,
+                    "[aot-cache] hits=%llu misses=%llu (%.0f%% hit) "
+                    "exe-key-hits=%llu obj-hits=%llu link-hits=%llu dir=%s\n",
+                    h, m, (h + m) ? 100.0 * h / (h + m) : 0.0, eh, oh, lh,
                     cacheDir().c_str());
             });
         }
@@ -1193,12 +1463,47 @@ inline void maybeGcCache() {
     (void)once;
 }
 
-// Compile `srcPath` to `exePath`, serving a cached link product when the key
-// (compiler ‖ runtime ‖ mode ‖ source) already has one. A hit runs NO link (and
-// no #1780 token); a miss delegates to forkedCompile and, on success, installs
-// the product. On a compile REJECT/CRASH/TIMEOUT nothing is cached (the real
-// diagnostics stay live). The returned CompileStatus is indistinguishable from
-// forkedCompile's — a hit yields {Ok, "", 0} with exePath populated.
+// Store paths. Whole-executable (KE) entries keep the original
+// <cacheDir>/<first2>/<key> layout so everything the pre-split harness stored is
+// still found; the two new kinds get their own prefix:
+//     <cacheDir>/o/<first2>/<key>   objects       (K1)
+//     <cacheDir>/l/<first2>/<key>   link products (K2)
+// The prefixes are one character and the KE subdirectories are two hex digits,
+// so the namespaces cannot collide. Segregating them is not required for
+// correctness (the keys are differently tagged) but it makes the store
+// self-describing: each kind can be counted, aged, or dropped on its own —
+// which is exactly what a "what would a runtime-only landing cost?" experiment
+// needs to do, and what makes the cache auditable rather than opaque.
+inline std::string exeEntryPath(const std::string& key) {
+    return cacheDir() + "/" + key.substr(0, 2) + "/" + key;
+}
+inline std::string objEntryPath(const std::string& key) {
+    return cacheDir() + "/o/" + key.substr(0, 2) + "/" + key;
+}
+inline std::string linkEntryPath(const std::string& key) {
+    return cacheDir() + "/l/" + key.substr(0, 2) + "/" + key;
+}
+
+// Compile `srcPath` to `exePath`, serving cached build products wherever the
+// inputs are unchanged. Three lookups, cheapest first (see the "k3" comment on
+// computeObjectKey/computeLinkKey for the keys and why each is sound):
+//
+//   1. KE — the whole executable, keyed exactly as before the split. On a
+//      fully-warm run this hits and the function is byte-for-byte the old fast
+//      path: one hash, one hardlink, no object I/O.
+//   2. K1 — the object. A hit means the front-end need not run (the compiler
+//      and the source are unchanged even though something else moved).
+//   3. K2 — the executable, keyed on the object's CONTENT. A hit means the link
+//      need not run (this exact object was already linked against this exact
+//      runtime with this exact recipe).
+//
+// A hit at 1 or 3 runs NO link (and holds no #1780 token for one). Whenever the
+// two-level path produces an executable it is ALSO stored under KE, so the next
+// run of the same tree collapses back to the single cheap lookup.
+//
+// On a compile REJECT/CRASH/TIMEOUT nothing is cached (the real diagnostics stay
+// live). The returned CompileStatus is indistinguishable from forkedCompile's —
+// a hit yields {Ok, "", 0} with exePath populated.
 inline CompileStatus cachedCompile(std::string_view source,
                                    const std::string& srcPath,
                                    const std::string& exePath,
@@ -1211,42 +1516,117 @@ inline CompileStatus cachedCompile(std::string_view source,
     // bypass it and the test would observe a successful run (a cache-on vs
     // cache-off divergence). When the hook is armed, always take the real
     // compile path. The hook is a test-only affordance, never set in normal runs.
-    if (std::getenv("BEZEL_AOT_TEST_CRASH_HOOK"))
+    //
+    // BEZEL_DUMP_IR is treated the same way: it asks the compiler to PRINT the
+    // module it emits, which a served product cannot do. A debugging affordance
+    // that silently produced no output would be worse than useless.
+    if (std::getenv("BEZEL_AOT_TEST_CRASH_HOOK") || std::getenv("BEZEL_DUMP_IR"))
         return forkedCompile(srcPath, exePath, opts, ccErrPath);
 
     if (!cacheEnabled())
         return forkedCompile(srcPath, exePath, opts, ccErrPath);
 
     ensureStatsAtExit();
-    const std::string key = computeCacheKey(source, opts);
-    if (key.empty())  // no sound compiler identity → never risk a stale hit
+    const std::string exeKey = computeCacheKey(source, opts);
+    if (exeKey.empty())  // no sound compiler identity → never risk a stale hit
         return forkedCompile(srcPath, exePath, opts, ccErrPath);
 
     maybeGcCache();  // once per process (guarded)
 
-    const std::string sub = cacheDir() + "/" + key.substr(0, 2);
-    const std::string cachePath = sub + "/" + key;
+    const std::string exePathInCache = exeEntryPath(exeKey);
+
+    // Best-effort LRU touch so a hot entry survives the size GC.
+    auto touch = [](const std::string& p) {
+        std::error_code e;
+        fs::last_write_time(p, fs::file_time_type::clock::now(), e);
+    };
+    auto installExe = [&](const std::string& from) {
+        if (!installFromCache(from, exePath)) return false;
+        cacheStats().hits.fetch_add(1, std::memory_order_relaxed);
+        touch(from);
+        return true;
+    };
 
     std::error_code ec;
-    if (fs::exists(cachePath, ec) && !ec) {
-        if (installFromCache(cachePath, exePath)) {
-            cacheStats().hits.fetch_add(1, std::memory_order_relaxed);
-            // Best-effort LRU touch so a hot entry survives the size GC.
-            std::error_code e2;
-            fs::last_write_time(cachePath,
-                                fs::file_time_type::clock::now(), e2);
-            return {CompileOutcome::Ok, {}, 0};
+    // ---- 1. whole-executable key (the unchanged fast path) ------------------
+    if (fs::exists(exePathInCache, ec) && !ec && installExe(exePathInCache)) {
+        cacheStats().exeKeyHits.fetch_add(1, std::memory_order_relaxed);
+        return {CompileOutcome::Ok, {}, 0};
+    }
+    // Install failed (disk error / vanished entry) → fall through rather than
+    // fail the test.
+
+    const std::string objKey = computeObjectKey(source, opts);
+    if (objKey.empty()) {
+        // The split is unusable in this configuration (no known runtime
+        // archive): fall back to the pre-split single-key behaviour exactly.
+        CompileStatus cc = forkedCompile(srcPath, exePath, opts, ccErrPath);
+        cacheStats().misses.fetch_add(1, std::memory_order_relaxed);
+        if (cc.outcome == CompileOutcome::Ok) {
+            fs::create_directories(fs::path(exePathInCache).parent_path(), ec);
+            storeToCache(exePath, exePathInCache);
         }
-        // Install failed (disk error / vanished entry) → fall through to a real
-        // compile rather than fail the test.
+        return cc;
     }
 
-    CompileStatus cc = forkedCompile(srcPath, exePath, opts, ccErrPath);
-    cacheStats().misses.fetch_add(1, std::memory_order_relaxed);
-    if (cc.outcome == CompileOutcome::Ok) {
-        fs::create_directories(sub, ec);
-        storeToCache(exePath, cachePath);  // best-effort atomic install
+    // ---- 2. object key -----------------------------------------------------
+    const std::string objPathInCache = objEntryPath(objKey);
+    const std::string objPath = exePath + ".o";   // the driver's own naming
+    bool haveObject = false;
+    if (fs::exists(objPathInCache, ec) && !ec) {
+        // Hardlink the cached object into the workdir BEFORE using it: that
+        // pins the inode, so a concurrent GC unlinking the entry between here
+        // and the link cannot turn a cache hit into a spurious test failure.
+        if (installFromCache(objPathInCache, objPath)) {
+            haveObject = true;
+            touch(objPathInCache);
+        }
     }
+    if (!haveObject) {
+        CompileStatus cc = forkedCompileObject(srcPath, objPath, opts, ccErrPath);
+        if (cc.outcome != CompileOutcome::Ok) {
+            cacheStats().misses.fetch_add(1, std::memory_order_relaxed);
+            return cc;   // reject / crash / timeout: never cached
+        }
+        fs::create_directories(fs::path(objPathInCache).parent_path(), ec);
+        storeToCache(objPath, objPathInCache);   // best-effort atomic install
+    } else {
+        cacheStats().objHits.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // ---- 3. link key, over the object's CONTENT ----------------------------
+    std::array<uint8_t, 32> objHash{};
+    const std::string linkKey =
+        sha256File(objPath, objHash) ? computeLinkKey(objHash, opts)
+                                     : std::string{};
+    std::string linkPathInCache;
+    if (!linkKey.empty()) {
+        linkPathInCache = linkEntryPath(linkKey);
+        if (fs::exists(linkPathInCache, ec) && !ec &&
+            installExe(linkPathInCache)) {
+            cacheStats().linkHits.fetch_add(1, std::memory_order_relaxed);
+            // Also record it under the whole-executable key so the next run of
+            // this tree takes lookup 1 and never touches the object at all.
+            fs::create_directories(fs::path(exePathInCache).parent_path(), ec);
+            storeToCache(exePath, exePathInCache);
+            std::error_code e2;
+            fs::remove(objPath, e2);
+            return {CompileOutcome::Ok, {}, 0};
+        }
+    }
+
+    cacheStats().misses.fetch_add(1, std::memory_order_relaxed);
+    CompileStatus cc = forkedLink(objPath, exePath, opts, ccErrPath);
+    if (cc.outcome == CompileOutcome::Ok) {
+        if (!linkKey.empty()) {
+            fs::create_directories(fs::path(linkPathInCache).parent_path(), ec);
+            storeToCache(exePath, linkPathInCache);
+        }
+        fs::create_directories(fs::path(exePathInCache).parent_path(), ec);
+        storeToCache(exePath, exePathInCache);
+    }
+    std::error_code e2;
+    fs::remove(objPath, e2);   // the driver removes its own .o; this is ours
     return cc;
 }
 
