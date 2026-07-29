@@ -6156,14 +6156,37 @@ bool Emitter::computeAncestorGenericSubst(
     const sema::TypeSymbol* cur = recvTy->declaration;
     if (cur == ancestor) return false;  // declared directly on receiver class
 
+    // §14.1 / §2.5 (fix #711): an IMPORTED type has NO ast::TypeDecl — its
+    // generic parameter names live on the TypeSymbol (built by
+    // ModuleLoader::convertGenericParams), exactly as fieldAddr's `!td`
+    // imported-generic branch already relies on. Read the names from whichever
+    // source exists: the AST decl for a locally-declared type (unchanged
+    // behaviour), the TypeSymbol otherwise. Without this the chain walk bailed
+    // on the FIRST `dynamic_cast<ast::TypeDecl*>` for a cross-module
+    // `Box<string> : Container<string>` (both imported), so the inherited base
+    // field `item` was read through the unspecialized T→i32 `%class.Container`
+    // template layout — `b.item.Length` loaded padding and returned 0.
+    auto genericParamNames =
+        [](const sema::TypeSymbol* ts) -> std::vector<std::string_view> {
+        std::vector<std::string_view> names;
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl)) {
+            names.reserve(td->genericParams.size());
+            for (const auto& gp : td->genericParams) names.push_back(gp.name);
+            return names;
+        }
+        names.reserve(ts->genericParams.size());
+        for (const sema::Symbol* gp : ts->genericParams)
+            if (gp) names.push_back(gp->name);
+        return names;
+    };
+
     // curArgs: the concrete TypeRefs bound to `cur`'s generic params at this
     // level. Seeded from the receiver's own generic args, then re-derived for
     // each base level by resolving the base ref's args through this map.
     std::unordered_map<std::string_view, const sema::TypeRef*> curArgs;
-    auto* curTd = dynamic_cast<const ast::TypeDecl*>(cur->decl);
-    if (!curTd || curTd->genericParams.size() != recvTy->genericArgs.size())
-        return false;
-    for (std::size_t gi = 0; gi < curTd->genericParams.size(); ++gi) {
+    const std::vector<std::string_view> curParams = genericParamNames(cur);
+    if (curParams.size() != recvTy->genericArgs.size()) return false;
+    for (std::size_t gi = 0; gi < curParams.size(); ++gi) {
         // §14.1 / §19.3 (v0.226, #2202): the receiver may itself have been
         // instantiated transitively inside an enclosing generic body, e.g.
         // `Outer<X>` creates `Sub<X>` where `Sub<U>: Base<U>`.  Its recorded
@@ -6173,7 +6196,7 @@ bool Emitter::computeAncestorGenericSubst(
         // step already resolves through curArgs.  With no active outer map the
         // substitution is identity, preserving the #585/#902/#747/#1101-C
         // direct, concrete-derived, synthesized-receiver, and layout paths.
-        curArgs[curTd->genericParams[gi].name] = substituteTypeRefLocal(
+        curArgs[curParams[gi]] = substituteTypeRefLocal(
             recvTy->genericArgs[gi], genericSubstSemaTy_);
     }
 
@@ -6196,20 +6219,36 @@ bool Emitter::computeAncestorGenericSubst(
         // arg passes through). If the base has params but no usable baseRef,
         // we cannot resolve — bail.
         std::unordered_map<std::string_view, const sema::TypeRef*> nextArgs;
-        auto* baseTd = dynamic_cast<const ast::TypeDecl*>(base->decl);
         if (!base->genericParams.empty()) {
-            if (!baseRef || !baseTd ||
-                baseTd->genericParams.size() != baseRef->genericArgs.size())
+            // fix #711: same AST-decl-or-TypeSymbol name source as the seed
+            // above, so an IMPORTED generic base resolves instead of bailing.
+            const std::vector<std::string_view> baseParams =
+                genericParamNames(base);
+            if (!baseRef || baseParams.size() != baseRef->genericArgs.size())
                 return false;
-            for (std::size_t gi = 0; gi < baseTd->genericParams.size(); ++gi) {
+            for (std::size_t gi = 0; gi < baseParams.size(); ++gi) {
                 const sema::TypeRef* arg = baseRef->genericArgs[gi];
-                if (arg && arg->kind == sema::TypeRef::Kind::Named &&
-                    !arg->declaration && arg->astNode && arg->astNode->name &&
-                    arg->astNode->name->parts.size() == 1) {
+                // A bare generic-parameter reference: locally that is a
+                // single-part Named ref with no declaration; for an IMPORTED
+                // base ref (fix #711) there is no astNode at all — the name
+                // rides `importedName` (ModuleLoader::convert, §2.5/#495), and
+                // headName() already reads it. Without this second form the
+                // `Container<T>` base ref of an imported `Box<T>` never
+                // resolved `T` through curArgs, so the ancestor substitution
+                // bound T to the bare-param ref and lowerTypeRef produced the
+                // i32 placeholder — a specialized-looking `Container$specN`
+                // with the WRONG (template) field layout.
+                const bool bareParam =
+                    arg && arg->kind == sema::TypeRef::Kind::Named &&
+                    !arg->declaration &&
+                    ((arg->astNode && arg->astNode->name &&
+                      arg->astNode->name->parts.size() == 1) ||
+                     (!arg->astNode && !arg->importedName.empty()));
+                if (bareParam) {
                     auto it = curArgs.find(arg->headName());
                     if (it != curArgs.end()) arg = it->second;
                 }
-                nextArgs[baseTd->genericParams[gi].name] = arg;
+                nextArgs[baseParams[gi]] = arg;
             }
         }
         cur = base;

@@ -290,6 +290,19 @@ public:
         }
         emittingGenericTemplateBody_ = false;  // #817: don't leak into ctors/etc.
         for (auto& [sym, fn] : ctorFns_) {
+            // §2.5 / §14 (issue #328 item 1, fix #711): an IMPORTED class's
+            // ctorFns_ entry is an EXTERNAL declaration — the DEFINING module
+            // owns `bz$<Type>$ctor` and emitted its body there. Skip it, exactly
+            // as the disposer loop below skips imported disposers. Without this,
+            // an imported GENERIC class whose ctor body was exported (#662
+            // Foundation C, so `cs->decl != nullptr`) had a second definition of
+            // the template symbol emitted importer-side by declareImportedCtor +
+            // this loop → `multiple definition of bz$Container$ctor` at link.
+            // That standalone copy is also DEAD: every use of an imported
+            // generic ctor goes through the per-instantiation inline path
+            // (lowerNew / emitChainCall → inlineCtorBody with genericSubst_
+            // active), never a call to the unspecialized template symbol.
+            if (ctx_.isImported(sym)) continue;
             emitConstructorBody(sym, fn);
         }
         for (auto& e : staticCtors_) {

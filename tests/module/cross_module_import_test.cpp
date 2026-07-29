@@ -3775,6 +3775,140 @@ BEZEL_TEST(cross_module_import,
     BEZEL_EXPECT_TRUE(!r->hadErrors);
 }
 
+// (27) §2.5 / §14 (fix #711, half 1 — SYMBOL OWNERSHIP): the DEFINING module
+// owns `bz$<Type>$ctor`; the importer must only ever DECLARE it.
+//
+// A local primary-constructor class `D(v: int) : Box<int>(v)` deriving an
+// IMPORTED GENERIC class makes codegen declare the base ctor
+// (emitImplicitBase → declareImportedCtor) while lowering `new D(7)` inside
+// Main — i.e. during the METHOD-body loop, so the entry is already in
+// `ctorFns_` when the constructor-body loop runs. That loop (unlike the
+// disposer loop beside it) did not skip IMPORTED constructors, and an imported
+// GENERIC class's ConstructorSymbol carries a re-parsed `decl` (#662
+// Foundation C), so `emitConstructorBody` emitted a SECOND definition of the
+// exporter's template symbol.
+//
+// WITHOUT the fix this test fails at the LINK step (`rb.success == false`):
+//   /usr/bin/ld: a.o: in function `bz$Box$ctor':
+//   multiple definition of `bz$Box$ctor'; b.o: first defined here
+// WITH the fix the importer emits only the external declaration, the call
+// binds to the exporter's definition, and the program returns `item` = 7.
+// This shape is NOT covered by the §14/#711 sema gate above (that gate fires
+// on `new ImportedGeneric<...>`; here the constructed type `D` is local).
+BEZEL_TEST(cross_module_import,
+           imported_generic_ctor_not_redefined_importer_side_spec_2_5_711) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bz711dup_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module Bz711CtorLib; "
+        "public class Box<T> "
+        "  public item: T; "
+        "  public constructor(v: T) item := v; end constructor; "
+        "end Box;");
+    writeSource(bSrc.path,
+        "module App711A; import Bz711CtorLib; "
+        "public class D(v: int) : Box<int>(v) end D; "
+        "class Program "
+        "  public static method Main(): int "
+        "    using var d := new D(7); "
+        "    return d.item; "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    // Before the fix this is where it broke: the linker rejected the duplicate
+    // `bz$Box$ctor` definition.
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 7);  // the imported base ctor stored 7 into `item`
+}
+
+// (28) §12 / §14.1 / §2.5 (fix #711, half 2 — INHERITED BASE FIELD LAYOUT):
+// a LOCAL generic class `D<T>` deriving an IMPORTED generic base `Box<T>` must
+// read/write the inherited `item: T` through the SPECIALIZED base layout.
+//
+// computeAncestorGenericSubst (the §585 base-chain walk that binds an
+// ancestor's generic params to the derived instantiation's concrete arguments)
+// read the parameter NAMES exclusively from `ast::TypeDecl`. An IMPORTED type
+// has no AST declaration — its parameter names live on the TypeSymbol
+// (ModuleLoader::convertGenericParams) — so the walk bailed on the first
+// `dynamic_cast` and left no substitution. `classStruct(Box)` then produced the
+// T→i32 TEMPLATE layout, and the inherited `item` was stored/read as an i32.
+//
+// WITHOUT the fix this test fails at COMPILE (`rb.success == false`) with an
+// IR-verifier report — the `ptr`-typed string field is GEP'd as i32:
+//   GEP base pointer is not a vector or a vector of pointers
+//     %13 = getelementptr inbounds nuw %bz.string, i32 %12, 0, 1
+// WITH the fix the ancestor substitution resolves T→string, the base subobject
+// is laid out with a `ptr` slot, and Main returns "hello".Length + 7 = 12.
+// This shape is NOT covered by the §14/#711 sema gate (the constructed type
+// `D<string>` is local, not imported).
+BEZEL_TEST(cross_module_import,
+           local_generic_derives_imported_generic_base_field_spec_12_14_711) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bz711anc_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module Bz711BaseLib; "
+        "public class Box<T> "
+        "  public item: T; "
+        "end Box;");
+    writeSource(bSrc.path,
+        "module App711B; import Bz711BaseLib; "
+        "public class D<T> : Box<T> "
+        "  public tag: int := 0; "
+        "  public constructor(v: T, t: int) item := v; tag := t; end constructor; "
+        "end D; "
+        "class Program "
+        "  public static method Main(): int "
+        "    using var d := new D<string>(\"hello\", 7); "
+        "    return d.item.Length + d.tag; "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    // Before the fix this is where it broke: IR verification rejected the
+    // i32-typed GEP into the inherited string field.
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 12);  // "hello".Length (5) + tag (7)
+}
+
 // §22.3 / issue #1221: a `ref` or `out` parameter of an IMPORTED method must be
 // passed by ADDRESS at the call site (not by loaded value). Before the fix the
 // else-branch (for ms->decl not an ast::MethodDecl) called lowerExpr for every
