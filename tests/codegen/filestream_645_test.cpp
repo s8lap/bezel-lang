@@ -33,7 +33,17 @@
 //   - Using FileStream through its `Stream` base (§7.1) — `Stream` is not a
 //     compiler-known type; only the concrete FileStream face is wired.
 //
-// Paths are unique per test (/tmp/bzt645_*) to avoid cross-test interference.
+// Paths are unique per test (/tmp/bzt645_*) to avoid cross-test interference —
+// the same convention as file_io_644_test.cpp. No two tests here share a path,
+// and no test depends on a file another test left behind (verified by running
+// the whole filter from a cleaned /tmp).
+//
+// If one of the runAotChecked cases below ever fails with a bare -999 (`ran` is
+// false), suspect BUILD CONTENTION before suspecting the code: these are the
+// most expensive links in the file (ASan-instrumented), so they are the first
+// to hit the harness's compile deadline when something else is rebuilding the
+// same tree. Re-run the suspect in isolation — `BEZEL_TEST_FILTER=<name>`, a
+// single-process run, with no concurrent build — before believing it.
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked
 #include "support/codegen_support.hpp"
@@ -426,9 +436,13 @@ BEZEL_TEST(filestream_645_7_2, repeated_open_and_dispose_leaks_nothing) {
 // crash and its disposal is a no-op. This pins the CURRENT behaviour, not a
 // spec rule — §7.5's IOException/FileNotFoundException surface is deferred with
 // the rest of the §7 error paths (see the header comment).
+// The path is under a directory that does not exist, so the open failure is
+// STRUCTURAL: unlike a plain unused filename, no stray probe or future test can
+// accidentally satisfy the precondition and turn this green for the wrong
+// reason.
 BEZEL_TEST(filestream_645_7_5, no_crash_on_missing_file_open) {
     BEZEL_EXPECT_EQ(runChecked(prog(
-        "using var r := new FileStream(\"/tmp/bzt645_absent_645.bin\", "
+        "using var r := new FileStream(\"/tmp/bzt645_no_such_dir/absent.bin\", "
         "                              FileMode.Open, FileAccess.Read); "
         "using var buf := new Array<byte>(4, byte(0)); "
         "var n := r.Read(buf, 0, 4); "
