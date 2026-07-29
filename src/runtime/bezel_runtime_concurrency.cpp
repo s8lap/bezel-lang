@@ -136,16 +136,157 @@ thread_local int g_task_then_depth = 0;
 // distinguish a SAME-thread re-entrant touch of an in-progress initializer —
 // which must raise a runtime-synthesized TypeInitializationException — from a
 // cross-domain touch on a different pool thread, which is the §22.12 rule-1
-// blocking case and is NOT synthesized here (that cross-domain waits-for /
-// blocking half is deliberately out of scope; tracked at #1391). The id is
-// drawn from a process-global atomic counter on first use per thread, so it is
-// unique per live thread and never 0 (0 marks "no owner recorded" in the
-// per-type owner-thread global).
+// blocking case (bz_static_init_wait below, #1391) and is NOT synthesized
+// here. The id is drawn from a process-global atomic counter on first use per
+// thread, so it is unique per live thread and never 0 (0 marks "no owner
+// recorded" in the per-type owner-thread global).
 extern "C" uint64_t bz_current_thread_id() {
     static std::atomic<uint64_t> next{1};
     static thread_local uint64_t id =
         next.fetch_add(1, std::memory_order_relaxed);
     return id;
+}
+
+// ---------------------------------------------------------------------------
+// bz_static_init_wait / bz_static_init_notify — §22.12 rule 1 (v0.228) cross-
+// domain blocking for lazy static initialization (#1391, the "blocking half";
+// the CAS-based double-init/torn-read half landed separately in
+// emitEnsureInitFns, LlvmBackend_Setup.cpp).
+// ---------------------------------------------------------------------------
+//
+// §22.12 rule 1: "a type's static initializer runs exactly once process-wide;
+// a domain touching a type mid-initialization by another domain blocks until
+// initialization completes (or observes the failed state, §22.7)."
+//
+// emitEnsureInitFns's `tryclaim` block makes the 0(uninit)->1(in-progress)
+// transition a single atomic compare-exchange, so at most one thread ever
+// becomes a type's initializer. Every OTHER thread whose CAS fails with
+// old==1 is routed (in the emitted IR, `chksame`) to one of two cases by
+// comparing the CURRENT thread id against the per-type owner-thread global
+// the winner recorded in initB:
+//   - SAME thread as the owner: the re-entrant self-reference case §22.13
+//     documents (a static helper the type's own initializer calls, which
+//     touches the type again) — proceeds immediately WITHOUT calling this
+//     function. It must not block: the thread IS the initializer, so nothing
+//     else could ever complete the initialization and unblock it.
+//   - a DIFFERENT thread: a genuine cross-domain touch. This is the only case
+//     that reaches bz_static_init_wait.
+//
+// Design: a process-global registry maps each type's per-type state-global
+// ADDRESS (`bz$T$initstate` — stable for the process lifetime, one such
+// global per type, emitted once by emitEnsureInitFns) to a lazily-created
+// {mutex, condvar} pair, mirroring the existing bz_task_t / condition_variable
+// pattern in this file (bz_task_await_sync / bz_task_complete) rather than
+// inventing a new primitive. The registry mutex is contended only at a type's
+// FIRST cross-domain wait, never while a thread is actually parked; a type
+// that is never cross-domain-contended never allocates an entry, and
+// notifyFn's registry lookup is a no-op for it (never allocates one just to
+// notify). Entries are never freed (a small, growth-bounded — one per
+// genuinely-contended type — process-lifetime table, matching this runtime's
+// other permanent small registries; still globally reachable, so this is not
+// an LSan-visible leak).
+//
+// Correctness (no lost wakeup): the emitted IR always performs the atomic
+// RELEASE store to the state global BEFORE calling bz_static_init_notify (see
+// doneB/failB, emitEnsureInitFns). bz_static_init_notify then takes the
+// per-type waiter's OWN mutex before calling notify_all, and
+// bz_static_init_wait takes that SAME mutex before its predicate-check loop.
+// Whichever side acquires the waiter's mutex first, the mutex's own
+// lock/unlock happens-before edge (independent of the state global's own
+// atomic ordering) guarantees the other side's subsequent state read observes
+// the completed transition: either the waiter is already parked in cv.wait()
+// (which atomically releases the mutex, so the notifier cannot acquire it and
+// call notify_all() without the waiter first being registered to receive it),
+// or the notifier's critical section fully precedes the waiter's, in which
+// case the waiter's own state re-check under the mutex (not the notify signal
+// itself) observes the update and returns without ever calling wait(). This
+// is the standard state-plus-condvar-plus-single-mutex pattern used elsewhere
+// in this file (bz_task_t::done / bz_task_complete / bz_task_await_sync).
+//
+// Lock-ordering / deadlock-freedom (verified against domain_drain, above):
+// domain_drain runs each continuation (`c.fn(c.task, c.state)`, where
+// ensureinit executes when a continuation touches a static) WITHOUT holding
+// dom->mtx (see the comment on that call). bz_static_init_wait/notify take
+// only the registry mutex (briefly) and a per-type waiter mutex — never a
+// bz_domain_t::mtx or BzScheduler::mtx — so this cannot deadlock through lock
+// ordering with the scheduler or a domain drain.
+//
+// A genuine runtime DEADLOCK is still possible here, but only for the case
+// §22.13's own text already names and accepts: "an undetected cycle spanning
+// two concurrently-initializing domains deadlocks in that blocking rather
+// than raising, an accepted bound: no cross-domain waits-for detection is
+// promised." Two types whose static initializers touch each other through a
+// path the compile-time cycle detector (StaticInitCycles.cpp) cannot see (a
+// function value, virtual dispatch, or a module boundary, §22.13 rule 1) and
+// that races onto two DIFFERENT threads will block each other forever — this
+// is the spec's own documented, accepted bound, not a defect introduced here.
+//
+// A bounded worker-pool thread that blocks here is unavailable to
+// BzScheduler for the wait's duration (its `threads` vector is fixed-size,
+// no elastic growth — see run_worker). This can only ever DELAY unrelated
+// domain work, not manufacture a NEW deadlock beyond the cycle case above:
+// whichever thread actually reaches and wins the CAS for a type keeps making
+// progress on its OWN thread without needing a fresh pool worker (static
+// initializers cannot `await`, §22.13), so the type genuinely being waited on
+// always completes in bounded time absent a cycle, and every blocked waiter
+// is woken once it does.
+struct StaticInitWaiter {
+    std::mutex mtx;
+    std::condition_variable cv;
+};
+static std::mutex g_static_init_registry_mtx;
+static std::unordered_map<void*, StaticInitWaiter*> g_static_init_registry;
+
+// Find-or-create the waiter entry for `state_ptr`, fully serialized by
+// g_static_init_registry_mtx (no TOCTOU: the lookup, the allocation on first
+// miss, and the insertion all happen under the one lock_guard), so concurrent
+// first-touches from different threads are guaranteed to converge on the same
+// StaticInitWaiter instance.
+static StaticInitWaiter* static_init_waiter_for(void* state_ptr) {
+    std::lock_guard<std::mutex> lk(g_static_init_registry_mtx);
+    StaticInitWaiter*& slot = g_static_init_registry[state_ptr];
+    if (!slot) slot = new StaticInitWaiter();
+    return slot;
+}
+
+// Called from the emitted `crosswait` block (a losing, CROSS-thread CAS,
+// old==1) to block until the type's per-type state byte at `state_ptr` (the
+// SAME `bz$T$initstate` global address the CAS operated on) reaches done(2)
+// or failed(3), returning that terminal value. Never returns 0 or 1.
+extern "C" uint8_t bz_static_init_wait(void* state_ptr) {
+    auto* state = reinterpret_cast<std::atomic<uint8_t>*>(state_ptr);
+    // Fast path: the owner's doneB/failB release store may already have
+    // landed between the caller's failed CAS and this call — avoids registry
+    // contention entirely on that common race outcome.
+    uint8_t s = state->load(std::memory_order_acquire);
+    if (s == 2 || s == 3) return s;
+    StaticInitWaiter* w = static_init_waiter_for(state_ptr);
+    std::unique_lock<std::mutex> lk(w->mtx);
+    // Standard condvar predicate loop: re-checks `state` (not just "were we
+    // notified") on every wake, including spurious ones — see the no-lost-
+    // wakeup argument in this section's header comment.
+    while ((s = state->load(std::memory_order_acquire)) == 1) {
+        w->cv.wait(lk);
+    }
+    return s;
+}
+
+// Called from the emitted doneB/failB blocks, immediately after the atomic
+// RELEASE store that transitions state to done(2) or failed(3) — including on
+// the path where the type's initializer THREW (failB runs regardless of
+// whether sfinit/cctor completed normally or raised, so a waiter is always
+// woken once the failed state is published; see that block's comment) — to
+// wake any thread parked in bz_static_init_wait for this type.
+extern "C" void bz_static_init_notify(void* state_ptr) {
+    StaticInitWaiter* w;
+    {
+        std::lock_guard<std::mutex> lk(g_static_init_registry_mtx);
+        auto it = g_static_init_registry.find(state_ptr);
+        if (it == g_static_init_registry.end()) return;  // never contended
+        w = it->second;
+    }
+    std::lock_guard<std::mutex> lk(w->mtx);
+    w->cv.notify_all();
 }
 
 // ---------------------------------------------------------------------------

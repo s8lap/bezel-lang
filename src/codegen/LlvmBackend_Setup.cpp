@@ -5264,16 +5264,22 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
 //   * done      → return immediately (atomic ACQUIRE load/observation, #1391 —
 //                 synchronizes-with the RELEASE store below so every static
 //                 field write is visible, not just the state byte itself).
-//   * in-progress → return immediately (a re-entrant access during this type's
-//                   own init sees its partially-initialized state, per §22.13
-//                   textual order; this also prevents unbounded recursion).
-//                   #1391: this is ALSO the path taken by a genuine CROSS-
-//                   DOMAIN touch of another domain's in-progress init — §22.12
-//                   rule 1 requires that domain to BLOCK instead, which is NOT
-//                   yet implemented (see the tryclaim block below); only the
-//                   double-init/torn-read half of #1391 is fixed here (the
-//                   0->1 transition is now an atomic compare-exchange, so at
-//                   most one domain ever runs the initializer for a type).
+//   * in-progress, SAME thread as the owner → return immediately (a re-entrant
+//                   access during this type's own init sees its partially-
+//                   initialized state, per §22.13 textual order; this also
+//                   prevents unbounded recursion and keeps the compile-time/
+//                   runtime cycle backstop, StaticInitCycles.cpp +
+//                   emitStaticPartialReadGuard, deadlock-free — see the
+//                   chksame block below).
+//   * in-progress, a DIFFERENT (cross-domain) thread → BLOCK until that
+//                   thread's init completes or fails (§22.12 rule 1's second
+//                   clause, #1391) via bz_static_init_wait
+//                   (bezel_runtime_concurrency.cpp), then re-check and route
+//                   into the done/failed handling below (see the crosswait
+//                   block below). A genuine cross-domain init CYCLE that the
+//                   compile-time detector cannot see deadlocks here — §22.13's
+//                   own text accepts this bound explicitly ("no cross-domain
+//                   waits-for detection is promised").
 //   * failed    → re-raise the saved TypeInitializationException (§22.7).
 //   * uninit    → CAS to in-progress (0->1, AcquireRelease/Acquire, #1391);
 //                 the CAS winner runs sfinit then cctor; if either leaves a
@@ -5343,8 +5349,18 @@ void Emitter::emitEnsureInitFns() {
     // id of the thread currently touching a type, to tell a SAME-thread re-entrant
     // touch of an in-progress initializer (→ synthesize TypeInitializationException)
     // apart from a cross-domain touch on another pool thread (→ §22.12 rule-1
-    // blocking; not synthesized here, #1391).
+    // blocking, #1391 — see waitFn/notifyFn below).
     llvm::Function* tidFn = declareC("bz_current_thread_id", i64(), {});
+    // §22.12 rule 1 (v0.228) / #1391: the cross-domain blocking pair. waitFn
+    // blocks the calling (non-owner) thread until the per-type state global it
+    // is given reaches done(2) or failed(3), returning that terminal value;
+    // notifyFn wakes any thread parked in waitFn for a given state global.
+    // Both are process-wide runtime entry points (bezel_runtime_concurrency.cpp)
+    // shared by every type's ensureinit, declared once here rather than per type.
+    llvm::Function* waitFn =
+        declareC("bz_static_init_wait", i8Ty, {ptrTy()});
+    llvm::Function* notifyFn =
+        declareC("bz_static_init_notify", llvm::Type::getVoidTy(llvm_), {ptrTy()});
 
     // Save the per-function builder state (emitEnsureInitFns runs during setup,
     // before/around other function emission).
@@ -5454,21 +5470,15 @@ void Emitter::emitEnsureInitFns() {
         // happens-before guarantee as the entry fast-load above when a domain
         // races the CAS against another domain's doneB/failB release store.
         //
-        // What is NOT yet fixed here (tracked as #1391's remaining half): a
-        // domain whose CAS fails with old==1 (in-progress, owned by ANOTHER
-        // domain) still falls through to `ret` immediately rather than
-        // BLOCKING until initialization completes, as §22.12 rule 1 requires
-        // ("a domain touching a type mid-initialization by another domain
-        // blocks until initialization completes"). That domain can therefore
-        // still proceed to run code that reads a not-yet-assigned static of
-        // the OTHER domain's in-progress init — emitStaticPartialReadGuard's
-        // backstop only raises for the OWNER thread's own re-entrancy, not for
-        // a genuine cross-domain touch (see its comment). Same-thread
-        // re-entrancy (a static helper calling back into its own type's
-        // still-running init) is unaffected: the CAS can only be WON once per
-        // type, so the owning thread's own recursive touch always fails the
-        // CAS with old==1 and falls through here exactly as the pre-#1391-fix
-        // code did for the in-progress case — a legitimate, immediate proceed.
+        // A domain whose CAS fails with old==1 (in-progress, owned by ANOTHER
+        // domain) is routed by chkOld/chkOldFailed below to chksame, which
+        // tells apart the two in-progress cases §22.12 rule 1 and §22.13
+        // require different treatment for: the owning thread's OWN recursive
+        // touch (proceed immediately — a same-type helper call during the
+        // type's own init, or the re-entrancy the cycle backstop relies on
+        // seeing as ordinary same-thread execution) versus a genuine CROSS-
+        // domain touch on a different thread, which now BLOCKS via
+        // bz_static_init_wait (#1391) instead of proceeding immediately.
         builder_.SetInsertPoint(tryClaim);
         llvm::Value* zero8 = llvm::ConstantInt::get(i8Ty, 0);
         llvm::Value* one8  = llvm::ConstantInt::get(i8Ty, 1);
@@ -5490,11 +5500,47 @@ void Emitter::emitEnsureInitFns() {
         builder_.SetInsertPoint(chkOldFailed);
         llvm::Value* oldFailed =
             builder_.CreateICmpEQ(old, llvm::ConstantInt::get(i8Ty, 3));
-        // #1553 / §22.13 (v0.181): old==1 (in-progress) -> return (proceed),
-        // NOT raise — see the tryclaim comment above for same-thread
-        // re-entrancy and the #1391 cross-domain-blocking gap this still
-        // leaves open.
-        builder_.CreateCondBr(oldFailed, failedB, retB);
+        auto* chkSameThread = llvm::BasicBlock::Create(llvm_, "chksame", fn);
+        builder_.CreateCondBr(oldFailed, failedB, chkSameThread);
+
+        // chksame: old==1 (in-progress). §22.12 rule 1 (v0.228) / #1391:
+        // distinguish the OWNER thread's own re-entrant touch — which must
+        // proceed immediately (it is that thread's own initializer running;
+        // there is no other thread that could ever complete it, and this is
+        // exactly the same-type-helper-call / cycle-backstop shape §22.13
+        // documents as ordinary self-execution, see emitStaticPartialReadGuard
+        // and StaticInitCycles.cpp's compile-time approximation) — from a
+        // genuine CROSS-domain touch on a DIFFERENT thread, which rule 1's
+        // second clause requires to BLOCK. ownerTidGV was recorded (plain
+        // store, initB below) by whichever thread won the CAS; this load/
+        // compare mirrors emitStaticPartialReadGuard's identical same-thread
+        // test for the partial-read backstop (same global, same idiom, same
+        // "torn/stale read degrades to the pre-#1391 proceed-immediately
+        // behavior, never to a new unsoundness" reasoning — see that
+        // function's comment).
+        builder_.SetInsertPoint(chkSameThread);
+        llvm::Value* ownerTidLoad =
+            builder_.CreateLoad(i64(), ownerTidGV, "cw.owner");
+        llvm::Value* curTid = builder_.CreateCall(tidFn, {}, "cw.self");
+        llvm::Value* sameThread = builder_.CreateICmpEQ(ownerTidLoad, curTid);
+        auto* crossWait = llvm::BasicBlock::Create(llvm_, "crosswait", fn);
+        builder_.CreateCondBr(sameThread, retB, crossWait);
+
+        // crosswait: genuine cross-domain touch of an in-progress init.
+        // BLOCK (§22.12 rule 1's second clause) until the owning thread's
+        // initializer completes or fails (§22.7), via bz_static_init_wait
+        // (bezel_runtime_concurrency.cpp) — a real OS-thread block (ensureinit
+        // runs as ordinary synchronous code on the caller's thread, not a
+        // domain-queue operation), holding no domain mutex while parked (see
+        // that function's own comment for the lock-ordering argument and the
+        // accepted cross-domain-init-cycle deadlock bound §22.13 itself
+        // states). The returned state is always terminal — 2 (done) or 3
+        // (failed); the wait loop never returns 1.
+        builder_.SetInsertPoint(crossWait);
+        llvm::Value* waited = builder_.CreateCall(waitFn, {stateGV}, "cw.state");
+        llvm::Value* waitedFailed =
+            builder_.CreateICmpEQ(waited, llvm::ConstantInt::get(i8Ty, 3));
+        builder_.CreateCondBr(waitedFailed, failedB, retB);
 
         // doinit: state is already 1 (the winning CAS above set it); record the
         // owner thread (§22.13 owner-thread tracking — same-thread-scoped use
@@ -5549,6 +5595,13 @@ void Emitter::emitEnsureInitFns() {
             doneSI->setAlignment(llvm::Align(1));
             doneSI->setAtomic(llvm::AtomicOrdering::Release);
         }
+        // #1391 / §22.12 rule 1: wake any thread parked in bz_static_init_wait
+        // (crosswait above) for this type — MUST come after the release store
+        // (a waiter's post-wake re-check must see the completed state) and
+        // before this function returns, on EVERY path out of initB (success
+        // here, failure below), so a waiter never blocks past its wake signal
+        // regardless of which terminal state the initializer reached.
+        builder_.CreateCall(notifyFn, {stateGV});
         builder_.CreateBr(retB);
 
         // setfail: bz_exc holds the TypeInitializationException (inner=original;
@@ -5575,6 +5628,12 @@ void Emitter::emitEnsureInitFns() {
             failSI->setAlignment(llvm::Align(1));
             failSI->setAtomic(llvm::AtomicOrdering::Release);
         }
+        // #1391 / §22.12 rule 1: wake any waiter (same rationale as doneB —
+        // an initializer that THROWS still must publish the failed state to
+        // every blocked cross-domain waiter, or they would block forever;
+        // this is the path an adversarial "initializer throws while a
+        // different domain is blocked on it" scenario exercises).
+        builder_.CreateCall(notifyFn, {stateGV});
         builder_.CreateBr(retB);
 
         // reraise: failed state — wrap a FRESH TypeInitializationException around
@@ -5755,10 +5814,15 @@ void Emitter::emitStaticPartialReadGuard(const sema::TypeSymbol* owner,
     auto* contBB = llvm::BasicBlock::Create(llvm_, "pg.cont",  currentFn_);
     builder_.CreateCondBr(isProg, chkBB, contBB);
 
-    // chk: raise only if this is the OWNER thread (same-thread re-entrancy; a
-    // cross-domain in-progress touch is the §22.12 rule-1 blocking case, #1391 —
-    // it proceeds here) AND the field has not been assigned yet (its index is at
-    // or beyond how far sfinit has progressed).
+    // chk: raise only if this is the OWNER thread (same-thread re-entrancy) AND
+    // the field has not been assigned yet (its index is at or beyond how far
+    // sfinit has progressed). A genuine cross-domain in-progress touch cannot
+    // reach this guard via the normal ensureinit-gated access path any more
+    // (#1391, §22.12 rule 1): emitEnsureStaticInit's ensureinit call now BLOCKS
+    // a different thread until the type leaves the in-progress state (crosswait,
+    // emitEnsureInitFns above), so by the time control reaches a field access
+    // here the state this reads is done/failed for every thread but the owner —
+    // isProg above is true only for the owner's own re-entrant touch.
     builder_.SetInsertPoint(chkBB);
     llvm::Value* ownerTid = builder_.CreateLoad(i64(), ownIt->second, "pg.owner");
     llvm::Value* self =

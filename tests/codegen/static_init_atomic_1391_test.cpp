@@ -25,25 +25,40 @@
 // load), so it can never mistake an in-progress or already-failed type for
 // uninitialized.
 //
-// What this fix does NOT yet do (tracked as #1391's remaining half, and named
-// explicitly in the emitEnsureInitFns comments this test's Test 1 inspects):
-// a domain that loses the CAS with old==1 (another domain's init genuinely
-// in progress) still falls through and PROCEEDS immediately rather than
-// BLOCKING until that other domain's initialization completes, as rule 1's
-// second clause requires. Test 2 below is therefore a best-effort STRESS test
-// for the half that *is* fixed (no double-init), not a proof that a losing
-// domain never observes a partially-initialized static through some other
-// path — see its comment for the precise claim and its limits.
+// Tests 1-2 are a mechanism check: they inspect the LLVM IR the compiler
+// emits (via BEZEL_DUMP_IR, LlvmBackend.cpp) for the per-type init-state
+// global and assert the atomic cmpxchg / atomic load-acquire / atomic
+// store-release instructions are present — the fix is a codegen change with
+// no Bezel-level syntax to assert on, so IR inspection is the direct way to
+// pin it. Reverting the fix (plain load/store, unconditional store-then-init)
+// makes this assertion fail; see the #1391 hand-off note for the manual
+// before/after verification performed when the fix landed (revert via
+// `git checkout`, rebuild, re-probe — never `git stash`, per this repo's
+// worktree discipline).
 //
-// Test 1 is a mechanism check: it inspects the LLVM IR the compiler emits
-// (via BEZEL_DUMP_IR, LlvmBackend.cpp) for the per-type init-state global and
-// asserts the atomic cmpxchg / atomic load-acquire / atomic store-release
-// instructions are present — the fix is a codegen change with no Bezel-level
-// syntax to assert on, so IR inspection is the direct way to pin it. Reverting
-// the fix (plain load/store, unconditional store-then-init) makes this
-// assertion fail; see the #1391 hand-off note for the manual before/after
-// verification performed when the fix landed (revert via `git checkout`,
-// rebuild, re-probe — never `git stash`, per this repo's worktree discipline).
+// The SECOND half of #1391 — a domain that loses the CAS with old==1
+// (another domain's init genuinely in progress) BLOCKING until that other
+// domain's initialization completes or fails, rather than proceeding
+// immediately (rule 1's second clause) — is fixed below the CAS half in this
+// same commit sequence. Tests 3-6 cover it:
+//   - Test 3 is a mechanism check (same IR-inspection technique as 1-2) for
+//     the new `chksame`/`crosswait` blocks and the bz_static_init_wait /
+//     bz_static_init_notify runtime calls (bezel_runtime_concurrency.cpp).
+//   - Test 4 extends the Test-6-style stress harness below with a
+//     deliberately SLOW initializer (a busy loop) to widen the in-progress
+//     window, and asserts every concurrently-touching domain observes the
+//     initializer's FINAL value, never a not-yet-assigned default — the
+//     direct, observable consequence of blocking instead of proceeding. Per
+//     this task's protocol: this is a best-effort, timing-dependent stress
+//     test, not a proof the race is structurally impossible (unlike Test 3,
+//     which pins the mechanism unconditionally); its comment states the
+//     calibration and the honest limits.
+//   - Test 5 is the adversarial "initializer throws while other domains are
+//     BLOCKED on it" scenario (§22.7's failed-state machinery): every blocked
+//     waiter must wake and reraise TypeInitializationException, not hang
+//     forever. Same best-effort timing caveat as Test 4.
+//   - Test 6 (originally Test 2) is the pre-existing double-init stress test,
+//     unchanged.
 
 #include <unistd.h>
 
@@ -193,6 +208,216 @@ BEZEL_TEST(static_init_atomic_1391, ensureinit_uses_acquire_load_and_release_sto
         pos = (lineEnd == std::string::npos) ? fn.size() : lineEnd;
     }
     BEZEL_EXPECT_EQ(static_cast<int>(releaseStores), 2);
+}
+
+// §22.12 rule 1 (v0.228) mechanism check — the BLOCKING half of #1391: a
+// losing, CROSS-thread CAS (old==1) must call bz_static_init_wait
+// (bezel_runtime_concurrency.cpp) instead of falling straight through to
+// `ret`, and both terminal transitions (setdone/setfail) must call
+// bz_static_init_notify to wake any thread parked there. Distinguishing
+// same-thread re-entrancy (proceed) from a cross-domain touch (block) needs
+// a same-thread comparison against the owner-thread global — the `chksame`
+// block — before ever reaching the `crosswait` block that calls
+// bz_static_init_wait. Reverting just this half (restoring `chkOldFailed`'s
+// unconditional `oldFailed ? failedB : retB` and dropping the two notify
+// calls, i.e. exactly what b122241 left as #1391's open remainder) makes
+// this assertion fail while Tests 1-2 above still pass — this test is scoped
+// to the incremental piece this session adds.
+BEZEL_TEST(static_init_atomic_1391, ensureinit_blocks_cross_thread_instead_of_proceeding) {
+    std::string ir = compileAndCaptureIR(
+        "module M; "
+        "class Counter "
+        "  public static readonly _v: int := Seed(); "
+        "  private static method Seed(): int => 42; "
+        "  public static method Get(): int => _v; "
+        "end Counter;");
+    BEZEL_EXPECT_TRUE(!ir.empty());
+    std::string fn = sliceEnsureInit(ir, "Counter");
+    BEZEL_EXPECT_TRUE(!fn.empty());
+    // The same-thread-vs-cross-thread dispatch block and the blocking block.
+    BEZEL_EXPECT_TRUE(fn.find("chksame:") != std::string::npos);
+    BEZEL_EXPECT_TRUE(fn.find("crosswait:") != std::string::npos);
+    // The blocking wait call, taking the state global's address and
+    // returning the terminal state (i8).
+    BEZEL_EXPECT_TRUE(fn.find("call i8 @bz_static_init_wait") != std::string::npos ||
+                       fn.find("call signext i8 @bz_static_init_wait") !=
+                           std::string::npos);
+    // Both terminal transitions (setdone, setfail) notify waiters — expect
+    // exactly two call sites, matching the two release stores Test 2 checks.
+    std::size_t pos = 0, notifyCalls = 0;
+    while ((pos = fn.find("@bz_static_init_notify", pos)) != std::string::npos) {
+        ++notifyCalls;
+        pos += 1;
+    }
+    BEZEL_EXPECT_EQ(static_cast<int>(notifyCalls), 2);
+}
+
+// §22.12 rule 1 (v0.228) behavioral stress test — the BLOCKING half of
+// #1391.
+//
+// `Slow2`'s static initializer runs a long, deliberately CPU-bound busy loop
+// BEFORE its `readonly` field's sfinit store lands, widening the in-progress
+// window enough that several domains spawned immediately after the first
+// touch reliably land INSIDE it (see the calibration note below). Each
+// spawned domain reads `Slow2.Get()` and records via an already-warmed
+// AtomicInteger<int> pair (Recorder2, settled single-threaded before any
+// spawn, exactly as Recorder is in the stress test below) whether it
+// observed the initializer's FINAL value (999) or anything else.
+//
+// With the fix (blocking): every domain that loses the CAS BLOCKS until the
+// winner's initializer completes, so every read observes exactly 999 —
+// WrongCount() must be 0, deterministically: this is the direct, structural
+// consequence of blocking (a blocked domain's ensureinit call cannot return
+// until state is done/failed), not a timing coincidence.
+//
+// Without the fix (the b122241-only baseline this session started from): a
+// losing domain proceeds immediately past ensureinit and reads whatever
+// value the field currently holds — its DEFAULT (0, an int field) until
+// sfinit's store lands at the very end of the busy loop. With the loop
+// calibrated wide enough this reliably (though, per this task's protocol,
+// not by formal proof — stated plainly) reproduces WrongCount() > 0; a
+// manual revert-rebuild-run cycle against the pre-blocking-fix source (same
+// scratch-copy protocol as the #1391 hand-off note, never `git stash`)
+// confirmed this before the busy-loop iteration count below was finalized.
+//
+// Calibration: BUSY_ITERS's magnitude targets roughly a few hundred
+// milliseconds of wall time on the reference machine (verified via a probe
+// build with `Stopwatch`, stdlib §8.1, before this constant was chosen) —
+// comfortably wider than the microsecond-scale gap between spawning four
+// domains back-to-back and the pool dispatching each one's `Touch2`
+// continuation. This is a best-effort, timing-dependent test (like the
+// double-init stress test below): it does not prove the race is
+// structurally impossible, only that it does not reproduce in practice with
+// a wide window. Test 3 above is the unconditional, timing-independent pin
+// for this half of the fix.
+BEZEL_TEST(static_init_atomic_1391, cross_domain_touch_blocks_until_init_completes) {
+    const std::string source =
+        "module M; "
+        "import System.Threading; "
+        "class Recorder2 "
+        "  private static _correct: AtomicInteger<int> := new AtomicInteger<int>(0); "
+        "  private static _wrong: AtomicInteger<int> := new AtomicInteger<int>(0); "
+        "  public static method RecordCorrect(): int => _correct.Increment(); "
+        "  public static method RecordWrong(): int => _wrong.Increment(); "
+        "  public static method CorrectCount(): int => _correct.Value; "
+        "  public static method WrongCount(): int => _wrong.Value; "
+        "end Recorder2; "
+        "class Slow2 "
+        "  public static readonly _v: int := ComputeSlow(); "
+        "  private static method ComputeSlow(): int "
+        "    var acc: int := 0; "
+        "    var i: int := 0; "
+        "    while i < 400000000 do acc := acc + 1; i := i + 1; end; "
+        "    return 999; "
+        "  end ComputeSlow; "
+        "  public static method Get(): int => _v; "
+        "end Slow2; "
+        "class Toucher2 "
+        "  public static method Touch2() "
+        "    var v: int := Slow2.Get(); "
+        "    if v = 999 then _ := Recorder2.RecordCorrect(); "
+        "    else _ := Recorder2.RecordWrong(); end; "
+        "  end Touch2; "
+        "end Toucher2; "
+        "class Program2 "
+        "  public static async method Main(): Task<int> "
+        "    _ := Recorder2.CorrectCount(); "  // settle Recorder2's OWN lazy init first
+        "    using var t1 := Domain.Spawn(Toucher2.Touch2); "
+        "    using var t2 := Domain.Spawn(Toucher2.Touch2); "
+        "    using var t3 := Domain.Spawn(Toucher2.Touch2); "
+        "    using var t4 := Domain.Spawn(Toucher2.Touch2); "
+        "    await t1; "
+        "    await t2; "
+        "    await t3; "
+        "    await t4; "
+        "    return Recorder2.WrongCount(); "
+        "  end Main; "
+        "end Program2;";
+    auto r = bezel::test::runAot(source);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);  // WrongCount() must be exactly 0
+}
+
+// §22.12 rule 1 (v0.228) / §22.7 adversarial stress test — an initializer
+// that THROWS while OTHER domains are blocked on it (#1391).
+//
+// `Thrower`'s static initializer busy-loops (same widening technique and
+// calibration as the previous test) and then throws. The CAS winner runs it,
+// eventually reaches failB — a RELEASE store of state=3(failed) followed by
+// bz_static_init_notify (LlvmBackend_Setup.cpp) — and the outer `ensureinit`
+// call reraises for the winner itself via the normal §22.7 path. Every OTHER
+// domain that touched `Thrower` while the winner's busy loop was still
+// running is, by this fix, parked in bz_static_init_wait (crosswait); this
+// test's central question is whether failB's notify reliably wakes them
+// (never leaving a blocked domain waiting forever) and whether the woken
+// `waited == 3` branch correctly routes into failedB (RE-RAISE, §22.7 —
+// "the ordinary failed-state machinery caches it"), rather than, say,
+// silently proceeding as if initialization had succeeded.
+//
+// Each spawned domain wraps its touch in try/catch and records via
+// Recorder3 (an already-warmed AtomicInteger<int> pair, settled
+// single-threaded before any spawn, exactly as Recorder/Recorder2 above)
+// whether it caught TypeInitializationException. With the fix: every domain
+// — the winner (reraising its own failure) and every blocked loser (waking
+// into the failed state) alike — must catch exactly one
+// TypeInitializationException each; UncaughtCount() must stay 0 and
+// CaughtCount() must equal the domain count. A domain that hung instead
+// would make this test TIME OUT rather than fail an assertion — the harness
+// itself is the deadlock detector here.
+//
+// Same honesty caveat as the previous test: this is a best-effort,
+// timing-dependent stress test for the *value/liveness* consequence of the
+// notify call, not a formal proof; Test 3 is the unconditional mechanism pin
+// for the notify calls' existence.
+BEZEL_TEST(static_init_atomic_1391, blocked_waiters_wake_into_failed_state_reraise) {
+    const std::string source =
+        "module M; "
+        "import System.Threading; "
+        "class Recorder3 "
+        "  private static _caught: AtomicInteger<int> := new AtomicInteger<int>(0); "
+        "  private static _uncaught: AtomicInteger<int> := new AtomicInteger<int>(0); "
+        "  public static method RecordCaught(): int => _caught.Increment(); "
+        "  public static method RecordUncaught(): int => _uncaught.Increment(); "
+        "  public static method CaughtCount(): int => _caught.Value; "
+        "  public static method UncaughtCount(): int => _uncaught.Value; "
+        "end Recorder3; "
+        "class Thrower "
+        "  public static readonly _v: int := Boom(); "
+        "  private static method Boom(): int "
+        "    var acc: int := 0; "
+        "    var i: int := 0; "
+        "    while i < 400000000 do acc := acc + 1; i := i + 1; end; "
+        "    throw new InvalidOperationException(\"boom\"); "
+        "  end Boom; "
+        "  public static method Get(): int => _v; "
+        "end Thrower; "
+        "class Toucher3 "
+        "  public static method Touch3() "
+        "    try "
+        "      _ := Thrower.Get(); "
+        "      _ := Recorder3.RecordUncaught(); "  // must never be reached
+        "    catch TypeInitializationException => _ := Recorder3.RecordCaught(); "
+        "    end; "
+        "  end Touch3; "
+        "end Toucher3; "
+        "class Program3 "
+        "  public static async method Main(): Task<int> "
+        "    _ := Recorder3.CaughtCount(); "  // settle Recorder3's OWN lazy init first
+        "    using var t1 := Domain.Spawn(Toucher3.Touch3); "
+        "    using var t2 := Domain.Spawn(Toucher3.Touch3); "
+        "    using var t3 := Domain.Spawn(Toucher3.Touch3); "
+        "    using var t4 := Domain.Spawn(Toucher3.Touch3); "
+        "    await t1; "
+        "    await t2; "
+        "    await t3; "
+        "    await t4; "
+        "    if Recorder3.UncaughtCount() = 0 then return Recorder3.CaughtCount(); end; "
+        "    return -1; "
+        "  end Main; "
+        "end Program3;";
+    auto r = bezel::test::runAot(source);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 4);  // all 4 domains caught exactly one TIE each
 }
 
 // §22.12 rule 1 (v0.228) stress test — the double-init half of #1391.
