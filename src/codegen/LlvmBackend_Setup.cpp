@@ -5255,21 +5255,33 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
 }
 
 
-// #720 / #796 / §22.13 / §22.7: build the per-type lazy-init function
+// #720 / #796 / §22.13 / §22.7 / #1391: build the per-type lazy-init function
 // `bz$<T>$ensureinit` for every type that has static state (an sfinit and/or a
 // cctor) — non-generic (#720) and generic (#796).
-// The function runs that type's initializers exactly once, on first use, guarded
-// by a per-type state global (0=uninit, 1=in-progress, 2=done, 3=failed):
-//   * done      → return immediately.
-//   * in-progress → return immediately (a re-entrant access during this type's own
-//                   init sees its partially-initialized state, per §22.13 textual
-//                   order; this also prevents unbounded recursion).
+// The function runs that type's initializer exactly once PROCESS-WIDE (§22.12
+// rule 1), guarded by a per-type state global (0=uninit, 1=in-progress,
+// 2=done, 3=failed):
+//   * done      → return immediately (atomic ACQUIRE load/observation, #1391 —
+//                 synchronizes-with the RELEASE store below so every static
+//                 field write is visible, not just the state byte itself).
+//   * in-progress → return immediately (a re-entrant access during this type's
+//                   own init sees its partially-initialized state, per §22.13
+//                   textual order; this also prevents unbounded recursion).
+//                   #1391: this is ALSO the path taken by a genuine CROSS-
+//                   DOMAIN touch of another domain's in-progress init — §22.12
+//                   rule 1 requires that domain to BLOCK instead, which is NOT
+//                   yet implemented (see the tryclaim block below); only the
+//                   double-init/torn-read half of #1391 is fixed here (the
+//                   0->1 transition is now an atomic compare-exchange, so at
+//                   most one domain ever runs the initializer for a type).
 //   * failed    → re-raise the saved TypeInitializationException (§22.7).
-//   * uninit    → mark in-progress, run sfinit then cctor; if either leaves a
+//   * uninit    → CAS to in-progress (0->1, AcquireRelease/Acquire, #1391);
+//                 the CAS winner runs sfinit then cctor; if either leaves a
 //                 pending exception (already wrapped in TypeInitializationException
-//                 by emitStaticConstructorBody), save it, mark failed, and leave it
-//                 pending for the caller's emitPendingCheck to route. Otherwise mark
-//                 done.
+//                 by emitStaticConstructorBody), save it, mark failed (atomic
+//                 RELEASE store, #1391), and leave it pending for the caller's
+//                 emitPendingCheck to route. Otherwise mark done (atomic
+//                 RELEASE store, #1391).
 // For a GENERIC type the guard is per-TYPE: the single sfinit initializes every
 // instantiation at once, so first use of ANY instantiation runs it once (§22.13
 // timing fixed; per-instantiation INIT-timing independence for T-dependent
@@ -5397,8 +5409,21 @@ void Emitter::emitEnsureInitFns() {
         auto* doneB   = llvm::BasicBlock::Create(llvm_, "setdone", fn);
         auto* retB    = llvm::BasicBlock::Create(llvm_, "ret",     fn);
 
+        // #1391 / §22.12 rule 1 (v0.163+): "a type's static initializer runs
+        // exactly once process-wide". The fast DONE check is an atomic ACQUIRE
+        // load (was a plain, unordered `load i8`, #1391 as filed): pairs with
+        // the RELEASE stores below (doneB/failB) so a domain that observes
+        // state==2 also observes every write sequenced-before that release —
+        // in particular the static field stores sfinit/cctor performed while
+        // becoming done. Without this pairing the C++/LLVM memory model makes
+        // no such guarantee even on architectures (x86) where it happens to
+        // hold in practice; the compiler is otherwise free to reorder around a
+        // plain load/store pair.
         builder_.SetInsertPoint(entry);
-        llvm::Value* s = builder_.CreateLoad(i8Ty, stateGV, "state");
+        llvm::LoadInst* sLI = builder_.CreateLoad(i8Ty, stateGV, "state");
+        sLI->setAlignment(llvm::Align(1));
+        sLI->setAtomic(llvm::AtomicOrdering::Acquire);
+        llvm::Value* s = sLI;
         llvm::Value* isDone =
             builder_.CreateICmpEQ(s, llvm::ConstantInt::get(i8Ty, 2));
         auto* chkFailed = llvm::BasicBlock::Create(llvm_, "chkfail", fn);
@@ -5407,29 +5432,75 @@ void Emitter::emitEnsureInitFns() {
         builder_.SetInsertPoint(chkFailed);
         llvm::Value* isFailed =
             builder_.CreateICmpEQ(s, llvm::ConstantInt::get(i8Ty, 3));
-        auto* chkProg = llvm::BasicBlock::Create(llvm_, "chkprog", fn);
-        builder_.CreateCondBr(isFailed, failedB, chkProg);
+        auto* tryClaim = llvm::BasicBlock::Create(llvm_, "tryclaim", fn);
+        builder_.CreateCondBr(isFailed, failedB, tryClaim);
 
-        // #1553 / §22.13 (v0.181): in-progress → return (proceed), NOT raise. A
-        // re-entrant touch here is the ordinary self-reference case — a same-type
-        // static METHOD call during the type's own init (e.g. `_v := Seed()`)
-        // legitimately re-enters and must run. Partial-state OBSERVATION is caught
-        // precisely at static-field READ sites (emitStaticPartialReadGuard): a
-        // re-entrant read, on the OWNER thread, of a static that the in-progress
-        // initializer has not assigned yet raises the backstop TIE. This keeps the
-        // backstop strictly same-thread-only (owner-thread tracking below) while
-        // not falsely raising for same-type helper calls or reads of already-
-        // assigned fields; a cross-domain in-progress touch proceeds here (the
-        // §22.12 rule-1 blocking case is unimplemented — #1391).
-        builder_.SetInsertPoint(chkProg);
-        llvm::Value* isProg =
-            builder_.CreateICmpEQ(s, llvm::ConstantInt::get(i8Ty, 1));
-        builder_.CreateCondBr(isProg, retB, initB);
+        // tryclaim: #1391 — the UNINIT/IN-PROGRESS cases collapse to a single
+        // atomic compare-exchange (0 -> 1, strong, AcquireRelease-on-success /
+        // Acquire-on-failure) instead of the old "plain load; if ==1 return;
+        // else fall through and unconditionally `store 1`" sequence. That old
+        // sequence had a TOCTOU race: two domains could both observe state==0
+        // (the entry `s` load above is racy on its own) and BOTH fall through
+        // to doinit, each running sfinit/cctor — double-init, and per §22.13
+        // each recording its OWN field stores/disposal-order entries (double-
+        // dispose at exit). The CAS makes the 0->1 transition a single atomic
+        // decision: at most one domain's CAS can observe the old value 0 and
+        // "win" (becomes the sole initializer, `initB`); every other domain's
+        // CAS necessarily fails and observes the ACTUAL current value at the
+        // CAS instant (never stale, unlike the outer `s`), which chkOld below
+        // dispatches on exactly like the done/failed checks above.
+        //
+        // The failure branch's Acquire ordering gives the same done/failed
+        // happens-before guarantee as the entry fast-load above when a domain
+        // races the CAS against another domain's doneB/failB release store.
+        //
+        // What is NOT yet fixed here (tracked as #1391's remaining half): a
+        // domain whose CAS fails with old==1 (in-progress, owned by ANOTHER
+        // domain) still falls through to `ret` immediately rather than
+        // BLOCKING until initialization completes, as §22.12 rule 1 requires
+        // ("a domain touching a type mid-initialization by another domain
+        // blocks until initialization completes"). That domain can therefore
+        // still proceed to run code that reads a not-yet-assigned static of
+        // the OTHER domain's in-progress init — emitStaticPartialReadGuard's
+        // backstop only raises for the OWNER thread's own re-entrancy, not for
+        // a genuine cross-domain touch (see its comment). Same-thread
+        // re-entrancy (a static helper calling back into its own type's
+        // still-running init) is unaffected: the CAS can only be WON once per
+        // type, so the owning thread's own recursive touch always fails the
+        // CAS with old==1 and falls through here exactly as the pre-#1391-fix
+        // code did for the in-progress case — a legitimate, immediate proceed.
+        builder_.SetInsertPoint(tryClaim);
+        llvm::Value* zero8 = llvm::ConstantInt::get(i8Ty, 0);
+        llvm::Value* one8  = llvm::ConstantInt::get(i8Ty, 1);
+        llvm::AtomicCmpXchgInst* cas = builder_.CreateAtomicCmpXchg(
+            stateGV, zero8, one8, llvm::MaybeAlign(1),
+            llvm::AtomicOrdering::AcquireRelease,
+            llvm::AtomicOrdering::Acquire);
+        llvm::Value* won = builder_.CreateExtractValue(cas, 1, "cas.won");
+        auto* chkOld = llvm::BasicBlock::Create(llvm_, "chkold", fn);
+        builder_.CreateCondBr(won, initB, chkOld);
 
-        // doinit: mark in-progress, record the owner thread (§22.13 owner-thread
-        // tracking), run sfinit then cctor with pending-exc checks.
+        builder_.SetInsertPoint(chkOld);
+        llvm::Value* old = builder_.CreateExtractValue(cas, 0, "cas.old");
+        llvm::Value* oldDone =
+            builder_.CreateICmpEQ(old, llvm::ConstantInt::get(i8Ty, 2));
+        auto* chkOldFailed = llvm::BasicBlock::Create(llvm_, "chkoldfail", fn);
+        builder_.CreateCondBr(oldDone, retB, chkOldFailed);
+
+        builder_.SetInsertPoint(chkOldFailed);
+        llvm::Value* oldFailed =
+            builder_.CreateICmpEQ(old, llvm::ConstantInt::get(i8Ty, 3));
+        // #1553 / §22.13 (v0.181): old==1 (in-progress) -> return (proceed),
+        // NOT raise — see the tryclaim comment above for same-thread
+        // re-entrancy and the #1391 cross-domain-blocking gap this still
+        // leaves open.
+        builder_.CreateCondBr(oldFailed, failedB, retB);
+
+        // doinit: state is already 1 (the winning CAS above set it); record the
+        // owner thread (§22.13 owner-thread tracking — same-thread-scoped use
+        // only, see emitStaticPartialReadGuard, so a plain store/load pair is
+        // sufficient there), run sfinit then cctor with pending-exc checks.
         builder_.SetInsertPoint(initB);
-        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1), stateGV);
         builder_.CreateStore(builder_.CreateCall(tidFn, {}, "owntid"), ownerTidGV);
         // #792 / §22.13: snapshot any PRE-EXISTING in-flight exception before
         // running sfinit/cctor. The lazy init can be triggered while an exception
@@ -5467,7 +5538,17 @@ void Emitter::emitEnsureInitFns() {
         }
 
         builder_.SetInsertPoint(doneB);
-        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 2), stateGV);
+        // #1391 / §22.12 rule 1: RELEASE store — publishes every static-field
+        // write sfinit/cctor just performed together with the state
+        // transition, so another domain's Acquire-ordered observation of
+        // state==2 (the entry fast-load, or a failed CAS above) is guaranteed
+        // to see the completed initialization, not a torn or reordered view.
+        {
+            llvm::StoreInst* doneSI =
+                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 2), stateGV);
+            doneSI->setAlignment(llvm::Align(1));
+            doneSI->setAtomic(llvm::AtomicOrdering::Release);
+        }
         builder_.CreateBr(retB);
 
         // setfail: bz_exc holds the TypeInitializationException (inner=original;
@@ -5485,7 +5566,15 @@ void Emitter::emitEnsureInitFns() {
         llvm::Value* inner0 = builder_.CreateLoad(
             ptrTy(), builder_.CreateGEP(i8Ty, tie0, builder_.getInt64(16)));
         builder_.CreateStore(inner0, excGV);
-        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 3), stateGV);
+        // #1391 / §22.12 rule 1: RELEASE store, same rationale as doneB — this
+        // publishes the excGV write just above (and the failed-state itself)
+        // to any domain that later observes state==3 via an Acquire load.
+        {
+            llvm::StoreInst* failSI =
+                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 3), stateGV);
+            failSI->setAlignment(llvm::Align(1));
+            failSI->setAtomic(llvm::AtomicOrdering::Release);
+        }
         builder_.CreateBr(retB);
 
         // reraise: failed state — wrap a FRESH TypeInitializationException around
