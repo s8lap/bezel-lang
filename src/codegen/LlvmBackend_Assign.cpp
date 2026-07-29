@@ -3103,7 +3103,9 @@ bool Emitter::argsCanFill(const std::vector<ast::Param>& params,
 // path (#1067/#1068/#552).
 llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         llvm::Value* v, const sema::TypeRef* targetTy,
-        const ast::Expr* srcExpr, bool ownLazyPipeline) {
+        const ast::Expr* srcExpr, bool ownLazyPipeline,
+        bool* outOwningWrap) {
+    if (outOwningWrap) *outOwningWrap = false;
     if (!v || !targetTy || !srcExpr) return v;
     if (!(targetTy->kind == sema::TypeRef::Kind::Named &&
           !targetTy->declaration && targetTy->astNode &&
@@ -3126,8 +3128,10 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     // ownLazyPipeline: only RETURN sites (the caller owns the result) pass true;
     // the ARGUMENT position (a BORROWED callee param) needs a call-site
     // temporary-disposal contract and is deferred (#1916).
-    if (ownLazyPipeline && isLazyEnumerableType(actualTy))
+    if (ownLazyPipeline && isLazyEnumerableType(actualTy)) {
+        if (outOwningWrap) *outOwningWrap = true;
         return drainLazyPipelineToOwnedIEnumerable(v, targetTy);
+    }
     std::string_view an;
     if (actualTy && actualTy->kind == sema::TypeRef::Kind::Named &&
         actualTy->astNode && actualTy->astNode->name &&
@@ -3137,13 +3141,55 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         (an == "Array" || an == "OwningArray" || an == "OwningBuffer" ||
          an == "Stack" || an == "OwningStack" ||
          an == "Queue" || an == "OwningQueue");
-    if (actualIsArray) {
+    // fix #1069 / stdlib §4.10 / §29.2: a `Set<T>`/`OwningSet<T>` widened to a
+    // pure `IEnumerable<T>` used to pass through UNWRAPPED — the callee's for-in
+    // then read the raw backing pointer's first word as a vtable (SIGSEGV; the
+    // issue reported the older "yields 0"). Two backings, two treatments:
+    //
+    //   * CLASS/interface element — genericBackingType declines every class, so
+    //     the set is bz_array_t-backed (`new Set<C>()` falls through lowerNew to
+    //     bz_array_alloc) and that backing IS the dense element array. The plain
+    //     array enumerator therefore walks exactly the set's logical elements;
+    //     take the BORROWING wrap below, which shares the source and adds no
+    //     ownership (the set's own binder still disposes its elements once).
+    //     `OwningSet<T>` requires `where T: class`, so this is the only backing a
+    //     valid OwningSet ever has.
+    //   * value/record/string element — a generic-key HASH table whose slots are
+    //     not a dense element array, which is exactly why #1068's dense-array fix
+    //     excluded Set. Snapshot it instead (below).
+    //
+    // `SortedSet<T>` is deliberately NOT included: the snapshot below is in hash
+    // order, and yielding a sorted set's elements unordered would silently break
+    // §4.18's ordered-iteration contract — a worse failure than the current one.
+    bool actualIsClassSet =
+        !actualIsArray && actualTy && (an == "Set" || an == "OwningSet") &&
+        genericBackingType(actualTy, 0, /*isSet=*/true, nullptr) == nullptr;
+    if (actualIsArray || actualIsClassSet) {
         // §29 / §12.9 (#1850): a nested covariant view whose elements are
         // themselves array-backed collections viewed as pure IEnumerable<T>
         // needs the per-element re-wrapping nested enumerator, not the plain one.
         if (nestedIEnumViewNeeded(actualTy, targetTy))
             return wrapNestedArrayAsIEnumerable(v, actualTy, targetTy);
         return wrapArrayAsIEnumerable(v, targetTy);
+    }
+    // fix #1069 / stdlib §4.10 / §5: DICT-backed `Set<T>` — snapshot its element
+    // keys into a fresh array and hand out an OWNING enumerator over the
+    // snapshot. Reuses the tested §389 Set lazy source (bz_lazy_from_set, which
+    // snapshots the key table) and the #1916 drain (bz_lazy_to_array, which
+    // materialises the array AND disposes the lazy source), so the only new
+    // object is the snapshot the returned enumerator owns. The SOURCE set is
+    // untouched — no element is retained, released, or disposed here, so an
+    // owning set still disposes each element exactly once at its own binder's
+    // scope end. `outOwningWrap` tells the caller it must dispose the enumerator.
+    if (actualTy && (an == "Set" || an == "OwningSet")) {
+        uint64_t ksz = 0;
+        if (genericBackingType(actualTy, 0, /*isSet=*/true, &ksz)) {
+            auto* setFn = declareC("bz_lazy_from_set", ptrTy(), {ptrTy(), i64()});
+            llvm::Value* lazy = builder_.CreateCall(
+                setFn, {v, builder_.getInt64((int64_t)ksz)}, "setenum.lazy");
+            if (outOwningWrap) *outOwningWrap = true;
+            return drainLazyPipelineToOwnedIEnumerable(lazy, targetTy);
+        }
     }
     if (actualTy && isLinkedListTypeName(actualTy))
         return wrapLinkedListAsIEnumerable(v, targetTy);
@@ -4963,9 +5009,20 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 !formalTy->astNode->name->parts.empty() &&
                 formalTy->headName() == "IEnumerable" &&
                 isLazyEnumerableType(ctx_.exprType(*a.value));
+            //
+            // fix #1069 / stdlib §4.10: the SAME contract now also covers a
+            // DICT-backed `Set<T>` argument — its wrap snapshots the key table
+            // into a fresh array behind an OWNING enumerator, a caller temporary
+            // with the identical disposal obligation. `owningArgWrap` is the
+            // wrap's own report of "this result is owned"; it is true for exactly
+            // the lazy-pipeline case (so the pre-existing behaviour is unchanged)
+            // and the new set-snapshot case. A CLASS-element set takes the
+            // BORROWING array wrap and reports false — nothing extra to dispose.
+            bool owningArgWrap = false;
             v = wrapAsIEnumerableForTarget(v, formalTy, a.value.get(),
-                                           /*ownLazyPipeline=*/lazyArgWrapped);
-            if (lazyArgWrapped && v && v->getType()->isPointerTy() &&
+                                           /*ownLazyPipeline=*/lazyArgWrapped,
+                                           &owningArgWrap);
+            if (owningArgWrap && v && v->getType()->isPointerTy() &&
                 !disposeStack_.empty()) {
                 llvm::AllocaInst* eslot = entryAlloca(v->getType());
                 builder_.CreateStore(v, eslot);

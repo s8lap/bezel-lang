@@ -7216,7 +7216,25 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                  initTR->headName() == "OwningStack" ||
                  initTR->headName() == "Queue" ||
                  initTR->headName() == "OwningQueue");
-            if (initIsArray) {
+            // fix #1069 / stdlib §4.10 / §29.2: a `Set<T>`/`OwningSet<T>` bound to
+            // an explicit `IEnumerable<T>` local, mirroring the buildOrderedArgs
+            // and RETURN splits (wrapAsIEnumerableForTarget). A CLASS-element set
+            // is bz_array_t-backed and its backing IS the dense element array, so
+            // it takes the plain (borrowing) array wrapper; a DICT-backed set is a
+            // hash table and is snapshotted below.
+            bool initIsClassSet =
+                !initIsArray && initTR && initTR->astNode &&
+                initTR->astNode->name && !initTR->astNode->name->parts.empty() &&
+                (initTR->headName() == "Set" ||
+                 initTR->headName() == "OwningSet") &&
+                genericBackingType(initTR, 0, /*isSet=*/true, nullptr) == nullptr;
+            bool initIsDictSet =
+                !initIsArray && initTR && initTR->astNode &&
+                initTR->astNode->name && !initTR->astNode->name->parts.empty() &&
+                (initTR->headName() == "Set" ||
+                 initTR->headName() == "OwningSet") &&
+                genericBackingType(initTR, 0, /*isSet=*/true, nullptr) != nullptr;
+            if (initIsArray || initIsClassSet) {
                 // §29 / §12.9 (#1850): a nested covariant view whose elements
                 // are themselves array-backed collections viewed as pure
                 // IEnumerable<T> (Array<Array<Dog>> → IEnumerable<IEnumerable<Dog>>)
@@ -7227,6 +7245,20 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     v = wrapNestedArrayAsIEnumerable(v, initTR, declTR);
                 else
                     v = wrapArrayAsIEnumerable(v, declTR);
+            } else if (initIsDictSet) {
+                // fix #1069 / stdlib §4.10 / §5: snapshot the hash table's element
+                // keys (bz_lazy_from_set) and drain them into a fresh array behind
+                // an OWNING enumerator (bz_lazy_to_array also disposes the lazy
+                // source). The local owns ONLY the snapshot — the source set is
+                // untouched, so an owning set still disposes each element exactly
+                // once at its own binder's scope end. registerIterableSourceDisposal
+                // frees the snapshot at this local's scope end (`wrappedHere`).
+                uint64_t ksz = 0;
+                genericBackingType(initTR, 0, /*isSet=*/true, &ksz);
+                auto* setFn = declareC("bz_lazy_from_set", ptrTy(), {ptrTy(), i64()});
+                llvm::Value* lazy = builder_.CreateCall(
+                    setFn, {v, builder_.getInt64((int64_t)ksz)}, "setenum.lazy");
+                v = drainLazyPipelineToOwnedIEnumerable(lazy, declTR);
             } else if (initTR && isLinkedListTypeName(initTR)) {
                 // #1177: (Owned)LinkedList<T> is node-based (bz_llist) — wrap
                 // with the node-walking enumerator, mirroring buildOrderedArgs.
@@ -7749,10 +7781,23 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
             bool initIsArray = initTR->astNode && initTR->astNode->name &&
                 !initTR->astNode->name->parts.empty() &&
                 initTR->headName() == "Array";
+            // fix #1069 / stdlib §4.10: a `Set<T>`/`OwningSet<T>` init is wrapped
+            // at this decl site too (lowerLocalDecl) — a class-element set into a
+            // borrowing array enumerator, a dict-backed one into an OWNING
+            // enumerator over a fresh key snapshot. Both are freshly allocated
+            // here and owned by this local, so both need the scope-end slot-1
+            // Dispose (the borrowing wrapper frees only its own frame; the owning
+            // one also frees the snapshot). The SOURCE set is never disposed by
+            // either — no double-free with the set's own binder.
+            bool initIsSet = initTR->astNode && initTR->astNode->name &&
+                !initTR->astNode->name->parts.empty() &&
+                (initTR->headName() == "Set" ||
+                 initTR->headName() == "OwningSet");
             // A user-class (declaration-carrying) init is wrapped (line 5413), as
             // is an Array init (line 5410). A declaration-less IEnumerable init is
             // NOT wrapped — it is a pre-existing IEnumerable value (an alias).
-            wrappedHere = initIsArray || initTR->declaration != nullptr;
+            wrappedHere = initIsArray || initIsSet ||
+                          initTR->declaration != nullptr;
         }
     }
     bool isCall = dynamic_cast<const ast::CallExpr*>(ld->initializer.get()) != nullptr;
@@ -16489,6 +16534,103 @@ Emitter::Disposal Emitter::buildCollectionTempDisposal(
 }
 
 
+// fix #1070 / #1069 / stdlib §4.10 / §15.4: materialize a `Set<C>`/`OwningSet<C>`
+// sequence literal whose element is a CLASS or INTERFACE — the array-backed set.
+//
+// genericBackingType declines every class element, so such a set is NOT hash-
+// backed: `new Set<C>()` / `new OwningSet<C>()` fall through lowerNew to
+// bz_array_alloc, and `.Add` dedup-appends into that bz_array_t with a linear
+// §8.3-equality scan (#837). This builds the SAME object from a literal, reusing
+// the same allocation (bz_array_alloc) and the same per-element insertion
+// (emitArrayBackedSetInsert — shared with `.Add`/`.UnionWith`), so a literal-
+// built class-element set is bit-for-bit what `new` + `.Add` builds and every
+// read (`Count` → bz_array_len, `Contains`/`in` → the linear scan, `for`-in →
+// lowerArrayFor, scope-end disposal → bz_array_free with the element disposer)
+// already agrees with it.
+//
+// §4.10 dedup: duplicates are collapsed, the FIRST textual occurrence retained;
+// for `OwningSet<T>` "each later duplicate's owned element is disposed at
+// construction" — emitArrayBackedSetInsert's dup branch calls the per-element
+// disposer, which elementPolicyFor yields only for the owning family (a
+// borrowing `Set<C>` holds borrows and disposes nothing).
+//
+// §15.4 L2170 (#1292): if an element expression THROWS partway, the elements
+// already inserted and the partially-filled backing must be disposed on the
+// unwind edge, exactly as the scope-end disposal would — mirrored from
+// materializeHeapCollectionLiteral. The disposed-on-dup element is not in the
+// array, so no slot is freed twice.
+//
+// Returns null (caller's safe no-op) when the element is neither dict-backed nor
+// a class/interface — a shape sema has already diagnosed.
+llvm::Value* Emitter::materializeArrayBackedSetLiteral(
+        const ast::CollectionLiteralExpr* cl, const sema::TypeRef* setTy) {
+    if (!cl || cl->isDict || !setTy) return nullptr;
+    if (!collectionElemIsClass(setTy, 0)) return nullptr;
+    const sema::TypeRef* elemRef =
+        (!setTy->genericArgs.empty()) ? setTy->genericArgs[0] : nullptr;
+    if (!elemRef) return nullptr;
+    std::string_view name = setTy->astNode && setTy->astNode->name &&
+                            !setTy->astNode->name->parts.empty()
+                                ? setTy->headName()
+                                : std::string_view{};
+    bool owning = common::isOwningPrefixedName(name);
+    llvm::Function* dupDisposer =
+        elementPolicyFor(elemRef, owning).disposerThunk;
+    int64_t esz = collectionElemSize(setTy);
+
+    // --- 1. Allocate the bz_array_t backing (same call lowerNew emits). ---
+    int64_t cap = std::max<int64_t>(16, (int64_t)cl->elements.size());
+    auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+    llvm::Value* arr = builder_.CreateCall(
+        allocFn, {builder_.getInt64(esz), builder_.getInt64(cap)}, "slit.arr");
+
+    // --- 2. #1292 / §15.4 L2170: unwind cleanup around the element evals. ---
+    llvm::BasicBlock* savedUnwind = unwindTarget_;
+    std::size_t savedDepth = unwindScopeDepth_;
+    {
+        auto* savedInsert = builder_.GetInsertBlock();
+        llvm::BasicBlock* enclosing = unwindBB();
+        auto* cleanup =
+            llvm::BasicBlock::Create(llvm_, "slit.elem.cleanup", currentFn_);
+        builder_.SetInsertPoint(cleanup);
+        auto* freeFn = declareC("bz_array_free",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+        builder_.CreateCall(freeFn, {arr, elementDisposerArg(elemRef, owning)});
+        builder_.CreateBr(enclosing);
+        builder_.SetInsertPoint(savedInsert);
+        unwindTarget_ = cleanup;
+        unwindScopeDepth_ = disposeStack_.size();
+    }
+
+    // --- 3. Insert each element in textual order (§4.10 dedup). ------------
+    for (const auto& elemPtr : cl->elements) {
+        if (!elemPtr) continue;
+        llvm::Value* ev = lowerExpr(*elemPtr);
+        if (!ev) {
+            // #1386: ICE — lowerExpr returned null for a Set/OwningSet literal
+            // element; the expression kind is not yet handled.
+            ctx_.diagnostics().report(
+                Severity::Error, elemPtr->span.begin,
+                "internal: lowerExpr returned null for Set/OwningSet "
+                "literal element — #1386");
+            continue;
+        }
+        if (!emitArrayBackedSetInsert(arr, ev, elemRef, dupDisposer, esz)) {
+            // emitRemoveElementEquality could not build the comparison — the
+            // same internal-failure path the .Add handler propagates.
+            ctx_.diagnostics().report(
+                Severity::Error, elemPtr->span.begin,
+                "internal: could not build element equality for a "
+                "Set/OwningSet literal element — #1070");
+            break;
+        }
+    }
+    unwindTarget_ = savedUnwind;
+    unwindScopeDepth_ = savedDepth;
+    return arr;
+}
+
+
 // #559 / stdlib §4.10: materialize a Set<T>/OwningSet<T> sequence literal
 // `[e1, e2, …]` into a freshly-allocated Set<T>.
 //
@@ -16510,11 +16652,13 @@ Emitter::Disposal Emitter::buildCollectionTempDisposal(
 // at insert); a +1 producer is transferred, a borrow/literal is retained —
 // exactly as Set.Add handles it in tryLowerCollectionInstanceCall.
 //
-// Returns a `ptr` to the bz_dict_t.  Returns null when `setTy` is not a
-// Set/OwningSet TypeRef with a recognised element type (caller then falls
-// through to the inline-array path, which is incorrect for Sets — but the
-// lowerLocalDecl guard already prevents reaching this function for non-Set
-// targets, so null here means "unrecognized element", which is a sema error).
+// Returns a `ptr` to the bz_dict_t (hash-backed element) or to the bz_array_t
+// (class/interface element — the #1070 array-backed branch below).  Returns
+// null when `setTy` is not a Set/OwningSet TypeRef with a recognised element
+// type (caller then falls through to the inline-array path, which is incorrect
+// for Sets — but the lowerLocalDecl guard already prevents reaching this
+// function for non-Set targets, so null here means "unrecognized element",
+// which is a sema error).
 llvm::Value* Emitter::materializeHeapSetLiteral(
         const ast::CollectionLiteralExpr* cl, const sema::TypeRef* setTy) {
     if (!cl || cl->isDict || !setTy) return nullptr;
@@ -16524,7 +16668,17 @@ llvm::Value* Emitter::materializeHeapSetLiteral(
     uint64_t ksz = 0;
     const sema::TypeRef* elemTy =
         genericBackingType(setTy, 0, /*isSet=*/true, &ksz);
-    if (!elemTy) return nullptr;
+    // fix #1070 / #1069 / stdlib §4.10 / §15.4: a CLASS-or-interface element has
+    // NO generic-dict backing (genericBackingType declines every class), so
+    // `new Set<C>()` / `new OwningSet<C>()` allocate a bz_array_t and `.Add`
+    // dedup-appends into it (#837). Note `OwningSet<T>` REQUIRES `where T: class`
+    // (stdlib §4.10), so this is the only backing a valid OwningSet ever has.
+    // The literal form used to return null here, and the caller's #559
+    // "materialization failed; safe no-op" guard then silently skipped the whole
+    // declaration — the local's slot was never created, so `Count` read 0,
+    // `Contains` was false and `for`-in failed to lower at all ("not yet
+    // implemented: codegen for this for statement"), with no diagnostic.
+    if (!elemTy) return materializeArrayBackedSetLiteral(cl, setTy);
 
     // --- 1. Allocate the backing hash table (same call as lowerNew Set<T>). ---
     llvm::Function* hashT = buildValueHashTrampoline(elemTy);

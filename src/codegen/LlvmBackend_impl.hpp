@@ -4524,10 +4524,23 @@ private:
     // it exactly once, after the call, on both the normal and unwind edges — the
     // callee never disposes a borrowed arg), so the drained array is leak-free
     // and never double-freed.
+    //
+    // fix #1069 / stdlib §4.10: a `Set<T>` / `OwningSet<T>` source is handled
+    // here too. A CLASS-element set is bz_array_t-backed and its backing IS the
+    // dense element array, so it takes the plain (BORROWING) array enumerator; a
+    // DICT-backed set (value/record/string element) is a hash table with no dense
+    // element array, so it is snapshotted (bz_lazy_from_set → bz_lazy_to_array)
+    // into a fresh array behind an OWNING enumerator. `outOwningWrap`, when
+    // non-null, reports whether the returned value is such an OWNING enumerator
+    // the CALLER must dispose exactly once (true for both the lazy-pipeline drain
+    // and the dict-backed-set snapshot). A RETURN site can ignore it — the caller
+    // owns a returned enumerator by construction (#1916); the ARGUMENT site must
+    // consult it and register the scope-end iterEnumDispose (#1923).
     llvm::Value* wrapAsIEnumerableForTarget(llvm::Value* v,
                                             const sema::TypeRef* targetTy,
                                             const ast::Expr* srcExpr,
-                                            bool ownLazyPipeline = false);
+                                            bool ownLazyPipeline = false,
+                                            bool* outOwningWrap = nullptr);
 
     // #1916 / #1911 / stdlib §5 / §29.11: drain a lazy LINQ pipeline (bz_lazy_t*)
     // once into a fresh owned Array<T> (bz_lazy_to_array also disposes the
@@ -5085,6 +5098,19 @@ private:
     llvm::Value* emitRemoveElementEquality(llvm::Value* el, llvm::Value* target,
                                            const sema::TypeRef* elemTy,
                                            bool elemIsClass);
+
+    // stdlib §4.10 / §8.3 (#837 / #1474 / #1070): dedup-insert `item` into the
+    // ARRAY-BACKED `Set<T>`/`OwningSet<T>` whose bz_array_t backing is `setArr`
+    // (a class/interface element T — genericBackingType declines those, so the
+    // set is a linear-scan array, not a hash table). A duplicate (per the §8.3
+    // equality of `elemRef`) is passed to `dupDisposer` when non-null (the
+    // OWNING family disposes the rejected element, §4.10) and not appended;
+    // otherwise `item` is appended via bz_array_add. Shared by the `.Add` /
+    // `.UnionWith` call paths and the §15.4 literal materializer. Returns false
+    // only on an internal emitRemoveElementEquality failure.
+    bool emitArrayBackedSetInsert(llvm::Value* setArr, llvm::Value* item,
+                                  const sema::TypeRef* elemRef,
+                                  llvm::Function* dupDisposer, int64_t esz);
 
     // §28.4 step 3: chain to the base class's Dispose. baseTypes[0] is
     // conventionally the base class when it resolves to one.
@@ -7419,6 +7445,14 @@ private:
     // (or null if `setTy` is not a Set/OwningSet TypeRef with a recognised
     // element type).
     llvm::Value* materializeHeapSetLiteral(
+        const ast::CollectionLiteralExpr* cl, const sema::TypeRef* setTy);
+
+    // fix #1070 / #1069 / stdlib §4.10 / §15.4: the CLASS/INTERFACE-element half
+    // of materializeHeapSetLiteral — such a set has no generic-dict backing, so
+    // it is a bz_array_t built with the same bz_array_alloc `new Set<C>()` emits
+    // and the same dedup insertion `.Add` emits (emitArrayBackedSetInsert).
+    // Returns a `ptr` to the bz_array_t, or null for a non-class element.
+    llvm::Value* materializeArrayBackedSetLiteral(
         const ast::CollectionLiteralExpr* cl, const sema::TypeRef* setTy);
 
     // per §4.6/§4.7: the resolved LinkedList<T>/OwningLinkedList<T> TypeRef of

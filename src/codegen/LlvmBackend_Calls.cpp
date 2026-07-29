@@ -678,6 +678,77 @@ llvm::Value* Emitter::emitRemoveElementEquality(llvm::Value* el,
 }
 
 
+// stdlib §4.10 / §8.3 (#837 / #1474; extracted for #1070): dedup-insert one
+// element into an ARRAY-BACKED `Set<T>` / `OwningSet<T>`.
+//
+// A class-or-interface element has no generic-dict backing (genericBackingType
+// declines every class), so `new Set<C>()` / `new OwningSet<C>()` allocate a
+// bz_array_t and every membership operation is a linear §8.3-equality scan.
+// This scans `setArr` for an element EQUAL to `item` per that contract (a user
+// `Equals` override is honoured, else reference identity — emitRemoveElement-
+// Equality); on a duplicate it calls `dupDisposer` (non-null only for the
+// OWNING family, whose §4.10 contract disposes the rejected element — the
+// caller relinquished ownership) and does NOT append; otherwise it appends via
+// bz_array_add. `item` is stored by value into the backing, so the array is the
+// sole remaining owner of an appended element.
+//
+// Shared by `OwningSet<T>.Add` / `.UnionWith` (the call path) and by the
+// §15.4 collection-literal materializer, so a literal-built set is bit-for-bit
+// what `new` + `.Add` builds. Returns false only on an internal
+// emitRemoveElementEquality failure (malformed comparison IR).
+bool Emitter::emitArrayBackedSetInsert(llvm::Value* setArr, llvm::Value* item,
+                                       const sema::TypeRef* elemRef,
+                                       llvm::Function* dupDisposer,
+                                       int64_t esz) {
+    if (!setArr || !item) return false;
+    auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+    llvm::Value* arrLen = builder_.CreateCall(lenFn, {setArr}, "sa.len");
+    auto* condBB = llvm::BasicBlock::Create(llvm_, "sa.c", currentFn_);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sa.b", currentFn_);
+    auto* nextBB = llvm::BasicBlock::Create(llvm_, "sa.n", currentFn_);
+    auto* dupBB  = llvm::BasicBlock::Create(llvm_, "sa.dup", currentFn_);
+    auto* newBB  = llvm::BasicBlock::Create(llvm_, "sa.new", currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "sa.end", currentFn_);
+    auto* idxSlot = entryAlloca(i64());
+    builder_.CreateStore(builder_.getInt64(0), idxSlot);
+    builder_.CreateBr(condBB);
+    builder_.SetInsertPoint(condBB);
+    llvm::Value* curIdx = builder_.CreateLoad(i64(), idxSlot, "sa.i");
+    builder_.CreateCondBr(
+        builder_.CreateICmpSLT(curIdx, arrLen), bodyBB, newBB);
+    builder_.SetInsertPoint(bodyBB);
+    auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                           {ptrTy(), i64(), i64()});
+    llvm::Value* ep = builder_.CreateCall(
+        ptrFn, {setArr, curIdx, builder_.getInt64(esz)}, "sa.ep");
+    llvm::Value* existing = builder_.CreateLoad(ptrTy(), ep, "sa.ex");
+    llvm::Value* same = emitRemoveElementEquality(
+        existing, item, elemRef, /*elemIsClass=*/true);
+    if (!same) return false;
+    builder_.CreateCondBr(same, dupBB, nextBB);
+    builder_.SetInsertPoint(nextBB);
+    builder_.CreateStore(
+        builder_.CreateAdd(curIdx, builder_.getInt64(1)), idxSlot);
+    builder_.CreateBr(condBB);
+    // duplicate: dispose the passed item (§4.10), do not append.
+    builder_.SetInsertPoint(dupBB);
+    if (dupDisposer) builder_.CreateCall(dupDisposer, {item});
+    builder_.CreateBr(endBB);
+    // new: append.
+    builder_.SetInsertPoint(newBB);
+    {
+        llvm::AllocaInst* slot = entryAlloca(item->getType());
+        builder_.CreateStore(item, slot);
+        auto* addFn = declareC("bz_array_add",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
+        builder_.CreateCall(addFn, {setArr, slot, builder_.getInt64(esz)});
+    }
+    builder_.CreateBr(endBB);
+    builder_.SetInsertPoint(endBB);
+    return true;
+}
+
+
 llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
@@ -3589,55 +3660,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // reuse the exact same per-element semantics when draining `other`.
         // Returns false only on an internal emitRemoveElementEquality failure
         // (malformed comparison IR) — callers propagate that as `return nullptr`.
+        // fix #1070: the body moved to the shared member helper
+        // emitArrayBackedSetInsert so the §15.4 collection-literal materializer
+        // builds a class-element set with the IDENTICAL dedup/dispose semantics.
         auto emitSetDedupInsert = [&](llvm::Value* item) -> bool {
-            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-            llvm::Value* arrLen = builder_.CreateCall(lenFn, {recv}, "sa.len");
-            auto* condBB = llvm::BasicBlock::Create(llvm_, "sa.c", currentFn_);
-            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sa.b", currentFn_);
-            auto* nextBB = llvm::BasicBlock::Create(llvm_, "sa.n", currentFn_);
-            auto* dupBB  = llvm::BasicBlock::Create(llvm_, "sa.dup", currentFn_);
-            auto* newBB  = llvm::BasicBlock::Create(llvm_, "sa.new", currentFn_);
-            auto* endBB  = llvm::BasicBlock::Create(llvm_, "sa.end", currentFn_);
-            auto* idxSlot = entryAlloca(i64());
-            builder_.CreateStore(builder_.getInt64(0), idxSlot);
-            builder_.CreateBr(condBB);
-            builder_.SetInsertPoint(condBB);
-            llvm::Value* curIdx = builder_.CreateLoad(i64(), idxSlot, "sa.i");
-            builder_.CreateCondBr(
-                builder_.CreateICmpSLT(curIdx, arrLen), bodyBB, newBB);
-            builder_.SetInsertPoint(bodyBB);
-            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
-                                   {ptrTy(), i64(), i64()});
-            llvm::Value* ep = builder_.CreateCall(
-                ptrFn, {recv, curIdx, builder_.getInt64(esz)}, "sa.ep");
-            llvm::Value* existing =
-                builder_.CreateLoad(ptrTy(), ep, "sa.ex");
-            llvm::Value* same = emitRemoveElementEquality(
-                existing, item, recvTy->genericArgs[0], /*elemIsClass=*/true);
-            if (!same) return false;
-            builder_.CreateCondBr(same, dupBB, nextBB);
-            builder_.SetInsertPoint(nextBB);
-            builder_.CreateStore(
-                builder_.CreateAdd(curIdx, builder_.getInt64(1)), idxSlot);
-            builder_.CreateBr(condBB);
-            // duplicate: dispose the passed item (§4.10), do not append.
-            builder_.SetInsertPoint(dupBB);
-            if (arrElemPol.disposerThunk)
-                builder_.CreateCall(arrElemPol.disposerThunk, {item});
-            builder_.CreateBr(endBB);
-            // new: append.
-            builder_.SetInsertPoint(newBB);
-            {
-                llvm::AllocaInst* slot = entryAlloca(item->getType());
-                builder_.CreateStore(item, slot);
-                auto* addFn = declareC("bz_array_add",
-                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
-                builder_.CreateCall(addFn,
-                    {recv, slot, builder_.getInt64(esz)});
-            }
-            builder_.CreateBr(endBB);
-            builder_.SetInsertPoint(endBB);
-            return true;
+            return emitArrayBackedSetInsert(recv, item, arrElemRef,
+                                            arrElemPol.disposerThunk, esz);
         };
         // isOwnedSetRecv: this call's receiver is exactly an OwningSet<T> (class
         // T). Gates the set-specific .Add/.UnionWith dedup handlers below —
