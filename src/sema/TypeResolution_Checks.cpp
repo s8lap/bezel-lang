@@ -3483,16 +3483,49 @@ void Resolver::checkStaticInterfaceConformance() {
             }
             for (MethodSymbol* im : statics) {
                 // The interface member's declared signature pieces.
+                //
+                // §11.8 / §2.8.2 (#2294): the interface may be IMPORTED, in
+                // which case `im->decl` is not a local ast::MethodDecl — an
+                // imported member carries no syntactic AST at all. Its resolved
+                // return type rides SemaContext's imported side table
+                // (ModuleLoader::setImportedReturnType) and its parameters carry
+                // `resolvedDeclType` instead of a syntactic `declType`. Reading
+                // only the AST conflated "imported" with "unit-returning" and
+                // left every imported parameter type null, so a CORRECT witness
+                // for an imported static-interface member was rejected with the
+                // "different signature" diagnostic below (a false rejection:
+                // §11.8 conformance was unusable across a module boundary).
                 const ast::Type* imRetNode = nullptr;
                 bool imRetOwned = false;
+                bool imHasAstDecl = false;
                 if (auto* imd = dynamic_cast<const ast::MethodDecl*>(im->decl)) {
                     imRetNode = imd->returnType.get();
                     imRetOwned = imd->returnOwned;
+                    imHasAstDecl = true;
                 } else if (auto* iod =
                                dynamic_cast<const ast::OperatorDecl*>(im->decl)) {
                     imRetNode = iod->returnType.get();
                     imRetOwned = iod->returnOwned;
+                    imHasAstDecl = true;
                 }
+                // The interface member's return, resolved from whichever source
+                // it has. `imRetRef` is null exactly when the member returns
+                // unit — for a local member that is a missing `: Type` node, for
+                // an imported one a `Unit`-kind (or absent) recorded type.
+                TypeRef* imRetRef = nullptr;
+                if (imHasAstDecl) {
+                    imRetRef = resolvedOf(imRetNode);
+                } else {
+                    imRetOwned = ctx_.importedReturnOwned(im);
+                    TypeRef* r = ctx_.importedReturnType(im);
+                    if (r && r->kind != TypeRef::Kind::Unit) imRetRef = r;
+                }
+                // "Declares a return" — the unit-vs-typed test below. For a
+                // local member with a `: Type` node whose resolution failed,
+                // keep the old behaviour (typed, and the match then fails on the
+                // null TypeRef) rather than silently reclassifying it as unit.
+                const bool imDeclaresReturn =
+                    imHasAstDecl ? (imRetNode != nullptr) : (imRetRef != nullptr);
                 const std::string memberSpelling =
                     im->isOperator
                         ? ("operator " + std::string(im->operatorToken))
@@ -3520,7 +3553,15 @@ void Resolver::checkStaticInterfaceConformance() {
                         auto* ip = dynamic_cast<ParameterSymbol*>(im->params[pi]);
                         auto* cp = dynamic_cast<ParameterSymbol*>(cms->params[pi]);
                         if (!ip || !cp) { ok = false; break; }
-                        TypeRef* it2 = resolvedOf(ip->declType);
+                        // §11.8 / §2.8.2 (#2294): an IMPORTED interface
+                        // parameter has no syntactic `declType`; the loader
+                        // records its already-resolved type in
+                        // `resolvedDeclType` instead (ModuleLoader::
+                        // convertParams). `cp` is always local here (the
+                        // conforming type is a member of this module), so only
+                        // the interface side needs the fallback.
+                        TypeRef* it2 = ip->declType ? resolvedOf(ip->declType)
+                                                    : ip->resolvedDeclType;
                         TypeRef* ct = resolvedOf(cp->declType);
                         if (!it2 || !ct) { ok = false; break; }
                         // §11.8/§28.1 (v0.196, #2063): an `owned`/`out owned`
@@ -3564,18 +3605,17 @@ void Resolver::checkStaticInterfaceConformance() {
                     // C` interface return and an unresolved bare-T both retain.
                     bool effImRetOwned = imRetOwned;
                     TypeRef* subIrt = nullptr;
-                    if (imRetNode) {
-                        TypeRef* irt = resolvedOf(imRetNode);
-                        if (irt) {
-                            subIrt = subst(irt, map);
-                            if (subIrt != irt && effImRetOwned &&
-                                ownedMarkerErasedAtSubstitutedType(subIrt))
-                                effImRetOwned = false;
-                        }
+                    if (imRetRef) {
+                        subIrt = subst(imRetRef, map);
+                        if (subIrt != imRetRef && effImRetOwned &&
+                            ownedMarkerErasedAtSubstitutedType(subIrt))
+                            effImRetOwned = false;
                     }
                     if (effImRetOwned != cRetOwned) continue;
-                    if (!imRetNode != !cRetNode) continue;  // unit vs typed
-                    if (imRetNode) {
+                    // unit vs typed (#2294: `imDeclaresReturn`, not the presence
+                    // of an AST node — an imported member never has one).
+                    if (imDeclaresReturn != (cRetNode != nullptr)) continue;
+                    if (imDeclaresReturn) {
                         TypeRef* crt = resolvedOf(cRetNode);
                         if (!subIrt || !crt) continue;
                         if (!typesMatch(subIrt, crt)) continue;
