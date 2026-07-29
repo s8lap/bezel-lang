@@ -7694,10 +7694,19 @@ llvm::FunctionType* Emitter::methodFnType(const sema::MethodSymbol* ms) {
         // #735 / §10.3 (#740): an ENUM instance method's `this` is the underlying
         // integer by value (default i32), matching the exporter (CG30) — not a ptr.
         if (!isStaticMethod(const_cast<sema::MethodSymbol*>(ms))) {
-            bool isEnumMethod =
-                ms->parent && ms->parent->kind == ast::TypeDeclKind::Enum;
-            paramTys.push_back(
-                isEnumMethod ? enumLlvmType(ms->parent) : ptrTy());
+            // §26.1 (#735 part B1): an imported EXTENSION method's receiver is
+            // the extended type (by value for a primitive/enum head), exactly as
+            // declareImportedFunctions declares it — the two must agree or the
+            // call is emitted against a mismatched signature.
+            if (isExtensionMethod(ms)) {
+                llvm::Type* thisTy = extensionThisType(ms, /*byPointer=*/nullptr);
+                paramTys.push_back(thisTy ? thisTy : ptrTy());
+            } else {
+                bool isEnumMethod =
+                    ms->parent && ms->parent->kind == ast::TypeDeclKind::Enum;
+                paramTys.push_back(
+                    isEnumMethod ? enumLlvmType(ms->parent) : ptrTy());
+            }
         }
         for (sema::Symbol* p : ms->params) {
             auto* ps = dynamic_cast<sema::ParameterSymbol*>(p);

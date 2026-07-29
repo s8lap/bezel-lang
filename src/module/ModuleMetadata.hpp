@@ -129,6 +129,18 @@ inline constexpr std::uint32_t kMetadataMagic = 0x644D7A42; // 'B','z','M','d' L
 // soundness-relevant field. `isExecutable` is NOT folded into semanticHash:
 // artifact kind is a build property, not part of the public-INTERFACE content
 // that staleness detection tracks.
+//
+// §26 EXTENSION CARRIAGE (#735, additive within v7): `ModuleMetadata::
+// extensions` carries exported `public extension T` blocks as a 6th trailing
+// top-level count scalar plus one EXTENSION_BLOCK subblock each, after the
+// constants. NO bump: the rule above is that a bump is reserved for a change
+// that makes an old reader MISINTERPRET an existing field, and this only ADDS
+// a trailing scalar and trailing subblocks. A reader predating the field stops
+// after the constants and never sees them — it then reports the pre-#735 clean
+// `no member` reject for a cross-module extension call, never a wrong value. A
+// module with no exported extension produces byte-identical metadata to before
+// (the 6th scalar is only emitted when there is at least one, mirroring the
+// #783 methodBodyText precedent).
 inline constexpr std::uint32_t kSchemaVersion = 7;
 
 // --- Type representation (decoupled mirror of sema::TypeRef) ----------------
@@ -439,6 +451,32 @@ struct MetaFunction {
     bool operator==(const MetaFunction&) const;
 };
 
+// §26 (#735): an exported `public extension T` block. Extensions are
+// statically dispatched receiver-directed members (§26.5): the exporter emits
+// each extension method as an ExternalLinkage `bz$ext$<T>$<M>` symbol, so the
+// importer needs only the block's TARGET type and its methods' SIGNATURES to
+// resolve `x.M()` (§26.5 step 2 — "the compiler searches the current module and
+// all imported modules for extension blocks on x's type") and emit the call.
+// No body text crosses the boundary (unlike the generic-class #662c/#783 paths).
+//
+// SCOPE (decline-with-reasons, CLAUDE.md §4): the builder exports only the
+// shapes whose cross-module dispatch is exactly the exported symbol —
+// a `public` block on a NON-generic target with no `where` clause, carrying
+// `public` NON-generic methods. A generic extension head (`extension Bag<T>`,
+// or a generic extension method `Map<U>`) would need importer-side
+// monomorphization of the body (the §14.1/#783 machinery) because the exported
+// symbol was compiled against the exporter's placeholder layout; an extension
+// PROPERTY has no exported accessor symbol at all (§26.1 properties are
+// inlined at the use site). Those shapes are not exported, so the importer
+// keeps its existing clean "no member" reject rather than mis-dispatching.
+struct MetaExtension {
+    MetaType target;                  // §26.1 the extended type
+    MetaVisibility visibility = MetaVisibility::Public;
+    std::vector<MetaMember> members;  // §26.3 methods (this increment)
+
+    bool operator==(const MetaExtension&) const;
+};
+
 // A public top-level constant (§11 const at module scope).
 struct MetaConstant {
     std::string name;
@@ -457,6 +495,10 @@ struct ModuleMetadata {
     std::vector<MetaTypeDecl> types;
     std::vector<MetaFunction> functions;
     std::vector<MetaConstant> constants;
+    // §26 / §2.5 (#735): exported extension blocks. Rides as a 6th top-level
+    // count scalar plus one trailing EXTENSION_BLOCK each, so a blob with no
+    // exported extensions is byte-identical to a pre-#735 one.
+    std::vector<MetaExtension> extensions;
 
     // §2.8.4 rule 1 / rule 4 (issue #1733, schema v6): the artifact's KIND.
     // true = this artifact was emitted as an EXECUTABLE build (it carries a

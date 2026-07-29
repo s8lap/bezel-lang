@@ -1159,6 +1159,51 @@ void pinInLlvmUsed(llvm::Module& module, llvm::GlobalVariable* gv) {
 
 }  // namespace
 
+// §26 / §2.5 (#735): convert one `public extension T` block into its wire form,
+// or return false to skip it (a shape whose cross-module dispatch is not exactly
+// the exported `bz$ext$<T>$<M>` symbol — see MetaExtension's header note).
+static bool convertExtension(const sema::ExtensionSymbol& ext,
+                             sema::SemaContext& ctx, MetaExtension& out,
+                             std::string_view source) {
+    const auto* decl = dynamic_cast<const ast::ExtensionDecl*>(ext.decl);
+    if (decl == nullptr || !decl->targetType) return false;
+    // §13.2 / §26.3: an `internal` block (the default) is not downstream-visible.
+    if (decl->visibility != ast::Visibility::Public) return false;
+    // §26.4: a block with `where` constraints, or a target carrying type
+    // arguments, binds block-level type parameters — the exported symbol was
+    // compiled against the exporter's placeholder layout, so dispatching it
+    // importer-side needs the #783 monomorphization machinery. Not exported.
+    if (!decl->genericConstraints.empty()) return false;
+    if (!decl->targetType->genericArgs.empty()) return false;
+    const sema::TypeRef* target = ctx.resolvedType(*decl->targetType);
+    if (target == nullptr) return false;
+    // §26.4: a bare single-segment identifier in the head introduces a fresh
+    // block-level type parameter; TypeResolution leaves such a head as a
+    // null-declaration Named ref. Only a resolved type (or a primitive, §26.2)
+    // has a stable cross-module identity to dispatch against.
+    if (target->kind == sema::TypeRef::Kind::Named &&
+        target->declaration == nullptr)
+        return false;
+    out.target = convertType(target);
+    out.visibility = toMetaVisibility(decl->visibility, /*inInterface=*/false);
+    for (sema::Symbol* m : ext.members) {
+        auto* meth = dynamic_cast<const sema::MethodSymbol*>(m);
+        // §26.3: extensions declare methods and computed read-only properties.
+        // A property has no exported accessor symbol (it is inlined at the use
+        // site), so only methods cross; a generic extension method would need
+        // importer-side monomorphization (as above).
+        if (meth == nullptr || meth->isOperator) continue;
+        if (!meth->genericParams.empty()) continue;
+        if (!isExportedMember(meth->visibility, /*inInterface=*/false)) continue;
+        if (dynamic_cast<const ast::MethodDecl*>(meth->decl) == nullptr) continue;
+        MetaMember mm;
+        if (convertMember(*meth, /*inInterface=*/false, ctx, mm,
+                          /*isGenericType=*/false, source))
+            out.members.push_back(std::move(mm));
+    }
+    return !out.members.empty();
+}
+
 ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
                                     std::string_view source) {
     ModuleMetadata md;
@@ -1183,8 +1228,17 @@ ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
     }
 
     for (sema::Symbol* child : mod->children) {
+        // §26 / §2.5 (#735): a `public extension T` block IS part of the
+        // exported surface — §26.5 step 2 requires an importer to search "all
+        // imported modules" for extension blocks on the receiver's type.
+        if (auto* ext = dynamic_cast<const sema::ExtensionSymbol*>(child)) {
+            MetaExtension me;
+            if (convertExtension(*ext, ctx, me, source))
+                md.extensions.push_back(std::move(me));
+            continue;
+        }
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(child);
-        if (ts == nullptr) continue;  // aliases/extensions/externs: see note
+        if (ts == nullptr) continue;  // aliases/externs: see note
         if (!isExportedType(*ts)) continue;  // §13.2 internal types not exported
         // §2.20/#2047: the auto-imported stdlib prelude decl (Result) is NOT
         // part of this module's public interface — every importer injects its
@@ -1205,8 +1259,9 @@ ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
     // TopDecl — TopDecl is only TypeDecl / TypeAlias / ExtensionDecl /
     // ExternBlock (ast::SourceFile::topDecls). So nothing populates md.functions
     // / md.constants here; the fields stay empty until that grammar lands. Type
-    // aliases, extensions, and extern blocks are likewise out of this
-    // increment's scope (their cross-module-import semantics are Increment 3+).
+    // aliases and extern blocks are likewise out of this increment's scope
+    // (their cross-module-import semantics are Increment 3+). Extension blocks
+    // ARE exported (§26 / #735) — see the loop above and MetaExtension.
     return md;
 }
 

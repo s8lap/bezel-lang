@@ -96,6 +96,14 @@ private:
     std::unordered_set<std::string> sourceImports_;
     // §2.2 v0.164 / #1365: bare names ambiguous due to import collision.
     std::unordered_set<std::string> ambiguousImportNames_;
+    // §26.5 step 2 / §2.5 (#735): the extension blocks reconstructed from the
+    // modules this source file `import`s — §26.5 requires the search to cover
+    // "the current module AND all imported modules". Populated in run() from
+    // SemaContext::importedExtensionsOf for each explicit import (so an
+    // artifact loaded but not imported stays invisible, matching the
+    // imported-TYPE gating), and searched by lookupExtensionMember alongside
+    // the current module's own ExtensionSymbols.
+    std::vector<ExtensionSymbol*> importedExtensions_;
     // §2.7 v0.164 / #1365: maps a MemberAccessExpr* → dotted module name when
     // that expression resolves to a partial module-name prefix in expression
     // position (e.g. `BankingApp.Transactions` in `BankingApp.Transactions.Calc`).

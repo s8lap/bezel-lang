@@ -122,6 +122,7 @@ void ExprTC::run(const ast::SourceFile& src) {
     importAliases_.clear();
     sourceImports_.clear();
     ambiguousImportNames_.clear();
+    importedExtensions_.clear();
     for (const auto& imp : src.imports) {
         if (!imp || !imp->name) continue;
         std::string dotted;
@@ -175,6 +176,15 @@ void ExprTC::run(const ast::SourceFile& src) {
             // §2.8.1 rule 4: a self-import never exposes a same-named
             // dependency artifact's publics (see the note above run()).
             if (!selfModuleName.empty() && dotted == selfModuleName) continue;
+            // §26.5 step 2 (#735): an imported module's `public extension`
+            // blocks join the extension search set for this file. Unlike a
+            // type, an extension has no name to expose in scope — it is found
+            // only by lookupExtensionMember matching its target type.
+            if (const std::vector<ExtensionSymbol*>* exts =
+                    ctx_.importedExtensionsOf(dotted)) {
+                for (ExtensionSymbol* e : *exts)
+                    if (e) importedExtensions_.push_back(e);
+            }
             if (const std::vector<TypeSymbol*>* exported =
                     ctx_.importedTypesOf(dotted)) {
                 for (TypeSymbol* t : *exported) {
@@ -5599,10 +5609,21 @@ Symbol* ExprTC::lookupExtensionMember(
     const TypeRef* receiver,
     std::string_view name,
     std::vector<std::pair<std::string, TypeRef*>>* outBinding) {
-    if (!receiver || !ctx_.module()) return nullptr;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* ext = dynamic_cast<ExtensionSymbol*>(child);
-        if (!ext) continue;
+    if (!receiver) return nullptr;
+    // §26.5 step 2: "the compiler searches the current module AND all imported
+    // modules for extension blocks on x's type". The candidate set is this
+    // file's own module children plus the blocks reconstructed from each
+    // `import`ed dependency artifact (#735) — before that carriage existed, a
+    // cross-module extension call reported a spurious "no member" reject.
+    std::vector<ExtensionSymbol*> candidates;
+    if (ctx_.module()) {
+        for (Symbol* child : ctx_.module()->children)
+            if (auto* e = dynamic_cast<ExtensionSymbol*>(child))
+                candidates.push_back(e);
+    }
+    candidates.insert(candidates.end(), importedExtensions_.begin(),
+                      importedExtensions_.end());
+    for (ExtensionSymbol* ext : candidates) {
         auto* decl = dynamic_cast<const ast::ExtensionDecl*>(ext->decl);
         if (!decl || !decl->targetType) continue;
         const TypeRef* target = ctx_.resolvedType(*decl->targetType);

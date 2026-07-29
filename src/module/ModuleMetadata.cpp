@@ -42,6 +42,7 @@ enum BlockID : unsigned {
     PARAM_BLOCK = 14,   // one MetaParam
     METATYPE_BLOCK = 15, // one MetaType (a signature type, possibly nested)
     CONTRACT_BLOCK = 16, // one MetaContractRecord (§22.16 / #2054)
+    EXTENSION_BLOCK = 17, // one MetaExtension (§26 / #735)
     // 17.. reserved for future additive subblocks (a reader skips unknown ids)
     UNKNOWN_FUTURE_BLOCK = 99, // test-only: a subblock id this reader skips
 };
@@ -211,7 +212,19 @@ std::uint64_t semanticHash(const ModuleMetadata& md) {
         hashType(h, c.type);
         hashStr(h, c.valueText);
     }
-    hashBool(h, md.contractRecordsCarried);
+    // §26 (#735): exported extension blocks are public interface — adding,
+    // removing, or re-signing an extension member must mark dependents stale.
+    // Folded LAST and only when non-empty so a module with no exported
+    // extension hashes exactly as it did before the field existed.
+    if (!md.extensions.empty()) {
+        hashU64(h, md.extensions.size());
+        for (const MetaExtension& ext : md.extensions) {
+            hashType(h, ext.target);
+            hashByte(h, static_cast<std::uint8_t>(ext.visibility));
+            hashU64(h, ext.members.size());
+            for (const MetaMember& m : ext.members) hashMember(h, m);
+        }
+    }
     return h;
 }
 
@@ -312,10 +325,15 @@ bool MetaConstant::operator==(const MetaConstant& o) const {
            valueText == o.valueText;
 }
 
+bool MetaExtension::operator==(const MetaExtension& o) const {
+    return target == o.target && visibility == o.visibility &&
+           members == o.members;
+}
+
 bool ModuleMetadata::operator==(const ModuleMetadata& o) const {
     return moduleName == o.moduleName && exports == o.exports &&
            types == o.types && functions == o.functions &&
-           constants == o.constants &&
+           constants == o.constants && extensions == o.extensions &&  // §26/#735
            isExecutable == o.isExecutable &&
            contractRecordsCarried == o.contractRecordsCarried;  // §2.8.6 (#2054)
 }
@@ -501,6 +519,20 @@ void emitFunction(llvm::BitstreamWriter& w, const MetaFunction& fn) {
     w.ExitBlock();
 }
 
+// §26 (#735): one exported extension block. Shape mirrors emitTypeDecl (scalars,
+// then the target type, then the members) so the reader is symmetric.
+void emitExtension(llvm::BitstreamWriter& w, const MetaExtension& ext) {
+    w.EnterSubblock(EXTENSION_BLOCK, 4);
+    llvm::SmallVector<std::uint64_t, 2> sc{
+        static_cast<std::uint64_t>(ext.visibility),
+        ext.members.size(),
+    };
+    w.EmitRecord(REC_SCALARS, sc);
+    emitType(w, ext.target);
+    for (const MetaMember& m : ext.members) emitMember(w, m);
+    w.ExitBlock();
+}
+
 void emitConstant(llvm::BitstreamWriter& w, const MetaConstant& c) {
     w.EnterSubblock(CONST_BLOCK, 4);
     llvm::SmallVector<std::uint64_t, 1> sc{
@@ -557,15 +589,21 @@ std::vector<std::uint8_t> serializeImpl(const ModuleMetadata& md,
             // makes it reject one); a v6 reader reads the flag, and a v<=5 BLOB
             // read by a v6 reader has only three scalars → isExecutable = false
             // (library), preserving back-compat for existing library artifacts.
-            llvm::SmallVector<std::uint64_t, 5> counts{
+            llvm::SmallVector<std::uint64_t, 6> counts{
                 md.types.size(), md.functions.size(), md.constants.size(),
                 md.isExecutable ? 1u : 0u,
                 md.contractRecordsCarried ? 1u : 0u};
+            // §26 (#735, additive): the extension count rides as a 6th scalar,
+            // emitted ONLY when there is at least one exported extension, so a
+            // module without extensions produces byte-identical metadata to
+            // before the field existed (an absent 6th scalar reads as 0).
+            if (!md.extensions.empty()) counts.push_back(md.extensions.size());
             w.EmitRecord(REC_SCALARS, counts);
         }
         for (const MetaTypeDecl& ty : md.types) emitTypeDecl(w, ty);
         for (const MetaFunction& fn : md.functions) emitFunction(w, fn);
         for (const MetaConstant& c : md.constants) emitConstant(w, c);
+        for (const MetaExtension& ext : md.extensions) emitExtension(w, ext);
 
         w.ExitBlock();
     }
@@ -1051,6 +1089,25 @@ bool readConstant(Reader& r, MetaConstant& c) {
     return readConstantBody(r, c);
 }
 
+// §26 (#735): the inverse of emitExtension.
+bool readExtensionBody(Reader& r, MetaExtension& ext) {
+    llvm::SmallVector<std::uint64_t, 2> sc;
+    if (!expectScalars(r, sc) || sc.size() < 2) return false;
+    ext.visibility = static_cast<MetaVisibility>(sc[0]);
+    std::uint64_t nMembers = sc[1];
+    if (!readType(r, ext.target)) return false;
+    ext.members.resize(nMembers);
+    for (std::uint64_t i = 0; i < nMembers; ++i) {
+        if (!readMember(r, ext.members[i])) return false;
+    }
+    return finishBlock(r);
+}
+
+bool readExtension(Reader& r, MetaExtension& ext) {
+    if (!enterSubblock(r, EXTENSION_BLOCK)) return false;
+    return readExtensionBody(r, ext);
+}
+
 // Validate magic + read the header record. Positions the cursor inside the
 // MODULE_BLOCK, just after the header record. Reports the schema version + hash
 // via out-params. Returns false on bad magic / newer schema / malformed input.
@@ -1121,6 +1178,14 @@ std::optional<ModuleMetadata> deserialize(
     md.constants.resize(counts[2]);
     for (std::uint64_t i = 0; i < counts[2]; ++i) {
         if (!readConstant(r, md.constants[i])) return std::nullopt;
+    }
+    // §26 (#735): the optional 6th scalar is the exported-extension count.
+    // Absent (every pre-#735 blob, and any module with no exported extension)
+    // → 0, so nothing is read and the decode ends exactly as it did before.
+    const std::uint64_t nExtensions = counts.size() >= 6 ? counts[5] : 0;
+    md.extensions.resize(nExtensions);
+    for (std::uint64_t i = 0; i < nExtensions; ++i) {
+        if (!readExtension(r, md.extensions[i])) return std::nullopt;
     }
     return md;
 }

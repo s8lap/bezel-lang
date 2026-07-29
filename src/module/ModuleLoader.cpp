@@ -1495,6 +1495,66 @@ static void loadMetadataPass2(
         }
     }
 
+    // §26 / §2.5 (#735) — Pass 4: reconstruct exported EXTENSION blocks. An
+    // extension member belongs to no type, so it cannot ride the TypeSymbol
+    // path: the importer needs a live `ast::ExtensionDecl` because
+    // ExprTC::lookupExtensionMember matches on its `targetType` (§26.5 step 2)
+    // and codegen's functionName / extensionThisType recover the exported
+    // `bz$ext$<T>$<M>` symbol and its receiver ABI from the same node. So
+    // synthesize a minimal AST: one ExtensionDecl per block, whose targetType is
+    // a Named ast::Type with the block's head spelled from the metadata and the
+    // resolved TypeRef registered directly. No re-parse and no fresh
+    // SemaContext are needed (unlike the #662c/#783 generic BODY paths) — an
+    // extension head is a plain type name, and the body never crosses the
+    // boundary: the call links against the exporter's emitted symbol.
+    if (!md.extensions.empty()) {
+        auto synth = std::make_unique<ast::SourceFile>();
+        for (const MetaExtension& me : md.extensions) {
+            auto decl = std::make_unique<ast::ExtensionDecl>();
+            decl->visibility = fromMetaVisibility(me.visibility);
+            auto targetTy = std::make_unique<ast::Type>();
+            targetTy->kind = ast::TypeKind::Named;
+            targetTy->name = std::make_unique<ast::QualifiedName>();
+            // The spelled head must be the SAME last segment the exporter
+            // mangled `bz$ext$<T>$<M>` with (Emitter::functionName reads
+            // targetType->name->parts.back()), so a class/record/enum head uses
+            // the type's own name and a §26.2 primitive head its keyword.
+            targetTy->name->parts.push_back(
+                ctx.internString(metaTypeToSourceText(me.target)));
+            decl->targetType = std::move(targetTy);
+            ctx.setResolvedType(decl->targetType.get(), loader.convert(me.target));
+
+            auto* extSym = ctx.makeImportedSymbol<sema::ExtensionSymbol>();
+            extSym->decl = decl.get();
+            extSym->scope = sema::kModuleScope;
+            for (const MetaMember& mm : me.members) {
+                if (mm.kind != MetaMemberKind::Method) continue;
+                const sema::ScopeId scope = ctx.newScope();
+                auto* ms = ctx.makeImportedSymbol<sema::MethodSymbol>();
+                ms->name = ctx.internString(mm.name);
+                ms->visibility = fromMetaVisibility(mm.visibility);
+                ms->modifiers = loader.intern(mm.modifiers);
+                // §26.1: an extension method has no `parent` TypeSymbol — that
+                // null parent is exactly how codegen distinguishes it, together
+                // with `extensionDecl`.
+                ms->parent = nullptr;
+                ms->scope = scope;
+                ms->params = loader.convertParams(mm.params, scope);
+                ms->extensionDecl = decl.get();
+                ms->isPure = mm.isPure;
+                ms->contractRecords = toContractRecords(mm.contracts);
+                loader.returnTypes_[ms] = loader.convert(mm.type);
+                loader.returnOwned_[ms] = mm.returnOwned;
+                extSym->members.push_back(ms);
+            }
+            ctx.registerImportedExtension(md.moduleName, extSym);
+            synth->topDecls.push_back(std::move(decl));
+        }
+        // The synthetic AST must outlive sema + codegen (every symbol above
+        // points into it), so hand it to the context's imported-AST arena.
+        ctx.ownImportedAst(std::move(synth));
+    }
+
     // Publish the loader's member-type side tables into the SemaContext so the
     // rest of the front-end (and codegen) can read an imported member's resolved
     // type without an ast::Type node.

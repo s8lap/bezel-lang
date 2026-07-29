@@ -204,6 +204,26 @@ public:
         importedByModule_[moduleName].push_back(t);
     }
 
+    // §26 / §2.5 (#735): register an imported `public extension T` block under
+    // its defining module's §2.1 dotted name. Kept in its own registry (NOT in
+    // ModuleSymbol::children) for two reasons: the importing file's own module
+    // symbol must keep holding only ITS OWN declarations (the §23.2 / §26.3
+    // per-block checks in TypeResolution walk `children` and must not re-check
+    // a dependency's already-checked block), and §26.5 step 2 visibility is
+    // `import`-gated exactly like an imported type's.
+    void registerImportedExtension(const std::string& moduleName,
+                                   ExtensionSymbol* e) {
+        importedExtensionsByModule_[moduleName].push_back(e);
+    }
+
+    // The imported extension blocks of a loaded module, or null if the module
+    // was never loaded (§26.5 step 2 — consulted only for `import`ed modules).
+    const std::vector<ExtensionSymbol*>* importedExtensionsOf(
+        const std::string& moduleName) const {
+        auto it = importedExtensionsByModule_.find(moduleName);
+        return it == importedExtensionsByModule_.end() ? nullptr : &it->second;
+    }
+
     // §14 / #662c: take ownership of a re-parsed SourceFile that holds
     // ctor/dtor AST nodes for imported generic classes.  The SourceFile's
     // lifetime is tied to this SemaContext so that symbol decl pointers
@@ -380,6 +400,9 @@ private:
     std::vector<std::unique_ptr<Symbol>> importedSymbols_;
     std::vector<std::unique_ptr<TypeRef>> importedTypeRefs_;
     std::unordered_map<std::string, std::vector<TypeSymbol*>> importedByModule_;
+    // §26 / §2.5 (#735): imported extension blocks, keyed by defining module.
+    std::unordered_map<std::string, std::vector<ExtensionSymbol*>>
+        importedExtensionsByModule_;
     std::unordered_set<Symbol*> imported_;
     std::vector<std::unique_ptr<std::string>> internedStrings_;
     std::unordered_map<const Symbol*, TypeRef*> importedReturnTypes_;
