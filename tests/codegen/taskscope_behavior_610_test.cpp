@@ -278,6 +278,66 @@ BEZEL_TEST(taskscope_behavior_610, captured_owned_sources_disposed_exactly_once)
     BEZEL_EXPECT_EQ(r.exitCode, 2);
 }
 
+// issue #1422 / stdlib §6.10 (v0.228) / spec §28.12 (v0.228): the exception
+// edge's `DisposeAsync` is documented as a NON-BLOCKING zombie drain (cancel +
+// mark zombie; the LAST child's own completion callback swallows any fault
+// and frees the scope — bz_task_scope_dispose_unwind,
+// bezel_runtime_concurrency.cpp), not an awaited drain, even though stdlib
+// §6.10 says DisposeAsync "drains remaining children" and spec §28.12 says
+// `await using`'s implicit finally "awaits DisposeAsync on both the normal
+// and exception edges of an async body". The gap is recorded rationale, not
+// an oversight: a BLOCKING wait inside a domain continuation is a
+// deterministic deadlock (bz_task_await_sync is documented for the non-
+// domain-runner main thread only), and the compiler's async-disposal
+// lowering does not support suspending mid-unwind (emitAsyncDisposeAwaitAndFree,
+// LlvmBackend_Async.cpp, always takes the synchronous-fallback branch when
+// isUnwind — LlvmBackend_Disposal.cpp's emitDisposals) — "awaiting across an
+// already-active unwind is a deferred increment".
+//
+// This test PINS the OBSERVED behavior mechanically: a child that sleeps then
+// increments a counter is still in flight when the outer exception fires.
+// Immediately after the `catch`, the child has NOT completed (an AWAITED
+// drain would have blocked control here until it had) — only after an
+// explicit extra delay does the increment become visible. A future change
+// that makes the exception-edge drain genuinely awaited (closing #1422)
+// would need to update this test's expected values.
+BEZEL_TEST(taskscope_behavior_610, exception_edge_drain_is_nonblocking_zombie_1422) {
+    auto r = runAot(
+        "module M; import System.Threading; "
+        "class Prog "
+        "  public static _count: int := 0; "
+        "  public static method Always(): bool => true; "
+        "  public static async method Run(): Task "
+        "    await using var scope := new TaskScope(); "
+        "    scope.Spawn(async lambda() => do "
+        "      await Task.Delay(30); "
+        "      Prog._count := Prog._count + 1; "
+        "    end); "
+        "    if Prog.Always() then "
+        "      throw new ArgumentException(\"outer\"); "
+        "    end; "
+        "    await scope.Join(); "
+        "  end Run; "
+        "  public static async method Main(): Task<int> "
+        "    var caught := false; "
+        "    try "
+        "      await Prog.Run(); "
+        "    catch "
+        "      var e: ArgumentException => do caught := true; end "
+        "    end; "
+        "    var rightAfterCatch := Prog._count; "
+        "    await Task.Delay(80); "
+        "    var afterDelay := Prog._count; "
+        "    if caught and rightAfterCatch = 0 and afterDelay = 1 then "
+        "      return 0; "
+        "    end; "
+        "    return 1; "
+        "  end Main; "
+        "end Prog;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
 // §6.10: a worker may Spawn MORE work while Join drains (drain completeness —
 // the counter never reaches zero early); all of it completes before Join
 // returns.

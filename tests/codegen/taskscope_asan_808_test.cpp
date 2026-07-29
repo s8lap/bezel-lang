@@ -211,3 +211,60 @@ BEZEL_TEST(taskscope_asan_808, exception_edge_unwind_drain_clean) {
         "end Prog;",
         0);
 }
+
+// issue #1422 residual: §6.10 EXCEPTION-EDGE drain with SEVERAL children,
+// TWO of which fault DURING the non-blocking zombie drain (after the outer
+// throw already fired and the scope's token was cancelled) — extends the
+// single-second-fault case above to the general "always swallows their
+// faults" contract (stdlib §6.10 v0.228) under concurrent zombie faults, and
+// to a child that is still suspended at an `await` when the drain begins
+// (the first child's while-loop). All of it — the still-running child, the
+// two that fault, the one that completes cleanly, their tasks, their own
+// fault objects, and the scope itself — must be reclaimed exactly once: no
+// leak, no UAF, no double-free. (Capture-free bodies for the same pre-
+// existing async-closure capture-cell leak reason noted above — orthogonal
+// to this drain and reproducible without any TaskScope; see issue #2334.)
+BEZEL_TEST(taskscope_asan_808, exception_edge_several_children_multi_fault_clean) {
+    expectAsanClean(
+        "module M; import System.Threading; "
+        "class Prog "
+        "  public static method Always(): bool => true; "
+        "  public static async method Run(): Task "
+        "    await using var scope := new TaskScope(); "
+        "    scope.Spawn(async lambda() => do "
+        "      var i := 0; "
+        "      while i < 20 do "
+        "        await Task.Delay(2); "
+        "        i := i + 1; "
+        "      end; "
+        "    end); "
+        "    scope.Spawn(async lambda() => do "
+        "      await Task.Delay(2); "
+        "      throw new InvalidOperationException(\"first drained fault\"); "
+        "    end); "
+        "    scope.Spawn(async lambda() => do "
+        "      await Task.Delay(4); "
+        "      throw new ArgumentNullException(\"second drained fault\"); "
+        "    end); "
+        "    scope.Spawn(async lambda() => do "
+        "      await Task.Delay(6); "
+        "    end); "
+        "    if Prog.Always() then "
+        "      throw new ArgumentException(\"outer\"); "
+        "    end; "
+        "    await scope.Join(); "
+        "  end Run; "
+        "  public static async method Main(): Task<int> "
+        "    var caught := false; "
+        "    try "
+        "      await Prog.Run(); "
+        "    catch "
+        "      var e: ArgumentException => do caught := true; end "
+        "    end; "
+        "    await Task.Delay(100); "
+        "    if caught then return 0; end; "
+        "    return 1; "
+        "  end Main; "
+        "end Prog;",
+        0);
+}
