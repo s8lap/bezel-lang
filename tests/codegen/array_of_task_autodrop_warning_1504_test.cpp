@@ -27,6 +27,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::runAotChecked;
 
 namespace {
 
@@ -131,4 +132,100 @@ BEZEL_TEST(codegen_array_of_task_autodrop_1504,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(r.hardErrorOnA);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// §28.3 / §28.9 / #1504 — the ISSUE'S ACTUAL REPRO (the `w2.bz` probe from
+// the 2026-07-07 spec/design review, preserved at
+// /var/tmp/bezel-scratch/specrun/async-await/w2.bz): an owned `Array<Task>`
+// local declared in an ASYNC method whose live range CROSSES an `await` —
+// i.e. a suspend-local (annotateSuspendLocals), not the simpler non-crossing
+// shape the cases above cover. This is a DISTINCT code path in
+// src/ownership/Ownership.cpp: the general sync/non-suspend-local warning
+// carves (the `!isAsync_` gate above, and the #1663 non-suspend-local async
+// gate) both bypass a suspend-local, which instead reaches the SB01-C1/D2
+// carve (#1786/#1868) — historically keyed ONLY to "is this local itself a
+// Task", so a suspend-local `Array<Task>` (a class, not a Task) fell through
+// to the hard §28.3 reject exactly as the issue reports, even though the
+// non-async/non-suspend-crossing shapes above (already fixed pre-#1786) were
+// long since fine. `Array<Task>` is a borrowing collection (§5.11) whose own
+// `Dispose()` is trivial (§28.9 — it holds no owned elements, only borrowed
+// `Task` references) — the "genuine frame-teardown gap" residual-leak
+// concern that keeps a general disposable-class suspend-local hard-rejected
+// (verified NOT to regress below) does not apply: there is nothing to lose
+// if the frame is abandoned before resuming, because Dispose() releases
+// nothing either way.
+BEZEL_TEST(codegen_array_of_task_autodrop_1504,
+           async_suspend_crossing_array_of_task_lints_not_errors) {
+    auto r = check(
+        "module M; "
+        "class Program "
+        "  public static async method Main(): Task "
+        "    using var t := Task.Delay(1); "
+        "    var a := new Array<Task>(); "
+        "    a.Add(t); "
+        "    await t; "
+        "    Console.WriteLine($\"{a.Count}\"); "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);             // binary produced (warning, not error)
+    BEZEL_EXPECT_FALSE(r.hardErrorOnA);   // NOT the §28.3 hard discharge error
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// §28.3 / §28.9 / #1504 — the same async-suspend-local shape, ASan/LSan-
+// checked: the array's own backing allocation must be reclaimed EXACTLY
+// ONCE when the frame resumes past the `await` and `a` auto-drops at scope
+// end. A leak (the pre-fix reject masked this question entirely — a program
+// that never compiled cannot leak) or a double-free (an over-broad carve
+// disposing an already-collection-owned or already-scope-end-disposed slot
+// twice) would flip `r.ran` to false under runAotChecked.
+BEZEL_TEST(codegen_array_of_task_autodrop_1504,
+           async_suspend_crossing_array_of_task_disposed_exactly_once) {
+    auto r = runAotChecked(
+        "module M; "
+        "class Program "
+        "  public static async method Main(): Task<int> "
+        "    using var t := Task.Delay(1); "
+        "    var a := new Array<Task>(); "
+        "    a.Add(t); "
+        "    await t; "
+        "    return a.Count; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);       // ASan/LSan-clean: no leak, no double-free
+    BEZEL_EXPECT_EQ(r.exitCode, 1); // a.Count == 1 (the one Add'd task)
+}
+
+// §28.3 / §28.9 / #1504 (negative control) — a GENUINELY disposable class
+// (a destructor — real cleanup to lose) as a suspend-local crossing an
+// `await` must STAY the hard §28.3 reject: the fix is scoped to §28.9
+// TRIVIAL-dispose suspend-locals (rhsIsDisposableClassType == false); a
+// non-trivial-dispose class suspend-local's frame-teardown gap is a genuine
+// residual leak risk (documented at the SB01-C1/D2 comment site in
+// Ownership.cpp) that this fix must not silently paper over.
+BEZEL_TEST(codegen_array_of_task_autodrop_1504,
+           async_suspend_crossing_disposable_class_still_hard_rejected) {
+    auto run = runAot(
+        "module M; "
+        "class Resource "
+        "  destructor end destructor; "
+        "end Resource; "
+        "class Program "
+        "  public static async method Main(): Task "
+        "    using var t := Task.Delay(1); "
+        "    var r := new Resource(); "
+        "    await t; "
+        "  end Main; "
+        "end Program;");
+    bool hardErrorOnR = false;
+    for (const auto& d : run.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("would be dropped here without disposal") !=
+                std::string::npos &&
+            d.message.find("`r`") != std::string::npos) {
+            hardErrorOnR = true;
+        }
+    }
+    BEZEL_EXPECT_FALSE(run.ran);   // still rejected — no binary
+    BEZEL_EXPECT_TRUE(hardErrorOnR);
 }

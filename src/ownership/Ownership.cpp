@@ -756,9 +756,49 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
                     if (auto* ld =
                             dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
+                        // §28.3/§28.11 (#1504): a suspend-local of a
+                        // BORROWING-COLLECTION type (isBorrowingCollectionName-
+                        // Head — Array<T>/Stack<T>/Queue<T>/Set<T>/
+                        // Dictionary<K,V>/LinkedList<T>, §28.11) whose element
+                        // type is Task-family (Task/Task<T>/OwningTask<T>) is
+                        // exempted from the suspend-local reject on the same
+                        // footing as SB01-C1/D2's bare-Task carve above: per
+                        // §28.11 the collection holds its elements as BORROWS
+                        // and never owns them, so dropping it — crossed-await
+                        // or not — abandons no task obligation, exactly the
+                        // issue's own argument for `Array<Task>`. Narrower
+                        // than a general "any trivial-dispose class" carve on
+                        // purpose: a plain non-collection class with no
+                        // destructor (`class T end T;`) stays the reject (see
+                        // tests/ownership/async_ownership_test.cpp's
+                        // suspend_local_dropped_on_normal_path_diagnosed,
+                        // #1504's negative control in
+                        // array_of_task_autodrop_warning_1504_test.cpp) —
+                        // whether §28.9's "implementation-defined reclaim"
+                        // genuinely carries zero leak risk on a permanently-
+                        // abandoned frame for an arbitrary trivial-dispose
+                        // class, the way it is accepted for Task specifically,
+                        // is a separate, NOT-YET-DECIDED design question this
+                        // fix declines to resolve silently (tracked #2332).
+                        // // per §28.3, §28.11, #1504
+                        bool taskElementBorrowingCollectionSuspendLocal = false;
+                        if (ld->initializer) {
+                            const sema::TypeRef* initTy =
+                                ctx_.exprType(*ld->initializer);
+                            if (initTy &&
+                                initTy->kind == sema::TypeRef::Kind::Named &&
+                                isBorrowingCollectionNameHead(initTy->headName()) &&
+                                !initTy->genericArgs.empty() &&
+                                initTy->genericArgs.back()) {
+                                taskElementBorrowingCollectionSuspendLocal =
+                                    common::isTaskFamilyHead(
+                                        initTy->genericArgs.back()->headName());
+                            }
+                        }
                         if (suspendLocalDecls_.count(ld) == 0 ||
                             borrowAwaitedOwnedTaskDecls_.count(ld) != 0 ||
-                            declInitializerIsOwnedTaskMint(ld)) {
+                            declInitializerIsOwnedTaskMint(ld) ||
+                            taskElementBorrowingCollectionSuspendLocal) {
                             const_cast<ast::LocalDecl*>(ld)->autoDropAtScopeEnd =
                                 true;
                             ctx_.diagnostics().report(
