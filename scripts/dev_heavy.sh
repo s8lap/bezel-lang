@@ -16,6 +16,36 @@
 #
 # Scratch artifacts -> /var/tmp/bezel-scratch, never /tmp (tmpfs=RAM).
 set -u
+
+# ---- ccache-on-tmpfs guard (2026-07-29) -------------------------------------
+# The ccache store may live on a separate spindle to keep its small-random IO off
+# the source/build/scratch disk. If that store is configured under a mount that
+# is NOT currently mounted, the path resolves to whatever filesystem is
+# underneath — and on this box the natural candidates (/run/media/..., /tmp) are
+# tmpfs, i.e. RAM. ccache would then happily fill memory until the machine
+# thrashes. That exact shape already cost a gate here: per-shard AOT caches were
+# rooted under ${TMPDIR:-/tmp} and exhausted the 16G tmpfs, killing all 8 shards
+# with "Disk quota exceeded" and reporting it as an untrustworthy undercount.
+#
+# So: refuse to start a heavy op when ccache's configured cache_dir sits on a
+# tmpfs/ramfs. Generic on purpose — it keys on the FILESYSTEM TYPE, not on any
+# particular path, so it keeps protecting after the store moves again. Cheap
+# (one ccache -k + one stat). Bypass with BEZEL_ALLOW_TMPFS_CCACHE=1.
+if [ -z "${BEZEL_ALLOW_TMPFS_CCACHE:-}" ] && command -v ccache >/dev/null 2>&1; then
+  _cc_dir=$(ccache -k cache_dir 2>/dev/null || true)
+  if [ -n "${_cc_dir:-}" ]; then
+    _cc_fs=$(stat -f -c %T "$_cc_dir" 2>/dev/null || echo missing)
+    case "$_cc_fs" in
+      tmpfs|ramfs)
+        echo "dev_heavy: ABORT — ccache cache_dir '$_cc_dir' is on $_cc_fs (RAM)." >&2
+        echo "  Its drive is probably not mounted. Mount it, or point cache_dir at real" >&2
+        echo "  disk, or set BEZEL_ALLOW_TMPFS_CCACHE=1 if you really mean it." >&2
+        exit 2 ;;
+      missing)
+        echo "dev_heavy: WARNING — ccache cache_dir '$_cc_dir' does not exist yet." >&2 ;;
+    esac
+  fi
+fi
 if [ "$#" -lt 1 ]; then
   echo "usage: dev_heavy.sh {build|suite|probe} cmd..." >&2
   exit 2
