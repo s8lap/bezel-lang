@@ -104,6 +104,14 @@ private:
     // imported-TYPE gating), and searched by lookupExtensionMember alongside
     // the current module's own ExtensionSymbols.
     std::vector<ExtensionSymbol*> importedExtensions_;
+    // §26.5 rule 4 (#1307): the defining module (dotted name) of each entry in
+    // `importedExtensions_`, captured at the same population site — an
+    // ExtensionSymbol carries no module-name field of its own (unlike a
+    // TypeSymbol registered under ctx_.importedTypesOf), so the ambiguity
+    // diagnostic's "defining module" fact for an imported candidate has
+    // nowhere else to come from. A local (current-module) candidate's module
+    // is ctx_.module()->name; this map covers only the imported ones.
+    std::unordered_map<ExtensionSymbol*, std::string> importedExtensionModule_;
     // §2.7 v0.164 / #1365: maps a MemberAccessExpr* → dotted module name when
     // that expression resolves to a partial module-name prefix in expression
     // position (e.g. `BankingApp.Transactions` in `BankingApp.Transactions.Calc`).
@@ -1145,10 +1153,22 @@ private:
     // §26.5 (#714): when a generic-extension method is found (extension has
     // free type variables), the inferred binding (e.g. T → int) is written into
     // `outBinding` so the caller can record it for typeCall and codegen.
+    // §26.5.1 rule 1 / §26.5 rule 4 (#1307): when more than one candidate
+    // block is applicable (matches `receiver` and declares `name`), the
+    // candidates are ranked by subtype specificity on their receiver-
+    // substituted heads; a unique most-specific candidate wins, and a tie
+    // among two or more equally-specific candidates is a compile error naming
+    // each one (defining module, declared head incl. `where` clause,
+    // declaration site) — `loc` is the diagnostic's location (the call site)
+    // and `reportAmbiguity` lets a pure existence PROBE (see
+    // extensionNameBlockedNote) suppress the diagnostic, since a probe must
+    // not itself cause the ambiguity error it is only checking for.
     Symbol* lookupExtensionMember(
         const TypeRef* receiver,
         std::string_view name,
-        std::vector<std::pair<std::string, TypeRef*>>* outBinding = nullptr);
+        std::vector<std::pair<std::string, TypeRef*>>* outBinding = nullptr,
+        SourceLocation loc = SourceLocation{},
+        bool reportAmbiguity = true);
 
     // §26.5 step 1 (v0.183): when an instance member of `name` name-blocks
     // extension lookup for `receiver` and the committed instance call then

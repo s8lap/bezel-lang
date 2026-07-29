@@ -557,3 +557,133 @@ BEZEL_TEST(sema_extension,
         "class P public method Use(f: Foo): int => f.Bar(); end P;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// ---------------------------------------------------------------------------
+// §26.5 rule 4 / §26.5.1 (issue #1307) — the ambiguity diagnostic.
+//
+// §26.5.1: "If neither candidate's substituted head is a proper subtype of
+// the other's, the candidates are equally specific and rule 4 of §26.5
+// produces an ambiguity error. In particular, candidates with IDENTICAL
+// substituted heads never auto-rank: neither a more-concrete-looking
+// declared head (`extension IEnumerable<int>` and `extension IEnumerable<T>`
+// are indistinguishable after substitution for an `Array<int>` receiver) nor
+// a stronger `where` clause on the same head makes one candidate more
+// specific than the other."
+//
+// §26.5 rule 4: "If two equally-specific extensions match, the call is a
+// compile error. Because extension blocks are nameless, the diagnostic must
+// identify each candidate by what it has: its defining module, its declared
+// head including any `where` clause, and its declaration site."
+//
+// The runtime (would-select-100-or-200) half of this pair — the STRICT-
+// subtype, non-tied case — is covered by the codegen tests in
+// tests/codegen/extension_specificity_1307_test.cpp; these sema-level tests
+// cover the case those RUNTIME tests cannot (a rejected program has no
+// runtime), and assert against the actual diagnostic TEXT rather than
+// accepting any compile error, per the rule-4 candidate-identifying
+// requirement above.
+// ---------------------------------------------------------------------------
+
+// The spec's own worked example (§26.5.1, second code block): `extension
+// IEnumerable<T>` and `extension IEnumerable<int>` both substitute to the
+// SAME head `IEnumerable<int>` for an `Array<int>` receiver — identical
+// substituted heads, so neither is a proper subtype of the other.
+BEZEL_TEST(sema_extension,
+           rule4_identical_substituted_heads_ambiguous_spec_26_5_1_1307) {
+    auto r = parseSemaAll(
+        "module M; "
+        "extension IEnumerable<T> public method Pick(): int => 100; end; "
+        "extension IEnumerable<int> public method Pick(): int => 200; end; "
+        "class C public static method Main(): int "
+        "  var xs: Array<int> := [1, 2, 3]; "
+        "  return xs.Pick(); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("ambiguous extension member") != std::string::npos &&
+            d.message.find("§26.5 rule 4") != std::string::npos &&
+            d.message.find("extension IEnumerable<T>") != std::string::npos &&
+            d.message.find("extension IEnumerable<int>") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// §26.5.1: "nor a stronger `where` clause on the same head makes one
+// candidate more specific than the other" — a `where`-constrained block does
+// NOT auto-beat the unconstrained same-head block; both substitute to
+// `IEnumerable<int>` for an `Array<int>` receiver (a `where` clause is "an
+// APPLICABILITY filter, never a ranking signal"), so this is also a tie.
+BEZEL_TEST(sema_extension,
+           rule4_constrained_vs_unconstrained_same_head_ambiguous_spec_26_5_1_1307) {
+    auto r = parseSemaAll(
+        "module M; "
+        "extension IEnumerable<T> public method Pick(): int => 100; end; "
+        "extension IEnumerable<T> where T: IComparable<T> "
+        "  public method Pick(): int => 200; "
+        "end; "
+        "class C public static method Main(): int "
+        "  var xs: Array<int> := [1, 2, 3]; "
+        "  return xs.Pick(); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("ambiguous extension member") != std::string::npos &&
+            d.message.find("§26.5 rule 4") != std::string::npos &&
+            d.message.find("where T: IComparable<T>") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// A tie need not share a head at all: two UNRELATED interfaces (neither a
+// subtype of the other) both implemented by the receiver's class — §26.5.1's
+// "neither candidate's substituted head is a proper subtype of the other's"
+// clause covers incomparable heads, not just identical ones.
+BEZEL_TEST(sema_extension,
+           rule4_unrelated_interfaces_ambiguous_spec_26_5_1307) {
+    auto r = parseSemaAll(
+        "module M; "
+        "interface IFoo end IFoo; "
+        "interface IBar end IBar; "
+        "extension IFoo public method Pick(): int => 10; end; "
+        "extension IBar public method Pick(): int => 20; end; "
+        "class Widget: IFoo, IBar end Widget; "
+        "class Runner public static method Main(): int "
+        "  var w := new Widget(); "
+        "  return w.Pick(); "
+        "end Main; end Runner;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("ambiguous extension member") != std::string::npos &&
+            d.message.find("§26.5 rule 4") != std::string::npos &&
+            d.message.find("extension IFoo") != std::string::npos &&
+            d.message.find("extension IBar") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}
+
+// The diagnostic must name each tied candidate's defining module (rule 4:
+// "its defining module, its declared head including any `where` clause, and
+// its declaration site") — both candidates here are declared in the same
+// (single, local) module `M`, so the module name `M` must appear once per
+// candidate line.
+BEZEL_TEST(sema_extension,
+           rule4_diagnostic_names_defining_module_1307) {
+    auto r = parseSemaAll(
+        "module M; "
+        "extension IEnumerable<T> public method Pick(): int => 100; end; "
+        "extension IEnumerable<int> public method Pick(): int => 200; end; "
+        "class C public static method Main(): int "
+        "  var xs: Array<int> := [1, 2, 3]; "
+        "  return xs.Pick(); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("ambiguous extension member") != std::string::npos &&
+            d.message.find("module `M`") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}

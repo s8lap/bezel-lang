@@ -182,8 +182,14 @@ void ExprTC::run(const ast::SourceFile& src) {
             // only by lookupExtensionMember matching its target type.
             if (const std::vector<ExtensionSymbol*>* exts =
                     ctx_.importedExtensionsOf(dotted)) {
-                for (ExtensionSymbol* e : *exts)
-                    if (e) importedExtensions_.push_back(e);
+                for (ExtensionSymbol* e : *exts) {
+                    if (!e) continue;
+                    importedExtensions_.push_back(e);
+                    // §26.5 rule 4 (#1307): remember this block's defining
+                    // module for the ambiguity diagnostic (see
+                    // importedExtensionModule_'s declaration).
+                    importedExtensionModule_[e] = dotted;
+                }
             }
             if (const std::vector<TypeSymbol*>* exported =
                     ctx_.importedTypesOf(dotted)) {
@@ -5605,10 +5611,110 @@ static bool extSignatureUsesFreeVar(
     return false;
 }
 
+// §26.5 rule 4 (#1307): a printable spelling of a receiver-substituted (or
+// declared) extension head from its resolved TypeRef — e.g. "IEnumerable<int>"
+// for a substituted head, or "IEnumerable<T>" for the declared head of a
+// generic block (a free type variable's TypeRef is a null-declaration Named
+// ref whose name IS "T", per namedTypeSimpleName). Extension targets are
+// always Named or a Primitive keyword (§26.2 admits classes, interfaces,
+// records, enums, and primitives only — never an inline-array or function
+// type), so those two TypeRef kinds are all this needs to cover.
+static std::string spellExtHeadTypeRef(const TypeRef* t) {
+    if (!t) return "?";
+    if (t->kind == TypeRef::Kind::Primitive) {
+        using P = PrimitiveType;
+        switch (t->primitive) {
+            case P::Bool:    return "bool";
+            case P::Char:    return "char";
+            case P::String:  return "string";
+            case P::Byte:    return "byte";
+            case P::SByte:   return "sbyte";
+            case P::Short:   return "short";
+            case P::UShort:  return "ushort";
+            case P::Int:     return "int";
+            case P::UInt:    return "uint";
+            case P::Long:    return "long";
+            case P::ULong:   return "ulong";
+            case P::Float:   return "float";
+            case P::Double:  return "double";
+            case P::Decimal: return "decimal";
+            case P::Object:  return "Object";
+            default:         return "?";
+        }
+    }
+    if (t->kind == TypeRef::Kind::Named) {
+        std::string s(namedTypeSimpleName(t));
+        if (s.empty()) s = "?";
+        if (!t->genericArgs.empty()) {
+            s += "<";
+            for (std::size_t i = 0; i < t->genericArgs.size(); ++i) {
+                if (i) s += ", ";
+                s += spellExtHeadTypeRef(t->genericArgs[i]);
+            }
+            s += ">";
+        }
+        return s;
+    }
+    return "?";
+}
+
+// §26.5 rule 4 (#1307): a printable spelling of an AST type node, used for the
+// `where` clause of a rule-4 ambiguity candidate. Read directly from the AST
+// (ExtensionDecl::genericConstraints) rather than a resolved TypeRef, because
+// an imported extension's synthesized AST (ModuleLoader.cpp Pass 4) never
+// reconstructs genericConstraints — module metadata does not currently
+// serialize a block's `where` clause — so spellExtWhereClause below
+// intentionally returns "" for an imported candidate rather than fabricating
+// text; see the diagnostic-site comment for the recorded follow-up.
+static std::string spellExtWhereAstType(const ast::Type& t) {
+    std::string s;
+    if (t.name)
+        for (std::size_t i = 0; i < t.name->parts.size(); ++i) {
+            if (i) s += ".";
+            s += std::string(t.name->parts[i]);
+        }
+    if (s.empty()) s = "?";
+    if (!t.genericArgs.empty()) {
+        s += "<";
+        for (std::size_t i = 0; i < t.genericArgs.size(); ++i) {
+            if (i) s += ", ";
+            s += spellExtWhereAstType(*t.genericArgs[i]);
+        }
+        s += ">";
+    }
+    if (t.nullable) s += "?";
+    return s;
+}
+
+static std::string spellExtWhereClause(
+    const std::vector<ast::GenericConstraint>& gcs) {
+    std::string out;
+    for (std::size_t gi = 0; gi < gcs.size(); ++gi) {
+        const auto& gc = gcs[gi];
+        if (gi) out += " ";
+        out += "where " + std::string(gc.typeParam) + ": ";
+        if (!gc.modifierConstraint.empty()) {
+            out += std::string(gc.modifierConstraint);
+            continue;
+        }
+        for (std::size_t ii = 0; ii < gc.items.size(); ++ii) {
+            if (ii) out += ", ";
+            const auto& item = gc.items[ii];
+            if (item.kind == "type" && item.typeArg)
+                out += spellExtWhereAstType(*item.typeArg);
+            else
+                out += std::string(item.kind);
+        }
+    }
+    return out;
+}
+
 Symbol* ExprTC::lookupExtensionMember(
     const TypeRef* receiver,
     std::string_view name,
-    std::vector<std::pair<std::string, TypeRef*>>* outBinding) {
+    std::vector<std::pair<std::string, TypeRef*>>* outBinding,
+    SourceLocation loc,
+    bool reportAmbiguity) {
     if (!receiver) return nullptr;
     // §26.5 step 2: "the compiler searches the current module AND all imported
     // modules for extension blocks on x's type". The candidate set is this
@@ -5623,6 +5729,28 @@ Symbol* ExprTC::lookupExtensionMember(
     }
     candidates.insert(candidates.end(), importedExtensions_.begin(),
                       importedExtensions_.end());
+    // §26.5.1 rule 1 / §26.5 rule 4 (#1307): collect every APPLICABLE
+    // candidate — a name-matching member from a block whose target
+    // structurally matches the receiver — instead of returning on the first
+    // match, so the full candidate set can be ranked by subtype specificity
+    // below rather than resolved by declaration order (the bug this fixes:
+    // the compiler previously took whichever block's ancestor-match loop
+    // reached first, silently re-routing a call whenever declaration order or
+    // imports changed). `ownedAncs` is function-scoped (not per-iteration) so
+    // every candidate's substituted-head TypeRef stays alive through the
+    // ranking step below — a synthesized builtin ancestor (e.g. the
+    // `IEnumerable<int>` wrapper matched for an `Array<int>` receiver) is
+    // owned here, not by the receiver's own tree.
+    struct ExtCandidate {
+        Symbol* member = nullptr;
+        const TypeRef* substHead = nullptr;  // receiver-substituted head, §26.5.1
+        const TypeRef* declaredHead = nullptr;  // unsubstituted declared head
+        ExtensionSymbol* ext = nullptr;
+        const ast::ExtensionDecl* decl = nullptr;
+        std::vector<std::pair<std::string, TypeRef*>> binding;
+    };
+    std::vector<ExtCandidate> found;
+    std::vector<std::unique_ptr<TypeRef>> ownedAncs;
     for (ExtensionSymbol* ext : candidates) {
         auto* decl = dynamic_cast<const ast::ExtensionDecl*>(ext->decl);
         if (!decl || !decl->targetType) continue;
@@ -5681,8 +5809,9 @@ Symbol* ExprTC::lookupExtensionMember(
         }
         // §26.5 (#714): find the ancestor of `receiver` that matches `target`
         // (could be receiver itself if exact match). We need the ancestor both
-        // for the bool match AND for extracting the concrete T-binding.
-        std::vector<std::unique_ptr<TypeRef>> ownedAncs;
+        // for the bool match AND for extracting the concrete T-binding — and,
+        // per §26.5.1 (#1307), it IS the receiver-substituted head the
+        // specificity ranking below compares.
         const TypeRef* matchedAnc = extensionFindMatchingAncestor(
             target, receiver, freeVars, ownedAncs);
         if (!matchedAnc) continue;
@@ -5718,11 +5847,103 @@ Symbol* ExprTC::lookupExtensionMember(
                 // Collect T→concrete mapping positionally from matched ancestor.
                 collectFreeVarBinding(target, matchedAnc, freeVars, binding);
             }
-            if (outBinding) *outBinding = binding;
-            return m;
+            // §26.5 (pre-existing, unchanged by #1307): the first same-named
+            // member within ONE block wins — per-block overload selection by
+            // arity/argument type is a separate, unimplemented gap (member
+            // access is typed independent of the enclosing call's argument
+            // list throughout this front-end), not touched here.
+            found.push_back({m, matchedAnc, target, ext, decl, std::move(binding)});
+            break;
         }
     }
-    return nullptr;
+    if (found.empty()) return nullptr;
+    if (found.size() == 1) {
+        if (outBinding) *outBinding = found[0].binding;
+        return found[0].member;
+    }
+    // §26.5.1 rule 1 (#1307): "An extension on E1 is more specific than one on
+    // E2 when E1 is a subtype of E2 and E2 is not a subtype of E1. The
+    // subtype test is evaluated on the receiver-substituted heads." subtypeOrEq
+    // reuses extensionFindMatchingAncestor itself as the general subtype test:
+    // for two already-CONCRETE (receiver-substituted) heads, "is `sub` an
+    // ancestor-or-self match for `base`" is exactly "is `sub` a subtype-or-
+    // equal of `base`" over the same class/interface/builtin-generic universe
+    // §26.5 step 2 already walks — so running it both directions reproduces
+    // the spec's own "identical substituted heads → neither wins" case for
+    // free (extensionTargetMatchesReceiver's exact-match branch returns true
+    // both ways when the heads are structurally equal).
+    auto subtypeOrEq = [&](const TypeRef* sub, const TypeRef* base) -> bool {
+        return extensionFindMatchingAncestor(
+                   base, sub, std::unordered_set<std::string_view>{},
+                   ownedAncs) != nullptr;
+    };
+    auto moreSpecific = [&](std::size_t i, std::size_t j) {
+        return subtypeOrEq(found[i].substHead, found[j].substHead) &&
+               !subtypeOrEq(found[j].substHead, found[i].substHead);
+    };
+    // The maximal elements of the "more specific" partial order: candidates
+    // no OTHER candidate strictly dominates. §26.5 rule 3 ("most specific
+    // type wins") removes every dominated (less-specific) candidate from
+    // consideration entirely — only a non-unique top tier is ambiguous.
+    std::vector<std::size_t> maximal;
+    for (std::size_t i = 0; i < found.size(); ++i) {
+        bool dominated = false;
+        for (std::size_t j = 0; j < found.size(); ++j) {
+            if (i != j && moreSpecific(j, i)) { dominated = true; break; }
+        }
+        if (!dominated) maximal.push_back(i);
+    }
+    if (maximal.size() == 1) {
+        const ExtCandidate& winner = found[maximal[0]];
+        if (outBinding) *outBinding = winner.binding;
+        return winner.member;
+    }
+    // §26.5 rule 4 (#1307): two or more equally-specific candidates — a
+    // compile error naming each one by "its defining module, its declared
+    // head including any where clause, and its declaration site" (spec's own
+    // wording, since extension blocks are nameless).
+    if (reportAmbiguity) {
+        std::string msg = "ambiguous extension member `" + std::string(name) +
+            "`: " + std::to_string(maximal.size()) +
+            " extensions are equally specific for this receiver — neither is "
+            "a subtype of the other (§26.5 rule 4, §26.5.1); candidates:";
+        for (std::size_t idx : maximal) {
+            const ExtCandidate& c = found[idx];
+            std::string moduleName;
+            if (auto it = importedExtensionModule_.find(c.ext);
+                it != importedExtensionModule_.end())
+                moduleName = it->second;
+            else if (ctx_.module())
+                moduleName = std::string(ctx_.module()->name);
+            std::string head = "extension " + spellExtHeadTypeRef(c.declaredHead);
+            std::string where = c.decl ? spellExtWhereClause(c.decl->genericConstraints)
+                                       : std::string();
+            if (!where.empty()) head += " " + where;
+            std::string site;
+            if (c.decl && c.decl->span.begin.line != 0)
+                site = "declared at line " +
+                       std::to_string(c.decl->span.begin.line) + ", column " +
+                       std::to_string(c.decl->span.begin.column);
+            else
+                // §1307 follow-up: an imported extension's synthesized AST
+                // carries no source span (module metadata doesn't serialize
+                // cross-module positions) — say so rather than print 0:0.
+                site = "declaration site not tracked across module imports";
+            msg += "\n  " + head + " — module `" + moduleName + "`, " + site;
+        }
+        msg += "\nremedies: narrow the import bringing in one of these "
+               "extension blocks; hoist the intended behavior into a "
+               "static-class helper method that takes the receiver as a "
+               "parameter; or, if both blocks are under your control, give "
+               "the colliding members distinct names (§26.5 rule 4).";
+        ctx_.diagnostics().report(Severity::Error, loc, msg);
+    }
+    // Error-recovery (mirrors resolveOverload's OverloadOutcome::Ambiguous
+    // handling, ExprTypecheck_Calls.cpp): return a deterministic candidate so
+    // downstream typing stays best-effort even though compilation fails.
+    const ExtCandidate& fallback = found[maximal[0]];
+    if (outBinding) *outBinding = fallback.binding;
+    return fallback.member;
 }
 
 // §26.5 step 1 (v0.183): see header. Re-runs the same extension search
@@ -5734,7 +5955,14 @@ Symbol* ExprTC::lookupExtensionMember(
 std::string ExprTC::extensionNameBlockedNote(const TypeRef* receiver,
                                              std::string_view name) {
     if (!receiver) return std::string();
-    if (!lookupExtensionMember(receiver, name, nullptr)) return std::string();
+    // §1307: this is a pure existence PROBE ("does any extension match this
+    // receiver/name at all") for the note text below — it must not itself
+    // trigger the §26.5 rule 4 ambiguity diagnostic (the instance-member call
+    // it annotates already failed for its own, unrelated reason; a second,
+    // premature error here would be confusing noise, not new information).
+    if (!lookupExtensionMember(receiver, name, nullptr, SourceLocation{},
+                               /*reportAmbiguity=*/false))
+        return std::string();
     return "; note: an extension member named `" + std::string(name) +
           "` also matches this receiver but was not considered — an "
           "instance member of the same name name-blocks extension lookup "

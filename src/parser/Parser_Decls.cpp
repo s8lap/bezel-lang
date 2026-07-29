@@ -609,6 +609,15 @@ std::unique_ptr<ast::TopDecl> Parser::parseExtensionDecl(
     ast::Visibility visibility) {
     // A.3 `ExtensionDecl ::= Visibility? "extension" Type GenericConstraints*
     //                         ExtensionMember* "end" ";"`.
+    // #1307: capture the `extension` keyword's own position (matching
+    // parseTypeDeclBody's `start` convention just above — the kind keyword's
+    // location, not the visibility prefix's) so the block carries a real span;
+    // previously ExtensionDecl::span was never stamped at all (neither call
+    // site in parseTopDecl wraps this in the file's `stampSpan` helper, unlike
+    // e.g. parseImportDecl), so every extension-block diagnostic that wants a
+    // declaration site — including the new §26.5 rule-4 ambiguity diagnostic —
+    // had nothing to report but 0:0.
+    const SourceLocation start = current_.location;
     auto ext = std::make_unique<ast::ExtensionDecl>();
     ext->visibility = visibility;
     advance(); // past `extension`
@@ -632,6 +641,10 @@ std::unique_ptr<ast::TopDecl> Parser::parseExtensionDecl(
         diagnostics_.report(Severity::Error, current_.location,
                             "expected ';' after 'end' of extension block");
     }
+    // #1307: stamp [start, current_.location] — mirrors parseTypeDeclBody's
+    // identical stamp just above (fix #1761).
+    ext->span.begin = start;
+    ext->span.end = current_.location;
     return std::unique_ptr<ast::TopDecl>(ext.release());
 }
 

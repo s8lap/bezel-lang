@@ -9968,8 +9968,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // and the instance-receiver `string` path (#702, "before
                 // reporting 'not yet supported', try a user-defined extension
                 // method"). Mirrors both.
-                if (Symbol* ext =
-                        lookupExtensionMember(ctx_.primitiveTypeRef(pt), mbr)) {
+                if (Symbol* ext = lookupExtensionMember(
+                        ctx_.primitiveTypeRef(pt), mbr, nullptr, ma.span.begin)) {
                     resolveExtensionMember(ma, ext);
                     return;
                 }
@@ -11329,7 +11329,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // user extension resolves it, type the member access from
                     // the extension's signature and return without error.  Only
                     // emit the diagnostic when no user extension matches.
-                    if (Symbol* ext = lookupExtensionMember(tt, ma.member)) {
+                    if (Symbol* ext = lookupExtensionMember(
+                            tt, ma.member, nullptr, ma.span.begin)) {
                         resolveExtensionMember(ma, ext);
                         return;
                     }
@@ -11476,8 +11477,16 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // §26.5 (#714): pass outBinding to capture the free-var
                 // binding when a generic extension matched via ancestor lookup.
                 std::vector<std::pair<std::string, sema::TypeRef*>> binding;
+                // #1307: the callee's own span is degenerate (line 0) when
+                // this access is a call callee (`x.M()`) — the parser sets it
+                // only on the property form (see the identical fallback a
+                // little further down, "The MemberAccessExpr span is
+                // degenerate..."). Fall back to the receiver's span so an
+                // ambiguity diagnostic points at real source, not 0:0.
+                auto extLoc = ma.span.begin;
+                if (extLoc.line == 0 && ma.target) extLoc = ma.target->span.begin;
                 if (Symbol* ext = lookupExtensionMember(
-                        recvTy, ma.member, &binding)) {
+                        recvTy, ma.member, &binding, extLoc)) {
                     if (!binding.empty())
                         ctx_.setExprExtBinding(&ma, std::move(binding));
                     resolveExtensionMember(ma, ext);
@@ -11592,8 +11601,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         }
         // §26.5 (#714): pass outBinding to capture the free-var binding.
         std::vector<std::pair<std::string, sema::TypeRef*>> binding;
+        // #1307: same degenerate-callee-span fallback as the primitive-
+        // receiver path above.
+        auto extLoc = ma.span.begin;
+        if (extLoc.line == 0 && ma.target) extLoc = ma.target->span.begin;
         if (Symbol* ext = lookupExtensionMember(
-                recvTy, ma.member, &binding)) {
+                recvTy, ma.member, &binding, extLoc)) {
             if (!binding.empty())
                 ctx_.setExprExtBinding(&ma, std::move(binding));
             resolveExtensionMember(ma, ext);
@@ -12435,7 +12448,8 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
     if (!member) {
         const TypeRef* recvTy = nm.target ? ctx_.exprType(*nm.target) : nullptr;
         if (recvTy) {
-            member = lookupExtensionMember(recvTy, nm.member);
+            member = lookupExtensionMember(recvTy, nm.member, nullptr,
+                                           nm.span.begin);
         }
         // §7.5 / #751: a string/primitive built-in member (e.g. `Length`) has
         // no Symbol — resolveMemberAccess types these via a large inlined
