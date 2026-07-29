@@ -1078,6 +1078,37 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             else if (par->declType)
                 ce.semaTy = ctx_.resolvedType(*par->declType);
         }
+        // §27.5 / §28.9 / #694: free the capture CELL in the envdtor when this
+        // PARAMETER is captured by exactly ONE env (singleCaptureLocals_, which
+        // keys parameters by Symbol*) and THIS lambda DEFINITELY escapes
+        // (definitelyEscapingLambdas_). Exactly the guard the captured-LOCALS
+        // branch below applies, and sound for the same two reasons: the sole
+        // holder means this envdtor is the cell's only free (no double-free), and
+        // a definitely-escaping closure outlives its defining scope, so the frame
+        // is gone before the envdtor runs (no UAF). The scope-end boxedCellFree
+        // cannot also fire — collectCellFreeEligible excludes anything captured by
+        // an escaping lambda, and a returned lambda is always classified escaping
+        // there. Params are never for-var.
+        //
+        // GUARDED BOXING. A parameter's slot is written in the prologue, never in
+        // the capture site's own basic block, so boxLocalSlot always takes the
+        // GUARDED path for it (the null-guarded holder that allocates the cell on
+        // the first pass and reuses it on later ones). The hazard guarded boxing
+        // protects against is a capture site INSIDE A LOOP: one cell shared by
+        // every iteration's closure, so any one envdtor freeing it would
+        // double-free/UAF the others — and singleCaptureLocals_ cannot see that,
+        // since it counts syntactic lambda NODES, not the closures a loop makes
+        // from one node. `loopStack_.empty()` is the proof that this capture site
+        // has no backward edge above it: the cell is then allocated exactly once
+        // per invocation and held by exactly one closure. (The same
+        // guarded-cell-allocated-once proof the captured-LOCALS scope-end path
+        // below uses for an inline owned array.) A capture inside a loop keeps the
+        // conservative exclusion — a bounded leak, never an over-free.
+        if (!alreadyBoxed && (!wasGuardedParam || loopStack_.empty()) &&
+            currentFn_ == boxCaptureLocalsFn_ &&
+            definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)) &&
+            singleCaptureLocals_.count(static_cast<const void*>(sym)))
+            ce.freeCellInEnvdtor = true;
         captures.push_back(ce);
     }
     // #1207 / §27.5/§22.3: captured outer ref/out params.

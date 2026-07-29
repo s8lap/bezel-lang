@@ -14684,9 +14684,20 @@ void Emitter::collectBoxCaptureLocals(
     };
     for (auto& s : body) scan(s.get());
 
-    // Tally how many distinct lambda envs capture each LOCAL — ALL captured
-    // locals (#694 needs the general count for singleCaptureLocals_), not just the
-    // box-producer candidates.
+    // Tally how many distinct lambda envs capture each LOCAL or PARAMETER — ALL
+    // captured entities (#694 needs the general count for singleCaptureLocals_),
+    // not just the box-producer candidates.
+    //
+    // #694 (parameter captures): a captured PARAMETER's cell is keyed throughout
+    // lowerLambda by its `sema::Symbol*` (see the captured-param branch, which
+    // consults cellFreeEligible_ with exactly that key), not by an AST decl node —
+    // parameters have no LocalDecl. Tallying only LocalSymbol therefore left every
+    // parameter out of singleCaptureLocals_, so `return () => param` never armed
+    // the envdtor cell-free and leaked its cell (4 B for an int, 8 B for a string
+    // reference) per returned closure. Counting parameters under their Symbol* key
+    // closes that: the key spaces cannot collide (distinct allocations), and
+    // boxCaptureLocals_ is unaffected because it additionally requires
+    // candidates.count(d), and `candidates` holds only LocalDecl nodes.
     std::vector<const ast::LambdaExpr*> lambdas;
     collectAllLambdas(body, lambdas);
     std::unordered_map<const void*, int> captureCount;
@@ -14697,6 +14708,8 @@ void Emitter::collectBoxCaptureLocals(
             if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s)) {
                 if (loc->decl)
                     captureCount[static_cast<const void*>(loc->decl)]++;
+            } else if (dynamic_cast<const sema::ParameterSymbol*>(s)) {
+                captureCount[static_cast<const void*>(s)]++;
             }
         }
     }
