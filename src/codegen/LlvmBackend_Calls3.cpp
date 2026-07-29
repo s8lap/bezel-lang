@@ -2658,12 +2658,22 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         return nullptr;
     std::string_view rcn = recvTy->headName();
 
-    // §3.3 (#883): ReadOnlyStringSpan instance methods (call form). The struct is
-    // {string-ptr, i32 start, i32 length}; Length/IsEmpty are field reads and
-    // Slice reconstructs a sub-view. The indexer is handled in
-    // lowerCollectionIndexerGet (loadCodePoint); the search methods
-    // (IndexOf/Contains/StartsWith/EndsWith/SequenceEqual) are deferred — sema
-    // rejects them, so they never reach here.
+    // §3.3 (#883, #971 item 1): ReadOnlyStringSpan instance methods (call form).
+    // The struct is {string-ptr, i32 start, i32 length}; Length/IsEmpty are field
+    // reads and Slice reconstructs a sub-view. The indexer is handled in
+    // lowerCollectionIndexerGet (loadCodePoint).
+    //
+    // The search/compare family lowers to the bz_strspan_* runtime helpers, which
+    // take each operand as an explicit (source string, start, len) CODE-POINT
+    // triple and compare code point by code point — so the operands' storage
+    // widths (§4.6 adaptive 1/2/4 bytes) are irrelevant and may differ. That is
+    // the whole reason a span over a string cannot reuse the buffer-backed span
+    // machinery (§3.3 "Why a separate type from ReadOnlySpan<char>").
+    //
+    // §3.3 defines the `string` overloads as "equivalent to calling the
+    // ReadOnlyStringSpan overload after value.AsSpan()", so a string operand is
+    // passed as the triple (ptr, 0, its code-point length) — the same call, no
+    // allocation, no separate runtime entry point.
     if (rcn == "ReadOnlyStringSpan") {
         llvm::Value* spanVal = lowerExpr(*ma->target);
         if (!spanVal) return nullptr;
@@ -2679,25 +2689,123 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         if (m == "Length" && call.args.empty()) return fLen();
         if (m == "IsEmpty" && call.args.empty())
             return builder_.CreateICmpEQ(fLen(), builder_.getInt32(0), "ss.empty");
-        if (m == "Slice" && call.args.size() == 2 &&
-            call.args[0].value && call.args[1].value) {
+        // §3.3: Slice(start, length), and — since v0.195 — Slice(start), which is
+        // `Slice(start, Length - start)`. The one-arg form previously fell out of
+        // this branch to `return nullptr`, leaving the result local undefined
+        // (an accept-trap: it compiled and produced garbage at run time).
+        if (m == "Slice" && (call.args.size() == 1 || call.args.size() == 2) &&
+            call.args[0].value &&
+            (call.args.size() == 1 || call.args[1].value)) {
             llvm::Value* st = lowerExpr(*call.args[0].value);
-            llvm::Value* sl = lowerExpr(*call.args[1].value);
-            if (!st || !sl) return nullptr;
+            if (!st) return nullptr;
             if (!st->getType()->isIntegerTy(32))
                 st = builder_.CreateTrunc(st, i32());
-            if (!sl->getType()->isIntegerTy(32))
-                sl = builder_.CreateTrunc(sl, i32());
             llvm::Value* b = fBase();
             llvm::Value* L = fLen();
             emitGuardThrow(builder_.CreateOr(
                 builder_.CreateICmpSLT(st, builder_.getInt32(0)),
                 builder_.CreateICmpSGT(st, L)), "IndexOutOfRangeException");
             llvm::Value* avail = builder_.CreateSub(L, st);
-            emitGuardThrow(builder_.CreateOr(
-                builder_.CreateICmpSLT(sl, builder_.getInt32(0)),
-                builder_.CreateICmpSGT(sl, avail)), "IndexOutOfRangeException");
+            llvm::Value* sl = avail;   // v0.195 one-arg form: to the end
+            if (call.args.size() == 2) {
+                sl = lowerExpr(*call.args[1].value);
+                if (!sl) return nullptr;
+                if (!sl->getType()->isIntegerTy(32))
+                    sl = builder_.CreateTrunc(sl, i32());
+                emitGuardThrow(builder_.CreateOr(
+                    builder_.CreateICmpSLT(sl, builder_.getInt32(0)),
+                    builder_.CreateICmpSGT(sl, avail)), "IndexOutOfRangeException");
+            }
             return buildArraySpan(fSrc(), builder_.CreateAdd(b, st), sl);
+        }
+        // §3.3 Materialization: ToString() → a fresh string holding the span's
+        // code points. bz_str_substring already slices a source string by
+        // code-point index at the narrowest storage width that fits the result,
+        // which is exactly this operation; it mints at rc := 1, and
+        // isPlusOneStringProducer records that so the consumer transfers rather
+        // than retains. (§3.3 permits returning the source itself when the span
+        // covers all of it; always materializing is the simpler correct choice.)
+        if (m == "ToString" && call.args.empty()) {
+            auto* fn = declareC("bz_str_substring", ptrTy(), {ptrTy(), i64(), i64()});
+            return builder_.CreateCall(
+                fn, {fSrc(), builder_.CreateSExt(fBase(), i64(), "ss.ts.st"),
+                     builder_.CreateSExt(fLen(), i64(), "ss.ts.len")},
+                "ss.tostr");
+        }
+        // The search/compare family. Sema has already rejected every operand
+        // shape §3.3 does not declare, so exactly one of the three cases below
+        // applies to a well-typed call.
+        if ((m == "IndexOf" || m == "Contains" || m == "StartsWith" ||
+             m == "EndsWith" || m == "SequenceEqual") &&
+            call.args.size() == 1 && call.args[0].value) {
+            const auto* at = ctx_.exprType(*call.args[0].value);
+            bool argIsChar = at && at->kind == sema::TypeRef::Kind::Primitive &&
+                             at->primitive == sema::PrimitiveType::Char;
+            bool argIsString = at && at->kind == sema::TypeRef::Kind::Primitive &&
+                               at->primitive == sema::PrimitiveType::String;
+            llvm::Value* selfSrc = fSrc();
+            llvm::Value* selfSt  = builder_.CreateSExt(fBase(), i64(), "ss.q.st");
+            llvm::Value* selfLen = builder_.CreateSExt(fLen(), i64(), "ss.q.len");
+            // §3.3: IndexOf(char) / Contains(char) — the code-point scan. These
+            // are the ONLY two methods with a char overload.
+            if (argIsChar) {
+                llvm::Value* cp = lowerExpr(*call.args[0].value);
+                if (!cp) return nullptr;
+                if (!cp->getType()->isIntegerTy(32))
+                    cp = builder_.CreateZExtOrTrunc(cp, i32());
+                auto* fn = declareC("bz_strspan_indexof_cp", i32(),
+                                    {ptrTy(), i64(), i64(), i32()});
+                llvm::Value* idx = builder_.CreateCall(
+                    fn, {selfSrc, selfSt, selfLen, cp}, "ss.iofc");
+                if (m == "Contains")
+                    return builder_.CreateICmpSGE(idx, builder_.getInt32(0),
+                                                  "ss.hasc");
+                return idx;
+            }
+            // The needle's (source, start, len) triple: a string operand is the
+            // whole string (start 0), a span operand is its own sub-range.
+            llvm::Value* nSrc = nullptr;
+            llvm::Value* nSt  = nullptr;
+            llvm::Value* nLen = nullptr;
+            if (argIsString) {
+                nSrc = lowerExpr(*call.args[0].value);
+                if (!nSrc) return nullptr;
+                nSt  = builder_.getInt64(0);
+                // -1 = the BZ_STRSPAN_WHOLE sentinel: "the whole string",
+                // resolved inside the runtime helper AFTER its null guard.
+                // Reading the length here instead (loadStringLen) would
+                // dereference the operand, and the builtin string-method surface
+                // still admits an un-narrowed `string?` argument — the sibling
+                // `"h".IndexOf(nullString)` compiles today and returns -1 rather
+                // than faulting, so this family must not fault either.
+                nLen = builder_.getInt64(-1);
+            } else {
+                llvm::Value* nv = lowerExpr(*call.args[0].value);
+                if (!nv || !nv->getType()->isStructTy()) return nullptr;
+                auto* nSlot = entryAlloca(spanSt);
+                builder_.CreateStore(nv, nSlot);
+                nSrc = builder_.CreateLoad(ptrTy(),
+                    builder_.CreateStructGEP(spanSt, nSlot, 0), "ss.n.src");
+                nSt = builder_.CreateSExt(builder_.CreateLoad(i32(),
+                    builder_.CreateStructGEP(spanSt, nSlot, 1)), i64(), "ss.n.st");
+                nLen = builder_.CreateSExt(builder_.CreateLoad(i32(),
+                    builder_.CreateStructGEP(spanSt, nSlot, 2)), i64(), "ss.n.len");
+            }
+            auto callSpanFn = [&](const char* name) {
+                auto* fn = declareC(name, i32(),
+                                    {ptrTy(), i64(), i64(), ptrTy(), i64(), i64()});
+                return builder_.CreateCall(
+                    fn, {selfSrc, selfSt, selfLen, nSrc, nSt, nLen}, "ss.q");
+            };
+            // §3.3: Contains(value) is defined as IndexOf(value) >= 0.
+            if (m == "IndexOf") return callSpanFn("bz_strspan_indexof");
+            if (m == "Contains")
+                return builder_.CreateICmpSGE(callSpanFn("bz_strspan_indexof"),
+                                              builder_.getInt32(0), "ss.has");
+            const char* fnName = m == "StartsWith" ? "bz_strspan_startswith"
+                               : m == "EndsWith"   ? "bz_strspan_endswith"
+                                                   : "bz_strspan_seqequal";
+            return builder_.CreateTrunc(callSpanFn(fnName), i1(), "ss.qb");
         }
         return nullptr;
     }

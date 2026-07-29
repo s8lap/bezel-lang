@@ -226,6 +226,141 @@ extern "C" int32_t bz_str_lastindexof(const void* self_p, const void* sub_p) {
     return -1;
 }
 
+// ---------------------------------------------------------------------------
+// stdlib §3.3 / #971 item 1: ReadOnlyStringSpan search + compare family.
+//
+// A ReadOnlyStringSpan is {Source: string, Start: int, Length: int} — a view
+// over the code-point range [Start, Start+Length) of `Source`. The search
+// methods therefore need the SAME code-point comparison the whole-string
+// family above uses, but over a caller-selected SUB-RANGE of each operand,
+// which is exactly what makes them a separate entry point rather than a call
+// into bz_str_indexof (that one always searches the whole string).
+//
+// Every operand is passed as an explicit (string, start, len) triple: the
+// receiver span, and — for the substring forms — the needle span. The `string`
+// overloads of §3.3 ("equivalent to calling the ReadOnlyStringSpan overload
+// after value.AsSpan()") are the same call with
+// (needle, 0, BZ_STRSPAN_WHOLE), so no separate entry point is needed for them.
+//
+// Comparison is code-point-by-code-point via bz_str_cp_seq_eq, so the two
+// operands' storage widths are irrelevant and may differ (§4.6 adaptive
+// storage — the reason ReadOnlyStringSpan is a distinct type from
+// ReadOnlySpan<char>, per §3.3 "Why a separate type"). No normalization and no
+// case folding, per §3.3 "Prefix and suffix" / "Equality".
+//
+// All indices and lengths are CODE-POINT counts. Returned indices are relative
+// to the RECEIVER SPAN's start (§3.3: "the start index of the match in the
+// receiver"), not to the underlying source string.
+//
+// The `len == 0` needle conventions mirror the whole-string family above so the
+// span and string surfaces agree: an empty needle is found at index 0
+// (bz_str_indexof), is always contained (bz_str_contains), and is both a prefix
+// and a suffix of every span (bz_str_startswith / bz_str_endswith).
+//
+// Defensive clamps: the codegen bounds-checks span construction, so a negative
+// start/len cannot arise from Bezel source; the guards here keep a stray
+// runtime caller from reading outside the source buffer.
+// ---------------------------------------------------------------------------
+
+// Normalize a (start, len) pair against the source string's code-point length,
+// so no helper below can index outside `s`'s data buffer.
+//
+// `len == BZ_STRSPAN_WHOLE` means "the rest of the source from `start`" — the
+// same sentinel bz_str_substring uses for its one-arg overload. Codegen passes
+// it for a `string` OPERAND (the §3.3 convenience overloads, whose span is the
+// whole string): resolving the length HERE, after each entry point's null
+// guard, is what keeps codegen from having to dereference the operand to read
+// its length. That matters because the builtin string-method surface currently
+// admits a `string?` argument without narrowing (`"h".IndexOf(nullString)`
+// compiles and returns -1 through bz_str_indexof's own null guard), so a null
+// operand does reach these functions and must behave the same way rather than
+// fault. Any OTHER negative length is nonsense and clamps to empty.
+#define BZ_STRSPAN_WHOLE ((int64_t)-1)
+static inline void bz_strspan_clamp(const bz_string_struct* s, int64_t* start,
+                                     int64_t* len) {
+    if (*start < 0) *start = 0;
+    if (*start > s->len) *start = s->len;
+    int64_t avail = s->len - *start;
+    if (*len == BZ_STRSPAN_WHOLE) *len = avail;
+    else if (*len < 0)            *len = 0;
+    if (*len > avail)             *len = avail;
+}
+
+// §3.3: IndexOf(value: char): int — first index in the span whose code point
+// equals `cp`, or -1 if none.
+extern "C" int32_t bz_strspan_indexof_cp(const void* self_p, int64_t s_start,
+                                          int64_t s_len, int32_t cp) {
+    if (!self_p) return -1;
+    const auto* s = (const bz_string_struct*)self_p;
+    bz_strspan_clamp(s, &s_start, &s_len);
+    for (int64_t i = 0; i < s_len; ++i) {
+        if (bz_str_cp(s, s_start + i) == (uint32_t)cp) return (int32_t)i;
+    }
+    return -1;
+}
+
+// §3.3: IndexOf(value: ReadOnlyStringSpan): int — first occurrence of the
+// needle span as a contiguous substring of the receiver span. Naïve scan (§3.3
+// explicitly leaves the algorithm to the implementation). Returns the match's
+// start index RELATIVE TO THE RECEIVER SPAN, or -1 if not found.
+extern "C" int32_t bz_strspan_indexof(const void* self_p, int64_t s_start,
+                                       int64_t s_len, const void* other_p,
+                                       int64_t o_start, int64_t o_len) {
+    if (!self_p || !other_p) return -1;
+    const auto* s = (const bz_string_struct*)self_p;
+    const auto* n = (const bz_string_struct*)other_p;
+    bz_strspan_clamp(s, &s_start, &s_len);
+    bz_strspan_clamp(n, &o_start, &o_len);
+    if (o_len == 0) return 0;          // empty needle matches at 0 (§9.6 form)
+    if (o_len > s_len) return -1;
+    int64_t limit = s_len - o_len;
+    for (int64_t i = 0; i <= limit; ++i) {
+        if (bz_str_cp_seq_eq(s, s_start + i, n, o_start, o_len))
+            return (int32_t)i;
+    }
+    return -1;
+}
+
+// §3.3: StartsWith(prefix): bool — the needle matches the leading portion.
+extern "C" int32_t bz_strspan_startswith(const void* self_p, int64_t s_start,
+                                          int64_t s_len, const void* other_p,
+                                          int64_t o_start, int64_t o_len) {
+    if (!self_p || !other_p) return 0;
+    const auto* s = (const bz_string_struct*)self_p;
+    const auto* n = (const bz_string_struct*)other_p;
+    bz_strspan_clamp(s, &s_start, &s_len);
+    bz_strspan_clamp(n, &o_start, &o_len);
+    if (o_len > s_len) return 0;
+    return bz_str_cp_seq_eq(s, s_start, n, o_start, o_len);
+}
+
+// §3.3: EndsWith(suffix): bool — the needle matches the trailing portion.
+extern "C" int32_t bz_strspan_endswith(const void* self_p, int64_t s_start,
+                                        int64_t s_len, const void* other_p,
+                                        int64_t o_start, int64_t o_len) {
+    if (!self_p || !other_p) return 0;
+    const auto* s = (const bz_string_struct*)self_p;
+    const auto* n = (const bz_string_struct*)other_p;
+    bz_strspan_clamp(s, &s_start, &s_len);
+    bz_strspan_clamp(n, &o_start, &o_len);
+    if (o_len > s_len) return 0;
+    return bz_str_cp_seq_eq(s, s_start + (s_len - o_len), n, o_start, o_len);
+}
+
+// §3.3: SequenceEqual(other): bool — same length AND matching code points at
+// every position. Pairwise; no normalization, no case folding.
+extern "C" int32_t bz_strspan_seqequal(const void* self_p, int64_t s_start,
+                                        int64_t s_len, const void* other_p,
+                                        int64_t o_start, int64_t o_len) {
+    if (!self_p || !other_p) return 0;
+    const auto* s = (const bz_string_struct*)self_p;
+    const auto* n = (const bz_string_struct*)other_p;
+    bz_strspan_clamp(s, &s_start, &s_len);
+    bz_strspan_clamp(n, &o_start, &o_len);
+    if (s_len != o_len) return 0;
+    return bz_str_cp_seq_eq(s, s_start, n, o_start, o_len);
+}
+
 // per §9.5 / §4.6 (issue #1282): char.ToString() / interpolation of a char. A
 // Bezel char is a Unicode scalar (up to U+10FFFF); build a single-code-point
 // string at the narrowest storage width (1/2/4 bytes per §4.6 adaptive

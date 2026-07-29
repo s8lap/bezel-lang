@@ -1262,6 +1262,23 @@ int32_t bz_str_indexof(const void* self, const void* sub);
 int32_t bz_str_lastindexof(const void* self, const void* sub);
 // Substring(start, count): fresh string of `count` code points from `start`.
 void*   bz_str_substring(const void* self, int64_t start, int64_t count);
+// stdlib §3.3 / #971 item 1: the ReadOnlyStringSpan search + compare family.
+// Each operand is an explicit (source string, start, len) code-point triple —
+// a span views a SUB-RANGE of its source, so the whole-string helpers above do
+// not apply. Comparison is code-point-by-code-point, so the two operands'
+// storage widths are irrelevant and may differ (§4.6). `Contains` is not a
+// separate entry point: it is `bz_strspan_indexof* >= 0` (§3.3). The returned
+// index of the IndexOf forms is relative to the RECEIVER SPAN's start.
+int32_t bz_strspan_indexof_cp(const void* self, int64_t s_start, int64_t s_len,
+                              int32_t cp);
+int32_t bz_strspan_indexof(const void* self, int64_t s_start, int64_t s_len,
+                           const void* other, int64_t o_start, int64_t o_len);
+int32_t bz_strspan_startswith(const void* self, int64_t s_start, int64_t s_len,
+                              const void* other, int64_t o_start, int64_t o_len);
+int32_t bz_strspan_endswith(const void* self, int64_t s_start, int64_t s_len,
+                            const void* other, int64_t o_start, int64_t o_len);
+int32_t bz_strspan_seqequal(const void* self, int64_t s_start, int64_t s_len,
+                            const void* other, int64_t o_start, int64_t o_len);
 // #1282: char.ToString() / char interpolation — a single-code-point string at
 // the narrowest storage width (preserves the full Unicode scalar, no truncation).
 void*   bz_char_to_string(int32_t cp);

@@ -5240,17 +5240,26 @@ bool Emitter::lowerStringSpanFor(const ast::ForStmt& fs) {
 
     builder_.SetInsertPoint(condBB);
     llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
-    // idx < len (widened from i32 → i64 for the compare)
+    // idx < len, widened from i32 → i64 for the compare. The widening is a
+    // SIGN extension and the compare is SIGNED, matching every sibling span
+    // path (the array-span for-in above compares `slen` with ICmpSLT and
+    // sign-extends `base`). `Length` and `Start` are §3.3 `int` fields — signed
+    // — so a zero extension plus an UNSIGNED compare reinterprets a negative
+    // Length as ~4 billion and turns what must be a zero-trip loop into a
+    // multi-gigabyte out-of-bounds read of the source string. No producer can
+    // hand a negative Length here today (every AsSpan/Slice path guards
+    // start >= 0 and len >= 0 with emitGuardThrow), so this changes no
+    // reachable behavior — it removes the trap rather than fixing a live bug.
     llvm::Value* len64 =
-        builder_.CreateZExt(len32, i64(), "ssp.len64");
-    llvm::Value* cond = builder_.CreateICmpULT(idx, len64, "ssp.cond");
+        builder_.CreateSExt(len32, i64(), "ssp.len64");
+    llvm::Value* cond = builder_.CreateICmpSLT(idx, len64, "ssp.cond");
     builder_.CreateCondBr(cond, bodyBB, endBB);
 
     builder_.SetInsertPoint(bodyBB);
     llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
-    // Source index = start + idx (start is i32).
+    // Source index = start + idx (start is a signed i32 §3.3 `int` field).
     llvm::Value* start64 =
-        builder_.CreateZExt(start, i64(), "ssp.start64");
+        builder_.CreateSExt(start, i64(), "ssp.start64");
     llvm::Value* srcIdx =
         builder_.CreateAdd(start64, idxB, "ssp.srcidx");
     builder_.CreateStore(loadCodePoint(srcPtr, srcIdx), varSlot);

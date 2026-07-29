@@ -3016,9 +3016,28 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // TypeSymbol (declaration == nullptr). `catch var e: Exception`
                     // gives e a builtin-typed receiver; ToString on it must return
                     // string just like any other class.  per §8.5 (v0.134).
+                    //
+                    // stdlib §3.3 / #971: EXCEPT a `ReadOnlyStringSpan`
+                    // receiver. That test ("Named TypeRef, no user TypeSymbol")
+                    // also matches the synthetic astNode-backed TypeRef of the
+                    // span view types, so `sp.ToString()` was typed here and
+                    // codegen then dispatched it through vtable slot 3 — but a
+                    // span is a {ptr, i32, i32} STRUCT VALUE with no vtable, so
+                    // the load read the source string's first 8 bytes as a
+                    // vtable pointer and jumped through it (segfault at run
+                    // time, an accept-trap rather than a diagnostic). §3.3
+                    // declares its own `ToString(): string` (materialize the
+                    // span's code points), so let the receiver fall through to
+                    // the ReadOnlyStringSpan member block below, which types
+                    // and lowers it correctly. A builtin exception type's
+                    // TypeRef carries no astNode, so this narrows the test
+                    // without disturbing the #608 case it was written for.
                     bool isBuiltinExRecv =
                         recvTy->kind == TypeRef::Kind::Named &&
-                        !recvTy->declaration;
+                        !recvTy->declaration &&
+                        !(recvTy->astNode && recvTy->astNode->name &&
+                          !recvTy->astNode->name->parts.empty() &&
+                          recvTy->headName() == "ReadOnlyStringSpan");
                     // §8.5 (v0.182, #1579): the unit type's default `ToString`
                     // is its name, `"()"` — previously unstated, and this
                     // universal-ToString dispatch had no case for a
@@ -5971,42 +5990,149 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             &ce, makeConcreteCollectionResult(
                                 "Array", ctx_.primitiveTypeRef(P::Byte)));
                     }
-                    // §3.3 (#883): ReadOnlyStringSpan instance methods. The
-                    // receiver is a string-backed view (Source: string, Start,
-                    // Length); the search methods (IndexOf/Contains/StartsWith/
-                    // EndsWith/SequenceEqual) are deferred (substring search over
-                    // the adaptive string encoding — see the follow-up issue).
+                    // §3.3 (#883, #971 item 1): ReadOnlyStringSpan instance
+                    // methods. The receiver is a string-backed view
+                    // (Source: string, Start, Length).
+                    //
+                    // The search/compare family (IndexOf/Contains/StartsWith/
+                    // EndsWith/SequenceEqual) is typed here and lowered in
+                    // LlvmBackend_Calls3.cpp; every operand is a code-point
+                    // (source, start, len) triple, so the operands' storage
+                    // widths (§4.6 adaptive 1/2/4-byte encoding) are irrelevant
+                    // and may differ. §3.3 declares the char overloads for
+                    // IndexOf/Contains ONLY — StartsWith/EndsWith/SequenceEqual
+                    // have no char form, so a char argument to those is a clean
+                    // reject rather than an invented overload.
+                    //
+                    // Two declared members remain deferred with an explicit
+                    // diagnostic naming what is missing: the v0.108
+                    // `SequenceEqual(other: IReadOnlySpan<char>)` (needs the
+                    // boxed interface-span representation, §4.16) and the v0.109
+                    // `CopyTo(destination: Span<char>)` (buffer-write family).
                     if (rcn == "ReadOnlyStringSpan") {
+                        // Classify a single argument against the operand kinds
+                        // §3.3 admits for the search/compare family.
+                        const TypeRef* a0 =
+                            (ce.args.size() == 1 && ce.args[0].value)
+                                ? ctx_.exprType(*ce.args[0].value) : nullptr;
+                        bool argIsChar = a0 && a0->kind == TypeRef::Kind::Primitive &&
+                                         a0->primitive == P::Char;
+                        bool argIsString = a0 && a0->kind == TypeRef::Kind::Primitive &&
+                                           a0->primitive == P::String;
+                        bool argIsSpan = a0 && a0->kind == TypeRef::Kind::Named &&
+                                         !a0->declaration && a0->astNode &&
+                                         a0->astNode->name &&
+                                         !a0->astNode->name->parts.empty() &&
+                                         a0->headName() == "ReadOnlyStringSpan";
+                        // The declared span/string operand forms of every
+                        // search/compare method (§3.3).
+                        bool argIsSpanOrString = argIsString || argIsSpan;
+                        auto rejectOperand = [&](const char* forms) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("`") + std::string(m) +
+                                "` on `ReadOnlyStringSpan` takes " + forms +
+                                "; the declared overloads are the only ones "
+                                "(stdlib \xC2\xA7""3.3)");
+                        };
                         if (m == "Length")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                         else if (m == "IsEmpty")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         else if (m == "Slice") {
-                            // Slice(start, length) → ReadOnlyStringSpan over the
-                            // same source.
-                            auto* tr = ctx_.makeTypeRef();
-                            tr->kind = TypeRef::Kind::Named;
-                            tr->declaration = nullptr;
-                            tr->astNode = recvTy->astNode;  // same synthetic node
-                            ctx_.setExprType(&ce, tr);
-                        } else if (m == "IndexOf" || m == "Contains" ||
-                                   m == "StartsWith" || m == "EndsWith" ||
+                            // §3.3: Slice(start, length) and — since v0.195 —
+                            // Slice(start) (`Slice(start, Length - start)`).
+                            // Both produce a ReadOnlyStringSpan over the same
+                            // source. Any OTHER arity is rejected: it used to be
+                            // typed as a span and then hit codegen's
+                            // `args.size() == 2` guard, which returned nullptr
+                            // and left the local holding an undefined value (an
+                            // accept-trap — `sp.Slice(1,2,3)` compiled and ran
+                            // to garbage).
+                            if (ce.args.size() != 1 && ce.args.size() != 2) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "`Slice` on `ReadOnlyStringSpan` takes "
+                                    "`(start)` or `(start, length)` "
+                                    "(stdlib \xC2\xA7""3.3)");
+                            } else {
+                                auto* tr = ctx_.makeTypeRef();
+                                tr->kind = TypeRef::Kind::Named;
+                                tr->declaration = nullptr;
+                                tr->astNode = recvTy->astNode;  // same synthetic node
+                                ctx_.setExprType(&ce, tr);
+                            }
+                        } else if (m == "ToString") {
+                            // §3.3 Materialization: ToString(): string — a fresh
+                            // string holding the span's code points.
+                            if (!ce.args.empty()) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "`ToString` on `ReadOnlyStringSpan` takes no "
+                                    "arguments (stdlib \xC2\xA7""3.3)");
+                            } else {
+                                ctx_.setExprType(&ce,
+                                                 ctx_.primitiveTypeRef(P::String));
+                            }
+                        } else if (m == "IndexOf") {
+                            // §3.3: IndexOf(char) / IndexOf(ReadOnlyStringSpan) /
+                            // IndexOf(string) → int (match index in the receiver,
+                            // or -1).
+                            if (argIsChar || argIsSpanOrString)
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                            else
+                                rejectOperand("a `char`, a `ReadOnlyStringSpan`, "
+                                              "or a `string`");
+                        } else if (m == "Contains") {
+                            // §3.3: Contains(char) / Contains(ReadOnlyStringSpan) /
+                            // Contains(string) → bool, defined as IndexOf(..) >= 0.
+                            if (argIsChar || argIsSpanOrString)
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                            else
+                                rejectOperand("a `char`, a `ReadOnlyStringSpan`, "
+                                              "or a `string`");
+                        } else if (m == "StartsWith" || m == "EndsWith" ||
                                    m == "SequenceEqual") {
+                            // §3.3: each has a ReadOnlyStringSpan and a string
+                            // overload (and no char overload). SequenceEqual also
+                            // declares an IReadOnlySpan<char> form (v0.108) that
+                            // is not yet lowerable.
+                            bool argIsCharSpanIface =
+                                a0 && a0->kind == TypeRef::Kind::Named &&
+                                a0->headName() == "IReadOnlySpan";
+                            if (argIsSpanOrString) {
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                            } else if (m == "SequenceEqual" && argIsCharSpanIface) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "`SequenceEqual(other: IReadOnlySpan<char>)` "
+                                    "on `ReadOnlyStringSpan` is not yet supported "
+                                    "(the boxed interface-span operand, stdlib "
+                                    "\xC2\xA7""4.16); use the `ReadOnlyStringSpan` "
+                                    "or `string` overload (stdlib \xC2\xA7""3.3)");
+                            } else {
+                                rejectOperand("a `ReadOnlyStringSpan` or a "
+                                              "`string`");
+                            }
+                        } else if (m == "CopyTo") {
+                            // §3.3 (v0.109): CopyTo(destination: Span<char>) is
+                            // declared but not yet lowered — the span-destination
+                            // write family, distinct from the read/search surface
+                            // implemented here.
                             ctx_.diagnostics().report(
                                 Severity::Error, ce.span.begin,
-                                std::string("`") + std::string(m) +
-                                "` on `ReadOnlyStringSpan` is not yet supported "
-                                "(substring search over the adaptive string "
-                                "encoding is deferred) — see the follow-up issue; "
-                                "for now materialize a substring with "
-                                "`s.Substring(...)` and use the `string` methods "
+                                "`CopyTo` on `ReadOnlyStringSpan` is not yet "
+                                "supported (the `Span<char>` destination write is "
+                                "deferred); materialize with `ToString()` "
                                 "(stdlib \xC2\xA7""3.3)");
                         } else {
                             ctx_.diagnostics().report(
                                 Severity::Error, ce.span.begin,
                                 std::string("no member `") + std::string(m) +
                                 "` on `ReadOnlyStringSpan`; documented surface: "
-                                "Length, IsEmpty, Slice(), and the indexer `[i]` "
+                                "Length, IsEmpty, Slice(), IndexOf(), Contains(), "
+                                "StartsWith(), EndsWith(), SequenceEqual(), "
+                                "ToString(), and the indexer `[i]` "
                                 "(stdlib \xC2\xA7""3.3)");
                         }
                     }

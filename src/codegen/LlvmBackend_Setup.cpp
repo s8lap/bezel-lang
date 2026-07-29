@@ -11268,6 +11268,21 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                         if (m == "Remove" && (argc == 1 || argc == 2))
                             return true;
                     }
+                    // stdlib §3.3 / #971: `span.ToString()` on a
+                    // ReadOnlyStringSpan materializes the span's code points
+                    // through the SAME `bz_str_substring` helper as
+                    // `string.Substring` above, so it hands the caller rc := 1
+                    // and belongs in this recognizer for the same reason: a
+                    // consumer that treated it as a borrow would retain on top
+                    // of the producer's +1 and leak (the #2199 shape). The
+                    // receiver is the span view type — a Named TypeRef with no
+                    // user TypeSymbol, carrying the synthetic astNode.
+                    if (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                        !tt->declaration && tt->astNode && tt->astNode->name &&
+                        !tt->astNode->name->parts.empty() &&
+                        tt->headName() == "ReadOnlyStringSpan" &&
+                        ma->member == "ToString" && call->args.empty())
+                        return true;
                 }
             }
         }
