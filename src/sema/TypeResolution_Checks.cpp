@@ -6414,6 +6414,26 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
                                  bool isField) {
         if (!rt || rt->kind == TypeRef::Kind::Error) return;
 
+        // A static whose declared type is one of the ENCLOSING TYPE's generic
+        // parameters (`T`, `T?`) is deliberately left at status quo — no
+        // warning, no error. §22.12 rule 2 enumerates its admitted forms by
+        // TYPE, and a bare type parameter has no single one: the same
+        // declaration is a primitive static in `Holder<int>` (form (iii)) and
+        // a class-typed one in `Holder<Cell>` (rule 2's residual error), so
+        // the category is only decided per monomorphization. Rule 2's prose
+        // names no form for it, and diagnosing at the DECLARATION — the only
+        // site this check runs at — would have to assume one instantiation
+        // for all. Erroring here regressed the pre-existing spec-cited
+        // `generic_static_state_536` round-trip cases (§22.12/§28.5), which
+        // exercise exactly `public static owned shared: T?;`.
+        // Per CLAUDE.md rule 1 this is left to a ruling rather than settled
+        // in the implementation: see #2331.
+        if (rt->kind == TypeRef::Kind::Named && !rt->declaration) {
+            for (Symbol* gp : t->genericParams) {
+                if (gp && gp->name == rt->headName()) return;
+            }
+        }
+
         // Form (iii) primitive/enum leg — admitted for fields AND
         // auto-properties alike; the "fields only" qualifier in the spec
         // text scopes only the inline-array alternative below.
