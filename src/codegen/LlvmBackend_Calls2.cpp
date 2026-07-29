@@ -5879,9 +5879,172 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     syncIterClosureArgs.push_back(args[ai]);
         }
     }
+    // fix #1073 / §28.14 (the CALL-BOUNDED DEFAULT) / §28.9 / §27.5: the same
+    // ARGUMENT-PASS release for a PLAIN (non-iterator, non-async) callee. A +1
+    // closure producer passed DIRECTLY into a *plain function-typed* parameter
+    // is a caller-owned temporary nothing ever drops — the parameter is a
+    // borrow, so the cell (40 bytes) + its env block (8 bytes) leak per call
+    // (LSan, on the issue's exact repro).
+    //
+    // WHY THE CALLER MAY DROP IT. §28.14: "A function-typed parameter declared
+    // *without* `scoped` is call-bounded: the callee receives the callback for
+    // the duration of the call only … it may not be stored in a field of any
+    // object, stored into any collection that is itself reachable beyond the
+    // call, returned, captured by a closure that itself escapes the callee, or
+    // forwarded into a `scoped` parameter position. These obligations are
+    // compiler-verified for user-authored callees." That verification is real
+    // and runs on every user body: `MethodOwnership::callBoundedScan`
+    // (src/ownership/Ownership_Checks.cpp) enrols exactly the *empty-modifier,
+    // function-typed* parameters in `callBoundedParams_` (Ownership.cpp) and
+    // rejects every one of those sinks. So for that parameter shape the callee
+    // provably holds no reference once the call returns, and the producer's +1
+    // is the caller's to drop.
+    //
+    // WHY GENERIC SUBSTITUTION CANNOT DEFEAT THE GUARD (#1921 / #2248 — the
+    // reverted sibling). That guard armed unless the callee's *declared return*
+    // resolved to `TypeRef::Kind::Function`; a bare `T` return resolves to
+    // `Kind::Named` (there is no TypeParam kind), so under `T := () -> int` the
+    // exclusion silently stopped firing, the callee's `return x;` emitted no
+    // retain, and the release freed a live cell — a UAF. Every clause below is
+    // a SOURCE-WRITTEN declaration shape or fails closed:
+    //   * the PARAMETER must be spelled as a function type in source
+    //     (`ast::TypeKind::Function`). A bare-`T` parameter is
+    //     `ast::TypeKind::Named` in the AST no matter what `T` is substituted
+    //     to, so the #1921 shape (`Id<T>(x: T): T`) can never arm this release
+    //     at ANY instantiation. The AST node is written by the parser and is
+    //     never rewritten by monomorphization.
+    //   * the parameter must carry NO modifier — this mirrors
+    //     `callBoundedParams_`'s enrolment one-for-one, so the release fires
+    //     only where the sink verification actually ran. `scoped` (§28.14
+    //     storage-bounded: the callee MAY store the callback) and `owned`
+    //     (ownership transfers IN) are thereby excluded.
+    //   * the callee must not be a DEFERRED-ACTIVATION callee, the one shape
+    //     §28.14 (*Call-bounded × deferred activation*) lets legitimately
+    //     retain the callback past the call in the returned frame: `async`
+    //     methods, sync iterators (already released by the #1864 block above —
+    //     arming here too would be a DOUBLE release), and any callee whose
+    //     declared return announces a frame (the same head-name set
+    //     `MethodOwnership::returnTypeIsDeferredActivation` tests — it is
+    //     precisely that predicate which admits a callee's
+    //     `return xs.Where(f);`).
+    //   * a BARE-TYPE-PARAMETER declared return bails (#2248's own recommended
+    //     remedy), and so does a call whose SUBSTITUTED result type
+    //     (`ctx_.exprType(call)`) is a frame, a lazy-query sentinel, or a
+    //     function value. That closes the virtual/interface-dispatch corner
+    //     where the static declaration reads `: T` and the runtime override is
+    //     an `async` body holding the callback in its frame.
+    // Failing any clause simply LEAKS, which is the safe direction; arming
+    // wrongly is a UAF, which is not — so every clause fails closed.
+    // // per §28.14, §28.9, §27.5
+    std::vector<llvm::Value*> callBoundedClosureArgs;
+    if (auto* mdCb = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        // The §28.14 deferred-activation frame heads — kept identical to
+        // MethodOwnership::returnTypeIsDeferredActivation /
+        // isDeferredActivationCallResult (Ownership_Checks.cpp). Those are the
+        // return types that ANNOUNCE frame residence of a call-bounded
+        // callback; a callee declaring one may hold the callback past the call.
+        auto headIsDeferredFrame = [](std::string_view h) {
+            return h == "IEnumerable" || h == "IEnumerator" ||
+                   h == "IAsyncEnumerable" || h == "IAsyncEnumerator" ||
+                   h == "IOwningEnumerable" || h == "IOwningEnumerator" ||
+                   h == "IOwningAsyncEnumerable" ||
+                   h == "IOwningAsyncEnumerator" || h == "Task" ||
+                   h == "OwningTask";
+        };
+        const bool isSyncIterCallee =
+            mdCb->bodyKind == ast::MethodBodyKind::Block &&
+            containsYield(mdCb->stmts);
+        // (1) The DECLARED return type: `void` (nothing can carry the callback
+        // out at all), or a single-part Named head that is neither a
+        // deferred-activation frame nor a generic parameter of the method or
+        // of its enclosing type. `headName()` is alias-transparent (#1462), so
+        // `type Fut = Task;` spelled `: Fut` is still seen as `Task`.
+        bool declaredReturnOk = false;
+        if (!mdCb->returnType) {
+            declaredReturnOk = true;
+        } else if (mdCb->returnType->kind == ast::TypeKind::Named &&
+                   mdCb->returnType->name &&
+                   mdCb->returnType->name->parts.size() == 1) {
+            std::string_view synHead = mdCb->returnType->name->parts.front();
+            bool isTypeParam = false;
+            for (const auto& gp : mdCb->genericParams)
+                if (gp.name == synHead) { isTypeParam = true; break; }
+            if (!isTypeParam && ms->parent)
+                for (const sema::Symbol* gp : ms->parent->genericParams)
+                    if (gp && gp->name == synHead) { isTypeParam = true; break; }
+            std::string_view head = synHead;
+            if (const sema::TypeRef* drt =
+                    ctx_.resolvedType(*mdCb->returnType)) {
+                if (drt->kind == sema::TypeRef::Kind::Function)
+                    isTypeParam = true;  // closure-returning — bail
+                else if (drt->kind == sema::TypeRef::Kind::Named &&
+                         !drt->headName().empty())
+                    head = drt->headName();
+            }
+            declaredReturnOk = !isTypeParam && !headIsDeferredFrame(head);
+        }
+        // (2) The SUBSTITUTED result type at THIS call site — the belt to (1)'s
+        // braces, closing the `: T`-through-an-interface corner where the
+        // override could be an `async` frame holder. An unknown result type
+        // bails.
+        bool callResultOk = true;
+        if (mdCb->returnType) {
+            const sema::TypeRef* rt = ctx_.exprType(call);
+            if (!rt || rt->kind == sema::TypeRef::Kind::Function) {
+                callResultOk = false;
+            } else if (rt->kind == sema::TypeRef::Kind::Named) {
+                // The §29.11 lazy-query sentinel: a synthesized Named TypeRef
+                // with no declaration, no astNode and generic args (mirrors
+                // isDeferredActivationCallResult).
+                if (!rt->declaration && !rt->astNode && !rt->genericArgs.empty() &&
+                    rt->importedName.empty())
+                    callResultOk = false;
+                else if (headIsDeferredFrame(rt->headName()))
+                    callResultOk = false;
+            }
+        }
+        // `args` carries the receiver at index 0 for an instance/extension
+        // callee and nothing extra for a static one; buildOrderedArgs then
+        // appends exactly `mdCb->params.size()` entries IN PARAMETER ORDER
+        // (named and defaulted arguments included), so the prefix width is the
+        // difference. Anything else is an unrecognised shape — bail.
+        if (!isAsyncMethod(ms) && !isSyncIterCallee && declaredReturnOk &&
+            callResultOk && argExprs.size() == args.size() &&
+            args.size() >= mdCb->params.size() &&
+            args.size() - mdCb->params.size() <= 1) {
+            const std::size_t off = args.size() - mdCb->params.size();
+            for (std::size_t pi = 0; pi < mdCb->params.size(); ++pi) {
+                const ast::Param& p = mdCb->params[pi];
+                if (!p.modifier.empty()) continue;
+                if (!p.type || p.type->kind != ast::TypeKind::Function) continue;
+                const std::size_t ai = off + pi;
+                if (argExprs[ai] && isPlusOneClosureProducer(argExprs[ai]))
+                    callBoundedClosureArgs.push_back(args[ai]);
+            }
+        }
+    }
+    // fix #1073 release site (2/2) — the EXCEPTION/UNWIND edge. Install the
+    // cleanup as `unwindTarget_` for the duration of the call only, so every
+    // unwind edge `emitMethodCall` emits (the callee's propagate, a static-init
+    // guard, an inlined generic body's uncaught throw) drops the same temporaries
+    // on its way to the enclosing catch/propagate boundary. Restored immediately
+    // after, so no later unwind edge can reach it. See
+    // Emitter::closureArgUnwindCleanup for the exactly-once argument.
+    llvm::BasicBlock* savedClArgUnwind = unwindTarget_;
+    if (!callBoundedClosureArgs.empty())
+        unwindTarget_ = closureArgUnwindCleanup(callBoundedClosureArgs);
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs);
-    if (!diverged_)
+    unwindTarget_ = savedClArgUnwind;
+    if (!diverged_) {
         for (llvm::Value* cl : syncIterClosureArgs) emitClosureRelease(cl);
+        // fix #1073 release site (1/2) — the NORMAL-return edge. Straight-line
+        // code in the pending check's `cont` block, with no branch between the
+        // producer's evaluation and here, so it runs exactly once per evaluation
+        // of the call and is mutually exclusive with the unwind cleanup above.
+        // (The #1864 sync-iterator block keeps its historical normal-edge-only
+        // behaviour; extending it is out of this fix's scope.)
+        for (llvm::Value* cl : callBoundedClosureArgs) emitClosureRelease(cl);
+    }
     // Record the concrete subst that drives the RESULT local's layout so that
     // lowerLocalDecl can associate it with the result's local variable.
     //

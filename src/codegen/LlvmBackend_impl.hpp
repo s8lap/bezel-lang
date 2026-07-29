@@ -4894,6 +4894,19 @@ private:
     // buildOrderedArgs, #993/#1918) BEFORE branching here to free `obj`.
     llvm::BasicBlock* newArgUnwindCleanup(llvm::Value* obj);
 
+    // fix #1073 / §28.14 / §28.3 "Exception-path discharge" / §28.9: the
+    // EXCEPTION-edge half of the call-bounded closure ARGUMENT-PASS release.
+    // Builds a cleanup block that drops the producer's +1 on each inline-closure
+    // argument and then continues to the CURRENT enclosing unwind (`unwindBB()`,
+    // captured before the caller overrides `unwindTarget_`). `lowerCall`
+    // installs it as `unwindTarget_` ONLY across `emitMethodCall` and restores
+    // the previous target immediately after, so its predecessors are exactly the
+    // unwind edges of that call — disjoint from the normal-path release emitted
+    // in the pending check's `cont` block. See the definition for the
+    // exactly-once argument.
+    llvm::BasicBlock* closureArgUnwindCleanup(
+        const std::vector<llvm::Value*>& closures);
+
     // §28.2 / §28.4: dispatch an object's PUBLIC idempotent Dispose through its
     // vtable (slot 1) — runs the destructor + owned fields + base chain at most
     // once. Does NOT free the block. `obj` must be non-null. Used as the dispatch

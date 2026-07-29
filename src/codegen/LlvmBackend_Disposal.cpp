@@ -1339,6 +1339,47 @@ llvm::BasicBlock* Emitter::newArgUnwindCleanup(llvm::Value* obj) {
 }
 
 
+llvm::BasicBlock* Emitter::closureArgUnwindCleanup(
+    const std::vector<llvm::Value*>& closures) {
+    // fix #1073 / §28.3 "Exception-path discharge" / §28.9: the EXCEPTION-edge
+    // half of the §28.14 call-bounded closure ARGUMENT-PASS release
+    // (LlvmBackend_Calls2.cpp). The producer's +1 on an inline-closure argument
+    // is dropped after the call on the normal edge; when the callee (or an
+    // operation emitted inside emitMethodCall, e.g. a static-init guard)
+    // PROPAGATES instead, `emitPendingCheck` branches away before that release
+    // and the cell + env would leak on the caught/propagate path. Install this
+    // block as `unwindTarget_` for the duration of emitMethodCall so every
+    // unwind edge it emits drops those same temporaries on the way out.
+    //
+    // EXACTLY-ONCE. The block's only predecessors are the unwind edges emitted
+    // WHILE it is installed; each of them is a `CreateCondBr` whose other side
+    // is the `call.cont` continuation carrying the normal-path release. The two
+    // are therefore mutually exclusive on any concrete execution: an exception
+    // edge branches out of the expression for good (it ends in a branch to the
+    // enclosing catch/propagate boundary and never rejoins `cont`), and the
+    // normal edge is only reachable when no pending exception fired. Nested
+    // `try` lowering inside an inlined callee body saves/restores
+    // `unwindTarget_` around its own catch dispatch, so a HANDLED throw resumes
+    // on the normal edge and reaches the post-call release exactly as it would
+    // without this block.
+    //
+    // Capturing `unwindBB()` BEFORE the caller overrides `unwindTarget_`
+    // preserves the enclosing catch/propagate boundary; the pending check has
+    // already run emitUnwindDisposals() for the enclosing scopes, so this
+    // cleanup only adds the missing closure releases (mirrors
+    // newArgUnwindCleanup above). // per §28.14, §28.3, §28.9
+    auto* savedInsert = builder_.GetInsertBlock();
+    llvm::BasicBlock* enclosingUnwind = unwindBB();
+    auto* cleanupBB =
+        llvm::BasicBlock::Create(llvm_, "clarg.throw.cleanup", currentFn_);
+    builder_.SetInsertPoint(cleanupBB);
+    for (llvm::Value* cl : closures) emitClosureRelease(cl);  // null-safe
+    builder_.CreateBr(enclosingUnwind);
+    if (savedInsert) builder_.SetInsertPoint(savedInsert);
+    return cleanupBB;
+}
+
+
 void Emitter::emitDynamicDispose(llvm::Value* obj) {
     // §28.2 / §28.4: dispatch the object's PUBLIC, idempotent Dispose through
     // its vtable (slot 2, CG35-itable) — which runs the destructor body, owned-field
