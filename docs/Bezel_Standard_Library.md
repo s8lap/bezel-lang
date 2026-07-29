@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.229 — July 2026**
+**Companion to the Bezel Language Specification, v0.230 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -989,6 +989,10 @@ Auto-imported. String interpolation dispatches a hole's format spec here (langua
 
 `C` (currency) deliberately does not exist — currency formatting is culture by definition; format money explicitly (`$"{amount:F2} EUR"`).
 
+**`decimal` midpoint rule (v0.230).** For a `decimal` operand, digit reduction under `F`/`Fn`, `P`/`Pn`, and `E`/`En` rounds a midpoint **half-to-even** (banker's rounding), agreeing with `Decimal.Round` ([§9.3](#sec-decimal)): `0.125m` under `F2` renders `"0.12"`, and `P`/`E` apply the same rule to their scaled digit strings — the format specifiers and `Round` are two spellings of one rounding operation and never disagree at a midpoint.
+
+**Temporal patterns: non-specifier characters are literals (v0.230).** In a temporal pattern (`DateTime`, `DateOnly`, `TimeOnly`), every character that does not begin one of the specifiers above is a **literal**, copied to the output verbatim — `T`, `Z`, `-`, `:`, space, and any other non-specifier character alike; the unrecognized-specifier fault governs malformed runs of the specifier letters (`y` `M` `d` `H` `m` `s` `f`), not literal characters. The temporal specifier vocabulary grows only by recorded ruling, and never in a way that reinterprets a character that passes through as a literal — a new specifier letter would be a breaking change for every pattern using it as a literal, and this section's default answer to such a proposal is no.
+
 <a id="sec-static-abstractions"></a>
 ### 2.19 `INumber<T>`, `ISteppable<T>`, `IParsable<T>` (v0.176, #807)
 
@@ -1236,6 +1240,8 @@ For convenience when comparing against string literals, `IndexOf(value: string)`
 **Prefix and suffix.** `StartsWith(prefix)` returns `true` if the prefix matches the leading portion of the span; `EndsWith(suffix)` is the trailing analog. Both compare code-point-by-code-point — no Unicode normalization, no case folding. For locale-aware or Unicode-equivalent comparison, users go through the dedicated string-comparison APIs ([§9.6](#sec-string)). Each method has both a `ReadOnlyStringSpan` and a `string` overload, mirroring the search methods above.
 
 **Equality.** `SequenceEqual(other)` returns `true` if the two spans have the same length and matching code points at every position. The comparison is pairwise; no normalization or case folding. A `SequenceEqual(other: string)` overload is provided for convenience.
+
+**Empty needles and empty receivers (v0.230).** The empty span or string is a valid needle, with the same vacuous-match conventions as the string family ([§9.6](#sec-string)): `IndexOf` of an empty needle returns `0`; `Contains`, `StartsWith`, and `EndsWith` of an empty needle return `true`; `SequenceEqual` against an empty operand is `true` iff the receiver is itself empty (the length rule above). A **zero-length receiver** is likewise well-defined: it reads no source code point, every non-empty needle is not found (`IndexOf` returns `-1`; `Contains`/`StartsWith`/`EndsWith` return `false`), and the empty needle matches per the conventions above.
 
 **Materialization.** `ToString()` returns a `string` containing the span's code points. If the span covers the entire source string (`Start = 0` and `Length = Source.Length`), implementations may return the source string directly (no copy); otherwise materialization is required (a fresh string is allocated). This is the way to "escape" a span into a plain string when the caller needs to retain the chars beyond the source's lifetime.
 
@@ -3121,7 +3127,7 @@ The predicate overloads of `First`, `Last`, and `Single` (and their `*OrNull` fo
 
 **Element-level semantics (v0.195).** `Zip` ends when either input ends. `Take`/`Skip` **clamp**: a negative count behaves as `0`, and a count beyond the source takes everything / skips everything — they are range operations, not magnitude constructors, so §1's negative-magnitude fault rule deliberately does not apply. `Distinct` and `Union` yield first occurrences in encounter order (`Union`: first input, then the second); `Intersect` and `Except` yield the retained elements, made distinct, in first-input order.
 
-**`GroupBy` semantics (v0.195).** `GroupBy` is lazy until its first enumeration, then **materializes fully** — no complete group can exist before the source is exhausted, so the operator buffers; its §29.11 consumption of the source happens at that point. Groups appear in first-occurrence-of-key order; elements within a group in source order. Each `IGrouping<TKey, T>` is independently single-consumption (spec §29.11) and remains valid after the outer sequence advances past it. When a group is aggregated more than once, materialize it — `for var g in logs.GroupBy(lambda(r) => r.Level) do using var items := g.ToArray(); … end;` — since `g.Count()` followed by `g.Average(…)` would be a second enumeration of `g`.
+**`GroupBy` semantics (v0.195).** `GroupBy` is lazy until its first enumeration, then **materializes fully** — no complete group can exist before the source is exhausted, so the operator buffers; its §29.11 consumption of the source happens at that point. Groups appear in first-occurrence-of-key order; elements within a group in source order. Single-consumption (spec §29.11) binds to the **outer** `IEnumerable<IGrouping<TKey, T>>` sequence only — the lazy query here. Each `IGrouping<TKey, T>` is a materialized, ordinarily **re-enumerable** collection whose elements are the grouping's own buffer, and it remains valid after the outer sequence advances past it: `g.Count()` followed by `g.Average(…)` is defined and reads the buffer twice. When a group feeds many aggregations, materializing it once — `for var g in logs.GroupBy(lambda(r) => r.Level) do using var items := g.ToArray(); … end;` — remains the advised shape; it is advice, not a rule.
 
 **`Reverse` (naming note, v0.195).** §5 keeps the .NET-heritage operator names, so the lazy `Reverse()` deliberately sits outside §4.4's imperative-mutates/participle-copies convention — recorded as a decision, not an accident (renaming to `Reversed()` was declined: §4.4's participle promises a fresh owned *copy*, which a lazy sequence is not). No call-site ambiguity arises: on an `Array<T>` receiver, instance resolution commits to the in-place `Reverse()` before extensions are consulted (spec §26.4 rule 1); the lazy operator applies only where the receiver's static type has no instance `Reverse`.
 
@@ -4295,6 +4301,8 @@ public enum FileAccess: byte
 end FileAccess;
 ```
 
+**Constructor contract (v0.230).** The two-argument constructor implies **`FileAccess.ReadWrite`**: `new FileStream(path, mode)` behaves as `new FileStream(path, mode, FileAccess.ReadWrite)`. A construction that cannot open the file raises the [§7.5](#sec-io-exception-types) types: `FileNotFoundException` when `FileMode.Open` names a file that does not exist, `DirectoryNotFoundException` when a directory component of `path` does not exist, and `IOException` otherwise (an existing file under `FileMode.CreateNew`, a permission failure, and every other OS-level open failure).
+
 **Disposal (flush-on-dispose).** Disposing a `FileStream` — at `using var` scope exit or an explicit `Dispose()` — flushes any buffered writes and releases the OS file handle. A `FileStream` opened for writing must be disposed (or explicitly `Flush()`ed) for buffered data to reach the file; the `using var` idiom guarantees this on every exit edge, including exceptions. `FileStream` overrides `ReadAsync`/`WriteAsync` ([§7.1](#sec-stream)) with genuinely asynchronous OS I/O — not the blocking base default.
 
 <a id="sec-file"></a>
@@ -4646,6 +4654,9 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string> 
   public pure method Contains(value: char): bool;
   public pure method StartsWith(value: string): bool;
   public pure method EndsWith(value: string): bool;
+                              // Empty needle (v0.230): Contains("") = true; StartsWith("") = true;
+                              //   EndsWith("") = true — the vacuous-match convention of IndexOf("") = 0;
+                              //   the §3.3 span family mirrors the whole set.
   public pure method IndexOf(value: char): int;       // code-point index of first occurrence, or -1 (v0.195)
   public pure method IndexOf(value: string): int;     // -1 when absent; IndexOf("") = 0 (v0.195)
   public pure method IndexOf(value: char, startIndex: int): int;    // v0.215: search from the code-point
