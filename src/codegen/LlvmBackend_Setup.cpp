@@ -2596,18 +2596,22 @@ void Emitter::setupBuiltinExceptions() {
         // (see builtinExceptionDisposeFn_ below); boxes still use this no-op
         // because they carry no string at offset 8.
         //
-        // §31.4/#811 note: the CauseChain snapshot a `(message, cause)` exception
-        // holds is NOT freed (in either disposer). An exception object has
-        // several disposal / reclaim paths (catch-arm dispose, scope-end dispose,
-        // and the async fault-propagation free in bz$async$*$Resume), and they
-        // are not a single idempotent site — a Dispose that read/free'd
-        // CauseChain@24 double-freed it (and read freed memory) on the async
-        // path. So the CauseChain is left to be reclaimed by process exit, like
-        // the runtime-owned TypeInitializationException.InnerException (§22.13).
-        // This is a small, bounded leak confined to a caught-and-disposed
-        // exception constructed WITH a cause; tracked as a follow-up. (The
-        // Message/ParamName strings DO get the slot-null idempotency guard
-        // below, so they are safe to release where CauseChain is not.)
+        // §31.4/#811/#1389 note: the CauseChain snapshot a `(message, cause)`
+        // exception holds is NOT freed by EITHER shared disposer — an exception
+        // object has several disposal/reclaim paths (catch-arm dispose,
+        // scope-end dispose, async fault propagation) that are not a single
+        // idempotent site, so a Dispose that read/freed CauseChain@24 raced a
+        // still-borrowed exception's CauseChain being read elsewhere (e.g. as a
+        // `cause`'s `nested` chain when it is itself chained into a new
+        // exception) — a use-after-free. CauseChain is instead reclaimed at the
+        // codegen `emitDisposeAndReclaim` TERMINAL reclaim site
+        // (LlvmBackend_Disposal.cpp, `bz_exc_reclaim_causechain`), which by
+        // ownership discipline runs exactly once per object, strictly after
+        // every live read — see that site's comment for the full reasoning.
+        // (The Message/ParamName strings DO get the slot-null idempotency guard
+        // below and are released once, here, in the shared disposer — safe
+        // because a re-dispatch reads null; CauseChain needs the reclaim-site
+        // exactly-once guarantee instead, not idempotency.)
         auto* bb = llvm::BasicBlock::Create(llvm_, "entry",
                                             builtinDisposeFn_);
         llvm::IRBuilder<> b(bb);
@@ -2655,8 +2659,10 @@ void Emitter::setupBuiltinExceptions() {
         llvm::Value* pn = b.CreateLoad(ptrTy(), pnSlot, "ex.param");
         b.CreateCall(relFn, {pn});
         b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pnSlot);
-        // CauseChain@kExcCauseOffset is intentionally NOT touched — see the
-        // #811 note in the no-op disposer's comment above.
+        // CauseChain@kExcCauseOffset is intentionally NOT touched here — see
+        // the #811/#1389 note in the no-op disposer's comment above (it is
+        // reclaimed at the terminal reclaim site instead, not in this shared,
+        // possibly-multiply-dispatched disposer).
         b.CreateRetVoid();
     }
 

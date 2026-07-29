@@ -86,15 +86,47 @@ extern "C" void* bz_exc_causechain_link(void* causeTypeName, void* causeMessage,
     return arr;
 }
 
-// §31.4/#811 note: a CauseChain snapshot is intentionally NOT freed when its
-// owning exception is disposed. An exception object has several disposal/reclaim
-// paths (catch-arm dispose, scope-end dispose, and the async fault-propagation
-// free in bz$async$*$Resume) that are not one idempotent site, so a Dispose that
-// freed CauseChain@24 double-freed it (and read freed memory) on the async path.
-// The CauseChain is therefore reclaimed by process exit, exactly like the
-// runtime-owned TypeInitializationException.InnerException (§22.13). A small,
-// bounded leak confined to a caught-and-disposed exception constructed WITH a
-// cause; see the codegen note in setupBuiltinExceptions.
+// §31.4/#811/#1389: reclaim a CauseChain snapshot at the exception object's
+// TERMINAL reclaim (immediately before the object's own block is freed) —
+// called from the codegen `emitDisposeAndReclaim` reclaim site
+// (LlvmBackend_Disposal.cpp), never from the shared vtable Dispose
+// (bz$exDisposeMsg). An exception object has several disposal/reclaim paths
+// (catch-arm dispose, scope-end dispose, async fault propagation) that are
+// not one idempotent site; earlier work tried freeing CauseChain@24 from the
+// shared Dispose (mirroring how it releases Message/ParamName) and hit a
+// use-after-free — a still-borrowed (not-yet-reclaimed) exception's
+// CauseChain can be read (as a `cause`'s `nested` chain, via
+// bz_exc_causechain_link below) AFTER its own Dispose has already dispatched
+// on some path, so freeing it there raced that read. The reclaim site is
+// different: ownership discipline runs it EXACTLY ONCE per object, strictly
+// after every live borrow/read has concluded, so it cannot race an in-flight
+// read. `excVtableTable` is the same null-terminated built-in-exception
+// vtable table bz_unhandled_exception gates on — a no-op for a non-built-in
+// (or user-subclass) object, which either has no CauseChain slot or does not
+// share this vtable/disposer. Not wired into the pure-runtime
+// vtable-Dispose-then-free reclaim sites that bypass codegen
+// (bz_dispose_class_obj, bz_domain_spawn's DomainFaultedException wrap) —
+// tracked as a follow-up, see the issue tracker.
+extern "C" void bz_exc_reclaim_causechain(void* obj, void** excVtableTable) {
+    if (!obj || !excVtableTable) return;
+    void* vtable; memcpy(&vtable, obj, sizeof(void*));
+    bool builtinExc = false;
+    for (void** p = excVtableTable; *p; ++p)
+        if (*p == vtable) { builtinExc = true; break; }
+    if (!builtinExc) return;
+    void* chain;
+    memcpy(&chain, (uint8_t*)obj + BZ_EXC_CAUSE_OFFSET, sizeof(void*));
+    if (!chain) return;
+    auto* arr = (bz_array_t*)chain;
+    auto* elems = (bz_excinfo_t*)arr->data;
+    for (int64_t i = 0; i < arr->count; i++) {
+        bz_string_release(elems[i].typeName);
+        bz_string_release(elems[i].message);
+        bz_string_release(elems[i].stackTrace);
+    }
+    free(arr->data);
+    free(arr);
+}
 
 // Write a bz_string's UTF-8 bytes to `f` (nothing for a null / empty string).
 static void bz_rt_fput_bzstring(void* s, FILE* f) {

@@ -1429,12 +1429,55 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
         declareC("bz_obj_identity_hash_forget",
                  llvm::Type::getVoidTy(llvm_), {ptrTy()}),
         {obj});
+    // §31.4/#811/#1389: reclaim the CauseChain snapshot HERE, at the terminal
+    // reclaim site, immediately before the block itself is freed — NOT inside
+    // the shared vtable Dispose (bz$exDisposeMsg, setupBuiltinExceptions). The
+    // shared disposer releases Message/ParamName this same release-and-null
+    // way, and freeing CauseChain there looks like the same idiom, but it is
+    // NOT safe there: a still-borrowed (not-yet-reclaimed) exception's
+    // CauseChain can be READ after ITS Dispose has already dispatched on some
+    // path (e.g. `throw new X(msg, ex)` inside `ex`'s own catch arm reads
+    // `ex.CauseChain` — bz_exc_causechain_link's `nested` argument — to build
+    // the new snapshot). Freeing CauseChain from the shared disposer produced
+    // a use-after-free there (diagnosed via gdb: bz_exc_causechain_link
+    // reading a `nested` pointer into an already-freed/reused block) across
+    // the several non-single-site exception disposal paths (catch-arm
+    // dispose, scope-end dispose, async fault propagation). THIS site is
+    // different: by ownership discipline it runs EXACTLY ONCE per object,
+    // strictly after every live borrow/read of it has concluded (the true end
+    // of the object's life) — it cannot race a still-in-flight CauseChain
+    // read, so it is safe to free here.
+    //
+    // Gate: `bz_exc_reclaim_causechain` checks obj's vtable against the same
+    // built-in-exception vtable table bz_unhandled_exception gates on (only a
+    // built-in exception type installs bz$exDisposeMsg / carries the
+    // CauseChain slot at BZ_EXC_CAUSE_OFFSET); a no-op for every other class.
+    //
+    // Scope: this covers every reclaim that funnels through this function —
+    // catch-arm dispose, using-var / owned-field scope-end dispose, and a
+    // faulted task's scope-end fault-exception dispose. It deliberately does
+    // NOT cover the handful of pure-runtime "vtable-Dispose-then-free" sites
+    // that bypass codegen entirely (bz_dispose_class_obj —
+    // Task.FireAndForget's abandoned-task continuation and the
+    // WhenAll/WhenAllOwned aggregate fault/result cleanup — and
+    // bz_domain_spawn's DomainFaultedException wrap-and-dispose of the
+    // original fault): those run in bezel_runtime_concurrency.cpp with no
+    // access to the codegen-built vtable table this gate needs. Filed as a
+    // follow-up (see the issue tracker) rather than fixed silently here.
+    builder_.CreateCall(
+        declareC("bz_exc_reclaim_causechain", llvm::Type::getVoidTy(llvm_),
+                 {ptrTy(), ptrTy()}),
+        {obj, builtinExcVtableTablePtr()});
     // §28.2 v0.134 / issue #601: in checked disposal mode the block is
     // quarantined (not freed) after disposal so that the per-instance disposed
     // flag at slot 1 (or 2) remains readable when a subsequent member-entry
     // guard loads it. This is a deliberate memory leak in checked (debug)
     // builds; the spec explicitly endorses deferred reclamation here. In
     // unchecked (release) mode the block is freed immediately as before.
+    // (The CauseChain reclaim above runs unconditionally, ahead of this
+    // branch, matching checked disposal's own deliberate-leak posture for
+    // everything else the block owns — only the block header itself is kept
+    // readable for the disposed-flag guard.)
     if (!checkedDisposal_)
         builder_.CreateCall(freeFn(), {obj});
 }
