@@ -83,17 +83,24 @@ real `bezelc`) and a **lit + FileCheck diagnostic track**
 (`tests/lit/*.bzl`, matching compiler diagnostics). The diagnostic track needs
 `lit` and `FileCheck` (from LLVM) on `PATH`; without them it is skipped cleanly.
 
+The gtest suite builds as several per-area binaries
+(`build/tests/bezel_tests_<group>`, one per `tests/<area>/` group); `bezel_tests`
+remains the CMake target that builds them all, and
+`build/tests/test_binaries.txt` is the generated list every runner reads.
+
 ```sh
-tests/run_parallel.sh 16                    # sharded gtest suite (~2 min)
+tests/run_parallel.sh 16                    # sharded gtest suite, all binaries (~2 min)
 cmake --build build --target check-lit      # diagnostic track
-scripts/gate.sh                             # both + a serial pass; prints a combined total
-BEZEL_TEST_FILTER=<substr> build/tests/bezel_tests   # a subset, serially
+scripts/gate.sh                             # both; prints a combined total
+scripts/agent_check.sh <substr>             # a targeted subset (finds the right binary for you)
+BEZEL_TEST_FILTER=<substr> build/tests/bezel_tests_sema   # one area, serially
 ```
 
 `scripts/gate.sh` is the blessed pre-push gate (`--full` adds a whole-suite ASan
-sweep). The serial binary (`build/tests/bezel_tests`) is authoritative — the
-sharded runner can over-report under load. See `tests/README.md` for how to
-write a test (the `runAot` harness and lit conventions).
+sweep). The sharded runner is the authoritative oracle (every test is
+process-isolated) and fails loudly on a crashed or dropped slice. See
+`tests/README.md` for how to write a test (the `runAot` harness and lit
+conventions).
 
 ## Repository layout
 

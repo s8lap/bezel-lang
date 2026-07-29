@@ -98,19 +98,35 @@ scripted by `scripts/extract_diag_to_lit.py`.
   dir. It refuses an empty filter and `--gtest_filter` (the binary ignores that
   flag). A lane must NOT run the whole suite — see the last two bullets, those are
   the coordinator/gate's job.
-- Targeted, by hand: `BEZEL_TEST_FILTER=<substr> build/tests/bezel_tests` (the
-  binary ignores `--gtest_filter`).
+- **The suite is several per-area binaries**, `build/tests/bezel_tests_<group>`
+  (`codegen`, `ownership`, `sema`, `frontend`, `module`, `support`), one per
+  `tests/<area>/` group — so a test-only edit relinks only its own area.
+  `bezel_tests` is still the *target* that builds them all, and
+  `build/tests/test_binaries.txt` (generated: `<group> <TAB> <path> <TAB>
+  <#sources>`) is the list every runner reads. Never hardcode a binary path.
+  `scripts/agent_check.sh --area <group> <filter>` builds+runs just one.
+- Targeted, by hand: `BEZEL_TEST_FILTER=<substr> build/tests/bezel_tests_sema`
+  (the binaries ignore `--gtest_filter`). `BEZEL_TEST_ENUMERATE=1` prints what a
+  process *would* run (`suite.name` per line) and exits without running — use it
+  to find which area holds a test, or to verify a shard partition.
 - Exact-list subset (#2100): `BEZEL_TEST_LIST=<file>` — one `suite.name` per
-  line, exact match, composable with the filter. The summary then carries an
-  explicit `N selected` field and `run_parallel.sh` switches its drop-detection
-  to *selected == ran* (an empty/unmatched list fails loudly, never green).
+  line, exact match, composable with the filter. Each binary's summary then
+  carries an explicit `N selected` field and `run_parallel.sh` switches its
+  drop-detection to *selected == ran*, **per binary** (a binary holding none of
+  the listed tests legitimately selects 0); "the list selected nothing at all"
+  and the phantom-name warning are computed globally by the runner, which is the
+  only place that can see the whole list.
   Lists are produced by `scripts/select_tests.py` (diff → affected tests;
   `--variant lane` for a tight lane subset, `--variant gate` for the canary;
   `--check` self-tests its parsing invariants). Lane convenience:
   `scripts/agent_check.sh --select [base]`.
-- Sharded (whole suite): `tests/run_parallel.sh 16`. **Serial**
-  (`build/tests/bezel_tests`) is the authoritative oracle — the sharded runner can
-  over-report under fork-resource contention; a real failure reproduces serially.
+- Sharded (whole suite): `tests/run_parallel.sh 16` — the argument is the
+  *concurrency* cap (how many test processes run at once), not a per-binary
+  shard count: every binary is sliced that many ways and the slices go through
+  one bounded queue. The sharded pass is the authoritative oracle (#1861); it
+  can over-report under fork-resource contention, so a suspect is re-checked in
+  isolation (`BEZEL_TEST_FILTER=<name> build/tests/bezel_tests_<group>`), not by
+  a serial whole-suite pass.
 - lit track: `cmake --build build --target check-lit`.
 - Full gate: `scripts/gate.sh` (`--full` adds the whole-suite ASan sweep, for
   codegen/runtime/disposal/layout changes). The gate runs a diff-selected
