@@ -4573,11 +4573,197 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
 }
 
 
+// fix #1302 / §22.3 (v0.228) "**`ref` local and field targets alias; accessor
+// targets bracket.**" — the copy-IN half.
+//
+// §22.3's "`ref` and `out` argument locations" admits "an indexer slot, or a
+// property with an accessible setter" as `ref`/`out` argument locations, and
+// the paragraph that follows fixes their semantics: such a target "is instead
+// **copy-in / copy-out** under §17.6's evaluate-once discipline: the receiver
+// and every index expression are evaluated exactly once, in §22.5's call-site
+// textual order; for `ref`, the getter is called once to produce the callee's
+// slot value (for `out` no getter call occurs); on **normal return** the setter
+// is called once with the slot's final value."
+//
+// Codegen had no such bracket. `lvalueAddr` resolves only locals, fields,
+// statics and INLINE-array elements (a real address exists for each), so every
+// accessor-mediated target — a heap-collection slot (`arr[0]`, `dict[k]`), a
+// user-defined indexer, a block-form property — returned null and the whole
+// call failed with buildOrderedArgs' "#1386" internal-error diagnostic. (Before
+// the #1682 §22.3 category check landed, the same null instead let the call
+// through with a garbage/temporary address and the callee's write was silently
+// DROPPED — the WRONG_VALUE #1302 was filed for.)
+//
+// This helper emits the copy-in half and records what the copy-out half needs:
+//   * the receiver and every index expression are lowered ONCE here and PINNED
+//     in `exprValueOverride_`, so the getter below AND the setter in
+//     emitAccessorRefArgWriteBacks reuse those values rather than re-evaluating
+//     a side-effecting subexpression (`M(ref a[Next()])` must call `Next()`
+//     once, not twice, and the get and the set must address the SAME slot —
+//     the identical hazard #1299 fixed for `a[i] OP= v`);
+//   * for `ref` the getter runs once (driving whichever existing read path the
+//     location has — bz_array_get / bz_dict_try_get_* / a user indexer getter /
+//     a property getter) and its value is stored into the callee's slot; for
+//     `out` NO getter call occurs, and the slot is zero-initialized so the
+//     callee's by-reference slot never starts as garbage;
+//   * the slot's address is what the callee receives, so the callee's writes
+//     land in the caller's frame and nothing aliases the collection.
+//
+// Returns the slot address, or null when `target` is not an accessor-mediated
+// location this bracket can drive (caller falls through to #1386).
+llvm::Value* Emitter::emitAccessorRefArgCopyIn(
+    const ast::Expr& target, const ast::Param& param, bool isOut,
+    std::vector<AccessorRefArg>& sink) {
+    AccessorRefArg rec;
+    rec.target = &target;
+
+    // Pin one already-lowered subexpression value so a later re-lowering of the
+    // same AST node (inside the getter here, or the setter after the call)
+    // returns it instead of re-running the expression. // per §22.3 / §17.6
+    auto pin = [&](const ast::Expr* e) -> bool {
+        if (!e) return true;
+        llvm::Value* v = lowerExpr(*e);
+        if (!v) return false;
+        exprValueOverride_[e] = v;
+        rec.pins.push_back(e);
+        return true;
+    };
+    auto unpinAll = [&]() {
+        for (const ast::Expr* e : rec.pins) exprValueOverride_.erase(e);
+    };
+
+    // --- Classify the location and evaluate its subexpressions exactly once ---
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&target)) {
+        // An indexer slot: the receiver, then every index expression, in
+        // call-site textual order (§22.3 / §22.5).
+        if (!ix->target || ix->indices.empty()) return nullptr;
+        if (!pin(ix->target.get())) { unpinAll(); return nullptr; }
+        for (const auto& iv : ix->indices)
+            if (!pin(iv.value.get())) { unpinAll(); return nullptr; }
+    } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(
+                   ctx_.exprSymbol(target))) {
+        // "a property with an accessible setter" (§22.3). An indexer is a
+        // PropertySymbol too but arrives as the IndexExpr above.
+        if (ps->isIndexer) return nullptr;
+        // A STATIC property is declined, deliberately and uniformly. §22.3
+        // excludes "no **mutable static** admitted by §22.12 rule 2, whose
+        // store semantics are defined for direct assignment only" — rule 2
+        // names "a mutable … static field or auto-property", so a mutable
+        // static AUTO-property is plainly excluded while a BLOCK-form static
+        // property (whose setter body does the storing) is not clearly either
+        // way. Rather than commit to a reading, keep the status quo — both
+        // spellings, `ref S` and `ref Box.S`, already fail the same way — and
+        // decline HERE so the two spellings cannot diverge: only the qualified
+        // one has a receiver expression to pin, so without this the bare-name
+        // form would have been silently admitted and the qualified one
+        // rejected. The ruling request is filed. // per §22.3 / §22.12 rule 2
+        for (const auto& m : ps->modifiers)
+            if (m == "static") return nullptr;
+        // An implicit-`this` access has no receiver expression to evaluate.
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target))
+            if (ma->target && !pin(ma->target.get())) { unpinAll(); return nullptr; }
+    } else {
+        return nullptr;  // not accessor-mediated — caller reports #1386
+    }
+
+    // --- The callee's slot. Its value type is the LOCATION's type (what the
+    //     setter consumes); the alloca is widened if the callee's declared
+    //     parameter type is larger, so a callee storing through a wider
+    //     parameter cannot write past the slot (the #2266 slot-clobber
+    //     shape). // per §22.3
+    llvm::Type* valueTy = nullptr;
+    if (const sema::TypeRef* et = ctx_.exprType(target)) valueTy = lowerTypeRef(et);
+    llvm::Type* paramTy = nullptr;
+    if (param.type)
+        if (const sema::TypeRef* pt = ctx_.resolvedType(*param.type))
+            paramTy = lowerTypeRef(pt);
+    if (!valueTy) valueTy = paramTy;
+    if (!valueTy) { unpinAll(); return nullptr; }
+    llvm::Type* slotTy = valueTy;
+    if (paramTy && paramTy != valueTy &&
+        module_->getDataLayout().getTypeAllocSize(paramTy) >
+            module_->getDataLayout().getTypeAllocSize(valueTy))
+        slotTy = paramTy;
+
+    llvm::AllocaInst* slot = entryAlloca(slotTy);
+    builder_.CreateStore(llvm::Constant::getNullValue(slotTy), slot);
+
+    // --- `ref`: one getter call, into the slot. `out`: no getter (§22.3). ---
+    if (!isOut) {
+        llvm::Value* cur = lowerExpr(target);
+        if (!cur) { unpinAll(); return nullptr; }
+        // The callee reads the slot at its PARAMETER's width, so an integer
+        // read narrower than the slot is widened first; otherwise the value's
+        // own type is stored (the alloca is at least that large by the sizing
+        // above). A shape neither equal nor integer-coercible is not one this
+        // bracket can pass safely — decline rather than emit a mistyped store.
+        if (cur->getType() != slotTy) {
+            if (cur->getType()->isIntegerTy() && slotTy->isIntegerTy())
+                cur = coerceNumericToType(cur, slotTy,
+                                          isUnsignedTargetExpr(target));
+            else if (cur->getType() != valueTy) { unpinAll(); return nullptr; }
+        }
+        builder_.CreateStore(cur, slot);
+    }
+
+    rec.slot = slot;
+    rec.valueTy = valueTy;
+    sink.push_back(std::move(rec));
+    return slot;
+}
+
+
+// fix #1302 / §22.3 — the copy-OUT half. "on **normal return** the setter is
+// called once with the slot's final value. Write-backs for multiple
+// accessor-mediated arguments run in argument textual order … and on an
+// exception exit no write-back occurs" — hence `emit` (false on the exception
+// edge) and the in-order walk of `recs`, which buildOrderedArgs appended in
+// call-site textual order.
+//
+// The setter is driven through the SAME helpers the ordinary `loc := v`
+// statement uses, so every location kind the language supports writes back by
+// its own rules (an owning collection's disposing set, a virtual/interface
+// property's dynamic dispatch, a user indexer's inlined accessor body). The
+// receiver and index subexpressions stay pinned until here, so those helpers'
+// internal `lowerExpr` calls reuse the copy-in's values and address exactly the
+// slot the getter read (§22.3's evaluate-once).
+void Emitter::emitAccessorRefArgWriteBacks(std::vector<AccessorRefArg>& recs,
+                                           bool emit) {
+    for (auto& r : recs) {
+        if (emit && r.slot && r.valueTy && r.target) {
+            llvm::Value* v = builder_.CreateLoad(r.valueTy, r.slot, "refacc.wb");
+            bool done = false;
+            if (auto* ix = dynamic_cast<const ast::IndexExpr*>(r.target)) {
+                // Mirrors lowerStmt's `obj[i] := v` order: a user-declared
+                // indexer first (it may be virtual/interface-dispatched), then
+                // the built-in heap collections (§4.4-§4.9).
+                done = lowerIndexerSet(*ix, v) ||
+                       lowerCollectionIndexerSet(*ix, v, /*valueExpr=*/nullptr);
+            } else {
+                // Mirrors lowerStmt's `obj.P := v` order: a virtual/interface
+                // property setter dispatches dynamically (§12.1/§12.5/§23);
+                // otherwise the statically-known accessor body is inlined.
+                done = lowerVirtualPropertySet(*r.target, v) ||
+                       lowerPropertySetValue(*r.target, v);
+            }
+            if (!done)
+                ctx_.diagnostics().report(
+                    Severity::Error, r.target->span.begin,
+                    "internal: no setter for the `ref`/`out` accessor "
+                    "write-back — #1302");
+        }
+        for (const ast::Expr* e : r.pins) exprValueOverride_.erase(e);
+    }
+    recs.clear();
+}
+
+
 bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                       const std::vector<ast::CallArgument>& args,
                       std::vector<llvm::Value*>& out,
                       std::vector<const ast::Expr*>* outExprs,
-                      bool nullTransferredOwned) {
+                      bool nullTransferredOwned,
+                      std::vector<AccessorRefArg>* accessorRefArgs) {
     std::vector<llvm::Value*> ordered(params.size(), nullptr);
     // issue #421 / #410: parallel source expression per parameter position, so
     // the caller can recover each argument's signedness for numeric widening.
@@ -4826,6 +5012,29 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         if (isByRefMod(params[idx].modifier)) {
             llvm::Type* et = nullptr;
             v = lvalueAddr(*a.value, et);
+            // fix #1302 / §22.3: `lvalueAddr` covers exactly the categories
+            // that ALIAS — "a `ref` argument naming a mutable local or writable
+            // field is a true alias" (plus §15.1's inline-array element, which
+            // is a slot inside such a location). The remaining admitted §22.3
+            // categories — "an indexer slot, or a property with an accessible
+            // setter" — have no address to alias; §22.3 gives them copy-in /
+            // copy-out instead, which this bracket emits. The write-back is
+            // flushed by the caller after the call returns normally.
+            //
+            // Restricted to `ref` and PLAIN `out`: §22.3 closes the list for
+            // the owned variant — "for `out owned`, the accepted forms remain
+            // exactly the inline `out using var x` / `out owned var x` of
+            // §22.4" — so an accessor-mediated `out owned` argument is NOT an
+            // admitted location and must not be bracketed into one (the
+            // callee's fresh owned value would be stored into a borrowing slot
+            // with nobody to discharge it, §28.6). It keeps today's
+            // compile-time rejection through the #1386 fallback below; the
+            // missing dedicated §22.3 diagnostic is filed separately.
+            if (!v && accessorRefArgs &&
+                (params[idx].modifier == "ref" || params[idx].modifier == "out"))
+                v = emitAccessorRefArgCopyIn(
+                    *a.value, params[idx],
+                    /*isOut=*/params[idx].modifier == "out", *accessorRefArgs);
         } else if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
                        a.value.get())) {
             // #999 / §15.4: a collection literal passed inline as a call argument.

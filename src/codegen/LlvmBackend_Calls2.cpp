@@ -5200,6 +5200,14 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // (not clear) so a nested call whose args this call is still evaluating has
     // already consumed its own entries under the same stack discipline.
     const std::size_t discardOwnedBase = discardOwnedOutSlots_.size();
+    // #1302 / §22.3 "accessor targets bracket": records for this call's
+    // accessor-mediated `ref`/`out` arguments (an indexer slot, a property).
+    // buildOrderedArgs emits their copy-IN and appends one record each, in
+    // call-site textual order; the copy-OUT (the setter call) is emitted below
+    // once the call has returned NORMALLY. A plain local per call — a nested
+    // call in an argument position flushes its own records before this one
+    // builds any, so no stack discipline is needed.
+    std::vector<AccessorRefArg> accessorRefArgs;
     bool baseQualified = false;  // `base.M()` → non-virtual (§12.3)
     if (!isStaticMethod(ms)) {
         // Receiver: the member-access target, else the current `this`.
@@ -5546,7 +5554,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             // to null the caller's transferred-owned slots at the call, so the
             // null-guarded unwind disposal is exactly-once across branches.
             if (!buildOrderedArgs(md->params, call.args, args, &argExprs,
-                                  /*nullTransferredOwned=*/true)) {
+                                  /*nullTransferredOwned=*/true,
+                                  &accessorRefArgs)) {
                 // Restore before early-return.
                 if (didPrePass) {
                     genericSubst_ = std::move(preSavedSubst);
@@ -5555,6 +5564,9 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 // #1467: drop any discard-owned slots this failed call recorded
                 // so the stack stays consistent for subsequent calls.
                 discardOwnedOutSlots_.resize(discardOwnedBase);
+                // #1302: the call never runs, so no §22.3 write-back is owed —
+                // release the pinned receiver/index values.
+                emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
                 return nullptr;
             }
         } else {
@@ -6134,6 +6146,16 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         lastCallGenericSubst_ = genericSubst_;
     genericSubst_ = std::move(savedSubst);
     genericSubstSemaTy_ = std::move(savedSemaTy);
+
+    // fix #1302 / §22.3: the copy-OUT half of every accessor-mediated `ref`/
+    // `out` argument — "on **normal return** the setter is called once with the
+    // slot's final value", "in argument textual order", and "on an exception
+    // exit no write-back occurs" (hence the `!diverged_` guard, the same edge
+    // condition the `out` copy-out rule states: "on an exception exit the
+    // recipient is untouched"). Emitted AFTER genericSubst_ is restored to the
+    // CALLER's substitution, because the setter is the caller's location's, not
+    // the callee's — the copy-IN getter ran under the same (caller) binding.
+    emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/!diverged_);
 
     // #429 (ARGUMENT-PASS category) / §4.6 / §28.9: a +1 string producer
     // (concat / interpolation / range-slice / user-method-return) that appears

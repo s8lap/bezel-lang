@@ -8111,6 +8111,25 @@ private:
     static bool argsCanFill(const std::vector<ast::Param>& params,
                             const std::vector<ast::CallArgument>& args);
 
+    // #1302 / §22.3 (v0.228) "**`ref` local and field targets alias; accessor
+    // targets bracket.**": a `ref`/`out` argument naming an **indexer slot or
+    // property** is NOT an alias — it is **copy-in / copy-out** under §17.6's
+    // evaluate-once discipline: "the receiver and every index expression are
+    // evaluated exactly once, in §22.5's call-site textual order; for `ref`,
+    // the getter is called once to produce the callee's slot value (for `out`
+    // no getter call occurs); on **normal return** the setter is called once
+    // with the slot's final value." One record per such argument.
+    struct AccessorRefArg {
+        const ast::Expr* target = nullptr;   // the lvalue (`a[i]`, `o.P`)
+        llvm::AllocaInst* slot = nullptr;    // the callee's copy-in/out slot
+        llvm::Type* valueTy = nullptr;       // the LOCATION's value type
+        // The receiver and index subexpressions, lowered ONCE at copy-in and
+        // pinned in exprValueOverride_ so the getter here and the setter in
+        // the write-back reuse those values instead of re-running a
+        // side-effecting subexpression. Erased when the record is flushed.
+        std::vector<const ast::Expr*> pins;
+    };
+
     // §22.4/§22.7: lower the call arguments into parameter order, honoring
     // named arguments and default values. Provided arguments are evaluated
     // in source order; defaults afterward in parameter order. Appends to
@@ -8127,11 +8146,40 @@ private:
     // the transferred value on the transfer/post-transfer edge, disposes the live
     // one on the sibling-throw edge). Paired with UnwindIneligibleWalker no longer
     // tainting that exact argument shape (LlvmBackend_Setup.cpp).
+    // #1302 / §22.3 ("`ref` local and field targets alias; accessor targets
+    // bracket"): when `accessorRefArgs` is non-null, a `ref`/`out` argument
+    // naming an ACCESSOR-mediated location — an indexer slot or a property,
+    // both admitted §22.3 storage categories — is bracketed copy-in /
+    // copy-out instead of aliased, and one record per such argument is
+    // appended for the caller to flush with emitAccessorRefArgWriteBacks
+    // after the call returns normally. When it is null (the constructor /
+    // record paths, which have no post-call flush point) the behavior is
+    // unchanged: `lvalueAddr` returns null for those locations and the
+    // caller's existing #1386 diagnostic fires.
     bool buildOrderedArgs(const std::vector<ast::Param>& params,
                           const std::vector<ast::CallArgument>& args,
                           std::vector<llvm::Value*>& out,
                           std::vector<const ast::Expr*>* outExprs = nullptr,
-                          bool nullTransferredOwned = false);
+                          bool nullTransferredOwned = false,
+                          std::vector<AccessorRefArg>* accessorRefArgs = nullptr);
+
+    // #1302 / §22.3: emit the copy-IN half of an accessor-mediated `ref`/`out`
+    // argument and record what the copy-OUT half needs. `target` is the
+    // argument's lvalue expression (`a[i]`, `d[k]`, `o.P`), `isOut` selects
+    // the `out` variant (no getter call — §22.3). Returns the address of the
+    // callee's slot, or null when `target` is not an accessor-mediated
+    // location this bracket can drive (the caller then falls through to its
+    // existing #1386 diagnostic).
+    llvm::Value* emitAccessorRefArgCopyIn(const ast::Expr& target,
+                                          const ast::Param& param, bool isOut,
+                                          std::vector<AccessorRefArg>& sink);
+
+    // #1302 / §22.3: emit the copy-OUT half — "on **normal return** the setter
+    // is called once with the slot's final value", in argument textual order.
+    // `emit` is false on the exception edge, where "no write-back occurs";
+    // either way the pinned receiver/index values are released. Clears `recs`.
+    void emitAccessorRefArgWriteBacks(std::vector<AccessorRefArg>& recs,
+                                      bool emit);
 
     // #1955 / §28.3: null the caller's slot for a call ARGUMENT that transferred
     // a bare owned LOCAL / owned PARAMETER's ownership to an owned recipient at a
