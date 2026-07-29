@@ -3924,9 +3924,26 @@ static void* bz_we_take_current(void* self) {
 // We use a static initializer trick: declare them as raw globals filled in
 // by bz_task_when_each_vtables_init, called lazily from the init funcs.
 
-static void* g_we_vtable_borrowing[4] = {nullptr, nullptr, nullptr, nullptr};
-static void* g_we_vtable_owning[4]    = {nullptr, nullptr, nullptr, nullptr};
+// fix #1268 / §29.11: slot 4 is the `GetAsyncEnumerator` the `await for`
+// desugaring now dispatches on EVERY async-enumerable source (it is how the
+// compiler-generated async iterator hands out an independent enumerator so a
+// second `await for` replays instead of use-after-freeing the first loop's
+// frame). This enumerator's enumerable and enumerator are the SAME object, so
+// its slot 4 returns `self` — the desugaring compares the two pointers and, on
+// equality, keeps exactly the pre-#1268 ownership (the loop disposes the one
+// object when it owns it, the binder does when it is named). The array must be
+// 5 wide or the desugaring's slot-4 read is out of bounds.
+static void* g_we_vtable_borrowing[5] = {nullptr, nullptr, nullptr, nullptr,
+                                         nullptr};
+static void* g_we_vtable_owning[5]    = {nullptr, nullptr, nullptr, nullptr,
+                                         nullptr};
 static std::once_flag g_we_vtables_once;
+
+// vtable slot 4. NOT bz_we_get_enumerator: that one consumes the §29.11
+// single-consumption guard (`get_enum_called`) and returns null on a repeat,
+// which the desugaring has no null path for. Re-enumeration enforcement for
+// WhenEach stays where it was — #2112.
+static void* bz_we_self_enumerator(void* self) { return self; }
 
 // Thread-safe one-time vtable fill. A plain `if (inited) return; inited = 1;`
 // flag has a first-use data race: two threads constructing enumerators
@@ -3940,10 +3957,12 @@ static void bz_we_vtables_init(void) {
         g_we_vtable_borrowing[1] = (void*)bz_we_dispose;
         g_we_vtable_borrowing[2] = (void*)bz_we_move_next;
         g_we_vtable_borrowing[3] = (void*)bz_we_current;
+        g_we_vtable_borrowing[4] = (void*)bz_we_self_enumerator;  // #1268
         g_we_vtable_owning[0] = g_we_vtable_owning;
         g_we_vtable_owning[1] = (void*)bz_we_dispose;
         g_we_vtable_owning[2] = (void*)bz_we_move_next;
         g_we_vtable_owning[3] = (void*)bz_we_take_current;
+        g_we_vtable_owning[4] = (void*)bz_we_self_enumerator;  // #1268
     });
 }
 

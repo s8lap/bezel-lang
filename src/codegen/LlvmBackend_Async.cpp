@@ -1690,8 +1690,26 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
         llvm::Function::InternalLinkage, prefix + "Dispose", module_.get());
 
-    // --- Vtable: [0]=self, [1]=Dispose, [2]=MoveNextAsync, [3]=Current ---
-    const unsigned VT_SIZE = 4;
+    // --- GetAsyncEnumerator(ptr self) -> ptr (vtable slot 4) ---
+    // fix #1268 / §29.3 + §30.7: `IAsyncEnumerable<T>` is RE-ITERABLE — "each
+    // call to GetAsyncEnumerator() runs the body again from the start" (§29.3),
+    // and §29.11 "Each GetEnumerator() call produces an independent enumerator".
+    // The async iterator previously had no such slot: the value the factory
+    // returns WAS treated as the enumerator, so a second `await for` over the
+    // same bound source drove — and the first loop's exit had already Disposed
+    // and freed — the very same frame (ASan: heap-use-after-free in the
+    // consumer's Resume). This is the async twin of the sync fix #943
+    // (LlvmBackend_Iterators.cpp), and the slot is emitted with the same
+    // semantics: a fresh calloc byte-copy of the frame with the state reset to
+    // the start, so N `await for` loops replay the body N times.
+    auto* getAsyncEnumFn = llvm::Function::Create(
+        llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
+        llvm::Function::InternalLinkage, prefix + "GetAsyncEnumerator",
+        module_.get());
+
+    // --- Vtable: [0]=self, [1]=Dispose, [2]=MoveNextAsync, [3]=Current,
+    //             [4]=GetAsyncEnumerator (#1268, §29.11) ---
+    const unsigned VT_SIZE = 5;
     std::vector<llvm::Constant*> vtElems(
         VT_SIZE, llvm::ConstantPointerNull::get(ptrTy()));
     auto* vtGVType = llvm::ArrayType::get(ptrTy(), VT_SIZE);
@@ -1702,7 +1720,68 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     vtElems[1] = disposeFn;
     vtElems[2] = moveNextFn;
     vtElems[3] = currentFn;
+    vtElems[4] = getAsyncEnumFn;
     vtGV->setInitializer(llvm::ConstantArray::get(vtGVType, vtElems));
+
+    // --- GetAsyncEnumerator body (vtable slot 4, #1268) ---
+    // §29.8: an iterator with an `owned` PARAMETER carries an affine obligation
+    // in the frame — only one enumerator may claim it, and the source Dispose
+    // (#973b's iteratorAutoDispose sweep) is what discharges it. Handing out a
+    // byte-copy would give two frames the same owned pointer, so for that narrow
+    // shape the slot returns `self` — the pre-#1268 single-use identity, exactly
+    // preserved. (`await for` then leaves the source undisposed at loop end when
+    // it is a named binding, so the binder's own scope-end disposal still runs
+    // it exactly once; see lowerAwaitFor.) The sync path's alternative — let the
+    // first clone claim the captures and raise IOE on the second
+    // (cloneDisposesOwnedCaptures) — is deliberately NOT replicated here: it is
+    // its own increment, and returning `self` cannot regress anything.
+    // Because the clone is only ever handed out when there is no owned capture,
+    // the source's Dispose and a clone's Dispose are the SAME function (the
+    // owned-param sweep is a no-op for such a frame), so no separate clone
+    // vtable / CloneDispose is needed — the clone reuses `vtGV`.
+    bool hasOwnedParamCapture = false;
+    for (sema::Symbol* psym : ms->params) {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(psym);
+        if (ps && ps->modifier == "owned") { hasOwnedParamCapture = true; break; }
+    }
+    {
+        auto* geEntry =
+            llvm::BasicBlock::Create(llvm_, "entry", getAsyncEnumFn);
+        llvm::IRBuilder<> gb(geEntry);
+        llvm::Value* geSelf = &*getAsyncEnumFn->arg_begin();
+        if (hasOwnedParamCapture) {
+            gb.CreateRet(geSelf);
+        } else {
+            uint64_t stSz =
+                module_->getDataLayout().getTypeAllocSize(stateStructTy);
+            auto* callocFnGE = declareC("calloc", ptrTy(), {i64(), i64()});
+            llvm::Value* clone = gb.CreateCall(
+                callocFnGE, {gb.getInt64(1), gb.getInt64((int64_t)stSz)},
+                "asynciter.clone");
+            auto* memcpyFnGE =
+                declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+            gb.CreateCall(memcpyFnGE,
+                          {clone, geSelf, gb.getInt64((int64_t)stSz)});
+            // Reset to the start: state 0, no yielded value, no in-flight
+            // per-advance / pending task, and no spill area (the clone lazily
+            // allocates its own on first resume — copying the source's pointer
+            // would make two frames free() the same region).
+            gb.CreateStore(gb.getInt32(0),
+                gb.CreateStructGEP(stateStructTy, clone, STATE_FIELD));
+            gb.CreateStore(llvm::Constant::getNullValue(elemTy),
+                gb.CreateStructGEP(stateStructTy, clone, CURRENT_VAL_FIELD));
+            gb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                gb.CreateStructGEP(stateStructTy, clone,
+                                   PER_ADVANCE_TASK_FIELD));
+            gb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                gb.CreateStructGEP(stateStructTy, clone, PENDING_TASK_FIELD));
+            gb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                gb.CreateStructGEP(stateStructTy, clone, SPILL_PTR_FIELD));
+            gb.CreateStore(vtGV,
+                gb.CreateStructGEP(stateStructTy, clone, VTABLE_FIELD));
+            gb.CreateRet(clone);
+        }
+    }
 
     // --- Construction entry (= the original method): calloc + fill frame ---
     {

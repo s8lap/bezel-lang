@@ -7771,7 +7771,16 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
         name = tr->headName();
     else if (!tr->importedName.empty())
         name = tr->importedName;
-    if (name != "IEnumerable" && name != "IOwningEnumerable")
+    // fix #1268 / §29.3 + §30.7: the ASYNC iterable heads join the list. Since
+    // #1268 the `await for` desugaring acquires a per-loop enumerator through
+    // vtable slot 4 and no longer disposes a NAMED source at loop end (that was
+    // what made a second `await for` over the same bound local a use-after-free),
+    // so — exactly as for the synchronous heads — the source object's single
+    // disposal is this scope-end one. When the source hands back ITSELF
+    // (`Task.WhenEach`, whose enumerable and enumerator are one object) the loop
+    // likewise leaves it alone, so this remains the only disposal there too.
+    if (name != "IEnumerable" && name != "IOwningEnumerable" &&
+        name != "IAsyncEnumerable" && name != "IOwningAsyncEnumerable")
         return false;
 
     // Only the local that OWNS the freshly produced source object is disposed

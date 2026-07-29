@@ -1479,65 +1479,89 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         if (rs->value) {
             if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
                     rs->value.get())) {
-                if (currentReturnTypeNode_) {
-                    if (const sema::TypeRef* rrt =
-                            ctx_.resolvedType(*currentReturnTypeNode_)) {
-                        // §15.3 (#781): a `return [e1, …]` whose declared return
-                        // type is an INLINE array (`[N owned]T?` / `[N]T`) builds
-                        // the `[N x elem]` aggregate and returns it BY VALUE.
-                        // lowerExpr returns null for a CollectionLiteralExpr, and
-                        // materializeHeapCollectionLiteral only makes a heap
-                        // bz_array_t* (a `ptr`, the wrong type for an inline
-                        // return) — so without this the method returned an
-                        // undef/zero array and the caller's `var a := Make()`
-                        // materialized as all-null. Mirrors the inline-array
-                        // local-decl build (lowerLocalDecl).
-                        if (rrt->kind == sema::TypeRef::Kind::InlineArray &&
-                            !cl->isDict) {
-                            if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(
-                                    lowerTypeRef(rrt))) {
-                                llvm::Type* elemTy = aty->getElementType();
-                                llvm::AllocaInst* tmp = entryAlloca(aty);
-                                for (std::size_t i = 0; i < cl->elements.size();
-                                     ++i) {
-                                    if (!cl->elements[i]) continue;
-                                    llvm::Value* ev = lowerExpr(*cl->elements[i]);
-                                    if (!ev) {
-                                        // #1386: ICE — lowerExpr returned null
-                                        // for an inline-array return element.
-                                        ctx_.diagnostics().report(
-                                            Severity::Error,
-                                            cl->elements[i]->span.begin,
-                                            "internal: lowerExpr returned null "
-                                            "for inline-array return element"
-                                            " — #1386");
-                                        continue;
-                                    }
-                                    if (ev->getType() != elemTy &&
-                                        ev->getType()->isIntegerTy() &&
-                                        elemTy->isIntegerTy()) {
-                                        unsigned eb =
-                                            ev->getType()->getIntegerBitWidth();
-                                        unsigned db =
-                                            elemTy->getIntegerBitWidth();
-                                        ev = db > eb
-                                                 ? builder_.CreateSExt(ev, elemTy)
-                                                 : builder_.CreateTrunc(ev,
-                                                                        elemTy);
-                                    }
-                                    llvm::Value* gep = builder_.CreateGEP(
-                                        aty, tmp,
-                                        {builder_.getInt32(0),
-                                         builder_.getInt32((int)i)});
-                                    builder_.CreateStore(ev, gep);
+                // fix #1289 / §30.5 Pattern A: inside an async method (or async
+                // lambda) the DECLARED return type node is the task type
+                // (`Task<Array<int>>` / `OwningTask<T>`), but the value a
+                // `return [e1, …]` produces is the task's RESULT T. Materializing
+                // the literal against `Task<Array<int>>` matches none of the
+                // collection shapes below, so `v` stayed null, `lowerExpr` also
+                // returns null for a CollectionLiteralExpr, and
+                // emitAsyncComplete(nullptr) completed the task with an EMPTY
+                // result buffer — `t.Result` then read a null Array<int> and any
+                // use of it (`.Count`) SIGSEGV'd. asyncResultSemaType_ is exactly
+                // genericArgs[0] of the declared task type (set by
+                // emitAsyncMethod / emitAsyncLambda), so it is the literal's real
+                // target type; everything downstream (the §15.3 inline-array
+                // branch, the heap array/dict materializers) is unchanged.
+                // // per §30.5, §15.4, #1289
+                // The `currentFn_ == asyncResumeFn_` conjunct keeps this to the
+                // async body's OWN Resume function: a nested non-async lambda
+                // lowered mid-body does not save/restore the sm*_ fields, so
+                // `smStateStruct_` alone would misroute its `return [ … ]` to
+                // the enclosing task's result type.
+                const sema::TypeRef* retTargetTy = nullptr;
+                if (smKind_ == SuspendKind::Await && smStateStruct_ &&
+                    asyncResumeFn_ && currentFn_ == asyncResumeFn_ &&
+                    asyncResultSemaType_)
+                    retTargetTy = asyncResultSemaType_;
+                else if (currentReturnTypeNode_)
+                    retTargetTy = ctx_.resolvedType(*currentReturnTypeNode_);
+                if (const sema::TypeRef* rrt = retTargetTy) {
+                    // §15.3 (#781): a `return [e1, …]` whose declared return
+                    // type is an INLINE array (`[N owned]T?` / `[N]T`) builds
+                    // the `[N x elem]` aggregate and returns it BY VALUE.
+                    // lowerExpr returns null for a CollectionLiteralExpr, and
+                    // materializeHeapCollectionLiteral only makes a heap
+                    // bz_array_t* (a `ptr`, the wrong type for an inline
+                    // return) — so without this the method returned an
+                    // undef/zero array and the caller's `var a := Make()`
+                    // materialized as all-null. Mirrors the inline-array
+                    // local-decl build (lowerLocalDecl).
+                    if (rrt->kind == sema::TypeRef::Kind::InlineArray &&
+                        !cl->isDict) {
+                        if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(
+                                lowerTypeRef(rrt))) {
+                            llvm::Type* elemTy = aty->getElementType();
+                            llvm::AllocaInst* tmp = entryAlloca(aty);
+                            for (std::size_t i = 0; i < cl->elements.size();
+                                 ++i) {
+                                if (!cl->elements[i]) continue;
+                                llvm::Value* ev = lowerExpr(*cl->elements[i]);
+                                if (!ev) {
+                                    // #1386: ICE — lowerExpr returned null
+                                    // for an inline-array return element.
+                                    ctx_.diagnostics().report(
+                                        Severity::Error,
+                                        cl->elements[i]->span.begin,
+                                        "internal: lowerExpr returned null "
+                                        "for inline-array return element"
+                                        " — #1386");
+                                    continue;
                                 }
-                                v = builder_.CreateLoad(aty, tmp, "ret.inlarr");
+                                if (ev->getType() != elemTy &&
+                                    ev->getType()->isIntegerTy() &&
+                                    elemTy->isIntegerTy()) {
+                                    unsigned eb =
+                                        ev->getType()->getIntegerBitWidth();
+                                    unsigned db =
+                                        elemTy->getIntegerBitWidth();
+                                    ev = db > eb
+                                             ? builder_.CreateSExt(ev, elemTy)
+                                             : builder_.CreateTrunc(ev,
+                                                                    elemTy);
+                                }
+                                llvm::Value* gep = builder_.CreateGEP(
+                                    aty, tmp,
+                                    {builder_.getInt32(0),
+                                     builder_.getInt32((int)i)});
+                                builder_.CreateStore(ev, gep);
                             }
-                        } else if (!cl->isDict)
-                            v = materializeHeapCollectionLiteral(cl, rrt);
-                        else if (!cl->keys.empty())
-                            v = materializeHeapDictLiteral(cl, rrt);
-                    }
+                            v = builder_.CreateLoad(aty, tmp, "ret.inlarr");
+                        }
+                    } else if (!cl->isDict)
+                        v = materializeHeapCollectionLiteral(cl, rrt);
+                    else if (!cl->keys.empty())
+                        v = materializeHeapDictLiteral(cl, rrt);
                 }
             }
             if (!v) v = lowerExpr(*rs->value);
@@ -6404,11 +6428,73 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     // unwind path — mirroring the synchronous iterator-for (lowerIEnumerableBuiltinFor).
     // This replaces the prior SSA-promoted enumerator: holding it in a frame slot
     // lets the disposal scope below dispose the frame on EVERY exit edge.
-    llvm::Value* enumPtr = lowerExpr(*fs.iterable);
-    if (!enumPtr) return false;
+    llvm::Value* srcPtr = lowerExpr(*fs.iterable);
+    if (!srcPtr) return false;
+    // fix #1268 / §29.3 + §29.11: the source is the async-ITERABLE; ask it for a
+    // FRESH, INDEPENDENT enumerator through vtable slot 4 (GetAsyncEnumerator)
+    // rather than driving — and Disposing — the source object itself. Without
+    // this a second `await for` over the same bound `IAsyncEnumerable<T>` local
+    // re-drove the frame the first loop had already Disposed and freed: a
+    // heap-use-after-free (SIGSEGV). Slot 4 is now carried by BOTH producers of
+    // an async-enumerable value the desugaring can see: the compiler-generated
+    // async iterator (emitAsyncIteratorMethod — returns a byte-copy clone reset
+    // to the start) and the runtime `Task.WhenEach`/`WhenEachOwned` enumerator
+    // (bezel_runtime_concurrency.cpp — returns `self`, its enumerable and
+    // enumerator being one object), so the slot-4 read is always in bounds.
+    llvm::Value* enumPtr = nullptr;
+    {
+        llvm::Value* srcVt = builder_.CreateLoad(ptrTy(), srcPtr);
+        llvm::Value* geSlotPtr =
+            builder_.CreateGEP(ptrTy(), srcVt, {builder_.getInt32(4)});
+        llvm::Value* geFnPtr = builder_.CreateLoad(ptrTy(), geSlotPtr);
+        auto* geTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+        enumPtr = builder_.CreateCall(geTy, geFnPtr, {srcPtr}, "afor.getenum");
+    }
     auto* enumSlot = entryAlloca(ptrTy());
     builder_.CreateStore(enumPtr, enumSlot);
     asyncHandlerSpillSlots_.push_back(enumSlot);  // survive the condBB await suspend
+    // §29.11 / §29.2 (#1268): who disposes what.
+    //   * The per-loop ENUMERATOR is loop-owned and disposed on every exit edge
+    //     — EXCEPT when the source handed back ITSELF (`en == src`) and the
+    //     source is a NAMED binding, in which case disposing it here would free
+    //     an object the binder disposes at its own scope end (a double free).
+    //   * The SOURCE is disposed by the loop only when it is a freshly produced
+    //     temporary (a CallExpr/NewExpr with no owning binding) AND it handed
+    //     back a distinct enumerator; when `en == src` the enumerator disposal
+    //     above already covers it. A named local/param/field source is disposed
+    //     at its own lifetime end (registerIterableSourceDisposal, §29.11).
+    // The `en == src` test is a runtime compare because the two producers differ
+    // and the static type (`IAsyncEnumerable<T>`) cannot tell them apart.
+    bool sourceIsNamedLocal = false;
+    if (sema::Symbol* sym = ctx_.exprSymbol(*fs.iterable)) {
+        if (dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
+            dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr ||
+            dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
+            sourceIsNamedLocal = true;
+        } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
+            sourceIsNamedLocal = sema::isAutoPropertySymbol(ps);
+        }
+    }
+    llvm::Value* enumIsSrc = builder_.CreateICmpEQ(enumPtr, srcPtr, "afor.selfen");
+    auto* enumOwnSlot = entryAlloca(ptrTy());
+    builder_.CreateStore(
+        sourceIsNamedLocal
+            ? builder_.CreateSelect(
+                  enumIsSrc, llvm::ConstantPointerNull::get(ptrTy()), enumPtr,
+                  "afor.enown")
+            : enumPtr,
+        enumOwnSlot);
+    asyncHandlerSpillSlots_.push_back(enumOwnSlot);
+    llvm::AllocaInst* srcOwnSlot = nullptr;
+    if (!sourceIsNamedLocal) {
+        srcOwnSlot = entryAlloca(ptrTy());
+        builder_.CreateStore(
+            builder_.CreateSelect(enumIsSrc,
+                                  llvm::ConstantPointerNull::get(ptrTy()),
+                                  srcPtr, "afor.srcown"),
+            srcOwnSlot);
+        asyncHandlerSpillSlots_.push_back(srcOwnSlot);
+    }
     // §30.8 (#765/#790): evaluate the optional `with` cancellation token. Its
     // value is a pointer to the source's cancellation-state cell (null for
     // CancellationToken.None). It is observed at each iteration's suspend point
@@ -6434,9 +6520,14 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     std::size_t outerDepth = disposeStack_.size();
     disposeStack_.emplace_back();
     {
-        Disposal d{enumSlot, nullptr};
+        Disposal d{enumOwnSlot, nullptr};
         d.iterEnumDispose = true;
         disposeStack_.back().push_back(d);
+    }
+    if (srcOwnSlot) {  // #1268: loop-owned temporary source (null when `en==src`)
+        Disposal ds{srcOwnSlot, nullptr};
+        ds.iterEnumDispose = true;
+        disposeStack_.back().push_back(ds);
     }
 
     // Vtable-dispatched MoveNextAsync (slot 2) / Current (slot 3); Dispose

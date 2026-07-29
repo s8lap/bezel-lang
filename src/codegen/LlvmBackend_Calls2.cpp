@@ -4392,12 +4392,21 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             }
         }
         // issue #757 / §30.7: a direct `src.GetAsyncEnumerator(token)` on a builtin
-        // IAsyncEnumerable<T>. For a compiler-generated async iterator the source
-        // value (the frame `Gen()` returns) IS the enumerator — the same identity
-        // the `await for` desugaring relies on (LlvmBackend_Stmts.cpp "the value IS
-        // the enumerator"). Return the receiver unchanged; the token argument is
-        // evaluated for side-effects/ownership then discarded (§30.8 cancellation
-        // deferred, consistent with the `await for` path).
+        // IAsyncEnumerable<T>. The token argument is evaluated for its
+        // side-effects/ownership then discarded (§30.8 cancellation deferred,
+        // consistent with the `await for` path).
+        //
+        // fix #1268 / §30.7: the interface declares
+        // `GetAsyncEnumerator(...): owned IAsyncEnumerator<T>` — a FRESH,
+        // caller-owned enumerator, and §29.3 makes `IAsyncEnumerable<T>`
+        // re-iterable. Dispatch vtable slot 4 (the clone the async iterator now
+        // carries, #1268) instead of returning the receiver unchanged, so the
+        // `await using var en := source.GetAsyncEnumerator(...)` that disposes
+        // `en` no longer disposes `source` itself — `source`'s own binder does
+        // that at its scope end (registerIterableSourceDisposal). A producer
+        // whose enumerable IS its enumerator (`Task.WhenEach`, and an async
+        // iterator with an `owned` parameter) returns `self` from slot 4, which
+        // reproduces the pre-#1268 identity exactly.
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                 call.callee.get())) {
             if (ma->member == "GetAsyncEnumerator" && ma->target) {
@@ -4413,7 +4422,43 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 if (isAsyncEnumerable) {
                     if (!call.args.empty() && call.args[0].value)
                         (void)lowerExpr(*call.args[0].value);
-                    return lowerExpr(*ma->target);
+                    llvm::Value* src = lowerExpr(*ma->target);
+                    if (!src) return nullptr;
+                    llvm::Value* srcVt = builder_.CreateLoad(ptrTy(), src);
+                    llvm::Value* geSlotPtr = builder_.CreateGEP(
+                        ptrTy(), srcVt, {builder_.getInt32(4)});
+                    llvm::Value* geFnPtr =
+                        builder_.CreateLoad(ptrTy(), geSlotPtr);
+                    auto* geTy =
+                        llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+                    llvm::Value* en = builder_.CreateCall(
+                        geTy, geFnPtr, {src}, "gae.enum");
+                    // §29.11: an UNBOUND temporary receiver (`Gen().Get…()`)
+                    // has no binder to discharge it, and the fresh enumerator
+                    // is an independent byte-copy — so the source frame's sole
+                    // disposal is here, the moment the enumerator is taken.
+                    // Skipped when the producer handed back itself (the caller
+                    // now owns that one object through `en`).
+                    if (!ctx_.exprSymbol(*ma->target)) {
+                        auto* skipBB = llvm::BasicBlock::Create(
+                            llvm_, "gae.samesrc", currentFn_);
+                        auto* dispBB = llvm::BasicBlock::Create(
+                            llvm_, "gae.dropsrc", currentFn_);
+                        builder_.CreateCondBr(
+                            builder_.CreateICmpEQ(en, src, "gae.selfen"),
+                            skipBB, dispBB);
+                        builder_.SetInsertPoint(dispBB);
+                        llvm::Value* dvt = builder_.CreateLoad(ptrTy(), src);
+                        llvm::Value* dSlot = builder_.CreateGEP(
+                            ptrTy(), dvt, {builder_.getInt32(1)});
+                        llvm::Value* dFn = builder_.CreateLoad(ptrTy(), dSlot);
+                        auto* dispTy = llvm::FunctionType::get(
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
+                        builder_.CreateCall(dispTy, dFn, {src});
+                        builder_.CreateBr(skipBB);
+                        builder_.SetInsertPoint(skipBB);
+                    }
+                    return en;
                 }
             }
         }
