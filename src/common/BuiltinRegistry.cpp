@@ -90,7 +90,7 @@ constexpr std::array<std::string_view, 2> kLinkedListNames = {
 // LlvmBackend_Layout.cpp (see header).  This is the intersection of the two
 // pre-refactor hand-lists: OwningBuffer (astNode-only) and the FFI class names
 // (imported-only) are NOT here — they stay as explicit deltas at the sites.
-constexpr std::array<std::string_view, 64> kHeapPointerReferenceBuiltins = {
+constexpr std::array<std::string_view, 65> kHeapPointerReferenceBuiltins = {
     // §4 collections (SortedSet: stdlib §4.18/#1426 — bz_dict_t* rep, both paths)
     "Array", "OwningArray", "Dictionary", "OwningDictionary",
     "SortedDictionary", "SortedSet", "Stack", "OwningStack", "Queue", "OwningQueue",
@@ -102,6 +102,11 @@ constexpr std::array<std::string_view, 64> kHeapPointerReferenceBuiltins = {
     // dispatch and returns ptr, so the type must lower to ptr here too, or the
     // function return type (i32 fallback) mismatches the ptr operand.
     "Stopwatch",
+    // stdlib §7.2 (#645): FileStream is a heap-allocated bz_filestream_t* —
+    // same reason as Stopwatch above: the type must lower to ptr on both rep
+    // paths or the `new FileStream(...)` result (a ptr) mismatches the
+    // fallback i32 lowering of the declared type.
+    "FileStream",
     // §29 iteration / collection interfaces
     "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
     "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",

@@ -179,6 +179,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // has no user PropertyDecl and the fallthrough would silently drop
             // the write.
             if (tryLowerAtomicValueSet(*as)) return false;
+            // stdlib §7.1 / #645: `fs.Position := n` — the one SETTABLE
+            // FileStream property (`public abstract property Position: long;`
+            // — Length and the Can* trio are `readonly`). Same reason as
+            // Atomic<T>.Value directly above: FileStream has no user
+            // PropertyDecl, so the fallthrough would silently drop the write.
+            if (tryLowerFileStreamPositionSet(*as)) return false;
             // §22.9: `obj.P := v` / `obj.P OP= v` where P is a block-form
             // property runs its setter body (with `value` = v); compound
             // assignment is a read-modify-write through getter + setter.
@@ -6764,6 +6770,29 @@ bool Emitter::tryLowerAtomicValueSet(const ast::AssignmentStmt& as) {
                               {ptrTy(), i64(), i32()});
     builder_.CreateCall(storeFn,
         {atom, v64, builder_.getInt32(cs)});
+    return true;
+}
+
+// stdlib §7.1 / issue #645: `fs.Position := n` — an absolute seek from the
+// beginning, via bz_filestream_set_position. Returns true when handled (so the
+// main assignment dispatcher returns early rather than falling through to the
+// lvalue path, which would silently drop the write: FileStream has no user
+// PropertyDecl to store into).
+bool Emitter::tryLowerFileStreamPositionSet(const ast::AssignmentStmt& as) {
+    if (!as.target || !as.value || as.op != ":=") return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(as.target.get());
+    if (!ma || !ma->target || ma->member != "Position") return false;
+    if (builtinTypeName(ctx_.exprType(*ma->target)) != "FileStream") return false;
+
+    llvm::Value* fs = lowerExpr(*ma->target);
+    if (!fs) return true;   // handled (suppress the lvalue fallthrough)
+    llvm::Value* pos = lowerExpr(*as.value);
+    if (!pos) return true;
+    if (pos->getType()->isIntegerTy() && !pos->getType()->isIntegerTy(64))
+        pos = builder_.CreateSExt(pos, i64(), "fs.pos64");
+    auto* fn = declareC("bz_filestream_set_position",
+                        llvm::Type::getVoidTy(llvm_), {ptrTy(), i64()});
+    builder_.CreateCall(fn, {fs, pos});
     return true;
 }
 

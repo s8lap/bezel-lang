@@ -133,7 +133,7 @@ BEZEL_TEST(builtin_registry_snapshot, iterable_interface_head_set) {
 // (imported-only) are deliberately NOT in the shared set — they are the small
 // site-local deltas the two call sites still test explicitly.
 BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
-    static constexpr std::array<std::string_view, 64> kSnapshot = {
+    static constexpr std::array<std::string_view, 65> kSnapshot = {
         "Array", "OwningArray", "Dictionary", "OwningDictionary",
         // INTENTIONAL addition (stdlib §4.18, #1426): SortedSet — bz_dict_t*
         // rep on both the astNode and imported paths.
@@ -144,6 +144,9 @@ BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
         // heap rep; without it, the generic `new T()` path returns ptr while the
         // type lowered to i32, IR-verifying as a return-type mismatch.
         "Stopwatch",
+        // INTENTIONAL addition (stdlib §7.2, #645): FileStream — bz_filestream_t*
+        // heap rep, same reason as Stopwatch directly above.
+        "FileStream",
         "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
         "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",
         "IOwningAsyncEnumerator", "IReadOnlyCollection", "IReadOnlyList",

@@ -762,6 +762,13 @@ private:
         // TypeSymbol, so classOfLocal returns null and the class-disposal path
         // misses it. At scope end it is freed via bz_stopwatch_free.
         bool stopwatch = false;
+        // stdlib §7.2 / issue #645: a `using var` bound to a FileStream. The
+        // stream is a heap handle (bz_filestream_t*) with no user TypeSymbol,
+        // so classOfLocal returns null and the class-disposal path misses it.
+        // At scope end it is disposed via bz_filestream_dispose, which is what
+        // realizes §7.2's flush-on-dispose contract on EVERY exit edge,
+        // exceptions included.
+        bool fileStream = false;
         // §28.13 / stdlib §2.16 (#603): a `using var` bound to a Shared<T>
         // handle. At scope end it is released via bz_shared_release (decrements
         // strong count; at 0 disposes the value then frees the control block if
@@ -8676,6 +8683,10 @@ private:
     // §6.4 / #647: `atom.Value := v` — seq-cst store into an Atomic<T> or
     // AtomicInteger<T> cell via bz_atomic_store.  Returns true when handled.
     bool tryLowerAtomicValueSet(const ast::AssignmentStmt& as);
+    // stdlib §7.1 / #645: `fs.Position := n` on a FileStream receiver — an
+    // absolute seek. Same shape/reason as tryLowerAtomicValueSet: the builtin
+    // has no user PropertyDecl, so without this the write is silently dropped.
+    bool tryLowerFileStreamPositionSet(const ast::AssignmentStmt& as);
 
     // per §2.11 / §24.4: true when `e`'s static type is the built-in
     // `Subscription` (stdlib §2.11), or — for an inferred local bound to a

@@ -2154,6 +2154,11 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 std::string_view n = tt->headName();
                 if (n == "StringBuilder") return false;  // has own handler
                 if (n == "Buffer") return false;          // issue #545: own handler
+                // stdlib §7.2 (#645): FileStream has its own `.Length` handler
+                // (bz_filestream_length). The string fallback's loadStringLen
+                // would read field[1] of the bz_filestream_t — the stored `path`
+                // POINTER — and hand it back as the file's length.
+                if (n == "FileStream") return false;
                 // #1006(b): an array-backed collection (`Array<T>` etc.) has its
                 // own `.Length` handler below (bz_array_len) that also reclaims an
                 // UNBOUND owned borrowing-array receiver (`P.Fold(s).Length`). Do
@@ -2216,6 +2221,35 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     // Returns TimeSpan (i64, 100-ns ticks).
                     auto* fn = declareC("bz_stopwatch_elapsed_ticks", i64(), {ptrTy()});
                     return builder_.CreateCall(fn, {sw}, "sw.el");
+                }
+            }
+            // stdlib §7.1/§7.2 / issue #645: FileStream instance property reads.
+            // Receiver is a bz_filestream_t* (heap pointer).
+            if (cn == "FileStream") {
+                llvm::Value* fs = lowerExpr(*ma->target);
+                if (!fs) return nullptr;
+                // §7.2: Path → a FRESH +1 bz.string (the same producer shape as
+                // File.ReadAllText), so the reader owns the reference it gets.
+                if (ma->member == "Path") {
+                    auto* fn = declareC("bz_filestream_path", ptrTy(), {ptrTy()});
+                    return builder_.CreateCall(fn, {fs}, "fs.path");
+                }
+                if (ma->member == "Length") {
+                    auto* fn = declareC("bz_filestream_length", i64(), {ptrTy()});
+                    return builder_.CreateCall(fn, {fs}, "fs.len");
+                }
+                if (ma->member == "Position") {
+                    auto* fn = declareC("bz_filestream_position", i64(), {ptrTy()});
+                    return builder_.CreateCall(fn, {fs}, "fs.pos");
+                }
+                if (ma->member == "CanRead" || ma->member == "CanWrite" ||
+                    ma->member == "CanSeek") {
+                    const char* rt = ma->member == "CanRead"  ? "bz_filestream_can_read"
+                                   : ma->member == "CanWrite" ? "bz_filestream_can_write"
+                                                              : "bz_filestream_can_seek";
+                    auto* fn = declareC(rt, i32(), {ptrTy()});
+                    llvm::Value* flag = builder_.CreateCall(fn, {fs}, "fs.can");
+                    return builder_.CreateICmpNE(flag, builder_.getInt32(0), "fs.can.b");
                 }
             }
             // §6.4 / issue #647: Atomic<T> and AtomicInteger<T> — Value getter.

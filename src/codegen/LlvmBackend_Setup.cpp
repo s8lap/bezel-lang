@@ -8290,6 +8290,34 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return;
         }
     }
+    // stdlib §7.2 / issue #645: a `using var` bound to a FileStream — a builtin
+    // heap handle (bz_filestream_t*) with no user TypeSymbol, disposed via
+    // bz_filestream_dispose (flush + close). Recognised by the same two
+    // patterns as Stopwatch directly above: the NewExpr type name, or the
+    // initializer's / declared type's builtin type name.
+    {
+        bool isFS = false;
+        if (ld->type)
+            if (auto* rt = ctx_.resolvedType(*ld->type))
+                isFS = builtinTypeName(rt) == "FileStream";
+        if (!isFS && ld->initializer) {
+            if (auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
+                isFS = ne->type && ne->type->name &&
+                       !ne->type->name->parts.empty() &&
+                       ne->type->name->parts[0] == "FileStream";
+        }
+        if (!isFS && ld->initializer) {
+            if (auto* rt = ctx_.exprType(*ld->initializer))
+                isFS = builtinTypeName(rt) == "FileStream";
+        }
+        if (isFS) {
+            Disposal d{it->second, nullptr};
+            d.fileStream = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
     // stdlib §10.1/§10.2/§10.3 / §32.6 / fix #977: a `using var` bound to a
     // CString, WString, or RawBytes produced by a static From/FromBytes factory.
     // All three are malloc'd buffers; disposal is a plain free() (null-guarded).

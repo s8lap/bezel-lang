@@ -4498,6 +4498,12 @@ bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
     // them here so the lint does not fight the disposal.
     if (head == "CString" || head == "WString" || head == "RawBytes")
         return true;
+    // stdlib §7.2 (#645): FileStream declares `destructor;` outright — "flushes
+    // buffered writes and closes the OS file handle" — and §7.2's own prose
+    // makes `using var` the canonical spelling ("the `using var` idiom
+    // guarantees this on every exit edge, including exceptions"). Without this
+    // arm the §28.10 lint would call that idiom vacuous.
+    if (head == "FileStream") return true;
     return head == "Channel" || head == "ChannelSender" ||
            head == "EventSource" || head == "AsyncEventSource" ||
            head == "Subscription" || head == "TaskScope" ||

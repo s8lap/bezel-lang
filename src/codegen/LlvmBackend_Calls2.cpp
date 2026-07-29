@@ -4733,6 +4733,40 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         return nullptr;
                     }
                 }
+                // stdlib §7.2 / issue #645: FileStream.Dispose() — the
+                // flush-on-dispose contract ("flushes buffered writes and closes
+                // the OS file handle"). bz_filestream_dispose is idempotent and
+                // null-tolerant, so an explicit Dispose() followed by `using var`
+                // scope exit cannot double-close (§28.2 exactly-once).
+                {
+                    auto* recvTy = ctx_.exprType(*ma->target);
+                    if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                        builtinTypeName(recvTy) == "FileStream") {
+                        llvm::Value* recv = lowerExpr(*ma->target);
+                        if (recv && recv->getType()->isPointerTy()) {
+                            auto* fn = declareC("bz_filestream_dispose",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                            builder_.CreateCall(fn, {recv});
+                            // Null the slot so the `using var` scope-exit
+                            // disposal is a no-op rather than a second
+                            // fclose/free (§28.2 exactly-once). Nulled
+                            // UNCONDITIONALLY, unlike the Buffer/Shared sites
+                            // above: those have a checked-disposal quarantine
+                            // that keeps the block alive for the use-after-
+                            // dispose guard, and FileStream has none — leaving
+                            // a dangling pointer in the slot under
+                            // checkedDisposal_ would trade a missing
+                            // diagnostic for a real double-free.
+                            llvm::Type* slotTy = nullptr;
+                            if (llvm::Value* slot =
+                                    lvalueAddr(*ma->target, slotTy))
+                                builder_.CreateStore(
+                                    llvm::ConstantPointerNull::get(ptrTy()),
+                                    slot);
+                        }
+                        return nullptr;
+                    }
+                }
                 // §6.1 / §30.8: CancellationTokenSource.Dispose() — runs the
                 // source's destructor (cancels surviving token observers, frees
                 // the source object) via bz_cts_dispose.  Recognized by the

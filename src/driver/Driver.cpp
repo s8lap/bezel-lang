@@ -71,14 +71,42 @@ const char kResultPreludeSource[] =
     "  public method IsError(): bool => not IsOk();\n"
     "end Result;\n";
 
-// Parse the auto-imported stdlib prelude and PREPEND its top-level declarations
-// to `unit`. The prelude source is a program-lifetime constant, so the AST
-// string_views into it stay valid for the whole compilation; ownership of the
-// parsed nodes transfers into `unit->topDecls`. A private diagnostics sink
-// absorbs any prelude parse diagnostic (the prelude is known-valid — a
-// diagnostic here would be an internal compiler defect, never the user's fault).
-void injectStdlibPrelude(ast::SourceFile& unit) {
-    static const std::string preludeSrc(kResultPreludeSource);
+// stdlib §7.1 / §7.2 (issue #645): the System.IO enums. Like `Result` above,
+// these are pure Bezel declarations with no compiler intrinsic — every rule
+// that applies to a user enum (§10.2 auto-increment values, §10.6 `case`
+// matching with prefix omission, §19.6 exhaustiveness, the underlying-type
+// casts of §5.2) applies to them unchanged — so they are made available by
+// injecting their VERBATIM stdlib source rather than by hand-registering a
+// builtin. The declaration order fixes the ordinals the FileStream runtime
+// consumes (FileMode.CreateNew = 0 … Append = 5, etc.), so this source and
+// bz_fs_open_flags in bezel_runtime_fileio.cpp must stay in step.
+//
+// The enums are always available rather than gated on `import System.IO;` —
+// the same stance the compiler already takes for the other §7 types
+// (File/Directory/Path resolve without the import today; import-gating is a
+// separate, uniform piece of work).
+const char kIoPreludeSource[] =
+    "module __bezel_prelude_io__;\n"
+    "public enum SeekOrigin: byte\n"
+    "  Begin, Current, End;\n"
+    "end SeekOrigin;\n"
+    "\n"
+    "public enum FileMode: byte\n"
+    "  CreateNew, Create, Open, OpenOrCreate, Truncate, Append;\n"
+    "end FileMode;\n"
+    "\n"
+    "public enum FileAccess: byte\n"
+    "  Read, Write, ReadWrite;\n"
+    "end FileAccess;\n";
+
+// Parse ONE auto-imported stdlib prelude source and PREPEND its top-level
+// declarations to `unit`. The prelude sources are program-lifetime constants,
+// so the AST string_views into them stay valid for the whole compilation;
+// ownership of the parsed nodes transfers into `unit->topDecls`. A private
+// diagnostics sink absorbs any prelude parse diagnostic (the prelude is
+// known-valid — a diagnostic here would be an internal compiler defect, never
+// the user's fault).
+void injectOnePrelude(ast::SourceFile& unit, const std::string& preludeSrc) {
     DiagnosticEngine preludeDiags;
     Lexer preludeLexer(preludeSrc, preludeDiags);
     Parser preludeParser(preludeLexer, preludeDiags);
@@ -121,6 +149,14 @@ void injectStdlibPrelude(ast::SourceFile& unit) {
         unit.topDecls.begin(),
         std::make_move_iterator(toInject.begin()),
         std::make_move_iterator(toInject.end()));
+}
+
+// Inject every auto-imported stdlib prelude source into `unit`.
+void injectStdlibPrelude(ast::SourceFile& unit) {
+    static const std::string resultSrc(kResultPreludeSource);
+    static const std::string ioSrc(kIoPreludeSource);
+    injectOnePrelude(unit, resultSrc);   // stdlib §2.20 Result<T, E>
+    injectOnePrelude(unit, ioSrc);       // stdlib §7.1/§7.2 System.IO enums
 }
 
 // Link a native object (plus any §2.5 dependency objects) into an executable

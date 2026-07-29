@@ -9184,6 +9184,93 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
     }
 
+    // ---------------------------------------------------------------------------
+    // stdlib §7.1/§7.2 / issue #645: FileStream instance methods.
+    // Receiver's exprType name-part is "FileStream" (a bz_filestream_t*).
+    // ---------------------------------------------------------------------------
+    {
+        if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            if (ma2->target &&
+                ctx_.exprType(*ma2->target) &&
+                builtinTypeName(ctx_.exprType(*ma2->target)) == "FileStream") {
+                llvm::Value* fs = lowerExpr(*ma2->target);
+                if (!fs) return nullptr;
+                const auto& mname = ma2->member;
+                // Lower an int-typed argument to i32.
+                auto argI32 = [&](size_t i) -> llvm::Value* {
+                    if (i >= call.args.size() || !call.args[i].value) return nullptr;
+                    llvm::Value* v = lowerExpr(*call.args[i].value);
+                    if (!v || !v->getType()->isIntegerTy()) return nullptr;
+                    if (v->getType()->isIntegerTy(32)) return v;
+                    return v->getType()->getIntegerBitWidth() < 32
+                        ? builder_.CreateSExt(v, i32())
+                        : builder_.CreateTrunc(v, i32());
+                };
+                // per stdlib §7.1: Read(buffer, offset, count): int and
+                // Write(buffer, offset, count). The runtime validates the
+                // window [offset, offset+count) against the buffer's Count and
+                // reports an out-of-range window as -1 WITHOUT performing any
+                // I/O; §7.1 makes that IndexOutOfRangeException.
+                if ((mname == "Read" || mname == "Write") &&
+                    call.args.size() == 3) {
+                    llvm::Value* buf = call.args[0].value
+                        ? lowerExpr(*call.args[0].value) : nullptr;
+                    llvm::Value* off = argI32(1);
+                    llvm::Value* cnt = argI32(2);
+                    if (!buf || !off || !cnt) return nullptr;
+                    if (mname == "Read") {
+                        auto* fn = declareC("bz_filestream_read", i64(),
+                                            {ptrTy(), ptrTy(), i32(), i32()});
+                        llvm::Value* n =
+                            builder_.CreateCall(fn, {fs, buf, off, cnt}, "fs.read");
+                        emitGuardThrow(
+                            builder_.CreateICmpSLT(n, builder_.getInt64(0), "fs.read.oor"),
+                            "IndexOutOfRangeException");
+                        return builder_.CreateTrunc(n, i32(), "fs.read.n");
+                    }
+                    auto* fn = declareC("bz_filestream_write", i32(),
+                                        {ptrTy(), ptrTy(), i32(), i32()});
+                    llvm::Value* st =
+                        builder_.CreateCall(fn, {fs, buf, off, cnt}, "fs.write");
+                    // Only the -1 (window) status raises. The -2 short/failed
+                    // write is swallowed for now: §7.1's "write the entire
+                    // window or raise" needs the §7.5 IOException surface the
+                    // whole §7 runtime still lacks (#2286, the same deferral
+                    // §7.3 already records).
+                    emitGuardThrow(
+                        builder_.CreateICmpEQ(st, builder_.getInt32(-1), "fs.write.oor"),
+                        "IndexOutOfRangeException");
+                    return nullptr;
+                }
+                if (mname == "Flush" && call.args.empty()) {
+                    auto* fn = declareC("bz_filestream_flush",
+                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                    builder_.CreateCall(fn, {fs});
+                    return nullptr;
+                }
+                // per stdlib §7.1: Seek(offset: long, origin: SeekOrigin): long.
+                if (mname == "Seek" && call.args.size() == 2 &&
+                    call.args[0].value && call.args[1].value) {
+                    llvm::Value* off = lowerExpr(*call.args[0].value);
+                    llvm::Value* org = lowerExpr(*call.args[1].value);
+                    if (!off || !org) return nullptr;
+                    if (!off->getType()->isIntegerTy(64))
+                        off = builder_.CreateSExt(off, i64());
+                    if (!org->getType()->isIntegerTy(32))
+                        org = builder_.CreateZExt(org, i32());
+                    auto* fn = declareC("bz_filestream_seek", i64(),
+                                        {ptrTy(), i64(), i32()});
+                    return builder_.CreateCall(fn, {fs, off, org}, "fs.seek");
+                }
+                // per stdlib §7.1: ReadAll(): owned Array<byte>.
+                if (mname == "ReadAll" && call.args.empty()) {
+                    auto* fn = declareC("bz_filestream_read_all", ptrTy(), {ptrTy()});
+                    return builder_.CreateCall(fn, {fs}, "fs.readall");
+                }
+            }
+        }
+    }
+
     // #1025: the CancellationTokenSource / CancellationToken instance-method and
     // property handlers were MOVED to before the `if (!id) return nullptr` guard
     // above — they accept ANY receiver expression (a chained `cts.Token` is a

@@ -741,6 +741,39 @@ char* bz_path_dirname(const char* path);        // directory part
 char* bz_path_absolute(const char* path);       // realpath equivalent
 
 // ---------------------------------------------------------------------------
+// stdlib §7.2 FileStream (issue #645) — a buffered OS file handle backing the
+// §7.1 Stream operations. `mode`/`access`/`origin` are the FileMode/FileAccess/
+// SeekOrigin ordinals (declaration order from 0, §10.2); see the
+// implementation comment in bezel_runtime_fileio.cpp for the mapping.
+// ---------------------------------------------------------------------------
+
+// `new FileStream(path, mode[, access])`. path_data/path_len are the bz.string
+// payload (not NUL-terminated). Null on an OS open failure.
+void*   bz_filestream_open(const char* path_data, int64_t path_len,
+                           int32_t mode, int32_t access);
+// Flush-on-dispose (§7.2): flush buffered writes, close the handle, free.
+// Idempotent and null-tolerant.
+void    bz_filestream_dispose(void* h);
+void    bz_filestream_flush(void* h);
+// Windowed read/write over a bz_array_t* of bytes. Both return -1 for an
+// out-of-range window so the caller raises IndexOutOfRangeException (§7.1)
+// before any I/O; bz_filestream_read otherwise returns the byte count (0 at
+// end of stream), bz_filestream_write returns 0 (whole window) or -2.
+int64_t bz_filestream_read(void* h, void* arr, int32_t offset, int32_t count);
+int32_t bz_filestream_write(void* h, void* arr, int32_t offset, int32_t count);
+int64_t bz_filestream_seek(void* h, int64_t offset, int32_t origin);
+int64_t bz_filestream_length(void* h);
+int64_t bz_filestream_position(void* h);
+void    bz_filestream_set_position(void* h, int64_t pos);
+int32_t bz_filestream_can_read(void* h);
+int32_t bz_filestream_can_write(void* h);
+int32_t bz_filestream_can_seek(void* h);
+// ReadAll(): current position to end, as a fresh owned Array<byte>.
+void*   bz_filestream_read_all(void* h);
+// The `Path` property — a fresh +1 bz.string.
+void*   bz_filestream_path(void* h);
+
+// ---------------------------------------------------------------------------
 // Task scheduler — minimal cooperative/preemptive scheduler for async/await.
 // Backed by a POSIX thread pool. Call bz_scheduler_init() once at startup.
 // ---------------------------------------------------------------------------

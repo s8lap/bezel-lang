@@ -387,3 +387,272 @@ char* bz_path_absolute(const char* path) {
     char buf[4096];
     return realpath(path, buf) ? strdup(buf) : strdup(path);
 }
+
+// ---------------------------------------------------------------------------
+// stdlib §7.2 FileStream (issue #645)
+//
+// Representation: bz_filestream_t* (heap pointer, owned by the Bezel
+// `FileStream` instance — the same shape as §8.1's bz_stopwatch_t*). The
+// underlying handle is a buffered `FILE*`, which is what makes stdlib §7.2's
+// flush-on-dispose contract observable: "A FileStream opened for writing must
+// be disposed (or explicitly Flush()ed) for buffered data to reach the file."
+//
+// The `mode` / `access` arguments are the §7.2 enum ordinals, which are the
+// declaration order of the two enums (§10.2 auto-increment from 0):
+//   FileMode:   CreateNew=0, Create=1, Open=2, OpenOrCreate=3,
+//               Truncate=4, Append=5
+//   FileAccess: Read=0, Write=1, ReadWrite=2
+// and §7.1's SeekOrigin for bz_filestream_seek:
+//   SeekOrigin: Begin=0, Current=1, End=2
+// The enums themselves are ordinary Bezel enums injected by the compiler's
+// stdlib prelude (Driver.cpp), so those ordinals are fixed by the verbatim
+// §7.1/§7.2 declarations.
+// ---------------------------------------------------------------------------
+
+struct bz_filestream_t {
+    FILE*   fp;
+    char*   path;       // NUL-terminated copy of the constructor's path
+    int64_t path_len;   // byte length of `path` (excluding the NUL)
+    int32_t can_read;
+    int32_t can_write;
+    int32_t can_seek;
+    int32_t closed;     // 1 once the handle has been closed (idempotent dispose)
+    int32_t last_op;    // 0 = none, 1 = read, 2 = write (see bz_fs_switch_to)
+};
+
+// C requires an intervening fflush/fseek between a write and a read (and a
+// file-positioning call between a read and a write) on an update stream — so a
+// FileAccess.ReadWrite stream that alternates Write/Read without one has
+// undefined behaviour. §7.1 imposes no such obligation on the Bezel caller, so
+// the switch is performed here rather than exposed. `want` is 1 (read) or 2
+// (write).
+static void bz_fs_switch_to(bz_filestream_t* fs, int32_t want) {
+    if (fs->last_op != 0 && fs->last_op != want) {
+        if (fs->last_op == 2) fflush(fs->fp);          // write → read
+        else                  fseek(fs->fp, 0, SEEK_CUR);  // read → write
+    }
+    fs->last_op = want;
+}
+
+// per stdlib §7.2: map (FileMode, FileAccess) onto POSIX open(2) flags.
+// Returns -1 for an unrecognised ordinal (never produced by well-typed Bezel).
+static int bz_fs_open_flags(int32_t mode, int32_t access) {
+    int flags;
+    switch (access) {
+        case 0: flags = O_RDONLY; break;   // FileAccess.Read
+        case 1: flags = O_WRONLY; break;   // FileAccess.Write
+        case 2: flags = O_RDWR;   break;   // FileAccess.ReadWrite
+        default: return -1;
+    }
+    switch (mode) {
+        case 0: flags |= O_CREAT | O_EXCL;  break;  // CreateNew: fail if present
+        case 1: flags |= O_CREAT | O_TRUNC; break;  // Create: create or truncate
+        case 2: break;                              // Open: must already exist
+        case 3: flags |= O_CREAT;           break;  // OpenOrCreate: no truncation
+        case 4: flags |= O_TRUNC;           break;  // Truncate: must already exist
+        case 5: flags |= O_CREAT | O_APPEND; break; // Append: writes go to the end
+        default: return -1;
+    }
+    return flags;
+}
+
+// The fdopen(3) mode string matching the flags computed above. `O_APPEND`
+// needs an "a" form so the C library keeps append semantics on the stream.
+static const char* bz_fs_stdio_mode(int32_t mode, int32_t access) {
+    bool append = (mode == 5);
+    switch (access) {
+        case 0: return "r";                    // Read (append is irrelevant)
+        case 1: return append ? "a"  : "w";    // Write
+        default: return append ? "a+" : "r+";  // ReadWrite
+    }
+}
+
+// per stdlib §7.2: `new FileStream(path, mode)` / `new FileStream(path, mode,
+// access)`. `path_data`/`path_len` are the bz.string payload (not
+// NUL-terminated), so the path is copied here. Returns a fresh owned handle,
+// or null when the OS refuses to open the file (the caller's `using var`
+// disposal is null-tolerant).
+void* bz_filestream_open(const char* path_data, int64_t path_len,
+                         int32_t mode, int32_t access) {
+    if (path_len < 0) path_len = 0;
+    char* path = (char*)malloc((size_t)path_len + 1);
+    if (!path) bz_alloc_fail("FileStream path");
+    if (path_len > 0 && path_data) memcpy(path, path_data, (size_t)path_len);
+    path[path_len] = '\0';
+
+    int flags = bz_fs_open_flags(mode, access);
+    if (flags < 0) { free(path); return nullptr; }
+    int fd = open(path, flags, 0644);
+    if (fd < 0) { free(path); return nullptr; }
+    FILE* fp = fdopen(fd, bz_fs_stdio_mode(mode, access));
+    if (!fp) { close(fd); free(path); return nullptr; }
+
+    auto* fs = (bz_filestream_t*)calloc(1, sizeof(bz_filestream_t));
+    if (!fs) { fclose(fp); free(path); bz_alloc_fail("FileStream handle"); }
+    fs->fp        = fp;
+    fs->path      = path;
+    fs->path_len  = path_len;
+    fs->can_read  = (access == 0 || access == 2) ? 1 : 0;
+    fs->can_write = (access == 1 || access == 2) ? 1 : 0;
+    // A regular file is seekable; a pipe/FIFO/character device is not.
+    struct stat st;
+    fs->can_seek  = (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) ? 1 : 0;
+    return fs;
+}
+
+// per stdlib §7.2 "Disposal (flush-on-dispose)": flush buffered writes and
+// release the OS file handle. Idempotent and null-tolerant — `using var` scope
+// exit and an explicit `Dispose()` reach the same code, and §28.2's
+// exactly-once rule must not turn a second arrival into a double fclose.
+void bz_filestream_dispose(void* h) {
+    auto* fs = (bz_filestream_t*)h;
+    if (!fs) return;
+    if (!fs->closed && fs->fp) {
+        fflush(fs->fp);
+        fclose(fs->fp);
+    }
+    fs->fp = nullptr;
+    fs->closed = 1;
+    free(fs->path);
+    fs->path = nullptr;
+    free(fs);
+}
+
+// per stdlib §7.1: Flush() — push buffered writes to the OS.
+void bz_filestream_flush(void* h) {
+    auto* fs = (bz_filestream_t*)h;
+    if (!fs || fs->closed || !fs->fp) return;
+    fflush(fs->fp);
+}
+
+// per stdlib §7.1 windowed-form contract: the window [offset, offset+count)
+// ranges over the buffer's Count; out-of-range is reported to the caller as
+// -1 so codegen can raise IndexOutOfRangeException BEFORE any I/O happens.
+// Otherwise returns the number of bytes read: 0 iff at end of stream (and for
+// a zero-length window, the one carve-out).
+int64_t bz_filestream_read(void* h, void* arrp, int32_t offset, int32_t count) {
+    auto* fs = (bz_filestream_t*)h;
+    auto* a  = (bz_array_t*)arrp;
+    int64_t cap = a ? a->count : 0;
+    if (offset < 0 || count < 0 || (int64_t)offset + (int64_t)count > cap)
+        return -1;                       // → IndexOutOfRangeException (§7.1)
+    if (count == 0) return 0;            // zero-length window: 0 immediately
+    if (!fs || fs->closed || !fs->fp || !fs->can_read) return 0;
+    bz_fs_switch_to(fs, 1);
+    size_t n = fread((uint8_t*)a->data + offset, 1, (size_t)count, fs->fp);
+    return (int64_t)n;
+}
+
+// per stdlib §7.1: Write(buffer, offset, count) writes the ENTIRE window or
+// raises. Returns 0 on success, -1 for an out-of-range window (codegen raises
+// IndexOutOfRangeException), -2 for a short/failed write.
+int32_t bz_filestream_write(void* h, void* arrp, int32_t offset, int32_t count) {
+    auto* fs = (bz_filestream_t*)h;
+    auto* a  = (bz_array_t*)arrp;
+    int64_t cap = a ? a->count : 0;
+    if (offset < 0 || count < 0 || (int64_t)offset + (int64_t)count > cap)
+        return -1;                       // → IndexOutOfRangeException (§7.1)
+    if (count == 0) return 0;
+    if (!fs || fs->closed || !fs->fp || !fs->can_write) return -2;
+    bz_fs_switch_to(fs, 2);
+    size_t n = fwrite((const uint8_t*)a->data + offset, 1, (size_t)count, fs->fp);
+    return n == (size_t)count ? 0 : -2;
+}
+
+// per stdlib §7.1: Seek(offset, origin) — returns the new position.
+// SeekOrigin: Begin=0, Current=1, End=2.
+int64_t bz_filestream_seek(void* h, int64_t offset, int32_t origin) {
+    auto* fs = (bz_filestream_t*)h;
+    if (!fs || fs->closed || !fs->fp) return 0;
+    int whence = (origin == 1) ? SEEK_CUR : (origin == 2) ? SEEK_END : SEEK_SET;
+    if (fseek(fs->fp, (long)offset, whence) != 0) return -1;
+    // fseek is itself the read↔write switch C requires on an update stream.
+    fs->last_op = 0;
+    long pos = ftell(fs->fp);
+    return pos < 0 ? -1 : (int64_t)pos;
+}
+
+// per stdlib §7.1: Length — the file's size in bytes. Buffered writes are
+// flushed first so the size reflects everything written so far. The flush is
+// gated on can_write: fflush on a read-only stream would discard the buffered
+// INPUT and move the file position, which `Position` must not observe.
+int64_t bz_filestream_length(void* h) {
+    auto* fs = (bz_filestream_t*)h;
+    if (!fs || fs->closed || !fs->fp) return 0;
+    if (fs->can_write) fflush(fs->fp);
+    struct stat st;
+    if (fstat(fileno(fs->fp), &st) != 0) return 0;
+    return (int64_t)st.st_size;
+}
+
+// per stdlib §7.1: Position (get).
+int64_t bz_filestream_position(void* h) {
+    auto* fs = (bz_filestream_t*)h;
+    if (!fs || fs->closed || !fs->fp) return 0;
+    long pos = ftell(fs->fp);
+    return pos < 0 ? 0 : (int64_t)pos;
+}
+
+// per stdlib §7.1: Position (set) — an absolute seek from the beginning.
+void bz_filestream_set_position(void* h, int64_t pos) {
+    auto* fs = (bz_filestream_t*)h;
+    if (!fs || fs->closed || !fs->fp) return;
+    fseek(fs->fp, (long)pos, SEEK_SET);
+    fs->last_op = 0;   // the seek is the read↔write switch (see bz_fs_switch_to)
+}
+
+// per stdlib §7.1: CanRead / CanWrite / CanSeek.
+int32_t bz_filestream_can_read(void* h) {
+    auto* fs = (bz_filestream_t*)h;
+    return (fs && !fs->closed) ? fs->can_read : 0;
+}
+int32_t bz_filestream_can_write(void* h) {
+    auto* fs = (bz_filestream_t*)h;
+    return (fs && !fs->closed) ? fs->can_write : 0;
+}
+int32_t bz_filestream_can_seek(void* h) {
+    auto* fs = (bz_filestream_t*)h;
+    return (fs && !fs->closed) ? fs->can_seek : 0;
+}
+
+// per stdlib §7.1: ReadAll() — "reads from current position to end" into a
+// fresh owned Array<byte> (bz_array_t*, elem_size = 1). Always returns a live
+// array (empty when the stream is at end or unreadable) so the caller's
+// disposal obligation is unconditional.
+void* bz_filestream_read_all(void* h) {
+    auto* fs = (bz_filestream_t*)h;
+    if (!fs || fs->closed || !fs->fp || !fs->can_read)
+        return bz_array_alloc(1, 1);
+    bz_fs_switch_to(fs, 1);
+    // Grow-by-doubling read loop: works for non-seekable handles too.
+    int64_t cap = 0, len = 0;
+    uint8_t* buf = nullptr;
+    for (;;) {
+        if (len == cap) {
+            int64_t ncap = cap ? cap * 2 : 8192;
+            uint8_t* nbuf = (uint8_t*)realloc(buf, (size_t)ncap);
+            if (!nbuf) { free(buf); bz_alloc_fail("FileStream.ReadAll buffer"); }
+            buf = nbuf; cap = ncap;
+        }
+        size_t n = fread(buf + len, 1, (size_t)(cap - len), fs->fp);
+        if (n == 0) break;
+        len += (int64_t)n;
+    }
+    void* arr = bz_array_alloc(1, len > 0 ? len : 1);
+    auto* a = (bz_array_t*)arr;
+    if (len > 0) {
+        memcpy(a->data, buf, (size_t)len);
+        a->count = len;
+    }
+    free(buf);
+    return arr;
+}
+
+// per stdlib §7.2: the `Path` property — a FRESH +1 bz.string built from the
+// stored path, so each read hands the caller its own reference (the same
+// producer shape as File.ReadAllText).
+void* bz_filestream_path(void* h) {
+    auto* fs = (bz_filestream_t*)h;
+    if (!fs || !fs->path) return bz_make_string("", 0);
+    return bz_make_string(fs->path, fs->path_len);
+}

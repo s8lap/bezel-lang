@@ -2838,6 +2838,29 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             builder_.SetInsertPoint(contBB);
             continue;
         }
+        // stdlib §7.2 / issue #645: a `using var` FileStream. Dispose via
+        // bz_filestream_dispose — flushes buffered writes, closes the OS handle
+        // and frees the handle object. Null-guarded like the sites above: an
+        // explicit `fs.Dispose()` earlier in the scope nulls the slot, and a
+        // failed open stores null, so the guard is what makes both cases a
+        // no-op rather than a second dispose.
+        if (it->fileStream) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* fs = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                fs, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* frBB   = llvm::BasicBlock::Create(llvm_, "fs.dispose", currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "fs.cont",    currentFn_);
+            builder_.CreateCondBr(isNull, contBB, frBB);
+            builder_.SetInsertPoint(frBB);
+            auto* fn = declareC("bz_filestream_dispose",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {fs});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
         // §6.1 / §30.8: a `using var` CancellationTokenSource. Dispose via
         // bz_cts_dispose (idempotent: signals all tokens, then frees the source).
         // null-guarded: bz_cts_dispose handles null internally (its disposed flag

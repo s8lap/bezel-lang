@@ -3349,6 +3349,47 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 auto* allocFn = declareC("bz_stopwatch_alloc", ptrTy(), {});
                 return builder_.CreateCall(allocFn, {}, "sw.alloc");
             }
+            // stdlib §7.2 / issue #645: the two declared FileStream constructors
+            //   constructor(path: string, mode: FileMode)
+            //   constructor(path: string, mode: FileMode, access: FileAccess)
+            // lower to bz_filestream_open(path_data, path_len, mode, access).
+            // The enum arguments are ordinary Bezel enum values (the prelude
+            // declares them `: byte`), so widen whatever integer width they
+            // lower to up to the runtime's i32.
+            //
+            // NOTE (recorded choice, #645): stdlib §7.2 declares the two-argument
+            // constructor but does NOT state which FileAccess it implies. This
+            // lowering uses FileAccess.ReadWrite (ordinal 2) — every mode except
+            // `Open` creates or rewrites the file, so a read-only default would
+            // make five of the six modes unusable through the short form. The
+            // spec gap is filed separately; a later ruling changes only this
+            // constant.
+            if (colName == "FileStream" &&
+                (ne.args.size() == 2 || ne.args.size() == 3) &&
+                ne.args[0].value && ne.args[1].value) {
+                llvm::Value* pathStr = lowerExpr(*ne.args[0].value);
+                if (!pathStr) return nullptr;
+                llvm::Value* pathData = loadStringData(pathStr);
+                llvm::Value* pathLen  = loadStringLen(pathStr);
+                auto toI32 = [&](llvm::Value* v) -> llvm::Value* {
+                    if (!v) return nullptr;
+                    if (v->getType()->isIntegerTy(32)) return v;
+                    if (v->getType()->isIntegerTy())
+                        return builder_.CreateZExt(v, i32());
+                    return nullptr;
+                };
+                llvm::Value* mode = toI32(lowerExpr(*ne.args[1].value));
+                if (!mode) return nullptr;
+                llvm::Value* access = builder_.getInt32(2);  // FileAccess.ReadWrite
+                if (ne.args.size() == 3 && ne.args[2].value) {
+                    access = toI32(lowerExpr(*ne.args[2].value));
+                    if (!access) return nullptr;
+                }
+                auto* openFn = declareC("bz_filestream_open", ptrTy(),
+                                        {ptrTy(), i64(), i32(), i32()});
+                return builder_.CreateCall(
+                    openFn, {pathData, pathLen, mode, access}, "fs.open");
+            }
             // per §6.8 / #652: new Domain(name: string) — allocate a named
             // domain instance backed by a bz_domain_t with a stored name field.
             // bz_domain_alloc(name_str_p) → bz_domain_t* (refs=1 for `using var`).

@@ -5114,6 +5114,23 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         oenTy->genericArgs.push_back(recvTy->genericArgs[0]); // T
                         ctx_.setExprType(&ce, oenTy);
                     }
+                    // stdlib §7.1/§7.2 / issue #645: FileStream instance
+                    // methods. FileStream has no user TypeDecl, so nothing else
+                    // types these calls.
+                    if (colName == "FileStream") {
+                        // §7.1: Read(buffer, offset, count) → int (bytes read).
+                        if (m == "Read")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        // §7.1: Seek(offset, origin) → long (the new position).
+                        else if (m == "Seek")
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Long));
+                        // §7.1: ReadAll() → owned Array<byte>.
+                        else if (m == "ReadAll")
+                            ctx_.setExprType(
+                                &ce, makeConcreteCollectionResult(
+                                    "Array", ctx_.primitiveTypeRef(P::Byte)));
+                        // Write / Flush / Dispose → unit (left untyped).
+                    }
                     // StringBuilder methods
                     if (colName == "StringBuilder") {
                         if (m == "ToString")
@@ -10713,6 +10730,28 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     tsTy->kind = TypeRef::Kind::Named;
                     tsTy->declaration = builtinClassSym("TimeSpan");
                     ctx_.setExprType(&ma, tsTy);
+                    return;
+                }
+            }
+            // stdlib §7.1/§7.2 / issue #645: FileStream instance property
+            // reads. FileStream is a builtin class (bz_filestream_t* heap
+            // pointer) with no user TypeDecl, so the ordinary member-lookup
+            // path never finds its properties.
+            if (dtcn == "FileStream") {
+                const auto& mbr = ma.member;
+                // §7.2: Path → string.
+                if (mbr == "Path") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                    return;
+                }
+                // §7.1: Length / Position → long.
+                if (mbr == "Length" || mbr == "Position") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Long));
+                    return;
+                }
+                // §7.1: CanRead / CanWrite / CanSeek → bool.
+                if (mbr == "CanRead" || mbr == "CanWrite" || mbr == "CanSeek") {
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
                     return;
                 }
             }

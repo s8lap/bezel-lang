@@ -264,6 +264,13 @@ int Resolver::builtinTypeArity(std::string_view n) {
         // "unresolved type name `Guid`" even though `Guid.NewGuid()` etc. work.
         n == "Guid" ||
         n == "File" || n == "Directory" || n == "Path" ||
+        // stdlib §7.2 / issue #645: FileStream — the concrete §7.1 Stream over
+        // an OS file handle. A heap-allocated builtin class (bz_filestream_t*)
+        // with no user TypeDecl, disposable per §7.2's flush-on-dispose
+        // contract. Its FileMode/FileAccess/SeekOrigin enums are NOT here —
+        // they are ordinary Bezel enums injected by the stdlib prelude
+        // (Driver.cpp), so they carry real TypeDecls.
+        n == "FileStream" ||
         n == "Encoding" || n == "Linq" ||
         // §2.15 / issue #550: BinarySerializer / BinaryDeserializer (opaque
         // runtime handles; require `import System.Serialization` per spec, but
