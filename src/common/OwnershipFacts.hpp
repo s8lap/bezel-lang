@@ -34,6 +34,7 @@
 // are Phase B, deliberately NOT done here.
 
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
@@ -41,6 +42,7 @@
 
 namespace bezel::ast {
 struct Expr;
+struct Stmt;
 struct CallExpr;
 struct MethodDecl;
 struct BindExpr;
@@ -440,5 +442,50 @@ bool bindClauseNeedsAtomDisposal(const ast::BindExpr& bx,
                                  std::size_t clauseIdx,
                                  const sema::SemaContext& ctx,
                                  const TypeParamResolver& resolveParam);
+
+// §29.8 / §30.1 (#973a): the ONE shared gate for the CONDITIONALLY-discharged
+// `owned` parameter of a state-machine method (iterator, async iterator, plain
+// `async`).
+//
+// The frame disposes an `owned` parameter "that has not been moved out of by
+// the body" (§29.8) — a RUNTIME property when the move-out is conditional. The
+// implementation encodes it as a runtime moved-from flag: the frame's capture
+// slot is NULLED at the move-out site, and the frame's terminal-state disposal
+// is null-guarded, so the discharged path skips and the fall-through path
+// disposes exactly once. That is sound only if EVERY move-out of the parameter
+// reaches a codegen site that nulls the FRAME slot — a missed site leaves the
+// slot non-null after a real move and the frame double-frees (the #841 class).
+//
+// This predicate is that guarantee, stated syntactically and CONSERVATIVELY:
+// true iff every occurrence of `param` in `body` is one of
+//   (a) the bare-identifier initializer of a `LocalDecl` carrying the `owned`
+//       binding-position transfer marker — `var y := owned p;` /
+//       `using var y := owned p;` (§28.3 v0.180, #1962) — the ONE discharge
+//       form whose lowering nulls the frame capture slot
+//       (Emitter::nullStateMachineOwnedParamCapture, called beside the
+//       existing #1978 `nullTransferredOwnedLocalSlot`); or
+//   (b) the TARGET of a member access / member call (`p.F`, `p.M(a)`) whose
+//       member is not `Dispose` — a borrow read that discharges nothing.
+// EVERY other occurrence, and every AST node the scan does not recognise,
+// makes this false: the parameter then keeps today's §28.3 drop-reject
+// (conservative-safe — a valid program is rejected, never miscompiled). The
+// other discharge forms (`p.Dispose()`, `_ := p`, `M(owned p)`,
+// `y := owned p`, `yield return p`, an owning-collection transfer) each null
+// only the caller's ALLOCA today, not the frame slot; admitting them needs the
+// same frame-null at each of their lowering sites and is tracked separately.
+//
+// The ownership pass is the single caller: a `true` here suppresses the reject
+// and sets `ParameterSymbol::iteratorFrameConditionalAutoDispose`, which is what
+// codegen's three frame-disposal loops read. Codegen cannot drift ACCEPT-ward
+// past it, because codegen's frame-slot nulling is emitted UNCONDITIONALLY at
+// form (a) — every marked adoption of a frame-captured `owned` parameter nulls
+// the slot, whether or not this predicate admitted the parameter. So the set of
+// nulled sites is always a superset of the set of admitted parameters' discharge
+// sites: sema can only ever be more conservative than the runtime flag, never
+// less (the #1661 no-drift direction that matters — an accept can never outrun
+// the disposal that has to make it exactly-once).
+bool stateMachineOwnedParamIsFrameNullable(
+    const sema::SemaContext& ctx, const sema::Symbol* param,
+    const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
 }  // namespace bezel::common

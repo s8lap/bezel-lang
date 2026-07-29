@@ -1398,4 +1398,205 @@ bool bindClauseNeedsAtomDisposal(const ast::BindExpr& bx,
            !bindClauseConsumedInAtom(bx, clauseIdx);
 }
 
+namespace {
+
+// §29.8 / §30.1 (#973a): the scan behind stateMachineOwnedParamIsFrameNullable.
+//
+// DENY-BY-DEFAULT, unlike every other walker in the tree (CaptureWalker &c.,
+// which silently ignore an unrecognised node). Here an unrecognised node could
+// HIDE a discharge of the parameter, and a hidden discharge is a double-free —
+// so `ok` is cleared on any node kind the scan does not enumerate, and the
+// caller then keeps the §28.3 reject. Every `return` below is reached only
+// after the node's children have been visited or the node has been proved
+// child-free.
+struct FrameNullableParamScan {
+    const sema::SemaContext& ctx;
+    const sema::Symbol* param;
+    bool ok = true;
+
+    // Is `e` a bare identifier naming the tracked parameter?
+    bool isParamRef(const ast::Expr* e) const {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        if (!id) return false;
+        return ctx.exprSymbol(*id) == param;
+    }
+
+    void expr(const ast::Expr* e) {
+        if (!ok || !e) return;
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+            // A bare read reached here through a position the allowlist below
+            // did not clear — treat it as a possible discharge.
+            if (ctx.exprSymbol(*id) == param) ok = false;
+            return;
+        }
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            // (b) `p.F` / `p.M(...)` — a borrow read of the parameter's
+            // storage. `p.Dispose()` IS a discharge (and nulls only the alloca
+            // today), so it is NOT admitted.
+            if (isParamRef(m->target.get())) {
+                if (m->member == "Dispose") { ok = false; return; }
+                return;
+            }
+            expr(m->target.get());
+            return;
+        }
+        if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            if (isParamRef(m->target.get())) {
+                if (m->member == "Dispose") { ok = false; return; }
+                return;
+            }
+            expr(m->target.get());
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            expr(c->callee.get());
+            // An ARGUMENT position is a possible transfer (`M(owned p)`, or a
+            // callee `owned` parameter) — expr() rejects a bare `p` there.
+            for (auto& a : c->args) expr(a.value.get());
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            expr(c->callee.get());
+            for (auto& a : c->args) expr(a.value.get());
+            return;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            expr(ix->target.get());
+            for (auto& a : ix->indices) expr(a.value.get());
+            return;
+        }
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            expr(b->left.get()); expr(b->right.get()); return;
+        }
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            expr(u->operand.get()); return;
+        }
+        if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            expr(p->operand.get()); return;
+        }
+        if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            expr(t->operand.get()); return;
+        }
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            expr(c->condition.get()); expr(c->thenValue.get());
+            expr(c->elseValue.get()); return;
+        }
+        if (auto* t = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            expr(t->operand.get()); return;
+        }
+        if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+            expr(r->lo.get()); expr(r->hi.get()); expr(r->step.get()); return;
+        }
+        if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+            for (auto& a : n->args) expr(a.value.get());
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (auto& part : is->parts) expr(part.expr.get());
+            return;
+        }
+        if (dynamic_cast<const ast::IntLiteralExpr*>(e) ||
+            dynamic_cast<const ast::FloatLiteralExpr*>(e) ||
+            dynamic_cast<const ast::StringLiteralExpr*>(e) ||
+            dynamic_cast<const ast::CharLiteralExpr*>(e) ||
+            dynamic_cast<const ast::BoolLiteralExpr*>(e) ||
+            dynamic_cast<const ast::NullLiteralExpr*>(e))
+            return;  // child-free leaves
+        // Anything else (lambdas, `case`/`when` expressions, binding atoms,
+        // marked transfers, collection literals, `with`, …) may hide a
+        // discharge in a position this scan does not model.
+        ok = false;
+    }
+
+    void stmt(const ast::Stmt* s) {
+        if (!ok || !s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            // (a) the MARKED adoption `var y := owned p;` / `using var y :=
+            // owned p;` — the admitted discharge form. Its lowering nulls the
+            // frame capture slot beside the caller's alloca.
+            if (ld->initializerHasOwnedMarker &&
+                isParamRef(ld->initializer.get()))
+                return;
+            expr(ld->initializer.get());
+            return;
+        }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            expr(lc->value.get()); return;
+        }
+        if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            expr(r->value.get()); return;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            expr(es->expr.get()); return;
+        }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            expr(ts->value.get()); return;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            expr(as->target.get()); expr(as->value.get()); return;
+        }
+        if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            expr(inc->target.get()); return;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            expr(ds->value.get()); return;   // `_ := p` is a discharge → reject
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            expr(ys->value.get()); return;   // `yield return p` → reject
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            expr(is->ifBranch.condition.get());
+            for (auto& b : is->ifBranch.body) stmt(b.get());
+            for (auto& br : is->elifBranches) {
+                expr(br.condition.get());
+                for (auto& b : br.body) stmt(b.get());
+            }
+            for (auto& b : is->elseBody) stmt(b.get());
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            expr(ws->condition.get());
+            for (auto& b : ws->body) stmt(b.get());
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            expr(fs->iterable.get()); expr(fs->withExpr.get());
+            for (auto& b : fs->body) stmt(b.get());
+            return;
+        }
+        if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) stmt(b.get());
+            return;
+        }
+        if (dynamic_cast<const ast::BreakStmt*>(s) ||
+            dynamic_cast<const ast::ContinueStmt*>(s))
+            return;  // child-free
+        // A `try` / `case` / anything else. `try` is denied wholesale for one
+        // specific reason: a marked adoption spelled in a `finally` is lowered
+        // TWICE — once on the body's own path and once more when the iterator's
+        // Dispose re-runs the pending finally chains for a suspended state — and
+        // reasoning about which of those two runs owns the value is a separate
+        // piece of work from this one. Denying the whole statement (rather than
+        // just its finally) also keeps the scan's rule to one sentence. `case` /
+        // `when` arms and binding atoms are denied for the same
+        // deny-what-is-not-modelled reason. Each is a false reject of a possibly
+        // valid program, never a miscompile.
+        ok = false;
+    }
+};
+
+}  // namespace
+
+bool stateMachineOwnedParamIsFrameNullable(
+    const sema::SemaContext& ctx, const sema::Symbol* param,
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    if (!param) return false;
+    FrameNullableParamScan scan{ctx, param};
+    for (const auto& s : body) {
+        scan.stmt(s.get());
+        if (!scan.ok) return false;
+    }
+    return scan.ok;
+}
+
 }  // namespace bezel::common

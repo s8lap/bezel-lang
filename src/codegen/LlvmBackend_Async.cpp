@@ -1982,12 +1982,22 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             // after disposal so a re-entrant Dispose (or a param already moved out
             // and nulled) never double-frees. Only params flagged
             // iteratorAutoDispose (never discharged on any path, set in
-            // Ownership.cpp) are disposed; a conditionally-discharged param stays a
-            // reject (#973a).
+            // Ownership.cpp) are disposed.
+            //
+            // #973a: `iteratorFrameConditionalAutoDispose` extends the same loop
+            // to a CONDITIONALLY discharged parameter. Nothing else changes —
+            // the null-guard IS the runtime moved-from test: the marked-adoption
+            // lowering nulls this very slot
+            // (Emitter::nullStateMachineOwnedParamCapture), so the adopting path
+            // loads null and skips while the fall-through path disposes exactly
+            // once. An async iterator frame is never cloned (no GetEnumerator
+            // memcpy), so the frame the body ran on is the frame disposed here.
             for (std::size_t i = frame.captures.size(); i-- > 0;) {
                 auto* ps = dynamic_cast<sema::ParameterSymbol*>(
                     frame.captures[i].first);
-                if (!ps || !ps->iteratorAutoDispose) continue;
+                if (!ps || (!ps->iteratorAutoDispose &&
+                            !ps->iteratorFrameConditionalAutoDispose))
+                    continue;
                 unsigned fieldIdx = frame.captureStart + (unsigned)i;
                 llvm::Value* fptr =
                     builder_.CreateStructGEP(stateStructTy, self, fieldIdx);
@@ -2710,7 +2720,15 @@ void Emitter::emitAsyncOwnedParamAutoDispose(llvm::Value* self) {
     const StateMachineFrame& frame = *asyncOwnedParamFrame_;
     for (std::size_t i = frame.captures.size(); i-- > 0;) {
         auto* ps = dynamic_cast<sema::ParameterSymbol*>(frame.captures[i].first);
-        if (!ps || !ps->iteratorAutoDispose) continue;
+        // #973a: `iteratorFrameConditionalAutoDispose` admits a CONDITIONALLY
+        // discharged parameter to this same loop. The null-guard below is then
+        // the runtime moved-from test — the marked-adoption lowering nulls this
+        // slot on the path that adopts, so only the fall-through path disposes.
+        // A plain-async frame has no clone, so the frame the body ran on is the
+        // one whose completion edges reach here.
+        if (!ps || (!ps->iteratorAutoDispose &&
+                    !ps->iteratorFrameConditionalAutoDispose))
+            continue;
         unsigned fieldIdx = frame.captureStart + (unsigned)i;
         llvm::Value* fptr =
             builder_.CreateStructGEP(smStateStruct_, self, fieldIdx);

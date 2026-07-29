@@ -7492,8 +7492,23 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // no-op here. // per §28.3 v0.180 #1978
     if (v && init)
         if (auto* ldNode = dynamic_cast<const ast::LocalDecl*>(declNode))
-            if (ldNode->initializerHasOwnedMarker)
+            if (ldNode->initializerHasOwnedMarker) {
                 nullTransferredOwnedLocalSlot(init);
+                // §29.8 / §30.1 (#973a): inside a state-machine body the
+                // parameter's real home is the FRAME capture slot — the alloca
+                // just nulled is a per-resume copy, and the frame's
+                // terminal-state disposal reads the slot. Null it too, so a
+                // CONDITIONALLY adopted `owned` parameter is disposed by the
+                // frame only on the path that did not adopt it (the runtime
+                // moved-from flag; see
+                // common::stateMachineOwnedParamIsFrameNullable). A no-op
+                // outside a state-machine body and for any parameter the frame
+                // does not capture, and harmless when the adoption is
+                // UNCONDITIONAL (the disposal loop already skips such a
+                // parameter — sema never flags it) — so this store only ever
+                // removes a double-free, never creates a leak.
+                nullStateMachineOwnedParamCapture(init);
+            }
     // #422 / #429 / §4.6 / §28.9: reference-count this `var` string local. A +1
     // PRODUCER (string `+` / interpolation / range-slice) transfers its single
     // reference into the slot; a BORROW (any other string initializer) is

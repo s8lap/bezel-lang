@@ -5881,6 +5881,23 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         llvm::Value* geFnPtr = builder_.CreateLoad(ptrTy(), geSlotPtr);
         auto* geTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
         enumObj = builder_.CreateCall(geTy, geFnPtr, {enumObj}, "ib.getenum");
+        // §29.8 / §29.11 (#2154, #973a): GetEnumerator RAISES. When the frame's
+        // owned captures are affine — the state-keyed yield-transfer shape
+        // (#2154) or a conditionally-adopted `owned` parameter (#973a) — the
+        // first enumerator CLAIMS them and a second GetEnumerator sets a pending
+        // InvalidOperationException and returns NULL rather than replaying
+        // pointers the first enumerator already consumed. Without this standard
+        // post-call gate the null flowed straight into the MoveNext vtable load
+        // below and the intended loud exception became a SIGSEGV. The check is
+        // the ordinary CG20 gate: a no-op on every non-raising GetEnumerator.
+        //
+        // Placed BEFORE the loop-owned-source registration below on purpose, and
+        // that cannot leak the source: the claim raises only on a SECOND
+        // GetEnumerator over the SAME source object, which requires the source to
+        // be a NAMED binding (a one-shot `for … in Gen(…)` temporary is
+        // enumerated exactly once by construction) — and a named source is
+        // disposed at its own scope end, not here.
+        emitPendingCheck();
     }
 
     // Store the (fresh) enumerator in a slot.

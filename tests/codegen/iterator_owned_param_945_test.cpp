@@ -174,20 +174,25 @@ BEZEL_TEST(iterator_owned_param_945, borrow_use_auto_disposed) {
         "  end Main; end P;"), 14);
 }
 
-// §29.8 (conservative): a CONDITIONALLY-discharged owned param stays rejected —
-// the state machine cannot statically tell whether the body moved it out, so
-// auto-disposing would risk a double-free. (Tracked as a follow-up.)
+// §29.8 (conservative): a CONDITIONALLY-discharged owned param used to be
+// rejected outright — the state machine could not statically tell whether the
+// body moved it out, so auto-disposing risked a double-free.
 //
 // §28.10 v0.180 / #2071: the unmarked `using var x := c;` form is a borrow-pin
 // over a named owned binding (§28.10), so the conservative conditional-adoption
 // shape no longer applies — the source is never moved by the using-var and the
-// state machine auto-disposes it. The conservative rejection lives on in the
-// MARKED `using var x := owned c;` form: a conditional adoption that does move
-// the source (the v0.180 binding-position marker, §28.3) cannot be statically
-// distinguished from a fall-through by the state machine, so auto-disposing
-// would still risk a double-free. The rejected-at-compile shape is therefore
-// the marked conditional adoption.
-BEZEL_TEST(iterator_owned_param_945, conditional_discharge_still_rejected) {
+// state machine auto-disposes it. The conservative rejection lived on in the
+// MARKED `using var x := owned c;` form.
+//
+// #973a: the MARKED conditional adoption is now ACCEPTED. §29.8's rule is
+// "disposes any `owned` parameter that has not been moved out of by the body" —
+// a runtime property — so the frame's capture slot became the runtime moved-from
+// flag (nulled at the adoption, read by the already-null-guarded frame
+// disposal). See `iterator_owned_param_conditional_973a_test.cpp` for the
+// exactly-once behaviour on both branches, on every teardown path, and for the
+// discharge forms that DO still keep the reject (`c.Dispose()`, `_ := c`,
+// `M(owned c)` — each nulls only the caller's alloca, not the frame slot).
+BEZEL_TEST(iterator_owned_param_945, conditional_discharge_now_accepted_973a) {
     BEZEL_EXPECT_EQ(rejectedAtCompile(
         "module M; "
         "class Cell public constructor() end constructor; "
@@ -197,7 +202,7 @@ BEZEL_TEST(iterator_owned_param_945, conditional_discharge_still_rejected) {
         "    if cond then using var x := owned c; end; "
         "    yield return 1; "
         "  end UseCell; "
-        "  public static method Main(): int return 0; end Main; end P;"), true);
+        "  public static method Main(): int return 0; end Main; end P;"), false);
 }
 
 // §29.8 (#973b): an ASYNC iterator's never-discharged `owned` param is no longer

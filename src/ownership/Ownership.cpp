@@ -57,6 +57,22 @@ bool bodyContainsYield(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
 void scanReassignStmts(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                        sema::SemaContext& ctx,
                        std::unordered_set<const sema::Symbol*>& out);
+
+// §29.8 / §30.1 (#973a): can a frame's terminal-state disposal reclaim this
+// `owned` parameter through its capture slot? All three frame-disposal loops
+// (sync iterator, async iterator, plain async) LOAD the slot as a pointer,
+// null-test it and dispatch the destructor, so the parameter must be class- or
+// interface-typed. A move-only value type (an owning inline array, §15.3) rides
+// a different pass and is deliberately outside the conditional gate.
+bool ownedParamIsFrameDisposable(const sema::ParameterSymbol& ps,
+                                 sema::SemaContext& ctx) {
+    const sema::TypeRef* pt = ps.declType ? ctx.resolvedType(*ps.declType)
+                                          : ps.resolvedDeclType;
+    return pt && pt->kind == sema::TypeRef::Kind::Named && pt->declaration &&
+           (pt->declaration->kind == ast::TypeDeclKind::Class ||
+            pt->declaration->kind == ast::TypeDeclKind::Interface) &&
+           !pt->declaration->isValueBuiltin;
+}
 }  // namespace
 
 // §28.1 (v0.196, #1817/#1860): isValueSubstitutionErased is declared in
@@ -446,6 +462,50 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                             "(§28.3/§29.8/§30.1 auto-drop); `move` / `return` / "
                             "`.Dispose()` it, or adopt it with `using var _ := "
                             "owned " + std::string(sym->name) +
+                            "`, to discharge it explicitly");
+                        continue;
+                    }
+                    // §29.8 / §30.1 (#973a): the CONDITIONALLY-discharged owned
+                    // parameter. §29.8 says the state machine disposes "any
+                    // `owned` parameter that has not been moved out of by the
+                    // body" — a RUNTIME property once the move-out sits on one
+                    // branch. The frame slot is therefore used as the runtime
+                    // moved-from flag: codegen NULLS it at the move-out site and
+                    // its terminal-state disposal is null-guarded, so the
+                    // discharged path skips and the fall-through path disposes
+                    // exactly once. That holds only when EVERY occurrence of the
+                    // parameter is one of the two forms the shared gate admits
+                    // (the marked adoption `using var y := owned p;`, whose
+                    // lowering nulls the frame slot, and a borrow read `p.F` /
+                    // `p.M(…)`); any other occurrence could discharge without
+                    // nulling the frame slot and the frame would double-free, so
+                    // the gate denies by default and the parameter keeps the
+                    // §28.3 reject below. Codegen emits the frame-slot null at
+                    // EVERY marked adoption of a frame-captured `owned`
+                    // parameter, admitted or not, so the nulled set is always a
+                    // superset of what this accepts — the accept can never
+                    // outrun the disposal that has to make it exactly-once.
+                    // // per §29.8, §30.1, §28.3
+                    if (ps->modifier == "owned" &&
+                        everDischarged_.count(sym) != 0 &&
+                        ownedParamIsFrameDisposable(*ps, ctx_) &&
+                        common::stateMachineOwnedParamIsFrameNullable(
+                            ctx_, sym, body)) {
+                        ps->iteratorFrameConditionalAutoDispose = true;
+                        // The same §28.3 must-use warning the never-discharged
+                        // branch above emits: on the branch that does NOT adopt,
+                        // the frame's teardown is an implicit drop.
+                        ctx_.diagnostics().report(
+                            Severity::Warning,
+                            st.obligationOrigin ? st.obligationOrigin->span.begin
+                                                : SourceLocation{},
+                            std::string("owned parameter `") +
+                            std::string(sym->name) +
+                            "` is implicitly disposed by the frame at teardown "
+                            "on the path that does not adopt it "
+                            "(§28.3/§29.8/§30.1 auto-drop); adopt it on every "
+                            "path with `using var _ := owned " +
+                            std::string(sym->name) +
                             "`, to discharge it explicitly");
                         continue;
                     }

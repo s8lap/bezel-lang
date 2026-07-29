@@ -302,6 +302,19 @@ void Emitter::emitFrameCaptureStores(const StateMachineFrame& frame,
 
 void Emitter::emitFrameCaptureRestores(const StateMachineFrame& frame,
                                        llvm::Value* self) {
+    // §29.8 / §30.1 (#973a): record, FOR THE FUNCTION BEING EMITTED, the frame
+    // the restores below read and the capture-field index of every `owned`
+    // PARAMETER in it, so a discharge lowered into this body can null the FRAME
+    // slot (the runtime moved-from flag) and not merely the alloca it is about
+    // to bind. Per-function, so a nested emission cannot clobber it — see the
+    // declaration comment.
+    SmFrameCaptures* fc = nullptr;
+    if (llvm::BasicBlock* bb = builder_.GetInsertBlock()) {
+        fc = &smFrameCaptures_[bb->getParent()];
+        fc->self = self;
+        fc->structTy = frame.structTy;
+        fc->ownedParamField.clear();
+    }
     unsigned idx = frame.captureStart;
     for (auto& [sym, ty] : frame.captures) {
         llvm::Value* capField =
@@ -315,8 +328,32 @@ void Emitter::emitFrameCaptureRestores(const StateMachineFrame& frame,
             auto* slot = entryAlloca(ty);
             builder_.CreateStore(val, slot);
             paramSlots_[sym] = slot;
+            if (fc)
+                if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym))
+                    if (ps->modifier == "owned" && ty->isPointerTy())
+                        fc->ownedParamField[sym] = idx - 1;
         }
     }
+}
+
+
+// §29.8 / §30.1 (#973a): see the declaration comment in LlvmBackend_impl.hpp.
+void Emitter::nullStateMachineOwnedParamCapture(const ast::Expr* src) {
+    llvm::BasicBlock* bb = builder_.GetInsertBlock();
+    if (!bb) return;
+    auto fit = smFrameCaptures_.find(bb->getParent());
+    if (fit == smFrameCaptures_.end()) return;   // not a state-machine body
+    const SmFrameCaptures& fc = fit->second;
+    if (!fc.self || !fc.structTy) return;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(src);
+    if (!id) return;
+    auto* ps = dynamic_cast<sema::ParameterSymbol*>(ctx_.exprSymbol(*id));
+    if (!ps || ps->modifier != "owned") return;
+    auto it = fc.ownedParamField.find(ps);
+    if (it == fc.ownedParamField.end()) return;
+    llvm::Value* fptr =
+        builder_.CreateStructGEP(fc.structTy, fc.self, it->second);
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), fptr);
 }
 
 
@@ -608,7 +645,48 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             ownedParamYieldStates.clear();
         }
     }
-    bool cloneDisposesOwnedCaptures = false;
+    // §29.8 (#973a): does any `owned` parameter carry the CONDITIONAL frame
+    // auto-dispose flag (discharged on some path, every occurrence admitted by
+    // common::stateMachineOwnedParamIsFrameNullable)? For such a parameter the
+    // frame capture slot is the runtime moved-from flag, and the body nulls it
+    // in whichever frame MoveNext is driving. For an `IEnumerable<T>` iterator
+    // that frame is the per-loop CLONE, so the clone must also be the OWNER —
+    // otherwise the source's Dispose would still see its own non-null slot and
+    // free a value the body had already adopted. Reuse the #2154 claim: the
+    // captures move source → clone at GetEnumerator and a second
+    // GetEnumerator raises InvalidOperationException, which is the correct
+    // affine reading anyway (a body that may consume the parameter cannot be
+    // replayed). For an `IEnumerator<T>` iterator GetEnumerator is never
+    // called, the source IS the driven frame, and its own Dispose does the
+    // null-guarded work.
+    bool frameConditionalOwnedParams = false;
+    for (sema::Symbol* sym : ms->params) {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+        if (ps && ps->modifier == "owned" &&
+            ps->iteratorFrameConditionalAutoDispose) {
+            frameConditionalOwnedParams = true;
+            break;
+        }
+    }
+    // Which owned captures does the CLONE take ownership of at GetEnumerator?
+    // Identical to the pre-#973a `hasState` test whenever no conditional
+    // parameter is present, so the #2154 path is bit-for-bit unchanged.
+    auto cloneOwnsParam = [&](sema::ParameterSymbol* ps) {
+        if (!ps || ps->modifier != "owned") return false;
+        // (#2154 part 2) include both the sema-side prototype's assignment
+        // (linear-flat body) AND the codegen-side extended scan (linear body
+        // that descends through `try`).
+        if (ps->iteratorMoveYieldState != 0 ||
+            ownedParamYieldStates.count(ps) != 0)
+            return true;
+        // #973a: once the claim is armed, EVERY owned capture the frame
+        // disposes must move to the clone — leaving one behind would have the
+        // source and the clone dispose the same pointer.
+        return frameConditionalOwnedParams &&
+               (ps->iteratorAutoDispose ||
+                ps->iteratorFrameConditionalAutoDispose);
+    };
+    bool cloneDisposesOwnedCaptures = frameConditionalOwnedParams;
     for (sema::Symbol* sym : ms->params) {
         auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
         if (!ps || ps->modifier != "owned") continue;
@@ -882,13 +960,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             for (std::size_t i = 0; i < frame.captures.size(); ++i) {
                 auto* ps = dynamic_cast<sema::ParameterSymbol*>(
                     frame.captures[i].first);
-                if (!ps || ps->modifier != "owned") continue;
-                // (#2154 part 2) include both the sema-side prototype's
-                // assignment (linear-flat body) AND the codegen-side
-                // extended scan (linear body that descends through `try`).
-                bool hasState = ps->iteratorMoveYieldState != 0 ||
-                    ownedParamYieldStates.count(ps) != 0;
-                if (!hasState) continue;
+                if (!cloneOwnsParam(ps)) continue;
                 unsigned fieldIdx = frame.captureStart + (unsigned)i;
                 gb.CreateStore(llvm::Constant::getNullValue(frame.captures[i].second),
                     gb.CreateStructGEP(stateStructTy, self, fieldIdx));
@@ -1192,8 +1264,14 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // auto-dispose because the clone borrows the captures from the source). The
     // bodies are otherwise identical (same finally chains, same spill free, same
     // state guard). Parameterised by `targetFn` and `disposeOwned`.
+    // `releaseClosures` is deliberately SEPARATE from `disposeOwned`: the frame's
+    // +1 on a closure parameter belongs to the SOURCE frame alone and must be
+    // dropped exactly once, whereas `disposeOwned` also becomes true for the
+    // clone once the owned-capture claim is armed (#2154, and #973a below). They
+    // were the same flag before, so an armed claim had both the source and the
+    // clone release the same closure cell. // per §27.5 / §28.9 (#1864)
     auto emitDisposeBody = [&](llvm::Function* targetFn, bool disposeOwned,
-                               bool stateKeyedOwned) {
+                               bool stateKeyedOwned, bool releaseClosures) {
         currentFn_ = targetFn;
         currentThis_ = nullptr;
         locals_.clear(); paramSlots_.clear(); refParams_.clear();
@@ -1298,7 +1376,17 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                 auto cit = ownedParamYieldStates.find(ps);
                 if (cit != ownedParamYieldStates.end()) yieldState = cit->second;
                 bool semaAutoDispose = ps->iteratorAutoDispose;
-                if (!semaAutoDispose && yieldState == 0) continue;
+                // #973a: a CONDITIONALLY discharged parameter enters the loop
+                // too. It carries no yield state (the two sema shapes are
+                // mutually exclusive: the state-keyed prototype requires every
+                // yield operand to be a bare owned parameter, which the
+                // marked-adoption shape is not), so it takes the pure
+                // null-guard below — and that guard IS its moved-from test,
+                // because the adoption lowering nulled this very slot in the
+                // frame MoveNext was driving.
+                if (!semaAutoDispose && !ps->iteratorFrameConditionalAutoDispose &&
+                    yieldState == 0)
+                    continue;
                 unsigned fieldIdx = frame.captureStart + (unsigned)i;
                 llvm::Value* fptr =
                     builder_.CreateStructGEP(stateStructTy, self, fieldIdx);
@@ -1345,7 +1433,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // env block at rc 0. Owned-class params (disposeOwnedParams) and closure
         // params are disjoint sets, so the two loops never touch the same field.
         auto releaseClosureCaptures = [&]() {
-            if (!disposeOwned) return;
+            if (!releaseClosures) return;
             for (std::size_t i = frame.captures.size(); i-- > 0;) {
                 auto* ps = dynamic_cast<sema::ParameterSymbol*>(
                     frame.captures[i].first);
@@ -1571,11 +1659,25 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // clone/enumerator Dispose does not. For a single-use IEnumerator<T> iterator
     // there is no separate clone, but emitting cloneDisposeFn is harmless (it is
     // never reached) and keeps the vtable layout uniform.
+    //
+    // #2271 item 2 / #973a — why the SOURCE runs with `stateKeyedOwned=false`:
+    // a parameter that enters the loop on `yieldState != 0` alone (sema proved
+    // it discharged) exists only for an `IOwningEnumerable<T>` iterator, whose
+    // only consumption path is `GetOwningEnumerator` (stdlib §4.13) — so the
+    // source is NEVER the driven frame, and the claim above has already nulled
+    // its slots by the time any transfer can have happened. The state guard
+    // would therefore be redundant there, while the null-guard still gives the
+    // right answer in the one remaining case (GetEnumerator never called ⇒
+    // slots live ⇒ dispose once, no leak). The same holds for a #973a
+    // conditional parameter: on the `IEnumerable<T>` path the claim nulls the
+    // source; on the `IEnumerator<T>` path there is no clone, the source IS the
+    // driven frame, and the body's own null is what the guard reads.
     emitDisposeBody(disposeFn, /*disposeOwned=*/true,
-                    /*stateKeyedOwned=*/false);
+                    /*stateKeyedOwned=*/false, /*releaseClosures=*/true);
     emitDisposeBody(cloneDisposeFn,
                     /*disposeOwned=*/cloneDisposesOwnedCaptures,
-                    /*stateKeyedOwned=*/cloneDisposesOwnedCaptures);
+                    /*stateKeyedOwned=*/cloneDisposesOwnedCaptures,
+                    /*releaseClosures=*/false);
 
     // Clear the per-iterator finally / disposal tracking.
     smIterFinallyAtState_.clear();

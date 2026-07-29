@@ -5848,6 +5848,40 @@ private:
     void emitFrameCaptureRestores(const StateMachineFrame& frame,
                                   llvm::Value* self);
 
+    // §29.8 / §30.1 (#973a): per state-machine FUNCTION, the frame pointer its
+    // captures were restored from and the capture-field index of each `owned`
+    // PARAMETER in it. Together they let a discharge lowered inside a
+    // state-machine body write the runtime moved-from flag —
+    // nullStateMachineOwnedParamCapture stores null into the FRAME slot, not
+    // just the restored alloca — so the frame's null-guarded terminal-state
+    // disposal skips a parameter the body moved out on this path.
+    //
+    // Keyed by `llvm::Function*` rather than held as three scalars ON PURPOSE:
+    // emitting a body can recursively emit ANOTHER function (a lazily
+    // monomorphized generic callee, a nested async lambda), and that inner
+    // emission calls emitFrameCaptureRestores too. Scalars would be clobbered
+    // and the OUTER body's later adoption would silently skip its frame null —
+    // a missed moved-from flag is a DOUBLE FREE, not a leak. A per-function map
+    // survives any nesting depth, and the lookup keys on the function being
+    // emitted right now, so a write can only ever land in its own frame. The
+    // Emitter is constructed per module, so the map never outlives the
+    // `llvm::Function*`s it keys on.
+    struct SmFrameCaptures {
+        llvm::Value* self = nullptr;
+        llvm::StructType* structTy = nullptr;
+        std::unordered_map<const sema::Symbol*, unsigned> ownedParamField;
+    };
+    std::unordered_map<const llvm::Function*, SmFrameCaptures> smFrameCaptures_;
+
+    // §29.8 / §30.1 (#973a): null the FRAME capture slot of the `owned`
+    // state-machine parameter named by the bare identifier `src`, if any. A
+    // no-op outside a state-machine body, for a non-parameter/borrow source,
+    // and for a parameter that is not a frame capture. Called beside the #1978
+    // `nullTransferredOwnedLocalSlot` at the marked-adoption lowering — the one
+    // discharge form common::stateMachineOwnedParamIsFrameNullable admits — so
+    // `admitted ⟹ frame slot nulled` is exact.
+    void nullStateMachineOwnedParamCapture(const ast::Expr* src);
+
     // Emit the resume dispatch: a `done` block (returns the kind's "exhausted"
     // value via `emitDone`), N+1 state blocks (entry + one per suspend point),
     // and a switch on the saved state index that targets them. Returns the

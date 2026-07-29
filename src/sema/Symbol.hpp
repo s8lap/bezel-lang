@@ -330,6 +330,17 @@ struct ParameterSymbol : Symbol {
     // Dispose then drops it only while suspended before that state.
     bool iteratorAutoDispose = false;
     unsigned iteratorMoveYieldState = 0;
+    // §29.8 / §30.1 (#973a): set by the ownership pass on an `owned` parameter
+    // of a state-machine method that IS discharged on some path but whose every
+    // occurrence is one of the two forms
+    // common::stateMachineOwnedParamIsFrameNullable admits — so the FRAME's
+    // capture slot is nulled at the (single, marked-adoption) move-out site and
+    // the frame's terminal-state disposal, already null-guarded, becomes an
+    // exact runtime moved-from test: the discharged path skips, the fall-through
+    // path disposes once. Disjoint from `iteratorAutoDispose` (which is the
+    // never-discharged-on-any-path case); codegen's three frame-disposal loops
+    // (sync iterator, async iterator, plain async) admit both flags.
+    bool iteratorFrameConditionalAutoDispose = false;
     // §28.3 v0.150/v0.152 (#1008 Part B, affine auto-drop extended to params):
     // set by the ownership pass on an `owned` parameter of a SYNCHRONOUS, non-
     // iterator, non-destructor method that is never discharged on any path
