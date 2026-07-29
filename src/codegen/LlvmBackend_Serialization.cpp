@@ -574,6 +574,34 @@ void Emitter::emitSerializeField(llvm::Value* val,
         return;
     }
 
+    // §9.8 v0.228 (issue #1065): a non-owning inline array [N]T is a standard
+    // sequence component, encoded exactly like a heap collection would be —
+    // BeginArray(N), each element via a recursive emitSerializeField, EndArray
+    // — except N is compile-time-constant (§15.1), so the element loop
+    // unrolls rather than reading a runtime Count. `val` is the raw LLVM
+    // ArrayType VALUE embedded in the record's struct (an inline array is a
+    // value type stored inline, not a heap pointer) — the same shape
+    // emitInlineArrayEquality consumes for auto-equality (§9.2).  An OWNING
+    // inline array never reaches here: isSerializationEligibleType rejects it
+    // (§9.8 record clause admits only "a non-owning inline array"), so a
+    // `serializedClass`/record component of that shape is already a compile
+    // error at the conformance declaration — this is defensive.
+    if (fieldTy->kind == K::InlineArray && !fieldTy->arrayOwned &&
+        fieldTy->arrayElement && val->getType()->isArrayTy()) {
+        auto* arrTy = llvm::cast<llvm::ArrayType>(val->getType());
+        unsigned n = static_cast<unsigned>(arrTy->getNumElements());
+        auto* beginFn = declareC("bz_binser_begin_array", voidTy,
+                                 {ptrTy(), i32()});
+        builder_.CreateCall(beginFn, {serPtr, builder_.getInt32(n)});
+        for (unsigned i = 0; i < n; ++i) {
+            llvm::Value* elem = builder_.CreateExtractValue(val, {i});
+            emitSerializeField(elem, fieldTy->arrayElement, serPtr);
+        }
+        auto* endFn = declareC("bz_binser_end_array", voidTy, {ptrTy()});
+        builder_.CreateCall(endFn, {serPtr});
+        return;
+    }
+
     if (fieldTy->kind == K::Named && fieldTy->declaration) {
         const TypeSymbol* fieldTs = fieldTy->declaration;
 
@@ -1285,6 +1313,47 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
         default:
             return nullptr;
         }
+    }
+
+    // §9.8 v0.228 (issue #1065): a non-owning inline array [N]T — the mirror
+    // of the emitSerializeField branch above. N is compile-time-constant
+    // (arraySizeValue, folded by sema per §15.1), so the reconstruction
+    // materializes element-by-element into a stack alloca and loads the
+    // aggregate back, exactly the pattern LlvmBackend_Assign.cpp's inline-
+    // array-typed call-argument collection-literal path already uses (#1382)
+    // — inline arrays are value types, so no disposal registration is
+    // needed. BeginArray()/EndArray() still bracket the read (consuming the
+    // wire's own count prefix / '['..']' delimiters per stdlib §2.15) even
+    // though the loop itself is driven by the DECLARED size N, not the wire
+    // count: a truncated or malformed wire array is a structural fault the
+    // per-element reads surface as SerializationException (e.g. an
+    // out-of-data primitive read), consistent with §9.8's "a type mismatch
+    // ... raises SerializationException unconditionally".
+    if (fieldTy->kind == K::InlineArray && !fieldTy->arrayOwned &&
+        fieldTy->arrayElement && fieldTy->arraySizeValue >= 0) {
+        llvm::Type* voidTy = llvm::Type::getVoidTy(llvm_);
+        llvm::Type* elemLlvmTy = lowerTypeRef(fieldTy->arrayElement);
+        auto n = static_cast<unsigned>(fieldTy->arraySizeValue);
+        if (elemLlvmTy) {
+            auto* arrLlvmTy = llvm::ArrayType::get(elemLlvmTy, n);
+            auto* beginFn = declareC("bz_binder_begin_array", i32(), {ptrTy()});
+            builder_.CreateCall(beginFn, {derPtr}, "deser.arr.n");
+            llvm::AllocaInst* slot = entryAlloca(arrLlvmTy);
+            builder_.CreateStore(llvm::ConstantAggregateZero::get(arrLlvmTy), slot);
+            for (unsigned i = 0; i < n; ++i) {
+                llvm::Value* elemVal =
+                    emitDeserializeField(fieldTy->arrayElement, derPtr);
+                if (!elemVal) continue;
+                llvm::Value* gep = builder_.CreateGEP(
+                    arrLlvmTy, slot,
+                    {builder_.getInt32(0), builder_.getInt32(i)});
+                builder_.CreateStore(elemVal, gep);
+            }
+            auto* endFn = declareC("bz_binder_end_array", voidTy, {ptrTy()});
+            builder_.CreateCall(endFn, {derPtr});
+            return builder_.CreateLoad(arrLlvmTy, slot, "deser.inlinearr");
+        }
+        return nullptr;
     }
 
     if (fieldTy->kind == K::Named && fieldTy->declaration) {

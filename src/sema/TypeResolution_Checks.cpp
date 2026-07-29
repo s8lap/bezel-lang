@@ -4901,11 +4901,16 @@ void Resolver::checkVarianceMarkerScope() {
 //   - A Shared<T> or Weak<T> whose element T is an eligible component type
 //     (§9.8 v0.141): Shared<T> serializes as an identity participant
 //     ($id/$ref), Weak<T> as a back-reference ($ref)
+//   - A non-owning inline array [N]T whose element type is eligible (§9.8
+//     v0.228, issue #1065): encoded like any other standard sequence
+//     collection (BeginArray(N)/per-element/EndArray)
 // NOT eligible:
 //   - A class without a `serialized tree`/`graph`/`cyclic` clause
 //   - A record that does not itself declare ISerializable/IDeserializable
 //   - Any other Named type (interface, etc.)
-//   - Function, inline-array, unit types
+//   - An OWNING inline array ([N owned]T) — no spec text admits it (§9.8
+//     v0.228, issue #1065)
+//   - Function, unit types
 //
 // A field marked `serialized skip` is excluded from the component set and does
 // not disqualify the type (§9.8).
@@ -4923,6 +4928,39 @@ void Resolver::checkVarianceMarkerScope() {
 // `Weak<T>`-typed components are therefore eligible only when the containing
 // type is a class, never a record (interface-typed components are already
 // unconditionally ineligible below, satisfying the same rule for records).
+// Codegen restriction helper for the InlineArray branch of
+// isSerializationEligibleType below (issue #1065 follow-up, filed): true when
+// `tr` is a `string`, OR a Named record/choice/class (which may itself carry
+// a `string` component, transitively) — i.e. a shape that MAY carry a
+// runtime-managed reference the record-scope-end release walk
+// (LlvmBackend_impl.hpp recordHasStringFields / emitRecordStringFieldReleases,
+// fix #1747) would need to reach through an inline array to release, but
+// currently does not (that walk inspects only a record's own DIRECT storage
+// members' kind). Deliberately conservative — it excludes every Named
+// element type rather than attempting the transitive "does this nested
+// record contain a string" walk, which is future work once the release walk
+// itself is extended to recurse into inline arrays (tracked in the filed
+// follow-up). Primitives-other-than-string, enums, and nested non-owning
+// inline arrays of the same carry no such obligation and are unaffected.
+static bool typeRiskingUnreleasedStringInInlineArray(const TypeRef* tr) {
+    if (!tr) return false;
+    using K = TypeRef::Kind;
+    if (tr->kind == K::Primitive)
+        return tr->primitive == PrimitiveType::String;
+    if (tr->kind == K::InlineArray)
+        return typeRiskingUnreleasedStringInInlineArray(tr->arrayElement);
+    if (tr->kind == K::Named) {
+        // A resolved Named type is a record, enum, choice, or class; only an
+        // enum is guaranteed string-free (its representation is an integer,
+        // §10.3). Everything else (record/choice/class, and an unresolved
+        // Named with no declaration, e.g. Shared<T>/Weak<T>) is excluded
+        // conservatively.
+        return !(tr->declaration &&
+                 tr->declaration->kind == ast::TypeDeclKind::Enum);
+    }
+    return false;
+}
+
 static bool isSerializationEligibleType(
         const TypeRef* tr,
         std::unordered_set<const TypeSymbol*>& visited,
@@ -4955,6 +4993,43 @@ static bool isSerializationEligibleType(
                 return false;
         }
     }
+    // §9.8 (v0.228, issue #1065): a non-owning inline array `[N]T` is a
+    // serialization-eligible standard sequence collection when its element
+    // type is eligible — "or a standard sequence collection (Array<T>,
+    // OwningArray<T>, LinkedList<T>, etc., and inline arrays [N]T) whose
+    // element type is serialization-eligible (encoded with
+    // BeginArray/EndArray)". Record-admissibility (the record clause, same
+    // section) further requires the array be NON-OWNING: "a non-owning
+    // inline array [N]T/[N]T? of record-admissible element type" — an
+    // owning inline array (`[N owned]T`) is a move-only value type with a
+    // per-element disposal obligation that BeginArray/EndArray's plain
+    // element-encoding does not model, and no spec text admits it as a
+    // component in either the record or the class list, so it is rejected
+    // here for both (simplest reading of an otherwise-silent case; recorded
+    // per CLAUDE.md rule 4 — see issue #1065 for the record of this choice).
+    if (tr->kind == K::InlineArray) {
+        if (tr->arrayOwned) return false;
+        if (!tr->arrayElement) return false;
+        // Codegen restriction (issue #1065 follow-up, filed): the synthesized
+        // Deserialize's element-materialization loop (LlvmBackend_Serialization.cpp)
+        // constructs the inline array via a raw GEP-store loop that bypasses the
+        // `recordHasStringFields`/`emitRecordStringFieldReleases` retain/release
+        // bookkeeping (LlvmBackend_impl.hpp, fix #1747) — that bookkeeping only
+        // inspects a record's DIRECT storage members' kind (Primitive/String), so
+        // it does not see a `string` (or a string-bearing record/choice) nested
+        // inside an inline-array component. Admitting such an element type here
+        // would synthesize a Deserialize that leaks every array-element string on
+        // the caller's scope exit (verified: a `[N]string` field leaks 2
+        // allocations per round-trip under ASan/LSan). Excluded here, conservatively,
+        // until that retain/release walk is extended to recurse into inline
+        // arrays; primitives-other-than-string, enums, and nested non-owning
+        // inline arrays thereof carry no such obligation and are unaffected.
+        if (typeRiskingUnreleasedStringInInlineArray(tr->arrayElement))
+            return false;
+        return isSerializationEligibleType(tr->arrayElement, visited, ctx,
+                                            forRecordComponent);
+    }
+
     if (tr->kind != K::Named) return false;
 
     // §9.8 (v0.141): Shared<T> and Weak<T> are serialization-eligible component
