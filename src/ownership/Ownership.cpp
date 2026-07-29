@@ -7945,7 +7945,10 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
         // the constructor-body path applies. A NARROW check only. // per §28.6
         if (fd->initializer) {
             MethodOwnership mo(ctx);
-            mo.checkFieldInitializer(*fd);
+            // §9.7 / §9.1 (#1251): the declaring type's kind scopes the §9.7
+            // borrow-bearing-storage leg to a CLASS instance field (a record's
+            // own component is not one).
+            mo.checkFieldInitializer(*fd, enclosingType);
             // §28.3 SB01-B (v0.190, #1926): a field INITIALIZER expression can
             // embed a lambda (`f: (Task<int>) -> Task<int> := (t) => t;`) that
             // the block/expr method-body drivers never reach — the initializer

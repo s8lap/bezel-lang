@@ -4365,11 +4365,71 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
     // `isNullSourceChoiceExpr` (#2209) for the same reason the record branch
     // uses `isNullSourceRecordExpr`: an `Opt.None` / `Choice.Empty` / explicit
     // `Borrowed(null)` payload admits the storage. Two distinct diagnostics
-    // so the message names the carrier kind. // per §9.7, §35.4
-    if (dest == Dest::Field) {
+    // so the message names the carrier kind.
+    //
+    // §9.7 / §4.14 / §4.15 (issue #1251): the builtin SPAN face. `Span<T>`,
+    // `ReadOnlySpan<T>` (stdlib §4.14) and `ArraySpan<T>`,
+    // `ReadOnlyArraySpan<T>` (stdlib §4.15) are declared in the stdlib as
+    // records over a class-typed backing store (`Buffer: OwningBuffer<T>` /
+    // `Source: Array<T>`), so they are borrow-bearing records by §9.7's own
+    // definition — indeed §9.7 names one as the CANONICAL case of this very
+    // bullet ("may be consumed through access paths with no per-access
+    // disposed-flag check (a span's buffer window is the canonical case)").
+    // But a builtin span has no user Record TypeDecl, so `isBorrowBearing
+    // Record` — which requires one — never classified it and a BARE span RHS
+    // slipped through this leg entirely: `class Box public f: ArraySpan<int>;`
+    // with `box.f := buf.AsSpan();` compiled clean and SEGV'd at runtime once
+    // the backing buffer was disposed. `isBorrowBearingRecordOrSpan` is the
+    // predicate that already names the builtin spans for the §30.1 async and
+    // §9.7 return-escape legs; using it here closes the field-store leg with
+    // the same authority. (A record that merely CONTAINS a span field was
+    // already covered — recordFieldIsBorrowCarrying classifies a span field,
+    // #2127; this is the bare-span RHS.)
+    //
+    // No null-source exemption applies on the span leg: §9.7's exception is
+    // "every borrow component `null`", and a span's backing-store field is
+    // non-nullable (stdlib §4.14/§4.15) — there is no null-source span. (The
+    // recognizer agrees: isNullSourceRecordExpr requires a `new Rec(...)` of
+    // a user Record TypeDecl, which a builtin span never has.) A separate
+    // diagnostic names the span and its backing store so the remedy is the
+    // concrete one, matching the span/record split the §9.7 return-escape
+    // wording already draws. // per §9.7, §4.14, §4.15
+    //
+    // §9.7 / §9.1 (issue #1251): the whole leg is scoped by
+    // `storeTargetIsClassField` to a CLASS (or interface) instance field. The
+    // bullet's own words are "an instance field of a **class**", and its
+    // premise is that a class instance's lifetime is not bounded by any borrow
+    // source's scope. A RECORD's own component is a different thing: the record
+    // is a value, reached only through itself, and §9.7's transitivity clause
+    // makes a borrow-carrying record component exactly what defines a
+    // borrow-bearing record. Without the scope, a borrow-bearing BODY record
+    // was unconstructible — its constructor's `v := x;` (a bare implicit-`this`
+    // field write) was rejected, while §9.1's synthesized primary constructor
+    // for the identical positional record was free to do the same store.
+    if (dest == Dest::Field && storeTargetIsClassField(*as.target)) {
         const sema::TypeRef* rhsType = ctx_.exprType(*as.value);
         const bool rhsIsRecord = isBorrowBearingRecord(rhsType);
-        const bool rhsIsChoice = !rhsIsRecord && isBorrowBearingChoice(rhsType);
+        const bool rhsIsSpan =
+            !rhsIsRecord && isBorrowBearingRecordOrSpan(rhsType);
+        const bool rhsIsChoice =
+            !rhsIsRecord && !rhsIsSpan && isBorrowBearingChoice(rhsType);
+        if (rhsIsSpan) {
+            report(
+                Severity::Error, as.span.begin,
+                std::string(
+                    "a span may not be stored in an instance field of a "
+                    "class — a span (§4.14/§4.15) is a borrow-bearing record "
+                    "over its backing Array / OwningBuffer, and a class "
+                    "instance's lifetime is not bounded by that backing "
+                    "store's scope; a span's buffer window is read with no "
+                    "per-access disposed-flag check, so the checked-mode "
+                    "trust regime that covers a direct class-typed borrow "
+                    "field does not apply here (§9.7; store the backing "
+                    "store instead — e.g. an `owned OwningBuffer<T>` or "
+                    "`owned Array<T>` field — and re-derive the span with "
+                    "`AsSpan()` at the use site)"));
+            return true;
+        }
         if ((rhsIsRecord && !isNullSourceRecordExpr(*as.value)) ||
             (rhsIsChoice && !isNullSourceChoiceExpr(*as.value))) {
             report(
@@ -7348,6 +7408,36 @@ bool MethodOwnership::targetIsOwnedField(const ast::Expr& target) const {
     return exprIsOwnedFieldRead(target);
 }
 
+// §9.7 / §9.1 (issue #1251): see the header for the rule. Reads the declaring
+// type of the member the target names — sema attaches the FieldSymbol /
+// PropertySymbol to both the `obj.f` member-access form and the bare
+// implicit-`this` identifier form — and answers "is this storage owned by a
+// class (or interface) instance?". A record's component answers false; so does
+// a choice's. An unresolvable target answers true, keeping the conservative
+// rejection for a shape this structural check cannot classify. // per §9.7
+bool MethodOwnership::storeTargetIsClassField(const ast::Expr& target) const {
+    const sema::TypeSymbol* owner = nullptr;
+    if (auto* ms = dynamic_cast<sema::MemberSymbol*>(ctx_.exprSymbol(target)))
+        owner = ms->parent;
+    if (!owner) {
+        // Fallback for a member access whose member symbol sema did not attach
+        // (e.g. an inherited or interface-dispatched member): classify by the
+        // RECEIVER's static type instead. `this.f` / `obj.f` / `C.f` all carry
+        // a resolved receiver type; anything else stays unclassified.
+        if (const auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(&target)) {
+            if (ma->target) {
+                const sema::TypeRef* rt = ctx_.exprType(*ma->target);
+                if (rt && rt->kind == sema::TypeRef::Kind::Named)
+                    owner = rt->declaration;
+            }
+        }
+    }
+    if (!owner) return true;  // unclassified → keep the rejection
+    return owner->kind == ast::TypeDeclKind::Class ||
+           owner->kind == ast::TypeDeclKind::Interface;
+}
+
 // #1020 / §28.6 (v0.153): a non-`owned` (borrow) field target. See the header.
 bool MethodOwnership::targetIsNonOwnedField(const ast::Expr& target) const {
     // Only a member access `obj.f` or a bare identifier resolving to a field
@@ -7395,7 +7485,8 @@ void MethodOwnership::checkGetterFreshOwnedReturn(const ast::Expr& e) {
 // initializer (producerState == Borrowed) is the legitimate back-reference
 // store and is not flagged. The diagnostic wording matches the constructor-body
 // counterpart so the two positions read identically. // per §28.6
-void MethodOwnership::checkFieldInitializer(const ast::FieldDecl& fd) {
+void MethodOwnership::checkFieldInitializer(const ast::FieldDecl& fd,
+                                            const ast::TypeDecl* enclosingType) {
     if (!fd.initializer) return;
     // Scope: INSTANCE fields only. A STATIC field follows the §22.13 static-init
     // model (its initializer runs at first-use, its value lives for the program
@@ -7421,12 +7512,47 @@ void MethodOwnership::checkFieldInitializer(const ast::FieldDecl& fd) {
     // a borrow-typed `local`) is rejected, with the same null-source
     // exception the record leg uses (an `Opt.None` payload-free case, or an
     // `Opt.Some(null)` with the borrow-carrying payload null, is admitted).
-    {
+    //
+    // §9.7 / §4.14 / §4.15 (issue #1251): the builtin SPAN face, in lockstep
+    // with checkBorrowStoreEscape's assignment-site leg — a field declared
+    // `f: ArraySpan<int> := …` is the same §9.7 instance-field store at the
+    // initializer position, and the same `isBorrowBearingRecord` gap let it
+    // through. No null-source exemption on the span leg (a span's backing-store
+    // field is non-nullable).
+    //
+    // §9.7 / §9.1 (issue #1251): the whole leg is scoped to a CLASS (or
+    // interface) declaring type, in lockstep with the assignment site's
+    // `storeTargetIsClassField` — §9.7's bullet says "an instance field of a
+    // **class**", and a RECORD's own borrow-carrying component is exactly what
+    // §9.7's transitivity clause defines as making the record borrow-bearing.
+    // A null `enclosingType` keeps the leg enabled (conservative). // per §9.7
+    const bool enclosingIsClass =
+        !enclosingType || enclosingType->kind == ast::TypeDeclKind::Class ||
+        enclosingType->kind == ast::TypeDeclKind::Interface;
+    if (enclosingIsClass) {
         const sema::TypeRef* fieldType =
             fd.type ? ctx_.resolvedType(*fd.type) : nullptr;
         const bool initIsRecord = isBorrowBearingRecord(fieldType);
+        const bool initIsSpan =
+            !initIsRecord && isBorrowBearingRecordOrSpan(fieldType);
         const bool initIsChoice =
-            !initIsRecord && isBorrowBearingChoice(fieldType);
+            !initIsRecord && !initIsSpan && isBorrowBearingChoice(fieldType);
+        if (initIsSpan) {
+            report(
+                Severity::Error, fd.initializer->span.begin,
+                std::string("a span may not be stored in the instance field `") +
+                std::string(fd.name) +
+                "` — a span (§4.14/§4.15) is a borrow-bearing record over its "
+                "backing Array / OwningBuffer, and a class instance's lifetime "
+                "is not bounded by that backing store's scope; a span's buffer "
+                "window is read with no per-access disposed-flag check, so the "
+                "checked-mode trust regime that covers a direct class-typed "
+                "borrow field does not apply here (§9.7; store the backing "
+                "store instead — e.g. an `owned OwningBuffer<T>` or `owned "
+                "Array<T>` field — and re-derive the span with `AsSpan()` at "
+                "the use site)");
+            return;
+        }
         if ((initIsRecord && !isNullSourceRecordExpr(*fd.initializer)) ||
             (initIsChoice && !isNullSourceChoiceExpr(*fd.initializer))) {
             report(

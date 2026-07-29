@@ -202,7 +202,16 @@ public:
     // `owned`-field path. checkAutoPropertyInitializer covers an auto-property's
     // generated backing field, which has no `owned` declaration form (§23.1).
     // Both checks exempt static storage (§22.13), and are NARROW checks only.
-    void checkFieldInitializer(const ast::FieldDecl& fd);
+    //
+    // `enclosingKind` (issue #1251) is the kind of the type that DECLARES `fd`.
+    // §9.7's storage bullet is scoped to "an instance field of a **class**", so
+    // the borrow-bearing record / span / choice leg must not fire on a RECORD's
+    // own component initializer — a record component of borrow-bearing type is
+    // exactly what §9.7's transitivity clause contemplates as legal. Null (the
+    // default) keeps the leg enabled, the conservative reading for a caller
+    // that cannot name the declaring type. // per §9.7
+    void checkFieldInitializer(const ast::FieldDecl& fd,
+                               const ast::TypeDecl* enclosingType = nullptr);
     void checkAutoPropertyInitializer(const ast::PropertyDecl& pd);
 
     // §28.3 SB01-B (v0.190, #1919/#1926): the callee-side borrow-return
@@ -1325,6 +1334,25 @@ private:
     // check (issue #402) can skip a borrow source #386 has already flagged and
     // avoid a duplicate diagnostic for the same store. // per §28.3
     bool checkBorrowStoreEscape(const ast::AssignmentStmt& as);
+
+    // §9.7 (issue #1251): true when an assignment TARGET classified as a field
+    // write names storage owned by a CLASS or INTERFACE instance, as opposed to
+    // a component of a RECORD value. §9.7's storage bullet is scoped to "an
+    // instance field of a **class**" — a class instance's lifetime is not
+    // bounded by any borrow source's scope, which is the whole premise of the
+    // rejection. A record is a VALUE: its components are reached only through
+    // the record value itself, which is subject to §9.7's rules at its own use
+    // sites, and §9.7's transitivity clause explicitly contemplates a record
+    // whose field is borrow-carrying (that is what MAKES it borrow-bearing).
+    // Rejecting a record's own component store would make a borrow-bearing body
+    // record unconstructible — `record SpanBox public v: ArraySpan<int>;
+    // constructor(x: ArraySpan<int>) v := x; end constructor;` — which the
+    // equivalent positional form (§9.1's synthesized primary constructor) is
+    // free to do. Resolves the target's member symbol (sema attaches it to both
+    // `obj.f` and the bare implicit-`this` form) and reads its declaring type's
+    // kind; an unresolvable target keeps the rejection, the conservative
+    // reading. // per §9.7, §9.1
+    bool storeTargetIsClassField(const ast::Expr& target) const;
 
     // §28.11 "Storing a borrow" (v0.180, #1539) — the borrowing-collection
     // store rule. Storing a class-typed borrow into a BORROWING collection
