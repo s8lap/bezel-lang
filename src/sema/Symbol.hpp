@@ -135,6 +135,21 @@ struct TypeSymbol : Symbol {
     // recorded here for codegen to lower the enum to the correct integer type
     // instead of the hardcoded i32.
     TypeRef* enumUnderlyingType = nullptr;
+    // #1488 / §2.1 / §2.8.3 rule 3: the declaring module's full dotted name
+    // (`module BankingApp.Transactions;` -> "BankingApp.Transactions"), the
+    // module-identity component of this type's program-wide identity ("a type
+    // is identified program-wide by its declaring module name, its qualified
+    // type name ..., and its generic arity"). Populated at symbol-creation
+    // time for BOTH local types (SymbolCollection::collectTypeDecl, from the
+    // enclosing ModuleDecl) and imported types (ModuleLoader, from the
+    // dependency's ModuleMetadata::moduleName) so the two sides always agree.
+    // Codegen (Emitter::mangledTypeName) reads this to qualify every emitted
+    // symbol name by module, so two modules exporting a same-named public
+    // type no longer collide at link time (`multiple definition of
+    // bz$Tx$Hello`) — the bug #1488 describes. Empty only for a synthetic
+    // TypeSymbol with no real module (builtins materialized on demand,
+    // ts->decl == nullptr); those are never part of the cross-module ABI.
+    std::string moduleName;
 };
 
 // A.2 TypeAliasDecl — its target type is resolved by Type Resolution.

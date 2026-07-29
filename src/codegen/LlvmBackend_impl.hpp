@@ -3513,6 +3513,29 @@ private:
     // other static method gets a mangled, collision-free name.
     std::string functionName(sema::MethodSymbol* ms);
 
+    // #1488 / §2.8.3 rule 3: the module-qualified mangling name for a type —
+    // "<declaring-module>.<TypeName>" — used as the `<Class>` component
+    // everywhere a "bz$"/"vt$"/"td$"/... symbol name is built from a
+    // sema::TypeSymbol. Two modules exporting a same-named public type (e.g.
+    // both declaring `public class Tx`) previously mangled identically
+    // ("bz$Tx$Hello" from both), which the linker rejected as a multiple
+    // definition (issue #1488) and which — even before the link step — made
+    // one compilation's OWN two external declarations of the same bare name
+    // collide (LLVM auto-uniquifying the second as "bz$Tx$Hello.1", a symbol
+    // that exists nowhere). Qualifying by the declaring module — carried on
+    // every TypeSymbol as `moduleName`, populated identically for a local
+    // declaration (SymbolCollection) and an imported one (ModuleLoader) so
+    // the exporter's definition and every importer's external declaration
+    // agree — makes every such symbol program-wide unique, matching
+    // §2.8.3 rule 3's identity ("declaring module name, ... qualified type
+    // name, and generic arity"). `ts` is never null at a genuine call site;
+    // the guard only covers a defensive/degenerate caller.
+    static std::string mangledTypeName(const sema::TypeSymbol* ts) {
+        if (!ts) return "";
+        if (ts->moduleName.empty()) return std::string(ts->name);
+        return ts->moduleName + "." + std::string(ts->name);
+    }
+
     // §26 (#433): is `ms` an extension method (declared in an `extension`
     // block)? Such a method has no `parent` TypeSymbol; its receiver type is
     // the extension's targetType.

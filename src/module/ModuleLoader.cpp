@@ -287,6 +287,11 @@ struct Loader {
         t->modifiers = intern(td.modifiers);
         t->scope = parent.memberScope;
         t->memberScope = ctx.newScope();
+        // #1488: a nested type declares in the same module as its enclosing
+        // type (§11.6 — nesting is not a separate module), so it inherits the
+        // parent's already-populated moduleName rather than needing its own
+        // MetaModule lookup.
+        t->moduleName = parent.moduleName;
         // §9.2 (issue #501): propagate positional-record flag.
         t->hasPositionalFields = td.hasPositionalFields;
         t->invariantContracts = toContractRecords(td.invariants);
@@ -1418,6 +1423,14 @@ static void loadMetadataPass1(
         // TypeSymbol::hasPositionalFields (no ast::TypeDecl exists for imported types).
         t->hasPositionalFields = td.hasPositionalFields;
         t->invariantContracts = toContractRecords(td.invariants);
+        // #1488 / §2.8.3 rule 3: this type's declaring-module identity, as
+        // reconstructed from the dependency's own metadata — the far side of
+        // the pairing with SymbolCollection::collectTypeDecl's local
+        // population. Both sides read `md.moduleName`'s equivalent (the local
+        // side via the ModuleDecl, this side directly from the artifact), so
+        // an importer's external symbol declarations and the exporter's
+        // definitions always agree.
+        t->moduleName = md.moduleName;
         localTypes[td.name] = t;
         created.push_back(t);
         ctx.registerImportedType(md.moduleName, t);

@@ -23,6 +23,31 @@ std::string_view moduleSymbolName(const ast::QualifiedName* qn) {
     return qn->parts.back();
 }
 
+// #1488 / §2.1 / §2.8.3 rule 3: the module's FULL dotted name
+// ("BankingApp.Transactions"), as opposed to moduleSymbolName's leaf-only
+// symbol name above. This is the module-identity component every TypeSymbol
+// carries in TypeSymbol::moduleName, so codegen can qualify emitted symbol
+// names and two modules' same-named public types never collide at link
+// time. Mirrors ModuleMetadataBuilder::moduleNameFor's identical
+// reconstruction (needed there for the exported interface's module
+// identity) — duplicated in miniature here rather than shared, since
+// SymbolCollection (sema/) runs before and has no dependency on the
+// module/ layer.
+std::string moduleDottedName(const ModuleSymbol* mod) {
+    if (!mod) return {};
+    if (auto* decl = dynamic_cast<const ast::ModuleDecl*>(mod->decl)) {
+        if (decl->name && !decl->name->parts.empty()) {
+            std::string out;
+            for (std::size_t i = 0; i < decl->name->parts.size(); ++i) {
+                if (i) out += '.';
+                out += std::string(decl->name->parts[i]);
+            }
+            return out;
+        }
+    }
+    return std::string(mod->name);
+}
+
 // §3.4 (#1081): the PascalCase primitive-alias library type names are RESERVED —
 // a user type (class/record/enum/interface/type alias) may not be declared with
 // one of these names. Each names a compiler-known primitive value type (or
@@ -218,6 +243,11 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
     sym->visibility = td.visibility;
     sym->modifiers = td.modifiers;
     sym->decl = &td;
+    // #1488: the declaring (local, current-compilation) module's full dotted
+    // name — see TypeSymbol::moduleName. collectTypeDecl runs for both
+    // top-level and nested type declarations, and ctx.module() is already set
+    // by collectSymbols before either kind is collected.
+    sym->moduleName = moduleDottedName(ctx.module());
     // fix #1761: copy the AST declaration's source location onto the symbol
     // so diagnostics keyed on t->declLoc / m->declLoc point at the actual
     // declaration site rather than reporting 0:0. The parser now stamps

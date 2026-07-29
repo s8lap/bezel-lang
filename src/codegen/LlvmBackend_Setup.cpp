@@ -75,12 +75,26 @@ std::string Emitter::functionName(sema::MethodSymbol* ms) {
     // class method `bz$<Class>$M` never aliases an extension `M`.
     if (isExtensionMethod(ms)) {
         std::string tgt = "?";
-        if (const ast::Type* tt = ms->extensionDecl->targetType.get())
+        if (const ast::Type* tt = ms->extensionDecl->targetType.get()) {
+            // #1488: when the target resolves to a real declared type (class/
+            // interface/record — anything with a TypeSymbol), qualify by its
+            // declaring module so two modules each extending a same-named
+            // target (or a local extension colliding with an imported one)
+            // don't mangle identically. A primitive/builtin target (`extension
+            // int`) has no TypeSymbol/module to qualify by; it keeps the bare
+            // spelling — a residual extension-on-primitive collision across
+            // modules is a known, separately-tracked gap (see #1488 follow-up).
+            if (const sema::TypeRef* rt = ctx_.resolvedType(*tt);
+                rt && rt->declaration) {
+                return "bz$ext$" + mangledTypeName(rt->declaration) + "$" +
+                       std::string(ms->name);
+            }
             if (tt->name && !tt->name->parts.empty())
                 tgt = std::string(tt->name->parts.back());
+        }
         return "bz$ext$" + tgt + "$" + std::string(ms->name);
     }
-    std::string cls = ms->parent ? std::string(ms->parent->name) : "";
+    std::string cls = ms->parent ? mangledTypeName(ms->parent) : "";
     // §25: an operator's name is empty; build a unique, collision-free
     // name from its token (a type may declare several operators).
     if (ms->isOperator)
@@ -495,7 +509,7 @@ void Emitter::declareStatics() {
         if (!fs || !isStaticField(fs)) continue;
         auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
         llvm::Type* ty = fd ? lowerType(fd->type.get()) : i32();
-        std::string cls = fs->parent ? std::string(fs->parent->name) : "";
+        std::string cls = fs->parent ? mangledTypeName(fs->parent) : "";
         // §2.5 / §2.6 step 4 (issue #328 FINDING [3] BUG B): a static field's
         // storage global is part of the module's exported, externally-linkable
         // surface — an importer references it by its mangled name. Emit it with
@@ -531,7 +545,7 @@ void Emitter::declareStatics() {
         if (!ps || !isStaticAutoProperty(ps)) continue;
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
         llvm::Type* ty = (pd && pd->type) ? lowerType(pd->type.get()) : i32();
-        std::string cls = ps->parent ? std::string(ps->parent->name) : "";
+        std::string cls = ps->parent ? mangledTypeName(ps->parent) : "";
         // §23.1 (#1146): a static auto-property may carry an inline initializer
         // (`static readonly property Total: int := 42`). Encode a CONSTANT
         // initializer as the global's LLVM initializer (mirroring a static
@@ -585,7 +599,7 @@ void Emitter::declareStatics() {
         if (!fs || !isStaticField(fs) || staticGlobals_.count(fs)) continue;
         sema::TypeRef* tr = ctx_.importedMemberType(fs);
         llvm::Type* ty = tr ? lowerTypeRef(tr) : i32();
-        std::string cls = fs->parent ? std::string(fs->parent->name) : "";
+        std::string cls = fs->parent ? mangledTypeName(fs->parent) : "";
         auto* gv = new llvm::GlobalVariable(
             *module_, ty, /*isConstant=*/false,
             llvm::GlobalValue::ExternalLinkage,
@@ -1074,7 +1088,7 @@ void Emitter::declareFunctions() {
         }
         auto* fnType = llvm::FunctionType::get(
             llvm::Type::getVoidTy(llvm_), paramTys, /*isVarArg=*/false);
-        std::string cls = cs->parent ? std::string(cs->parent->name) : "";
+        std::string cls = cs->parent ? mangledTypeName(cs->parent) : "";
         auto* fn = llvm::Function::Create(
             fnType, llvm::Function::ExternalLinkage, "bz$" + cls + "$ctor",
             module_.get());
@@ -1143,7 +1157,7 @@ void Emitter::declareFunctions() {
         if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym.get())) {
             if (!cs->isStatic) continue;
             if (!dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) continue;
-            std::string cls = cs->parent ? std::string(cs->parent->name) : "";
+            std::string cls = cs->parent ? mangledTypeName(cs->parent) : "";
             auto* fn = llvm::Function::Create(
                 voidFnType, llvm::Function::ExternalLinkage,
                 "bz$" + cls + "$cctor", module_.get());
@@ -1186,7 +1200,7 @@ void Emitter::declareFunctions() {
             fnType,
             synthesizedBuiltin ? llvm::Function::InternalLinkage
                                : llvm::Function::ExternalLinkage,
-            "bz$" + std::string(ts->name) + "$Dispose", module_.get());
+            "bz$" + mangledTypeName(ts) + "$Dispose", module_.get());
         disposerFns_[ts] = fn;
         // §2.5 / §2.6 / §28.4 step 3 (issue #328 / #103): the DisposeCore (the
         // unguarded destructor + owned-field disposal + base-core chain) is
@@ -1203,7 +1217,7 @@ void Emitter::declareFunctions() {
             fnType,
             exportedCore ? llvm::Function::ExternalLinkage
                          : llvm::Function::InternalLinkage,
-            "bz$" + std::string(ts->name) + "$DisposeCore", module_.get());
+            "bz$" + mangledTypeName(ts) + "$DisposeCore", module_.get());
         disposerCoreFns_[ts] = coreFn;
 
         // §2.5 / §2.6 / §22.8 (issue #328 item 2+3): a PUBLIC, non-generic class
@@ -1219,7 +1233,7 @@ void Emitter::declareFunctions() {
             ts->genericParams.empty()) {
             auto* initFn = llvm::Function::Create(
                 fnType, llvm::Function::ExternalLinkage,
-                "bz$" + std::string(ts->name) + "$init", module_.get());
+                "bz$" + mangledTypeName(ts) + "$init", module_.get());
             initFns_[ts] = initFn;
         }
     }
@@ -1254,7 +1268,7 @@ void Emitter::declareFunctions() {
                 llvm::Type::getVoidTy(llvm_), {ptrTy()}, /*isVarArg=*/false);
             auto* fn = llvm::Function::Create(
                 fnType, llvm::Function::ExternalLinkage,
-                "bz$" + std::string(ts->name) + "$Dispose", module_.get());
+                "bz$" + mangledTypeName(ts) + "$Dispose", module_.get());
             disposerFns_[ts] = fn;
             // §2.5 / §2.6 / §28.4 step 3 (issue #328 / #103): also declare the
             // imported class's external DisposeCore, so a LOCAL class deriving
@@ -1269,7 +1283,7 @@ void Emitter::declareFunctions() {
                 ts->genericParams.empty()) {
                 auto* coreFn = llvm::Function::Create(
                     fnType, llvm::Function::ExternalLinkage,
-                    "bz$" + std::string(ts->name) + "$DisposeCore",
+                    "bz$" + mangledTypeName(ts) + "$DisposeCore",
                     module_.get());
                 disposerCoreFns_[ts] = coreFn;
             }
@@ -1379,7 +1393,7 @@ void Emitter::emitExportedPropertyGetters() {
             // Derive the return type.
             llvm::Type* valTy = lowerType(pd->type.get());
             if (!valTy) valTy = i32();
-            std::string clsName = std::string(ts->name);
+            std::string clsName = mangledTypeName(ts);
             std::string propName = std::string(ps->name);
             std::string mangled = "bz$" + clsName + "$" + propName + "$propget";
             // Avoid double-declaration if the function was already created
@@ -1438,7 +1452,7 @@ void Emitter::declareImportedPropertyGetters() {
         // Derive the return type from the side table.
         sema::TypeRef* retRef = ctx_.importedMemberType(ps);
         llvm::Type* retTy = retRef ? lowerTypeRef(retRef) : i32();
-        std::string clsName = ps->parent ? std::string(ps->parent->name) : "";
+        std::string clsName = ps->parent ? mangledTypeName(ps->parent) : "";
         std::string mangled =
             "bz$" + clsName + "$" + std::string(ps->name) + "$propget";
         // Re-use an existing module declaration if present (e.g. a double-
@@ -1479,7 +1493,7 @@ llvm::Function* Emitter::declareImportedCtor(const sema::ConstructorSymbol* cs) 
     }
     auto* fnType = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                            paramTys, /*isVarArg=*/false);
-    std::string cls = cs->parent ? std::string(cs->parent->name) : "";
+    std::string cls = cs->parent ? mangledTypeName(cs->parent) : "";
     auto* fn = llvm::Function::Create(fnType, llvm::Function::ExternalLinkage,
                                       "bz$" + cls + "$ctor", module_.get());
     ctorFns_[const_cast<sema::ConstructorSymbol*>(cs)] = fn;
@@ -2134,7 +2148,7 @@ void Emitter::declareVtables() {
             *module_, arrTy, /*isConstant=*/true,
             exportedDesc ? llvm::GlobalValue::ExternalLinkage
                          : llvm::GlobalValue::InternalLinkage,
-            nullptr, "td$" + std::string(ts->name));
+            nullptr, "td$" + mangledTypeName(ts));
     }
     // §2.5 / §2.6 / §12 (issue #328 / #103): declare EXTERNAL descriptor globals
     // for IMPORTED public, non-generic classes/interfaces that a local type's
@@ -2164,7 +2178,7 @@ void Emitter::declareVtables() {
             descArray_[ts] = new llvm::GlobalVariable(
                 *module_, arrTy, /*isConstant=*/true,
                 llvm::GlobalValue::ExternalLinkage, /*init=*/nullptr,
-                "td$" + std::string(ts->name));
+                "td$" + mangledTypeName(ts));
         }
     }
     // Pass C: fill each descriptor with [self + transitive bases, null]. A base
@@ -2470,7 +2484,7 @@ void Emitter::declareVtables() {
             *module_, arrTy, /*isConstant=*/true,
             exported ? llvm::GlobalValue::ExternalLinkage
                      : llvm::GlobalValue::InternalLinkage,
-            init, "vt$" + std::string(ts->name));
+            init, "vt$" + mangledTypeName(ts));
         allVtables_.push_back(vtables_[ts]);  // §8.6 #417: string discriminator
     }
 }
@@ -5326,7 +5340,11 @@ void Emitter::emitEnsureInitFns() {
     auto* savedInsert = builder_.GetInsertBlock();
 
     for (const sema::TypeSymbol* t : types) {
-        std::string cls(t->name);
+        // #1488: qualified by module for `ensureinit` below (ExternalLinkage
+        // when exported); the state/exc/owner/progress globals that also use
+        // `cls` stay InternalLinkage regardless, so the longer name is inert
+        // for them — kept as one shared `cls` for the whole per-type block.
+        std::string cls = mangledTypeName(t);
         // Per-type state guard + saved-exception globals.
         auto* stateGV = new llvm::GlobalVariable(
             *module_, i8Ty, /*isConstant=*/false,
@@ -5548,7 +5566,7 @@ void Emitter::emitEnsureStaticInit(const sema::TypeSymbol* owner) {
     // at link. Generic imported types are excluded (cross-module generic static
     // init is the #428 family).
     if (ctx_.isImported(owner) && owner->genericParams.empty()) {
-        std::string name = "bz$" + std::string(owner->name) + "$ensureinit";
+        std::string name = "bz$" + mangledTypeName(owner) + "$ensureinit";
         llvm::Function* fn = module_->getFunction(name);
         if (!fn) {
             auto* voidFnTy = llvm::FunctionType::get(
@@ -6236,7 +6254,7 @@ llvm::Function* Emitter::declareImportedInit(const sema::TypeSymbol* ts) {
     auto* fnType = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                            {ptrTy()}, /*isVarArg=*/false);
     auto* fn = llvm::Function::Create(fnType, llvm::Function::ExternalLinkage,
-                                      "bz$" + std::string(ts->name) + "$init",
+                                      "bz$" + mangledTypeName(ts) + "$init",
                                       module_.get());
     initFns_[ts] = fn;
     return fn;
