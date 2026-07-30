@@ -1021,6 +1021,40 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     // release below. (null-safe: a null namePtr stored here is a no-op release.)
     builder_.CreateStore(namePtr, namePtrSlot);
 
+    // fix #2404 / §9.8 / §28.9: bz_binder_read_field_name can still return a
+    // NULL bz_string* WITHOUT a pending exception on the OOM allocation-
+    // failure paths inside bz_binder_read_bz_string (malloc/calloc returning
+    // null while building the decoded string/header) -- the ordinary
+    // truncated-input path is already caught by the emitPendingCheck() just
+    // above, since fix #2403 made bz_binder_read_bz_string raise
+    // SerializationException before ever returning null on truncation (both
+    // the binary length/data-truncation case and, transitively, the JSON
+    // unterminated-object case, which bz_jder_count_object_fields already
+    // rejects before this loop's first iteration). Without this check, a
+    // null namePtr here is dereferenced unguarded a few lines down
+    // (CreateStructGEP/CreateLoad against namePtr for the wire-name
+    // comparison) -- a null-pointer read. Mirrors emitClassDeserialize's
+    // identical defence (its errBB, ~line 3144) for the exact same
+    // OOM-residual gap; unlike the class path, no manual per-slot dispose
+    // loop is needed here -- the #2398 disposeStack_ scope pushed above
+    // (before this loop started) already registers every already-filled
+    // component slot (string / one-level nested-record) for automatic
+    // release, and emitThrowBuiltin's emitUnwindDisposals() sweeps it on
+    // this throw exactly as it does for every other throw in this function
+    // (including namePtrSlot itself, just stored above).
+    {
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            namePtr, llvm::ConstantPointerNull::get(ptrTy()), "deser.fname.isnull");
+        auto* nullBB = llvm::BasicBlock::Create(llvm_, "deser.fname.null", currentFn_);
+        auto* liveBB = llvm::BasicBlock::Create(llvm_, "deser.fname.live", currentFn_);
+        builder_.CreateCondBr(isNull, nullBB, liveBB);
+        builder_.SetInsertPoint(nullBB);
+        emitThrowBuiltin("SerializationException");
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateUnreachable();
+        builder_.SetInsertPoint(liveBB);
+    }
+
     // Dispatch: compare namePtr against each component's wire name.
     // Use bz_string_compare (runtime ordinal comparison) to test equality.
     // We need the wire-name string lengths too for the C comparison function:
@@ -1995,6 +2029,34 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
             llvm::Value* namePtr = builder_.CreateCall(readNameFn, {derPtr}, "chdes.fname");
             emitPendingCheck();
             builder_.CreateStore(namePtr, namePtrSlot);
+
+            // fix #2404 / §9.8 / §28.9: same OOM-residual null-without-
+            // exception gap as emitRecordDeserialize's matching fix above
+            // (see its comment for the full rationale) -- the ordinary
+            // truncated-input path is already caught by emitPendingCheck()
+            // just above (fix #2403); only a raw malloc/calloc failure
+            // inside bz_binder_read_bz_string can still leave namePtr null
+            // here with no pending exception, and it is dereferenced
+            // unguarded a few lines down. No manual per-slot dispose loop
+            // needed: the #2398 disposeStack_ scope pushed above (before
+            // this payload loop, per case) already registers every
+            // already-filled payload slot for automatic release, swept by
+            // emitThrowBuiltin's emitUnwindDisposals() below.
+            {
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    namePtr, llvm::ConstantPointerNull::get(ptrTy()),
+                    "chdes.fname.isnull");
+                auto* nullBB = llvm::BasicBlock::Create(
+                    llvm_, "chdes.fname.null", currentFn_);
+                auto* liveBB = llvm::BasicBlock::Create(
+                    llvm_, "chdes.fname.live", currentFn_);
+                builder_.CreateCondBr(isNull, nullBB, liveBB);
+                builder_.SetInsertPoint(nullBB);
+                emitThrowBuiltin("SerializationException");
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateUnreachable();
+                builder_.SetInsertPoint(liveBB);
+            }
 
             auto* skipBB  = llvm::BasicBlock::Create(llvm_, "chdes.skip",  currentFn_);
             auto* afterBB = llvm::BasicBlock::Create(llvm_, "chdes.after", currentFn_);
