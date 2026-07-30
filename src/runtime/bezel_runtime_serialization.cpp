@@ -839,9 +839,27 @@ static int bz_binder_read_le64_impl(bz_binder_t* d, uint64_t* out) {
     return 1;
 }
 
+// fix #688 / §2.15: forward-declared here so bz_binder_read_bz_string (below,
+// used before the definition at its usual spot near the other throw helpers)
+// can raise on binary truncation the same way bz_binder_read_int/_uint/_float
+// already do. Defined further down in this file.
+static void bz_ser_throw_at_binary(const char* msg, int64_t offset);
+
 // Read a LE32-prefixed UTF-8 byte string and return a heap-allocated
 // bz_string_struct* with adaptive-width code-point storage.
-// Returns nullptr on truncated data.
+// Raises SerializationException (bz_ser_throw_at_binary) on truncated data —
+// fix #2403 / stdlib §2.14/§2.15 (v0.235): a truncated length prefix or a
+// length prefix whose declared byte count exceeds the remaining buffer is
+// "malformed input" under the stdlib's Errors rule ("Malformed input ...
+// raise SerializationException"; §2.15 also states the binary format "is
+// length-prefixed", so an unsatisfiable length prefix is definitionally
+// malformed) — exactly the same failure shape bz_binder_read_int/_uint/_float
+// already raise on. Previously this returned nullptr silently, so a truncated
+// string VALUE (via bz_binder_read_string), CHAR (bz_binder_read_char), or
+// FIELD NAME/discriminator (the other callers below) looked like ordinary
+// end-of-data instead of an error — the "worse than a leak" silent-data-loss
+// defect in #2403, sharing its root cause with #2394's bool/decimal reports
+// (see the fixes to bz_binder_read_bool/bz_binder_read_decimal below).
 //
 // #635: the bz_string `len` field is a CODE-POINT count, not a byte count.
 // Previously this function set len=byte_len with width=1 (treating each byte as
@@ -854,9 +872,20 @@ static int bz_binder_read_le64_impl(bz_binder_t* d, uint64_t* out) {
 // buffer at that width, and set len to the decoded code-point count.  This mirrors
 // exactly what lowerStringLiteralConst() does at compile time.
 static void* bz_binder_read_bz_string(bz_binder_t* d) {
+    // fix #2403 / §2.15: capture the start-of-value offset once, mirroring the
+    // scalar readers and the object-header read above — both failure sites
+    // below (truncated length prefix, truncated payload) report the same
+    // start-of-field offset rather than the mid-read position.
+    int64_t off = d->pos;
     uint32_t byte_len = 0;
-    if (!bz_binder_read_le32_impl(d, &byte_len)) return nullptr;
-    if (d->pos + (int64_t)byte_len > d->len)     return nullptr;
+    if (!bz_binder_read_le32_impl(d, &byte_len)) {
+        bz_ser_throw_at_binary("Truncated binary input reading string length (§2.15)", off);
+        return nullptr;
+    }
+    if (d->pos + (int64_t)byte_len > d->len) {
+        bz_ser_throw_at_binary("Truncated binary input reading string data (§2.15)", off);
+        return nullptr;
+    }
 
     const uint8_t* src = d->data + d->pos;
     d->pos += (int64_t)byte_len;
@@ -1482,9 +1511,21 @@ void* bz_binder_read_decimal(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
     if (d->kind >= 1) return bz_jder_parse_decimal(d);
     static thread_local uint32_t dec_buf[4];
+    // fix #2394 / §2.15 (v0.235): each of the 4 LE32 words was read unchecked,
+    // so a truncated wire silently left the tail word(s) zeroed instead of
+    // raising — e.g. cutting the flags word zeroes the decimal's scale,
+    // turning 3.14m into the wrong value 314m with NO exception (silent data
+    // corruption, not just a missing-value default). Mirror bz_binder_read_int
+    // /_uint/_float: report the offset of the decimal's first byte, matching
+    // the "off = start of this value" convention used there and in
+    // bz_binder_read_bz_string above.
+    int64_t off = d->pos;
     for (int i = 0; i < 4; ++i) {
         uint32_t v = 0;
-        bz_binder_read_le32_impl(d, &v);
+        if (!bz_binder_read_le32_impl(d, &v)) {
+            bz_ser_throw_at_binary("Truncated binary input reading decimal (§2.15)", off);
+            return dec_buf;  // pending exception; caller's emitPendingCheck() discards this
+        }
         dec_buf[i] = v;
     }
     return dec_buf;
@@ -1503,8 +1544,15 @@ int8_t bz_binder_read_bool(void* derp) {
         bz_ser_throw_at_json("Expected JSON bool (§2.15)", d);
         return 0;
     }
+    // fix #2394 / §2.15 (v0.235): the byte read was unchecked, so truncation
+    // silently returned the default `false` instead of raising — mirror
+    // bz_binder_read_int/_uint/_float (and the JSON branch above, which
+    // already throws on its own malformed-input shape).
+    int64_t off = d->pos;
     uint8_t b = 0;
-    bz_binder_read_byte_impl(d, &b);
+    if (!bz_binder_read_byte_impl(d, &b)) {
+        bz_ser_throw_at_binary("Truncated binary input reading bool (§2.15)", off);
+    }
     return b ? 1 : 0;
 }
 
