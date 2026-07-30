@@ -2125,6 +2125,12 @@ void* bz_binder_read_poly_discriminator(void* derp) {
             bz_ser_throw("Polymorphic deserialize: expected ':' after \"$type\" (§9.8)", nullptr);
             return nullptr;
         }
+        // fix #2419 (§9.8 / stdlib §2.15, v0.235): skip whitespace between the
+        // "$type" colon and its value — the identical gap flagged (but not
+        // independently confirmed) on this function's "$case" sibling
+        // (bz_binder_read_case_discriminator, above); see the fix comment
+        // there for the full rationale.
+        bz_jder_skip_ws(d);
         // Read the discriminator string value.
         void* disc = bz_jder_parse_string(d);
         if (!disc) {
@@ -2260,6 +2266,15 @@ void* bz_binder_read_case_discriminator(void* derp) {
                          nullptr);
             return nullptr;
         }
+        // fix #2419 (§9.8 / stdlib §2.15, v0.235): skip whitespace between the
+        // "$case" colon and its value so ordinary/pretty-printed JSON spacing
+        // (`"$case": "Both"`) is tolerated exactly like every other field-value
+        // read in this file (e.g. bz_binder_read_string at line ~1560, which
+        // skips ws before its own bz_jder_parse_string call). Without this,
+        // bz_jder_parse_string_cps requires d->pos to sit exactly on the
+        // opening '"' and spuriously raises "failed to read \"$case\" value"
+        // on legally-formatted, RFC 8259-compliant JSON.
+        bz_jder_skip_ws(d);
         void* disc = bz_jder_parse_string(d);
         if (!disc) {
             bz_ser_throw("Choice deserialize: failed to read \"$case\" value (§9.8)",
