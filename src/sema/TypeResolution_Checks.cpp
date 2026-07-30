@@ -2234,19 +2234,49 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
     }
     auto* dDecl = dynamic_cast<const ast::MethodDecl*>(derived->decl);
     auto* bDecl = dynamic_cast<const ast::MethodDecl*>(base->decl);
-    if (dDecl && bDecl) {
+    // §2.8.2/§12.1 (v0.235, #2386): `base` may be an IMPORTED virtual/
+    // abstract ancestor member — the BFS at this check's `override`-handling
+    // call site walks the full inheritance chain with no same-module
+    // restriction, and ModuleLoader never attaches an ast::MethodDecl to a
+    // body-less imported declaration (§2.8.2/§2.8.3: the artifact interface
+    // carries no AST). The old `if (dDecl && bDecl)` gate made `bDecl`
+    // unconditionally null for a cross-module base, silently skipping the
+    // ENTIRE return-type/`owned`-return comparison — a false ACCEPT of any
+    // override with a mismatched return type. Confirmed: overriding an
+    // imported `public abstract method Get(): int;` with `override method
+    // Get(): string => "garbage marker string"` compiled clean; dispatched
+    // through the base-typed reference, `b.Get()` (statically `int`) read a
+    // garbage int off the string body's actual return (observed v=4610944).
+    // `derived` is always a LOCAL override (from `t`'s own module), so
+    // `dDecl` needs no fallback. Mirrors #2373's fallback for the identical
+    // read shape in `checkAbstractImplementations` (same file): fall back to
+    // ctx_.importedReturnType/importedReturnOwned (ModuleLoader::
+    // setImportedReturnType) when the base has no AST node.
+    TypeRef* bRet = nullptr;
+    bool bDeclaresReturn = false;
+    bool bRetOwned = false;
+    if (bDecl) {
+        bRet = bDecl->returnType ? ctx_.resolvedType(*bDecl->returnType)
+                                 : nullptr;
+        bDeclaresReturn = (bDecl->returnType != nullptr);
+        bRetOwned = bDecl->returnOwned;
+    } else {
+        bRetOwned = ctx_.importedReturnOwned(base);
+        TypeRef* r = ctx_.importedReturnType(base);
+        if (r && r->kind != TypeRef::Kind::Unit) bRet = r;
+        bDeclaresReturn = (bRet != nullptr);
+    }
+    if (dDecl) {
         // Return type (null == unit) and owned-return modifier.
         TypeRef* dRet = dDecl->returnType
             ? ctx_.resolvedType(*dDecl->returnType) : nullptr;
-        TypeRef* bRet = bDecl->returnType
-            ? ctx_.resolvedType(*bDecl->returnType) : nullptr;
         // Apply substitution to base return type (T → int, etc.).
         TypeRef* bRetSubst = applyGenericSubst(bRet, genericSubst);
-        bool bothNullReturn = !dDecl->returnType && !bDecl->returnType;
+        bool bothNullReturn = !dDecl->returnType && !bDeclaresReturn;
         if (!bothNullReturn && !typeRefEqual(dRet, bRetSubst)) {
             err("return type");
         }
-        if (dDecl->returnOwned != bDecl->returnOwned) {
+        if (dDecl->returnOwned != bRetOwned) {
             err("`owned` return modifier");
         }
     }
@@ -2272,8 +2302,19 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
         }
         TypeRef* dt = dp->declType ? ctx_.resolvedType(*dp->declType)
                                    : nullptr;
+        // §2.8.2/§12.1 (v0.235, #2386): mirrors #2373's ParameterSymbol
+        // fallback (checkAbstractImplementations, same file) — an IMPORTED
+        // base member's parameter carries no syntactic `declType` at all;
+        // ModuleLoader::convertParams stashes the already-resolved type on
+        // `resolvedDeclType` instead (there is no ast::Type to attach).
+        // Reading `declType` alone made `bt` null for every imported base
+        // parameter, silently skipping this whole comparison via
+        // `if (dt && btSubst && ...)` below — a further false ACCEPT,
+        // independent of the return-type gate above (this loop was never
+        // gated on `dDecl`/`bDecl`). `dp` is always a LOCAL override
+        // parameter, so `dt` needs no fallback.
         TypeRef* bt = bp->declType ? ctx_.resolvedType(*bp->declType)
-                                   : nullptr;
+                                   : bp->resolvedDeclType;
         // Apply substitution to base parameter type. §12.1 (v0.181, #1560):
         // a parameter may widen the base's `T` to `T?` (monotone down the
         // chain — see overrideParamTypeMatches); every other mismatch,
@@ -2297,6 +2338,19 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
     // `method Foo<T>` on both sides), not the enclosing class's generic
     // substitution — a method-level type parameter is fresh per declaration
     // regardless of name reuse.
+    //
+    // #2386: deliberately STILL gated on `bDecl` (unlike the return-type and
+    // parameter-type checks above, now fixed) — an imported generic method's
+    // `where` clauses are not reconstructed anywhere on the imported side.
+    // MetaGenericParam does carry constraintTypes/specialConstraints
+    // (ModuleMetadataBuilder.cpp's convertGenericParams), but
+    // ModuleLoader::convertGenericParams only reads `name`/`variance` off it
+    // when rebuilding a GenericParamSymbol — the constraint payload is
+    // dropped on import, and GenericParamSymbol itself has no field to hold
+    // it. So this restatement check cannot be reconstructed from a
+    // `ctx_.imported*` side table the way return/parameter types can; adding
+    // one is a metadata-schema change, out of this fix's scope per CLAUDE.md
+    // rule 4 (decline-with-reasons rather than invent). Filed as #2391.
     if (dDecl && bDecl &&
         dDecl->genericParams.size() == bDecl->genericParams.size()) {
         for (std::size_t gi = 0; gi < dDecl->genericParams.size(); ++gi) {
@@ -2404,7 +2458,22 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
 
     auto* dDecl = dynamic_cast<const ast::PropertyDecl*>(derived->decl);
     auto* bDecl = dynamic_cast<const ast::PropertyDecl*>(base->decl);
-    if (dDecl && bDecl) {
+    // §2.8.2/§12.1/§23 (v0.235, #2386): the OVERRIDE-MATCHING twin of #2380's
+    // `checkAbstractImplementations` fix (§11.2 conformance, same file) for
+    // the identical bDecl-null-for-imported-base gap. ModuleLoader never
+    // attaches an ast::PropertyDecl to a body-less imported declaration; the
+    // resolved property type instead rides the same importedMemberType side
+    // table used for imported fields/consts (ModuleLoader.cpp ~437: "the
+    // getter BODY is not reconstructed here"). Falling back there when
+    // `bDecl` is null covers the property-TYPE comparison for an override of
+    // an imported base member — the confirmed false-accept shape in #2386
+    // (overriding an imported `public abstract property Val: int;` with
+    // `override property Val: string => ...` compiled clean). `derived` is
+    // always a LOCAL override, so `dDecl` needs no fallback.
+    TypeRef* bTy = bDecl ? (bDecl->type ? ctx_.resolvedType(*bDecl->type)
+                                        : nullptr)
+                         : ctx_.importedMemberType(base);
+    if (dDecl) {
         // The property type is the getter's return type (and the setter's
         // implicit `value` parameter type). Per §12.1, return types must
         // match exactly — no covariance in this version — so no T→T?
@@ -2412,8 +2481,6 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
         // parameter, which are inputs).
         TypeRef* dTy =
             dDecl->type ? ctx_.resolvedType(*dDecl->type) : nullptr;
-        TypeRef* bTy =
-            bDecl->type ? ctx_.resolvedType(*bDecl->type) : nullptr;
         TypeRef* bTySubst = applyGenericSubst(bTy, genericSubst);
         if (!typeRefEqual(dTy, bTySubst)) {
             err("property type");
@@ -2424,8 +2491,19 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
         // slot shape — codegen installs a separate `$set` slot only when a
         // property has a setter (LlvmBackend_Setup.cpp), so a mismatched
         // override leaves a slot unfilled or orphaned. propertyDeclHasSetter
-        // is the same predicate codegen uses to decide slot allocation.
-        if (propertyDeclHasSetter(dDecl) != propertyDeclHasSetter(bDecl)) {
+        // is the same predicate codegen uses to decide slot allocation, but
+        // it reads the base's AST accessor shape directly — unavailable for
+        // an imported base (bDecl null), and NOT reconstructible from the
+        // current module-metadata schema (no accessor-presence bit is
+        // exported per §2.8.2's artifact-interface contents; PropertySymbol
+        // ::modifiers alone is insufficient — e.g. an expression-bodied
+        // get-only property carries no "readonly" modifier at all, so its
+        // absence cannot distinguish get-only from settable). Left unchecked
+        // for that case rather than guessed at (CLAUDE.md rule 4); filed as
+        // #2390 for a follow-up metadata addition. The property-TYPE check
+        // above — the confirmed false-accept shape — is unaffected.
+        if (bDecl &&
+            propertyDeclHasSetter(dDecl) != propertyDeclHasSetter(bDecl)) {
             err("accessor set/get presence");
         }
     }
@@ -2458,8 +2536,13 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
             }
             TypeRef* dt =
                 dp->declType ? ctx_.resolvedType(*dp->declType) : nullptr;
+            // §2.8.2/§12.1 (v0.235, #2386): same ParameterSymbol fallback as
+            // the method-override parameter loop above — an imported base
+            // indexer's index parameter carries no `declType`, only
+            // `resolvedDeclType` (ModuleLoader::convertParams).
             TypeRef* bt =
-                bp->declType ? ctx_.resolvedType(*bp->declType) : nullptr;
+                bp->declType ? ctx_.resolvedType(*bp->declType)
+                             : bp->resolvedDeclType;
             TypeRef* btSubst = applyGenericSubst(bt, genericSubst);
             if (dt && btSubst &&
                 !overrideParamTypeMatches(dt, btSubst,
