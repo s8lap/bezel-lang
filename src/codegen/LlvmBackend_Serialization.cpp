@@ -919,6 +919,61 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
         disposeStack_.back().push_back(nd);
     }
 
+    // fix #2398 / §9.8 / §28.3/§28.9: a dedicated scope guarding already-
+    // populated component slots against a LATER component's read throwing —
+    // mirrors #2378's emitClassDeserialize fix (Bug B) for the record case.
+    // A record's serialized components are record-admissible only (§9.8:
+    // "primitive, string, an enum, another serialization-eligible record,
+    // a value-like serialization-eligible choice, T? of a record-admissible
+    // T, or a non-owning inline array" — no class-, interface-, Shared<T>-,
+    // Weak<T>-, or heap-collection-typed component is ever admitted), so
+    // there is no class half to mirror here — but §4.6's string is a
+    // runtime-managed +1 reference like any other, and a nested record
+    // component may itself own one. Pushed before any component is read;
+    // each string-typed slot is registered as a plain stringRelease
+    // disposal, and each NESTED-RECORD-typed slot whose own storage owns a
+    // string (recordHasStringFields, the #1747 mechanism) is registered to
+    // release ITS direct string members via the existing
+    // emitRecordStringFieldReleases helper — reusing #1747's proven,
+    // one-level-deep release rather than inventing new machinery. (That
+    // reuse is intentionally narrow, matching #1747's own scope: it does
+    // NOT recurse into a nested record's own nested-record/choice
+    // components, and it excludes a NULLABLE record component, whose slot
+    // is the wrapped {i8, T} struct, not the bare record layout
+    // emitRecordStringFieldReleases expects — isRecordWithStringFieldsTypeRef
+    // already guards both. A record component that is itself a value-like
+    // CHOICE with a string payload is a documented residual gap: no
+    // equivalent release helper exists for choices yet — issue filed.)
+    // Popped WITHOUT disposal once every required component is confirmed
+    // present (below, just before construction begins) — by then each
+    // slot's value is about to be consumed into the constructed record.
+    //
+    // Without this: a component slot populated by an EARLIER successful
+    // read (e.g. `first: string` read before `second: int`) had no
+    // disposal registered anywhere. A LATER component's read that throws —
+    // a truncated wire value, or a nested record/choice Deserialize that
+    // throws from deep inside its own recursive call — unwinds straight
+    // past this function's own explicit skip/match dispatch (which only
+    // releases namePtr, never a component slot), orphaning the already-read
+    // value (issue #2398, the same shape as #2378's own follow-up leak;
+    // empirically confirmed: 63 bytes / 2 allocations for the issue's exact
+    // record repro, matching #2378's class-side signature exactly).
+    disposeStack_.emplace_back();
+    for (unsigned i = 0; i < components.size(); ++i) {
+        if (components[i].isSkip || !slots[i] || !components[i].ty) continue;
+        const auto* cty = components[i].ty;
+        if (cty->kind == sema::TypeRef::Kind::Primitive &&
+            cty->primitive == sema::PrimitiveType::String) {
+            Disposal sd{slots[i], nullptr};
+            sd.stringRelease = true;
+            disposeStack_.back().push_back(sd);
+        } else if (isRecordWithStringFieldsTypeRef(cty)) {
+            Disposal rd{slots[i], cty->declaration};
+            rd.recordStringFields = true;
+            disposeStack_.back().push_back(rd);
+        }
+    }
+
     // BeginObject → read field count.
     auto* beginFn = declareC("bz_binder_begin_object", i32(), {ptrTy()});
     llvm::Value* fieldCount = builder_.CreateCall(beginFn, {derPtr}, "deser.count");
@@ -1058,13 +1113,11 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     emitPendingCheck();
 
     // fix #668: §9.8 / §2.15: check all required components were seen.
-    // Records have no owned class fields so there is nothing to dispose on this
-    // path — any already-read value-type slots (int, string, etc.) are held in
-    // allocas that will simply be ignored if we throw.  String slots may hold a
-    // bz_string* that needs release if it was already populated; for simplicity
-    // we accept the minor leak on this rare structural-error path (matching the
-    // behaviour of the truncated-input path for records which also does not
-    // release string slots before emitThrowBuiltin).
+    // fix #2398: this missing-required-component throw is now ALSO covered
+    // by the component-disposal scope pushed above (still open at this
+    // point — it is popped only below, once construction is about to
+    // begin) — an already-read string/nested-record slot is disposed on
+    // this path too, not just a sibling's-read-throws path.
     for (const auto& rse : recSeenFlags) {
         llvm::Value* seen = builder_.CreateLoad(i8(), rse.seenSlot, "rdeser.seen");
         llvm::Value* notSeen = builder_.CreateICmpEQ(seen, builder_.getInt8(0), "rdeser.nseen");
@@ -1077,6 +1130,16 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
             builder_.CreateUnreachable();
         builder_.SetInsertPoint(okBB);
     }
+
+    // fix #2398 / §9.8 / §28.3/§28.9: pop the component-disposal scope
+    // pushed above (guarding already-populated string/nested-record slots
+    // against a later throw during the field loop / the missing-required-
+    // component check just above). Every required component is now
+    // confirmed present and construction is about to begin, consuming each
+    // slot's value into the constructed record — nothing in this scope
+    // should be disposed on this (normal) path, so pop it WITHOUT invoking
+    // its disposals (mirrors #2378's emitClassDeserialize pop).
+    disposeStack_.pop_back();
 
     // §9.8 v0.182 (#1572): if the record declares an explicit (non-static)
     // constructor, the synthesized Deserialize CALLS the unique constructor
@@ -1814,6 +1877,43 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
                 }
             }
 
+            // fix #2398 / §9.8 / §28.3/§28.9: a dedicated scope guarding
+            // already-populated payload slots against a LATER payload
+            // field's read throwing — mirrors #2378's emitClassDeserialize
+            // fix (Bug B) and emitRecordDeserialize's matching fix above.
+            // A choice's payload fields are record-admissible components
+            // (§9.8 "Choice serialization": "every payload field's type is
+            // serialization-eligible and record-admissible ... the same
+            // Deserialize-has-no-owner argument as for class-typed record
+            // fields"), so — exactly as for records — there is no class
+            // half to mirror; only string-typed and nested-record-typed
+            // (one level, via the #1747 emitRecordStringFieldReleases
+            // reuse — see emitRecordDeserialize's matching comment above
+            // for the full rationale and its documented narrow scope)
+            // payload slots are registered. Pushed before any payload is
+            // read; popped WITHOUT disposal once every required payload is
+            // confirmed present (below, just before the case's value is
+            // constructed) — by then each slot's value is about to be
+            // consumed into the constructed choice. Scoped PER CASE (this
+            // block runs once per declared case; only one ever executes at
+            // runtime, but each has its own `slots`), unlike the record/
+            // class fix's single scope for the whole function.
+            disposeStack_.emplace_back();
+            for (std::size_t pi = 0; pi < np; ++pi) {
+                if (skip[pi] || !slots[pi] || !ptys[pi]) continue;
+                const auto* pty = ptys[pi];
+                if (pty->kind == sema::TypeRef::Kind::Primitive &&
+                    pty->primitive == sema::PrimitiveType::String) {
+                    Disposal sd{slots[pi], nullptr};
+                    sd.stringRelease = true;
+                    disposeStack_.back().push_back(sd);
+                } else if (isRecordWithStringFieldsTypeRef(pty)) {
+                    Disposal rd{slots[pi], pty->declaration};
+                    rd.recordStringFields = true;
+                    disposeStack_.back().push_back(rd);
+                }
+            }
+
             // Payload-read loop (payloadCount iterations).
             auto* loopHdr  = llvm::BasicBlock::Create(llvm_, "chdes.loop.hdr",  currentFn_);
             auto* loopBody = llvm::BasicBlock::Create(llvm_, "chdes.loop.body", currentFn_);
@@ -1913,6 +2013,14 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
                     builder_.CreateUnreachable();
                 builder_.SetInsertPoint(okBB);
             }
+
+            // fix #2398 / §9.8 / §28.3/§28.9: pop the payload-disposal scope
+            // pushed above. Every required payload is now confirmed present
+            // and construction is about to begin, consuming each slot's
+            // value into the constructed choice — nothing in this scope
+            // should be disposed on this (normal) path, so pop it WITHOUT
+            // invoking its disposals (mirrors the record/class fix's pop).
+            disposeStack_.pop_back();
 
             // Build the choice value: tag = ci, payload assembled from the slots.
             llvm::Value* payloadVal = llvm::Constant::getNullValue(payloadTy);
