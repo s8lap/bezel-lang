@@ -2082,6 +2082,13 @@ void* bz_binder_read_poly_discriminator(void* derp) {
 
         // Pre-count the remaining fields (from current position).
         int32_t total_count = bz_jder_count_object_fields(d);
+        // fix #2432 (§9.8 / stdlib §2.15, v0.235): mirrors #2427's fix on the
+        // "$case" sibling below (bz_binder_read_case_discriminator) — LSan-
+        // confirmed via a truncated {"$type":"leaf","V":9 (missing '}'): the
+        // pre-count itself raises internally (and returns -1) on truncation, an
+        // already-in-flight exception the unconditional bz_ser_throw a few lines
+        // down would otherwise supersede/orphan. Bail out before re-inspecting.
+        if (bz_exc) return nullptr;
         if (total_count <= 0) {
             bz_ser_throw("Polymorphic deserialize: empty object, missing \"$type\" field (§9.8)",
                          nullptr);
@@ -2122,6 +2129,12 @@ void* bz_binder_read_poly_discriminator(void* derp) {
         }
         // Skip ':'.
         if (!bz_jder_expect_char(d, ':')) {
+            // fix #2432 (§9.8 / stdlib §2.15, v0.235): bz_jder_expect_char already
+            // raised internally (bz_ser_throw_at_json) on failure; bail out before
+            // the manual bz_ser_throw below supersedes it (Bug-A pattern). By
+            // inspection, byte-identical in shape to the LSan-confirmed "$case"
+            // sibling a few lines down (bz_binder_read_case_discriminator).
+            if (bz_exc) return nullptr;
             bz_ser_throw("Polymorphic deserialize: expected ':' after \"$type\" (§9.8)", nullptr);
             return nullptr;
         }
@@ -2134,6 +2147,14 @@ void* bz_binder_read_poly_discriminator(void* derp) {
         // Read the discriminator string value.
         void* disc = bz_jder_parse_string(d);
         if (!disc) {
+            // fix #2432 (§9.8 / stdlib §2.15, v0.235): bz_jder_parse_string raises
+            // internally on every malformed-input path; the one exception (OOM in
+            // bz_jder_cps_to_bz_string) returns nullptr WITHOUT throwing, so the
+            // manual bz_ser_throw below remains the correct safety net for THAT
+            // case. Bail out only when an exception is already in flight. By
+            // inspection, byte-identical in shape to the LSan-confirmed "$case"
+            // sibling a few lines down (bz_binder_read_case_discriminator).
+            if (bz_exc) return nullptr;
             bz_ser_throw("Polymorphic deserialize: failed to read \"$type\" value (§9.8)", nullptr);
             return nullptr;
         }
@@ -2276,6 +2297,12 @@ void* bz_binder_read_case_discriminator(void* derp) {
             return nullptr;
         }
         if (!bz_jder_expect_char(d, ':')) {
+            // fix #2432 (§9.8 / stdlib §2.15, v0.235): bz_jder_expect_char already
+            // raised internally (bz_ser_throw_at_json) on failure; bail out before
+            // the manual bz_ser_throw below supersedes it (Bug-A pattern,
+            // LSan-confirmed: a non-colon byte after "$case" leaked 123 bytes /
+            // 3 allocations behind the wrong exception message).
+            if (bz_exc) return nullptr;
             bz_ser_throw("Choice deserialize: expected ':' after \"$case\" (§9.8)",
                          nullptr);
             return nullptr;
@@ -2291,6 +2318,14 @@ void* bz_binder_read_case_discriminator(void* derp) {
         bz_jder_skip_ws(d);
         void* disc = bz_jder_parse_string(d);
         if (!disc) {
+            // fix #2432 (§9.8 / stdlib §2.15, v0.235): bz_jder_parse_string raises
+            // internally on every malformed-input path; the one exception (OOM in
+            // bz_jder_cps_to_bz_string) returns nullptr WITHOUT throwing, so the
+            // manual bz_ser_throw below remains the correct safety net for THAT
+            // case. Bail out only when an exception is already in flight
+            // (Bug-A pattern, LSan-confirmed: an unknown \z escape in the "$case"
+            // value leaked 122 bytes / 3 allocations behind the wrong message).
+            if (bz_exc) return nullptr;
             bz_ser_throw("Choice deserialize: failed to read \"$case\" value (§9.8)",
                          nullptr);
             return nullptr;
