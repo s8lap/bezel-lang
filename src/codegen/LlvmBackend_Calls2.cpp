@@ -4391,10 +4391,12 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 }
             }
         }
-        // issue #757 / §30.7: a direct `src.GetAsyncEnumerator(token)` on a builtin
-        // IAsyncEnumerable<T>. The token argument is evaluated for its
-        // side-effects/ownership then discarded (§30.8 cancellation deferred,
-        // consistent with the `await for` path).
+        // issue #757 / §30.7 (#1525): a direct `src.GetAsyncEnumerator(token)` on
+        // a builtin IAsyncEnumerable<T>. The token is now routed through as the
+        // slot-4 call's second argument — "the enumerator returned by the
+        // generated GetAsyncEnumerator(token) captures the token" (§30.7 v0.228)
+        // — so a compiler-generated async iterator's MoveNextAsync/Resume
+        // observes cancellation even when driven manually (no `await for`).
         //
         // fix #1268 / §30.7: the interface declares
         // `GetAsyncEnumerator(...): owned IAsyncEnumerator<T>` — a FRESH,
@@ -4420,19 +4422,23 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     (recvTy->headName() == "IAsyncEnumerable" ||
                      recvTy->headName() == "IOwningAsyncEnumerable");
                 if (isAsyncEnumerable) {
-                    if (!call.args.empty() && call.args[0].value)
-                        (void)lowerExpr(*call.args[0].value);
                     llvm::Value* src = lowerExpr(*ma->target);
                     if (!src) return nullptr;
+                    llvm::Value* tokenArg =
+                        llvm::ConstantPointerNull::get(ptrTy());  // None
+                    if (!call.args.empty() && call.args[0].value) {
+                        llvm::Value* t = lowerExpr(*call.args[0].value);
+                        if (t) tokenArg = t;
+                    }
                     llvm::Value* srcVt = builder_.CreateLoad(ptrTy(), src);
                     llvm::Value* geSlotPtr = builder_.CreateGEP(
                         ptrTy(), srcVt, {builder_.getInt32(4)});
                     llvm::Value* geFnPtr =
                         builder_.CreateLoad(ptrTy(), geSlotPtr);
-                    auto* geTy =
-                        llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+                    auto* geTy = llvm::FunctionType::get(
+                        ptrTy(), {ptrTy(), ptrTy()}, false);
                     llvm::Value* en = builder_.CreateCall(
-                        geTy, geFnPtr, {src}, "gae.enum");
+                        geTy, geFnPtr, {src, tokenArg}, "gae.enum");
                     // §29.11: an UNBOUND temporary receiver (`Gen().Get…()`)
                     // has no binder to discharge it, and the fresh enumerator
                     // is an independent byte-copy — so the source frame's sole

@@ -4084,7 +4084,15 @@ static std::once_flag g_we_vtables_once;
 // single-consumption guard (`get_enum_called`) and returns null on a repeat,
 // which the desugaring has no null path for. Re-enumeration enforcement for
 // WhenEach stays where it was — #2112.
-static void* bz_we_self_enumerator(void* self) { return self; }
+//
+// §30.7 (v0.228, #1525): slot 4's calling convention grew a second `token`
+// argument (the compiler-generated async iterator's GetAsyncEnumerator(token)
+// now captures it — LlvmBackend_Async.cpp). Every slot-4 producer must match the
+// 2-arg ABI the call sites now use (LlvmBackend_Stmts.cpp's `await for`,
+// LlvmBackend_Calls2.cpp's direct call); WhenEach has no token-aware cancellation
+// path of its own (out of this fix's scope — WhenEach cancellation would be a
+// separate ruling), so the argument is accepted and ignored.
+static void* bz_we_self_enumerator(void* self, void* /*token*/) { return self; }
 
 // Thread-safe one-time vtable fill. A plain `if (inited) return; inited = 1;`
 // flag has a first-use data race: two threads constructing enumerators

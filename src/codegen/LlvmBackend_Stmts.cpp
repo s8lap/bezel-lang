@@ -6409,14 +6409,18 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
 // exactly the mechanism the embedded-await pre-suspend operands already rely on.
 bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     if (!fs.isAwait || !fs.iterable) return false;
-    // §30.7/§30.8 (#765): an optional `with token` clause is now lowered. For a
-    // compiler-generated async iterator the source value IS the enumerator (the
-    // enumPtr below is the source directly — there is no separate
-    // GetAsyncEnumerator(token) call), so the token is evaluated for its
-    // side-effects/ownership and then discarded; the rest of the loop is
-    // identical to the no-`with` form. Honoring the token for cancellation
-    // (§30.8) remains deferred, exactly as on a direct GetAsyncEnumerator path.
-    // The token expression is lowered after the source is evaluated, below.
+    // §30.7/§30.8 (#765, #1525): an optional `with token` clause. "The `with
+    // token` clause passes `token` as the argument to `GetAsyncEnumerator(token)`.
+    // When omitted, `CancellationToken.None` is passed." (§30.7 v0.228) — the
+    // token is now evaluated right after the source (below) and passed as the
+    // second argument to the slot-4 GetAsyncEnumerator call, so a
+    // compiler-generated async iterator captures it in its frame and checks it
+    // internally (LlvmBackend_Async.cpp's Resume-entry check). The per-iteration
+    // consumer-side check further below (§30.8 / #790) is KEPT as well — it is
+    // the only enforcement for enumerator producers with no frame of their own
+    // (e.g. `Task.WhenEach`'s runtime enumerator) and is a harmless redundant
+    // early-out for the compiler-generated case (same condition, checked one
+    // step earlier in program order).
     // The consuming context must be an async state machine (the await suspend
     // lives in its Resume function). sema rejects `await for` outside async; this
     // is a defensive guard so a stray case produces a diagnostic, not bad IR.
@@ -6439,6 +6443,14 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     // lets the disposal scope below dispose the frame on EVERY exit edge.
     llvm::Value* srcPtr = lowerExpr(*fs.iterable);
     if (!srcPtr) return false;
+    // §30.7/§30.8 (#765/#1525): evaluate the optional `with` token right after
+    // the source, before the GetAsyncEnumerator(token) call below — the
+    // desugaring's own argument-evaluation order (receiver, then the token
+    // argument). `tokenVal` stays null (C++) when no `with` clause is written;
+    // `tokenArg` is the LLVM value actually passed (None ⇒ a null cell pointer).
+    llvm::Value* tokenVal = fs.withExpr ? lowerExpr(*fs.withExpr) : nullptr;
+    llvm::Value* tokenArg =
+        tokenVal ? tokenVal : llvm::ConstantPointerNull::get(ptrTy());
     // fix #1268 / §29.3 + §29.11: the source is the async-ITERABLE; ask it for a
     // FRESH, INDEPENDENT enumerator through vtable slot 4 (GetAsyncEnumerator)
     // rather than driving — and Disposing — the source object itself. Without
@@ -6456,8 +6468,10 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
         llvm::Value* geSlotPtr =
             builder_.CreateGEP(ptrTy(), srcVt, {builder_.getInt32(4)});
         llvm::Value* geFnPtr = builder_.CreateLoad(ptrTy(), geSlotPtr);
-        auto* geTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
-        enumPtr = builder_.CreateCall(geTy, geFnPtr, {srcPtr}, "afor.getenum");
+        auto* geTy =
+            llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false);
+        enumPtr = builder_.CreateCall(geTy, geFnPtr, {srcPtr, tokenArg},
+                                      "afor.getenum");
     }
     auto* enumSlot = entryAlloca(ptrTy());
     builder_.CreateStore(enumPtr, enumSlot);
@@ -6504,11 +6518,11 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
             srcOwnSlot);
         asyncHandlerSpillSlots_.push_back(srcOwnSlot);
     }
-    // §30.8 (#765/#790): evaluate the optional `with` cancellation token. Its
-    // value is a pointer to the source's cancellation-state cell (null for
-    // CancellationToken.None). It is observed at each iteration's suspend point
-    // (condBB below): a cancelled token raises OperationCanceledException.
-    llvm::Value* tokenVal = fs.withExpr ? lowerExpr(*fs.withExpr) : nullptr;
+    // §30.8 (#765/#790): `tokenVal` (evaluated earlier, above) is a pointer to
+    // the source's cancellation-state cell (null for CancellationToken.None). It
+    // is ALSO observed at each iteration's suspend point (condBB below): a
+    // cancelled token raises OperationCanceledException — the consumer-side half
+    // of the redundant pair described above.
 
     // Loop variable slot — the body sees `x` here.
     auto* varSlot = entryAlloca(elemTy);

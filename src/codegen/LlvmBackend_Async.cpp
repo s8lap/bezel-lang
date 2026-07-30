@@ -1644,9 +1644,13 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     asyncResultTy_ = i1();
 
     // Frame: locals + [ T current_val, ptr perAdvanceTask, ptr pendingTask,
-    //                   ptr spill ].
+    //                   ptr spill, ptr token ].
+    // §30.7 (v0.228, #1525): TOKEN_FIELD is the CancellationToken cell captured
+    // by GetAsyncEnumerator(token) — null (CancellationToken.None) by default
+    // (calloc-zeroed at construction), never cancels until GetAsyncEnumerator
+    // stores a real token.
     StateMachineFrame frame = buildStateMachineFrame(
-        ms, *ci.stmts, {elemTy, ptrTy(), ptrTy(), ptrTy()},
+        ms, *ci.stmts, {elemTy, ptrTy(), ptrTy(), ptrTy(), ptrTy()},
         std::string("asynciter.") + std::string(ms->name));
     auto* stateStructTy = frame.structTy;
     const unsigned VTABLE_FIELD = frame.vtableField;
@@ -1655,6 +1659,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     const unsigned PER_ADVANCE_TASK_FIELD = frame.currentValField + 1;
     const unsigned PENDING_TASK_FIELD = frame.currentValField + 2;
     const unsigned SPILL_PTR_FIELD = frame.currentValField + 3;
+    const unsigned TOKEN_FIELD = frame.currentValField + 4;
     // The Resume completes the per-advance task; reuse asyncOuterTaskField_ for it.
     asyncOuterTaskField_ = PER_ADVANCE_TASK_FIELD;
     asyncPendingTaskField_ = PENDING_TASK_FIELD;
@@ -1690,7 +1695,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
         llvm::Function::InternalLinkage, prefix + "Dispose", module_.get());
 
-    // --- GetAsyncEnumerator(ptr self) -> ptr (vtable slot 4) ---
+    // --- GetAsyncEnumerator(ptr self, ptr token) -> ptr (vtable slot 4) ---
     // fix #1268 / §29.3 + §30.7: `IAsyncEnumerable<T>` is RE-ITERABLE — "each
     // call to GetAsyncEnumerator() runs the body again from the start" (§29.3),
     // and §29.11 "Each GetEnumerator() call produces an independent enumerator".
@@ -1702,8 +1707,15 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     // (LlvmBackend_Iterators.cpp), and the slot is emitted with the same
     // semantics: a fresh calloc byte-copy of the frame with the state reset to
     // the start, so N `await for` loops replay the body N times.
+    //
+    // §30.7 (v0.228, #1525): "the enumerator returned by the generated
+    // GetAsyncEnumerator(token) captures the token" — the interface signature
+    // is `GetAsyncEnumerator(token: CancellationToken := CancellationToken.None):
+    // owned IAsyncEnumerator<T>`, so the slot now takes a second ptr argument (the
+    // CancellationToken cell; null = None) and stores it into the returned
+    // enumerator's TOKEN_FIELD.
     auto* getAsyncEnumFn = llvm::Function::Create(
-        llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
+        llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false),
         llvm::Function::InternalLinkage, prefix + "GetAsyncEnumerator",
         module_.get());
 
@@ -1748,8 +1760,14 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         auto* geEntry =
             llvm::BasicBlock::Create(llvm_, "entry", getAsyncEnumFn);
         llvm::IRBuilder<> gb(geEntry);
-        llvm::Value* geSelf = &*getAsyncEnumFn->arg_begin();
+        llvm::Value* geSelf = getAsyncEnumFn->getArg(0);
+        llvm::Value* geToken = getAsyncEnumFn->getArg(1);
         if (hasOwnedParamCapture) {
+            // §30.7 (#1525): the token still belongs to the returned enumerator
+            // even when the affine owned-param shape returns `self` unchanged
+            // (the enumerABLE and enumerator are the same object here).
+            gb.CreateStore(geToken,
+                gb.CreateStructGEP(stateStructTy, geSelf, TOKEN_FIELD));
             gb.CreateRet(geSelf);
         } else {
             uint64_t stSz =
@@ -1777,6 +1795,12 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
                 gb.CreateStructGEP(stateStructTy, clone, PENDING_TASK_FIELD));
             gb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
                 gb.CreateStructGEP(stateStructTy, clone, SPILL_PTR_FIELD));
+            // §30.7 (#1525): the clone captures the CALLER's token — NOT the
+            // source's (the source's own TOKEN_FIELD is whatever was stored the
+            // last time GetAsyncEnumerator was called on it, normally still null
+            // since the constructing call `Gen()` never sets it).
+            gb.CreateStore(geToken,
+                gb.CreateStructGEP(stateStructTy, clone, TOKEN_FIELD));
             gb.CreateStore(vtGV,
                 gb.CreateStructGEP(stateStructTy, clone, VTABLE_FIELD));
             gb.CreateRet(clone);
@@ -1910,6 +1934,59 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
 
         llvm::Value* self = resumeFn->getArg(1);
         emitFrameCaptureRestores(frame, self);
+
+        // §30.7 (v0.228, #1525): "every MoveNextAsync() performs an implicit
+        // token.ThrowIfCancellationRequested() — on entry, and at each resume
+        // from suspension within the advance — so a requested cancellation
+        // faults the in-flight MoveNextAsync task with OperationCanceledException
+        // at the next suspension boundary." Resume is the SOLE trampoline for
+        // both cases: MoveNextAsync calls it directly (the "on entry" call), and
+        // the bz_task_then completion callback of every internal `await` calls it
+        // again to continue the advance (the "at each resume from suspension"
+        // call) — so one check here, before the state dispatch below, covers
+        // both. On cancellation the in-flight per-advance task is faulted with a
+        // fresh OperationCanceledException and STATE IS LEFT UNTOUCHED: the
+        // pending using-var/finally cleanup for whichever suspension point the
+        // frame is currently parked at is the consumer's Dispose() responsibility
+        // when it unwinds on the faulted task (§29.7) — exactly the same
+        // abandonment path a `break`/exception exit already takes, not a second,
+        // divergent cleanup written here.
+        {
+            llvm::Value* tokenFieldGEP =
+                builder_.CreateStructGEP(stateStructTy, self, TOKEN_FIELD);
+            llvm::Value* tokenLoaded =
+                builder_.CreateLoad(ptrTy(), tokenFieldGEP, "asynciter.tok");
+            auto* isCancFn = declareC("bz_ctoken_is_cancelled", i32(), {ptrTy()});
+            llvm::Value* isCancelled = builder_.CreateICmpNE(
+                builder_.CreateCall(isCancFn, {tokenLoaded}, "asynciter.tok.canc"),
+                builder_.getInt32(0));
+            auto* tokCancelBB =
+                llvm::BasicBlock::Create(llvm_, "asynciter.tokcancel", resumeFn);
+            auto* tokProceedBB =
+                llvm::BasicBlock::Create(llvm_, "asynciter.tokproceed", resumeFn);
+            builder_.CreateCondBr(isCancelled, tokCancelBB, tokProceedBB);
+
+            builder_.SetInsertPoint(tokCancelBB);
+            llvm::Value* advTaskField = builder_.CreateStructGEP(
+                stateStructTy, self, PER_ADVANCE_TASK_FIELD);
+            llvm::Value* advTask =
+                builder_.CreateLoad(ptrTy(), advTaskField, "asynciter.tok.task");
+            auto ceVit = builtinVtable_.find("OperationCanceledException");
+            if (ceVit != builtinVtable_.end()) {
+                llvm::Value* oceObj = builder_.CreateCall(
+                    callocFn(),
+                    {builder_.getInt64(1), builder_.getInt64(kExcObjSize)},
+                    "asynciter.tok.oce");
+                builder_.CreateStore(ceVit->second, oceObj);
+                auto* completeErrFn = declareC(
+                    "bz_task_complete_error_obj", llvm::Type::getVoidTy(llvm_),
+                    {ptrTy(), ptrTy()});
+                builder_.CreateCall(completeErrFn, {advTask, oceObj});
+            }
+            builder_.CreateRetVoid();
+
+            builder_.SetInsertPoint(tokProceedBB);
+        }
 
         llvm::Value* stateGEP =
             builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
