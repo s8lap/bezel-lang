@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.230 — July 2026**
+**Companion to the Bezel Language Specification, v0.231 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -35,7 +35,7 @@ Throughout this document:
 - Implementations may add internal helper methods and private members. Anything documented here is part of the public contract.
 - Methods returning freshly-allocated class instances annotate the return type with `owned` to communicate the caller's disposal obligation (see [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows) and [§28.8](Bezel_Language_Spec.md#sec-ownership-transfer) of the language spec). Methods returning `string` or other runtime-managed types ([§28.9](Bezel_Language_Spec.md#sec-runtime-managed-types)) do not use `owned`, since those types are exempt from manual disposal. Two further families are deliberately unmarked, their declared return type itself being the transfer announcement (language spec [§28.3](Bezel_Language_Spec.md#sec-producers)): **`Task`-family returns** (v0.190 — every call whose declared return type is `Task`/`Task<T>`/`OwningTask<T>` mints a caller-owned task; [§6.7](#sec-task-static-helpers)) and **deferred-activation interface returns** (the lazy [§5](#sec-system-collections-linq) operators, `Drain()`, `ReceiveAll()` — the iterator convention). Where a signature does spell `owned` on such a return (`GetEnumerator`, `Domain.Spawn`), it states the same contract with emphasis (v0.195).
 - Generic constraints are noted where relevant; absence of a constraint clause means "any T."
-- **The Try convention (v0.171, #1336; shape (c) codified v0.184; shape (d) v0.195).** Exactly three Try shapes are sanctioned for payload extraction, plus the payload-free shape (d) at the end of this bullet. **(a) `bool` + nullable out** — `TryX(..., out item: T?): bool` (with `owned` on the out where the payload transfers) — for keyed/positional extraction: the bool distinguishes the outcome from a legitimately-null payload, and, for a **generic or class-typed** payload, the out parameter is *nullable in every form*, because a class payload has no `default` to assign on the false path (spec §17.11) and a generic payload may be instantiated by a class; §22.3 requires every out assigned on every return path (v0.184 wording; throw paths carry no obligation), and the false path assigns `null`. **(b) nullable return** — `TryX(...): owned T?` — when null alone is the signal (e.g. `Mutex.TryAcquire` — simpler call sites; `Weak<T>.TryUpgrade` — the handle payload is statically non-nullable at every instantiation, so a bool would carry no information). **(c) `bool` + non-nullable value-typed out** — `TryX(..., out result: T): bool` with `default(T)` assigned on the false path (spec §22.3) — for APIs whose payload type is a **concrete value type**: the §9 primitive `TryParse` family, `Convert.TryTo*` (§2.3), the `DateTime`/`DateOnly`/`TimeOnly`/`Guid` `TryParse` members (§2.5/§2.6), and the §4.14/§4.15 `TryRead*` accessors. The `when true` postcondition does not apply — the out is never null, so `default(T)` (a real value distinguished only by the `bool`) is what the false path assigns. **Every shape-(a) signature in this document carries the `when true` nullability postcondition** on its out parameter (language spec §22.4, v0.183) — `TryX(..., out item: T? when true): bool` — so in a region where the call is known `true`, the recipient is narrowed non-null and no `!` is needed. The clause is elided from the per-type listings below for brevity but is normative for **every** shape-(a) member in this document (`TryGetValue`, `TryPop`/`TryPeek`/`TryDequeue`, `TryPopFirst`/`TryPopLast`, `Channel<T>.TryReceive`, `OwningSet<T>.TryTake`, `OwningDictionary<K, V>.TryPopValue`, and `IParsable<T>.TryParse` through the constraint). A fourth, payload-free shape exists alongside the three extraction shapes — **(d) bool-only attempt** (v0.195): `TryX(...): bool` with no out parameter, for operations whose only outcome is succeeded/declined and whose payload, if any, was passed *in* — `TryAdd` (§4.10/§4.18), the `TrySet*` completion family (§6.6), and the span `TryWrite*` accessors (§4.14/§4.15). Shape (d) carries no nullability postcondition: there is no out to narrow.
+- **The Try convention (v0.171, #1336; shape (c) codified v0.184; shape (d) v0.195).** Exactly three Try shapes are sanctioned for payload extraction, plus the payload-free shape (d) at the end of this bullet. **(a) `bool` + nullable out** — `TryX(..., out item: T?): bool` (with `owned` on the out where the payload transfers) — for keyed/positional extraction: the bool distinguishes the outcome from a legitimately-null payload, and, for a **generic or class-typed** payload, the out parameter is *nullable in every form*, because a class payload has no `default` to assign on the false path (spec §17.11) and a generic payload may be instantiated by a class; §22.3 requires every out assigned on every return path (v0.184 wording; throw paths carry no obligation), and the false path assigns `null`. **(b) nullable return** — `TryX(...): owned T?` — when null alone is the signal (e.g. `Mutex.TryAcquire` — simpler call sites; `Weak<T>.TryUpgrade` — the handle payload is statically non-nullable at every instantiation, so a bool would carry no information). **(c) `bool` + non-nullable value-typed out** — `TryX(..., out result: T): bool` with `default(T)` assigned on the false path (spec §22.3) — for APIs whose payload type is a **concrete value type**: the §9 primitive `TryParse` family, `Convert.TryTo*` (§2.3), the `DateTime`/`DateOnly`/`TimeOnly`/`Guid` `TryParse` members (§2.5/§2.6), and the §4.14/§4.15 `TryRead*` accessors. The `when true` postcondition does not apply — the out is never null, so `default(T)` (a real value distinguished only by the `bool`) is what the false path assigns. **Every shape-(a) signature in this document carries the `when true` nullability postcondition** on its out parameter (language spec §22.4, v0.183) — `TryX(..., out item: T? when true): bool` — so in a region where the call is known `true`, the recipient is narrowed non-null and no `!` is needed. The clause is elided from the per-type listings below for brevity but is normative for **every** shape-(a) member in this document (`TryGetValue`, `TryPop`/`TryPeek`/`TryDequeue`, `TryPopFirst`/`TryPopLast`, `Channel<T>.TryReceive`, `OwningSet<T>.TryTake`, `OwningDictionary<K, V>.TryPopValue`, and `IParsable<T>.TryParse` through the constraint). A fourth, payload-free shape exists alongside the three extraction shapes — **(d) bool-only attempt** (v0.195): `TryX(...): bool` with no out parameter, for operations whose only outcome is succeeded/declined and whose payload, if any, was passed *in* — `TryAdd` (§4.10/§4.18), the `TrySet*` completion family (§6.6), and the span `TryWrite*` accessors (§4.14/§4.15). Shape (d) carries no nullability postcondition: there is no out to narrow. **The `*OrNull` convenience tier (v0.231).** Beside the Try shapes, a surface may carry a nullable-return **convenience form**, named with the `OrNull` suffix (`ParseOrNull`, `GetOrNull`, §5's `*OrNull` element accessors) — a recorded tier in the sense of the no-dual rule below, and band 2's nullable-return value shape in the failure-signal rule below. The three access tiers, named: the **throwing form** (`Parse`, the `[key]` indexer) treats absence as a bug, the **`*OrNull` form** returns `T?` for direct `??`/`?.` composition where the payload can carry the signal, and the **`Try` form** remains the only shape that distinguishes the outcomes a collapsed `T?` cannot (spec §7.10). Shape (b)'s `TryX` spelling stays reserved for acquisition-shaped members whose payload is statically non-nullable (`TryAcquire`, `TryUpgrade`).
 - **Negative magnitudes fault (v0.183, #1396).** Every constructor parameter that states a magnitude — `capacity`, `size`, `length` — raises `ArgumentOutOfRangeException` when passed a negative value: `StringBuilder(capacity)`, `Array<T>(capacity)`, `Array<T>(size, fill)`, `OwningArray<T>(capacity)`, the `Dictionary`/`OwningDictionary`/`Set`/`OwningSet` capacity forms, and `OwningBuffer<T>(length)` with its `init` overloads. Zero is valid (an empty container or zero-length buffer). A negative magnitude is a programming error, not a request — the defined-fault stance of `DateTime`'s component validation (§2.5), chosen over a silent empty fallback. (`Channel<T>(capacity)` is stricter under its own v0.174 contract — `capacity >= 1`, `ArgumentException` otherwise — and is unchanged.)
 - **The `Async` suffix (v0.195).** The suffix marks the asynchronous member of a sync/async pair (`Acquire`/`AcquireAsync`, `Send`/`SendAsync`, `ReadAll`/`ReadAllAsync`, `Lock`/`LockAsync`); an operation that exists only in asynchronous form carries no suffix (`Channel<T>.Receive`, `TaskScope.Join`, `Task.Delay`). `Receive` beside `SendAsync` on the §6.9 endpoint pair is this rule at work, not an inconsistency.
 - Compiler-intrinsic types (primitive wrappers, `Range<T>`) may declare `const` members whose values are provided by the compiler rather than by a source-level initializer expression. In the declarations below, a `const` field shown without `:= value` (e.g. `public static const MaxValue: double;`) is such a compiler-provided constant. User-defined code may not omit `const` initializers (see language spec [§22.12](Bezel_Language_Spec.md#sec-static-members)).
@@ -57,6 +57,8 @@ The band-3/band-4 boundary, stated once: what distinguishes them is **where cons
 **Error-payload governance (v0.229).** An error-payload type — the `E` of a `Result<T, E>` return, or a domain choice declared to carry a producer's failures — lives with its producer: it is declared alongside the producer whose failures it describes and carries the producer's import (the producer-locality discipline of language spec [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types), transposed from the exception taxonomy). Error-payload types are value-like (language spec [§35.4](Bezel_Language_Spec.md#sec-choice-classification)) unless a recorded ruling states otherwise. One producer family, one payload type: a second module extends by wrapping, never by widening the producer's type. Additions to a shipped payload type's case set are gated by recorded ruling, exactly as growth of the exception taxonomy is — and with sharper consequence here, because a choice is a closed sum: every case addition breaks every exhaustive consumer (language spec [§35.6](Bezel_Language_Spec.md#sec-choice-exhaustiveness)).
 
 **Naming conventions for acronyms and widths (recorded v0.165, #1359, generalizing the v0.148 ruling).** Acronyms in Bezel-coined names are PascalCase (`IeeeEquals`); names inherited verbatim from .NET keep the .NET spelling (`IEEERemainder`, `Encoding.UTF8`, `ToInt64`) — so `Math.IEEERemainder` and `Double.IeeeEquals` are both *correct* under one rule, not an inconsistency. Where a bit-width is the point of the name, the width-bearing .NET type words are used (`Int32`, `Int64` — e.g. `Random.NextInt64`, `BitConverter`'s family). The owning enumeration interfaces carry the `I-` prefix since the v0.168 family rename (#1372).
+
+**`Count` vs `Length` (v0.231).** `Length` measures a fixed or contiguous extent — text (`String`, `StringBuilder`, `ReadOnlyStringSpan`), buffers and spans (§4.14–§4.16), `FrozenArray<T>`, `Stream`, and the §10 FFI carriers; `Count` counts the elements of a collection whose membership grows and shrinks (the `Add`/`Remove`/`Push`/`Enqueue` families). A type declares one or the other, never both, and new types follow the same line — which is why the resizable `Array<T>` says `Count` where .NET's fixed array says `Length`.
 
 **Replay intercept points (v0.204).** The members of this library that consult the world outside the process — the clock and elapsed-time reads (§2.5, §8.1), entropy (§2.6, and §2.7's parameterless constructor), environment, argument, and process information (§2.4), console input (§2.1), and the file system (§7) — together with the scheduling and synchronized-object operations the language spec enumerates (language spec [§30.13](Bezel_Language_Spec.md#sec-determinism), *Determinism*) — are **intercept points**: a conforming runtime may record their results and later substitute the recorded values, and no program may observe the substitution except through the values themselves. Everything not so designated is pure computation and is deliberately not interceptable. A future addition to this library that reads the world must declare itself an intercept point in its own section at the time it is added.
 
@@ -88,6 +90,7 @@ public static class Console
   // Input
   public static method ReadLine(): string?;     // null at EOF
   public static method ReadKey(): char;         // blocks for one key; EndOfStreamException at end of input (v0.195; see below)
+  public static method ReadKeyOrNull(): char?;  // v0.231 (§1 *OrNull tier): null at end of input; otherwise blocks for one key
 
   // Streams
   public static readonly property In: TextReader;
@@ -101,7 +104,7 @@ end Console;
 
 The `Object` overloads invoke `ToString()`. For interpolated strings, the compiler resolves the `string` overload directly.
 
-`ReadKey()` blocks until one key (code point) is available and raises `EndOfStreamException` ([§7.5](#sec-io-exception-types); catching it by name requires `import System.IO;`) at end of input, where no key can exist — `ReadLine`'s null-at-EOF shape has no `char` analog (v0.195). Whether the key is echoed is implementation-defined.
+`ReadKey()` blocks until one key (code point) is available and raises `EndOfStreamException` ([§7.5](#sec-io-exception-types); catching it by name requires `import System.IO;`) at end of input, where no key can exist. `ReadKeyOrNull()` (v0.231) is the [§1](#sec-failure-signal-rule) `*OrNull` tier beside it — `null` at end of input, the key otherwise — resolving the misfit the failure-signal rule recorded at v0.229: end of input is band 2's expected absence, and `char?` is exactly the `ReadLine` null-at-EOF analog the v0.195 note said was missing (`char` is a non-nullable value type, so `null` is unambiguous). `ReadKey` remains the assert-shaped throwing tier — end of input is a bug at its call sites. Whether the key is echoed is implementation-defined.
 
 <a id="sec-math"></a>
 ### 2.2 `Math`
@@ -225,23 +228,23 @@ public static class Environment
   public static readonly property ProcessorCount: int;
   public static readonly property CommandLineArgs: IReadOnlyList<string>;   // read-only view of cached process-lived storage (§4.1); dedicated view object, not an Array — §2.13's downcast rule (#1805)
 
-  public static method GetEnvironmentVariable(name: string): string?;
+  public static method Get(name: string): string?;    // null when the variable is absent (v0.231)
   public static method GetInt(name: string): int?;    // v0.215 convenience tier: null when the variable is
   public static method GetBool(name: string): bool?;  //   absent OR malformed — deliberately conflated
                                                       //   (recorded): callers that must distinguish keep the
-                                                      //   two-step idiom (GetEnvironmentVariable + TryParse).
+                                                      //   two-step idiom (Get + TryParse).
                                                       //   GetBool accepts exactly Boolean.Parse's forms
                                                       //   ("true"/"false", case-insensitive); "1"/"yes" are null.
-  public static method SetEnvironmentVariable(name: string, value: string?);
+  public static method Set(name: string, value: string?);
       // value = null removes the variable; an empty name, or one containing "=",
       //   raises ArgumentException (v0.195)
-  public static method GetEnvironmentVariables(): owned Dictionary<string, string>;
+  public static method Variables(): owned Dictionary<string, string>;
 
   public static method Exit(exitCode: int);
 end Environment;
 ```
 
-`GetEnvironmentVariables()` returns a freshly-allocated `owned Dictionary<string, string>` (per the §1 convention for fresh-instance returns). Although `Environment` itself is auto-imported via `System` ([§2.3](Bezel_Language_Spec.md#sec-always-available-names) of the language spec), the `Dictionary` type lives in `System.Collections.Generic` and is not auto-imported; callers using the return value typically `import System.Collections.Generic;` to access dictionary members.
+`Variables()` (v0.231) returns a freshly-allocated `owned Dictionary<string, string>` (per the §1 convention for fresh-instance returns). Although `Environment` itself is auto-imported via `System` ([§2.3](Bezel_Language_Spec.md#sec-always-available-names) of the language spec), the `Dictionary` type lives in `System.Collections.Generic` and is not auto-imported; callers using the return value typically `import System.Collections.Generic;` to access dictionary members.
 
 <a id="sec-datetime-timespan-dateonly-timeonly"></a>
 ### 2.5 `DateTime`, `TimeSpan`, `DateOnly`, `TimeOnly`
@@ -300,6 +303,9 @@ public record DateTime: IComparable<DateTime>, IEquatable<DateTime>
 
   public static method Parse(s: string): DateTime;
   public static method TryParse(s: string, out result: DateTime): bool;
+  public static method ParseOrNull(s: string): DateTime?;   // v0.231 (§1 *OrNull tier): null exactly
+                                                            //   where Parse(s) raises; otherwise the
+                                                            //   parsed value
 
   public static method operator -(a: DateTime, b: DateTime): TimeSpan;
   public static method operator -(d: DateTime, t: TimeSpan): DateTime;
@@ -371,6 +377,8 @@ public record DateOnly: IComparable<DateOnly>, IEquatable<DateOnly>
   public method ToDateTime(time: TimeOnly): DateTime;     // Kind = Unspecified
   public static method Parse(s: string): DateOnly;        // FormatException on invalid
   public static method TryParse(s: string, out result: DateOnly): bool;
+  public static method ParseOrNull(s: string): DateOnly?; // v0.231: null exactly where Parse(s)
+                                                          //   raises; otherwise the parsed value
   public method ToString(): string;                       // "yyyy-MM-dd"
   public method ToString(format: string): string;         // format vocabulary: §2.18
 end DateOnly;
@@ -384,6 +392,8 @@ public record TimeOnly: IComparable<TimeOnly>, IEquatable<TimeOnly>
   public method CompareTo(other: TimeOnly): int;
   public static method Parse(s: string): TimeOnly;
   public static method TryParse(s: string, out result: TimeOnly): bool;
+  public static method ParseOrNull(s: string): TimeOnly?; // v0.231: null exactly where Parse(s)
+                                                          //   raises; otherwise the parsed value
   public method ToString(): string;                       // "HH:mm:ss"
   public method ToString(format: string): string;         // format vocabulary: §2.18
 end TimeOnly;
@@ -402,7 +412,7 @@ end ArgumentOutOfRangeException;
 
 The no-argument `ToString()` renders a `DateTime` in the round-trippable ISO 8601 form `yyyy-MM-ddTHH:mm:ss` (e.g. `2024-03-15T00:00:00`); it is the value also used when a `DateTime` is interpolated into a string with no format specifier. `ToString(format)` selects an explicit format.
 
-**Parse and range contracts (v0.195).** `DateTime.Parse` accepts exactly the type's own rendered forms — the round-trip form `yyyy-MM-ddTHH:mm:ss`, optionally extended with a fractional-seconds tail `.fff`, and the date-only form `yyyy-MM-dd` (time components zero); the result's `Kind` is `Unspecified` (the rendered forms carry no zone), and any other input raises `FormatException`, the `DateOnly.Parse` stance. `TimeOnly.Parse` accepts `HH:mm:ss` with the same optional `.fff` tail. Every `TryParse` returns `false` exactly where its `Parse` would raise. The `Add*` family, `Add`/`Subtract`, and `FromTicks` raise `ArgumentOutOfRangeException` when the result falls outside `MinValue..MaxValue`. `ToUnixTimeSeconds` converts a `Kind = Local` value via `ToUtc()` first and treats `Unspecified` as already UTC (deterministic — no hidden machine-zone read); `FromUnixTimeSeconds` produces `Kind = Utc`.
+**Parse and range contracts (v0.195).** `DateTime.Parse` accepts exactly the type's own rendered forms — the round-trip form `yyyy-MM-ddTHH:mm:ss`, optionally extended with a fractional-seconds tail `.fff`, and the date-only form `yyyy-MM-dd` (time components zero); the result's `Kind` is `Unspecified` (the rendered forms carry no zone), and any other input raises `FormatException`, the `DateOnly.Parse` stance. `TimeOnly.Parse` accepts `HH:mm:ss` with the same optional `.fff` tail. Every `TryParse` returns `false`, and every `ParseOrNull` returns `null` (v0.231, the §1 `*OrNull` tier), exactly where its `Parse` would raise. The `Add*` family, `Add`/`Subtract`, and `FromTicks` raise `ArgumentOutOfRangeException` when the result falls outside `MinValue..MaxValue`. `ToUnixTimeSeconds` converts a `Kind = Local` value via `ToUtc()` first and treats `Unspecified` as already UTC (deterministic — no hidden machine-zone read); `FromUnixTimeSeconds` produces `Kind = Utc`.
 
 <a id="sec-guid"></a>
 ### 2.6 `Guid`
@@ -419,8 +429,19 @@ public record Guid: IComparable<Guid>, IEquatable<Guid>
   public static readonly property Empty: Guid;
 
   public static method NewGuid(): Guid;
+      // v0.231 pin: a version-4 (random) UUID — the version and variant bits are
+      //   fixed (0100 / 10), the remaining 122 bits drawn from the runtime's
+      //   entropy source (the §1 v0.204 replay-intercept point declared for this
+      //   section). Uniqueness is probabilistic, not checked: no dedup, no
+      //   cross-process coordination. The entropy source is NOT specified as
+      //   cryptographically strong — §2.7's recorded posture: cryptographic
+      //   randomness belongs to the future System.Security.Cryptography module —
+      //   so NewGuid values must not serve as secrets (session tokens,
+      //   capability strings).
   public static method Parse(s: string): Guid;      // accepts the "D" and "N" renderings (§2.18); FormatException otherwise (v0.195)
   public static method TryParse(s: string, out result: Guid): bool;
+  public static method ParseOrNull(s: string): Guid?;   // v0.231 (§1 *OrNull tier): null exactly where
+                                                        //   Parse(s) raises; otherwise the parsed value
 
   public method ToString(): string;          // canonical form
   public method ToString(format: string): string;   // "N", "D" — the §2.18 vocabulary; any other specifier raises FormatException (v0.195)
@@ -596,7 +617,7 @@ end Type;
 
 **`Implements` and `IsAssignableFrom`.** `t.Implements(i)` requires `i.IsInterface` (otherwise it raises `InvalidOperationException`) and returns whether the type `t` conforms to interface `i`. `a.IsAssignableFrom(b)` is the reflective form of the `is` operator (language spec [§12.7](Bezel_Language_Spec.md#sec-type-tests-is-is-not-as)): it returns whether a value whose runtime type is `b` may be assigned to a location of static type `a` — true when `a = b`, when `a` is a base class of `b`, or when `a` is an interface that `b` implements. The two are related: `a.IsAssignableFrom(b)` with `a.IsInterface` is equivalent to `b.Implements(a)`. Both operate on `Type` tokens with no value in hand, which is what distinguishes them from `is`/`as`.
 
-**Enum metadata.** When `IsEnum`, `EnumNames` and `EnumValues` are parallel arrays (same length, same order — declaration order of the enum members) giving each member's source name and its integer value widened to `long` — except for an enum whose underlying type is `ulong` (spec §10.3 admits it), whose values are **bit-reinterpreted** into `long` (`BitConverter.Reinterpret` semantics, [§2.12](#sec-bitconverter): the bit pattern is preserved; callers of such enums reinterpret back to `ulong`), since values above `long.MaxValue` have no widening (v0.195). They are the building blocks for enum-to-string formatting, string-to-enum parsing, and enumerating all members for UI or validation. On any non-enum `Type`, accessing either property raises `InvalidOperationException` (the property is meaningless, and a silent empty array would mask a programming error). The properties are **read-only views** over cached, process-lived storage (`IReadOnlyList<T>`, [§4.1](#sec-borrowing-collection-interfaces)), handed out as borrows (a property getter may not mint — spec §28.6) — the [§4.8](#sec-dictionaryk-v) `Keys`/`Values` shape, **including its backing**: each view is a dedicated view object owned by the `Type` instance, whose class is not nameable in user code and is in particular not `Array<T>`. There is no mutation surface, declared or recoverable: the view type has no mutating members, so the pre-v0.222 hazard of mutating process-wide metadata through the borrow is closed at compile time, and a type-test downcast (spec [§12.7](Bezel_Language_Spec.md#sec-type-tests-is-is-not-as)) cannot reach one — `typeof(E).EnumNames as Array<string>` is `null` (#1805). The same backing rule governs [§2.4](#sec-environment)'s `CommandLineArgs`. `IReadOnlyList` lives in `System.Collections.Generic`; callers touching the view's members import it, as for [§2.4](#sec-environment)'s `GetEnvironmentVariables` result. Example:
+**Enum metadata.** When `IsEnum`, `EnumNames` and `EnumValues` are parallel arrays (same length, same order — declaration order of the enum members) giving each member's source name and its integer value widened to `long` — except for an enum whose underlying type is `ulong` (spec §10.3 admits it), whose values are **bit-reinterpreted** into `long` (`BitConverter.Reinterpret` semantics, [§2.12](#sec-bitconverter): the bit pattern is preserved; callers of such enums reinterpret back to `ulong`), since values above `long.MaxValue` have no widening (v0.195). They are the building blocks for enum-to-string formatting, string-to-enum parsing, and enumerating all members for UI or validation. On any non-enum `Type`, accessing either property raises `InvalidOperationException` (the property is meaningless, and a silent empty array would mask a programming error). The properties are **read-only views** over cached, process-lived storage (`IReadOnlyList<T>`, [§4.1](#sec-borrowing-collection-interfaces)), handed out as borrows (a property getter may not mint — spec §28.6) — the [§4.8](#sec-dictionaryk-v) `Keys`/`Values` shape, **including its backing**: each view is a dedicated view object owned by the `Type` instance, whose class is not nameable in user code and is in particular not `Array<T>`. There is no mutation surface, declared or recoverable: the view type has no mutating members, so the pre-v0.222 hazard of mutating process-wide metadata through the borrow is closed at compile time, and a type-test downcast (spec [§12.7](Bezel_Language_Spec.md#sec-type-tests-is-is-not-as)) cannot reach one — `typeof(E).EnumNames as Array<string>` is `null` (#1805). The same backing rule governs [§2.4](#sec-environment)'s `CommandLineArgs`. `IReadOnlyList` lives in `System.Collections.Generic`; callers touching the view's members import it, as for [§2.4](#sec-environment)'s `Variables` result. Example:
 
 ```bezel
 public method DescribeEnum(t: Type)
@@ -1710,6 +1731,8 @@ public class Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>
                                                    //   enables `key in dict`
   public method Remove(key: K): bool;
   public method TryGetValue(key: K, out value: V?): bool;   // v0.171 (#1336): false path assigns null; value-typed V reads as V? at the call site
+  public method GetOrNull(key: K): V?;             // v0.231 (§1 *OrNull tier): absent -> null; present -> the
+                                                   //   value — read semantics and caveat in the prose below
   public method GetOrAdd(key: K, factory: (K) -> V): V;
 
   public method Clear();
@@ -1733,7 +1756,9 @@ public class KeyNotFoundException: Exception
 end KeyNotFoundException;
 ```
 
-The write surface is the indexer and `Add`: `dict[key] := value` inserts the key or updates an existing one (add-or-update), while `Add(key, value)` inserts and raises `ArgumentException` if the key is already present. There is no separate `Set` method — neither here nor on any other collection (`OwningDictionary` in [§4.9](#sec-owneddictionaryk-v) writes through its owned-taking indexer-set `dict[key] := value`, and the array/list/stack/queue types write through their own indexer or `Add`/`Push`/`Enqueue`). A call to a `Set` method on any collection is rejected as an unknown member.
+**`GetOrNull` (v0.231).** The §1 `*OrNull` convenience tier's keyed-lookup form, beside the throwing indexer and the distinguishing `TryGetValue`: `null` when the key is absent, otherwise the value under the family's read semantics — a copy for value-typed `V` and `string`, a borrow of the stored value (source: the receiver) for class-typed `V`. (When the value type is itself nullable, `?` is idempotent under substitution — spec §7.10, v0.159 — so a `GetOrNull` result cannot distinguish "absent" from "a present `null`"; use `ContainsKey` or the `Try` shape when the distinction matters.) At class-typed `V` the borrowed result does not meet an owned fallback through `??` (spec §7.7's `if`/`else`-join meet rule): a borrowed fallback composes, and a fresh fallback binds the result first and null-tests — the direct `??` composition is for value-typed and `string` `V` (`counts.GetOrNull(word) ?? 0`, `config.GetOrNull(key) ?? "default"`).
+
+The write surface is the indexer and `Add`: `dict[key] := value` inserts the key or updates an existing one (add-or-update), while `Add(key, value)` inserts and raises `ArgumentException` if the key is already present. There is no separate `Set` method — neither here nor on any other collection (`OwningDictionary` in [§4.9](#sec-owneddictionaryk-v) writes through its owned-taking indexer-set `dict[key] := value`, and the array/list/stack/queue types write through their own indexer or `Add`/`Push`/`Enqueue`). A call to a `Set` method on any collection is rejected as an unknown member. (A rule about the collections' write surface only, not about the name: a `Set` member elsewhere in the library — e.g. `Environment.Set`, [§2.4](#sec-environment) — is unrelated.)
 
 **Counting and update-in-place (v0.195).** `dict[key] += 1` desugars to a getter plus a setter (spec §6.6/§17.6), and the getter raises `KeyNotFoundException` on an absent key — the compound form updates, it never inserts. The counting idiom initializes explicitly:
 
@@ -1788,6 +1813,14 @@ public class OwningDictionary<K, V>: IDisposable where V: class
   public method Contains(key: K): bool;
   public method Remove(key: K): bool;          // disposes the removed value
   public method TryGetValue(key: K, out value: V?): bool;      // out is borrow; v0.171 (#1336)
+  public method GetOrNull(key: K): V?;                         // v0.231 (§1 *OrNull tier): absent -> null;
+                                                               //   present -> a borrow of the stored value, the
+                                                               //   indexer's get posture — ownership stays with
+                                                               //   the dictionary: a look, not a take (the take
+                                                               //   forms remain PopValue/TryPopValue). where V:
+                                                               //   class makes V statically non-nullable at
+                                                               //   every instantiation (spec §7.10), so null
+                                                               //   means absent, unambiguously
   public method GetOrAdd(key: K, factory: (K) -> owned V): V;  // returns borrow
 
   // Drain
@@ -2848,6 +2881,9 @@ public class SortedDictionary<K, V>: IReadOnlyCollection<DictionaryEntry<K, V>> 
   public method ContainsKey(key: K): bool;
   public method Contains(key: K): bool;         // alias for ContainsKey; enables `key in dict` (§4.8 convention; v0.195)
   public method TryGetValue(key: K, out value: V?): bool;   // v0.171 (#1336): nullable out, matching §4.8's revised uniform Try shape
+  public method GetOrNull(key: K): V?;          // v0.231 (§1 *OrNull tier): absent -> null; present -> the
+                                                //   value under §4.8's read semantics — caveat in the prose
+                                                //   below
   public method Remove(key: K): bool;           // false if absent
   public method Clear();
 
@@ -2856,9 +2892,9 @@ public class SortedDictionary<K, V>: IReadOnlyCollection<DictionaryEntry<K, V>> 
 end SortedDictionary;
 ```
 
-Ordering is defined by `K`'s `IComparable<K>.CompareTo` — there is no separate comparer parameter; a type that needs a different order wraps its key in a record with the desired `CompareTo` (the single-order rule keeps equality, ordering, and hashing in one place, on the type). Two keys are the same key exactly when `CompareTo` returns `0`. Point operations (`[k]`, `ContainsKey`, `TryGetValue`, `Remove`) are **O(log n)**; iteration is **O(n)** in ascending key order and is the single-pass borrowing form of [§4.8](#sec-dictionaryk-v) (`for var e in sd` yields entries with `e.Key`/`e.Value` borrows, one live pass at a time, structural modification during iteration raises `InvalidOperationException`).
+Ordering is defined by `K`'s `IComparable<K>.CompareTo` — there is no separate comparer parameter; a type that needs a different order wraps its key in a record with the desired `CompareTo` (the single-order rule keeps equality, ordering, and hashing in one place, on the type). Two keys are the same key exactly when `CompareTo` returns `0`. Point operations (`[k]`, `ContainsKey`, `TryGetValue`, `GetOrNull`, `Remove`) are **O(log n)**; iteration is **O(n)** in ascending key order and is the single-pass borrowing form of [§4.8](#sec-dictionaryk-v) (`for var e in sd` yields entries with `e.Key`/`e.Value` borrows, one live pass at a time, structural modification during iteration raises `InvalidOperationException`).
 
-Value semantics match `Dictionary<K, V>`: values are copied in and out for value types and `string`, borrowed for class types. There is no owning `OwningSortedDictionary` in this revision — owning sorted collections ride the self-hosted-collections work (changelog, v0.136).
+Value semantics match `Dictionary<K, V>`: values are copied in and out for value types and `string`, borrowed for class types. `GetOrNull` (v0.231) follows the same read semantics. (When the value type is itself nullable, `?` is idempotent under substitution — spec §7.10, v0.159 — so a `GetOrNull` result cannot distinguish "absent" from "a present `null`"; use `ContainsKey` or the `Try` shape when the distinction matters.) There is no owning `OwningSortedDictionary` in this revision — owning sorted collections ride the self-hosted-collections work (changelog, v0.136).
 
 <a id="sec-sorted-set"></a>
 ### 4.18 `SortedSet<T>` (added in v0.136)
@@ -4458,6 +4494,13 @@ public record Int32: IComparable<int>, IEquatable<int>
 
   public static pure method Parse(s: string): int;
   public static method TryParse(s: string, out result: int): bool;
+  public static pure method ParseOrNull(s: string): int?;             // v0.231 (§1 *OrNull tier): null exactly
+                                                                      //   where Parse(s) raises (the
+                                                                      //   FormatException/OverflowException
+                                                                      //   contract); otherwise the parsed
+                                                                      //   value. Same strict input grammar as
+                                                                      //   Parse — no whitespace tolerance
+                                                                      //   (v0.137); string form only
   public static pure method Parse(s: string, radix: int): int;        // radix in {2, 8, 10, 16}; any other
                                                                       //   radix raises ArgumentException — a
                                                                       //   caller bug, not input failure (v0.228 pin)
@@ -4482,7 +4525,7 @@ end Int32;
 
 Records implement `IEquatable<T>` implicitly through the auto-generated equality (language spec [§9.2](Bezel_Language_Spec.md#sec-body-records)): `Equals(other: int): bool` exists on `Int32` and is invoked when calling `someInt.Equals(otherInt)` directly or when an `IEquatable<int>`-constrained generic uses `Equals` through the constraint. The same convention applies to every primitive declaration in [§9.1](#sec-integer-types)–[§9.5](#sec-char).
 
-The span overloads (v0.222, #1810) accept exactly the inputs the string forms accept — same `FormatException`/`OverflowException` contract, no whitespace tolerance (v0.137) — over a `ReadOnlyStringSpan` window without materializing a substring; `TryParse` is shape (c) of the §1 Try convention. `IParsable<T>` (§2.19) is unchanged — the span forms are per-type members, not constraint surface.
+The span overloads (v0.222, #1810) accept exactly the inputs the string forms accept — same `FormatException`/`OverflowException` contract, no whitespace tolerance (v0.137) — over a `ReadOnlyStringSpan` window without materializing a substring; `TryParse` is shape (c) of the §1 Try convention. `IParsable<T>` (§2.19) is unchanged — the span forms are per-type members, not constraint surface. The `ParseOrNull` members (v0.231) are the §1 `*OrNull` convenience tier's parse form — string input only, no radix or span duals — and share the span forms' per-type, non-constraint status.
 
 <a id="sec-double-and-float"></a>
 ### 9.2 `Double` and `Float`
@@ -4505,6 +4548,8 @@ public record Double: IComparable<double>, IEquatable<double>
 
   public static pure method Parse(s: string): double;
   public static method TryParse(s: string, out result: double): bool;
+  public static pure method ParseOrNull(s: string): double?;          // v0.231: null exactly where Parse(s)
+                                                                      //   raises; otherwise the parsed value
   public static pure method Parse(s: ReadOnlyStringSpan): double;                  // v0.222 (#1810): span form
   public static method TryParse(s: ReadOnlyStringSpan, out result: double): bool;
 
@@ -4540,6 +4585,8 @@ public record Float: IComparable<float>, IEquatable<float>
 
   public static pure method Parse(s: string): float;
   public static method TryParse(s: string, out result: float): bool;
+  public static pure method ParseOrNull(s: string): float?;           // v0.231: null exactly where Parse(s)
+                                                                      //   raises; otherwise the parsed value
   public static pure method Parse(s: ReadOnlyStringSpan): float;                   // v0.222 (#1810): span form
   public static method TryParse(s: ReadOnlyStringSpan, out result: float): bool;
 
@@ -4568,6 +4615,8 @@ public record Decimal: IComparable<decimal>, IEquatable<decimal>
 
   public static pure method Parse(s: string): decimal;
   public static method TryParse(s: string, out result: decimal): bool;
+  public static pure method ParseOrNull(s: string): decimal?;         // v0.231: null exactly where Parse(s)
+                                                                      //   raises; otherwise the parsed value
   public static pure method Parse(s: ReadOnlyStringSpan): decimal;                 // v0.222 (#1810): span form
   public static method TryParse(s: ReadOnlyStringSpan, out result: decimal): bool;
 
@@ -4590,6 +4639,9 @@ end Decimal;
 public record Boolean: IEquatable<bool>
   public static pure method Parse(s: string): bool;            // "true"/"false", case-insensitive
   public static method TryParse(s: string, out result: bool): bool;
+  public static pure method ParseOrNull(s: string): bool?;     // v0.231 (§1 *OrNull tier): null exactly
+                                                               //   where Parse(s) raises; otherwise the
+                                                               //   parsed value
 
   public pure method ToString(): string;                       // "True" or "False"
 end Boolean;
@@ -4618,6 +4670,8 @@ public record Char: IComparable<char>, IEquatable<char>
 
   public static pure method Parse(s: string): char;                 // exactly one code point
   public static method TryParse(s: string, out result: char): bool;
+  public static pure method ParseOrNull(s: string): char?;          // v0.231: null exactly where Parse(s)
+                                                                    //   raises; otherwise the parsed value
 
   public pure method ToString(): string;
   public pure method CompareTo(other: char): int;
@@ -4634,6 +4688,7 @@ The most extensive primitive type. `String` is treated as both a primitive (with
 ```bezel
 public class String: IEnumerable<char>, IComparable<string>, IEquatable<string>     // alias: string
   public pure readonly property Length: int;            // number of code points (O(1))
+  public pure readonly property IsEmpty: bool;          // Length = 0 — §3.3's spelling (O(1)) (v0.231)
   public pure readonly property IsAscii: bool;          // true iff every code point < 128 (O(1))
   public pure readonly property [i: int]: char;                  // O(1)
 
