@@ -3127,7 +3127,7 @@ The predicate overloads of `First`, `Last`, and `Single` (and their `*OrNull` fo
 
 **Element-level semantics (v0.195).** `Zip` ends when either input ends. `Take`/`Skip` **clamp**: a negative count behaves as `0`, and a count beyond the source takes everything / skips everything — they are range operations, not magnitude constructors, so §1's negative-magnitude fault rule deliberately does not apply. `Distinct` and `Union` yield first occurrences in encounter order (`Union`: first input, then the second); `Intersect` and `Except` yield the retained elements, made distinct, in first-input order.
 
-**`GroupBy` semantics (v0.195).** `GroupBy` is lazy until its first enumeration, then **materializes fully** — no complete group can exist before the source is exhausted, so the operator buffers; its §29.11 consumption of the source happens at that point. Groups appear in first-occurrence-of-key order; elements within a group in source order. Single-consumption (spec §29.11) binds to the **outer** `IEnumerable<IGrouping<TKey, T>>` sequence only — the lazy query here. Each `IGrouping<TKey, T>` is a materialized, ordinarily **re-enumerable** collection whose elements are the grouping's own buffer, and it remains valid after the outer sequence advances past it: `g.Count()` followed by `g.Average(…)` is defined and reads the buffer twice. When a group feeds many aggregations, materializing it once — `for var g in logs.GroupBy(lambda(r) => r.Level) do using var items := g.ToArray(); … end;` — remains the advised shape; it is advice, not a rule.
+**`GroupBy` semantics (v0.195; single-consumption scoping v0.230).** `GroupBy` is lazy until its first enumeration, then **materializes fully** — no complete group can exist before the source is exhausted, so the operator buffers; its §29.11 consumption of the source happens at that point. Groups appear in first-occurrence-of-key order; elements within a group in source order. Single-consumption (spec §29.11) binds to the **outer** `IEnumerable<IGrouping<TKey, T>>` sequence only — the lazy query here. Each `IGrouping<TKey, T>` is a materialized, ordinarily **re-enumerable** collection whose elements are the grouping's own buffer, and it remains valid after the outer sequence advances past it: `g.Count()` followed by `g.Average(…)` is defined and reads the buffer twice. When a group feeds many aggregations, materializing it once — `for var g in logs.GroupBy(lambda(r) => r.Level) do using var items := g.ToArray(); … end;` — remains the advised shape; it is advice, not a rule.
 
 **`Reverse` (naming note, v0.195).** §5 keeps the .NET-heritage operator names, so the lazy `Reverse()` deliberately sits outside §4.4's imperative-mutates/participle-copies convention — recorded as a decision, not an accident (renaming to `Reversed()` was declined: §4.4's participle promises a fresh owned *copy*, which a lazy sequence is not). No call-site ambiguity arises: on an `Array<T>` receiver, instance resolution commits to the in-place `Reverse()` before extensions are consulted (spec §26.4 rule 1); the lazy operator applies only where the receiver's static type has no instance `Reverse`.
 
@@ -3577,8 +3577,9 @@ All six event types live in `System.Threading` and are always available without 
 See [§30.11](Bezel_Language_Spec.md#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet) of the language spec.
 
 ```bezel
-// For non-class T (value types, string, runtime-managed reference types).
-// Instantiating with a class T is a compile error pointing to OwningTaskCompletionSource<T>.
+// For non-class T (copyable value types, string, runtime-managed reference types).
+// Instantiating with a class T is a compile error pointing to OwningTaskCompletionSource<T>;
+// a move-only value T is rejected per spec §30.5 (its Task<T> is itself ill-formed).
 public class TaskCompletionSource<T>
   public constructor();
   public readonly property Task: Task<T>;
@@ -3636,14 +3637,16 @@ See [§30.10](Bezel_Language_Spec.md#sec-standard-library-task-helpers) of the l
 
 ```bezel
 public class Task
-  // For non-class T (value types, string, runtime-managed reference types).
-  // For class T, use FromOwnedResult instead.
+  // For non-class T (copyable value types, string, runtime-managed reference types).
+  // For class T, use FromOwnedResult instead; a move-only value T is rejected
+  // per spec §30.5.
   public static method FromResult<T>(value: T): Task<T>;
 
   // For class T. Produces a Pattern B task; awaiters consume under `using var x := await ...`.
   public static method FromOwnedResult<T>(owned value: T): OwningTask<T> where T: class;
 
-  // For any T: a faulted task never produces its result, so the Pattern A vs
+  // For any T over which Task<T> is well-formed (spec §30.5 — move-only value T
+  // is not): a faulted task never produces its result, so the Pattern A vs
   // Pattern B distinction does not apply. `FromException<MyClass>(ex)` is correctly
   // typed as Task<MyClass> even when MyClass is a class type — there is no value
   // to transfer ownership of, only an exception to re-raise on await.
@@ -4301,7 +4304,7 @@ public enum FileAccess: byte
 end FileAccess;
 ```
 
-**Constructor contract (v0.230).** The two-argument constructor implies **`FileAccess.ReadWrite`**: `new FileStream(path, mode)` behaves as `new FileStream(path, mode, FileAccess.ReadWrite)`. A construction that cannot open the file raises the [§7.5](#sec-io-exception-types) types: `FileNotFoundException` when `FileMode.Open` names a file that does not exist, `DirectoryNotFoundException` when a directory component of `path` does not exist, and `IOException` otherwise (an existing file under `FileMode.CreateNew`, a permission failure, and every other OS-level open failure).
+**Constructor contract (v0.230).** The two-argument constructor implies **`FileAccess.ReadWrite`**: `new FileStream(path, mode)` behaves as `new FileStream(path, mode, FileAccess.ReadWrite)`. A construction that cannot open the file raises the [§7.5](#sec-io-exception-types) types: `FileNotFoundException` when `FileMode.Open` names a file that does not exist, `DirectoryNotFoundException` when a directory component of `path` does not exist, and `IOException` otherwise (an existing file under `FileMode.CreateNew`, a permission failure, and every other OS-level open failure — where the OS reports a too-long path, as [§7.5](#sec-io-exception-types)'s `IOException`-derived `PathTooLongException`).
 
 **Disposal (flush-on-dispose).** Disposing a `FileStream` — at `using var` scope exit or an explicit `Dispose()` — flushes any buffered writes and releases the OS file handle. A `FileStream` opened for writing must be disposed (or explicitly `Flush()`ed) for buffered data to reach the file; the `using var` idiom guarantees this on every exit edge, including exceptions. `FileStream` overrides `ReadAsync`/`WriteAsync` ([§7.1](#sec-stream)) with genuinely asynchronous OS I/O — not the blocking base default.
 

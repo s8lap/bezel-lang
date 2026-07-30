@@ -122,6 +122,8 @@ The randomness-source sentence is deliberately *relative*: it neither promises C
 
 ## 4. §2.18 temporal pattern literals — resolve [#2243](https://github.com/s8lap/bezel-lang/issues/2243) with interpretation (a)
 
+> **Landed at v0.230** (owner-ruled 2026-07-29; Q4 resolved as interpretation (a) with the growth rider; recorded in the v0.230 changelog entry). This item graduated ahead of its batch; the proposal's remaining items await their own graduation.
+
 **The defect (issue #2243, filed 2026-07-28 per the CLAUDE.md stop-and-open-an-issue rule).** §2.18's temporal row specifies "pattern strings of `yyyy` `MM` `dd` `HH` `mm` `ss` `fff` plus literal separators", and §2.18's fault rule says "An unrecognized specifier raises `FormatException` (strict-fault, as everywhere)". Whether an **alphabetic** non-specifier character — the `T` in `yyyy-MM-ddTHH:mm:ss` — is a "literal separator" (pass-through) or an "unrecognized specifier" (fault) is unstated. The surrounding texts presuppose the literal reading: the no-format `DateTime.ToString()` renders `yyyy-MM-ddTHH:mm:ss` (§2.5) — the pattern of the type's *own default output* is unwritable if `T` faults — and proposal [0010](0010-serialization-value-builtins.md)'s owner-ruled (2026-07-04) conditional-`Z` wire form is sketched in 0010's own text as `ToString("yyyy-MM-ddTHH:mm:ss.fff") + "Z"`. A user today cannot reliably write the very pattern an owner ruling specifies. (Scope note: this is a `ToString(format)` question only — no pattern-driven `Parse` exists; §2.5's `Parse` accepts the pinned rendered forms and nothing else.)
 
 **Proposed: interpretation (a), pinned.** One sentence added to §2.18's temporal entry:
@@ -166,5 +168,5 @@ Doc-only; no member changes anywhere.
 - **Q1 (item 1):** accept the `Get`/`Set` renames (recommended — the no-users window argument), or decline and record the two-register family as an accepted §15.x-style cost?
 - **Q2 (item 1):** the enumeration member — rename to `Variables()` (recommended), keep `GetEnvironmentVariables` while renaming only `Get`/`Set` (a smaller break, a residual long name), or another spelling? (`GetAll` was considered and reads thinly.)
 - **Q3 (item 3):** confirm the version-4 pin; and is a time-ordered (v7-style) id wanted as a *separately named future member* (capability decision; 0068's secure-random seam is the related plumbing), or should its decline be recorded now?
-- **Q4 (item 4):** interpretation (a) with the growth rider (recommended), or (b) quoting/escaping to reserve the specifier letter space?
+- **Q4 (item 4):** interpretation (a) with the growth rider (recommended), or (b) quoting/escaping to reserve the specifier letter space? **Resolved: (a), landed at v0.230 (#2243).**
 - **Q5 (item 5):** land the `Count`-vs-`Length` sentence as drafted, including its closing `Array<T>`-vs-.NET clause, or trimmed to the bare rule?
