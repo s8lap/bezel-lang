@@ -6472,6 +6472,14 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
             llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false);
         enumPtr = builder_.CreateCall(geTy, geFnPtr, {srcPtr, tokenArg},
                                       "afor.getenum");
+        // fix #2356 / §29.8: an owned-param compiler-generated async iterator's
+        // GetAsyncEnumerator (LlvmBackend_Async.cpp) can now raise
+        // InvalidOperationException (the affine claim-once guard) — the first
+        // vtable-slot-4 producer able to throw, so this is the first call site
+        // that needs the check. A non-throwing producer (the no-owned-param
+        // clone path, or the runtime Task.WhenEach self-return) leaves no
+        // pending exception and this is a harmless no-op branch.
+        emitPendingCheck();
     }
     auto* enumSlot = entryAlloca(ptrTy());
     builder_.CreateStore(enumPtr, enumSlot);

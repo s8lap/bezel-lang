@@ -4439,6 +4439,12 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         ptrTy(), {ptrTy(), ptrTy()}, false);
                     llvm::Value* en = builder_.CreateCall(
                         geTy, geFnPtr, {src, tokenArg}, "gae.enum");
+                    // fix #2356 / §29.8: a second GetAsyncEnumerator() call on
+                    // an owned-param async iterator now raises
+                    // InvalidOperationException (the affine claim-once guard,
+                    // LlvmBackend_Async.cpp) instead of silently aliasing the
+                    // first clone — check for it before touching `en` further.
+                    emitPendingCheck();
                     // §29.11: an UNBOUND temporary receiver (`Gen().Get…()`)
                     // has no binder to discharge it, and the fresh enumerator
                     // is an independent byte-copy — so the source frame's sole

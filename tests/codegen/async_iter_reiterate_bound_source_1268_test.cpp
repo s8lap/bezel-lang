@@ -167,13 +167,22 @@ BEZEL_TEST(async_iter_reiterate_bound_source_1268, temporary_source_still_discha
         "end C;"), 0);
 }
 
-// §29.8 (#973b) + §29.11: the deliberate CARVE. An async iterator with an
-// `owned` PARAMETER carries an affine obligation in its frame, so slot 4 returns
-// `self` rather than a byte-copy that would give two frames the same owned
-// pointer. The loop then leaves a NAMED source alone (its binder disposes it at
-// scope end) — the same late timing the synchronous #943 path already has for
-// `var src := UseCell(new Cell()); for var x in src do … end`. Cell.n back to 0
-// after the source's scope means the owned param was disposed EXACTLY once.
+// §29.8 (#973b) + §29.11. UPDATED by fix #2356 (docs v0.234): slot 4 no
+// longer returns `self` for an owned-param async iterator — #2356 found that
+// self-return let a hand-written `await using var en := src.GetAsyncEnumerator();`
+// on a NAMED source double-free (§29.3's "re-iterable ... independent
+// enumerator" contract carries no owned-param carve-out in the text). Slot 4
+// now ALWAYS hands back a genuine clone; the first call CLAIMS the affine
+// `owned` capture (transfers it into the clone, nulls `self`'s own copy) so
+// a SECOND call raises `InvalidOperationException` instead of aliasing
+// (LlvmBackend_Async.cpp). This test's own shape — one `await for` loop,
+// one call to GetAsyncEnumerator via the loop desugaring — still exercises
+// the ordinary (non-repeat) claim path and its assertion is UNCHANGED: `src`
+// itself is still disposed at its own scope end (now correctly disposing an
+// inert, already-claimed husk — a no-op for the Cell, matching the
+// synchronous #943 path's late-disposal timing), and the CLONE the loop
+// drove (not `src`) is what actually disposed the Cell when the loop ended.
+// Cell.n back to 0 by the time `src`'s scope ends still proves exactly-once.
 BEZEL_TEST(async_iter_reiterate_bound_source_1268, owned_param_iterator_self_enumerator) {
     BEZEL_EXPECT_EQ(run(
         "module M; "

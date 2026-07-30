@@ -1735,22 +1735,53 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     vtElems[4] = getAsyncEnumFn;
     vtGV->setInitializer(llvm::ConstantArray::get(vtGVType, vtElems));
 
-    // --- GetAsyncEnumerator body (vtable slot 4, #1268) ---
-    // §29.8: an iterator with an `owned` PARAMETER carries an affine obligation
-    // in the frame — only one enumerator may claim it, and the source Dispose
-    // (#973b's iteratorAutoDispose sweep) is what discharges it. Handing out a
-    // byte-copy would give two frames the same owned pointer, so for that narrow
-    // shape the slot returns `self` — the pre-#1268 single-use identity, exactly
-    // preserved. (`await for` then leaves the source undisposed at loop end when
-    // it is a named binding, so the binder's own scope-end disposal still runs
-    // it exactly once; see lowerAwaitFor.) The sync path's alternative — let the
-    // first clone claim the captures and raise IOE on the second
-    // (cloneDisposesOwnedCaptures) — is deliberately NOT replicated here: it is
-    // its own increment, and returning `self` cannot regress anything.
-    // Because the clone is only ever handed out when there is no owned capture,
-    // the source's Dispose and a clone's Dispose are the SAME function (the
-    // owned-param sweep is a no-op for such a frame), so no separate clone
-    // vtable / CloneDispose is needed — the clone reuses `vtGV`.
+    // --- GetAsyncEnumerator body (vtable slot 4, #1268; owned-param CLAIM
+    // mechanism fix #2356) ---
+    // §29.3 (v0.234): "`IAsyncEnumerable<T>` (re-iterable)" — the same defining
+    // clause as the sync form, "re-iterable: each call to `GetEnumerator()` runs
+    // the body again from the start" — with NO carve-out for an owned parameter;
+    // "`owned` parameters remain admitted (§29.8)" merely says the parameter
+    // kind does not disqualify the method from being an iterator at all (unlike
+    // `ref`/`out`, forbidden by the same sentence's neighbor), not that it
+    // waives re-iterability. §29.11: "Each `GetEnumerator()` call produces an
+    // independent enumerator." §30.7's own interface block types the method
+    // `GetAsyncEnumerator(...): owned IAsyncEnumerator<T>` — an `owned`-returning
+    // method mints a fresh, caller-owned value per call (§29.1: "the caller
+    // takes ownership of the enumerator and must dispose it"); handing back
+    // `self` — an object the ENUMERABLE's own binder still owns too — breaks
+    // that contract regardless of the disposal bookkeeping around it. Returning
+    // `self` unconditionally (the pre-#2356 shape) is therefore read as spec-
+    // NON-compliant, not merely leaky: issue #2356's own double-free was the
+    // symptom, not the defect (two bindings validly OWNING the SAME object, per
+    // §28's "every heap object is disposed exactly once").
+    //
+    // Fix: GetAsyncEnumerator ALWAYS hands back a genuine independent clone
+    // (byte-copy + state reset — the SAME machinery already used below for the
+    // no-owned-param case). For the affine `owned` parameter specifically (it
+    // cannot be duplicated — no implicit Clone()), the FIRST call CLAIMS every
+    // owned-param capture: the clone's byte-copy takes the (still-live) pointer,
+    // and `self`'s own copy is nulled — so `self`'s later Dispose
+    // (emitFreeAndReturn's existing null-guarded sweep, unchanged) becomes a
+    // no-op for it, exactly the same null-guard the moved-from case already
+    // relies on. `self`'s state becomes the sentinel `-3` (unused elsewhere in
+    // this state space — Dispose's own state switch (below) only recognizes
+    // non-negative suspension states and treats anything else, `-1` for
+    // "completed" included, as "no pending cleanup, just free"), so a SECOND
+    // GetAsyncEnumerator call sees the claim and raises a loud
+    // `InvalidOperationException` rather than silently handing out a second
+    // alias of the same affine resource — the same "claim once, IOE on repeat"
+    // shape as the sync iterator's #973a/#2154 GetEnumerator claim
+    // (LlvmBackend_Iterators.cpp), simplified: EVERY owned param is claimed
+    // uniformly by the first call (no attempt to distinguish a param the body
+    // never moves out from one it does — that finer-grained sharing the sync
+    // path allows for a never-consumed capture is intentionally NOT replicated
+    // here, tracked as a follow-up, #2362, for whoever revisits this for
+    // throughput; claim-once is conservative but sound for every shape).
+    // `await for`'s desugaring (lowerAwaitFor) already drives exclusively
+    // through the RETURNED enumerator pointer (never `self` directly), so it
+    // needs no change beyond the pending-exception check this fix adds at both
+    // call sites (here callers must, since this is now the first vtable-slot-4
+    // path that can throw).
     bool hasOwnedParamCapture = false;
     for (sema::Symbol* psym : ms->params) {
         auto* ps = dynamic_cast<sema::ParameterSymbol*>(psym);
@@ -1762,49 +1793,106 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         llvm::IRBuilder<> gb(geEntry);
         llvm::Value* geSelf = getAsyncEnumFn->getArg(0);
         llvm::Value* geToken = getAsyncEnumFn->getArg(1);
+        llvm::Value* sourceStateField =
+            gb.CreateStructGEP(stateStructTy, geSelf, STATE_FIELD);
+        auto* cloneBB = geEntry;
         if (hasOwnedParamCapture) {
-            // §30.7 (#1525): the token still belongs to the returned enumerator
-            // even when the affine owned-param shape returns `self` unchanged
-            // (the enumerABLE and enumerator are the same object here).
-            gb.CreateStore(geToken,
-                gb.CreateStructGEP(stateStructTy, geSelf, TOKEN_FIELD));
-            gb.CreateRet(geSelf);
-        } else {
-            uint64_t stSz =
-                module_->getDataLayout().getTypeAllocSize(stateStructTy);
-            auto* callocFnGE = declareC("calloc", ptrTy(), {i64(), i64()});
-            llvm::Value* clone = gb.CreateCall(
-                callocFnGE, {gb.getInt64(1), gb.getInt64((int64_t)stSz)},
-                "asynciter.clone");
-            auto* memcpyFnGE =
-                declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-            gb.CreateCall(memcpyFnGE,
-                          {clone, geSelf, gb.getInt64((int64_t)stSz)});
-            // Reset to the start: state 0, no yielded value, no in-flight
-            // per-advance / pending task, and no spill area (the clone lazily
-            // allocates its own on first resume — copying the source's pointer
-            // would make two frames free() the same region).
-            gb.CreateStore(gb.getInt32(0),
-                gb.CreateStructGEP(stateStructTy, clone, STATE_FIELD));
-            gb.CreateStore(llvm::Constant::getNullValue(elemTy),
-                gb.CreateStructGEP(stateStructTy, clone, CURRENT_VAL_FIELD));
-            gb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
-                gb.CreateStructGEP(stateStructTy, clone,
-                                   PER_ADVANCE_TASK_FIELD));
-            gb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
-                gb.CreateStructGEP(stateStructTy, clone, PENDING_TASK_FIELD));
-            gb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
-                gb.CreateStructGEP(stateStructTy, clone, SPILL_PTR_FIELD));
-            // §30.7 (#1525): the clone captures the CALLER's token — NOT the
-            // source's (the source's own TOKEN_FIELD is whatever was stored the
-            // last time GetAsyncEnumerator was called on it, normally still null
-            // since the constructing call `Gen()` never sets it).
-            gb.CreateStore(geToken,
-                gb.CreateStructGEP(stateStructTy, clone, TOKEN_FIELD));
-            gb.CreateStore(vtGV,
-                gb.CreateStructGEP(stateStructTy, clone, VTABLE_FIELD));
-            gb.CreateRet(clone);
+            auto* claimedBB =
+                llvm::BasicBlock::Create(llvm_, "gae.claimed", getAsyncEnumFn);
+            cloneBB = llvm::BasicBlock::Create(llvm_, "gae.claim", getAsyncEnumFn);
+            llvm::Value* priorState =
+                gb.CreateLoad(i32(), sourceStateField, "gae.priorstate");
+            gb.CreateCondBr(
+                gb.CreateICmpEQ(priorState, gb.getInt32(-3), "gae.isclaimed"),
+                claimedBB, cloneBB);
+
+            // Already claimed by an earlier GetAsyncEnumerator call: raise
+            // InvalidOperationException synchronously (this method is NOT
+            // itself async — a plain `owned IAsyncEnumerator<T>`-returning
+            // call — so the pending-exception protocol, not a faulted Task,
+            // is the right channel; mirrors the sync claim block's IOE, and
+            // the #1349 TakeCurrent IOE emission a few functions below).
+            // NOTE: this block builds `getAsyncEnumFn` through its OWN local
+            // `gb` IRBuilder, not the shared `builder_` — `emitExcSlot()`
+            // (like most Emitter helpers) emits through `builder_` and would
+            // insert the bz_exc_addr() call into whatever function/block
+            // `builder_` currently points at (a DIFFERENT function's IR —
+            // "referring to an instruction in another function", caught by
+            // the verifier). Declare and call bz_exc_addr directly through
+            // `gb` instead, exactly mirroring the sync iterator's GetEnumerator
+            // claim block (LlvmBackend_Iterators.cpp) and the #1349 TakeCurrent
+            // IOE emission (both of which build their own vtable function
+            // bodies the same self-contained way).
+            gb.SetInsertPoint(claimedBB);
+            llvm::Value* excObj = gb.CreateCall(
+                callocFn(),
+                {gb.getInt64(1), gb.getInt64((int64_t)kExcObjSize)},
+                "gae.excobj");
+            auto vit = builtinVtable_.find("InvalidOperationException");
+            if (vit != builtinVtable_.end())
+                gb.CreateStore(vit->second, excObj);
+            auto* excAddrTy = llvm::FunctionType::get(ptrTy(), {}, false);
+            auto* excAddrFnGE =
+                module_->getOrInsertFunction("bz_exc_addr", excAddrTy)
+                    .getCallee();
+            llvm::Value* excSlotGE =
+                gb.CreateCall(excAddrTy, excAddrFnGE, {}, "gae.excslot");
+            gb.CreateStore(excObj, excSlotGE);
+            gb.CreateRet(llvm::ConstantPointerNull::get(ptrTy()));
+            gb.SetInsertPoint(cloneBB);
         }
+
+        uint64_t stSz =
+            module_->getDataLayout().getTypeAllocSize(stateStructTy);
+        auto* callocFnGE = declareC("calloc", ptrTy(), {i64(), i64()});
+        llvm::Value* clone = gb.CreateCall(
+            callocFnGE, {gb.getInt64(1), gb.getInt64((int64_t)stSz)},
+            "asynciter.clone");
+        auto* memcpyFnGE =
+            declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+        gb.CreateCall(memcpyFnGE,
+                      {clone, geSelf, gb.getInt64((int64_t)stSz)});
+        // Reset to the start: state 0, no yielded value, no in-flight
+        // per-advance / pending task, and no spill area (the clone lazily
+        // allocates its own on first resume — copying the source's pointer
+        // would make two frames free() the same region).
+        gb.CreateStore(gb.getInt32(0),
+            gb.CreateStructGEP(stateStructTy, clone, STATE_FIELD));
+        gb.CreateStore(llvm::Constant::getNullValue(elemTy),
+            gb.CreateStructGEP(stateStructTy, clone, CURRENT_VAL_FIELD));
+        gb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+            gb.CreateStructGEP(stateStructTy, clone,
+                               PER_ADVANCE_TASK_FIELD));
+        gb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+            gb.CreateStructGEP(stateStructTy, clone, PENDING_TASK_FIELD));
+        gb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+            gb.CreateStructGEP(stateStructTy, clone, SPILL_PTR_FIELD));
+        // §30.7 (#1525): the clone captures the CALLER's token — NOT the
+        // source's (the source's own TOKEN_FIELD is whatever was stored the
+        // last time GetAsyncEnumerator was called on it, normally still null
+        // since the constructing call `Gen()` never sets it).
+        gb.CreateStore(geToken,
+            gb.CreateStructGEP(stateStructTy, clone, TOKEN_FIELD));
+        gb.CreateStore(vtGV,
+            gb.CreateStructGEP(stateStructTy, clone, VTABLE_FIELD));
+        if (hasOwnedParamCapture) {
+            // Transfer: the clone's byte-copy above already took a live
+            // pointer for every owned-param capture; null `self`'s own copies
+            // so `self`'s later Dispose (emitFreeAndReturn's null-guarded
+            // sweep, unchanged) is a no-op for them, and mark `self` claimed
+            // so a repeat call raises IOE above instead of aliasing the clone.
+            for (std::size_t i = 0; i < frame.captures.size(); ++i) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    frame.captures[i].first);
+                if (!ps || ps->modifier != "owned") continue;
+                unsigned fieldIdx = frame.captureStart + (unsigned)i;
+                gb.CreateStore(
+                    llvm::Constant::getNullValue(frame.captures[i].second),
+                    gb.CreateStructGEP(stateStructTy, geSelf, fieldIdx));
+            }
+            gb.CreateStore(gb.getInt32(-3), sourceStateField);
+        }
+        gb.CreateRet(clone);
     }
 
     // --- Construction entry (= the original method): calloc + fill frame ---
@@ -2146,8 +2234,17 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             // lowering nulls this very slot
             // (Emitter::nullStateMachineOwnedParamCapture), so the adopting path
             // loads null and skips while the fall-through path disposes exactly
-            // once. An async iterator frame is never cloned (no GetEnumerator
-            // memcpy), so the frame the body ran on is the frame disposed here.
+            // once. fix #2356 / §29.8: an owned-param async iterator's
+            // GetAsyncEnumerator (vtable slot 4, above) now DOES clone — the
+            // first call transfers every owned-param capture into the clone
+            // and NULLS `self`'s own copies, so this sweep is a genuine no-op
+            // when it later runs on the (inert, never-driven) SOURCE frame,
+            // and disposes the still-live captures when it runs on the CLONE
+            // (the frame the body actually ran on). Both cases are exactly-
+            // once-safe through the same null guard; no clone/source
+            // distinction is needed here because the transfer already made
+            // "self's own copy" the single source of truth for whichever
+            // frame this call is disposing.
             for (std::size_t i = frame.captures.size(); i-- > 0;) {
                 auto* ps = dynamic_cast<sema::ParameterSymbol*>(
                     frame.captures[i].first);
