@@ -8563,7 +8563,32 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 v = drainLazyPipelineToOwnedIEnumerable(v, declTR);
             } else if (initTR && initTR->kind == sema::TypeRef::Kind::Named &&
                        initTR->declaration) {
-                v = wrapUserClassAsIEnumerable(v, initTR->declaration, declTR);
+                // fix #2424 (§28 preamble/§28.9, §29.1, v0.235): a genuinely
+                // UNOWNED temporary source (`var s: IEnumerable<int> := new
+                // IntRange(...);` — the `new` result is bound to no other
+                // name anywhere) has no independent disposer; THIS coercion's
+                // own wrapper must be the one to reclaim it (via the ownsSrc
+                // flag wrapUserClassAsIEnumerable now threads into the
+                // generated wrapper). A NAMED source (`var r := new
+                // IntRange(...); var s: IEnumerable<int> := r;`) is disposed
+                // at ITS OWN scope end by the ordinary local/param/field
+                // disposal machinery — freeing it again here would
+                // double-free. Mirrors lowerIEnumerableFor's
+                // `sourceIsNamedOwner` test (LlvmBackend_Stmts.cpp), the
+                // sibling fix for the analogous for-in desugaring gap.
+                bool srcIsNamedOwner = false;
+                if (sema::Symbol* sym = ctx_.exprSymbol(*init)) {
+                    if (dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
+                        dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr ||
+                        dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
+                        srcIsNamedOwner = true;
+                    } else if (auto* ps =
+                                   dynamic_cast<sema::PropertySymbol*>(sym)) {
+                        srcIsNamedOwner = sema::isAutoPropertySymbol(ps);
+                    }
+                }
+                v = wrapUserClassAsIEnumerable(v, initTR->declaration, declTR,
+                                                /*ownsSrc=*/!srcIsNamedOwner);
             }
         }
     }

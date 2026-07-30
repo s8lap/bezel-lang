@@ -4956,9 +4956,24 @@ private:
     // expected, so that lowerIEnumerableBuiltinFor's vtable dispatch works
     // uniformly for all IEnumerable<T> sources. Returns src unchanged on
     // resolution failure (GetEnumerator or enumerator-class not found).
+    //
+    // fix #2424 (§28 preamble/§28.9, §29.1, v0.235): `ownsSrc` tells the
+    // generated wrapper whether ITS OWN scope-end disposal is `src`'s ONLY
+    // disposer (a genuinely unnamed temporary — `var s: IEnumerable<int> :=
+    // new IntRange(...);`) as opposed to a NAMED, independently-owned source
+    // that disposes itself at its own scope end (freeing it here too would
+    // double-free). This is call-SITE data, not a per-(enumerator class)
+    // constant — the SAME cached wrapper function (keyed on the (source,
+    // enumerator) class pair, see the .cpp) may be reached from both a
+    // temporary and a named call site across a program, so it is threaded
+    // through as a stored runtime flag on the wrapper instance, not baked
+    // into the shared IR function. Defaults to `false` (preserves the
+    // pre-#2424 behavior — never dispose `src`) for every call site that has
+    // not been individually analyzed for named-vs-temporary ownership.
     llvm::Value* wrapUserClassAsIEnumerable(llvm::Value* src,
                                             const sema::TypeSymbol* srcTs,
-                                            const sema::TypeRef* iEnumTy);
+                                            const sema::TypeRef* iEnumTy,
+                                            bool ownsSrc = false);
 
     // §29.2 (#552): generate (or reuse) a standalone thunk function for an
     // expression-form property getter (`property P: T => expr` or

@@ -4561,7 +4561,8 @@ llvm::Function* Emitter::ensureExprGetterThunk(const sema::PropertySymbol* ps,
 // runtime, but that's no worse than before this fix).
 llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
                                                   const sema::TypeSymbol* srcTs,
-                                                  const sema::TypeRef* iEnumTy) {
+                                                  const sema::TypeRef* iEnumTy,
+                                                  bool ownsSrc) {
     // 1. Find GetEnumerator on the source class.
     sema::MethodSymbol* getEnumSym = findMethodByName(srcTs, "GetEnumerator");
     if (!getEnumSym) return src;
@@ -4676,16 +4677,50 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
         auto dIt = disposerFns_.find(enumTs);
         if (dIt != disposerFns_.end()) enumDisposeFn = dIt->second;
     }
+    // fix #2424: resolve the SOURCE class's own Dispose too (distinct from
+    // enumDisposeFn whenever the two-class idiom applies — enumTs != srcTs).
+    // Needed so a wrapper that owns a temporary source can dispatch srcTs's
+    // own destructor/owned-field cascade (§28.2) before reclaiming its block,
+    // not just the enumerator's.
+    llvm::Function* srcDisposeFn = nullptr;
+    {
+        auto sdIt = disposerFns_.find(srcTs);
+        if (sdIt != disposerFns_.end()) srcDisposeFn = sdIt->second;
+    }
 
-    // 7. Build type-specific wrapper functions keyed on the enumerator class name.
-    std::string key = std::string(enumTs->name);
+    // 7. Build type-specific wrapper functions keyed on the (source,
+    // enumerator) class PAIR.
+    //
+    // fix #2424: widened from `enumTs->name` alone to `srcTs->name + "$" +
+    // enumTs->name`. `srcDisposeFn` (above) is a SPECIFIC llvm::Function*
+    // closed over directly into the generated `wrapDisposeFn`'s IR body
+    // (mirroring how `enumDisposeFn` is already closed over) — safe only if
+    // this cached wrapper is unique per source class. Keying on `enumTs`
+    // alone is NOT enough: two unrelated source classes can legally return
+    // the SAME enumerator class from GetEnumerator() (e.g. two IEnumerable<T>
+    // classes both minting a shared `RangeEnum`), and `getOrCreate` reuses
+    // whichever function was compiled FIRST by name — reusing an
+    // `enumTs`-only-keyed wrapper across two different `srcTs` would bake in
+    // the WRONG source's disposer. Widening the key gives each (source,
+    // enumerator) pair its own generated functions, closing that hazard; the
+    // common case (one source class per enumerator class) is unaffected since
+    // the pair is still unique and the cache still hits on every repeat wrap.
+    std::string key = std::string(srcTs->name) + "$" + std::string(enumTs->name);
     std::string stName = "userenumenum." + key;
     auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
     if (!stTy)
-        // §29.11 (#943): { ptr vtable, ptr enumerator, ptr source } — the source
-        // object is retained so GetEnumerator (slot 4) can re-run the source's own
-        // GetEnumerator() to hand out an independent enumerator on re-iteration.
-        stTy = llvm::StructType::create(llvm_, {ptrTy(), ptrTy(), ptrTy()}, stName);
+        // §29.11 (#943): { ptr vtable, ptr enumerator, ptr source, i1 ownsSrc }
+        // — the source object is retained so GetEnumerator (slot 4) can
+        // re-run the source's own GetEnumerator() to hand out an independent
+        // enumerator on re-iteration. fix #2424: slot 3 (`ownsSrc`) is a
+        // per-INSTANCE runtime flag — true only on the ORIGINAL wrapper
+        // returned directly from THIS call when the caller determined `src`
+        // is an unowned temporary; every clone `wrapGetEnumFn` mints always
+        // stores `false` here regardless (see below) — only the ORIGINAL
+        // binding's single scope-end disposal may ever free `src`, never a
+        // re-iteration clone (which would multiply-free the shared source).
+        stTy = llvm::StructType::create(
+            llvm_, {ptrTy(), ptrTy(), ptrTy(), i1()}, stName);
 
     // Resolve the source class's GetEnumerator LLVM function so the clone can call
     // it directly with the retained source as `this`. If unavailable, the clone
@@ -4778,6 +4813,47 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
             b.CreateCall(freeFnTy, freeFnCallee, {enumPtr});
             b.CreateBr(afterEnumBB);
             b.SetInsertPoint(afterEnumBB);
+            // fix #2424 (§28 preamble/§28.9, §29.1, v0.235): when THIS
+            // specific instance owns `srcObj` (slot 3, `ownsSrc` — true only
+            // for the original wrapper bound to an unnamed temporary source;
+            // always false on a re-iteration clone, see wrapGetEnumFn below),
+            // it is `srcObj`'s ONLY disposer anywhere in the program — no
+            // named local/param/field/using-var owns it independently. Two
+            // sub-cases:
+            //   * aliasesSrc (self-returning idiom, `enumPtr == srcObj`):
+            //     `enumDisposeFn(enumPtr)` above ALREADY dispatched `srcObj`'s
+            //     own Dispose (enumTs == srcTs when aliased, so the two
+            //     disposer functions are the same one) — only the physical
+            //     reclaim (skipped above by the alias guard) remains.
+            //   * !aliasesSrc (two-class idiom): `srcObj` is a genuinely
+            //     distinct object whose Dispose was never dispatched by
+            //     anything above — dispatch `srcDisposeFn` (srcTs's own
+            //     §28.2 Dispose) here, then reclaim.
+            llvm::Value* ownsF = b.CreateStructGEP(stTy, self, 3);
+            llvm::Value* ownsSrcVal = b.CreateLoad(b.getInt1Ty(), ownsF);
+            auto* ownSrcBB =
+                llvm::BasicBlock::Create(llvm_, "wrapdispose.ownsrc", f);
+            auto* afterSrcBB =
+                llvm::BasicBlock::Create(llvm_, "wrapdispose.aftersrc", f);
+            b.CreateCondBr(ownsSrcVal, ownSrcBB, afterSrcBB);
+            b.SetInsertPoint(ownSrcBB);
+            {
+                auto* dispatchSrcBB =
+                    llvm::BasicBlock::Create(llvm_, "wrapdispose.srcdispatch", f);
+                auto* reclaimSrcBB =
+                    llvm::BasicBlock::Create(llvm_, "wrapdispose.srcreclaim", f);
+                b.CreateCondBr(aliasesSrc, reclaimSrcBB, dispatchSrcBB);
+                b.SetInsertPoint(dispatchSrcBB);
+                if (srcDisposeFn) {
+                    b.CreateCall(srcDisposeFn->getFunctionType(), srcDisposeFn,
+                                 {srcObj});
+                }
+                b.CreateBr(reclaimSrcBB);
+                b.SetInsertPoint(reclaimSrcBB);
+                b.CreateCall(freeFnTy, freeFnCallee, {srcObj});
+                b.CreateBr(afterSrcBB);
+            }
+            b.SetInsertPoint(afterSrcBB);
             b.CreateCall(freeFnTy, freeFnCallee, {self});
             b.CreateRetVoid();
         });
@@ -4821,8 +4897,11 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
     // Re-run the source class's GetEnumerator() on the retained source object to
     // obtain a brand-new inner enumerator positioned before the first element, and
     // wrap it in a fresh struct. A second `for` loop over the same IEnumerable<T>
-    // value therefore replays from the start. The source is disposed once at its
-    // own scope end; each loop disposes only its own wrapper+inner enumerator.
+    // value therefore replays from the start. The source is disposed once — either
+    // at its own independent scope end (a NAMED source), or by the ORIGINAL
+    // wrapper's own disposal (an owned temporary, fix #2424, `ownsSrc`) — and
+    // EITHER WAY that is never this clone's job: each loop disposes only its own
+    // wrapper+inner enumerator.
     llvm::Function* wrapGetEnumFn = getOrCreate(prefix + "GetEnumerator",
         llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
         [&](llvm::Function* f) {
@@ -4849,6 +4928,13 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
                   // wrapper struct → disposal stays independent of the source).
                 innerEnum = b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 1));
             b.CreateStore(innerEnum, b.CreateStructGEP(stTy, clone, 1));
+            // fix #2424: the clone NEVER owns `srcObj`, regardless of whether
+            // `self` (the wrapper this clone was minted from) does. Only the
+            // ORIGINAL binding's own scope-end disposal may free the shared
+            // source — every clone disposing it too would multiply-free it
+            // (confirmed as the exact hazard the multiple-live-enumerators
+            // axis targets; see the adversarial-grid tests).
+            b.CreateStore(b.getFalse(), b.CreateStructGEP(stTy, clone, 3));
             b.CreateRet(clone);
         });
 
@@ -4876,7 +4962,8 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
     llvm::Value* enumPtr = emitMethodCall(getEnumSym, geArgs, /*baseQualified=*/false);
     if (!enumPtr) return src;
 
-    // 10. Allocate wrapper struct and fill fields (vtable, enumerator, source).
+    // 10. Allocate wrapper struct and fill fields (vtable, enumerator, source,
+    // ownsSrc).
     uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stTy);
     auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
     llvm::Value* wrap = builder_.CreateCall(callocFn2,
@@ -4884,6 +4971,11 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
     builder_.CreateStore(vtGV, builder_.CreateStructGEP(stTy, wrap, 0));
     builder_.CreateStore(enumPtr, builder_.CreateStructGEP(stTy, wrap, 1));
     builder_.CreateStore(src, builder_.CreateStructGEP(stTy, wrap, 2));
+    // fix #2424: only THIS original instance's `ownsSrc` reflects the
+    // caller's named-vs-temporary determination — every clone this wrapper
+    // later mints (wrapGetEnumFn) hardcodes `false` regardless (see above).
+    builder_.CreateStore(ownsSrc ? builder_.getTrue() : builder_.getFalse(),
+                          builder_.CreateStructGEP(stTy, wrap, 3));
     return wrap;
 }
 

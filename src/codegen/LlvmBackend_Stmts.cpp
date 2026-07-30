@@ -6363,6 +6363,35 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     }
     std::size_t outerDepth = disposeStack_.size();
     disposeStack_.emplace_back();
+    // fix #2424 (§28 preamble/§28.9, §29.1, v0.235): a genuinely UNOWNED
+    // temporary iterable source (`for var x in new IntRange(...) do ... end`
+    // — the `new` result is bound to no other name anywhere) has no
+    // independent disposer in the program; this loop is its SOLE owner and
+    // must dispose it too, exactly as it already disposes the enumerator it
+    // constructs. Only the TWO-CLASS idiom needs a SEPARATE registration
+    // here (`enumTs != ts`): `srcPtr` is then a genuinely distinct object
+    // from `enumPtr`. The self-returning idiom (`enumTs == ts`) needs no
+    // separate entry — `enumPtr == srcPtr` at runtime, and the
+    // `enumDisposeSlot` registration just below (identity-guarded to null
+    // when `sourceIsNamedOwner`, or the plain `enumSlot` otherwise) already
+    // disposes that single shared object exactly once. A NAMED source
+    // (`sourceIsNamedOwner`) is disposed at ITS OWN scope end by the
+    // ordinary local/param/field disposal machinery — registering it again
+    // here would double-free. Mirrors `lowerIEnumerableBuiltinFor`'s
+    // identical `!sourceIsNamedLocal` gate for the array/collection sibling
+    // path (§29.2: "a freshly produced source value with no owning binding
+    // ... is owned by this loop"). Pushed BEFORE the enumerator's own entry
+    // so LIFO scope-end disposal (`emitDisposals` iterates in reverse) frees
+    // the enumerator first, the source second — the natural reverse of their
+    // construction order; the two never alias here (`enumTs != ts` is
+    // exactly this branch's guard) so the order has no correctness
+    // consequence, only readability.
+    llvm::AllocaInst* srcDisposeSlot = nullptr;
+    if (!sourceIsNamedOwner && enumTs != ts && disposerFns_.count(ts)) {
+        srcDisposeSlot = entryAlloca(ptrTy());
+        builder_.CreateStore(srcPtr, srcDisposeSlot);
+        disposeStack_.back().push_back({srcDisposeSlot, ts});
+    }
     if (disposerFns_.count(enumTs))
         disposeStack_.back().push_back({enumDisposeSlot, enumTs});
 
@@ -6390,7 +6419,12 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     // Loop variable slot — the body sees `x` here.
     auto* varSlot = entryAlloca(elemTy);
     locals_[&fs] = varSlot;
-    registerForLoopSpillSlots(fs, {enumSlot, varSlot});  // #747 R42
+    // fix #2424: srcDisposeSlot (null unless the two-class-idiom-owned-
+    // temporary branch above registered it) must survive a suspend the same
+    // way enumSlot already does — it is read back only at loop end (endBB),
+    // which may be reached after a resume. registerForLoopSpillSlots
+    // null-guards each slot itself, so passing a possibly-null entry is safe.
+    registerForLoopSpillSlots(fs, {enumSlot, srcDisposeSlot, varSlot});  // #747 R42
 
     auto* condBB = llvm::BasicBlock::Create(llvm_, "ien.cond", currentFn_);
     auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ien.body", currentFn_);
