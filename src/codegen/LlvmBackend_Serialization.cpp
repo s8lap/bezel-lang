@@ -2981,8 +2981,25 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
 
     auto* readNameFn = declareC("bz_binder_read_field_name", ptrTy(), {ptrTy()});
     llvm::Value* namePtr = builder_.CreateCall(readNameFn, {derPtr}, "cdeser.fname");
+    // fix #2403 follow-up / §2.15: bz_binder_read_field_name's binary path can
+    // now raise DIRECTLY (bz_binder_read_bz_string calls bz_ser_throw_at_binary
+    // on truncation as of the #2403 fix, matching every other binary reader) —
+    // check for that pending exception BEFORE the manual null-check-and-throw
+    // block below, mirroring every other read call in this function (e.g.
+    // bz_binder_begin_object above). Without this, the manual block's own
+    // unconditional emitThrowBuiltin() call a few lines down would SUPERSEDE
+    // the #2403 exception with a fresh, message-less one — orphaning/leaking
+    // the first exception object, exactly the #2378 Bug A pattern this
+    // function was already fixed against for every OTHER read in its loop.
+    // The pre-existing disposeStack_ scope pushed above (before this loop
+    // starts) is still active here, so emitPendingCheck()'s unwind still
+    // disposes every already-filled component slot correctly.
+    emitPendingCheck();
 
-    // §9.8 / #550: truncated input — bz_binder_read_field_name returns null.
+    // §9.8 / #550: truncated input — bz_binder_read_field_name returns null
+    // WITHOUT a pending exception (reached only for the OOM allocation-failure
+    // paths inside bz_binder_read_bz_string, which still return null silently
+    // — a truncation-caused null is now caught by emitPendingCheck() above).
     // Dispose any already-allocated owned-class slots, raise SerializationException.
     {
         llvm::Value* isNull = builder_.CreateICmpEQ(
